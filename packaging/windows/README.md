@@ -140,7 +140,60 @@ fresh install uses the generated random console password — read it from
 > punktfunk-planning: `windows-build-and-packaging.md` (internal planning repo) for the toolchain
 > + signing details.
 
+## Installer signing (Azure Artifact Signing)
+
+`setup.exe`, `punktfunk-host.exe`, `punktfunk-tray.exe` and the Vulkan HDR layer are signed with
+**Azure Artifact Signing** (formerly Trusted Signing): account `unomsigning`, certificate profile
+`unom-io`, endpoint `https://neu.codesigning.azure.net/`. It is a publicly trusted CA, so users get
+a named publisher in the UAC prompt and there is no `.cer` to import — `HOST_CER_PATH` is simply not
+emitted in this mode (every consumer already guards on `Test-Path`).
+
+`pack-host-installer.ps1` resolves a backend in this order, first match wins:
+
+| order | backend | selected by |
+| --- | --- | --- |
+| 1 | Azure Artifact Signing | `AZURE_CODESIGNING_ENDPOINT` + `_ACCOUNT` + `_PROFILE` all set |
+| 2 | stable self-signed `.pfx` | `MSIX_CERT_PFX_B64` / `MSIX_CERT_PASSWORD` |
+| 3 | ephemeral self-signed | nothing set (canary / local only; a `v*` tag **fails closed**) |
+
+Credentials for mode 1 come from the environment via `DefaultAzureCredential` — `AZURE_TENANT_ID`,
+`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, the `punktfunk-ci-signing` service principal. It holds
+exactly one role, *Artifact Signing Certificate Profile Signer*, scoped to the `unom-io` profile: it
+can sign and can do nothing else with the subscription. The script hard-fails if the trio is missing
+rather than letting `DefaultAzureCredential` fall through to an interactive login that would hang a
+runner forever.
+
+> **Timestamping is mandatory here, not best-effort.** Azure mints a leaf certificate per request,
+> valid for about three days. An untimestamped signature therefore goes untrusted within days of
+> release — it would verify fine on the runner and fail on users' machines that weekend. `Sign-File`
+> refuses to retry without a timestamp in Azure mode; modes 2 and 3 keep the old lenient retry, where
+> the cert outlives the release anyway.
+
+### Runner setup
+
+`signtool` reaches Azure through `Azure.CodeSigning.Dlib.dll`, which ships in the
+`Microsoft.Trusted.Signing.Client` NuGet package — no installer, no fixed path. On the Windows runner:
+
+```powershell
+nuget install Microsoft.Trusted.Signing.Client -OutputDirectory $env:USERPROFILE\.nuget\packages
+```
+
+`Find-AzureDlib` searches that path and `C:\trusted-signing\`, newest first, so a package update needs
+no script edit. Set `AZURE_CODESIGNING_DLIB` to override with an explicit path.
+
 ## Driver signing (`DRIVER_CERT_PFX_B64`)
+
+> **The drivers are deliberately NOT on Azure.** Their catalogs keep the self-signed
+> `CN=punktfunk-driver` cert below, which the installer still plants in the machine `Root` store.
+> The two signatures are independent by design — Windows verifies the installer via SmartScreen/UAC
+> and driver catalogs via PnP, and never requires a common signer, which is why the installer could
+> move to a public CA without touching the driver track at all.
+>
+> Worth revisiting: these are **user-mode** (UMDF) drivers and we already clear `FORCE_INTEGRITY`, so
+> a catalog signed by the publicly trusted Azure cert would likely chain to a root every Windows box
+> already has — which would let us drop the `Root` plant entirely and keep only the `TrustedPublisher`
+> entry that suppresses the device-software prompt. That is a real reduction in what we ask of a
+> user's machine, but it is **unverified**: test it on the Windows box before believing it.
 
 Our three UMDF drivers are signed with a **stable self-signed code-signing cert**, subject
 `CN=punktfunk-driver`, supplied to `build-pf-vdisplay.ps1` / `build-gamepad-drivers.ps1` as the
@@ -241,7 +294,8 @@ the recovery. From a Linux box drive either over SSH, e.g.
 #    statically links the vendored VPL dispatcher — needs cmake + a libclang, no FFmpeg)
 cargo build --release -p punktfunk-host --features nvenc,qsv
 
-# 2. pack (self-signed unless MSIX_CERT_PFX_B64/MSIX_CERT_PASSWORD are set; -NoDriver to skip pf-vdisplay)
+# 2. pack (self-signed unless the AZURE_CODESIGNING_* trio or MSIX_CERT_PFX_B64/MSIX_CERT_PASSWORD
+#    are set — see "Installer signing" above; -NoDriver to skip pf-vdisplay)
 pwsh -File packaging\windows\pack-host-installer.ps1 -Version 0.0.0-dev -TargetDir C:\t\release -OutDir C:\t\out
 ```
 

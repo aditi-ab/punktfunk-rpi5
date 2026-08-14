@@ -3,8 +3,14 @@
   MSIX package manifest for the punktfunk Windows client (WinUI 3 via windows-reactor).
 
   This is a TEMPLATE: packaging/pack-msix.ps1 substitutes {VERSION} (4-part numeric, e.g.
-  0.2.137.0) and {PUBLISHER} (must EXACTLY equal the signing cert's subject DN — default
-  `CN=unom` for the self-signed CI cert; a real code-signing cert just passes its own subject).
+  0.2.137.0) and {PUBLISHER} (must EXACTLY equal the signing cert's subject DN — the default is
+  the verified subject of the Azure `unom-io` certificate profile; the self-signed fallback mints
+  a throwaway cert with that same subject so canary and release share a package identity).
+
+  Package identity is Name + Publisher, so changing {PUBLISHER} makes this a DIFFERENT package:
+  installs of the older publisher cannot be upgraded in place and must be uninstalled first. That
+  is a user-visible migration, not a packaging detail — mention it in the release notes. pack-msix.ps1
+  reads the signature back off the packed .msix and fails the build if the two ever drift.
 
   Why this packages cleanly even though the app was built "unpackaged": windows-reactor calls
   MddBootstrapInitialize2 with OnPackageIdentity_NOOP (crates/libs/reactor/src/app.rs), so under

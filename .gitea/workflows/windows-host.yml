@@ -20,11 +20,17 @@
 #   main push / dispatch -> <next-minor>.<run_number>  (canary; `canary/` alias; base one minor
 #                          ahead of the latest stable tag via scripts/ci/pf-version.ps1, run climbs).
 #
-# Signing reuses the client's MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD secrets (CN=unom). Without them
-# an ephemeral self-signed cert is generated and its public .cer published next to the installer
-# (import once to LocalMachine\TrustedPublisher). That fallback is for canary/CI ONLY — on a v* tag
+# Signing goes through Azure Artifact Signing (account `unomsigning`, profile `unom-io`) — a publicly
+# trusted CA, so there is no .cer for users to import and no SmartScreen "unknown publisher" prompt.
+# It falls back to the old MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD self-signed cert, and then to an
+# ephemeral one, for builds without Azure access. Those fallbacks are for canary/CI ONLY — on a v* tag
 # the pack script FAILS CLOSED rather than ship a release signed by a per-build throwaway cert.
 # See packaging/windows/pack-host-installer.ps1.
+#
+# The bundled DRIVERS are NOT signed by Azure — they keep their own DRIVER_CERT_* cert and are still
+# trusted by planting that cert in the machine Root store at install time. Independent by design:
+# Windows checks the installer's signature via SmartScreen/UAC and driver catalogs via PnP, and never
+# requires a common signer. See packaging/windows/README.md for why that root-plant is still there.
 #
 # GPU backends: the host builds with --features nvenc,amf-qsv,qsv = all three vendors in one installer.
 #  - NVENC (NVIDIA, direct SDK): nothing needed at build time — the entry points are resolved at
@@ -415,12 +421,26 @@ jobs:
       - name: Pack + sign installer
         shell: pwsh
         env:
+          # Azure Artifact Signing (formerly Trusted Signing) — takes precedence over MSIX_CERT_*
+          # when all three of these are set. Not secret: an account/profile name and a regional
+          # endpoint, all inert without the credentials below, so they live here where a reviewer
+          # can see which profile a release was signed by.
+          AZURE_CODESIGNING_ENDPOINT: https://neu.codesigning.azure.net/
+          AZURE_CODESIGNING_ACCOUNT: unomsigning
+          AZURE_CODESIGNING_PROFILE: unom-io
+          # Service principal 'punktfunk-ci-signing', holding ONLY the Artifact Signing Certificate
+          # Profile Signer role, scoped to the unom-io profile — it can sign and nothing else.
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          # Legacy self-signed path, kept as the fallback for builds without Azure access.
           MSIX_CERT_PFX_B64: ${{ secrets.MSIX_CERT_PFX_B64 }}
           MSIX_CERT_PASSWORD: ${{ secrets.MSIX_CERT_PASSWORD }}
           # The DRIVER cert is separate from the host/MSIX one and reaches the two driver build
           # scripts through the environment (pack-host-installer.ps1 invokes them, they read
           # $env:DRIVER_CERT_PFX_B64 themselves). Without it they sign with a per-build throwaway,
           # which the installer then trusts as a machine root — see packaging/windows/README.md.
+          # NOT moved to Azure: driver catalogs are a separate track, see that README.
           DRIVER_CERT_PFX_B64: ${{ secrets.DRIVER_CERT_PFX_B64 }}
           DRIVER_CERT_PASSWORD: ${{ secrets.DRIVER_CERT_PASSWORD }}
         run: |

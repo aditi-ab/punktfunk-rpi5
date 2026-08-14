@@ -7,12 +7,20 @@
 //! 1. **SHA-256 == the signed manifest's** — the primary integrity gate (the manifest is the
 //!    Ed25519-verified document; this check makes the downloaded bytes those exact bytes).
 //! 2. **Authenticode**: the embedded signature must be cryptographically valid, tolerating
-//!    `CERT_E_UNTRUSTEDROOT` while the shipping cert is self-signed (`CN=unom`); when the
+//!    `CERT_E_UNTRUSTEDROOT` (canary and local builds still sign with a self-signed cert, and
+//!    releases moved to Azure Artifact Signing without needing this to tighten); when the
 //!    manifest carries leaf pins, the signing leaf's SHA-256 must match one. The leaf is taken
 //!    from the SAME `WinVerifyTrust` state (`WTHelperGetProvSignerFromChain`), never a second
 //!    parse — no verify-vs-inspect gap. An empty pin list skips only the pin comparison (the
-//!    manifest hash already binds content; pins arrive via `AUTHENTICODE_SHA256` in CI once
-//!    the cert story settles — the field exists so Trusted Signing is a manifest edit).
+//!    manifest hash already binds content).
+//!
+//!    **Leaf pinning cannot be used with Azure Artifact Signing.** That service mints a fresh leaf
+//!    per signing request, valid ~3 days, so an `AUTHENTICODE_SHA256` pin would go stale within days
+//!    of publishing and reject every subsequent release. (An earlier note here assumed the opposite —
+//!    that the pin field made Trusted Signing "a manifest edit". It does not.) If pinning is wanted
+//!    against the Azure-signed artifacts, pin something stable instead: the issuing intermediate, or
+//!    the certificate subject. Leave the list empty until then; the Ed25519-signed manifest hash is
+//!    what actually binds the downloaded bytes.
 //!
 //! The spawn uses `CREATE_BREAKAWAY_FROM_JOB`: the service worker's job object is kill-on-close
 //! (a stopping service would otherwise take the installer down with it) and was created
@@ -284,8 +292,10 @@ fn preflight_disk(at: &Path, needed: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// Authenticode: valid embedded signature (untrusted root tolerated — self-signed `CN=unom`),
-/// signing-leaf SHA-256 ∈ `pins` when pins are present. The leaf comes out of the same
+/// Authenticode: valid embedded signature (untrusted root tolerated — canary/local builds are still
+/// self-signed), signing-leaf SHA-256 ∈ `pins` when pins are present — but see the module docs: a
+/// leaf pin is unusable against Azure-signed releases, whose leaf rotates every few days. The leaf
+/// comes out of the same
 /// `WinVerifyTrust` state via `WTHelperGetProvSignerFromChain`. (`pub(crate)`: the service
 /// supervisor's boot-loop rollback re-checks the cached previous installer with it.)
 pub(crate) fn verify_authenticode(path: &Path, pins: &[String]) -> Result<(), String> {

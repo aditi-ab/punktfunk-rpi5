@@ -56,34 +56,45 @@ MSIX requires a strictly 4-part numeric version. The workflow computes:
 
 ## Signing & install
 
-CI signs every build with a **stable self-signed code-signing cert** (`CN=unom`, SHA-1
-`CD1EFDEEEC9743AFC38F56C5AF30C5A3009BE941`, valid to 2036). Its public half is checked in as
-[`punktfunk-codesign.cer`](punktfunk-codesign.cer); the private `.pfx` + password live in the
-`MSIX_CERT_PFX_B64` / `MSIX_CERT_PASSWORD` Actions secrets. Because it's the *same* cert every build,
-trusting it is **one-time, per machine** — once imported, every future build and in-place upgrade is
-trusted with no further prompt:
+CI signs every build with **Azure Artifact Signing** (formerly Trusted Signing) — account
+`unomsigning`, certificate profile `unom-io`, endpoint `https://neu.codesigning.azure.net/`. That
+chain is publicly trusted, so **there is nothing to import**:
 
 ```powershell
-# once per machine (elevated): trust the publisher
-Import-Certificate -FilePath .\punktfunk-codesign.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople
-# then install the package for your CPU (and re-run for each upgrade — no re-trust needed)
+# install the package for your CPU (and re-run for each upgrade)
 Add-AppxPackage -Path .\punktfunk-client-windows_<ver>_x64.msix     # Intel/AMD
 Add-AppxPackage -Path .\punktfunk-client-windows_<ver>_arm64.msix   # ARM64 (Snapdragon, etc.)
 ```
-
-The matching `.cer` is also published next to each `.msix` in the registry, so it's always at hand.
 
 The MSIX declares a dependency on the Windows App SDK 2.x runtime; install
 [the App SDK runtime](https://aka.ms/windowsappsdk) if `Add-AppxPackage` reports a missing
 `Microsoft.WindowsAppRuntime.2` framework.
 
-`pack-msix.ps1` signing precedence: it uses the **`MSIX_CERT_PFX_B64` / `MSIX_CERT_PASSWORD`** secrets
-when present (the stable cert above), else generates an *ephemeral* self-signed cert (forks / local
-builds without the secrets). Either way it exports the signing cert's public `.cer` for the import.
-**To move to a publicly-trusted (no-import) cert** — Azure Artifact Signing or a public OV cert —
-replace the two secrets with the new `.pfx`; the cert's subject DN must equal the manifest
-`Publisher`, so pass a matching `-Publisher` (it's stamped into the package `Identity`, and changing
-it changes the package identity → a one-time reinstall).
+### How signing resolves
+
+`pack-msix.ps1` picks a backend in this order:
+
+1. **Azure Artifact Signing** when `AZURE_CODESIGNING_ENDPOINT` / `_ACCOUNT` / `_PROFILE` are all
+   set (the workflow sets them; they aren't secret). Credentials come from `AZURE_TENANT_ID` /
+   `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` — the `punktfunk-ci-signing` service principal, which
+   holds only the *Artifact Signing Certificate Profile Signer* role scoped to the `unom-io` profile.
+   Keys are HSM-backed and never leave Azure, so there is no `.pfx` and no `.cer` is emitted.
+2. **`MSIX_CERT_PFX_B64` / `MSIX_CERT_PASSWORD`** — the older stable self-signed cert (`CN=unom`,
+   public half checked in as [`punktfunk-codesign.cer`](punktfunk-codesign.cer)), kept as a fallback.
+3. An **ephemeral** self-signed cert (forks / local builds with no secrets at all).
+
+Modes 2 and 3 still export a `.cer` to import into `Cert:\LocalMachine\TrustedPeople` first. On a
+`v*` tag, a build with no real signing backend **fails closed** rather than shipping a throwaway.
+
+Two things about Azure mode that are easy to get wrong:
+
+- **Timestamping is mandatory, not best-effort.** Azure mints a leaf cert per request that expires in
+  about three days. An untimestamped signature therefore stops verifying within days of release, so
+  the script refuses to retry without one (modes 2 and 3 keep the old best-effort retry).
+- **The manifest `Publisher` must equal the signer's subject exactly**, because MSIX package identity
+  is Name + Publisher. The default `-Publisher` is the `unom-io` profile's verified subject; after
+  signing, the script reads the signature back off the `.msix` and fails the build on any drift.
+  Changing it makes a *different* package — existing installs must be uninstalled, not upgraded.
 
 ## Building locally
 

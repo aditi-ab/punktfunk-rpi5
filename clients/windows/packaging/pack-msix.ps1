@@ -13,14 +13,21 @@
   packaging/windows/pack-host-installer.ps1 still ships them for its amf-qsv encode path.
 
   Signing cert precedence:
+    0. Azure Artifact Signing (formerly Trusted Signing) when AZURE_CODESIGNING_ENDPOINT/_ACCOUNT/
+       _PROFILE are all set. HSM-backed, so there is no .pfx and nothing to export: the chain is
+       publicly trusted, so no .cer is produced and MSIX_CER_PATH stays unset.
     1. -PfxBase64 / -PfxPassword  (a real or shared code-signing cert, e.g. from CI secrets) — the
        cert's subject DN MUST match -Publisher (which is stamped into the manifest Identity).
     2. otherwise an EPHEMERAL self-signed code-signing cert with subject = -Publisher is generated
        in-process. The package installs only where that cert is trusted, so the matching public
        .cer is exported next to the .msix for the user to import (Trusted People) before install.
-       Swap in a real cert later with zero manifest changes — just pass -PfxBase64/-Publisher.
        This fallback is for canary/CI/dev ONLY: on a v* tag build a missing cert is a hard failure
        (-RequireSignedCert), never a silent downgrade to a throwaway cert.
+
+  WHICHEVER mode runs, the signed .msix is read back and its signer subject compared to -Publisher;
+  a mismatch fails the build. MSIX package identity is Name + Publisher, so a publisher that does
+  not match the signer is not a cosmetic problem — Add-AppxPackage rejects the package outright,
+  and it would only be discovered by a user trying to install the release.
 
   Run on the Windows runner (or the dev VM) with the MSVC/Windows SDK present.
 
@@ -36,9 +43,21 @@ param(
     [Parameter(Mandatory = $true)][string]$TargetDir,                   # cargo --release output dir (has the exe)
     [ValidateSet('x64', 'arm64')][string]$Arch = 'x64',                 # package ProcessorArchitecture + artifact suffix
     [string]$OutDir = (Join-Path $TargetDir 'msix'),
-    [string]$Publisher = 'CN=unom',                                     # MUST equal the signing cert subject DN
+    # MUST equal the signing cert subject DN — this is the verified subject the Azure 'unom-io'
+    # certificate profile issues. The 'ü' is written as an escape, not a literal: this file is UTF-8
+    # with no BOM, and read by anything other than pwsh 7 a literal would silently mojibake into a
+    # publisher that no longer matches the signer, which surfaces only as an Add-AppxPackage refusal
+    # on a user's machine. Verified against the real signer after signing below.
+    [string]$Publisher = "CN=unom - Enrico B$([char]0xFC)hler, O=unom - Enrico B$([char]0xFC)hler, L=Rottweil, S=Baden-W$([char]0xFC)rttemberg, C=DE",
     [string]$PfxBase64 = $env:MSIX_CERT_PFX_B64,                        # optional: base64 of a code-signing .pfx
     [string]$PfxPassword = $env:MSIX_CERT_PASSWORD,
+    # Azure Artifact Signing. All three select it, ahead of any .pfx. Credentials arrive through the
+    # environment via DefaultAzureCredential (AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET)
+    # rather than as arguments, so they cannot leak into a process listing or a transcript.
+    [string]$AzureEndpoint = $env:AZURE_CODESIGNING_ENDPOINT,           # e.g. https://neu.codesigning.azure.net/
+    [string]$AzureAccount = $env:AZURE_CODESIGNING_ACCOUNT,             # signing account name
+    [string]$AzureProfile = $env:AZURE_CODESIGNING_PROFILE,             # certificate profile name
+    [string]$AzureDlib = $env:AZURE_CODESIGNING_DLIB,                   # path to Azure.CodeSigning.Dlib.dll
     # 'auto' (default) = required iff this is a v* tag build; 'true'/'false' to force. See below.
     [ValidateSet('auto', 'true', 'false')][string]$RequireSignedCert = 'auto'
 )
@@ -62,6 +81,28 @@ function Find-SdkTool([string]$name) {
         Sort-Object { [version]([regex]::Match($_.FullName, '\\(10\.0\.\d+\.\d+)\\x64\\').Groups[1].Value) } |
         Select-Object -Last 1
     if (-not $hit) { throw "$name not found under $root — install the Windows 10/11 SDK." }
+    $hit.FullName
+}
+# Azure.CodeSigning.Dlib.dll ships in the Microsoft.Trusted.Signing.Client NuGet package, which has
+# no installer and no fixed location — hence an explicit override first, then the paths the runner
+# setup uses (packaging/windows/README.md). Newest wins, so a package update needs no edit here.
+function Find-AzureDlib([string]$Explicit) {
+    if ($Explicit) {
+        if (-not (Test-Path $Explicit)) { throw "AZURE_CODESIGNING_DLIB points at a missing file: $Explicit" }
+        return (Resolve-Path $Explicit).Path
+    }
+    $roots = @(
+        (Join-Path $env:USERPROFILE '.nuget\packages\microsoft.trusted.signing.client'),
+        'C:\trusted-signing\microsoft.trusted.signing.client'
+    ) | Where-Object { $_ -and (Test-Path $_) }
+    $hit = $roots | ForEach-Object { Get-ChildItem -Path $_ -Recurse -Filter 'Azure.CodeSigning.Dlib.dll' -ErrorAction SilentlyContinue } |
+        Where-Object { $_.FullName -match '\\bin\\x64\\' } |
+        Sort-Object LastWriteTime | Select-Object -Last 1
+    if (-not $hit) {
+        throw ("Azure.CodeSigning.Dlib.dll not found. Install the signing client on this box, e.g. " +
+               "``nuget install Microsoft.Trusted.Signing.Client -OutputDirectory " +
+               "`$env:USERPROFILE\.nuget\packages``, or set AZURE_CODESIGNING_DLIB to its full path.")
+    }
     $hit.FullName
 }
 $makeappx = Find-SdkTool 'makeappx.exe'
@@ -159,13 +200,34 @@ $requireCert = if ($RequireSignedCert -eq 'auto') { $env:GITHUB_REF -like 'refs/
                else { [Convert]::ToBoolean($RequireSignedCert) }
 $pfxPath = Join-Path $OutDir 'signing.pfx'
 $cerPath = Join-Path $OutDir "punktfunk-client-windows_${Version}_${Arch}.cer"
-if ($PfxBase64) {
+$azureMetadata = Join-Path $OutDir 'azure-codesigning.json'
+$signMode = 'selfsigned'
+if ($AzureEndpoint -and $AzureAccount -and $AzureProfile) {
+    $signMode = 'azure'
+    $AzureDlib = Find-AzureDlib $AzureDlib
+    # signtool takes the account/profile from this file (/dmdf), not the command line.
+    @{
+        Endpoint               = $AzureEndpoint
+        CodeSigningAccountName = $AzureAccount
+        CertificateProfileName = $AzureProfile
+    } | ConvertTo-Json | Set-Content -Path $azureMetadata -Encoding utf8
+    Write-Host "signing via Azure Artifact Signing: $AzureAccount/$AzureProfile at $AzureEndpoint"
+    Write-Host "  dlib: $AzureDlib"
+    foreach ($v in 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET') {
+        if (-not [Environment]::GetEnvironmentVariable($v)) {
+            throw ("Azure signing selected but $v is not set. The dlib authenticates with " +
+                   "DefaultAzureCredential; without the service-principal trio it falls through to an " +
+                   "interactive login that cannot complete on a runner and hangs the build.")
+        }
+    }
+} elseif ($PfxBase64) {
+    $signMode = 'pfx'
     Write-Host "signing with supplied code-signing cert (MSIX_CERT_PFX_B64)"
     [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($PfxBase64))
 } elseif ($requireCert) {
-    throw ("release build ($env:GITHUB_REF) with no MSIX_CERT_PFX_B64 — refusing to fall back to an " +
-           "ephemeral self-signed cert. Restore the MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD repo " +
-           "secrets, or pass -RequireSignedCert false if this really is a test build.")
+    throw ("release build ($env:GITHUB_REF) with neither AZURE_CODESIGNING_* nor MSIX_CERT_PFX_B64 — " +
+           "refusing to fall back to an ephemeral self-signed cert. Restore the signing secrets " +
+           "(packaging/windows/README.md), or pass -RequireSignedCert false if this really is a test build.")
 } else {
     Write-Host "no MSIX_CERT_PFX_B64 -> generating an ephemeral self-signed cert (subject $Publisher)"
     if (-not $PfxPassword) { $PfxPassword = 'punktfunk' }
@@ -178,35 +240,80 @@ if ($PfxBase64) {
     Remove-Item "Cert:\CurrentUser\My\$($tmp.Thumbprint)" -Force
 }
 
-# Always export the public .cer from the pfx. For a self-signed / private-trust cert it's the file
-# users import once (Trusted People) — a STABLE cert (same pfx every build via the secret) means that
-# import is a one-time, per-machine step that keeps working across upgrades. For a public-CA cert
-# it's just an unused extra (harmless). The manifest Publisher must equal the cert's subject DN.
-$pwsec = if ($PfxPassword) { ConvertTo-SecureString -String $PfxPassword -Force -AsPlainText } else { $null }
-$pubCert = if ($pwsec) { Get-PfxCertificate -FilePath $pfxPath -Password $pwsec } else { Get-PfxCertificate -FilePath $pfxPath }
-Export-Certificate -Cert $pubCert -FilePath $cerPath | Out-Null
-Write-Host "signing cert subject=$($pubCert.Subject) thumbprint=$($pubCert.Thumbprint)"
-if ($pubCert.Subject -ne $Publisher) {
-    Write-Warning "cert subject '$($pubCert.Subject)' != manifest Publisher '$Publisher' — Add-AppxPackage will reject the mismatch. Pass -Publisher '$($pubCert.Subject)'."
+# Export the public .cer from the pfx. For a self-signed / private-trust cert it's the file users
+# import once (Trusted People) — a STABLE cert (same pfx every build via the secret) means that
+# import is a one-time, per-machine step that keeps working across upgrades. Azure signing is
+# HSM-backed: there is no pfx to read and its chain is publicly trusted, so no .cer is produced.
+if ($signMode -ne 'azure') {
+    $pwsec = if ($PfxPassword) { ConvertTo-SecureString -String $PfxPassword -Force -AsPlainText } else { $null }
+    $pubCert = if ($pwsec) { Get-PfxCertificate -FilePath $pfxPath -Password $pwsec } else { Get-PfxCertificate -FilePath $pfxPath }
+    Export-Certificate -Cert $pubCert -FilePath $cerPath | Out-Null
+    Write-Host "signing cert subject=$($pubCert.Subject) thumbprint=$($pubCert.Thumbprint)"
 }
 
-# --- sign (timestamp best-effort) ---
-$signArgs = @('sign', '/fd', 'SHA256', '/f', $pfxPath)
-if ($PfxPassword) { $signArgs += @('/p', $PfxPassword) }
-& $signtool ($signArgs + @('/tr', 'http://timestamp.digicert.com', '/td', 'SHA256', $msix))
+# --- sign ---
+# The timestamp is best-effort for a .pfx whose cert outlives the release, but MANDATORY under Azure
+# signing: those leaf certs are minted per request and expire in ~3 days, so an untimestamped
+# signature stops verifying within days of shipping. Retrying without one there would produce a
+# package that installs on the runner and fails for every user that weekend — so the fallback is
+# gated on the mode rather than applied blindly.
+if ($signMode -eq 'azure') {
+    $signArgs = @('sign', '/fd', 'SHA256', '/dlib', $AzureDlib, '/dmdf', $azureMetadata)
+    $ts = 'http://timestamp.acs.microsoft.com'
+} else {
+    $signArgs = @('sign', '/fd', 'SHA256', '/f', $pfxPath)
+    if ($PfxPassword) { $signArgs += @('/p', $PfxPassword) }
+    $ts = 'http://timestamp.digicert.com'
+}
+& $signtool ($signArgs + @('/tr', $ts, '/td', 'SHA256', $msix))
 if ($LASTEXITCODE -ne 0) {
+    if ($signMode -eq 'azure') {
+        throw ("timestamped sign failed ($LASTEXITCODE) — NOT retrying without a timestamp. An Azure " +
+               "signing cert is valid for ~3 days; an untimestamped signature would go untrusted " +
+               "within days of release.")
+    }
     Write-Warning "timestamped sign failed — retrying without a timestamp"
     & $signtool ($signArgs + @($msix))
     if ($LASTEXITCODE -ne 0) { throw "signtool sign failed ($LASTEXITCODE)" }
 }
 Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
+Remove-Item $azureMetadata -Force -ErrorAction SilentlyContinue
+
+# Read the signature back off the packed .msix and hold it against the manifest Publisher. MSIX
+# package identity is Name + Publisher, so a publisher that doesn't match the signer isn't cosmetic:
+# Add-AppxPackage refuses the package outright. Checking the ACTUAL signer (rather than a pfx we
+# happen to hold) is the only form of this check that works in every signing mode, and failing the
+# build here is the difference between a red pipeline and a release nobody can install.
+# Deliberately asymmetric: a subject we CAN read and that DISAGREES is a hard failure, but a subject
+# we cannot read at all is only a warning. Get-AuthenticodeSignature's support for the .msix/.appx
+# subject interface varies by Windows version, and signtool has already reported success by this
+# point — turning "the check could not run" into a build break would trade a real defect we catch for
+# an imaginary one we invent.
+$signerSubject = $null
+try { $signerSubject = (Get-AuthenticodeSignature $msix).SignerCertificate.Subject } catch { }
+if (-not $signerSubject) {
+    Write-Warning ("could not read a signer subject back from $msix, so Publisher/signer agreement is " +
+                   "UNVERIFIED on this box. If the package is rejected at Add-AppxPackage time, compare " +
+                   "`signtool verify /pa /v` against the manifest Publisher '$Publisher' by hand.")
+} elseif ($signerSubject -ne $Publisher) {
+    throw ("signer subject does not match the manifest Publisher, so this package cannot install:`n" +
+           "  signer    : '$signerSubject'`n" +
+           "  Publisher : '$Publisher'`n" +
+           "Pass -Publisher '$signerSubject' (or fix the certificate profile) and repack.")
+} else {
+    Write-Host "verified signer subject matches manifest Publisher: $signerSubject"
+}
 
 Write-Host ""
 Write-Host "==> MSIX: $msix"
-Write-Host "==> trust the cert once per machine (then it stays trusted across all future builds):"
-Write-Host "    Import-Certificate -FilePath '$cerPath' -CertStoreLocation Cert:\LocalMachine\TrustedPeople"
+if ($signMode -eq 'azure') {
+    Write-Host "==> signed by a publicly trusted CA — nothing for users to import."
+} else {
+    Write-Host "==> trust the cert once per machine (then it stays trusted across all future builds):"
+    Write-Host "    Import-Certificate -FilePath '$cerPath' -CertStoreLocation Cert:\LocalMachine\TrustedPeople"
+}
 # emit paths for the workflow to publish (only under CI, where GITHUB_ENV is set)
 if ($env:GITHUB_ENV) {
     "MSIX_PATH=$msix" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-    "MSIX_CER_PATH=$cerPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    if ($signMode -ne 'azure') { "MSIX_CER_PATH=$cerPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8 }
 }

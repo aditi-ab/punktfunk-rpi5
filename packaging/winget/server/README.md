@@ -16,12 +16,10 @@ winget upgrade unom.PunktfunkHost
 ## Why self-hosted rather than the community repo
 
 `microsoft/winget-pkgs` gates submissions on its `Binary-Validation-Error` /
-`Validation-Defender-Error` checks, and the host installer is currently signed with a self-signed
-cert (`CN=unom`). That is a pre-existing condition — winget does not sign anything, so SmartScreen
-behaves identically whether the installer arrives by browser or by `winget` — but it does block that
-route until a publicly trusted cert is in place. A self-hosted source has no such gate, can carry
-`Agreements` (verified-developers-only upstream), and can serve channels the community repo would
-never accept.
+`Validation-Defender-Error` checks, which need a publicly trusted signing cert. That blocker is
+gone — the host installer is now signed with Azure Artifact Signing (see `packaging/windows/README.md`)
+— but a self-hosted source is still the right call: it has no such gate, can carry `Agreements`
+(verified-developers-only upstream), and can serve channels the community repo would never accept.
 
 ## What it implements
 

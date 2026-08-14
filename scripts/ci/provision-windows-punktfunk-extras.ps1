@@ -113,4 +113,60 @@ $env:PATH = "C:\Users\Public\ffmpeg\bin;" + $env:PATH
 '@ | Set-Content -Encoding UTF8 $projectEnv
 info "wrote $projectEnv (FFMPEG_DIR) - restart the gitea-act-runner scheduled task to pick it up"
 
+# --- Azure Artifact Signing (formerly Trusted Signing) toolchain, for the signing step in
+# windows-host.yml + windows-client.yml. Two pieces, neither of which the generic unom/infra image
+# carries, and both of which fail in ways that do not name themselves:
+#
+#   1. The .NET 8 runtime. Azure.CodeSigning.Dlib.dll is a mixed-mode (C++/CLI) assembly - it ships
+#      Ijwhost.dll and a runtimeconfig.json pinning Microsoft.NETCore.App 8.0.0 - so on a box with
+#      no .NET runtime, signtool exits 3 having printed NOTHING AT ALL. Verified on .133 2026-08-14:
+#      the box had pwsh 7 (self-contained, brings no shared runtime) and no dotnet whatsoever.
+#   2. The signing client, installed MACHINE-WIDE under C:\trusted-signing rather than into a user's
+#      .nuget. The act_runner daemon runs as SYSTEM, whose USERPROFILE is
+#      C:\Windows\System32\config\systemprofile - so a per-user install under Administrator is
+#      invisible to every job that actually builds. Find-AzureDlib in both pack scripts searches
+#      this exact path for that reason; verified by resolving it from a SYSTEM scheduled task.
+#
+# Both are SHA-256 pinned against version-immutable URLs (a nuget.org flat-container package and the
+# dotnet builds CDN are both immutable per version), so these fail closed on tampering rather than
+# every time Microsoft ships a patch release. Bump version + hash together to move either. ---
+$dotnetVer = '8.0.30'
+$dotnetSha = 'E40F199C6D5584AFF0554C01163C3C8D9CCF6BEC3A577E4D967E41070772A1C1'
+$tscVer = '1.0.95'
+$tscSha = '3BFCF1E0A3CB42AF1692F0A8ED45C15DE070C2DE86F28A59B2795D904D8A920F'
+
+if (Test-Path 'C:\Program Files\dotnet\shared\Microsoft.NETCore.App') {
+  info "shared .NET runtime already present ($((Get-ChildItem 'C:\Program Files\dotnet\shared\Microsoft.NETCore.App' | ForEach-Object Name) -join ', '))"
+} else {
+  info "installing .NET $dotnetVer runtime (required by Azure.CodeSigning.Dlib.dll)"
+  $dn = "$env:TEMP\dotnet-runtime-$dotnetVer-win-x64.exe"
+  Invoke-WebRequest -Uri "https://builds.dotnet.microsoft.com/dotnet/Runtime/$dotnetVer/dotnet-runtime-$dotnetVer-win-x64.exe" -OutFile $dn -UseBasicParsing
+  $got = (Get-FileHash $dn -Algorithm SHA256).Hash
+  if ($got -ne $dotnetSha) { Remove-Item $dn -Force; throw ".NET runtime download hash mismatch (got $got, pinned $dotnetSha)." }
+  # -Wait is load-bearing: the bundle is a GUI PE that returns immediately when invoked with &,
+  # leaving $LASTEXITCODE unset and racing any completion check against the install.
+  $p = Start-Process -FilePath $dn -ArgumentList '/install', '/quiet', '/norestart' -Wait -PassThru
+  Remove-Item $dn -Force -ErrorAction SilentlyContinue
+  if ($p.ExitCode -ne 0) { throw ".NET runtime installer exited $($p.ExitCode)." }
+  if (-not (Test-Path 'C:\Program Files\dotnet\shared\Microsoft.NETCore.App')) { throw ".NET runtime installer reported success but installed no shared runtime." }
+}
+
+$tscDir = "C:\trusted-signing\microsoft.trusted.signing.client\$tscVer"
+if (Test-Path (Join-Path $tscDir 'bin\x64\Azure.CodeSigning.Dlib.dll')) {
+  info "Trusted Signing client $tscVer already present at $tscDir"
+} else {
+  info "installing Microsoft.Trusted.Signing.Client $tscVer (machine-wide, for SYSTEM)"
+  $nupkg = "$env:TEMP\microsoft.trusted.signing.client.$tscVer.nupkg"
+  Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.trusted.signing.client/$tscVer/microsoft.trusted.signing.client.$tscVer.nupkg" -OutFile $nupkg -UseBasicParsing
+  $got = (Get-FileHash $nupkg -Algorithm SHA256).Hash
+  if ($got -ne $tscSha) { Remove-Item $nupkg -Force; throw "Trusted Signing client download hash mismatch (got $got, pinned $tscSha)." }
+  if (Test-Path $tscDir) { Remove-Item -Recurse -Force $tscDir }
+  New-Item -ItemType Directory -Force -Path $tscDir | Out-Null
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  [System.IO.Compression.ZipFile]::ExtractToDirectory($nupkg, $tscDir)
+  Remove-Item $nupkg -Force -ErrorAction SilentlyContinue
+  Get-ChildItem -Path $tscDir -Recurse -File | Unblock-File -ErrorAction SilentlyContinue
+  if (-not (Test-Path (Join-Path $tscDir 'bin\x64\Azure.CodeSigning.Dlib.dll'))) { throw "extracted $tscVer but bin\x64\Azure.CodeSigning.Dlib.dll is absent." }
+}
+
 info "punktfunk extras provisioned OK."
