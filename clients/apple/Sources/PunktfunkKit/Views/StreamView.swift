@@ -410,8 +410,9 @@ public final class StreamLayerView: NSView {
     // keycode) → Windows VK and forward via InputCapture.sendKey, then CONSUME (return without
     // super) to stop the responder chain's "unhandled keyDown" beep. Keys with no VK mapping
     // are still consumed while captured so they don't beep either. The ⌘⎋ toggle's Esc is
-    // swallowed upstream by InputCapture's keyDown monitor (suppressedVK), so it never gets
-    // here as a send; ⌘-combos still arrive via performKeyEquivalent and stay functional (⌘D).
+    // swallowed upstream by InputCapture's keyDown monitor (suppressedVK), so it never gets here
+    // as a send — and so are ⌘ combos generally while captured, which that monitor forwards to the
+    // host itself (`forwardsCommandChord`) rather than letting a menu key equivalent claim them.
     // Modifier keys never fire keyDown/keyUp — they come through flagsChanged below.
     public override var acceptsFirstResponder: Bool { true }
     // A click after the app was inactive (Cmd-Tab away and back) must reach mouseDown so the
@@ -570,6 +571,9 @@ public final class StreamLayerView: NSView {
         let wasCaptured = captured
         if wasCaptured { releaseCapture() }
         desktopMouse = on
+        // The ⌘-chord passthrough is off under the desktop model (system chords stay local there,
+        // as on every other client) — and the model moves live, so the capture is told, not asked.
+        inputCapture?.desktopMouse = on
         if wasCaptured { engageCapture(fromClick: false) }
         window?.invalidateCursorRects(for: self)
         if on, let p = reappearAt, let sp = cgScreenPoint(forHostX: p.x, p.y) {
@@ -917,6 +921,7 @@ public final class StreamLayerView: NSView {
         ) ?? .capture
         let absOK = connection.resolvedCompositor != .gamescope
         desktopMouse = mode == .desktop && absOK
+        capture.desktopMouse = desktopMouse
         if mode == .desktop && !absOK {
             streamInputLog.info("desktop mouse mode unavailable on a gamescope host (relative-only) — using capture")
         }

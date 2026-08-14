@@ -68,6 +68,10 @@ to one readable line.
   **⌃⌥⇧Q / M / D / S** — but not the microphone mute. **⌘⎋** also toggles capture,
   **⌃⌘F** toggles fullscreen, and **⌃⌥⇧C** starts or stops [clipboard sharing](/docs/clipboard). The
   **Stream** menu lists them all except the mouse-mode combo, which works but has no menu item.
+  Every *other* ⌘ chord goes to the host while input is captured — ⌘Q reaches the host's compositor
+  rather than quitting the app — unless you turn **Capture system shortcuts** off in
+  [client settings](/docs/client-settings#input). ⌘⎋ and ⌃⌘F are held back either way, so there is
+  always a way out.
 - **iPhone and iPad** with a hardware keyboard: **⌃⌥⇧Q** releases input while it is captured, and
   **⌘⎋** toggles capture in either direction. **⌃⌥⇧D** (disconnect) and **⌃⌥⇧S** (stats) come from
   the app's Stream shortcuts rather than from the stream itself; if they don't respond while you're
@@ -154,7 +158,8 @@ There are two, and they are a per-client setting called **Mouse input**:
 - **Capture (games)** — the pointer locks to the stream and only relative movement is sent. The only
   cursor you see is the host's. This is what mouse-look in a game needs. The session window also
   grabs the keyboard here, so Alt+Tab and the Windows key (Super on Linux) reach the host rather than
-  your own desktop — turn **Capture system shortcuts** off in
+  your own desktop — on macOS that is the ⌘ chords, ⌘Q included, with ⌘⎋ kept back as the way out.
+  Turn **Capture system shortcuts** off in
   [client settings](/docs/client-settings#input) to keep them local.
 - **Desktop (absolute)** — the pointer is not locked. It moves in and out of the stream freely and
   its position is sent as an absolute point — what you want for remote desktop work. Your local

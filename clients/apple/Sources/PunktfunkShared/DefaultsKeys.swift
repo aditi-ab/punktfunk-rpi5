@@ -157,6 +157,16 @@ public enum DefaultsKey {
     /// Read live at the wire boundary by `InputCapture`. Control/Shift never move (same position on
     /// both keyboards).
     public static let modifierLayout = "punktfunk.modifierLayout"
+    /// Send system chords to the host while input is captured — the cross-client
+    /// `inhibit_shortcuts`, ON by default. On the SDL clients it is SDL's keyboard grab (Alt+Tab,
+    /// the Windows key); macOS has no such grab from a plain app, so `InputCapture`'s keyDown
+    /// monitor implements it by taking every ⌘ chord off AppKit before a menu key equivalent can
+    /// fire and forwarding it instead — which is what makes ⌘Q reach the host's compositor rather
+    /// than quitting the client. Off keeps the chords local (the second-screen/work profile).
+    /// The client's own reserved chords (⌘⎋, ⌃⌘F, ⌃⌥⇧…) are never forwarded either way, and — as
+    /// on the SDL clients — the setting has no effect under the `desktop` mouse model, which is
+    /// something you ⌘Tab *away* from. macOS-only today; nothing reads it on iOS/tvOS.
+    public static let inhibitShortcuts = "punktfunk.inhibitShortcuts"
     /// iPad: capture the mouse/trackpad pointer (pointer lock → relative movement) for games,
     /// rather than forwarding an absolute cursor position. On by default. Only meaningful on iPad
     /// with a hardware mouse/trackpad; the system grants the lock only to a full-screen, frontmost

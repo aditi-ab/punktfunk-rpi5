@@ -86,6 +86,21 @@ public final class InputCapture {
     /// its Esc suppression need it in both states).
     private var cmdKeysDown: Set<UInt32> = []
 
+    #if os(macOS)
+    /// Windows VKs the ⌘-chord passthrough sent DOWN (see the keyDown monitor). macOS stops
+    /// delivering keyUp for ordinary keys while Command is held, so the release half of ⌘Q/⌘W/…
+    /// cannot be relied on to arrive through the responder chain at all: these are flushed when
+    /// the last ⌘ comes up (`flushCommandChord`), which is what stands between the host and a
+    /// key held down for the rest of the session.
+    private var commandChordVKs: Set<UInt32> = []
+
+    /// Mirrors StreamLayerView's live mouse model — ⌃⌥⇧M flips it mid-session, so it can't be
+    /// read from the settings. The ⌘-chord passthrough stays off under the desktop model, matching
+    /// what the SDL clients' keyboard grab does: a remote desktop is something you ⌘Tab away from,
+    /// not into.
+    public var desktopMouse = false
+    #endif
+
     #if !os(macOS)
     /// The key currently auto-repeating, and the timer driving it. iOS/tvOS only — see
     /// `startAutoRepeat`. Main-queue only, like every other field here.
@@ -244,19 +259,27 @@ public final class InputCapture {
         ) { [weak self] _ in
             self?.releaseAll()
         })
-        // ⌘⎋ — the capture toggle — is detected here so it works in both states. ONLY
-        // that one combo is intercepted: swallowing keys wholesale at the monitor level
-        // risks starving GC's own delivery, so the no-beep behavior lives in
-        // StreamLayerView (first responder consumes keyDown/keyUp while captured).
-        // (On iOS there is no NSEvent monitor — the GC key handler detects the combo.)
+        // This monitor is the FIRST thing in the app to see a key: AppKit calls it before
+        // `sendEvent:`, so before any menu key equivalent and before StreamLayerView's keyDown.
+        // Returning nil discards the event outright — which cuts BOTH of those off, and on macOS
+        // the second one is the host's only key path (the GCKeyboard send is iOS-only; see
+        // `attach(keyboard:)`). So the rule here is: anything swallowed must either be handled
+        // client-side or forwarded to the host from inside this block, because nothing downstream
+        // will get a second chance at it.
+        //
+        // ⌘⎋ (capture toggle) and ⌃⌥⇧M (mouse model) are client-side in BOTH states; ⌃⌥⇧Q/D/S/A
+        // and ⌃⌘F are client-side only while forwarding (released, the events pass through and the
+        // menu's identical key equivalents handle them). Every OTHER ⌘ chord is the HOST's while
+        // captured — see `forwardsCommandChord`. (On iOS there is no NSEvent monitor — the GC key
+        // handler detects the combos.)
         #if os(macOS)
         keyEventMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.keyDown]
         ) { [weak self] event in
             guard let self else { return event }
-            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let flags = Self.chordFlags(event)
             if event.keyCode == 53 /* Esc */, flags == .command {
-                self.suppressedVK = 0x1B // the same physical Esc is en route via GC
+                self.suppressedVK = 0x1B // VK_ESC — its keyUp still reaches the responder chain
                 self.onToggleCapture?()
                 return nil
             }
@@ -266,7 +289,7 @@ public final class InputCapture {
             // (latched like ⌘⎋'s Esc) so it doesn't type into the host, and swallow the
             // event so it doesn't beep.
             if event.keyCode == 46 /* M */, flags == [.control, .option, .shift] {
-                self.suppressedVK = 0x4D // VK_M — the same physical M is en route via GC
+                self.suppressedVK = 0x4D // VK_M — its keyUp still reaches the responder chain
                 self.onToggleMouseMode?()
                 return nil
             }
@@ -304,8 +327,32 @@ public final class InputCapture {
             // captured stream view swallows the menu's identical equivalent); the F is latched so its
             // keyUp can't type into the host. keyCode 3 = kVK_ANSI_F (layout-independent).
             if self.forwarding, flags == [.control, .command], event.keyCode == 3 /* F */ {
-                self.suppressedVK = 0x46 // VK_F — the same physical F is en route via GC
+                self.suppressedVK = 0x46 // VK_F — its keyUp still reaches the responder chain
                 self.onToggleFullscreen?()
+                return nil
+            }
+            // Every OTHER ⌘ chord belongs to the HOST while captured — the cross-client "capture
+            // system shortcuts" setting, which the Apple client had no answer to because SDL's
+            // keyboard grab is what implements it everywhere else. Without this the app menu's key
+            // equivalents fire first, so ⌘Q quits the client instead of reaching the compositor as
+            // Super+Q — one of the most-bound chords on a Linux desktop, and the reported break.
+            //
+            // It has to SEND from here: returning nil is what keeps the menu out, and it takes
+            // StreamLayerView's keyDown — the host's only key path on macOS — out with it.
+            // Chords with no host VK are swallowed but not sent: doing nothing beats a menu
+            // opening under a captured stream. The ⌘ itself needs no handling — modifiers arrive
+            // as flagsChanged, which this monitor never sees, so it was already forwarded as
+            // VK_LWIN/VK_RWIN (or Alt, under the Windows modifier layout) when it went down.
+            //
+            // The two cheap conditions are repeated in front of the call on purpose: off-session,
+            // `SessionSettings.current` re-reads the whole defaults suite, and this monitor sees
+            // every keystroke the app receives — including the ones typed into the host list.
+            if self.forwarding, flags.contains(.command), Self.forwardsCommandChord(
+                keyCode: event.keyCode, flags: flags, forwarding: self.forwarding,
+                inhibitShortcuts: SessionSettings.current.inhibitShortcuts,
+                desktopMouse: self.desktopMouse
+            ) {
+                if let vk = Self.keyCodeToVK[event.keyCode] { self.sendCommandChordKey(vk) }
                 return nil
             }
             return event
@@ -358,6 +405,9 @@ public final class InputCapture {
         cmdKeysDown.removeAll()
         chordModifiersDown.removeAll()
         suppressedVK = nil
+        #if os(macOS)
+        commandChordVKs.removeAll() // their releases are in `pressedVKs`, flushed just below
+        #endif
         for vk in pressedVKs {
             emitKey(vk, down: false)
         }
@@ -522,7 +572,15 @@ public final class InputCapture {
         // Keep cmdKeysDown in step (the ⌘⎋ toggle + Esc suppression read it); sendKey
         // adds the VK to pressedVKs so releaseAll/blur flushes a held modifier cleanly.
         if vk == 0x5B || vk == 0x5C {
-            if down { cmdKeysDown.insert(vk) } else { cmdKeysDown.remove(vk) }
+            if down {
+                cmdKeysDown.insert(vk)
+            } else {
+                cmdKeysDown.remove(vk)
+                // Last ⌘ up: release the chord keys whose own keyUp macOS never delivered. BEFORE
+                // the ⌘'s own release goes out, so the host never sees the letter outlive the
+                // modifier it was pressed with.
+                if cmdKeysDown.isEmpty { flushCommandChord() }
+            }
         }
         sendKey(vk, down: down)
     }
@@ -551,6 +609,68 @@ public final class InputCapture {
             down = !isDown(mod.vk)
         }
         return (mod.vk, down)
+    }
+
+    // MARK: - ⌘ chord passthrough
+
+    /// The four modifiers a client chord is ever spelled with, isolated from the incidental bits
+    /// `deviceIndependentFlagsMask` also carries: Caps Lock, and the `.function`/`.numericPad`
+    /// pair every arrow and F-key sets. Equality against the raw masked flags meant a chord
+    /// stopped being recognized the moment Caps Lock was on — ⌘⎋ and ⌃⌥⇧Q, both escape hatches,
+    /// included. That was survivable while the monitor claimed six chords; it is not, now that it
+    /// swallows every ⌘ chord there is.
+    static let chordFlagMask: NSEvent.ModifierFlags = [.command, .control, .option, .shift]
+
+    /// One event's chord modifiers (see `chordFlagMask`).
+    static func chordFlags(_ event: NSEvent) -> NSEvent.ModifierFlags {
+        event.modifierFlags.intersection(chordFlagMask)
+    }
+
+    /// The ⌘ chords the CLIENT keeps while captured, which is to say: the way out. ⌘⎋ releases
+    /// the mouse/keyboard and ⌃⌘F leaves fullscreen — hand either of those to the host and a
+    /// captured stream becomes a room with no door. (⌃⌥⇧Q/D/S/A carry no ⌘ and never reach here.)
+    static func isClientReservedChord(keyCode: UInt16, flags: NSEvent.ModifierFlags) -> Bool {
+        if keyCode == 53, flags == .command { return true } // ⌘⎋ — capture toggle
+        if keyCode == 3, flags == [.control, .command] { return true } // ⌃⌘F — fullscreen
+        return false
+    }
+
+    /// Does this keyDown get taken off AppKit and forwarded to the host instead? Only while input
+    /// is actually captured, only with the cross-client `inhibit_shortcuts` on, and never under the
+    /// desktop mouse model (where the chords stay local by design) — and never for the client's own
+    /// reserved chords, whatever the setting says.
+    static func forwardsCommandChord(
+        keyCode: UInt16, flags: NSEvent.ModifierFlags,
+        forwarding: Bool, inhibitShortcuts: Bool, desktopMouse: Bool
+    ) -> Bool {
+        guard forwarding, inhibitShortcuts, !desktopMouse else { return false }
+        guard flags.contains(.command) else { return false }
+        return !isClientReservedChord(keyCode: keyCode, flags: flags)
+    }
+
+    /// Forward one key of a ⌘ chord the monitor just took off AppKit, remembering it so its
+    /// release can be synthesized (see `commandChordVKs`).
+    private func sendCommandChordKey(_ vk: UInt32) {
+        commandChordVKs.insert(vk)
+        sendKey(vk, down: true)
+    }
+
+    /// Release whatever the ⌘-chord passthrough sent down and is still held — called when the last
+    /// physical ⌘ comes up. A keyUp that DID arrive has already taken its VK out of `pressedVKs`,
+    /// so this only fires for the ones macOS swallowed.
+    private func flushCommandChord() {
+        // Same cause, different victim: a one-shot latch whose key-up never arrived goes on to eat
+        // the NEXT press of that key (⌃⌘F's F, ⌘⎋'s Esc). Once ⌘ is up, a pending latch is stale.
+        suppressedVK = nil
+        guard !commandChordVKs.isEmpty else { return }
+        for vk in commandChordVKs where pressedVKs.contains(vk) {
+            pressedVKs.remove(vk)
+            emitKey(vk, down: false)
+            if inputDebug {
+                inputLog.debug("key \(vk, privacy: .public) up SYNTHESIZED (⌘ chord release)")
+            }
+        }
+        commandChordVKs.removeAll()
     }
     #endif
 

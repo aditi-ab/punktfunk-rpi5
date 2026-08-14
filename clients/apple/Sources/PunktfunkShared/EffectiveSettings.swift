@@ -33,6 +33,9 @@ public struct EffectiveSettings: Equatable, Sendable {
     public var touchMode = "trackpad"
     public var mouseMode = "capture"
     public var invertScroll = false
+    /// Cross-client `inhibit_shortcuts` (default on): system chords reach the host while input is
+    /// captured. See `DefaultsKey.inhibitShortcuts` — on macOS this is the ⌘-chord passthrough.
+    public var inhibitShortcuts = true
     public var gamepadType = 0
     public var gamepadForwarding = true
     /// Cross-client `system_buttons`: "auto" | "forward" | "local".
@@ -97,6 +100,7 @@ public struct EffectiveSettings: Equatable, Sendable {
         touchMode = str(DefaultsKey.touchMode, touchMode)
         mouseMode = str(DefaultsKey.mouseMode, mouseMode)
         invertScroll = bool(DefaultsKey.invertScroll, invertScroll)
+        inhibitShortcuts = bool(DefaultsKey.inhibitShortcuts, inhibitShortcuts)
         gamepadType = int(DefaultsKey.gamepadType, gamepadType)
         gamepadForwarding = bool(DefaultsKey.gamepadForwarding, gamepadForwarding)
         systemButtons = str(DefaultsKey.systemButtons, systemButtons)
@@ -177,6 +181,7 @@ public struct EffectiveSettings: Equatable, Sendable {
         if let v = overlay.touchMode { s.touchMode = v }
         if let v = overlay.mouseMode { s.mouseMode = v }
         if let v = overlay.invertScroll { s.invertScroll = v }
+        if let v = overlay.inhibitShortcuts { s.inhibitShortcuts = v }
         if let v = overlay.gamepadType { s.gamepadType = v }
         if let v = overlay.gamepadForwarding { s.gamepadForwarding = v }
         if let v = overlay.systemButtons { s.systemButtons = v }

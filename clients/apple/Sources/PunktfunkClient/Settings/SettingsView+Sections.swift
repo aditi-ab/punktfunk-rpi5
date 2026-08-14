@@ -515,6 +515,9 @@ extension SettingsView {
                     Text("Desktop (absolute)").tag(MouseInputMode.desktop.rawValue)
                 }
             }
+            described(inhibitShortcutsDescription, field: "inhibit_shortcuts") {
+                Toggle("Capture system shortcuts", isOn: scoped(SettingsFields.inhibitShortcuts))
+            }
             #endif
             described(
                 (ModifierLayout(rawValue: effective.modifierLayout) ?? .mac).detail,
@@ -534,6 +537,19 @@ extension SettingsView {
     }
 
     #if os(macOS)
+    /// Dynamic like the captions above, because the setting genuinely has no effect under the
+    /// desktop mouse model (system chords stay local there on every client) — and a toggle that
+    /// silently does nothing should say so instead of leaving the user to find out.
+    private var inhibitShortcutsDescription: String {
+        if (MouseInputMode(rawValue: effective.mouseMode) ?? .capture) == .desktop {
+            return "⌘ shortcuts stay on this Mac under the desktop mouse model. Switch Mouse "
+                + "input to Capture to send them to the host."
+        }
+        return "Sends ⌘ shortcuts to the host while input is captured, so ⌘Q and friends reach "
+            + "the remote desktop instead of this app. ⌘⎋ always stays local — it is what "
+            + "releases capture."
+    }
+
     /// The SELECTED mouse model explained — dynamic, like the touch-mode caption.
     private var mouseModeDescription: String {
         switch MouseInputMode(rawValue: effective.mouseMode) ?? .capture {
