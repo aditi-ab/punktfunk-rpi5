@@ -10,7 +10,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.27.0"
+    "version": "0.28.0"
   },
   "paths": {
     "/api/v1/clients": {
@@ -30,6 +30,36 @@
                   "items": {
                     "$ref": "#/components/schemas/PairedClient"
                   }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "clients"
+        ],
+        "summary": "Unpair every client",
+        "description": "The collection form of [`unpair_client`]: empties the pairing store in ONE persisted write,\ncarrying the same revocation guarantees across the whole set. A LIVE GameStream session is\nended (its owning certificate is necessarily one of those just removed), and the ENet control\nport (UDP 47999) closes, because no pairing is left to hold it open.\n\nIdempotent, and so a 200 rather than the single unpair's 204/404 pair: \"unpair everything\" is\nsatisfied by an already-empty store, and the operator still wants to know whether that meant\nthree devices or none.",
+        "operationId": "unpairAllClients",
+        "responses": {
+          "200": {
+            "description": "Every client unpaired (possibly none)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnpairAllResult"
                 }
               }
             }
@@ -1758,6 +1788,56 @@
           },
           "401": {
             "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "native"
+        ],
+        "summary": "Unpair every native client",
+        "description": "The collection form of [`unpair_native_client`]: empties the punktfunk/1 trust store in ONE\npersisted write (not a loop of them — a failure partway would leave a half-emptied store), and\nends every live native session the removed clients own.\n\nIdempotent, hence a 200 rather than the single unpair's 204/404: an already-empty store\nsatisfies the request, and the count still tells the operator what it meant.",
+        "operationId": "unpairAllNativeClients",
+        "responses": {
+          "200": {
+            "description": "Every native client unpaired (possibly none)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnpairAllResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not persist the trust store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Native host not enabled",
             "content": {
               "application/json": {
                 "schema": {
@@ -7684,6 +7764,22 @@
         "properties": {
           "pkg": {
             "type": "string"
+          }
+        }
+      },
+      "UnpairAllResult": {
+        "type": "object",
+        "description": "What a bulk unpair removed. Shared by the two collection DELETEs (`/clients` and\n`/native/clients`) so the console sees one schema across both pairing planes.\n\nA count rather than 204: \"unpair everything\" is idempotent, so an empty store is a success, and\nthe operator still wants to be told whether that meant three devices or none.",
+        "required": [
+          "unpaired"
+        ],
+        "properties": {
+          "unpaired": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Clients removed from the trust store — 0 when nothing was paired.",
+            "example": 3,
+            "minimum": 0
           }
         }
       },
