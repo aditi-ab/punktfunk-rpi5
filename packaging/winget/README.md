@@ -107,10 +107,10 @@ These manifests stay in winget-pkgs' own format rather than a bespoke one, so su
 later is a copy, not a rewrite. Two things would need attention on that path: the signing note
 below, and `Agreements` being verified-developers-only in the community repo.
 
-> **Signing.** The installer is currently signed with a self-signed cert (`CN=unom`, subject ==
-> issuer) and ships a `.cer` users import manually. winget does not sign anything; it downloads and
-> runs the same binary, so SmartScreen behaves exactly as it does for a browser download. That is a
-> pre-existing condition rather than something winget introduces — but the community repo
-> (`microsoft/winget-pkgs`) gates on it via its `Binary-Validation-Error` /
-> `Validation-Defender-Error` checks, so a submission there needs a publicly-trusted cert (Azure
-> Trusted Signing is the cheap path). A self-hosted source has no such gate.
+> **Signing.** The installer is signed with **Azure Artifact Signing** (account `unomsigning`,
+> profile `unom-io`) — a publicly trusted CA, so there is no `.cer` for users to import. This
+> removed the blocker on submitting to the community repo (`microsoft/winget-pkgs`), whose
+> `Binary-Validation-Error` / `Validation-Defender-Error` checks require a publicly trusted cert;
+> the remaining upstream obstacle is `Agreements` being verified-developers-only. Note that a
+> trusted cert is not an instant SmartScreen bypass: reputation still accrues per publisher over
+> downloads, it just now accrues to a named identity instead of being permanently unknown.
