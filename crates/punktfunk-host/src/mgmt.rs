@@ -57,7 +57,77 @@ pub(crate) use plugins::ui_credential;
 
 /// Default management port — adjacent to the GameStream block (47984…48010), and the same
 /// number Sunshine users already associate with "the config UI".
+///
+/// ⚠ That last part is also why it is the ONE port a Sunshine fork and a GameStream-off Punktfunk
+/// still collide on (47990 is their web UI). Moving it is supported — see [`publish_endpoint`] and
+/// `PUNKTFUNK_MGMT_BIND` — and every consumer derives the real port rather than assuming this one.
 pub const DEFAULT_PORT: u16 = 47990;
+
+/// The file [`publish_endpoint`] writes the effective mgmt URL to, next to `mgmt-token`.
+const ENDPOINT_FILE: &str = "mgmt-endpoint";
+
+/// Publish the mgmt API's *effective* loopback URL to `<config-dir>/mgmt-endpoint`, in the same
+/// `KEY=VALUE` form as `mgmt-token` so the bundled console can source it directly as a systemd
+/// `EnvironmentFile` (and `windows::service::spawn_web` can read it with `read_env_file_value`).
+///
+/// **Why this exists:** the port used to be a literal `47990` in five places — this constant, the
+/// Windows service's console launch, `scripts/punktfunk-web.service`, the NixOS module, and the
+/// console's own default. Moving the listener therefore silently broke the console, because nothing
+/// downstream had any way to learn the new port. Now the host is the single source of truth and
+/// publishes what it actually bound; consumers keep a 47990 fallback purely so an OLD host with a
+/// NEW console still works.
+///
+/// Always loopback, never `bind`'s own address: the console proxies over loopback by design (see
+/// the module docs — the bearer-token admin surface is confined to loopback peers), so a wide
+/// `0.0.0.0` bind must not be echoed here as a LAN URL.
+///
+/// Best-effort: a console that cannot read this simply falls back to 47990, which is strictly what
+/// it did before, so a write failure must not stop the host from serving.
+pub fn publish_endpoint(bind: SocketAddr) {
+    let dir = pf_paths::config_dir();
+    if let Err(e) = pf_paths::create_private_dir(&dir) {
+        tracing::warn!(error = %e, "could not create the config dir to publish the mgmt endpoint");
+        return;
+    }
+    match write_endpoint(&dir, bind.port()) {
+        Ok(path) => {
+            tracing::debug!(path = %path.display(), port = bind.port(), "published mgmt endpoint")
+        }
+        Err(e) => tracing::warn!(
+            dir = %dir.display(),
+            error = %e,
+            "could not publish the mgmt endpoint — a console on another port will fall back to 47990"
+        ),
+    }
+}
+
+/// The IO half of [`publish_endpoint`], taking the directory so it is testable without touching
+/// `PUNKTFUNK_CONFIG_DIR` (which every other test in this process shares).
+///
+/// Deliberately NOT `pf_paths::write_secret_file`: this is not a secret — the same port is already
+/// in the mDNS TXT record — and locking it to SYSTEM/Administrators on Windows would keep a
+/// user-session console from reading the very thing it is published for. The 0700 config dir is the
+/// access control that matters.
+fn write_endpoint(dir: &std::path::Path, port: u16) -> std::io::Result<std::path::PathBuf> {
+    let path = dir.join(ENDPOINT_FILE);
+    // Write-then-rename rather than a plain truncating write: the console's systemd unit may source
+    // this file at any moment, including while the host is restarting and rewriting it. A torn read
+    // would hand systemd an EMPTY `PUNKTFUNK_MGMT_URL`, which is worse than a missing file — the
+    // built-in default only applies to an UNSET variable, not a set-but-blank one. `rename` over an
+    // existing path is atomic on Unix and replaces on Windows, so a reader sees old or new, never
+    // half. (The consumers treat blank as unset too — this is the belt to that pair of braces.)
+    let tmp = dir.join(format!("{ENDPOINT_FILE}.tmp"));
+    std::fs::write(&tmp, endpoint_line(port))?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+/// The published line. Must stay valid as BOTH a systemd `EnvironmentFile` entry and input to
+/// `windows::service::read_env_file_value` — i.e. exactly one `KEY=VALUE` line, no quoting, and no
+/// `=` inside the value (a URL has none).
+fn endpoint_line(port: u16) -> String {
+    format!("PUNKTFUNK_MGMT_URL=https://127.0.0.1:{port}\n")
+}
 
 /// Management server options (CLI: `serve --mgmt-bind ADDR --mgmt-token TOKEN`).
 #[derive(Clone, Debug)]

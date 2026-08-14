@@ -29,6 +29,38 @@ and capture/display glitches.
   If you only want to try Punktfunk without removing the other host, at least make sure the other
   host is fully **stopped** first (they cannot both run at once).
 
+### If you must run both anyway
+
+Still unsupported, and you are on your own for the parts below — but if you keep Punktfunk's
+GameStream compat **off** (the default), the overlap narrows to two things you can move.
+
+1. **The port.** With compat off, the Punktfunk *host* binds only UDP 9777, UDP 5353 and TCP
+   **47990** — the web console is a separate service on 47992/47993, which nothing else wants — and
+   47990 is the only one the other host wants, as its web UI. Whoever starts first takes it; the
+   loser is not symmetric, because Punktfunk treats the failure as fatal and exits (the streaming
+   plane goes with the console), while Sunshine merely loses its config UI. That is why it can look
+   like it "worked until one day it didn't" — it is a boot race, not a setting. Move ours:
+
+   ```sh
+   # ~/.config/punktfunk/host.env
+   PUNKTFUNK_MGMT_BIND=0.0.0.0:47991
+   ```
+
+   Nothing else needs changing: clients learn the port from discovery, and the web console reads it
+   from `~/.config/punktfunk/mgmt-endpoint`, which the host rewrites on every start. A host added
+   manually **by IP address** is the exception — it assumes 47990 and its library will stop loading,
+   so re-add it from discovery. (You can move the other host instead: Sunshine and its forks derive
+   every port from one base setting.)
+
+2. **The display, on Windows.** Punktfunk defaults to an *exclusive* topology — while streaming it
+   disables the other displays so its virtual one is the whole desktop, and re-asserts that every
+   two seconds. Apollo-family forks are virtual-display-driven, so their monitor is what gets
+   switched off, repeatedly. Set `PUNKTFUNK_NO_ISOLATE=1`, or pick a different topology in the web
+   console, before blaming the other host.
+
+To see who currently holds the port: `ss -lptn 'sport = :47990'` on Linux,
+`netstat -ano | findstr :47990` on Windows.
+
 ## The host isn't found on the network
 
 - Make sure the host is actually running — on Linux `systemctl --user status punktfunk-host` (or you

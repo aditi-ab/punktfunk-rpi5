@@ -144,6 +144,19 @@ pub struct HostConfig {
     /// text ("Living Room PC"); the DNS-level `<label>.local.` target keeps using a sanitized
     /// machine-safe label, so a spacey display name can't produce an invalid mDNS record.
     pub host_name: Option<String>,
+    /// `PUNKTFUNK_MGMT_BIND` — the management API's listen address (`IP:PORT`), equivalent to the
+    /// `--mgmt-bind` CLI flag, which still wins when both are given. Unset = `0.0.0.0:47990`.
+    ///
+    /// This exists so moving the port SURVIVES: `--mgmt-bind` lives in a unit file / service
+    /// registration that a package upgrade rewrites, whereas `host.env` is operator-owned and is
+    /// the documented place every other knob lives. The motivating case is coexistence with a
+    /// Sunshine fork — 47990 is *their* web UI port as well as our management API, and it is the
+    /// only port the two share once the GameStream planes are off, so moving it is the whole fix.
+    ///
+    /// Kept as the raw string rather than a parsed `SocketAddr`: this crate is the
+    /// parse-once-from-env layer, and `main.rs` owns turning a bad value into the same
+    /// `bad --mgmt-bind (want IP:PORT)` error the flag produces, from one place.
+    pub mgmt_bind: Option<String>,
     /// `PUNKTFUNK_GAMESTREAM` — enable the GameStream/Moonlight-compat planes (nvhttp pairing,
     /// RTSP, ENet control, `_nvstream` mDNS) from `host.env`, equivalent to the `--gamestream`
     /// CLI flag (either source turns it on). **Default OFF** — the secure native-only host: the
@@ -372,6 +385,11 @@ impl HostConfig {
             // only split dispatch — capture ignored it while the vdisplay manager obeyed it, and `=0`
             // produced dead-swap-chain reuse on reconnect. A stale setting in an old host.env is ignored.)
             host_name: val("PUNKTFUNK_HOST_NAME")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            // Blank-is-unset, like `host_name` above: an operator who comments a value out by
+            // emptying it (`PUNKTFUNK_MGMT_BIND=`) means "default", not "parse the empty string".
+            mgmt_bind: val("PUNKTFUNK_MGMT_BIND")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
             // Default OFF, explicit-on grammar: the Moonlight-compat planes are opt-in

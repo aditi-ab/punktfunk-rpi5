@@ -1,6 +1,42 @@
 //! Handler + auth tests for the management API, exercised through `app()`. Split out of the
 //! `mgmt` facade (plan §W5).
 
+/// The published endpoint line has to satisfy TWO parsers written independently: systemd
+/// (`EnvironmentFile=`) and `windows::service::read_env_file_value`. This pins the shape both need
+/// — one `KEY=VALUE` line — and re-implements the Windows reader's split, so a change to the format
+/// fails here rather than silently pointing the console at the wrong port on the one platform CI
+/// cannot exercise.
+#[test]
+fn published_endpoint_line_parses_the_way_both_consumers_read_it() {
+    let dir = std::env::temp_dir().join(format!(
+        "pf-mgmt-endpoint-{}-{:p}",
+        std::process::id(),
+        &0u8 as *const u8
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = super::write_endpoint(&dir, 47991).unwrap();
+    assert_eq!(path.file_name().unwrap(), super::ENDPOINT_FILE);
+
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(contents, "PUNKTFUNK_MGMT_URL=https://127.0.0.1:47991\n");
+
+    // `read_env_file_value`'s exact logic: first non-blank line, split once on '=', take the value.
+    let line = contents
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap()
+        .trim();
+    let value = line.split_once('=').map_or(line, |(_, v)| v).trim();
+    assert_eq!(value, "https://127.0.0.1:47991");
+    // The value must survive that split intact — i.e. carry no '=' of its own.
+    assert!(!value.contains('='));
+    // Loopback whatever the listener binds: the console proxies over loopback by design, so a wide
+    // 0.0.0.0 bind must never be echoed here as a LAN URL.
+    assert!(value.starts_with("https://127.0.0.1:"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 use super::*;
 use crate::encode::Codec;
 #[cfg(feature = "gamestream")]

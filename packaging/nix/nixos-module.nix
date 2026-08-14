@@ -649,7 +649,11 @@ in
         # below went on promising the behaviour it removes.
         unitConfig.StartLimitIntervalSec = 0;
         environment = {
-          PUNKTFUNK_MGMT_URL = "https://127.0.0.1:47990";
+          # PUNKTFUNK_MGMT_URL is deliberately absent: the host publishes the port it actually bound
+          # to ~/.config/punktfunk/mgmt-endpoint (mgmt::publish_endpoint), sourced below, and the
+          # server falls back to https://127.0.0.1:47990 on its own when that file does not exist.
+          # Hardcoding it here would have to out-rank the file, which is a directive-ordering
+          # question in the generated unit — so we simply do not create the conflict.
           PORT = "47992";
           HOST = "0.0.0.0";
           # Serve HTTPS with the host's own identity cert (the anchor native clients already pin) and
@@ -663,6 +667,9 @@ in
           EnvironmentFile = [
             "%h/.config/punktfunk/mgmt-token"
             "-%h/.config/punktfunk/web-password"
+            # The host's effective mgmt URL — see the `environment` note above. Optional: absent on
+            # a host predating mgmt::publish_endpoint, and the server default covers that.
+            "-%h/.config/punktfunk/mgmt-endpoint"
           ];
           ExecStart = "${cfg.web.package}/bin/punktfunk-web-server";
           # `always`, not `on-failure`: a console that exits 0 has still stopped serving, and

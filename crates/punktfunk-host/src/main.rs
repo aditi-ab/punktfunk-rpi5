@@ -844,9 +844,24 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
     // default". This only LAN-exposes the read-only cert allowlist; the bearer-token admin surface
     // is confined to loopback peers in `mgmt::require_auth`, so binding wide adds no admin exposure.
     // An operator who pinned `--mgmt-bind` (e.g. `127.0.0.1:47990` to restore loopback-only) keeps it.
+    //
+    // Same two-source shape as `--gamestream` / `PUNKTFUNK_GAMESTREAM` below, and for the same
+    // reason: the packaged units ship a fixed ExecStart, so `host.env` is the only route a package
+    // user has to move this that an upgrade won't overwrite. CLI wins — it is the more explicit of
+    // the two and the one a support instruction reaches for.
     if !mgmt_bind_explicit {
-        opts.bind = std::net::SocketAddr::from(([0, 0, 0, 0], mgmt::DEFAULT_PORT));
+        opts.bind = match pf_host_config::config().mgmt_bind.as_deref() {
+            Some(s) => s
+                .parse()
+                .map_err(|_| anyhow::anyhow!("bad PUNKTFUNK_MGMT_BIND '{s}' (want IP:PORT)"))?,
+            None => std::net::SocketAddr::from(([0, 0, 0, 0], mgmt::DEFAULT_PORT)),
+        };
     }
+    // Publish the resolved port for the console, right here rather than inside `serve`: the
+    // console's unit gates on `mgmt-token` (persisted a few lines above), so writing the endpoint
+    // in the same function keeps the two files effectively simultaneous. A console that still wins
+    // that race falls back to 47990 and its `Restart=always` retry picks the file up.
+    mgmt::publish_endpoint(opts.bind);
     let native = native::NativeServe {
         port: native_port,
         require_pairing: !open,
@@ -999,10 +1014,13 @@ USAGE:
     punktfunk-host spike [OPTIONS]            capture→encode→file pipeline spike (dev tool)
 
 SERVE OPTIONS:
-    --mgmt-bind <IP:PORT>        management API address (default: 0.0.0.0:47990 — paired clients
+    --mgmt-bind <IP:PORT>        management API address (or PUNKTFUNK_MGMT_BIND in host.env, which
+                                 this flag overrides). Default: 0.0.0.0:47990 — paired clients
                                  reach the read-only surface, incl. the game library, over mTLS;
                                  the bearer admin API stays loopback-only. Pin 127.0.0.1:47990 to
-                                 bind loopback only)
+                                 bind loopback only. Move the PORT (e.g. 0.0.0.0:47991) to share a
+                                 machine with Sunshine/Apollo/Vibeshine, whose web UI owns 47990 —
+                                 clients follow via mDNS and the console via mgmt-endpoint
     --mgmt-token <TOKEN>         bearer token for the management API (or PUNKTFUNK_MGMT_TOKEN); the
                                  admin endpoints it guards are honored only from a loopback peer
                                  (the co-located web console), never over the LAN
