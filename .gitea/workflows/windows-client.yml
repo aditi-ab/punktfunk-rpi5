@@ -70,12 +70,18 @@
 #                latest stable tag via scripts/ci/pf-version.ps1, run number climbs monotonically).
 # Both arches share the version; artifacts are arch-suffixed (..._x64.msix / ..._arm64.msix).
 #
-# Signing (clients/windows/packaging/pack-msix.ps1): if the MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD
-# Actions secrets are set (a real or shared code-signing .pfx whose subject DN == Publisher), the
-# package is signed with them. Otherwise an ephemeral self-signed cert is generated and its public
-# .cer is published next to the .msix (users import it to Trusted People before install).
+# Signing (clients/windows/packaging/pack-msix.ps1), first match wins:
+#   1. Azure Artifact Signing — what this workflow always takes, since the AZURE_CODESIGNING_*
+#      endpoint/account/profile are literals below and only the AZURE_TENANT_ID / AZURE_CLIENT_ID /
+#      AZURE_CLIENT_SECRET secrets are needed. Publicly trusted, so NO .cer is emitted or published
+#      and users import nothing. NOTE the Publisher DN is the Azure profile's verified subject, and
+#      MSIX identity is name + publisher: moving to it changed the package identity, so installs
+#      predating it need an uninstall, not an upgrade.
+#   2. MSIX_CERT_PFX_B64 / MSIX_CERT_PASSWORD — the older self-signed .pfx, kept as a fallback.
+#   3. an ephemeral self-signed cert. Modes 2 and 3 DO emit a .cer next to the .msix, which users
+#      would have to import into Trusted People before Windows will install the package.
 #
-# That fallback is for canary/CI ONLY. On a v* tag the pack script FAILS CLOSED — a missing secret
+# Modes 2 and 3 are for canary/CI ONLY. On a v* tag the pack script FAILS CLOSED — a missing secret
 # aborts the build instead of quietly shipping a release signed by a per-build throwaway cert that
 # no one can pin. Nothing to opt into here: the script reads GITHUB_REF itself.
 name: windows-client

@@ -303,7 +303,8 @@ pwsh -File packaging\windows\pack-host-installer.ps1 -Version 0.0.0-dev -TargetD
 
 Push a `vX.Y.Z` tag — one tag releases every platform (see
 [Release Channels](https://punktfunk.unom.io/docs/channels)). The workflow builds, signs, and
-publishes `punktfunk-host-setup-X.Y.Z.exe` + the public `.cer`, refreshes the stable `latest/`
+publishes `punktfunk-host-setup-X.Y.Z.exe` (no `.cer` — Azure signing is publicly trusted, and mode 2
+or 3 would be needed to emit one), refreshes the stable `latest/`
 alias, and attaches the installer to the unified Gitea Release. Main pushes publish rolling
 `<next-minor>.<run>` **canary** builds (base derived from the latest stable tag by
 `scripts/ci/pf-version.ps1`) to the `canary/` alias.
