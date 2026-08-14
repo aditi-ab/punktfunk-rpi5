@@ -24,6 +24,16 @@ release is born complete and the announcement always has something to say.
    Discord `#releases`. Pressing "go" is the quality gate — a half-built release is never
    announced. Stable-only; a `-rc` tag is refused unless `allow_prerelease=true`.
 
+**If a platform's run never appears, do not re-run the PR run — it cannot publish.** A re-run
+replays the original event (`pull_request`), and android's publish steps are gated on a `push`, so
+they stay skipped no matter how often you press it. Merging two PRs seconds apart can leave the
+older merge sha with **no run at all** — Gitea attributes the window's runs to the newer head
+(2026-08-14: `1e5dca4c` lost its run to `b5cace3a`, 12 s later), which is how an android change
+reaches main having never been built. Recover it by dispatching `android.yml` on that ref with
+**`publish=true`**; that is the only manual path reaching the registry and Play, and a plain
+dispatch stays build-only so a stray click can't ship to testers. Check for the gap by matching
+your own merge sha in the run list — "CI ran" is not the same as "your commit ran".
+
 Editing the notes after the tag is fine: update this file, then re-run step 4 (or PATCH the body
 via the API) — the announce step always re-syncs from the file, so the file stays authoritative
 even across a tag re-point.

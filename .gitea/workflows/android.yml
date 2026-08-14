@@ -56,7 +56,21 @@ on:
       - 'rust-toolchain.toml'
       - 'scripts/ci/**'
       - '.gitea/workflows/android.yml'
+  # Manual runs are BUILD-ONLY by default. The escape hatch below exists because a push run can
+  # go missing entirely: merge two PRs seconds apart and Gitea attributes the window's runs to the
+  # newer head, so the older merge sha gets no run at all — its android change then sits on main
+  # having never been built, let alone published (2026-08-14: `1e5dca4c`, PR #235, lost its run to
+  # `b5cace3a` 12 s later). Re-running the PR run does NOT recover it: a re-run replays the original
+  # `pull_request` event, so every gate below stays false. Only a dispatch with publish=true can
+  # ship that commit without inventing a filler push.
   workflow_dispatch:
+    inputs:
+      publish:
+        # String, not a boolean: matches apple.yml's `testflight` input, which is the form proven
+        # to evaluate correctly on this Gitea. Compared as `inputs.publish == 'true'` below.
+        description: "Also publish this build (registry + Google Play). main -> beta+alpha, vX.Y.Z tag -> production at 100%. Default false: a stray click must not reach testers."
+        required: false
+        default: "false"
 
 # Shared compile cache: sccache -> RustFS S3 (storage.unom.io, LAN-pinned via ci-core's
 # unbound). The NDK clang targets get their own key universes automatically (keys embed
@@ -228,7 +242,9 @@ jobs:
       # Single source of the version name + the Play track for the release steps below. versionCode
       # stays github.run_number (monotonic across both tracks; Play rejects a regressed code).
       - name: Version + channel
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        if: >-
+          (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish == 'true'))
+          && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         run: |
           eval "$(bash scripts/ci/pf-version.sh)"   # -> PF_BASE (one minor ahead of the latest stable tag)
           case "$GITHUB_REF" in
@@ -250,7 +266,9 @@ jobs:
           echo "android version $VN -> Play track '$TRACK'${ALSO:+ (+ '$ALSO')}"
 
       - name: Build Release (signed AAB + universal APK)
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        if: >-
+          (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish == 'true'))
+          && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         working-directory: clients/android
         env:
           VERSION_CODE: ${{ github.run_number }}   # VERSION_NAME comes from the Version+channel step (GITHUB_ENV)
@@ -285,7 +303,9 @@ jobs:
       # main = canary store + `canary/` sideload alias; a `vX.Y.Z` tag = `latest/` alias + attached
       # to the unified Gitea Release.
       - name: Publish to generic registry + attach to Gitea release
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        if: >-
+          (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish == 'true'))
+          && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         env:
           REGISTRY: git.unom.io
           OWNER: unom
@@ -328,7 +348,9 @@ jobs:
       # `--status inProgress --user-fraction 0.2`; to undo a bad one, halt or roll back from the
       # Console (or `android-promote.yml`, which can re-point production at an older versionCode).
       - name: Upload to Google Play
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        if: >-
+          (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish == 'true'))
+          && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
         env:
           SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
         run: |
