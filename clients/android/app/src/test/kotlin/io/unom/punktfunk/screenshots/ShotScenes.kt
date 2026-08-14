@@ -1,5 +1,16 @@
 package io.unom.punktfunk.screenshots
 
+import android.content.Context
+import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.LinearGradient
+import android.graphics.Paint
+import android.graphics.Shader
+import android.graphics.Typeface
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.Drawable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -35,8 +46,26 @@ import androidx.compose.runtime.CompositionLocalProvider
 import io.unom.punktfunk.GamepadHome
 import io.unom.punktfunk.GamepadInk
 import io.unom.punktfunk.GamepadPalette
+import coil.ImageLoader
+import coil.test.FakeImageLoaderEngine
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeSource
 import io.unom.punktfunk.ConsoleControllersScreen
+import io.unom.punktfunk.ConsoleHeader
+import io.unom.punktfunk.ConsoleLegendInset
 import io.unom.punktfunk.ConsoleLicensesScreen
+import io.unom.punktfunk.ControllersScreen
+import io.unom.punktfunk.Coverflow
+import io.unom.punktfunk.GamepadAuroraBackground
+import io.unom.punktfunk.GamepadHintBar
+import io.unom.punktfunk.PadGlyph
+import io.unom.punktfunk.PadInfo
+import io.unom.punktfunk.consoleLegendInsets
+import io.unom.punktfunk.consoleSafeArea
+import io.unom.punktfunk.kit.Gamepad
+import io.unom.punktfunk.kit.library.Artwork
+import io.unom.punktfunk.kit.library.GameEntry
+import androidx.compose.ui.platform.LocalConfiguration
 import io.unom.punktfunk.GamepadSettingsScreen
 import io.unom.punktfunk.HomeTile
 import io.unom.punktfunk.LocalGamepadInk
@@ -510,8 +539,8 @@ internal fun ConsoleHomeScene(paletteId: String = "violet") {
  * whole risk. Their touch presentation is inked by the app theme, which is always dark, so nothing
  * before this could catch light-grey body text stranded on a pastel field.
  *
- * Robolectric enumerates no input devices, so the controllers scene renders its deterministic
- * "nothing connected" state.
+ * Robolectric enumerates no input devices, so the controllers scenes inject [shotPads] — the
+ * deterministic connected-pads state the store listing needs.
  */
 @Composable
 internal fun ConsoleLicensesScene(paletteId: String = "violet") =
@@ -520,14 +549,130 @@ internal fun ConsoleLicensesScene(paletteId: String = "violet") =
 @Composable
 internal fun ConsoleControllersScene(paletteId: String = "violet") =
     ConsolePalette(paletteId) {
-        ConsoleControllersScreen(gamepadSetting = 0, onBack = {}, navActive = false)
+        // Robolectric enumerates no input devices, so the shot injects the two pads the store
+        // listing talks about — the empty "no controller detected" state proves the palette but
+        // sells nothing.
+        ConsoleControllersScreen(
+            gamepadSetting = 0, onBack = {}, navActive = false, padsOverride = shotPads(),
+        )
     }
+
+/**
+ * The touch presentation of the same screen, with the same injected pads. Wrapped in a background
+ * [Surface]: the activity provides the dark ground in the app, and without one here the content
+ * color falls back to black-on-white while the cards stay dark.
+ */
+@Composable
+internal fun ControllersScene() =
+    Surface(color = MaterialTheme.colorScheme.background) {
+        ControllersScreen(gamepadSetting = 0, onBack = {}, padsOverride = shotPads())
+    }
+
+/** The two pads the store listing names: DualSense (adaptive triggers, LEDs, rumble) and Xbox. */
+internal fun shotPads() = listOf(
+    PadInfo(
+        name = "DualSense Wireless Controller",
+        detail = "054C:0CE6 · gamepad · joystick",
+        forwarded = true, controllerNumber = 1,
+        resolvedPref = Gamepad.PREF_DUALSENSE, canRumble = true,
+    ),
+    PadInfo(
+        name = "Xbox Wireless Controller",
+        detail = "045E:0B13 · gamepad · joystick",
+        forwarded = true, controllerNumber = 2,
+        resolvedPref = Gamepad.PREF_XBOXONE, canRumble = true,
+    ),
+)
 
 /**
  * Publish the palette locals `App` would normally provide. A scene that calls a console screen
  * directly gets the DEFAULT dark ink without this, and a pale-palette shot would then silently
  * prove nothing at all.
  */
+/**
+ * The game-library coverflow (the real [Coverflow] over the real console chrome) with a mock shelf.
+ * The library screen itself can't be shot — its state comes off the network — so the scene rebuilds
+ * the same shell [io.unom.punktfunk.LibraryScreen] draws around it: aurora, header, floating hint
+ * bar. Cover art is answered synchronously by coil-test's [FakeImageLoaderEngine] with generated
+ * posters, so the frozen animation clock never races an async load.
+ */
+@Composable
+internal fun LibraryScene(paletteId: String = "violet") = ConsolePalette(paletteId) {
+    val context = LocalContext.current
+    val loader = remember { shotLibraryLoader(context) }
+    val games = remember { shotGames() }
+    val hazeState = remember { HazeState() }
+    val landscape =
+        LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    Box(Modifier.fillMaxSize()) {
+        Box(Modifier.fillMaxSize().hazeSource(hazeState)) {
+            GamepadAuroraBackground(Modifier.fillMaxSize())
+            Column(Modifier.fillMaxSize().consoleSafeArea()) {
+                ConsoleHeader("Living Room PC — Library")
+                Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    Coverflow(games, loader, navActive = false, onLaunch = {})
+                }
+            }
+        }
+        Box(
+            Modifier.align(Alignment.BottomStart)
+                .consoleLegendInsets(landscape)
+                .padding(ConsoleLegendInset),
+        ) {
+            GamepadHintBar(
+                listOf(PadGlyph.hint('A', "Launch"), PadGlyph.hint('B', "Close")),
+                hazeState = hazeState,
+            )
+        }
+    }
+}
+
+/** A believable shelf: four titles with art plus the Steam launcher entry (brand-mark tile). */
+private fun shotGames() = listOf(
+    GameEntry("custom:aurora", "custom", "Aurora Drift", Artwork("shot://art/aurora", null, null)),
+    GameEntry("steam:starfall", "steam", "Starfall Vale", Artwork("shot://art/starfall", null, null)),
+    GameEntry("heroic:neon", "heroic", "Neon Circuit", Artwork("shot://art/neon", null, null)),
+    GameEntry("gog:ember", "gog", "Ember Peaks", Artwork("shot://art/ember", null, null)),
+    GameEntry("steam:launcher", "steam", "Steam", Artwork(null, null, null), role = "launcher", icon = "steam"),
+)
+
+private fun shotLibraryLoader(context: Context): ImageLoader {
+    val engine = FakeImageLoaderEngine.Builder()
+        .intercept("shot://art/aurora", cover(context, 0xFF6656F2, 0xFF141040, "A"))
+        .intercept("shot://art/starfall", cover(context, 0xFFE86FA8, 0xFF3A1030, "S"))
+        .intercept("shot://art/neon", cover(context, 0xFF35D0C5, 0xFF0A2A33, "N"))
+        .intercept("shot://art/ember", cover(context, 0xFFEF8F4B, 0xFF3A1608, "E"))
+        .default(ColorDrawable(0xFF221E44.toInt()))
+        .build()
+    return ImageLoader.Builder(context).components { add(engine) }.build()
+}
+
+/** A generated 2:3 poster: vertical brand-adjacent gradient + a big monogram. */
+private fun cover(context: Context, top: Long, bottom: Long, mark: String): Drawable {
+    val w = 600
+    val h = 900
+    val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(bmp)
+    canvas.drawRect(
+        0f, 0f, w.toFloat(), h.toFloat(),
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            shader = LinearGradient(
+                0f, 0f, 0f, h.toFloat(), top.toInt(), bottom.toInt(), Shader.TileMode.CLAMP,
+            )
+        },
+    )
+    canvas.drawText(
+        mark, w / 2f, h / 2f + 110f,
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xD9FFFFFF.toInt()
+            textSize = 320f
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            textAlign = Paint.Align.CENTER
+        },
+    )
+    return BitmapDrawable(context.resources, bmp)
+}
+
 @Composable
 private fun ConsolePalette(paletteId: String, content: @Composable () -> Unit) {
     val palette = GamepadPalette.named(paletteId)

@@ -254,8 +254,10 @@ private fun MessageState(text: String) {
     )
 }
 
+// Internal (not private): the screenshot harness composes the real coverflow with mock games —
+// the library screen itself can't be shot, its state comes off the network.
 @Composable
-private fun Coverflow(
+internal fun Coverflow(
     games: List<GameEntry>,
     loader: ImageLoader,
     navActive: Boolean,

@@ -173,6 +173,21 @@ class ScreenshotTest {
     @Test
     fun consoleControllers() = shootRoot("console-controllers") { ConsoleControllersScene() }
 
+    /** The touch presentation, pads connected — the store's FEEL THE GAME frame. */
+    @Test
+    fun controllers() = shootRoot("controllers") { ControllersScene() }
+
+    /**
+     * The library coverflow with a mock shelf — the store's PICK & PLAY frame. Landscape: the
+     * orientation the coverflow actually runs in, and the only one wide enough for neighbours.
+     */
+    @Test
+    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
+    fun library() = shootRoot("library") { LibraryScene() }
+
+    @Test
+    fun libraryPortrait() = shootRoot("library-portrait") { LibraryScene() }
+
     @Test
     fun consoleControllersLight() =
         shootRoot("console-controllers-light") { ConsoleControllersScene(paletteId = "holo") }

@@ -755,7 +755,7 @@ jobs:
           bash tools/screenshots.sh ipad || echo "::warning::iPad 13\" screenshots skipped"
           # tvOS shoots only the scenes that exist there — the 06–09 gamepad-console scenes are
           # compiled out on tvOS (native focus engine), and an unknown name = a normal app launch.
-          SCENES="01-stream 02-hosts 05-settings 03-pair" \
+          SCENES="01-stream 02-hosts 11-library 05-settings 03-pair" \
             bash tools/screenshots.sh tvos || echo "::warning::Apple TV screenshots skipped"
           echo "Produced:"; ls -la screenshots || true
 

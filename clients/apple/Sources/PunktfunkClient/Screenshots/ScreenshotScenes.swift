@@ -35,6 +35,11 @@ enum ShotScenes {
             ShotScene(name: "05-settings", orientation: .natural, colorScheme: .dark) {
                 AnyView(ShotSettings())
             },
+            // 06–10 are the iOS/macOS console-shell block below; the library is cross-platform
+            // (tvOS renders the same coverflow), hence the number above that range.
+            ShotScene(name: "11-library", orientation: .landscape, colorScheme: .dark) {
+                AnyView(ShotLibrary())
+            },
         ]
         #if os(iOS) || os(macOS)
         // The gamepad-mode console screens (no tvOS — native focus engine there). Dev-only shots
@@ -193,6 +198,24 @@ enum ShotMock {
         #endif
     }
 
+    /// A believable shelf for the library coverflow. Decoded rather than constructed:
+    /// `GameEntry`'s memberwise init is internal to PunktfunkKit, and Codable is its public
+    /// construction surface. No art URLs — the posters render their deterministic fallback
+    /// (title tiles, the Steam entry its brand mark), which is also what keeps the shot offline.
+    static let games: [GameEntry] = {
+        let json = """
+        [
+          {"id": "custom:aurora", "store": "custom", "title": "Aurora Drift", "art": {}},
+          {"id": "steam:starfall", "store": "steam", "title": "Starfall Vale", "art": {}},
+          {"id": "heroic:neon", "store": "heroic", "title": "Neon Circuit", "art": {}},
+          {"id": "gog:ember", "store": "gog", "title": "Ember Peaks", "art": {}},
+          {"id": "steam:launcher", "store": "steam", "title": "Steam", "art": {},
+           "role": "launcher", "icon": "steam"}
+        ]
+        """
+        return (try? JSONDecoder().decode([GameEntry].self, from: Data(json.utf8))) ?? []
+    }()
+
     /// A plausible-looking 32-byte SHA-256 for the trust card / pin lock glyphs.
     static let fingerprint = hostFingerprint(0)
 
@@ -227,6 +250,19 @@ private struct ShotHome: View {
             connect: { _, _ in }, connectDiscovered: { _ in },
             onPaired: { _, _ in }, onLaunchTitle: { _, _ in }, wake: { _ in })
         #endif
+    }
+}
+
+// MARK: - Library
+
+/// The library coverflow with the mock shelf — the store listing's PICK & PLAY frame. The real
+/// `LibraryCoverflowView`, no network: artless entries settle to their deterministic fallback
+/// posters, and the entrance's 700 ms backstop has long fired by the time the driver captures.
+private struct ShotLibrary: View {
+    var body: some View {
+        LibraryCoverflowView(
+            games: ShotMock.games, artLoader: nil,
+            onLaunch: { _ in }, onDismiss: {}, controllerActive: false)
     }
 }
 
