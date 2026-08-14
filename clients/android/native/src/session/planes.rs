@@ -357,10 +357,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetVideoSta
     })
 }
 
-/// `NativeBridge.nativeStartAudio(handle, lowLatencyMode)` — start the Opus→AAudio playback thread.
-/// `lowLatencyMode` (the experimental toggle) tags the stream usage=Game for the HAL's game-audio
-/// routing. No-op if already started or on a `0` handle. Best-effort: a failure leaves video
-/// streaming.
+/// `NativeBridge.nativeStartAudio(handle, lowLatencyMode, isTv)` — start the Opus→AAudio playback
+/// supervisor. `lowLatencyMode` (the experimental toggle) tags the stream usage=Game for the HAL's
+/// game-audio routing; `isTv` steers the AAudio open ladder (see `crate::audio::open_ladder`).
+/// No-op if already started or on a `0` handle. Best-effort: a failure leaves video streaming.
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartAudio(
@@ -368,6 +368,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartAudio(
     _this: JObject,
     handle: jlong,
     low_latency_mode: jboolean,
+    is_tv: jboolean,
 ) {
     if handle == 0 {
         return;
@@ -378,7 +379,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartAudio(
     if guard.is_some() {
         return; // already playing
     }
-    match crate::audio::AudioPlayback::start(h.client.clone(), low_latency_mode) {
+    match crate::audio::AudioPlayback::start(h.client.clone(), low_latency_mode, is_tv) {
         Some(p) => *guard = Some(p),
         None => log::error!("nativeStartAudio: playback init failed (video unaffected)"),
     }
