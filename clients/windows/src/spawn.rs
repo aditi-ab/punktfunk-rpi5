@@ -160,6 +160,7 @@ pub(crate) fn spawn_session(
             fp_hex: Some(fp_hex.to_string()),
             mac: Vec::new(), // wake ran before this spawn (initiate_waking) — not the plan's job
             id: None,
+            mgmt_port: None, // the library fetch runs in the shell (`Target`), never off a spawn plan
         },
         launch.map(str::to_string),
         profile.map(str::to_string),

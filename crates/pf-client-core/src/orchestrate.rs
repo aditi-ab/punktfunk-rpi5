@@ -38,6 +38,12 @@ pub struct HostTarget {
     pub fp_hex: Option<String>,
     pub mac: Vec<String>,
     pub id: Option<String>,
+    /// The host's management-API port (saved store or live advert) — where the library is
+    /// served, distinct from `port` (the native QUIC plane). Carried on the target for the same
+    /// reason as `mac`: a front-end holding a plan has no `KnownHost` in hand, and resolving to
+    /// [`crate::library::DEFAULT_MGMT_PORT`] there is what made a moved mgmt port work on the
+    /// LAN but not over a VPN. `None` = unknown, fall back to the constant.
+    pub mgmt_port: Option<u16>,
 }
 
 impl From<&KnownHost> for HostTarget {
@@ -49,6 +55,7 @@ impl From<&KnownHost> for HostTarget {
             fp_hex: (!h.fp_hex.is_empty()).then(|| h.fp_hex.clone()),
             mac: h.mac.clone(),
             id: h.id.clone(),
+            mgmt_port: h.mgmt_port,
         }
     }
 }
