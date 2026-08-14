@@ -6,7 +6,7 @@
 # android.yml would mean an `if:` on all ten of its build steps.
 #
 # What it is for:
-#   * promote a tested build up a track (alpha -> production)
+#   * promote a tested build up a track (beta -> production)
 #   * roll production back by re-pointing it at an older versionCode (to_track=production,
 #     version_code=<the good one>, from_track blank)
 #   * halt a rollout (status=halted)
@@ -36,7 +36,7 @@ on:
       from_track:
         description: 'track to verify it is on, then clear (blank = touch nothing else)'
         required: false
-        default: 'alpha'
+        default: 'beta'
       notes_tag:
         description: "tag whose docs/releases/whatsnew/<tag>.txt to attach, e.g. v0.23.0 (blank = none)"
         required: false

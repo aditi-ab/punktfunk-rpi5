@@ -54,8 +54,8 @@ no build, no assets on the Gitea release, nothing on Play. Two more checks sit d
 `play-upload.py` refuses text over the 500-char cap (printing the real count) before it uploads,
 because the API only rejects oversized notes at commit, by which point the AAB is already on Play.
 
-Canary is exempt: it has no curated notes, and Play reusing text for internal testers costs
-nothing.
+Canary is exempt: it has no curated notes; open-testing users see the previous release's text on
+a canary, which is cosmetic and cheaper than gating every main push on a notes file.
 
 Same freeze rule as the notes: once the tag exists, this file is the record of what that
 versionCode shipped.
