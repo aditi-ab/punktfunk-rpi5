@@ -26,13 +26,22 @@
 //!   mixing mono or at 24 kHz) loses to real hardware; see [`super::wiring_plan`]. **Never** the
 //!   Steam Streaming Speakers, whose loopback is silent — validated live;
 //! * default **RECORDING** → the mic target's capture endpoint (VB-Cable "CABLE Output") so host apps
-//!   record the client's mic by default.
+//!   record the client's mic by default — applied, like the playback default, ONLY while a
+//!   desktop-audio capture is open. It used to be asserted on EVERY wiring pass, mic pump at boot
+//!   included, which left an IDLE box's default recording/communication device parked on a virtual
+//!   microphone nothing feeds — and games bind the default microphone at launch (`SetDefaultEndpoint`
+//!   covers eCommunications, so in-game voice binds it too). The 2026-08 Helldivers 2 field reports
+//!   measured that as 1% lows of 2–5 FPS in a LOCALLY played game while the host sat idle (HD2 is
+//!   Wwise + always-on voice, exactly the "finicky with audio devices" case its own wiki warns
+//!   about). An idle host must leave the box's audio defaults exactly as the operator set them.
 //!
-//! Because the playback default is *parked* on a silent sink during a stream, it is remembered
-//! ([`park_default_playback`], plus an on-disk crash marker) and put back when the capture closes
-//! ([`restore_default_playback`]) or, after a crash, on the next process's first wiring pass — an
-//! operator must never be stranded with silent speakers. A default the operator changed themselves
-//! mid-stream is respected (no restore over their choice).
+//! Because both defaults are *parked* during a stream — playback on a silent sink, recording on the
+//! virtual mic — the operator's devices are remembered ([`park_default_playback`] /
+//! [`park_default_recording`], plus on-disk crash markers) and put back when the capture closes
+//! ([`restore_default_playback`] / [`restore_default_recording`]) or, after a crash, on the next
+//! process's first wiring pass — an operator must never be stranded with silent speakers or a dead
+//! mic. A default the operator changed themselves mid-stream is respected (no restore over their
+//! choice).
 //!
 //! The assignment rules are the PURE [`wiring_plan`](super::wiring_plan) module (unit-tested on every
 //! platform); this module only enumerates endpoints, applies the plan, and logs. [`wire_now`] runs on
@@ -142,8 +151,8 @@ pub(crate) fn endpoint_fingerprint() -> u64 {
 }
 
 /// [`wire_now_full`] for callers that only need the assignment (the mic paths).
-pub(crate) fn wire_now(set_playback: bool) -> Wiring {
-    wire_now_full(set_playback).wiring
+pub(crate) fn wire_now(park_defaults: bool) -> Wiring {
+    wire_now_full(park_defaults).wiring
 }
 
 /// The most recent wiring verdict, as the LAST wiring pass computed it (the mic pump wires
@@ -170,13 +179,15 @@ fn pad_render_ids(renders: &[Endpoint]) -> Vec<String> {
 
 /// Enumerate endpoints, compute the assignment, apply the default-device changes (unless
 /// `PUNKTFUNK_KEEP_DEFAULT`), and return the plan for the caller to act on (mic target / loopback
-/// echo guard). `set_playback` — true only from the desktop-audio capture open — additionally
-/// parks the default PLAYBACK device on the plan's loopback endpoint for the capture's lifetime
-/// (the mic pump passes false: it runs while the host is idle and must not silence the box).
-/// Must run on a COM-initialized thread (the WASAPI worker threads all `initialize_mta` first).
-/// Logged only when the assignment changes, so per-open recomputation stays quiet in the steady
-/// state.
-pub(crate) fn wire_now_full(set_playback: bool) -> WiredPlan {
+/// echo guard). `park_defaults` — true only from the desktop-audio capture open — additionally
+/// parks the default PLAYBACK device on the plan's loopback endpoint and the default RECORDING
+/// device on the virtual mic's capture side, both for the capture's lifetime (the mic pump passes
+/// false: it runs while the host is idle and must neither silence the box nor hold its default
+/// microphone — the idle-parked recording default is the 2026-08 Helldivers 2 tank, see the
+/// module docs). Must run on a COM-initialized thread (the WASAPI worker threads all
+/// `initialize_mta` first). Logged only when the assignment changes, so per-open recomputation
+/// stays quiet in the steady state.
+pub(crate) fn wire_now_full(park_defaults: bool) -> WiredPlan {
     recover_orphaned_default();
     let renders = list_endpoints(Direction::Render);
     let captures = list_endpoints(Direction::Capture);
@@ -188,11 +199,11 @@ pub(crate) fn wire_now_full(set_playback: bool) -> WiredPlan {
     // them out of every role. Identity is platform data (stamped container / devnode marker),
     // so it is collected HERE and passed in, like the candidate lists themselves.
     let pad_ids = pad_render_ids(&renders);
-    // Mix formats are read only when we are actually going to park the playback default (i.e. a
+    // Mix formats are read only when we are actually going to park the defaults (i.e. a
     // desktop-audio capture is opening). The mic pump wires on every open while the host is idle
     // and does not care which loopback endpoint wins, so it must not pay an IAudioClient
     // activation per render endpoint on every pass.
-    let probe: &dyn Fn(&Endpoint) -> Option<MixFormat> = if set_playback {
+    let probe: &dyn Fn(&Endpoint) -> Option<MixFormat> = if park_defaults {
         &mix_format_of
     } else {
         &wiring_plan::no_formats
@@ -311,30 +322,44 @@ pub(crate) fn wire_now_full(set_playback: bool) -> WiredPlan {
             }
         }
     }
-    if set_playback {
+    // Recording-default hygiene, IDLE passes only: builds before 2026-08-14 parked the default
+    // recording on the virtual mic on EVERY wiring pass (boot included) and recorded nothing to
+    // restore — so an upgraded box would otherwise sit wedged on a microphone nothing feeds
+    // until the operator noticed (the Helldivers 2 idle tank; the session-scoped park below
+    // can't heal it either: it remembers a previous default only when the default isn't already
+    // ours). While nothing is parked, a default found sitting on the plan's mic capture moves to
+    // the first real microphone. Session passes own the default and are exempt; a box with no
+    // real microphone is left alone.
+    if !park_defaults && PARKED_REC.lock().unwrap().is_none() {
+        if let Some((mic_name, mic_id)) = &wiring.mic_capture {
+            if default_capture_id().as_deref() == Some(mic_id.as_str()) {
+                if let Some((name, id)) =
+                    wiring_plan::real_capture(&captures, Some(mic_id.as_str()))
+                {
+                    match set_default_endpoint(id) {
+                        Ok(()) => tracing::info!(from = %mic_name, device = %name,
+                            "default recording was left on the virtual mic outside a stream — \
+                             moved it back to a real microphone"),
+                        Err(e) => tracing::warn!(device = %name, error = %format!("{e:#}"),
+                            "failed to move the default recording off the virtual mic"),
+                    }
+                }
+            }
+        }
+    }
+    if park_defaults {
         if let Some((name, id)) = &wiring.loopback_render {
             let mic_id = wiring.mic_render.as_ref().map(|(_, m)| m.as_str());
             park_default_playback(name, id, changed, mic_id);
         }
-    }
-    if let Some((name, id)) = &wiring.mic_capture {
-        // `set_default_endpoint` is NOT a no-op on an unchanged default: it unconditionally
-        // fires SetDefaultEndpoint for all three roles (an audio-policy write plus a
-        // device-graph notification, each). Re-asserting on every wiring pass therefore both
-        // churned the policy store AND silently stomped an operator's own recording-device
-        // choice within one reopen cycle — write only when the plan changed or the default
-        // actually drifted off the target.
-        if changed || default_capture_id().as_deref() != Some(id.as_str()) {
-            match set_default_endpoint(id) {
-                Ok(()) => {
-                    if changed {
-                        tracing::info!(device = %name,
-                            "audio wiring: default recording = virtual mic (apps record the client's mic)");
-                    }
-                }
-                Err(e) => tracing::warn!(device = %name, error = %format!("{e:#}"),
-                    "audio wiring: failed to set the default recording device"),
-            }
+        // The recording default is SESSION-SCOPED like the playback default, and for the same
+        // reason inverted: parking it while idle handed the box's default microphone (and, via
+        // eCommunications, every game's voice input) to a virtual mic nothing feeds — the
+        // 2026-08 Helldivers 2 idle tank (see the module docs). A game launched DURING the
+        // stream still binds the client's mic (this runs before the session's game does);
+        // one launched before the stream keeps the operator's mic, which is the honest answer.
+        if let Some((name, id)) = &wiring.mic_capture {
+            park_default_recording(name, id, changed);
         }
     }
     done(wiring)
@@ -348,6 +373,26 @@ static PARKED: Mutex<Option<(String, String)>> = Mutex::new(None);
 /// On-disk crash marker mirroring [`PARKED`] (two lines: previous id, set id).
 fn park_marker_path() -> std::path::PathBuf {
     pf_paths::config_dir().join("audio-default.prev")
+}
+
+/// The operator's default recording endpoint while we have it parked on the virtual mic:
+/// `(previous_id, id_we_set)` — the recording-side twin of [`PARKED`].
+static PARKED_REC: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+/// On-disk crash marker mirroring [`PARKED_REC`] (two lines: previous id, set id).
+fn rec_marker_path() -> std::path::PathBuf {
+    pf_paths::config_dir().join("audio-default-rec.prev")
+}
+
+/// Consume a park marker file: returns the PREVIOUS default's id when the marker existed AND the
+/// current default still is the endpoint we set — a default the operator changed since wins, like
+/// on every other restore path. The file is removed either way (it describes a park that is over).
+fn take_marker(path: &std::path::Path, current_default: Option<String>) -> Option<String> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let _ = std::fs::remove_file(path);
+    let mut lines = s.lines();
+    let (prev, set) = (lines.next()?, lines.next()?);
+    (current_default.as_deref() == Some(set)).then(|| prev.to_string())
 }
 
 /// The current default RENDER endpoint id, if any. pub(crate): the pad-endpoint provisioning
@@ -374,31 +419,28 @@ pub(crate) fn default_capture_id() -> Option<String> {
         .ok()
 }
 
-/// Once per process: if a crash marker from a previous run exists, the host died while the
-/// playback default was parked — put the operator's device back, but only if the default still
-/// IS the endpoint we set (a manual change since the crash wins). Runs on the first wiring pass
-/// (the mic pump wires eagerly at host start, so this fires at boot, not at the first stream).
+/// Once per process: if a crash marker from a previous run exists, the host died while a default
+/// (playback and/or recording) was parked — put the operator's device back, but only if the
+/// default still IS the endpoint we set (a manual change since the crash wins). Runs on the first
+/// wiring pass (the mic pump wires eagerly at host start, so this fires at boot, not at the first
+/// stream).
 fn recover_orphaned_default() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let path = park_marker_path();
-        let Ok(s) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        let _ = std::fs::remove_file(&path);
-        let mut lines = s.lines();
-        let (Some(prev), Some(set)) = (lines.next(), lines.next()) else {
-            return;
-        };
-        if default_render_id().as_deref() != Some(set) {
-            return;
-        }
-        match set_default_endpoint(prev) {
-            Ok(()) => tracing::info!(
-                "restored the default playback device a previous host run left parked"
-            ),
-            Err(e) => tracing::warn!(error = %format!("{e:#}"),
-                "failed to restore the default playback device left by a previous run"),
+        for (path, current, what) in [
+            (park_marker_path(), default_render_id(), "playback"),
+            (rec_marker_path(), default_capture_id(), "recording"),
+        ] {
+            let Some(prev) = take_marker(&path, current) else {
+                continue;
+            };
+            match set_default_endpoint(&prev) {
+                Ok(()) => tracing::info!(
+                    "restored the default {what} device a previous host run left parked"
+                ),
+                Err(e) => tracing::warn!(error = %format!("{e:#}"),
+                    "failed to restore the default {what} device left by a previous run"),
+            }
         }
     });
 }
@@ -415,20 +457,18 @@ fn recover_orphaned_default() {
 ///
 /// Returns whether a device was actually put back — the caller only logs it.
 pub(crate) fn unpark_default_for_uninstall() -> bool {
-    let path = park_marker_path();
-    let Ok(s) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let _ = std::fs::remove_file(&path);
-    let mut lines = s.lines();
-    let (Some(prev), Some(set)) = (lines.next(), lines.next()) else {
-        return false;
-    };
-    // A default the operator changed by hand since the park wins, exactly as on the recovery path.
-    if default_render_id().as_deref() != Some(set) {
-        return false;
+    let mut restored = false;
+    for (path, current) in [
+        (park_marker_path(), default_render_id()),
+        (rec_marker_path(), default_capture_id()),
+    ] {
+        // A default the operator changed by hand since the park wins, exactly as on the
+        // recovery path (`take_marker` answers None then).
+        if let Some(prev) = take_marker(&path, current) {
+            restored |= set_default_endpoint(&prev).is_ok();
+        }
     }
-    set_default_endpoint(prev).is_ok()
+    restored
 }
 
 /// Make `id` the default playback device for the duration of the desktop-audio capture,
@@ -469,6 +509,48 @@ fn park_default_playback(name: &str, id: &str, changed: bool, mic_id: Option<&st
     }
 }
 
+/// Make `id` the default recording device for the duration of the desktop-audio capture —
+/// [`park_default_playback`]'s recording twin, remembering the operator's current default (in
+/// memory + the crash marker) the FIRST time so [`restore_default_recording`] can put it back.
+/// Nothing is remembered when `id` already is the default — there is nothing to restore.
+fn park_default_recording(name: &str, id: &str, changed: bool) {
+    let cur = default_capture_id();
+    if cur.as_deref() != Some(id) {
+        let mut parked = PARKED_REC.lock().unwrap();
+        match parked.as_mut() {
+            None => {
+                if let Some(prev) = cur.clone() {
+                    let _ = std::fs::write(rec_marker_path(), format!("{prev}\n{id}"));
+                    *parked = Some((prev, id.to_string()));
+                }
+            }
+            // Re-park onto a different endpoint mid-stream (plan changed): keep the ORIGINAL
+            // previous default, update what we set.
+            Some((prev, set)) if set != id => {
+                let _ = std::fs::write(rec_marker_path(), format!("{prev}\n{id}"));
+                *set = id.to_string();
+            }
+            Some(_) => {}
+        }
+    }
+    // `set_default_endpoint` is NOT a no-op on an unchanged default: it unconditionally fires
+    // SetDefaultEndpoint for all three roles (an audio-policy write plus a device-graph
+    // notification, each) — write only when the plan changed or the default actually drifted
+    // off the target, or the policy store churns on every reopen.
+    if changed || cur.as_deref() != Some(id) {
+        match set_default_endpoint(id) {
+            Ok(()) => {
+                if changed {
+                    tracing::info!(device = %name,
+                        "audio wiring: default recording = virtual mic (apps record the client's mic)");
+                }
+            }
+            Err(e) => tracing::warn!(device = %name, error = %format!("{e:#}"),
+                "audio wiring: failed to set the default recording device"),
+        }
+    }
+}
+
 /// Put the default playback device back on the endpoint we are already capturing, WITHOUT a
 /// wiring pass (WP2.4).
 ///
@@ -504,6 +586,25 @@ pub(crate) fn restore_default_playback() {
         Ok(()) => tracing::info!("default playback device restored after streaming"),
         Err(e) => tracing::warn!(error = %format!("{e:#}"),
             "failed to restore the default playback device after streaming"),
+    }
+}
+
+/// Put the operator's default recording device back after streaming — the inverse of
+/// [`park_default_recording`], with [`restore_default_playback`]'s exact rules: no-op if we never
+/// parked it, and a default the operator changed themselves mid-stream is left alone. Must run on
+/// a COM-initialized thread (called from the capture thread's exit path).
+pub(crate) fn restore_default_recording() {
+    let Some((prev, set)) = PARKED_REC.lock().unwrap().take() else {
+        return;
+    };
+    let _ = std::fs::remove_file(rec_marker_path());
+    if default_capture_id().as_deref() != Some(set.as_str()) {
+        return;
+    }
+    match set_default_endpoint(&prev) {
+        Ok(()) => tracing::info!("default recording device restored after streaming"),
+        Err(e) => tracing::warn!(error = %format!("{e:#}"),
+            "failed to restore the default recording device after streaming"),
     }
 }
 
