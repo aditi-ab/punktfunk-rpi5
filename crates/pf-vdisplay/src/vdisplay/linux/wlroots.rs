@@ -191,6 +191,10 @@ struct Keepalive {
 /// up and unplugging the output anyway. See `hyprland.rs`'s twin.
 const CAST_CLOSE_BUDGET: Duration = Duration::from_secs(3);
 
+/// Ceiling on the whole ScreenCast handshake, under the caller's 20 s wait — see the note at the
+/// handshake, and the longer one on `hyprland.rs`'s copy.
+const HANDSHAKE_BUDGET: Duration = Duration::from_secs(15);
+
 /// Ends the cast: signals the portal thread, then **waits for it to have closed the ScreenCast
 /// session**, so the caller may safely unplug the output afterwards.
 ///
@@ -602,40 +606,60 @@ fn portal_thread(
             // — so EVERY cursor-forward session on this backend asked for a mode that cancelled the
             // cast. Different wording from xdph's "unavailable cursor mode 4", same dead session.
             let cursor_mode = crate::portal_cursor::negotiate(&proxy, hw_cursor, "xdpw").await;
-            let session = proxy
-                .create_session(Default::default())
-                .await
-                .context("create_session")?;
-            proxy
-                .select_sources(
-                    &session,
-                    SelectSourcesOptions::default()
-                        .set_cursor_mode(cursor_mode)
-                        // xdpw offers MONITOR only; the chooser picks our output.
-                        .set_sources(BitFlags::from_flag(SourceType::Monitor))
-                        .set_multiple(false)
-                        .set_persist_mode(PersistMode::DoNot),
-                )
-                .await
-                .context("select_sources")?
-                .response()
-                .context("select_sources rejected")?;
-            let streams = proxy
-                .start(&session, None, Default::default())
-                .await
-                .context("start cast")?
-                .response()
-                .context("start response (chooser declined? check the xdpw config/chooser file)")?;
-            let stream = streams
-                .streams()
-                .first()
-                .context("portal returned no streams")?
-                .clone();
-            let node_id = stream.pipe_wire_node_id();
-            let fd = proxy
-                .open_pipe_wire_remote(&session, Default::default())
-                .await
-                .context("open_pipe_wire_remote")?;
+            // Bounded for the same reason as `hyprland.rs`'s copy (the long note lives there): an
+            // await on a wedged portal never returns, the `stop` flag is only read by the park loop
+            // further down, so the thread leaks — and a leaked half-handshake poisons every later
+            // portal request from this process. xdpw has the identical unbounded node-id spin as
+            // xdph (`screencast.c`), so it can wedge the same way.
+            let handshake = async {
+                let session = proxy
+                    .create_session(Default::default())
+                    .await
+                    .context("create_session")?;
+                proxy
+                    .select_sources(
+                        &session,
+                        SelectSourcesOptions::default()
+                            .set_cursor_mode(cursor_mode)
+                            // xdpw offers MONITOR only; the chooser picks our output.
+                            .set_sources(BitFlags::from_flag(SourceType::Monitor))
+                            .set_multiple(false)
+                            .set_persist_mode(PersistMode::DoNot),
+                    )
+                    .await
+                    .context("select_sources")?
+                    .response()
+                    .context("select_sources rejected")?;
+                let streams = proxy
+                    .start(&session, None, Default::default())
+                    .await
+                    .context("start cast")?
+                    .response()
+                    .context(
+                        "start response (chooser declined? check the xdpw config/chooser file)",
+                    )?;
+                let stream = streams
+                    .streams()
+                    .first()
+                    .context("portal returned no streams")?
+                    .clone();
+                let node_id = stream.pipe_wire_node_id();
+                let fd = proxy
+                    .open_pipe_wire_remote(&session, Default::default())
+                    .await
+                    .context("open_pipe_wire_remote")?;
+                Ok::<_, anyhow::Error>((session, fd, node_id))
+            };
+            let (session, fd, node_id) =
+                match tokio::time::timeout(HANDSHAKE_BUDGET, handshake).await {
+                    Ok(v) => v?,
+                    Err(_) => bail!(
+                        "the ScreenCast portal did not complete the handshake within {}s — \
+                         abandoning it instead of parking this thread on it forever (a hung \
+                         request poisons every later one from this process)",
+                        HANDSHAKE_BUDGET.as_secs()
+                    ),
+                };
 
             setup_tx
                 .send(Ok((fd, node_id)))

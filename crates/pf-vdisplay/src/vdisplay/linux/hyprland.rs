@@ -422,6 +422,12 @@ impl Drop for OutputGuard {
 /// stream thread, whose only way to end a session is to return, so one hung query used to wedge the
 /// session for good. Generous next to a healthy call (single-digit milliseconds), and every call
 /// site already has a failed-query path.
+/// Ceiling on the whole ScreenCast handshake (`create_session` → `select_sources` → `start` →
+/// `open_pipe_wire_remote`). Deliberately under [`select_and_cast`]'s 20 s wait so a stuck portal is
+/// reported by the thread that owns it, with a reason, instead of the caller timing out on it — and,
+/// far more importantly, so that thread EXITS. See the note at the handshake itself.
+const HANDSHAKE_BUDGET: Duration = Duration::from_secs(15);
+
 const HYPRCTL_BUDGET: Duration = Duration::from_secs(5);
 
 /// Budget for the one-shot xdph restart. `systemctl --user try-restart` waits for the user manager's
@@ -911,40 +917,62 @@ fn portal_thread(
             // hardcode killed EVERY cursor-forward session here, on today's packages, not just on
             // old installs: `unavailable cursor mode 4`, "pipeline build failed", black client.
             let cursor_mode = crate::portal_cursor::negotiate(&proxy, hw_cursor, "xdph").await;
-            let session = proxy
-                .create_session(Default::default())
-                .await
-                .context("create_session")?;
-            proxy
-                .select_sources(
-                    &session,
-                    SelectSourcesOptions::default()
-                        .set_cursor_mode(cursor_mode)
-                        // xdph offers MONITOR; the custom picker selects our output.
-                        .set_sources(BitFlags::from_flag(SourceType::Monitor))
-                        .set_multiple(false)
-                        .set_persist_mode(PersistMode::DoNot),
-                )
-                .await
-                .context("select_sources")?
-                .response()
-                .context("select_sources rejected")?;
-            let streams = proxy
-                .start(&session, None, Default::default())
-                .await
-                .context("start cast")?
-                .response()
-                .context("start response (custom picker declined? check the xdph config/shim/selection file)")?;
-            let stream = streams
-                .streams()
-                .first()
-                .context("portal returned no streams")?
-                .clone();
-            let node_id = stream.pipe_wire_node_id();
-            let fd = proxy
-                .open_pipe_wire_remote(&session, Default::default())
-                .await
-                .context("open_pipe_wire_remote")?;
+            // 🛑 BOUNDED, and that bound is load-bearing. `select_sources`/`start` await a D-Bus
+            // reply a wedged portal never sends, and an await that never returns CANNOT be cancelled
+            // by the `stop` flag — the thread never reaches the park loop that reads it. That is how
+            // one host accumulated NINE live cast threads (28 tokio workers) on 2026-08-14: each
+            // timed-out attempt left one behind holding a half-created portal session on this
+            // process's shared D-Bus connection, and from the first hang onwards EVERY later request
+            // from this process hung too — while a freshly-spawned process talking to the very same
+            // portal completed the identical handshake fine. Shorter than the caller's 20 s wait, so
+            // the failure is reported HERE with a reason instead of surfacing as a bare timeout.
+            let handshake = async {
+                let session = proxy
+                    .create_session(Default::default())
+                    .await
+                    .context("create_session")?;
+                proxy
+                    .select_sources(
+                        &session,
+                        SelectSourcesOptions::default()
+                            .set_cursor_mode(cursor_mode)
+                            // xdph offers MONITOR; the custom picker selects our output.
+                            .set_sources(BitFlags::from_flag(SourceType::Monitor))
+                            .set_multiple(false)
+                            .set_persist_mode(PersistMode::DoNot),
+                    )
+                    .await
+                    .context("select_sources")?
+                    .response()
+                    .context("select_sources rejected")?;
+                let streams = proxy
+                    .start(&session, None, Default::default())
+                    .await
+                    .context("start cast")?
+                    .response()
+                    .context("start response (custom picker declined? check the xdph config/shim/selection file)")?;
+                let stream = streams
+                    .streams()
+                    .first()
+                    .context("portal returned no streams")?
+                    .clone();
+                let node_id = stream.pipe_wire_node_id();
+                let fd = proxy
+                    .open_pipe_wire_remote(&session, Default::default())
+                    .await
+                    .context("open_pipe_wire_remote")?;
+                Ok::<_, anyhow::Error>((session, fd, node_id))
+            };
+            let (session, fd, node_id) =
+                match tokio::time::timeout(HANDSHAKE_BUDGET, handshake).await {
+                    Ok(v) => v?,
+                    Err(_) => bail!(
+                        "the ScreenCast portal did not complete the handshake within {}s — \
+                         abandoning it instead of parking this thread on it forever (a hung \
+                         request poisons every later one from this process)",
+                        HANDSHAKE_BUDGET.as_secs()
+                    ),
+                };
 
             setup_tx
                 .send(Ok((fd, node_id)))
