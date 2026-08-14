@@ -63,9 +63,13 @@ require_xcode() {
 # ---------------------------------------------------------------------------- macOS
 
 shoot_macos() {
-  log "macOS — building (swift build -c release)…"
-  swift build -c release >/dev/null
-  local bin=".build/release/PunktfunkClient"
+  # DEBUG build, deliberately: the whole shot harness lives behind `#if DEBUG`
+  # (ScreenshotHost/ScreenshotScenes), so a release binary launches as the NORMAL app, never
+  # prints PF_SHOT_WINDOW, and every scene "never reported a window". Debug renders the same
+  # pixels — SwiftUI has no release-only visuals.
+  log "macOS — building (swift build)…"
+  swift build >/dev/null
+  local bin=".build/debug/PunktfunkClient"
   [ -x "$bin" ] || die "build produced no $bin"
 
   for scene in "${SCENES[@]}"; do
