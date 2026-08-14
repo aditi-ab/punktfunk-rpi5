@@ -22,7 +22,8 @@ Google TV, budget Amlogic boxes) that otherwise reject a 64-bit-only build as "n
 
 ## Get it
 
-Published to **Google Play (Internal Testing)** — join the beta via the
+Published to **Google Play (Open Testing)** — join via the
+[public opt-in link](https://play.google.com/apps/testing/io.unom.punktfunk) or the
 [Discord](https://discord.gg/kaPNvzMuGU). Per-device setup and pairing:
 **[docs.punktfunk.unom.io/docs/install-client](https://docs.punktfunk.unom.io/docs/install-client)**.
 
