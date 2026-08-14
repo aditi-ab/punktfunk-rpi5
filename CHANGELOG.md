@@ -12,7 +12,183 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ---
 
-## v0.28.1
+## v0.29.0
+
+53 commits since v0.28.1 (36 non-merge).
+
+The headline contract change is one **additive** C ABI bump: the host now tells the client, in-band,
+where its management API lives, and the connection grew an accessor for it. The wire protocol, the
+driver protocol and the plugin contract do not move; every 0.28.x host, client, driver and plugin
+keeps interoperating with 0.29.0 in both directions, with no re-pairing. The one thing that needs an
+operator's hand is on Windows: the MSIX package identity changed with the move to a publicly
+trusted signing certificate, so that install path needs a one-time uninstall + reinstall.
+
+### Versions
+
+| | v0.28.1 | v0.29.0 | Notes |
+|---|---|---|---|
+| Wire protocol | 2 | **2** | unchanged — `Welcome` grew a trailing field older peers never read (below) |
+| C ABI | 19 | **20** | one symbol added: `punktfunk_connection_mgmt_port` (below) |
+| Rust edition | 2024 | **2024** | unchanged |
+| MSRV (`rust-version`) | 1.85 | **1.85** | unchanged |
+| Workspace crate dirs | 27 | **27** | unchanged |
+| Virtual-display driver protocol | 6 | **6** | unchanged (minimum accepted still 3); `pf-driver-proto` shows no diff against the v0.28.1 tag |
+| Windows virtual-gamepad channel | 3 | **3** | unchanged |
+| Plugin index schema | 1 | **1** | unchanged |
+| `api/openapi.json` | 0.28.0 | **0.28.0** | the management API surface did not change; the file keeps the stamp it was regenerated under |
+| gamescope patch level (`+pfhdrN`) | 7 | **7** | unchanged — the patch series is untouched |
+| `@punktfunk/host` (SDK) | 0.1.4 | **0.1.4** | unchanged |
+| `@punktfunk/plugin-kit` | 0.4.1 | **0.4.1** | unchanged |
+
+### ⚠ Breaking changes
+
+- **C ABI 19 → 20, addition only.** `include/punktfunk_core.h` gains exactly one declaration,
+  `punktfunk_connection_mgmt_port(const PunktfunkConnection *, uint16_t *)` — the management-API
+  port the host advertised in its `Welcome`, or the documented default when it advertised none.
+  Nothing is removed or reshaped; an embedder that compares `PUNKTFUNK_ABI_VERSION` at build time
+  rebuilds against the new header and is done. Nothing in-tree compares it at runtime.
+- **The Windows MSIX package identity changed.** Releases are now signed by Azure Artifact Signing
+  (below), and the MSIX manifest `Publisher` must equal the signer subject byte-for-byte — so it
+  moved from the self-signed `CN=unom` to the verified subject. Package identity is Name +
+  Publisher: Windows treats the new package as a different app, and an in-place upgrade is
+  impossible by design. One-time uninstall + reinstall for MSIX installs; the `.exe` installer and
+  winget-via-installer paths upgrade normally.
+- **Android embedder edge, additive:** `NativeBridge` gains `nativeHostMgmtPort`, and the native
+  discovery record gains its 9th field, `mgmt` (the record's append-only rule; 0, non-numeric and
+  out-of-range all parse as unknown). Out-of-tree JNI callers are unaffected unless they want the
+  value.
+
+### The management port is movable, survives, and is learned in-band
+
+47990 is the management API's port and also the web-UI port of Sunshine and its forks — with the
+GameStream planes off, the only port the two still contend for. Moving it now actually works, end
+to end:
+
+- **`PUNKTFUNK_MGMT_BIND` joins `host.env`** (the `PUNKTFUNK_GAMESTREAM` shape: env or CLI flag,
+  the flag wins), so the choice survives package upgrades that rewrite the unit file. `serve`
+  publishes the port it *actually bound* to `~/.config/punktfunk/mgmt-endpoint` (KEY=VALUE, written
+  write-then-rename), and the console, the Windows service and the unit files all derive from that
+  one file; the six hardcoded 47990 literals survive only as the old-host fallback.
+- **`Welcome.mgmt_port`** — a trailing `u16` after the cipher block, the same additive discipline
+  as the eight fields before it, so `WIRE_VERSION` stays 2 and an older peer stops earlier and uses
+  the default. ⚠ One encode subtlety, pinned by test: `cipher` used to be emitted only when
+  non-default, and appending the port to an AES `Welcome` would land its low byte at offset 68 —
+  exactly where every shipped 0.28.x client reads `cipher`, fail-closed. `encode` therefore writes
+  an explicit cipher byte whenever a port rides along; a host advertising no port still emits
+  exactly 68 bytes. The standalone `punktfunk1-host` binary advertises `0` (it has no management
+  API).
+- **Clients persist it**: `KnownHost.mgmt_port` + `effective_mgmt_port()` across the Rust clients
+  (three-rung: live advert → stored → default), the session console, Android (through
+  `DiscoveredHost`), and Apple — where `StoredHost.mgmtPort` had existed all along but nothing ever
+  wrote it, so every Apple client resolved 47990 regardless. A host that has never been seen over
+  mDNS (VPN, routed subnet, multicast-dead network) now learns the port from the authenticated
+  connection itself.
+- **`PUNKTFUNK_NATIVE_PORT`** completes the pair for the data plane — `--native-port` was CLI-only
+  and died on upgrade. A bad value is a startup **error**, not a silent fall back to 9777.
+- The Windows shell's half of the client-side learn landed separately (#241): `trust.rs` re-exports
+  `learn_mgmt_port`, the shell's own mDNS browser parses the `mgmt` TXT, and `HostTarget` carries
+  the port like the mac client's target does.
+
+### Linux thread priority: the renice was a no-op on every install to date
+
+`boost_thread_priority`'s `setpriority()` needs `CAP_SYS_NICE` or a raised `RLIMIT_NICE`; no
+channel granted either, and the host binary can never carry a file capability (a capped process's
+`/proc/<pid>/exe` is unreadable to KWin — the 0.26.0-1 incident). So capture/encode/send ran at
+nice 0, and a shader-compile storm could deschedule them hard enough to stutter audio and drag ABR
+to its floor at zero loss. Now:
+
+- **RealtimeKit fallback** — `MakeThreadHighPriorityWithPID`, the same unprivileged broker
+  PipeWire clients use. Only the nice verb, never `MakeThreadRealtime`; nothing enters the
+  permitted set, KWin identification is untouched.
+- **The audio plane is boosted at all, for the first time**: the 5 ms Opus
+  capture→encode→send loop, the PipeWire capture mainloop, and the pad-audio streamer (on Windows
+  too, via the existing `SetThreadPriority` arm).
+- **Packaging ships headroom for rtkit-less boxes**: `packaging/linux/50-punktfunk-nice.conf`
+  (`user@.service.d`, `LimitNICE=-15` — a limit, not a grant; effective from next login) on rpm,
+  Arch and deb, written to `/etc/systemd/system/user@.service.d` by the Steam Deck installer; deb
+  and rpm gain a weak `Recommends: rtkit`, Arch an optdepends hint, and the NixOS module sets
+  `security.rtkit.enable = mkDefault true`.
+
+### Host capture gain works on `punktfunk/1`, and boosting no longer hard-clips
+
+`PUNKTFUNK_AUDIO_GAIN` existed only on the GameStream plane, and where it applied it was a hard
+`clamp(-1.0, 1.0)` — flat-topping, so pushing past ~1.5× sounded broken long before it got loud
+(WASAPI loopback taps upstream of the endpoint's master volume, so the host's own slider never
+changes the sent level either). `punktfunk_core::audio::apply_gain` now serves **both planes** with
+a tanh soft knee above `SOFT_LIMIT_KNEE` (0.7, ≈−3.1 dBFS): C1-continuous, bounded by
+construction, odd-symmetric, memoryless (zero added latency). Unity is a no-op inside the function
+itself, so the default wire stays byte-for-byte identical. `capture_gain` rejects non-positive
+values and caps at 8.0 (+18 dB). This buys headroom, not loudness — it is deliberately not a
+compressor, and the docs say so. `SOFT_LIMIT_KNEE` is excluded from cbindgen on purpose.
+
+### Windows binaries are signed by Azure Artifact Signing
+
+Account `unomsigning`, profile `unom-io`, signed by a service principal holding only the
+profile-scoped signer role. Azure mints a **per-request leaf that expires in ~3 days**, which
+changes two rules: a timestamped countersignature is now *mandatory* (the old retry-without-
+timestamp fallback is a hard failure in Azure mode — it would ship an artifact that goes untrusted
+days later, everywhere at once), and leaf pinning is structurally impossible (the updater's
+`AUTHENTICODE_SHA256` note claiming otherwise is corrected). `pack-msix.ps1` reads the signature
+back off the packed `.msix` and fails on Publisher drift. Driver catalogs are deliberately
+untouched: they keep the `DRIVER_CERT_*` cert and the installer still plants it as a machine root
+(PnP trust is independent of SmartScreen/UAC trust). Canary and fork builds keep the `.pfx` and
+ephemeral fallbacks.
+
+### Library: a launcher the host cannot open no longer costs the whole sync
+
+`valid_launcher_ui` conflated vocabulary with environment. It is now split: `known_launcher_ui`
+(an unknown launcher kind is a plugin bug — still a hard 400) and `resolvable_launcher_ui` (the
+launcher just is not installed on this box — the entry is dropped with one warn and the games
+sync). Same shape as the unservable-cover fix, on the launch side. And Playnite is actually
+findable now: the old lookup read the LocalSystem service's own HKCU and `%LOCALAPPDATA%` (the
+SYSTEM profile — a per-user Playnite is invisible there) and matched a registry key name Inno Setup
+never writes. Now: every loaded hive under `HKEY_USERS` plus both HKLM views, matched on
+`DisplayName`, then `C:\Users\*\AppData\Local\Playnite`.
+
+### Hyprland/sway capture: six defects, all ours, and streaming now survives past one session
+
+The wlr portal route looked environmental and never was. Measured on Hyprland 0.55.4 +
+xdg-desktop-portal-hyprland 1.3.12, fixed in one arc (#240):
+
+- **The dmabuf pod offered `BGRx`; xdph offers `BGRA`.** The modifier lists intersect perfectly,
+  the fourcc never does, so PipeWire failed the link itself (`no more input formats`) — and the
+  pods live only in the PipeWire *daemon's* log, which is why it read as a GPU/modifier problem.
+- **A per-cast tokio runtime orphaned ashpd's process-global D-Bus connection.** ashpd caches its
+  connection in a `OnceLock`; the first cast's runtime hosted zbus's reader task and then died
+  with the cast, so the first stream of a host process worked and every later one went black.
+  Both wlr backends now share one long-lived portal runtime.
+- **Teardown removed the captured output before closing the cast**, and xdph spun on the wreckage;
+  the order is now cast-then-output.
+- **A hung portal handshake leaked its thread** and the leak poisoned every later cast; the
+  handshake is now bounded.
+- **The wlr absolute-motion injector aimed at the operator's head**, never the streamed one; the
+  pointer is now bound to the streamed output.
+- **The cursor park schedule read a missing cursor overlay as a lost pointer** — an Embedded-mode
+  portal never sends one.
+
+### Everything else an integrator might notice
+
+- **vdisplay/KDE:** a bare-spawn gamescope session under an exclusive topology now darkens the
+  physical panels over `org_kde_kwin_dpms` (new in-process `kwin_dpms` module,
+  `kscreen-doctor --dpms` fallback), refcounted host-wide so concurrent spawns compose; DPMS is
+  non-persistent, so a dead host leaves nothing to journal. Managed and Attach routes untouched.
+- **macOS client:** `Settings::inhibit_shortcuts` is finally implemented on Apple — a local
+  keyDown monitor claims every ⌘ chord while input is captured and forwards it host-side (AppKit
+  dispatches menu key equivalents before the stream view sees them, so ⌘Q used to quit the
+  client). ⌘⎋ and ⌃⌘F stay client-side; ⌘Tab/⌘Space/Mission Control are out of reach without a
+  CGEventTap. Chord matching no longer compares Caps Lock and `.function`/`.numericPad` bits raw.
+- **Android client:** `Gamepad.padButtonBit` resolves a gamepad-sourced `KEYCODE_BACK` to
+  `BTN_BACK` — pads that report Select as plain BACK (the Android-TV shape) no longer quit the
+  stream on one press, and the Select chords (exit chord, mic mute, stats tier) become reachable
+  on exactly those pads. `FLAG_FALLBACK` events stay excluded.
+- **CI:** Android canaries now feed Play **open testing (beta) and closed testing (alpha)** from
+  one Play edit (`play-upload.py --also-track`); tags still publish production only, and a manual
+  `android.yml` dispatch can now opt into publishing (`publish=true`), so a lost merge run is no
+  longer a dead end. Windows
+  runners provision the .NET 8 runtime and a machine-wide signing client (a mixed-mode dlib with
+  no runtime makes signtool exit 3 in silence).
+
+
 
 60 commits since v0.28.0.
 
