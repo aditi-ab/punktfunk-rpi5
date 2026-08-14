@@ -63,15 +63,24 @@ public final class SessionAudio {
     private var micMuted = false
     /// The playback jitter ring — created by whichever engine starts playback first and KEPT
     /// across an engine rebuild (the permission-grant upgrade in `startEngines` swaps engines,
-    /// not the ring, so the drain thread never has to be re-pointed). Main-thread confined,
-    /// like every start path.
+    /// not the ring, so the drain thread never has to be re-pointed). Guarded by `stateLock`:
+    /// the start paths run on `engineQueue`, while `stats` reads from the main thread.
     private var ring: AudioRing?
+    /// Every engine build, start, stop and rebuild runs here, serially — and NOT on the main
+    /// thread. macOS captures and sends input from the main thread, so the seconds a
+    /// voice-processing start can take (~1.9 s measured in the 2026-08-14 field loop) would
+    /// freeze the stream's input for exactly that long — the recovery must never make the main
+    /// thread wait on the audio server. The main queue keeps only the trigger bookkeeping
+    /// (debounce, backoff, retry ladder), which is cheap by construction.
+    private let engineQueue = DispatchQueue(
+        label: "io.unom.punktfunk.audio.engines", qos: .userInitiated)
     /// The video plane's end-to-end meter (capture→on-glass), if the owner wired one — the
     /// reference the A/V sync loop steers the ring against. `nil` leaves the loop inert and the
     /// ring exactly as it was before sync existed, which is also what the stage-1 fallback
     /// presenter gets: it decodes and presents inside the layer with no per-frame stamp, so it can
-    /// offer no reference, and a loop with no reference must not invent one. Main-thread confined,
-    /// like `ring`; the meter itself is internally locked and read from the drain thread.
+    /// offer no reference, and a loop with no reference must not invent one. Written ONCE in
+    /// `start()` before anything is dispatched (the queue hop orders it for `startDrain`); the
+    /// meter itself is internally locked and read from the drain thread.
     private var videoLatency: LatencyMeter?
     #if !os(macOS)
     /// AVAudioSession `setCategory`/`setActive` are synchronous and block on the audio server, so
@@ -99,7 +108,8 @@ public final class SessionAudio {
     // MARK: - Device changes (see `installDeviceChangeRecovery`)
 
     /// What `start()` was asked for, so a rebuild can put back the SAME topology the session was
-    /// started with. Main-thread confined, like the start paths that read it.
+    /// started with. Guarded by `stateLock` (written on the caller's thread, read when a rebuild
+    /// fires on the main queue).
     private var startConfig: StartConfig?
     private struct StartConfig {
         let speakerUID: String
@@ -110,9 +120,9 @@ public final class SessionAudio {
     }
     /// Watches the hardware for us (see `AudioDeviceWatcher`). Guarded by `stateLock`.
     private var deviceWatcher: AudioDeviceWatcher?
-    /// Whether the engines have been built at least once. Distinguishes "not started yet" (iOS
-    /// starts asynchronously) from "started and dead", which is what the recovery may act on.
-    /// Main-thread confined.
+    /// Whether the engines have been built at least once. Distinguishes "not started yet" (every
+    /// platform starts asynchronously now) from "started and dead", which is what the recovery
+    /// may act on. Guarded by `stateLock` (set on `engineQueue`, read on the main queue).
     private var enginesAttempted = false
     /// A rebuild is already on the main queue — one device switch produces a burst of triggers
     /// and they must collapse into one restart. Main-thread confined.
@@ -124,7 +134,7 @@ public final class SessionAudio {
     /// Latches a voice-processing start failure per input device, so a rebuild never re-attempts
     /// a topology that deterministically fails — the retry is what turned one failure into a
     /// rebuild loop (see `CombinedTopologyGate` and the note on `installDeviceChangeRecovery`).
-    /// Main-thread confined, like the start paths that consult it.
+    /// `engineQueue`-confined, like the start paths that consult and feed it.
     private var combinedGate = CombinedTopologyGate()
     #endif
     /// Retries when a rebuild's `start()` loses the race with a device that is still going away
@@ -154,11 +164,12 @@ public final class SessionAudio {
     }
 
     /// Start playback (and, if enabled+authorized, the mic uplink). Empty UIDs = system default
-    /// device; on iOS the UIDs are ignored entirely (routes are AVAudioSession-managed). On macOS
-    /// the engines start synchronously on the caller's (main) thread. On iOS/tvOS start() is
-    /// ASYNCHRONOUS: it activates the AVAudioSession off the main thread, then starts the engines on
-    /// a later main-queue hop (gated by `!flag.isStopped`) — so playback is live shortly after, not
-    /// on return. The mic may start later still if the permission prompt is pending.
+    /// device; on iOS the UIDs are ignored entirely (routes are AVAudioSession-managed).
+    /// ASYNCHRONOUS on every platform: the engines start on `engineQueue` (iOS/tvOS activate the
+    /// AVAudioSession off the main thread first), gated by `!flag.isStopped` — so playback is
+    /// live shortly after, not on return. An engine start can block on the audio server for
+    /// seconds, and the caller's (main) thread is where macOS input capture lives — it must
+    /// never wait. The mic may start later still if the permission prompt is pending.
     /// `echoCancel` picks the engine topology — see the header note and `wantsCombined`.
     ///
     /// `videoLatency` is the session's END-TO-END latency meter (capture→on-glass). Pass it to arm
@@ -169,26 +180,33 @@ public final class SessionAudio {
         speakerUID: String, micUID: String, micChannel: Int, micEnabled: Bool, echoCancel: Bool,
         videoLatency: LatencyMeter? = nil
     ) {
-        self.videoLatency = videoLatency
+        self.videoLatency = videoLatency // before any dispatch below — startDrain reads it
         // Before any engine exists: the recovery watches the hardware, not the engines, and the
         // config it rebuilds from has to be recorded whether or not this start succeeds.
+        stateLock.lock()
         startConfig = StartConfig(
             speakerUID: speakerUID, micUID: micUID, micChannel: micChannel,
             micEnabled: micEnabled, echoCancel: echoCancel)
+        stateLock.unlock()
         installDeviceChangeRecovery(micEnabled: micEnabled)
         #if os(macOS)
-        // No AVAudioSession on macOS — start the engines directly (caller's thread, as before).
-        startEngines(
-            speakerUID: speakerUID, micUID: micUID, micChannel: micChannel,
-            micEnabled: micEnabled, echoCancel: echoCancel)
+        // No AVAudioSession on macOS — but the engines start on `engineQueue`, never the
+        // caller's (main) thread: a voice-processing start can block on the audio server for
+        // seconds, and the main thread is where input capture lives.
+        engineQueue.async { [weak self] in
+            guard let self, !self.flag.isStopped else { return }
+            self.startEngines(
+                speakerUID: speakerUID, micUID: micUID, micChannel: micChannel,
+                micEnabled: micEnabled, echoCancel: echoCancel)
+        }
         #else
         // Configure + activate the session OFF the main thread (it blocks on the audio server),
-        // then start the engines back on the main thread once it's active — engine routing/format
+        // then start the engines on `engineQueue` once it's active — engine routing/format
         // depend on the active session. A stop() racing in between is caught by the flag guard.
         Self.sessionQueue.async { [weak self] in
             guard let self else { return }
             self.activateAudioSession(micEnabled: micEnabled)
-            DispatchQueue.main.async { [weak self] in
+            self.engineQueue.async { [weak self] in
                 guard let self, !self.flag.isStopped else { return }
                 self.startEngines(
                     speakerUID: speakerUID, micUID: micUID, micChannel: micChannel,
@@ -345,12 +363,15 @@ public final class SessionAudio {
     #endif
 
     /// Build + start the engines — combined (voice-processed) or split, per `wantsCombined` —
-    /// with the mic uplink only when enabled + authorized. Main thread (engine setup); on
-    /// iOS/tvOS the session is already active by the time this runs.
+    /// with the mic uplink only when enabled + authorized. Runs on `engineQueue` (a start can
+    /// block on the audio server for seconds — never the main thread); on iOS/tvOS the session
+    /// is already active by the time this runs.
     private func startEngines(
         speakerUID: String, micUID: String, micChannel: Int, micEnabled: Bool, echoCancel: Bool
     ) {
+        stateLock.lock()
         enginesAttempted = true // even if every path below fails — see `reviveStoppedEngines`
+        stateLock.unlock()
         #if os(tvOS)
         // No app-accessible microphone input on tvOS — playback only.
         startPlayback(speakerUID: speakerUID)
@@ -393,7 +414,8 @@ public final class SessionAudio {
             // drain thread carry over — see `makePlaybackChain`).
             startPlayback(speakerUID: speakerUID)
             AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
-                DispatchQueue.main.async {
+                guard let self else { return }
+                self.engineQueue.async { [weak self] in
                     guard let self, granted, !self.flag.isStopped else { return }
                     if combined {
                         self.stateLock.lock()
@@ -609,7 +631,10 @@ public final class SessionAudio {
     /// output device at the moment it connected — and leaving it silent for good. On iOS the same
     /// flag keeps this from racing the asynchronous start, where no engine yet is normal.
     private func reviveStoppedEngines(_ reason: String) {
-        guard !flag.isStopped, enginesAttempted, !playbackIsLive else { return }
+        stateLock.lock()
+        let attempted = enginesAttempted
+        stateLock.unlock()
+        guard !flag.isStopped, attempted, !playbackIsLive else { return }
         scheduleEngineRebuild(reason: "playback is stopped and \(reason)")
     }
 
@@ -644,11 +669,30 @@ public final class SessionAudio {
             log.info("\(reason) — restarting the audio engines in \(Int(delay * 1000)) ms")
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.rebuildEngines(attempt: 0)
+            self?.rebuildFire(attempt: 0)
+        }
+    }
+
+    /// The scheduled rebuild came due (main queue): close out the bookkeeping and hand the
+    /// actual engine work to `engineQueue` — the teardown + start can block on the audio server
+    /// for seconds, and the main thread is where macOS captures and sends the stream's input.
+    /// A trigger arriving while the work is in flight schedules a fresh rebuild rather than
+    /// being swallowed; `engineQueue` is serial, so the two never interleave.
+    private func rebuildFire(attempt: Int) {
+        rebuildQueued = false
+        guard !flag.isStopped else { return }
+        stateLock.lock()
+        let config = startConfig
+        stateLock.unlock()
+        guard let config else { return }
+        rebuildBackoff.noteRebuild(at: ProcessInfo.processInfo.systemUptime)
+        engineQueue.async { [weak self] in
+            self?.performRebuild(config: config, attempt: attempt)
         }
     }
 
     /// Put back the topology this session was started with, on whatever hardware is there now.
+    /// Runs on `engineQueue`.
     ///
     /// A full rebuild rather than a `start()` on the stopped engine, because the mic side has to
     /// follow too: `installMicTap` reads the input's live format, and the voice processor
@@ -656,10 +700,8 @@ public final class SessionAudio {
     /// across (`makePlaybackChain` reuses it, `startDrain` is idempotent), so the drain thread
     /// keeps decoding right through the switch and its overflow policy has already dropped
     /// everything that went stale while the engine was down.
-    private func rebuildEngines(attempt: Int) {
-        rebuildQueued = false
-        guard !flag.isStopped, let config = startConfig else { return }
-        rebuildBackoff.noteRebuild(at: ProcessInfo.processInfo.systemUptime)
+    private func performRebuild(config: StartConfig, attempt: Int) {
+        guard !flag.isStopped else { return }
         tearDownEngines()
         startEngines(
             speakerUID: config.speakerUID, micUID: config.micUID, micChannel: config.micChannel,
@@ -672,6 +714,18 @@ public final class SessionAudio {
             log.info("audio engines restarted on the current device")
             return
         }
+        DispatchQueue.main.async { [weak self] in
+            self?.rebuildFailed(attempt: attempt)
+        }
+    }
+
+    /// A rebuild's playback did not come back (main queue) — walk the retry ladder. Retries
+    /// when a rebuild's `start()` loses the race with a device that is still going away
+    /// (0.3 s, 0.6 s, 1.2 s): a failed rebuild leaves no engine to post the next notification,
+    /// so this ladder — and, on macOS, the HAL listener — is all that stands between a mistimed
+    /// switch and a silent session.
+    private func rebuildFailed(attempt: Int) {
+        guard !flag.isStopped else { return }
         guard attempt < Self.rebuildAttempts else {
             #if os(macOS)
             log.error("""
@@ -683,10 +737,11 @@ public final class SessionAudio {
             #endif
             return
         }
+        guard !rebuildQueued else { return } // a fresh trigger already queued a full rebuild
         rebuildQueued = true // holds off a trigger that would only race this ladder
         let delay = RebuildBackoff.debounce * Double(1 << (attempt + 1))
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.rebuildEngines(attempt: attempt + 1)
+            self?.rebuildFire(attempt: attempt + 1)
         }
     }
 
@@ -832,9 +887,13 @@ public final class SessionAudio {
         public let avOffsetMS: Int
     }
 
-    /// A snapshot of `Stats`, or nil before playback starts. Main thread (`ring` is main-confined;
-    /// the ring's own numbers are taken under its lock, so they describe one instant).
+    /// A snapshot of `Stats`, or nil before playback starts. Safe from any thread (the handle is
+    /// taken under `stateLock`; the ring's own numbers are taken under its lock, so they
+    /// describe one instant).
     public var stats: Stats? {
+        stateLock.lock()
+        let ring = self.ring
+        stateLock.unlock()
         guard let s = ring?.stats else { return nil }
         return Stats(bufferMS: s.bufferedMS, avOffsetMS: s.avOffsetMS)
     }
@@ -859,7 +918,7 @@ public final class SessionAudio {
     /// The playback jitter ring + the source node draining it — shared by the plain playback
     /// engine and the combined voice-processing engine, and REUSED across an engine rebuild
     /// (same session, same ring: the drain thread keeps writing right through the swap). nil
-    /// when the host's channel layout can't be expressed (already logged). Main thread.
+    /// when the host's channel layout can't be expressed (already logged). Runs on `engineQueue`.
     private func makePlaybackChain()
         -> (ring: AudioRing, source: AVAudioSourceNode, format: AVAudioFormat)?
     {
@@ -869,8 +928,10 @@ public final class SessionAudio {
         // 1 s interleaved capacity, scaled by the channel count. The de-jitter depth itself is
         // the ring's own business now (`AudioRing.targetMS`, mirroring `JitterTuning::COREAUDIO`)
         // rather than a prefill passed in here.
+        stateLock.lock()
         let ring = self.ring ?? AudioRing(capacity: 48_000 * channels, channels: channels)
         self.ring = ring
+        stateLock.unlock()
 
         // Engine-native deinterleaved float; the render block deinterleaves from the ring. Surround
         // uses an explicit wire-order channel layout; the mixer downmixes to the output device when

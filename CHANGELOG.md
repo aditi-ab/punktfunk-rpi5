@@ -481,6 +481,15 @@ single one covers every feedback shape:
 iOS/tvOS behaviour is untouched (routes are session-managed there; nothing is latched). Until a
 client carries this, the field workaround is turning the client microphone off.
 
+**And the engines no longer start on the main thread at all.** An engine start can block on the
+audio server for seconds (~1.9 s per attempt in the field case) and macOS captures and sends the
+stream's input from the main thread — so even a single legitimate device switch froze input for
+the length of the rebuild, loop or no loop. All engine build/start/teardown now runs on a
+per-session serial `engineQueue`; the main queue keeps only the trigger bookkeeping (debounce,
+backoff, retry ladder), which is cheap by construction. ⚠ Embedder-visible edge:
+`SessionAudio.start()` is now asynchronous on macOS too (it always was on iOS/tvOS) — playback is
+live shortly after the call, not on return, and `stats` is safe from any thread.
+
 ### Apple gamepad UI — a host menu, and About becomes a page
 
 **UP on a saved tile opens Wake / Copy link / Edit… / Forget pairing / Remove.** The desktop and
