@@ -704,7 +704,7 @@ fn kscreen_ok(args: &[String]) -> bool {
 /// before exiting, so a slow-but-working KWin gives us a kill on a request that already landed;
 /// any caller that treats `None` as "it failed" is asserting something it does not know, and for
 /// the restore path that assertion costs a monitor its refresh rate.
-fn kscreen_verdict(args: &[String]) -> Option<bool> {
+pub(crate) fn kscreen_verdict(args: &[String]) -> Option<bool> {
     match crate::proc::status_within(
         std::process::Command::new("kscreen-doctor").args(args),
         KSCREEN_BUDGET,

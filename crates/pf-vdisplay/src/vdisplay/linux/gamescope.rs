@@ -69,6 +69,11 @@ pub struct GamescopeDisplay {
     /// the decision and this session's `create`. `None` = nothing resolved it (a caller that never
     /// ran `apply_input_env`); `create` then falls through to the bare spawn, the safe default.
     route: Option<crate::GamescopeRoute>,
+    /// The topology-restore action the bare-spawn `create` prepared under `Topology::Exclusive` —
+    /// the release of this display's [`crate::kwin_dpms`] darken hold — pending pickup by the
+    /// registry via [`VirtualDisplay::take_topology_restore`], so it runs at the display's
+    /// teardown (§6.1) and never before.
+    pending_restore: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// A running host-managed session (its transient systemd --user unit) + the mode it was launched at.
@@ -441,6 +446,14 @@ impl VirtualDisplay for GamescopeDisplay {
         self.route = route;
     }
 
+    fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        // The DPMS darken-hold release the bare-spawn `create` registered (Exclusive topology
+        // only). The registry stores it on this display's entry and runs it at teardown — which,
+        // for gamescope, is the display's OWN teardown: every spawn is its own group, and the
+        // cross-session ordering lives in `kwin_dpms`'s refcount, not in the group float.
+        self.pending_restore.take()
+    }
+
     fn poolable_now(&self) -> bool {
         // Only a bare SPAWN is registry-poolable (its `create` reports `Owned`); Managed and
         // Attach report `SessionManaged`/`External`, so the registry must not reuse a kept spawn
@@ -576,6 +589,23 @@ impl VirtualDisplay for GamescopeDisplay {
             hz = mode.refresh_hz,
             "gamescope virtual output ready"
         );
+        // `Topology::Exclusive`, bare-spawn edition: this spawn is its OWN headless compositor —
+        // nothing above touched the box's live desktop (KWin), which would otherwise keep driving
+        // the physical panel with the idle desktop for the whole stream. The KWin route disables
+        // the physicals outright, but that door is closed here (KWin refuses zero enabled outputs,
+        // and no output on that desktop is ours to leave enabled) — so the desktop's panels go to
+        // DPMS-off instead, best-effort and self-gating (a box with no KDE desktop declines
+        // quietly inside `kwin_dpms`). Placed AFTER the spawn succeeded, so a failed create never
+        // blanks the user's screen. The hold is refcounted in `kwin_dpms` rather than floated
+        // through the registry's group restore, because every gamescope spawn is its own group
+        // (`registry::group_key`) — the float alone would re-light the panel when the FIRST of two
+        // concurrent spawns ends, under the second's still-live stream. Skipped for Managed (its
+        // takeover already stopped the desktop) and Attach (it mirrors a gamescope that may itself
+        // be driving the physical panel) — both returned earlier in this function.
+        if crate::effective_topology() == crate::policy::Topology::Exclusive {
+            crate::kwin_dpms::acquire_stream_darken();
+            self.pending_restore = Some(Box::new(crate::kwin_dpms::release_stream_darken));
+        }
         // Bare SPAWN: we own the nested gamescope process → registry-poolable (keep-alive-able).
         Ok(VirtualOutput::owned(
             node_id,
