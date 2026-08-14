@@ -9,7 +9,8 @@ tolerates it being raw JSON *or* base64-encoded JSON.
 Usage (upload a new build):
   SERVICE_ACCOUNT_JSON='<raw-or-base64 SA key>' \
     python3 play-upload.py --package io.unom.punktfunk \
-      --aab path/to/app-release.aab --track internal --status completed [--no-commit]
+      --aab path/to/app-release.aab --track beta --also-track alpha \
+      --status completed [--no-commit]
 
 Usage (promote a build that is already on Play, no rebuild):
   python3 play-upload.py --package io.unom.punktfunk \
@@ -164,6 +165,9 @@ def main():
     ap.add_argument("--promote-from", metavar="TRACK",
                     help="with --promote: assert the code is on TRACK, then clear TRACK")
     ap.add_argument("--track", default="internal")
+    ap.add_argument("--also-track", action="append", default=[], metavar="TRACK",
+                    help="assign the same versionCode to this track too, in the same edit "
+                         "(repeatable). Canary uses it to feed open + closed testing at once.")
     ap.add_argument("--status", default="completed")
     ap.add_argument("--user-fraction", type=float,
                     help="staged rollout fraction, 0<f<1; required by --status inProgress")
@@ -183,6 +187,11 @@ def main():
         sys.exit(f"ERROR: --user-fraction must be strictly between 0 and 1 (got {a.user_fraction})")
     if a.aab and not os.path.isfile(a.aab):
         sys.exit(f"ERROR: AAB not found: {a.aab}")
+    for t in a.also_track:
+        # `--also-track <promote-from>` would assign and clear the same track in one edit;
+        # whichever PUT lands second silently wins. Refuse the ambiguity instead.
+        if t in (a.track, a.promote_from):
+            sys.exit(f"ERROR: --also-track {t} duplicates --track/--promote-from")
 
     notes = load_release_notes(a.release_notes_file, a.release_notes_language) \
         if a.release_notes_file else None
@@ -209,6 +218,11 @@ def main():
         put_track(app, edit, tok, a.track, [vc], a.status, a.user_fraction, notes)
         print(f"assigned versionCode={vc} -> track={a.track} status={a.status}"
               + (f" userFraction={a.user_fraction}" if a.user_fraction is not None else ""))
+        # Same edit, so one commit (and one Play review) covers every track the code lands on —
+        # the tracks can never disagree about which canary is current.
+        for t in a.also_track:
+            put_track(app, edit, tok, t, [vc], a.status, a.user_fraction, notes)
+            print(f"assigned versionCode={vc} -> track={t} status={a.status}")
         # Same edit as the assignment above, so the code is never active on both tracks at once.
         if a.promote_from:
             put_track(app, edit, tok, a.promote_from, [], a.status)
