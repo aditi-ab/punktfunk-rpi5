@@ -150,12 +150,13 @@ fn percent_decode(s: &str) -> String {
 /// H-2): `mgmt-token`, `key.pem`, the SAM hive. So the value is confined here, at the one place
 /// bytes are read, rather than trusted because of where it was written.
 ///
-/// Default: the users base (`C:\Users`), which is where every launcher keeps its art cache —
-/// Playnite, the only local-art provider, stores covers under `%APPDATA%\Playnite`. Derived from
+/// Default: the users base (`C:\Users`), where the launchers that install per-user keep their art —
+/// Playnite stores covers under `%APPDATA%\Playnite`, Heroic under `%APPDATA%\heroic`. Derived from
 /// `%PUBLIC%`'s parent because the host runs as SYSTEM, whose own `%USERPROFILE%` is
-/// `…\config\systemprofile` and tells us nothing about where the operator's launchers live.
-/// `PUNKTFUNK_LIBRARY_ART_ROOTS` (`;`-separated) replaces the default for an operator whose library
-/// is on another drive.
+/// `…\config\systemprofile` and tells us nothing about where the operator's launchers live. Plus
+/// the Steam install root ([`steam_art_roots`]), which is the one launcher that does NOT live under
+/// the users base. `PUNKTFUNK_LIBRARY_ART_ROOTS` (`;`-separated) replaces the whole default for an
+/// operator whose library is somewhere else again.
 fn art_roots() -> Vec<PathBuf> {
     if let Some(configured) = std::env::var_os("PUNKTFUNK_LIBRARY_ART_ROOTS") {
         return std::env::split_paths(&configured)
@@ -174,6 +175,8 @@ fn art_roots() -> Vec<PathBuf> {
             roots.push(PathBuf::from(drive).join("Users"));
         }
     }
+    #[cfg(windows)]
+    roots.extend(steam_art_roots());
     // POSIX: the user's home, which is the exact analogue of the Windows users base above — and
     // where every launcher this host reads art from actually keeps it. Steam's
     // `appcache/librarycache` and `userdata/<id>/config/grid`, Lutris's `coverart`/`banners` (both
@@ -198,6 +201,54 @@ fn art_roots() -> Vec<PathBuf> {
         }
     }
     roots
+}
+
+/// Windows: every Steam install root that exists on this box.
+///
+/// Steam is the one launcher whose art is NOT under the users base: it installs to
+/// `C:\Program Files (x86)\Steam`, and both places the `steam` library plugin publishes covers from
+/// — `appcache\librarycache\<appid>\…` and each account's `userdata\<id>\config\grid\` overrides —
+/// live under that root. Without this the users base rejected every one of them, and because an
+/// unservable path used to fail the WHOLE reconcile payload the plugin synced NO GAMES AT ALL, not
+/// merely no art. That is a v0.28.0 regression: the built-in scanner this plugin replaced served its
+/// covers through the legacy `steam:` art-proxy branch, which never passed through this confinement.
+/// (POSIX needs no equivalent — every Steam layout there, native and Flatpak, is already under
+/// `$HOME`.)
+///
+/// This does not widen what the host can be *tricked* into reading. The confinement exists to close
+/// one asymmetry: the host reads as SYSTEM, while the plugin lane that supplies the path is the far
+/// weaker LocalService (2026-08-05 review H-2). The Steam directory is readable by LocalService
+/// already, so nothing reachable through it is reachable *because* the host is privileged. The
+/// extension, regular-file, magic-byte and config-dir gates all still apply on top, so Steam's own
+/// `config.vdf` and `ssfn*` credential blobs are not servable from it either.
+#[cfg(windows)]
+fn steam_art_roots() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        // `is_dir` before dedup: `%ProgramFiles%` and `%ProgramW6432%` are the same directory on a
+        // 64-bit host, and the registry commonly repeats whichever of the two Steam sits in.
+        if p.is_dir() && !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    for var in ["ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"] {
+        if let Some(pf) = std::env::var_os(var) {
+            push(PathBuf::from(pf).join("Steam"));
+        }
+    }
+    // A Steam installed off the default path — a second drive is common — is only discoverable from
+    // the registry. HKLM and not HKCU, for the same reason the plugin reads HKLM: the host is
+    // SYSTEM, whose own hive knows nothing about where the operator installed anything.
+    for key in [r"SOFTWARE\WOW6432Node\Valve\Steam", r"SOFTWARE\Valve\Steam"] {
+        if let Some(p) = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+            .open_subkey(key)
+            .ok()
+            .and_then(|k| k.get_value::<String, _>("InstallPath").ok())
+        {
+            push(PathBuf::from(p));
+        }
+    }
+    out
 }
 
 /// Whether `path` resolves inside one of [`art_roots`] and outside the host config dir.
@@ -315,6 +366,43 @@ pub fn validate_art_paths(art: &Artwork) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Strip every **local-file** art value the proxy would refuse to serve, returning the
+/// `(field, value)` pairs dropped. URLs and already-proxied paths are left alone.
+///
+/// The provider-reconcile counterpart to [`validate_art_paths`]. Both enforce the same invariant —
+/// an unservable path never reaches `library.json` — and differ only on what the REST of the payload
+/// is worth. An operator writing one custom entry typed that path by hand, so a hard 400 is the
+/// feedback they need. A plugin reconciling its whole entry set did not: it publishes hundreds of
+/// covers it resolved from disk, and refusing the payload over one of them costs the operator their
+/// entire library for that store.
+///
+/// That is not hypothetical. A default Windows Steam install put every cover outside the art roots,
+/// so `PUT /library/provider/steam` 400'd, the plugin could only report `HostRequestError`, and the
+/// grid stayed empty with no indication that the games themselves were fine. [`steam_art_roots`]
+/// fixes that specific mismatch; this makes the NEXT one cost a cover instead of a library.
+///
+/// Dropping rather than rewriting is deliberate: `None` is exactly what an entry with no art
+/// carries, and every client already renders that.
+pub fn sanitize_art_paths(art: &mut Artwork) -> Vec<(&'static str, String)> {
+    let mut dropped = Vec::new();
+    for (field, value) in [
+        ("portrait", &mut art.portrait),
+        ("hero", &mut art.hero),
+        ("logo", &mut art.logo),
+        ("header", &mut art.header),
+    ] {
+        let unservable = value
+            .as_deref()
+            .is_some_and(|v| is_local_art_path(v) && !art_path_is_servable(v));
+        if unservable {
+            if let Some(v) = value.take() {
+                dropped.push((field, v));
+            }
+        }
+    }
+    dropped
 }
 
 /// Read a local image file into `(bytes, content-type)` for the art proxy. `None` if it isn't an
@@ -542,15 +630,67 @@ mod tests {
 
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13];
 
-    /// `PUNKTFUNK_LIBRARY_ART_ROOTS` is process-global while cargo runs tests as threads, so the
-    /// tests that repoint it must not overlap — one clearing the variable mid-flight makes the
-    /// other's temp root stop being a root, which fails as a confinement bug that isn't there.
+    /// The variables the art roots derive from are process-global while cargo runs tests as threads,
+    /// so the tests that repoint them must not overlap — one clearing a variable mid-flight makes
+    /// another's temp root stop being a root, which fails as a confinement bug that isn't there.
     /// Poisoning is recovered rather than propagated: a panic in one test should report ITS
     /// failure, not cascade into an unrelated `PoisonError`.
     static ART_ROOTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn lock_art_roots() -> std::sync::MutexGuard<'static, ()> {
-        ART_ROOTS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    /// Holds `ART_ROOTS_LOCK` and the overrides one test needs, restoring the previous values on
+    /// drop. **The only place these tests touch the process environment** — which is what keeps the
+    /// unsafe-hygiene gate's count flat as tests are added, and what makes the restore run on an
+    /// unwind (the hand-rolled set/restore this replaced leaked its override to every later test
+    /// whenever an assertion fired between the two halves).
+    struct ArtRootsEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ArtRootsEnv {
+        /// `None` unsets the variable for the test's duration.
+        fn set(vars: &[(&'static str, Option<&Path>)]) -> Self {
+            let _lock = ART_ROOTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut saved = Vec::new();
+            for (key, value) in vars {
+                saved.push((*key, std::env::var_os(key)));
+                // SAFETY: `_lock` is held for this guard's whole lifetime, and this type is the
+                // only writer of these variables in the binary — so no other thread is reading
+                // them while they change.
+                unsafe { write_env(key, value.map(|p| p.as_os_str())) };
+            }
+            Self { _lock, saved }
+        }
+    }
+
+    impl Drop for ArtRootsEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                // SAFETY: still under `_lock`, which outlives this loop — same argument as `set`.
+                unsafe { write_env(key, value.as_deref()) };
+            }
+        }
+    }
+
+    /// The single write point, so the hygiene gate has exactly one pair of call sites to judge.
+    ///
+    /// # Safety
+    /// The caller must hold `ART_ROOTS_LOCK`; the process environment is global and unsound to
+    /// mutate while another thread reads it.
+    unsafe fn write_env(key: &str, value: Option<&std::ffi::OsStr>) {
+        match value {
+            // SAFETY: the caller holds `ART_ROOTS_LOCK` (this function's documented contract), and
+            // `ArtRootsEnv` is the only writer in the binary — so no other thread is reading the
+            // environment while it changes.
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            // SAFETY: as above — the caller's lock is what makes this sound.
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    /// `PUNKTFUNK_LIBRARY_ART_ROOTS` pointed at one directory — what most of these tests want.
+    fn confine_art_to(dir: &Path) -> ArtRootsEnv {
+        ArtRootsEnv::set(&[("PUNKTFUNK_LIBRARY_ART_ROOTS", Some(dir))])
     }
 
     /// The art proxy reads bytes in the HOST process (LocalSystem on Windows) from a path the
@@ -558,15 +698,12 @@ mod tests {
     /// (2026-08-05 review H-2). Confinement, extension, and content are all load-bearing.
     #[test]
     fn local_art_bytes_is_confined_and_image_only() {
-        let _guard = lock_art_roots();
         let dir = std::env::temp_dir().join(format!("pf-art-test-{}", std::process::id()));
         let outside = std::env::temp_dir().join(format!("pf-art-out-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         // Confine the proxy to `dir` for the duration of this test.
-        // SAFETY: `_guard` holds ART_ROOTS_LOCK (`lock_art_roots`), which serializes every test
-        // that writes or reads this variable in the binary.
-        unsafe { std::env::set_var("PUNKTFUNK_LIBRARY_ART_ROOTS", &dir) };
+        let _env = confine_art_to(&dir);
 
         // A real image inside the root: served, with the content type SNIFFED from the bytes.
         let cover = dir.join("cover.png");
@@ -642,8 +779,6 @@ mod tests {
         // A UNC path is refused outright (outbound SMB auth coercion), before any filesystem hit.
         assert!(!art_path_is_servable(r"\\attacker\share\a.png"));
 
-        // SAFETY: still under `_guard` — the same ART_ROOTS_LOCK serialization as the set.
-        unsafe { std::env::remove_var("PUNKTFUNK_LIBRARY_ART_ROOTS") };
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
     }
@@ -706,14 +841,11 @@ mod tests {
     /// readable together is the point: either alone passes with the bug present.
     #[test]
     fn file_url_art_is_accepted_at_write_time_exactly_as_at_read_time() {
-        let _guard = lock_art_roots();
         let dir = std::env::temp_dir().join(format!("pf-art-wr-{}", std::process::id()));
         let outside = std::env::temp_dir().join(format!("pf-art-wr-out-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
-        // SAFETY: `_guard` holds ART_ROOTS_LOCK (`lock_art_roots`), which serializes every test
-        // that writes or reads this variable in the binary.
-        unsafe { std::env::set_var("PUNKTFUNK_LIBRARY_ART_ROOTS", &dir) };
+        let _env = confine_art_to(&dir);
 
         let cover = dir.join("cover.png");
         std::fs::write(&cover, PNG).unwrap();
@@ -765,10 +897,147 @@ mod tests {
             "an out-of-root file:// cover is still refused"
         );
 
-        // SAFETY: still under `_guard` — the same ART_ROOTS_LOCK serialization as the set.
-        unsafe { std::env::remove_var("PUNKTFUNK_LIBRARY_ART_ROOTS") };
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// A reconcile keeps its entries when a cover is unservable — it drops the cover.
+    ///
+    /// Regression for the report that opened this: on a default Windows Steam install every
+    /// `appcache\librarycache` path fell outside the users base, `validate_art_paths` refused the
+    /// whole `PUT /library/provider/steam` payload, and the operator's grid stayed EMPTY. The games
+    /// were never the problem. Asserting the survivors matters as much as the drop: a sanitizer that
+    /// cleared the whole struct would also "pass" a drop-only test.
+    #[test]
+    fn sanitize_drops_only_the_unservable_local_art() {
+        let dir = std::env::temp_dir().join(format!("pf-art-san-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _env = confine_art_to(&dir);
+
+        let cover = dir.join("cover.png");
+        std::fs::write(&cover, PNG).unwrap();
+        let cover_url = file_url(&cover);
+        let outside = if cfg!(windows) {
+            r"C:\Program Files (x86)\Steam\appcache\librarycache\570\a\library_hero.jpg".to_string()
+        } else {
+            "/opt/steam/appcache/librarycache/570/a/library_hero.jpg".to_string()
+        };
+
+        let mut art = Artwork {
+            portrait: Some(cover_url.clone()),
+            hero: Some(outside.clone()),
+            logo: Some("https://cdn/l.png".into()),
+            header: Some("/api/v1/library/art/steam:570/header".into()),
+        };
+        let dropped = sanitize_art_paths(&mut art);
+        assert_eq!(
+            dropped,
+            vec![("hero", outside)],
+            "only the out-of-root local path is dropped, and it is reported"
+        );
+        assert!(art.hero.is_none(), "the unservable value is gone, not kept");
+        // A servable local cover, a remote URL and an already-proxied path all survive untouched —
+        // the entry still renders everything it legitimately can.
+        assert_eq!(art.portrait.as_deref(), Some(cover_url.as_str()));
+        assert_eq!(art.logo.as_deref(), Some("https://cdn/l.png"));
+        assert_eq!(
+            art.header.as_deref(),
+            Some("/api/v1/library/art/steam:570/header")
+        );
+        // Idempotent: what survived one pass survives the next, and nothing new is reported.
+        assert!(sanitize_art_paths(&mut art).is_empty());
+
+        // The invariant the hard 400 used to hold is still held — nothing the write gate would
+        // refuse comes out the other side.
+        assert!(validate_art_paths(&art).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows only, and the actual bug report: a Steam cover under Program Files is servable with
+    /// NO `PUNKTFUNK_LIBRARY_ART_ROOTS` set.
+    ///
+    /// Drives the whole chain the `steam` plugin's payload traverses — Program Files probe →
+    /// [`steam_art_roots`] → [`art_roots`] → confinement → [`art_path_is_servable`] →
+    /// [`local_art_bytes`] — against a synthetic Steam tree, by repointing `%ProgramFiles(x86)%` at
+    /// a temp dir. Hermetic on purpose: asserting over whatever Steam this box happens to have would
+    /// pass vacuously on every CI runner, which is exactly the shape of test that let this ship.
+    #[cfg(windows)]
+    #[test]
+    fn steam_librarycache_cover_is_servable_without_configuration() {
+        let base = std::env::temp_dir().join(format!("pf-art-steam-{}", std::process::id()));
+        // `appcache\librarycache\<appid>\<hash>\library_hero.jpg` — the exact shape the plugin
+        // publishes, and the exact field the reported failure named.
+        let hero = base
+            .join("Steam")
+            .join("appcache")
+            .join("librarycache")
+            .join("570")
+            .join("abcdef")
+            .join("library_hero.jpg");
+        std::fs::create_dir_all(hero.parent().unwrap()).unwrap();
+        std::fs::write(&hero, PNG).unwrap();
+
+        // No configured roots (that is the claim under test), and the Program Files probe pointed
+        // at the synthetic tree. Both restored on drop — `%ProgramFiles(x86)%` is a real variable
+        // on this box that later tests in the same process may legitimately read.
+        let _env = ArtRootsEnv::set(&[
+            ("PUNKTFUNK_LIBRARY_ART_ROOTS", None),
+            ("ProgramFiles(x86)", Some(&base)),
+        ]);
+
+        let steam_root = base.join("Steam");
+        assert!(
+            steam_art_roots().contains(&steam_root),
+            "the Program Files probe must find the Steam install"
+        );
+        assert!(
+            art_roots().contains(&steam_root),
+            "the DEFAULT art roots must include it — the whole point is that no env var is needed"
+        );
+
+        // The plugin sends `file://`, so that is what has to be accepted; before the fix this was
+        // false and `validate_art_paths` 400'd the entire reconcile.
+        let url = file_url(&hero);
+        assert!(art_path_is_servable(&url), "{url} must be servable");
+        assert!(
+            validate_art_paths(&Artwork {
+                hero: Some(url.clone()),
+                ..Default::default()
+            })
+            .is_ok(),
+            "a Steam-shaped payload must reconcile"
+        );
+        assert!(
+            sanitize_art_paths(&mut Artwork {
+                hero: Some(url.clone()),
+                ..Default::default()
+            })
+            .is_empty(),
+            "and nothing about it is dropped"
+        );
+        assert_eq!(
+            local_art_bytes(&url).expect("read time serves it too").0,
+            PNG
+        );
+
+        // The confinement did not go slack on the way: a secret next door is still not servable,
+        // and neither is a non-image that merely wears the extension.
+        let secret = base.join("Steam").join("config").join("config.vdf");
+        std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        std::fs::write(&secret, b"\"Accounts\"\n{\n\"user\" \"token\"\n}\n").unwrap();
+        assert!(
+            local_art_bytes(secret.to_str().unwrap()).is_none(),
+            "Steam's own credential blob must not be servable from an art root"
+        );
+        let disguised = base.join("Steam").join("config.png");
+        std::fs::write(&disguised, b"\"Accounts\" { \"user\" \"token\" }").unwrap();
+        assert!(
+            local_art_bytes(disguised.to_str().unwrap()).is_none(),
+            "an image extension is still not enough — the bytes must BE an image"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

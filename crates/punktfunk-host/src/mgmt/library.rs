@@ -9,6 +9,10 @@ use axum::Extension;
 /// Refuse a write whose payload carries an operator-privileged field to a lane that may not set one
 /// (2026-08-05 review H-1), and refuse any local art path the proxy would not serve back (H-2).
 ///
+/// The **single-entry writes** — the operator creating or editing one custom entry. The provider
+/// reconcile takes [`check_privileged_fields`] and sanitizes art instead; the split is the whole
+/// point, and [`crate::library::sanitize_art_paths`] carries the reasoning.
+///
 /// Both checks belong here rather than in the route gate: `PUT /library/provider/{p}` is a route a
 /// provider plugin must be able to call — reconciling its own entry set is the whole point of a
 /// scanner plugin — while `prep` / `launch.kind = "command"` inside that payload are the operator's
@@ -22,11 +26,29 @@ use axum::Extension;
 /// `reason` is the caller's log line. It exists because these are TWO different refusals — an
 /// operator-privileged field (403) and an unservable art path (400) — and logging both as "carries
 /// a field this lane may not set" sent the Lutris/Steam `file://` art rejection looking like an
-/// auth problem. The plugin only ever sees `HostRequestError`, so this log line is the sole
-/// diagnosis surface for whoever has to explain why a scanner syncs nothing.
+/// auth problem.
 fn check_entry_fields(
     lane: AuthLane,
     art: &crate::library::Artwork,
+    launch: Option<&crate::library::LaunchSpec>,
+    prep: &[crate::hooks::PrepCmd],
+    icon: Option<&str>,
+) -> Option<(String, Response)> {
+    check_privileged_fields(lane, launch, prep, icon).or_else(|| {
+        crate::library::validate_art_paths(art)
+            .err()
+            .map(|e| (e.clone(), api_error(StatusCode::BAD_REQUEST, &e)))
+    })
+}
+
+/// The half of [`check_entry_fields`] that is about *authority* rather than about art: an
+/// operator-privileged field this lane may not set (403), or an unrepresentable icon token (400).
+///
+/// Split out for the provider reconcile, which must apply exactly these two and NOT the art check —
+/// it sanitizes unservable covers instead of refusing the payload
+/// ([`crate::library::sanitize_art_paths`] explains why the two callers want different answers).
+fn check_privileged_fields(
+    lane: AuthLane,
     launch: Option<&crate::library::LaunchSpec>,
     prep: &[crate::hooks::PrepCmd],
     icon: Option<&str>,
@@ -55,9 +77,7 @@ fn check_entry_fields(
     if let Err(e) = crate::library::validate_icon(icon) {
         return Some((e.clone(), api_error(StatusCode::BAD_REQUEST, &e)));
     }
-    crate::library::validate_art_paths(art)
-        .err()
-        .map(|e| (e.clone(), api_error(StatusCode::BAD_REQUEST, &e)))
+    None
 }
 
 #[derive(Deserialize)]
@@ -468,7 +488,7 @@ pub(crate) async fn reconcile_provider_entries(
     Extension(lane): Extension<AuthLane>,
     Path(provider): Path<String>,
     Query(q): Query<ReconcileQuery>,
-    ApiJson(inputs): ApiJson<Vec<crate::library::ProviderEntryInput>>,
+    ApiJson(mut inputs): ApiJson<Vec<crate::library::ProviderEntryInput>>,
 ) -> Response {
     if let Err(e) = crate::library::validate_provider_name(&provider) {
         return api_error(StatusCode::BAD_REQUEST, &e);
@@ -484,9 +504,15 @@ pub(crate) async fn reconcile_provider_entries(
     }
     // Every entry in the payload, not just the first — a reconcile replaces a whole entry set, so
     // one privileged field anywhere in it is one command execution.
+    //
+    // Art is deliberately NOT part of this refusal. A privileged field is the plugin overreaching
+    // and must fail the write; an unservable cover is a path mismatch between where a launcher keeps
+    // its art and where the host is allowed to read, and failing the payload over one of those threw
+    // away a working library to save a thumbnail. Those covers are stripped below instead, which
+    // holds the same "no unservable path is ever persisted" invariant.
     for (i, e) in inputs.iter().enumerate() {
         if let Some((reason, denied)) =
-            check_entry_fields(lane, &e.art, e.launch.as_ref(), &e.prep, e.icon.as_deref())
+            check_privileged_fields(lane, e.launch.as_ref(), &e.prep, e.icon.as_deref())
         {
             tracing::warn!(
                 provider,
@@ -497,6 +523,29 @@ pub(crate) async fn reconcile_provider_entries(
             );
             return denied;
         }
+    }
+    // One aggregated line, not one per entry: a root mismatch misses EVERY cover in the payload, and
+    // a per-entry warn would bury the rest of the log under a thousand copies of one fact.
+    let mut dropped_art = 0usize;
+    let mut first_dropped: Option<(String, &'static str, String)> = None;
+    for e in inputs.iter_mut() {
+        for (field, value) in crate::library::sanitize_art_paths(&mut e.art) {
+            dropped_art += 1;
+            first_dropped.get_or_insert_with(|| (e.title.clone(), field, value));
+        }
+    }
+    if let Some((title, field, path)) = first_dropped {
+        tracing::warn!(
+            provider,
+            dropped = dropped_art,
+            example_title = %title,
+            example_field = field,
+            example_path = %path,
+            "library reconcile: dropped local art the proxy may not serve — these entries still \
+             sync, but their covers will be blank. The path must be an image file (jpg/png/webp/\
+             gif/bmp/ico/tga) inside an allowed art root; set PUNKTFUNK_LIBRARY_ART_ROOTS if this \
+             library's art lives outside the defaults"
+        );
     }
     match crate::library::reconcile_provider(&provider, store.as_deref(), inputs) {
         Ok(crate::library::MutateOutcome::Done(entries)) => {
