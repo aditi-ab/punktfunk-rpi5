@@ -115,6 +115,7 @@ See your desktop page ([KDE](/docs/kde), [GNOME](/docs/gnome)) for when to set t
 |---|---|---|
 | `PUNKTFUNK_KWIN_VIRTUAL_PRIMARY` | `1` | Make the streamed per-session output the sole desktop so plasmashell + windows render on it (not on the headless bootstrap output). Set by the KDE appliance `host.env`. Superseded by the console's **Topology** setting. |
 | `PUNKTFUNK_MUTTER_VIRTUAL_PRIMARY` | `1` | GNOME/Mutter equivalent of the above. |
+| `PUNKTFUNK_PORTAL_CURSOR_MODE` | `auto` *(default)* · `embedded` · `metadata` · `hidden` | **Hyprland / wlroots only, and a troubleshooting knob** — which ScreenCast cursor mode the host asks the portal for. Unset, the host asks for `metadata` when the client draws the pointer itself and `embedded` otherwise, then settles that against the modes your portal advertises; it never requests one your portal lacks. Set `embedded` if the pointer misbehaves on a portal that *claims* metadata support but implements it poorly — that is the one case the automatic negotiation cannot detect. A pin is still only a preference: it is checked against the advertised modes like any other. |
 
 ## Session recovery (Linux)
 

@@ -55,12 +55,17 @@ fn chooser_cmd() -> String {
 /// The wlroots/Sway virtual-display driver. Stateless — each [`create`](VirtualDisplay::create)
 /// adds one headless output and spins up a portal thread owning the cast on it.
 pub struct WlrootsDisplay {
-    /// Out-of-band cursor request (`set_hw_cursor`, the negotiated cursor channel): portal
+    /// Out-of-band cursor request (`set_hw_cursor`, the negotiated cursor channel): PREFER portal
     /// `CursorMode::Metadata` — shapes/positions ride `SPA_META_Cursor` for the channel + the
-    /// composite blend. Off (every non-channel session): `Embedded` — the compositor paints the
-    /// pointer into frames, zero host-side cursor work (the pre-channel default this backend
-    /// always had). ⚠️ Metadata is UNTESTED on-glass for this backend (Phase B wired it so the
-    /// channel isn't silently dead here; KWin/Mutter are the validated legs).
+    /// composite blend. Off (every non-channel session): prefer `Embedded` — the compositor paints
+    /// the pointer into frames, zero host-side cursor work (the pre-channel default this backend
+    /// always had).
+    ///
+    /// Both are only a PREFERENCE: [`crate::portal_cursor`] settles it against what xdpw actually
+    /// advertises, because requesting an unadvertised mode closes the session outright. xdpw
+    /// refuses metadata by construction (see the portal thread), so on this backend the channel can
+    /// never be served out-of-band: it now degrades to `Embedded` and streams, where it used to
+    /// cancel the cast and hand the client a black screen.
     hw_cursor: bool,
 }
 
@@ -512,13 +517,7 @@ fn portal_thread(
     stop: Arc<AtomicBool>,
     hw_cursor: bool,
 ) {
-    // Portal cursor mode per the session's channel negotiation (see the struct doc).
-    let cursor_mode = if hw_cursor {
-        CursorMode::Metadata
-    } else {
-        CursorMode::Embedded
-    };
-    use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
+    use ashpd::desktop::screencast::{Screencast, SelectSourcesOptions, SourceType};
     use ashpd::desktop::PersistMode;
     use ashpd::enumflags2::BitFlags;
 
@@ -542,6 +541,14 @@ fn portal_thread(
             let proxy = Screencast::new().await.context(
                 "connect ScreenCast portal (is xdg-desktop-portal running with the wlr backend?)",
             )?;
+            // NEGOTIATED against what xdpw advertises, never asserted from `hw_cursor` alone — see
+            // the xdph copy in `hyprland.rs` for the incident. xdpw is the sharper case: its
+            // screencast.c refuses the mode outright —
+            //     if (sess->screencast_data.cursor_mode & METADATA) {
+            //         logprint(ERROR, "dbus: unsupported cursor mode requested, cancelling");
+            // — so EVERY cursor-forward session on this backend asked for a mode that cancelled the
+            // cast. Different wording from xdph's "unavailable cursor mode 4", same dead session.
+            let cursor_mode = crate::portal_cursor::negotiate(&proxy, hw_cursor, "xdpw").await;
             let session = proxy
                 .create_session(Default::default())
                 .await
