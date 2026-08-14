@@ -76,6 +76,20 @@ pub struct VirtualOutput {
     /// capturer must hold frames until that renegotiation lands. Linux-only.
     #[cfg(target_os = "linux")]
     pub expect_exact_dims: bool,
+    /// The compositor's own name for this output (Hyprland's `PF-<pid>-<n>`, sway's `HEADLESS-N`,
+    /// a mirrored head's connector) — the Linux answer to what `win_capture` carries on Windows:
+    /// the identity the host needs to aim **absolute input** at the head it is streaming
+    /// (`pf_inject::set_stream_output`, called from `capture::capture_virtual_output`).
+    ///
+    /// It is the `wl_output.name` of that head, which the protocol guarantees is the same string
+    /// for every client — so the injector can match it on its own Wayland connection. `None` on
+    /// the backends whose absolute mapping does not need it (KWin/Mutter inject through libei,
+    /// which selects by region; gamescope owns its whole seat).
+    ///
+    /// This crate must not depend on pf-inject (see the crate doc), so the name is only CARRIED
+    /// here — the host publishes it.
+    #[cfg(target_os = "linux")]
+    pub output_name: Option<String>,
 }
 
 impl VirtualOutput {
@@ -101,6 +115,8 @@ impl VirtualOutput {
             pool_gen: None,
             #[cfg(target_os = "linux")]
             expect_exact_dims: false,
+            #[cfg(target_os = "linux")]
+            output_name: None,
         }
     }
 }

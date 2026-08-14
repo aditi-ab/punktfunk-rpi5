@@ -175,6 +175,10 @@ impl VirtualDisplay for WlrootsDisplay {
             reused_gen: None,
             pool_gen: None,
             expect_exact_dims: false,
+            // Same EXTEND problem as Hyprland: on a sway session with real heads this `HEADLESS-N`
+            // sits beside them, and absolute input must be aimed at it by name. `swaymsg`'s output
+            // name is the head's `wl_output.name`, which is what the injector matches.
+            output_name: Some(name),
         })
     }
 }

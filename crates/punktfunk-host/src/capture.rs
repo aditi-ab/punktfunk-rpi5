@@ -135,6 +135,17 @@ pub fn capture_virtual_output(
     // handshake already resolved that through [`capturer_supports_hdr_for`] before the Welcome,
     // so passing it through here is the whole of this arm's HDR logic. It used to be dropped on
     // the floor, which is what kept the Linux native plane at 8 bits.
+    //
+    // Aim the wlr injector's absolute mapping (abs-mouse, and `park_pointer`'s opening warp) at
+    // THIS head — the Linux counterpart of the `set_stream_target` call in the Windows arm below.
+    // The wlroots virtual pointer maps `motion_absolute` onto the `wl_output` it was created with,
+    // and on the EXTEND backends (Hyprland, sway) the streamed head sits BESIDE the operator's, so
+    // without this every absolute sample landed on their screen and the cursor never entered the
+    // stream at all. `None` (KWin/Mutter/gamescope, none of which inject through that backend)
+    // CLEARS the slot rather than leaving a stale name: one compositor serves the whole host, so a
+    // `None` here means no session on this host wants a named binding — e.g. a Game-Mode switch
+    // from a Hyprland desktop to gamescope, after which the old `PF-…` name means nothing.
+    crate::inject::set_stream_output(vout.output_name.clone());
     pf_capture::open_virtual_output(
         vout.remote_fd,
         vout.node_id,

@@ -128,7 +128,9 @@ impl VirtualDisplay for MirrorDisplay {
         // NOTE: aiming absolute input at this head is the HOST's job, not ours — this crate must
         // not depend on pf-inject (see the crate doc: "never on capture/inject"). The host sets the
         // anchor from the same pin at startup; §7.2 of the design doc explains why it is host-level
-        // rather than set here per session.
+        // rather than set here per session. We only CARRY the head's name out (`output_name`
+        // below), which is what the wlr injector needs to bind its virtual pointer to this head —
+        // the libei anchor above cannot serve it, because that backend selects by region.
         tracing::info!(
             connector = %target.connector,
             mode = %target.mode_label(),
@@ -145,6 +147,9 @@ impl VirtualDisplay for MirrorDisplay {
         out.remote_fd = stream.remote_fd;
         // Never pooled, never lingered, never made primary/exclusive: we don't own this head.
         out.ownership = DisplayOwnership::External;
+        // The head absolute input maps into is the one we mirror — its connector IS its
+        // `wl_output.name` on the wlroots/Hyprland backends, where the injector matches on it.
+        out.output_name = Some(target.connector.clone());
         Ok(out)
     }
 }

@@ -252,6 +252,10 @@ impl VirtualDisplay for HyprlandDisplay {
             reused_gen: None,
             pool_gen: None,
             expect_exact_dims: false,
+            // Hyprland is an EXTEND topology: this head sits BESIDE the operator's, so absolute
+            // input has to be aimed at it by name or it lands on their screen. `hyprctl`'s monitor
+            // name is the head's `wl_output.name`, which is what the injector matches.
+            output_name: Some(name),
         })
     }
 }

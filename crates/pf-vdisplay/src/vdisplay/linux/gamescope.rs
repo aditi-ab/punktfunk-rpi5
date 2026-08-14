@@ -525,6 +525,9 @@ impl VirtualDisplay for GamescopeDisplay {
                 reused_gen: None,
                 pool_gen: None,
                 expect_exact_dims: false,
+                // gamescope owns its own seat and injects through its EIS socket, not the wlr
+                // virtual pointer (`point_injector_at_eis`) — nothing here to aim by name.
+                output_name: None,
             });
         }
         check_gamescope_version(); // diagnostic only — warns on known-deadlock-prone versions
@@ -718,6 +721,9 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
             reused_gen: None,
             pool_gen: None,
             expect_exact_dims: false,
+            // gamescope owns its own seat and injects through its EIS socket, not the wlr
+            // virtual pointer (`point_injector_at_eis`) — nothing here to aim by name.
+            output_name: None,
         });
     }
     // B1b: a desktop-session Steam (outside any gamescope unit) also holds the single instance and
@@ -834,6 +840,9 @@ fn managed_output(node_id: u32, mode: Mode) -> VirtualOutput {
         reused_gen: None,
         pool_gen: None,
         expect_exact_dims: false,
+        // gamescope owns its own seat and injects through its EIS socket, not the wlr
+        // virtual pointer (`point_injector_at_eis`) — nothing here to aim by name.
+        output_name: None,
     }
 }
 
