@@ -74,7 +74,7 @@ struct LibraryView: View {
     @State private var errorText: String?
     /// Cover-art loader (the same paired identity + host pinning as the list fetch, reused across
     /// every poster in the grid). Built alongside `games` in `load()`; dropped on disappear.
-    @State private var artLoader: LibraryArtLoader?
+    @State private var artLoader: (any LibraryArtSource)?
     #if os(iOS) || os(macOS)
     /// The plain grid's hardware-keyboard cursor (a game id), and the grid width the column count
     /// is derived from. nil until the first arrow press, so a touch user never sees a selection
@@ -409,7 +409,7 @@ private struct LibraryBackCatcher: View {
 /// (portrait → header → hero) and finally a text placeholder.
 private struct GameCard: View {
     let game: GameEntry
-    let artLoader: LibraryArtLoader?
+    let artLoader: (any LibraryArtSource)?
     /// The hardware-keyboard cursor is on this tile — drawn as an accent ring, since the plain
     /// grid has no other way to say "Return launches THIS one".
     var selected = false

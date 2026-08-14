@@ -70,7 +70,7 @@ private extension Image {
 struct PosterImage: View {
     let candidates: [URL]
     let title: String
-    let loader: LibraryArtLoader?
+    let loader: (any LibraryArtSource)?
     /// The entry's brand-mark token (`GameEntry.iconToken`), when it has one. A launcher tile ships
     /// no cover art by design, so for those the mark IS the poster — see `placeholder`.
     var icon: String?

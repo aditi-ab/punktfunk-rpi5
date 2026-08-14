@@ -228,6 +228,16 @@ extension Artwork {
     }
 }
 
+/// Anything that answers poster bytes for a cover-art URL. The production implementation is
+/// [`LibraryArtLoader`]; the screenshot harness substitutes a canned source so store frames carry
+/// artwork without a host on the network.
+public protocol LibraryArtSource: Sendable {
+    func data(for url: URL) async throws -> Data
+    /// Release pooled connections when the owning screen goes away. Sources without connections
+    /// have nothing to do.
+    func close() async
+}
+
 /// Loads cover art for the library UI, routing each URL to the transport that suits its origin.
 ///
 /// A `GameEntry`'s art candidates mix two very different things: the host's own art proxy
@@ -242,7 +252,7 @@ extension Artwork {
 /// TLS handshake per tile.
 ///
 /// Built once per library screen and reused across a whole grid's worth of posters.
-public final class LibraryArtLoader: @unchecked Sendable {
+public final class LibraryArtLoader: LibraryArtSource, @unchecked Sendable {
     private let address: String
     private let port: UInt16
     private let identity: SecIdentity

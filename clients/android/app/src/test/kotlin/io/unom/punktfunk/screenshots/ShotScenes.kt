@@ -3,9 +3,12 @@ package io.unom.punktfunk.screenshots
 import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.graphics.BlendMode
 import android.graphics.Canvas
 import android.graphics.LinearGradient
 import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RadialGradient
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.BitmapDrawable
@@ -708,39 +711,250 @@ private fun shotGames() = listOf(
 
 private fun shotLibraryLoader(context: Context): ImageLoader {
     val engine = FakeImageLoaderEngine.Builder()
-        .intercept("shot://art/aurora", cover(context, 0xFF6656F2, 0xFF141040, "A"))
-        .intercept("shot://art/starfall", cover(context, 0xFFE86FA8, 0xFF3A1030, "S"))
-        .intercept("shot://art/neon", cover(context, 0xFF35D0C5, 0xFF0A2A33, "N"))
-        .intercept("shot://art/ember", cover(context, 0xFFEF8F4B, 0xFF3A1608, "E"))
+        .intercept("shot://art/aurora", poster(context, "AURORA DRIFT", ::drawAurora))
+        .intercept("shot://art/starfall", poster(context, "STARFALL VALE", ::drawStarfall))
+        .intercept("shot://art/neon", poster(context, "NEON CIRCUIT", ::drawNeon))
+        .intercept("shot://art/ember", poster(context, "EMBER PEAKS", ::drawEmber))
         .default(ColorDrawable(0xFF221E44.toInt()))
         .build()
     return ImageLoader.Builder(context).components { add(engine) }.build()
 }
 
-/** A generated 2:3 poster: vertical brand-adjacent gradient + a big monogram. */
-private fun cover(context: Context, top: Long, bottom: Long, mark: String): Drawable {
-    val w = 600
-    val h = 900
-    val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+// The four shelf posters, drawn procedurally at capture time — the same designs the Apple
+// harness draws with CoreGraphics (`ShotPosterArt.swift`), so both listings show the same shelf.
+// All geometry below is in a 600×900, y-UP space (matching the CG source); `posterY()` flips it.
+
+private const val POSTER_W = 600
+private const val POSTER_H = 900
+
+private fun posterY(v: Float) = POSTER_H - v
+
+/** Deterministic LCG (same constants and seeds as the Swift twin) so every capture is identical. */
+private class ShotRand(var state: ULong) {
+    fun next(): Float {
+        state = state * 6364136223846793005UL + 1442695040888963407UL
+        return (state shr 33).toFloat() / (1L shl 31).toFloat()
+    }
+    fun range(lo: Float, hi: Float) = lo + next() * (hi - lo)
+}
+
+private fun poster(context: Context, title: String, draw: (Canvas) -> Unit): Drawable {
+    val bmp = Bitmap.createBitmap(POSTER_W, POSTER_H, Bitmap.Config.ARGB_8888)
     val canvas = Canvas(bmp)
+    draw(canvas)
+    posterTitle(canvas, title)
+    return BitmapDrawable(context.resources, bmp)
+}
+
+/** Vertical gradient over the full canvas; stops bottom-to-top as (location, color). */
+private fun sky(canvas: Canvas, stops: List<Pair<Float, Int>>) {
     canvas.drawRect(
-        0f, 0f, w.toFloat(), h.toFloat(),
+        0f, 0f, POSTER_W.toFloat(), POSTER_H.toFloat(),
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
             shader = LinearGradient(
-                0f, 0f, 0f, h.toFloat(), top.toInt(), bottom.toInt(), Shader.TileMode.CLAMP,
+                0f, POSTER_H.toFloat(), 0f, 0f,
+                stops.map { it.second }.toIntArray(),
+                stops.map { it.first }.toFloatArray(),
+                Shader.TileMode.CLAMP,
             )
         },
     )
-    canvas.drawText(
-        mark, w / 2f, h / 2f + 110f,
+}
+
+private fun glowDot(canvas: Canvas, x: Float, y: Float, radius: Float, color: Int) {
+    canvas.drawCircle(
+        x, posterY(y), radius,
         Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xD9FFFFFF.toInt()
-            textSize = 320f
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            textAlign = Paint.Align.CENTER
+            shader = RadialGradient(
+                x, posterY(y), radius, color, color and 0x00FFFFFF, Shader.TileMode.CLAMP,
+            )
         },
     )
-    return BitmapDrawable(context.resources, bmp)
+}
+
+private fun shotAlpha(color: Int, a: Float) = (color and 0x00FFFFFF) or ((a * 255).toInt() shl 24)
+
+/** Three strokes, wide-and-faint to thin-and-bright, in screen blend — the cheap neon glow. */
+private fun glowStroke(canvas: Canvas, path: Path, width: Float, color: Int) {
+    for ((mult, a) in listOf(2.6f to 0.12f, 1.3f to 0.28f, 0.55f to 0.85f)) {
+        canvas.drawPath(
+            path,
+            Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.STROKE
+                strokeCap = Paint.Cap.ROUND
+                strokeJoin = Paint.Join.ROUND
+                strokeWidth = width * mult
+                this.color = shotAlpha(color, a)
+                blendMode = BlendMode.SCREEN
+            },
+        )
+    }
+}
+
+private fun posterTitle(canvas: Canvas, title: String) {
+    sky(canvas, listOf(0f to shotAlpha(0x000000, 0.55f), 0.22f to shotAlpha(0x000000, 0f)))
+    canvas.drawText(
+        title, POSTER_W / 2f, posterY(72f),
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = shotAlpha(0xFFFFFF, 0.94f)
+            textSize = 46f
+            letterSpacing = 5f / 46f
+            typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
+            textAlign = Paint.Align.CENTER
+            setShadowLayer(8f, 0f, 2f, shotAlpha(0x000000, 0.6f))
+        },
+    )
+}
+
+private fun drawAurora(canvas: Canvas) {
+    sky(canvas, listOf(0f to 0xFF221E5C.toInt(), 0.45f to 0xFF141040.toInt(), 1f to 0xFF0B0830.toInt()))
+    val rng = ShotRand(11UL)
+    repeat(48) {
+        val x = rng.range(0f, 600f)
+        val y = rng.range(300f, 890f)
+        val r = rng.range(1.4f, 3.2f)
+        glowDot(canvas, x, y, r, shotAlpha(0xFFFFFF, rng.range(0.25f, 0.8f)))
+    }
+    data class Ribbon(
+        val base: Float, val amp: Float, val freq: Float,
+        val phase: Float, val w: Float, val c: Int,
+    )
+    for (r in listOf(
+        Ribbon(700f, 55f, 1.15f, 0.4f, 30f, 0xFF6656F2.toInt()),
+        Ribbon(615f, 70f, 1.4f, 2.2f, 24f, 0xFF8F7BFF.toInt()),
+        Ribbon(530f, 45f, 0.95f, 4.1f, 18f, 0xFF35D0C5.toInt()),
+    )) {
+        val path = Path()
+        for (i in 0..60) {
+            val t = i / 60f
+            val x = t * 600f
+            val y = r.base + r.amp * kotlin.math.sin(t * Math.PI.toFloat() * r.freq + r.phase) + 40f * t
+            if (i == 0) path.moveTo(x, posterY(y)) else path.lineTo(x, posterY(y))
+        }
+        glowStroke(canvas, path, r.w, r.c)
+    }
+    // A low ridge grounds the scene — without it the poster's bottom half is bare sky.
+    for ((fill, baseline, rough) in listOf(
+        Triple(0xFF191345.toInt(), 212f, 30f),
+        Triple(0xFF0E0A2E.toInt(), 148f, 38f),
+    )) {
+        val path = Path()
+        path.moveTo(0f, posterY(0f))
+        path.lineTo(0f, posterY(baseline + rng.range(-rough, rough)))
+        for (i in 1..9) {
+            val x = i / 9f * 600f
+            path.lineTo(x, posterY(baseline + rng.range(-rough, rough)))
+        }
+        path.lineTo(600f, posterY(0f))
+        path.close()
+        canvas.drawPath(path, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = fill })
+    }
+}
+
+private fun drawStarfall(canvas: Canvas) {
+    sky(
+        canvas,
+        listOf(
+            0f to 0xFF2A0C24.toInt(), 0.35f to 0xFF7A2B58.toInt(),
+            0.8f to 0xFFE86FA8.toInt(), 1f to 0xFFF7A8C8.toInt(),
+        ),
+    )
+    val rng = ShotRand(23UL)
+    repeat(6) {
+        val hx = rng.range(60f, 560f)
+        val hy = rng.range(420f, 840f)
+        val len = rng.range(90f, 170f)
+        val dx = kotlin.math.cos(2.15f)
+        val dy = kotlin.math.sin(2.15f)
+        val path = Path()
+        path.moveTo(hx, posterY(hy))
+        path.lineTo(hx + dx * len, posterY(hy + dy * len))
+        glowStroke(canvas, path, 4f, 0xFFFFE3EF.toInt())
+        glowDot(canvas, hx, hy, 11f, shotAlpha(0xFFFFFF, 0.9f))
+    }
+    for ((fill, baseline, rough) in listOf(
+        Triple(0xFF3A1430.toInt(), 300f, 26f),
+        Triple(0xFF1D0818.toInt(), 216f, 34f),
+    )) {
+        val path = Path()
+        path.moveTo(0f, posterY(0f))
+        path.lineTo(0f, posterY(baseline))
+        for (i in 1..8) {
+            val x = i / 8f * 600f
+            path.lineTo(x, posterY(baseline + rng.range(-rough, rough)))
+        }
+        path.lineTo(600f, posterY(0f))
+        path.close()
+        canvas.drawPath(path, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = fill })
+    }
+}
+
+private fun drawNeon(canvas: Canvas) {
+    sky(canvas, listOf(0f to 0xFF0A2A33.toInt(), 1f to 0xFF04161C.toInt()))
+    val rng = ShotRand(7UL)
+    val ring = Path().apply {
+        addOval(300f - 105f, posterY(560f) - 105f, 300f + 105f, posterY(560f) + 105f, Path.Direction.CW)
+    }
+    glowStroke(canvas, ring, 10f, 0xFF35D0C5.toInt())
+    val gateX = listOf(-105f, 105f, 0f, 0f)
+    val gateY = listOf(0f, 0f, -105f, 105f)
+    for (i in 0 until 9) {
+        var px: Float
+        var py: Float
+        if (i < 4) {
+            px = 300f + gateX[i]
+            py = 560f + gateY[i]
+        } else {
+            px = 40f * kotlin.math.round(rng.range(1f, 14f))
+            py = 40f * kotlin.math.round(rng.range(1f, 21f))
+        }
+        val path = Path()
+        path.moveTo(px, posterY(py))
+        var horizontal = rng.next() > 0.5f
+        repeat(rng.range(3f, 6f).toInt()) {
+            val step = 40f * kotlin.math.round(rng.range(1f, 4f)) * (if (rng.next() > 0.5f) 1f else -1f)
+            if (horizontal) px = (px + step).coerceIn(20f, 580f) else py = (py + step).coerceIn(20f, 880f)
+            path.lineTo(px, posterY(py))
+            horizontal = !horizontal
+        }
+        val color = if (rng.next() > 0.6f) 0xFF7FE8DE.toInt() else 0xFF35D0C5.toInt()
+        glowStroke(canvas, path, 5f, color)
+        glowDot(canvas, px, py, 12f, shotAlpha(color, 0.9f))
+    }
+}
+
+private fun drawEmber(canvas: Canvas) {
+    sky(
+        canvas,
+        listOf(
+            0f to 0xFF200A04.toInt(), 0.3f to 0xFF7A2E12.toInt(),
+            0.42f to 0xFFEF8F4B.toInt(), 1f to 0xFF2A0E06.toInt(),
+        ),
+    )
+    glowDot(canvas, 300f, 385f, 160f, shotAlpha(0xFFC37A, 0.85f))
+    val rng = ShotRand(41UL)
+    for ((fill, baseline, rough) in listOf(
+        Triple(0xFF5A2410.toInt(), 340f, 42f),
+        Triple(0xFF401708.toInt(), 255f, 56f),
+        Triple(0xFF200A04.toInt(), 165f, 48f),
+    )) {
+        val path = Path()
+        path.moveTo(0f, posterY(0f))
+        path.lineTo(0f, posterY(baseline + rng.range(-rough, rough)))
+        for (i in 1..10) {
+            val x = i / 10f * 600f
+            path.lineTo(x, posterY(baseline + rng.range(-rough, rough)))
+        }
+        path.lineTo(600f, posterY(0f))
+        path.close()
+        canvas.drawPath(path, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = fill })
+    }
+    repeat(20) {
+        val x = rng.range(30f, 570f)
+        val y = rng.range(180f, 620f)
+        val r = rng.range(2.5f, 6f)
+        glowDot(canvas, x, y, r, shotAlpha(0xFFB067, rng.range(0.35f, 0.9f)))
+    }
 }
 
 @Composable
