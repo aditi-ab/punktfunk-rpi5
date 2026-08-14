@@ -630,15 +630,67 @@ mod tests {
 
     const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13];
 
-    /// `PUNKTFUNK_LIBRARY_ART_ROOTS` is process-global while cargo runs tests as threads, so the
-    /// tests that repoint it must not overlap — one clearing the variable mid-flight makes the
-    /// other's temp root stop being a root, which fails as a confinement bug that isn't there.
+    /// The variables the art roots derive from are process-global while cargo runs tests as threads,
+    /// so the tests that repoint them must not overlap — one clearing a variable mid-flight makes
+    /// another's temp root stop being a root, which fails as a confinement bug that isn't there.
     /// Poisoning is recovered rather than propagated: a panic in one test should report ITS
     /// failure, not cascade into an unrelated `PoisonError`.
     static ART_ROOTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn lock_art_roots() -> std::sync::MutexGuard<'static, ()> {
-        ART_ROOTS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    /// Holds `ART_ROOTS_LOCK` and the overrides one test needs, restoring the previous values on
+    /// drop. **The only place these tests touch the process environment** — which is what keeps the
+    /// unsafe-hygiene gate's count flat as tests are added, and what makes the restore run on an
+    /// unwind (the hand-rolled set/restore this replaced leaked its override to every later test
+    /// whenever an assertion fired between the two halves).
+    struct ArtRootsEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ArtRootsEnv {
+        /// `None` unsets the variable for the test's duration.
+        fn set(vars: &[(&'static str, Option<&Path>)]) -> Self {
+            let _lock = ART_ROOTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut saved = Vec::new();
+            for (key, value) in vars {
+                saved.push((*key, std::env::var_os(key)));
+                // SAFETY: `_lock` is held for this guard's whole lifetime, and this type is the
+                // only writer of these variables in the binary — so no other thread is reading
+                // them while they change.
+                unsafe { write_env(key, value.map(|p| p.as_os_str())) };
+            }
+            Self { _lock, saved }
+        }
+    }
+
+    impl Drop for ArtRootsEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                // SAFETY: still under `_lock`, which outlives this loop — same argument as `set`.
+                unsafe { write_env(key, value.as_deref()) };
+            }
+        }
+    }
+
+    /// The single write point, so the hygiene gate has exactly one pair of call sites to judge.
+    ///
+    /// # Safety
+    /// The caller must hold `ART_ROOTS_LOCK`; the process environment is global and unsound to
+    /// mutate while another thread reads it.
+    unsafe fn write_env(key: &str, value: Option<&std::ffi::OsStr>) {
+        match value {
+            // SAFETY: the caller holds `ART_ROOTS_LOCK` (this function's documented contract), and
+            // `ArtRootsEnv` is the only writer in the binary — so no other thread is reading the
+            // environment while it changes.
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            // SAFETY: as above — the caller's lock is what makes this sound.
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    /// `PUNKTFUNK_LIBRARY_ART_ROOTS` pointed at one directory — what most of these tests want.
+    fn confine_art_to(dir: &Path) -> ArtRootsEnv {
+        ArtRootsEnv::set(&[("PUNKTFUNK_LIBRARY_ART_ROOTS", Some(dir))])
     }
 
     /// The art proxy reads bytes in the HOST process (LocalSystem on Windows) from a path the
@@ -646,15 +698,12 @@ mod tests {
     /// (2026-08-05 review H-2). Confinement, extension, and content are all load-bearing.
     #[test]
     fn local_art_bytes_is_confined_and_image_only() {
-        let _guard = lock_art_roots();
         let dir = std::env::temp_dir().join(format!("pf-art-test-{}", std::process::id()));
         let outside = std::env::temp_dir().join(format!("pf-art-out-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         // Confine the proxy to `dir` for the duration of this test.
-        // SAFETY: `_guard` holds ART_ROOTS_LOCK (`lock_art_roots`), which serializes every test
-        // that writes or reads this variable in the binary.
-        unsafe { std::env::set_var("PUNKTFUNK_LIBRARY_ART_ROOTS", &dir) };
+        let _env = confine_art_to(&dir);
 
         // A real image inside the root: served, with the content type SNIFFED from the bytes.
         let cover = dir.join("cover.png");
@@ -730,8 +779,6 @@ mod tests {
         // A UNC path is refused outright (outbound SMB auth coercion), before any filesystem hit.
         assert!(!art_path_is_servable(r"\\attacker\share\a.png"));
 
-        // SAFETY: still under `_guard` — the same ART_ROOTS_LOCK serialization as the set.
-        unsafe { std::env::remove_var("PUNKTFUNK_LIBRARY_ART_ROOTS") };
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
     }
@@ -794,14 +841,11 @@ mod tests {
     /// readable together is the point: either alone passes with the bug present.
     #[test]
     fn file_url_art_is_accepted_at_write_time_exactly_as_at_read_time() {
-        let _guard = lock_art_roots();
         let dir = std::env::temp_dir().join(format!("pf-art-wr-{}", std::process::id()));
         let outside = std::env::temp_dir().join(format!("pf-art-wr-out-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
-        // SAFETY: `_guard` holds ART_ROOTS_LOCK (`lock_art_roots`), which serializes every test
-        // that writes or reads this variable in the binary.
-        unsafe { std::env::set_var("PUNKTFUNK_LIBRARY_ART_ROOTS", &dir) };
+        let _env = confine_art_to(&dir);
 
         let cover = dir.join("cover.png");
         std::fs::write(&cover, PNG).unwrap();
@@ -853,8 +897,6 @@ mod tests {
             "an out-of-root file:// cover is still refused"
         );
 
-        // SAFETY: still under `_guard` — the same ART_ROOTS_LOCK serialization as the set.
-        unsafe { std::env::remove_var("PUNKTFUNK_LIBRARY_ART_ROOTS") };
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
     }
@@ -868,12 +910,9 @@ mod tests {
     /// cleared the whole struct would also "pass" a drop-only test.
     #[test]
     fn sanitize_drops_only_the_unservable_local_art() {
-        let _guard = lock_art_roots();
         let dir = std::env::temp_dir().join(format!("pf-art-san-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // SAFETY: `_guard` holds ART_ROOTS_LOCK (`lock_art_roots`), which serializes every test
-        // that writes or reads this variable in the binary.
-        unsafe { std::env::set_var("PUNKTFUNK_LIBRARY_ART_ROOTS", &dir) };
+        let _env = confine_art_to(&dir);
 
         let cover = dir.join("cover.png");
         std::fs::write(&cover, PNG).unwrap();
@@ -912,8 +951,6 @@ mod tests {
         // refuse comes out the other side.
         assert!(validate_art_paths(&art).is_ok());
 
-        // SAFETY: still under `_guard` — the same ART_ROOTS_LOCK serialization as the set.
-        unsafe { std::env::remove_var("PUNKTFUNK_LIBRARY_ART_ROOTS") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -928,7 +965,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn steam_librarycache_cover_is_servable_without_configuration() {
-        let _guard = lock_art_roots();
         let base = std::env::temp_dir().join(format!("pf-art-steam-{}", std::process::id()));
         // `appcache\librarycache\<appid>\<hash>\library_hero.jpg` — the exact shape the plugin
         // publishes, and the exact field the reported failure named.
@@ -942,15 +978,13 @@ mod tests {
         std::fs::create_dir_all(hero.parent().unwrap()).unwrap();
         std::fs::write(&hero, PNG).unwrap();
 
-        // Restored at the end: `%ProgramFiles(x86)%` is a real variable on this box that later
-        // tests in the same process may legitimately read.
-        let saved = std::env::var_os("ProgramFiles(x86)");
-        // SAFETY: `_guard` holds ART_ROOTS_LOCK, which serializes every test that reads or writes
-        // the variables the art roots are derived from.
-        unsafe {
-            std::env::remove_var("PUNKTFUNK_LIBRARY_ART_ROOTS");
-            std::env::set_var("ProgramFiles(x86)", &base);
-        }
+        // No configured roots (that is the claim under test), and the Program Files probe pointed
+        // at the synthetic tree. Both restored on drop — `%ProgramFiles(x86)%` is a real variable
+        // on this box that later tests in the same process may legitimately read.
+        let _env = ArtRootsEnv::set(&[
+            ("PUNKTFUNK_LIBRARY_ART_ROOTS", None),
+            ("ProgramFiles(x86)", Some(&base)),
+        ]);
 
         let steam_root = base.join("Steam");
         assert!(
@@ -1003,13 +1037,6 @@ mod tests {
             "an image extension is still not enough — the bytes must BE an image"
         );
 
-        // SAFETY: still under `_guard` — same serialization as the set above.
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var("ProgramFiles(x86)", v),
-                None => std::env::remove_var("ProgramFiles(x86)"),
-            }
-        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
