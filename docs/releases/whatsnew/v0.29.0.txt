@@ -1,0 +1,2 @@
+• One press of Select no longer ends your stream. Some controllers report Select as the "Back" every TV remote has; that press quit the session, and the Select shortcuts (the emergency exit hold, mic mute, stats) never worked on those pads. Fixed — a remote's Back still exits.
+• The app now learns a host's settings port from the host itself when it connects, so hosts reached over a VPN or another network work fully, without local discovery.
