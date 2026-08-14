@@ -214,7 +214,12 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
         ))
         .routes(routes!(host::get_status))
         .routes(routes!(host::get_local_summary))
-        .routes(routes!(clients::list_paired_clients))
+        // GET and DELETE share the `/clients` path, so they must be ONE `routes!` — utoipa-axum
+        // merges the methods of a single call into one route; two calls collide on the path.
+        .routes(routes!(
+            clients::list_paired_clients,
+            clients::unpair_all_clients
+        ))
         .routes(routes!(clients::unpair_client));
     // The GameStream PIN flow exists only when the compat planes do (WP19) — a native-only
     // build's API (and its OpenAPI document) simply has no such endpoints.
@@ -226,7 +231,11 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
         .routes(routes!(native::get_native_pairing))
         .routes(routes!(native::arm_native_pairing))
         .routes(routes!(native::disarm_native_pairing))
-        .routes(routes!(native::list_native_clients))
+        // Same-path pair as `/clients` above — one `routes!` for both methods.
+        .routes(routes!(
+            native::list_native_clients,
+            native::unpair_all_native_clients
+        ))
         .routes(routes!(native::unpair_native_client))
         .routes(routes!(native::list_pending_devices))
         .routes(routes!(native::approve_pending_device))

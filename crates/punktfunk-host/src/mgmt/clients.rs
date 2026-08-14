@@ -153,6 +153,62 @@ pub(crate) async fn unpair_client(
     }
 }
 
+/// Unpair every client
+///
+/// The collection form of [`unpair_client`]: empties the pairing store in ONE persisted write,
+/// carrying the same revocation guarantees across the whole set. A LIVE GameStream session is
+/// ended (its owning certificate is necessarily one of those just removed), and the ENet control
+/// port (UDP 47999) closes, because no pairing is left to hold it open.
+///
+/// Idempotent, and so a 200 rather than the single unpair's 204/404 pair: "unpair everything" is
+/// satisfied by an already-empty store, and the operator still wants to know whether that meant
+/// three devices or none.
+#[utoipa::path(
+    delete,
+    path = "/clients",
+    tag = "clients",
+    operation_id = "unpairAllClients",
+    responses(
+        (status = OK, description = "Every client unpaired (possibly none)", body = UnpairAllResult),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn unpair_all_clients(State(st): State<Arc<MgmtState>>) -> Response {
+    let mut paired = st.app.paired.lock().unwrap_or_else(|e| e.into_inner());
+    if paired.is_empty() {
+        // Nothing to persist, no port to sync — an empty store is already the requested state.
+        return Json(UnpairAllResult { unpaired: 0 }).into_response();
+    }
+    let removed: Vec<[u8; 32]> = paired
+        .iter()
+        .map(|der| Sha256::digest(der).into())
+        .collect();
+    paired.clear();
+    // Persist under the lock, as the single unpair does: a pairing resurrected by a restart would
+    // silently re-open the control port.
+    crate::gamestream::save_paired(&paired);
+    drop(paired);
+    // A mid-stream client must not keep streaming once its pairing is gone. Clearing the launch
+    // makes the ENet control thread send the standard TERMINATION+disconnect. (An owner-less
+    // launch — the cert was unreadable at /launch — cannot be attributed, and is left to the port
+    // teardown below, which here always fires: no pairing remains.)
+    let live_owner = st
+        .app
+        .launch
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .and_then(|l| l.owner_fp);
+    if live_owner.is_some_and(|fp| removed.contains(&fp)) {
+        st.app.quit_session("client unpaired");
+    }
+    if let Err(e) = crate::gamestream::sync_control(&st.app) {
+        tracing::warn!(error = %format!("{e:#}"), "control port sync after unpair-all failed");
+    }
+    let unpaired = removed.len() as u32;
+    tracing::info!(unpaired, "management API: all clients unpaired");
+    Json(UnpairAllResult { unpaired }).into_response()
+}
+
 /// Pairing-flow status
 ///
 /// Poll this to know when to prompt the user for the PIN Moonlight displays.

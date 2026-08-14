@@ -77,7 +77,15 @@ if [ -n "$GAMESCOPE" ]; then
   [ -x "$GS_BIN" ] || { echo "$GAMESCOPE did not provide usr/bin/punktfunk-gamescope" >&2; exit 1; }
   "$GS_BIN" --version 2>&1 | grep -q '+pfhdr' || {
     echo "$GAMESCOPE's binary has no +pfhdr marker — it is not a punktfunk HDR build" >&2; exit 1; }
-  echo "folded in $("$GS_BIN" --version 2>&1 | head -1)"
+  # The package carries the Vulkan WSI layer alongside the compositor and the extraction above takes
+  # the whole `usr`, so this is an assertion rather than a step — but a silent one is exactly how
+  # this went wrong before: an image with the compositor and no layer streams HDR while every game
+  # inside it renders SDR, and nothing anywhere says why.
+  for f in usr/lib/punktfunk/libVkLayer_PUNKTFUNK_gamescope_wsi.so \
+           usr/lib/punktfunk/vulkan/implicit_layer.d/punktfunk_gamescope_wsi.json; do
+    [ -f "$STAGE/$f" ] || { echo "$GAMESCOPE has no $f — no game HDR without it" >&2; exit 1; }
+  done
+  echo "folded in $("$GS_BIN" --version 2>&1 | head -1) + its WSI layer"
 fi
 
 # The marker systemd-sysext requires to merge the image. ID=_any merges onto ANY host os-release

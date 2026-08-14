@@ -507,6 +507,16 @@ in
         # can still override this (or set it to `off` to force the in-process encoder) — the same
         # "an operator's own override still wins" posture as PUNKTFUNK_GAMESCOPE_BIN above.
         environment.PUNKTFUNK_ENCODE_WORKER = "${config.security.wrapperDir}/punktfunk-encode-worker";
+        # Where our Vulkan WSI layer's manifest lives. The host defaults to the FHS path every
+        # distro package uses, which no NixOS box has — here the layer travels inside the gamescope
+        # derivation, so point at it. Without this a game nested under the compositor gets no HDR10
+        # swapchain at all: that layer is the only route to one, and the host falls back to
+        # disabling the system layer, which is HDR-less by construction.
+        #
+        # Same override posture as PUNKTFUNK_GAMESCOPE_BIN: `Environment=` renders before
+        # `EnvironmentFile=`, so an operator's `settings` still wins.
+        environment.PUNKTFUNK_GAMESCOPE_WSI_LAYER_DIR = mkIf cfg.host.gamescopeHdr
+          "${cfg.host.gamescopePackage}/lib/punktfunk/vulkan/implicit_layer.d";
         serviceConfig = {
           # The store path DIRECTLY — not a capability wrapper. /proc/<pid>/exe then resolves to the
           # very path packages.nix substituted into io.unom.Punktfunk.Host.desktop's Exec=, which is

@@ -21,6 +21,18 @@ pub(crate) struct ApiError {
     error: String,
 }
 
+/// What a bulk unpair removed. Shared by the two collection DELETEs (`/clients` and
+/// `/native/clients`) so the console sees one schema across both pairing planes.
+///
+/// A count rather than 204: "unpair everything" is idempotent, so an empty store is a success, and
+/// the operator still wants to be told whether that meant three devices or none.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct UnpairAllResult {
+    /// Clients removed from the trust store — 0 when nothing was paired.
+    #[schema(example = 3)]
+    pub(crate) unpaired: u32,
+}
+
 pub(crate) fn api_error(status: StatusCode, message: &str) -> Response {
     (
         status,

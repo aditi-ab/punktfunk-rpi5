@@ -19,6 +19,7 @@ The patches here add the missing half, and nothing else. See
 | `0006-punktfunk-never-destroy-the-Vulkan-device-or-output-.patch` | Give `g_device` and `g_output` storage that is never destroyed, so their destructors cannot call a Vulkan driver glibc has already unloaded at `exit()` | **Yes** — a plain static-destruction-order bug, not punktfunk-specific |
 | `0007-pipewire-never-leave-pw_buffer-user_data-pointing-at.patch` | Associate `pw_buffer->user_data` with its `pipewire_buffer` for every path out of `add_buffer`, clear it in `remove_buffer` (the last point both halves are known), and null-check the consumers — killing the use-after-free that aborted the session on every capture renegotiation | **Yes** — a plain use-after-free in the PipeWire buffer lifecycle |
 | `0008-steamcompmgr-honor-GAMESCOPE_NO_FOCUS-never-a-focus-.patch` | Honor `GAMESCOPE_NO_FOCUS` (set by hhd-ui and MangoHud, consumed by nobody): such windows are skipped by both focus-candidate collectors, so a mapped-but-unpainted overlay app can no longer win focus and turn the composite black. Compositing is untouched — only focus SELECTION is barred | **Yes** — the atom's setters already exist in the wild; some compositor has to keep the promise |
+| `0009-pipewire-destroy-capture-textures-on-the-compositor-.patch` | Move capture-buffer destruction off the PipeWire thread: `remove_buffer`/stale-push queue the corpse (`bury_buffer`), steamcompmgr reaps on every vblank — including while the stream is paused, which is exactly the linger window. Without it, dropping the last `CVulkanTexture` ref on the PW thread races `vulkan_screenshot` on the same device and SIGSEGVs (NVIDIA `insertBarrier`), so a lingered display is dead and reconnect loses the session. Reported + written by luxus (punktfunk-overlay#9) | **Yes** — the race is upstream's `paint_pipewire` vs `destroy_buffer`; our patches only make the paint path heavier |
 
 ### Why the headless patch matters
 
@@ -68,6 +69,20 @@ variant of the same fault instead. Two traps when triaging it:
   lands in a working-looking game mode at the wrong resolution and without any of these patches.
   Read the banner in `~/.gamescope-stdout.log`, not the fact that a session exists.
 
+### Why the teardown patch is what makes linger real
+
+Patch 0007 keeps a session alive across renegotiations; patch 0009 keeps it alive across
+*disconnects*. When the capture consumer leaves, `stream_handle_remove_buffer` used to destroy
+idle buffers on the PipeWire thread — and `~CVulkanTexture` talks to the Vulkan device
+(`vkDestroyImage`/`FreeMemory`/dmabuf fds) while steamcompmgr can still be inside
+`vulkan_screenshot` on another buffer of the same 4-buffer pool. On NVIDIA that races to a SIGSEGV
+in `CVulkanCmdBuffer::insertBarrier`, timed precisely at stream end — so the display the host
+keeps lingering for a reconnect is already dead, and the "resumed" session silently becomes a
+fresh compositor with the game lost. The journal signature: a linger line, then a coredump, then
+`kept display was dead — recreating`. Found, fixed and proven live by luxus
+([punktfunk-overlay#9](https://github.com/luxus/punktfunk-overlay/issues/9)) on 4K60 HDR + composited
+cursor, the heaviest paint path we ship.
+
 ## Why the marker exists
 
 punktfunk decides a session's shape **before** the virtual display exists: the bit depth at
@@ -87,6 +102,7 @@ The number is a **monotonic patch-set revision**, so one probe answers every cap
 | `+pfhdr4` | …and `--pipewire-composite-external-overlay` |
 | `+pfhdr5` | …and the PipeWire buffer use-after-free is fixed (no new capability) |
 | `+pfhdr6` | …and `GAMESCOPE_NO_FOCUS` windows are never focus candidates (no new capability) |
+| `+pfhdr7` | …and PipeWire teardown cannot SIGSEGV a lingering compositor (no new capability) |
 
 Bump it whenever a patch adds or changes something the host must know about before it spawns.
 

@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: luxus <luxus@users.noreply.github.com>
+Date: Thu, 13 Aug 2026 23:15:48 +0200
+Subject: [PATCH] pipewire: destroy capture textures on the compositor thread
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When the capture consumer leaves, PipeWire remove_buffer destroys idle
+buffers on the PW thread. CVulkanTexture's destructor talks to the Vulkan
+device (DestroyImage / FreeMemory / close dmabuf fds). steamcompmgr may
+still be inside vulkan_screenshot on another buffer of the same device.
+
+That race SIGSEGVs in CVulkanCmdBuffer::insertBarrier / libnvidia-eglcore
+and kills the compositor. A lingering gamescope session then cannot be
+reused — the host has to spawn a new one.
+
+Queue those corpses and delete them on the steamcompmgr vblank, including
+when the stream is only paused (linger: no consumer, compositor stays up).
+
+The same race exists on the stale-push path (dispatch_nudge destroying a
+buffer whose pw_buffer vanished while it was copying), so that call is
+buried too. Corpses queued when the compositor exits are reclaimed by the
+kernel, same as patch 0006's deliberate leak.
+
+Reported, written and proven live by luxus (punktfunk-overlay#9): four
+coredumps on an NVIDIA host, all at stream end / linger, three in
+paint_pipewire → vulkan_screenshot → insertBarrier with a concurrent
+destroy_buffer → ~CVulkanTexture on the PipeWire thread; after this patch
+a disconnect/reconnect reuses the lingered session.
+
+Not addressed here: stream_handle_add_buffer's `error:` path still deletes
+on the PW thread. By the later `goto error`s a texture may be attached, so
+the same race is reachable in theory — but only when an add FAILS mid-
+renegotiation, which none of the field coredumps show. Left as-is to stay
+byte-identical with the change that was proven on-glass.
+
+punktfunk: the banner moves to +pfhdr7. No new capability — but a build
+whose linger can die of its own capture teardown is indistinguishable from
+one that cannot except by this marker, and "reconnect lost my game" is
+exactly the field report that needs that read (same rule as pfhdr5/6).
+
+Upstream: yes — the race is upstream's paint_pipewire vs destroy_buffer;
+our HDR/cursor patches only make the paint path heavier.
+---
+ src/meson.build      |  3 ++-
+ src/pipewire.cpp     | 28 ++++++++++++++++++++++++++--
+ src/pipewire.hpp     |  3 +++
+ src/steamcompmgr.cpp | 10 ++++++++--
+ 4 files changed, 39 insertions(+), 5 deletions(-)
+
+diff --git a/src/meson.build b/src/meson.build
+index acfcaea..fe854af 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -186,7 +186,8 @@ vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()
+ #   +pfhdr4 — …and `--pipewire-composite-external-overlay`
+ #   +pfhdr5 — …and the PipeWire buffer use-after-free is fixed (no new capability)
+ #   +pfhdr6 — …and GAMESCOPE_NO_FOCUS windows are never focus candidates (no new capability)
+-version_tag = vcs_tag + '+pfhdr6' + ' (' + compiler_name + ' ' + compiler_version + ')'
++#   +pfhdr7 — …and PipeWire teardown cannot SIGSEGV a lingering compositor (no new capability)
++version_tag = vcs_tag + '+pfhdr7' + ' (' + compiler_name + ' ' + compiler_version + ')'
+ 
+ gamescope_version_conf = configuration_data()
+ gamescope_version_conf.set('VCS_TAG', version_tag)
+diff --git a/src/pipewire.cpp b/src/pipewire.cpp
+index c683b3a..3c727e9 100644
+--- a/src/pipewire.cpp
++++ b/src/pipewire.cpp
+@@ -7,6 +7,7 @@
+ #include <unistd.h>
+ 
+ #include <atomic>
++#include <mutex>
+ #include <thread>
+ #include <vector>
+ 
+@@ -103,6 +104,29 @@ static void destroy_buffer(struct pipewire_buffer *buffer) {
+ 	delete buffer;
+ }
+ 
++// The PipeWire thread must not destroy CVulkanTextures: steamcompmgr may be
++// inside vulkan_screenshot on another buffer of the same device. Queue the
++// corpse and let steamcompmgr delete it on the next vblank.
++static std::mutex s_deadBuffersMutex;
++static std::vector<struct pipewire_buffer *> s_deadBuffers;
++
++static void bury_buffer(struct pipewire_buffer *buffer)
++{
++	std::lock_guard<std::mutex> lock(s_deadBuffersMutex);
++	s_deadBuffers.push_back(buffer);
++}
++
++void pipewire_reap_dead_buffers(void)
++{
++	std::vector<struct pipewire_buffer *> dead;
++	{
++		std::lock_guard<std::mutex> lock(s_deadBuffersMutex);
++		dead.swap(s_deadBuffers);
++	}
++	for (struct pipewire_buffer *buffer : dead)
++		destroy_buffer(buffer);
++}
++
+ void pipewire_destroy_buffer(struct pipewire_buffer *buffer)
+ {
+ 	destroy_buffer(buffer);
+@@ -384,7 +408,7 @@ static void dispatch_nudge(struct pipewire_state *state, int fd)
+ 				pwr_log.errorf("pw_stream_queue_buffer failed");
+ 			}
+ 		} else {
+-			destroy_buffer(buffer);
++			bury_buffer(buffer);
+ 		}
+ 	}
+ }
+@@ -694,7 +718,7 @@ static void stream_handle_remove_buffer(void *data, struct pw_buffer *pw_buffer)
+ 	buffer->buffer = nullptr;
+ 
+ 	if (!buffer->copying) {
+-		destroy_buffer(buffer);
++		bury_buffer(buffer);
+ 	}
+ }
+ 
+diff --git a/src/pipewire.hpp b/src/pipewire.hpp
+index b4d7e29..d0b510c 100644
+--- a/src/pipewire.hpp
++++ b/src/pipewire.hpp
+@@ -60,5 +60,8 @@ uint32_t get_pipewire_stream_node_id(void);
+ struct pipewire_buffer *dequeue_pipewire_buffer(void);
+ bool pipewire_is_streaming();
+ void pipewire_destroy_buffer(struct pipewire_buffer *buffer);
++// Destroy textures queued by the PipeWire thread. Must run on steamcompmgr —
++// CVulkanTexture's dtor talks to the Vulkan device.
++void pipewire_reap_dead_buffers(void);
+ void push_pipewire_buffer(struct pipewire_buffer *buffer);
+ void nudge_pipewire(void);
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 14596ae..932316f 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -9321,8 +9321,14 @@ steamcompmgr_main(int argc, char **argv)
+ 
+ #if HAVE_PIPEWIRE
+ 		// Drive on vblank, not the timer: under VRR the timer starves (page flips re-arm it).
+-		if ( vblank && pipewire_is_streaming() )
+-			paint_pipewire();
++		// Reap even when the consumer is gone: linger keeps us alive, and textures
++		// queued by remove_buffer must die on this thread, not PipeWire's.
++		if ( vblank )
++		{
++			pipewire_reap_dead_buffers();
++			if ( pipewire_is_streaming() )
++				paint_pipewire();
++		}
+ #endif
+ 
+ 		update_vrr_atoms(root_ctx, false, &flush_root);

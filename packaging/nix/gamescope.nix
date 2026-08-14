@@ -31,7 +31,9 @@
 {
   lib,
   gamescope,
+  python3,
   patchDir,
+  manifestRewriter,
 }:
 let
   # As of nixos-unstable (checked 2026-07-28) `gamescope` IS the buildable derivation — pname
@@ -81,14 +83,39 @@ unwrapped.overrideAttrs (old: {
         "vcs_tag = '${old.version}'"
   '';
 
-  # Ship ONLY the compositor, renamed. Everything else nixpkgs installs (gamescopectl,
-  # gamescopereaper, gamescopestream, the WSI layer, .desktop files) belongs to the real gamescope
-  # package — duplicating it here would put two of each on PATH. The host only execs the
-  # compositor.
+  # Ship the compositor, renamed, AND the WSI layer built beside it. Everything else nixpkgs
+  # installs (gamescopectl, gamescopereaper, gamescopestream, .desktop files) belongs to the real
+  # gamescope package — duplicating it here would put two of each on PATH.
+  #
+  # The layer is not dressing: a game nested under this compositor gets its HDR10 swapchain from it
+  # or from nowhere, and a layer built for a DIFFERENT gamescope makes the compositor reject the
+  # client's swapchain_feedback and kills every Vulkan client. So it travels with the binary it was
+  # built against. It is renamed and re-homed under $out/lib/punktfunk, with its own enable
+  # variable, so it sits beside the system gamescope's layer rather than shadowing it — the Vulkan
+  # loader deduplicates implicit layers by name, so two of the same name would be a coin toss.
+  #
+  # Staged through $TMPDIR because the prune below removes $out/lib and $out/share wholesale.
   postInstall = (old.postInstall or "") + ''
+    layerSo=$(find $out -type f -name 'libVkLayer_*gamescope_wsi*.so' | head -1)
+    layerJson=$(find $out -type f -name '*gamescope_wsi*.json' | head -1)
+    if [ -z "$layerSo" ] || [ -z "$layerJson" ]; then
+      echo "punktfunk-gamescope: this nixpkgs' gamescope built no WSI layer, so no game under the" >&2
+      echo "                     compositor could ever obtain an HDR10 swapchain" >&2
+      exit 1
+    fi
+    cp "$layerSo" "$TMPDIR/pf-layer.so"
+    ${python3}/bin/python3 ${manifestRewriter} \
+      "$layerJson" "$TMPDIR/pf-layer.json" \
+      "$out/lib/punktfunk/libVkLayer_PUNKTFUNK_gamescope_wsi.so"
+
     find $out -mindepth 1 -maxdepth 1 ! -name bin -exec rm -rf {} +
     find $out/bin -mindepth 1 ! -name gamescope -delete
     mv $out/bin/gamescope $out/bin/punktfunk-gamescope
+
+    install -Dm0755 "$TMPDIR/pf-layer.so" \
+      "$out/lib/punktfunk/libVkLayer_PUNKTFUNK_gamescope_wsi.so"
+    install -Dm0644 "$TMPDIR/pf-layer.json" \
+      "$out/lib/punktfunk/vulkan/implicit_layer.d/punktfunk_gamescope_wsi.json"
   '';
 
   # `gamescope --version` exits non-zero on some builds; the grep is the real assertion.
@@ -97,6 +124,13 @@ unwrapped.overrideAttrs (old: {
     runHook preInstallCheck
     $out/bin/punktfunk-gamescope --version 2>&1 | grep -q '+pfhdr' \
       || { echo "punktfunk-gamescope: the +pfhdr marker is missing — the patches did not take"; exit 1; }
+    # The manifest must name a library this derivation actually installed. A manifest pointing at a
+    # path that does not exist is the worst shape of this bug: the loader reads it, finds nothing,
+    # and carries on silently, so the box looks healthy and every game renders SDR.
+    lib=$(sed -n 's/.*"library_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      $out/lib/punktfunk/vulkan/implicit_layer.d/punktfunk_gamescope_wsi.json)
+    [ -f "$lib" ] \
+      || { echo "punktfunk-gamescope: the layer manifest points at $lib, which is not installed"; exit 1; }
     runHook postInstallCheck
   '';
 

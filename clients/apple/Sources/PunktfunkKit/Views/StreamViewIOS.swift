@@ -758,10 +758,18 @@ public final class StreamViewController: StreamViewControllerBase {
     /// the switch never lands, so an SDR-composited display can't show blown-out PQ either way.
     /// Applied once per session, as soon as the window and the negotiated mode both exist; the
     /// stop() teardown clears it.
+    ///
+    /// ⚠️ Gated on the STREAM being HDR (`connection.isHDR`), not just on the user's HDR setting.
+    /// The criteria below hardcode BT.2020 + ST.2084 PQ, so without that check an ordinary SDR
+    /// session drove an HDR-capable TV into PQ output — which is a standard way to raise the black
+    /// floor, since the Apple TV switches HDMI to limited-range levels in its HDR modes and a set
+    /// configured for full-range then renders code 16 as grey. Layout re-runs this, so a session
+    /// that flips to HDR mid-stream still picks the mode up on the next pass.
     private func applyDisplayCriteriaIfNeeded() {
         guard let manager = view.window?.avDisplayManager, let connection,
               manager.preferredDisplayCriteria == nil,
-              SessionSettings.current.hdrEnabled
+              SessionSettings.current.hdrEnabled,
+              connection.isHDR
         else { return }
         let mode = connection.currentMode()
         guard mode.width > 0, mode.height > 0, mode.refreshHz > 0 else { return }

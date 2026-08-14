@@ -77,7 +77,9 @@ export const Armed: Story = {
 				error={null}
 				refetch={noop}
 				onUnpair={noop}
+				onUnpairAll={noop}
 				pendingFingerprint={null}
+				isUnpairingAll={false}
 			/>
 		),
 	},

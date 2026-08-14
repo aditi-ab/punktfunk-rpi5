@@ -9,7 +9,7 @@
 # The counterpart for Arch is packaging/gamescope/PKGBUILD, which DOES build from source, because
 # makepkg fetches sources by design and the AUR-style recipe is what an Arch user expects.
 #
-# Usage: bash packaging/gamescope/build-gamescope-rpm.sh --binary <path-to-punktfunk-gamescope>
+# Usage: bash packaging/gamescope/build-gamescope-rpm.sh --stage <destdir-the-build-script-wrote>
 Name:           punktfunk-gamescope
 Version:        %{pf_version}
 Release:        %{pf_release}%{?dist}
@@ -19,6 +19,12 @@ Summary:        gamescope with punktfunk's PipeWire capture patches (HDR, cursor
 License:        BSD-2-Clause
 URL:            https://git.unom.io/unom/punktfunk
 Source0:        punktfunk-gamescope
+# The Vulkan WSI layer built from the same tree at the same rev as the compositor above. A game
+# nested under gamescope gets its HDR10 swapchain from this layer and from nothing else, and a layer
+# built for a DIFFERENT gamescope kills every Vulkan client — so the two ship together or the
+# package is a trap.
+Source1:        libVkLayer_PUNKTFUNK_gamescope_wsi.so
+Source2:        punktfunk_gamescope_wsi.json
 
 # Not `Provides: gamescope` and not `Conflicts:` either — this ships a differently-named binary and
 # is designed to coexist. A box's Game Mode session keeps running the distro's gamescope; only the
@@ -49,7 +55,10 @@ packaging/gamescope/patches:
   * --pipewire-composite-external-overlay: paint the mangoapp performance overlay into the capture
     stream, so the fps/stats readout is visible to someone watching remotely.
 
-Installed as /usr/bin/punktfunk-gamescope. Your system gamescope is untouched.
+Installed as /usr/bin/punktfunk-gamescope, with its matching Vulkan WSI layer under
+/usr/lib/punktfunk. The layer carries its own name and its own enable variable, so it sits beside
+the one your gamescope package installs rather than replacing it, and only sessions punktfunk-host
+starts switch to it. Your system gamescope is untouched.
 
 %prep
 # Nothing to unpack: Source0 IS the binary.
@@ -59,6 +68,14 @@ Installed as /usr/bin/punktfunk-gamescope. Your system gamescope is untouched.
 
 %install
 install -Dm0755 %{SOURCE0} %{buildroot}%{_bindir}/punktfunk-gamescope
+
+# /usr/lib, spelled literally rather than %{_libdir}, which is /usr/lib64 here. The layer's manifest
+# carries an ABSOLUTE library_path baked in at build time (/usr/lib/punktfunk/...), so this path and
+# that string have to agree or the loader finds a manifest pointing at nothing. Nothing links this
+# .so by soname — the Vulkan loader dlopens it by that absolute path — so there is no multilib
+# question to answer, and a private vendor directory is where it belongs.
+install -Dm0755 %{SOURCE1} %{buildroot}/usr/lib/punktfunk/libVkLayer_PUNKTFUNK_gamescope_wsi.so
+install -Dm0644 %{SOURCE2} %{buildroot}/usr/lib/punktfunk/vulkan/implicit_layer.d/punktfunk_gamescope_wsi.json
 
 %check
 # The marker is the host's entire capability probe (`gamescope_patch_level()`): a binary that lost
@@ -71,8 +88,22 @@ install -Dm0755 %{SOURCE0} %{buildroot}%{_bindir}/punktfunk-gamescope
   exit 1
 }
 
+# The manifest's absolute library_path must name the file we actually installed. Getting this wrong
+# (%{_libdir} on a multilib box, a renamed .so) produces a package that installs cleanly and then
+# does nothing at all — the loader reads a manifest, finds no library, and moves on in silence.
+LAYER_LIB="$(grep -o '"library_path"[[:space:]]*:[[:space:]]*"[^"]*"' \
+  %{buildroot}/usr/lib/punktfunk/vulkan/implicit_layer.d/punktfunk_gamescope_wsi.json \
+  | sed 's/.*"\(\/[^"]*\)".*/\1/')"
+[ -f "%{buildroot}${LAYER_LIB}" ] || {
+  echo "punktfunk-gamescope: the layer manifest points at ${LAYER_LIB}, which this package does" >&2
+  echo "                     not install — games would silently get no HDR swapchain" >&2
+  exit 1
+}
+
 %files
 %{_bindir}/punktfunk-gamescope
+/usr/lib/punktfunk/libVkLayer_PUNKTFUNK_gamescope_wsi.so
+/usr/lib/punktfunk/vulkan/implicit_layer.d/punktfunk_gamescope_wsi.json
 
 %changelog
 # Generated per build; see the git history for the patch set's own changes.

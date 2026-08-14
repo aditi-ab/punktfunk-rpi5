@@ -130,6 +130,28 @@ impl TrustStore {
         Ok(removed)
     }
 
+    /// Remove EVERY paired client, in ONE persisted write. Returns the fingerprints removed, so
+    /// the caller can tear down the live sessions they own. On a persist failure the in-memory
+    /// store is rolled back (it never diverges from disk), exactly like [`Self::remove`].
+    ///
+    /// Not a loop over [`Self::remove`]: that would rewrite (and fsync-rename) the store once per
+    /// client, and a failure partway would leave the operator with a half-emptied trust store and
+    /// no way to tell which half.
+    pub(super) fn remove_all(&self) -> Result<Vec<String>> {
+        let mut p = self.paired.lock().unwrap();
+        if p.clients.clients.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `take` leaves the empty list in place to be persisted, and hands us the snapshot that
+        // doubles as both the rollback value and the removed-fingerprint report.
+        let snapshot = std::mem::take(&mut p.clients.clients);
+        if let Err(e) = save(&p) {
+            p.clients.clients = snapshot;
+            return Err(e);
+        }
+        Ok(snapshot.into_iter().map(|c| c.fingerprint).collect())
+    }
+
     /// The number of paired clients (for the status snapshot).
     pub(super) fn count(&self) -> u32 {
         self.paired.lock().unwrap().clients.clients.len() as u32

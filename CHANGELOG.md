@@ -64,6 +64,25 @@ existing `debug.punktfunk.no_av_sync`: `debug.punktfunk.audio_sharing` (`exclusi
 old give-up-on-disconnect behaviour). A stream that stops taking samples after it started now says
 so at `error` level instead of looking exactly like an app with no sound.
 
+### punktfunk-gamescope `+pfhdr7` — a lingered session no longer dies of its own capture teardown
+
+🛑 **On client disconnect the host keeps the headless gamescope alive so a reconnect resumes the
+same session — and gamescope could SIGSEGV in exactly that window, so the kept display was dead and
+reconnect silently got a fresh compositor with the game lost.** When the capture consumer leaves,
+PipeWire's `remove_buffer` (and the stale-push path in `dispatch_nudge`) destroyed idle buffers on
+the **PipeWire thread**; dropping the last `CVulkanTexture` reference there calls into the Vulkan
+driver (`vkDestroyImage`/`FreeMemory`/dmabuf fds) while steamcompmgr can still be inside
+`vulkan_screenshot` on another buffer of the same 4-buffer pool. On NVIDIA that races to a SIGSEGV
+in `CVulkanCmdBuffer::insertBarrier` — timed at stream end, which is why it selectively killed
+linger. The journal signature: linger line → coredump → `kept display was dead — recreating`.
+
+Patch 0009 queues those corpses on the PipeWire thread and has steamcompmgr reap them on every
+vblank — including while the stream is paused, which is precisely the linger state. Found, fixed
+and proven live by **luxus** ([punktfunk-overlay#9](https://github.com/luxus/punktfunk-overlay/issues/9)):
+four coredumps on 4K60 HDR + composited cursor, zero after; disconnect/reconnect now reuses the
+lingered session. Banner `+pfhdr6` → `+pfhdr7` (no new capability — but "reconnect lost my game"
+triage must be able to read a box's exposure off its banner, the same rule as `+pfhdr5`/`6`).
+
 ### NixOS — the plugin runner was installed, running, and reported missing
 
 🛑 **On NixOS every plugin *package* op failed with "the plugin runner isn't installed", on a box
