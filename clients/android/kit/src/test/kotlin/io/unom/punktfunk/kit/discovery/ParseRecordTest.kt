@@ -47,6 +47,31 @@ class ParseRecordTest {
             rec("k", "n", "10.0.0.5", "9777", "", "optional", "", "linux/fedora/bazzite"),
         )!!
         assertEquals("linux/fedora/bazzite", h.os)
+        // A record from a native lib predating the 9th field: no mgmt port, so the caller falls
+        // back to 47990. Absent must read as "unknown", never as port 0.
+        assertNull(h.mgmtPort)
+    }
+
+    @Test
+    fun ninthFieldCarriesTheMgmtPort() {
+        // 47991, not the 47990 default — a host that MOVED its mgmt port is the whole reason this
+        // field is on the wire, and a test pinned to the default would pass against a hardcode.
+        val h = parseHostRecord(
+            rec("k", "n", "10.0.0.5", "9777", "", "optional", "", "linux/arch", "47991"),
+        )!!
+        assertEquals(47991, h.mgmtPort)
+    }
+
+    @Test
+    fun mgmtPortOutOfRangeOrUnparsableReadsAsUnknown() {
+        // Unauthenticated advert data: 0 (the "not advertised" sentinel the Rust side emits),
+        // a non-number, and an out-of-range value must all mean "assume the default" rather than
+        // produce a port the client would then fail to connect to.
+        val base = arrayOf("k", "n", "10.0.0.5", "9777", "", "optional", "", "linux/arch")
+        assertNull(parseHostRecord(rec(*base, "0"))!!.mgmtPort)
+        assertNull(parseHostRecord(rec(*base, "not-a-port"))!!.mgmtPort)
+        assertNull(parseHostRecord(rec(*base, "70000"))!!.mgmtPort)
+        assertNull(parseHostRecord(rec(*base, ""))!!.mgmtPort)
     }
 
     @Test

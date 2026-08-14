@@ -691,6 +691,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 fp_hex: Some(k.fp_hex.clone()),
                 pair_optional: false,
                 mac: k.mac.clone(),
+                mgmt_port: k.mgmt_port,
                 profile: None,
                 launch: None,
             };
@@ -714,6 +715,18 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 (h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port)) && !h.os.is_empty()
             }) {
                 crate::trust::learn_os(&k.fp_hex, &k.addr, k.port, &a.os);
+            }
+            // Same for its management port — load-bearing, unlike the two above: a host moved off
+            // 47990 loses its library entirely once mDNS is gone unless we write the port down.
+            if let Some(p) = hosts
+                .iter()
+                .find(|h| {
+                    (h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port))
+                        && h.mgmt_port.is_some()
+                })
+                .and_then(|h| h.mgmt_port)
+            {
+                crate::trust::learn_mgmt_port(&k.fp_hex, &k.addr, k.port, p);
             }
             let can_wake = !online && !k.mac.is_empty();
             let menu = {
@@ -1046,6 +1059,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 fp_hex: (!h.fp_hex.is_empty()).then(|| h.fp_hex.clone()),
                 pair_optional: h.pair == "optional",
                 mac: h.mac.clone(),
+                mgmt_port: h.mgmt_port,
                 profile: None,
                 launch: None,
             };
@@ -1140,6 +1154,11 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     fp_hex: None,
                     pair_optional: false,
                     mac: Vec::new(),
+                    // Added by hand, so nothing has told us where its mgmt API is: fall back to
+                    // 47990 (exactly today's behaviour) until an advert teaches us otherwise.
+                    // A host that moved its mgmt port AND is never visible on mDNS still needs the
+                    // host to announce the port in-band — see the note in `Target::mgmt_port`.
+                    mgmt_port: None,
                     profile: None,
                     launch: None,
                 },

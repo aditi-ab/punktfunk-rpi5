@@ -59,7 +59,6 @@ import coil.ImageLoader
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import io.unom.punktfunk.components.launcherIcon
-import io.unom.punktfunk.kit.library.DEFAULT_MGMT_PORT
 import io.unom.punktfunk.kit.library.GameEntry
 import io.unom.punktfunk.kit.library.LibraryClient
 import io.unom.punktfunk.kit.library.LibraryResult
@@ -120,14 +119,16 @@ fun LibraryScreen(
     }
     val streamSettings = remember(settings, profile) { settings.effectiveFor(profile) }
 
-    LaunchedEffect(host.address, host.port, host.fpHex) {
+    // Keyed on the mgmt port too: a discovery tick can learn it after this screen is composed, and
+    // the fetch must redo itself against the real port rather than stay on a stale 47990 failure.
+    LaunchedEffect(host.address, host.port, host.fpHex, host.effectiveMgmtPort) {
         state = LibState.Loading
         state = withContext(Dispatchers.IO) {
             val id = runCatching { obtainIdentity(IdentityStore(context)) }.getOrNull()
                 ?: return@withContext LibState.Message("Identity unavailable — re-pair may be required.")
             when (val res = LibraryClient.fetch(
                 address = host.address,
-                mgmtPort = DEFAULT_MGMT_PORT,
+                mgmtPort = host.effectiveMgmtPort,
                 certPem = id.certPem,
                 keyPem = id.privateKeyPem,
                 fpHex = host.fpHex,

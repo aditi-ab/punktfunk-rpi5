@@ -103,6 +103,11 @@ pub(crate) struct Target {
     /// Wake-on-LAN MAC(s) for this host (from the saved store or the live advert) — used to send a
     /// magic packet before connecting to an offline host. Empty when none is known.
     pub(crate) mac: Vec<String>,
+    /// This host's management-API port (saved store or live advert), where the library screen
+    /// fetches from. `None` = unknown, use [`pf_client_core::library::DEFAULT_MGMT_PORT`]. Carried
+    /// on the target for the same reason as `mac`: the library screen has no `KnownHost` in hand,
+    /// and assuming 47990 there is what made a moved mgmt port work on the LAN but not over a VPN.
+    pub(crate) mgmt_port: Option<u16>,
     /// A ONE-OFF settings profile for this connect ("Connect with"): `Some(id)` overrides the
     /// host's binding for this launch, `Some("")` forces the global defaults on a bound host,
     /// `None` honors the binding. It never rebinds anything — the default changes only through
@@ -406,6 +411,7 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                         fp_hex: p.host.fp_hex.clone(),
                         pair_optional: false,
                         mac: p.host.mac.clone(),
+                        mgmt_port: p.host.mgmt_port,
                         profile: p.profile_override.clone(),
                         launch: None, // routed explicitly below (initiate_launch*)
                     };
@@ -447,6 +453,9 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                         fp_hex: u.fp.clone(),
                         pair_optional: false,
                         mac: Vec::new(),
+                        // A link carries no mgmt port (nor a MAC), so this stays unknown until
+                        // an advert teaches it — same fallback as the hand-added case.
+                        mgmt_port: None,
                         profile: u.profile.clone(),
                         launch: u.launch.clone(),
                     };

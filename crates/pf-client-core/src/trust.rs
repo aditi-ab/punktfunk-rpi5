@@ -313,6 +313,20 @@ pub struct KnownHost {
     /// sleep. `default` (and elided when empty) so pre-existing stores load unchanged.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub os: String,
+    /// The host's management-API port (mDNS `mgmt` TXT), where the game library is served —
+    /// distinct from `port`, which is the native QUIC plane. Learned from the advert while the
+    /// host is online and persisted here for the same reason as `mac` and `os`: so it survives the
+    /// advert going away.
+    ///
+    /// That is not a cosmetic loss like a missing OS icon. A host that moved its mgmt port off
+    /// 47990 — the supported fix for sharing a machine with a Sunshine fork, whose web UI owns
+    /// that port — was reachable only for as long as mDNS was: on a VPN, a routed subnet, or a
+    /// multicast-dead network the library silently went blank, because the port the client had
+    /// already been told was never written down. `None` = never learned, resolve via
+    /// [`KnownHost::effective_mgmt_port`]. Optional + `default` so pre-existing stores load
+    /// (the Apple client's `StoredHost.mgmtPort` is the same field for the same reason).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mgmt_port: Option<u16>,
     /// Share this machine's clipboard with THIS host (design/clipboard-and-file-transfer.md
     /// §5.3 — the Apple client's `StoredHost.clipboardSync`). Per-host, not global: handing a
     /// host your clipboard is a trust decision about that host. Default off; the host must
@@ -353,6 +367,7 @@ impl Default for KnownHost {
             last_used: None,
             mac: Vec::new(),
             os: String::new(),
+            mgmt_port: None,
             clipboard_sync: false,
             profile_id: None,
             pinned_profiles: Vec::new(),
@@ -362,6 +377,17 @@ impl Default for KnownHost {
 }
 
 impl KnownHost {
+    /// Where this host's management API actually is: the port learned from its advert, else the
+    /// compiled-in 47990. The twin of the Apple client's `StoredHost.effectiveMgmtPort`.
+    ///
+    /// Every library/art call resolves through this rather than reaching for
+    /// [`crate::library::DEFAULT_MGMT_PORT`] directly — that constant is the FALLBACK, not the
+    /// answer, and call sites that treated it as the answer are why a moved port only worked while
+    /// mDNS was up.
+    pub fn effective_mgmt_port(&self) -> u16 {
+        self.mgmt_port.unwrap_or(crate::library::DEFAULT_MGMT_PORT)
+    }
+
     /// This host's pinned profiles that still exist, in card order, without duplicates — what
     /// a grid renders. Dangling pins (the profile was deleted) simply disappear, per design
     /// §5.2a: a pin is presentation state, never a reason to show an error.
@@ -506,6 +532,13 @@ impl KnownHosts {
             if !entry.os.is_empty() {
                 h.os = entry.os;
             }
+            // And for the learned mgmt port. Stated explicitly rather than left to the
+            // does-not-mention-it rule below: this one is load-bearing (a host that moved off
+            // 47990 is unreachable for the library without it), so a reconnect upsert that
+            // carries `None` must visibly not clear what a discovery taught us.
+            if entry.mgmt_port.is_some() {
+                h.mgmt_port = entry.mgmt_port;
+            }
             // Everything below is state the user set ON this record, which a refresh (a
             // reconnect, a re-pair, a rediscovery) never carries and therefore must never
             // clear: the per-host clipboard decision — which survives today only because this
@@ -580,6 +613,9 @@ impl KnownHosts {
             }
             if h.os.is_empty() {
                 h.os = old.os;
+            }
+            if h.mgmt_port.is_none() {
+                h.mgmt_port = old.mgmt_port;
             }
             if h.profile_id.is_none() {
                 h.profile_id = old.profile_id;
@@ -689,6 +725,27 @@ pub fn learn_os(fp_hex: &str, addr: &str, port: u16, os: &str) {
         return;
     }
     h.os = os.to_string();
+    let _ = known.save();
+}
+
+/// Learn/refresh a saved host's management-API port from its live advert (mDNS `mgmt` TXT),
+/// matched like [`learn_mac`]: by fingerprint or address. No-op — and no disk write — when
+/// unchanged, so the hosts page can call it on every discovery tick without churning the store.
+///
+/// This is what makes a moved mgmt port outlive mDNS. Until it existed the port was read straight
+/// off the live advert and thrown away, so the library worked on the LAN and went blank over a VPN.
+pub fn learn_mgmt_port(fp_hex: &str, addr: &str, port: u16, mgmt_port: u16) {
+    if mgmt_port == 0 {
+        return;
+    }
+    let mut known = KnownHosts::load();
+    let Some(h) = learn_target(&mut known, fp_hex, addr, port) else {
+        return;
+    };
+    if h.mgmt_port == Some(mgmt_port) {
+        return;
+    }
+    h.mgmt_port = Some(mgmt_port);
     let _ = known.save();
 }
 
@@ -1781,6 +1838,9 @@ mod tests {
                 last_used: Some(1000),
                 mac: vec!["aa:bb:cc:dd:ee:ff".into()],
                 os: "linux/fedora/bazzite".into(),
+                // Deliberately NOT 47990: a host that moved its mgmt port is the case this field
+                // exists for, so the default would make the assertions below pass vacuously.
+                mgmt_port: Some(47991),
                 clipboard_sync: true,
                 profile_id: Some("aaaaaaaaaaaa".into()),
                 pinned_profiles: vec!["bbbbbbbbbbbb".into()],
@@ -1804,6 +1864,9 @@ mod tests {
         assert_eq!(h.mac, vec!["aa:bb:cc:dd:ee:ff".to_string()]);
         // The learned OS chain rides the same rule as `mac`: a carrier-less upsert keeps it.
         assert_eq!(h.os, "linux/fedora/bazzite");
+        // And the learned mgmt port. If a reconnect could reset this to None the host would fall
+        // back to 47990 and its library would 404 — the exact regression this rule prevents.
+        assert_eq!(h.mgmt_port, Some(47991));
         assert!(h.clipboard_sync);
         assert_eq!(h.profile_id.as_deref(), Some("aaaaaaaaaaaa"));
         assert_eq!(h.pinned_profiles, vec!["bbbbbbbbbbbb".to_string()]);
@@ -1823,6 +1886,51 @@ mod tests {
         assert_eq!(k.hosts[0].pinned_profiles, vec!["dddddddddddd".to_string()]);
     }
 
+    /// The mgmt port a host advertises has to OUTLIVE the advert: a store written before the field
+    /// existed must load, resolve to 47990, and then take and keep a learned value. Without the
+    /// middle rung a host moved off 47990 (to share a box with a Sunshine fork, whose web UI owns
+    /// that port) served its library on the LAN and nowhere else — over a VPN or a routed subnet
+    /// there is no advert to read and the client silently went back to a dead port.
+    #[test]
+    fn mgmt_port_survives_a_store_that_predates_it_and_then_persists() {
+        // A store written before the field existed: no `mgmt_port` key at all.
+        let old = r#"{"hosts":[{
+            "name": "Gaming PC", "addr": "192.168.1.50", "port": 9777,
+            "fp_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "paired": true
+        }]}"#;
+        let mut k: KnownHosts = serde_json::from_str(old).unwrap();
+        assert_eq!(k.hosts[0].mgmt_port, None, "absent key decodes to None");
+        assert_eq!(
+            k.hosts[0].effective_mgmt_port(),
+            crate::library::DEFAULT_MGMT_PORT,
+            "unknown resolves to the compiled-in default, i.e. today's behaviour"
+        );
+        // Unset stays out of the serialized form, so an untouched store is byte-stable.
+        assert!(!serde_json::to_string(&k).unwrap().contains("mgmt_port"));
+
+        // Learning one (what a discovery tick does) takes effect and round-trips.
+        k.hosts[0].mgmt_port = Some(47991);
+        assert_eq!(k.hosts[0].effective_mgmt_port(), 47991);
+        let round: KnownHosts = serde_json::from_str(&serde_json::to_string(&k).unwrap()).unwrap();
+        assert_eq!(round.hosts[0].mgmt_port, Some(47991));
+
+        // A re-key carries it onto the surviving record — otherwise a host that regenerated its
+        // identity would silently drop back to 47990.
+        let fresh = fp('a');
+        let mut k2 = k;
+        k2.upsert_trusted(KnownHost {
+            name: "Gaming PC".into(),
+            addr: "192.168.1.50".into(),
+            port: 9777,
+            fp_hex: fresh.clone(),
+            paired: true,
+            ..Default::default()
+        });
+        let kept = k2.hosts.iter().find(|h| h.fp_hex == fresh).unwrap();
+        assert_eq!(kept.mgmt_port, Some(47991), "re-key must not lose the port");
+    }
+
     /// A host that regenerated its identity (reinstall, wiped ProgramData, re-key) ends up with
     /// ONE record for its address — the live one. This is the `.173` lockout: `upsert` keys on
     /// the fingerprint, so the re-paired host used to be appended beside the dead record, and
@@ -1840,6 +1948,7 @@ mod tests {
                 last_used: Some(1000),
                 mac: vec!["aa:bb:cc:dd:ee:ff".into()],
                 os: "windows".into(),
+                mgmt_port: Some(47991),
                 clipboard_sync: true,
                 profile_id: Some("aaaaaaaaaaaa".into()),
                 pinned_profiles: vec!["bbbbbbbbbbbb".into()],
@@ -1864,6 +1973,9 @@ mod tests {
         // What describes the BOX rides along, so a reinstall doesn't cost the user their setup.
         assert_eq!(h.mac, vec!["aa:bb:cc:dd:ee:ff".to_string()]);
         assert_eq!(h.os, "windows");
+        // The mgmt port describes the BOX, not the retired certificate: a reinstall must not send
+        // the library back to 47990 on a host that serves it somewhere else.
+        assert_eq!(h.mgmt_port, Some(47991));
         assert_eq!(h.profile_id.as_deref(), Some("aaaaaaaaaaaa"));
         assert_eq!(h.pinned_profiles, vec!["bbbbbbbbbbbb".to_string()]);
         assert_eq!(h.last_used, Some(1000));

@@ -19,13 +19,16 @@ data class DiscoveredHost(
     val pairingRequired: Boolean = false,
     val mac: List<String> = emptyList(), // TXT "mac" (wake-capable NIC MAC(s), for Wake-on-LAN)
     val os: String = "", // TXT "os" (OS-identity chain, e.g. "linux/fedora/bazzite"); "" on older hosts
+    // TXT "mgmt" — the management-API port the library is served on, distinct from `port` (the
+    // native QUIC plane). null on an older host / older native lib, meaning "assume 47990".
+    val mgmtPort: Int? = null,
 )
 
 /** Field separator the native browse uses inside one record (ASCII Unit Separator). */
 private const val FIELD_SEP = '\u001F'
 
 /**
- * Parse one record from [NativeBridge.nativeDiscoveryPoll] (`key␟name␟addr␟port␟fp␟pair␟mac␟os`),
+ * Parse one record from [NativeBridge.nativeDiscoveryPoll] (`key␟name␟addr␟port␟fp␟pair␟mac␟os␟mgmt`),
  * or null if it's malformed. Fields past the 6th are optional — an older native lib omits them
  * (`mac` 7th, `os` 8th). Pure — unit-tested without Android (see ParseRecordTest). The native side
  * already applied the protocol gate and address selection, so this is just field marshaling.
@@ -46,6 +49,9 @@ fun parseHostRecord(record: String): DiscoveredHost? {
         mac = if (f.size > 6) f[6].split(",").map { it.trim() }.filter { it.isNotEmpty() }
         else emptyList(),
         os = if (f.size > 7) sanitizeOsChain(f[7]) else "",
+        // 9th field, absent on an older native lib. `0` (and anything out of range) means "not
+        // advertised" → null, and the caller falls back to 47990.
+        mgmtPort = if (f.size > 8) f[8].toIntOrNull()?.takeIf { it in 1..65535 } else null,
     )
 }
 

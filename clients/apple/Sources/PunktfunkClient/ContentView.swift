@@ -1262,6 +1262,9 @@ struct ContentView: View {
         if let live = discovery.hosts.first(where: { host.matches($0) }) {
             store.updateMacs(host.id, macs: live.macAddresses) // learn — on every platform
             store.updateOsChain(host.id, chain: live.osChain) // ditto for the card's OS mark
+            // ...and the mgmt port, so the library keeps working against a host that moved it once
+            // this device can no longer see the advert (VPN, routed subnet, multicast-dead Wi-Fi).
+            store.updateMgmtPort(host.id, port: live.mgmtPort)
         } else if autoWakeEnabled, PunktfunkConnection.wakeOnLANAvailable, !host.wakeMacs.isEmpty {
             // Auto-wake only: fire the up-front packet so a genuinely-asleep host is booting while the
             // dial times out. With auto-wake off, connects go straight through (no packet).
@@ -1320,6 +1323,7 @@ struct ContentView: View {
         guard !model.isBusy else { return }
         let host = StoredHost(
             name: d.name, address: d.host, port: d.port,
+            mgmtPort: d.mgmtPort,
             macAddresses: d.macAddresses.isEmpty ? nil : d.macAddresses,
             osChain: d.osChain.isEmpty ? nil : d.osChain)
         store.add(host)

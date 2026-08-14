@@ -761,6 +761,9 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
     // paired clients can browse the game library out of the box (the bearer admin surface stays
     // loopback-gated in `mgmt::require_auth` regardless of the bind).
     let mut mgmt_bind_explicit = false;
+    // Same question for the native port: an explicit `--native-port` out-ranks
+    // `PUNKTFUNK_NATIVE_PORT` from host.env, resolved after the loop.
+    let mut native_port_explicit = false;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -793,7 +796,8 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
             "--native-port" => {
                 native_port = next()?
                     .parse()
-                    .map_err(|_| anyhow::anyhow!("bad --native-port (want a port number)"))?
+                    .map_err(|_| anyhow::anyhow!("bad --native-port (want a port number)"))?;
+                native_port_explicit = true;
             }
             "--data-port" => {
                 data_port = Some(
@@ -856,6 +860,16 @@ fn parse_serve(args: &[String]) -> Result<(mgmt::Options, native::NativeServe, b
                 .map_err(|_| anyhow::anyhow!("bad PUNKTFUNK_MGMT_BIND '{s}' (want IP:PORT)"))?,
             None => std::net::SocketAddr::from(([0, 0, 0, 0], mgmt::DEFAULT_PORT)),
         };
+    }
+    // Same two-source resolution as the mgmt bind above. A bad value is FATAL rather than ignored:
+    // silently serving on 9777 while host.env says otherwise is the failure that reads as "I moved
+    // the port and the client still can't reach me".
+    if !native_port_explicit {
+        if let Some(s) = pf_host_config::config().native_port.as_deref() {
+            native_port = s
+                .parse()
+                .map_err(|_| anyhow::anyhow!("bad PUNKTFUNK_NATIVE_PORT '{s}' (want a port)"))?;
+        }
     }
     // Publish the resolved port for the console, right here rather than inside `serve`: the
     // console's unit gates on `mgmt-token` (persisted a few lines above), so writing the endpoint
@@ -1031,7 +1045,9 @@ SERVE OPTIONS:
                                  Also PUNKTFUNK_GAMESTREAM=1 in host.env (how a packaged install
                                  opts in — the shipped units run native-only)
     --native                     no-op (the native punktfunk/1 plane always runs in `serve` now)
-    --native-port <PORT>         native QUIC port (default 9777)
+    --native-port <PORT>         native QUIC port (or PUNKTFUNK_NATIVE_PORT in host.env, which
+                                 this flag overrides). Default 9777. Clients follow via mDNS, and
+                                 a manually-added host keeps whatever port it was added with
     --data-port <PORT>           pin the per-session video data plane to this fixed UDP port and
                                  stream direct (no hole-punch) — open exactly this port in a host
                                  firewall to avoid the ~2.5 s punch-timeout. Default (unset) or

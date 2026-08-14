@@ -243,6 +243,15 @@ fun ConnectScreen(
                     knownHostStore.learnOs(dh.host, dh.port, dh.os)
                     any = true
                 }
+                // And the mgmt port, so a host that moved off 47990 keeps its library once this
+                // device can no longer see the advert (VPN, routed subnet, multicast-dead Wi-Fi).
+                val mgmt = dh.mgmtPort
+                if (mgmt != null &&
+                    knownHostStore.get(dh.host, dh.port)?.let { it.mgmtPort != mgmt } == true
+                ) {
+                    knownHostStore.learnMgmtPort(dh.host, dh.port, mgmt)
+                    any = true
+                }
             }
             any
         }

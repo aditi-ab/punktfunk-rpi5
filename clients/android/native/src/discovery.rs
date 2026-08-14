@@ -32,7 +32,7 @@ const PROTO: &str = "punktfunk/1";
 /// Field separator inside one serialized record (ASCII Unit Separator — never in a field value).
 const FIELD_SEP: char = '\u{1f}';
 
-/// One resolved host, serialized to Kotlin as `key␟name␟addr␟port␟fp␟pair␟mac␟os`
+/// One resolved host, serialized to Kotlin as `key␟name␟addr␟port␟fp␟pair␟mac␟os␟mgmt`
 /// (`␟` = [`FIELD_SEP`]). Records are newline-joined in a poll snapshot; [`Host::encode`] strips
 /// the framing bytes from every field so no value can break it. New fields append (the Kotlin
 /// parser tolerates both arities), never reorder.
@@ -49,6 +49,10 @@ struct Host {
     /// OS-identity chain from the mDNS `os` TXT (`linux/fedora/bazzite`, ...), for the host
     /// card's OS icon. Empty if absent (older host).
     os: String,
+    /// Management-API port from the mDNS `mgmt` TXT — where the game library is served, distinct
+    /// from `port` (the native QUIC plane). `0` if absent. Kotlin persists it on the host record so
+    /// a host that moved off 47990 keeps its library once mDNS is no longer reachable.
+    mgmt: u16,
 }
 
 impl Host {
@@ -61,7 +65,7 @@ impl Host {
             s.replace(['\n', '\r', FIELD_SEP], "")
         }
         format!(
-            "{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}",
+            "{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}{FIELD_SEP}{}",
             clean(&self.key),
             clean(&self.name),
             clean(&self.addr),
@@ -70,6 +74,7 @@ impl Host {
             clean(&self.pair),
             clean(&self.mac),
             clean(&self.os),
+            self.mgmt,
         )
     }
 }
@@ -193,6 +198,8 @@ fn resolve(info: &ResolvedService) -> Option<Host> {
         pair: val("pair"),
         mac: val("mac"),
         os: val("os"),
+        // 0 = the host didn't advertise one (older host); Kotlin then falls back to 47990.
+        mgmt: val("mgmt").parse().unwrap_or(0),
     })
 }
 
@@ -213,7 +220,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoverySt
 }
 
 /// `NativeBridge.nativeDiscoveryPoll(handle): String` — the current resolved-host snapshot,
-/// newline-joined records of `key␟name␟addr␟port␟fp␟pair␟mac␟os` (`␟` = U+001F). Empty string = no hosts /
+/// newline-joined records of `key␟name␟addr␟port␟fp␟pair␟mac␟os␟mgmt` (`␟` = U+001F). Empty string = no hosts /
 /// `0` handle. Poll ~1 Hz from the UI thread (cheap: a mutex lock + string build).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDiscoveryPoll<'local>(
@@ -277,10 +284,11 @@ mod tests {
             pair: "required".into(),
             mac: "aa:bb:cc:dd:ee:ff".into(),
             os: "linux/fedora/bazzite".into(),
+            mgmt: 47991,
         };
         let encoded = h.encode();
         let fields: Vec<&str> = encoded.split(FIELD_SEP).collect();
-        assert_eq!(fields.len(), 8);
+        assert_eq!(fields.len(), 9);
         assert_eq!(fields[0], "host-123");
         assert_eq!(fields[1], "home-worker-2");
         assert_eq!(fields[2], "192.168.1.70");
@@ -289,6 +297,9 @@ mod tests {
         assert_eq!(fields[5], "required");
         assert_eq!(fields[6], "aa:bb:cc:dd:ee:ff");
         assert_eq!(fields[7], "linux/fedora/bazzite");
+        // A NON-default port on purpose: the whole point of carrying this field is the host that
+        // moved off 47990, so a test pinned to the default would pass against a hardcoded value.
+        assert_eq!(fields[8], "47991");
         assert!(
             !encoded.contains('\n'),
             "a record must never contain the record separator"
@@ -308,13 +319,11 @@ mod tests {
             pair: "required\n".into(),
             mac: "aa:bb\u{1f}cc".into(),
             os: "linux\u{1f}evil/arch".into(),
+            // A numeric field cannot smuggle a separator — it is formatted from a u16, not cleaned.
+            mgmt: 47991,
         };
         let encoded = h.encode();
-        assert_eq!(
-            encoded.matches(FIELD_SEP).count(),
-            7,
-            "exactly eight fields"
-        );
+        assert_eq!(encoded.matches(FIELD_SEP).count(), 8, "exactly nine fields");
         assert!(!encoded.contains('\n') && !encoded.contains('\r'));
         let fields: Vec<&str> = encoded.split(FIELD_SEP).collect();
         assert_eq!(fields[0], "kinjected");

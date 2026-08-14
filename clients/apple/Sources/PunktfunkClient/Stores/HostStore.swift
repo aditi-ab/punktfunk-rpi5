@@ -162,6 +162,17 @@ final class HostStore: ObservableObject {
         hosts[i].osChain = chain
     }
 
+    /// Learn/refresh this host's management-API port from its live advert — same contract as
+    /// `updateMacs`. Until this existed, `StoredHost.mgmtPort` was declared and read but never
+    /// written, so `effectiveMgmtPort` always answered 47990 and a host that had moved its mgmt
+    /// port simply had no working library here.
+    func updateMgmtPort(_ hostID: UUID, port: UInt16?) {
+        guard let port, port > 0,
+              let i = hosts.firstIndex(where: { $0.id == hostID }),
+              hosts[i].mgmtPort != port else { return }
+        hosts[i].mgmtPort = port
+    }
+
     /// Bind this host to a settings profile, or to "Default settings" (nil) — the ONLY way the
     /// default changes. A one-off "Connect with ▸" deliberately never lands here (§5.2:
     /// predictable, not sticky).

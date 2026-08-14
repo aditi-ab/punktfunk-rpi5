@@ -61,6 +61,16 @@ public struct DiscoveredHost: Identifiable, Sendable, Equatable {
     /// (`sanitizeOsChain`) — drives the host card's OS mark and is persisted like the MACs.
     /// Empty when not advertised (older host). Advisory/unauthenticated like the rest.
     public let osChain: String
+    /// The host's management-API port (mDNS `mgmt` TXT) — where the game library is served, NOT
+    /// `port`, which is the native QUIC plane. nil when not advertised (older host), and the
+    /// client then assumes `punktfunkDefaultMgmtPort`.
+    ///
+    /// Persisted onto the saved host like the MACs and the OS chain, and for a sharper reason:
+    /// `StoredHost.mgmtPort` has existed all along but nothing ever wrote it, so
+    /// `effectiveMgmtPort` always resolved to 47990. A host that moved its mgmt port off 47990 —
+    /// the supported way to share a machine with a Sunshine fork, whose web UI owns that port —
+    /// therefore had no working library on any Apple client at all.
+    public let mgmtPort: UInt16?
 }
 
 @MainActor
@@ -211,12 +221,12 @@ public final class HostDiscovery: ObservableObject {
     public static func debugAdvert(
         id: String, name: String, host: String, port: UInt16 = 9777,
         fingerprintHex: String? = nil, requiresPairing: Bool = false, allowsTofu: Bool = true,
-        macAddresses: [String] = [], osChain: String = ""
+        macAddresses: [String] = [], osChain: String = "", mgmtPort: UInt16? = nil
     ) -> DiscoveredHost {
         DiscoveredHost(
             id: id, name: name, host: host, port: port, fingerprintHex: fingerprintHex,
             requiresPairing: requiresPairing, allowsTofu: allowsTofu,
-            macAddresses: macAddresses, osChain: osChain)
+            macAddresses: macAddresses, osChain: osChain, mgmtPort: mgmtPort)
     }
     #endif
 
@@ -429,6 +439,7 @@ public final class HostDiscovery: ObservableObject {
         var id: String?
         var macs: [String] = []
         var osChain = ""
+        var mgmtPort: UInt16?
         if case let .bonjour(txt) = result.metadata {
             fp = entry(txt, "fp")
             pair = entry(txt, "pair")
@@ -438,13 +449,16 @@ public final class HostDiscovery: ObservableObject {
                 .map { $0.trimmingCharacters(in: .whitespaces) }
                 .filter { !$0.isEmpty }
             osChain = sanitizeOsChain(entry(txt, "os") ?? "")
+            // Unauthenticated input, so range-check rather than trust: a non-numeric or 0 value
+            // means "not advertised" and the client falls back to the default.
+            mgmtPort = entry(txt, "mgmt").flatMap(UInt16.init).flatMap { $0 > 0 ? $0 : nil }
         }
         return DiscoveredHost(
             id: (id?.isEmpty == false) ? id! : name,
             name: name, host: address, port: port,
             fingerprintHex: fp, requiresPairing: pair == "required",
             allowsTofu: pair == "optional", macAddresses: macs,
-            osChain: osChain)
+            osChain: osChain, mgmtPort: mgmtPort)
     }
 
     private static func key(_ result: NWBrowser.Result) -> String {

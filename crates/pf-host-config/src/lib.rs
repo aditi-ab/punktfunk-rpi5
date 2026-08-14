@@ -157,6 +157,17 @@ pub struct HostConfig {
     /// parse-once-from-env layer, and `main.rs` owns turning a bad value into the same
     /// `bad --mgmt-bind (want IP:PORT)` error the flag produces, from one place.
     pub mgmt_bind: Option<String>,
+    /// `PUNKTFUNK_NATIVE_PORT` — the native punktfunk/1 (QUIC) control port, equivalent to the
+    /// `--native-port` CLI flag, which still wins. Unset = 9777.
+    ///
+    /// Same survives-an-upgrade argument as [`Self::mgmt_bind`]: `--native-port` lives in an
+    /// ExecStart a package rewrites. Unlike the mgmt port, the CLIENT side of moving this already
+    /// worked — `KnownHost.port` is persisted per host and `--connect HOST:PORT` names it — so this
+    /// key is the last piece of making the native port genuinely movable.
+    ///
+    /// Raw string, parsed in `main.rs`, for the same reason as `mgmt_bind`: a typo'd port must be a
+    /// startup ERROR, not a silent fall back to 9777 while the operator believes they moved it.
+    pub native_port: Option<String>,
     /// `PUNKTFUNK_GAMESTREAM` — enable the GameStream/Moonlight-compat planes (nvhttp pairing,
     /// RTSP, ENet control, `_nvstream` mDNS) from `host.env`, equivalent to the `--gamestream`
     /// CLI flag (either source turns it on). **Default OFF** — the secure native-only host: the
@@ -390,6 +401,9 @@ impl HostConfig {
             // Blank-is-unset, like `host_name` above: an operator who comments a value out by
             // emptying it (`PUNKTFUNK_MGMT_BIND=`) means "default", not "parse the empty string".
             mgmt_bind: val("PUNKTFUNK_MGMT_BIND")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            native_port: val("PUNKTFUNK_NATIVE_PORT")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
             // Default OFF, explicit-on grammar: the Moonlight-compat planes are opt-in

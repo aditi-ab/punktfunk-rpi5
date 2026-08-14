@@ -32,6 +32,16 @@ data class KnownHost(
      * first learned (or forever, against an older host).
      */
     val os: String = "",
+    /**
+     * The host's management-API port (mDNS `mgmt` TXT), where the game library is served — NOT
+     * [port], which is the native QUIC plane. Learned while online and kept for the same reason as
+     * [mac] and [os], except this one is load-bearing: a host that moved its mgmt port off 47990
+     * (the supported way to share a machine with a Sunshine fork, whose web UI owns that port)
+     * served its library only while mDNS was reachable, because the advert was the sole place the
+     * real port ever existed. `null` until learned — resolve with [effectiveMgmtPort].
+     * Mirrors the Apple client's `StoredHost.mgmtPort` and the Rust `KnownHost.mgmt_port`.
+     */
+    val mgmtPort: Int? = null,
     /** Stable record identity — see the class doc. Minted here for a genuinely new record. */
     val id: String = newRecordId(),
     /**
@@ -54,7 +64,16 @@ data class KnownHost(
      * that no longer exist are dropped when the cards are rendered.
      */
     val pinnedProfileIds: List<String> = emptyList(),
-)
+) {
+    /**
+     * Where this host's management API actually is: the port learned from its advert, else 47990.
+     * The twin of the Apple client's `StoredHost.effectiveMgmtPort` and the Rust
+     * `KnownHost::effective_mgmt_port`. Resolve through this — the constant is the FALLBACK, not
+     * the answer.
+     */
+    val effectiveMgmtPort: Int
+        get() = mgmtPort ?: io.unom.punktfunk.kit.library.DEFAULT_MGMT_PORT
+}
 
 /**
  * Persists trusted hosts — the pinned-fingerprint store *and* the saved-hosts list — keyed by
@@ -130,6 +149,17 @@ class KnownHostStore(context: Context) {
         save(h.copy(os = os))
     }
 
+    /**
+     * Learn/refresh a saved host's management-API port from its live advert — same contract as
+     * [learnMac]. This is the one that keeps a moved mgmt port working once mDNS isn't reachable.
+     */
+    fun learnMgmtPort(address: String, port: Int, mgmtPort: Int) {
+        if (mgmtPort <= 0) return
+        val h = get(address, port) ?: return
+        if (h.mgmtPort == mgmtPort) return
+        save(h.copy(mgmtPort = mgmtPort))
+    }
+
     /** Forget [host] (the next connect re-pairs / re-TOFUs). */
     fun remove(host: KnownHost) {
         prefs.edit().remove(host.id).apply()
@@ -180,6 +210,10 @@ class KnownHostStore(context: Context) {
             paired = j.optBoolean("paired", false),
             mac = j.optString("mac", "").split(",").map { it.trim() }.filter { it.isNotEmpty() },
             os = j.optString("os", ""),
+            // 0 (or absent) = never learned. `optInt` cannot express "missing", hence the sentinel
+            // rather than a bare default — a record written before this field existed must decode
+            // to null and fall back to 47990, not to port 0.
+            mgmtPort = j.optInt("mgmt", 0).takeIf { it > 0 },
             // A record without an id can only be one this build wrote before the migration ran, or
             // a hand-edited file; minting here keeps the parse total rather than dropping a host.
             id = j.optString("id", "").ifEmpty { newRecordId() },
@@ -266,6 +300,7 @@ class KnownHostStore(context: Context) {
             .put("paired", host.paired)
             .put("mac", host.mac.joinToString(","))
             .put("os", host.os)
+            .put("mgmt", host.mgmtPort ?: 0)
             .put("clip", host.clipboardSync)
             .put("profile", host.profileId ?: "")
             .put("pins", JSONArray(host.pinnedProfileIds))

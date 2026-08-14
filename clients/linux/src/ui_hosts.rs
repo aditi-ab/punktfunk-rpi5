@@ -1108,6 +1108,18 @@ impl HostsPage {
                 {
                     crate::trust::learn_os(&k.fp_hex, &k.addr, k.port, &a.os);
                 }
+                // Same for its management port — and this one is not cosmetic: without it a host
+                // that moved off 47990 loses its library the moment mDNS is unavailable, because
+                // the advert was the only place the real port ever lived.
+                if let Some(a) = self
+                    .adverts
+                    .values()
+                    .find(|a| matches(k, a) && a.mgmt_port.is_some())
+                {
+                    if let Some(p) = a.mgmt_port {
+                        crate::trust::learn_mgmt_port(&k.fp_hex, &k.addr, k.port, p);
+                    }
+                }
                 saved.push_back(HostCard {
                     connecting: self.connecting.as_deref() == Some(k.fp_hex.as_str()),
                     kind: CardKind::Saved {
@@ -1183,18 +1195,33 @@ impl HostsPage {
         });
     }
 
-    /// The advertised mgmt port for the host `req` points at, when a matching live
-    /// advert carries the `mgmt` TXT.
+    /// The mgmt port for the host `req` points at: a matching live advert's `mgmt` TXT first,
+    /// else the port a previous advert taught us and we saved on the host record.
+    ///
+    /// The saved rung is not redundant. Reading the advert alone meant a host that had moved its
+    /// mgmt port off 47990 served its library on the LAN and nowhere else — over a VPN, a routed
+    /// subnet, or any multicast-dead network there is no advert to read, and the fallback silently
+    /// went back to a port nothing was listening on. `None` here still means "assume the default".
     fn mgmt_port_for(&self, req: &ConnectRequest) -> Option<u16> {
-        self.adverts
+        let matches_req = |fp: &str, addr: &str, port: u16| {
+            req.fp_hex
+                .as_deref()
+                .is_some_and(|want| !fp.is_empty() && fp == want)
+                || (addr == req.addr && port == req.port)
+        };
+        if let Some(p) = self
+            .adverts
             .values()
-            .find(|a| {
-                req.fp_hex
-                    .as_deref()
-                    .is_some_and(|fp| !a.fp_hex.is_empty() && a.fp_hex == fp)
-                    || (a.addr == req.addr && a.port == req.port)
-            })
+            .find(|a| matches_req(&a.fp_hex, &a.addr, a.port))
             .and_then(|a| a.mgmt_port)
+        {
+            return Some(p);
+        }
+        crate::trust::KnownHosts::load()
+            .hosts
+            .iter()
+            .find(|h| matches_req(&h.fp_hex, &h.addr, h.port))
+            .and_then(|h| h.mgmt_port)
     }
 
     /// Rename a saved host — an entry in an alert, then upsert + refresh.

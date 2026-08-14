@@ -104,7 +104,7 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
             let mut state = LibraryState::default();
             let games = match library::fetch_games(
                 &target.addr,
-                library::DEFAULT_MGMT_PORT,
+                target.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
                 &identity,
                 pin,
             ) {
@@ -120,7 +120,10 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
             }
 
             // Seed cached posters; queue the art pipeline for the rest.
-            let base = library::base_url(&target.addr, library::DEFAULT_MGMT_PORT);
+            let base = library::base_url(
+                &target.addr,
+                target.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
+            );
             let cache = art_cache_dir();
             let mut jobs: VecDeque<(String, Vec<String>)> = VecDeque::new();
             for g in &games {
