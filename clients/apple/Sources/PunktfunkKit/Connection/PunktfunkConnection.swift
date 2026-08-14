@@ -99,6 +99,12 @@ public enum HostRejection: Sendable {
     case superseded
     case wireVersionMismatch
     case busy
+    /// This device's access grant expired (per-client access §4) — at connect (an expired
+    /// record races the knock path), or as the typed close ending a live session.
+    case accessExpired
+    /// The Hello asked to launch a title but this device's grants exclude `LAUNCH` — refused
+    /// at the handshake so the user gets a sentence, not a bare desktop they didn't ask for.
+    case launchNotPermitted
 
     init?(status: Int32) {
         switch status {
@@ -111,6 +117,8 @@ public enum HostRejection: Sendable {
         case PUNKTFUNK_STATUS_REJECTED_SUPERSEDED.rawValue: self = .superseded
         case PUNKTFUNK_STATUS_REJECTED_WIRE_VERSION.rawValue: self = .wireVersionMismatch
         case PUNKTFUNK_STATUS_REJECTED_BUSY.rawValue: self = .busy
+        case PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED.rawValue: self = .accessExpired
+        case PUNKTFUNK_STATUS_REJECTED_LAUNCH_NOT_PERMITTED.rawValue: self = .launchNotPermitted
         default: return nil
         }
     }
@@ -140,6 +148,12 @@ public enum HostRejection: Sendable {
             return "Client and host versions don't match — update both to the same release."
         case .busy:
             return "The host is busy with another session."
+        case .accessExpired:
+            return "Your access to this host has expired — ask its owner to grant "
+                + "access again."
+        case .launchNotPermitted:
+            return "This device isn't permitted to launch games on the host — connect "
+                + "to the desktop instead, or ask the owner to allow launching."
         }
     }
 }
@@ -479,6 +493,135 @@ public final class PunktfunkConnection {
     /// Apple Pencil out of the touch path onto the pen plane (``sendPen(_:)``).
     public var hostSupportsPen: Bool {
         hostCaps & UInt8(PUNKTFUNK_HOST_CAP_PEN) != 0
+    }
+
+    // MARK: - Per-client access (design/per-client-access.md §7)
+
+    /// The `PUNKTFUNK_GRANT_*` access bits — what a paired device may DO on the host, per the
+    /// session's live grants (``accessGrants``). Values are wire/ABI-frozen (the header's
+    /// expression macros don't import into Swift, like `userFlagChunkAligned`'s).
+    public static let grantGamepad: UInt32 = 1 << 0
+    public static let grantPointer: UInt32 = 1 << 1
+    public static let grantKeyboard: UInt32 = 1 << 2
+    public static let grantClipboard: UInt32 = 1 << 3
+    public static let grantMic: UInt32 = 1 << 4
+    public static let grantLaunch: UInt32 = 1 << 5
+    /// Every defined grant — full control, today's behavior and what an old host's Welcome
+    /// decodes to.
+    public static let grantAll: UInt32 = 0x3F
+
+    /// The three user-facing access presets plus "Custom", DERIVED from the mask (never
+    /// stored — design §3.2, no drift). The label vocabulary is the cross-client one the web
+    /// console's Access column uses.
+    public enum AccessLevel: Sendable, Equatable {
+        case fullControl
+        case controllerOnly
+        case viewOnly
+        case custom
+
+        public init(grants: UInt32) {
+            switch grants & PunktfunkConnection.grantAll {
+            case PunktfunkConnection.grantAll: self = .fullControl
+            case PunktfunkConnection.grantGamepad: self = .controllerOnly
+            case 0: self = .viewOnly
+            default: self = .custom
+            }
+        }
+
+        public var label: String {
+            switch self {
+            case .fullControl: return "Full control"
+            case .controllerOnly: return "Controller only"
+            case .viewOnly: return "View only"
+            case .custom: return "Custom"
+            }
+        }
+    }
+
+    /// The session's LIVE effective access grants (`PUNKTFUNK_GRANT_*`): the Welcome advert
+    /// first, then latest-wins over every mid-session `AccessUpdate` (a console edit) — so a
+    /// 1 Hz poll of this is how the chip and the capture gates track changes. Full control
+    /// against an old host, and after close (nothing to restrict on a dead session).
+    ///
+    /// Courtesy truth only: the HOST enforces the mask regardless. The client uses it to not
+    /// capture what can't land — a keyboard that silently does nothing is the failure mode
+    /// this exists to prevent.
+    public var accessGrants: UInt32 {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return Self.grantAll }
+        var grants: UInt32 = Self.grantAll
+        _ = punktfunk_connection_grants(h, &grants)
+        return grants
+    }
+
+    /// Seconds until this session's access expires, LIVE (the core counts it down from the
+    /// Welcome / the latest `AccessUpdate`, anchored to this device's clock — skew never moves
+    /// it). `0` = permanent — show no countdown then; while a deadline exists it clamps to
+    /// ≥ 1, so `0` stays unambiguous. Poll ~1 Hz for the "ends in 1 h 58 m" chip.
+    public var accessExpiresInSeconds: UInt32 {
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        guard let h = handle, !closeRequested else { return 0 }
+        var secs: UInt32 = 0
+        _ = punktfunk_connection_access_expires_in(h, &secs)
+        return secs
+    }
+
+    /// The session's grants allow controller input (pads, rich DualSense input).
+    public var canSendGamepad: Bool { accessGrants & Self.grantGamepad != 0 }
+    /// The session's grants allow pointing input (mouse, scroll, touch, pen) — the
+    /// pointer-lock / touch-capture gate.
+    public var canSendPointer: Bool { accessGrants & Self.grantPointer != 0 }
+    /// The session's grants allow key input — the keyboard-grab gate.
+    public var canSendKeyboard: Bool { accessGrants & Self.grantKeyboard != 0 }
+    /// The session's grants allow the shared clipboard (AND this with
+    /// ``hostSupportsClipboard`` before offering the toggle).
+    public var canUseClipboard: Bool { accessGrants & Self.grantClipboard != 0 }
+    /// The session's grants allow mic injection — hide the mic UI without it.
+    public var canUseMic: Bool { accessGrants & Self.grantMic != 0 }
+    /// Anything about this session's access differs from the everyday full-and-permanent —
+    /// the chip's visibility gate: full + permanent must look exactly like today.
+    public var accessIsLimited: Bool {
+        accessGrants & Self.grantAll != Self.grantAll || accessExpiresInSeconds != 0
+    }
+
+    /// The grant bit one wire input kind needs — the Swift mirror of core's exhaustive
+    /// `classify` (keys → keyboard; mouse/scroll/touch → pointer; pads → gamepad), consulted
+    /// by ``send(_:)``'s courtesy filter. An unknown/future kind maps to 0 — never granted —
+    /// matching the host's default-deny.
+    private static func grantBit(forInputKind kind: UInt8) -> UInt32 {
+        switch UInt32(kind) {
+        case PUNKTFUNK_INPUT_KIND_KEY_DOWN.rawValue,
+             PUNKTFUNK_INPUT_KIND_KEY_UP.rawValue,
+             PUNKTFUNK_INPUT_KIND_TEXT_INPUT.rawValue:
+            return grantKeyboard
+        case PUNKTFUNK_INPUT_KIND_MOUSE_MOVE.rawValue,
+             PUNKTFUNK_INPUT_KIND_MOUSE_MOVE_ABS.rawValue,
+             PUNKTFUNK_INPUT_KIND_MOUSE_BUTTON_DOWN.rawValue,
+             PUNKTFUNK_INPUT_KIND_MOUSE_BUTTON_UP.rawValue,
+             PUNKTFUNK_INPUT_KIND_MOUSE_SCROLL.rawValue,
+             PUNKTFUNK_INPUT_KIND_TOUCH_DOWN.rawValue,
+             PUNKTFUNK_INPUT_KIND_TOUCH_MOVE.rawValue,
+             PUNKTFUNK_INPUT_KIND_TOUCH_UP.rawValue:
+            return grantPointer
+        case PUNKTFUNK_INPUT_KIND_GAMEPAD_BUTTON.rawValue,
+             PUNKTFUNK_INPUT_KIND_GAMEPAD_AXIS.rawValue,
+             PUNKTFUNK_INPUT_KIND_GAMEPAD_STATE.rawValue,
+             PUNKTFUNK_INPUT_KIND_GAMEPAD_REMOVE.rawValue,
+             PUNKTFUNK_INPUT_KIND_GAMEPAD_ARRIVAL.rawValue:
+            return grantGamepad
+        default:
+            return 0
+        }
+    }
+
+    /// Whether the LIVE grants include `bit`. Call with `abiLock` held and a live handle —
+    /// the send paths' shape, so the read and the send see the same session.
+    private func granted(_ bit: UInt32, handle h: OpaquePointer) -> Bool {
+        var grants: UInt32 = Self.grantAll
+        _ = punktfunk_connection_grants(h, &grants)
+        return grants & bit != 0
     }
 
     /// One forwarded host-cursor shape (the cursor channel, ABI v11): straight-alpha RGBA,
@@ -1271,12 +1414,17 @@ public final class PunktfunkConnection {
     }
 
     /// Send one input event (delivered to the host as a QUIC datagram). Thread-safe;
-    /// silently dropped after close.
+    /// silently dropped after close — and dropped when the session's live grants exclude the
+    /// event's class (the courtesy mirror of the host's classify-and-drop: the HOST enforces
+    /// regardless, but not putting undeliverable events on the wire is what lets every input
+    /// path honor a mid-session grant edit without each caller re-checking).
     public func send(_ event: PunktfunkInputEvent) {
         var ev = event
         abiLock.lock()
         defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return }
+        guard let h = handle, !closeRequested,
+              granted(Self.grantBit(forInputKind: ev.kind), handle: h)
+        else { return }
         _ = punktfunk_connection_send_input(h, &ev)
     }
 
@@ -1287,7 +1435,9 @@ public final class PunktfunkConnection {
         guard !samples.isEmpty else { return }
         abiLock.lock()
         defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return }
+        // The pen plane is pointing input — same courtesy grant gate as `send(_:)`.
+        guard let h = handle, !closeRequested, granted(Self.grantPointer, handle: h)
+        else { return }
         samples.withUnsafeBufferPointer { buf in
             _ = punktfunk_connection_send_pen(h, buf.baseAddress, UInt32(buf.count))
         }
@@ -1339,7 +1489,10 @@ public final class PunktfunkConnection {
     public func sendMic(_ opus: Data, seq: UInt32, ptsNs: UInt64) {
         abiLock.lock()
         defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return }
+        // Mic injection needs its grant — same courtesy gate as `send(_:)` (the host drops
+        // the plane regardless; the UI additionally hides the mic controls via `canUseMic`).
+        guard let h = handle, !closeRequested, granted(Self.grantMic, handle: h)
+        else { return }
         opus.withUnsafeBytes { p in
             _ = punktfunk_connection_send_mic(
                 h, p.bindMemory(to: UInt8.self).baseAddress, UInt(opus.count), seq, ptsNs)
@@ -1353,7 +1506,9 @@ public final class PunktfunkConnection {
     public func sendTouchpad(pad: UInt8 = 0, finger: UInt8, active: Bool, x: UInt16, y: UInt16) {
         abiLock.lock()
         defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return }
+        // Rich pad input rides the GAMEPAD grant (it IS controller input) — same gate as `send`.
+        guard let h = handle, !closeRequested, granted(Self.grantGamepad, handle: h)
+        else { return }
         var rich = PunktfunkRichInput()
         rich.kind = UInt8(PUNKTFUNK_RICH_TOUCHPAD)
         rich.pad = pad
@@ -1374,7 +1529,9 @@ public final class PunktfunkConnection {
     ) {
         abiLock.lock()
         defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return }
+        // Motion is controller input too — same GAMEPAD gate as `sendTouchpad`.
+        guard let h = handle, !closeRequested, granted(Self.grantGamepad, handle: h)
+        else { return }
         var rich = PunktfunkRichInput()
         rich.kind = UInt8(PUNKTFUNK_RICH_MOTION)
         rich.pad = pad
@@ -1582,6 +1739,20 @@ public final class PunktfunkConnection {
 
     /// Shorthand for the single most actionable reason: the host's launched game exited.
     public var endedBecauseGameExited: Bool { sessionEndReason == .gameExited }
+
+    /// The typed rejection a MID-SESSION close carried, if any — an access expiry being the
+    /// case this exists for: `sessionEndReason` can only file that deliberate close under
+    /// `.hostError`, and "ended with an error" is the wrong sentence for "your access
+    /// expired". Same read discipline as `sessionEndReason` (ask after the end, before
+    /// teardown); nil for every ordinary end and for connect-time rejections (those surface
+    /// from the connect itself as `.rejected`).
+    public var endRejection: HostRejection? {
+        guard let h = liveHandle() else { return nil }
+        var status: Int32 = 0
+        guard punktfunk_connection_end_reject(h, &status) == statusOK, status != 0
+        else { return nil }
+        return HostRejection(status: status)
+    }
 
     deinit { close() }
 

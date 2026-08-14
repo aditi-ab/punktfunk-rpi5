@@ -316,7 +316,11 @@ public final class StreamViewController: StreamViewControllerBase {
     /// full-screen + frontmost and may drop the lock (Slide Over/Stage Manager/backgrounding) —
     /// syncPointerLock() handles the actual grant/drop and falls back to absolute when unlocked.
     private var wantsPointerLock: Bool {
+        // The trailing grant test is per-client access §7 — no pointer lock without the
+        // POINTER bit (a Controller-only guest's trackpad stays a normal local pointer);
+        // read live, so a mid-session re-grant lets the next resolve pass lock.
         captured && pointerCaptureEnabled && UIDevice.current.userInterfaceIdiom == .pad
+            && connection?.canSendPointer == true
     }
 
     public override var prefersPointerLocked: Bool { wantsPointerLock && !pointerLockForcedOff }

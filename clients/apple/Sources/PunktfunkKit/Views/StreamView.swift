@@ -472,15 +472,25 @@ public final class StreamLayerView: NSView {
         // NSApp.isActive / isKeyWindow are still false for the click coming in from
         // another app) — only the auto-engage paths require already-held key status.
         // `connection != nil` is the session-active gate (presenter internals are opaque here).
-        guard captureEnabled, !captured, connection != nil, window != nil,
+        guard captureEnabled, !captured, let connection, window != nil,
               fromClick || (NSApp.isActive && window?.isKeyWindow == true)
         else { return }
+        // Per-client access §7 — never capture what can't land: a Controller-only or
+        // View-only session gets NO mouse/keyboard grab (its clicks stay local UI clicks),
+        // instead of a frozen cursor over input the host silently drops. Live grants, so a
+        // mid-session re-grant makes the next click work; the revoke direction is released
+        // by the session model's access tick.
+        guard connection.canSendPointer || connection.canSendKeyboard else { return }
         // If the cursor grab is refused (e.g. the reactivating click arrives before the app is
         // frontmost), stay released so the NEXT click retries — never latch captured=true over
         // a free cursor, which would make mouseDown's `!captured` guard reject every later click.
         // In the desktop mouse model there is no grab (the pointer stays free) — capture
-        // always engages and the monitor forwards absolute positions instead.
-        guard cursorCapture.capture(in: self, disassociate: !desktopMouse) else { return }
+        // always engages and the monitor forwards absolute positions instead. A session
+        // whose grants exclude POINTER also keeps its cursor free (keyboard-only capture):
+        // freezing a pointer whose motion cannot land would just trap the user's mouse.
+        guard cursorCapture.capture(
+            in: self, disassociate: !desktopMouse && connection.canSendPointer)
+        else { return }
         inputCapture?.setForwarding(true, suppressClick: fromClick)
         // Install AFTER the warp + setForwarding: the engage warp generates no forwarded
         // delta (the monitor isn't up yet), and the engage click's suppression latch is

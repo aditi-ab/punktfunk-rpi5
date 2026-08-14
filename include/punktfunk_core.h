@@ -114,7 +114,20 @@
 // every existing function keeps its signature and behaviour, and an embedder that never calls it
 // is unchanged. The `Welcome` grew a trailing field, which older peers skip in both directions
 // (see `Welcome::encode`), so [`WIRE_VERSION`] is unchanged.
-#define PUNKTFUNK_ABI_VERSION 20
+// v21: the per-client access surface (`design/per-client-access.md` §7) —
+// `punktfunk_connection_grants` and `punktfunk_connection_access_expires_in` read the session's
+// LIVE access state (the `PUNKTFUNK_GRANT_*` mask and the countdown to its expiry — Welcome
+// snapshot first, then latest-wins over every mid-session `AccessUpdate` the control task
+// folds in), and `punktfunk_connection_end_reject` reports the typed rejection a mid-session
+// close carried (`PUNKTFUNK_STATUS_REJECTED_*`; `0` = none), because `end_reason` can only
+// file an access-expiry close under HOST_ERROR and that is the wrong sentence for "your
+// access expired". NEW symbols, not widened ones — the same rule v18 states: every existing
+// function keeps its signature and behaviour, and an embedder that never adopts any of the
+// three is unchanged (it simply lacks the courtesy UX; the HOST enforces the grants either
+// way). Additive and client-local: the mask, the expiry and the `AccessUpdate` message all
+// shipped with the Welcome's trailing-field append (old peers skip them in both directions),
+// so [`WIRE_VERSION`] is unchanged.
+#define PUNKTFUNK_ABI_VERSION 21
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -3243,6 +3256,60 @@ PunktfunkStatus punktfunk_connection_mgmt_port(const PunktfunkConnection *c, uin
 // # Safety
 // `c` is a valid connection handle; `caps` is writable (NULL is skipped).
 PunktfunkStatus punktfunk_connection_host_caps(const PunktfunkConnection *c, uint8_t *caps);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The session's LIVE effective access grants — a `PUNKTFUNK_GRANT_*` bitmask
+// (per-client access, `design/per-client-access.md` §7): seeded from the `Welcome` advert
+// and moved by every mid-session `AccessUpdate` the host sends (latest wins), so this is
+// current state, NOT a connect-time snapshot. An old host advertises nothing and this reads
+// `PUNKTFUNK_GRANT_ALL` — full control, the pre-grants behavior, so an embedder keying UI
+// off it changes nothing there.
+//
+// Courtesy truth only: the HOST enforces the mask whatever a client renders. Use it to not
+// capture what can't land (no pointer lock / keyboard grab without the bits) and to label
+// the session ("Controller only"). Cheap (one relaxed atomic load) — poll it alongside a
+// stats tick rather than caching it for the session. Safe any time after connect.
+//
+// # Safety
+// `c` is a valid connection handle; `grants` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_grants(const PunktfunkConnection *c, uint32_t *grants);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Seconds until this session's access expires, LIVE — counted down from the `Welcome`'s
+// `expires_in_secs` and re-anchored by every mid-session `AccessUpdate`, so successive reads
+// shrink on their own (render a countdown by polling this, ~1 Hz). `0` = permanent: today's
+// default, and everything an old host's Welcome decodes to — show nothing then. The deadline
+// is anchored to the CLIENT's clock at receipt (the wire carries relative seconds), so
+// host/client skew never moves the countdown.
+//
+// While a deadline exists the value never reads `0`: in the sliver between the deadline
+// passing and the host's typed expiry close (`PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED`
+// via [`punktfunk_connection_end_reject`]) it clamps to `1`, so `0` stays unambiguous.
+// The T−5 m / T−1 m warnings are the embedder's to derive from the countdown crossing
+// those marks. Safe any time after connect.
+//
+// # Safety
+// `c` is a valid connection handle; `secs` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_access_expires_in(const PunktfunkConnection *c,
+                                                       uint32_t *secs);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The typed rejection a MID-SESSION close carried, as its `PUNKTFUNK_STATUS_REJECTED_*`
+// value (`0` = none — every ordinary end). Exists because
+// [`punktfunk_connection_end_reason`] can only file an unrecognized deliberate close under
+// `PUNKTFUNK_END_REASON_HOST_ERROR`, and "the host ended the session with an error" is the
+// wrong sentence for an access expiry (`PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED`) — the
+// case this was added for; any future typed mid-session close surfaces the same way. Ask
+// AFTER the session ended, before freeing the handle, exactly like `end_reason` (the two
+// latch together); connect-time rejections never land here — they come back from the
+// connect call itself.
+//
+// # Safety
+// `c` is a valid connection handle; `status` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_end_reject(const PunktfunkConnection *c, int32_t *status);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

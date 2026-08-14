@@ -3895,6 +3895,133 @@ pub unsafe extern "C" fn punktfunk_connection_host_caps(
     })
 }
 
+/// The session's LIVE effective access grants — a `PUNKTFUNK_GRANT_*` bitmask
+/// (per-client access, `design/per-client-access.md` §7): seeded from the `Welcome` advert
+/// and moved by every mid-session `AccessUpdate` the host sends (latest wins), so this is
+/// current state, NOT a connect-time snapshot. An old host advertises nothing and this reads
+/// `PUNKTFUNK_GRANT_ALL` — full control, the pre-grants behavior, so an embedder keying UI
+/// off it changes nothing there.
+///
+/// Courtesy truth only: the HOST enforces the mask whatever a client renders. Use it to not
+/// capture what can't land (no pointer lock / keyboard grab without the bits) and to label
+/// the session ("Controller only"). Cheap (one relaxed atomic load) — poll it alongside a
+/// stats tick rather than caching it for the session. Safe any time after connect.
+///
+/// # Safety
+/// `c` is a valid connection handle; `grants` is writable (NULL is skipped).
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_grants(
+    c: *const PunktfunkConnection,
+    grants: *mut u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_ref` reports as `None` and the `match` handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        // SAFETY: per the ABI contract - the out-param is OPTIONAL, so it is null-checked before
+        // it is written; a non-null one is a caller-owned writable slot.
+        unsafe {
+            if !grants.is_null() {
+                *grants = c.inner.access_grants();
+            }
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
+/// Seconds until this session's access expires, LIVE — counted down from the `Welcome`'s
+/// `expires_in_secs` and re-anchored by every mid-session `AccessUpdate`, so successive reads
+/// shrink on their own (render a countdown by polling this, ~1 Hz). `0` = permanent: today's
+/// default, and everything an old host's Welcome decodes to — show nothing then. The deadline
+/// is anchored to the CLIENT's clock at receipt (the wire carries relative seconds), so
+/// host/client skew never moves the countdown.
+///
+/// While a deadline exists the value never reads `0`: in the sliver between the deadline
+/// passing and the host's typed expiry close (`PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED`
+/// via [`punktfunk_connection_end_reject`]) it clamps to `1`, so `0` stays unambiguous.
+/// The T−5 m / T−1 m warnings are the embedder's to derive from the countdown crossing
+/// those marks. Safe any time after connect.
+///
+/// # Safety
+/// `c` is a valid connection handle; `secs` is writable (NULL is skipped).
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_access_expires_in(
+    c: *const PunktfunkConnection,
+    secs: *mut u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_ref` reports as `None` and the `match` handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        let remaining = match c.inner.access_deadline_unix() {
+            None => 0,
+            Some(deadline) => {
+                let now = crate::quic::wall_clock_ns() / 1_000_000_000;
+                // Clamp to ≥ 1 while a deadline is set: 0 means "permanent", never "expired".
+                u32::try_from(deadline.saturating_sub(now))
+                    .unwrap_or(u32::MAX)
+                    .max(1)
+            }
+        };
+        // SAFETY: per the ABI contract - the out-param is OPTIONAL, so it is null-checked before
+        // it is written; a non-null one is a caller-owned writable slot.
+        unsafe {
+            if !secs.is_null() {
+                *secs = remaining;
+            }
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
+/// The typed rejection a MID-SESSION close carried, as its `PUNKTFUNK_STATUS_REJECTED_*`
+/// value (`0` = none — every ordinary end). Exists because
+/// [`punktfunk_connection_end_reason`] can only file an unrecognized deliberate close under
+/// `PUNKTFUNK_END_REASON_HOST_ERROR`, and "the host ended the session with an error" is the
+/// wrong sentence for an access expiry (`PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED`) — the
+/// case this was added for; any future typed mid-session close surfaces the same way. Ask
+/// AFTER the session ended, before freeing the handle, exactly like `end_reason` (the two
+/// latch together); connect-time rejections never land here — they come back from the
+/// connect call itself.
+///
+/// # Safety
+/// `c` is a valid connection handle; `status` is writable (NULL is skipped).
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_end_reject(
+    c: *const PunktfunkConnection,
+    status: *mut i32,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_ref` reports as `None` and the `match` handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        let value = match c.inner.end_reject() {
+            Some(reason) => crate::error::PunktfunkError::Rejected(reason).status() as i32,
+            None => 0,
+        };
+        // SAFETY: per the ABI contract - the out-param is OPTIONAL, so it is null-checked before
+        // it is written; a non-null one is a caller-owned writable slot.
+        unsafe {
+            if !status.is_null() {
+                *status = value;
+            }
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
 /// Enable or disable the shared clipboard for this session (`design` §3.1). Opt-in: nothing is
 /// announced or served until this is called with `enabled = true`. `flags` carries
 /// `quic::CLIP_FLAG_FILES` (allow file transfer). The host replies with a `State` event.

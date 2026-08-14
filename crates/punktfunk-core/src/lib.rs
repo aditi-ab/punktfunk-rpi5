@@ -185,7 +185,20 @@ pub use stats::Stats;
 /// every existing function keeps its signature and behaviour, and an embedder that never calls it
 /// is unchanged. The `Welcome` grew a trailing field, which older peers skip in both directions
 /// (see `Welcome::encode`), so [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 20;
+/// v21: the per-client access surface (`design/per-client-access.md` §7) —
+/// `punktfunk_connection_grants` and `punktfunk_connection_access_expires_in` read the session's
+/// LIVE access state (the `PUNKTFUNK_GRANT_*` mask and the countdown to its expiry — Welcome
+/// snapshot first, then latest-wins over every mid-session `AccessUpdate` the control task
+/// folds in), and `punktfunk_connection_end_reject` reports the typed rejection a mid-session
+/// close carried (`PUNKTFUNK_STATUS_REJECTED_*`; `0` = none), because `end_reason` can only
+/// file an access-expiry close under HOST_ERROR and that is the wrong sentence for "your
+/// access expired". NEW symbols, not widened ones — the same rule v18 states: every existing
+/// function keeps its signature and behaviour, and an embedder that never adopts any of the
+/// three is unchanged (it simply lacks the courtesy UX; the HOST enforces the grants either
+/// way). Additive and client-local: the mask, the expiry and the `AccessUpdate` message all
+/// shipped with the Welcome's trailing-field append (old peers skip them in both directions),
+/// so [`WIRE_VERSION`] is unchanged.
+pub const ABI_VERSION: u32 = 21;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

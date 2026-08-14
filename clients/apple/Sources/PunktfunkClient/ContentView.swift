@@ -378,7 +378,11 @@ struct ContentView: View {
         #if !os(tvOS)
         .focusedSceneValue(\.sessionFocus, SessionFocus(
             isStreaming: model.connection != nil,
-            clipboardAvailable: model.connection?.hostSupportsClipboard == true,
+            // Host cap AND this device's CLIPBOARD grant (per-client access §7) — an
+            // ungranted session's menu item greys out instead of inviting a refused enable.
+            clipboardAvailable: model.connection.map {
+                $0.hostSupportsClipboard && $0.canUseClipboard
+            } == true,
             clipboardOn: model.clipboardEnabled,
             toggleClipboard: { model.toggleClipboardSync() },
             micAvailable: model.micAvailable,
@@ -1063,7 +1067,25 @@ struct ContentView: View {
                             MotionUnreachableBadge()
                                 .transition(.opacity.combined(with: .scale(scale: 0.9)))
                         }
+                        // The expiry-warning toast (T−5 m / T−1 m, per-client access §7) —
+                        // transient, every platform, every tier: "the pad just died" must
+                        // read as "the evening's access ended" while it can still be fixed.
+                        if captureEnabled, let warning = model.accessWarning {
+                            AccessWarningBadge(text: warning)
+                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                        }
                         #if !os(tvOS)
+                        // The access chip — up for the life of a LIMITED session ("Controller
+                        // only · ends in 1 h 58 m"), at every tier and with the overlay off.
+                        // Never mounted for a full-and-permanent session (every old host):
+                        // today's look must not change there. tvOS states it as a line in the
+                        // stats overlay instead (StreamHUDView).
+                        if captureEnabled && model.accessLimited {
+                            AccessChipBadge(
+                                label: model.accessLevel.label,
+                                remainingSecs: model.accessRemainingSecs)
+                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                        }
                         // Shown for as long as the mic is muted, at every stats tier and with the
                         // overlay off — see MicMutedBadge. tvOS has no microphone to mute.
                         if captureEnabled && model.micMuted {
@@ -1083,6 +1105,8 @@ struct ContentView: View {
                     }
                     .padding(.bottom, 24)
                     .animation(.easeOut(duration: 0.2), value: model.micMuted)
+                    .animation(.easeOut(duration: 0.2), value: model.accessWarning)
+                    .animation(.easeOut(duration: 0.2), value: model.accessLimited)
                 }
                 #if os(iOS)
                 // Touch users have no menu / ⌘D, so when the HUD's Disconnect button isn't on

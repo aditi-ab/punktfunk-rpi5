@@ -96,6 +96,21 @@ struct StreamHUDView: View {
                         .lineLimit(1)
                 }
             }
+            #if os(tvOS)
+            // The session's access level (per-client access §7). tvOS carries it HERE, as a
+            // stats-overlay line, instead of the floating chip the pointer platforms wear — a
+            // couch surface where every extra overlay competes with the picture keeps the
+            // fact with the other session facts. Absent for full-and-permanent sessions
+            // (every old host): today's overlay must not change there.
+            if model.accessLimited {
+                Text(model.accessRemainingSecs == 0
+                    ? "access \(model.accessLevel.label.lowercased())"
+                    : "access \(model.accessLevel.label.lowercased()) · ends in "
+                        + SessionModel.accessCountdown(model.accessRemainingSecs))
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            #endif
             if model.endToEndValid {
                 // Stage-2: the end-to-end headline (capture→on-glass, measured directly, skew-
                 // corrected) — "(same-host clock)" when the host didn't answer the skew
@@ -210,15 +225,20 @@ struct StreamHUDView: View {
             // Capture hint, shown only until input is captured — how to grab it. The RELEASE
             // shortcut is intentionally not surfaced in the overlay (it lives on the Stream menu
             // and, on macOS, the start-of-stream banner), keeping the HUD uncluttered while playing.
+            // Both hints are additionally gated on the session's grants ALLOWING a capture
+            // (per-client access §7): inviting a Controller-only or View-only session to
+            // "capture input" the host would only drop is the lie the grants advert exists
+            // to prevent. Read live off the connection — a re-render lands with the model's
+            // access churn.
             #if os(macOS)
-            if !model.mouseCaptured {
+            if !model.mouseCaptured, connection.canSendPointer || connection.canSendKeyboard {
                 Text("Click the stream to capture input")
                     .font(.geist(11, relativeTo: .caption2))
                     .foregroundStyle(.secondary)
             }
             #elseif os(iOS)
             // Touch always plays directly; ⌘⎋ (hardware keyboard) captures kb/mouse.
-            if !model.mouseCaptured {
+            if !model.mouseCaptured, connection.canSendPointer || connection.canSendKeyboard {
                 Text("⌘⎋ captures keyboard & mouse")
                     .font(.geist(11, relativeTo: .caption2))
                     .foregroundStyle(.secondary)
@@ -358,6 +378,68 @@ struct MotionUnreachableBadge: View {
         .accessibilityLabel(
             "This controller's motion will not reach the game. "
                 + "Set Controller type to DualSense to enable it.")
+    }
+}
+
+#if !os(tvOS)
+/// The session's access chip (per-client access §7) — "Controller only · ends in 1 h 58 m".
+/// Rides over the stream for the life of a LIMITED session, at every stats tier and with the
+/// overlay off entirely, in the badges' glass language: what this session may do (and for how
+/// long) is not a statistic, and a guest whose keyboard does nothing deserves the why on
+/// screen. Never mounted for full-and-permanent sessions — today's look does not change.
+/// (tvOS states the same fact as a stats-overlay line instead — a chip would fight the couch
+/// UI's single-focus rule.)
+struct AccessChipBadge: View {
+    let label: String
+    /// Seconds until access expires; `0` = permanent (the chip then shows the level alone).
+    let remainingSecs: UInt32
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.75))
+            Text(remainingSecs == 0
+                ? label
+                : "\(label) · ends in \(SessionModel.accessCountdown(remainingSecs))")
+                .font(.geist(12, .medium, relativeTo: .caption))
+                .foregroundStyle(.white.opacity(0.9))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .glassBackground(Capsule())
+        .environment(\.colorScheme, .dark) // reads over any frame, like the resize overlay
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            remainingSecs == 0
+                ? "Access level: \(label)"
+                : "Access level: \(label), ends in \(SessionModel.accessCountdown(remainingSecs))")
+    }
+}
+#endif
+
+/// The expiry-warning toast (per-client access §7): the host's T−5 m / T−1 m `AccessUpdate`
+/// warnings, surfaced briefly in the badge stack — every platform, tvOS included (unlike the
+/// chip, a warning is worth a moment of couch overlay; it is how "the pad just died" becomes
+/// "the evening's access ended, ask for more").
+struct AccessWarningBadge: View {
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "clock.badge.exclamationmark")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.yellow)
+            Text(text)
+                .font(.geist(12, .medium, relativeTo: .caption))
+                .foregroundStyle(.white.opacity(0.9))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .glassBackground(Capsule())
+        .environment(\.colorScheme, .dark) // reads over any frame, like the resize overlay
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(text)
     }
 }
 
