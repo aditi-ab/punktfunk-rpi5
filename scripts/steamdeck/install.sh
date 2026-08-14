@@ -313,6 +313,17 @@ if [ "$SUDO_OK" = 1 ]; then
         | sudo tee /etc/sysctl.d/99-punktfunk-net.conf >/dev/null
     sudo sysctl -q -p /etc/sysctl.d/99-punktfunk-net.conf >/dev/null
     ok "UDP socket buffers raised to 32 MB (persisted)"
+    # Nice-limit headroom for the host's data-plane threads (audio/send): without it (or rtkit,
+    # which SteamOS does not guarantee) the per-thread renice silently no-ops and a busy game can
+    # deschedule the 5 ms audio loop. SteamOS's /usr is read-only, so unlike the packaged installs
+    # this lands in /etc — same drop-in, same effect, from the next login. NEVER a file capability
+    # on the host binary (see the setcap note above — KWin identification).
+    if [ -f "$SRC/packaging/linux/50-punktfunk-nice.conf" ]; then
+        sudo install -Dm644 "$SRC/packaging/linux/50-punktfunk-nice.conf" \
+            /etc/systemd/system/user@.service.d/50-punktfunk-nice.conf
+        sudo systemctl daemon-reload || true
+        ok "nice-limit drop-in installed (data-plane thread priority; applies from next login)"
+    fi
     if [ -f "$SRC/scripts/60-punktfunk.rules" ]; then
         sudo install -m644 "$SRC/scripts/60-punktfunk.rules" /etc/udev/rules.d/60-punktfunk.rules
         sudo udevadm control --reload-rules && sudo udevadm trigger || true

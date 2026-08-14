@@ -642,6 +642,38 @@ CONTRIBUTING.md) and nothing in CI enforces it.** Three drifts in two release cy
 argument for gating it; until something does, **treat the copy as part of regenerating, not as a
 follow-up.**
 
+### Linux — the data-plane threads finally get the priority they ask for (⚠ packager-visible)
+
+**On every Linux host to date, `pf_frame::thread_qos`'s per-thread renice was a silent no-op** —
+it needs CAP_SYS_NICE or a raised RLIMIT_NICE, no packaging channel granted either, and the host
+binary can never carry a file capability (KWin identification, the 0.26.0-1 incident). So the
+capture/encode and send threads ran at nice 0, and a CPU-saturating burst on the host — a fresh
+game launch's shader-compile storm is the canonical one — descheduled them at will. A 2026-08-14
+field log showed the result end to end: 5 ms audio datagrams leaving late enough to stutter, the
+client's delay signal rising, and ABR cutting a gigabit-Ethernet session to its 5 Mbps floor with
+zero packet loss — while the box carried 708 Mbps cleanly minutes later, once the storm passed.
+
+**The renice now falls back to RealtimeKit** (`MakeThreadHighPriorityWithPID`, one blocking
+system-bus call per boosted thread) — the same unprivileged broker PipeWire clients use, present
+on effectively every desktop install. No capability enters the host's permitted set, so KWin
+identification is untouched. Boxes with neither rtkit nor the new limit keep today's best-effort
+no-op, one debug line per thread.
+
+**The audio plane is boosted at all for the first time.** The 5 ms Opus capture→encode→send loop,
+the PipeWire capture mainloop thread (its `process` callbacks run there — PipeWire's own
+`module-rt` only covers data loops we don't use), and the pad-audio streamer now take the same
+boost the video threads always asked for. The audio loop is `critical`: a scheduling stall there
+is directly audible where a late video frame is one presentation slip.
+
+⚠ **Packagers: a new `user@.service.d` drop-in.** rpm/deb/Arch (and the Bazzite sysext, via the
+RPM) now ship `packaging/linux/50-punktfunk-nice.conf` →
+`/usr/lib/systemd/system/user@.service.d/50-punktfunk-nice.conf` (`LimitNICE=-15`), so the direct
+`setpriority()` also works where rtkit isn't running. It raises a session *limit*, from the next
+login — nothing is reprioritized by itself. The NixOS module instead sets
+`security.rtkit.enable = lib.mkDefault true` (rtkit is not a given there). It remains true that
+**no channel may ever grant the host binary a file capability** — this change is the sanctioned
+route to the same end.
+
 ---
 
 ## v0.28.0

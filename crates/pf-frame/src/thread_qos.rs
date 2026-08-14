@@ -44,10 +44,9 @@ pub fn boost_thread_priority(critical: bool) {
         // Best-effort nice of the CALLING thread. On Linux `setpriority(PRIO_PROCESS, 0, …)` acts on
         // the calling thread (the kernel resolves who==0 to the current task/tid), and both call
         // sites run inside their worker thread — so this nices exactly the capture/encode (critical)
-        // and send (non-critical) threads, nothing else. Silently no-ops without CAP_SYS_NICE / a
-        // raised RLIMIT_NICE, which is fine. We deliberately do NOT use SCHED_RR/FIFO by default: a
-        // realtime CPU class can preempt the compositor AND the game's own render thread, adding the
-        // very frame-time we refuse to add (opt-in only — see PUNKTFUNK_SCHED_RR).
+        // and send (non-critical) threads, nothing else. We deliberately do NOT use SCHED_RR/FIFO by
+        // default: a realtime CPU class can preempt the compositor AND the game's own render thread,
+        // adding the very frame-time we refuse to add (opt-in only — see PUNKTFUNK_SCHED_RR).
         let nice = if critical { -10 } else { -5 };
         // SAFETY: `setpriority` takes three by-value integers and no pointers, so there is nothing to
         // alias or outlive. `PRIO_PROCESS` with `who == 0` targets the calling task on Linux and
@@ -57,14 +56,68 @@ pub fn boost_thread_priority(critical: bool) {
         if rc == 0 {
             tracing::debug!(critical, nice, "thread nice raised");
         } else {
-            tracing::debug!(
-                critical,
-                "setpriority(nice) no-op (needs CAP_SYS_NICE / RLIMIT_NICE)"
-            );
+            // The direct call needs CAP_SYS_NICE or a raised RLIMIT_NICE, and the host binary can
+            // NEVER carry a file capability (a capped process's /proc/<pid>/exe is unreadable to
+            // KWin, which kills desktop streaming — the 0.26.0-1 field incident). RealtimeKit is
+            // the sanctioned unprivileged path: the same broker PipeWire's clients use, present on
+            // effectively every desktop install. Packaging also ships a `user@.service.d`
+            // LimitNICE drop-in so the direct call works on rtkit-less boxes — but only from the
+            // next login, and existing installs upgrade the binary alone; rtkit is what fixes the
+            // installed base. A 2026-08-14 field log showed exactly this rung missing: every
+            // fresh-launch shader storm descheduled the unprioritized audio/send threads.
+            match linux_rtkit::make_high_priority(nice) {
+                Ok(()) => tracing::debug!(critical, nice, "thread nice raised via rtkit"),
+                Err(e) => tracing::debug!(
+                    critical,
+                    reason = %e,
+                    "setpriority(nice) no-op (needs CAP_SYS_NICE / RLIMIT_NICE, and rtkit \
+                     was unavailable)"
+                ),
+            }
         }
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = critical;
+    }
+}
+
+/// RealtimeKit fallback for [`boost_thread_priority`]: ask the system-bus broker
+/// (`org.freedesktop.RealtimeKit1`) to renice the calling thread when the direct
+/// `setpriority` was refused. This is how PulseAudio/PipeWire clients get their boosts on a
+/// stock desktop — no capability anywhere, which matters here because a file capability on the
+/// host binary breaks KWin's client identification outright.
+///
+/// Only the high-priority (nice) verb is used, never `MakeThreadRealtime` — the SCHED_RR
+/// reservations in [`boost_thread_priority`]'s comment apply to rtkit-granted RR too (and the
+/// RT verb additionally demands an RLIMIT_RTTIME we don't set).
+#[cfg(target_os = "linux")]
+mod linux_rtkit {
+    /// One-shot blocking D-Bus call. Must be made from a plain worker thread, never from async
+    /// context — which already holds for every caller: `boost_thread_priority` acts on the
+    /// calling thread, so it only ever runs inside the dedicated capture/encode/send threads.
+    /// The connection is per-call rather than cached: this runs at most a handful of times per
+    /// session (thread starts), and holding a system-bus connection for the session's lifetime
+    /// to save microseconds at session start is a bad trade against a wedged bus daemon pinning
+    /// a socket in every session forever.
+    pub(super) fn make_high_priority(nice: i32) -> Result<(), zbus::Error> {
+        // SAFETY: `gettid` takes no arguments, touches no memory, and returns the calling
+        // thread's kernel tid — always valid on Linux.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u64;
+        let pid = u64::from(std::process::id());
+        let conn = zbus::blocking::Connection::system()?;
+        // `MakeThreadHighPriorityWithPID(u64 process, u64 thread, i32 priority)` — priority is a
+        // nice level, floored by rtkit's MinNiceLevel (defaults well below our -10). The WithPID
+        // variant with our own pid is the explicit spelling of "this thread of this process";
+        // rtkit still authenticates the caller via the bus, so it grants nothing a plain
+        // `setpriority` caller couldn't be granted.
+        conn.call_method(
+            Some("org.freedesktop.RealtimeKit1"),
+            "/org/freedesktop/RealtimeKit1",
+            Some("org.freedesktop.RealtimeKit1"),
+            "MakeThreadHighPriorityWithPID",
+            &(pid, tid, nice),
+        )?;
+        Ok(())
     }
 }

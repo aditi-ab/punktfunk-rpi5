@@ -189,7 +189,8 @@ package_punktfunk-host() {
            'mesa' 'libglvnd' 'libxkbcommon' 'wayland'
            'libavcodec.so' 'libavutil.so' 'libavfilter.so' 'libavdevice.so'
            'libavformat.so' 'libswscale.so' 'libswresample.so')
-  optdepends=('pipewire-pulse: PulseAudio-API audio from games/apps (real `pulseaudio` also works)'
+  optdepends=('rtkit: data-plane thread priority without a relogin (else the shipped LimitNICE drop-in applies from next login)'
+              'pipewire-pulse: PulseAudio-API audio from games/apps (real `pulseaudio` also works)'
               'nvidia-utils: NVENC hardware encode + GPU EGL/CUDA zero-copy (REQUIRED to encode on NVIDIA)'
               'gamescope: per-session nested compositor backend (no desktop login needed) — needs >=3.16.22'
               'punktfunk-gamescope: HDR (10-bit BT.2020 PQ) streaming on the gamescope backend — attempted by default when installed'
@@ -235,6 +236,12 @@ package_punktfunk-host() {
   install -Dm0644 "$R/scripts/punktfunk-modules.conf" "$pkgdir/usr/lib/modules-load.d/punktfunk.conf"
   # 32 MB UDP socket buffers (send-side headroom at high bitrate)
   install -Dm0644 "$R/scripts/99-punktfunk-net.conf"  "$pkgdir/usr/lib/sysctl.d/99-punktfunk-net.conf"
+  # Nice-limit headroom for the host's data-plane threads: raises the user-session RLIMIT_NICE so
+  # pf-frame's setpriority() works on boxes without RealtimeKit (with rtkit the host never needs
+  # it). A limit, not a grant — and NEVER a file capability on the host binary (see the KWin
+  # identification note in punktfunk-host.install). Applies from the next login.
+  install -Dm0644 "$R/packaging/linux/50-punktfunk-nice.conf" \
+    "$pkgdir/usr/lib/systemd/system/user@.service.d/50-punktfunk-nice.conf"
   # systemd USER units (the host runs in the graphical session, not as root); repoint ExecStart.
   install -Dm0644 "$R/scripts/punktfunk-host.service" "$pkgdir/usr/lib/systemd/user/punktfunk-host.service"
   sed -i 's#%h/punktfunk/target/release/punktfunk-host#/usr/bin/punktfunk-host#' \

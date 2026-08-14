@@ -123,6 +123,11 @@ Requires:       wireplumber
 # made the host uninstallable for anyone running real PulseAudio, which serves those games just
 # as well. Fedora installs pipewire-pulseaudio by default, so the default box is unaffected.
 Recommends:     pipewire-pulseaudio
+# The data-plane threads renice themselves through RealtimeKit when the direct setpriority() is
+# refused (thread_qos — the host binary can never carry CAP_SYS_NICE, see the %%files note).
+# Weak-dep: Fedora desktops ship rtkit anyway, and without it the user@.service.d LimitNICE
+# drop-in below still covers the direct path from the next login.
+Recommends:     rtkit
 Requires:       opus
 Requires:       libei
 # FFmpeg runtime with NVENC (RPM Fusion). Weak-dep so the package installs even if
@@ -371,6 +376,12 @@ sed -i 's#%h/punktfunk/scripts/headless/run-headless-kde.sh#%{_datadir}/%{name}/
 install -Dm0644 packaging/linux/io.unom.Punktfunk.Host.desktop \
                 %{buildroot}%{_datadir}/applications/io.unom.Punktfunk.Host.desktop
 
+# Scheduling headroom for the host's data-plane threads (see the no-caps note in %%files): raise
+# the user-session nice hard limit so pf-frame's setpriority() also works where RealtimeKit isn't
+# running. A limit, not a grant — takes effect at the user's next login.
+install -Dm0644 packaging/linux/50-punktfunk-nice.conf \
+                %{buildroot}%{_unitdir}/user@.service.d/50-punktfunk-nice.conf
+
 # Status tray: the per-user SNI icon + its XDG autostart entry (self-gating: --autostart exits
 # silently for users who don't run a host) + the hicolor status icons it names.
 install -Dm0755 target/release/punktfunk-tray %{buildroot}%{_bindir}/punktfunk-tray
@@ -526,8 +537,10 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 # why neither prctl(PR_SET_DUMPABLE, 1) nor systemd AmbientCapabilities= rescues it.
 #
 # The cost of not having it is pacing only: pf-zerocopy walks REALTIME -> HIGH -> default when a
-# priority class is refused, and pf-frame's thread nice is a best-effort no-op. That is exactly
-# how 0.25.0 behaved, which is the behaviour that worked.
+# priority class is refused, and pf-frame's thread nice falls back to RealtimeKit (the same
+# unprivileged broker PipeWire clients use — no capability enters the permitted set, so the KWin
+# identification above is untouched) and to the user@.service.d LimitNICE drop-in shipped below.
+# Only on a box with neither does it remain the best-effort no-op 0.25.0 shipped with.
 #
 # rpm applies file capabilities from package metadata, so a package built WITHOUT %caps() installs
 # the binary with none and an upgrade from 0.26.0-1 clears it — no scriptlet needed.
@@ -553,6 +566,8 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 # Debugging the WORKER (not the host): a capability makes it AT_SECURE, so the loader ignores
 # LD_LIBRARY_PATH/LD_PRELOAD for it and core dumps are suppressed by default.
 %caps(cap_sys_nice=ep) %{_bindir}/punktfunk-encode-worker
+%dir %{_unitdir}/user@.service.d
+%{_unitdir}/user@.service.d/50-punktfunk-nice.conf
 %{_bindir}/punktfunk-tray
 %{_udevrulesdir}/60-punktfunk.rules
 %dir %{_libexecdir}/punktfunk
