@@ -173,9 +173,19 @@ class ScreenshotTest {
     @Test
     fun consoleControllers() = shootRoot("console-controllers") { ConsoleControllersScene() }
 
-    /** The touch presentation, pads connected — the store's FEEL THE GAME frame. */
+    /**
+     * The touch presentation, pads connected — landscape, like every store frame: the app is
+     * built for horizontal use, and a portrait capture shows a layout nobody streams in.
+     */
     @Test
+    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
     fun controllers() = shootRoot("controllers") { ControllersScene() }
+
+    /** The console presentation at the same landscape geometry — the store's FEEL THE GAME frame. */
+    @Test
+    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
+    fun consoleControllersLandscape() =
+        shootRoot("console-controllers-landscape") { ConsoleControllersScene() }
 
     /**
      * The library coverflow with a mock shelf — the store's PICK & PLAY frame. Landscape: the
@@ -184,9 +194,6 @@ class ScreenshotTest {
     @Test
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
     fun library() = shootRoot("library") { LibraryScene() }
-
-    @Test
-    fun libraryPortrait() = shootRoot("library-portrait") { LibraryScene() }
 
     @Test
     fun consoleControllersLight() =

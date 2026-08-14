@@ -75,8 +75,9 @@ enum ShotScenes {
             },
             // FEEL THE GAME — the controller test panel with injected pads. Gated with the
             // console block because ControllerTestView doesn't build on tvOS, not because it
-            // is a console screen.
-            ShotScene(name: "12-controllers", orientation: .natural, colorScheme: .dark) {
+            // is a console screen. Landscape like the rest of the store set: the app is built
+            // for horizontal use, so the two pads sit as side-by-side columns (see the scene).
+            ShotScene(name: "12-controllers", orientation: .landscape, colorScheme: .dark) {
                 AnyView(ShotControllers())
             },
         ]
@@ -374,14 +375,18 @@ private struct ShotControllers: View {
                 .shadow(radius: 40, y: 16)
         }
         #else
-        ControllerTestView(shotPads: Self.pads)
+        // Landscape canvas: one column per pad, so neither story is cut by the short height —
+        // the DualSense feedback surface left, the Xbox live-input readout right.
+        HStack(spacing: 0) {
+            ControllerTestView(shotPads: [Self.pads[0]])
+            ControllerTestView(shotPads: [Self.pads[1]])
+        }
         #endif
     }
 
     /// Transport/battery/player ride in `detail` — the panel has no dedicated battery row.
-    /// Each pad shows a different half of the panel so both fit one portrait canvas: the
-    /// DualSense skips the input card (the effect grid is the marketing point), the Xbox pad
-    /// skips rumble and shows the readout instead.
+    /// Each pad shows a different half of the panel: the DualSense skips the input card (the
+    /// effect grid is the marketing point), the Xbox pad skips rumble and shows the readout.
     static let pads: [ControllerTestView.ShotPad] = [
         .init(
             name: "DualSense Wireless Controller",
