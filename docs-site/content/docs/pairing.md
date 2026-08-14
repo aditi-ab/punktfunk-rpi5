@@ -36,6 +36,30 @@ blocklist). Requests expire on their own after **10 minutes**.
 This works because approval happens on the host's authenticated management surface — only someone
 with console access can admit a device.
 
+## Choosing access when you admit a device
+
+Admitting a device and deciding what it may do are **one dialog**, not two trips. The Approve
+dialog carries, alongside the device's name:
+
+- **Access level** — **Full control**, **Controller only**, or **View only**, with an **Advanced**
+  expander for the individual toggles. See [Access levels](/docs/access-levels) for exactly what
+  each covers.
+- **Expires** — **Forever**, or **1 h / 4 h / 8 h / custom**.
+
+The defaults are **Full control · Forever** — approving your *own* new laptop is the common case,
+and it should behave like pairing always has. The guest case gets its own button instead: a
+distinct secondary action, **"Approve as guest"**, admits the device as **Controller only for
+4 hours** in one click. The whole co-play flow is: your friend installs a client, connects, the
+knock appears in your console, you tap **Approve as guest** — and their pad lights up as
+controller #2. When the evening's over, the access expires on its own.
+
+The same two controls appear on the **arm pairing** card for the PIN path: whatever access and
+expiry you choose while arming applies to whichever device completes the PIN ceremony in that
+window.
+
+Everything here can be changed later from the Paired devices table — see
+[Managing paired devices](#managing-paired-devices) below.
+
 ## Pairing with a PIN
 
 PIN pairing is the **default and required** path for any new host: unless the host has explicitly
@@ -127,7 +151,11 @@ re-pairing through the PIN ceremony rather than offering to re-trust the new ide
 ## Managing paired devices
 
 The [web console](/docs/web-console) lists every paired device and lets you remove one (revoking its
-access). Re-pairing is just the PIN ceremony again.
+access). Each row also shows the device's **Access** — the preset and, for temporary grants, a live
+countdown ("Controller · 2 h left") — and an edit sheet to change the level, extend or cut the
+expiry, or expire it right now; edits reach a live session immediately. See
+[Access levels](/docs/access-levels). Re-pairing is just the PIN ceremony again — and it keeps the
+device's existing access rather than widening it.
 
 If a client can't pair at all, see [Troubleshooting → Pairing is
 rejected](/docs/troubleshooting#pairing-is-rejected--the-client-cant-connect).
