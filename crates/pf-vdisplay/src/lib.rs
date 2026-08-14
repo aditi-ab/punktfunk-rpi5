@@ -79,6 +79,10 @@ pub(crate) fn emit_display_event(ev: DisplayEvent) {
 #[path = "vdisplay/backend.rs"]
 pub(crate) mod backend;
 pub use backend::{DisplayOwnership, VirtualDisplay, VirtualOutput};
+/// The NEGOTIATED ScreenCast cursor mode of a portal-backed output, reported per session by
+/// [`VirtualDisplay::last_portal_cursor_mode`]. (The module itself stays private — the ladder that
+/// picks the mode is this crate's business; the verdict is the caller's.)
+pub use portal_cursor::Mode as PortalCursorMode;
 
 /// Time-bounded child-process helpers — every compositor query shells out, and an unbounded one
 /// can wedge the calling (session) thread forever.
@@ -832,6 +836,21 @@ mod portal_config;
 /// so they should run on every platform's CI rather than only where the callers compile.
 #[path = "vdisplay/linux/portal_cursor.rs"]
 mod portal_cursor;
+
+/// The line fed to xdph's custom picker to select an output headlessly.
+///
+/// Declared unconditionally for the same reason again: it is a wire format with no schema and no
+/// error report, so the transcribed-parser tests are the only place a malformed line is visible
+/// without a compositor. That is not hypothetical — a missing separator shipped, and the one
+/// assertion that existed for it passed throughout.
+#[path = "vdisplay/linux/portal_picker.rs"]
+mod portal_picker;
+
+/// The single, never-dropped tokio runtime the portal handshakes run on. Linux-only: it exists to
+/// outlive ashpd's process-global cached D-Bus connection, and only the Linux backends speak to it.
+#[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/portal_rt.rs"]
+mod portal_rt;
 
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/hyprland.rs"]

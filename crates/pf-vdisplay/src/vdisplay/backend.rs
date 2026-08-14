@@ -76,6 +76,20 @@ pub struct VirtualOutput {
     /// capturer must hold frames until that renegotiation lands. Linux-only.
     #[cfg(target_os = "linux")]
     pub expect_exact_dims: bool,
+    /// The compositor's own name for this output (Hyprland's `PF-<pid>-<n>`, sway's `HEADLESS-N`,
+    /// a mirrored head's connector) — the Linux answer to what `win_capture` carries on Windows:
+    /// the identity the host needs to aim **absolute input** at the head it is streaming
+    /// (`pf_inject::set_stream_output`, called from `capture::capture_virtual_output`).
+    ///
+    /// It is the `wl_output.name` of that head, which the protocol guarantees is the same string
+    /// for every client — so the injector can match it on its own Wayland connection. `None` on
+    /// the backends whose absolute mapping does not need it (KWin/Mutter inject through libei,
+    /// which selects by region; gamescope owns its whole seat).
+    ///
+    /// This crate must not depend on pf-inject (see the crate doc), so the name is only CARRIED
+    /// here — the host publishes it.
+    #[cfg(target_os = "linux")]
+    pub output_name: Option<String>,
 }
 
 impl VirtualOutput {
@@ -101,6 +115,8 @@ impl VirtualOutput {
             pool_gen: None,
             #[cfg(target_os = "linux")]
             expect_exact_dims: false,
+            #[cfg(target_os = "linux")]
+            output_name: None,
         }
     }
 }
@@ -183,6 +199,33 @@ pub trait VirtualDisplay: Send {
     /// vice versa (the pointer would be missing from frames).
     fn hw_cursor(&self) -> bool {
         false
+    }
+    /// The ScreenCast cursor mode the backend's portal actually NEGOTIATED for the most recent
+    /// [`create`](Self::create) — the answer to [`set_hw_cursor`](Self::set_hw_cursor), which is
+    /// only ever a *request*.
+    ///
+    /// This is the difference between the two that matters downstream: on the whole wlr family
+    /// (xdph, xdpw) `AvailableCursorModes` is `Hidden|Embedded`, so a session that asked for
+    /// metadata is served **`Embedded`** — the compositor paints the pointer into the frames and
+    /// sends no `SPA_META_Cursor`, ever, wherever the pointer is. A consumer that reads "no cursor
+    /// overlay" as a symptom (the host's park schedule reads it as "the seat pointer has not
+    /// reached the streamed output" — true on Mutter, which suppresses metadata while the pointer
+    /// is off the recorded view) is then acting on noise; see
+    /// [`PortalCursorMode::delivers_metadata`](crate::PortalCursorMode::delivers_metadata).
+    ///
+    /// `None` — the default, and what every non-portal backend reports — means "nothing was
+    /// negotiated through the xdg ScreenCast portal here, so this says nothing at all": KWin
+    /// (`zkde_screencast` `pointer` mode), Mutter (`RecordVirtual` `cursor-mode`), gamescope (no
+    /// pointer either way) and Windows (IddCx) all get exactly what they ask for through their own
+    /// protocols, and their consumers must keep behaving as they always did. It is also `None`
+    /// before the first `create`.
+    ///
+    /// Reported by the wlr-family backends (`hyprland`, `wlroots`) and by the monitor
+    /// [`mirror`](crate::open_mirror) when it delegates to one. Those outputs are never registry-
+    /// pooled (`remote_fd.is_some()` — the portal fd cannot be re-opened per attach), so a reused
+    /// kept display can never hand back a *stale* answer here.
+    fn last_portal_cursor_mode(&self) -> Option<crate::PortalCursorMode> {
+        None
     }
     /// The stable identity slot the backend resolved for the most recent [`create`](Self::create) —
     /// the per-client id the identity policy assigned (`Some`), or `None` for shared/anonymous. The

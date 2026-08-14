@@ -602,6 +602,9 @@ pub(crate) fn stream_existing_output(
         node_id,
         // Mutter's RecordMonitor node lives on the user's PipeWire daemon (like RecordVirtual).
         remote_fd: None,
+        // Not an xdg-portal session: `cursor-mode` was set directly on `RecordMonitor` and Mutter
+        // honours it, so the request IS the answer and there is nothing to report back.
+        cursor_mode: None,
         keepalive: Box::new(guard),
     })
 }

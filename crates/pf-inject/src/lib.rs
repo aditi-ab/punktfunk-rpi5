@@ -149,6 +149,15 @@ static ABSOLUTE_ANCHOR: std::sync::RwLock<Option<AbsoluteAnchor>> = std::sync::R
 /// record in `design/per-monitor-portal-capture.md` §5.3) and wrong for anything per-client. A
 /// per-session anchor needs the injector to become session-aware first; don't call this from a
 /// session path until it is.
+///
+/// The wlroots backend does **not** consult this — it aims at a named output via
+/// `stream_output::set_stream_output` (Linux), which the host DOES publish per session and which
+/// therefore takes exactly the last-bring-up-wins trade this warning describes: on purpose, and
+/// stated in the open in that module's doc, matching the Windows `stream_target` slot that already
+/// made the same call. The two are separate slots because they answer different questions and are
+/// written by different owners: this anchor is the operator's host-wide capture pin, recomputed
+/// from policy whenever the console writes it — which would wipe a per-session value written here —
+/// while the stream output is whatever head the session's capture actually attached to.
 pub fn set_absolute_anchor(anchor: Option<AbsoluteAnchor>) {
     let anchor = anchor.filter(|a| !a.is_empty());
     tracing::debug!(?anchor, "input: absolute-coordinate anchor set");
@@ -529,6 +538,14 @@ pub mod pen;
 pub mod stream_target;
 #[cfg(target_os = "windows")]
 pub use stream_target::set_stream_target;
+/// Linux: the streamed compositor output (by name) that absolute coordinates map into — the
+/// counterpart of the Windows `stream_target` module, published by the host at capture bring-up and
+/// consumed by the wlroots virtual-pointer backend, which binds its pointer to that `wl_output`.
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/stream_output.rs"]
+pub mod stream_output;
+#[cfg(target_os = "linux")]
+pub use stream_output::{set_stream_output, stream_output};
 /// Stub — pen injection needs the Linux uinput tablet or Windows synthetic pointers;
 /// `pen_supported()` is false here, so no host advertises the cap and no batches arrive.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]

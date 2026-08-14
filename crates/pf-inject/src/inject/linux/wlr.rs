@@ -5,6 +5,11 @@
 //! virtual keyboard (the host's layout via the standard `XKB_DEFAULT_LAYOUT` et al., defaulting
 //! to evdev/US), and translate events into virtual pointer/keyboard requests, tracking modifier
 //! state so the compositor resolves shifted keysyms correctly.
+//!
+//! **Absolute** motion is mapped by the compositor onto the `wl_output` the virtual pointer was
+//! CREATED with, so which output that is decides where every absolute sample lands. We aim it at
+//! the head the session is actually streaming — published by name in [`crate::stream_output`] and
+//! re-resolved (re-creating the pointer) whenever it changes; see [`WlrootsInjector::retarget`].
 
 use super::{gs_button_to_evdev, vk_to_evdev, InputEvent, InputInjector};
 use anyhow::{bail, Context, Result};
@@ -12,7 +17,12 @@ use punktfunk_core::input::InputKind;
 use std::io::Write;
 use std::os::fd::{AsFd, FromRawFd};
 use std::time::Instant;
-use wayland_client::protocol::{wl_output::WlOutput, wl_pointer, wl_registry, wl_seat::WlSeat};
+use wayland_client::backend::WaylandError;
+use wayland_client::protocol::{
+    wl_output::{self, WlOutput},
+    wl_pointer, wl_registry,
+    wl_seat::WlSeat,
+};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
@@ -27,13 +37,65 @@ use xkbcommon::xkb;
 /// `code` value marking a horizontal scroll event (mirrors `gamestream::input`).
 const SCROLL_HORIZONTAL: u32 = 1;
 
+/// `wl_output.name` — the connector name we match the streamed head on — arrived in v4. Nothing
+/// else we ask of an output needs more than v1, so a lower advert only costs us the names (and
+/// with them the ability to aim absolute input; see [`index_named`]). Same constant, same reason,
+/// as `pf_vdisplay`'s `kwin_dpms`.
+const WL_OUTPUT_MAX: u32 = 4;
+
+/// One `wl_output` the compositor has advertised.
+struct Output {
+    /// The registry global name — the key `wl_registry.global_remove` reports, and the user data
+    /// each `wl_output` event carries back so we know which head it describes.
+    global: u32,
+    proxy: WlOutput,
+    /// `wl_output.name` (protocol v4): the compositor's own name for the head — `HDMI-A-1`,
+    /// Hyprland's `PF-<pid>-<n>`, sway's `HEADLESS-N`. The protocol guarantees this is "the same
+    /// output name for all clients", which is what lets us match the name `hyprctl`/`swaymsg`
+    /// minted on the vdisplay side. `None` on a compositor stuck at v3, which has no name event at
+    /// all — then there is nothing to match on and the pointer stays unbound.
+    name: Option<String>,
+}
+
 /// Globals bound from the registry (the Wayland dispatch state).
 #[derive(Default)]
 struct Globals {
     pointer_mgr: Option<ZwlrVirtualPointerManagerV1>,
     keyboard_mgr: Option<ZwpVirtualKeyboardManagerV1>,
     seat: Option<WlSeat>,
-    output: Option<WlOutput>,
+    /// EVERY advertised output, in advertisement order — not just the first. The streamed head is
+    /// created per session, so it is never the first one advertised (that is the operator's
+    /// oldest physical head), and binding only the first is what aimed absolute input at the
+    /// wrong screen on every EXTEND box.
+    outputs: Vec<Output>,
+}
+
+/// Which advertised output — by position in `names`, which is advertisement order — the virtual
+/// pointer should bind to for the published target `want`.
+///
+/// The rule has **no fallback on purpose**, and that absence is the fix: what this replaced was a
+/// fallback ("bind whatever `wl_output` came first"), and the first-advertised output is the oldest
+/// global, i.e. the operator's physical head — never the per-session headless one the client is
+/// looking at. A target that matches nothing therefore yields `None`, which binds the pointer to no
+/// output and maps absolute coordinates over the whole layout: wrong-ish, but reachable, where a
+/// pin to the wrong head is unreachable.
+///
+/// Split out of [`Globals::output_named`] so the rule is testable — a `WlOutput` proxy cannot be
+/// constructed without a live Wayland connection, but the decision it feeds can.
+fn index_named<'a>(
+    names: impl IntoIterator<Item = Option<&'a str>>,
+    want: Option<&str>,
+) -> Option<usize> {
+    let want = want?;
+    names.into_iter().position(|n| n == Some(want))
+}
+
+impl Globals {
+    /// The `wl_output` whose compositor name is `want`, if it is currently advertised.
+    fn output_named(&self, want: &str) -> Option<WlOutput> {
+        index_named(self.outputs.iter().map(|o| o.name.as_deref()), Some(want))
+            .map(|i| self.outputs[i].proxy.clone())
+    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for Globals {
@@ -45,13 +107,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Globals {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        {
-            match interface.as_str() {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => match interface.as_str() {
                 "zwlr_virtual_pointer_manager_v1" => {
                     state.pointer_mgr = Some(registry.bind(name, version.min(2), qh, ()));
                 }
@@ -61,16 +122,52 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Globals {
                 "wl_seat" => {
                     state.seat = Some(registry.bind(name, version.min(7), qh, ()));
                 }
-                "wl_output" if state.output.is_none() => {
-                    state.output = Some(registry.bind(name, version.min(3), qh, ()));
+                "wl_output" => {
+                    // The `name` event is the only thing that tells the streamed head from the
+                    // operator's. Older compositors bind lower and stay nameless (harmless:
+                    // `output_named` then matches nothing and the pointer maps over the layout).
+                    // The registry global name rides along as user data so the events that follow
+                    // land on the right entry.
+                    let proxy = registry.bind(name, version.min(WL_OUTPUT_MAX), qh, name);
+                    state.outputs.push(Output {
+                        global: name,
+                        proxy,
+                        name: None,
+                    });
                 }
                 _ => {}
+            },
+            // A head went away — a session's headless output being torn down is the common case,
+            // and the pointer must stop being aimed at a dead object (`retarget` re-resolves and
+            // falls back to the whole layout on the next absolute sample).
+            wl_registry::Event::GlobalRemove { name } => {
+                state.outputs.retain(|o| o.global != name);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlOutput, u32> for Globals {
+    fn event(
+        state: &mut Self,
+        _: &WlOutput,
+        event: wl_output::Event,
+        global: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Only the name matters here: geometry/mode/scale are the compositor's problem, because
+        // binding the pointer to an output makes IT do the mapping (see `retarget`).
+        if let wl_output::Event::Name { name } = event {
+            if let Some(o) = state.outputs.iter_mut().find(|o| o.global == *global) {
+                o.name = Some(name);
             }
         }
     }
 }
 
-// The managers, the two virtual devices, the seat and the output emit no events we use.
+// The managers, the two virtual devices and the seat emit no events we use.
 macro_rules! ignore_events {
     ($($t:ty),* $(,)?) => {$(
         impl Dispatch<$t, ()> for Globals {
@@ -80,7 +177,6 @@ macro_rules! ignore_events {
 }
 ignore_events!(
     WlSeat,
-    WlOutput,
     ZwlrVirtualPointerManagerV1,
     ZwlrVirtualPointerV1,
     ZwpVirtualKeyboardManagerV1,
@@ -92,12 +188,39 @@ pub struct WlrootsInjector {
     queue: EventQueue<Globals>,
     globals: Globals,
     pointer: ZwlrVirtualPointerV1,
+    /// The compositor name of the output `pointer` is bound to, or `None` when it is bound to no
+    /// output (absolute coordinates then span the whole layout). Compared against
+    /// [`crate::stream_output`] on every absolute sample; a difference re-creates the pointer.
+    bound_output: Option<String>,
+    /// evdev codes of the mouse buttons currently held on `pointer`, so re-creating the device
+    /// can release them first — the compositor has no reason to, and a virtual pointer destroyed
+    /// mid-press leaves the host with a stuck mouse button.
+    pressed: Vec<u32>,
     keyboard: ZwpVirtualKeyboardV1,
     xkb_state: xkb::State,
     _keymap_file: std::fs::File, // keep the memfd alive for the compositor's mmap
     /// Dedicated committed-text device ([`InputKind::TextInput`]), created on first use.
     text: Option<TextKeyboard>,
     start: Instant,
+}
+
+/// Resolve the published stream output ([`crate::stream_output`]) against the outputs this
+/// connection has bound: `(proxy, name)` when the target is live, `(None, None)` otherwise.
+///
+/// `(None, None)` covers three cases that all want the same answer — nothing published yet (before
+/// the first capture bring-up), the target's `wl_output` global not advertised yet (the injector
+/// opens on the first input event, which can beat the session's display), and the target torn down
+/// (session end). A pointer bound to no output maps absolute coordinates over the whole layout,
+/// which on a single-output compositor is exactly that output and on a multi-head one at least
+/// keeps the streamed head reachable — unlike a pin to a head nobody is streaming.
+fn resolve_target(globals: &Globals) -> (Option<WlOutput>, Option<String>) {
+    let Some(want) = crate::stream_output() else {
+        return (None, None);
+    };
+    match globals.output_named(&want) {
+        Some(proxy) => (Some(proxy), Some(want)),
+        None => (None, None),
+    }
 }
 
 /// Cap on distinct characters the dynamic text keymap holds before it restarts from scratch
@@ -140,12 +263,16 @@ impl WlrootsInjector {
             .clone()
             .context("compositor advertised no wl_seat")?;
 
-        let pointer = pointer_mgr.create_virtual_pointer_with_output(
-            Some(&seat),
-            globals.output.as_ref(),
-            &qh,
-            (),
-        );
+        // A second roundtrip: the first only said WHICH globals exist. The `wl_output.name` events
+        // that identify each head are emitted on the objects we bound *during* that roundtrip, so
+        // they only land now — and the pointer's output has to be resolved before we create it.
+        queue
+            .roundtrip(&mut globals)
+            .context("Wayland output-name roundtrip")?;
+
+        let (target, bound_output) = resolve_target(&globals);
+        let pointer =
+            pointer_mgr.create_virtual_pointer_with_output(Some(&seat), target.as_ref(), &qh, ());
         let keyboard = keyboard_mgr.create_virtual_keyboard(&seat, &qh, ());
 
         // The keymap the compositor resolves our raw evdev keycodes with. Empty names defer to
@@ -174,7 +301,9 @@ impl WlrootsInjector {
         conn.flush().ok();
 
         tracing::info!(
-            output = globals.output.is_some(),
+            outputs = globals.outputs.len(),
+            want = ?crate::stream_output(),
+            bound = ?bound_output,
             "wlroots virtual input ready (pointer + keyboard)"
         );
         Ok(Self {
@@ -182,12 +311,98 @@ impl WlrootsInjector {
             queue,
             globals,
             pointer,
+            bound_output,
+            pressed: Vec::new(),
             keyboard,
             xkb_state,
             _keymap_file: file,
             text: None,
             start: Instant::now(),
         })
+    }
+
+    /// Aim the virtual pointer at the output the session is streaming, re-creating it when that
+    /// changes — the fix for absolute input landing on the operator's screen.
+    ///
+    /// The wlr protocol maps `motion_absolute` onto the output the pointer was **created with**
+    /// and offers no way to re-aim one, so a change means destroy + create. Cheap and rare: the
+    /// host publishes the target once per capture bring-up, so a re-create fires at most a couple
+    /// of times per session. The no-change path — every other absolute sample — costs one `RwLock`
+    /// read and a scan of the output list, which has one entry per head.
+    ///
+    /// Called from the `MouseMoveAbs` arm immediately BEFORE the motion is sent, so a re-created
+    /// pointer gets its first position in the same batch rather than sitting wherever the
+    /// compositor puts a brand-new device.
+    ///
+    /// Resolution is by NAME, never by size: `MouseMoveAbs`'s extent is the client's letterboxed
+    /// content rect in ITS window, not the streamed mode, so no size ladder could identify the
+    /// head. Falling back to no output at all (whole-layout mapping) when the target is unknown is
+    /// deliberate — see [`crate::stream_output`]'s module doc.
+    fn retarget(&mut self) {
+        let (target, want) = resolve_target(&self.globals);
+        if want == self.bound_output {
+            return;
+        }
+        let (Some(mgr), Some(seat)) = (self.globals.pointer_mgr.clone(), self.globals.seat.clone())
+        else {
+            return; // cannot re-create without the manager/seat; keep the pointer we have
+        };
+        // Never destroy a device with a button held: nothing else will release it.
+        if !self.pressed.is_empty() {
+            let t = self.now_ms();
+            for btn in std::mem::take(&mut self.pressed) {
+                self.pointer
+                    .button(t, btn, wl_pointer::ButtonState::Released);
+            }
+            self.pointer.frame();
+        }
+        self.pointer.destroy();
+        self.pointer = mgr.create_virtual_pointer_with_output(
+            Some(&seat),
+            target.as_ref(),
+            &self.queue.handle(),
+            (),
+        );
+        tracing::info!(
+            from = ?self.bound_output,
+            to = ?want,
+            "wlroots virtual pointer re-aimed (absolute input now maps into this output)"
+        );
+        self.bound_output = want;
+    }
+
+    /// Drain the compositor's half of the connection, then push our batch to it — run after every
+    /// injected event.
+    ///
+    /// The **read** is the load-bearing half, and it used to be missing: `dispatch_pending`'s own
+    /// documentation says it "will not perform reads on the Wayland socket", so the queue only
+    /// ever held what [`Self::open`]'s roundtrips put there. Two consequences, both real. The
+    /// injector could never learn about a `wl_output` created AFTER it opened — which is exactly
+    /// the ordering the field report was captured in, and would have left [`Self::retarget`] with
+    /// nothing to resolve. And everything the compositor sent us piled up unread in the socket
+    /// buffer for the host's lifetime, including the protocol errors the code here claimed to be
+    /// surfacing but structurally could not.
+    ///
+    /// Non-blocking by construction: `read()` is documented to answer `WouldBlock` when the socket
+    /// has nothing for us, which is the common case at input rates and is not an error.
+    fn pump(&mut self) -> Result<()> {
+        // `prepare_read` will not hand out a guard while events are still queued, so dispatch first.
+        self.queue
+            .dispatch_pending(&mut self.globals)
+            .context("wayland dispatch")?;
+        if let Some(guard) = self.conn.prepare_read() {
+            match guard.read() {
+                Ok(_) => {
+                    self.queue
+                        .dispatch_pending(&mut self.globals)
+                        .context("wayland dispatch (post-read)")?;
+                }
+                Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e).context("wayland read"),
+            }
+        }
+        self.conn.flush().context("wayland flush")?;
+        Ok(())
     }
 
     fn now_ms(&self) -> u32 {
@@ -271,6 +486,12 @@ impl InputInjector for WlrootsInjector {
                 let w = (event.flags >> 16) & 0xffff;
                 let h = event.flags & 0xffff;
                 if w > 0 && h > 0 {
+                    // The compositor maps these onto the pointer's bound output, so make sure that
+                    // is the head this session streams before sending any. Checked here rather
+                    // than per inject: only absolute motion depends on the binding, and a pointer
+                    // swapped mid-drag is the one thing `retarget` has to work to be safe about.
+                    self.retarget();
+                    let t = self.now_ms(); // `retarget` may have consumed time releasing buttons
                     let x = event.x.clamp(0, w as i32) as u32;
                     let y = event.y.clamp(0, h as i32) as u32;
                     self.pointer.motion_absolute(t, x, y, w, h);
@@ -280,8 +501,12 @@ impl InputInjector for WlrootsInjector {
             InputKind::MouseButtonDown | InputKind::MouseButtonUp => {
                 if let Some(btn) = gs_button_to_evdev(event.code) {
                     let st = if event.kind == InputKind::MouseButtonDown {
+                        if !self.pressed.contains(&btn) {
+                            self.pressed.push(btn);
+                        }
                         wl_pointer::ButtonState::Pressed
                     } else {
+                        self.pressed.retain(|&b| b != btn);
                         wl_pointer::ButtonState::Released
                     };
                     self.pointer.button(t, btn, st);
@@ -328,12 +553,7 @@ impl InputInjector for WlrootsInjector {
             // wlroots has no virtual-touch protocol wired here; touch is the libei path only.
             InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp => {}
         }
-        // Surface protocol errors / disconnects, then push the batch to the compositor.
-        self.queue
-            .dispatch_pending(&mut self.globals)
-            .context("wayland dispatch")?;
-        self.conn.flush().context("wayland flush")?;
-        Ok(())
+        self.pump()
     }
 }
 
@@ -382,4 +602,41 @@ fn memfd_with(s: &str) -> Result<std::fs::File> {
     f.write_all(s.as_bytes()).context("write keymap")?;
     f.write_all(&[0]).context("write keymap NUL")?;
     Ok(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The live-box layout the field report came from: the operator's `HDMI-A-1` is advertised
+    /// FIRST (it exists from compositor start), and the session's headless head is added later —
+    /// so "first advertised" is always the wrong answer, whichever order the injector and the
+    /// display happen to come up in.
+    const HYPRLAND_BOX: [Option<&str>; 2] = [Some("HDMI-A-1"), Some("PF-87756-3")];
+
+    #[test]
+    fn binds_the_streamed_head_not_the_first_advertised_one() {
+        assert_eq!(index_named(HYPRLAND_BOX, Some("PF-87756-3")), Some(1));
+        assert_eq!(index_named(HYPRLAND_BOX, Some("HDMI-A-1")), Some(0));
+        // sway's own naming, and a mirrored physical head, resolve the same way.
+        let sway = [Some("HEADLESS-1"), Some("DP-2"), Some("HEADLESS-2")];
+        assert_eq!(index_named(sway, Some("HEADLESS-2")), Some(2));
+        assert_eq!(index_named(sway, Some("DP-2")), Some(1));
+    }
+
+    /// Every "we don't know" must land on NO output (whole-layout mapping), never on a guess —
+    /// the regression this whole change exists to prevent.
+    #[test]
+    fn an_unknown_target_binds_nothing_rather_than_falling_back() {
+        // Published but not advertised (yet, or any more — the injector opens on the first input
+        // event, which can beat the display, and the head goes away at session end).
+        assert_eq!(index_named(HYPRLAND_BOX, Some("PF-87756-9")), None);
+        // Nothing published at all — before the first capture bring-up.
+        assert_eq!(index_named(HYPRLAND_BOX, None), None);
+        // A compositor older than wl_output v4 emits no `name` event, so nothing is matchable.
+        assert_eq!(index_named([None, None], Some("PF-87756-3")), None);
+        // …and a compositor advertising no outputs at all cannot resolve anything either.
+        let headless: [Option<&str>; 0] = [];
+        assert_eq!(index_named(headless, Some("PF-87756-3")), None);
+    }
 }

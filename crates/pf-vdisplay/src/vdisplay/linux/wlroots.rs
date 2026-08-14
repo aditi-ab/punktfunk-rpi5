@@ -11,8 +11,10 @@
 //!    (`~/.config/xdg-desktop-portal-wlr/config`, written once + portal restarted on change)
 //!    sets `chooser_type=simple` with a `chooser_cmd` that cats the chooser file, which we
 //!    write per session (`Monitor: <NAME>` — xdpw 0.8 parses that prefix strictly).
-//! 4. Teardown is RAII: drop stops the portal thread (its zbus connection ends the cast) and
-//!    runs `swaymsg output <NAME> unplug` (headless outputs support unplug since sway 1.8).
+//! 4. Teardown is RAII **and ordered**: drop closes the ScreenCast session and WAITS for the portal
+//!    to confirm it, and only then runs `swaymsg output <NAME> unplug` (headless outputs support
+//!    unplug since sway 1.8). See [`StopGuard`] — and the long root-cause note on `hyprland.rs`'s
+//!    copy, which is where this was measured.
 //!
 //! Requirements: the host runs inside the sway session's environment (`SWAYSOCK` for swaymsg,
 //! and the portal activation env — `WAYLAND_DISPLAY`/`XDG_CURRENT_DESKTOP=sway` imported into
@@ -67,11 +69,18 @@ pub struct WlrootsDisplay {
     /// never be served out-of-band: it now degrades to `Embedded` and streams, where it used to
     /// cancel the cast and hand the client a black screen.
     hw_cursor: bool,
+    /// What the portal actually gave us on the most recent [`create`](VirtualDisplay::create) — see
+    /// [`VirtualDisplay::last_portal_cursor_mode`], which is how the host learns that a cursor
+    /// overlay is never coming instead of inferring it from an absence.
+    last_cursor_mode: Option<crate::portal_cursor::Mode>,
 }
 
 impl WlrootsDisplay {
     pub fn new() -> Result<Self> {
-        Ok(WlrootsDisplay { hw_cursor: false })
+        Ok(WlrootsDisplay {
+            hw_cursor: false,
+            last_cursor_mode: None,
+        })
     }
 }
 
@@ -98,6 +107,10 @@ impl VirtualDisplay for WlrootsDisplay {
 
     fn hw_cursor(&self) -> bool {
         self.hw_cursor
+    }
+
+    fn last_portal_cursor_mode(&self) -> Option<crate::PortalCursorMode> {
+        self.last_cursor_mode
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
@@ -146,16 +159,21 @@ impl VirtualDisplay for WlrootsDisplay {
         // its own thread (it parks to keep the cast alive, like the other backends). Serialized:
         // the chooser is one per-user file, so a concurrent session's write between ours and xdpw's
         // read would silently capture the wrong output (see `SELECTION_LOCK`).
-        let (fd, node_id, stop) = {
+        let (fd, node_id, cursor_mode, stop) = {
             let _sel = SELECTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             select_and_cast(&name, self.hw_cursor)?
         };
+        // Latched for `last_portal_cursor_mode`: xdpw refuses metadata by construction, so this is
+        // `embedded` whatever we asked for, and the session's whole cursor behaviour follows from
+        // that fact rather than from `hw_cursor`.
+        self.last_cursor_mode = Some(cursor_mode);
         tracing::info!(
             node_id,
             output = %name,
             w = mode.width,
             h = mode.height,
             hz = mode.refresh_hz,
+            cursor = cursor_mode.name(),
             "sway headless output ready"
         );
         Ok(VirtualOutput {
@@ -173,24 +191,75 @@ impl VirtualDisplay for WlrootsDisplay {
             reused_gen: None,
             pool_gen: None,
             expect_exact_dims: false,
+            // Same EXTEND problem as Hyprland: on a sway session with real heads this `HEADLESS-N`
+            // sits beside them, and absolute input must be aimed at it by name. `swaymsg`'s output
+            // name is the head's `wl_output.name`, which is what the injector matches.
+            output_name: Some(name),
         })
     }
 }
 
-/// Drop order matters: stop the portal thread first (zbus connection drop ends the cast),
-/// then unplug the output (fields drop in declaration order).
+/// Drop order matters, and it is the whole fix: [`StopGuard`] **blocks until the ScreenCast session
+/// is actually closed**, and only then does [`OutputGuard`] unplug the output (fields drop in
+/// declaration order). This used to unplug first — see [`StopGuard`].
 struct Keepalive {
     _stop: StopGuard,
     _output: OutputGuard,
 }
 
-/// Dropping this ends the portal keepalive thread, closing its zbus connection — the portal
-/// then tears the screencast session down.
-struct StopGuard(Arc<AtomicBool>);
+/// How long teardown waits for the portal to confirm the ScreenCast session is closed before giving
+/// up and unplugging the output anyway. See `hyprland.rs`'s twin.
+const CAST_CLOSE_BUDGET: Duration = Duration::from_secs(3);
+
+/// Ceiling on the whole ScreenCast handshake, under the caller's 20 s wait — see the note at the
+/// handshake, and the longer one on `hyprland.rs`'s copy.
+const HANDSHAKE_BUDGET: Duration = Duration::from_secs(15);
+
+/// Ends the cast: signals the portal thread, then **waits for it to have closed the ScreenCast
+/// session**, so the caller may safely unplug the output afterwards.
+///
+/// 🛑 THE WAIT IS THE POINT. Root-caused on the Hyprland leg (see the long note on `hyprland.rs`'s
+/// `StopGuard`, which carries the measurements); the defect is the same here, and this is NOT an
+/// assumption of symmetry — xdpw was read to confirm it, against `emersion/xdg-desktop-portal-wlr`:
+///
+/// * **Only `Close` tears a session down.** `src/core/session.c` gives the session object exactly
+///   one method — `SD_BUS_METHOD("Close", …, method_close, …)` — and nothing else calls
+///   `xdpw_session_destroy` for a live cast. Like xdph, xdpw has no peer-vanished watcher of its own
+///   and depends entirely on xdg-desktop-portal's `peer_died_cb` calling `Close` for us, which
+///   happens only after our bus name goes away, asynchronously, and therefore after the old
+///   `StopGuard` had already let `OutputGuard` unplug the output.
+/// * **The same unbounded busy-wait is waiting for it.** `src/screencast/screencast.c:599-605`:
+///   `while (cast->node_id == SPA_ID_INVALID) { pw_loop_iterate(state->pw_loop, 0); }` — timeout 0,
+///   i.e. non-blocking, i.e. a hot spin on the portal's only loop with no escape if the stream never
+///   gets a node id. xdph's copy (`Screencopy.cpp:307-313`) is this code; that is the one measured
+///   pinning a core solid until it was restarted.
+///
+/// So sway's `output unplug` yanks a captured output out from under a live session exactly the way
+/// Hyprland's `output remove` did. Whether xdpw wedges *identically* has not been observed on glass
+/// — no sway box was available — but the two preconditions are present in its source, and closing
+/// the session before unplugging is the correct order regardless of what the backend does with it.
+struct StopGuard {
+    stop: Arc<AtomicBool>,
+    /// Signalled by the portal thread once it has closed the ScreenCast session. `None` when no cast
+    /// was ever established — nothing to close, and nothing worth spending the budget on.
+    closed: Option<std::sync::mpsc::Receiver<()>>,
+}
 
 impl Drop for StopGuard {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Relaxed);
+        let Some(closed) = self.closed.take() else {
+            return;
+        };
+        match closed.recv_timeout(CAST_CLOSE_BUDGET) {
+            // Closed, or the thread is gone without confirming — either way nothing holds the cast.
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
+                budget_s = CAST_CLOSE_BUDGET.as_secs(),
+                "the ScreenCast session did not close in time — unplugging the output underneath \
+                 it; the next cast may find the portal busy"
+            ),
+        }
     }
 }
 
@@ -346,7 +415,10 @@ impl Drop for ChooserFile {
 
 /// Point xdpw's chooser at `output` and run the ScreenCast handshake, returning the portal fd +
 /// node id and the guard that stops the cast. The caller must hold [`SELECTION_LOCK`].
-fn select_and_cast(output: &str, hw_cursor: bool) -> Result<(OwnedFd, u32, StopGuard)> {
+fn select_and_cast(
+    output: &str,
+    hw_cursor: bool,
+) -> Result<(OwnedFd, u32, crate::portal_cursor::Mode, StopGuard)> {
     ensure_xdpw_config()?;
     let chooser = chooser_file();
     std::fs::write(&chooser, format!("Monitor: {output}\n"))
@@ -354,12 +426,21 @@ fn select_and_cast(output: &str, hw_cursor: bool) -> Result<(OwnedFd, u32, StopG
     // Owned from the write on: every arm below (and every `?`) leaves the handshake, which is the
     // only thing that reads it.
     let _chooser = ChooserFile(chooser);
-    let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
+    // The NEGOTIATED cursor mode rides back with the fd and node id: it is decided inside the
+    // portal thread (only there is the proxy to ask), and nothing downstream can re-derive it —
+    // `hw_cursor` is the request, not the answer.
+    let (setup_tx, setup_rx) =
+        std::sync::mpsc::channel::<Result<(OwnedFd, u32, crate::portal_cursor::Mode), String>>();
+    // The teardown handshake: the thread signals this once it has closed the ScreenCast session, and
+    // `StopGuard::drop` waits on it before the output is unplugged (see `StopGuard`). Kept a
+    // SEPARATE channel from the setup one above — it fires at the other end of the cast's life,
+    // long after `setup_rx` has been consumed.
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     thread::Builder::new()
         .name("punktfunk-wlr-cast".into())
-        .spawn(move || portal_thread(setup_tx, stop_thread, hw_cursor))
+        .spawn(move || portal_thread(setup_tx, closed_tx, stop_thread, hw_cursor))
         .context("spawn wlroots portal thread")?;
     // Built BEFORE the wait so EVERY error arm below sets the flag on its way out — as Mutter's
     // `create` does. Returning the bare `Arc` and letting the CALLER wrap it left the two failure
@@ -368,9 +449,13 @@ fn select_and_cast(output: &str, hw_cursor: bool) -> Result<(OwnedFd, u32, StopG
     // parks forever on `while !stop`, holding a live ScreenCast session, its zbus connection, an
     // `OwnedFd` and a 2-worker tokio runtime — one more set per slow-portal connect, for the host's
     // lifetime, against an output that no longer exists.
-    let guard = StopGuard(stop);
+    let mut guard = StopGuard { stop, closed: None };
     match setup_rx.recv_timeout(Duration::from_secs(20)) {
-        Ok(Ok((fd, node_id))) => Ok((fd, node_id, guard)),
+        Ok(Ok((fd, node_id, cursor_mode))) => {
+            // A cast exists now, so teardown has something to close and must wait for it.
+            guard.closed = Some(closed_rx);
+            Ok((fd, node_id, cursor_mode, guard))
+        }
         Ok(Err(e)) => bail!("ScreenCast portal on {output} failed: {e}"),
         Err(_) => bail!("timed out waiting for the ScreenCast portal on {output}"),
     }
@@ -387,10 +472,11 @@ pub(crate) fn stream_existing_output(
     hw_cursor: bool,
 ) -> Result<crate::mirror::MirrorStream> {
     let _sel = SELECTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (fd, node_id, stop) = select_and_cast(connector, hw_cursor)?;
+    let (fd, node_id, cursor_mode, stop) = select_and_cast(connector, hw_cursor)?;
     Ok(crate::mirror::MirrorStream {
         node_id,
         remote_fd: Some(fd),
+        cursor_mode: Some(cursor_mode),
         keepalive: Box::new(stop),
     })
 }
@@ -513,7 +599,8 @@ fn ensure_xdpw_config() -> Result<()> {
 /// reports the fd + node id and parks until stopped — the zbus connection is the cast's
 /// lifetime). xdpw answers the source selection via the chooser, no dialog.
 fn portal_thread(
-    setup_tx: Sender<Result<(OwnedFd, u32), String>>,
+    setup_tx: Sender<Result<(OwnedFd, u32, crate::portal_cursor::Mode), String>>,
+    closed_tx: Sender<()>,
     stop: Arc<AtomicBool>,
     hw_cursor: bool,
 ) {
@@ -523,14 +610,13 @@ fn portal_thread(
 
     // Multi-thread runtime: the zbus background reader must be pumped across the
     // create_session → select_sources → start handshake (see capture/linux.rs).
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-    {
+    // The SHARED, never-dropped runtime — see [`crate::portal_rt`] and the long note on
+    // `hyprland.rs`'s copy: a per-cast runtime kills ashpd's process-global cached connection when
+    // the cast ends, and every later handshake in the process then hangs.
+    let rt = match crate::portal_rt::portal_runtime() {
         Ok(rt) => rt,
         Err(e) => {
-            let _ = setup_tx.send(Err(format!("build tokio runtime: {e}")));
+            let _ = setup_tx.send(Err(e));
             return;
         }
     };
@@ -538,9 +624,20 @@ fn portal_thread(
 
     rt.block_on(async move {
         let result: Result<()> = async {
-            let proxy = Screencast::new().await.context(
-                "connect ScreenCast portal (is xdg-desktop-portal running with the wlr backend?)",
-            )?;
+            // Bounded, like `hyprland.rs`'s copy: an orphaned cached connection hangs HERE, before
+            // any handshake call, so a bound that starts later never fires.
+            let connect = async {
+                Screencast::new().await.context(
+                    "connect ScreenCast portal (is xdg-desktop-portal running with the wlr backend?)",
+                )
+            };
+            let proxy = match tokio::time::timeout(HANDSHAKE_BUDGET, connect).await {
+                Ok(v) => v?,
+                Err(_) => bail!(
+                    "connecting to the ScreenCast portal did not return within {}s",
+                    HANDSHAKE_BUDGET.as_secs()
+                ),
+            };
             // NEGOTIATED against what xdpw advertises, never asserted from `hw_cursor` alone — see
             // the xdph copy in `hyprland.rs` for the incident. xdpw is the sharper case: its
             // screencast.c refuses the mode outright —
@@ -549,51 +646,91 @@ fn portal_thread(
             // — so EVERY cursor-forward session on this backend asked for a mode that cancelled the
             // cast. Different wording from xdph's "unavailable cursor mode 4", same dead session.
             let cursor_mode = crate::portal_cursor::negotiate(&proxy, hw_cursor, "xdpw").await;
-            let session = proxy
-                .create_session(Default::default())
-                .await
-                .context("create_session")?;
-            proxy
-                .select_sources(
-                    &session,
-                    SelectSourcesOptions::default()
-                        .set_cursor_mode(cursor_mode)
-                        // xdpw offers MONITOR only; the chooser picks our output.
-                        .set_sources(BitFlags::from_flag(SourceType::Monitor))
-                        .set_multiple(false)
-                        .set_persist_mode(PersistMode::DoNot),
-                )
-                .await
-                .context("select_sources")?
-                .response()
-                .context("select_sources rejected")?;
-            let streams = proxy
-                .start(&session, None, Default::default())
-                .await
-                .context("start cast")?
-                .response()
-                .context("start response (chooser declined? check the xdpw config/chooser file)")?;
-            let stream = streams
-                .streams()
-                .first()
-                .context("portal returned no streams")?
-                .clone();
-            let node_id = stream.pipe_wire_node_id();
-            let fd = proxy
-                .open_pipe_wire_remote(&session, Default::default())
-                .await
-                .context("open_pipe_wire_remote")?;
+            // Bounded for the same reason as `hyprland.rs`'s copy (the long note lives there): an
+            // await on a wedged portal never returns, the `stop` flag is only read by the park loop
+            // further down, so the thread leaks — and a leaked half-handshake poisons every later
+            // portal request from this process. xdpw has the identical unbounded node-id spin as
+            // xdph (`screencast.c`), so it can wedge the same way.
+            let handshake = async {
+                let session = proxy
+                    .create_session(Default::default())
+                    .await
+                    .context("create_session")?;
+                proxy
+                    .select_sources(
+                        &session,
+                        SelectSourcesOptions::default()
+                            .set_cursor_mode(cursor_mode.to_ashpd())
+                            // xdpw offers MONITOR only; the chooser picks our output.
+                            .set_sources(BitFlags::from_flag(SourceType::Monitor))
+                            .set_multiple(false)
+                            .set_persist_mode(PersistMode::DoNot),
+                    )
+                    .await
+                    .context("select_sources")?
+                    .response()
+                    .context("select_sources rejected")?;
+                let streams = proxy
+                    .start(&session, None, Default::default())
+                    .await
+                    .context("start cast")?
+                    .response()
+                    .context(
+                        "start response (chooser declined? check the xdpw config/chooser file)",
+                    )?;
+                let stream = streams
+                    .streams()
+                    .first()
+                    .context("portal returned no streams")?
+                    .clone();
+                let node_id = stream.pipe_wire_node_id();
+                let fd = proxy
+                    .open_pipe_wire_remote(&session, Default::default())
+                    .await
+                    .context("open_pipe_wire_remote")?;
+                Ok::<_, anyhow::Error>((session, fd, node_id))
+            };
+            let (session, fd, node_id) =
+                match tokio::time::timeout(HANDSHAKE_BUDGET, handshake).await {
+                    Ok(v) => v?,
+                    Err(_) => bail!(
+                        "the ScreenCast portal did not complete the handshake within {}s — \
+                         abandoning it instead of parking this thread on it forever (a hung \
+                         request poisons every later one from this process)",
+                        HANDSHAKE_BUDGET.as_secs()
+                    ),
+                };
 
             setup_tx
-                .send(Ok((fd, node_id)))
+                .send(Ok((fd, node_id, cursor_mode)))
                 .map_err(|_| anyhow!("virtual-output opener went away"))?;
 
-            // Park, keeping `proxy` + `session` (the zbus connection) alive until stopped —
-            // the cast is torn down when the connection drops.
+            // Park, keeping `proxy` + `session` alive until stopped. Polled at 20 ms rather than the
+            // 200 ms this used to use, because teardown now WAITS on what follows.
             let _keep_alive = (&proxy, &session);
             while !stop.load(Ordering::Relaxed) {
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
+
+            // 🛑 CLOSE THE SESSION, AND CLOSE IT *BEFORE* THE OUTPUT IS UNPLUGGED. `Session.Close` is
+            // the only thing that ends an xdpw session (`src/core/session.c`); dropping the
+            // connection and trusting the peer to notice is not the contract. The caller is blocked
+            // in `StopGuard::drop` on the signal below — see `StopGuard`. Bounded, so an
+            // already-wedged portal cannot hang teardown with it.
+            match tokio::time::timeout(CAST_CLOSE_BUDGET, session.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    error = %e,
+                    "closing the ScreenCast session failed — the next cast may find the portal busy"
+                ),
+                Err(_) => tracing::warn!(
+                    budget_s = CAST_CLOSE_BUDGET.as_secs(),
+                    "the ScreenCast portal did not answer Session.Close in time — it is probably \
+                     already wedged"
+                ),
+            }
+            // Release the teardown. Best-effort: the receiver is gone if the caller already gave up.
+            let _ = closed_tx.send(());
             Ok(())
         }
         .await;

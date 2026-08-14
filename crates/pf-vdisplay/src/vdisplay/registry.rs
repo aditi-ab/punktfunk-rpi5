@@ -302,6 +302,14 @@ mod pool {
         pub(super) keepalive: Box<dyn Send>,
         pub(super) node_id: u32,
         pub(super) preferred_mode: Option<(u32, u32, u32)>,
+        /// The compositor's name for this output ([`VirtualOutput::output_name`]) — the identity the
+        /// host aims absolute input with. Kept across a keep-alive reuse for the same reason
+        /// `preferred_mode` is: the reused display IS the same head, so the output the caller is
+        /// handed must answer with the same name a fresh create would. No poolable backend sets it
+        /// today — the ones that do are all passed through unpooled (Hyprland/sway carry a portal
+        /// fd, a mirror is `External`) — so this only exists so that stops being a silent trap the
+        /// day one does.
+        pub(super) output_name: Option<String>,
         pub(super) mode: Mode,
         pub(super) backend: &'static str,
         /// The identity slot the backend resolved for this display (KWin per-slot naming; `None` for
@@ -601,6 +609,7 @@ mod pool {
                 keepalive: Box::new(()),
                 node_id: 0,
                 preferred_mode: None,
+                output_name: None,
                 mode: Mode {
                     width: 1920,
                     height: 1080,
@@ -1083,6 +1092,7 @@ mod linux {
     fn output_for(
         node_id: u32,
         preferred_mode: Option<(u32, u32, u32)>,
+        output_name: Option<String>,
         generation: u64,
         quit: Arc<AtomicBool>,
         reused: bool,
@@ -1093,6 +1103,8 @@ mod linux {
             preferred_mode,
             Box::new(DisplayLease { generation, quit }),
         );
+        // The head is the same one the entry was created for, so it answers with the same name.
+        out.output_name = output_name;
         // A2: tell the pipeline builder this was a REUSED kept display, so a first-frame failure can
         // `mark_failed(generation)` (tear the corpse down) rather than re-wedge the retry loop on the same node.
         out.reused_gen = reused.then_some(generation);
@@ -1176,6 +1188,7 @@ mod linux {
                             let generation = r.generation.fetch_add(1, Ordering::Relaxed);
                             es[idx].generation = generation;
                             let preferred_mode = es[idx].preferred_mode;
+                            let output_name = es[idx].output_name.clone();
                             tracing::info!(
                                 backend,
                                 node_id,
@@ -1184,6 +1197,7 @@ mod linux {
                             ReuseOutcome::Reused(output_for(
                                 node_id,
                                 preferred_mode,
+                                output_name,
                                 generation,
                                 quit.clone(),
                                 true,
@@ -1279,6 +1293,7 @@ mod linux {
 
         let node_id = real.node_id;
         let preferred_mode = real.preferred_mode;
+        let output_name = real.output_name.clone();
         // Fresh creates only: the backend may have birthed the output at a sacrificial mode whose
         // stream must renegotiate before frames count (KWin >60 Hz — see backend.rs). A REUSED kept
         // display already renegotiated in its prior session (the producer's rebuilt offer persists
@@ -1295,6 +1310,7 @@ mod linux {
             keepalive: real.keepalive,
             node_id,
             preferred_mode,
+            output_name: output_name.clone(),
             mode,
             backend,
             identity_slot,
@@ -1349,7 +1365,14 @@ mod linux {
         if (position.x, position.y) != (0, 0) {
             vd.apply_position(position.x, position.y);
         }
-        let mut out = output_for(node_id, preferred_mode, generation, quit, false);
+        let mut out = output_for(
+            node_id,
+            preferred_mode,
+            output_name,
+            generation,
+            quit,
+            false,
+        );
         out.expect_exact_dims = expect_exact_dims;
         Ok(out)
     }

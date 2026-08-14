@@ -1450,16 +1450,21 @@ pub fn pipewire_thread(
              RGB CSC; PUNKTFUNK_PIPEWIRE_NV12=0 restores the packed-RGB negotiation)"
         );
     }
-    // Modifiers our import stack handles for BGRx: the EGL-importable (tiled) set, plus LINEAR
-    // (0) — NVIDIA's EGL won't list it, but LINEAR dmabufs (gamescope's only offer) import via
-    // CUDA external memory instead. For the VAAPI passthrough path we advertise LINEAR only:
-    // radeonsi/iHD import it and any compositor can allocate it.
-    let mut modifiers = importer
-        .as_mut()
-        .map(|i| i.supported_modifiers(pf_frame::drm_fourcc(PixelFormat::Bgrx).unwrap()))
-        .unwrap_or_default();
-    if (importer.is_some() || vaapi_passthrough) && !modifiers.contains(&0) {
-        modifiers.push(0); // DRM_FORMAT_MOD_LINEAR
+    // Modifiers our import stack handles, enumerated PER FOURCC. `XR24` (BGRx) and `AR24` (BGRA)
+    // are asked separately on purpose: EGL/libva answer per format, and nothing entitles us to
+    // assume a driver that imports one imports the other. Keeping them apart is also what makes
+    // the BGRA pod below correct on AMD and Intel rather than an NVIDIA-shaped guess — each list
+    // is whatever THIS GPU's stack actually said.
+    //
+    // To each list we add LINEAR (0) — NVIDIA's EGL won't list it, but LINEAR dmabufs (gamescope's
+    // only offer) import via CUDA external memory instead. For the VAAPI passthrough path there is
+    // no importer at all, so the lists start empty and LINEAR is all we advertise: radeonsi/iHD
+    // import it and any compositor can allocate it.
+    let mut modifiers = Vec::new();
+    let mut modifiers_bgra = Vec::new();
+    if let Some(i) = importer.as_mut() {
+        modifiers = i.supported_modifiers(pf_frame::drm_fourcc(PixelFormat::Bgrx).unwrap());
+        modifiers_bgra = i.supported_modifiers(pf_frame::drm_fourcc(PixelFormat::Bgra).unwrap());
     }
     // PyroWave passthrough: the encoder imports through Vulkan, not libva — extend the
     // advertisement with every modifier its device samples from, so compositors that
@@ -1468,12 +1473,20 @@ pub fn pipewire_thread(
     // the host's `pyrowave` feature is on AND the session (or the global encoder pref) is
     // PyroWave — so capture never calls back into `encode` and needs no feature gate of its
     // own (the emptiness check gates it).
-    if vaapi_passthrough && !policy.pyrowave_modifiers.is_empty() {
-        for &m in &policy.pyrowave_modifiers {
-            if !modifiers.contains(&m) {
-                modifiers.push(m);
+    let extend_pyrowave = vaapi_passthrough && !policy.pyrowave_modifiers.is_empty();
+    for list in [&mut modifiers, &mut modifiers_bgra] {
+        if (importer.is_some() || vaapi_passthrough) && !list.contains(&0) {
+            list.push(0); // DRM_FORMAT_MOD_LINEAR
+        }
+        if extend_pyrowave {
+            for &m in &policy.pyrowave_modifiers {
+                if !list.contains(&m) {
+                    list.push(m);
+                }
             }
         }
+    }
+    if extend_pyrowave {
         tracing::info!(
             count = modifiers.len(),
             "zero-copy: advertising the PyroWave device's Vulkan-importable dmabuf modifiers"
@@ -1540,9 +1553,14 @@ pub fn pipewire_thread(
         );
     } else if want_dmabuf {
         tracing::info!(
-            count = modifiers.len(),
+            bgrx_count = modifiers.len(),
+            bgra_count = modifiers_bgra.len(),
+            // `sample` is TRUNCATED to 6, and LINEAR is pushed last — so reading the sample as the
+            // whole list makes a perfectly good offer look tiled-only. That misreading cost a full
+            // debugging session on 2026-08-14, hence stating the one bit that was actually wanted.
+            linear_offered = modifiers.contains(&0),
             sample = ?&modifiers[..modifiers.len().min(6)],
-            "zero-copy: advertising EGL-importable dmabuf modifiers"
+            "zero-copy: advertising EGL-importable dmabuf modifiers (BGRx + BGRA pods)"
         );
     } else if consumer.cpu_is_downgrade() {
         // Reached only when no dmabuf is advertised at all (every arm above rules out a
@@ -2094,17 +2112,39 @@ pub fn pipewire_thread(
             .map(|fmt| build_hdr_dmabuf_format(*fmt, preferred))
             .collect::<Result<Vec<_>>>()?
     } else if want_dmabuf {
-        let mut pods = Vec::with_capacity(if prefer_native_nv12 { 2 } else { 1 });
+        let mut pods = Vec::with_capacity(if prefer_native_nv12 { 3 } else { 2 });
         if prefer_native_nv12 {
             // First compatible consumer pod wins. Gamescope advertises NV12 and BGRx; pinning
             // BT.709 limited here selects its RGB→NV12 shader with our bitstream colorimetry.
             pods.push(build_dmabuf_format(VideoFormat::NV12, &[0], preferred)?);
         }
-        pods.push(build_dmabuf_format(
-            VideoFormat::BGRx,
-            &modifiers,
-            preferred,
-        )?);
+        if !modifiers.is_empty() {
+            pods.push(build_dmabuf_format(
+                VideoFormat::BGRx,
+                &modifiers,
+                preferred,
+            )?);
+        }
+        // xdph (Hyprland/sway) offers ONLY **BGRA** on its dmabuf EnumFormat — it lists BGRA *and*
+        // BGRx on the SHM pod, so a BGRx-only dmabuf offer intersects with nothing and PipeWire
+        // fails the link outright:
+        //     pw.link: negotiating -> error no more input formats (-22)
+        // Measured 2026-08-14 on Hyprland 0.55.4 + xdph 1.3.12: the 12 tiled modifiers matched on
+        // both sides perfectly — only the fourcc never did, which is why the failure reads like a
+        // GPU/modifier problem and is not one.
+        //
+        // BGRA and BGRx are the same 32-bit layout; the alpha byte is ignored the whole way to the
+        // encoder (`vk_util` maps both to `B8G8R8A8_UNORM`, VAAPI both to `Pixel::BGRA`), and the
+        // dmabuf import is driven by the NEGOTIATED format's fourcc, so an AR24 frame imports as
+        // AR24. Listed AFTER BGRx so a producer offering both still lands on the pre-existing path
+        // — first compatible consumer pod wins, so this is purely additive.
+        if !modifiers_bgra.is_empty() {
+            pods.push(build_dmabuf_format(
+                VideoFormat::BGRA,
+                &modifiers_bgra,
+                preferred,
+            )?);
+        }
         pods
     } else {
         vec![serialize_pod(obj)?]

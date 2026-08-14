@@ -33,8 +33,15 @@
 
 /// A ScreenCast cursor mode, valued as the portal's own wire bits — which is what a backend prints
 /// when it rejects one, so `Metadata`'s `4` is literally the number in the field report.
+///
+/// Public because the NEGOTIATED mode is a per-session fact the consumer needs: the host's stream
+/// loop reads it back off the backend ([`VirtualDisplay::last_portal_cursor_mode`]) to know whether
+/// `SPA_META_Cursor` can ever arrive on this output. Re-exported as
+/// [`crate::PortalCursorMode`](crate::PortalCursorMode).
+///
+/// [`VirtualDisplay::last_portal_cursor_mode`]: crate::VirtualDisplay::last_portal_cursor_mode
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Mode {
+pub enum Mode {
     /// No pointer in the cast at all.
     Hidden = 1,
     /// The compositor paints the pointer into the frames it hands us.
@@ -52,12 +59,26 @@ impl Mode {
     }
 
     /// The spelling used in logs and in `PUNKTFUNK_PORTAL_CURSOR_MODE`.
-    pub(crate) const fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Mode::Hidden => "hidden",
             Mode::Embedded => "embedded",
             Mode::Metadata => "metadata",
         }
+    }
+
+    /// Can `SPA_META_Cursor` EVER arrive under this mode? Only under [`Metadata`](Mode::Metadata) —
+    /// and this is the whole point of surfacing the negotiated mode.
+    ///
+    /// Under `Embedded` the compositor paints the pointer into the frames and sends no cursor
+    /// metadata **regardless of where the pointer is**, so on such a session the absence of a cursor
+    /// overlay carries NO information: not about the pointer's position, not about whether the
+    /// capture is healthy. Consumers that treat "no overlay" as a symptom (the host's seat-pointer
+    /// park schedule, which reads it as "the pointer has not reached the streamed output" — true on
+    /// Mutter, which suppresses metadata while the pointer is off the recorded view) must ask this
+    /// first. Under `Hidden` there is no pointer at all, so the same holds.
+    pub const fn delivers_metadata(self) -> bool {
+        matches!(self, Mode::Metadata)
     }
 
     /// What to ask for instead, best first, when this mode is not advertised.
@@ -185,7 +206,7 @@ pub(crate) fn want(hw_cursor: bool, backend: &str) -> Mode {
 
 #[cfg(target_os = "linux")]
 impl Mode {
-    fn to_ashpd(self) -> ashpd::desktop::screencast::CursorMode {
+    pub(crate) fn to_ashpd(self) -> ashpd::desktop::screencast::CursorMode {
         use ashpd::desktop::screencast::CursorMode;
         match self {
             Mode::Hidden => CursorMode::Hidden,
@@ -198,12 +219,17 @@ impl Mode {
 /// Ask the portal what it supports, run the ladder, and hand back the mode to put in
 /// `SelectSources`. Infallible by construction: a backend we cannot interrogate gets `Embedded`,
 /// the mode that predates the property and that every implementation has always had.
+///
+/// Returns OUR [`Mode`], not ashpd's — the caller converts with [`Mode::to_ashpd`] for the request
+/// and carries the value out of the portal thread, because what was negotiated (as opposed to
+/// asked for) governs how the session's cursor behaves for its whole life. See
+/// [`Mode::delivers_metadata`].
 #[cfg(target_os = "linux")]
 pub(crate) async fn negotiate(
     proxy: &ashpd::desktop::screencast::Screencast,
     hw_cursor: bool,
     backend: &str,
-) -> ashpd::desktop::screencast::CursorMode {
+) -> Mode {
     let want = want(hw_cursor, backend);
     let advertised = match proxy.available_cursor_modes().await {
         Ok(avail) => avail.bits(),
@@ -216,7 +242,7 @@ pub(crate) async fn negotiate(
                 error = %e,
                 "ScreenCast: AvailableCursorModes query failed — requesting Embedded cursor"
             );
-            return Mode::Embedded.to_ashpd();
+            return Mode::Embedded;
         }
     };
     let choice = pick(advertised, want);
@@ -238,7 +264,7 @@ pub(crate) async fn negotiate(
              (requesting it anyway would close the session)"
         ),
     }
-    choice.mode.to_ashpd()
+    choice.mode
 }
 
 #[cfg(test)]
@@ -284,6 +310,21 @@ mod tests {
         let c = pick(3, Mode::Metadata);
         assert_eq!(c.mode, Mode::Embedded);
         assert_eq!(c.wanted, Some(Mode::Metadata));
+    }
+
+    /// The consumer-facing half of the same incident: xdph negotiates `3` down to `Embedded`, and
+    /// under Embedded no `SPA_META_Cursor` ever arrives — so a host that reads "no cursor overlay"
+    /// as "the pointer has not reached the streamed output" (true on Mutter, which suppresses
+    /// metadata off-view) re-centres the user's pointer forever. Field report 2026-08-14: the seat
+    /// pointer warped to centre once a second for the full park cap on a working Hyprland stream.
+    #[test]
+    fn only_metadata_can_deliver_a_cursor_overlay() {
+        assert!(Mode::Metadata.delivers_metadata());
+        assert!(!Mode::Embedded.delivers_metadata());
+        assert!(!Mode::Hidden.delivers_metadata());
+        // The negotiated mode is what governs, not the wanted one: this is the exact ladder result
+        // on xdph/xdpw, and it says "no overlay is ever coming" even though metadata was requested.
+        assert!(!pick(3, Mode::Metadata).mode.delivers_metadata());
     }
 
     /// The same portal, a session with no cursor channel: already asking for what exists, so the

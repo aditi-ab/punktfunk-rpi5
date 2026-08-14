@@ -31,6 +31,12 @@ use anyhow::{bail, Context, Result};
 pub(crate) struct MirrorStream {
     pub node_id: u32,
     pub remote_fd: Option<std::os::fd::OwnedFd>,
+    /// The cursor mode the xdg ScreenCast portal NEGOTIATED for this recording, for the two
+    /// portal-based backends; `None` for the compositor-protocol ones (KWin/Mutter/gamescope),
+    /// which get what they ask for. Reported on to the host as
+    /// [`VirtualDisplay::last_portal_cursor_mode`] — same split as `remote_fd` above, and for the
+    /// same reason: only the portal path has an answer that can differ from the request.
+    pub cursor_mode: Option<crate::portal_cursor::Mode>,
     /// Dropping this ends the recording. It never owns the monitor — we did not create it.
     pub keepalive: Box<dyn Send>,
 }
@@ -40,6 +46,9 @@ pub struct MirrorDisplay {
     compositor: Compositor,
     connector: String,
     hw_cursor: bool,
+    /// What the portal gave the most recent [`create`](VirtualDisplay::create), when this mirror
+    /// delegated to a portal-based backend. See [`VirtualDisplay::last_portal_cursor_mode`].
+    last_cursor_mode: Option<crate::portal_cursor::Mode>,
 }
 
 impl MirrorDisplay {
@@ -48,6 +57,7 @@ impl MirrorDisplay {
             compositor,
             connector,
             hw_cursor: false,
+            last_cursor_mode: None,
         })
     }
 }
@@ -63,6 +73,10 @@ impl VirtualDisplay for MirrorDisplay {
 
     fn hw_cursor(&self) -> bool {
         self.hw_cursor
+    }
+
+    fn last_portal_cursor_mode(&self) -> Option<crate::PortalCursorMode> {
+        self.last_cursor_mode
     }
 
     fn poolable_now(&self) -> bool {
@@ -125,10 +139,15 @@ impl VirtualDisplay for MirrorDisplay {
             ),
         };
 
+        // Latched for `last_portal_cursor_mode` — the delegate's verdict is this mirror's verdict.
+        self.last_cursor_mode = stream.cursor_mode;
+
         // NOTE: aiming absolute input at this head is the HOST's job, not ours — this crate must
         // not depend on pf-inject (see the crate doc: "never on capture/inject"). The host sets the
         // anchor from the same pin at startup; §7.2 of the design doc explains why it is host-level
-        // rather than set here per session.
+        // rather than set here per session. We only CARRY the head's name out (`output_name`
+        // below), which is what the wlr injector needs to bind its virtual pointer to this head —
+        // the libei anchor above cannot serve it, because that backend selects by region.
         tracing::info!(
             connector = %target.connector,
             mode = %target.mode_label(),
@@ -145,6 +164,9 @@ impl VirtualDisplay for MirrorDisplay {
         out.remote_fd = stream.remote_fd;
         // Never pooled, never lingered, never made primary/exclusive: we don't own this head.
         out.ownership = DisplayOwnership::External;
+        // The head absolute input maps into is the one we mirror — its connector IS its
+        // `wl_output.name` on the wlroots/Hyprland backends, where the injector matches on it.
+        out.output_name = Some(target.connector.clone());
         Ok(out)
     }
 }
