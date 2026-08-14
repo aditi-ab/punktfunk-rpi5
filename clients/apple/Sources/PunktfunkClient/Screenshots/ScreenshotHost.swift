@@ -16,6 +16,7 @@
 // can wait for layout instead of guessing with a fixed sleep.
 
 #if DEBUG
+import PunktfunkKit
 import SwiftUI
 #if os(macOS)
 import AppKit
@@ -43,6 +44,17 @@ enum ScreenshotMode {
 /// readiness ping for the capture script.
 struct ScreenshotHostView: View {
     let scene: ShotScene
+
+    init(scene: ShotScene) {
+        self.scene = scene
+        // Pin the palette for the capture. The aurora screens read the LIVE `uiPalette` default,
+        // and a reused Simulator (or a dev Mac) carries whatever was last picked there — the
+        // Apple TV set once shipped out on a sunset palette that a test device had persisted.
+        // Idempotent, and only ever runs in shot mode (this view exists behind that gate).
+        UserDefaults.standard.set(
+            ProcessInfo.processInfo.environment["PUNKTFUNK_SHOT_PALETTE"] ?? "violet",
+            forKey: DefaultsKey.uiPalette)
+    }
     #if os(iOS)
     @Environment(\.horizontalSizeClass) private var hSizeClass
     @Environment(\.verticalSizeClass) private var vSizeClass

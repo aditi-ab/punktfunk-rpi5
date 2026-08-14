@@ -142,6 +142,14 @@ shoot_sim() {
   # incremental build instead of cold-building into a throwaway tmpdir — CI pins this
   # (apple.yml); local runs keep the self-cleaning mktemp default.
   local dd; dd="${PF_SHOT_DERIVED_DATA:-$(mktemp -d)}"; mkdir -p "$dd"
+  # tvOS-SIMULATOR trap (Xcode 26.6 and the 27 beta, local only so far): the build planner
+  # schedules the SwiftPM MACRO plugin targets that swiftui-navigation-transitions pulls in
+  # (OnceMacro/SwizzlingMacro/AssociationMacro) for the *tvOS* triple and never plans their
+  # swift-syntax dependencies at all — "unable to resolve module dependency: 'SwiftSyntax'".
+  # Device archives and iOS builds don't hit it (only the tvOS target links that package), and
+  # prebuilt-vs-source swift-syntax makes no difference. Until Xcode fixes the planner, the
+  # workaround is temporarily unlinking SwiftUINavigationTransitions from the tvOS target
+  # (HomeView's use is canImport-guarded — the push transition degrades to the crossfade).
   xcodebuild -project Punktfunk.xcodeproj -scheme "$scheme" -configuration Debug \
     -sdk "$sdk" -destination "id=$udid" -derivedDataPath "$dd" \
     CODE_SIGNING_ALLOWED=NO build >/dev/null \
