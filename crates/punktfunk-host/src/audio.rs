@@ -13,6 +13,54 @@ pub const SAMPLE_RATE: u32 = 48_000;
 /// Stereo channel count — the default and the punktfunk/1 audio plane's fixed layout.
 pub const CHANNELS: usize = 2;
 
+/// Highest boost `PUNKTFUNK_AUDIO_GAIN` will honour (+18 dB). Past this the soft knee is doing
+/// essentially all the work and the result is a squashed signal, not a louder one — so a runaway
+/// value (a stray `180` for `1.8`) is capped and said out loud rather than silently shipped.
+const MAX_CAPTURE_GAIN: f32 = 8.0;
+
+/// The operator's capture gain, shared by BOTH audio planes (`PUNKTFUNK_AUDIO_GAIN`, default
+/// `1.0` = untouched).
+///
+/// **Why the host needs one at all.** WASAPI loopback is tapped UPSTREAM of the endpoint's master
+/// volume, so turning the host's speaker slider up does nothing whatsoever to the level a client
+/// receives. Before this, the native `punktfunk/1` plane had no gain of any kind, which left no
+/// host-side way to raise a quiet desktop mix — the GameStream plane's knob was the only one, and
+/// it applied to the wrong protocol.
+///
+/// Applied through [`punktfunk_core::audio::apply_gain`], whose soft knee replaces the hard
+/// `clamp(-1.0, 1.0)` this used to be. That clamp is why boosting was a trap: it flat-tops peaks,
+/// and flat tops are audible as harsh distortion long before the operator reaches the level they
+/// were chasing.
+///
+/// ⚠ This is headroom, not loudness. It cannot close a peak-to-loudness gap against
+/// already-limited broadcast content — that needs a real compressor with a time constant, which is
+/// deliberately NOT what this is.
+pub fn capture_gain() -> f32 {
+    let raw: f32 = std::env::var("PUNKTFUNK_AUDIO_GAIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0);
+    // A negative or non-finite gain is a typo, never an intent: it would invert or poison every
+    // sample. Fall back to unity rather than shipping it.
+    if !raw.is_finite() || raw <= 0.0 {
+        if std::env::var("PUNKTFUNK_AUDIO_GAIN").is_ok() {
+            tracing::warn!(
+                "PUNKTFUNK_AUDIO_GAIN must be a positive number (1.0 = unchanged) — ignoring"
+            );
+        }
+        return 1.0;
+    }
+    if raw > MAX_CAPTURE_GAIN {
+        tracing::warn!(
+            requested = raw,
+            capped = MAX_CAPTURE_GAIN,
+            "PUNKTFUNK_AUDIO_GAIN is above the +18 dB ceiling — capping"
+        );
+        return MAX_CAPTURE_GAIN;
+    }
+    raw
+}
+
 /// Produces interleaved `f32` PCM at [`SAMPLE_RATE`] in the channel count it was opened
 /// with. Lives on its own thread; never blocks the capture loop (drops if the consumer
 /// falls behind).

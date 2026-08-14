@@ -955,6 +955,68 @@ pub fn crossfade_drop(ring: &mut std::collections::VecDeque<f32>, drop: usize, f
     ring.drain(..drop);
 }
 
+/// Where [`apply_gain`]'s soft knee begins, in linear amplitude (≈ −3.1 dBFS). Below this the
+/// gained signal is passed through EXACTLY — a boost whose peaks never reach the knee is plain
+/// multiplication, sample for sample, so the limiter costs nothing on material that does not need
+/// it.
+pub const SOFT_LIMIT_KNEE: f32 = 0.7;
+
+/// Multiply `samples` by `gain`, bending anything that would overshoot full scale into a soft knee
+/// instead of slicing it flat.
+///
+/// **Why this is not a `clamp`.** The GameStream plane's gain was `(s * gain).clamp(-1.0, 1.0)`,
+/// which is a hard clip: the waveform's peaks are replaced by literal flat tops, and a flat top is
+/// a discontinuity in the first derivative. That radiates high-order harmonics — the harsher and
+/// more aliasing-prone the higher they go — which is why a field report of "+18 dB and everything
+/// warbles" is the expected outcome of that code and not a bug in anything downstream. Any operator
+/// who set `PUNKTFUNK_AUDIO_GAIN` much above ~1.5 was hearing this.
+///
+/// The curve here is `tanh`-based and chosen for three properties, in this order:
+///
+/// 1. **C¹-continuous at the knee.** The shaped branch's slope at `m == KNEE` is
+///    `(1-K) · sech²(0) · 1/(1-K) == 1`, exactly the slope of the linear branch it meets. There is
+///    no corner in the transfer curve, so the onset of limiting is not itself an audible event —
+///    the failure mode of a naïve piecewise limiter, which trades one discontinuity for another.
+/// 2. **Bounded by construction.** `tanh` is asymptotic to 1, so the output approaches but never
+///    exceeds full scale for any finite input, and `±inf` maps to `±1.0`. No sample can leave here
+///    out of range, which is what the encoder downstream assumes.
+/// 3. **Odd-symmetric.** `f(-x) == -f(x)`, so the distortion it does introduce is odd-harmonic and
+///    adds no DC offset — the benign, "saturating" flavour rather than the rectifying one.
+///
+/// Callers gate on `gain != 1.0`, so the default path is untouched and the wire stays byte-for-byte
+/// identical to a build without this. Note this is a WAVESHAPER, not a lookahead limiter: it is
+/// memoryless and therefore costs zero latency, which is the trade that makes it acceptable in the
+/// realtime encode path. It raises headroom; it does not raise *loudness* the way a compressor
+/// with a real time constant would, and it should not be sold as one.
+pub fn apply_gain(samples: &mut [f32], gain: f32) {
+    // Unity is a no-op, not "multiply by one and shape": the shaper is only correct to apply to a
+    // signal somebody asked to boost. Without this, calling at unity would bend every peak above
+    // the knee — a silent quality change for anyone who forgot to gate the call, and the reason
+    // the callers' `gain != 1.0` guards are a convenience rather than a load-bearing contract.
+    if gain == 1.0 {
+        return;
+    }
+    for s in samples {
+        *s = soft_limit(*s * gain);
+    }
+}
+
+/// The waveshaper behind [`apply_gain`]: identity below [`SOFT_LIMIT_KNEE`], asymptotic to ±1.0
+/// above it. Exposed so the clients can mirror the curve if they ever grow a gain of their own.
+pub fn soft_limit(x: f32) -> f32 {
+    let m = x.abs();
+    if m <= SOFT_LIMIT_KNEE {
+        return x;
+    }
+    let head = 1.0 - SOFT_LIMIT_KNEE;
+    let shaped = SOFT_LIMIT_KNEE + head * ((m - SOFT_LIMIT_KNEE) / head).tanh();
+    if x < 0.0 {
+        -shaped
+    } else {
+        shaped
+    }
+}
+
 // ---- per-platform channel-layout helpers (pure data; no platform deps) --------------------
 
 /// Windows `WAVEFORMATEXTENSIBLE.dwChannelMask` for the wire layout.
@@ -2431,5 +2493,78 @@ mod tests {
         let s = simulate_bunching(JitterTuning::COREAUDIO, None, 600_000, 25, 300, -50);
         assert!(s.audible_tail <= 4, "{s:?}");
         assert!(s.audible <= 12, "{s:?}");
+    }
+
+    /// Unity must be bit-exact. The callers gate on `gain != 1.0` anyway, but if this ever stopped
+    /// holding, every default session's wire would shift and the "byte-for-byte identical" claim
+    /// the tier machinery rests on would quietly become false.
+    #[test]
+    fn unity_gain_is_bit_exact() {
+        let src: Vec<f32> = (0..512).map(|i| (i as f32 / 512.0) * 2.0 - 1.0).collect();
+        let mut got = src.clone();
+        apply_gain(&mut got, 1.0);
+        assert_eq!(got, src, "unity gain must not touch a single sample");
+    }
+
+    /// Below the knee the limiter is not in circuit at all: a boost whose peaks stay under
+    /// `SOFT_LIMIT_KNEE` must be plain multiplication, or quiet material pays for a limiter it
+    /// never needed.
+    #[test]
+    fn below_the_knee_is_plain_multiplication() {
+        let mut got = vec![0.0, 0.1, -0.2, 0.34, -0.05];
+        apply_gain(&mut got, 2.0);
+        for (i, (g, s)) in got.iter().zip([0.0f32, 0.1, -0.2, 0.34, -0.05]).enumerate() {
+            assert_eq!(*g, s * 2.0, "sample {i} must be untouched below the knee");
+        }
+    }
+
+    /// The property the hard `clamp` violated and this exists to restore: no input, however
+    /// absurdly gained, may leave the shaper out of range — and non-finite input must not escape
+    /// as something the encoder would choke on.
+    #[test]
+    fn nothing_escapes_full_scale() {
+        for gain in [1.5f32, 4.0, 8.0, 64.0, 1000.0] {
+            let mut got: Vec<f32> = (0..401).map(|i| (i as f32 - 200.0) / 200.0).collect();
+            apply_gain(&mut got, gain);
+            for s in &got {
+                assert!(s.abs() <= 1.0, "gain {gain} produced {s}");
+            }
+        }
+        assert_eq!(soft_limit(f32::INFINITY), 1.0);
+        assert_eq!(soft_limit(f32::NEG_INFINITY), -1.0);
+    }
+
+    /// Monotonic and odd-symmetric. Monotonicity is what keeps the shaper a limiter rather than a
+    /// fold-back distortion; odd symmetry is what keeps its harmonics benign and its DC at zero.
+    #[test]
+    fn the_curve_is_monotonic_and_odd() {
+        let mut prev = f32::NEG_INFINITY;
+        for i in 0..=4000 {
+            let x = (i as f32 - 2000.0) / 500.0; // -4.0 ..= 4.0
+            let y = soft_limit(x);
+            assert!(y >= prev, "not monotonic at {x}: {y} < {prev}");
+            prev = y;
+            assert!(
+                (soft_limit(-x) + y).abs() < 1e-6,
+                "not odd-symmetric at {x}"
+            );
+        }
+    }
+
+    /// The knee must not itself be an audible event. Both branches meet at the same value AND the
+    /// same slope, so the transfer curve has no corner — a piecewise limiter that gets this wrong
+    /// just swaps the clip's discontinuity for a softer one.
+    #[test]
+    fn the_knee_has_no_corner() {
+        let k = SOFT_LIMIT_KNEE;
+        assert!((soft_limit(k) - k).abs() < 1e-6, "value jumps at the knee");
+        let h = 1e-4;
+        let below = (soft_limit(k) - soft_limit(k - h)) / h;
+        let above = (soft_limit(k + h) - soft_limit(k)) / h;
+        assert!((below - 1.0).abs() < 1e-2, "linear side slope {below}");
+        assert!(
+            (above - below).abs() < 1e-2,
+            "slope jumps at the knee: {below} -> {above}"
+        );
     }
 }

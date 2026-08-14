@@ -397,11 +397,9 @@ fn audio_body(
     // stays small.
     let start = Instant::now();
     let mut frame_no: u64 = 0;
-    // Optional linear gain for quiet capture sources (PUNKTFUNK_AUDIO_GAIN, default 1.0).
-    let gain: f32 = std::env::var("PUNKTFUNK_AUDIO_GAIN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1.0);
+    // Optional gain for quiet capture sources (PUNKTFUNK_AUDIO_GAIN, default 1.0). Soft-limited
+    // rather than clamped — see `crate::audio::capture_gain`.
+    let gain = crate::audio::capture_gain();
     tracing::info!(
         channels = layout.channels,
         streams = layout.streams,
@@ -418,9 +416,7 @@ fn audio_body(
         while acc.len() >= frame_len {
             let mut frame: Vec<f32> = acc.drain(..frame_len).collect();
             if gain != 1.0 {
-                for s in &mut frame {
-                    *s = (*s * gain).clamp(-1.0, 1.0);
-                }
+                punktfunk_core::audio::apply_gain(&mut frame, gain);
             }
             let n = enc.encode_float(&frame, &mut out)?;
             // AES-128-CBC the Opus payload (RTP header stays plaintext). Per-packet IV =

@@ -17,7 +17,19 @@ parse_deps = false
 # imports and their #[repr(C)] structs into the header, where socklen_t/ssize_t/iovec/msghdr are
 # undefined and the C harness fails to compile: the Apple batched recv (transport/udp.rs
 # `recvmsg_x` + `MsghdrX`) and the Android bionic mmsg bindings (`android_mmsg` module).
-exclude = ["MsghdrX", "recvmsg_x", "mmsghdr", "sendmmsg", "recvmmsg"]
+#
+# `SOFT_LIMIT_KNEE` is host-side CAPTURE processing (the operator gain's soft knee, applied before
+# the encoder). No C embedder can act on it — they receive already-gained audio — so exporting it
+# would add a bare `#define` to the ABI surface, against R21 below, for a constant with no meaning
+# on that side of the boundary. Excluded rather than renamed: the header stays byte-identical.
+exclude = [
+    "MsghdrX",
+    "recvmsg_x",
+    "mmsghdr",
+    "sendmmsg",
+    "recvmmsg",
+    "SOFT_LIMIT_KNEE",
+]
 # Reached by no exported SIGNATURE, so cbindgen's sweep misses it — but a C embedder needs the
 # vocabulary: `punktfunk_connection_end_reason` writes one of these as a bare byte (deliberately,
 # so the JNI/Swift sides can marshal a `u8` rather than an enum), which without this would leave
