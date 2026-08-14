@@ -100,6 +100,11 @@ pub(super) fn audio_thread(
     /// pacing exists to prevent — so past this point the debt is forgiven, not repaid.
     const PACE_REANCHOR: std::time::Duration = std::time::Duration::from_millis(100);
     let want = punktfunk_core::audio::normalize_channels(channels);
+    // Same boost the video capture/encode loop takes, and this thread needs it MORE: it paces
+    // 5 ms datagrams, so a scheduling stall here is directly audible where a late video frame
+    // is one presentation slip. The 2026-08-14 field log's stutter was exactly this thread
+    // descheduled by fresh-game-launch shader storms — it carried no priority at all.
+    pf_frame::thread_qos::boost_thread_priority(true);
     // Tier and redundancy are ONE decision, budgeted against the session's video bitrate — see
     // `handshake::audio_budget`. An unparseable `audio.quality` was already warned about there
     // and fell back to the default, so nothing here can silently downgrade someone's audio.

@@ -682,6 +682,10 @@ fn pw_thread(
     use pw::{properties::properties, spa};
     use spa::param::audio::{AudioFormat, AudioInfoRaw};
     use spa::pod::Pod;
+    // The stream's `process` callbacks run ON this mainloop thread (we never hand PipeWire a
+    // separate data loop), so PipeWire's own client `module-rt` boost of its data loops does not
+    // cover it — the ~2.7 ms capture quantum lives or dies by this thread's scheduling.
+    pf_frame::thread_qos::boost_thread_priority(true);
 
     // Setup errors funnel through the ready handshake (mirrors mic_pw_thread's IIFE).
     let result = (|| -> Result<()> {

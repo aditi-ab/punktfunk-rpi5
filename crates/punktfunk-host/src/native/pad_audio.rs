@@ -472,6 +472,9 @@ fn pad_audio_thread<C: crate::audio::AudioCapturer>(
     open: impl Fn() -> anyhow::Result<C>,
     stop: Arc<AtomicBool>,
 ) {
+    // Above-normal like the session send thread — this plane is silence-gated and tiny, but when
+    // a pad speaker/haptics stream IS live it runs the same ≤10 ms cadence as session audio.
+    crate::native::boost_thread_priority(false);
     let mut lanes = match build_lanes(kinds) {
         Ok(l) => l,
         Err(e) => {

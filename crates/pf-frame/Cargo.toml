@@ -21,6 +21,10 @@ tracing = "0.1"
 # `FramePayload::Cuda` owns a zero-copy `DeviceBuffer`; `libc` for the per-thread `setpriority`.
 pf-zerocopy = { path = "../pf-zerocopy" }
 libc = "0.2"
+# The rtkit fallback in `thread_qos` (one blocking system-bus call per boosted thread). Same zbus
+# the host already pulls via ashpd; `tokio` mirrors ashpd's backend choice so this adds the
+# `blocking-api` surface without changing the resolved I/O backend, and no default `async-io`.
+zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # The DXGI capture identity (`WinCaptureTarget`/`D3d11Frame`/`pack_luid`/`make_device`) + the GPU
