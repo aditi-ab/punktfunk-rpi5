@@ -8,6 +8,6 @@
 //! still load via a serde alias in core.
 
 pub use pf_client_core::trust::{
-    hex, learn_mac, learn_os, load_or_create_identity, pair_error_message, parse_hex32, KnownHost,
-    KnownHosts, Settings,
+    hex, learn_mac, learn_mgmt_port, learn_os, load_or_create_identity, pair_error_message,
+    parse_hex32, KnownHost, KnownHosts, Settings,
 };
