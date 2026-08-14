@@ -42,7 +42,10 @@ public enum AudioDevices {
         return channelCount(id, scope: kAudioObjectPropertyScopeInput)
     }
 
-    private static func defaultInputDevice() -> AudioDeviceID? {
+    /// The device the system is currently capturing from — the key `SessionAudio`'s
+    /// voice-processing gate latches a start failure against (the failure is a property of the
+    /// input device, so a new device earns a fresh attempt).
+    static func defaultInputDevice() -> AudioDeviceID? {
         systemDevice(kAudioHardwarePropertyDefaultInputDevice)
     }
 

@@ -32,7 +32,7 @@ final class AudioDeviceWatcherTests: XCTestCase {
         let engine = AVAudioEngine()
         var reasons: [AudioDeviceWatcher.Reason] = []
         let watcher = AudioDeviceWatcher(
-            isOurs: { $0 === engine }, onChange: { reasons.append($0) })
+            isOurs: { $0 === engine }, onChange: { reason, _ in reasons.append(reason) })
         watcher.start()
         defer { watcher.stop() }
 
@@ -51,7 +51,7 @@ final class AudioDeviceWatcherTests: XCTestCase {
         let stranger = AVAudioEngine()
         var reasons: [AudioDeviceWatcher.Reason] = []
         let watcher = AudioDeviceWatcher(
-            isOurs: { $0 === ours }, onChange: { reasons.append($0) })
+            isOurs: { $0 === ours }, onChange: { reason, _ in reasons.append(reason) })
         watcher.start()
         defer { watcher.stop() }
 
@@ -66,7 +66,7 @@ final class AudioDeviceWatcherTests: XCTestCase {
         let engine = AVAudioEngine()
         var reasons: [AudioDeviceWatcher.Reason] = []
         let watcher = AudioDeviceWatcher(
-            isOurs: { $0 === engine }, onChange: { reasons.append($0) })
+            isOurs: { $0 === engine }, onChange: { reason, _ in reasons.append(reason) })
         watcher.start()
         watcher.stop()
 
@@ -93,7 +93,7 @@ final class AudioDeviceWatcherTests: XCTestCase {
         }
 
         var reasons: [AudioDeviceWatcher.Reason] = []
-        let watcher = AudioDeviceWatcher(isOurs: { _ in false }, onChange: { reasons.append($0) })
+        let watcher = AudioDeviceWatcher(isOurs: { _ in false }, onChange: { reason, _ in reasons.append(reason) })
         watcher.start()
         defer {
             _ = Self.setDefaultOutput(original)

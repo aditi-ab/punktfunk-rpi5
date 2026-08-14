@@ -117,13 +117,16 @@ public final class SessionAudio {
     /// A rebuild is already on the main queue — one device switch produces a burst of triggers
     /// and they must collapse into one restart. Main-thread confined.
     private var rebuildQueued = false
-    /// `systemUptime` of the last rebuild, so a device that renegotiates in a loop cannot spin
-    /// the session. Main-thread confined.
-    private var lastRebuildAt: TimeInterval = 0
-    /// Let the burst of triggers from one switch land before rebuilding.
-    private static let rebuildDebounce: TimeInterval = 0.15
-    /// Floor between two rebuilds.
-    private static let rebuildFloor: TimeInterval = 0.5
+    /// Debounce/floor for the next rebuild, with an escalating floor when rebuilds chain (each
+    /// retriggered by its predecessor — see `RebuildBackoff`). Main-thread confined.
+    private var rebuildBackoff = RebuildBackoff()
+    #if os(macOS)
+    /// Latches a voice-processing start failure per input device, so a rebuild never re-attempts
+    /// a topology that deterministically fails — the retry is what turned one failure into a
+    /// rebuild loop (see `CombinedTopologyGate` and the note on `installDeviceChangeRecovery`).
+    /// Main-thread confined, like the start paths that consult it.
+    private var combinedGate = CombinedTopologyGate()
+    #endif
     /// Retries when a rebuild's `start()` loses the race with a device that is still going away
     /// (0.3 s, 0.6 s, 1.2 s). A failed rebuild leaves no engine to post the next notification,
     /// so this ladder — and, on macOS, the HAL listener — is all that stands between a mistimed
@@ -356,9 +359,25 @@ public final class SessionAudio {
             startPlayback(speakerUID: speakerUID)
             return
         }
+        #if os(macOS)
+        // A rebuild must not re-attempt a voice-processing start that already failed on this
+        // input device: the failure repeats, and the failed attempt's HAL churn stops the healthy
+        // fallback engines — the 2026-08-14 rebuild loop (see `CombinedTopologyGate`).
+        var combined = wantsCombined(
+            speakerUID: speakerUID, micUID: micUID, micChannel: micChannel,
+            echoCancel: echoCancel)
+        if combined, !combinedGate.shouldTry(input: AudioDevices.defaultInputDevice()) {
+            log.info("""
+                voice processing already failed on this input device — split engines, no echo \
+                cancellation
+                """)
+            combined = false
+        }
+        #else
         let combined = wantsCombined(
             speakerUID: speakerUID, micUID: micUID, micChannel: micChannel,
             echoCancel: echoCancel)
+        #endif
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             if combined {
@@ -513,6 +532,17 @@ public final class SessionAudio {
     ///  - the route-change and media-services-reset notifications, iOS/tvOS, where the session and
     ///    not the device is what moves.
     ///
+    /// And three defenses keep the recovery from ANSWERING ITSELF — a rebuild is not a silent
+    /// act (a voice-processing start builds and tears down HAL aggregates, and every fresh engine
+    /// renegotiates its IO), so its own fallout can retrigger it. The 2026-08-14 field loop was
+    /// exactly that: VPIO failed on a 6-channel mic, every rebuild re-tried it, and the failure's
+    /// churn stopped the fallback engines — audio and (via the main thread) INPUT cutting out
+    /// every ~2.5 s for the whole session. The defenses: a configuration change from an engine
+    /// that is RUNNING is a rebuild's echo and is ignored (`hardwareMoved`); a VPIO failure is
+    /// latched per input device and never re-attempted on it (`CombinedTopologyGate`); and
+    /// rebuilds that chain anyway back off exponentially instead of metronoming
+    /// (`RebuildBackoff`).
+    ///
     /// `micEnabled` only decides whether the mic-bearing session observers are worth installing.
     /// Main thread.
     private func installDeviceChangeRecovery(micEnabled: Bool) {
@@ -523,7 +553,7 @@ public final class SessionAudio {
 
         let watcher = AudioDeviceWatcher(
             isOurs: { [weak self] posted in self?.ownsEngine(posted) ?? false },
-            onChange: { [weak self] reason in self?.hardwareMoved(reason) })
+            onChange: { [weak self] reason, posted in self?.hardwareMoved(reason, posted: posted) })
         stateLock.lock()
         deviceWatcher = watcher
         stateLock.unlock()
@@ -549,10 +579,17 @@ public final class SessionAudio {
     /// question — is playback still where it should be — but they answer it differently: an engine
     /// that told us it stopped is definitive, while the default device moving might not concern us
     /// at all.
-    private func hardwareMoved(_ reason: AudioDeviceWatcher.Reason) {
+    private func hardwareMoved(_ reason: AudioDeviceWatcher.Reason, posted: AnyObject?) {
         guard !flag.isStopped else { return }
         switch reason {
         case .engineConfiguration:
+            // The engine stops itself BEFORE posting this — so an engine that is RUNNING when the
+            // notification lands on the main queue is one a rebuild already replaced or restarted:
+            // the notification is the rebuild's own echo, and answering it is how the recovery
+            // loops. A change that stops the engine again after this posts again, and the HAL
+            // backstop checks placement independently, so ignoring a live engine's echo can never
+            // strand a stopped one.
+            if let engine = posted as? AVAudioEngine, engine.isRunning { return }
             scheduleEngineRebuild(reason: reason.rawValue)
         case .defaultOutputDevice:
             #if os(macOS)
@@ -594,9 +631,18 @@ public final class SessionAudio {
     private func scheduleEngineRebuild(reason: String) {
         guard !rebuildQueued else { return }
         rebuildQueued = true
-        let since = ProcessInfo.processInfo.systemUptime - lastRebuildAt
-        let delay = max(Self.rebuildDebounce, Self.rebuildFloor - since)
-        log.info("\(reason) — restarting the audio engines in \(Int(delay * 1000)) ms")
+        let delay = rebuildBackoff.delay(now: ProcessInfo.processInfo.systemUptime)
+        if rebuildBackoff.chain >= 2 {
+            // Each rebuild is retriggering the next — a feedback shape the echo guard and the
+            // topology gate did not identify. Keep answering (a real recovery must not be
+            // abandoned), but say what is happening: this line repeating IS the diagnosis.
+            log.warning("""
+                audio engine rebuilds are chaining (\(self.rebuildBackoff.chain) in a row — \
+                \(reason)); backing off \(Int(delay * 1000)) ms
+                """)
+        } else {
+            log.info("\(reason) — restarting the audio engines in \(Int(delay * 1000)) ms")
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             self?.rebuildEngines(attempt: 0)
         }
@@ -613,7 +659,7 @@ public final class SessionAudio {
     private func rebuildEngines(attempt: Int) {
         rebuildQueued = false
         guard !flag.isStopped, let config = startConfig else { return }
-        lastRebuildAt = ProcessInfo.processInfo.systemUptime
+        rebuildBackoff.noteRebuild(at: ProcessInfo.processInfo.systemUptime)
         tearDownEngines()
         startEngines(
             speakerUID: config.speakerUID, micUID: config.micUID, micChannel: config.micChannel,
@@ -638,7 +684,7 @@ public final class SessionAudio {
             return
         }
         rebuildQueued = true // holds off a trigger that would only race this ladder
-        let delay = Self.rebuildDebounce * Double(1 << (attempt + 1))
+        let delay = RebuildBackoff.debounce * Double(1 << (attempt + 1))
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             self?.rebuildEngines(attempt: attempt + 1)
         }
@@ -983,6 +1029,17 @@ public final class SessionAudio {
     // MARK: - Mic (mic → host)
 
     #if !os(tvOS)
+    /// The combined topology failed to come up. On macOS, latch the input device it failed on so
+    /// a rebuild goes straight to the split topology instead of re-running the failure — the
+    /// failed attempt is what churns the HAL and retriggers the recovery (see
+    /// `CombinedTopologyGate`). On iOS routes are session-managed and a VPIO failure is the
+    /// transient route-transition kind, so nothing is latched there.
+    private func noteCombinedFailure() {
+        #if os(macOS)
+        combinedGate.noteFailure(input: AudioDevices.defaultInputDevice())
+        #endif
+    }
+
     /// One engine, both directions: engage the system voice processor on the shared IO unit
     /// (AEC + noise suppression + AGC), hang the playback source off its render side and the
     /// mic tap off its capture side. Every failure falls back to a WORKING configuration —
@@ -1001,6 +1058,7 @@ public final class SessionAudio {
                 voice processing unavailable (\(error.localizedDescription)) — separate \
                 engines, no echo cancellation
                 """)
+            noteCombinedFailure()
             startPlayback(speakerUID: speakerUID)
             startCapture(micUID: micUID, micChannel: micChannel)
             return
@@ -1054,6 +1112,7 @@ public final class SessionAudio {
             // processor won't engage at all, already does exactly this; this arm used to give up
             // on the mic instead, which is how a whole session could go silent uplink-only.)
             engine.stop()
+            noteCombinedFailure()
             startPlayback(speakerUID: speakerUID)
             startCapture(micUID: micUID, micChannel: micChannel)
             return
@@ -1064,6 +1123,7 @@ public final class SessionAudio {
             log.error("combined engine failed to start: \(error.localizedDescription)")
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
+            noteCombinedFailure()
             // Same rule: a working mic without echo cancellation beats no mic at all.
             startPlayback(speakerUID: speakerUID)
             startCapture(micUID: micUID, micChannel: micChannel)
