@@ -66,6 +66,38 @@ Punktfunk only takes it for the duration of a stream. If you *want* apps to reco
 while idle, select "Punktfunk Microphone" manually; the host no longer re-asserts it (idle
 re-assertion used to stomp a manual choice within one mic-pump reopen).
 
+### The NixOS module started a second host in root's systemd, which stole the ports from the real one
+
+Found on the first real deployment of `packaging/nix/nixos-module.nix` (NixOS 26.05, punktfunk
+0.28.0-nix). The host crash-looped forever on one line:
+
+```
+ERROR punktfunk_host: start RTSP server: bind RTSP 48010: Address already in use (os error 98)
+```
+
+`systemd.user.*` has no per-user form in NixOS: it installs units into **every** user's systemd
+manager. `host.autoStart` then adds them to `default.target` — for every user, including **root**,
+whose `user@0.service` springs into existence the moment anybody so much as SSHes in as root. Root's
+copy of the host won the race for the fixed ports, and the desktop user's copy could never bind.
+
+The failure is nastier than it sounds because every *other* listener binds first and logs success —
+the version banner, mDNS on 47989, the GameStream warning all print normally — so the log reads like
+a conflict with some unrelated program. A second copy of *itself*, running as root, is the last
+thing anyone looks for. `host.users` did not help: that option only granted `input`/`punktfunk`
+group membership and never scoped the units.
+
+Fixed by rendering `ConditionUser=` on all four user units (`punktfunk-host`, `punktfunk-web`,
+`punktfunk-web-init`, `punktfunk-scripting`) from `host.users`. Each entry is written `|user` — the
+pipe makes it a *triggering* condition, which systemd ORs; plain repeated `ConditionUser=` lines are
+ANDed and would have matched nobody. With `host.users` empty the units fall back to
+`ConditionUser=!@system`, which still keeps root out while leaving a normal login free to run the
+host by hand, as the module header documents.
+
+`packaging/nix/module-check.nix` gained three assertions covering both branches and the fact that
+`punktfunk-web-init` keeps its pre-existing (non-triggering) `ConditionPathExists` alongside the new
+condition. They run in the `eval` leg of `nix.yml`, and were verified to fail against the unfixed
+module before being committed.
+
 ### The Steam plugin synced nothing on Windows: its art is in Program Files, the art roots were not
 
 Field report — the plugin installed, the grid stayed empty, and the only clue was one host warn per

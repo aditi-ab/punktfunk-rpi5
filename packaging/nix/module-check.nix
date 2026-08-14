@@ -143,6 +143,39 @@ let
       ok = failedAssertions clientOnly == [ ];
     }
 
+    # --- user scoping: the second-copy-steals-the-ports trap -----------------------------------
+    # `systemd.user.*` installs into EVERY user's manager, root's included (user@0.service exists
+    # as soon as anyone logs in as root), and `autoStart` puts these in default.target. Root's host
+    # then wins the fixed ports and the desktop user's restarts forever on
+    # `bind RTSP 48010: Address already in use` — every other listener in its log having bound
+    # fine, so it reads like an unrelated program. MEASURED on a real box before this was fixed.
+    {
+      # `|` = TRIGGERING condition, which systemd ORs. Plain repeated ConditionUser= lines are
+      # ANDed and would match nobody — the whole reason the prefix is there.
+      name = "host.users scopes every user unit to those users, OR-ed";
+      ok =
+        let
+          scoped = name: has desktop name "ConditionUser=|alice";
+        in
+        scoped "punktfunk-host" && scoped "punktfunk-web" && scoped "punktfunk-scripting";
+    }
+    {
+      # web-init already carried a ConditionPathExists. That one is NON-triggering, so systemd
+      # requires it AND at least one triggering user condition — adding ours must not drop it.
+      name = "web-init keeps its path condition alongside the user scope";
+      ok =
+        has desktop "punktfunk-web-init" "ConditionUser=|alice"
+        && has desktop "punktfunk-web-init" "ConditionPathExists=!%h/.config/punktfunk/web-password";
+    }
+    {
+      # With no host.users to name, still keep SYSTEM users (root) out, while leaving the module
+      # header's manual `systemctl --user enable --now punktfunk-host` working for a normal login.
+      name = "with no host.users, the units still refuse system users (root)";
+      ok =
+        has appliance "punktfunk-host" "ConditionUser=!@system"
+        && !(has appliance "punktfunk-host" "ConditionUser=|");
+    }
+
     # --- the KWin identification trap (packaging/arch/punktfunk-host.install) -------------------
     # The host MUST exec the plain store path. A capability wrapper here would put CAP_SYS_NICE in
     # the process's permitted set, and the kernel then refuses KWin the /proc/<pid>/exe readlink it
