@@ -1,0 +1,3 @@
+• Fixes having no sound at all on some Android TV boxes, the NVIDIA Shield among them. The app now checks that your TV or receiver is really taking the audio, instead of trusting that it will.
+• Sound returns on its own when your TV or receiver changes mode during a stream. Before, it could stay silent for the rest of the session.
+• A stream that loses audio now says so, rather than looking exactly like an app with nothing to play.

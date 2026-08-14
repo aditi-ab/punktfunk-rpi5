@@ -12,7 +12,82 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ---
 
-## v0.28.1 — in development
+## v0.28.1
+
+50 commits since v0.28.0.
+
+A patch release in the strict sense: **nothing on the wire, in the C ABI, in the driver protocol or
+in the plugin contract moves.** Every host, client, driver and plugin built against v0.28.0 keeps
+working against v0.28.1 and vice versa, in both directions and with no re-pairing.
+
+### Versions
+
+| | v0.28.0 | v0.28.1 | Notes |
+|---|---|---|---|
+| Wire protocol | 2 | **2** | unchanged |
+| C ABI | 19 | **19** | unchanged — `include/punktfunk_core.h` is byte-identical to the v0.28.0 tag |
+| Rust edition | 2024 | **2024** | unchanged |
+| MSRV (`rust-version`) | 1.85 | **1.85** | unchanged |
+| Workspace crate dirs | 27 | **27** | unchanged |
+| Virtual-display driver protocol | 6 | **6** | unchanged (minimum accepted still 3) |
+| Windows virtual-gamepad channel | 3 | **3** | unchanged |
+| Plugin index schema | 1 | **1** | unchanged |
+| `api/openapi.json` | 0.27.0 | **0.28.0** | the management API **did** change (two collection deletes, below); the file carries the stamp it was regenerated under, not `0.28.1` |
+| gamescope patch level (`+pfhdrN`) | 6 | **7** | 8 patches → 9 (the linger crash); no new capability |
+| `@punktfunk/host` (SDK) | 0.1.4 | **0.1.4** | unchanged |
+| `@punktfunk/plugin-kit` | 0.4.1 | **0.4.1** | unchanged |
+
+⚠ **The `api/openapi.json` stamp is not a per-release counter** and should not be read as one. The
+drift test (`openapi_document_is_complete_and_checked_in`) normalizes `info.version` on both sides,
+so only the *surface* is gated and a version bump alone never invalidates the snapshot. The table
+row says what the file actually says. Regenerating it needs a Linux or Windows host build —
+`punktfunk-host` does not compile on macOS.
+
+### ⚠ Breaking changes
+
+**None.** No wire change, no C ABI change, no driver-protocol change, no plugin-contract change.
+Three things are worth an embedder's or packager's attention anyway, none of which break a build:
+
+- **The Rust crate gained one public constant.** `punktfunk_core::client::FLUSH_COOLDOWN` was
+  `pub(crate)`; the host now compares against it rather than against a copy of the number (see the
+  keyframe-cadence fix below). Addition only.
+- **`NativeBridge.nativeStartAudio` takes a third argument** on Android — `isTv`. Detail in the
+  Android section; this is a JNI signature change, so an out-of-tree caller must pass it.
+- **Every Linux packaging channel now ships a second gamescope artifact**, the Vulkan WSI layer,
+  and a package that carries the compositor without it is *fatal* rather than degraded. If you
+  repackage `punktfunk-gamescope` downstream, read the gamescope section before rebuilding.
+
+### The management API gains two collection deletes — "unpair all"
+
+Clearing a host's trust store meant one row-level delete per device, each with its own
+confirmation. Two new endpoints, one per pairing plane:
+
+```
+DELETE /api/v1/clients          -> {"unpaired": N}
+DELETE /api/v1/native/clients   -> {"unpaired": N}
+```
+
+They are **not** a loop over the per-fingerprint deletes. Each empties its store in ONE persisted
+write, because N deletes would rewrite and atomically rename the store N times and a failure
+partway leaves a half-emptied store with nothing saying which half. The two planes are separate
+endpoints because they own separate trust stores with separate persistence and separate revocation
+duties.
+
+Being collection deletes, they carry the single delete's revocation guarantees across the whole
+set: a live session owned by any removed certificate is ended, and on the GameStream side the ENet
+control port (UDP 47999) closes, because no pairing is left to hold it open.
+
+**200 with a count, not the single delete's 204/404.** "Unpair everything" is idempotent — an
+already-empty store satisfies it — and the count still distinguishes three devices from none.
+
+⚠ **Both are admin-token only.** The route-classification gates match on (method, path), so the
+roster's plugin-readable `GET` does not carry over to emptying it; both new routes have explicit
+rows in the table, like every other pairing-administration route. The native endpoint answers
+**503** on a host built without that plane, which is why the console calls only the planes that
+actually have a row.
+
+`UnpairAllResult` is the one new schema. `api/openapi.json` is regenerated;
+`docs-site/public/openapi.json` is re-synced from it (see **Documentation** at the end).
 
 ### The pad-audio "Wireless Controller" speaker hides while no client pad is attached
 
@@ -142,6 +217,39 @@ silence would be the wrong answer.
 expect art, the cue is the host log's `dropped local art the proxy may not serve` line, and the knob
 is `PUNKTFUNK_LIBRARY_ART_ROOTS` (which **replaces** the defaults — list every root you need).
 
+### Hyprland/Sway — the wlr-family backends asserted a cursor mode instead of negotiating it
+
+🛑 **Every cursor-forward session on current Hyprland died at `select_sources`** — "pipeline build
+failed" and a black client, with `unavailable cursor mode 4` in the portal log.
+
+Hyprland and wlroots both hardcoded portal `CursorMode::Metadata` whenever the session had
+negotiated the cursor channel, and never asked the backend what it supports. That is **not** a soft
+failure: xdg-desktop-portal's **frontend** validates the requested mode against the backend's
+`AvailableCursorModes` and fails the call with `"Unavailable cursor mode %x"` before the backend
+ever sees it.
+
+⭐ **Measured on glass 2026-08-14, and worse than the report suggested.** Against a live Hyprland
+0.56.2 with xdg-desktop-portal-hyprland 1.4.1 and xdg-desktop-portal 1.22.1 — all current —
+`AvailableCursorModes` reads **3** (`Hidden|Embedded`) on both the backend impl interface and the
+frontend. **xdph does not offer the metadata cursor at all**, so this broke every cursor-forward
+session on current Hyprland, not merely on old installs, and **updating the portal would not have
+helped.** xdpw is the same from the other end: its `screencast.c` refuses `METADATA` outright.
+
+`pf-capture`'s own portal path has always negotiated (`choose_cursor_mode`); this restates that
+ladder in `pf-vdisplay`, which may not depend on `pf-capture`. The downgrade is graceful rather than
+merely survivable: with the portal on `Embedded` no `SPA_META_Cursor` arrives, so the host feeds the
+cursor channel nothing and a cursor-forward client draws nothing of its own — **one pointer, not
+two.**
+
+**`PUNKTFUNK_PORTAL_CURSOR_MODE=auto|hidden|embedded|metadata`** pins the preference for a backend
+that advertises a mode it implements badly, which negotiation cannot detect. It is a preference
+only: a pin runs the same ladder, so no value can re-create the refused request.
+
+⚠ The module is declared **unconditionally**, so its ladder tests run on every CI leg rather than
+only the one that compiles `mod hyprland` — including a Linux-only test pinning our bit values
+against ashpd's enum (ashpd answers 4 for `Metadata`, the number in the report), verified
+non-vacuous by planting a wrong discriminant.
+
 ### Android — the audio plane trusted AAudio, and a TV box that opened a stream it never played was silent for the session
 
 🛑 **Reported from the field: no audio at all on an NVIDIA Shield Android TV, stereo, with the same
@@ -192,6 +300,84 @@ existing `debug.punktfunk.no_av_sync`: `debug.punktfunk.audio_sharing` (`exclusi
 old give-up-on-disconnect behaviour). A stream that stops taking samples after it started now says
 so at `error` level instead of looking exactly like an app with no sound.
 
+### gamescope — we ship our own Vulkan WSI layer, so a game can reach an HDR10 swapchain (⚠ packager-visible)
+
+🛑 **On essentially every box running a distro gamescope, no game could render HDR at all** — and
+nothing said so.
+
+A game nested under gamescope gets an HDR10 swapchain from the FROG WSI layer and from nothing
+else: gamescope advertises no runtime colour-management protocol a Mesa/NVIDIA WSI could negotiate
+through. That layer speaks `gamescope_swapchain` to the compositor, and when the two disagree the
+compositor rejects the client's `swapchain_feedback` and **every Vulkan client dies on a black
+screen** with sound and input intact and no error anywhere.
+
+We shipped our own compositor and *not* a layer, on the recorded grounds that the layer is
+"version-independent of the compositor binary". It is not — `wsi_layer_matches_our_gamescope()`
+exists precisely because it is not — so the host was left guessing from version triples, and that
+guess is wrong in both directions. A distro at the same upstream tag that patched the protocol
+compares EQUAL and keeps a layer that will black-screen every game; a distro at a different tag
+with a byte-identical protocol compares unequal and loses HDR for nothing. **Since we pin a rev,
+the second case is the normal one.**
+
+We now build the layer from the same tree at the same rev as the compositor and ship it, so the two
+cannot drift and the guess stops being load-bearing. It installs under **our own** name
+(`VK_LAYER_PUNKTFUNK_gamescope_wsi`), at our own path, with our own enable/disable variables, so it
+coexists with the distro's rather than colliding — the Vulkan loader keys implicit layers on that
+name — and the host switches the two independently within one session.
+
+`WsiPlan` resolves three states once per launch (the fallback spawns `--version` probes):
+
+| state | condition | action |
+|---|---|---|
+| `Ours` | our layer is installed | enable ours, force the distro's off — **both halves, or it is a bug** |
+| `DistroKept` | no layer of ours, distro's looks compatible | touch nothing |
+| `DistroDisabled` | no layer of ours, distro's untrusted | v0.28.0's behaviour |
+
+That last arm is the fail-safe: a host newer than its gamescope package behaves exactly as it did,
+rather than enabling a layer that is not there.
+
+⚠ **What packagers must know.** The layer manifest carries an **absolute** `library_path` baked in
+at build time, so every channel installs the `.so` at exactly that path: literal
+`/usr/lib/punktfunk` — **not** `%{_libdir}` (which is `/usr/lib64` on Fedora) and not a Debian
+multiarch triplet. Nothing links it by soname (the loader `dlopen`s it by that path), so multilib
+has no claim. rpm and nix read the path back **out of the manifest** and fail if it names a file the
+package does not install, because a manifest pointing at nothing is the silent shape of this bug.
+A missing layer is **fatal in every channel**, not best-effort: a package carrying the compositor
+without it looks completely healthy and then silently denies every game an HDR10 swapchain.
+
+The packaging scripts now take `--stage` (the DESTDIR the gamescope build script wrote) instead of
+a path to one binary, and CI caches the whole staged tree; the `gs-cache` key already hashes
+`packaging/gamescope/**`, so stale caches in the old single-file shape cannot be restored into the
+new layout. The manifest rewrite lives in `packaging/gamescope/rewrite-wsi-layer-manifest.py`
+rather than a heredoc, because the FHS builds and the Nix store both need it and must rename the
+layer identically. **NixOS has no `/usr`**, so the layer lives inside the gamescope derivation and
+the host's path is overridable with **`PUNKTFUNK_GAMESCOPE_WSI_LAYER_DIR`**, which the module sets
+— the same posture as `PUNKTFUNK_GAMESCOPE_BIN`.
+
+### gamescope — HDR sessions anchored SDR white a stop bright, and never said game HDR was unreachable
+
+🛑 **Field report: Steam's Big Picture UI glaring and over-saturated while HDR game content looked
+washed out, on the same stream.** Those are one error.
+
+gamescope maps everything that is not an HDR game — the desktop, the Steam overlay, an SDR title —
+into the session's PQ container at `--hdr-sdr-content-nits`, and we passed that flag **only** when
+an operator had set `PUNKTFUNK_GAMESCOPE_SDR_NITS`. Unset, gamescope used its own default of
+**400**, while every first-party client anchors diffuse white at **203** (BT.2408 reference white;
+the Apple presenter hands exactly that to `CAEDRMetadata.hdr10`'s `opticalOutputScale`). The two
+ends sat nearly a stop apart, so the UI landed above SDR white and the client's tone-mapper worked
+from a reference point the host had never used, flattening the content around it.
+
+**The flag is now always passed, defaulting to 203.** `PUNKTFUNK_GAMESCOPE_SDR_NITS` still
+overrides it for anyone who wants a brighter or dimmer desktop — it is the anchor, not a taste
+knob. ⭐ Because it is an env var, a field A/B needs **no rebuild**.
+
+Separately, and visible in the same log: the two HDR decisions in a gamescope session were made
+independently. `hdr_args()` never consulted `wsi_layer_matches_our_gamescope()`, so when the layer
+check fired the session launched **advertising HDR while having made an HDR10 swapchain
+unreachable for every game in it** — a title told to render HDR rendered it into an SDR swapchain
+and looked washed out, with nothing anywhere saying why. It now warns. The behaviour of the check
+itself is deliberately unchanged; the section above is the real fix.
+
 ### punktfunk-gamescope `+pfhdr7` — a lingered session no longer dies of its own capture teardown
 
 🛑 **On client disconnect the host keeps the headless gamescope alive so a reconnect resumes the
@@ -210,6 +396,166 @@ and proven live by **luxus** ([punktfunk-overlay#9](https://github.com/luxus/pun
 four coredumps on 4K60 HDR + composited cursor, zero after; disconnect/reconnect now reuses the
 lingered session. Banner `+pfhdr6` → `+pfhdr7` (no new capability — but "reconnect lost my game"
 triage must be able to read a box's exposure off its banner, the same rule as `+pfhdr5`/`6`).
+
+### Apple — the stats overlay lied three ways, and every host-anchored number with it
+
+🛑 **Two sessions minutes apart on the same wire read `hostnet_p50` 17–21 ms, then a physically
+impossible 4.4 ms** — host-side encode alone is ~4.7. Three independent defects, all of which
+corrupt any measurement taken against a host clock:
+
+- **A frozen clock-offset.** The client consumed the **connect-time** skew offset and cached it —
+  in a `Stage2Pipeline` field, in a `StreamPump` `let`, and in a `ContentView` closure **capture
+  list** feeding the hostnet meter and the host/network splitter. The core keeps a *live* estimate
+  (`punktfunk_connection_clock_offset_now_ns`, ABI v10, re-synced every 60 s and on suspected
+  wall-clock steps) whose own doc says the connect-time value "silently corrupts every
+  capture-clock comparison" after an NTP step — **and a VM host steps.**
+  `PunktfunkConnection.clockOffsetNs` is now the live read (an atomic load behind the FFI), read at
+  use: per record, per AU, per enqueue. The Swift audio plane's AvSync observation takes the same
+  live value.
+- **Silently trimmed impossible samples.** `LatencyMeter`'s guard (≤ 0 after offset correction)
+  dropped samples without counting them, so a wrong offset did not invalidate a window — it trimmed
+  the impossible half of the shifted distribution and presented the surviving tail as a plausible
+  small number. That is the origin of the historical "0 ms network / 0 ms e2e" readings. Refusals
+  are now counted and drained **separately from `Stats`** — deliberately, because a fully-poisoned
+  window drains to `nil` and a count inside `Stats` would vanish with it. The HUD shows an orange
+  **`clock offset suspect`** line and the stats line grew **`skew_trim=N`**; nonzero means
+  disregard `e2e`/`hostnet` for that window.
+- **`-1` fallbacks printing as `NaN`.** In a `CVarArg` context `cond ? someDouble : -1` does **not**
+  unify to `Double` — the literal goes in as `Int`, and `%f` reads `Int64(-1)`'s all-ones bit
+  pattern, which is a quiet NaN. Latent since the 1 Hz stats line existed. All fallbacks are now
+  typed `-1.0`.
+
+⚠ **Any client-side e2e or hostnet figure recorded before this release is suspect** and worth
+re-measuring rather than trusted as a baseline.
+
+Two new levers ship with the tvOS present-floor investigation, both env-only:
+**`PUNKTFUNK_FRAME_LATENCY`** (float 0…4, default 1) makes the `preferredFrameLatency` ask
+adjustable, so an on-device ladder can establish whether the property does anything on tvOS — the
+previous "immovable two-refresh floor" verdict rested on a **readback** of a plain read-write
+float, which is not a grant. **`PUNKTFUNK_PRESENTER=stage1` now resolves on Release builds** (the
+persisted picker stays DEBUG-gated; an env var takes a `devicectl`/Xcode launch to exist, so it is
+never a leftover). Stage-1 presents on the hardware video plane rather than through the GPU
+compositor — the one rung that can dodge the two-refresh regime — and the field A/B that concluded
+otherwise had silently run stage-4, because the gate keyed on build config.
+
+### Apple — two colour faults: an SDR stream shipped untagged, and it forced the TV into HDR10
+
+- **The SDR layer was never tagged.** `configure(hdr:)` guards on `hdr != hdrActive` and
+  `hdrActive` starts `false`, so a session that is SDR from its first frame matched the initial
+  state, fell through the guard, and `configureColor` never ran once — the layer kept `make()`'s
+  bare configuration, which assigns no colour space. An untagged `CAMetalLayer` gets no colour
+  matching: a BT.709 stream is drawn in the display's native space. Mild oversaturation on a P3 Mac
+  or iPad; on a tvOS display composited for HDR it also lifts the black floor. ⚠ It also made
+  `PUNKTFUNK_SDR_COLORSPACE` **dead code on exactly the sessions it exists to fix**, so a field A/B
+  of that knob would have shown no change.
+- **An SDR stream drove an HDR-capable TV into PQ output.** `applyDisplayCriteriaIfNeeded` builds a
+  synthetic format description hardcoding BT.2020 primaries, ST.2084 and the BT.2020 matrix, then
+  hands it to `AVDisplayManager` — and its guard checked only that no criteria had been set and that
+  the user's HDR *setting* was on, never that **the stream** was HDR. That setting defaults to true.
+  The Apple TV switches HDMI to limited range in its HDR modes, so a set configured for full range
+  renders code 16 as grey rather than black. Now gated on `connection.isHDR` as well; layout re-runs
+  it, so a session that flips to HDR mid-stream still picks the mode up.
+
+### Apple gamepad UI — a host menu, and About becomes a page
+
+**UP on a saved tile opens Wake / Copy link / Edit… / Forget pairing / Remove.** The desktop and
+Android consoles have had this for a while; this is the Apple port, so the three consoles are
+learned once. Wiring UP takes the whole vertical axis away from scrolling (down goes inert) — a
+horizontal carousel has no vertical travel to spend, and one meaning per direction is what makes
+the gesture learnable. **Remove arms on the first press and fires on the second**, disarming if
+focus wanders off the row: the touch grid gets a system confirmation dialog, and a thumbstick from
+across a room deserves at least as much. Edit reuses `GamepadAddHostView` seeded from the record and
+writes a **copy** back through `HostStore.update`, so the fingerprint, MACs, pins and binding the
+form never shows survive a rename; it **replaces** the menu rather than stacking on it, keeping the
+shell's "depth ≤ 1 by construction" true. A pinned profile card offers only Unpin — it is a
+shortcut, not a second host.
+
+**The start-of-stream shortcut banner is retired.** Telling someone the controls for six seconds,
+over the stream they just connected to, answers the question at the one moment nobody is asking it
+— and it put a composited overlay above the stream to do it. The words are now a catalogue rendered
+in an About page you can open, which is also its own section rather than the last row of Interface.
+Its remaining fixes: the identity card became a version line under the rows, a zero-radius clip is
+still a clip (it cropped the TV's wide icon), and the card ignored the row column.
+
+⚠ **Apple console screens read the ink they publish.** A SwiftUI screen cannot read the environment
+value it publishes in the same view — so a pale palette stayed white-on-white on Apple TV. Fixed
+across every console screen.
+
+### Console UI — Skia sized its function table to the loader, not to what we promised
+
+🛑 **On a Steam Deck the console home died on update**, and in a stream the same failure quietly
+cost the stats OSD and capture HUD.
+
+The skia-safe 0.87 → 0.99 move swapped `BackendContext::new` for `new_builder(…, None)` and
+recorded the `None` as "byte-for-byte what the removed constructor did". True of the **value**,
+false of the **behaviour**: `None` leaves Skia's `fMaxAPIVersion` at its `0` sentinel, and the newer
+Skia acts on that sentinel by falling back to **`vkEnumerateInstanceVersion()` — the loader's
+ceiling, not ours.** The presenter declares 1.3; a current Mesa answers 1.4 (1.4.321 on SteamOS
+3.7, host and inside the flatpak sandbox alike). Skia then validates a 1.4 function table against an
+instance that only promised 1.3, `vkGetDeviceProcAddr` returns null for the entry points in
+between, and `make_vulkan` hands back `None`. At 0.87 the sentinel was inert because that Skia knew
+nothing of Vulkan 1.4 — **which is why this surfaced the moment v0.28.0 landed.**
+
+`run.rs` makes an overlay that cannot init fatal for `--browse`, so the Decky panel's button and the
+gamepad-UI library shortcut both failed to open. The presenter now publishes
+`SharedDevice::api_version` — `min(what we declared, what the loader reports)` — and
+`SkiaOverlay::init` passes it instead of `None`. ⚠ `pf-presenter`'s `vk` module is
+`cfg(any(linux, windows))`, so this was never Deck-specific.
+
+### pf-vkdecode — AV1's "maximum parameters" level is not a level above the ceiling
+
+🛑 **Every AV1 session demoted to D3D11VA** with `stream level (seq_level_idx 31) above the device's
+maxLevel (AV1 Std level 23)` — on hardware decoding the stream trivially on the rung it fell
+through to.
+
+`seq_level_idx` is a 5-bit field: Annex A defines 0…23 (levels 2.0…7.3), reserves 24…30, and makes
+**31 the "maximum parameters" level — the spec's own way of saying the bitstream is not constrained
+to a level.** `StdVideoAV1Level` stops at 7.3 = 23, so 31 has no Std code point and the index-coded
+comparison that holds across 0…23 says nothing: `31 > 23` is true even of a device that decodes
+everything AV1 can name, which is what makes it useless as a capability test. We write no AV1 level
+on any host encode path, so whichever sentinel the vendor's encoder defaults to is what the client
+must accept. This is the AV1 half of the same defect fixed for H.264/H.265 in v0.28.0, which was
+left alone on the premise that no over-declaration had been seen in the field — the reporter's log
+from that same day already showed otherwise.
+
+### Client stats — the stage line is a partition again
+
+A field reader added up `host 5.4 · net 0.3 · decode 6.6 · display 1.4` against `e2e 8.1` and asked
+why the parts did not sum. Fair question: they sum **without** `decode`.
+
+The stages *are* a per-frame partition of e2e — pts →(host+net)→ received →(decode)→ decoded
+→(display)→ displayed — for as long as the `decoded` stamp is a **completion** stamp. On the
+synchronous rungs it is. On the **native-Vulkan** rung `receive_frame` returns at *submission*
+(~0.1 ms) and the stamp is taken there, so `display` is measured from submit and the GPU decode
+happens **inside** it. `host+net` and `display` already tile e2e; the `decode` figure (received →
+fence-complete) re-counts the GPU work `display` contains — two figures with one overlap, printed
+as though they tiled.
+
+On that rung `decode` now leaves the stage line and gets its own, carrying the two caveats a reader
+needs: it is **one sample per window** there, not the p50 every other figure on that line is, and it
+is already inside `display`, so adding it double-counts. The synchronous rungs are untouched.
+⚠ **Deliberately not changed:** the one-sample-per-window design. A per-frame fence wait serialises
+the decode pipeline (an APU's 19 ms decode capping a 5120×1440 stream at ~51 fps) and polling
+quantises every sample up by a frame interval. The reporting was the defect, not the sampling.
+
+### Host — two warnings that named the wrong subsystem
+
+Both fired in the same 2026-08-13 field log, and both sent an investigation somewhere innocent:
+
+- **"Client keyframe recoveries are METRONOMIC — a periodic host/display disturbance … is the
+  likely cause"**, at `period_s=2.0`, naming three host subsystems. **2.0 s is the *client's*
+  `FLUSH_COOLDOWN`.** The receive-backlog guard sheds a standing queue with a flush plus a keyframe
+  request, rate-limited to one per cooldown, so a client that cannot sustain the stream asks for a
+  keyframe at exactly that spacing for as long as it stays behind. **Perfect periodicity is the
+  signature of a fixed software cooldown, not of a physical disturbance.** The host now compares
+  against `punktfunk_core::client::FLUSH_COOLDOWN` itself rather than a copy of the number, so the
+  two cannot drift.
+- **"The audio encode thread could not keep up — captured audio was DROPPED"**, worst case
+  `dropped_chunks=11251`. Not one sample anybody wanted was lost. PipeWire negotiated a 128-frame
+  quantum, so the plane produces 48000/128 = 375 chunks/s and a 30 s window holds exactly 11250 —
+  a 100 % drop rate at `peak_db=-120.0`, digital silence. Every one of the ten warnings straddled a
+  **session boundary**, and `dropped_chunks/375` matches the seconds with *no live session* in that
+  window to within a fraction of a second. The warning no longer fires for idle seconds.
 
 ### NixOS — the plugin runner was installed, running, and reported missing
 
@@ -248,6 +594,19 @@ longer needed and can be removed.
 NixOS ships only `sh` in `/bin`, so `gamelease`'s hand-off test and `pyrowave_remote`'s
 handshake-rung test failed there for reasons unrelated to the code under test. Both now resolve a
 real binary rather than assuming an FHS path.
+
+### Documentation
+
+**`docs-site/public/openapi.json` was stale again, and by the same mechanism as last release.**
+v0.28.0 fixed it once (it was five releases behind at `0.21.0`); the scanner-removal regen then
+updated `api/openapi.json` alone and it drifted a second time inside that same cycle. It has now
+drifted a third time, across the unpair-all endpoints — the docs-site copy was still stamped
+`0.27.0` and missing both collection deletes. Re-synced; the two files are byte-identical again.
+
+⚠ **The copy is a documented manual step (`cp api/openapi.json docs-site/public/openapi.json`,
+CONTRIBUTING.md) and nothing in CI enforces it.** Three drifts in two release cycles is the
+argument for gating it; until something does, **treat the copy as part of regenerating, not as a
+follow-up.**
 
 ---
 
