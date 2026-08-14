@@ -25,6 +25,12 @@
 //!    behind the measured MMDevices ACL repair (see [`grant_system_full_control`]).
 //! 3. **Capture**: sessions loopback-capture the endpoint ([`PadLoopbackCapturer`], 4 ch f32
 //!    interleaved) and ship the PCM to the client's pad speaker/haptics.
+//! 4. **Visibility** ([`set_visibility`]): the endpoint parks HIDDEN (`DEVICE_STATE_DISABLED`)
+//!    whenever no client pad is attached — provisioning hides it at startup, the per-pad
+//!    streamer shows it for exactly the pad's lifetime. The DualSense disguise that makes games
+//!    route haptics at it during a session makes idle libScePad titles STALL on it otherwise
+//!    (Helldivers 2, field-confirmed 2026-08-14: 2–5 FPS 1% lows with the host idle). The
+//!    devnode, driver binding and stamps stay put, so flips raise no PnP traffic.
 //!
 //! The wiring plan must never route desktop audio or the virtual mic onto these endpoints —
 //! [`audio_control`](super::audio_control) collects the exclusion ids via
@@ -1484,6 +1490,10 @@ static PROVISIONING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 pub(crate) fn provision_at_startup() {
     if !pad_audio_enabled() {
         tracing::info!("pad audio disabled (PUNKTFUNK_PAD_AUDIO=0)");
+        // Endpoints a previous run provisioned persist and stay VISIBLE — and a visible idle
+        // pad speaker is exactly what libScePad titles stall on (see [`set_visibility`]).
+        // Turning the feature off must also park the leftovers.
+        hide_leftover_endpoints();
         return;
     }
     if PROVISIONED.get().is_some() {
@@ -1531,6 +1541,17 @@ pub(crate) fn provision_at_startup() {
                          stored-but-not-served until the next reboot"),
                 }
             }
+            // Park every provisioned endpoint HIDDEN until a client pad actually attaches. The
+            // expensive work (devnode, driver bind, stamps, the AEB kick above) stays at boot —
+            // the #185 lesson: no PnP traffic at session boundaries — but the ENDPOINT must not
+            // sit visible on an idle box: libScePad titles (Helldivers 2, field-confirmed
+            // 2026-08-14) find the "Wireless Controller" speaker BY IDENTITY, engage their
+            // DualSense-haptics path against it, and stall on an endpoint nothing services —
+            // 1% lows of 2–5 FPS with the host completely idle. The per-pad streamer shows it
+            // for exactly the pad's lifetime, like a real DualSense arriving.
+            for pe in &eps {
+                set_visibility(&pe.endpoint_id, pe.pad_index, false);
+            }
             // R5: latch the result ONLY if we actually provisioned something. This used to store
             // whatever `eps` held even when the loop broke on the first error — an empty vec —
             // and `OnceLock` made that permanent: one transient failure (a busy audio stack, a
@@ -1567,6 +1588,54 @@ pub(crate) fn provisioned_endpoints() -> Option<Arc<Vec<PadEndpoint>>> {
 pub(crate) fn ensure_provisioned() {
     if PROVISIONED.get().is_none() {
         provision_at_startup();
+    }
+}
+
+/// Show or hide a pad endpoint (best-effort, logged). Hidden = `DEVICE_STATE_DISABLED` via
+/// [`audio_control::set_endpoint_visibility`] — the endpoint keeps its devnode, driver binding
+/// and DualSense stamps, but vanishes from every ACTIVE enumeration and cannot be opened.
+///
+/// WHY pad endpoints park hidden: the stamp set exists so libScePad titles read the endpoint as
+/// a real DualSense speaker and route haptics audio at it — during a pad session that is the
+/// feature, on an idle box it is a trap. Helldivers 2 (field-confirmed 2026-08-14) finds the
+/// idle "Wireless Controller" speaker, engages its DualSense-haptics path against an endpoint
+/// nothing services, and drops to 2–5 FPS 1% lows with the host completely idle; the manual
+/// community remedy is disabling the device in mmsys.cpl — this is that remedy, automated and
+/// scoped to "no pad attached". Visibility flips raise no PnP traffic (the #185 lesson), only
+/// an endpoint state notification — the same event a real pad's arrival/departure raises.
+pub(crate) fn set_visibility(endpoint_id: &str, pad_index: u8, visible: bool) {
+    match audio_control::set_endpoint_visibility(endpoint_id, visible) {
+        Ok(()) => tracing::info!(pad = pad_index, endpoint = %endpoint_id,
+            state = if visible { "shown (client pad attached)" } else { "hidden (no pad attached)" },
+            "pad-audio endpoint visibility"),
+        Err(e) => tracing::warn!(pad = pad_index, endpoint = %endpoint_id, visible,
+            error = %format!("{e:#}"),
+            "pad-audio endpoint visibility change failed — an idle visible pad speaker can \
+             stall libScePad titles (disable it in mmsys.cpl as a manual fallback)"),
+    }
+}
+
+/// Hide any pad endpoints a previous run left behind — the `PUNKTFUNK_PAD_AUDIO=0` path, where
+/// the provisioning worker never runs but persisted endpoints would otherwise stay visible (and
+/// stall idle libScePad titles) forever.
+fn hide_leftover_endpoints() {
+    let spawned = thread::Builder::new()
+        .name("punktfunk-pad-audio-hide".into())
+        .spawn(|| {
+            if wasapi::initialize_mta().ok().is_err() {
+                return;
+            }
+            for idx in 0..4u8 {
+                match find(idx) {
+                    Ok(Some(pe)) if !pe.endpoint_id.is_empty() => {
+                        set_visibility(&pe.endpoint_id, idx, false);
+                    }
+                    _ => {}
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "could not spawn the pad-endpoint hide sweep");
     }
 }
 

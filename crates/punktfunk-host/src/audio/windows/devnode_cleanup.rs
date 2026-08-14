@@ -46,8 +46,8 @@ pub(crate) struct Removed {
     pub endpoint_records: usize,
 }
 
-/// Restore the default playback device if we left it parked, then remove every audio devnode
-/// this product minted, newest registry record and all.
+/// Restore the default playback/recording devices if we left them parked, then remove every
+/// audio devnode this product minted, newest registry record and all.
 ///
 /// Best-effort throughout, like the rest of the (un)install path: a devnode that refuses to go
 /// is counted and reported, never fatal — a non-zero exit here would abort the whole uninstaller
@@ -59,7 +59,7 @@ pub(crate) fn purge() -> Result<Removed> {
     // what the operator had. Putting it back is the difference between "the box works again"
     // and "the box works again, on the device it started with".
     if audio_control::unpark_default_for_uninstall() {
-        println!("restored the default playback device this host had parked");
+        println!("restored the default audio device(s) this host had parked");
     }
 
     let mut out = Removed::default();

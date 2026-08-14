@@ -24,8 +24,8 @@
 //! the set changes — the thread says why once, then parks on a cheap fingerprint poll and
 //! re-plans the instant the set moves (the 2026-08 field case hammered a full wiring pass —
 //! IPolicyConfig writes included — every 2 s for 8+ minutes without ever being able to
-//! succeed). On thread exit (capturer dropped at stream end) the parked default playback
-//! device is restored.
+//! succeed). On thread exit (capturer dropped at stream end) the parked default playback AND
+//! recording devices are restored — both defaults are strictly session-scoped.
 
 use super::capture_policy::{CaptureStats, FightDamper, FIGHT_BACKOFF, STATS_EVERY};
 use super::{audio_control, wiring_plan, AudioCapturer, SAMPLE_RATE};
@@ -290,9 +290,13 @@ fn capture_thread(
             }
         }
     }
-    // Hand the default playback device back to the operator (no-op if we never parked it, or if
-    // they changed it themselves mid-stream). COM is initialized on this thread.
+    // Hand the default playback AND recording devices back to the operator (no-ops if we never
+    // parked them, or if they changed them themselves mid-stream). COM is initialized on this
+    // thread. The recording restore is what keeps the parked default session-scoped — an idle
+    // box holding the default microphone on a virtual mic nothing feeds is the 2026-08
+    // Helldivers 2 tank (see `audio_control`'s module docs).
     audio_control::restore_default_playback();
+    audio_control::restore_default_recording();
     Ok(())
 }
 

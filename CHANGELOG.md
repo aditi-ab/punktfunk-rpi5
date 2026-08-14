@@ -14,6 +14,58 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ## v0.28.1 — in development
 
+### The pad-audio "Wireless Controller" speaker hides while no client pad is attached
+
+Field-confirmed (2026-08-14, the same Helldivers 2 reports as below): the per-pad audio endpoint
+the Windows host mints — a Steam-Streaming-Speakers instance stamped with a DualSense's name,
+container and 4 ch/48 kHz formats, **pre-provisioned at every host start** — is deliberately
+indistinguishable from a real DualSense speaker. That disguise is the feature during a pad
+session (libScePad titles route haptics audio at it) and a trap the rest of the time: an idle
+Helldivers 2 finds the endpoint by identity, engages its DualSense-haptics path against a device
+nothing services, and drops to 2–5 FPS 1% lows — with the host completely idle, no controller
+plugged in, and no session ever run. The reporter isolating "the DualSense speaker" and disabling
+it in mmsys.cpl restored full performance; that manual remedy is now automatic.
+
+The endpoint now parks **hidden** (`DEVICE_STATE_DISABLED`, via `IPolicyConfig::
+SetEndpointVisibility` — the exact call behind mmsys.cpl's Disable) whenever no client pad is
+attached: provisioning hides it at startup (and a `PUNKTFUNK_PAD_AUDIO=0` host hides leftovers
+from earlier runs), the per-pad streamer shows it for exactly the pad's lifetime — to a game,
+indistinguishable from a DualSense arriving and leaving. The devnode, driver binding and stamps
+stay put, so the flips raise no PnP traffic and the expensive provisioning still happens once at
+boot.
+
+⚠ **Operator-visible:** "Speakers (Wireless Controller)" now shows as *disabled* in the Sound
+control panel while no client pad is connected — that is the parked state, not a defect. The
+`pad-endpoint` devtest grew `show`/`hide` verbs; `tone`/`capture` need a `show` first.
+
+### An idle Windows host no longer owns the box's default microphone
+
+Field report (the second Helldivers 2 one — the first led to v0.28.0's mint-retry fix): with the
+host **idle**, a locally played Helldivers 2 tanks to 2–5 FPS 1% lows, and Windows' own Sound
+settings Recording tab goes unresponsive. Root cause: the audio wiring pass asserted *default
+recording = the virtual mic's capture side* on **every** pass, including the mic pump's eager
+boot pass — and `SetDefaultEndpoint` covers eCommunications, so every game's voice input bound a
+virtual microphone whose feeder only runs during a stream. Nothing ever restored it: not session
+end, not service stop. Games that hold an always-open voice capture (Helldivers 2 is Wwise +
+in-game voice — its own wiki calls the game "finicky with audio devices") stall on that dead
+endpoint.
+
+The recording default is now **session-scoped**, exactly like the playback default has always
+been: parked on the virtual mic only while a desktop-audio capture is open, the operator's device
+remembered (plus an on-disk crash marker, `audio-default-rec.prev`), restored when the capture
+closes, recovered at next boot after a crash, and unparked by the uninstaller. A game launched
+*during* a stream still records the client's mic; one launched before the stream keeps the
+operator's own microphone.
+
+Boxes wedged by earlier builds (which recorded nothing to restore) heal themselves: an idle
+wiring pass that finds the default recording sitting on the plan's mic capture moves it back to
+the first real microphone.
+
+⚠ **Operator-visible:** outside a stream, the default recording device is now whatever you set —
+Punktfunk only takes it for the duration of a stream. If you *want* apps to record the client mic
+while idle, select "Punktfunk Microphone" manually; the host no longer re-asserts it (idle
+re-assertion used to stomp a manual choice within one mic-pump reopen).
+
 ### The NixOS module started a second host in root's systemd, which stole the ports from the real one
 
 Found on the first real deployment of `packaging/nix/nixos-module.nix` (NixOS 26.05, punktfunk
