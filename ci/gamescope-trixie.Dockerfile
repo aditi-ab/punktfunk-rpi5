@@ -51,6 +51,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxdamage-dev libxcomposite-dev libxrender-dev libxext-dev libxxf86vm-dev \
     libxtst-dev libx11-dev libxres-dev libxmu-dev libxcursor-dev libxi-dev \
     libxfixes-dev libxkbcommon-dev libxkbcommon-x11-dev libcap-dev libdrm-dev \
+    # x11-xcb is needed by the VULKAN WSI LAYER (layer/meson.build), not by the compositor — so it
+    # was not missed until v0.28.1 started building the layer beside the binary. Debian is the only
+    # channel that needs it named: Arch's libx11 and Fedora's libX11-devel both carry x11-xcb.pc
+    # themselves, while Debian splits it into its own -dev package.
+    libx11-xcb-dev \
     libinput-dev libudev-dev libpipewire-0.3-dev libseat-dev libsdl2-dev \
     libluajit-5.1-dev libavif-dev libdecor-0-dev hwdata libglm-dev libbenchmark-dev \
     libvulkan-dev libxcb1-dev libxcb-composite0-dev libxcb-xfixes0-dev libxcb-res0-dev \
@@ -66,3 +71,13 @@ RUN set -eux; \
     pkg-config --atleast-version=1.23.1 wayland-server \
       || { echo "wayland-server $have < 1.23.1 — the vendored wlroots will not configure" >&2; exit 1; }; \
     echo "wayland-server $have — OK"
+
+# The layer's own floor, asserted for the same reason: a missing x11-xcb does not fail the
+# COMPOSITOR build, it fails `layer/meson.build` — and the layer is the only route to an HDR10
+# swapchain for a nested game, so losing it silently ships a package that looks healthy and denies
+# every game HDR. This is exactly how v0.28.1's deb leg broke, one release after the layer was
+# added; assert it here so the next dep the layer grows fails at image build, not mid-release.
+RUN set -eux; \
+    pkg-config --exists x11-xcb \
+      || { echo "x11-xcb absent — the Vulkan WSI layer will not configure (need libx11-xcb-dev)" >&2; exit 1; }; \
+    echo "x11-xcb $(pkg-config --modversion x11-xcb) — OK"
