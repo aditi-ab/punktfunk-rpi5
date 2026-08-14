@@ -9,11 +9,13 @@
 #                   login gate, session sealing, mgmt bearer token), sdk (@punktfunk/host),
 #                   plugin-kit (@punktfunk/plugin-kit).
 #   * pnpm audit  → clients/decky (the Steam Deck plugin).
-#   * docs-site   → scanned NON-blocking (continue-on-error): known transitive advisories ride in
-#                   via the CMS/UI chain (@unom/ui → payload → dompurify/monaco) and the nitropack
-#                   build chain (node-tar, brace-expansion); clearing them needs coordinated bumps
-#                   verified against the LIVE site (the docs don't build standalone) — tracked in
-#                   punktfunk-planning design/cra-readiness.md. Flip to blocking once clean.
+#   * docs-site   → scanned NON-blocking (continue-on-error). 2026-08-14: docs-site's own deps
+#                   are current (fumadocs/tanstack/react bumped; build + tsc + serve verified),
+#                   but every remaining advisory is pinned INSIDE @unom/ui 0.9.2's dependency
+#                   tree (@payloadcms/* → fast-uri/image-size/sharp, next 16.x, sass→immutable) —
+#                   nothing bumpable from this lockfile, and overrides would fork what the CMS
+#                   actually ships. The fix belongs in the @unom/ui package repo; flip this to
+#                   blocking after a ui release with a clean payload chain lands here.
 #   * cargo-about → license-allowlist gate over the host + driver workspaces (about.toml `accepted`);
 #                   fails if any crate carries a license outside the allowlist — the regression
 #                   guard about.toml always promised. (The Android Gradle tree has no lockfile, so

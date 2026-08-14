@@ -5,12 +5,16 @@ machine, so we take security reports seriously and appreciate responsible disclo
 
 ## Supported versions
 
-Punktfunk ships on two tracks — **stable** (a `vX.Y.Z` tag; the current line is **0.22.x**) and
+Punktfunk ships on two tracks — **stable** (a `vX.Y.Z` tag) and
 **canary** (built from `main`). Fixes ship as a new release on those tracks; in practice
 we don't backport to older minor versions, so the supported versions are the latest stable release
 and the current canary build. If you're on an older build, please check that the issue still
 reproduces on the latest stable before reporting it. See
 [Release Channels](https://docs.punktfunk.unom.io/docs/channels).
+
+Security fixes are **free of charge**, ship **without undue delay**, and are **separated from
+feature updates where feasible**: on the stable track they arrive as patch releases (`vX.Y.Z+1`)
+that carry the fix rather than waiting on the next feature release.
 
 ## Reporting a vulnerability
 

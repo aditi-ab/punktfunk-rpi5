@@ -62,10 +62,18 @@
     {
       "type": "application",
       "name": "punktfunk-gamescope",
-      "version": "upstream gamescope pinned by packaging/nix/gamescope.nix (nixpkgs) or built by packaging/gamescope/build-punktfunk-gamescope.sh, plus 3 local patches from packaging/gamescope/patches/",
+      "version": "upstream gamescope pinned by packaging/nix/gamescope.nix (nixpkgs) or built by packaging/gamescope/build-punktfunk-gamescope.sh, plus the local patch series from packaging/gamescope/patches/",
       "description": "Patched gamescope compositor distributed via sysext/Arch/nix channels alongside the host",
       "licenses": [{ "license": { "id": "BSD-2-Clause" } }],
       "externalReferences": [{ "type": "vcs", "url": "https://github.com/ValveSoftware/gamescope" }]
+    },
+    {
+      "type": "application",
+      "name": "Bun",
+      "version": "1.3.14 (pinned in .gitea/workflows/windows-host.yml)",
+      "description": "Portable JavaScript runtime bundled in the Windows host installer to run the web console (.output) and the plugin/script runner. Embeds JavaScriptCore (LGPL-2.1).",
+      "licenses": [{ "license": { "id": "MIT" } }],
+      "externalReferences": [{ "type": "vcs", "url": "https://github.com/oven-sh/bun" }]
     }
   ]
 }
