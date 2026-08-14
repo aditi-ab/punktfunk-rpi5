@@ -782,6 +782,28 @@ pub fn touch_last_used(fp_hex: &str) {
     }
 }
 
+/// Save a host's management-API port learned from the **session's own `Welcome`**, keyed by
+/// fingerprint alone — the identity a just-connected client is certain of.
+///
+/// This is the mDNS-free path, and the one that matters most: [`learn_mgmt_port`] can only fire
+/// where an advert is visible, whereas this fires on any successful connect, including a host
+/// added by IP on a network where discovery has never worked. No-op — and no disk write — when
+/// the fingerprint isn't stored or the value is unchanged, so it is safe on every connect.
+pub fn learn_mgmt_port_by_fp(fp_hex: &str, mgmt_port: u16) {
+    if fp_hex.is_empty() || mgmt_port == 0 {
+        return;
+    }
+    let mut known = KnownHosts::load();
+    let Some(h) = known.hosts.iter_mut().find(|h| h.fp_hex == fp_hex) else {
+        return;
+    };
+    if h.mgmt_port == Some(mgmt_port) {
+        return;
+    }
+    h.mgmt_port = Some(mgmt_port);
+    let _ = known.save();
+}
+
 /// Run the SPAKE2 PIN ceremony against a host. `device_name` is the label the HOST
 /// stores this client under (its paired-devices list); the 90 s budget covers a
 /// human-typed PIN. Returns the host's now-verified certificate fingerprint to pin.

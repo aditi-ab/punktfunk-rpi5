@@ -66,6 +66,23 @@ pub const DEFAULT_PORT: u16 = 47990;
 /// The file [`publish_endpoint`] writes the effective mgmt URL to, next to `mgmt-token`.
 const ENDPOINT_FILE: &str = "mgmt-endpoint";
 
+/// The port the management API actually bound, recorded once by [`publish_endpoint`].
+static EFFECTIVE_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+
+/// The mgmt port this process is serving on, or `0` when there is no management API at all — the
+/// standalone `punktfunk1-host` binary, which never calls [`publish_endpoint`].
+///
+/// The native handshake reads this to put the port in every session's `Welcome`, so a client learns
+/// it over the connection it has already authenticated instead of needing the mDNS advert. Resolved
+/// ONCE, from the same value the endpoint file carries, so the wire, the file and the advert cannot
+/// disagree — the whole point of this being a lookup rather than a fourth place to compute a port.
+///
+/// ⚠ `0` matters: advertising 47990 from a host with no mgmt API would point clients at a port
+/// nothing is listening on, which is strictly worse than saying nothing and letting them fall back.
+pub fn effective_port() -> u16 {
+    EFFECTIVE_PORT.get().copied().unwrap_or(0)
+}
+
 /// Publish the mgmt API's *effective* loopback URL to `<config-dir>/mgmt-endpoint`, in the same
 /// `KEY=VALUE` form as `mgmt-token` so the bundled console can source it directly as a systemd
 /// `EnvironmentFile` (and `windows::service::spawn_web` can read it with `read_env_file_value`).
@@ -84,6 +101,9 @@ const ENDPOINT_FILE: &str = "mgmt-endpoint";
 /// Best-effort: a console that cannot read this simply falls back to 47990, which is strictly what
 /// it did before, so a write failure must not stop the host from serving.
 pub fn publish_endpoint(bind: SocketAddr) {
+    // Record it for [`effective_port`] BEFORE the write: the native handshake reads that to put the
+    // port in every Welcome, and a failed file write must not also cost us the in-band answer.
+    let _ = EFFECTIVE_PORT.set(bind.port());
     let dir = pf_paths::config_dir();
     if let Err(e) = pf_paths::create_private_dir(&dir) {
         tracing::warn!(error = %e, "could not create the config dir to publish the mgmt endpoint");

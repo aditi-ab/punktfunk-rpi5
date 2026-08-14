@@ -176,7 +176,16 @@ pub use stats::Stats;
 /// is unchanged (it simply keeps the double-arm race the pair exists to close). Additive and
 /// client-local: nothing new goes on the wire — the width is computed from frame indices the client
 /// already receives — so [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 19;
+/// v20: `punktfunk_connection_mgmt_port` — reads the host's management-API port out of the
+/// session's `Welcome`, so a client can find the game library WITHOUT mDNS. The port previously
+/// existed only in the host's mDNS TXT, which made a host that had moved it off 47990 (the
+/// supported way to share a machine with a Sunshine fork, whose web UI owns that port) reachable
+/// only where multicast worked — over a VPN, a routed subnet, or for a host added by IP, the
+/// library silently fell back to a port nothing was listening on. A NEW symbol, not a widened one:
+/// every existing function keeps its signature and behaviour, and an embedder that never calls it
+/// is unchanged. The `Welcome` grew a trailing field, which older peers skip in both directions
+/// (see `Welcome::encode`), so [`WIRE_VERSION`] is unchanged.
+pub const ABI_VERSION: u32 = 20;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

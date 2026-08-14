@@ -50,6 +50,21 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeClipSupport
     client(handle).is_some_and(|h| h.client.host_caps() & HOST_CAP_CLIPBOARD != 0)
 }
 
+/// `NativeBridge.nativeHostMgmtPort(handle)` — the management-API port the host reported in this
+/// session's `Welcome`, or `0` if it advertised none (older host / no management API).
+///
+/// Kotlin persists this on the host record, which is what lets the library screen reach a host that
+/// moved its mgmt port off 47990 WITHOUT ever having seen an mDNS advert — the VPN / routed-subnet
+/// / added-by-address cases, where the `mgmt` TXT the discovery path relies on never arrives.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostMgmtPort(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+) -> jint {
+    client(handle).map_or(0, |h| jint::from(h.client.mgmt_port()))
+}
+
 /// `NativeBridge.nativeClipControl(handle, enabled)` — session-level opt-in/out. Nothing
 /// clipboard-related happens on either side until an `enabled: true` crosses.
 #[unsafe(no_mangle)]

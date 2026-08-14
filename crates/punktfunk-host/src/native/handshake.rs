@@ -658,9 +658,14 @@ pub(super) async fn negotiate(
             } else {
                 0
             },
+        // Where this host serves its game library, so the client never has to have seen an mDNS
+        // advert to find it. `0` on the standalone punktfunk1-host binary (no management API),
+        // and the client then keeps its compiled-in default.
+        mgmt_port: crate::mgmt::effective_port(),
         // The negotiated session AEAD (resolved above) + its 32-byte key toward a ChaCha
         // client; toward everyone else cipher 0 keeps the Welcome byte-identical to the
-        // pre-cipher wire form. The host's own data plane picks the cipher up via
+        // pre-cipher wire form — unless a mgmt port rides along, which forces the cipher
+        // placeholder (see `Welcome::encode`). The host's own data plane picks the cipher up via
         // `welcome.session_config` — no other host change.
         cipher: if chacha {
             punktfunk_core::quic::CIPHER_CHACHA20_POLY1305

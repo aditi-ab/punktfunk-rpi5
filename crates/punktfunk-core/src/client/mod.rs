@@ -268,6 +268,9 @@ pub struct NativeClient {
     /// The host capability bitfield ([`crate::quic::Welcome::host_caps`]) — see
     /// [`NativeClient::host_caps`].
     pub host_caps: u8,
+    /// The host's management-API port ([`crate::quic::Welcome::mgmt_port`]), or `0` when the host
+    /// did not advertise one — see [`NativeClient::mgmt_port`].
+    pub mgmt_port: u16,
     /// Speed-test accumulator, shared with the data-plane pump + control task.
     probe: Arc<Mutex<ProbeState>>,
     shutdown: Arc<AtomicBool>,
@@ -723,6 +726,7 @@ impl NativeClient {
             next_xfer_id: AtomicU32::new(1),
             pen_seq: AtomicU16::new(0),
             host_caps: negotiated.host_caps,
+            mgmt_port: negotiated.mgmt_port,
             probe,
             shutdown,
             end_reason,
@@ -1376,6 +1380,18 @@ impl NativeClient {
     /// shared-clipboard toggle.
     pub fn host_caps(&self) -> u8 {
         self.host_caps
+    }
+
+    /// The host's management-API port, from this session's [`crate::quic::Welcome`] — where its
+    /// game library is served. `0` when the host did not advertise one (an older host, or the
+    /// standalone `punktfunk1-host` binary, which has no management API); the caller then keeps
+    /// its own default.
+    ///
+    /// This is the mDNS-free answer to "where is the library": it arrives over the connection the
+    /// client has already authenticated, so a host reached by IP over a VPN — or on any network
+    /// where multicast never worked — no longer has to be assumed to be on 47990.
+    pub fn mgmt_port(&self) -> u16 {
+        self.mgmt_port
     }
 
     /// Enable or disable the shared clipboard for this session (`design/clipboard-and-file-transfer.md`

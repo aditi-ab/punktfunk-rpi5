@@ -354,9 +354,14 @@ struct ContentView: View {
                 // Persist on the next runloop tick: HostStore is an ObservableObject, and mutating
                 // its @Published from inside .onChange (a view-update callback) trips SwiftUI's
                 // "Publishing changes from within view updates". A one-tick delay is imperceptible.
+                // The session's own Welcome told us where this host's library lives — the one
+                // source that does not need an mDNS advert, so it also covers a host reached by
+                // address over a VPN. 0 = not advertised; updateMgmtPort ignores it.
+                let liveMgmtPort = model.connection?.hostMgmtPort
                 let store = store
                 DispatchQueue.main.async {
                     store.markConnected(host.id)
+                    store.updateMgmtPort(host.id, port: liveMgmtPort)
                     if let approvedFingerprint { store.pin(host.id, fingerprint: approvedFingerprint) }
                 }
             case .idle:

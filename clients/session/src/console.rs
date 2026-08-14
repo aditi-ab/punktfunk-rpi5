@@ -184,7 +184,7 @@ pub fn run(target: Option<&str>) -> u8 {
         vsync: settings_at_start.vsync,
         allow_vrr: settings_at_start.allow_vrr,
         json_status,
-        on_connected: Some(Box::new(move |fingerprint: [u8; 32]| {
+        on_connected: Some(Box::new(move |fingerprint: [u8; 32], mgmt_port: u16| {
             let fp_hex = trust::hex(&fingerprint);
             trust::touch_last_used(&fp_hex);
             // A request-access connect just succeeded → the operator approved us. Save the
@@ -194,6 +194,10 @@ pub fn run(target: Option<&str>) -> u8 {
                     trust::persist_host(&p.name, &p.addr, p.port, &fp_hex, true);
                 }
             }
+            // Where this host serves its library, from the session's own Welcome — recorded
+            // AFTER the persist above so a host saved by this very connect gets it too. `0` =
+            // the host advertised none, and the call is a no-op.
+            trust::learn_mgmt_port_by_fp(&fp_hex, mgmt_port);
         })),
         overlay: Some(Box::new(overlay)),
         window_size: crate::session_main::window_size(&settings_at_start),

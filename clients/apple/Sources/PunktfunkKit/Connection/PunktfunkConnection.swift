@@ -452,6 +452,14 @@ public final class PunktfunkConnection {
     /// The host capability bitfield (`Welcome.host_caps`): `PUNKTFUNK_HOST_CAP_GAMEPAD_STATE` /
     /// `PUNKTFUNK_HOST_CAP_CLIPBOARD`. `0` for an older host that didn't say.
     public private(set) var hostCaps: UInt8 = 0
+    /// The host's management-API port, from this session's `Welcome` — where its game library is
+    /// served. `0` when the host advertised none (an older host, or one with no management API);
+    /// resolve through `StoredHost.effectiveMgmtPort` rather than dialing a `0`.
+    ///
+    /// Read this after a connect and persist it: it is the only source that does not depend on
+    /// mDNS, so it is what makes a moved mgmt port work for a host reached over a VPN or added by
+    /// address on a network where discovery never functions.
+    public private(set) var hostMgmtPort: UInt16 = 0
     /// Whether this host advertises the shared clipboard (`HOST_CAP_CLIPBOARD`) — the gate for
     /// offering the clipboard toggle. Absent on an older host, or one whose operator policy
     /// (`PUNKTFUNK_CLIPBOARD=off`) keeps the feature dark.
@@ -677,6 +685,12 @@ public final class PunktfunkConnection {
         var caps: UInt8 = 0
         _ = punktfunk_connection_host_caps(handle, &caps)
         hostCaps = caps
+        // Where this host serves its game library, straight from the session's Welcome. 0 = the
+        // host advertised none (older host / no management API), and the caller keeps whatever it
+        // already had. This is the answer that does NOT require an mDNS advert to have been seen.
+        var mgmt: UInt16 = 0
+        _ = punktfunk_connection_mgmt_port(handle, &mgmt)
+        hostMgmtPort = mgmt
     }
 
     /// A bandwidth speed-test measurement (see `startSpeedTest`). Partial until `done`.

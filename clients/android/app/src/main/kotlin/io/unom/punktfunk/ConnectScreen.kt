@@ -322,13 +322,24 @@ fun ConnectScreen(
     // What the stream screen is handed: the settings this connect actually used, plus the HOST's
     // clipboard decision (a property of the record, not a global). A host we never saved — a
     // connect that failed to pin — falls back to the on default the setting always had.
-    fun session(handle: Long, record: KnownHost?, profile: StreamProfile?) = ActiveSession(
-        handle,
-        settings.effectiveFor(profile),
-        clipboardSync = record?.clipboardSync ?: true,
-        profileName = profile?.name,
-        hostId = record?.id,
-    )
+    fun session(handle: Long, record: KnownHost?, profile: StreamProfile?): ActiveSession {
+        // The session's own Welcome carries where this host serves its library. Save it now: this
+        // is the only source that does not need an mDNS advert, so it is what makes a host that
+        // moved off 47990 browsable over a VPN or when it was added by address. 0 = not
+        // advertised, and learnMgmtPort ignores it.
+        if (record != null) {
+            NativeBridge.nativeHostMgmtPort(handle).takeIf { it > 0 }?.let {
+                knownHostStore.learnMgmtPort(record.address, record.port, it)
+            }
+        }
+        return ActiveSession(
+            handle,
+            settings.effectiveFor(profile),
+            clipboardSync = record?.clipboardSync ?: true,
+            profileName = profile?.name,
+            hostId = record?.id,
+        )
+    }
 
     // The actual dial (identity already ready). On a TOFU connect (pinHex null), pin the fingerprint
     // the host presented (as an unpaired known host) so the next connect goes straight through and it
