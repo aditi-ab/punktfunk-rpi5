@@ -15,11 +15,18 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BatteryFull
+import androidx.compose.material.icons.filled.SignalCellular4Bar
+import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material3.Icon
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -98,6 +105,51 @@ import io.unom.punktfunk.models.HostStatus
 @Composable
 internal fun ShotTheme(content: @Composable () -> Unit) {
     MaterialTheme(colorScheme = BrandDark, content = content)
+}
+
+/**
+ * Robolectric has no system UI, so every capture was missing the status bar and the content sat
+ * where the bar belongs — on the Pixel render the app title collided with the camera punch-hole.
+ * This frame draws a plausible bar (time left, radios right, the CENTRE left empty for the hole)
+ * and pushes the scene below it, the same geometry real insets produce. The height mirrors a
+ * Pixel's tall bar as measured off a real 1344×2992 capture (~145 px ≈ 40 dp).
+ */
+@Composable
+internal fun ShotStatusFrame(content: @Composable () -> Unit) {
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        Row(
+            Modifier.fillMaxWidth().height(40.dp).padding(horizontal = 28.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "21:47",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.9f),
+            )
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    Icons.Filled.Wifi, contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.9f),
+                    modifier = Modifier.size(15.dp),
+                )
+                Icon(
+                    Icons.Filled.SignalCellular4Bar, contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.9f),
+                    modifier = Modifier.size(14.dp),
+                )
+                Icon(
+                    Icons.Filled.BatteryFull, contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.9f),
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+        }
+        Box(Modifier.weight(1f).fillMaxWidth()) { content() }
+    }
 }
 
 private data class MockHost(

@@ -34,18 +34,31 @@ class ScreenshotTest {
     // cursor via an infinite animation that otherwise keeps Compose perpetually "busy", so
     // setContent's wait-for-idle never returns. Frozen, the capture is also deterministic.
 
-    /** Full-screen content scenes: the compose root fills the device, so a root capture is the shot. */
-    private fun shootRoot(name: String, content: @androidx.compose.runtime.Composable () -> Unit) {
+    /**
+     * Full-screen content scenes: the compose root fills the device, so a root capture is the
+     * shot. [statusBar] draws the fake system bar and pushes content below it (see
+     * [ShotStatusFrame]) — off for the immersive surfaces (stream, console shell), which hide
+     * the real bar too.
+     */
+    private fun shootRoot(
+        name: String,
+        statusBar: Boolean = true,
+        content: @androidx.compose.runtime.Composable () -> Unit,
+    ) {
         compose.mainClock.autoAdvance = false
-        compose.setContent { ShotTheme(content) }
+        compose.setContent { ShotTheme { if (statusBar) ShotStatusFrame(content) else content() } }
         compose.mainClock.advanceTimeBy(800)
         compose.onRoot().captureRoboImage("$out/phone-$name.png")
     }
 
     /** Dialog scenes: the AlertDialog is a separate window, so capture the whole screen (all windows). */
-    private fun shootScreen(name: String, content: @androidx.compose.runtime.Composable () -> Unit) {
+    private fun shootScreen(
+        name: String,
+        statusBar: Boolean = true,
+        content: @androidx.compose.runtime.Composable () -> Unit,
+    ) {
         compose.mainClock.autoAdvance = false
-        compose.setContent { ShotTheme(content) }
+        compose.setContent { ShotTheme { if (statusBar) ShotStatusFrame(content) else content() } }
         // 1.6 s, not 0.8: a ModalBottomSheet's entrance spring is still mid-rise at 0.8 s and the
         // add-host sheet's Connect button was captured half below the frame.
         compose.mainClock.advanceTimeBy(1600)
@@ -75,25 +88,25 @@ class ScreenshotTest {
 
     @Test
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi") // landscape — the stream is immersive
-    fun stream() = shootRoot("stream") { StreamScene(io.unom.punktfunk.StatsVerbosity.DETAILED) }
+    fun stream() = shootRoot("stream", statusBar = false) { StreamScene(io.unom.punktfunk.StatsVerbosity.DETAILED) }
 
     @Test
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
-    fun streamCompact() = shootRoot("stream-compact") { StreamScene(io.unom.punktfunk.StatsVerbosity.COMPACT) }
+    fun streamCompact() = shootRoot("stream-compact", statusBar = false) { StreamScene(io.unom.punktfunk.StatsVerbosity.COMPACT) }
 
     @Test
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
-    fun streamNormal() = shootRoot("stream-normal") { StreamScene(io.unom.punktfunk.StatsVerbosity.NORMAL) }
+    fun streamNormal() = shootRoot("stream-normal", statusBar = false) { StreamScene(io.unom.punktfunk.StatsVerbosity.NORMAL) }
 
     // Both banner texts, in the stream's own landscape geometry — it is bottom-centre, so the
     // aspect is load-bearing.
     @Test
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
-    fun streamBannerPad() = shootRoot("stream-banner-pad") { StreamBannerScene(pad = true) }
+    fun streamBannerPad() = shootRoot("stream-banner-pad", statusBar = false) { StreamBannerScene(pad = true) }
 
     @Test
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
-    fun streamBannerTouch() = shootRoot("stream-banner-touch") { StreamBannerScene(pad = false) }
+    fun streamBannerTouch() = shootRoot("stream-banner-touch", statusBar = false) { StreamBannerScene(pad = false) }
 
     // The touch flow is a Material dialog over the host grid (a separate window → shootScreen).
     @Test
@@ -116,15 +129,15 @@ class ScreenshotTest {
 
     // The console flow is the full-screen aurora takeover (a root capture).
     @Test
-    fun connectingConsole() = shootRoot("connecting-console") { ConnectConsoleScene() }
+    fun connectingConsole() = shootRoot("connecting-console", statusBar = false) { ConnectConsoleScene() }
 
     @Test
-    fun consoleSettings() = shootRoot("console-settings") { ConsoleSettingsScene() }
+    fun consoleSettings() = shootRoot("console-settings", statusBar = false) { ConsoleSettingsScene() }
 
     /** A PALE palette: the whole UI flips to dark ink on white frost, which only a shot proves. */
     @Test
     fun consoleSettingsLight() =
-        shootRoot("console-settings-light") { ConsoleSettingsScene(paletteId = "holo") }
+        shootRoot("console-settings-light", statusBar = false) { ConsoleSettingsScene(paletteId = "holo") }
 
     /**
      * Landscape — the orientation the console actually runs in, and a DIFFERENT layout since the
@@ -134,16 +147,16 @@ class ScreenshotTest {
     @Test
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
     fun consoleSettingsLandscape() =
-        shootRoot("console-settings-landscape") { ConsoleSettingsScene() }
+        shootRoot("console-settings-landscape", statusBar = false) { ConsoleSettingsScene() }
 
     // The console home, the screen the living backdrop is most of. The default sdk (36) draws the
     // real AGSL MESH field; the paired API-31 shot below draws the blob fallback, so the two
     // renderings of the same palette can be compared rather than assumed equivalent.
     @Test
-    fun consoleHome() = shootRoot("console-home") { ConsoleHomeScene() }
+    fun consoleHome() = shootRoot("console-home", statusBar = false) { ConsoleHomeScene() }
 
     @Test
-    fun consoleHomeLight() = shootRoot("console-home-light") { ConsoleHomeScene(paletteId = "holo") }
+    fun consoleHomeLight() = shootRoot("console-home-light", statusBar = false) { ConsoleHomeScene(paletteId = "holo") }
 
     /**
      * Landscape — the orientation the console UI actually runs in, and the only one wide enough to
@@ -151,7 +164,7 @@ class ScreenshotTest {
      */
     @Test
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
-    fun consoleHomeLandscape() = shootRoot("console-home-landscape") { ConsoleHomeScene() }
+    fun consoleHomeLandscape() = shootRoot("console-home-landscape", statusBar = false) { ConsoleHomeScene() }
 
     /**
      * The API 31/32 field. `RuntimeShader` is API 33+, so everything below it keeps the four
@@ -160,20 +173,20 @@ class ScreenshotTest {
      */
     @Test
     @Config(sdk = [31], qualifiers = "w360dp-h800dp-xxhdpi")
-    fun consoleHomeBlobFallback() = shootRoot("console-home-blobs") { ConsoleHomeScene() }
+    fun consoleHomeBlobFallback() = shootRoot("console-home-blobs", statusBar = false) { ConsoleHomeScene() }
 
     // The two screens the console reached for the first time in WP8.3. Each is shot on a dark AND a
     // pale palette, because the console draws them through a ColorScheme derived from the palette's
     // ink — and the pale one is the only place a grey-on-pastel slip can show up.
     @Test
-    fun consoleLicenses() = shootRoot("console-licenses") { ConsoleLicensesScene() }
+    fun consoleLicenses() = shootRoot("console-licenses", statusBar = false) { ConsoleLicensesScene() }
 
     @Test
     fun consoleLicensesLight() =
-        shootRoot("console-licenses-light") { ConsoleLicensesScene(paletteId = "holo") }
+        shootRoot("console-licenses-light", statusBar = false) { ConsoleLicensesScene(paletteId = "holo") }
 
     @Test
-    fun consoleControllers() = shootRoot("console-controllers") { ConsoleControllersScene() }
+    fun consoleControllers() = shootRoot("console-controllers", statusBar = false) { ConsoleControllersScene() }
 
     /**
      * The touch presentation, pads connected — landscape, like every store frame: the app is
@@ -187,7 +200,7 @@ class ScreenshotTest {
     @Test
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
     fun consoleControllersLandscape() =
-        shootRoot("console-controllers-landscape") { ConsoleControllersScene() }
+        shootRoot("console-controllers-landscape", statusBar = false) { ConsoleControllersScene() }
 
     /**
      * The library coverflow with a mock shelf — the store's PICK & PLAY frame. Landscape: the
@@ -195,11 +208,11 @@ class ScreenshotTest {
      */
     @Test
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
-    fun library() = shootRoot("library") { LibraryScene() }
+    fun library() = shootRoot("library", statusBar = false) { LibraryScene() }
 
     @Test
     fun consoleControllersLight() =
-        shootRoot("console-controllers-light") { ConsoleControllersScene(paletteId = "holo") }
+        shootRoot("console-controllers-light", statusBar = false) { ConsoleControllersScene(paletteId = "holo") }
 
     @Test
     fun trust() = shootScreen("trust") {
