@@ -69,11 +69,18 @@ pub struct WlrootsDisplay {
     /// never be served out-of-band: it now degrades to `Embedded` and streams, where it used to
     /// cancel the cast and hand the client a black screen.
     hw_cursor: bool,
+    /// What the portal actually gave us on the most recent [`create`](VirtualDisplay::create) — see
+    /// [`VirtualDisplay::last_portal_cursor_mode`], which is how the host learns that a cursor
+    /// overlay is never coming instead of inferring it from an absence.
+    last_cursor_mode: Option<crate::portal_cursor::Mode>,
 }
 
 impl WlrootsDisplay {
     pub fn new() -> Result<Self> {
-        Ok(WlrootsDisplay { hw_cursor: false })
+        Ok(WlrootsDisplay {
+            hw_cursor: false,
+            last_cursor_mode: None,
+        })
     }
 }
 
@@ -100,6 +107,10 @@ impl VirtualDisplay for WlrootsDisplay {
 
     fn hw_cursor(&self) -> bool {
         self.hw_cursor
+    }
+
+    fn last_portal_cursor_mode(&self) -> Option<crate::PortalCursorMode> {
+        self.last_cursor_mode
     }
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
@@ -148,16 +159,21 @@ impl VirtualDisplay for WlrootsDisplay {
         // its own thread (it parks to keep the cast alive, like the other backends). Serialized:
         // the chooser is one per-user file, so a concurrent session's write between ours and xdpw's
         // read would silently capture the wrong output (see `SELECTION_LOCK`).
-        let (fd, node_id, stop) = {
+        let (fd, node_id, cursor_mode, stop) = {
             let _sel = SELECTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             select_and_cast(&name, self.hw_cursor)?
         };
+        // Latched for `last_portal_cursor_mode`: xdpw refuses metadata by construction, so this is
+        // `embedded` whatever we asked for, and the session's whole cursor behaviour follows from
+        // that fact rather than from `hw_cursor`.
+        self.last_cursor_mode = Some(cursor_mode);
         tracing::info!(
             node_id,
             output = %name,
             w = mode.width,
             h = mode.height,
             hz = mode.refresh_hz,
+            cursor = cursor_mode.name(),
             "sway headless output ready"
         );
         Ok(VirtualOutput {
@@ -399,7 +415,10 @@ impl Drop for ChooserFile {
 
 /// Point xdpw's chooser at `output` and run the ScreenCast handshake, returning the portal fd +
 /// node id and the guard that stops the cast. The caller must hold [`SELECTION_LOCK`].
-fn select_and_cast(output: &str, hw_cursor: bool) -> Result<(OwnedFd, u32, StopGuard)> {
+fn select_and_cast(
+    output: &str,
+    hw_cursor: bool,
+) -> Result<(OwnedFd, u32, crate::portal_cursor::Mode, StopGuard)> {
     ensure_xdpw_config()?;
     let chooser = chooser_file();
     std::fs::write(&chooser, format!("Monitor: {output}\n"))
@@ -407,9 +426,15 @@ fn select_and_cast(output: &str, hw_cursor: bool) -> Result<(OwnedFd, u32, StopG
     // Owned from the write on: every arm below (and every `?`) leaves the handshake, which is the
     // only thing that reads it.
     let _chooser = ChooserFile(chooser);
-    let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
+    // The NEGOTIATED cursor mode rides back with the fd and node id: it is decided inside the
+    // portal thread (only there is the proxy to ask), and nothing downstream can re-derive it —
+    // `hw_cursor` is the request, not the answer.
+    let (setup_tx, setup_rx) =
+        std::sync::mpsc::channel::<Result<(OwnedFd, u32, crate::portal_cursor::Mode), String>>();
     // The teardown handshake: the thread signals this once it has closed the ScreenCast session, and
-    // `StopGuard::drop` waits on it before the output is unplugged (see `StopGuard`).
+    // `StopGuard::drop` waits on it before the output is unplugged (see `StopGuard`). Kept a
+    // SEPARATE channel from the setup one above — it fires at the other end of the cast's life,
+    // long after `setup_rx` has been consumed.
     let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
@@ -426,10 +451,10 @@ fn select_and_cast(output: &str, hw_cursor: bool) -> Result<(OwnedFd, u32, StopG
     // lifetime, against an output that no longer exists.
     let mut guard = StopGuard { stop, closed: None };
     match setup_rx.recv_timeout(Duration::from_secs(20)) {
-        Ok(Ok((fd, node_id))) => {
+        Ok(Ok((fd, node_id, cursor_mode))) => {
             // A cast exists now, so teardown has something to close and must wait for it.
             guard.closed = Some(closed_rx);
-            Ok((fd, node_id, guard))
+            Ok((fd, node_id, cursor_mode, guard))
         }
         Ok(Err(e)) => bail!("ScreenCast portal on {output} failed: {e}"),
         Err(_) => bail!("timed out waiting for the ScreenCast portal on {output}"),
@@ -447,10 +472,11 @@ pub(crate) fn stream_existing_output(
     hw_cursor: bool,
 ) -> Result<crate::mirror::MirrorStream> {
     let _sel = SELECTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (fd, node_id, stop) = select_and_cast(connector, hw_cursor)?;
+    let (fd, node_id, cursor_mode, stop) = select_and_cast(connector, hw_cursor)?;
     Ok(crate::mirror::MirrorStream {
         node_id,
         remote_fd: Some(fd),
+        cursor_mode: Some(cursor_mode),
         keepalive: Box::new(stop),
     })
 }
@@ -573,7 +599,7 @@ fn ensure_xdpw_config() -> Result<()> {
 /// reports the fd + node id and parks until stopped — the zbus connection is the cast's
 /// lifetime). xdpw answers the source selection via the chooser, no dialog.
 fn portal_thread(
-    setup_tx: Sender<Result<(OwnedFd, u32), String>>,
+    setup_tx: Sender<Result<(OwnedFd, u32, crate::portal_cursor::Mode), String>>,
     closed_tx: Sender<()>,
     stop: Arc<AtomicBool>,
     hw_cursor: bool,
@@ -634,7 +660,7 @@ fn portal_thread(
                     .select_sources(
                         &session,
                         SelectSourcesOptions::default()
-                            .set_cursor_mode(cursor_mode)
+                            .set_cursor_mode(cursor_mode.to_ashpd())
                             // xdpw offers MONITOR only; the chooser picks our output.
                             .set_sources(BitFlags::from_flag(SourceType::Monitor))
                             .set_multiple(false)
@@ -676,7 +702,7 @@ fn portal_thread(
                 };
 
             setup_tx
-                .send(Ok((fd, node_id)))
+                .send(Ok((fd, node_id, cursor_mode)))
                 .map_err(|_| anyhow!("virtual-output opener went away"))?;
 
             // Park, keeping `proxy` + `session` alive until stopped. Polled at 20 ms rather than the

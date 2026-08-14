@@ -3604,6 +3604,9 @@ pub(crate) fn stream_existing_output(
     Ok(crate::mirror::MirrorStream {
         node_id,
         remote_fd: None,
+        // No xdg portal in this path at all (gamescope publishes the node itself), and no pointer
+        // in the node either way — nothing to report.
+        cursor_mode: None,
         keepalive: Box::new(()),
     })
 }

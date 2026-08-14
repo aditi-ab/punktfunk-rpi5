@@ -200,6 +200,33 @@ pub trait VirtualDisplay: Send {
     fn hw_cursor(&self) -> bool {
         false
     }
+    /// The ScreenCast cursor mode the backend's portal actually NEGOTIATED for the most recent
+    /// [`create`](Self::create) — the answer to [`set_hw_cursor`](Self::set_hw_cursor), which is
+    /// only ever a *request*.
+    ///
+    /// This is the difference between the two that matters downstream: on the whole wlr family
+    /// (xdph, xdpw) `AvailableCursorModes` is `Hidden|Embedded`, so a session that asked for
+    /// metadata is served **`Embedded`** — the compositor paints the pointer into the frames and
+    /// sends no `SPA_META_Cursor`, ever, wherever the pointer is. A consumer that reads "no cursor
+    /// overlay" as a symptom (the host's park schedule reads it as "the seat pointer has not
+    /// reached the streamed output" — true on Mutter, which suppresses metadata while the pointer
+    /// is off the recorded view) is then acting on noise; see
+    /// [`PortalCursorMode::delivers_metadata`](crate::PortalCursorMode::delivers_metadata).
+    ///
+    /// `None` — the default, and what every non-portal backend reports — means "nothing was
+    /// negotiated through the xdg ScreenCast portal here, so this says nothing at all": KWin
+    /// (`zkde_screencast` `pointer` mode), Mutter (`RecordVirtual` `cursor-mode`), gamescope (no
+    /// pointer either way) and Windows (IddCx) all get exactly what they ask for through their own
+    /// protocols, and their consumers must keep behaving as they always did. It is also `None`
+    /// before the first `create`.
+    ///
+    /// Reported by the wlr-family backends (`hyprland`, `wlroots`) and by the monitor
+    /// [`mirror`](crate::open_mirror) when it delegates to one. Those outputs are never registry-
+    /// pooled (`remote_fd.is_some()` — the portal fd cannot be re-opened per attach), so a reused
+    /// kept display can never hand back a *stale* answer here.
+    fn last_portal_cursor_mode(&self) -> Option<crate::PortalCursorMode> {
+        None
+    }
     /// The stable identity slot the backend resolved for the most recent [`create`](Self::create) —
     /// the per-client id the identity policy assigned (`Some`), or `None` for shared/anonymous. The
     /// registry reads it right after `create` to key the display's group **arrangement** (manual

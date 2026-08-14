@@ -1467,6 +1467,9 @@ pub(crate) fn stream_existing_output(
         node_id,
         // KWin publishes on the user's own PipeWire daemon — no portal remote to carry.
         remote_fd: None,
+        // Not an xdg-portal session either: the `zkde_screencast` pointer mode was asked of KWin
+        // directly and KWin honours it, so the request IS the answer.
+        cursor_mode: None,
         keepalive: Box::new(StopOnDrop(stop)),
     })
 }

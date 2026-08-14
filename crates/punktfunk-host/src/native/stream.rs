@@ -1347,8 +1347,19 @@ pub(super) struct SessionContext {
 /// its embedded mode paints nothing either) the stream has NO cursor at all, in both the
 /// embedded and the cursor-channel composite models. Parking once per (re)built display — and
 /// again on the mid-stream flip to the capture model, which heals a pointer that drifted off the
-/// output's edge — pins the pointer to the surface the client actually sees. A desktop-model
-/// client overrides it with its first absolute move, so the jump is invisible in practice.
+/// output's edge — pins the pointer to the surface the client actually sees.
+///
+/// **Retried only for a relative-only client.** The schedule used to repeat this for every session,
+/// on the theory that "a desktop-model client overrides it with its first absolute move, so the
+/// jump is invisible in practice". One park at bring-up is; a *repeat* is not. A desktop-model
+/// client sends absolute positions — the very same [`MouseMoveAbs`] this synthesizes, only aimed
+/// where the user is actually pointing — so once those are flowing the park has nothing left to add
+/// and every later attempt is a visible yank to centre that fights them (field report 2026-08-14).
+/// The schedule below therefore keeps the single bring-up park for such a client (so its first
+/// click cannot land on the monitor the seat pointer was left on) and drops the retry; the
+/// capture-model flip re-arms the full schedule.
+///
+/// [`MouseMoveAbs`]: punktfunk_core::input::InputKind::MouseMoveAbs
 #[cfg(target_os = "linux")]
 fn park_pointer(input_tx: &std::sync::mpsc::SyncSender<super::input::ClientInput>, w: u32, h: u32) {
     let ev = punktfunk_core::input::InputEvent {
@@ -1373,6 +1384,65 @@ fn park_pointer(input_tx: &std::sync::mpsc::SyncSender<super::input::ClientInput
             "parked the seat pointer at the streamed surface's centre"
         );
     }
+}
+
+/// Settle this session's cursor plan against the cursor mode the display's portal ACTUALLY
+/// negotiated — THE rule, shared by bring-up and the capture-loss rebuild so the two cannot drift.
+///
+/// Returns whether "the capture has no cursor overlay" still MEANS anything on this display, and
+/// clears `metadata_composite` when the negotiated mode makes it a fiction. Both answers come from
+/// the same fact, which is why they are settled together.
+///
+/// The fact: [`set_hw_cursor`] is a *request*. On the whole wlr family (xdph, xdpw) the portal
+/// advertises `Hidden|Embedded` — measured, `AvailableCursorModes = 3`, on current packages — so a
+/// session that asked for metadata is served **Embedded**: the compositor paints the pointer into
+/// the frames and sends no `SPA_META_Cursor`, ever, wherever the pointer is. That breaks two
+/// downstream beliefs at once:
+///
+/// * the host planned a metadata composite it can never feed (the stream logs "host-composite
+///   active but the capture has no live cursor overlay yet" forever, and shows no host pointer —
+///   the compositor's own burnt-in one is the real cursor there), and
+/// * the seat-pointer park schedule reads "no overlay" as "the pointer has not reached the streamed
+///   output". That inference is sound on **Mutter**, which suppresses cursor metadata while the
+///   pointer is off the recorded view (`should_cursor_metadata_be_set`) — it is the signal
+///   [`park_pointer`] was built on — and it is pure noise under Embedded, where the host then
+///   re-centres the user's pointer once a second for the whole cap, fighting every mouse movement
+///   (field report 2026-08-14, Hyprland).
+///
+/// A backend that reports no negotiated mode (`None` — KWin, Mutter, gamescope, Windows) is served
+/// the cursor mode it asked for through its own protocol, so nothing here applies and both answers
+/// stay exactly as they were.
+///
+/// What this does NOT undo is [`SessionPlan::cursor_blend`]: the blend capability is resolved
+/// before any display exists, and the negotiation only happens inside `create`, so a session that
+/// lands on Embedded still captures RGB for a blend stage it will never be handed an overlay for.
+/// That costs a colour conversion, not correctness — and pre-judging it would mean re-asserting
+/// what the wlr portals advertise, which is exactly the hardcode `pf_vdisplay::portal_cursor`
+/// exists to have deleted.
+///
+/// [`set_hw_cursor`]: pf_vdisplay::VirtualDisplay::set_hw_cursor
+/// [`SessionPlan::cursor_blend`]: crate::session_plan::SessionPlan::cursor_blend
+#[cfg(target_os = "linux")]
+fn settle_portal_cursor(
+    vd: &dyn crate::vdisplay::VirtualDisplay,
+    metadata_composite: &mut bool,
+) -> bool {
+    let Some(negotiated) = vd.last_portal_cursor_mode() else {
+        return true;
+    };
+    if negotiated.delivers_metadata() {
+        return true;
+    }
+    if *metadata_composite {
+        *metadata_composite = false;
+        tracing::info!(
+            negotiated = negotiated.name(),
+            "the portal negotiated a cursor mode that carries no cursor metadata — dropping the \
+             host composite; the pointer in this stream is the compositor's own, burnt into the \
+             frames"
+        );
+    }
+    false
 }
 
 pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDisplay>) -> Result<()> {
@@ -1705,6 +1775,11 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         mut cur_display_gen,
         built_bitrate,
     ) = pipe;
+    // The display exists now, so the portal has answered: settle the cursor plan against what it
+    // actually negotiated rather than what this session asked for (see `settle_portal_cursor`).
+    // `mut`: every capture-loss rebuild re-runs `create`, hence re-negotiates.
+    #[cfg(target_os = "linux")]
+    let mut no_overlay_means_off_output = settle_portal_cursor(&*vd, &mut metadata_composite);
     // The encoder may have opened at a re-resolved rate (a mirrored head delivering a size this
     // session never negotiated). Adopt it before anything downstream reads `bitrate_kbps`.
     adopt_built_bitrate(
@@ -2064,12 +2139,15 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // compositing), NOT an encoder problem. Logged every 2 s when `PUNKTFUNK_PERF`.
     let (mut diag_new, mut diag_repeat) = (0u64, 0u64);
     // Seat-pointer park schedule (see `park_pointer`): per (re)built display, and re-armed by
-    // the capture-model flip. More than one attempt because the first park of a session can
-    // land on a still-cold EIS connection (devices not yet resumed → the injector DROPS it) —
-    // observed on-glass; the retry a second later goes through. While the session is in the
+    // the capture-model flip. More than one attempt for a RELATIVE-ONLY session, because the
+    // first park can land on a still-cold EIS connection (devices not yet resumed → the injector
+    // DROPS it) — observed on-glass; the retry a second later goes through. A client that steers
+    // the pointer itself gets the bring-up park only: its own absolute moves are the retry, and
+    // a synthetic one on top of them is just a yank to centre. While the session is in the
     // capture model with no live cursor overlay, keep trying up to the cap: no overlay there
     // means the pointer still isn't on the streamed output, and a relative-only client can
-    // never fix that itself.
+    // never fix that itself — but only where an absent overlay is evidence of anything at all
+    // (`no_overlay_means_off_output`, settled per display by `settle_portal_cursor`).
     #[cfg(target_os = "linux")]
     let mut parked_display = None;
     #[cfg(target_os = "linux")]
@@ -3033,6 +3111,17 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 interval = new_interval;
                 cur_node_id = new_node_id;
                 cur_display_gen = new_display_gen;
+                // The rebuild re-ran `create`, so the portal answered again — possibly a different
+                // backend's portal (the retarget above), possibly with a different verdict. Settle
+                // the cursor plan against THIS display, exactly as bring-up did: the retarget arm
+                // recomputes `metadata_composite` from the compositor alone (it has to — it runs
+                // BEFORE the rebuild, to set `hw_cursor`), so without this a switch onto a wlr
+                // backend would re-arm both defects mid-session.
+                #[cfg(target_os = "linux")]
+                {
+                    no_overlay_means_off_output =
+                        settle_portal_cursor(&*vd, &mut metadata_composite);
+                }
                 // A capture-loss rebuild can land on a different source than it lost (this loop
                 // re-detects the session every cycle, precisely so it can follow a switch), so the
                 // delivered size — and with it an Automatic rate — may have changed under us.
@@ -3136,10 +3225,15 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         None => {
                             if !composite_saw_none {
                                 composite_saw_none = true;
+                                // NOT necessarily "cursorless", which this line used to assert:
+                                // where the portal negotiated Embedded (the whole wlr family) no
+                                // `SPA_META_Cursor` is ever sent and the compositor's own pointer
+                                // is already in the pixels — the host blend has nothing to add.
+                                // `settle_portal_cursor` logs which of the two this session is.
                                 tracing::info!(
                                     "host-composite active but the capture has no live cursor \
-                                     overlay yet (no SPA_META_Cursor bitmap) — the stream is \
-                                     cursorless until one arrives"
+                                     overlay (no SPA_META_Cursor bitmap) — nothing for the encoder \
+                                     blend to draw; the pointer, if any, is the compositor's own"
                                 );
                             }
                         }
@@ -3189,14 +3283,32 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             frame.cursor = None;
         }
         // The seat-pointer park schedule (state + rationale at the declarations above; armed by
-        // the first frame of every (re)built display and by the capture-model flip). The first
-        // two attempts run unconditionally — attempt 1 can be swallowed by a cold EIS
-        // connection. Past those, only a host-composite session that STILL has no live overlay
-        // keeps trying — a channel session in the capture model, or a no-channel
-        // metadata-composite session (both relative-only): no overlay there means the pointer
-        // has not reached the streamed output (the compositor reports cursor metadata only
-        // while it is over the recorded view), and a relative-only client cannot get it there
-        // on its own.
+        // the first frame of every (re)built display and by the capture-model flip).
+        //
+        // Two unconditional attempts for a RELATIVE-ONLY session — attempt 1 can be swallowed by
+        // a cold EIS connection, and nothing else will ever move that pointer onto the output.
+        // Exactly ONE for a client that steers the seat pointer itself (a channel client in the
+        // desktop model): the park still runs once at bring-up, so the session's first click
+        // cannot land on whatever monitor the seat pointer was left on, but the retry a second
+        // later is dropped — by then the client's own absolute moves are doing this job, better
+        // (same event, aimed where the user is actually pointing), and the retry is a visible
+        // yank to centre that fights them (field report 2026-08-14; see `park_pointer`). A cold
+        // EIS swallows the client's moves too, and those keep coming, so it needs no retry.
+        //
+        // Past the unconditional attempts, only a host-composite session that STILL has no live
+        // overlay keeps trying — a channel session in the capture model, or a no-channel
+        // metadata-composite session: no overlay there means the pointer has not reached the
+        // streamed output (the compositor reports cursor metadata only while it is over the
+        // recorded view), and a relative-only client cannot get it there on its own.
+        //
+        // ...but ONLY where that inference holds — `no_overlay_means_off_output`, settled per
+        // display by `settle_portal_cursor`. Under a portal that negotiated Embedded no cursor
+        // metadata is EVER sent, so "no overlay" says nothing about where the pointer is, and
+        // this heuristic re-centred the user's pointer for the full cap on every Hyprland/sway
+        // session (the same field report). Those sessions still get the two unconditional
+        // attempts, which are what puts the pointer — and thus the compositor's burnt-in cursor,
+        // and the client's input — on the streamed output in the first place.
+        //
         // Armed from the loop's first tick — a static desktop may never deliver a fresh frame
         // (`parked_display` is only bookkeeping for rebuild re-arming), and the pointer must be
         // parked regardless.
@@ -3205,17 +3317,22 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             && park_attempts < PARK_ATTEMPTS_MAX
             && std::time::Instant::now() >= next_park_at
         {
-            let composite_starved = ((cursor_fwd.is_some()
-                && !cursor_client_draws.load(Ordering::Relaxed))
+            let client_steers = cursor_fwd.is_some() && cursor_client_draws.load(Ordering::Relaxed);
+            let unconditional = if client_steers { 1 } else { 2 };
+            // Never true while `client_steers`: the channel term excludes it outright, and
+            // `metadata_composite` implies no channel at all.
+            let composite_starved = ((cursor_fwd.is_some() && !client_steers)
                 || metadata_composite)
-                && capturer.cursor().is_none();
-            if park_attempts < 2 || composite_starved {
+                && capturer.cursor().is_none()
+                && no_overlay_means_off_output;
+            if park_attempts < unconditional || composite_starved {
                 park_pointer(&input_tx, frame.width, frame.height);
                 park_attempts += 1;
                 next_park_at = std::time::Instant::now() + std::time::Duration::from_secs(1);
             } else {
-                // Settled (overlay flowing, or the client draws): stop scheduling until a
-                // rebuild or a capture-model flip re-arms it.
+                // Settled (the client steers, the overlay is flowing, or its absence carries no
+                // information here): stop scheduling until a rebuild or a capture-model flip
+                // re-arms it.
                 park_attempts = PARK_ATTEMPTS_MAX;
             }
         }
@@ -5114,5 +5231,66 @@ mod tests {
                 || (shift - 2_000_000).rem_euclid(SIM_P) > SIM_P - 1_000,
             "a +2 ms offset must shift the next target by +2 ms mod P, got {shift}"
         );
+    }
+
+    /// The 2026-08-14 Hyprland field report, in one function: xdph advertises `Hidden|Embedded`,
+    /// so a session that asked for cursor metadata is served **Embedded** — no `SPA_META_Cursor`
+    /// is ever sent, whatever the pointer does. The host must then (a) stop planning a metadata
+    /// composite it can never feed, and (b) stop reading "no cursor overlay" as "the seat pointer
+    /// is not on the streamed output" — the inference that re-centred the user's pointer once a
+    /// second for the whole park cap.
+    ///
+    /// The `None` case is the regression guard for GNOME: Mutter is served the cursor mode it
+    /// asks for through its own protocol and DOES suppress metadata while the pointer is off the
+    /// recorded view, which is the signal `park_pointer` exists for. Nothing here may touch it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_embedded_portal_voids_both_the_composite_and_the_starvation_signal() {
+        struct Fake(Option<pf_vdisplay::PortalCursorMode>);
+        impl crate::vdisplay::VirtualDisplay for Fake {
+            fn name(&self) -> &'static str {
+                "fake"
+            }
+            fn create(
+                &mut self,
+                _mode: pf_vdisplay::Mode,
+            ) -> anyhow::Result<crate::vdisplay::VirtualOutput> {
+                anyhow::bail!("this test never creates a display")
+            }
+            fn last_portal_cursor_mode(&self) -> Option<pf_vdisplay::PortalCursorMode> {
+                self.0
+            }
+        }
+
+        // The whole wlr family, today: metadata wanted, Embedded served.
+        let mut composite = true;
+        assert!(!settle_portal_cursor(
+            &Fake(Some(pf_vdisplay::PortalCursorMode::Embedded)),
+            &mut composite
+        ));
+        assert!(!composite, "the composite can never be fed — drop it");
+
+        // Hidden is the same story from the other end: no pointer, so no overlay, so no signal.
+        let mut composite = true;
+        assert!(!settle_portal_cursor(
+            &Fake(Some(pf_vdisplay::PortalCursorMode::Hidden)),
+            &mut composite
+        ));
+        assert!(!composite);
+
+        // A portal that really does serve metadata (xdph ≥ #366, or the portal path on
+        // KWin/Mutter): everything stays exactly as it was.
+        let mut composite = true;
+        assert!(settle_portal_cursor(
+            &Fake(Some(pf_vdisplay::PortalCursorMode::Metadata)),
+            &mut composite
+        ));
+        assert!(composite);
+
+        // Not portal-negotiated at all — KWin `zkde_screencast`, Mutter `RecordVirtual`,
+        // gamescope, Windows. THE no-regression case.
+        let mut composite = true;
+        assert!(settle_portal_cursor(&Fake(None), &mut composite));
+        assert!(composite);
     }
 }
