@@ -142,6 +142,20 @@ pub(super) fn audio_thread(
     };
 
     let frame_len = SAMPLES_PER_FRAME * want as usize;
+    // Operator capture gain, soft-limited (`PUNKTFUNK_AUDIO_GAIN`, default 1.0 = untouched). This
+    // plane had NO gain at all until now, so `PUNKTFUNK_AUDIO_GAIN` silently did nothing on
+    // punktfunk/1 while working on GameStream — and since WASAPI loopback taps upstream of the
+    // endpoint's master volume, there was no other host-side way to lift a quiet desktop mix.
+    // Read once per session rather than per frame: this is an operator setting, not a live control.
+    let gain = crate::audio::capture_gain();
+    if gain != 1.0 {
+        tracing::info!(
+            gain,
+            "audio: applying operator capture gain (soft-limited above \
+             {}; headroom, not loudness)",
+            punktfunk_core::audio::SOFT_LIMIT_KNEE
+        );
+    }
     let mut acc: Vec<f32> = Vec::with_capacity(frame_len * 4);
     // Sized for the largest surround frame (7.1 HQ ≈ 1.3 KB at 5 ms); ample for normal quality.
     let mut opus_buf = vec![0u8; 4096];
@@ -253,7 +267,10 @@ pub(super) fn audio_thread(
             }
             pace_due = Some(pace_due.unwrap_or_else(std::time::Instant::now) + FRAME_INTERVAL);
 
-            let frame: Vec<f32> = acc.drain(..frame_len).collect();
+            let mut frame: Vec<f32> = acc.drain(..frame_len).collect();
+            if gain != 1.0 {
+                punktfunk_core::audio::apply_gain(&mut frame, gain);
+            }
             let pts_ns = next_pts_ns;
             next_pts_ns += FRAME_MS as u64 * 1_000_000;
             match enc.encode_float(&frame, &mut opus_buf) {
