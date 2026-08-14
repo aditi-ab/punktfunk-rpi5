@@ -524,6 +524,18 @@ pub(crate) async fn reconcile_provider_entries(
             return denied;
         }
     }
+    // A launcher this box cannot open is a fact about the box, not a defect in the payload, so it
+    // costs its own tile and nothing else. Before this, the Playnite plugin's single launcher entry
+    // 400'd every game it shipped alongside.
+    for (title, value) in crate::library::sanitize_launcher_entries(&mut inputs) {
+        tracing::warn!(
+            provider,
+            launcher = %value,
+            title = %title,
+            "library reconcile: dropped a launcher tile this host cannot open — the rest of the \
+             payload still syncs. Install the launcher, or turn the tile off in the plugin's config"
+        );
+    }
     // One aggregated line, not one per entry: a root mismatch misses EVERY cover in the payload, and
     // a per-entry warn would bury the rest of the log under a thousand copies of one fact.
     let mut dropped_art = 0usize;

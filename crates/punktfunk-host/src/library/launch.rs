@@ -478,13 +478,31 @@ fn launcher_ui_stores() -> &'static [&'static str] {
     }
 }
 
-/// Is this a `launcher_ui` value this host can resolve?
+/// Is `value` a launcher this host's platform knows about at all?
 ///
-/// On Windows, Playnite is validated by *resolution* rather than by being on the list: a host
-/// without Playnite installed refuses the entry (a 400 the plugin author can act on) instead of
-/// publishing a tile that does nothing when a user clicks it.
-pub(crate) fn valid_launcher_ui(value: &str) -> bool {
-    if !launcher_ui_stores().contains(&value) {
+/// The *vocabulary* half of the old `valid_launcher_ui`. A value outside this set is a plugin
+/// author's mistake — a typo, or a launcher this OS has no support for — and no amount of
+/// installing things on the box will make it resolve, so the reconcile refuses the payload.
+pub(crate) fn known_launcher_ui(value: &str) -> bool {
+    launcher_ui_stores().contains(&value)
+}
+
+/// Can this host open `value`'s launcher **right now**?
+///
+/// The *environment* half. Deliberately separate from [`known_launcher_ui`], because the two
+/// failures are not the same kind of thing and must not get the same answer:
+///
+/// - an unknown value is a bug in the plugin, and a 400 is the only way its author finds out;
+/// - a known value that will not resolve means the launcher simply is not installed here, which is
+///   an ordinary fact about the box, not a defect in the payload.
+///
+/// Conflating them cost a real library: the Playnite plugin publishes one launcher tile alongside
+/// every game, so a host that could not resolve Playnite 400'd the whole reconcile and the operator
+/// got **no games at all** — the same shape as the unservable-cover bug that
+/// [`super::sanitize_art_paths`] was introduced to fix. The tile is dropped now (see
+/// [`super::sanitize_launcher_entries`]) and the games sync.
+pub(crate) fn resolvable_launcher_ui(value: &str) -> bool {
+    if !known_launcher_ui(value) {
         return false;
     }
     #[cfg(windows)]
@@ -502,34 +520,139 @@ pub(crate) fn valid_launcher_ui(value: &str) -> bool {
 /// directly, which is also why nothing here is interpolated from the entry: the whole value is the
 /// literal `"playnite"`.
 ///
-/// Playnite installs per-user by default, so the install directory comes from its own uninstall
-/// entry (HKCU first, then HKLM for a machine-wide install), falling back to the default
-/// `%LOCALAPPDATA%\Playnite`. `None` when nothing resolves, which is what refuses the tile.
+/// `None` when nothing resolves, which is what drops the tile.
 #[cfg(windows)]
 fn playnite_fullscreen_exe() -> Option<std::path::PathBuf> {
-    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
-    use winreg::RegKey;
-    const KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Playnite";
     const EXE: &str = "Playnite.FullscreenApp.exe";
-
-    let from_registry = [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE]
+    playnite_install_dirs()
         .into_iter()
-        .find_map(|root| {
-            RegKey::predef(root)
-                .open_subkey(KEY)
-                .ok()?
-                .get_value::<String, _>("InstallLocation")
-                .ok()
-        })
-        .map(std::path::PathBuf::from);
-
-    from_registry
-        .into_iter()
-        .chain(
-            std::env::var_os("LOCALAPPDATA").map(|l| std::path::PathBuf::from(l).join("Playnite")),
-        )
         .map(|dir| dir.join(EXE))
         .find(|p| p.is_file())
+}
+
+/// Windows: every directory that might hold a Playnite install, best candidates first.
+///
+/// **Playnite installs per-user by default, and this host is a LocalSystem service** — which
+/// invalidates all three of the obvious lookups, and is why this is not a two-liner:
+///
+/// - `HKEY_CURRENT_USER` is *SYSTEM's own* hive (`S-1-5-18`), never the person's, so a per-user
+///   install is invisible there. Every **loaded** hive under `HKEY_USERS` is read instead: only
+///   logged-on users' hives are loaded, which is exactly the set that can be streaming, and it
+///   avoids a `WTSQueryUserToken` dance for what is a best-effort probe. Same trade-off
+///   [`crate::procscan::steam_running_hint`] makes, for the same reason.
+/// - The uninstall subkey is matched by its **`DisplayName`**, not by key name. Playnite ships an
+///   Inno Setup installer and Inno registers `<AppId>_is1` — measured on a Windows box where Git
+///   and Inno itself appear as `Git_is1` and `Inno Setup 6_is1`. The hardcoded
+///   `…\Uninstall\Playnite` this replaced matched nothing on any box.
+/// - `%LOCALAPPDATA%` for a SYSTEM service is `C:\Windows\System32\config\systemprofile\AppData\
+///   Local`, so the default-install fallback cannot trust the variable — it enumerates the profiles
+///   under the users base instead, the same breadth [`super::art::art_roots`] already allows.
+///
+/// Order matters only as a preference: a registry `InstallLocation` is what the installer actually
+/// did, so it is consulted before the conventional path. Every candidate is probed for the exe, so
+/// a stale entry costs one `is_file` and nothing else.
+#[cfg(windows)]
+fn playnite_install_dirs() -> Vec<std::path::PathBuf> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ};
+    use winreg::RegKey;
+
+    // 64-bit and 32-bit views. HKCU/HKU `Software` is not redirected (only `Software\Classes` is),
+    // so the WOW view is a machine-hive concern only.
+    const UNINSTALL: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall";
+    const UNINSTALL_WOW: &str = r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
+
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    playnite_dirs_from_uninstall(&hklm, UNINSTALL, &mut dirs);
+    playnite_dirs_from_uninstall(&hklm, UNINSTALL_WOW, &mut dirs);
+
+    let users = RegKey::predef(HKEY_USERS);
+    for sid in users.enum_keys().flatten() {
+        // The `…_Classes` companion hives carry file associations, never uninstall entries.
+        if sid.ends_with("_Classes") {
+            continue;
+        }
+        if let Ok(hive) = users.open_subkey_with_flags(&sid, KEY_READ) {
+            playnite_dirs_from_uninstall(&hive, UNINSTALL, &mut dirs);
+        }
+    }
+
+    // The conventional per-user location, for every profile on the box — this is where Playnite's
+    // own default install lands, and it covers a user whose hive is not currently loaded.
+    for profile in windows_user_profiles() {
+        push_unique(&mut dirs, profile.join(r"AppData\Local\Playnite"));
+    }
+    dirs
+}
+
+/// Collect `InstallLocation` from every Playnite-looking uninstall entry under `root\path`.
+///
+/// Matched on `DisplayName` because the key name is the installer's `AppId` (see
+/// [`playnite_install_dirs`]). `starts_with` rather than equality so a versioned or suffixed display
+/// name still counts; the value is only ever used as a directory to probe for the exe, so a false
+/// positive costs one failed `is_file`.
+#[cfg(windows)]
+fn playnite_dirs_from_uninstall(
+    root: &winreg::RegKey,
+    path: &str,
+    out: &mut Vec<std::path::PathBuf>,
+) {
+    use winreg::enums::KEY_READ;
+
+    let Ok(uninstall) = root.open_subkey_with_flags(path, KEY_READ) else {
+        return;
+    };
+    for name in uninstall.enum_keys().flatten() {
+        let Ok(entry) = uninstall.open_subkey_with_flags(&name, KEY_READ) else {
+            continue;
+        };
+        let display: String = entry.get_value("DisplayName").unwrap_or_default();
+        if !display.starts_with("Playnite") {
+            continue;
+        }
+        if let Ok(location) = entry.get_value::<String, _>("InstallLocation") {
+            let location = location.trim();
+            if !location.is_empty() {
+                push_unique(out, std::path::PathBuf::from(location));
+            }
+        }
+    }
+}
+
+/// Every user profile directory on the box (`C:\Users\*`), minus the shared `Public` pseudo-profile.
+///
+/// `%PUBLIC%`'s parent is the users base on every supported Windows — the same derivation
+/// [`super::art::art_roots`] uses — with `%SystemDrive%\Users` as the fallback when the variable is
+/// missing from a service's environment.
+#[cfg(windows)]
+fn windows_user_profiles() -> Vec<std::path::PathBuf> {
+    let base = std::env::var_os("PUBLIC")
+        .map(std::path::PathBuf::from)
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .or_else(|| {
+            std::env::var_os("SystemDrive").map(|d| std::path::PathBuf::from(d).join("Users"))
+        });
+    let Some(base) = base else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && !p.ends_with("Public"))
+        .collect()
+}
+
+/// Push `path` unless an equal one is already there — the candidate lists are a handful of entries,
+/// so a linear check beats carrying a set around.
+#[cfg(windows)]
+fn push_unique(out: &mut Vec<std::path::PathBuf>, path: std::path::PathBuf) {
+    if !out.contains(&path) {
+        out.push(path);
+    }
 }
 
 /// Map a `heroic` LaunchSpec value (`<runner>:<appName>`) to the Heroic launch command, run nested in
@@ -800,33 +923,38 @@ mod tests {
     fn launcher_ui_accepts_only_launchers_this_host_can_open() {
         #[cfg(target_os = "linux")]
         {
-            assert!(valid_launcher_ui("heroic"));
-            assert!(valid_launcher_ui("lutris"));
-            // Not wired on this OS — refused inbound rather than becoming a tile that does nothing.
-            assert!(!valid_launcher_ui("gog"));
+            assert!(known_launcher_ui("heroic"));
+            assert!(known_launcher_ui("lutris"));
+            // Not wired on this OS — outside the vocabulary, so it is refused inbound rather than
+            // becoming a tile that does nothing.
+            assert!(!known_launcher_ui("gog"));
         }
         #[cfg(windows)]
         {
-            // Playnite is accepted only when this host can actually FIND its Fullscreen app:
-            // validation is resolution, so a box without Playnite refuses the entry rather than
-            // publishing a tile that does nothing when clicked.
+            // Playnite is in the vocabulary unconditionally — whether this particular box has it
+            // installed is a separate question, answered by `resolvable_launcher_ui` below. Keeping
+            // them separate is the fix for the reconcile that 400'd a whole library over one tile.
+            assert!(known_launcher_ui("playnite"));
             assert_eq!(
-                valid_launcher_ui("playnite"),
+                resolvable_launcher_ui("playnite"),
                 playnite_fullscreen_exe().is_some()
             );
             // The Linux launchers, and the Windows ones whose activation is still unverified
             // (Epic, GOG Galaxy, the Xbox app), stay refused.
-            assert!(!valid_launcher_ui("heroic"));
-            assert!(!valid_launcher_ui("gog"));
+            assert!(!known_launcher_ui("heroic"));
+            assert!(!known_launcher_ui("gog"));
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         {
             // No launcher UIs are wired on this OS, so every value is refused.
-            assert!(!valid_launcher_ui("heroic"));
-            assert!(!valid_launcher_ui("gog"));
+            assert!(!known_launcher_ui("heroic"));
+            assert!(!known_launcher_ui("gog"));
         }
-        assert!(!valid_launcher_ui(""));
-        assert!(!valid_launcher_ui("lutris; rm -rf ~"));
+        // Junk is outside the vocabulary on every OS, so it never reaches a resolver.
+        assert!(!known_launcher_ui(""));
+        assert!(!known_launcher_ui("lutris; rm -rf ~"));
+        assert!(!resolvable_launcher_ui(""));
+        assert!(!resolvable_launcher_ui("lutris; rm -rf ~"));
     }
 
     /// The `xbox` kind is what a library PLUGIN can publish: the runner's principal cannot read

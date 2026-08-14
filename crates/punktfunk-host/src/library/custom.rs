@@ -442,6 +442,35 @@ pub fn validate_store_claim(store: &str) -> Result<(), String> {
     }
 }
 
+/// Drop every `launcher_ui` entry naming a launcher this host cannot actually open, returning the
+/// `(title, value)` pairs removed.
+///
+/// The launch-side counterpart to [`sanitize_art_paths`], and it exists for the same reason: a
+/// plugin reconciles its **whole** entry set at once, so anything that fails the payload costs the
+/// operator every game in it. The Playnite plugin appends one launcher tile beside the games, so a
+/// host that could not resolve `Playnite.FullscreenApp.exe` refused the lot — the operator saw an
+/// empty grid and a `HostRequestError` naming `entries[9]`, with nothing to say the other entries
+/// were fine.
+///
+/// Only the *unresolvable* case is dropped. A value outside the platform's vocabulary is still a
+/// hard 400 in [`validate_provider_payload`]: that one is a bug in the plugin, and silently
+/// swallowing it would leave the author with a tile that never appears and no reason why.
+///
+/// Dropping the whole entry rather than clearing its `launch` is deliberate — a launcher tile with
+/// no launch is a dead tile, which is strictly worse than no tile.
+pub fn sanitize_launcher_entries(inputs: &mut Vec<ProviderEntryInput>) -> Vec<(String, String)> {
+    let mut dropped = Vec::new();
+    inputs.retain(|e| {
+        let Some(launch) = &e.launch else { return true };
+        if launch.kind != "launcher_ui" || resolvable_launcher_ui(&launch.value) {
+            return true;
+        }
+        dropped.push((e.title.clone(), launch.value.clone()));
+        false
+    });
+    dropped
+}
+
 /// Validate a reconcile payload: non-empty titles and unique, non-empty external ids (the
 /// diff key — a duplicate would make ownership of the surviving entry ambiguous).
 pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), String> {
@@ -467,12 +496,13 @@ pub fn validate_provider_payload(inputs: &[ProviderEntryInput]) -> Result<(), St
                     "entries[{i}]: `launch.value` for kind `steam_ui` must be `bigpicture` or `desktop`"
                 ));
             }
-            // Refused rather than silently accepted, because the failure is otherwise invisible
-            // until a user clicks the tile: an unresolvable value yields no command at launch time.
-            if launch.kind == "launcher_ui" && !valid_launcher_ui(&launch.value) {
+            // Only the VOCABULARY is refused here. Whether the launcher is actually installed on
+            // this box is not the payload's fault, and 400ing over it threw away every game in the
+            // reconcile — see `sanitize_launcher_entries`, which drops just the tile instead.
+            if launch.kind == "launcher_ui" && !known_launcher_ui(&launch.value) {
                 return Err(format!(
-                    "entries[{i}]: `launch.value` for kind `launcher_ui` names a launcher this host \
-                     cannot open (`{}`)",
+                    "entries[{i}]: `launch.value` for kind `launcher_ui` is not a launcher this \
+                     host's platform supports (`{}`)",
                     launch.value
                 ));
             }
@@ -1065,6 +1095,14 @@ mod tests {
         // Other kinds are unconstrained here (the host validates them per-kind at launch).
         assert!(validate_provider_payload(&[with_launch("command", "anything")]).is_ok());
 
+        // `launcher_ui` is checked for VOCABULARY only. A launcher that is merely not installed
+        // must pass here and be dropped later — see `an_unopenable_launcher_tile_costs_only_itself`.
+        assert!(validate_provider_payload(&[with_launch("launcher_ui", "nonesuch")]).is_err());
+        #[cfg(windows)]
+        assert!(validate_provider_payload(&[with_launch("launcher_ui", "playnite")]).is_ok());
+        #[cfg(target_os = "linux")]
+        assert!(validate_provider_payload(&[with_launch("launcher_ui", "lutris")]).is_ok());
+
         let with_env = |key: &str, value: Option<&str>| {
             let mut i = input("a", "A");
             i.detect.env_marker = Some(EnvMarker {
@@ -1128,5 +1166,41 @@ mod tests {
             validate_provider_payload(&[input("a", "A"), input("a", "B")]).is_err(),
             "duplicate external_id"
         );
+    }
+
+    /// The regression `sanitize_launcher_entries` exists for: a launcher tile this host cannot open
+    /// must cost that tile, not the games reconciled beside it.
+    ///
+    /// Field shape — the Playnite plugin appends exactly one `launcher_ui` tile after its games, so
+    /// `entries[N]` failing validation used to refuse the entire payload and leave the operator with
+    /// an empty grid and a `HostRequestError` that named only the index.
+    #[test]
+    fn an_unopenable_launcher_tile_costs_only_itself() {
+        let mut tile = input("launcher", "Playnite");
+        tile.role = GameRole::Launcher;
+        tile.launch = Some(LaunchSpec {
+            kind: "launcher_ui".into(),
+            value: "playnite".into(),
+        });
+
+        let mut inputs = vec![input("a", "A"), tile, input("b", "B")];
+        let dropped = sanitize_launcher_entries(&mut inputs);
+
+        if resolvable_launcher_ui("playnite") {
+            // A Windows box with Playnite actually installed keeps all three.
+            assert!(dropped.is_empty());
+            assert_eq!(inputs.len(), 3);
+        } else {
+            // Everywhere else the tile goes and both games survive — the whole point of the split.
+            assert_eq!(dropped.len(), 1);
+            assert_eq!(dropped[0].1, "playnite");
+            assert_eq!(inputs.len(), 2);
+            assert!(inputs.iter().all(|e| e.external_id != "launcher"));
+        }
+
+        // A payload of nothing but games is untouched on every OS.
+        let mut only_games = vec![input("a", "A"), input("b", "B")];
+        assert!(sanitize_launcher_entries(&mut only_games).is_empty());
+        assert_eq!(only_games.len(), 2);
     }
 }
