@@ -321,16 +321,26 @@ pub(super) fn spawn(
     }
     let stop_t = stop.clone();
     let endpoint_id = ep.endpoint_id;
+    let vis_id = endpoint_id.clone();
     match std::thread::Builder::new()
         .name(format!("punktfunk1-pad{pad}"))
         .spawn(move || {
+            // COM for the visibility flips (the capturer's opens run on their own thread).
+            let _ = wasapi::initialize_mta();
+            // The endpoint parks HIDDEN while no pad is attached — an idle visible "Wireless
+            // Controller" speaker makes libScePad titles engage their DualSense-haptics path
+            // against an endpoint nothing services (the 2026-08-14 Helldivers 2 field tank).
+            // Show it for exactly this pad's lifetime, like a real DualSense arriving; the
+            // capturer's open/backoff loop absorbs the moment audiosrv takes to re-activate.
+            crate::audio::pad_endpoint::set_visibility(&vis_id, pad, true);
             pad_audio_thread(
                 conn,
                 pad,
                 kinds,
                 move || crate::audio::pad_endpoint::PadLoopbackCapturer::open(&endpoint_id),
                 stop_t,
-            )
+            );
+            crate::audio::pad_endpoint::set_visibility(&vis_id, pad, false);
         }) {
         Ok(join) => Some(PadAudioHandle {
             stop,

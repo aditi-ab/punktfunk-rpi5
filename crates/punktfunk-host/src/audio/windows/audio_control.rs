@@ -619,10 +619,11 @@ pub(crate) fn open_endpoint(ep: &Endpoint) -> Result<wasapi::Device> {
         .map_err(|e| anyhow!("open endpoint {:?}: {e:#}", ep.0))
 }
 
-// --- IPolicyConfig (undocumented): set a default audio endpoint by id, for all three roles. ---
+// --- IPolicyConfig (undocumented): default-endpoint and endpoint-visibility writes. ---
 
-/// The `IPolicyConfig` vtable. Only `SetDefaultEndpoint` is called; the 10 methods between `Release`
-/// and it (`GetMixFormat` … `SetPropertyValue`) are placeholders so the slot offset is correct.
+/// The `IPolicyConfig` vtable. Only `SetDefaultEndpoint` and `SetEndpointVisibility` are called;
+/// the 10 methods between `Release` and them (`GetMixFormat` … `SetPropertyValue`) are
+/// placeholders so the slot offsets are correct.
 #[repr(C)]
 struct IPolicyConfigVtbl {
     query_interface: unsafe extern "system" fn(
@@ -638,7 +639,11 @@ struct IPolicyConfigVtbl {
         windows::core::PCWSTR,
         u32,
     ) -> windows::core::HRESULT,
-    // SetEndpointVisibility follows — unused.
+    set_endpoint_visibility: unsafe extern "system" fn(
+        *mut c_void,
+        windows::core::PCWSTR,
+        i32,
+    ) -> windows::core::HRESULT,
 }
 
 // This mirrors the vtable of the UNDOCUMENTED `IPolicyConfig` COM interface, so there is no header
@@ -647,18 +652,21 @@ struct IPolicyConfigVtbl {
 // table" — so a field added, removed or resized above it does not fail to compile: it silently calls
 // a DIFFERENT function through a mismatched signature, which is arbitrary-code territory rather
 // than a wrong answer. The `_reserved` gap is what makes that easy to get wrong, since its ten slots
-// carry no names to anchor a review. These assertions pin the two things the call actually depends
-// on: the slot index of `set_default_endpoint`, and the size of the table up to it.
+// carry no names to anchor a review. These assertions pin the things the calls actually depend
+// on: the slot indexes of `set_default_endpoint` and `set_endpoint_visibility`, and the size of
+// the table up to them.
 const _: () = {
     use std::mem::{offset_of, size_of};
     type P = *const c_void;
-    // 3 IUnknown slots + 10 reserved = `set_default_endpoint` is slot 13 (0-based).
+    // 3 IUnknown slots + 10 reserved = `set_default_endpoint` is slot 13 (0-based),
+    // `set_endpoint_visibility` the slot after.
     assert!(offset_of!(IPolicyConfigVtbl, query_interface) == 0);
     assert!(offset_of!(IPolicyConfigVtbl, add_ref) == size_of::<P>());
     assert!(offset_of!(IPolicyConfigVtbl, release) == 2 * size_of::<P>());
     assert!(offset_of!(IPolicyConfigVtbl, _reserved) == 3 * size_of::<P>());
     assert!(offset_of!(IPolicyConfigVtbl, set_default_endpoint) == 13 * size_of::<P>());
-    assert!(size_of::<IPolicyConfigVtbl>() == 14 * size_of::<P>());
+    assert!(offset_of!(IPolicyConfigVtbl, set_endpoint_visibility) == 14 * size_of::<P>());
+    assert!(size_of::<IPolicyConfigVtbl>() == 15 * size_of::<P>());
 };
 
 /// Set `device_id` as the default audio endpoint for eConsole/eMultimedia/eCommunications via the
@@ -702,5 +710,43 @@ pub(crate) fn set_default_endpoint(device_id: &str) -> Result<()> {
         }
         ((*vtbl).release)(raw);
         result
+    }
+}
+
+/// Show or hide an audio endpoint via the undocumented `IPolicyConfig::SetEndpointVisibility` —
+/// the exact call behind mmsys.cpl's "Disable"/"Enable" device menu. A hidden endpoint drops to
+/// `DEVICE_STATE_DISABLED`: it vanishes from every ACTIVE enumeration and cannot be opened, but
+/// its devnode, driver binding and stamped identity all stay put — showing it again is instant
+/// and raises no PnP traffic. pub(crate): the pad-endpoint provider parks its "Wireless
+/// Controller" speaker hidden while no client pad is attached (a visible idle pad speaker makes
+/// libScePad titles engage their DualSense-haptics path against an endpoint nothing services —
+/// the 2026-08-14 Helldivers 2 field confirmation).
+pub(crate) fn set_endpoint_visibility(device_id: &str, visible: bool) -> Result<()> {
+    use windows::core::{IUnknown, Interface, GUID, PCWSTR};
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+
+    const CLSID_POLICY_CONFIG: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
+    const IID_IPOLICY_CONFIG: GUID = GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
+
+    let wide: Vec<u16> = device_id.encode_utf16().chain(std::iter::once(0)).collect();
+
+    // SAFETY: same contract as `set_default_endpoint` — owned IUnknown from CoCreateInstance,
+    // QI'd pointer checked non-null, the call goes through the assertion-pinned vtable slot with
+    // a NUL-terminated UTF-16 id and an INT bool, and the QI'd pointer is Released before return.
+    unsafe {
+        let unk: IUnknown = CoCreateInstance(&CLSID_POLICY_CONFIG, None, CLSCTX_ALL)
+            .map_err(|e| anyhow!("CoCreateInstance(PolicyConfig): {e}"))?;
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        unk.query(&IID_IPOLICY_CONFIG, &mut raw)
+            .ok()
+            .map_err(|e| anyhow!("QueryInterface(IPolicyConfig): {e}"))?;
+        if raw.is_null() {
+            bail!("IPolicyConfig QueryInterface returned null");
+        }
+        let vtbl = *(raw as *const *const IPolicyConfigVtbl);
+        let hr = ((*vtbl).set_endpoint_visibility)(raw, PCWSTR(wide.as_ptr()), visible as i32);
+        ((*vtbl).release)(raw);
+        hr.ok()
+            .map_err(|e| anyhow!("SetEndpointVisibility({visible}): {e}"))
     }
 }
