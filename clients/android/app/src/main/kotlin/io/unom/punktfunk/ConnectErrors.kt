@@ -53,6 +53,11 @@ object ConnectErrors {
                 "on the host."
         "wire-version" -> "Client and host versions don't match — update both to the same release."
         "busy" -> "The host is busy with another session."
+        "access-expired" ->
+            "Your access to this host has expired — ask the host's owner to grant it again."
+        "launch-not-permitted" ->
+            "This device's access doesn't include launching games — connect to the desktop, " +
+                "or ask the host's owner."
         else -> null
     }
 

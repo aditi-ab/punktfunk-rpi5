@@ -44,6 +44,18 @@ class MouseForwarder(
     var onRequestCapture: (() -> Unit)? = null
     var onReleaseCapture: (() -> Unit)? = null
 
+    /**
+     * Whether this session's access includes the POINTER grant ([io.unom.punktfunk.kit.SessionAccess.POINTER])
+     * — seeded from the Welcome, kept live by StreamScreen's access poll. Without it the mouse
+     * path goes inert: nothing forwards, and — the part that matters — the pointer is never
+     * GRABBED, because a captured mouse that moves nothing is the "my mouse does nothing and
+     * nobody says why" failure the grants UX exists to prevent (the Access chip says why
+     * instead). Revocation mid-session releases an existing grab (StreamScreen calls [release]).
+     * Volatile: set on the main thread, read wherever the dispatch path runs.
+     */
+    @Volatile
+    var pointerGranted: Boolean = true
+
     /** Live capture state, updated from [android.app.Activity.onPointerCaptureChanged]. */
     var captured = false
         private set
@@ -59,6 +71,7 @@ class MouseForwarder(
 
     /** Uncaptured mouse events on the TOUCH stream (position while a button is down). */
     fun onTouchEvent(ev: MotionEvent): Boolean {
+        if (!pointerGranted) return true // inert: consumed over the stream, nothing forwards
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 if (captureWanted && !captured && !userReleased) {
@@ -80,6 +93,7 @@ class MouseForwarder(
 
     /** Uncaptured mouse events on the GENERIC stream (hover motion, wheel, button edges). */
     fun onGenericMotion(ev: MotionEvent): Boolean {
+        if (!pointerGranted) return true // inert: consumed over the stream, nothing forwards
         when (ev.actionMasked) {
             MotionEvent.ACTION_HOVER_MOVE -> sendAbs(ev)
             MotionEvent.ACTION_SCROLL -> wheel(ev)
@@ -98,6 +112,7 @@ class MouseForwarder(
      * gesture layer is the touchpad story); returning false leaves those to the framework.
      */
     fun onCapturedPointer(ev: MotionEvent): Boolean {
+        if (!pointerGranted) return true // a revocation is racing the release of the grab
         if (!ev.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE)) return false
         when (ev.actionMasked) {
             MotionEvent.ACTION_MOVE -> {
@@ -131,7 +146,7 @@ class MouseForwarder(
         if (captured) {
             userReleased = true
             onReleaseCapture?.invoke()
-        } else {
+        } else if (pointerGranted) { // never grab a pointer whose input can't land
             userReleased = false
             onRequestCapture?.invoke()
         }
@@ -139,7 +154,7 @@ class MouseForwarder(
 
     /** Auto-engage at stream start (setting on + a mouse actually present). */
     fun engageFromStart() {
-        if (captureWanted && !captured && !userReleased && hasPhysicalMouse()) {
+        if (pointerGranted && captureWanted && !captured && !userReleased && hasPhysicalMouse()) {
             onRequestCapture?.invoke()
         }
     }
@@ -204,7 +219,9 @@ class MouseForwarder(
      * input reader synthesizes them in), so both paths funnel into the same held-set and the
      * add/remove guard collapses the pair into a single wire press.
      */
-    fun sideButtonKey(back: Boolean, down: Boolean) = press(if (back) 4 else 5, down)
+    fun sideButtonKey(back: Boolean, down: Boolean) {
+        if (pointerGranted) press(if (back) 4 else 5, down)
+    }
 
     private fun button(actionButton: Int, down: Boolean) {
         val b = when (actionButton) {

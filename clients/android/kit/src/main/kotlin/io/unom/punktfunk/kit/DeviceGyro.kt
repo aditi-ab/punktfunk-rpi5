@@ -105,9 +105,12 @@ class DeviceGyro(
                 for (i in 0..2) lastAccel[i] = Gamepad.motionAccelWire(v[i])
             }
             Sensor.TYPE_GYROSCOPE -> {
-                // The write gate, per sample: pad 0 must exist (motion never creates a pad)
-                // and must not be a capture link's (its own IMU is streaming).
-                val write = router.padPresent(0) && !router.padHasOwnMotion(0)
+                // The write gate, per sample: sends must be on at all (the forwarding
+                // preference AND the session's GAMEPAD grant — an AccessUpdate can revoke it
+                // mid-session), pad 0 must exist (motion never creates a pad) and must not be
+                // a capture link's (its own IMU is streaming).
+                val write = router.sendsEnabled() && router.padPresent(0) &&
+                    !router.padHasOwnMotion(0)
                 if (!write) {
                     // Stand-down edge: never leave the last angular velocity latched host-side.
                     if (wasWriting) {

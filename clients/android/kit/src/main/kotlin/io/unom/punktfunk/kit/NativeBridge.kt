@@ -100,6 +100,17 @@ object NativeBridge {
     external fun nativeEndReason(handle: Long): Int
 
     /**
+     * The session's live access state as `[grants, remainingSecs, updateSeq]`, or `null` on a `0`
+     * handle. `grants` is a [SessionAccess] bitmask; `remainingSecs` counts down to the access
+     * expiry (`0` = permanent); `updateSeq` increments once per `AccessUpdate` the host sent
+     * (latest-wins — the state IS the fold, this counter is how a poller tells a fresh T−5 m /
+     * T−1 m warning arrived and owes a toast). Seeded from the Welcome's access advert; an old
+     * host — or an old native lib — reads as full control, permanent, exactly what such a host
+     * enforces. Poll ~1 Hz alongside [nativeSessionEnded]. Cheap; safe on the UI thread.
+     */
+    external fun nativeAccessState(handle: Long): IntArray?
+
+    /**
      * Run the SPAKE2 PIN ceremony, presenting [certPem]/[keyPem]. Returns the host's verified
      * fingerprint (64-hex) to persist + pin, or `""` on failure (wrong PIN / MITM / unreachable).
      * Blocking — call off the main thread.

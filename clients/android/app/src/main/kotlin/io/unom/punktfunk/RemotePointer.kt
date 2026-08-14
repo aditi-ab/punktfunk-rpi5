@@ -44,6 +44,21 @@ class RemotePointer(
     var active = false
         private set
 
+    /**
+     * Whether this session's access includes the POINTER grant — StreamScreen keeps it live from
+     * the access poll. Ungranted, the SELECT long-press stops entering pointer mode (a mode whose
+     * every action the host would drop; the Access chip says why), and a revocation while the
+     * mode is on leaves it cleanly ([setGranted]). Everything else passes through untouched,
+     * exactly as when the mode is off — the remote stays a remote.
+     */
+    private var granted = true
+
+    /** Update the POINTER grant; revoking while pointer mode is on leaves the mode. Main thread. */
+    fun setGranted(ok: Boolean) {
+        granted = ok
+        if (!ok && active) toggle()
+    }
+
     private val handler = Handler(Looper.getMainLooper())
     private val held = mutableSetOf<Int>() // D-pad keycodes currently down
     private var moveAccX = 0f
@@ -169,6 +184,7 @@ class RemotePointer(
     }
 
     private fun toggle() {
+        if (!active && !granted) return // never enter a mode whose input can't land
         active = !active
         if (!active) {
             held.clear()

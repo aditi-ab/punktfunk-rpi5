@@ -70,6 +70,7 @@ import io.unom.punktfunk.kit.deviceBodyVibrator
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.PadSensors
 import io.unom.punktfunk.kit.Sc2Capture
+import io.unom.punktfunk.kit.SessionAccess
 import io.unom.punktfunk.kit.SessionEndReason
 import io.unom.punktfunk.kit.VideoDecoders
 import io.unom.punktfunk.models.ActiveSession
@@ -100,6 +101,20 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     val streamHz = remember(handle) { NativeBridge.nativeVideoSize(handle)?.getOrNull(2) ?: 0 }
     val controller = remember(window) {
         window?.let { WindowCompat.getInsetsController(it, it.decorView) }
+    }
+
+    // The session's access level (the per-client grants of design/per-client-access.md), the
+    // courtesy mirror of what the host enforces: seeded from the Welcome's advert here, kept live
+    // by the 1 Hz poll below (the host's AccessUpdate messages fold latest-wins into the native
+    // state). Full control + permanent — the only state an old host or an old native lib ever
+    // reports — gates nothing and draws nothing: today's look, unchanged.
+    val initialAccess = remember(handle) { NativeBridge.nativeAccessState(handle) }
+    var accessGrants by remember(handle) {
+        mutableStateOf(initialAccess?.getOrNull(0) ?: SessionAccess.ALL)
+    }
+    // Seconds until this session's access expires (0 = permanent), as last reported natively.
+    var accessRemaining by remember(handle) {
+        mutableStateOf(initialAccess?.getOrNull(1) ?: 0)
     }
 
     // Start mic only if the user enabled it AND granted RECORD_AUDIO (else the AAudio input fails).
@@ -182,6 +197,34 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         NativeBridge.nativeSetMicMuted(handle, muted)
     }
 
+    // Push a grant mask into every gate that consults one — called at session start (once the
+    // router/forwarders exist) and again whenever the poll sees the mask change (an AccessUpdate
+    // revoked or restored something mid-session). A lambda, deliberately not a local fun — this
+    // codebase has been burned by `::localFun` references in composable scopes. The gates it does
+    // NOT reach (the Compose-side ones — the touch layer, the IME summon, the banner line, the
+    // chip) key on `accessGrants` directly and re-run on the state write.
+    val applyAccess: (Int) -> Unit = { grants ->
+        activity?.streamAccess = grants
+        activity?.gamepadRouter?.gamepadGranted = grants and SessionAccess.GAMEPAD != 0
+        val pointerOk = grants and SessionAccess.POINTER != 0
+        activity?.mouseForwarder?.let { m ->
+            m.pointerGranted = pointerOk
+            // A revocation must also let an existing grab go (and lift held buttons): a captured
+            // mouse that moves nothing reads as a broken mouse, not a spectator session.
+            if (!pointerOk) m.release()
+        }
+        activity?.remotePointer?.setGranted(pointerOk)
+        // Mic revoked mid-session: stop the capture — the host detaches its end regardless, and
+        // an open mic (with the platform's recording indicator lit) feeding a plane the host
+        // drops would be the worst kind of lie. Not restarted on a re-grant: the host attaches
+        // the mic service at session setup only, so a fresh session is the honest offer.
+        if (grants and SessionAccess.MIC == 0 && micRunning) {
+            releaseMicEffects(micEffects)
+            NativeBridge.nativeStopMic(handle)
+            micRunning = false
+        }
+    }
+
     // Live decode stats for the HUD. `statsOn` (verbosity != OFF) gates the whole native pipeline:
     // the per-frame sampling (nativeSetVideoStatsEnabled — a hidden HUD costs one atomic load per
     // frame) AND the 1 s poll loop, which only runs while the overlay is visible. Enabling resets
@@ -243,22 +286,62 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // open, so this fires only on a genuinely dead peer, never a false positive. Keyed on `handle`, so
     // it stops the moment we navigate away (the handle is only freed later, in onDispose).
     LaunchedEffect(handle) {
+        var lastAccessSeq = initialAccess?.getOrNull(2) ?: 0
         while (true) {
             delay(1000)
+            // Access first, ended second: a session about to close on its expiry gets its final
+            // countdown read, which is what lets the ended branch word that close honestly.
+            NativeBridge.nativeAccessState(handle)?.let { st ->
+                val grants = st.getOrNull(0) ?: SessionAccess.ALL
+                val seq = st.getOrNull(2) ?: 0
+                if (grants != accessGrants) {
+                    accessGrants = grants
+                    applyAccess(grants)
+                }
+                accessRemaining = st.getOrNull(1) ?: 0
+                if (seq != lastAccessSeq) {
+                    lastAccessSeq = seq
+                    // A fresh AccessUpdate close to the deadline is the host's T−5 m / T−1 m
+                    // courtesy warning — surface it. Grant edits (and a warning's grant echo)
+                    // otherwise just move the chip; a toast per edit would be noise.
+                    if (accessRemaining in 1..330) {
+                        val mins = (accessRemaining + 30) / 60
+                        Toast.makeText(
+                            context,
+                            if (mins <= 1) {
+                                "Access expires in about a minute."
+                            } else {
+                                "Access expires in about $mins minutes."
+                            },
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }
+            }
             if (NativeBridge.nativeSessionEnded(handle)) {
                 // WHY it ended decides what the user is told. This used to show the "host may be
                 // asleep" line for EVERY ending — including a game the player had just quit and a
                 // session the host ended on purpose — which reads as a failure report for
                 // something nobody did wrong. Only a connection that actually died says that now.
                 val reason = SessionEndReason.fromNative(NativeBridge.nativeEndReason(handle))
-                when (reason) {
-                    SessionEndReason.LOST ->
+                when {
+                    // The session died inside the access countdown's final stretch: that IS the
+                    // typed expiry close (ACCESS_EXPIRED), worded with the shared rejection
+                    // sentence rather than the generic host-ended silence. Recognized off the
+                    // countdown because the generic end-reason byte predates the expiry code.
+                    accessRemaining in 1..75 ->
+                        Toast.makeText(
+                            context,
+                            "Your access to this host has expired.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    reason == SessionEndReason.LOST ->
                         Toast.makeText(
                             context,
                             "Connection lost — the host may be asleep. Wake it to reconnect.",
                             Toast.LENGTH_LONG,
                         ).show()
-                    SessionEndReason.HOST_ERROR ->
+                    reason == SessionEndReason.HOST_ERROR ->
                         Toast.makeText(
                             context,
                             "The host ended the session with an error.",
@@ -266,10 +349,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                         ).show()
                     // Deliberate endings — the player quit the game, the host was stopped, or we
                     // closed it. Leaving the stream IS the feedback; a toast would only add noise.
-                    SessionEndReason.GAME_EXITED,
-                    SessionEndReason.HOST_ENDED,
-                    SessionEndReason.LOCAL,
-                    SessionEndReason.NONE -> {}
+                    else -> {}
                 }
                 onSessionEnded(reason)
                 return@LaunchedEffect
@@ -465,15 +545,32 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                 handle,
                 surfaceWidth = { videoView?.width?.takeIf { it > 0 } ?: decor?.width ?: 1920 },
                 onActiveChanged = { on -> remotePointerOn = on },
-                onKeyboardToggle = { keyCapture?.let { it.setImeVisible(!it.imeShown) } },
+                // The toggle TYPES — summoning also needs the KEYBOARD grant (hiding is free).
+                onKeyboardToggle = {
+                    keyCapture?.let { v ->
+                        if (v.imeShown || accessGrants and SessionAccess.KEYBOARD != 0) {
+                            v.setImeVisible(!v.imeShown)
+                        }
+                    }
+                },
             )
         } else {
             null
         }
         activity?.remotePointer = remote
-        // Shared clipboard (text v1): only when the user setting is on AND the host has a
-        // working clipboard service. Protocol-level opt-in + the poll thread live in the sync.
-        val clip = if (session.clipboardSync && NativeBridge.nativeClipSupported(handle)) {
+        // Everything the grant gates hang off now exists — apply the session's access level once
+        // up front (the poll only re-applies on change, and a restricted session is restricted
+        // from its first event, not from its first poll).
+        applyAccess(accessGrants)
+        // Shared clipboard (text v1): only when the user setting is on AND the session's access
+        // includes the clipboard AND the host has a working clipboard service. Ungranted, the
+        // host's policy resolution declines everything anyway (grants AND into it); not starting
+        // the sync is the client-side mirror — no offers announced, no poll thread for a plane
+        // that cannot move. Applied at session start only, like the host's own coordinator gate.
+        val clip = if (session.clipboardSync &&
+            accessGrants and SessionAccess.CLIPBOARD != 0 &&
+            NativeBridge.nativeClipSupported(handle)
+        ) {
             ClipboardSync(context, handle).also { it.start() }
         } else {
             null
@@ -699,6 +796,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             activity?.remotePointer = null
             decor?.pointerIcon = priorPointerIcon
             activity?.streamHandle = 0L
+            activity?.streamAccess = SessionAccess.ALL // grants are per session, like the handle
             activity?.requestStreamExit = null
             // Back in the menus: the SC2 (if present) resumes driving the console UI.
             activity?.startSc2MenuNav()
@@ -817,7 +915,12 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                                         .roundToInt(),
                             )
                             NativeBridge.nativeStartAudio(handle, lowLatencyMode, isTv)
-                            if (micWanted) {
+                            // The MIC grant is read live (a surface recreate re-runs this, and
+                            // the mask may have changed since the last one): without it no
+                            // capture opens — the host never attached this session to its mic
+                            // service, so the platform's recording indicator would announce a
+                            // mic nobody can hear.
+                            if (micWanted && accessGrants and SessionAccess.MIC != 0) {
                                 val sessionId =
                                     NativeBridge.nativeStartMic(handle, initialSettings.echoCancel)
                                 if (initialSettings.echoCancel) {
@@ -881,6 +984,22 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                 )
             }
         }
+        // The Access chip — what this session is allowed to do, said in the preset vocabulary
+        // ("Controller only · 1 h 58 m left"), standing for the whole stream. Full control with
+        // no expiry — every session against an old host, and most against a new one — shows
+        // NOTHING: the chip exists for the sessions where input silently not landing needs an
+        // explanation, not as new chrome on everyone's stream. TopEnd, in the shared pill family
+        // (TopStart is the HUD's, TopCentre the transient cues', BottomCentre the banner's).
+        val accessChip = when {
+            accessGrants and SessionAccess.ALL == SessionAccess.ALL && accessRemaining == 0 -> null
+            accessRemaining > 0 ->
+                "${SessionAccess.label(accessGrants)} · " +
+                    "${SessionAccess.remainingLabel(accessRemaining)} left"
+            else -> SessionAccess.label(accessGrants)
+        }
+        if (accessChip != null) {
+            AccessChip(accessChip, Modifier.align(Alignment.TopEnd).padding(12.dp))
+        }
         // "Hold to quit" hint while the gamepad exit chord is armed — the exit debounces on a ~1 s
         // hold, so without this cue a couch user reads the (deliberately no-longer-instant) chord as
         // broken. Purely visual; it sits above the video and below the gesture layer.
@@ -898,7 +1017,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         // Above the video and below the gesture layer: it teaches touches, it must never eat one.
         //
         // Bottom-centre is the desktop's placement and the only edge left — TopStart is the HUD,
-        // TopEnd the mic badge, TopCentre the three transient cues — but MotionUnreachableHint
+        // TopEnd the Access chip, TopCentre the three transient cues — but MotionUnreachableHint
         // already owns it, and both of these can be up at t≈0. The banner YIELDS rather than
         // stacking or sliding off-centre: the notice reports something broken about THIS session
         // and names the setting that fixes it, while the banner repeats shortcuts that will be
@@ -919,8 +1038,13 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                         // button — all land on the same BackHandler).
                         add("Back leaves the stream")
                         // The tap lives in the pointer touch models only — passthrough gives every
-                        // finger to the host verbatim — and needs a screen to put three fingers on.
-                        if (hasTouch && touchMode != TouchMode.TOUCH) add("three-finger tap for stats")
+                        // finger to the host verbatim — and needs a screen to put three fingers on,
+                        // plus the POINTER grant (without it the gesture layer is not installed).
+                        if (hasTouch && touchMode != TouchMode.TOUCH &&
+                            accessGrants and SessionAccess.POINTER != 0
+                        ) {
+                            add("three-finger tap for stats")
+                        }
                     }
                 }.joinToString(" · "),
                 alpha = bannerAlpha,
@@ -951,23 +1075,35 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         // Stylus lane (design/pen-tablet-input.md §7): against a HOST_CAP_PEN host a stylus
         // splits out of BOTH touch models onto the pen plane; its heartbeat coroutine keeps a
         // stationary held stroke alive (and its cancellation lifts everything on teardown).
-        val stylus = remember(handle) {
-            if (NativeBridge.nativeHostSupportsPen(handle)) StylusStream(handle) else null
+        // The POINTER grant gates the whole touch/stylus capture layer — "don't capture what
+        // can't land": ungranted, no gesture handler is installed at all (and no pen lane opens),
+        // rather than fingers being read into events the host will drop. Keyed on the grant so an
+        // AccessUpdate flipping it mid-session swaps the layer live.
+        val pointerOk = accessGrants and SessionAccess.POINTER != 0
+        val stylus = remember(handle, pointerOk) {
+            if (pointerOk && NativeBridge.nativeHostSupportsPen(handle)) StylusStream(handle) else null
         }
         if (stylus != null) {
             LaunchedEffect(stylus) { stylus.heartbeatLoop() }
         }
         Box(
-            videoFit.pointerInput(handle, touchMode) {
-                when (touchMode) {
-                    TouchMode.TOUCH -> streamTouchPassthrough(handle, stylus)
+            videoFit.pointerInput(handle, touchMode, pointerOk) {
+                when {
+                    !pointerOk -> {} // no capture — the Access chip is what says why
+                    touchMode == TouchMode.TOUCH -> streamTouchPassthrough(handle, stylus)
                     else -> streamTouchInput(
                         handle,
                         stylus,
                         trackpad = touchMode == TouchMode.TRACKPAD,
                         invertScroll = initialSettings.invertScroll,
                         onCycleStats = { statsVerbosity = statsVerbosity.next() },
-                        onKeyboard = { show -> keyCapture?.setImeVisible(show) },
+                        // The summon rides the pointer gesture but TYPES — so it also needs the
+                        // KEYBOARD grant (dismissing is always allowed).
+                        onKeyboard = { show ->
+                            if (!show || accessGrants and SessionAccess.KEYBOARD != 0) {
+                                keyCapture?.setImeVisible(show)
+                            }
+                        },
                     )
                 }
             },
@@ -1028,6 +1164,25 @@ private fun MicChordHint(text: String, modifier: Modifier = Modifier) {
             .padding(horizontal = 14.dp, vertical = 8.dp),
         color = Color.White,
         fontSize = 15.sp,
+    )
+}
+
+/**
+ * The standing Access chip — the session's access level in the preset vocabulary, with the live
+ * countdown when the grant expires ("Controller only · 1 h 58 m left"). Same pill family as the
+ * other in-stream overlays, sized down a step because it stands for the whole session rather than
+ * flashing a moment's confirmation. Only composed when there is something to say: a full-control
+ * permanent session — today's normal — shows nothing at all.
+ */
+@Composable
+private fun AccessChip(text: String, modifier: Modifier = Modifier) {
+    Text(
+        text,
+        modifier = modifier
+            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
+            .padding(horizontal = 10.dp, vertical = 5.dp),
+        color = Color.White,
+        fontSize = 12.sp,
     )
 }
 

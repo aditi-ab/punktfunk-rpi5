@@ -17,6 +17,7 @@
 //! TODO(M4 Android stage 1): client→host DualSense rich input (`send_rich_input`), mode
 //! renegotiation. Port the remaining orchestration from `clients/linux`.
 
+mod access;
 mod clipboard;
 mod connect;
 mod input;
@@ -25,7 +26,7 @@ mod probe;
 
 use punktfunk_core::client::NativeClient;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -82,6 +83,10 @@ pub(crate) struct SessionHandle {
     /// fresh capture could send an unmuted frame. Per session and never persisted: a new session
     /// starts unmuted.
     pub mic_muted: Arc<AtomicBool>,
+    /// Count of `AccessUpdate`s drained from the connector's event plane, bumped by the
+    /// `nativeAccessState` poll ([`access`]) — how the Kotlin poller tells a fresh update
+    /// (the host's expiry warnings) arrived without holding a blocking event thread.
+    pub(crate) access_seq: AtomicU32,
 }
 
 struct VideoThread {
