@@ -32,8 +32,11 @@ final class AudioDeviceWatcher {
     /// posts one last change as it is torn down, and other AVAudioEngines in the process are not
     /// ours to restart.
     private let isOurs: (AnyObject?) -> Bool
-    /// Delivered on the main queue.
-    private let onChange: (Reason) -> Void
+    /// Delivered on the main queue. The second argument is the engine that posted the change
+    /// (`.engineConfiguration` only; nil for the HAL listener) — the owner needs the OBJECT, not
+    /// just the reason, because an engine that is RUNNING when the notification lands is one the
+    /// owner already restarted: acting on that echo is how a rebuild loop starts.
+    private let onChange: (Reason, AnyObject?) -> Void
 
     private let lock = NSLock()
     private var configObserver: NSObjectProtocol?
@@ -41,7 +44,7 @@ final class AudioDeviceWatcher {
     private var defaultOutputListener: AudioObjectPropertyListenerBlock?
     #endif
 
-    init(isOurs: @escaping (AnyObject?) -> Bool, onChange: @escaping (Reason) -> Void) {
+    init(isOurs: @escaping (AnyObject?) -> Bool, onChange: @escaping (Reason, AnyObject?) -> Void) {
         self.isOurs = isOurs
         self.onChange = onChange
     }
@@ -63,7 +66,7 @@ final class AudioDeviceWatcher {
             let posted = note.object as AnyObject?
             DispatchQueue.main.async {
                 guard let self, self.isOurs(posted) else { return }
-                self.onChange(.engineConfiguration)
+                self.onChange(.engineConfiguration, posted)
             }
         }
         lock.lock()
@@ -77,7 +80,8 @@ final class AudioDeviceWatcher {
         // (the voice-processing engine, which is the DEFAULT macOS configuration and which no Mac
         // here can even initialize). The HAL is told either way.
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.onChange(.defaultOutputDevice) // on the main queue — registered against it below
+            // On the main queue — registered against it below. No engine posted this, so nil.
+            self?.onChange(.defaultOutputDevice, nil)
         }
         var address = Self.defaultOutputAddress()
         let status = AudioObjectAddPropertyListenerBlock(

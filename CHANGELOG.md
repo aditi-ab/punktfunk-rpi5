@@ -456,6 +456,31 @@ otherwise had silently run stage-4, because the gate keyed on build config.
   renders code 16 as grey rather than black. Now gated on `connection.isHDR` as well; layout re-runs
   it, so a session that flips to HDR mid-stream still picks the mode up.
 
+### Apple — the macOS device-change recovery could answer itself forever (mic on)
+
+**Streaming from a Mac with the microphone enabled cut audio AND input on a ~2.5 s metronome
+while video ran untouched** (field, 2026-08-14: a Mac Studio whose default input is a 6-channel
+device). The chain: the voice-processing engine cannot start on that mic, every rebuild re-tried
+it, and the failed attempt's HAL churn (VPIO builds and tears down an aggregate device) stopped
+the healthy fallback engines — which posted the `AVAudioEngineConfigurationChange` that scheduled
+the next rebuild. Each ~1.9 s rebuild runs on the main thread, where macOS input capture and
+sending live, so input froze on the same beat — and since audio, input and mic share the QUIC
+datagram plane while video rides its own socket, the wire signature read as a network fault and
+the host's METRONOMIC heuristic pointed at the display stack. Three defenses, layered because no
+single one covers every feedback shape:
+
+- **A voice-processing start failure latches per input device** (`CombinedTopologyGate`): a
+  rebuild goes straight to the split topology instead of re-running a failure that is a property
+  of the device. A different default input earns exactly one fresh attempt.
+- **A configuration change posted by an engine that is RUNNING is the rebuild's own echo, and is
+  ignored**: an engine stops itself before posting, so a live poster was already restarted.
+- **Rebuilds that chain anyway back off exponentially** (`RebuildBackoff`: 0.5 s floor doubling
+  to a 30 s cap, reset by 10 s of quiet) — an unforeseen loop costs one blip per half-minute
+  instead of a metronome, and the chaining itself logs a WARN that names the condition.
+
+iOS/tvOS behaviour is untouched (routes are session-managed there; nothing is latched). Until a
+client carries this, the field workaround is turning the client microphone off.
+
 ### Apple gamepad UI — a host menu, and About becomes a page
 
 **UP on a saved tile opens Wake / Copy link / Edit… / Forget pairing / Remove.** The desktop and
