@@ -340,6 +340,7 @@ mod tests {
             audio_channels: 2,
             codec: CODEC_HEVC,
             host_caps: HOST_CAP_GAMEPAD_STATE | HOST_CAP_CLIPBOARD,
+            mgmt_port: 0,
             cipher: 0,
             key_chacha: None,
         };

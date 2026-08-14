@@ -73,8 +73,11 @@ pub fn run(target: Option<&str>) -> u8 {
                 paired: k.is_some_and(|h| h.paired) || fake,
                 saved: k.is_some(),
                 online: false,
+                // Explicit --mgmt wins; else the port this host's advert taught us and we saved;
+                // else 47990. The middle rung is what survives mDNS being unavailable later.
                 mgmt_port: arg_value("--mgmt")
                     .and_then(|p| p.parse().ok())
+                    .or_else(|| k.and_then(|h| h.mgmt_port))
                     .unwrap_or(library::DEFAULT_MGMT_PORT),
                 can_wake: false,
                 last_used: k.and_then(|h| h.last_used),
@@ -181,7 +184,7 @@ pub fn run(target: Option<&str>) -> u8 {
         vsync: settings_at_start.vsync,
         allow_vrr: settings_at_start.allow_vrr,
         json_status,
-        on_connected: Some(Box::new(move |fingerprint: [u8; 32]| {
+        on_connected: Some(Box::new(move |fingerprint: [u8; 32], mgmt_port: u16| {
             let fp_hex = trust::hex(&fingerprint);
             trust::touch_last_used(&fp_hex);
             // A request-access connect just succeeded → the operator approved us. Save the
@@ -191,6 +194,10 @@ pub fn run(target: Option<&str>) -> u8 {
                     trust::persist_host(&p.name, &p.addr, p.port, &fp_hex, true);
                 }
             }
+            // Where this host serves its library, from the session's own Welcome — recorded
+            // AFTER the persist above so a host saved by this very connect gets it too. `0` =
+            // the host advertised none, and the call is a no-op.
+            trust::learn_mgmt_port_by_fp(&fp_hex, mgmt_port);
         })),
         overlay: Some(Box::new(overlay)),
         window_size: crate::session_main::window_size(&settings_at_start),
@@ -682,6 +689,12 @@ impl ServiceState {
                         || (d.addr == h.addr && d.port == h.port)
                 });
                 let online = advert.is_some() || probed.get(&key).copied().unwrap_or(false);
+                // Write the advertised mgmt port down while the host is visible, so this console
+                // keeps working against a moved port once it is not. No-op (and no disk write)
+                // when unchanged, so this is safe on every refresh tick.
+                if let Some(p) = advert.and_then(|d| d.mgmt_port) {
+                    pf_client_core::trust::learn_mgmt_port(&h.fp_hex, &h.addr, h.port, p);
+                }
                 let row = HostRow {
                     key: key.clone(),
                     name: host_display_name(&h.name, &h.addr),
@@ -691,8 +704,12 @@ impl ServiceState {
                     paired: h.paired,
                     saved: true,
                     online,
+                    // Live advert first, then what we saved from an earlier one, then 47990 —
+                    // the same three rungs `os` uses just below. Reading the advert ALONE is why
+                    // a host on a moved mgmt port lost its library the moment mDNS went quiet.
                     mgmt_port: advert
                         .and_then(|d| d.mgmt_port)
+                        .or(h.mgmt_port)
                         .unwrap_or(library::DEFAULT_MGMT_PORT),
                     can_wake: !online && !h.mac.is_empty(),
                     last_used: h.last_used,

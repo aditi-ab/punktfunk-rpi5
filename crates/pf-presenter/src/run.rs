@@ -39,6 +39,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// [`SessionOpts::on_connected`]'s callback: the host's certificate fingerprint, then the
+/// management-API port from its `Welcome` (`0` = it advertised none).
+///
+/// A named type rather than the inline `Box<dyn FnMut(...)>` because adding the second parameter
+/// tipped it over `clippy::type_complexity` — factoring it out is what that lint asks for, and it
+/// gives the two positional arguments somewhere to be documented.
+pub type ConnectedFn = Box<dyn FnMut([u8; 32], u16)>;
+
 pub struct SessionOpts {
     pub window_title: String,
     /// Start fullscreen (gamescope / `--fullscreen`).
@@ -84,9 +92,14 @@ pub struct SessionOpts {
     pub allow_vrr: bool,
     /// Emit the `{"ready":true}` stdout line after the first presented frame.
     pub json_status: bool,
-    /// Called once on `Connected` with the host's fingerprint (trust persistence is the
-    /// binary's business — this loop stays store-agnostic).
-    pub on_connected: Option<Box<dyn FnMut([u8; 32])>>,
+    /// Called once on `Connected` with the host's fingerprint and the management-API port the
+    /// host reported in its `Welcome` (`0` = it advertised none). Trust persistence is the
+    /// binary's business — this loop stays store-agnostic.
+    ///
+    /// The port rides along because this is the one moment a client is guaranteed to have it
+    /// WITHOUT mDNS: the session it just authenticated carries it. A client that saves it here
+    /// can browse the library of a host it has only ever reached by address.
+    pub on_connected: Option<ConnectedFn>,
     /// The console-UI overlay (§6.1) — `None` is the Skia-free power-user build (stats
     /// stay stdout-only). An overlay whose `init` fails degrades to `None` with a
     /// warning rather than killing the session. Browse mode requires one.
@@ -1377,9 +1390,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     apply_capture(&mut window, &mouse, true, cap.desktop(), inhibit_shortcuts);
                     st.capture = Some(cap);
                     st.cursor_chan = Some(crate::cursor::CursorChannel::new(&c));
+                    // Read the mgmt port BEFORE `c` is moved into `st` — the Welcome's answer to
+                    // "where is this host's library", which the binary persists so it survives
+                    // without ever needing an mDNS advert.
+                    let mgmt_port = c.mgmt_port();
                     st.connector = Some(c);
                     if let Some(f) = opts.on_connected.as_mut() {
-                        f(fingerprint);
+                        f(fingerprint, mgmt_port);
                     }
                     if let Some(o) = overlay.as_mut() {
                         o.session_phase(SessionPhase::Streaming);

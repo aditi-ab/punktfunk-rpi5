@@ -105,7 +105,16 @@
 // is unchanged (it simply keeps the double-arm race the pair exists to close). Additive and
 // client-local: nothing new goes on the wire — the width is computed from frame indices the client
 // already receives — so [`WIRE_VERSION`] is unchanged.
-#define PUNKTFUNK_ABI_VERSION 19
+// v20: `punktfunk_connection_mgmt_port` — reads the host's management-API port out of the
+// session's `Welcome`, so a client can find the game library WITHOUT mDNS. The port previously
+// existed only in the host's mDNS TXT, which made a host that had moved it off 47990 (the
+// supported way to share a machine with a Sunshine fork, whose web UI owns that port) reachable
+// only where multicast worked — over a VPN, a routed subnet, or for a host added by IP, the
+// library silently fell back to a port nothing was listening on. A NEW symbol, not a widened one:
+// every existing function keeps its signature and behaviour, and an embedder that never calls it
+// is unchanged. The `Welcome` grew a trailing field, which older peers skip in both directions
+// (see `Welcome::encode`), so [`WIRE_VERSION`] is unchanged.
+#define PUNKTFUNK_ABI_VERSION 20
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -3123,6 +3132,22 @@ PunktfunkStatus punktfunk_connection_mode(const PunktfunkConnection *c,
 // # Safety
 // `c` is a valid connection handle; `gamepad` is writable (NULL is skipped).
 PunktfunkStatus punktfunk_connection_gamepad(const PunktfunkConnection *c, uint32_t *gamepad);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The host's management-API port, from this session's `Welcome` — where its game library is
+// served (distinct from the streaming ports). `0` means the host did not advertise one: an older
+// host, or the standalone `punktfunk1-host` binary, which has no management API. Treat `0` as
+// "unknown" and fall back to your own default (47990), never as a port to dial.
+//
+// This exists so a client does NOT need mDNS to find the library. The port used to live only in
+// the host's mDNS TXT, so a host that had moved it off 47990 — the supported way to coexist with
+// a Sunshine fork, whose web UI owns that port — was reachable only where multicast worked. Read
+// this after connect and prefer it over any cached or default value. Safe any time after connect.
+//
+// # Safety
+// `c` is a valid connection handle; `port` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_mgmt_port(const PunktfunkConnection *c, uint16_t *port);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

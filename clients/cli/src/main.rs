@@ -796,7 +796,9 @@ from the config directory for a true factory reset."
             );
             return NEEDS_INTERACTION;
         }
-        match library::fetch_games(&host.addr, library::DEFAULT_MGMT_PORT, &identity, pin) {
+        // The port this host actually serves its library on — learned from its advert and saved,
+        // falling back to 47990. Reaching for the constant here is what broke a moved port.
+        match library::fetch_games(&host.addr, host.effective_mgmt_port(), &identity, pin) {
             Ok(games) => {
                 if has(args, "--json") {
                     let rows: Vec<serde_json::Value> = games

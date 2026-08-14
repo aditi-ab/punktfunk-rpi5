@@ -41,6 +41,13 @@ rem Fixed deployment wiring (the Windows analogue of scripts/punktfunk-web.servi
 set "PORT=47992"
 set "HOST=0.0.0.0"
 set "PUNKTFUNK_MGMT_URL=https://127.0.0.1:47990"
+rem ...unless the host published a different one. `serve` writes mgmt-endpoint in the same single
+rem KEY=VALUE form as the token above, carrying the port it ACTUALLY bound - so a host moved off
+rem 47990 (PUNKTFUNK_MGMT_BIND, e.g. to share the box with a Sunshine fork whose web UI owns that
+rem port) brings the console with it. Imported AFTER the default so it wins; absent on an older host,
+rem and then the default above stands.
+set "ENDPOINTFILE=%PFDATA%\mgmt-endpoint"
+if exist "%ENDPOINTFILE%" for /f "usebackq tokens=1* delims==" %%A in ("%ENDPOINTFILE%") do set "%%A=%%B"
 rem No NODE_TLS_REJECT_UNAUTHORIZED: the host's self-signed cert is accepted only for the loopback
 rem proxy hop, scoped inside the proxy code (Bun per-request TLS), not process-wide.
 rem Serve HTTPS (HTTP/1.1 over TLS) with the host's identity cert; mark the session cookie Secure.

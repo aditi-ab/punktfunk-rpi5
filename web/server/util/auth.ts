@@ -105,7 +105,13 @@ export function uiPassword(): string {
  * loopback hop via Bun's per-request `tls` option (routes/api/[...].ts, util/forward.ts). There is
  * deliberately no process-wide NODE_TLS_REJECT_UNAUTHORIZED — see .env.example. */
 export function mgmtUrl(): string {
-	return process.env.PUNKTFUNK_MGMT_URL ?? "https://127.0.0.1:47990";
+	// Blank counts as UNSET, which `??` alone would not do. On a packaged install this value comes
+	// from ~/.config/punktfunk/mgmt-endpoint (written by the host's `serve` with the port it really
+	// bound, so a host moved off 47990 to coexist with a Sunshine fork carries the console with it),
+	// sourced as a systemd EnvironmentFile. An empty or truncated file would otherwise set the
+	// variable to "" and send every proxy hop to a URL that cannot parse.
+	const url = process.env.PUNKTFUNK_MGMT_URL?.trim();
+	return url ? url : "https://127.0.0.1:47990";
 }
 
 /** Bearer token for the management API, injected server-side. */

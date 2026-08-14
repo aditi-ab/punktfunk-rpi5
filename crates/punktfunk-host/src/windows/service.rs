@@ -1063,13 +1063,22 @@ fn spawn_web(cfg: &WebConfig, data: &Path, job: HANDLE) -> Result<Child> {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .or_else(|| read_env_file_value(&data.join("web-password")));
+    // The mgmt URL resolves env-over-file too, for the same reason the token does — except the file
+    // here is written by `mgmt::publish_endpoint` on every `serve`, so a host moved off 47990 (a
+    // Sunshine fork owns that port as its web UI) carries the console with it instead of leaving it
+    // proxying to a port nothing is listening on. The literal stays only as the last-resort default.
+    let mgmt_url = std::env::var("PUNKTFUNK_MGMT_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| read_env_file_value(&data.join("mgmt-endpoint")))
+        .unwrap_or_else(|| "https://127.0.0.1:47990".into());
 
     let mut overrides: Vec<(&str, String)> = vec![
         ("PORT", "47992".into()),
         ("HOST", "0.0.0.0".into()),
         // The /api proxy hop to the host's loopback HTTPS mgmt API. The host's self-signed cert is
         // accepted only inside the proxy code (per-request TLS), never process-wide.
-        ("PUNKTFUNK_MGMT_URL", "https://127.0.0.1:47990".into()),
+        ("PUNKTFUNK_MGMT_URL", mgmt_url),
         // Serve HTTPS with the host's own identity cert; mark the session cookie Secure.
         (
             "PUNKTFUNK_UI_TLS_CERT",

@@ -211,6 +211,22 @@ pub struct Welcome {
     /// advertised, so an unknown id reaching us is a bug, and falling back would yield an
     /// undecryptable session with a confusing failure signature.
     pub cipher: u8,
+    /// The host's management-API port — where its game library is served, distinct from every
+    /// other port here (`udp_port` is the data plane; the control plane is the QUIC port the
+    /// client already dialed). `0` = not advertised (an older host), and the client falls back to
+    /// the compiled-in 47990.
+    ///
+    /// **Why this is on the wire at all:** the port was previously discoverable ONLY from the
+    /// mDNS `mgmt` TXT. A host that moved it off 47990 — the supported way to share a machine with
+    /// a Sunshine fork, whose web UI owns that port — therefore had a working library only where
+    /// multicast worked. Carrying it in the `Welcome` means the client learns it over the
+    /// connection it has already authenticated, so a VPN-only, routed-subnet or manually-added
+    /// host needs no discovery at all.
+    ///
+    /// Appended AFTER the cipher block (offset 69, or 101 when a ChaCha key precedes it) rather
+    /// than at the next free fixed offset, and emitting it forces the `cipher` placeholder — see
+    /// the note in [`Welcome::encode`]. `0` when an older host omitted it.
+    pub mgmt_port: u16,
     /// The 256-bit ChaCha20-Poly1305 session key (RFC 8439 requires the full 32 bytes; wire
     /// cost is once per handshake) — present iff `cipher == 1`, at offsets 69..101. The legacy
     /// 16-byte `key` keeps its offset and stays independently random, so nothing downstream
@@ -473,10 +489,23 @@ impl Welcome {
             self.key_chacha.is_some(),
             "key_chacha present iff cipher == 1"
         );
-        if self.cipher != CIPHER_AES_128_GCM {
+        //
+        // ⚠ `mgmt_port` follows the cipher block, so emitting it FORCES the cipher byte even for
+        // an AES session — the placeholder discipline `Hello::encode` already uses for
+        // `audio_channels`/`preferred_codec`. Without that, an AES Welcome carrying a mgmt port
+        // would put the port's low byte at offset 68, exactly where every 0.28.x client reads
+        // `cipher` — and that decode is deliberately fail-closed on an unknown id, so the whole
+        // handshake would break against currently-shipped clients. An explicit `cipher = 0` is
+        // harmless by comparison: a current client reads AES (correct), and a pre-cipher client
+        // stops before 68 regardless.
+        let mgmt_present = self.mgmt_port != 0;
+        if self.cipher != CIPHER_AES_128_GCM || mgmt_present {
             b.push(self.cipher);
             if let Some(k) = &self.key_chacha {
                 b.extend_from_slice(k);
+            }
+            if mgmt_present {
+                b.extend_from_slice(&self.mgmt_port.to_le_bytes());
             }
         }
         b
@@ -488,9 +517,12 @@ impl Welcome {
         // salt[45..49] frames[49..53] compositor[53] gamepad[54] bitrate_kbps[55..59]
         // bit_depth[59] color.primaries[60] color.transfer[61] color.matrix[62] color.range[63]
         // chroma_format[64] audio_channels[65] codec[66] host_caps[67] cipher[68]
-        // key_chacha[69..101] (everything from compositor on is an optional trailing byte; an
-        // older host stops earlier; cipher/key_chacha are present only when ChaCha was
-        // negotiated).
+        // key_chacha[69..101] mgmt_port[69..71 | 101..103] (everything from compositor on is an
+        // optional trailing byte; an older host stops earlier; cipher/key_chacha are present only
+        // when ChaCha was negotiated). `mgmt_port` is the one field whose offset is NOT fixed: it
+        // follows the cipher block, so it starts at 69 for an AES session and 101 when a 32-byte
+        // ChaCha key precedes it. Emitting it forces the cipher byte (see `encode`), so "cipher
+        // absent" and "mgmt_port present" can never both hold.
         if b.len() < 53 || &b[0..4] != MAGIC {
             return Err(PunktfunkError::InvalidArg("bad Welcome"));
         }
@@ -518,6 +550,18 @@ impl Welcome {
             }
             _ => return Err(PunktfunkError::InvalidArg("bad Welcome")),
         };
+        // The mgmt port sits after the cipher block, so its offset depends on whether a ChaCha key
+        // preceded it. Absent (an older host, or one that did not advertise) → `0` = unknown, and
+        // the client falls back to the compiled-in default.
+        let mgmt_off = if cipher == CIPHER_CHACHA20_POLY1305 {
+            101
+        } else {
+            69
+        };
+        let mgmt_port = b
+            .get(mgmt_off..mgmt_off + 2)
+            .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
+            .unwrap_or(0);
         Ok(Welcome {
             abi_version: u32at(4),
             udp_port: u16at(8),
@@ -585,6 +629,7 @@ impl Welcome {
             // Optional trailing host-caps byte — absent on an older host → 0 (no gamepad-state
             // snapshots; the client keeps sending legacy per-transition events).
             host_caps: b.get(67).copied().unwrap_or(0),
+            mgmt_port,
             cipher,
             key_chacha,
         })
@@ -671,6 +716,7 @@ mod tests {
             audio_channels: 2,
             codec: CODEC_H264, // exercise a non-default codec through the roundtrip
             host_caps: HOST_CAP_GAMEPAD_STATE,
+            mgmt_port: 0,
             cipher: 0,
             key_chacha: None,
         };
@@ -736,6 +782,7 @@ mod tests {
             audio_channels: 2,
             codec: CODEC_HEVC,
             host_caps: 0,
+            mgmt_port: 0,
             cipher: CIPHER_AES_128_GCM,
             key_chacha: None,
         };
@@ -779,6 +826,48 @@ mod tests {
         let cha_cfg = cha.session_config(Role::Client);
         assert_eq!(cha_cfg.key, SessionKey::ChaCha20Poly1305(k32));
         cha_cfg.validate().expect("ChaCha config validates");
+
+        // ── mgmt_port, the trailing field after the cipher block ──────────────────────────────
+        //
+        // ⚠ THE HAZARD THIS PINS: `mgmt_port` follows `cipher`, and `cipher` is emitted only when
+        // non-default. Appending the port to an AES Welcome without forcing the cipher byte would
+        // land the port's LOW BYTE at offset 68 — exactly where every shipped client reads
+        // `cipher`, whose decode is fail-closed on an unknown id. 47991 is 0xBB57, so byte 68
+        // would read 0x57 = 87, an unknown id, and EVERY 0.28.x client would fail the handshake
+        // against a host that had merely moved its mgmt port. Assert the placeholder is there.
+        let mgmt = Welcome {
+            mgmt_port: 47991,
+            ..base
+        };
+        let menc = mgmt.encode();
+        assert_eq!(menc.len(), 68 + 1 + 2, "cipher placeholder + LE u16 port");
+        assert_eq!(
+            menc[68], CIPHER_AES_128_GCM,
+            "the cipher byte MUST be present (as 0) so a current client still reads AES here"
+        );
+        assert_eq!(&menc[69..71], &47991u16.to_le_bytes());
+        assert_eq!(Welcome::decode(&menc).unwrap(), mgmt);
+
+        // With ChaCha the port sits after the 32-byte key instead, at 101..103.
+        let both = Welcome {
+            mgmt_port: 47991,
+            cipher: CIPHER_CHACHA20_POLY1305,
+            key_chacha: Some(k32),
+            ..base
+        };
+        let benc = both.encode();
+        assert_eq!(benc.len(), 68 + 1 + 32 + 2);
+        assert_eq!(&benc[101..103], &47991u16.to_le_bytes());
+        assert_eq!(Welcome::decode(&benc).unwrap(), both);
+
+        // A host that advertises no mgmt port emits nothing extra — an AES Welcome stays exactly
+        // 68 bytes, so this field costs the common case zero and cannot perturb an old client.
+        assert_eq!(base.encode().len(), 68);
+        // ...and an old host's Welcome decodes to 0 = unknown, never to a port we might dial.
+        assert_eq!(Welcome::decode(&enc).unwrap().mgmt_port, 0);
+        assert_eq!(Welcome::decode(&cenc).unwrap().mgmt_port, 0);
+        // A truncated tail (one byte of the port) is not half a port: it reads as unknown.
+        assert_eq!(Welcome::decode(&menc[..70]).unwrap().mgmt_port, 0);
     }
 
     #[test]
@@ -873,6 +962,7 @@ mod tests {
                 audio_channels: 2,
                 codec: CODEC_PYROWAVE,
                 host_caps: 0,
+                mgmt_port: 0,
                 cipher: 0,
                 key_chacha: None,
             }
@@ -947,6 +1037,7 @@ mod tests {
                 audio_channels: 2,
                 codec: CODEC_H264,
                 host_caps: 0,
+                mgmt_port: 0,
                 cipher: 0,
                 key_chacha: None,
             }
@@ -1058,6 +1149,7 @@ mod tests {
             audio_channels: 6, // 5.1 — exercises the non-default trailing byte
             codec: CODEC_HEVC,
             host_caps: HOST_CAP_GAMEPAD_STATE,
+            mgmt_port: 0,
             cipher: 0,
             key_chacha: None,
         };

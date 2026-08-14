@@ -477,6 +477,16 @@ object NativeBridge {
     // cross only when the host pastes (a "fetch:" event answered by nativeClipServeText). Host
     // copies arrive as "offer:" events, fetched eagerly into the system clipboard.
 
+    /**
+     * The management-API port the host reported in this session's `Welcome` — where its game
+     * library is served — or 0 if it advertised none (older host, or no management API).
+     *
+     * Persist it on the host record: unlike the mDNS `mgmt` TXT, this arrives over the connection
+     * we have already authenticated, so it is what makes a host that moved off 47990 browsable
+     * over a VPN, a routed subnet, or when it was added by address.
+     */
+    external fun nativeHostMgmtPort(handle: Long): Int
+
     /** Whether the host advertised a working shared-clipboard service (HOST_CAP_CLIPBOARD). */
     external fun nativeClipSupported(handle: Long): Boolean
 

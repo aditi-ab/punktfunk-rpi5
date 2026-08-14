@@ -3826,6 +3826,42 @@ fn build_clip_event(
     out
 }
 
+/// The host's management-API port, from this session's `Welcome` — where its game library is
+/// served (distinct from the streaming ports). `0` means the host did not advertise one: an older
+/// host, or the standalone `punktfunk1-host` binary, which has no management API. Treat `0` as
+/// "unknown" and fall back to your own default (47990), never as a port to dial.
+///
+/// This exists so a client does NOT need mDNS to find the library. The port used to live only in
+/// the host's mDNS TXT, so a host that had moved it off 47990 — the supported way to coexist with
+/// a Sunshine fork, whose web UI owns that port — was reachable only where multicast worked. Read
+/// this after connect and prefer it over any cached or default value. Safe any time after connect.
+///
+/// # Safety
+/// `c` is a valid connection handle; `port` is writable (NULL is skipped).
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_mgmt_port(
+    c: *const PunktfunkConnection,
+    port: *mut u16,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_ref` reports as `None` and the `match` handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        // SAFETY: per the ABI contract - the out-param is OPTIONAL, so it is null-checked before
+        // it is written; a non-null one is a caller-owned writable slot.
+        unsafe {
+            if !port.is_null() {
+                *port = c.inner.mgmt_port();
+            }
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
 /// The host capability bitfield the session's `Welcome` carried — a bitfield of
 /// `PUNKTFUNK_HOST_CAP_GAMEPAD_STATE` / `PUNKTFUNK_HOST_CAP_CLIPBOARD` /
 /// `PUNKTFUNK_HOST_CAP_PEN`. A client tests `caps & PUNKTFUNK_HOST_CAP_CLIPBOARD` to decide

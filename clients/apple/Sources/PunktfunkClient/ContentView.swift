@@ -354,9 +354,14 @@ struct ContentView: View {
                 // Persist on the next runloop tick: HostStore is an ObservableObject, and mutating
                 // its @Published from inside .onChange (a view-update callback) trips SwiftUI's
                 // "Publishing changes from within view updates". A one-tick delay is imperceptible.
+                // The session's own Welcome told us where this host's library lives — the one
+                // source that does not need an mDNS advert, so it also covers a host reached by
+                // address over a VPN. 0 = not advertised; updateMgmtPort ignores it.
+                let liveMgmtPort = model.connection?.hostMgmtPort
                 let store = store
                 DispatchQueue.main.async {
                     store.markConnected(host.id)
+                    store.updateMgmtPort(host.id, port: liveMgmtPort)
                     if let approvedFingerprint { store.pin(host.id, fingerprint: approvedFingerprint) }
                 }
             case .idle:
@@ -1262,6 +1267,9 @@ struct ContentView: View {
         if let live = discovery.hosts.first(where: { host.matches($0) }) {
             store.updateMacs(host.id, macs: live.macAddresses) // learn — on every platform
             store.updateOsChain(host.id, chain: live.osChain) // ditto for the card's OS mark
+            // ...and the mgmt port, so the library keeps working against a host that moved it once
+            // this device can no longer see the advert (VPN, routed subnet, multicast-dead Wi-Fi).
+            store.updateMgmtPort(host.id, port: live.mgmtPort)
         } else if autoWakeEnabled, PunktfunkConnection.wakeOnLANAvailable, !host.wakeMacs.isEmpty {
             // Auto-wake only: fire the up-front packet so a genuinely-asleep host is booting while the
             // dial times out. With auto-wake off, connects go straight through (no packet).
@@ -1320,6 +1328,7 @@ struct ContentView: View {
         guard !model.isBusy else { return }
         let host = StoredHost(
             name: d.name, address: d.host, port: d.port,
+            mgmtPort: d.mgmtPort,
             macAddresses: d.macAddresses.isEmpty ? nil : d.macAddresses,
             osChain: d.osChain.isEmpty ? nil : d.osChain)
         store.add(host)

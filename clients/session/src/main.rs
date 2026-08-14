@@ -986,9 +986,16 @@ mod session_main {
             vsync: settings.vsync,
             allow_vrr: settings.allow_vrr,
             json_status: true,
-            on_connected: Some(Box::new(|fingerprint: [u8; 32]| {
+            on_connected: Some(Box::new(|fingerprint: [u8; 32], mgmt_port: u16| {
+                let fp = trust::hex(&fingerprint);
                 // This host's card carries the accent bar in the desktop client now.
-                trust::touch_last_used(&trust::hex(&fingerprint));
+                trust::touch_last_used(&fp);
+                // Save where this host serves its library, learned from the session's own
+                // Welcome rather than an mDNS advert — so it keeps working on a network where
+                // discovery never does. `0` = the host advertised none; leave what we have.
+                if mgmt_port != 0 {
+                    trust::learn_mgmt_port_by_fp(&fp, mgmt_port);
+                }
             })),
             // The Skia console UI (stats OSD, capture HUD) — compiled out of the
             // power-user build (`--no-default-features` drops the `ui` feature).

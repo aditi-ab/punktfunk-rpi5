@@ -73,4 +73,8 @@ pub(crate) struct Negotiated {
     /// [`crate::quic::HOST_CAP_GAMEPAD_STATE`], [`crate::quic::HOST_CAP_CLIPBOARD`]. Exposed to the
     /// embedder via [`NativeClient::host_caps`] so a native client greys out unsupported toggles.
     pub(crate) host_caps: u8,
+    /// The host's management-API port ([`crate::quic::Welcome::mgmt_port`]), `0` when it did not
+    /// advertise one. Surfaced to the embedder via [`crate::NativeClient::mgmt_port`] so a client
+    /// can reach the game library without ever having seen an mDNS advert.
+    pub(crate) mgmt_port: u16,
 }
