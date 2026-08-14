@@ -14,6 +14,50 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ## v0.28.1 — in development
 
+### The Steam plugin synced nothing on Windows: its art is in Program Files, the art roots were not
+
+Field report — the plugin installed, the grid stayed empty, and the only clue was one host warn per
+sync:
+
+```
+plugin:steam sync (fs-change) failed: HostRequestError: PUT /library/provider/steam?store=steam
+  failed: art.hero: local art must be an image file (…) inside an allowed art root
+```
+
+Two independent defects, both fixed here.
+
+**1. Steam's art was never inside an allowed root on Windows.** `art_roots()` defaulted to the users
+base (`C:\Users`, from `%PUBLIC%`'s parent), which covers the launchers that install per-user —
+Playnite under `%APPDATA%`, Heroic under `%APPDATA%` — but *not* Steam, which installs to
+`C:\Program Files (x86)\Steam` and keeps both the art the plugin publishes there:
+`appcache\librarycache\<appid>\<hash>\` and each account's `userdata\<id>\config\grid\` overrides.
+Every cover the plugin emitted was out of root. This is a v0.28.0 regression: the built-in scanner
+the plugin replaced served its covers through the legacy `steam:` art-proxy branch, which never
+passed through the H-2 confinement — deleting the scanner routed that art through a gate it had
+never been measured against. `art_roots()` now also includes every Steam install root it can find,
+from `%ProgramFiles(x86)%` / `%ProgramFiles%` / `%ProgramW6432%` and from HKLM
+`Valve\Steam\InstallPath` (so a Steam on another drive is covered too). POSIX needed no equivalent —
+every Steam layout there, native and Flatpak, is already under `$HOME`.
+
+This does not weaken the confinement. It exists to stop the host (SYSTEM) reading files the plugin
+lane (LocalService) cannot reach itself; the Steam directory is readable by LocalService already, so
+nothing there is reachable *because* the host is privileged. The extension, regular-file, magic-byte
+and config-dir gates all still apply, so Steam's own `config.vdf` and `ssfn*` credential blobs are
+not servable from it — there is a test.
+
+**2. One unservable cover threw away the entire library.** `PUT /library/provider/{p}` validated art
+per entry and returned 400 for the whole payload on the first bad value, so a path mismatch cost the
+operator *every game from that store*, not a thumbnail — and the plugin, which only ever sees
+`HostRequestError`, could not say which. A provider reconcile now **strips** unservable local art and
+syncs the rest (`sanitize_art_paths`), logging one aggregated warn naming the count, an example path
+and the env var. The invariant the 400 held is unchanged: no unservable path is ever persisted. The
+operator's own single-entry custom writes keep the hard 400 — there the path was typed by hand, and
+silence would be the wrong answer.
+
+⚠ **Operator-visible:** an art-root mismatch no longer fails a sync. If covers are blank where you
+expect art, the cue is the host log's `dropped local art the proxy may not serve` line, and the knob
+is `PUNKTFUNK_LIBRARY_ART_ROOTS` (which **replaces** the defaults — list every root you need).
+
 ### punktfunk-gamescope `+pfhdr7` — a lingered session no longer dies of its own capture teardown
 
 🛑 **On client disconnect the host keeps the headless gamescope alive so a reconnect resumes the
