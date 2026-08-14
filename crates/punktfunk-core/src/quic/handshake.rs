@@ -227,6 +227,20 @@ pub struct Welcome {
     /// than at the next free fixed offset, and emitting it forces the `cipher` placeholder — see
     /// the note in [`Welcome::encode`]. `0` when an older host omitted it.
     pub mgmt_port: u16,
+    /// The session's effective access grants — the [`GRANT_GAMEPAD`](super::GRANT_GAMEPAD)-family
+    /// bitmask (per-client access, `design/per-client-access.md` §7). Courtesy, not authority:
+    /// the HOST enforces the mask regardless; the client uses this to not capture what can't
+    /// land (no keyboard grab without the bit — "my keyboard does nothing and nobody says why"
+    /// is the failure mode this prevents) and to label the session ("Controller only").
+    /// Appended after `mgmt_port` as 4 trailing bytes; absent (an older host) →
+    /// [`GRANT_ALL`](super::GRANT_ALL), the pre-grants behavior.
+    pub grants: u32,
+    /// Seconds until this device's access expires, measured when the Welcome is built; `0` =
+    /// permanent (also what an older host's omission decodes to). Mid-session changes ride
+    /// [`AccessUpdate`](super::AccessUpdate); the expiry itself closes with
+    /// [`ACCESS_EXPIRED_CLOSE_CODE`](crate::reject). Appended after `grants` as 4 trailing
+    /// bytes.
+    pub expires_in_secs: u32,
     /// The 256-bit ChaCha20-Poly1305 session key (RFC 8439 requires the full 32 bytes; wire
     /// cost is once per handshake) — present iff `cipher == 1`, at offsets 69..101. The legacy
     /// 16-byte `key` keeps its offset and stays independently random, so nothing downstream
@@ -498,14 +512,25 @@ impl Welcome {
         // handshake would break against currently-shipped clients. An explicit `cipher = 0` is
         // harmless by comparison: a current client reads AES (correct), and a pre-cipher client
         // stops before 68 regardless.
+        // The access advert (grants + expiry) follows `mgmt_port`, extending the same chain:
+        // emitting it forces BOTH placeholders before it — the cipher byte (as 0 = AES) and the
+        // mgmt port (as 0 = not advertised, exactly what its absence decodes to) — so the two
+        // u32s always land at a deterministic offset. A full-control permanent session
+        // (`GRANT_ALL`, no deadline) is what every absent-field decode yields anyway, so it is
+        // omitted and the common case stays byte-identical to the pre-grants wire form.
         let mgmt_present = self.mgmt_port != 0;
-        if self.cipher != CIPHER_AES_128_GCM || mgmt_present {
+        let access_present = self.grants != super::access::GRANT_ALL || self.expires_in_secs != 0;
+        if self.cipher != CIPHER_AES_128_GCM || mgmt_present || access_present {
             b.push(self.cipher);
             if let Some(k) = &self.key_chacha {
                 b.extend_from_slice(k);
             }
-            if mgmt_present {
+            if mgmt_present || access_present {
                 b.extend_from_slice(&self.mgmt_port.to_le_bytes());
+            }
+            if access_present {
+                b.extend_from_slice(&self.grants.to_le_bytes());
+                b.extend_from_slice(&self.expires_in_secs.to_le_bytes());
             }
         }
         b
@@ -517,12 +542,14 @@ impl Welcome {
         // salt[45..49] frames[49..53] compositor[53] gamepad[54] bitrate_kbps[55..59]
         // bit_depth[59] color.primaries[60] color.transfer[61] color.matrix[62] color.range[63]
         // chroma_format[64] audio_channels[65] codec[66] host_caps[67] cipher[68]
-        // key_chacha[69..101] mgmt_port[69..71 | 101..103] (everything from compositor on is an
+        // key_chacha[69..101] mgmt_port[69..71 | 101..103] grants[71..75 | 103..107]
+        // expires_in_secs[75..79 | 107..111] (everything from compositor on is an
         // optional trailing byte; an older host stops earlier; cipher/key_chacha are present only
-        // when ChaCha was negotiated). `mgmt_port` is the one field whose offset is NOT fixed: it
-        // follows the cipher block, so it starts at 69 for an AES session and 101 when a 32-byte
-        // ChaCha key precedes it. Emitting it forces the cipher byte (see `encode`), so "cipher
-        // absent" and "mgmt_port present" can never both hold.
+        // when ChaCha was negotiated). `mgmt_port` and the access pair are the fields whose
+        // offsets are NOT fixed: they follow the cipher block, shifted by 32 when a ChaCha key
+        // precedes them. Emitting a later field forces every earlier one (see `encode`), so
+        // "cipher absent" and "mgmt_port present" — or "mgmt_port absent" and "grants present" —
+        // can never both hold.
         if b.len() < 53 || &b[0..4] != MAGIC {
             return Err(PunktfunkError::InvalidArg("bad Welcome"));
         }
@@ -561,6 +588,18 @@ impl Welcome {
         let mgmt_port = b
             .get(mgmt_off..mgmt_off + 2)
             .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
+            .unwrap_or(0);
+        // The access advert trails the mgmt port. Absent (an older host, or a full-control
+        // permanent session — encode omits the default) → GRANT_ALL / no deadline, which is
+        // exactly the pre-grants behavior; a truncated tail is never half an advert.
+        let grants_off = mgmt_off + 2;
+        let grants = b
+            .get(grants_off..grants_off + 4)
+            .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+            .unwrap_or(super::access::GRANT_ALL);
+        let expires_in_secs = b
+            .get(grants_off + 4..grants_off + 8)
+            .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
             .unwrap_or(0);
         Ok(Welcome {
             abi_version: u32at(4),
@@ -630,6 +669,8 @@ impl Welcome {
             // snapshots; the client keeps sending legacy per-transition events).
             host_caps: b.get(67).copied().unwrap_or(0),
             mgmt_port,
+            grants,
+            expires_in_secs,
             cipher,
             key_chacha,
         })
@@ -717,6 +758,8 @@ mod tests {
             codec: CODEC_H264, // exercise a non-default codec through the roundtrip
             host_caps: HOST_CAP_GAMEPAD_STATE,
             mgmt_port: 0,
+            grants: GRANT_ALL,
+            expires_in_secs: 0,
             cipher: 0,
             key_chacha: None,
         };
@@ -783,6 +826,8 @@ mod tests {
             codec: CODEC_HEVC,
             host_caps: 0,
             mgmt_port: 0,
+            grants: GRANT_ALL,
+            expires_in_secs: 0,
             cipher: CIPHER_AES_128_GCM,
             key_chacha: None,
         };
@@ -868,6 +913,77 @@ mod tests {
         assert_eq!(Welcome::decode(&cenc).unwrap().mgmt_port, 0);
         // A truncated tail (one byte of the port) is not half a port: it reads as unknown.
         assert_eq!(Welcome::decode(&menc[..70]).unwrap().mgmt_port, 0);
+
+        // ── grants + expiry, the access advert after the mgmt port ────────────────────────────
+        //
+        // Same chain discipline one link further: emitting the access pair forces BOTH the
+        // cipher byte (as 0 = AES) and the mgmt port (as 0 = not advertised) so the two u32s
+        // land at a deterministic offset — 71..79 for AES, 103..111 behind a ChaCha key.
+        let guest = Welcome {
+            grants: GRANT_PRESET_CONTROLLER_ONLY,
+            expires_in_secs: 4 * 3600,
+            ..base
+        };
+        let genc = guest.encode();
+        assert_eq!(
+            genc.len(),
+            68 + 1 + 2 + 8,
+            "cipher + mgmt placeholders + 2 u32s"
+        );
+        assert_eq!(genc[68], CIPHER_AES_128_GCM, "forced cipher placeholder");
+        assert_eq!(
+            &genc[69..71],
+            &0u16.to_le_bytes(),
+            "forced mgmt placeholder"
+        );
+        assert_eq!(&genc[71..75], &GRANT_PRESET_CONTROLLER_ONLY.to_le_bytes());
+        assert_eq!(&genc[75..79], &(4u32 * 3600).to_le_bytes());
+        assert_eq!(Welcome::decode(&genc).unwrap(), guest);
+        // The forced-zero mgmt placeholder decodes exactly like its absence: unknown.
+        assert_eq!(Welcome::decode(&genc).unwrap().mgmt_port, 0);
+
+        // All three trailing features together, behind a ChaCha key: 103..111.
+        let full_chain = Welcome {
+            mgmt_port: 47991,
+            grants: GRANT_PRESET_VIEW_ONLY,
+            expires_in_secs: 60,
+            cipher: CIPHER_CHACHA20_POLY1305,
+            key_chacha: Some(k32),
+            ..base
+        };
+        let fenc = full_chain.encode();
+        assert_eq!(fenc.len(), 68 + 1 + 32 + 2 + 8);
+        assert_eq!(&fenc[103..107], &GRANT_PRESET_VIEW_ONLY.to_le_bytes());
+        assert_eq!(&fenc[107..111], &60u32.to_le_bytes());
+        assert_eq!(Welcome::decode(&fenc).unwrap(), full_chain);
+
+        // Old-welcome-decodes-with-defaults: every shorter wire form — the pre-cipher 68 bytes,
+        // a cipher-only form, and a mgmt-port form — reads as full control, permanent. Grants
+        // arriving as GRANT_ALL from an old host is the CORRECT meaning: that host enforces
+        // nothing, exactly like a full-control session.
+        for old in [&enc[..], &cenc[..], &menc[..]] {
+            let w = Welcome::decode(old).unwrap();
+            assert_eq!(w.grants, GRANT_ALL);
+            assert_eq!(w.expires_in_secs, 0);
+        }
+        // A truncated advert (partial u32) is never half a mask; grants-without-expiry reads
+        // the mask and leaves the deadline permanent.
+        assert_eq!(Welcome::decode(&genc[..73]).unwrap().grants, GRANT_ALL);
+        let g_only = Welcome::decode(&genc[..75]).unwrap();
+        assert_eq!(g_only.grants, GRANT_PRESET_CONTROLLER_ONLY);
+        assert_eq!(g_only.expires_in_secs, 0);
+
+        // New-welcome-decoded-by-old-reader semantics: a 0.29-era reader stops at the bytes it
+        // knows. The mgmt-port-era reader consumes [..71] of the guest Welcome and sees a valid
+        // session (cipher 0 = AES, port 0 = unknown) — the appended advert never perturbs it.
+        let old_view = Welcome::decode(&genc[..71]).unwrap();
+        assert_eq!(old_view.cipher, CIPHER_AES_128_GCM);
+        assert_eq!(old_view.mgmt_port, 0);
+        assert_eq!(old_view, base);
+
+        // A full-control permanent session emits NO advert — the common case stays
+        // byte-identical to the pre-grants wire form (and to the pre-cipher one).
+        assert_eq!(base.encode().len(), 68);
     }
 
     #[test]
@@ -963,6 +1079,8 @@ mod tests {
                 codec: CODEC_PYROWAVE,
                 host_caps: 0,
                 mgmt_port: 0,
+                grants: GRANT_ALL,
+                expires_in_secs: 0,
                 cipher: 0,
                 key_chacha: None,
             }
@@ -1038,6 +1156,8 @@ mod tests {
                 codec: CODEC_H264,
                 host_caps: 0,
                 mgmt_port: 0,
+                grants: GRANT_ALL,
+                expires_in_secs: 0,
                 cipher: 0,
                 key_chacha: None,
             }
@@ -1150,6 +1270,8 @@ mod tests {
             codec: CODEC_HEVC,
             host_caps: HOST_CAP_GAMEPAD_STATE,
             mgmt_port: 0,
+            grants: GRANT_ALL,
+            expires_in_secs: 0,
             cipher: 0,
             key_chacha: None,
         };

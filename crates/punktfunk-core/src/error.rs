@@ -62,6 +62,8 @@ pub enum PunktfunkStatus {
     RejectedWireVersion = -27,
     RejectedBusy = -28,
     RejectedSetupFailed = -29,
+    RejectedAccessExpired = -30,
+    RejectedLaunchNotPermitted = -31,
     Panic = -99,
 }
 
@@ -91,6 +93,8 @@ impl PunktfunkError {
                     R::WireVersionMismatch => PunktfunkStatus::RejectedWireVersion,
                     R::Busy => PunktfunkStatus::RejectedBusy,
                     R::SetupFailed => PunktfunkStatus::RejectedSetupFailed,
+                    R::AccessExpired => PunktfunkStatus::RejectedAccessExpired,
+                    R::LaunchNotPermitted => PunktfunkStatus::RejectedLaunchNotPermitted,
                 }
             }
         }

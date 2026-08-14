@@ -24,7 +24,8 @@
 //!
 //! Split by concern (networking-audit deferred plan §3 — a pure move): `handshake` the
 //! positional Hello/Welcome/Start codecs, `caps` the capability/codec-negotiation
-//! vocabulary, `control` the typed control + clipboard messages, `pairing` the pairing
+//! vocabulary, `access` the per-client grant bits + input-kind classifier,
+//! `control` the typed control + clipboard messages, `pairing` the pairing
 //! message codecs with [`pake`] the SPAKE2 itself, `datagram` the 0xC9–0xD1 plane codecs,
 //! `pen` the stylus batch (0xCC kind 0x05) + host stroke tracker,
 //! [`io`] framed stream IO, `clock` skew estimation + mid-stream re-sync, [`endpoint`] the
@@ -41,6 +42,7 @@ pub const MAGIC: &[u8; 4] = b"PKF1";
 /// vice-versa, regardless of field values.
 pub const CTL_MAGIC: &[u8; 4] = b"PKFc";
 
+mod access;
 mod caps;
 mod clock;
 mod control;
@@ -68,6 +70,7 @@ pub mod clipstream;
 /// cannot reach a shared key).
 pub mod pake;
 
+pub use access::*;
 pub use caps::*;
 pub use clock::*;
 pub use control::*;

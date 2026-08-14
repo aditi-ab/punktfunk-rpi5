@@ -1040,6 +1040,54 @@ impl CursorRenderMode {
     }
 }
 
+// --- Per-client access (design/per-client-access.md §4/§9) -----------------------------------
+// Mid-session grant/expiry traffic. The grant vocabulary itself lives in [`super::access`];
+// this is the one control message that carries it host → client.
+// ---------------------------------------------------------------------------------------------
+
+/// Type byte of [`AccessUpdate`] (host → client): the session's effective grants or remaining
+/// lifetime changed. 0x58: the 0x50 block belongs to the cursor channel (0x50/0x51 taken),
+/// so access sits at its top, clear of both the clipboard block (0x40-0x44) and any further
+/// cursor growth.
+pub const MSG_ACCESS_UPDATE: u8 = 0x58;
+
+/// `host → client` ([`MSG_ACCESS_UPDATE`]): a console edit changed this device's grants, or its
+/// temporary access is about to run out (the T−5 m / T−1 m warnings). Latest-wins and
+/// best-effort — the HOST enforces regardless; this exists so the client can re-gate capture
+/// and warn the user before the expiry close ([`ACCESS_EXPIRED_CLOSE_CODE`](crate::reject))
+/// instead of the session just ending. An older client hits its "unknown control message" arm
+/// and simply misses the courtesy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccessUpdate {
+    /// The effective grant bitmask ([`super::GRANT_GAMEPAD`] family) — same vocabulary as the
+    /// [`Welcome`](super::Welcome) advert.
+    pub grants: u32,
+    /// Seconds until this device's access expires; `0` = permanent (no deadline).
+    pub remaining_secs: u32,
+}
+
+impl AccessUpdate {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] grants[5..9] remaining_secs[9..13]
+        let mut b = Vec::with_capacity(13);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_ACCESS_UPDATE);
+        b.extend_from_slice(&self.grants.to_le_bytes());
+        b.extend_from_slice(&self.remaining_secs.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<AccessUpdate> {
+        if b.len() != 13 || &b[0..4] != CTL_MAGIC || b[4] != MSG_ACCESS_UPDATE {
+            return Err(PunktfunkError::InvalidArg("bad AccessUpdate"));
+        }
+        Ok(AccessUpdate {
+            grants: u32::from_le_bytes(b[5..9].try_into().unwrap()),
+            remaining_secs: u32::from_le_bytes(b[9..13].try_into().unwrap()),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::Mode;
@@ -1517,5 +1565,33 @@ mod tests {
         assert!(CursorShape::decode(&short).is_err());
         // Distinct from the neighboring vocabulary.
         assert!(ClipState::decode(&s.encode()).is_err());
+    }
+
+    #[test]
+    fn access_update_roundtrip() {
+        for (grants, remaining_secs) in [
+            (GRANT_ALL, 0u32),                   // full control, permanent
+            (GRANT_PRESET_CONTROLLER_ONLY, 300), // guest at the T−5 m warning
+            (GRANT_PRESET_VIEW_ONLY, 60),        // spectator at T−1 m
+            (GRANT_GAMEPAD | GRANT_CLIPBOARD, u32::MAX),
+        ] {
+            let m = AccessUpdate {
+                grants,
+                remaining_secs,
+            };
+            assert_eq!(AccessUpdate::decode(&m.encode()).unwrap(), m);
+        }
+        // 0x58 stays clear of every neighbor's decoder (an old peer's dispatch chain must fall
+        // through to its "unknown control message" arm), and the length is exact.
+        let bytes = AccessUpdate {
+            grants: GRANT_ALL,
+            remaining_secs: 1,
+        }
+        .encode();
+        assert_eq!(bytes[4], MSG_ACCESS_UPDATE);
+        assert!(ClipState::decode(&bytes).is_err());
+        assert!(CursorRenderMode::decode(&bytes).is_err());
+        assert!(AccessUpdate::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+        assert!(AccessUpdate::decode(&bytes[..bytes.len() - 1]).is_err());
     }
 }

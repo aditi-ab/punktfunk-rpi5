@@ -640,6 +640,68 @@
 #define PUNKTFUNK_MIN_STREAM_BLOCK_SHARDS 16
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Controller input: gamepad button/axis/snapshot/remove/arrival events, plus everything that
+// rides with a pad — rich DualSense input (0xCC motion/touchpad), pad-audio, rumble return,
+// and virtual-pad creation itself (deny-at-setup: no bit, no uinput node).
+#define PUNKTFUNK_GRANT_GAMEPAD (1 << 0)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Pointing input: mouse rel/abs + buttons, scroll, touch, and the pen plane.
+#define PUNKTFUNK_GRANT_POINTER (1 << 1)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Key input: key down/up and IME-committed text.
+#define PUNKTFUNK_GRANT_KEYBOARD (1 << 2)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Shared clipboard — ANDed into the operator clipboard policy, never overriding it.
+#define PUNKTFUNK_GRANT_CLIPBOARD (1 << 3)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Mic injection: the mic datagram plane + the per-session mic-service attach.
+#define PUNKTFUNK_GRANT_MIC (1 << 4)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Library launch: `Hello.launch` resolution (and any future in-session launch/end verbs).
+#define PUNKTFUNK_GRANT_LAUNCH (1 << 5)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Every defined grant. Also the value an *absent* mask means — a record from before grants
+// existed (or an old host's Welcome that omits the field) is full control, so existing
+// pairings keep today's behavior.
+#define PUNKTFUNK_GRANT_ALL (((((PUNKTFUNK_GRANT_GAMEPAD | PUNKTFUNK_GRANT_POINTER) | PUNKTFUNK_GRANT_KEYBOARD) | PUNKTFUNK_GRANT_CLIPBOARD) | PUNKTFUNK_GRANT_MIC) | PUNKTFUNK_GRANT_LAUNCH)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The reserved-must-be-zero region: a mask with any of these bits set is invalid today and is
+// rejected at the management API (never silently cleared — the caller meant *something* this
+// host doesn't understand, and clearing would grant less than they asked for without saying so).
+#define PUNKTFUNK_GRANT_RESERVED ~PUNKTFUNK_GRANT_ALL
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Preset: **Full control** — all bits; today's behavior and the default for absent grants.
+#define PUNKTFUNK_GRANT_PRESET_FULL PUNKTFUNK_GRANT_ALL
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Preset: **Controller only** — the guest/co-play preset. Deliberately excludes `LAUNCH`
+// (design §11 D2: in co-play the owner drives what runs).
+#define PUNKTFUNK_GRANT_PRESET_CONTROLLER_ONLY PUNKTFUNK_GRANT_GAMEPAD
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Preset: **View only** — spectator; sees and hears the stream, sends nothing.
+#define PUNKTFUNK_GRANT_PRESET_VIEW_ONLY 0
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) HEVC stream.
 #define PUNKTFUNK_VIDEO_CAP_10BIT 1
 #endif
@@ -1153,6 +1215,14 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`AccessUpdate`] (host → client): the session's effective grants or remaining
+// lifetime changed. 0x58: the 0x50 block belongs to the cursor channel (0x50/0x51 taken),
+// so access sits at its top, clear of both the clipboard block (0x40-0x44) and any further
+// cursor growth.
+#define PUNKTFUNK_MSG_ACCESS_UPDATE 88
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Datagram wire tags. Video rides UDP; everything low-rate rides QUIC datagrams,
 // demultiplexed by the first byte: input = [`crate::input::INPUT_MAGIC`] (0xC8, client→host),
 // audio = [`AUDIO_MAGIC`] (0xC9, host→client), rumble = [`RUMBLE_MAGIC`] (0xCA, host→client),
@@ -1558,6 +1628,17 @@
 // finished mid-frame") — indistinguishable from transport trouble.
 #define PUNKTFUNK_SETUP_FAILED_CLOSE_CODE 104
 
+// This device's temporary access ran out (per-client access, `design/per-client-access.md` §4)
+// — sent when the deadline fires mid-session, and by "Expire now" in the console. Only the
+// expiring device's sessions close with it; a reconnect lands in the console's pending list
+// for a one-click re-grant.
+#define PUNKTFUNK_ACCESS_EXPIRED_CLOSE_CODE 105
+
+// The `Hello.launch` request named a game this device's grants don't cover (no `LAUNCH` bit).
+// Refused AT the handshake — a crisp typed reason beats silently dropping the user onto a
+// bare desktop they didn't ask for. Connecting *without* a launch request still works.
+#define PUNKTFUNK_LAUNCH_NOT_PERMITTED_CLOSE_CODE 106
+
 // Minimum supported multiplier (renders under native, upscaled on present).
 #define PUNKTFUNK_MIN_SCALE 0.5
 
@@ -1592,6 +1673,8 @@ enum PunktfunkStatus
     PUNKTFUNK_STATUS_REJECTED_WIRE_VERSION = -27,
     PUNKTFUNK_STATUS_REJECTED_BUSY = -28,
     PUNKTFUNK_STATUS_REJECTED_SETUP_FAILED = -29,
+    PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED = -30,
+    PUNKTFUNK_STATUS_REJECTED_LAUNCH_NOT_PERMITTED = -31,
     PUNKTFUNK_STATUS_PANIC = -99,
 };
 #ifndef __cplusplus

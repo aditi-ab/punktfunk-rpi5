@@ -662,6 +662,12 @@ pub(super) async fn negotiate(
         // advert to find it. `0` on the standalone punktfunk1-host binary (no management API),
         // and the client then keeps its compiled-in default.
         mgmt_port: crate::mgmt::effective_port(),
+        // Per-client access (design/per-client-access.md): full control, no deadline — the
+        // wire-identical default every pre-grants client assumes. The trust store's per-device
+        // mask/expiry replaces these constants when admission starts consulting it (plan WP2/WP3);
+        // until then every admitted session is full-control, exactly today's behavior.
+        grants: punktfunk_core::quic::GRANT_ALL,
+        expires_in_secs: 0,
         // The negotiated session AEAD (resolved above) + its 32-byte key toward a ChaCha
         // client; toward everyone else cipher 0 keeps the Welcome byte-identical to the
         // pre-cipher wire form — unless a mgmt port rides along, which forces the cipher
