@@ -69,6 +69,10 @@ pub(super) async fn pair_ceremony(
     // window (no DoS from garbage). The operator re-arms (web console / restart) for the next device —
     // including after a successful pair; the protocol gives no reliable host-observable "wrong PIN"
     // signal to scope this to failures only (the client just disconnects).
+    //
+    // The armed window carries the operator's access choice for whoever completes this ceremony
+    // (design §5.7) — read it BEFORE the consume below wipes it with the rest of the window.
+    let access = np.armed_access();
     np.disarm();
 
     let proof = tokio::time::timeout(PAIRING_TIMEOUT, io::read_msg(&mut recv))
@@ -81,7 +85,7 @@ pub(super) async fn pair_ceremony(
     let ok = pake::verify(&confirms.client, &proof.confirm);
 
     if ok {
-        if let Err(e) = np.add(&req.name, &fingerprint_hex(&client_fp)) {
+        if let Err(e) = np.add_with_access(&req.name, &fingerprint_hex(&client_fp), access) {
             tracing::error!(error = %format!("{e:#}"), "could not persist paired clients");
         }
         tracing::info!(name = %name, "pairing complete — client trusted");

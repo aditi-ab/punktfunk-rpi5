@@ -144,7 +144,9 @@ pub(crate) async fn arm_native_pairing(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_ascii_lowercase());
     let bound_to_device = bound.is_some();
-    let _pin = np.arm_for(std::time::Duration::from_secs(ttl as u64), bound);
+    // No access choice yet — WP6/WP7 add it to the arm form; until then the window carries the
+    // full/permanent default, exactly today's behavior.
+    let _pin = np.arm_for(std::time::Duration::from_secs(ttl as u64), bound, None);
     tracing::info!(
         ttl_secs = ttl,
         bound_to_device,
@@ -365,7 +367,9 @@ pub(crate) async fn approve_pending_device(
     let Some(np) = &st.native else {
         return api_error(StatusCode::SERVICE_UNAVAILABLE, "native host not enabled");
     };
-    match np.approve_pending(id, req.name.as_deref()) {
+    // No access choice yet — WP6 adds it to the approve payload; until then approval keeps a
+    // re-approved device's existing access (or the full/permanent default for a first pairing).
+    match np.approve_pending(id, req.name.as_deref(), None) {
         Ok(Some(client)) => {
             tracing::info!(name = %client.name, fingerprint = %client.fingerprint,
                 "management API: pending device approved (delegated pairing)");

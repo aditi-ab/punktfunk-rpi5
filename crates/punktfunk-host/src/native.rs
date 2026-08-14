@@ -2639,7 +2639,7 @@ mod tests {
                 pend.name
             );
             np_approve
-                .approve_pending(pend.id, Some("Approved Device"))
+                .approve_pending(pend.id, Some("Approved Device"), None)
                 .unwrap()
                 .expect("pending id must approve");
         });
