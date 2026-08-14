@@ -39,6 +39,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// [`SessionOpts::on_connected`]'s callback: the host's certificate fingerprint, then the
+/// management-API port from its `Welcome` (`0` = it advertised none).
+///
+/// A named type rather than the inline `Box<dyn FnMut(...)>` because adding the second parameter
+/// tipped it over `clippy::type_complexity` — factoring it out is what that lint asks for, and it
+/// gives the two positional arguments somewhere to be documented.
+pub type ConnectedFn = Box<dyn FnMut([u8; 32], u16)>;
+
 pub struct SessionOpts {
     pub window_title: String,
     /// Start fullscreen (gamescope / `--fullscreen`).
@@ -91,7 +99,7 @@ pub struct SessionOpts {
     /// The port rides along because this is the one moment a client is guaranteed to have it
     /// WITHOUT mDNS: the session it just authenticated carries it. A client that saves it here
     /// can browse the library of a host it has only ever reached by address.
-    pub on_connected: Option<Box<dyn FnMut([u8; 32], u16)>>,
+    pub on_connected: Option<ConnectedFn>,
     /// The console-UI overlay (§6.1) — `None` is the Skia-free power-user build (stats
     /// stay stdout-only). An overlay whose `init` fails degrades to `None` with a
     /// warning rather than killing the session. Browse mode requires one.
