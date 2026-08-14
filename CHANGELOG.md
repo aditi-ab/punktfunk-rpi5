@@ -14,6 +14,34 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ## v0.28.1 — in development
 
+### An idle Windows host no longer owns the box's default microphone
+
+Field report (the second Helldivers 2 one — the first led to v0.28.0's mint-retry fix): with the
+host **idle**, a locally played Helldivers 2 tanks to 2–5 FPS 1% lows, and Windows' own Sound
+settings Recording tab goes unresponsive. Root cause: the audio wiring pass asserted *default
+recording = the virtual mic's capture side* on **every** pass, including the mic pump's eager
+boot pass — and `SetDefaultEndpoint` covers eCommunications, so every game's voice input bound a
+virtual microphone whose feeder only runs during a stream. Nothing ever restored it: not session
+end, not service stop. Games that hold an always-open voice capture (Helldivers 2 is Wwise +
+in-game voice — its own wiki calls the game "finicky with audio devices") stall on that dead
+endpoint.
+
+The recording default is now **session-scoped**, exactly like the playback default has always
+been: parked on the virtual mic only while a desktop-audio capture is open, the operator's device
+remembered (plus an on-disk crash marker, `audio-default-rec.prev`), restored when the capture
+closes, recovered at next boot after a crash, and unparked by the uninstaller. A game launched
+*during* a stream still records the client's mic; one launched before the stream keeps the
+operator's own microphone.
+
+Boxes wedged by earlier builds (which recorded nothing to restore) heal themselves: an idle
+wiring pass that finds the default recording sitting on the plan's mic capture moves it back to
+the first real microphone.
+
+⚠ **Operator-visible:** outside a stream, the default recording device is now whatever you set —
+Punktfunk only takes it for the duration of a stream. If you *want* apps to record the client mic
+while idle, select "Punktfunk Microphone" manually; the host no longer re-asserts it (idle
+re-assertion used to stomp a manual choice within one mic-pump reopen).
+
 ### The Steam plugin synced nothing on Windows: its art is in Program Files, the art roots were not
 
 Field report — the plugin installed, the grid stayed empty, and the only clue was one host warn per
