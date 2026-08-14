@@ -94,12 +94,14 @@ are `winget upgrade unom.PunktfunkHost` and removal is `winget uninstall unom.Pu
 
 ### About the signatures
 
-Punktfunk signs with its own certificates rather than a publicly trusted one, so Windows warns about
-an unknown publisher before setup runs. Accepting the prompt is enough. To silence it for good, the
-matching **`punktfunk-host-windows_<ver>.cer`** is published next to the installer and it is the
-same certificate for every release — the one-time import is in
-[Install → Windows](/docs/install#windows). This applies to the winget path too: winget downloads
-and runs that same installer.
+Setup, and the Punktfunk executables it installs, are signed with a **publicly trusted** certificate,
+so UAC names the publisher rather than warning about an unknown one, and there is nothing for you to
+import. This applies to the winget path too: winget downloads and runs that same installer. (The
+bundled third-party pieces keep whatever their own vendors shipped.)
+
+Releases **0.28.1 and earlier** were signed with our own self-signed certificate, and the docs then
+asked you to import `punktfunk-host-windows_<ver>.cer`. Current builds no longer produce or need it —
+[Install → Windows](/docs/install#windows) shows how to remove it if you imported one.
 
 The bundled drivers carry a **second, separate** self-signed certificate (`CN=punktfunk-driver`,
 SHA-1 thumbprint `4B8493E7CD565758D335F8F4F05C5A7261A13E02`). The installer adds it to the machine's
@@ -114,11 +116,21 @@ punktfunk-host-setup-<ver>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-
 
 Keep `/SUPPRESSMSGBOXES`: without it an unattended run can stop on a message box nobody can see.
 
-A silent run takes the same defaults as the wizard, so add or drop individual options with Inno's
-`/MERGETASKS` — a bare name adds a task, a `!` prefix removes one. `/MERGETASKS="gamestream"` turns
-on Moonlight compatibility; `/MERGETASKS="!trayicon"` skips the status icon. The task names are
-`installdriver`, `installgamepad`, `installaudiocable`, `installhdrlayer`, `gamestream`,
+A silent **first** install takes the same defaults as the wizard, so add or drop individual options
+with Inno's `/MERGETASKS` — a bare name adds a task, a `!` prefix removes one.
+`/MERGETASKS="gamestream"` turns on Moonlight compatibility; `/MERGETASKS="!trayicon"` skips the
+status icon. The task names are `installdriver`, `installgamepad`, `installhdrlayer`, `gamestream`,
 `allowpublicfw`, `startservice` and `trayicon`.
+
+An **upgrade** is different: it reuses the choices the previous install recorded, not the defaults
+above. That is usually what you want, but it means anything you once declined stays declined — and
+if that includes `installgamepad`, the gamepad drivers are never updated alongside the host, which
+surfaces later as a virtual controller games stop seeing. To force the full set on an upgrade, name
+them (`/MERGETASKS` merges with the remembered set rather than replacing it):
+
+```powershell
+punktfunk-host-setup-<ver>.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /MERGETASKS="installdriver,installgamepad,installhdrlayer,startservice"
+```
 
 Two things to know before you script it:
 

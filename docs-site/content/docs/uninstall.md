@@ -227,9 +227,12 @@ Three things are left on purpose:
   component other apps may be using, so the Punktfunk uninstaller never touches it. Remove it
   with its own uninstaller — `VBCABLE_Setup_x64.exe -u -h` — or the **VB-Audio Virtual Cable**
   entry in Installed apps.
-- **The publisher certificate**, if you imported it by hand to silence the Unknown Publisher prompt.
-  Remove it in `certlm.msc` under **Trusted Publishers** and **Trusted Root Certification
-  Authorities**. (This is *not* the driver certificate above, which the uninstaller does remove.)
+- **The old publisher certificate**, if you imported it by hand to silence the Unknown Publisher
+  prompt on 0.28.1 or earlier. Releases since then are signed by a publicly trusted CA and never
+  needed it, so it is safe to drop: remove the certificate issued to **unom** (thumbprint
+  `CD1EFDEEEC9743AFC38F56C5AF30C5A3009BE941`) in `certlm.msc` under **Trusted Publishers** and
+  **Trusted Root Certification Authorities**. (This is *not* the driver certificate above, which the
+  uninstaller does remove.)
 
 If you registered the winget source, drop it too — in an **admin** PowerShell, the same as
 registering it:

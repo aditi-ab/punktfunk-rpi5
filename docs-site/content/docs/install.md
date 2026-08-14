@@ -70,22 +70,22 @@ everything the installer puts on the machine, its optional tasks, the console pa
 This is also the path for **canary** builds, which winget doesn't carry — see
 [Release Channels](/docs/channels) for that download.
 
-> **About the Unknown Publisher prompt.** The installer is signed with a self-signed certificate, so
-> Windows warns before it runs — accepting the prompt is enough, nothing else is required. The winget
-> route is no different: it downloads and runs that same installer. If you'd
-> rather silence it, the matching **`punktfunk-host-windows_<ver>.cer`** is published next to the
-> installer, and it's the **same certificate for every release**, so this is one-time. A self-signed
-> certificate is its own root, so it has to go in both stores. In an **admin** PowerShell:
+> **About signing.** The installer is signed with a publicly trusted certificate, so Windows shows
+> the publisher by name at the UAC prompt — there is no Unknown Publisher warning and nothing to
+> import. The winget route is no different: it downloads and runs that same installer.
 >
-> ```powershell
-> Import-Certificate -FilePath .\punktfunk-host-windows_<ver>.cer `
->   -CertStoreLocation Cert:\LocalMachine\Root
-> Import-Certificate -FilePath .\punktfunk-host-windows_<ver>.cer `
->   -CertStoreLocation Cert:\LocalMachine\TrustedPublisher
-> ```
+> SmartScreen is a separate mechanism that builds reputation per publisher, so shortly after a new
+> signing certificate starts being used it can still show *"Windows protected your PC"* on the first
+> downloads — **More info → Run anyway**. It settles as installs accumulate.
 >
-> This is a different certificate from the one the bundled **drivers** are signed with — the
-> installer imports that one for you.
+> The bundled **drivers** are a separate matter — they carry their own certificate, and the installer
+> imports that one for you. [Windows Host](/docs/windows-host#about-the-signatures) has the detail.
+>
+> Releases **0.28.1 and earlier** were signed with our own self-signed certificate, and older docs
+> told you to import it. Nothing needs it any more: if you imported
+> `punktfunk-host-windows_<ver>.cer` back then, you can remove it from `Cert:\LocalMachine\Root` and
+> `Cert:\LocalMachine\TrustedPublisher` (look for the certificate issued to **unom**, thumbprint
+> `CD1EFDEEEC9743AFC38F56C5AF30C5A3009BE941`).
 
 ## NixOS
 

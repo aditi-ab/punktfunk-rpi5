@@ -12,7 +12,8 @@ x64 Windows runner — `x86_64-pc-windows-msvc` builds natively, `aarch64-pc-win
 cross-compiled (the x64 MSVC toolset ships the ARM64 cross compiler; since M10 nothing in the
 package links FFmpeg, so neither arch needs a per-arch `FFMPEG_DIR` tree staged on the runner —
 one less thing the ARM64 leg can be missing). Artifacts are arch-suffixed
-(`..._x64.msix` / `..._arm64.msix`, each with its matching `.cer`); `pack-msix.ps1 -Arch x64|arm64`
+(`..._x64.msix` / `..._arm64.msix`, plus a matching `.cer` only in the fallback signing modes 2 and 3
+— Azure signing emits none); `pack-msix.ps1 -Arch x64|arm64`
 stamps the manifest `ProcessorArchitecture` and names the output. See
 [`windows-client.yml`](../../../.gitea/workflows/windows-client.yml) for the cross-build rationale.
 
@@ -52,7 +53,8 @@ low-level input hooks, WASAPI and SDL3.
 MSIX requires a strictly 4-part numeric version. The workflow computes:
 - `vX.Y.Z` tag → `X.Y.Z.0` (THE release; any `-rc`/`+meta` suffix is dropped for MSIX). Published to
   the stable `latest/` alias and attached to the unified Gitea Release.
-- `main` push / `workflow_dispatch` → `0.3.<run_number>.0` (canary, climbs by run number; `canary/` alias).
+- `main` push / `workflow_dispatch` → `X.<Y+1>.<run_number>.0` (canary — the minor *after* the latest
+  `v*` tag, per `scripts/ci/pf-version.ps1`, climbing by run number; `canary/` alias).
 
 ## Signing & install
 

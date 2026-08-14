@@ -103,35 +103,34 @@ See [packaging/flatpak](https://git.unom.io/unom/punktfunk/src/branch/main/packa
 
 ## Windows
 
-The Windows client ships as a **signed MSIX** in the package registry. Builds use a self-signed
-certificate, so you import that certificate once before Windows will install the package.
+The Windows client ships as a **signed MSIX** in the package registry, signed with a publicly
+trusted certificate — so there is nothing to import and nothing to trust by hand. Download, install.
 
-1. Download the package and its certificate. Each channel keeps one fixed URL, so these two lines
-   always fetch the current build — in PowerShell:
+1. Download the package. Each channel keeps one fixed URL, so this line always fetches the current
+   build — in PowerShell:
 
    ```powershell
    curl.exe -LO https://git.unom.io/api/packages/unom/generic/punktfunk-client-windows/latest/punktfunk-client-windows_x64.msix
-   curl.exe -LO https://git.unom.io/api/packages/unom/generic/punktfunk-client-windows/latest/punktfunk-client-windows_x64.cer
    ```
 
    Swap `_x64` for `_arm64` on an Arm device, and `latest` for `canary` to track `main`. The same
-   two files are attached to every [release](https://git.unom.io/unom/punktfunk/releases), and every
+   file is attached to every [release](https://git.unom.io/unom/punktfunk/releases), and every
    build is also kept under its own version on the
    [packages page](https://git.unom.io/unom/-/packages) (generic group, `punktfunk-client-windows`).
-2. **Trust the publisher certificate**, then install. The MSIX won't install until the certificate is
-   trusted — but it's the **same certificate for every release**, so this is genuinely one-time and
-   later updates need nothing. In an **admin** PowerShell:
+2. Install it:
 
    ```powershell
-   # use the _arm64 files instead on an Arm device
-   Import-Certificate -FilePath .\punktfunk-client-windows_x64.cer `
-     -CertStoreLocation Cert:\LocalMachine\TrustedPeople
+   # use the _arm64 file instead on an Arm device
    Add-AppxPackage .\punktfunk-client-windows_x64.msix
    ```
 
    If Windows reports a missing dependency, install the
    [Windows App Runtime 2.x](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads)
    (the MSIX depends on `Microsoft.WindowsAppRuntime.2`), then re-run `Add-AppxPackage`.
+
+   Install from a signed-in desktop session. Over a remote, non-interactive session (SSH, an RMM
+   tool) `Add-AppxPackage` can fail with `0x80070005` when the Windows App Runtime it depends on is
+   in use and Windows can't restart the apps holding it.
 
 3. Launch **Punktfunk** from the Start menu and pick your host. The package also adds a second
    entry, **Punktfunk Console** — the same client as a controller-driven fullscreen interface for a
@@ -223,7 +222,7 @@ but keeping them close is the least surprising. (Updating the **host** is its ow
 | **Linux Flatpak** | `flatpak update --user io.unom.Punktfunk` — **without `sudo`** (see the [Flatpak section](#linux-desktop-flatpak)) |
 | **Linux apt / dnf / pacman** | your normal `sudo apt upgrade` / `sudo dnf upgrade` / `sudo pacman -Syu`, or the app's own updater below |
 | **Fedora Atomic (layered)** | `rpm-ostree upgrade` on its own is not enough — see the note below the table |
-| **Windows MSIX** | no self-update — download the newer `.msix` as in [Windows](#windows) and re-run `Add-AppxPackage`. The certificate is the same every release, so you don't import it again |
+| **Windows MSIX** | no self-update — download the newer `.msix` as in [Windows](#windows) and re-run `Add-AppxPackage`. Coming from **0.28.1 or earlier**, see the note below the table |
 | **macOS `.dmg`** | download the newer `Punktfunk-<version>.dmg` and drag it over the copy in Applications |
 | **iOS / iPadOS / tvOS** | TestFlight updates it |
 | **Android** | Google Play updates it; if you sideloaded, download the APK again and install over it |
@@ -243,6 +242,20 @@ systemctl reboot
 
 The client's own updater below runs exactly that dance for you, if you'd rather not remember it. (A
 layered **host** has the same trap — [Updating](/docs/updating) covers it.)
+
+**Windows, coming from 0.28.1 or earlier — uninstall first.** Those builds were signed with our own
+self-signed certificate. The move to a publicly trusted one changes the package's *publisher*, and an
+MSIX's identity is its name **plus** its publisher — so Windows treats the new package as a different
+app rather than an update, and installing it leaves you with two **Punktfunk** entries. Remove the
+old one first, then install the new `.msix` as above:
+
+```powershell
+Get-AppxPackage *Punktfunk* | Remove-AppxPackage
+```
+
+This is one-time; releases after that upgrade in place. Note that a packaged app's settings live
+*inside* its package, so removing the old one also removes this client's identity and its paired
+hosts — expect to [pair](/docs/pairing) again once. Nothing on the host side is affected.
 
 ### The Linux client can update itself
 
