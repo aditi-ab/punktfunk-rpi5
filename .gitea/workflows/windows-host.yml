@@ -472,7 +472,13 @@ jobs:
           # Refresh the channel alias (delete-then-reupload, like flatpak.yml/decky.yml) for a
           # predictable download URL: stable release -> `latest/`, canary main build -> `canary/`.
           $alias = if ($env:GITHUB_REF -like 'refs/tags/v*') { 'latest' } else { 'canary' }
-          $aliasNames = @{ $env:HOST_SETUP_PATH = 'punktfunk-host-setup.exe'; $env:HOST_CER_PATH = 'punktfunk-host-windows.cer' }
+          # Build this incrementally, NOT as one literal: under Azure signing there is no .cer, so
+          # HOST_CER_PATH is unset — and an unset $env: var is $null, which is a HARD ERROR as a hash
+          # literal key ("A null key is not allowed in a hash literal"), not the empty-string key it
+          # looks like it should be. The $files guard above filters the missing .cer out just fine;
+          # this line ran before anything could use it and failed the whole publish step.
+          $aliasNames = @{ $env:HOST_SETUP_PATH = 'punktfunk-host-setup.exe' }
+          if ($env:HOST_CER_PATH) { $aliasNames[$env:HOST_CER_PATH] = 'punktfunk-host-windows.cer' }
           foreach ($f in $files) {
             $an = $aliasNames[$f]; if (-not $an) { continue }
             curl.exe -fsS -o NUL --user "enricobuehler:$($env:REGISTRY_TOKEN)" -X DELETE "$base/$alias/$an" 2>$null

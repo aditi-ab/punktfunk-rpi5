@@ -288,10 +288,13 @@ jobs:
           # stable release -> `latest/` alias; canary main build -> `canary/` alias.
           $alias = if ($env:GITHUB_REF -like 'refs/tags/v*') { 'latest' } else { 'canary' }
           # version-less, arch-suffixed alias names so each channel keeps one predictable URL.
-          $aliasNames = @{
-            "$($env:MSIX_PATH)"     = "$($env:PKG)_${{ matrix.arch }}.msix"
-            "$($env:MSIX_CER_PATH)" = "$($env:PKG)_${{ matrix.arch }}.cer"
-          }
+          # Under Azure signing there is no .cer, so MSIX_CER_PATH is unset. The quotes below are
+          # load-bearing: "$($env:UNSET)" interpolates to an empty string (a legal key), whereas a
+          # BARE $env:UNSET is $null and a null key is a hard error in a hash literal — which is
+          # exactly how windows-host.yml's publish step broke. Added explicitly rather than relying
+          # on that accident, so removing the quotes can't silently reintroduce it.
+          $aliasNames = @{ "$($env:MSIX_PATH)" = "$($env:PKG)_${{ matrix.arch }}.msix" }
+          if ($env:MSIX_CER_PATH) { $aliasNames[$env:MSIX_CER_PATH] = "$($env:PKG)_${{ matrix.arch }}.cer" }
           $files = @($env:MSIX_PATH, $env:MSIX_CER_PATH) | Where-Object { $_ -and (Test-Path $_) }
           if (-not $files) { throw "pack produced no artifacts to publish" }
           function Put($f, $url) {
