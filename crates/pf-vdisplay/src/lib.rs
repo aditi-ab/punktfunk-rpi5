@@ -833,6 +833,15 @@ mod portal_config;
 #[path = "vdisplay/linux/portal_cursor.rs"]
 mod portal_cursor;
 
+/// The line fed to xdph's custom picker to select an output headlessly.
+///
+/// Declared unconditionally for the same reason again: it is a wire format with no schema and no
+/// error report, so the transcribed-parser tests are the only place a malformed line is visible
+/// without a compositor. That is not hypothetical — a missing separator shipped, and the one
+/// assertion that existed for it passed throughout.
+#[path = "vdisplay/linux/portal_picker.rs"]
+mod portal_picker;
+
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/hyprland.rs"]
 mod hyprland;
