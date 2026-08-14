@@ -73,6 +73,12 @@ enum ShotScenes {
             ShotScene(name: "09f-wake-timed-out-modal", orientation: .natural, colorScheme: .dark) {
                 AnyView(ShotConnect(kind: .timedOut, gamepadUI: false))
             },
+            // FEEL THE GAME — the controller test panel with injected pads. Gated with the
+            // console block because ControllerTestView doesn't build on tvOS, not because it
+            // is a console screen.
+            ShotScene(name: "12-controllers", orientation: .natural, colorScheme: .dark) {
+                AnyView(ShotControllers())
+            },
         ]
         #endif
         scenes.append(ShotScene(name: "10-edithost", orientation: .natural, colorScheme: .dark) {
@@ -346,6 +352,57 @@ private struct ShotConnect: View {
             ShotHome()
         }
     }
+}
+
+// MARK: - Controllers (the pads the store listing names)
+
+/// The FEEL THE GAME frame: the controller test panel rendering the two pads the listing talks
+/// about. A GCController cannot be constructed, so the panel draws injected `ShotPad`s — the
+/// DualSense leads with the feedback surface (adaptive-trigger effects, rumble backend, lightbar
+/// + player LEDs), the Xbox pad carries the input readout, frozen mid-game.
+private struct ShotControllers: View {
+    var body: some View {
+        #if os(macOS)
+        // The panel is a window-modal sheet in the app — float it at sheet width over the
+        // dimmed host grid, the way the other mac sheet shots read.
+        ZStack {
+            ShotHome().blur(radius: 24).overlay(Color.black.opacity(0.45))
+            ControllerTestView(shotPads: Self.pads)
+                .frame(width: 500, height: 840)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .shadow(radius: 40, y: 16)
+        }
+        #else
+        ControllerTestView(shotPads: Self.pads)
+        #endif
+    }
+
+    /// Transport/battery/player ride in `detail` — the panel has no dedicated battery row.
+    /// Each pad shows a different half of the panel so both fit one portrait canvas: the
+    /// DualSense skips the input card (the effect grid is the marketing point), the Xbox pad
+    /// skips rumble and shows the readout instead.
+    static let pads: [ControllerTestView.ShotPad] = [
+        .init(
+            name: "DualSense Wireless Controller",
+            detail: "Bluetooth · 85% · Player 1",
+            isDualSense: true, hasAdaptiveTriggers: true, hasLight: true,
+            rumbleBackend: "DualSense HID · Bluetooth"),
+        .init(
+            name: "Xbox Wireless Controller",
+            detail: "Bluetooth · 60% · Player 2",
+            isDualSense: false, hasAdaptiveTriggers: false, hasLight: false,
+            input: .init(
+                leftStick: .init(x: -0.31, y: 0.54),
+                rightStick: .init(x: 0.72, y: -0.16),
+                leftTrigger: 0.08, rightTrigger: 0.62,
+                buttons: [
+                    ("A", true), ("B", false), ("X", false), ("Y", false),
+                    ("LB", false), ("RB", true), ("L3", false), ("R3", false),
+                    ("Menu", false), ("Opts", false),
+                    ("↑", false), ("↓", false), ("←", false), ("→", false),
+                ])),
+    ]
 }
 #endif
 

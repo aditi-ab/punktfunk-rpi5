@@ -45,7 +45,7 @@ BUNDLE_ID="io.unom.punktfunk"
 # The App Store set, in listing order — the first three are what most people ever see, so they are
 # the stream itself, the machines it found, and the couch/controller mode. Everything else in
 # ShotScenes.all is a dev scene; capture those with `SCENES="06-gamepad-home 10-edithost" ...`.
-SCENES=(${SCENES:-01-stream 02-hosts 11-library 06-gamepad-home 09e-waking-modal 05-settings 03-pair})
+SCENES=(${SCENES:-01-stream 02-hosts 11-library 12-controllers 06-gamepad-home 09e-waking-modal 05-settings 03-pair})
 SETTLE="${SETTLE:-4}" # seconds to let a scene lay out before capturing
 
 mkdir -p "$OUT"
