@@ -241,6 +241,30 @@ pub(crate) fn silent_sink(lname: &str) -> bool {
     lname.contains("steam streaming microphone")
 }
 
+/// A capture endpoint that surfaces a VIRTUAL device's audio (cables, streaming mics, mixer
+/// strips, the host's own minted "Punktfunk" microphone) rather than a real microphone. The
+/// recording-default hygiene pass must never move the box's default onto one of these.
+pub(crate) fn virtual_capture(lname: &str) -> bool {
+    lname.contains("cable output")
+        || lname.contains("steam streaming")
+        || lname.contains("voicemeeter")
+        || lname.contains("virtual")
+        || lname.contains("punktfunk")
+}
+
+/// The first REAL capture endpoint (skipping `avoid_id` and every [`virtual_capture`]) — where
+/// the recording-default hygiene sends a default an earlier build left parked on the virtual mic
+/// while the host is idle. `None` on a box with no real microphone: nothing sane to move to, so
+/// the default is left alone.
+pub(crate) fn real_capture<'a>(
+    captures: &'a [Endpoint],
+    avoid_id: Option<&str>,
+) -> Option<&'a Endpoint> {
+    captures
+        .iter()
+        .find(|(n, id)| Some(id.as_str()) != avoid_id && !virtual_capture(&n.to_lowercase()))
+}
+
 /// A known-virtual device (cables/streaming endpoints). A render WITHOUT these markers is real
 /// hardware — the best loopback source (apps render there by default and the operator can also
 /// hear it).
@@ -1135,6 +1159,29 @@ mod tests {
         // Both wrong: the message must name both problems.
         let both = fmt(16_000, 1).narrowing(6).unwrap();
         assert!(both.contains("16000") && both.contains("channel"), "{both}");
+    }
+
+    /// The recording-default hygiene picker: skips every virtual capture (cable, streaming mic,
+    /// the minted "Punktfunk" pair, VoiceMeeter) and lands on the real microphone — the exact
+    /// recording-tab zoo of the 2026-08-14 Helldivers 2 field box.
+    #[test]
+    fn recording_hygiene_picks_the_real_microphone() {
+        let captures = [
+            ep("Microphone (2- Punktfunk)"),
+            ep("CABLE Output (VB-Audio Virtual Cable)"),
+            ep("Microphone (Steam Streaming Microphone)"),
+            ep("VoiceMeeter Output (VB-Audio VoiceMeeter VAIO)"),
+            ep("Desktop Microphone (2- Microsoft LifeCam HD-3000)"),
+        ];
+        assert_eq!(
+            real_capture(&captures, None).unwrap().0,
+            "Desktop Microphone (2- Microsoft LifeCam HD-3000)"
+        );
+        // `avoid_id` guards the plan's own mic capture even when its name would pass the
+        // virtual test; with nothing else real, the answer is honestly None.
+        let only = [ep("Desk Mic (USB)")];
+        assert!(real_capture(&only, Some("id-desk mic (usb)")).is_none());
+        assert!(real_capture(&[], None).is_none());
     }
 
     /// Operator override beats the candidate order.

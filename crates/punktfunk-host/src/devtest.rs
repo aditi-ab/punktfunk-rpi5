@@ -623,12 +623,15 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Windows: pad-audio endpoint provisioning — `pad-endpoint ensure|remove|status [--index N]`.
+/// Windows: pad-audio endpoint provisioning — `pad-endpoint
+/// ensure|remove|status|tone|capture|show|hide [--index N]`.
 /// `ensure` runs the idempotent startup path (reuse-or-create the devnode, bind the Steam
 /// Streaming Speakers driver, stamp the DualSense identity + 4ch/48k formats, report whether
 /// the stamps are SERVED); `status` prints the devnode/endpoint and per-stamp stored vs served
 /// state without changing anything; `remove` deletes the devnode via pnputil — the escape
-/// hatch only, endpoints are persistent by design. Stamping needs SYSTEM (the MMDevices ACL);
+/// hatch only, endpoints are persistent by design; `show`/`hide` flip the endpoint's
+/// visibility (the host parks it hidden while no client pad is attached — show it before
+/// `tone`/`capture`). Stamping needs SYSTEM (the MMDevices ACL);
 /// run `ensure` under the service account or PsExec when the property-store route is denied.
 /// Windows: the audio-substrate toolbox (`windows-audio-endpoints-and-vbcable.md`) —
 /// `audio-probe ssm|sink|sss-primary|mint|plan|cleanup [--keep]`. The S1–S3 spikes (`ssm` =
@@ -744,7 +747,29 @@ pub fn pad_endpoint(args: &[String]) -> Result<()> {
             pe::capture_probe(&endpoint_id, secs)
         }
         Some("status") => pe::print_status(idx),
-        _ => anyhow::bail!("usage: punktfunk-host pad-endpoint <ensure|remove|status> [--index N]"),
+        // `show`/`hide` — flip the endpoint's visibility (DEVICE_STATE_DISABLED). The host parks
+        // pad endpoints hidden while no client pad is attached (idle libScePad titles stall on a
+        // visible one — the 2026-08-14 Helldivers 2 field case); `tone`/`capture` need the
+        // endpoint SHOWN first, and `hide` puts the box back to the idle-safe state after.
+        Some(verb @ ("show" | "hide")) => {
+            let endpoint_id = match endpoint_override {
+                Some(id) => id,
+                None => match pe::find(idx)? {
+                    Some(ep) if !ep.endpoint_id.is_empty() => ep.endpoint_id,
+                    _ => {
+                        println!("pad-endpoint {verb}: pad {idx} has no endpoint — run `ensure`");
+                        return Ok(());
+                    }
+                },
+            };
+            pe::set_visibility(&endpoint_id, idx, verb == "show");
+            println!("pad-endpoint {verb}: {endpoint_id}");
+            Ok(())
+        }
+        _ => anyhow::bail!(
+            "usage: punktfunk-host pad-endpoint \
+             <ensure|remove|status|tone|capture|show|hide> [--index N]"
+        ),
     }
 }
 

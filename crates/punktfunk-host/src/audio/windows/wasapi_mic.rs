@@ -261,8 +261,10 @@ fn resolve_target() -> Result<(wasapi::Device, String)> {
     // on the cable while later plans paired the default recording with the minted microphone
     // nothing wrote into (see `minted::ensure_blocking`). Instant once latched.
     super::minted::ensure_blocking();
-    // set_playback=false: the mic pump runs while the host is idle — only the desktop-audio
-    // capture may park the playback default (on the silent sink) for a stream's lifetime.
+    // park_defaults=false: the mic pump runs while the host is idle — only the desktop-audio
+    // capture may park the box's defaults (playback on the silent sink, recording on the virtual
+    // mic) for a stream's lifetime. An idle box must keep the operator's own devices default —
+    // an idle-parked recording default is the 2026-08 Helldivers 2 tank (`audio_control` docs).
     let mut wiring = audio_control::wire_now(false);
     if wiring.mic_render.is_none() && !wiring.mic_withheld {
         // A WITHHELD mic skips the install attempt: the Streaming Microphone exists — the plan
