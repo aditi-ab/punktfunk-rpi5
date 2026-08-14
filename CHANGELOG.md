@@ -14,6 +14,30 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ## v0.28.1 — in development
 
+### The pad-audio "Wireless Controller" speaker hides while no client pad is attached
+
+Field-confirmed (2026-08-14, the same Helldivers 2 reports as below): the per-pad audio endpoint
+the Windows host mints — a Steam-Streaming-Speakers instance stamped with a DualSense's name,
+container and 4 ch/48 kHz formats, **pre-provisioned at every host start** — is deliberately
+indistinguishable from a real DualSense speaker. That disguise is the feature during a pad
+session (libScePad titles route haptics audio at it) and a trap the rest of the time: an idle
+Helldivers 2 finds the endpoint by identity, engages its DualSense-haptics path against a device
+nothing services, and drops to 2–5 FPS 1% lows — with the host completely idle, no controller
+plugged in, and no session ever run. The reporter isolating "the DualSense speaker" and disabling
+it in mmsys.cpl restored full performance; that manual remedy is now automatic.
+
+The endpoint now parks **hidden** (`DEVICE_STATE_DISABLED`, via `IPolicyConfig::
+SetEndpointVisibility` — the exact call behind mmsys.cpl's Disable) whenever no client pad is
+attached: provisioning hides it at startup (and a `PUNKTFUNK_PAD_AUDIO=0` host hides leftovers
+from earlier runs), the per-pad streamer shows it for exactly the pad's lifetime — to a game,
+indistinguishable from a DualSense arriving and leaving. The devnode, driver binding and stamps
+stay put, so the flips raise no PnP traffic and the expensive provisioning still happens once at
+boot.
+
+⚠ **Operator-visible:** "Speakers (Wireless Controller)" now shows as *disabled* in the Sound
+control panel while no client pad is connected — that is the parked state, not a defect. The
+`pad-endpoint` devtest grew `show`/`hide` verbs; `tone`/`capture` need a `show` first.
+
 ### An idle Windows host no longer owns the box's default microphone
 
 Field report (the second Helldivers 2 one — the first led to v0.28.0's mint-retry fix): with the
