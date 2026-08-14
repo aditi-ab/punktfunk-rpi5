@@ -207,15 +207,20 @@ enum ShotMock {
 
     /// A believable shelf for the library coverflow. Decoded rather than constructed:
     /// `GameEntry`'s memberwise init is internal to PunktfunkKit, and Codable is its public
-    /// construction surface. No art URLs — the posters render their deterministic fallback
-    /// (title tiles, the Steam entry its brand mark), which is also what keeps the shot offline.
+    /// construction surface. The `shot://art/…` posters are answered by [`ShotPosterArt.source`]
+    /// (drawn at capture time), so the shot stays offline; the Steam launcher entry stays artless
+    /// by design and renders its brand mark.
     static let games: [GameEntry] = {
         let json = """
         [
-          {"id": "custom:aurora", "store": "custom", "title": "Aurora Drift", "art": {}},
-          {"id": "steam:starfall", "store": "steam", "title": "Starfall Vale", "art": {}},
-          {"id": "heroic:neon", "store": "heroic", "title": "Neon Circuit", "art": {}},
-          {"id": "gog:ember", "store": "gog", "title": "Ember Peaks", "art": {}},
+          {"id": "custom:aurora", "store": "custom", "title": "Aurora Drift",
+           "art": {"portrait": "shot://art/aurora"}},
+          {"id": "steam:starfall", "store": "steam", "title": "Starfall Vale",
+           "art": {"portrait": "shot://art/starfall"}},
+          {"id": "heroic:neon", "store": "heroic", "title": "Neon Circuit",
+           "art": {"portrait": "shot://art/neon"}},
+          {"id": "gog:ember", "store": "gog", "title": "Ember Peaks",
+           "art": {"portrait": "shot://art/ember"}},
           {"id": "steam:launcher", "store": "steam", "title": "Steam", "art": {},
            "role": "launcher", "icon": "steam"}
         ]
@@ -263,12 +268,12 @@ private struct ShotHome: View {
 // MARK: - Library
 
 /// The library coverflow with the mock shelf — the store listing's PICK & PLAY frame. The real
-/// `LibraryCoverflowView`, no network: artless entries settle to their deterministic fallback
-/// posters, and the entrance's 700 ms backstop has long fired by the time the driver captures.
+/// `LibraryCoverflowView`, no network: `ShotPosterArt` answers the mock entries' art immediately,
+/// so the cards swing in already carrying posters (the entrance waits on art settling).
 private struct ShotLibrary: View {
     var body: some View {
         LibraryCoverflowView(
-            games: ShotMock.games, artLoader: nil,
+            games: ShotMock.games, artLoader: ShotPosterArt.source,
             onLaunch: { _ in }, onDismiss: {}, controllerActive: false)
     }
 }

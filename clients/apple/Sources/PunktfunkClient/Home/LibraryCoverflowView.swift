@@ -24,7 +24,7 @@ struct LibraryCoverflowView: View {
     @AppStorage(DefaultsKey.uiPalette) private var paletteID = "violet"
     private var ink: GamepadInk { .stored(paletteID) }
     let games: [GameEntry]
-    let artLoader: LibraryArtLoader?
+    let artLoader: (any LibraryArtSource)?
     var onLaunch: ((String) -> Void)?
     /// Button B (back) — dismisses the library screen. No touch equivalent needed here (the toolbar
     /// Close button already covers that); this is what makes gamepad-only exit possible.
