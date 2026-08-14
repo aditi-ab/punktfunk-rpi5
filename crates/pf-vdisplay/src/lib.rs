@@ -848,6 +848,15 @@ mod kwin;
 #[path = "vdisplay/linux/kwin_output_mgmt.rs"]
 mod kwin_output_mgmt;
 
+// DPMS control of the box's live KDE desktop (org_kde_kwin_dpms) — how a bare-spawn gamescope
+// session honors `Topology::Exclusive`: the spawn is its own headless compositor, so the desktop's
+// physical outputs can't be *disabled* (KWin refuses zero enabled outputs and no output there is
+// ours) — they are put to DPMS-off for the stream instead, refcounted across concurrent spawns.
+// Consumed by `gamescope` (best-effort, with kscreen fallback).
+#[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/kwin_dpms.rs"]
+mod kwin_dpms;
+
 #[cfg(target_os = "windows")]
 #[path = "vdisplay/windows/manager.rs"]
 pub mod manager;
