@@ -224,8 +224,8 @@ regular pad). Automatic arms it only where the raw guide press can't reach the h
 Gaming Mode, iPhone/iPad, Apple TV — because the gesture has a cost: a Select *tap* arrives a beat
 late, and a game that expects a *held* Select would trigger it. Set **On** or **Off** to overrule.
 
-**Capture system shortcuts** — *default: on.* Offered by the Linux and Windows apps and the console
-home; Windows spells the row out as *Capture system shortcuts (Alt+Tab, Win, …)*. On a Deck it
+**Capture system shortcuts** — *default: on.* Offered by the Linux, Windows and macOS apps and the
+console home; Windows spells the row out as *Capture system shortcuts (Alt+Tab, Win, …)*. On a Deck it
 matters only for a keyboard you attached yourself, for the reason the paragraph below gives: Gaming
 Mode is gamescope, which has nothing to hold back. On, Alt+Tab and the Windows key
 (Super on Linux) reach the host while the stream has input captured. Off, they act on this machine
@@ -233,6 +233,14 @@ instead — what you want when the stream shares a screen with local work. Eithe
 back the moment you release capture with **Ctrl+Alt+Shift+Q**, the window loses focus, or the stream
 ends, and [Desktop mouse mode](/docs/input#mouse-modes) never takes them at all. Leaving this on does
 mean **Ctrl+Alt+Shift+Q is your way out** of a captured stream, since Alt+Tab no longer is.
+
+On macOS the chords in question are the **⌘** ones — ⌘Q above all, which reaches the host as Super+Q,
+one of the most-bound chords on a Linux desktop. On, ⌘Q, ⌘W, ⌘H and the rest go to the host instead
+of this app's menu bar while input is captured. Off, they act on the Mac as usual, which means ⌘Q
+quits Punktfunk mid-stream. **⌘⎋ always stays local whichever way the toggle is set** — it is what
+releases capture, as is ⌃⌥⇧Q, and ⌃⌘F keeps working on the window. A few chords never reach the host
+either way, because macOS claims them before any app can see them: ⌘Tab, ⌘Space, and the Mission
+Control keys.
 
 On Linux this needs a compositor that supports keyboard-shortcuts-inhibit — KDE Plasma, GNOME and
 the wlroots compositors all do, and X11 sessions grab the keyboard directly. Under

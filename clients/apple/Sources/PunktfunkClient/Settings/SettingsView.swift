@@ -115,6 +115,10 @@ struct SettingsView: View {
     #endif
     #if os(macOS)
     @AppStorage(DefaultsKey.mouseMode) var mouseMode = MouseInputMode.capture.rawValue
+    /// Cross-client `inhibit_shortcuts` — here, the ⌘-chord passthrough (⌘Q & co. reach the host
+    /// instead of the app menu while captured). macOS-only: it is the one platform whose window
+    /// system hands a plain app no keyboard grab, so the client has to claim the chords itself.
+    @AppStorage(DefaultsKey.inhibitShortcuts) var inhibitShortcuts = true
     @AppStorage(DefaultsKey.speakerUID) var speakerUID = ""
     @AppStorage(DefaultsKey.micUID) var micUID = ""
     @AppStorage(DefaultsKey.micChannel) var micChannel = 0

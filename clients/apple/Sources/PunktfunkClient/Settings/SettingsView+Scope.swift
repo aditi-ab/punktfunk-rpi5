@@ -114,6 +114,10 @@ enum SettingsFields {
         .init(name: "invert_scroll", key: DefaultsKey.invertScroll,
               overlay: \.invertScroll, effective: \.invertScroll)
     }
+    static var inhibitShortcuts: SettingsField<Bool> {
+        .init(name: "inhibit_shortcuts", key: DefaultsKey.inhibitShortcuts,
+              overlay: \.inhibitShortcuts, effective: \.inhibitShortcuts)
+    }
     static var modifierLayout: SettingsField<String> {
         .init(name: "modifier_layout", key: DefaultsKey.modifierLayout,
               overlay: \.modifierLayout, effective: \.modifierLayout)
@@ -205,6 +209,7 @@ extension SettingsView {
         #endif
         #if os(macOS)
         base.mouseMode = mouseMode
+        base.inhibitShortcuts = inhibitShortcuts
         base.vsync = vsync
         base.windowedSafePresent = windowedSafePresent
         #endif
