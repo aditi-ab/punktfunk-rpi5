@@ -691,8 +691,11 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                         ),
                     )
                 }
-                ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) ==
-                    PackageManager.PERMISSION_GRANTED -> {
+                // No USB pad: fall back to a bonded BLE one. The Bluetooth-permission gate lives
+                // inside pairedBleAddress() (it answers null, and says why, when the grant is
+                // missing) rather than being restated here — the grant itself is asked for where
+                // a user can act on it, in the console UI and the Controllers screen.
+                else -> {
                     sc2.pairedBleAddress()?.let { addr ->
                         Log.i("punktfunk", "SC2: no USB pad — using the paired BLE controller $addr")
                         sc2.startBle(addr)
