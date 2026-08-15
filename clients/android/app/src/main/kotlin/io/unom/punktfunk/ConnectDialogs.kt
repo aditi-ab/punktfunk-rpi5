@@ -1,6 +1,5 @@
 package io.unom.punktfunk
 
-import android.os.Build
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -31,6 +30,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import io.unom.punktfunk.kit.NativeBridge
@@ -137,7 +137,8 @@ internal fun PairPinDialog(
 ) {
     val scope = rememberCoroutineScope()
     var pin by remember(pt) { mutableStateOf("") }
-    var name by remember(pt) { mutableStateOf(Build.MODEL ?: "Android") }
+    val context = LocalContext.current
+    var name by remember(pt) { mutableStateOf(deviceName(context)) }
     var pairing by remember(pt) { mutableStateOf(false) }
     var err by remember(pt) { mutableStateOf<String?>(null) }
     AlertDialog(

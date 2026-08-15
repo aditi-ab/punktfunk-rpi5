@@ -479,8 +479,16 @@ fn register_hot_tid(reg: &Mutex<Vec<i32>>) {
 /// This machine's name — the default value for [`NativeClient::connect`]'s `name` parameter
 /// (what a host shows in its pending-approval list and files this client under when approved).
 /// `/etc/hostname` first (the answer on any Linux box, and available in a minimal build with no
-/// desktop toolkit to ask), then the usual environment fallbacks. Lives here (not in a client
-/// shell crate) so the C ABI's `punktfunk_connect` can share the same default.
+/// desktop toolkit to ask), then the usual environment fallbacks, then the OS hostname itself.
+/// Lives here (not in a client shell crate) so the C ABI's `punktfunk_connect` can share the
+/// same default.
+///
+/// The `gethostname` step is what saves the GUI clients: **no** Apple app has `COMPUTERNAME`
+/// (Windows-only) or `HOSTNAME` (a shell variable — never exported into a `launchd`-started
+/// process) in its environment, so before it every Mac, iPad, iPhone and Apple TV knocked as
+/// the literal "This device" and the console's pending list could not tell them apart. An
+/// embedder that knows a better, user-facing name should pass it explicitly instead
+/// ([`crate::abi::punktfunk_connect_ex10`]'s `device_name`) — this is only the floor.
 pub fn device_name() -> String {
     #[cfg(target_os = "linux")]
     if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
@@ -493,7 +501,34 @@ pub fn device_name() -> String {
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok()
         .filter(|s| !s.trim().is_empty())
+        .or_else(os_hostname)
         .unwrap_or_else(|| "This device".into())
+}
+
+/// The OS hostname (`gethostname`), or `None` when it is missing/unset/useless. macOS returns
+/// the user's computer name as an mDNS host label ("Enricos-MacBook-Pro.local"), iOS/tvOS the
+/// device name — so the `.local` suffix comes off, and the placeholder answers every platform
+/// gives when nothing is configured ("localhost") is rejected: it labels nothing.
+#[cfg(unix)]
+fn os_hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `gethostname` writes at most `len` bytes into the caller's buffer; this one is a
+    // stack array we own and pass its true length. A truncating write may omit the NUL, which
+    // the `position` fallback below covers.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let s = std::str::from_utf8(&buf[..end]).ok()?.trim();
+    let s = s.strip_suffix(".local").unwrap_or(s);
+    (!s.is_empty() && !s.eq_ignore_ascii_case("localhost")).then(|| s.to_string())
+}
+
+/// Windows has no `gethostname` without linking winsock (and `COMPUTERNAME` is always set there
+/// anyway, so the env step above never falls through to this).
+#[cfg(not(unix))]
+fn os_hostname() -> Option<String> {
+    None
 }
 
 impl NativeClient {

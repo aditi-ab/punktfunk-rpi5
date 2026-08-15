@@ -21,11 +21,9 @@ struct PairSheet: View {
     let onPaired: (Data) -> Void
 
     @State private var pin = ""
-    #if os(macOS)
-    @State private var clientName = Host.current().localizedName ?? "Mac"
-    #else
-    @State private var clientName = UIDevice.current.name
-    #endif
+    // Same source the connect path knocks with (`DeviceName.current`), so a device the operator
+    // approves from the console's pending list and one that pairs by PIN land under one name.
+    @State private var clientName = DeviceName.current
     @StateObject private var ceremony = PairCeremony()
 
     private var busy: Bool { ceremony.busy }

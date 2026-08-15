@@ -1,6 +1,5 @@
 package io.unom.punktfunk
 
-import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
@@ -44,6 +43,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -396,7 +396,8 @@ fun GamepadPairPinDialog(pt: PendingTrust, identity: ClientIdentity?, onPaired: 
     var slot by remember(pt) { mutableIntStateOf(0) } // 0..3 = digit slots, 4 = Pair button
     var pairing by remember(pt) { mutableStateOf(false) }
     var err by remember(pt) { mutableStateOf<String?>(null) }
-    val name = remember { Build.MODEL ?: "Android" }
+    val context = LocalContext.current
+    val name = remember(context) { deviceName(context) }
 
     fun pair() {
         val id = identity ?: return
