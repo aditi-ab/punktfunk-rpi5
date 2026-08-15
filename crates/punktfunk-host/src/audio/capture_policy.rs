@@ -138,6 +138,22 @@ pub(crate) struct CaptureStats {
     /// memory. Every one of these used to `return` silently, so a stream that fired its callback
     /// on time and handed us nothing looked identical to a stream nobody was feeding.
     pub(crate) missed_dequeues: u64,
+    /// Spans this window spent with the stream NOT in `Streaming`, and how long they totalled.
+    ///
+    /// `gaps` deliberately cannot see these (see [`Self::observe_callback`]) — a paused stream
+    /// fires no callbacks at all, so there is no delta to score and the caller drops its cadence
+    /// stamp on every transition. The cost of that correct decision was that the outage went
+    /// somewhere else entirely: into `delivered_pct`, as an unattributed shortfall, because the
+    /// reporting window is flushed from the callback and therefore STRETCHES by exactly the time
+    /// we were not being scheduled.
+    ///
+    /// Measured on a live host on 2026-08-15: a 16.2 s pause produced
+    /// `delivered_pct=63 gaps=0 max_gap_ms=0`. Every number was correct and the line still could
+    /// not say what happened — the explanation existed only in the state DEBUG lines, which a
+    /// field journal at INFO does not carry. These two fields are that explanation, at INFO,
+    /// beside the percentage they explain.
+    pub(crate) pauses: u64,
+    pub(crate) paused_us: u64,
 }
 
 impl CaptureStats {
@@ -157,9 +173,13 @@ impl CaptureStats {
     ///
     /// `since_last` is `None` for the first callback of a stream — and, deliberately, for the
     /// first after a state transition: the caller drops its stamp when the stream pauses, so a
-    /// legitimately Paused span is not scored as one enormous hole. (The Paused↔Streaming flaps
-    /// around a format renegotiation stay visible as the state DEBUG lines next to a small
-    /// post-resume gap, which is the honest reading of what happened.)
+    /// legitimately Paused span is not scored as one enormous hole.
+    ///
+    /// That leaves this counter about ONE thing — holes inside a stream that is running — and
+    /// pushes the other kind onto [`Self::observe_pause`]. The split matters because the two want
+    /// opposite answers: a run of sub-10 ms holes is a scheduling problem on the box, whereas a
+    /// multi-second pause is our node not being in the graph at all. A single "gap" number that
+    /// mixed them would be worse than either.
     ///
     /// `quantum` is the NEGOTIATED buffer duration, not the one we asked for: a graph handing us
     /// 21.3 ms buffers is not gapping when its callbacks are 21.3 ms apart — it is doing exactly
@@ -183,6 +203,21 @@ impl CaptureStats {
         self.max_gap_us / 1_000
     }
 
+    /// Record one span the stream spent away from `Streaming`.
+    ///
+    /// Called on the transition BACK, so the whole span lands in the window that is flushed after
+    /// the resume — which is the same window whose `delivered_pct` the span diluted. Keeping the
+    /// two together is the entire point: apart, neither is interpretable.
+    pub(crate) fn observe_pause(&mut self, span: Duration) {
+        self.pauses += 1;
+        self.paused_us += span.as_micros() as u64;
+    }
+
+    /// Total time away from `Streaming` this window, in whole ms.
+    pub(crate) fn paused_ms(&self) -> u64 {
+        self.paused_us / 1_000
+    }
+
     /// `(peak dBFS, rms dBFS, delivered %)` for this window. Silence reports -120 dB rather than
     /// -inf so the log line stays parseable.
     pub(crate) fn summary(&self, elapsed: Duration, sample_rate: u32) -> (f64, f64, f64) {
@@ -196,6 +231,76 @@ impl CaptureStats {
             db(rms),
             (self.frames as f64 / expected.max(1.0)) * 100.0,
         )
+    }
+}
+
+/// A departure this far past its slot is a slip worth counting rather than ordinary jitter: one
+/// whole protocol frame, so a frame that merely rounds late never scores.
+const LATE_DEPARTURE: Duration = Duration::from_millis(FRAME_MS as u64);
+
+/// One reporting window of AUDIO EGRESS vitals (WP-C).
+///
+/// Capture has been instrumented since WP-A2 and the send path has not, so a field log could show
+/// audio arriving at the tap and say nothing whatsoever about how it left. That asymmetry is not
+/// neutral: it made "the host paces audio badly" unfalsifiable, and an unfalsifiable suspect stays
+/// on the list forever. Across five 2026-08-15 field logs the entire egress path emitted 14 lines,
+/// all of them the same session-open banner.
+///
+/// The point of these counters is to be *boring*. If departures are clean while capture reports
+/// holes, the pacing rework introduced in v0.25 is acquitted permanently and the search moves
+/// upstream for good.
+#[derive(Default)]
+pub(crate) struct SendStats {
+    pub(crate) sent: u64,
+    /// Frames synthesized to cover a capture hole. Wire continuity and captured continuity are
+    /// different claims and a log that conflates them cannot be used to judge either.
+    pub(crate) infilled: u64,
+    /// Departures that missed their paced slot by at least [`LATE_DEPARTURE`].
+    pub(crate) late: u64,
+    /// The worst such miss, µs — kept even when the count is zero, because "never late" and
+    /// "never late by a whole frame" are different statements.
+    pub(crate) max_late_us: u64,
+    /// Widest gap between two consecutive departures, µs. The number a client-side starvation
+    /// complaint is actually about: the wire going quiet, whatever the reason.
+    pub(crate) max_spacing_us: u64,
+    /// Times the schedule fell more than `PACE_REANCHOR` behind and was re-anchored instead of
+    /// chased. Each one silently forgives accumulated debt, which is exactly the kind of event
+    /// that leaves no trace and then gets blamed on the network.
+    pub(crate) reanchors: u64,
+}
+
+impl SendStats {
+    /// Score one frame leaving the host. `late` is how far past its paced slot it went (zero when
+    /// the schedule is unanchored), `since_prev` the spacing from the previous departure.
+    pub(crate) fn observe_departure(
+        &mut self,
+        late: Duration,
+        since_prev: Option<Duration>,
+        infilled: bool,
+    ) {
+        self.sent += 1;
+        if infilled {
+            self.infilled += 1;
+        }
+        self.max_late_us = self.max_late_us.max(late.as_micros() as u64);
+        if late >= LATE_DEPARTURE {
+            self.late += 1;
+        }
+        if let Some(gap) = since_prev {
+            self.max_spacing_us = self.max_spacing_us.max(gap.as_micros() as u64);
+        }
+    }
+
+    pub(crate) fn observe_reanchor(&mut self) {
+        self.reanchors += 1;
+    }
+
+    pub(crate) fn max_late_ms(&self) -> u64 {
+        self.max_late_us / 1_000
+    }
+
+    pub(crate) fn max_spacing_ms(&self) -> u64 {
+        self.max_spacing_us / 1_000
     }
 }
 
@@ -524,5 +629,128 @@ mod tests {
         s.observe_callback(Some(Duration::from_millis(5)), Q);
         assert_eq!(s.gaps, 0);
         assert_eq!(s.max_gap_ms(), 0);
+    }
+
+    /// The companion to the test above, and the reason it is safe: a pause stays out of `gaps`,
+    /// but it does NOT stay out of the log line. Numbers are the ones measured on a live host on
+    /// 2026-08-15, where a 16.2 s pause reported `delivered_pct=63 gaps=0 max_gap_ms=0` and no
+    /// field in the line could say why.
+    #[test]
+    fn a_paused_span_is_reported_even_though_it_is_not_a_gap() {
+        let mut s = CaptureStats::default();
+        s.observe_callback(Some(Duration::from_millis(5)), Q);
+        s.observe_pause(Duration::from_millis(16_214));
+        s.observe_callback(None, Q); // resumed
+        s.observe_callback(Some(Duration::from_millis(5)), Q);
+
+        assert_eq!(s.gaps, 0, "a pause is still not a delivery gap");
+        assert_eq!(s.max_gap_ms(), 0);
+        assert_eq!(s.pauses, 1, "…but it is now countable");
+        assert_eq!(s.paused_ms(), 16_214);
+    }
+
+    /// One long outage and a burst of short flaps must not read alike — the same argument that
+    /// makes `gaps` and `max_gap_ms` two fields instead of one. The triple here is the shape every
+    /// Skynet and AVALON session start produced: three dwells, no format actually changing.
+    #[test]
+    fn pause_spans_accumulate_and_stay_countable() {
+        let mut long = CaptureStats::default();
+        long.observe_pause(Duration::from_millis(38_400));
+
+        let mut flappy = CaptureStats::default();
+        for ms in [12_534, 17_030, 8_765] {
+            flappy.observe_pause(Duration::from_millis(ms));
+        }
+
+        assert_eq!(long.pauses, 1);
+        assert_eq!(flappy.pauses, 3);
+        assert_eq!(flappy.paused_ms(), 38_329);
+        assert!(
+            long.paused_ms().abs_diff(flappy.paused_ms()) < 100,
+            "near-identical dead time, and the count is the only thing that separates them"
+        );
+    }
+
+    /// The discriminator the field logs needed. A stream that is running and starved reports gaps
+    /// and NO pause; a stream that was never scheduled reports the mirror image. Both dilute
+    /// `delivered_pct` identically, which is exactly why neither can be diagnosed from it alone.
+    #[test]
+    fn starvation_and_absence_are_told_apart() {
+        let mut starved = CaptureStats::default();
+        for _ in 0..60 {
+            starved.observe_callback(Some(Duration::from_millis(30)), Q);
+        }
+
+        let mut absent = CaptureStats::default();
+        absent.observe_pause(Duration::from_millis(1_800));
+
+        assert_eq!(starved.gaps, 60);
+        assert_eq!(starved.pauses, 0, "a running stream was never absent");
+        assert_eq!(absent.gaps, 0);
+        assert_eq!(absent.pauses, 1, "an absent stream never got to be slow");
+        assert_eq!(absent.paused_ms(), 1_800);
+    }
+
+    /// The acquittal case, and the whole reason [`SendStats`] exists: a pacer doing its job must
+    /// produce a line a reader can dismiss at a glance.
+    #[test]
+    fn a_healthy_pacer_reports_nothing_alarming() {
+        let mut s = SendStats::default();
+        let frame = Duration::from_millis(FRAME_MS as u64);
+        for i in 0..200 {
+            s.observe_departure(Duration::ZERO, (i > 0).then_some(frame), false);
+        }
+        assert_eq!(s.sent, 200);
+        assert_eq!(s.late, 0);
+        assert_eq!(s.reanchors, 0);
+        assert_eq!(s.infilled, 0);
+        assert_eq!(s.max_late_ms(), 0);
+        assert_eq!(s.max_spacing_ms(), FRAME_MS as u64);
+    }
+
+    /// Lateness under one frame is jitter, not a slip — but it must still be *visible*, or
+    /// "never late" and "never late by a whole frame" become the same report.
+    #[test]
+    fn sub_frame_lateness_is_measured_without_being_counted() {
+        let mut s = SendStats::default();
+        s.observe_departure(Duration::from_micros(3_400), None, false);
+        assert_eq!(s.late, 0, "3.4 ms has not slipped a whole 5 ms slot");
+        assert_eq!(s.max_late_ms(), 3, "…and it is still on the record");
+    }
+
+    /// A slot missed by a whole frame or more is the event the field logs could never show.
+    #[test]
+    fn a_slipped_slot_is_counted_and_its_worst_case_kept() {
+        let mut s = SendStats::default();
+        s.observe_departure(Duration::from_millis(6), None, false);
+        s.observe_departure(
+            Duration::from_millis(41),
+            Some(Duration::from_millis(47)),
+            false,
+        );
+        s.observe_departure(Duration::ZERO, Some(Duration::from_millis(5)), false);
+        s.observe_reanchor();
+
+        assert_eq!(s.late, 2);
+        assert_eq!(s.max_late_ms(), 41);
+        assert_eq!(s.max_spacing_ms(), 47, "the wire's worst quiet stretch");
+        assert_eq!(s.reanchors, 1);
+    }
+
+    /// Wire continuity is not captured continuity. A window whose frames were all synthesized
+    /// looks perfect on every other counter, and must not be readable as healthy audio.
+    #[test]
+    fn synthesized_frames_stay_distinguishable_from_captured_ones() {
+        let mut s = SendStats::default();
+        let frame = Duration::from_millis(FRAME_MS as u64);
+        for _ in 0..100 {
+            s.observe_departure(Duration::ZERO, Some(frame), true);
+        }
+        assert_eq!(s.sent, 100);
+        assert_eq!(
+            s.infilled, 100,
+            "every one of these was silence we invented"
+        );
+        assert_eq!(s.late, 0);
     }
 }

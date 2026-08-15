@@ -395,6 +395,11 @@ const MIC_STALE: Duration = Duration::from_secs(1);
 /// against the same number the ask used.
 const CAPTURE_QUANTUM_FRAMES: u32 = 240;
 
+/// Callbacks that must agree on a new buffer size before it replaces the one gaps are scored
+/// against. Three is enough to reject a boundary artefact and still adopt a genuine re-plan
+/// within ~15 ms.
+const QUANTUM_CONFIRM: u8 = 3;
+
 fn mic_pw_thread(
     pcm_rx: Receiver<(std::time::Instant, Vec<f32>)>,
     quit_rx: pipewire::channel::Receiver<Terminate>,
@@ -686,9 +691,19 @@ fn pw_thread(
     use pw::{properties::properties, spa};
     use spa::param::audio::{AudioFormat, AudioInfoRaw};
     use spa::pod::Pod;
-    // The stream's `process` callbacks run ON this mainloop thread (we never hand PipeWire a
-    // separate data loop), so PipeWire's own client `module-rt` boost of its data loops does not
-    // cover it — the ~2.7 ms capture quantum lives or dies by this thread's scheduling.
+    // ⚠ This boosts the MAINLOOP thread, which is NOT where the capture callback runs.
+    //
+    // The previous comment here asserted the opposite ("we never hand PipeWire a separate data
+    // loop"), and it was wrong: we pass `RT_PROCESS` below, so libpipewire runs `process()` on a
+    // data loop it creates and schedules itself. Measured in one live host process on 2026-08-15
+    // — this thread at SCHED_OTHER/nice 0, `data-loop.0` at SCHED_RR/20. That mattered more than
+    // a stale comment usually does: a field investigation read the boost's success line as
+    // evidence that the audio callback was prioritised, and spent a round concluding priorities
+    // were "engaged but insufficient" when they had never been applied to the thread in question.
+    //
+    // The boost is kept — this thread still dispatches state and format events, and it IS the
+    // capture thread when `PUNKTFUNK_STREAM_SINK=0` selects the legacy monitor path. What replaces
+    // the assumption is a measurement: the callback reports its own scheduling on first entry.
     pf_frame::thread_qos::boost_thread_priority(true);
 
     // Setup errors funnel through the ready handshake (mirrors mic_pw_thread's IIFE).
@@ -782,12 +797,17 @@ fn pw_thread(
             channels: u32,
             stats: crate::audio::capture_policy::CaptureStats,
             last_stats: std::time::Instant,
-            /// Whether this OPEN has reported its negotiated buffer size yet. Per-open, not the
-            /// process-wide `static AtomicBool` this replaces: a host runs for days across many
-            /// sessions, so the old form reported the very first capture of the process and then
-            /// never again — the one number that identifies a clamped quantum, invisible on every
+            /// Frames per callback the graph is currently handing us, `0` until the first is
+            /// confirmed. Per-open, not a process-wide latch: a host runs for days across many
+            /// sessions, so a process-wide form reported the very first capture and then never
+            /// again — the one number that identifies a clamped quantum, invisible on every
             /// subsequent open (including every reopen after a device change).
-            reported_quantum: bool,
+            quantum_frames: usize,
+            /// A buffer size seen but not yet believed, with how many callbacks in a row have
+            /// agreed on it. Stops one short buffer from moving the gap threshold.
+            quantum_candidate: Option<(usize, u8)>,
+            /// Whether this open has reported the scheduling of the thread running `process()`.
+            reported_sched: bool,
             /// When the callback last ran (WP-A2), so its CADENCE can be scored and not just its
             /// content. Cleared across a state transition — a deliberate Paused span must not
             /// read as one enormous hole. Lives here rather than in `stats` because the stats
@@ -804,19 +824,25 @@ fn pw_thread(
             /// Shared with the capturer — see [`PwAudioCapturer::active`]. Read on every
             /// failed hand-off to keep parked-capturer backpressure out of the drop count.
             active: Arc<AtomicBool>,
+            /// When the stream last left `Streaming`, so the span can be charged to the window
+            /// that the span itself stretched. `None` while streaming.
+            paused_since: Option<std::time::Instant>,
         }
         let ud = CapUd {
             tx,
             channels,
             stats: Default::default(),
             last_stats: std::time::Instant::now(),
-            reported_quantum: false,
+            quantum_frames: 0,
+            quantum_candidate: None,
+            reported_sched: false,
             last_cb: None,
             quantum: Duration::from_micros(
                 CAPTURE_QUANTUM_FRAMES as u64 * 1_000_000 / SAMPLE_RATE as u64,
             ),
             negotiated: None,
             active,
+            paused_since: None,
         };
         let _listener = stream
             .add_local_listener_with_user_data(ud)
@@ -829,6 +855,22 @@ fn pw_thread(
                     // existing. Scoring it would report one huge hole per renegotiation and bury
                     // the sub-10 ms ones the field log is actually about (WP-A2).
                     ud.last_cb = None;
+                    // …but it still has to be reported, because the reporting window is flushed
+                    // from the process callback and therefore stretches by the whole span. Charge
+                    // it to the window flushed after the resume — the same window it diluted.
+                    // Without this the line says `delivered_pct=4 gaps=0` and cannot say whether
+                    // that is a dead capture path or a sink nobody was rendering into; the
+                    // 2026-08-15 field logs are 40 s of exactly that ambiguity per session start.
+                    match new {
+                        pw::stream::StreamState::Streaming => {
+                            if let Some(since) = ud.paused_since.take() {
+                                ud.stats.observe_pause(since.elapsed());
+                            }
+                        }
+                        _ => {
+                            ud.paused_since.get_or_insert_with(std::time::Instant::now);
+                        }
+                    }
                     // A stream error is unrecoverable for this instance — exit so the sessions'
                     // reopen path builds a fresh one (same contract as the core-error path above).
                     if matches!(new, pw::stream::StreamState::Error(_)) {
@@ -888,6 +930,24 @@ fn pw_thread(
                     ud.last_cb = Some(now);
                     ud.stats.observe_callback(since_last, ud.quantum);
 
+                    if !ud.reported_sched {
+                        ud.reported_sched = true;
+                        // Say what the thread that ACTUALLY runs this callback is scheduled as.
+                        // Whether the capture callback is realtime decides whether a Wine shader
+                        // storm can deschedule it for tens of ms at a 2.7 ms quantum, and until
+                        // now no log anywhere carried the answer — only that we had asked for a
+                        // boost, on a different thread. Once per open, off the hot path after
+                        // that.
+                        let (policy, rt_priority, nice) =
+                            pf_frame::thread_qos::current_thread_sched();
+                        tracing::info!(
+                            policy,
+                            rt_priority,
+                            nice,
+                            "audio capture callback scheduling"
+                        );
+                    }
+
                     let Some(mut buffer) = stream.dequeue_buffer() else {
                         ud.stats.missed_dequeues += 1;
                         return;
@@ -913,42 +973,70 @@ fn pw_thread(
                     let region = &buf[offset..(offset + size).min(buf.len())];
                     // Negotiated as F32LE; reinterpret the byte region as interleaved f32.
                     let n = region.len() / 4;
-                    if !ud.reported_quantum {
-                        ud.reported_quantum = true;
-                        // What we ASKED for vs what PipeWire actually handed us. Stating only the
-                        // result ("samples=2048") reads as a fact about the device; stating it
-                        // next to the request is what makes a clamp legible. A VM is the common
-                        // cause — stock `pipewire.conf` raises `default.clock.min-quantum` to
-                        // 1024 whenever `cpu.vm.name` is set, so a 5 ms ask silently becomes
-                        // 21.3 ms and the audio plane starts arriving in bursts. That cost a
-                        // whole field investigation to find; it should cost one log line.
-                        let frames = n / (ud.channels.max(1) as usize);
-                        let want = CAPTURE_QUANTUM_FRAMES as usize;
-                        // What a gap is measured against from here on — see `CapUd::quantum`.
-                        if frames > 0 {
+                    // Track the quantum the graph is ACTUALLY handing us, not merely the first one
+                    // it ever did. The graph re-plans whenever anything else on the box asks for a
+                    // different latency, and latching the first callback of the open left every
+                    // subsequent gap scored against a buffer size that no longer existed — a
+                    // silent corruption of the one metric this whole diagnosis rests on. A new
+                    // size has to survive `QUANTUM_CONFIRM` callbacks before it is believed,
+                    // because one short buffer at a boundary is not a new deal.
+                    let frames = n / (ud.channels.max(1) as usize);
+                    if frames > 0 && frames != ud.quantum_frames {
+                        let streak = match ud.quantum_candidate {
+                            Some((f, c)) if f == frames => c.saturating_add(1),
+                            _ => 1,
+                        };
+                        if streak < QUANTUM_CONFIRM {
+                            ud.quantum_candidate = Some((frames, streak));
+                        } else {
+                            let was = ud.quantum_frames;
+                            ud.quantum_frames = frames;
+                            ud.quantum_candidate = None;
+                            // What a gap is measured against from here on — see `CapUd::quantum`.
                             ud.quantum = Duration::from_micros(
                                 frames as u64 * 1_000_000 / SAMPLE_RATE as u64,
                             );
+                            let want = CAPTURE_QUANTUM_FRAMES as usize;
+                            let negotiated_ms =
+                                format!("{:.1}", frames as f32 * 1000.0 / SAMPLE_RATE as f32);
+                            if was != 0 {
+                                // A mid-open change. Rare, and worth a line of its own: it moves
+                                // the gap threshold under a reader who is comparing windows.
+                                tracing::info!(
+                                    previous_frames = was,
+                                    negotiated_frames = frames,
+                                    negotiated_ms,
+                                    "the audio graph re-planned our quantum mid-stream"
+                                );
+                            } else if frames > want {
+                                // What we ASKED for vs what PipeWire actually handed us. Stating
+                                // only the result ("samples=2048") reads as a fact about the
+                                // device; stating it next to the request is what makes a clamp
+                                // legible. A VM is the common cause — stock `pipewire.conf` raises
+                                // `default.clock.min-quantum` to 1024 whenever `cpu.vm.name` is
+                                // set, so a 5 ms ask silently becomes 21.3 ms and the audio plane
+                                // starts arriving in bursts. That cost a whole field
+                                // investigation to find; it should cost one log line.
+                                tracing::warn!(
+                                    requested_frames = want,
+                                    negotiated_frames = frames,
+                                    negotiated_ms,
+                                    "the audio graph refused our low-latency quantum — capture \
+                                     arrives in bursts this size, and the client must buffer at \
+                                     least that much to play them smoothly. On a VM this is \
+                                     PipeWire's `default.clock.min-quantum = 1024` rule; check \
+                                     `pw-metadata -n settings`"
+                                );
+                            } else {
+                                tracing::info!(
+                                    requested_frames = want,
+                                    negotiated_frames = frames,
+                                    "audio capture quantum negotiated"
+                                );
+                            }
                         }
-                        if frames > want {
-                            tracing::warn!(
-                                requested_frames = want,
-                                negotiated_frames = frames,
-                                negotiated_ms =
-                                    format!("{:.1}", frames as f32 * 1000.0 / SAMPLE_RATE as f32),
-                                "the audio graph refused our low-latency quantum — capture arrives \
-                                 in bursts this size, and the client must buffer at least that \
-                                 much to play them smoothly. On a VM this is PipeWire's \
-                                 `default.clock.min-quantum = 1024` rule; check \
-                                 `pw-metadata -n settings`"
-                            );
-                        } else {
-                            tracing::info!(
-                                requested_frames = want,
-                                negotiated_frames = frames,
-                                "audio capture quantum negotiated"
-                            );
-                        }
+                    } else if frames == ud.quantum_frames {
+                        ud.quantum_candidate = None;
                     }
                     let mut samples = Vec::with_capacity(n);
                     for i in 0..n {
@@ -991,6 +1079,12 @@ fn pw_thread(
                             // percentage and mean entirely different things.
                             gaps = ud.stats.gaps,
                             max_gap_ms = ud.stats.max_gap_ms(),
+                            // The OTHER thing a shortfall can be (see `CaptureStats::pauses`):
+                            // time our node was not in the graph at all. `gaps` deliberately
+                            // cannot see it, so without these two a paused span and a starved
+                            // stream are the same number.
+                            pauses = ud.stats.pauses,
+                            paused_ms = ud.stats.paused_ms(),
                             missed_dequeues = ud.stats.missed_dequeues,
                             dropped_chunks = ud.stats.dropped_chunks,
                             "desktop audio capture"
