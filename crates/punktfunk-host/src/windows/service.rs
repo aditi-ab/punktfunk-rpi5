@@ -211,12 +211,24 @@ fn load_host_env() {
         }
         if let Some((k, v)) = line.split_once('=') {
             let (k, v) = (k.trim(), v.trim().trim_matches('"'));
-            if !k.is_empty() {
+            // Allow-list, matching `interactive::merged_env_block`'s filter at the child-spawn
+            // boundary: import ONLY `PUNKTFUNK_*` / `RUST_LOG` into the LocalSystem service's own
+            // environment. Without this, EVERY key was injected — including `SystemRoot`, from which
+            // `pf_paths::icacls_path()` / the powershell warner build the absolute program paths a
+            // privileged service must never resolve through a poisoned env — so a `host.env` planted
+            // in the user-writable %ProgramData% before install yielded code execution as SYSTEM.
+            // security-review 2026-08-15 finding 3. (Note: `PUNKTFUNK_HOST_CMD` / `PUNKTFUNK_CONFIG_DIR`
+            // are legitimate installer-written knobs and still pass; a PLANTED file redirecting THEM
+            // is closed separately by distrusting a non-admin-owned host.env — findings 3c/4.)
+            let allowed = k.starts_with("PUNKTFUNK_") || k == "RUST_LOG";
+            if !k.is_empty() && allowed {
                 // SAFETY: called from the service main before this process spawns any thread —
                 // the network-profile warner and the supervisor's host child both start after
                 // `load_host_env` returns, so nothing reads the environment concurrently.
                 unsafe { std::env::set_var(k, v) };
                 n += 1;
+            } else if !k.is_empty() {
+                tracing::warn!(key = %k, "host.env: ignoring non-allow-listed key");
             }
         }
     }
