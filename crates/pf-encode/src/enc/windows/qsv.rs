@@ -1467,6 +1467,39 @@ impl Encoder for QsvEncoder {
         }
     }
 
+    /// Withdraw anchor trust from every live LTR (trait docs carry the why).
+    ///
+    /// This backend's mechanism, unchanged from the sweep's: distrust is the SEPARATE
+    /// `ltr_tainted` flag, never a cleared mirror slot. `ltr_slots` mirrors the HARDWARE DPB and
+    /// nulling an entry issues no VPL call, so the frame stays marked long-term in the encoder —
+    /// and the RejectedRefList built at submit only names `Some` slots, so a cleared mirror would
+    /// silently SKIP the very entry being distrusted and the recovery frame could still predict
+    /// from it. Taint keeps the mirror intact and the rejection reachable.
+    ///
+    /// The taint lifts itself: an IDR flush and a re-mark both clear it, so this suppresses RFI
+    /// for a few frames, never for the session.
+    ///
+    /// `pending_force` is cleared for the same reason as the decline arm above — an un-consumed
+    /// force would point at a slot this call just distrusted.
+    fn distrust_references(&mut self) {
+        let live = self
+            .ltr_slots
+            .iter()
+            .enumerate()
+            .filter(|&(slot, m)| m.is_some() && !self.ltr_tainted[slot])
+            .count();
+        if live == 0 && self.pending_force.is_none() {
+            return;
+        }
+        self.ltr_tainted = [true; NUM_LTR_SLOTS];
+        self.pending_force = None;
+        tracing::debug!(
+            live,
+            "QSV LTR-RFI: client reported unrepaired damage — withdrawing anchor trust from every \
+             live LTR (cleared by the next re-mark or IDR flush)"
+        );
+    }
+
     fn caps(&self) -> EncoderCaps {
         EncoderCaps {
             // As Windows NVENC: the capturer composites; this backend never reads `frame.cursor`.

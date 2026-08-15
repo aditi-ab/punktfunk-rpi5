@@ -175,4 +175,56 @@ mod tests {
         apply(&mut all, plan.tainted);
         assert_eq!(pick_anchor(&view(&all), 5), None);
     }
+
+    /// `Encoder::distrust_references` — the OTHER way trust is withdrawn, and the one that needs no
+    /// loss range. The host calls it when the client reports damage the host did not repair (a
+    /// coalesced keyframe request, or an RFI anchor the client kept asking past): the sweep cannot
+    /// run there because a keyframe request carries no range, so every resident reference is
+    /// withdrawn wholesale instead. All three backends persist that through their own marker; what
+    /// the shared policy must guarantee is the consequence — the next pick finds nothing and
+    /// declines, so the caller keyframes instead of serving an anchor over unrepaired damage.
+    #[test]
+    fn distrusting_every_reference_makes_the_next_anchor_pick_decline() {
+        // A table with plenty of pre-loss candidates: without the withdrawal, wire 7 anchors.
+        let mut wires = [4i64, 5, 6, 7, -1, -1, -1, -1];
+        assert_eq!(
+            pick_anchor(&view(&wires), 9),
+            Some((3, 7)),
+            "precondition: this table would happily anchor"
+        );
+
+        // The Vulkan mechanism (blank the wire) stands in for all three: AMF clears its mirror and
+        // QSV raises `ltr_tainted`, but each is filtered out of the trusted view identically —
+        // which is exactly what makes one pure policy serve three persistence schemes.
+        apply(&mut wires, u32::MAX);
+        assert_eq!(
+            pick_anchor(&view(&wires), 9),
+            None,
+            "every reference withdrawn → no anchor, caller falls through to its keyframe path"
+        );
+        // And it holds for ANY later loss, not just this one — the point of persisting distrust.
+        assert_eq!(pick_anchor(&view(&wires), 100), None);
+    }
+
+    /// The withdrawal must be temporary, or one coalesced keyframe request would cost a session its
+    /// RFI recovery for good and every later loss would ride the 20-40× IDR path. Each backend
+    /// restores trust the same way it always did — a slot re-marked with a fresh frame (and an IDR
+    /// flush, which empties the table first) — so a refilled slot anchors again.
+    #[test]
+    fn a_re_marked_slot_restores_anchor_trust_after_a_full_withdrawal() {
+        let mut wires = [4i64, 5, 6, 7, -1, -1, -1, -1];
+        apply(&mut wires, u32::MAX);
+        assert_eq!(pick_anchor(&view(&wires), 20), None);
+
+        // Encoding continues; the ring refills two slots with post-withdrawal frames. Those really
+        // are clean — the client's damage was repaired by the IDR the withdrawal forced — so they
+        // are legitimate anchors and the sweep must not keep rejecting them.
+        wires[0] = 14;
+        wires[1] = 15;
+        assert_eq!(
+            pick_anchor(&view(&wires), 20),
+            Some((1, 15)),
+            "a re-marked slot is trusted again — the suppression is a few frames, not the session"
+        );
+    }
 }

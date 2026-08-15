@@ -2010,6 +2010,30 @@ impl Encoder for AmfEncoder {
         }
     }
 
+    /// Withdraw anchor trust from every live LTR (trait docs carry the why).
+    ///
+    /// This backend's mechanism, unchanged from the sweep's: distrust = clear the mirror slot.
+    /// Dropped slots stay dropped and the marking cadence re-marks a clean frame within ~1/4 s, so
+    /// the suppression is brief by construction.
+    ///
+    /// `pending_force` is cleared with them, matching the decline arm above: an un-consumed force
+    /// would otherwise point at a slot this call just distrusted, and the next submit would
+    /// force-reference it anyway — shipping the corruption tagged `recovery_anchor`, which is the
+    /// whole failure being closed.
+    fn distrust_references(&mut self) {
+        let live = self.ltr_slots.iter().filter(|m| m.is_some()).count();
+        if live == 0 && self.pending_force.is_none() {
+            return;
+        }
+        self.ltr_slots = [None; NUM_LTR_SLOTS];
+        self.pending_force = None;
+        tracing::debug!(
+            live,
+            "AMF LTR-RFI: client reported unrepaired damage — withdrawing anchor trust from every \
+             live LTR (the marking cadence re-marks a clean frame within ~1/4 s)"
+        );
+    }
+
     fn caps(&self) -> EncoderCaps {
         EncoderCaps {
             // As Windows NVENC: the capturer composites; this backend never reads `frame.cursor`.
