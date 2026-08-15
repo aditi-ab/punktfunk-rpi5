@@ -162,7 +162,11 @@ impl Drop for PwAudioCapturer {
 
 impl AudioCapturer for PwAudioCapturer {
     fn next_chunk(&mut self) -> Result<Vec<f32>> {
-        match self.chunks.recv_timeout(Duration::from_secs(5)) {
+        self.next_chunk_within(Duration::from_secs(5))
+    }
+
+    fn next_chunk_within(&mut self, budget: Duration) -> Result<Vec<f32>> {
+        match self.chunks.recv_timeout(budget) {
             Ok(c) => Ok(c),
             // A quiet sink (paused game, idle desktop) is NOT a failure — return an empty chunk so the
             // caller keeps the capturer alive. Only a dead capture thread is an Err (→ caller reopens).
@@ -740,6 +744,18 @@ fn pw_thread(
                     // default election against real hardware; session routing comes from the
                     // stream_sink claim, not from priority.
                     "priority.session"          => "50",
+                    // Never let the session manager suspend this node (WP-B2). The 2026-08-15
+                    // field log shows three `audio format negotiated` lines in the first minute,
+                    // each wrapped in a Paused↔Streaming flap: Wine churns its audio device at
+                    // launch, the sink goes briefly unused, WirePlumber suspends it on its idle
+                    // timeout, and the next app resumes it — and every one of those round trips
+                    // is a real hole in a stream someone is listening to.
+                    //
+                    // Deliberately NOT `node.always-process`: that keeps the node SCHEDULED with
+                    // nothing connected, so a host sitting between sessions would run this
+                    // callback two hundred times a second forever (risk R5). Disabling the
+                    // suspend keeps the node available without asking anyone to drive it.
+                    "session.suspend-timeout-seconds" => "0",
                 };
                 p.insert(*pw::keys::NODE_NAME, name.as_str());
                 p
@@ -772,6 +788,19 @@ fn pw_thread(
             /// never again — the one number that identifies a clamped quantum, invisible on every
             /// subsequent open (including every reopen after a device change).
             reported_quantum: bool,
+            /// When the callback last ran (WP-A2), so its CADENCE can be scored and not just its
+            /// content. Cleared across a state transition — a deliberate Paused span must not
+            /// read as one enormous hole. Lives here rather than in `stats` because the stats
+            /// reset every reporting window and the cadence does not.
+            last_cb: Option<std::time::Instant>,
+            /// The quantum actually negotiated, which is what a gap is measured against. Seeded
+            /// with the one we ASK for, and corrected on the first callback that carries data —
+            /// on a graph that clamped us to 1024 frames, 21.3 ms between callbacks is the deal
+            /// we got, not a fault.
+            quantum: Duration,
+            /// The format currently negotiated, so a renegotiation that resolves to the SAME one
+            /// can be told from a real change (WP-B2).
+            negotiated: Option<(spa::param::audio::AudioFormat, u32, u32)>,
             /// Shared with the capturer — see [`PwAudioCapturer::active`]. Read on every
             /// failed hand-off to keep parked-capturer backpressure out of the drop count.
             active: Arc<AtomicBool>,
@@ -782,14 +811,24 @@ fn pw_thread(
             stats: Default::default(),
             last_stats: std::time::Instant::now(),
             reported_quantum: false,
+            last_cb: None,
+            quantum: Duration::from_micros(
+                CAPTURE_QUANTUM_FRAMES as u64 * 1_000_000 / SAMPLE_RATE as u64,
+            ),
+            negotiated: None,
             active,
         };
         let _listener = stream
             .add_local_listener_with_user_data(ud)
             .state_changed({
                 let mainloop = mainloop.clone();
-                move |_s, _ud, old, new| {
+                move |_s, ud, old, new| {
                     tracing::debug!(?old, ?new, "pipewire audio stream state");
+                    // Any transition ends the cadence we were measuring: the span across a
+                    // Paused↔Streaming flap is not a gap in delivery, it is a gap in the stream
+                    // existing. Scoring it would report one huge hole per renegotiation and bury
+                    // the sub-10 ms ones the field log is actually about (WP-A2).
+                    ud.last_cb = None;
                     // A stream error is unrecoverable for this instance — exit so the sessions'
                     // reopen path builds a fresh one (same contract as the core-error path above).
                     if matches!(new, pw::stream::StreamState::Error(_)) {
@@ -797,13 +836,29 @@ fn pw_thread(
                     }
                 }
             })
-            .param_changed(move |_stream, _tx, id, param| {
+            .param_changed(move |_stream, ud, id, param| {
                 let Some(param) = param else { return };
                 if id != pw::spa::param::ParamType::Format.as_raw() {
                     return;
                 }
                 let mut info = AudioInfoRaw::default();
                 if info.parse(param).is_ok() {
+                    // Renegotiating to the format we already had is the graph resuming us, not
+                    // the stream changing (WP-B2): the field log's minute-1 burst was three of
+                    // these, which read as three format changes and were none. Say which it was
+                    // — the flap itself stays visible in the state DEBUG lines and in A2's gap
+                    // counters, where it belongs.
+                    let now = (info.format(), info.rate(), info.channels());
+                    if ud.negotiated == Some(now) {
+                        tracing::debug!(
+                            format = ?now.0,
+                            rate = now.1,
+                            channels = now.2,
+                            "audio format renegotiated, unchanged (the graph resumed our sink)"
+                        );
+                        return;
+                    }
+                    ud.negotiated = Some(now);
                     // `stream_sink` says WHICH source this format describes, and that changes how
                     // much it is worth. In stream-sink mode the host owns the sink, so this IS the
                     // format apps render into and the desktop mix cannot have been narrowed before
@@ -824,11 +879,22 @@ fn pw_thread(
             })
             .process(|stream, ud| {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Score the ARRIVAL before anything can make us return: a callback that ran
+                    // and carried nothing still proves the callback ran, and that is a different
+                    // fault from one that never ran at all. Stamped first, so the two are
+                    // counted independently (WP-A2).
+                    let now = std::time::Instant::now();
+                    let since_last = ud.last_cb.map(|t| now.duration_since(t));
+                    ud.last_cb = Some(now);
+                    ud.stats.observe_callback(since_last, ud.quantum);
+
                     let Some(mut buffer) = stream.dequeue_buffer() else {
+                        ud.stats.missed_dequeues += 1;
                         return;
                     };
                     let datas = buffer.datas_mut();
                     if datas.is_empty() {
+                        ud.stats.missed_dequeues += 1;
                         return;
                     }
                     let d = &mut datas[0];
@@ -836,8 +902,12 @@ fn pw_thread(
                         let c = d.chunk();
                         (c.offset() as usize, c.size() as usize)
                     };
-                    let Some(buf) = d.data() else { return };
+                    let Some(buf) = d.data() else {
+                        ud.stats.missed_dequeues += 1;
+                        return;
+                    };
                     if offset > buf.len() {
+                        ud.stats.missed_dequeues += 1;
                         return;
                     }
                     let region = &buf[offset..(offset + size).min(buf.len())];
@@ -854,6 +924,12 @@ fn pw_thread(
                         // whole field investigation to find; it should cost one log line.
                         let frames = n / (ud.channels.max(1) as usize);
                         let want = CAPTURE_QUANTUM_FRAMES as usize;
+                        // What a gap is measured against from here on — see `CapUd::quantum`.
+                        if frames > 0 {
+                            ud.quantum = Duration::from_micros(
+                                frames as u64 * 1_000_000 / SAMPLE_RATE as u64,
+                            );
+                        }
                         if frames > want {
                             tracing::warn!(
                                 requested_frames = want,
@@ -910,6 +986,12 @@ fn pw_thread(
                             peak_db = format!("{peak_db:.1}"),
                             rms_db = format!("{rms_db:.1}"),
                             delivered_pct = format!("{delivered_pct:.0}"),
+                            // The shape of whatever `delivered_pct` is short by (WP-A2): one
+                            // long hole and three hundred short ones read the same in the
+                            // percentage and mean entirely different things.
+                            gaps = ud.stats.gaps,
+                            max_gap_ms = ud.stats.max_gap_ms(),
+                            missed_dequeues = ud.stats.missed_dequeues,
                             dropped_chunks = ud.stats.dropped_chunks,
                             "desktop audio capture"
                         );

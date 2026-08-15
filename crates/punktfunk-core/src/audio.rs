@@ -470,6 +470,15 @@ impl JitterTuning {
         deprime_ms: 60,
     };
 
+    /// How long a packet DROUGHT may be concealed before the ring is allowed to underrun and the
+    /// de-prime hysteresis is allowed to run (WP-C1). Twice the de-prime window: long enough to
+    /// ride out the delivery stalls that de-prime rings today, short enough that a genuinely dead
+    /// stream is not papered over. DERIVED rather than a fifth field, so it cannot drift away from
+    /// the fuse it exists to protect — and per-platform for free, since `deprime_ms` already is.
+    pub const fn plc_max_ms(&self) -> u32 {
+        self.deprime_ms * 2
+    }
+
     /// How far above the live target the depth average must sit before drift correction sheds:
     /// the middle of the headroom band, but never less than two protocol frames (so it cannot be
     /// hair-triggered by one quantum of normal swing). Deriving it from `headroom_ms` rather than
@@ -482,6 +491,79 @@ impl JitterTuning {
         } else {
             2 * FRAME_MS
         }
+    }
+}
+
+/// A drought must outlast ordinary arrival jitter before anything is synthesized for it: two
+/// protocol frames, the same tolerance the host's capture-hole infill uses at the other end.
+const DROUGHT_AFTER: std::time::Duration = std::time::Duration::from_millis(2 * FRAME_MS as u64);
+/// …and the ring must actually be running out. A drought a deep ring can cover is not audible,
+/// and concealing it would synthesize audio the late packets are about to duplicate — pushing the
+/// whole stream later and handing the drift shed a mess to clean up audibly.
+const DROUGHT_FLOOR_MS: u32 = 2 * FRAME_MS;
+
+/// Bounded concealment of a packet DROUGHT — the client-side twin of the host's capture-hole
+/// infill (design/host-source-stutter-fixes.md, WP-C1).
+///
+/// The decode path already conceals a SEQ GAP: [`AudioGapTracker`] reports the packets missing
+/// before the one that arrived and libopus synthesizes each from the decoder's own state. But that
+/// only fires when a LATER packet arrives to reveal the gap. When the wire simply goes quiet — a
+/// delivery stall on a bunching Wi-Fi link, or a host whose capture stalled — nothing arrives to
+/// reveal anything: the ring drains to empty, the callback runs short, and
+/// [`JitterPolicy::note_read`] de-primes and then re-primes a whole target's worth of fresh
+/// silence. The artifact is far longer than the audio actually missing, and this is the shape the
+/// 2026-08-15 field session spent 3–16 % of its wall-clock in.
+///
+/// So a drought that is draining the ring gets concealed too, from the same decoder state, for a
+/// bounded time. Denominated in TIME, never in frames or callbacks: that is the recorded lesson
+/// from the very fuse this protects, where a count gave an iPad a third of a Mac's slack for no
+/// reason anyone intended.
+///
+/// Time is passed IN, so the policy stays as syscall-free and deterministic as the rest of this
+/// module.
+pub struct DroughtConceal {
+    /// Concealed since the last real packet.
+    concealed_ms: u32,
+    max_ms: u32,
+    /// Concealed over the session — what the 10 s `plc_ms=` line reports. Concealment must be
+    /// visible: a policy that quietly papers over a failing link is a policy that hides the bug.
+    total_ms: u64,
+}
+
+impl DroughtConceal {
+    pub fn new(max_ms: u32) -> DroughtConceal {
+        DroughtConceal {
+            concealed_ms: 0,
+            max_ms,
+            total_ms: 0,
+        }
+    }
+
+    /// A packet arrived, ending any drought. Returns how many FRAMES were concealed for it, so the
+    /// caller can subtract them from the loss concealment [`AudioGapTracker`] is about to ask for:
+    /// packets genuinely lost inside a drought we already covered must not be covered twice, which
+    /// would insert audio the stream never had and push everything after it later.
+    pub fn packet(&mut self) -> u32 {
+        std::mem::take(&mut self.concealed_ms) / FRAME_MS
+    }
+
+    /// Should one more frame be concealed? `depth_ms` is the playout ring as the callback last
+    /// saw it.
+    pub fn conceal(&mut self, since_last_packet: std::time::Duration, depth_ms: u32) -> bool {
+        if since_last_packet < DROUGHT_AFTER
+            || depth_ms > DROUGHT_FLOOR_MS
+            || self.concealed_ms >= self.max_ms
+        {
+            return false;
+        }
+        self.concealed_ms += FRAME_MS;
+        self.total_ms += FRAME_MS as u64;
+        true
+    }
+
+    /// Concealment over the session, ms.
+    pub fn total_ms(&self) -> u64 {
+        self.total_ms
     }
 }
 
@@ -1066,6 +1148,11 @@ pub fn spa_positions(channels: u8) -> &'static [u32] {
 pub struct AudioSyncCell {
     depth: std::sync::atomic::AtomicUsize,
     target: std::sync::atomic::AtomicUsize,
+    /// Concealment the decode side has synthesized this session, ms — telemetry travelling the
+    /// same way the target does. It rides here because the counter is produced on the decode
+    /// thread and the 10 s playback line is emitted from the callback, and concealment that
+    /// nobody can see is concealment that hides the bug it is covering (WP-C1, risk R6).
+    plc_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Default for AudioSyncCell {
@@ -1073,6 +1160,7 @@ impl Default for AudioSyncCell {
         AudioSyncCell {
             depth: std::sync::atomic::AtomicUsize::new(0),
             target: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            plc_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -1087,6 +1175,16 @@ impl AudioSyncCell {
     /// Decode side: the ring depth as last seen by the audio callback.
     pub fn depth(&self) -> usize {
         self.depth.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Decode side: publish total concealment synthesized for packet droughts.
+    pub fn publish_plc_ms(&self, ms: u64) {
+        self.plc_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Callback side: that total, for the periodic playback line.
+    pub fn plc_ms(&self) -> u64 {
+        self.plc_ms.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Decode side: ask the ring to aim for this depth (`None` = run unsynchronised).
@@ -1413,6 +1511,77 @@ mod tests {
             emitted.windows(2).all(|w| w[1] == w[0] + 1),
             "and in order: {emitted:?}"
         );
+    }
+
+    // ---- drought concealment (WP-C1) -----------------------------------------------------
+
+    /// Concealment is for a ring that is running OUT. A drought a deep ring can cover is
+    /// inaudible, and synthesizing over it would insert audio the late packets are about to
+    /// duplicate — the stream would then run permanently later and the drift shed would have to
+    /// cut it back out, audibly.
+    #[test]
+    fn a_drought_is_concealed_only_while_the_ring_is_running_out() {
+        let mut c = DroughtConceal::new(JitterTuning::PIPEWIRE.plc_max_ms());
+        let stalled = DROUGHT_AFTER + std::time::Duration::from_millis(FRAME_MS as u64);
+        assert!(
+            !c.conceal(stalled, 40),
+            "a 40 ms ring covers this drought by itself"
+        );
+        assert!(c.conceal(stalled, 0), "an empty ring does not");
+        assert_eq!(c.total_ms(), FRAME_MS as u64);
+    }
+
+    /// Ordinary arrival jitter is not a drought — this policy must be invisible until the wire
+    /// has genuinely stopped.
+    #[test]
+    fn ordinary_jitter_is_not_a_drought() {
+        let mut c = DroughtConceal::new(JitterTuning::AAUDIO.plc_max_ms());
+        for _ in 0..1_000 {
+            assert!(!c.conceal(std::time::Duration::from_millis(FRAME_MS as u64), 0));
+        }
+        assert_eq!(c.total_ms(), 0);
+        assert_eq!(c.packet(), 0);
+    }
+
+    /// The window is bounded, and bounded in TIME — the whole reason `deprime_ms` stopped being a
+    /// callback count. Every preset must get exactly twice its own de-prime fuse, so no platform
+    /// silently gets a third of another's protection again.
+    #[test]
+    fn drought_concealment_is_bounded_at_twice_the_deprime_fuse() {
+        for t in [
+            JitterTuning::PIPEWIRE,
+            JitterTuning::WASAPI,
+            JitterTuning::COREAUDIO,
+            JitterTuning::AAUDIO,
+        ] {
+            assert_eq!(t.plc_max_ms(), t.deprime_ms * 2);
+            let mut c = DroughtConceal::new(t.plc_max_ms());
+            let mut ms = 0u32;
+            while c.conceal(DROUGHT_AFTER, 0) {
+                ms += FRAME_MS;
+                assert!(ms <= t.plc_max_ms(), "ran past the budget for {t:?}");
+            }
+            assert_eq!(ms, t.plc_max_ms(), "must use exactly the budget for {t:?}");
+        }
+    }
+
+    /// Packets genuinely lost INSIDE a drought we already covered must not be covered a second
+    /// time by the loss path: doing both would insert audio the stream never carried and push
+    /// everything after it later.
+    #[test]
+    fn concealment_already_paid_for_is_not_paid_for_twice() {
+        let mut c = DroughtConceal::new(JitterTuning::WASAPI.plc_max_ms());
+        for _ in 0..4 {
+            assert!(c.conceal(DROUGHT_AFTER, 0));
+        }
+        let mut gaps = AudioGapTracker::new();
+        gaps.missing_before(10);
+        // Four frames concealed; the wire then reveals six were lost. Only two are still owed.
+        let already = c.packet();
+        assert_eq!(already, 4);
+        assert_eq!(gaps.missing_before(17).saturating_sub(already), 2);
+        // …and the next drought starts from a full budget.
+        assert!(c.conceal(DROUGHT_AFTER, 0));
     }
 
     // ---- bitrate tiers -------------------------------------------------------------------

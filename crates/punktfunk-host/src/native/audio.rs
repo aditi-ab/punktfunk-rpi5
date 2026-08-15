@@ -162,9 +162,22 @@ pub(super) fn audio_thread(
         );
     }
     let mut acc: Vec<f32> = Vec::with_capacity(frame_len * 4);
+    // The frame currently being encoded. Reused rather than collected fresh each time: it is
+    // filled from `acc` on the normal path and padded out with silence on the infill path, and
+    // one buffer covers both without allocating 200 times a second.
+    let mut frame_buf: Vec<f32> = Vec::with_capacity(frame_len);
     // Sized for the largest surround frame (7.1 HQ ≈ 1.3 KB at 5 ms); ample for normal quality.
     let mut opus_buf = vec![0u8; 4096];
     let mut seq: u32 = 0;
+    // W-B1 — whether the wire covers a capture hole with silence, and for how long. See
+    // [`InfillPolicy`]: before this, a hole meant the loop simply blocked in `next_chunk` and
+    // NOTHING left the host for its duration, so the client's ring drained → underran →
+    // de-primed → re-primed, and a 30 ms hole became a much longer audible artifact.
+    let mut infill = crate::audio::capture_policy::InfillPolicy::default();
+    let mut last_chunk_at = std::time::Instant::now();
+    // Nothing may be synthesized before the first real frame: there is no continuity to protect
+    // yet, and the wire clock has no anchor to continue from.
+    let mut sent_any = false;
     // Reopen-with-backoff: hold the capturer in an Option so a mid-session capture-thread death
     // (device unplug, daemon restart) — or a first open lost to session-start churn above —
     // reopens instead of muting the rest of a multi-hour session. A quiet sink is NOT a death —
@@ -199,7 +212,11 @@ pub(super) fn audio_thread(
     // Uninitialised on purpose: every read is preceded by the re-anchor at the top of the chunk
     // loop, and seeding it with a placeholder would just be a value the compiler correctly points
     // out is never read.
-    let mut next_pts_ns: u64;
+    //
+    // Seeded rather than left uninitialised now that infilled frames advance it too: it is the
+    // pts of the NEXT frame to leave, real or synthesized, and every send advances it by one
+    // frame. `sent_any` is what keeps the seed from ever reaching the wire.
+    let mut next_pts_ns: u64 = 0;
     let mut pace_due: Option<std::time::Instant> = None;
     if capturer.is_some() {
         tracing::info!(
@@ -235,7 +252,30 @@ pub(super) fn audio_thread(
                 }
             }
         }
-        let chunk = match capturer.as_mut().unwrap().next_chunk() {
+        // Wake on whichever comes first: a capture chunk, or the moment the wire next has
+        // something to say. Waiting only on capture is what made a hole cost more than the audio
+        // it swallowed — see [`InfillPolicy`].
+        let waited = if infill.exhausted() || !sent_any {
+            // Nothing is owed until real audio returns: either the infill budget is spent (the
+            // host is not glitching, it is QUIET) or nothing has ever been sent, so there is no
+            // continuity to hold. Block the way this loop always did rather than waking two
+            // hundred times a second to decide to stay silent — a session that starts on a quiet
+            // desktop would otherwise spin until the first sound.
+            capturer.as_mut().unwrap().next_chunk()
+        } else {
+            let now = std::time::Instant::now();
+            // A frame that is due but has no audio behind it cannot be acted on until the hole is
+            // old enough to be worth covering, so wait for the LATER of the two — waiting only for
+            // the due time would spin through the window between them.
+            let ready_at = match pace_due {
+                Some(due) if acc.len() >= frame_len => due,
+                Some(due) => due.max(last_chunk_at + crate::audio::capture_policy::INFILL_AFTER),
+                None => now + FRAME_INTERVAL,
+            };
+            let budget = ready_at.saturating_duration_since(now).min(PACE_MAX_SLEEP);
+            capturer.as_mut().unwrap().next_chunk_within(budget)
+        };
+        let chunk = match waited {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "audio capture lost — reopening");
@@ -244,41 +284,68 @@ pub(super) fn audio_thread(
                 continue;
             }
         };
-        // Anchor the sample clock on THIS chunk's arrival. PipeWire hands us a buffer of already
-        // captured audio, so the newest sample in `acc` is ~now and the oldest is one whole
-        // buffer-occupancy earlier. Re-deriving the anchor every chunk (rather than free-running
-        // a counter) keeps the stamp tied to the capture device's own cadence, so a drifting or
-        // resampling graph corrects itself instead of accumulating error over a long session.
-        let arrival_ns = now_ns();
-        acc.extend_from_slice(&chunk);
-        let queued_frames = (acc.len() / want as usize) as u64;
-        next_pts_ns = arrival_ns.saturating_sub(queued_frames * 1_000_000_000 / SAMPLE_RATE as u64);
-        while acc.len() >= frame_len {
-            // Hold each frame until its slot on the audio clock. The FIRST frame of a chunk is
-            // already due (its samples are the oldest we hold), so this only ever delays the
-            // tail of a multi-frame chunk — exactly the burst we are trying not to send. A
-            // schedule that has fallen more than one frame behind is re-anchored rather than
-            // chased, so a scheduling hiccup cannot turn into a permanent send-time debt.
+        if !chunk.is_empty() {
+            if infill.chunk_arrived() {
+                // The wire fell silent across that hole. The partial frame in `acc` and the
+                // redundancy predecessor both describe audio from before a discontinuity, so
+                // splicing either onto what follows is a click plus a pts that lies about it.
+                acc.clear();
+                prev_frame.clear();
+            }
+            last_chunk_at = std::time::Instant::now();
+            // Anchor the sample clock on THIS chunk's arrival. PipeWire hands us a buffer of
+            // already captured audio, so the newest sample in `acc` is ~now and the oldest is one
+            // whole buffer-occupancy earlier. Re-deriving the anchor every chunk (rather than
+            // free-running a counter) keeps the stamp tied to the capture device's own cadence, so
+            // a drifting or resampling graph corrects itself instead of accumulating error over a
+            // long session.
+            let arrival_ns = now_ns();
+            acc.extend_from_slice(&chunk);
+            let queued_frames = (acc.len() / want as usize) as u64;
+            let anchor =
+                arrival_ns.saturating_sub(queued_frames * 1_000_000_000 / SAMPLE_RATE as u64);
+            // Never step backwards. Infilled frames advanced the wire clock while capture was
+            // away, and an anchor re-derived from this chunk's arrival can land at or before the
+            // last frame we already sent.
+            next_pts_ns = anchor.max(next_pts_ns);
+        }
+        // Everything the wire owes for the slots that have come due — real or synthesized, one
+        // schedule, one encoder, one `seq`. A schedule that has fallen more than one frame behind
+        // is re-anchored rather than chased, so a scheduling hiccup cannot turn into a permanent
+        // send-time debt.
+        loop {
             let now = std::time::Instant::now();
             match pace_due {
-                Some(due) if due > now => {
-                    let wait = due - now;
-                    // Never sleep longer than the audio we are holding: `next_chunk` has to be
-                    // serviced or the capture channel backs up and starts dropping.
-                    std::thread::sleep(wait.min(PACE_MAX_SLEEP));
-                }
+                Some(due) if due > now => break, // this frame's slot has not arrived yet
                 Some(due) if now.duration_since(due) > PACE_REANCHOR => pace_due = None,
                 _ => {}
             }
+            frame_buf.clear();
+            if acc.len() >= frame_len {
+                frame_buf.extend(acc.drain(..frame_len));
+            } else if !sent_any {
+                break;
+            } else {
+                match infill.decide(last_chunk_at.elapsed()) {
+                    crate::audio::capture_policy::Infill::Silence => {
+                        // Pad the partial frame out with silence and send THAT, rather than
+                        // leaving it for post-gap samples to complete: one frame carrying audio
+                        // from both sides of a hole is a click, and its pts is a lie about when
+                        // half of it was captured.
+                        frame_buf.append(&mut acc);
+                        frame_buf.resize(frame_len, 0.0);
+                    }
+                    crate::audio::capture_policy::Infill::Wait
+                    | crate::audio::capture_policy::Infill::Quiet => break,
+                }
+            }
             pace_due = Some(pace_due.unwrap_or_else(std::time::Instant::now) + FRAME_INTERVAL);
-
-            let mut frame: Vec<f32> = acc.drain(..frame_len).collect();
             if gain != 1.0 {
-                punktfunk_core::audio::apply_gain(&mut frame, gain);
+                punktfunk_core::audio::apply_gain(&mut frame_buf, gain);
             }
             let pts_ns = next_pts_ns;
             next_pts_ns += FRAME_MS as u64 * 1_000_000;
-            match enc.encode_float(&frame, &mut opus_buf) {
+            match enc.encode_float(&frame_buf, &mut opus_buf) {
                 Ok(n) => {
                     let opus = &opus_buf[..n];
                     let d = if redundancy {
@@ -299,6 +366,9 @@ pub(super) fn audio_thread(
                         prev_frame.extend_from_slice(opus);
                     }
                     seq = seq.wrapping_add(1);
+                    // From here there is a continuity worth protecting, and `next_pts_ns` has a
+                    // real anchor to continue from — both preconditions for synthesizing anything.
+                    sent_any = true;
                 }
                 Err(e) => {
                     opus_encode_errs += 1;

@@ -37,6 +37,7 @@ struct OutputReady {
     index: usize,
     pts_us: u64,
     decoded_ns: i128,
+    decoded_mono_ns: i64,
 }
 
 /// Events the async decode loop reacts to. The codec's async-notify callbacks (which run on its
@@ -51,11 +52,12 @@ enum DecodeEvent {
     Au(Frame, u32),
     /// An input buffer slot freed (index) — we can queue an AU into it.
     InputAvailable(usize),
-    /// A decoded frame is ready (buffer index + echoed pts + the callback-time `decoded` stamp).
+    /// A decoded frame is ready (buffer index + echoed pts + the callback-time `decoded` stamps).
     OutputAvailable {
         index: usize,
         pts_us: u64,
         decoded_ns: i128,
+        decoded_mono_ns: i64,
     },
     /// The output format changed — re-check the stream's colour signalling (HDR DataSpace).
     FormatChanged,
@@ -126,6 +128,12 @@ pub(super) fn run_async(
                     // decode stage ends when the frame actually became available — not after the
                     // channel hop + whatever work the loop coalesces in front of presenting it.
                     decoded_ns: now_realtime_ns(),
+                    // Its monotonic twin, from the same instant. The stats are REALTIME (they
+                    // fold the host's clock offset in), while the cadence loop and
+                    // `releaseOutputBufferAtTime` are both CLOCK_MONOTONIC — and the loop is fed
+                    // and read in one domain, never converted (`punktfunk_core::phase`: a
+                    // constant offset between domains is what its offset estimator absorbs).
+                    decoded_mono_ns: now_monotonic_ns(),
                 });
             })),
             on_format_changed: Some(Box::new(move |_fmt| {
@@ -232,7 +240,7 @@ pub(super) fn run_async(
                 PresentPriority::Smooth { buffer } => format!("smoothness, buffer {buffer}"),
             }
         );
-        Some(Presenter::new(priority))
+        Some(Presenter::new(priority, mode.refresh_hz))
     };
     stats.set_presenter_active(presenter.is_some());
     // The vsync clock, started LAZILY on the first decoded frame (see `vsync.rs`); its ticks ride
@@ -299,6 +307,7 @@ pub(super) fn run_async(
     // codec error; `recovery_flags` carries each AU's user_flags from `dispatch_event` (feed) to
     // `present_ready` (present), keyed by the codec-echoed pts.
     let mut gate = ReanchorGate::new(client.frames_dropped());
+    let mut last_arms = gate.arms();
     let mut recovery_flags: VecDeque<(u64, u32)> = VecDeque::new();
     let mut last_kf_req: Option<Instant> = None;
     // Productive (dispatch+feed+present) time between displayed frames; reported to ADPF once one is
@@ -378,6 +387,19 @@ pub(super) fn run_async(
             &mut queued_stamps,
             &mut gate,
         );
+        // The cadence loop's re-anchor seam. A fresh arm means a loss was detected: the gate is
+        // about to freeze on the last good picture and the frames that reach the presenter on the
+        // far side come through a decoder that has just recovered, so the source→presentable delay
+        // the loop had measured is not the one it will see. Watched by ARM COUNT rather than at
+        // each `gate.arm` site because those are spread across the dispatcher, the feeder and this
+        // loop's own backstops, and the count catches every one of them — including the ones
+        // `feed_ready` raises for an abandoned partial AU.
+        if gate.arms() != last_arms {
+            last_arms = gate.arms();
+            if let Some(p) = presenter.as_mut() {
+                p.reset_cadence();
+            }
+        }
         let had_output = !ready.is_empty();
         let rendered_before = rendered;
         present_ready(
@@ -414,7 +436,7 @@ pub(super) fn run_async(
             if let (Some(_), Some(c)) = (p.flush_log(&meter, clock), clock) {
                 let period = c.panel_period_ns().max(c.period_ns());
                 if period > 0 {
-                    if let Some(t) = c.next_target(now_monotonic_ns(), 0) {
+                    if let Some(t) = c.next_target(now_monotonic_ns()) {
                         let mono_now = now_monotonic_ns();
                         let real_now = now_realtime_ns();
                         let leads_us: Vec<u64> = arrival_stamps
@@ -737,10 +759,12 @@ fn dispatch_event(
             index,
             pts_us,
             decoded_ns,
+            decoded_mono_ns,
         } => ready.push(OutputReady {
             index,
             pts_us,
             decoded_ns,
+            decoded_mono_ns,
         }),
         DecodeEvent::FormatChanged => *fmt_dirty = true,
         DecodeEvent::Vsync => *vsync_tick = true,
@@ -998,7 +1022,7 @@ fn present_ready(
         for o in ready.drain(..) {
             let flags = take_flags(recovery_flags, o.pts_us);
             if gate.on_decoded(flags, false, now) == GateVerdict::Present {
-                let dropped = p.submit(codec, o.index, o.pts_us, o.decoded_ns);
+                let dropped = p.submit(codec, o.index, o.pts_us, o.decoded_ns, o.decoded_mono_ns);
                 skipped += dropped;
                 *discarded += dropped;
             } else {

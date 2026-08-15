@@ -208,7 +208,19 @@ pub use stats::Stats;
 /// way). Additive and client-local: the mask, the expiry and the `AccessUpdate` message all
 /// shipped with the Welcome's trailing-field append (old peers skip them in both directions),
 /// so [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 22;
+/// v23: added `punktfunk_connection_audio_plc` — one frame of libopus packet-loss concealment,
+/// synthesized from the connection's OWN decoder state, for an embedder whose playout ring is
+/// draining because nothing is arriving (design/host-source-stutter-fixes.md WP-C1). The three
+/// Rust clients conceal a packet drought on their decode thread; Apple's ring is Swift and its
+/// decoder sits behind this ABI, so without a call it had no way to reach the one thing that can
+/// extrapolate the missing audio — a second decoder would conceal from empty state, because PLC
+/// extrapolates from the last decoded frame. A NEW symbol: every existing function keeps its
+/// signature and behaviour, and an embedder that never calls it behaves exactly as before (it
+/// simply de-primes over droughts, as all four clients used to). Frames it returns carry `seq`
+/// and `pts_ns` of `0` — concealed audio was never on the wire and must not reach an A/V-sync
+/// observation. Additive and client-local: nothing new is sent or parsed, so [`WIRE_VERSION`] is
+/// unchanged.
+pub const ABI_VERSION: u32 = 23;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

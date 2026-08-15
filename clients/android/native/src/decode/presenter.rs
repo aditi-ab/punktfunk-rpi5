@@ -14,6 +14,12 @@
 //!    frame timeline (API 33+, via [`super::vsync`]), so the latch phase is deterministic instead
 //!    of inheriting network + decode jitter. On the 31/32 fallback the release is ASAP —
 //!    identical to the legacy path — and only the budget prediction uses the measured period.
+//!  * under the SMOOTHNESS intent only, a **due time** per frame from
+//!    [`punktfunk_core::phase::CadenceClock`]: the release targets the first timeline at or after
+//!    the instant the SOURCE's own timestamp says the frame is due, rather than the first one
+//!    after it happened to decode, so the host's cadence reaches glass instead of the network's
+//!    (`design/presenter-cadence-rework.md` D1). The latency intent holds no clock at all and
+//!    stays arrival-driven by construction.
 //!
 //! The legacy behaviour (release the newest ready buffer immediately, unbudgeted) remains
 //! selectable at runtime: `adb shell setprop debug.punktfunk.presenter arrival` — the on-device
@@ -21,6 +27,7 @@
 //! (off = the synchronous pre-overhaul loop, no presenter at all).
 
 use ndk::media::media_codec::MediaCodec;
+use punktfunk_core::phase::{CadenceClock, CadenceHealth, CadenceTuning};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
@@ -103,8 +110,9 @@ const FALLBACK_PERIOD_NS: i64 = 8_333_333;
 pub(crate) enum PresentPriority {
     /// Newest-wins, release the instant the budget opens. The default.
     Latency,
-    /// A small FIFO (1..=3 frames) drained one per vsync: jitter absorbed at one refresh of
-    /// added display latency per slot, which the metrics show rather than hide.
+    /// A small holding store (1..=3 frames) drained on each frame's DUE time from the source's own
+    /// timestamps: transport jitter absorbed in the cushion the cadence loop sizes from its own
+    /// measured residual, at a latency the metrics show rather than hide.
     Smooth { buffer: usize },
 }
 
@@ -129,6 +137,9 @@ struct HeldFrame {
     pts_us: u64,
     /// The output callback's `CLOCK_REALTIME` stamp — the pace metric's start (decoded→release).
     decoded_ns: i128,
+    /// When the source says this frame is due, monotonic — [`CadenceClock::due_ns`] folded at
+    /// submit. `None` under the latency intent, which has no clock.
+    due_ns: Option<i64>,
 }
 
 /// The one-in-flight glass budget.
@@ -287,20 +298,33 @@ fn p50_max_ms(mut v: Vec<u64>) -> (f64, f64) {
 }
 
 pub(super) struct Presenter {
-    /// 0 = newest-wins; 1..=3 = smoothing FIFO capacity.
+    /// 0 = newest-wins; 1..=3 = the holding store's capacity, a bound against a burst rather than
+    /// a pacing depth (design §4.3).
     fifo_capacity: usize,
     frames: VecDeque<HeldFrame>,
-    /// FIFO preroll: `take` withholds until the buffer filled to capacity once, re-armed on a dry
-    /// run — the Apple `FrameStore` semantics (headroom never builds without it).
-    prerolled: bool,
+    /// The source-cadence loop, and the ONLY thing that makes this presenter anything but
+    /// arrival-driven. `None` under the latency intent — not "a clock we choose to ignore" but no
+    /// clock at all, so that path cannot drift into cadence targeting by accident (`design/
+    /// presenter-cadence-rework.md` §5; the test below is what holds it there).
+    cadence: Option<CadenceClock>,
+    /// The source's nominal frame interval — [`CadenceClock`]'s cushion ceiling, which is a design
+    /// invariant rather than a tunable (a cushion past one whole frame buys smoothness the source
+    /// cannot supply). From the negotiated stream rate, which cannot change without tearing this
+    /// loop down.
+    frame_interval_ns: i64,
     inflight: Option<InFlight>,
-    /// A vsync arrived since the last release — the FIFO's one-per-refresh drain pace.
+    /// A vsync arrived since the last release — the retry beat for a parked frame, and what the
+    /// empty-store readout below is counted against.
     vsync_tick: bool,
     // -- 1 Hz pf-present window, always on --
     released: u64,
     paced_drops: u64,
     no_budget: u64,
     forced: u64,
+    /// Vsync ticks that found the store empty. Under cadence targeting an empty store is the
+    /// ordinary state between a frame's decode and its due time, so this reads as supply depth
+    /// rather than as the underflow alarm it was under the retired per-slot drain — the alarm is
+    /// the loop's own late count.
     dry: u64,
     /// Pump passes that held a frame back because too many earlier releases were still
     /// unconfirmed ([`UNDISPLAYED_CAP`]) — reads 0 on a healthy device, and a climbing value is
@@ -321,7 +345,12 @@ pub(super) struct Presenter {
 }
 
 impl Presenter {
-    pub(super) fn new(priority: PresentPriority) -> Presenter {
+    /// `source_hz` is the NEGOTIATED STREAM rate, not the panel's — it sizes the cadence loop's
+    /// cushion ceiling, and the quantity that must not be exceeded is one source frame. 0 (an
+    /// unnegotiated rate) falls back to [`FALLBACK_PERIOD_NS`], the tighter of the two plausible
+    /// answers: a ceiling set too low costs smoothness, one set too high costs latency the user
+    /// never asked for.
+    pub(super) fn new(priority: PresentPriority, source_hz: u32) -> Presenter {
         let pinned = latch_margin_ns();
         let (margin_ns, margin_pinned) = match pinned {
             Some(ns) => (ns, true),
@@ -336,13 +365,27 @@ impl Presenter {
                 " (adaptive — widens on latch misses)"
             }
         );
+        let frame_interval_ns = match source_hz {
+            0 => FALLBACK_PERIOD_NS,
+            hz => 1_000_000_000 / i64::from(hz),
+        };
+        // `snapping()`, because every release here goes through the frame-timeline grid: the
+        // snap-up carries roughly half a refresh of implicit slack, so the cushion is small.
+        let cadence = matches!(priority, PresentPriority::Smooth { .. }).then(|| {
+            log::info!(
+                "presenter: cadence clock on the source's timeline, frame interval {:.2}ms",
+                frame_interval_ns as f64 / 1e6
+            );
+            CadenceClock::new(CadenceTuning::snapping())
+        });
         Presenter {
             fifo_capacity: match priority {
                 PresentPriority::Latency => 0,
                 PresentPriority::Smooth { buffer } => buffer,
             },
             frames: VecDeque::new(),
-            prerolled: false,
+            cadence,
+            frame_interval_ns,
             inflight: None,
             vsync_tick: false,
             released: 0,
@@ -359,8 +402,9 @@ impl Presenter {
         }
     }
 
-    /// A vsync pulse from the clock thread's event — the retry tick for a parked frame and the
-    /// FIFO's drain pace.
+    /// A vsync pulse from the clock thread's event — the retry tick for a frame parked on a closed
+    /// budget, and the beat the empty-store readout is counted against. No longer a drain pace:
+    /// under cadence targeting the due time is what releases a frame.
     pub(super) fn on_vsync(&mut self) {
         self.vsync_tick = true;
     }
@@ -368,13 +412,21 @@ impl Presenter {
     /// Accept one decoded, gate-approved output buffer. Newest-wins evicts everything older
     /// (released unrendered — the explicit, counted drop); the FIFO evicts its oldest past
     /// capacity. Returns how many frames were dropped by the policy (the HUD's `skipped`).
+    ///
+    /// `decoded_mono_ns` is the monotonic twin of `decoded_ns`, stamped at the same instant on the
+    /// codec's callback thread: the cadence loop and `releaseOutputBufferAtTime` both live in
+    /// `CLOCK_MONOTONIC`, while the latency stats live in `CLOCK_REALTIME`, and the loop is fed and
+    /// read in ONE domain (`phase.rs`: a constant offset between domains is absorbed by the offset
+    /// estimator, so no conversion belongs anywhere in this path).
     pub(super) fn submit(
         &mut self,
         codec: &MediaCodec,
         index: usize,
         pts_us: u64,
         decoded_ns: i128,
+        decoded_mono_ns: i64,
     ) -> u64 {
+        let due_ns = self.due_at(pts_us, decoded_mono_ns);
         let mut dropped = 0u64;
         if self.fifo_capacity == 0 {
             while let Some(stale) = self.frames.pop_front() {
@@ -386,6 +438,7 @@ impl Presenter {
             index,
             pts_us,
             decoded_ns,
+            due_ns,
         });
         if self.fifo_capacity > 0 && self.frames.len() > self.fifo_capacity {
             if let Some(stale) = self.frames.pop_front() {
@@ -395,6 +448,61 @@ impl Presenter {
         }
         self.paced_drops += dropped;
         dropped
+    }
+
+    /// When the source says this frame is due, or `None` under the latency intent.
+    ///
+    /// `pts_us` IS the host's own stamp — it round-trips through the codec's presentation time, so
+    /// the source timeline needs no plumbing of its own. The µs the codec API quantises it to
+    /// costs ±0.5 µs of white noise on an 8.3 ms period, and that passes through to the due time
+    /// like any other variation in the source's cadence: the loop smooths the offset, never the
+    /// timestamps.
+    fn due_at(&mut self, pts_us: u64, decoded_mono_ns: i64) -> Option<i64> {
+        let interval_ns = self.frame_interval_ns;
+        self.cadence
+            .as_mut()
+            .map(|c| c.due_ns(pts_us.saturating_mul(1_000), decoded_mono_ns, interval_ns))
+    }
+
+    /// The earliest present a release may target: SurfaceFlinger's latch lead ahead of now, since
+    /// a present it cannot latch in time is not a target, and never before the frame's own due
+    /// time. That second half is the whole of the cadence change — `next_target(max(now, due))`
+    /// where it used to be `next_target(now)` (design §4.2).
+    fn not_before_ns(&self, now_mono_ns: i64, due_ns: Option<i64>) -> i64 {
+        let submit_floor_ns = now_mono_ns + self.margin_ns;
+        due_ns.map_or(submit_floor_ns, |due| due.max(submit_floor_ns))
+    }
+
+    /// Whether the frame at the head of the smoothing store may leave it yet.
+    ///
+    /// The store's job under cadence targeting is to HOLD WHAT IS NOT DUE YET (design §4.3): the
+    /// due time paces, so capacity is a bound against a burst rather than the clock. A frame is
+    /// releasable once the grid point it aims at is the next one this pump could still submit for
+    /// — one `grid_period_ns` of reach past the submit margin. Sooner buys nothing, because the
+    /// release is timed either way and holding keeps the store's own eviction policy live over the
+    /// frame; later risks the loop's 5 ms housekeeping wake landing inside the submit lead, which
+    /// costs the frame a whole refresh.
+    fn head_is_releasable(&self, now_mono_ns: i64, grid_period_ns: i64) -> bool {
+        let reach_ns = now_mono_ns + self.margin_ns + grid_period_ns;
+        self.frames
+            .front()
+            .is_some_and(|f| f.due_ns.is_none_or(|due| due <= reach_ns))
+    }
+
+    /// Force the cadence loop to re-anchor on the next frame — the discontinuity hook the clock
+    /// asks its callers for. The Android seam is the re-anchor gate arming: a loss freezes the
+    /// gate, the decoder recovers behind it, and what reaches this store on the far side comes
+    /// through a pipeline whose delay is no longer the one the loop measured. Source-timestamp
+    /// regressions and half-second gaps the loop catches by itself. No-op under latency.
+    pub(super) fn reset_cadence(&mut self) {
+        if let Some(c) = self.cadence.as_mut() {
+            c.reset();
+        }
+    }
+
+    /// The cadence loop's health for the 1 Hz line, or `None` when there is no loop to read.
+    fn cadence_health(&self) -> Option<CadenceHealth> {
+        self.cadence.as_ref().map(CadenceClock::health)
     }
 
     /// The present decision point — run on every loop pass (frame arrivals, vsync ticks, and the
@@ -423,28 +531,28 @@ impl Presenter {
         // pass — frame waiting or not — so its forgiveness timer measures real elapsed time
         // rather than how often a frame happened to be ready.
         let backlogged = self.unconfirmed_backlog(meter, now_mono_ns);
+        // The grid a release snaps to, for the store's due-time reach below: the panel's own
+        // period where it is known — the app's choreographer stream can be down-rated below it
+        // (see `VsyncShared::next_target`) — and the measured callback period otherwise.
+        let grid_period_ns = clock
+            .map(|c| c.panel_period_ns().max(c.period_ns()))
+            .filter(|&p| p > 0)
+            .unwrap_or(FALLBACK_PERIOD_NS);
         // Pick the frame this pump may release.
         let frame = if self.fifo_capacity == 0 {
             self.frames.pop_back() // submit() kept it a single slot; back == the newest
         } else {
-            // FIFO: drain exactly one frame per vsync tick, after preroll; a drain tick that
-            // finds the buffer dry re-arms preroll (the Apple `FrameStore` underflow semantics —
-            // the previous frame persists on glass, a repeat by omission, while headroom
-            // rebuilds). Everything is gated on the tick so an idle stream neither counts
-            // underflows nor churns the preroll flag 200×/s.
-            if !self.vsync_tick {
-                return false;
-            }
-            if !self.prerolled {
-                if self.frames.len() < self.fifo_capacity {
-                    return false;
+            // The smoothing store releases on the DUE time, so there is no drain tick to gate on
+            // and no preroll beneath it. One-frame-per-slot was itself the defect: at 60 fps on a
+            // 120 Hz panel it drains at twice supply, the store empties, preroll re-arms, and the
+            // intervals become 1,3,1,3 where 2,2,2 is the correct answer — the smoothing mode
+            // juddering by construction at exactly the rate mismatch it exists to smooth (design
+            // §4.3, D3). Due times one source period apart snap to every second vblank instead.
+            if !self.head_is_releasable(now_mono_ns, grid_period_ns) {
+                if self.vsync_tick && self.frames.is_empty() {
+                    self.dry += 1;
                 }
-                self.prerolled = true;
-            }
-            if self.frames.is_empty() {
-                self.prerolled = false;
-                self.dry += 1;
-                self.vsync_tick = false; // this tick's drain ran (and found nothing)
+                self.vsync_tick = false; // this tick's evaluation ran (and released nothing)
                 return false;
             }
             self.frames.pop_front()
@@ -463,8 +571,11 @@ impl Presenter {
             }
             return false;
         }
-        // Release: timeline-timed when the clock has one, ASAP otherwise.
-        let target = clock.and_then(|c| c.next_target(now_mono_ns, self.margin_ns));
+        // Release: timeline-timed when the clock has one, ASAP otherwise. Under cadence targeting
+        // the floor is the frame's due time rather than this instant — the source's grid rather
+        // than the network's.
+        let target =
+            clock.and_then(|c| c.next_target(self.not_before_ns(now_mono_ns, frame.due_ns)));
         let released = match target {
             Some(t) => codec
                 .release_output_buffer_at_time_by_index(frame.index, t.expected_present_ns)
@@ -549,6 +660,12 @@ impl Presenter {
     /// codec-pure queued→decoded time) / `e2e` (capture→decoded, skew-corrected — the wireless
     /// A/B headline) / `vsync` (the measured panel period).
     ///
+    /// Under the smoothness intent it carries the cadence loop's health as well — `late‰` of all
+    /// frames folded (a due time already past when the frame became presentable: the direct signal
+    /// the cushion is too small, and WP8's acceptance criterion), `jitter` (the loop residual's
+    /// mean absolute deviation, our first honest per-stream jitter number), `cushion` and
+    /// `reanchors`. Absent under latency, where there is no loop.
+    ///
     /// Returns this window's CIRCULAR latch statistics `(vector-mean latch ns mod panel period,
     /// coherence ‰)` when a window actually flushed — the phase-lock reporter's v2 error signal
     /// (design/phase-locked-capture.md §6; the v1 median was immovable under jitter).
@@ -577,6 +694,21 @@ impl Presenter {
         let period_ms = clock.map(|c| c.period_ns() as f64 / 1e6).unwrap_or(0.0);
         let panel_ns = clock.map(|c| c.panel_period_ns()).unwrap_or(0);
         let (outstanding, _) = meter.outstanding();
+        // Cumulative over the session rather than this window (the loop's counters survive
+        // `reset`): `late` is a RATE question, and one second of it is too few frames to read a
+        // sub-percent criterion off.
+        let cadence = self
+            .cadence_health()
+            .map(|h| {
+                format!(
+                    " late={}‰ jitterMs={:.2} cushionMs={:.2} reanchors={}",
+                    h.late.saturating_mul(1000) / h.frames.max(1),
+                    h.jitter_ns as f64 / 1e6,
+                    h.cushion_ns as f64 / 1e6,
+                    h.reanchors,
+                )
+            })
+            .unwrap_or_default();
         log::info!(
             target: "pf.present",
             "released={} displays={} paced={} noBudget={} forced={} qDry={} \
@@ -584,7 +716,7 @@ impl Presenter {
              paceMs p50={:.2} max={:.2} latchMs p50={:.2} max={:.2} \
              feedMs p50={:.2} max={:.2} codecMs p50={:.2} max={:.2} \
              e2eMs p50={:.2} max={:.2} circ={:.2}ms coh={} \
-             vsyncMs={:.2} panelMs={:.2}",
+             vsyncMs={:.2} panelMs={:.2}{}",
             self.released,
             displays,
             self.paced_drops,
@@ -607,6 +739,7 @@ impl Presenter {
             circ.map(|(_, c)| c).unwrap_or(0),
             period_ms,
             panel_ns as f64 / 1e6,
+            cadence,
         );
         self.released = 0;
         // Margin adaptation, off the MEASURED latch. A release targets the first grid point past
@@ -670,4 +803,109 @@ pub(super) fn presenter_disabled_by_sysprop() -> bool {
         )
     };
     n > 0 && &buf[..n as usize] == b"arrival"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SOURCE_HZ: u32 = 120;
+    const P: i64 = 8_333_333; // one 120 Hz source interval, ns
+    /// A host stamping realtime, played out against a monotonic present clock — two different
+    /// eras, which is the whole reason the loop estimates the offset rather than being told it.
+    const PTS0_NS: i64 = 1_786_000_000_000_000_000;
+    const MONO0: i64 = 987_000_000_000;
+    const PTS0_US: u64 = (PTS0_NS / 1000) as u64;
+
+    /// `k`'s pts as the CODEC echoes it — µs, truncated exactly as `feed_ready` queues it — and
+    /// the monotonic instant it became presentable, with `jitter_ns` of transport noise on the
+    /// arrival and none on the source stamp.
+    fn frame(k: i64, jitter_ns: i64) -> (u64, i64) {
+        (((PTS0_NS + k * P) / 1000) as u64, MONO0 + k * P + jitter_ns)
+    }
+
+    #[test]
+    fn the_latency_intent_never_consults_the_cadence_clock() {
+        let mut p = Presenter::new(PresentPriority::Latency, SOURCE_HZ);
+        for k in 0..600 {
+            let (pts_us, ready) = frame(k, (k % 11) * 400_000);
+            assert_eq!(
+                p.due_at(pts_us, ready),
+                None,
+                "latency must produce no due time at all"
+            );
+        }
+        assert!(
+            p.cadence_health().is_none(),
+            "latency holds no loop to have health"
+        );
+        // …so the target floor is exactly what it was before the clock existed: this instant plus
+        // SurfaceFlinger's latch lead, and nothing else.
+        assert_eq!(p.not_before_ns(MONO0, None), MONO0 + p.margin_ns);
+    }
+
+    #[test]
+    fn the_smooth_intent_puts_every_decoded_frame_through_the_loop() {
+        let mut p = Presenter::new(PresentPriority::Smooth { buffer: 2 }, SOURCE_HZ);
+        for k in 0..600 {
+            let (pts_us, ready) = frame(k, (k % 11) * 400_000);
+            assert!(p.due_at(pts_us, ready).is_some());
+        }
+        let h = p.cadence_health().expect("smooth holds a loop");
+        assert_eq!(h.frames, 600);
+        assert_eq!(
+            h.reanchors, 1,
+            "only the cold start anchors on a clean trace"
+        );
+    }
+
+    #[test]
+    fn a_due_time_ahead_of_now_moves_the_target_and_one_behind_it_does_not() {
+        let p = Presenter::new(PresentPriority::Smooth { buffer: 2 }, SOURCE_HZ);
+        let floor = MONO0 + p.margin_ns;
+        // Due ahead: the release aims at the source's grid, which is the entire change.
+        assert_eq!(p.not_before_ns(MONO0, Some(floor + P)), floor + P);
+        // Due already past — a late frame, which the loop deliberately reports unclamped: present
+        // at the next opportunity, never drag the grid back to the frame.
+        assert_eq!(p.not_before_ns(MONO0, Some(floor - 5 * P)), floor);
+    }
+
+    #[test]
+    fn the_store_holds_a_frame_that_is_not_due_yet_and_releases_it_within_reach_of_its_slot() {
+        let mut p = Presenter::new(PresentPriority::Smooth { buffer: 2 }, SOURCE_HZ);
+        let due = MONO0 + 4 * P;
+        p.frames.push_back(HeldFrame {
+            index: 0,
+            pts_us: PTS0_US,
+            decoded_ns: 0,
+            due_ns: Some(due),
+        });
+        assert!(!p.head_is_releasable(MONO0, P), "four refreshes early");
+        assert!(
+            !p.head_is_releasable(due - P - p.margin_ns - 1, P),
+            "one nanosecond outside the submit reach of its own slot"
+        );
+        assert!(
+            p.head_is_releasable(due - P - p.margin_ns, P),
+            "exactly one panel period of reach, the earliest that still buys nothing to wait"
+        );
+        assert!(
+            p.head_is_releasable(due + 10 * P, P),
+            "late frames go at once"
+        );
+    }
+
+    #[test]
+    fn a_frame_carrying_no_due_time_is_always_releasable() {
+        // `HeldFrame` is shared with the latency intent, where the due time is always absent, so
+        // the predicate has to drain on a frame it cannot answer for rather than wedge behind it.
+        let mut p = Presenter::new(PresentPriority::Smooth { buffer: 2 }, SOURCE_HZ);
+        p.frames.push_back(HeldFrame {
+            index: 0,
+            pts_us: PTS0_US,
+            decoded_ns: 0,
+            due_ns: None,
+        });
+        assert!(p.head_is_releasable(MONO0, P));
+    }
 }

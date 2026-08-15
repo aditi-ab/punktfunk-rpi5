@@ -1030,6 +1030,16 @@ public final class SessionAudio {
             defer { drainDone.signal() }
             var drained = 0
             var av = AvSync(channels: channels)
+            // WP-C1 — the drought half of concealment. Core heals a SEQ GAP, but only when a later
+            // packet arrives to reveal it; when the wire simply goes quiet nothing arrives to
+            // reveal anything, and the ring drains into an underrun and a de-prime whose re-prime
+            // is a longer artifact than the audio that was missing.
+            var drought = DroughtConceal(maxMS: AudioRing.plcMaxMS)
+            var lastPacketNs = DispatchTime.now().uptimeNanoseconds
+            // Something has decoded, so there is both state to conceal from and continuity to
+            // hold. Until then a session whose host never sends audio keeps the long timeout below
+            // rather than waking two hundred times a second to do nothing.
+            var decoded = false
             // Decode happens IN-CORE (libopus multistream) — AudioToolbox's Opus path is
             // stereo-only — and is handed back as interleaved f32 PCM in wire channel order.
             // Per-iteration autorelease pool: no runloop on this thread (see Stage2Pipeline).
@@ -1038,11 +1048,48 @@ public final class SessionAudio {
                 alive = autoreleasepool { () -> Bool in
                 let pcm: PunktfunkConnection.AudioPCM?
                 do {
-                    pcm = try connection.nextAudioPcm(timeoutMs: 100)
+                    // Wait at most one frame WHILE there is a stream to protect: the drought
+                    // decision has to be made on the wire's schedule, not whenever the next packet
+                    // happens to turn up.
+                    pcm = try connection.nextAudioPcm(
+                        timeoutMs: decoded ? UInt32(AudioRing.frameMS) : 100)
                 } catch {
                     return false // session closed
                 }
-                guard let pcm, pcm.frameCount > 0 else { return true }
+                guard let pcm, pcm.frameCount > 0 else {
+                    // Nothing on the wire. If the ring is draining with it, conceal from the
+                    // decoder's own state — the same libopus interpolation the loss path uses,
+                    // bounded by this ring's de-prime fuse so a genuinely dead stream is not
+                    // papered over. ONE frame per tick, not a burst: this arm runs every frame,
+                    // which is the rate the callback drains at, so concealment keeps pace with
+                    // playout instead of racing ahead of a depth reading it has already
+                    // invalidated.
+                    guard decoded else { return true }
+                    let quietMS = Int(
+                        (DispatchTime.now().uptimeNanoseconds &- lastPacketNs) / 1_000_000)
+                    guard drought.conceal(sinceLastPacketMS: quietMS, depthMS: ring.bufferedMS)
+                    else {
+                        return true
+                    }
+                    let plc: PunktfunkConnection.AudioPCM?
+                    do {
+                        plc = try connection.audioPlc()
+                    } catch {
+                        return false // session closed
+                    }
+                    if let plc {
+                        plc.samples.withUnsafeBufferPointer { p in
+                            if let base = p.baseAddress {
+                                ring.write(base, count: plc.frameCount * plc.channels)
+                            }
+                        }
+                    }
+                    ring.notePlcMS(drought.totalMS)
+                    return true
+                }
+                decoded = true
+                lastPacketNs = DispatchTime.now().uptimeNanoseconds
+                drought.packet()
                 // Place this frame against the picture it belongs with BEFORE queueing it: the
                 // depth read here is everything that must still play first, which is exactly what
                 // delays it. Skipped wholesale when no meter was wired, so an un-armed session
@@ -1070,12 +1117,14 @@ public final class SessionAudio {
                 // Periodic vitals (~10 s at the protocol's 5 ms frames). The other three clients
                 // log buffer depth and underruns; without this an Apple audio report — latency or
                 // dropout — arrives with no numbers at all, which is the position every platform
-                // was in before the 2026-08 audio work.
+                // was in before the 2026-08 audio work. `plc_ms` rides along because a healthy
+                // `underruns` bought with a climbing `plc_ms` is a link in trouble, not a link
+                // that is fine.
                 drained += 1
                 if drained % 2_000 == 0 {
                     let s = ring.stats
                     log.info(
-                        "audio: buffer_ms=\(s.bufferedMS) target_ms=\(s.targetMS) underruns=\(s.underruns) drift_sheds=\(s.sheds) av_offset_ms=\(s.avOffsetMS)"
+                        "audio: buffer_ms=\(s.bufferedMS) target_ms=\(s.targetMS) underruns=\(s.underruns) drift_sheds=\(s.sheds) av_offset_ms=\(s.avOffsetMS) plc_ms=\(s.plcMS)"
                     )
                 }
                 return true

@@ -48,11 +48,17 @@ final class AudioRing: @unchecked Sendable {
     /// gaps per 10 minutes at a 5 ms quantum, against 3 at 8 ms and 1 at 16 ms on an identical
     /// link. Mirrors `JitterTuning::COREAUDIO.deprime_ms`.
     private static let deprimeMS = 60
+    /// How long a packet DROUGHT may be concealed (`DroughtConceal`) before this ring is allowed
+    /// to underrun and the hysteresis above is allowed to run: twice that window — long enough to
+    /// ride out the delivery stalls that de-prime rings today, short enough that a genuinely dead
+    /// stream is not papered over. DERIVED from the fuse rather than written out, so it cannot
+    /// drift away from the thing it exists to protect. Mirrors `JitterTuning::plc_max_ms`.
+    static let plcMaxMS = deprimeMS * 2
     /// Floor in callbacks under `deprimeMS`, so a large-quantum device keeps real hysteresis
     /// instead of de-priming on the first short read. Mirrors `MIN_DEPRIME_CALLBACKS`.
     private static let minDeprimeCallbacks = 2
     /// The protocol's frame: the shed unit, and the slack added over a large device quantum.
-    private static let frameMS = 5
+    static let frameMS = 5
     /// Depth average must exceed target by this before drift correction fires — the middle of the
     /// headroom band, so the smooth shed always gets its chance BEFORE the hard cap trims.
     private static let shedExcessMS = 15
@@ -151,6 +157,10 @@ final class AudioRing: @unchecked Sendable {
     /// no timestamps, so the drain thread (which has both a packet's `pts_ns` and the video leg)
     /// hands the number back for reporting. Mirrors `NativeClient::audio_av_offset_ms`.
     private var avOffsetMS = 0
+    /// Drought concealment the drain thread has synthesized this session, ms — STORED here for the
+    /// same reason `avOffsetMS` is: the ring cannot compute it, but it is where the numbers a
+    /// listener's complaint needs can be read under one lock.
+    private var plcMS = 0
     private let channels: Int
     private let perMS: Int
     private let lock = OSAllocatedUnfairLock()
@@ -222,6 +232,16 @@ final class AudioRing: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         avOffsetMS = ms
+    }
+
+    /// Store the drain thread's running drought concealment (`DroughtConceal.totalMS`) for
+    /// reporting. Concealment that nobody can see is concealment that hides the bug it is
+    /// covering: a healthy `underruns` bought with a climbing `plc_ms` is a link in trouble, not
+    /// a link that is fine.
+    func notePlcMS(_ ms: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        plcMS = ms
     }
 
     /// Buffered depth in interleaved samples — what the sync loop measures against (`bufferedMS`
@@ -481,6 +501,10 @@ final class AudioRing: @unchecked Sendable {
         /// Reported next to the depth, never instead of it: a deep ring on a jittery link is
         /// CORRECT behaviour, and only the offset separates that from a ring holding audio late.
         let avOffsetMS: Int
+        /// Audio synthesized for packet droughts this session (`DroughtConceal`), ms — read next
+        /// to `underruns`, which it exists to prevent, because the two only mean something
+        /// together.
+        let plcMS: Int
     }
 
     var stats: Stats {
@@ -491,7 +515,8 @@ final class AudioRing: @unchecked Sendable {
             targetMS: target / max(perMS, 1),
             underruns: underrunCount,
             sheds: shedCount,
-            avOffsetMS: avOffsetMS)
+            avOffsetMS: avOffsetMS,
+            plcMS: plcMS)
     }
 }
 
@@ -638,6 +663,70 @@ struct AvSync {
         guard abs(offsetMs) >= Double(Self.deadbandMS) else { return nil }
         let delta = Int(offsetMs * Double(perMS))
         return max(0, currentDepth - delta)
+    }
+}
+
+// MARK: - Drought concealment
+
+/// Bounded concealment of a packet DROUGHT — the Apple leg of the policy the three Rust clients
+/// share (`punktfunk_core::audio::DroughtConceal`; design/host-source-stutter-fixes.md, WP-C1).
+///
+/// The decode path already conceals a SEQ GAP: core's in-ABI decoder synthesizes the packets the
+/// sequence says went missing before the one that arrived (`nextAudioPcm`). But that only fires
+/// when a LATER packet arrives to reveal the gap. When the wire simply goes quiet — a delivery
+/// stall on a bunching Wi-Fi link, or a host whose capture stalled — nothing arrives to reveal
+/// anything: `AudioRing` drains to empty, the render callback runs short, and `noteRead` de-primes
+/// and then re-primes a whole target's worth of fresh silence. The artifact is far longer than the
+/// audio actually missing, and this is the shape the 2026-08-15 field session spent 3–16 % of its
+/// wall-clock in.
+///
+/// So a drought that is draining the ring gets concealed too, from the same decoder state
+/// (`PunktfunkConnection.audioPlc`), for a bounded time. Denominated in TIME, never in frames or
+/// callbacks: that is the recorded lesson from the very fuse this protects, where a count gave an
+/// iPad a third of a Mac's slack (`AudioRing.deprimeMS`, and
+/// `testDeprimeFuseIsADurationNotACallbackCount`).
+///
+/// Time is passed IN, so the policy stays as deterministic as the ring's own.
+struct DroughtConceal {
+    /// A drought must outlast ordinary arrival jitter before anything is synthesized for it: two
+    /// protocol frames, the same tolerance the host's capture-hole infill uses at the other end.
+    private static let afterMS = 2 * AudioRing.frameMS
+    /// …and the ring must actually be running out. A drought a deep ring can cover is not audible,
+    /// and concealing it would synthesize audio the late packets are about to duplicate — pushing
+    /// the whole stream later and handing the drift shed a mess to clean up audibly.
+    private static let floorMS = 2 * AudioRing.frameMS
+
+    /// Concealed since the last real packet.
+    private var concealedMS = 0
+    private let maxMS: Int
+    /// Concealed over the session — what the 10 s `plc_ms=` line reports. Concealment must be
+    /// visible: a policy that quietly papers over a failing link is a policy that hides the bug.
+    private(set) var totalMS = 0
+
+    init(maxMS: Int) {
+        self.maxMS = maxMS
+    }
+
+    /// A packet arrived, ending any drought — the next one starts from a full budget.
+    ///
+    /// The Rust twin also hands back the frames it concealed, for its caller to subtract from the
+    /// loss concealment the seq path is about to ask for. Here that subtraction is core's, on the
+    /// far side of the ABI, because that is where the gap tracker lives (see
+    /// `punktfunk_connection_audio_plc`) — a packet genuinely lost inside a covered drought must
+    /// not be concealed twice either way.
+    mutating func packet() {
+        concealedMS = 0
+    }
+
+    /// Should one more frame be concealed? `depthMS` is the playout ring as the render callback
+    /// last left it.
+    mutating func conceal(sinceLastPacketMS: Int, depthMS: Int) -> Bool {
+        if sinceLastPacketMS < Self.afterMS || depthMS > Self.floorMS || concealedMS >= maxMS {
+            return false
+        }
+        concealedMS += AudioRing.frameMS
+        totalMS += AudioRing.frameMS
+        return true
     }
 }
 

@@ -1686,8 +1686,25 @@ fn spawn_audio(
             if !av_sync_enabled {
                 tracing::info!("A/V sync disabled by PUNKTFUNK_NO_AV_SYNC");
             }
+            // WP-C1 — the drought half of concealment. The loop below already conceals a SEQ GAP,
+            // but only when a later packet arrives to reveal it; when the wire simply goes quiet
+            // nothing arrives to reveal anything, and the ring drains into an underrun and a
+            // de-prime whose re-prime is a longer artifact than the audio that was missing.
+            let mut drought =
+                punktfunk_core::audio::DroughtConceal::new(audio::TUNING.plc_max_ms());
+            let mut last_packet = std::time::Instant::now();
             while !stop.load(Ordering::SeqCst) {
-                match connector.next_audio(Duration::from_millis(100)) {
+                // Wait at most one frame WHILE there is a stream to protect: the drought decision
+                // has to be made on the wire's schedule, not whenever the next packet happens to
+                // turn up. Before anything has decoded there is no state to conceal from and
+                // nothing to conceal for, so a session whose host never sends audio keeps the old
+                // long timeout rather than waking two hundred times a second to do nothing.
+                let wait_ms = if frame_samples > 0 {
+                    punktfunk_core::audio::FRAME_MS as u64
+                } else {
+                    100
+                };
+                match connector.next_audio(Duration::from_millis(wait_ms)) {
                     Ok(pkt) => {
                         // Place this frame against the picture it belongs with, BEFORE it is
                         // queued: `buffered_ahead` is everything that must still play first, so
@@ -1710,10 +1727,15 @@ fn spawn_audio(
                             sync_cell.set_target(av.desired_depth(depth));
                             av_offset_out.store(av.offset_ms() as i64, Ordering::Relaxed);
                         }
+                        last_packet = std::time::Instant::now();
+                        // Anything the drought path already covered is audio the stream now has;
+                        // concealing it a second time here would insert samples it never carried
+                        // and push everything after them later.
+                        let already = drought.packet();
                         // Conceal lost packets (a seq gap) with libopus PLC before decoding the one
                         // that arrived: empty input synthesizes `frame_samples` of interpolation per
                         // missing packet — an inaudible fade instead of the click a hard gap makes.
-                        for _ in 0..gaps.missing_before(pkt.seq) {
+                        for _ in 0..gaps.missing_before(pkt.seq).saturating_sub(already) {
                             let plc = frame_samples * channels as usize;
                             if plc == 0 {
                                 break; // no decoded frame yet to size the concealment from
@@ -1736,7 +1758,28 @@ fn spawn_audio(
                             Err(e) => tracing::debug!(error = %e, "opus decode failed"),
                         }
                     }
-                    Err(PunktfunkError::NoFrame) => {}
+                    Err(PunktfunkError::NoFrame) => {
+                        // Nothing on the wire. If the ring is draining with it, conceal from the
+                        // decoder's own state — the same libopus interpolation the loss path uses,
+                        // bounded by this backend's de-prime fuse so a genuinely dead stream is
+                        // not papered over. `frame_samples` is 0 until something has decoded:
+                        // there is no state to extrapolate from before then.
+                        //
+                        // ONE frame per tick, not a burst: this arm fires every `FRAME_MS`, which
+                        // is exactly the rate the callback drains at, so concealment keeps pace
+                        // with playout instead of racing ahead of a depth reading it has already
+                        // invalidated.
+                        let depth_ms = (sync_cell.depth() / per_ms) as u32;
+                        if frame_samples > 0 && drought.conceal(last_packet.elapsed(), depth_ms) {
+                            let plc = frame_samples * channels as usize;
+                            if let Ok(samples) = dec.decode_float(&[], &mut pcm[..plc], false) {
+                                let mut buf = player.take_buffer();
+                                buf.extend_from_slice(&pcm[..samples * channels as usize]);
+                                player.push(buf);
+                            }
+                            sync_cell.publish_plc_ms(drought.total_ms());
+                        }
+                    }
                     Err(_) => break, // plane closed — the session is ending
                 }
             }

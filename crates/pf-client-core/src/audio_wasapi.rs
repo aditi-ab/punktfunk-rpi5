@@ -41,6 +41,13 @@ const CAPT_CHANNELS: usize = 2;
 /// halves the frame-fill share of mouth-to-ear latency vs the old 20 ms.
 const MIC_FRAME: usize = 480;
 
+/// This backend's de-jitter tuning. Named once so the decode thread can read the same numbers the
+/// render loop runs on — its drought concealment is bounded by this preset's de-prime fuse, and
+/// the two drifting apart is exactly how one platform quietly ends up with a third of another's
+/// slack.
+pub(crate) const TUNING: punktfunk_core::audio::JitterTuning =
+    punktfunk_core::audio::JitterTuning::WASAPI;
+
 /// A selectable WASAPI endpoint for the settings pickers.
 #[derive(Clone, Debug)]
 pub struct AudioDevice {
@@ -305,10 +312,7 @@ fn render_thread(
         // returns to target instead of ratcheting, and de-prime hysteresis — the last replacing
         // the old `if ring.is_empty()`, where a single transient drain manufactured a whole
         // target's worth of fresh silence.
-        let mut policy = punktfunk_core::audio::JitterPolicy::new(
-            punktfunk_core::audio::JitterTuning::WASAPI,
-            channels,
-        );
+        let mut policy = punktfunk_core::audio::JitterPolicy::new(TUNING, channels);
         let mut out = Vec::new(); // per-quantum scratch, reused across iterations
         let (mut underruns, mut sheds, mut callbacks) = (0u64, 0u64, 0u64);
 
@@ -367,6 +371,10 @@ fn render_thread(
                     target_ms = policy.target_ms(),
                     underruns,
                     drift_sheds = sheds,
+                    // Concealment must be visible next to the underruns it prevented: a healthy
+                    // `underruns` bought with a climbing `plc_ms` is a link in trouble, not a
+                    // link that is fine.
+                    plc_ms = sync.plc_ms(),
                     "audio playback"
                 );
             }

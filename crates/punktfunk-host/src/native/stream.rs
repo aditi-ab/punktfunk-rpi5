@@ -271,10 +271,21 @@ impl PhaseCtl {
 /// budget catches any residual chase the statistics miss. New in v3: ANTIPODE DAMPING — an
 /// error within 1 ms of ±period/2 flips sign on sampling noise (measured as 0↔2↔4 ms offset
 /// chatter), so near-antipode steps are halved until the error commits to a side.
+///
+/// New in v4 (design/host-source-stutter-fixes.md WP-A1, from the 2026-08-15 Skynet log): a host
+/// whose coherence oscillates around [`COHERENCE_FLOOR_MILLI`](Self::COHERENCE_FLOOR_MILLI) used
+/// to flap forever, because engagement needed ONE coherent report and the incoherent disengage
+/// asked for NO backoff — 41 engage/disengage cycles in 24 minutes on a KWin host. Each cycle is
+/// a self-inflicted timing step in both directions (engage starts holding submits by up to a
+/// period; disengage drops the offset to 0 and the next frames leave that much earlier), so the
+/// controller was manufacturing the very arrival jitter it exists to remove. Hence: engagement
+/// needs SUSTAINED coherence, each incoherent cycle backs off longer than the last, and a host
+/// that cannot hold coherence at all parks for the session.
 struct PhaseController {
     /// Grid offset, ns ∈ [0, period). Meaningful only while engaged.
     offset_ns: i64,
-    /// The grid's epoch; `None` = disengaged (no submit-grid sleeps, zero cost).
+    /// The grid's epoch; `None` = disengaged (no submit-grid sleeps, zero cost). Doubles as the
+    /// lock's age — it is stamped at engage and cleared at disengage, nowhere else.
     epoch: Option<std::time::Instant>,
     /// Last adjust instant (~1 Hz cadence).
     last_adjust: std::time::Instant,
@@ -282,6 +293,13 @@ struct PhaseController {
     cum_travel_ns: i64,
     /// Consecutive incoherent reports; 3 disengage.
     incoherent_streak: u32,
+    /// Consecutive COHERENT reports — the v4 engage gate.
+    coherent_streak: u32,
+    /// Incoherent disengages this session: escalates the backoff, and blows the fuse. Forgiven
+    /// by a lock that holds for [`LOCK_STABLE`](Self::LOCK_STABLE).
+    incoherent_cycles: u32,
+    /// Fuse blown — parked for the session, no further engagement and no further log lines.
+    fused: bool,
     /// Adjust ticks to sit out after a disengage before re-engaging.
     reengage_backoff: u32,
 }
@@ -304,6 +322,19 @@ impl PhaseController {
     const ANTIPODE_GUARD_NS: i64 = 1_000_000;
     /// Adjust ticks sat out after a disengage (travel exhaustion) before trying again.
     const REENGAGE_BACKOFF: u32 = 10;
+    /// Consecutive coherent reports the grid must see before it engages (v4). One was enough in
+    /// v3, which is why a host hovering at the coherence floor re-engaged within a second of
+    /// every disengage; at the ~1 Hz report cadence this asks for ~5 s of a phase worth locking.
+    const ENGAGE_COHERENT_REPORTS: u32 = 5;
+    /// Incoherent cycles before the grid parks for the session. A host that has failed this many
+    /// times is telling us its arrival phase is not lockable, and permanently disengaged (today's
+    /// default, zero added latency) is strictly better than another cycle of steps.
+    const INCOHERENT_FUSE: u32 = 8;
+    /// Escalation ceiling — `REENGAGE_BACKOFF << 5` = 320 ticks ≈ 5 min.
+    const MAX_BACKOFF_SHIFT: u32 = 5;
+    /// A lock held this long forgives the session's escalation: a transient bad patch (a shader
+    /// storm, a game launch) must not fuse a host that is otherwise perfectly lockable.
+    const LOCK_STABLE: std::time::Duration = std::time::Duration::from_secs(60);
 
     fn new() -> PhaseController {
         PhaseController {
@@ -312,6 +343,9 @@ impl PhaseController {
             last_adjust: std::time::Instant::now(),
             cum_travel_ns: 0,
             incoherent_streak: 0,
+            coherent_streak: 0,
+            incoherent_cycles: 0,
+            fused: false,
             reengage_backoff: 0,
         }
     }
@@ -320,10 +354,14 @@ impl PhaseController {
         self.epoch.is_some()
     }
 
-    fn disengage(&mut self, reason: &'static str, backoff: u32) {
+    /// `coherence_milli` is the report that caused the disengage: without it the log showed how
+    /// far the offset had walked but not how far below the gate the phase actually was, which is
+    /// the number that says whether the host is marginal or hopeless.
+    fn disengage(&mut self, reason: &'static str, backoff: u32, coherence_milli: u16) {
         if self.engaged() {
             tracing::info!(
                 offset_ms = self.offset_ns as f64 / 1e6,
+                coherence_milli,
                 reason,
                 "phase lock: disengaging the submit grid"
             );
@@ -331,6 +369,10 @@ impl PhaseController {
         self.epoch = None;
         self.offset_ns = 0;
         self.cum_travel_ns = 0;
+        // Both streaks restart: re-engaging costs a fresh ENGAGE_COHERENT_REPORTS of proof, and
+        // the next disengage costs a fresh three incoherent reports.
+        self.incoherent_streak = 0;
+        self.coherent_streak = 0;
         self.reengage_backoff = backoff;
     }
 
@@ -338,7 +380,7 @@ impl PhaseController {
     /// Sign convention: a positive (shortest-way) error means frames arrive too early and wait
     /// at the client — submit LATER (grow the offset); negative — earlier.
     fn adjust(&mut self, r: &punktfunk_core::quic::PhaseReport, period_ns: i64) {
-        if period_ns <= 0 {
+        if period_ns <= 0 || self.fused {
             return;
         }
         self.last_adjust = std::time::Instant::now();
@@ -349,13 +391,43 @@ impl PhaseController {
         let coherent =
             r.coherence_milli == u16::MAX || r.coherence_milli >= Self::COHERENCE_FLOOR_MILLI;
         if !coherent {
+            self.coherent_streak = 0;
             self.incoherent_streak += 1;
             if self.incoherent_streak >= 3 {
-                self.disengage("incoherent arrival phase", 0);
+                // Only a disengage that tore down an ENGAGED grid cost the stream a timing step.
+                // Counting the others would let a launch-time shader storm — minutes of genuinely
+                // incoherent arrival before the controller ever locks — blow the fuse on a host
+                // that then locks perfectly for the next three hours.
+                if self.engaged() {
+                    self.incoherent_cycles += 1;
+                    if self.incoherent_cycles >= Self::INCOHERENT_FUSE {
+                        self.fused = true;
+                        tracing::info!(
+                            cycles = self.incoherent_cycles,
+                            coherence_milli = r.coherence_milli,
+                            "phase lock: arrival phase incoherent on this host — parked for the \
+                             session"
+                        );
+                    }
+                }
+                // Each cycle waits longer than the last: 10 ticks (~10 s) doubling to 320 (~5 min).
+                let backoff = Self::REENGAGE_BACKOFF
+                    << self
+                        .incoherent_cycles
+                        .saturating_sub(1)
+                        .min(Self::MAX_BACKOFF_SHIFT);
+                self.disengage("incoherent arrival phase", backoff, r.coherence_milli);
             }
             return;
         }
         self.incoherent_streak = 0;
+        self.coherent_streak = self.coherent_streak.saturating_add(1);
+        // A lock this old has proven itself — forgive the escalation so a session that hits one
+        // bad patch an hour is not slowly fused by it. Checked here rather than at disengage so
+        // the state decays while the lock is good, not only when it is lost.
+        if self.epoch.is_some_and(|e| e.elapsed() >= Self::LOCK_STABLE) {
+            self.incoherent_cycles = 0;
+        }
         let target = Self::TARGET_LEAD_FLOOR_NS.max(r.uncertainty_ns as i64 + 1_000_000);
         // Signed SHORTEST-WAY error around the period.
         let raw = (r.arrival_lead_ns as i64 - target).rem_euclid(period_ns);
@@ -369,8 +441,16 @@ impl PhaseController {
             return;
         }
         if !self.engaged() {
+            // Hysteresis: an offset worth holding submits for has to be backed by a phase that
+            // stayed coherent, not by the one report that happened to clear the gate.
+            if self.coherent_streak < Self::ENGAGE_COHERENT_REPORTS {
+                return;
+            }
             self.epoch = Some(std::time::Instant::now());
-            tracing::info!("phase lock: engaging the submit grid");
+            tracing::info!(
+                coherence_milli = r.coherence_milli,
+                "phase lock: engaging the submit grid"
+            );
         }
         let mut step = error.clamp(-Self::MAX_STEP_NS, Self::MAX_STEP_NS);
         // Antipode damping: this error sits where its sign is a coin flip — half steps until
@@ -382,7 +462,7 @@ impl PhaseController {
         self.cum_travel_ns += step.abs();
         if self.cum_travel_ns > period_ns + period_ns / 4 {
             tracing::info!("phase lock: travel budget exhausted without convergence — disengaging");
-            self.disengage("travel budget", Self::REENGAGE_BACKOFF);
+            self.disengage("travel budget", Self::REENGAGE_BACKOFF, r.coherence_milli);
         }
     }
 
@@ -5230,6 +5310,173 @@ mod tests {
             (shift - 2_000_000).rem_euclid(SIM_P) < 1_000
                 || (shift - 2_000_000).rem_euclid(SIM_P) > SIM_P - 1_000,
             "a +2 ms offset must shift the next target by +2 ms mod P, got {shift}"
+        );
+    }
+
+    // ---- v4 flap hygiene (design/host-source-stutter-fixes.md WP-A1) ----
+    //
+    // These exercise the controller's reaction to the COHERENCE STATISTIC rather than the
+    // statistic itself (`report_from_lead` above covers that), because the shape being replayed
+    // is "coherence oscillating around the floor" — far easier to state directly than to conjure
+    // out of a sample spread, and the number under test is the gate, not the estimator.
+
+    /// Just above / just below the gate — the neighbourhood the field host lived in.
+    const COHERENT: u16 = PhaseController::COHERENCE_FLOOR_MILLI + 40;
+    const INCOHERENT: u16 = PhaseController::COHERENCE_FLOOR_MILLI - 40;
+    /// A lead far enough from the target to be worth acting on (error ≫ deadband).
+    const ACTIONABLE_LEAD: i64 = 7_500_000;
+
+    fn report_at(coherence_milli: u16, lead_ns: i64) -> punktfunk_core::quic::PhaseReport {
+        punktfunk_core::quic::PhaseReport {
+            next_latch_host_ns: 0,
+            latch_period_ns: SIM_P as u32,
+            uncertainty_ns: 1_000_000,
+            arrival_lead_ns: lead_ns.rem_euclid(SIM_P) as u32,
+            coherence_milli,
+        }
+    }
+
+    /// One full cycle on a host that keeps losing its phase: engage on a sustained good phase,
+    /// then lose it. Returns the backoff the disengage asked for, and leaves the controller with
+    /// that backoff spent so the caller can run another cycle.
+    fn one_incoherent_cycle(c: &mut PhaseController) -> u32 {
+        for _ in 0..PhaseController::ENGAGE_COHERENT_REPORTS {
+            c.adjust(&report_at(COHERENT, ACTIONABLE_LEAD), SIM_P);
+        }
+        assert!(c.engaged(), "the cycle must engage before it tears down");
+        for _ in 0..3 {
+            c.adjust(&report_at(INCOHERENT, ACTIONABLE_LEAD), SIM_P);
+        }
+        let asked = c.reengage_backoff;
+        while !c.fused && c.reengage_backoff > 0 {
+            c.adjust(&report_at(INCOHERENT, ACTIONABLE_LEAD), SIM_P);
+        }
+        asked
+    }
+
+    #[test]
+    fn engage_requires_sustained_coherence() {
+        let mut c = PhaseController::new();
+        for i in 1..PhaseController::ENGAGE_COHERENT_REPORTS {
+            c.adjust(&report_at(COHERENT, ACTIONABLE_LEAD), SIM_P);
+            assert!(!c.engaged(), "engaged on only {i} coherent report(s)");
+        }
+        c.adjust(&report_at(COHERENT, ACTIONABLE_LEAD), SIM_P);
+        assert!(
+            c.engaged(),
+            "sustained coherence must still engage the grid"
+        );
+
+        // …and the proof is CONSECUTIVE: one bad report puts it back to zero, which is the whole
+        // difference from v3 on a host that clears the gate every other second.
+        let mut c = PhaseController::new();
+        for _ in 0..PhaseController::ENGAGE_COHERENT_REPORTS - 1 {
+            c.adjust(&report_at(COHERENT, ACTIONABLE_LEAD), SIM_P);
+        }
+        c.adjust(&report_at(INCOHERENT, ACTIONABLE_LEAD), SIM_P);
+        for _ in 0..PhaseController::ENGAGE_COHERENT_REPORTS - 1 {
+            c.adjust(&report_at(COHERENT, ACTIONABLE_LEAD), SIM_P);
+        }
+        assert!(
+            !c.engaged(),
+            "a broken streak must not count toward engaging"
+        );
+    }
+
+    #[test]
+    fn incoherent_disengage_backoff_escalates() {
+        let mut c = PhaseController::new();
+        let asked: Vec<u32> = (0..4).map(|_| one_incoherent_cycle(&mut c)).collect();
+        assert_eq!(
+            asked,
+            vec![10, 20, 40, 80],
+            "each cycle must wait longer than the last (v3 asked for zero, every time)"
+        );
+    }
+
+    #[test]
+    fn fuse_after_repeated_cycles() {
+        let mut c = PhaseController::new();
+        for _ in 0..PhaseController::INCOHERENT_FUSE {
+            one_incoherent_cycle(&mut c);
+        }
+        assert!(
+            c.fused,
+            "a host that never holds a lock must park for the session"
+        );
+        // Parked means parked: even a v1-style bypass report (u16::MAX) cannot wake it.
+        for _ in 0..50 {
+            c.adjust(&report_at(u16::MAX, ACTIONABLE_LEAD), SIM_P);
+        }
+        assert!(!c.engaged(), "a fused controller must stay disengaged");
+    }
+
+    #[test]
+    fn stable_lock_resets_escalation() {
+        let mut c = PhaseController::new();
+        one_incoherent_cycle(&mut c);
+        one_incoherent_cycle(&mut c);
+        assert_eq!(c.incoherent_cycles, 2, "two cycles should have escalated");
+
+        for _ in 0..PhaseController::ENGAGE_COHERENT_REPORTS {
+            c.adjust(&report_at(COHERENT, ACTIONABLE_LEAD), SIM_P);
+        }
+        assert!(c.engaged());
+        // Buy the minute by moving the epoch back, the same way the grid test places its epoch —
+        // the lock's age IS the epoch's age.
+        c.epoch = Some(
+            std::time::Instant::now()
+                - PhaseController::LOCK_STABLE
+                - std::time::Duration::from_secs(1),
+        );
+        c.adjust(&report_at(COHERENT, ACTIONABLE_LEAD), SIM_P);
+        assert_eq!(
+            c.incoherent_cycles, 0,
+            "a lock that held past LOCK_STABLE must forgive the escalation"
+        );
+    }
+
+    /// The 2026-08-15 Skynet log in one function: 24 minutes of a host whose arrival phase sits
+    /// ON the coherence gate, flipping sides every few reports. v3 engaged on the FIRST coherent
+    /// report after a zero-backoff disengage and logged **41 engage/disengage cycles** — 82
+    /// self-inflicted timing steps (each engage holds submits by up to a period, each disengage
+    /// drops the offset to zero) on a session whose transport was provably clean.
+    #[test]
+    fn flap_replay_stops_the_engage_churn() {
+        let mut c = PhaseController::new();
+        let mut rng = Lcg(23);
+        let (mut engagements, mut reports, mut coherent_side) = (0u32, 0u32, true);
+        while reports < 24 * 60 {
+            // Runs of 2-4 reports a side: "every few reports", the logged shape.
+            let run = 2 + rng.next_noise(3).rem_euclid(3) as u32;
+            for _ in 0..run {
+                let was = c.engaged();
+                let side = if coherent_side { COHERENT } else { INCOHERENT };
+                c.adjust(&report_at(side, ACTIONABLE_LEAD), SIM_P);
+                engagements += u32::from(!was && c.engaged());
+                reports += 1;
+            }
+            coherent_side = !coherent_side;
+        }
+        assert!(
+            engagements <= 2,
+            "24 min of gate-hovering must not churn the grid: {engagements} engagements"
+        );
+        // …and the cure must not be "never engage again": a host that settles still locks. This
+        // is R1 in the plan's register, asserted rather than argued.
+        assert!(
+            !c.fused,
+            "flapping that never engaged must not blow the fuse"
+        );
+        // The replay ends mid-backoff — a bad patch always does — so recovery costs that backoff
+        // plus the engage proof, ~15 s at the report cadence. That delay IS the trade: every
+        // second of it is spent in today's disengaged default, which adds no latency at all.
+        for _ in 0..PhaseController::REENGAGE_BACKOFF + PhaseController::ENGAGE_COHERENT_REPORTS {
+            c.adjust(&report_at(COHERENT, ACTIONABLE_LEAD), SIM_P);
+        }
+        assert!(
+            c.engaged(),
+            "a phase that finally holds must still get the grid"
         );
     }
 

@@ -47,6 +47,12 @@ public struct ReadyFrame: @unchecked Sendable {
     /// context so the re-anchor gate can classify this decoded frame (IDR / RFI anchor / recovery
     /// mark) at present time — the async decode callback has no other access to it. 0 when unknown.
     public let flags: UInt32
+    /// When this frame is DUE on the SOURCE's cadence, in `CACurrentMediaTime` seconds — the
+    /// domain the present path schedules against (`presentAtMediaTime`, `VsyncClock`). Stamped
+    /// where the frame enters the ready store, by the pipeline's `CadenceClock`; `nil` under the
+    /// latency intent, which has no clock and presents on arrival. May be in the PAST: that is a
+    /// late frame, and the contract is "already due ⇒ present at the next opportunity".
+    public var dueMediaTime: CFTimeInterval?
 
     /// The VideoToolbox path's buffer; nil for a PyroWave planar frame. (Kept as the accessor
     /// the decode round-trip tests assert against.)

@@ -1139,6 +1139,46 @@ public final class PunktfunkConnection {
         }
     }
 
+    /// Synthesize one frame of concealment from the in-core decoder's own state — no packet
+    /// involved, nothing pulled off the wire. `nil` when there is nothing to extrapolate from
+    /// (before the first decode, or when libopus declines), which the caller treats exactly like a
+    /// timeout: write nothing this tick. Throws `.closed` once the session ended.
+    ///
+    /// `nextAudioPcm` heals a gap the SEQUENCE reveals; that needs a later packet to arrive and
+    /// reveal it. This is for the wire simply going quiet, where nothing arrives to reveal
+    /// anything and the ring drains into an underrun and a de-prime whose re-prime is a longer
+    /// artifact than the audio that was missing. `DroughtConceal` owns WHEN to ask — bounded in
+    /// time, and only while the ring is genuinely running out.
+    ///
+    /// Same audio thread as `nextAudioPcm`, whose borrowed buffer this call invalidates (they
+    /// share the slot). The returned `samples` are copied out. `ptsNs`/`seq` read 0: this frame was
+    /// never on the wire, so it has no capture instant and must not reach an `AvSync` observation.
+    public func audioPlc() throws -> AudioPCM? {
+        audioLock.lock()
+        defer { audioLock.unlock() }
+        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
+
+        var out = PunktfunkAudioPcm()
+        let rc = punktfunk_connection_audio_plc(h, &out)
+        switch rc {
+        case statusOK:
+            let channels = Int(out.channels)
+            let total = Int(out.frame_count) * channels
+            guard let base = out.samples, total > 0 else { return nil }
+            // Copy: the pointer borrows connection memory only until the next PCM call.
+            let samples = Array(UnsafeBufferPointer(start: base, count: total))
+            return AudioPCM(
+                samples: samples, frameCount: Int(out.frame_count),
+                channels: channels, ptsNs: out.pts_ns, seq: out.seq)
+        case statusNoFrame:
+            return nil
+        case statusClosed:
+            throw PunktfunkClientError.closed
+        default:
+            throw PunktfunkClientError.status(rc)
+        }
+    }
+
     /// Pull the next force-feedback update for the GCController haptics engine:
     /// `(pad, lowFrequency, highFrequency)` with 0...0xFFFF amplitudes, (0, 0) = stop.
     /// Drain from the (single) feedback thread, alongside `nextHidOutput`. Drops the v2

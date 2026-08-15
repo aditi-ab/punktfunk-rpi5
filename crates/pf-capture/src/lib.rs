@@ -564,6 +564,12 @@ pub type CursorForwardSender = std::sync::Arc<dyn Fn(bool) -> Result<()> + Send 
 #[cfg(target_os = "linux")]
 pub mod pwinit;
 
+// Which clock the wire's `pts_ns` comes from, and how clean each candidate is. Only the Linux
+// capturer consumes it, but the arithmetic is pure and platform-independent, so its tests run
+// everywhere rather than only where the backend does.
+#[cfg(any(target_os = "linux", test))]
+mod pts_provenance;
+
 // The Windows backend lives under `windows/`, the Linux one under `linux/`. Windows capture is IDD
 // direct-push only (DXGI Desktop Duplication + the WGC relay were removed).
 #[cfg(target_os = "windows")]
