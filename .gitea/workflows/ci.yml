@@ -114,8 +114,14 @@ jobs:
           path: |
             /usr/local/cargo/registry
             /usr/local/cargo/git
-          key: cargo-home-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-home-
+          # Namespaced `-ci-` so a fork PR's cargo-home cache can never land in the `cargo-home-`
+          # pool the SIGNED release builds (deb.yml / android.yml) restore: registry/src holds
+          # already-extracted crate sources that cargo compiles WITHOUT re-checksumming past
+          # `.cargo-ok`, so a poisoned entry would be arbitrary Rust source compiled into a release
+          # artifact with no Cargo.lock diff. security-review 2026-08-15 finding 5. (The definitive
+          # control is operator-side: Gitea's "require approval for fork PRs".)
+          key: cargo-home-ci-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-ci-
       - uses: actions/cache@v4
         with:
           path: target
@@ -258,8 +264,14 @@ jobs:
           path: |
             /usr/local/cargo/registry
             /usr/local/cargo/git
-          key: cargo-home-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-home-
+          # Namespaced `-ci-` so a fork PR's cargo-home cache can never land in the `cargo-home-`
+          # pool the SIGNED release builds (deb.yml / android.yml) restore: registry/src holds
+          # already-extracted crate sources that cargo compiles WITHOUT re-checksumming past
+          # `.cargo-ok`, so a poisoned entry would be arbitrary Rust source compiled into a release
+          # artifact with no Cargo.lock diff. security-review 2026-08-15 finding 5. (The definitive
+          # control is operator-side: Gitea's "require approval for fork PRs".)
+          key: cargo-home-ci-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-home-ci-
       - uses: actions/cache@v4
         with:
           path: target

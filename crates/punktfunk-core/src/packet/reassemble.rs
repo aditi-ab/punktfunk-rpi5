@@ -203,6 +203,28 @@ const IN_FLIGHT_BUF_FACTOR: usize = 4;
 /// more; it also needs ~6× fewer buffers per block, so the pool rarely fills there.
 const RECOVERY_POOL_MAX: usize = 512;
 
+/// Byte cost a [`BlockState`] commits to the in-flight budget. Both vectors are sized from
+/// attacker-declared header fields (`data_shards`, `recovery_shards`), so a slice-streamed frame
+/// can mint thousands of distinct-index blocks while its `FrameBuf::buf` stays pinned near zero —
+/// they must be metered exactly like the buffer, or the firewall meters only half the allocation
+/// (security-review 2026-08-15 finding 11).
+fn block_state_bytes(data_shards: usize, recovery_shards: usize) -> usize {
+    std::mem::size_of::<BlockState>()
+        + data_shards // have_data: Vec<bool>
+        + recovery_shards * std::mem::size_of::<Option<Vec<u8>>>() // recovery slot table
+}
+
+/// Everything a frame has committed to the in-flight budget: its zeroed buffer plus every block's
+/// state. Computed at each release site BEFORE any `buf` truncation, so it nets exactly against the
+/// increments made at buffer allocation and block insertion.
+fn frame_cost(f: &FrameBuf) -> usize {
+    f.buf.len()
+        + f.blocks
+            .values()
+            .map(|b| block_state_bytes(b.data_shards, b.recovery_shards))
+            .sum::<usize>()
+}
+
 /// Buffers incoming shards, recovers lost ones via FEC, and emits whole access units.
 /// Client-side only.
 pub struct Reassembler {
@@ -232,7 +254,8 @@ pub struct Reassembler {
     /// still need their own storage (data shards land straight in the frame buffer). Capped at
     /// [`RECOVERY_POOL_MAX`].
     recovery_pool: Vec<Vec<u8>>,
-    /// Sum of in-flight `FrameBuf::buf` bytes across both windows (see [`IN_FLIGHT_BUF_FACTOR`]).
+    /// Sum of in-flight `FrameBuf::buf` bytes PLUS per-block [`BlockState`] cost across both
+    /// windows (see [`IN_FLIGHT_BUF_FACTOR`] and [`block_state_bytes`]).
     in_flight_bytes: usize,
 }
 
@@ -638,7 +661,7 @@ impl Reassembler {
                     .frames
                     .remove(&hdr.frame_index)
                     .expect("frame entry exists");
-                *in_flight_bytes -= f.buf.len();
+                *in_flight_bytes -= frame_cost(&f);
                 // Remember the index (with its late-shard memory, exactly like an aged-out
                 // frame) so stragglers can't resurrect it, reclaim the parity buffers, and
                 // count the loss — the client's recovery request is the right outcome for a
@@ -708,17 +731,31 @@ impl Reassembler {
         } else {
             block_idx * lim.max_data_shards
         };
-        let block = blocks.entry(hdr.block_index).or_insert_with(|| BlockState {
-            data_shards,
-            recovery_shards,
-            base_shard,
-            have_data: vec![false; data_shards],
-            data_received: 0,
-            recovery: vec![None; recovery_shards],
-            recovery_received: 0,
-            done: false,
-            reconstructed: false,
-        });
+        let block = match blocks.entry(hdr.block_index) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                // A NEW block's state is sized from the header-declared shard counts, so gate it on
+                // the same in-flight budget as the frame buffer — otherwise a slice-streamed frame
+                // mints unmetered block state per distinct index (security-review 2026-08-15 #11).
+                let cost = block_state_bytes(data_shards, recovery_shards);
+                if *in_flight_bytes + cost > IN_FLIGHT_BUF_FACTOR * lim.max_frame_bytes {
+                    drop(stats);
+                    return Ok(None);
+                }
+                *in_flight_bytes += cost;
+                e.insert(BlockState {
+                    data_shards,
+                    recovery_shards,
+                    base_shard,
+                    have_data: vec![false; data_shards],
+                    data_received: 0,
+                    recovery: vec![None; recovery_shards],
+                    recovery_received: 0,
+                    done: false,
+                    reconstructed: false,
+                })
+            }
+        };
         if block.recovery_shards != recovery_shards {
             drop(stats);
             return Ok(None);
@@ -838,7 +875,7 @@ impl Reassembler {
                 hdr.frame_index,
                 reconstructed_shards(&done.blocks, lim.max_data_shards),
             );
-            *in_flight_bytes -= done.buf.len();
+            *in_flight_bytes -= frame_cost(&done); // buffer + block state, before the truncate below
             done.buf.truncate(done.frame_bytes); // trim trailing-shard zero padding
                                                  // Slice-progressive consumers already hold the delivered prefix — the completing
                                                  // packet hands up only the SUFFIX (with `last`), or the degenerate whole-AU part
@@ -998,8 +1035,8 @@ impl ReassemblyWindow {
                 // before the frame died still counted `fec_recovered_shards`, so their restored
                 // shards join the late-shard memory exactly like an emitted frame's.
                 completed.insert(idx, reconstructed_shards(&f.blocks, max_data_shards));
-                // Release its buffer budget and reclaim its parity bufs for the pool.
-                *in_flight_bytes -= f.buf.len();
+                // Release its buffer budget (+ block state) and reclaim its parity bufs for the pool.
+                *in_flight_bytes -= frame_cost(f);
                 // Partial delivery (chunk-aligned AUs only): the buffer is already exactly
                 // what the consumer needs — received shards at their final offsets, zeros
                 // where shards are missing (the codec's block walk skips zero windows).

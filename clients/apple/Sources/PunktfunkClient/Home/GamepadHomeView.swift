@@ -551,8 +551,10 @@ struct GamepadHomeView: View {
                     filled: true,
                     // A pinned card reaches the library too, and gets its OWN shelf: browsing is
                     // this card's connect with a title picked first, not a host-level action like
-                    // wake or forget.
-                    hasLibrary: true,
+                    // wake or forget. Gated on a pinned identity: the library plane's MgmtTransport
+                    // accepts any cert for an unpinned host, so an unpaired host must not expose a
+                    // library affordance a LAN MITM could answer. security-review 2026-08-15 #8.
+                    hasLibrary: host.pinnedSHA256 != nil,
                     osChain: host.osChain,
                     canWake: autoWakeEnabled && PunktfunkConnection.wakeOnLANAvailable
                         && !online && !host.wakeMacs.isEmpty,

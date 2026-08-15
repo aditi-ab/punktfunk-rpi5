@@ -286,6 +286,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                         stream::GameLifetime {
                             quit: state.quit.clone(),
                             fingerprint: ls.owner_fp.map(hex::encode),
+                            owner_ip: ls.peer_ip,
                             on_game_exit: {
                                 let st = state.clone();
                                 Arc::new(move || {
@@ -310,6 +311,9 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                     *state.audio_params.lock().unwrap(),
                     state.audio_cap.clone(),
                     on_lost,
+                    // Same owner-IP bind as the video plane: only the launching peer's pings are
+                    // honored at the audio endpoint. security-review 2026-08-15 finding 1.
+                    ls.peer_ip,
                 );
             }
             response(&req.cseq, &[("Session", "DEADBEEFCAFE;timeout = 90")], None)

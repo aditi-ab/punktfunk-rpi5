@@ -259,8 +259,15 @@ fn steam_art_roots() -> Vec<PathBuf> {
 /// where every host secret lives.
 fn art_path_is_confined(path: &Path) -> bool {
     // A UNC value (`\\attacker\share\a.png`) is refused outright: reading it would coerce the host's
-    // machine account into outbound SMB authentication to a peer of the caller's choosing.
-    if path.to_string_lossy().starts_with(r"\\") {
+    // machine account into outbound SMB authentication to a peer of the caller's choosing — and the
+    // `canonicalize()` below would itself do it. A bare `starts_with(r"\\")` missed the forward-slash
+    // (`//server/share`) and mixed (`\/`, `/\`) UNC forms Windows accepts equally, so test for ANY two
+    // leading path separators before touching the filesystem. security-review 2026-08-15 (low: art
+    // UNC guard is a `\\` string test).
+    let lossy = path.to_string_lossy();
+    let bytes = lossy.as_bytes();
+    let is_sep = |c: u8| c == b'\\' || c == b'/';
+    if bytes.len() >= 2 && is_sep(bytes[0]) && is_sep(bytes[1]) {
         return false;
     }
     let Ok(real) = path.canonicalize() else {

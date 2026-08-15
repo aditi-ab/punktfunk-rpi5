@@ -250,6 +250,65 @@ fn privileged_sids() -> Result<Vec<Vec<u8>>> {
     .collect()
 }
 
+/// Owner check for a SINGLE secret file: `Some(true)` if owned by SYSTEM / Administrators /
+/// TrustedInstaller, `Some(false)` if owned by any other (non-privileged) account, `None` if the
+/// owner could not be determined. Used to distrust a `host.env` / `web-password` a non-admin
+/// pre-created under `%ProgramData%` before a privileged install ran — the file's bytes would
+/// otherwise be adopted verbatim into the SYSTEM service's environment / the console password
+/// (security-review 2026-08-15 findings 3c and 4). Reads the security descriptor directly, like
+/// [`ensure_admin_only_source`], to stay locale-independent. Must be consulted BEFORE any
+/// `create_private_dir` re-owns the file to Administrators and erases the signal.
+#[cfg(windows)]
+pub(crate) fn is_admin_owned(path: &Path) -> Option<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        EqualSid, IsValidSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut owner = PSID::default();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the out-params are live locals; the
+    // returned descriptor is the single allocation, LocalFree'd below (owner points into it).
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            &mut sd,
+        )
+    };
+    let verdict = (|| -> Option<bool> {
+        rc.ok().ok()?;
+        let privileged = privileged_sids().ok()?;
+        // SAFETY: `owner` points into the descriptor returned above; IsValidSid is the probe.
+        if owner.is_invalid() || !unsafe { IsValidSid(owner) }.as_bool() {
+            return None;
+        }
+        let admin = privileged.iter().any(|p| {
+            // SAFETY: `owner` passed IsValidSid; `p` is an owned, length-exact SID copy.
+            unsafe { EqualSid(owner, PSID(p.as_ptr().cast_mut().cast())) }.is_ok()
+        });
+        Some(admin)
+    })();
+    // SAFETY: `sd` is the single LocalAlloc'd descriptor GetNamedSecurityInfoW returned.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    }
+    verdict
+}
+
 /// The subject CN both driver-signing certs carry (`build-pf-vdisplay.ps1` /
 /// `build-gamepad-drivers.ps1`). certutil matches a CertId against the subject, so this is how we
 /// find our own certs again without parsing any localized output — see `purge_driver_certs`.
@@ -757,12 +816,30 @@ fn web_setup(args: &[String]) -> Result<()> {
 /// Source: a non-empty `--password-file` (fresh install) > keep existing (upgrade) > random fallback.
 /// Writes `PUNKTFUNK_UI_PASSWORD=<pw>\n` (LF, no BOM) + ACLs it to Administrators + SYSTEM only.
 fn set_web_password(pw_path: &Path, pw_file: Option<&str>) {
+    // A password file that exists but is owned by a NON-admin was planted by an unprivileged user
+    // before this privileged install (`%ProgramData%` CREATOR OWNER). The installer's
+    // `FreshWebInstall := not FileExists` check then mistakes it for an upgrade, skips the password
+    // page, and adopts the attacker's console password. Distrust it: rename aside and rotate to a
+    // fresh random below (`!planted` forces the random branch even if the rename failed). A password
+    // file from a prior privileged install is Administrators-owned and is kept. security-review
+    // 2026-08-15 finding 4.
+    let planted = pw_path.exists() && is_admin_owned(pw_path) == Some(false);
+    if planted {
+        let mut aside = pw_path.to_path_buf().into_os_string();
+        aside.push(".untrusted");
+        let aside = std::path::PathBuf::from(aside);
+        let _ = std::fs::remove_file(&aside);
+        let _ = std::fs::rename(pw_path, &aside);
+        println!(
+            "web console password file was owned by a non-admin (planted before install) — rotating to a fresh password"
+        );
+    }
     let password = pw_file
         .and_then(|f| std::fs::read_to_string(f).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            if pw_path.exists() {
+            if pw_path.exists() && !planted {
                 println!("keeping existing web console password");
                 None
             } else {

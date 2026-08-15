@@ -211,12 +211,24 @@ fn load_host_env() {
         }
         if let Some((k, v)) = line.split_once('=') {
             let (k, v) = (k.trim(), v.trim().trim_matches('"'));
-            if !k.is_empty() {
+            // Allow-list, matching `interactive::merged_env_block`'s filter at the child-spawn
+            // boundary: import ONLY `PUNKTFUNK_*` / `RUST_LOG` into the LocalSystem service's own
+            // environment. Without this, EVERY key was injected — including `SystemRoot`, from which
+            // `pf_paths::icacls_path()` / the powershell warner build the absolute program paths a
+            // privileged service must never resolve through a poisoned env — so a `host.env` planted
+            // in the user-writable %ProgramData% before install yielded code execution as SYSTEM.
+            // security-review 2026-08-15 finding 3. (Note: `PUNKTFUNK_HOST_CMD` / `PUNKTFUNK_CONFIG_DIR`
+            // are legitimate installer-written knobs and still pass; a PLANTED file redirecting THEM
+            // is closed separately by distrusting a non-admin-owned host.env — findings 3c/4.)
+            let allowed = k.starts_with("PUNKTFUNK_") || k == "RUST_LOG";
+            if !k.is_empty() && allowed {
                 // SAFETY: called from the service main before this process spawns any thread —
                 // the network-profile warner and the supervisor's host child both start after
                 // `load_host_env` returns, so nothing reads the environment concurrently.
                 unsafe { std::env::set_var(k, v) };
                 n += 1;
+            } else if !k.is_empty() {
+                tracing::warn!(key = %k, "host.env: ignoring non-allow-listed key");
             }
         }
     }
@@ -1354,6 +1366,32 @@ fn uninstall() -> Result<()> {
 /// defaults to `auto` — the host picks NVENC (NVIDIA) / AMF (AMD) / QSV (Intel) from the GPU vendor.
 fn ensure_default_host_env() -> Result<()> {
     let path = host_env_path();
+    // If a host.env already exists but is owned by a NON-admin account, it was pre-created by an
+    // unprivileged user before this privileged install ran (`%ProgramData%` grants BUILTIN\Users
+    // add-subdirectory + CREATOR OWNER). Its bytes become the SYSTEM service's environment and the
+    // command line it launches, so it must NOT be adopted verbatim. Checked HERE, before
+    // `create_private_dir` below re-owns it to Administrators and erases the only signal that
+    // distinguishes a planted file from a legitimately-provisioned one. A legitimate host.env from a
+    // prior privileged install is Administrators-owned and passes. security-review 2026-08-15 #3c.
+    let planted = path.exists() && crate::install::is_admin_owned(&path) == Some(false);
+    if planted {
+        // Best-effort rename-aside for forensics; the security guarantee is the `!planted` skip
+        // below, which drops through to overwriting the file with the default even if this fails.
+        let mut aside = path.clone().into_os_string();
+        aside.push(".untrusted");
+        let aside = std::path::PathBuf::from(aside);
+        let _ = std::fs::remove_file(&aside);
+        match std::fs::rename(&path, &aside) {
+            Ok(()) => tracing::warn!(
+                path = %path.display(), aside = %aside.display(),
+                "host.env was owned by a non-admin account (planted before install) — renamed aside; writing the default"
+            ),
+            Err(e) => tracing::error!(
+                error = %e, path = %path.display(),
+                "host.env is non-admin-owned and could not be renamed aside — overwriting it with the default"
+            ),
+        }
+    }
     // Harden the config dir FIRST, unconditionally — before the `exists()` check, not inside the
     // branch that creates the file.
     //
@@ -1367,10 +1405,12 @@ fn ensure_default_host_env() -> Result<()> {
     if let Some(dir) = path.parent() {
         pf_paths::create_private_dir(dir).ok();
     }
-    if path.exists() {
+    if path.exists() && !planted {
         // An existing host.env may predate the hardening (or have been planted before it ran), in
         // which case it is still owned by whoever created it — and an owner can rewrite the DACL it
         // inherited. Re-apply the SYSTEM/Administrators lock to the FILE as well as the directory.
+        // (A non-admin-owned file is `planted` above and is NOT adopted — it falls through to the
+        // default write below, overwriting it even if the rename-aside failed.)
         pf_paths::restrict_existing_secret_file(&path);
         return Ok(());
     }

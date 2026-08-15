@@ -56,7 +56,12 @@ enum HTTPResponseParser {
             guard let length = Int(field.trimmingCharacters(in: .whitespaces)), length >= 0 else {
                 throw HTTPParseError.malformedHeader
             }
-            let end = head.bodyStart + length
+            // A malicious host can send Content-Length = Int.max; `bodyStart + length` would then
+            // overflow, and Swift integer overflow TRAPS (uncatchable crash), not throws. Add
+            // reporting overflow and reject instead. security-review 2026-08-15 (low: HTTPResponse
+            // Int overflow).
+            let (end, overflow) = head.bodyStart.addingReportingOverflow(length)
+            if overflow { throw HTTPParseError.malformedHeader }
             return b.count >= end ? end : nil
         }
         return nil // framed by connection close
