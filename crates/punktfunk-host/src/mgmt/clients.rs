@@ -265,6 +265,13 @@ pub(crate) async fn submit_pairing_pin(
             "no pairing handshake is waiting for a PIN",
         );
     }
-    st.app.pairing.pin.submit(pin.to_string());
+    if !st.app.pairing.pin.submit(pin.to_string()) {
+        // More than one handshake is parked, so which one the operator means is ambiguous — the PIN
+        // slot is unbound (security-review 2026-08-15 #7). Refuse rather than let a racer take it.
+        return api_error(
+            StatusCode::CONFLICT,
+            "more than one client is waiting to pair — retry once only your device is pairing",
+        );
+    }
     StatusCode::NO_CONTENT.into_response()
 }
