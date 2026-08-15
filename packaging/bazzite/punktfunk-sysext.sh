@@ -191,6 +191,22 @@ post_merge() {
   # Re-fire the vhci rule against the (possibly already-present) controller so attach/detach pick up
   # the input-group ownership even when the module's original add event predated the reloaded rule.
   udevadm trigger --subsystem-match=platform --sysname-match='vhci_hcd.*' 2>/dev/null || :
+  # ds_inhibit dontaudit drop-in (Bazzite ships steamos-manager; keyed on its binary): Valve's
+  # ds_inhibit walks /proc/*/fd on every open/close of a hid-playstation hidraw — exactly what the
+  # virtual DualSense is — and SELinux denies steamos_manager_t that walk at ~324 AVCs/sec;
+  # setroubleshootd amplifies the flood into a box-wide stall that starves the stream (gamescope
+  # 0 fps, encode submit ~150 ms/frame). The policy STORE is host state (/var/lib/selinux), so the
+  # image carries only the CIL source and the module must be inserted here. Keyed on the module
+  # NAME for idempotence (a policy rebuild costs seconds every merge otherwise — if the rules ever
+  # change, RENAME the file and every reference so existing installs converge). Rationale and the
+  # dontaudit-vs-allow choice: the .cil header / packaging/bazzite/README.md.
+  if command -v semodule >/dev/null 2>&1 && [ -e /usr/lib/steamos-manager ] \
+     && [ -f /usr/share/punktfunk/selinux/punktfunk-ds-inhibit.cil ] \
+     && ! semodule -l 2>/dev/null | grep -qx punktfunk-ds-inhibit; then
+    echo "installing SELinux drop-in 'punktfunk-ds-inhibit' (silences the steamos-manager ds_inhibit audit flood)…"
+    semodule -i /usr/share/punktfunk/selinux/punktfunk-ds-inhibit.cil \
+      || echo "!! semodule -i failed — the ds_inhibit audit flood stays live; see packaging/bazzite/README.md" >&2
+  fi
   # The /etc payload a sysext can't carry. The gamescope-session drop-in is %config(noreplace):
   # only seed it, never clobber a local edit. The tray autostart entry is not user config.
   if [ -f "$ETC_SRC/gamescope-session-plus/sessions.d/steam" ] \
