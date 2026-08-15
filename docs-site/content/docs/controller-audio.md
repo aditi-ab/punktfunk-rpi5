@@ -156,6 +156,19 @@ On the Steam Deck and other flatpak installs, run it inside the sandbox:
 flatpak run --command=punktfunk-session io.unom.Punktfunk --pad-audio-test
 ```
 
+### Why the speaker needs more than routing
+
+The controller's speaker and its headphone jack **share a channel**. Channel 1 of the pad's audio
+device is the headphone jack's right channel *and* the built-in speaker, and the controller decides
+which one actually sounds. It powers up pointing at the jack — so with nothing plugged in, a
+perfectly routed speaker stream is heard by nobody.
+
+Punktfunk points the pad at its own speaker when **Controller speaker** is on. The voice coils are
+different channels and are not affected by that choice, which is why haptics work as soon as the
+audio is routed correctly and the speaker needs this extra step. A game that drives the pad's audio
+settings itself still overrides it. If your pad's speaker stays quiet, `PUNKTFUNK_PAD_SPEAKER_PATH`
+and `PUNKTFUNK_PAD_SPEAKER_VOLUME` let you bisect it without a rebuild.
+
 ## Known limits
 
 - **Bluetooth client pads get rumble, not haptics.** No audio interface exists over BT.
