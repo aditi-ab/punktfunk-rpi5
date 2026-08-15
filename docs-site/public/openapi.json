@@ -10,9 +10,242 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.28.0"
+    "version": "0.29.0"
   },
   "paths": {
+    "/api/v1/client-logs": {
+      "get": {
+        "tags": [
+          "logs"
+        ],
+        "summary": "List uploaded client log bundles",
+        "description": "Every stored bundle's metadata, newest first.",
+        "operationId": "clientLogsList",
+        "responses": {
+          "200": {
+            "description": "Stored bundles, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ClientLogMeta"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "logs"
+        ],
+        "summary": "Upload a client log bundle",
+        "description": "A PAIRED DEVICE posts its recent client log as plain text, authenticated by its streaming\ncertificate (the same mTLS identity it pairs and streams with) — no bearer token. Bundles are\ncapped at 1 MiB and only the newest few per device are kept. The operator downloads them from\nthe console's Logs page. This is deliberately write-only for devices: uploading grants no read.",
+        "operationId": "clientLogsUpload",
+        "requestBody": {
+          "description": "The client's log text",
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Bundle stored",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientLogUploaded"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No paired-device certificate on the connection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The device's access has expired (per-client access)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Bundle exceeds the size cap",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Empty body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not store the bundle",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/client-logs/{id}": {
+      "get": {
+        "tags": [
+          "logs"
+        ],
+        "summary": "Download a client log bundle",
+        "description": "The bundle body as plain text, for saving or attaching to a report.",
+        "operationId": "clientLogsGet",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The bundle id (its filename stem)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The bundle body",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No bundle with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The bundle file is unreadable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "logs"
+        ],
+        "summary": "Delete a client log bundle",
+        "description": "Removes the bundle `id` from disk. `404` if there is no such bundle.",
+        "operationId": "clientLogsDelete",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The bundle id (its filename stem)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Bundle deleted"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No bundle with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not delete the bundle",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/clients": {
       "get": {
         "tags": [
@@ -151,6 +384,70 @@
                   "items": {
                     "$ref": "#/components/schemas/AvailableCompositor"
                   }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/diagnostics": {
+      "get": {
+        "tags": [
+          "diagnostics"
+        ],
+        "summary": "Host health checks",
+        "description": "Every verdict this host computes about its own health — group membership the managed takeover\nneeds, the input device nodes virtual controllers are built on, competing streaming servers —\nwith the impact and a copy-pasteable remedy for each.\n\nCached: the probes run once at startup and on demand via `POST /diagnostics/refresh`, so this is\ncheap to poll. Checks whose status is `ok` and `inapplicable` are included — a troubleshooting\npage needs to show what is working and to answer \"why isn't this check relevant here?\".\n\n`summary`, `impact` and `remedy.text` are always present in English. A console that recognizes\nthe check's `id` replaces them with a localized string interpolated from `params`; one that does\nnot renders the wire text as-is, which is what keeps a console paired with a newer host readable.",
+        "operationId": "getDiagnostics",
+        "responses": {
+          "200": {
+            "description": "The current verdicts, worst-first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiagnosticsReport"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/diagnostics/refresh": {
+      "post": {
+        "tags": [
+          "diagnostics"
+        ],
+        "summary": "Re-run the health checks",
+        "description": "Runs every probe again and returns the refreshed verdicts. Most checks describe state that only\nchanges when an operator changes it (a group membership, an installed udev rule), so this exists\nfor exactly the moment after they have done so — a \"did that fix it?\" button, not a poll.",
+        "operationId": "refreshDiagnostics",
+        "responses": {
+          "200": {
+            "description": "The refreshed verdicts, worst-first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiagnosticsReport"
                 }
               }
             }
@@ -1903,6 +2200,97 @@
             }
           }
         }
+      },
+      "patch": {
+        "tags": [
+          "native"
+        ],
+        "summary": "Update a native client's access",
+        "description": "Partial edit of a paired device's grants/expiry (the console edit sheet: preset change,\nextend, \"expire now\", make permanent). Omitted fields keep their current value; the edit\nreaches the device's live sessions immediately. Not a way to pair a device (404 when the\nfingerprint isn't in the trust store).",
+        "operationId": "updateNativeClientAccess",
+        "parameters": [
+          {
+            "name": "fingerprint",
+            "in": "path",
+            "description": "Hex SHA-256 of the client certificate (case-insensitive)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateNativeAccess"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Access updated; the stored record as now in force",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NativeClient"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Reserved grant bits set, or expires_in_secs together with clear_expiry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No paired native client with that fingerprint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not persist the trust store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Native host not enabled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/native/pair": {
@@ -1976,7 +2364,7 @@
           "native"
         ],
         "summary": "Arm native pairing",
-        "description": "Opens a pairing window and mints a fresh PIN to display. The user enters it on their device\nwithin `ttl_secs`; the device then appears in the native client list.",
+        "description": "Opens a pairing window and mints a fresh PIN to display. The user enters it on their device\nwithin `ttl_secs`; the device then appears in the native client list. An access choice\n(`grants` / `expires_in_secs`) applies to whichever device completes this window's ceremony.",
         "operationId": "armNativePairing",
         "requestBody": {
           "content": {
@@ -1995,6 +2383,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/NativePairStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Reserved grant bits set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
                 }
               }
             }
@@ -2063,7 +2461,7 @@
           "native"
         ],
         "summary": "Approve a pending device",
-        "description": "Pairs the device's certificate fingerprint — it can connect immediately (no PIN). Optionally\nrelabel it via the body; send `{}` to keep the name it knocked with.",
+        "description": "Pairs the device's certificate fingerprint — it can connect immediately (no PIN). Optionally\nrelabel it and/or choose its access via the body; send `{}` to keep the name it knocked with\nand its existing access (full/permanent for a first pairing). The response is the stored\nrecord — what is actually in force, not necessarily this request's inputs.",
         "operationId": "approvePendingDevice",
         "parameters": [
           {
@@ -2090,11 +2488,21 @@
         },
         "responses": {
           "200": {
-            "description": "Device paired",
+            "description": "Device paired; the stored record as now in force",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/NativeClient"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Reserved grant bits set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
                 }
               }
             }
@@ -4128,8 +4536,28 @@
       },
       "ApprovePending": {
         "type": "object",
-        "description": "Approve-pending-device request body. Send `{}` to keep the device's own name.",
+        "description": "Approve-pending-device request body. Send `{}` to keep the device's own name and — for a\nre-approved device — its existing access (the full/permanent default for a first pairing).",
         "properties": {
+          "expires_in_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Access expiry in seconds **from now** (relative — the host stores the absolute deadline\nand stamps the grant time). Alone, it means full control until then.",
+            "example": 14400,
+            "minimum": 0
+          },
+          "grants": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Access choice: grant bitmask (`GRANT_*` bits 0–5). Reserved bits are a 400. Omitting BOTH\naccess fields keeps a re-approved device's stored access; `grants` without\n`expires_in_secs` grants permanently.",
+            "example": 1,
+            "minimum": 0
+          },
           "name": {
             "type": [
               "string",
@@ -4144,6 +4572,16 @@
         "type": "object",
         "description": "Arm-native-pairing request body.",
         "properties": {
+          "expires_in_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Optional access expiry for the pairing device, in seconds **from now** (relative — the\nhost stores the absolute deadline). NOT the pairing window's length; that is `ttl_secs`.\nOmit for permanent access (when `grants` is set) or preserved access (when neither is).",
+            "example": 14400,
+            "minimum": 0
+          },
           "fingerprint": {
             "type": [
               "string",
@@ -4151,6 +4589,16 @@
             ],
             "description": "Optional: bind the window to ONE device fingerprint (hex SHA-256, e.g. from a pending knock).\nWhen set, only a pairing attempt from that fingerprint consumes the window — so an unpaired\nLAN peer can neither pair nor burn a window armed for a specific device (security-review #9).\nOmit for an unbound window (any device may use the PIN — trusted-LAN only).",
             "example": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+          },
+          "grants": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Optional access choice for whichever device completes this window's ceremony: a grant\nbitmask (`GRANT_*` bits 0–5). Reserved bits are a 400. Omit (with `expires_in_secs`) for\ntoday's behavior — a new device gets full control, a re-pairing device keeps what it has.",
+            "example": 1,
+            "minimum": 0
           },
           "ttl_secs": {
             "type": [
@@ -4518,6 +4966,75 @@
           }
         }
       },
+      "CheckSource": {
+        "type": "string",
+        "description": "Where a verdict came from. `Event` is reserved for the live feeds (transitions push instead of\nwaiting for a refresh); v1 produces only `Startup` and `Refresh`.",
+        "enum": [
+          "startup",
+          "event",
+          "refresh"
+        ]
+      },
+      "CheckStatus": {
+        "type": "string",
+        "description": "What a probe found. `Inapplicable` is deliberately distinct from `Ok`: \"this box will never do\nthe thing\" and \"the thing works here\" are different answers, and the troubleshooting page shows\nthem differently.",
+        "enum": [
+          "ok",
+          "warn",
+          "fail",
+          "inapplicable"
+        ]
+      },
+      "ClientLogMeta": {
+        "type": "object",
+        "description": "One stored bundle, as the console lists it.",
+        "required": [
+          "id",
+          "device_name",
+          "fingerprint_prefix",
+          "received_ms",
+          "size_bytes"
+        ],
+        "properties": {
+          "device_name": {
+            "type": "string",
+            "description": "The paired device's name at upload time (sanitized for the filesystem)."
+          },
+          "fingerprint_prefix": {
+            "type": "string",
+            "description": "First 16 hex chars of the device's pairing fingerprint — enough to correlate with the\npaired-devices roster without repeating the full identity in every filename."
+          },
+          "id": {
+            "type": "string",
+            "description": "The bundle id (its filename stem) — pass to the fetch/delete endpoints."
+          },
+          "received_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Upload time (unix ms, from the file's mtime).",
+            "minimum": 0
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bundle size in bytes.",
+            "minimum": 0
+          }
+        }
+      },
+      "ClientLogUploaded": {
+        "type": "object",
+        "description": "Response to a successful upload.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The stored bundle's id."
+          }
+        }
+      },
       "ClientRef": {
         "type": "object",
         "description": "The connecting/disconnecting client's identity.",
@@ -4790,6 +5307,29 @@
           },
           "plane": {
             "$ref": "#/components/schemas/Plane"
+          }
+        }
+      },
+      "DiagnosticsReport": {
+        "type": "object",
+        "description": "The `GET /diagnostics` body.",
+        "required": [
+          "ran_at_unix",
+          "checks"
+        ],
+        "properties": {
+          "checks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HostCheck"
+            },
+            "description": "Every registered check, worst-first. Includes `ok` and `inapplicable` rows — the console\ndecides what to hide, because \"what's working\" is the reassurance the dashboard omits."
+          },
+          "ran_at_unix": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the probes last ran (unix seconds).",
+            "minimum": 0
           }
         }
       },
@@ -5227,6 +5767,91 @@
                 "type": "string",
                 "enum": [
                   "pairing.denied"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A device was granted access with an explicit operator choice — the approve dialog, the\narm window's carried choice, or any other `add_with_access(Some)` path\n(design/per-client-access.md §6). A plain pairing with no choice emits only\n`pairing.completed` (its access is the preserved/default record, nothing was *chosen*).",
+            "required": [
+              "device",
+              "grants",
+              "kind"
+            ],
+            "properties": {
+              "device": {
+                "$ref": "#/components/schemas/DeviceRef"
+              },
+              "expires_unix": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "description": "Absolute expiry, host wall clock unix seconds; absent = permanent."
+              },
+              "grants": {
+                "type": "integer",
+                "format": "int32",
+                "description": "The granted mask (the `GRANT_*` bit vocabulary), reserved bits already cleared.",
+                "minimum": 0
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "access.granted"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A paired device's access was edited after the fact (the console edit sheet / extend /\n\"expire now\") — the owner's hook can say \"the TV is view-only now\".",
+            "required": [
+              "device",
+              "grants",
+              "kind"
+            ],
+            "properties": {
+              "device": {
+                "$ref": "#/components/schemas/DeviceRef"
+              },
+              "expires_unix": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64"
+              },
+              "grants": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "access.changed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A device's temporary access reached its deadline and its live session was closed — \"guest\naccess ended\". Emitted at deadline fire by the expiring session (a device with no live\nsession expires silently; the console row flips to \"Expired\" either way).",
+            "required": [
+              "device",
+              "kind"
+            ],
+            "properties": {
+              "device": {
+                "$ref": "#/components/schemas/DeviceRef"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "access.expired"
                 ]
               }
             }
@@ -5870,6 +6495,72 @@
           }
         }
       },
+      "HostCheck": {
+        "type": "object",
+        "description": "One health verdict. This IS the wire shape.",
+        "required": [
+          "id",
+          "status",
+          "severity",
+          "summary",
+          "impact",
+          "params",
+          "source"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable snake_case machine code — the console's i18n key (see [`ids`])."
+          },
+          "impact": {
+            "type": "string",
+            "description": "What actually breaks, in the operator's terms. Empty only for `ok`/`inapplicable` rows."
+          },
+          "params": {
+            "type": "object",
+            "description": "Interpolation values for the console's localized strings (`{user}`, `{group}`, …). The\nconsole needs these because it cannot re-derive them: only the host can see the username.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "remedy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Remedy"
+              }
+            ]
+          },
+          "severity": {
+            "$ref": "#/components/schemas/Severity",
+            "description": "What a non-ok status means. Meaningless when `status` is `ok`/`inapplicable`; carried anyway\nso a check never changes shape as it flips."
+          },
+          "since_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "First non-ok observation in this host run. Per-run bookkeeping, not a time series — there is\nno history here by design.",
+            "minimum": 0
+          },
+          "source": {
+            "$ref": "#/components/schemas/CheckSource"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CheckStatus"
+          },
+          "summary": {
+            "type": "string",
+            "description": "One line, English. The console replaces this with a localized message when it knows `id`."
+          }
+        }
+      },
       "HostEvent": {
         "allOf": [
           {
@@ -6497,9 +7188,43 @@
           "fingerprint"
         ],
         "properties": {
+          "access_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The preset this device's mask amounts to, for display: `full` | `controller` | `view` |\n`custom`. Derived from `grants` on the host; absent only on hosts older than the field.",
+            "example": "controller"
+          },
+          "expires_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Absolute access expiry, unix seconds on the host's wall clock. `null` = permanent. Whether\nit has already passed is the reader's arithmetic — an expired device stays listed (shown\nas \"Expired\"), it just isn't authorized."
+          },
           "fingerprint": {
             "type": "string",
             "description": "Hex SHA-256 of the client certificate — its stable id here."
+          },
+          "granted_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When access was last granted, unix seconds — display/audit only, never enforced."
+          },
+          "grants": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Grant bitmask (`GRANT_*` bits 0–5). `null` = a record from before grants existed, which\nmeans full control.",
+            "example": 1,
+            "minimum": 0
           },
           "name": {
             "type": "string",
@@ -6627,15 +7352,48 @@
           "age_secs"
         ],
         "properties": {
+          "access_level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The stored mask's preset name (`full` | `controller` | `view` | `custom`) — `null` for a\ndevice with no stored record, unlike [`NativeClient`] where it is always derivable.",
+            "example": "controller"
+          },
           "age_secs": {
             "type": "integer",
             "format": "int64",
             "description": "Seconds since the device last knocked.",
             "minimum": 0
           },
+          "expires_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The stored record's absolute expiry (unix seconds; likely in the past — that's why it's\nknocking). `null` when unknown or permanent."
+          },
           "fingerprint": {
             "type": "string",
             "description": "Hex SHA-256 of the device's certificate — what approval pins."
+          },
+          "granted_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the stored record's access was granted (unix seconds). `null` when unknown."
+          },
+          "grants": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The grant mask this fingerprint is ALREADY stored with, if it was paired before (the\nexpired-guest re-knock: the approve dialog can offer \"re-grant what they had\"). `null`\nwhen the device is unknown, or known with a pre-grants record (= full).",
+            "minimum": 0
           },
           "id": {
             "type": "integer",
@@ -7055,6 +7813,31 @@
           }
         }
       },
+      "Remedy": {
+        "type": "object",
+        "description": "What the operator should do about it. Always copy-paste — the host runs unprivileged and the\nconsole must never trigger privileged mutation. The `punktfunk` group in particular is\ndeliberately opt-in: writing the vhci `attach` node materialises arbitrary emulated USB devices\n(security review 2026-08-05, M-4), so joining it stays a deliberate act with the caveat attached.",
+        "required": [
+          "text",
+          "relogin_required"
+        ],
+        "properties": {
+          "command": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A single pasteable shell command, when one fixes it outright."
+          },
+          "relogin_required": {
+            "type": "boolean",
+            "description": "True when the fix only takes effect after logging out and back in — a `systemd --user`\nmanager keeps the supplementary group set it started with. This distinction is the\ndifference between \"I already added myself!\" and a working virtual pad."
+          },
+          "text": {
+            "type": "string",
+            "description": "Plain-language instruction. English fallback — the console overrides it by check id."
+          }
+        }
+      },
       "RuntimeRequest": {
         "type": "object",
         "required": [
@@ -7374,6 +8157,15 @@
             "example": "manual"
           }
         }
+      },
+      "Severity": {
+        "type": "string",
+        "description": "How much a non-ok status matters. Orthogonal to [`CheckStatus`] on purpose: a check can be\n`warn` about something `critical` (degraded, not dead) and the console sorts by both.",
+        "enum": [
+          "info",
+          "warning",
+          "critical"
+        ]
       },
       "SourceInput": {
         "type": "object",
@@ -7856,6 +8648,39 @@
           }
         }
       },
+      "UpdateNativeAccess": {
+        "type": "object",
+        "description": "PATCH body for a paired device's access (the console edit sheet: change the preset, extend,\n\"expire now\", make permanent). **Partial**: an omitted `grants` keeps the current grants, and\nomitted expiry fields keep the current expiry — send only what changes.",
+        "properties": {
+          "clear_expiry": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`true` removes the expiry — access becomes permanent. Mutually exclusive with\n`expires_in_secs` (400)."
+          },
+          "expires_in_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "New expiry in seconds **from now** (relative; the host stores the absolute deadline).\n`0` expires the device now. Omit to keep the current expiry. Mutually exclusive with\n`clear_expiry` (400).",
+            "example": 14400,
+            "minimum": 0
+          },
+          "grants": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "New grant bitmask (`GRANT_*` bits 0–5); reserved bits are a 400. Omit to keep the\ndevice's current grants.",
+            "example": 1,
+            "minimum": 0
+          }
+        }
+      },
       "UpdateResultInfo": {
         "type": "object",
         "description": "Durable outcome of the most recent apply attempt (survives the host's own restart).",
@@ -8027,6 +8852,10 @@
     {
       "name": "host",
       "description": "Host identity, capabilities, and liveness"
+    },
+    {
+      "name": "diagnostics",
+      "description": "Host health checks: what is wrong, what it breaks, and how to fix it (admin lane only)"
     },
     {
       "name": "gpu",

@@ -18,6 +18,10 @@ import { RunningGames } from "./RunningGames";
 export const DashboardView: FC<{
 	status: Loadable<RuntimeStatus>;
 	library?: GameEntry[];
+	/** Host health warnings — renders nothing when the host is healthy (see `AttentionCard.tsx`).
+	 * Sits above the status query on purpose: a host whose `/status` is failing is exactly when
+	 * its health checks are worth reading. */
+	attention?: ReactNode;
 	onStopSession: () => void;
 	onRequestIdr: () => void;
 	onEndGame: (game: ActiveGame) => void;
@@ -27,6 +31,7 @@ export const DashboardView: FC<{
 }> = ({
 	status,
 	library,
+	attention,
 	onStopSession,
 	onRequestIdr,
 	onEndGame,
@@ -39,6 +44,7 @@ export const DashboardView: FC<{
 		<Section maxWidth={false}>
 			<div className="flex flex-col gap-card">
 				<h1 className="text-2xl font-semibold">{m.status_title()}</h1>
+				{attention}
 				<QueryState
 					isLoading={status.isLoading}
 					error={status.error}

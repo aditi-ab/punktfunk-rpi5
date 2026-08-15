@@ -422,6 +422,10 @@ pub(crate) async fn serve(
     // mirroring the box's own session — so without this it surfaces only as a black screen on
     // every connect. No-op off Linux and on any box the takeover can't apply to.
     crate::vdisplay::preflight_takeover_privilege();
+    // Same verdicts, second destination: the log line above is for whoever reads logs, and the
+    // registry is for whoever opens the console. Runs after the subsystems the probes inspect are
+    // up, so a probe never reports a device node that was about to appear.
+    crate::diagnostics::preflight();
     // …and the other end of that: give the box its session back when WE are the ones going away.
     install_shutdown_restore();
     // (No cover-art warmer any more: it existed to fetch GOG/Xbox art off the hot path for the two

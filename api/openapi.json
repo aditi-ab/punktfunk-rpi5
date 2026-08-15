@@ -401,6 +401,70 @@
         }
       }
     },
+    "/api/v1/diagnostics": {
+      "get": {
+        "tags": [
+          "diagnostics"
+        ],
+        "summary": "Host health checks",
+        "description": "Every verdict this host computes about its own health — group membership the managed takeover\nneeds, the input device nodes virtual controllers are built on, competing streaming servers —\nwith the impact and a copy-pasteable remedy for each.\n\nCached: the probes run once at startup and on demand via `POST /diagnostics/refresh`, so this is\ncheap to poll. Checks whose status is `ok` and `inapplicable` are included — a troubleshooting\npage needs to show what is working and to answer \"why isn't this check relevant here?\".\n\n`summary`, `impact` and `remedy.text` are always present in English. A console that recognizes\nthe check's `id` replaces them with a localized string interpolated from `params`; one that does\nnot renders the wire text as-is, which is what keeps a console paired with a newer host readable.",
+        "operationId": "getDiagnostics",
+        "responses": {
+          "200": {
+            "description": "The current verdicts, worst-first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiagnosticsReport"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/diagnostics/refresh": {
+      "post": {
+        "tags": [
+          "diagnostics"
+        ],
+        "summary": "Re-run the health checks",
+        "description": "Runs every probe again and returns the refreshed verdicts. Most checks describe state that only\nchanges when an operator changes it (a group membership, an installed udev rule), so this exists\nfor exactly the moment after they have done so — a \"did that fix it?\" button, not a poll.",
+        "operationId": "refreshDiagnostics",
+        "responses": {
+          "200": {
+            "description": "The refreshed verdicts, worst-first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiagnosticsReport"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/display/layout": {
       "put": {
         "tags": [
@@ -4902,6 +4966,25 @@
           }
         }
       },
+      "CheckSource": {
+        "type": "string",
+        "description": "Where a verdict came from. `Event` is reserved for the live feeds (transitions push instead of\nwaiting for a refresh); v1 produces only `Startup` and `Refresh`.",
+        "enum": [
+          "startup",
+          "event",
+          "refresh"
+        ]
+      },
+      "CheckStatus": {
+        "type": "string",
+        "description": "What a probe found. `Inapplicable` is deliberately distinct from `Ok`: \"this box will never do\nthe thing\" and \"the thing works here\" are different answers, and the troubleshooting page shows\nthem differently.",
+        "enum": [
+          "ok",
+          "warn",
+          "fail",
+          "inapplicable"
+        ]
+      },
       "ClientLogMeta": {
         "type": "object",
         "description": "One stored bundle, as the console lists it.",
@@ -5224,6 +5307,29 @@
           },
           "plane": {
             "$ref": "#/components/schemas/Plane"
+          }
+        }
+      },
+      "DiagnosticsReport": {
+        "type": "object",
+        "description": "The `GET /diagnostics` body.",
+        "required": [
+          "ran_at_unix",
+          "checks"
+        ],
+        "properties": {
+          "checks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HostCheck"
+            },
+            "description": "Every registered check, worst-first. Includes `ok` and `inapplicable` rows — the console\ndecides what to hide, because \"what's working\" is the reassurance the dashboard omits."
+          },
+          "ran_at_unix": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the probes last ran (unix seconds).",
+            "minimum": 0
           }
         }
       },
@@ -6386,6 +6492,72 @@
             "items": {
               "$ref": "#/components/schemas/HookEntry"
             }
+          }
+        }
+      },
+      "HostCheck": {
+        "type": "object",
+        "description": "One health verdict. This IS the wire shape.",
+        "required": [
+          "id",
+          "status",
+          "severity",
+          "summary",
+          "impact",
+          "params",
+          "source"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable snake_case machine code — the console's i18n key (see [`ids`])."
+          },
+          "impact": {
+            "type": "string",
+            "description": "What actually breaks, in the operator's terms. Empty only for `ok`/`inapplicable` rows."
+          },
+          "params": {
+            "type": "object",
+            "description": "Interpolation values for the console's localized strings (`{user}`, `{group}`, …). The\nconsole needs these because it cannot re-derive them: only the host can see the username.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "remedy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Remedy"
+              }
+            ]
+          },
+          "severity": {
+            "$ref": "#/components/schemas/Severity",
+            "description": "What a non-ok status means. Meaningless when `status` is `ok`/`inapplicable`; carried anyway\nso a check never changes shape as it flips."
+          },
+          "since_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "First non-ok observation in this host run. Per-run bookkeeping, not a time series — there is\nno history here by design.",
+            "minimum": 0
+          },
+          "source": {
+            "$ref": "#/components/schemas/CheckSource"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CheckStatus"
+          },
+          "summary": {
+            "type": "string",
+            "description": "One line, English. The console replaces this with a localized message when it knows `id`."
           }
         }
       },
@@ -7641,6 +7813,31 @@
           }
         }
       },
+      "Remedy": {
+        "type": "object",
+        "description": "What the operator should do about it. Always copy-paste — the host runs unprivileged and the\nconsole must never trigger privileged mutation. The `punktfunk` group in particular is\ndeliberately opt-in: writing the vhci `attach` node materialises arbitrary emulated USB devices\n(security review 2026-08-05, M-4), so joining it stays a deliberate act with the caveat attached.",
+        "required": [
+          "text",
+          "relogin_required"
+        ],
+        "properties": {
+          "command": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A single pasteable shell command, when one fixes it outright."
+          },
+          "relogin_required": {
+            "type": "boolean",
+            "description": "True when the fix only takes effect after logging out and back in — a `systemd --user`\nmanager keeps the supplementary group set it started with. This distinction is the\ndifference between \"I already added myself!\" and a working virtual pad."
+          },
+          "text": {
+            "type": "string",
+            "description": "Plain-language instruction. English fallback — the console overrides it by check id."
+          }
+        }
+      },
       "RuntimeRequest": {
         "type": "object",
         "required": [
@@ -7960,6 +8157,15 @@
             "example": "manual"
           }
         }
+      },
+      "Severity": {
+        "type": "string",
+        "description": "How much a non-ok status matters. Orthogonal to [`CheckStatus`] on purpose: a check can be\n`warn` about something `critical` (degraded, not dead) and the console sorts by both.",
+        "enum": [
+          "info",
+          "warning",
+          "critical"
+        ]
       },
       "SourceInput": {
         "type": "object",
@@ -8646,6 +8852,10 @@
     {
       "name": "host",
       "description": "Host identity, capabilities, and liveness"
+    },
+    {
+      "name": "diagnostics",
+      "description": "Host health checks: what is wrong, what it breaks, and how to fix it (admin lane only)"
     },
     {
       "name": "gpu",

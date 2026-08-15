@@ -7,9 +7,9 @@ import {
 	MonitorPlay,
 	MoreHorizontal,
 	Puzzle,
-	ScrollText,
 	Server,
 	Settings,
+	Stethoscope,
 	Workflow,
 } from "lucide-react";
 import { motion } from "motion/react";
@@ -31,7 +31,9 @@ const NAV = [
 	{ to: "/displays", icon: MonitorPlay, label: () => m.nav_displays() },
 	{ to: "/library", icon: LibraryBig, label: () => m.nav_library() },
 	{ to: "/stats", icon: GaugeCircle, label: () => m.nav_stats() },
-	{ to: "/logs", icon: ScrollText, label: () => m.nav_logs() },
+	// The page is the troubleshooting home now — health checks above the log stream. The ROUTE stays
+	// `/logs`: bookmarks and deep links outlive a label.
+	{ to: "/logs", icon: Stethoscope, label: () => m.nav_troubleshooting() },
 	{ to: "/pairing", icon: KeyRound, label: () => m.nav_pairing() },
 	{ to: "/automation", icon: Workflow, label: () => m.nav_automation() },
 	{ to: "/plugins", icon: Puzzle, label: () => m.nav_plugins() },

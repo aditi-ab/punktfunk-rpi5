@@ -15,6 +15,7 @@
 //! `inject/libei.rs`) — wired and live-validated.
 
 use super::{DisplayOwnership, Mode, VirtualDisplay, VirtualOutput};
+use crate::routing::{TakeoverInapplicable, TakeoverVerdict};
 use anyhow::{anyhow, bail, Context, Result};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -2443,25 +2444,15 @@ fn dm_helper(verb: &str) -> std::result::Result<(), DmHelperError> {
 /// Steam Deck pad attaches through, and THAT is a credential check against this process, whose
 /// supplementary groups were fixed when its `systemd --user` manager started.
 pub fn preflight_takeover_privilege() {
-    if crate::proc::current_uid() == 0 {
-        return; // root: `systemctl stop <dm>` succeeds outright, the helper is never consulted
-    }
-    let Some(dm) = display_manager_unit() else {
-        return; // no DM drives this box's logins — nothing for the takeover to stop
+    let TakeoverVerdict::MissingMembership {
+        user,
+        dm,
+        helper,
+        group,
+    } = takeover_privilege_verdict()
+    else {
+        return; // gated out, or the user is already a member — either way, nothing to say
     };
-    if !managed_session_available() {
-        return; // no session-plus/SteamOS ⇒ no autologin gaming session ⇒ no takeover
-    }
-    let Some(helper) = installed_dm_helper() else {
-        return; // unpackaged install: no helper, no group, the polkit-rule route applies instead
-    };
-    let Some(user) = current_user_name() else {
-        return; // cannot name the user ⇒ cannot give a usable `usermod` line; stay quiet
-    };
-    let group = DM_HELPER_GROUP;
-    if user_in_group(&user, group) {
-        return;
-    }
     tracing::warn!(
         %user,
         %dm,
@@ -2476,6 +2467,53 @@ pub fn preflight_takeover_privilege() {
          the virtual Steam Deck pad's usbip nodes. It can present arbitrary emulated USB devices, \
          so join it only on a machine you trust."
     );
+}
+
+/// The gated verdict [`preflight_takeover_privilege`] logs from — and the same value the host's
+/// diagnostics registry maps into a console check, so the log line and the console can never
+/// disagree about this box.
+///
+/// The four gates and the user-database question are documented on
+/// [`preflight_takeover_privilege`]; this function only moves *where the answer goes*. Each
+/// `Inapplicable` reason is kept distinct rather than collapsed to a bool, because the
+/// troubleshooting page's job is to answer "why isn't this check relevant here?" — a hidden row
+/// cannot.
+pub fn takeover_privilege_verdict() -> TakeoverVerdict {
+    if crate::proc::current_uid() == 0 {
+        return TakeoverVerdict::Inapplicable {
+            why: TakeoverInapplicable::Root,
+        };
+    }
+    let Some(dm) = display_manager_unit() else {
+        return TakeoverVerdict::Inapplicable {
+            why: TakeoverInapplicable::NoDisplayManager,
+        };
+    };
+    if !managed_session_available() {
+        return TakeoverVerdict::Inapplicable {
+            why: TakeoverInapplicable::NoManagedSession,
+        };
+    }
+    let Some(helper) = installed_dm_helper() else {
+        return TakeoverVerdict::Inapplicable {
+            why: TakeoverInapplicable::NoPackagedHelper,
+        };
+    };
+    let Some(user) = current_user_name() else {
+        return TakeoverVerdict::Inapplicable {
+            why: TakeoverInapplicable::UnknownUser,
+        };
+    };
+    let group = DM_HELPER_GROUP;
+    if user_in_group(&user, group) {
+        return TakeoverVerdict::Ok { user, group };
+    }
+    TakeoverVerdict::MissingMembership {
+        user,
+        dm,
+        helper,
+        group,
+    }
 }
 
 /// This process's login name, for a `usermod` line the operator can paste. From `id -un <uid>`

@@ -23,6 +23,9 @@ mod bringup;
 mod capture;
 mod detect;
 mod devtest;
+/// Host health verdicts as one structured channel (design/web-console-diagnostics.md).
+#[forbid(unsafe_code)]
+mod diagnostics;
 // Network-facing on the secure default host (see the forbid block at `mod mgmt` below).
 #[forbid(unsafe_code)]
 mod discovery;

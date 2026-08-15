@@ -307,6 +307,137 @@ pub fn pen_supported() -> bool {
     false
 }
 
+/// What an open probe of the input device nodes found — [`uinput_probe`].
+///
+/// [`pen_supported`] asks the same question and throws the answer away: it returns a bare `bool`,
+/// so "the module was never installed" and "you are not in the `input` group" look identical, and
+/// the two need completely different remedies. This keeps the errno so the host's diagnostics can
+/// tell an operator which one they have. A plain verdict enum on purpose — this crate must never
+/// learn about the host's wire types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UinputVerdict {
+    /// Every node opened — virtual gamepads and the pen can be created.
+    Ok,
+    /// `EACCES`/`EPERM`: the node is there but this process may not open it. Either the user is not
+    /// in the `input` group, or the udev rule granting that group access was never installed.
+    PermissionDenied { path: &'static str },
+    /// `ENOENT` and friends: the node does not exist at all — the module or the rule is missing.
+    Missing { path: &'static str },
+    /// Some other errno; carried verbatim rather than guessed at.
+    Error { path: &'static str, message: String },
+    /// No uinput/uhid injection on this platform.
+    Inapplicable,
+}
+
+/// The device nodes every virtual input device needs, in the order they are worth reporting:
+/// `/dev/uinput` kills the pen and the evdev gamepads, `/dev/uhid` kills the DualSense/Switch Pro
+/// backends that need a real HID transport.
+#[cfg(target_os = "linux")]
+const INPUT_NODES: &[(&std::ffi::CStr, &str)] =
+    &[(c"/dev/uinput", "/dev/uinput"), (c"/dev/uhid", "/dev/uhid")];
+
+/// Probe `/dev/uinput` and `/dev/uhid` the way the backends will, **keeping the errno**. Cheap (two
+/// `open()`s), so the diagnostics refresh can re-run it on demand.
+#[cfg(target_os = "linux")]
+pub fn uinput_probe() -> UinputVerdict {
+    for &(c_path, path) in INPUT_NODES {
+        // SAFETY: 'static NUL-terminated path literal; `open` returns a fresh fd (or -1) and
+        // retains nothing.
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: `fd >= 0` is the fd opened above, owned by no one else; closed exactly once.
+            unsafe { libc::close(fd) };
+            continue;
+        }
+        // Read the errno IMMEDIATELY: any further libc call (including the close above) clobbers it.
+        let err = std::io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(libc::EACCES) | Some(libc::EPERM) => UinputVerdict::PermissionDenied { path },
+            Some(libc::ENOENT) | Some(libc::ENXIO) | Some(libc::ENODEV) => {
+                UinputVerdict::Missing { path }
+            }
+            _ => UinputVerdict::Error {
+                path,
+                message: err.to_string(),
+            },
+        };
+    }
+    UinputVerdict::Ok
+}
+
+/// See the Linux variant — uinput/uhid are Linux interfaces; Windows injects through its own driver
+/// stack, whose health is a separate check.
+#[cfg(not(target_os = "linux"))]
+pub fn uinput_probe() -> UinputVerdict {
+    UinputVerdict::Inapplicable
+}
+
+/// What the usbip/vhci attach node looks like from here — [`vhci_probe`].
+///
+/// Deliberately reports **device facts only**: whether the module is there and whether this process
+/// can write the node. It does NOT reason about group membership, because the interesting
+/// distinction (in the group on disk vs. in the group in this process) needs the user database, and
+/// that is the host's business, not this crate's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VhciVerdict {
+    /// The module is loaded and this process can write `attach` — the virtual Deck can come up.
+    Ok,
+    /// No `/sys/devices/platform/vhci_hcd*/status`: the module is not loaded.
+    ModuleMissing,
+    /// The node is there and this process cannot write it. Why is the host's question to answer.
+    NotWritable { path: String },
+    /// The virtual-Deck-over-usbip route does not apply here.
+    Inapplicable { why: &'static str },
+}
+
+/// Probe the vhci attach node: module present, and writable by *this process*?
+///
+/// Writability is the ground truth rather than a group-name comparison, because that is exactly what
+/// the attach will attempt — `60-punktfunk.rules` `chgrp punktfunk` + `chmod 0660` the node, so a
+/// member of the group whose process actually carries it gets `W_OK` and nobody else does.
+#[cfg(target_os = "linux")]
+pub fn vhci_probe() -> VhciVerdict {
+    use std::os::unix::ffi::OsStrExt;
+
+    if !steam_usbip::usbip_preferred() {
+        return VhciVerdict::Inapplicable {
+            why: "the virtual Steam Deck's usbip transport is disabled (PUNKTFUNK_STEAM_USBIP=0)",
+        };
+    }
+    let Some(base) = steam_usbip::vhci_base() else {
+        return VhciVerdict::ModuleMissing;
+    };
+    let attach = base.join("attach");
+    let Ok(c_path) = std::ffi::CString::new(attach.as_os_str().as_bytes()) else {
+        return VhciVerdict::NotWritable {
+            path: attach.display().to_string(),
+        };
+    };
+    // SAFETY: `c_path` is a NUL-terminated path owned by this frame and outlives the call;
+    // `access` only reads it and retains nothing.
+    let writable = unsafe { libc::access(c_path.as_ptr(), libc::W_OK) } == 0;
+    if writable {
+        VhciVerdict::Ok
+    } else {
+        VhciVerdict::NotWritable {
+            path: attach.display().to_string(),
+        }
+    }
+}
+
+/// See the Linux variant — usbip/vhci is a Linux kernel facility.
+#[cfg(not(target_os = "linux"))]
+pub fn vhci_probe() -> VhciVerdict {
+    VhciVerdict::Inapplicable {
+        why: "the virtual Steam Deck's usbip transport is Linux-only",
+    }
+}
+
 #[path = "inject/service.rs"]
 mod service;
 pub use service::InjectorService;
