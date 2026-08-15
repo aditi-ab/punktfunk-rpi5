@@ -1,10 +1,11 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { MoonlightPairing } from "@/sections/Pairing/MoonlightPairingCard";
 import { NativePairingCard } from "@/sections/Pairing/NativePairingCard";
-import { PairedDevices } from "@/sections/Pairing/PairedDevices";
+import { PairedDevices, type PairedRow } from "@/sections/Pairing/PairedDevices";
 import { PendingDevices } from "@/sections/Pairing/PendingDevices";
 import { PairingView } from "@/sections/Pairing/view";
 import {
+	accessNowUnix,
 	nativeClients,
 	nativePairArmed,
 	pairedClients,
@@ -14,6 +15,22 @@ import {
 
 const noop = () => {};
 const idle = { isLoading: false, error: null, refetch: noop };
+
+/** The fixture clients as table rows, access fields carried along (what the container maps). */
+const nativeRows: PairedRow[] = nativeClients.map((c) => ({
+	protocol: "native" as const,
+	fingerprint: c.fingerprint,
+	name: c.name,
+	accessLevel: c.access_level,
+	grants: c.grants,
+	expiresUnix: c.expires_unix,
+}));
+
+const moonlightRows: PairedRow[] = pairedClients.map((c) => ({
+	protocol: "moonlight" as const,
+	fingerprint: c.fingerprint,
+	name: c.subject ?? "",
+}));
 
 // Renders the REAL page layout (PairingView) — the same component index.tsx uses. The live page
 // fills its slots with the self-contained containers; here we fill them with the pure cards + mock
@@ -61,21 +78,12 @@ export const Armed: Story = {
 		),
 		paired: (
 			<PairedDevices
-				rows={[
-					...nativeClients.map((c) => ({
-						protocol: "native" as const,
-						fingerprint: c.fingerprint,
-						name: c.name,
-					})),
-					...pairedClients.map((c) => ({
-						protocol: "moonlight" as const,
-						fingerprint: c.fingerprint,
-						name: c.subject ?? "",
-					})),
-				]}
+				rows={[...nativeRows, ...moonlightRows]}
 				isLoading={false}
 				error={null}
 				refetch={noop}
+				nowUnix={accessNowUnix}
+				onEditAccess={noop}
 				onUnpair={noop}
 				onUnpairAll={noop}
 				pendingFingerprint={null}

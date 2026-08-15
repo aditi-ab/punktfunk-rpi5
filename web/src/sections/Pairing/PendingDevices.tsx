@@ -1,7 +1,8 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { UserPlus, X } from "lucide-react";
-import type { FC } from "react";
-import type { PendingDevice } from "@/api/gen/model";
+import { type FC, useState } from "react";
+import type { ApprovePending } from "@/api/gen/model/approvePending";
+import type { PendingDevice } from "@/api/gen/model/pendingDevice";
 import {
 	getListNativeClientsQueryKey,
 	getListPendingDevicesQueryKey,
@@ -9,7 +10,6 @@ import {
 	useDenyPendingDevice,
 	useListPendingDevices,
 } from "@/api/gen/native/native";
-import { useDialogs } from "@/components/dialogs";
 import { QueryState } from "@/components/query-state";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -17,6 +17,7 @@ import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table";
 import type { Loadable } from "@/lib/query";
 import { fmtAge } from "@/lib/utils";
 import { m } from "@/paraglide/messages";
+import { ApproveDialog } from "./ApproveDialog";
 
 /**
  * Container: devices awaiting delegated approval. Polls so a knock appears while
@@ -28,28 +29,26 @@ export const PendingDevicesSection: FC = () => {
 	// A knock arrives as a `pairing.pending` event (api/events.ts), so the timer is the fallback —
 	// but it stays reasonably brisk: this list is the one the operator is actively waiting on, and
 	// the rows carry an age that should not visibly lag.
-	const { promptText } = useDialogs();
 	const pending = useListPendingDevices({ query: { refetchInterval: 10_000 } });
 	const approve = useApprovePendingDevice();
 	const deny = useDenyPendingDevice();
+	// The row whose Approve dialog is open — a snapshot, so the 10 s poll can't reset the form.
+	const [approving, setApproving] = useState<PendingDevice | null>(null);
 
 	const refresh = () => {
 		qc.invalidateQueries({ queryKey: getListPendingDevicesQueryKey() });
 		qc.invalidateQueries({ queryKey: getListNativeClientsQueryKey() });
 	};
-	const onApprove = async (id: number, currentName: string) => {
-		const name = await promptText({
-			title: m.pairing_pending_name_title(),
-			label: m.pairing_pending_name_prompt(),
-			defaultValue: currentName,
-			confirmLabel: m.pairing_pending_approve(),
-		});
-		if (name == null) return; // operator cancelled
+	const onApprove = (id: number, body: ApprovePending) =>
 		approve.mutate(
-			{ id, data: { name: name.trim() ? name.trim() : null } },
-			{ onSuccess: refresh },
+			{ id, data: body },
+			{
+				onSuccess: () => {
+					setApproving(null);
+					refresh();
+				},
+			},
 		);
-	};
 	const onDeny = (id: number) => deny.mutate({ id }, { onSuccess: refresh });
 
 	// The id of the row whose approve/deny is in flight — only that row's buttons disable.
@@ -59,23 +58,33 @@ export const PendingDevicesSection: FC = () => {
 		null;
 
 	return (
-		<PendingDevices
-			pending={pending}
-			onApprove={onApprove}
-			onDeny={onDeny}
-			pendingId={pendingId}
-		/>
+		<>
+			<PendingDevices
+				pending={pending}
+				onApprove={setApproving}
+				onDeny={onDeny}
+				pendingId={pendingId}
+			/>
+			<ApproveDialog
+				device={approving}
+				onCancel={() => setApproving(null)}
+				onApprove={onApprove}
+				isPending={approve.isPending}
+			/>
+		</>
 	);
 };
 
 /**
  * Devices awaiting delegated approval: an unpaired device that tried to connect
- * shows up here, and Approve pairs it on the spot. Renders nothing while empty
+ * shows up here, and Approve opens the access dialog (name + access level +
+ * expiry — one dialog, per design §6.1). Renders nothing while empty
  * (the common case) unless there's an error to surface.
  */
 export const PendingDevices: FC<{
 	pending: Loadable<PendingDevice[]>;
-	onApprove: (id: number, currentName: string) => void;
+	/** Opens the approve dialog for this row. */
+	onApprove: (device: PendingDevice) => void;
 	onDeny: (id: number) => void;
 	/** Id of the row whose approve/deny is in flight, or null — only that row disables. */
 	pendingId: number | null;
@@ -136,7 +145,7 @@ export const PendingDevices: FC<{
 											<Button
 												size="sm"
 												disabled={pendingId === p.id}
-												onClick={() => onApprove(p.id, p.name)}
+												onClick={() => onApprove(p)}
 											>
 												{m.pairing_pending_approve()}
 											</Button>
