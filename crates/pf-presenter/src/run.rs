@@ -21,7 +21,8 @@ use crate::overlay::{
     FrameCtx, Overlay, OverlayAction, OverlayFrame, PointerButton, PointerInput, SessionPhase,
 };
 use crate::present_pace::{
-    Cadence, CadenceProbe, FrameStore, LatchClock, PresentGate, MARGIN_MAX_NS, MARGIN_STEP_NS,
+    Cadence, CadenceProbe, FrameStore, LatchClock, PresentGate, SourcePacer, MARGIN_MAX_NS,
+    MARGIN_STEP_NS,
 };
 use crate::touch::Abs;
 use crate::vk::{FrameInput, Presenter};
@@ -209,6 +210,17 @@ enum ModeCtl<'a> {
 /// pure wake-up — the loop drains the frame channel regardless of why it woke.
 struct FrameWake;
 
+/// A decoded frame and when the source cadence says it is due on glass — the pair the
+/// intent store holds, so the due time is decided from the arrival process the store SAW
+/// rather than from whatever survived it.
+struct Paced {
+    frame: DecodedFrame,
+    /// In `session::now_ns`'s domain (`DecodedFrame::decoded_ns` is the same clock, which
+    /// is what lets this path run with no conversion in it). `0` under the latency intent,
+    /// which never asks.
+    due_ns: i64,
+}
+
 /// Everything one stream session accumulates — created at session start, dropped at
 /// session end (browse mode cycles through several per process lifetime).
 struct StreamState {
@@ -265,10 +277,18 @@ struct StreamState {
     /// smoothness. NOTE: a smoothing store holds decoder-pool frames (Vulkan-Video
     /// AVFrames) up to `buffer` deep on top of the depth-2 wake channels — within pool
     /// headroom for 1..=3, but any deeper store must revisit pool sizing.
-    store: FrameStore<DecodedFrame>,
+    store: FrameStore<Paced>,
     /// The panel latch grid (present-wait glass stamps; submit-anchored fallback) — the
     /// smoothness slot clock, and the values published to the host-facing `latch_grid`.
     clock: LatchClock,
+    /// Plays smoothness frames out on the SOURCE's cadence instead of on their arrival
+    /// instant — inert under latency, which never folds a frame into it.
+    pacer: SourcePacer,
+    /// The SOURCE's nominal frame interval: the negotiated STREAM mode's refresh, never
+    /// the panel's. It is the cushion's ceiling, so it has to describe the cadence the host
+    /// produces — on a 120 fps stream shown on a 60 Hz panel the panel's period would
+    /// license twice the hold the source's own cadence can justify.
+    source_interval_ns: i64,
     /// The FIFO glass budget (one undisplayed present in flight) — inert off FIFO modes
     /// or without present timing.
     gate: PresentGate,
@@ -279,9 +299,6 @@ struct StreamState {
     /// VRR is off, and so the cadence probe's reference. Deliberately not the learned
     /// period (see the probe's call site).
     mode_period_ns: u64,
-    /// The latch slot the last smoothness present served (one present per slot); 0 =
-    /// none yet.
-    last_target_ns: u64,
     /// Smoothness slot-pick margin: starts 0 (a fixed lead is pure display tax —
     /// measured on Android), widens +500 µs per >2-miss window toward 2.5 ms.
     margin_ns: u64,
@@ -385,6 +402,9 @@ impl StreamState {
         native_refresh_hz: u32,
     ) -> StreamState {
         let profile = params.profile.clone();
+        // The rate we ASKED for, until the Welcome resolves it (`Connected` below). No
+        // frames flow before that, so this only ever has to be sane, not right.
+        let source_interval_ns = frame_interval_ns(params.mode.refresh_hz, native_refresh_hz);
         // The presenter's half of phase-locked capture: it writes the latch grid the
         // pump reads (see `LatchGrid`), so keep the Arc before the params move. `None`
         // when the session didn't advertise the cap — the 1 Hz fold then skips the work.
@@ -431,10 +451,11 @@ impl StreamState {
             presented: PresentedWindow::default(),
             store: FrameStore::new(usize::from(priority.fifo_capacity())),
             clock: LatchClock::new(native_refresh_hz),
+            pacer: SourcePacer::new(),
+            source_interval_ns,
             gate: PresentGate::default(),
             cadence: CadenceProbe::new(),
             mode_period_ns: 1_000_000_000 / u64::from(native_refresh_hz.max(1)),
-            last_target_ns: 0,
             margin_ns: 0,
             win_misses: 0,
             win_out_max: 0,
@@ -481,24 +502,59 @@ impl StreamState {
         self.handle.stop.store(true, Ordering::SeqCst);
     }
 
-    /// The event-loop wait bound: a smoothness stream with buffered frames sleeps only
-    /// to its next latch-slot deadline; everything else keeps the 15 ms housekeeping
-    /// tick (frames, input, and present completions all wake the loop early anyway).
+    /// The event-loop wait bound: a smoothness stream with a frame in hand sleeps only to
+    /// the pass that can still serve it; everything else keeps the 15 ms housekeeping tick
+    /// (frames, input, and present completions all wake the loop early anyway).
+    ///
+    /// ⚠ This is the present decision's mirror and has to stay one — it answers "when does
+    /// that decision first say yes?", so a rule changed on one side and not the other
+    /// oversleeps a smooth stream straight past its own due time.
     fn wake_timeout(&self) -> Duration {
         const TICK: Duration = Duration::from_millis(15);
-        if !self.store.is_smoothing() || self.store.is_empty() {
+        if !self.store.is_smoothing() {
             return TICK;
         }
-        let now = session::now_ns();
-        let mut target = self
-            .clock
-            .next_slot_after(now.saturating_add(self.margin_ns));
-        if target == self.last_target_ns {
-            // This slot is already served — the next boundary is the deadline.
-            target += self.clock.period_ns();
-        }
-        Duration::from_nanos(target.saturating_sub(now)).clamp(Duration::from_millis(1), TICK)
+        let Some(p) = self.store.front() else {
+            return TICK;
+        };
+        // Free-running presents at the due time itself. Snapping presents once the slot the
+        // frame is aimed at is the next one still reachable — one period, less the submit
+        // lead, before it. Before the first on-glass stamp there is no grid and
+        // `next_slot_after` answers "one period from the query" instead, so the decision's
+        // slot moves with `now` and the frame is servable a period sooner; mirror that too,
+        // or a session's opening frames sit in the store for a refresh they never owed.
+        let lead_ns = self.clock.period_ns() as i64 + self.margin_ns as i64;
+        let wake_ns = if self.pacer.free_running() {
+            p.due_ns
+        } else if self.clock.anchor_ns() == 0 {
+            p.due_ns - lead_ns
+        } else {
+            self.clock.next_slot_after(p.due_ns.max(0) as u64) as i64 - lead_ns
+        };
+        Duration::from_nanos(wake_ns.saturating_sub(session::now_ns() as i64).max(0) as u64)
+            .clamp(Duration::from_millis(1), TICK)
     }
+}
+
+/// One frame at `refresh_hz`, in ns — the SOURCE's nominal interval, and so the cadence
+/// cushion's ceiling.
+///
+/// The negotiated stream mode's refresh is the only source-rate signal a client has, and it
+/// is the right one: it is the rate the host's virtual output runs at, so it bounds the
+/// cadence the capture can produce. The MEASURED fps would be the tempting alternative and
+/// is the wrong answer — it sags exactly when the transport is struggling, which is when a
+/// ceiling derived from it would start licensing a bigger hold.
+///
+/// `0` = the mode asked for "native", which the host resolves to the display this client
+/// reported; that display's rate is therefore what it will produce. Neither known falls
+/// back to 60 Hz, the same last resort [`native_mode`]'s caller takes.
+fn frame_interval_ns(refresh_hz: u32, fallback_hz: u32) -> i64 {
+    let hz = match (refresh_hz, fallback_hz) {
+        (0, 0) => 60,
+        (0, f) => f,
+        (r, _) => r,
+    };
+    1_000_000_000 / i64::from(hz)
 }
 
 /// Whether a present error is `VK_ERROR_DEVICE_LOST` anywhere in its chain. A lost
@@ -857,7 +913,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 st.mode_period_ns = 1_000_000_000 / u64::from(hz);
                             }
                             st.cadence.reset();
-                            st.last_target_ns = 0;
+                            // The estimate was built against a panel this stream is no
+                            // longer on, and the verdict its cushion policy came from has
+                            // just been thrown away with it. Re-anchoring costs one frame;
+                            // the measured jitter survives, because that describes the link.
+                            st.pacer.reset();
                             tracing::info!(
                                 refresh_hz = hz,
                                 "display changed — relearning the latch grid"
@@ -1394,6 +1454,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         continue;
                     }
                     st.mode_line = format!("{}×{}@{}", m.width, m.height, m.refresh_hz);
+                    // The RESOLVED rate — a `0 = native` request becomes a real number
+                    // here, and this is the last moment before frames start arriving.
+                    st.source_interval_ns = frame_interval_ns(m.refresh_hz, native.refresh_hz);
                     tracing::info!(mode = %st.mode_line, "connected");
                     window
                         .set_title(&format!("{} · {}", opts.window_title, st.mode_line))
@@ -1904,26 +1967,39 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         );
                     }
                 }
-                st.store.submit(f);
+                // The intent AFTER any PyroWave collapse above, so a wavelet stream folds
+                // nothing into a loop it will never consult.
+                let smoothing = st.store.is_smoothing();
+                let due_ns = st
+                    .pacer
+                    .due_ns(smoothing, f.pts_ns, f.decoded_ns, st.source_interval_ns)
+                    .unwrap_or(0);
+                st.store.submit(Paced { frame: f, due_ns });
             }
 
             // One frame out, by intent: latency takes the newest whenever the glass
-            // gate allows; smoothness serves at most one frame per latch slot (the
+            // gate allows; smoothness serves the frame whose due time has come (the
             // preroll/underflow behavior lives in the store).
             let now_ns = session::now_ns();
-            let mut slot_target = 0u64;
+            st.pacer.follow(st.cadence.verdict());
             let mut to_present = if st.store.is_smoothing() {
-                let target = st
-                    .clock
-                    .next_slot_after(now_ns.saturating_add(st.margin_ns));
-                if target != st.last_target_ns {
-                    slot_target = target;
-                    st.store.take()
+                if st.pacer.free_running() {
+                    // Variable refresh, measured: the panel refreshes when we present, so
+                    // there is no grid to aim at and the due time IS the target.
+                    st.store.take(|p| p.due_ns <= now_ns as i64)
                 } else {
-                    None
+                    // The first latch still reachable from here, given the submit lead. A
+                    // frame due before it cannot be shown any sooner by waiting; one due
+                    // after it would land a slot early, which is the judder this exists to
+                    // remove. (`next_slot_after` is monotone, so "its own target slot is
+                    // not later than this one" reduces to the comparison below.)
+                    let slot = st
+                        .clock
+                        .next_slot_after(now_ns.saturating_add(st.margin_ns));
+                    st.store.take(|p| p.due_ns < slot as i64)
                 }
             } else {
-                st.store.take()
+                st.store.take(|_| true)
             };
             // The FIFO glass budget: one undisplayed present in flight, so the
             // swapchain's own FIFO can never become a standing queue (a measured
@@ -1942,7 +2018,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     }
                 }
             }
-            if let Some(f) = to_present {
+            if let Some(Paced { frame: f, .. }) = to_present {
                 // Resize END: a frame at the steered target size means the sharp new-mode
                 // picture is here — lift the scrim. A no-op unless a switch is in flight.
                 let (fw, fh) = f.image.dimensions();
@@ -2168,12 +2244,6 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 };
                 if did_present {
                     presented_video = true;
-                    // Smoothness: this latch slot is served — one present per slot.
-                    // (Set only on success: a gated or failed present leaves the slot
-                    // open for the retry.)
-                    if slot_target != 0 {
-                        st.last_target_ns = slot_target;
-                    }
                     if opts.json_status && !st.ready_announced {
                         st.ready_announced = true;
                         println!("{{\"ready\":true}}");
@@ -2261,6 +2331,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 // when anything moved, or always under PUNKTFUNK_PRESENT_DEBUG=1 —
                 // the field-triage instrument for the intent engine.
                 if pacing_active && (present_debug || q_drop + q_dry + gated + forced > 0) {
+                    let cadence_health = st.pacer.health();
                     tracing::info!(
                         smoothing = st.presented.smoothing,
                         mode = st.presented.mode,
@@ -2276,6 +2347,15 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         latch_ms = st.presented.latch_ms,
                         period_us = st.clock.period_ns() / 1000,
                         margin_us = st.margin_ns / 1000,
+                        // The cadence loop's current hold and the jitter it is sized from,
+                        // plus the frames whose due time had already passed when they
+                        // arrived — the direct read on whether the cushion is big enough.
+                        // All three are cumulative/instantaneous, NOT window sums like the
+                        // counters above: the loop's state is what a triage session wants,
+                        // and a one-second slice of a running estimate says nothing.
+                        cushion_us = cadence_health.cushion_ns / 1000,
+                        jitter_us = cadence_health.jitter_ns / 1000,
+                        late = cadence_health.late,
                         "presenter window"
                     );
                 }
@@ -2391,6 +2471,11 @@ fn hud_mode_tick(st: &mut StreamState, window: &mut sdl3::video::Window, title_b
         st.mode_line = format!("{}×{}@{}", m.width, m.height, m.refresh_hz);
         tracing::info!(mode = %st.mode_line, "stream mode switched");
         let _ = window.set_title(&format!("{title_base} · {}", st.mode_line));
+        // A switch is a full host-side rebuild of the virtual display and the encoder: the
+        // interval the cushion is bounded by can change, and the gap the rebuild leaves is
+        // a hole the cadence estimate must re-anchor across rather than slew over.
+        st.source_interval_ns = frame_interval_ns(m.refresh_hz, 0);
+        st.pacer.reset();
     }
     st.shown_mode = Some(m);
 }
@@ -3214,6 +3299,21 @@ mod tests {
         // A negative mode size is clamped, not wrapped into a huge u32.
         let m = native_mode(-1, -1, 1.5, 60.0);
         assert_eq!((m.width, m.height), (0, 0));
+    }
+
+    /// The cadence cushion is bounded by the SOURCE's frame interval, and the negotiated
+    /// stream mode is where that number comes from. Substituting the panel's period —
+    /// the tempting simplification, since the presenter has one at hand — would let a
+    /// 120 fps stream on a 60 Hz panel hold a frame for twice the source's own cadence.
+    #[test]
+    fn the_cadence_interval_comes_from_the_stream_mode_not_the_panel() {
+        assert_eq!(frame_interval_ns(120, 60), 8_333_333);
+        assert_eq!(frame_interval_ns(60, 165), 16_666_666);
+        // A `0 = native` request is resolved by the host to the display this client
+        // reported, so that display's rate is what it will produce.
+        assert_eq!(frame_interval_ns(0, 165), 6_060_606);
+        // Neither known: 60 Hz, never an unbounded ceiling.
+        assert_eq!(frame_interval_ns(0, 0), 16_666_666);
     }
 
     #[test]
