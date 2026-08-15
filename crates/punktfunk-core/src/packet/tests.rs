@@ -520,13 +520,19 @@ fn e2e_unrecoverable_loss_ages_out() {
 /// gigabytes (the eager whole-frame buffer's amplification defense).
 #[test]
 fn in_flight_buffer_budget_bounds_allocation() {
-    let lim = limits(); // max_frame_bytes 4096, shards 16 B, ≤8 data shards × ≤4 blocks
+    // limits(): max_frame_bytes 4096, shards 16 B, ≤8 data shards × ≤4 blocks → budget 16384 B.
+    let lim = limits();
+    let budget = IN_FLIGHT_BUF_FACTOR * lim.max_frame_bytes;
+    // What ONE such frame commits: the largest geometry-consistent buffer (4 blocks × 8 shards
+    // × 16 B = 512 B) plus the state of the single block this first shard opens. Both are sized
+    // from header fields, so the firewall meters both — counting only the buffer is precisely
+    // the hole security-review 2026-08-15 #11 closed, and the boundary moved when it did.
+    let per_frame = 512 + block_state_bytes(8, 0);
+    let fits = budget / per_frame;
     let mut r = Reassembler::new(lim);
     let coder = coder_for(FecScheme::Gf8);
     let stats = StatsCounters::default();
-    // Largest geometry-consistent frame: 4 blocks × 8 shards × 16 B = 512 B per buffer.
-    // Budget = 4 × 4096 = 16384 B → exactly 32 such frames fit; the 33rd must be refused.
-    for i in 0..33u32 {
+    for i in 0..=fits as u32 {
         let mut h = base_header();
         h.frame_index = i;
         h.frame_bytes = 512;
@@ -538,6 +544,14 @@ fn in_flight_buffer_budget_bounds_allocation() {
         stats.snapshot().packets_dropped,
         1,
         "the frame past the budget is dropped, everything under it accepted"
+    );
+    // The point of the whole exercise: whatever the geometry, the commitment stays under the
+    // ceiling. Asserted on the live figure, so a release site that forgets half the cost (the
+    // 0.23.0 accounting-drift lesson on `in_flight`) fails here and not in the field.
+    assert!(
+        r.in_flight() <= budget,
+        "in-flight commitment {} must never exceed the {budget} B budget",
+        r.in_flight(),
     );
 }
 
@@ -1519,11 +1533,15 @@ fn streamed_open_commits_its_own_extent_and_stays_bounded() {
     );
 
     // A SLICE sentinel whose wire base sits just under the ceiling really does commit a
-    // max-sized frame (base 3968 B + K 8 = 256 shards = 4096 B) — four fit the budget, the
-    // fifth must be refused.
-    let mut r = Reassembler::new(limits());
+    // max-sized frame (base 3968 B + K 8 = 256 shards = 4096 B), plus the state of the block it
+    // opens — so the budget takes fewer of these than the buffer alone would suggest, and the
+    // first one past it must be refused.
+    let lim = limits();
+    let budget = IN_FLIGHT_BUF_FACTOR * lim.max_frame_bytes;
+    let fits = budget / (4096 + block_state_bytes(8, 0));
+    let mut r = Reassembler::new(lim);
     let stats = StatsCounters::default();
-    for fi in 0..5u32 {
+    for fi in 0..=fits as u32 {
         let mut h = base_header();
         h.user_flags = USER_FLAG_SLICE_STREAM;
         h.block_count = 0;
@@ -1537,10 +1555,15 @@ fn streamed_open_commits_its_own_extent_and_stays_bounded() {
             .unwrap()
             .is_none());
     }
+    assert!(
+        r.in_flight() <= budget,
+        "in-flight commitment {} must never exceed the {budget} B budget",
+        r.in_flight(),
+    );
     assert_eq!(
         stats.snapshot().packets_dropped,
         1,
-        "the fifth ceiling-claiming open must be refused by the in-flight budget"
+        "the first ceiling-claiming open past the budget must be refused"
     );
 }
 
