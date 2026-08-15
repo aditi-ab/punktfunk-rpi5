@@ -250,6 +250,11 @@ pub(crate) struct SinkNode {
     /// This node's OWN proplist said DualSense (cards state it more reliably — see
     /// `pick_pad_sink`, which accepts either).
     pub(crate) ds5: bool,
+    /// `media.class` was `Audio/Sink/Internal` (or the node called itself
+    /// `api.alsa.split.parent`): the hidden RAW node behind a split card, carrying the
+    /// hardware's own channels. Usable, but the LAST four-channel choice — see
+    /// `pick_pad_sink` for the measurement that says so.
+    pub(crate) internal: bool,
 }
 
 /// A PipeWire `Device` — an ALSA card — reduced to the same shape.
@@ -292,6 +297,25 @@ pub(crate) fn is_unpositioned(positions: &[String]) -> bool {
 /// The whole requirement is four channels on a DualSense's own card: the voice coils ARE
 /// channels 3 and 4, so a stereo or mono node opens perfectly and renders the haptics into the
 /// headphone jack. v1 renders ONE physical DS5 — with two plugged in the first match wins.
+///
+/// ⚠⚠ **A card's PUBLIC four-channel sink beats its hidden parent, even though the parent is
+/// the "rawer" node.** Measured on a Steam Deck (SteamOS 3.7, `alsa-ucm-conf` with
+/// `DualSense-PS5.conf`), where the card offers both:
+///
+/// | node | `audio.position` | what our channels reach |
+/// |---|---|---|
+/// | `HiFi__SpeakerHaptic__sink` (public, 4 ch) | `FL,FR,RL,RR` | split `[AUX1,AUX1,AUX2,AUX3]` |
+/// | `alsa_output.hw_Controller_0` (`Audio/Sink/Internal`, 4 ch) | `AUX0..AUX3` | the hardware |
+///
+/// The hardware map is **AUX1 = the mono speaker, AUX2/AUX3 = the two voice coils, AUX0 =
+/// nothing**. Our stream is speaker on 0/1 and haptics on 2/3, so index-exact into the PARENT
+/// puts speaker-left into the dead AUX0 and only speaker-right into the speaker — half the
+/// speaker signal thrown away. The public split sink maps BOTH of our speaker channels onto
+/// AUX1 (the fold the UCM author intended) and passes the coil pair straight through. Haptics
+/// are identical either way; the speaker is not, so the public sink wins.
+///
+/// The parent stays as the next choice for cards that publish nothing else — and Pro Audio's
+/// `pro-output-0`, which is a PUBLIC `AUX` quad, is caught by the first rule.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn pick_pad_sink(sinks: &[SinkNode], cards: &[CardDevice]) -> Option<PadSinkPick> {
     let ds5_card = |id: u32| cards.iter().any(|c| c.id == id && c.ds5);
@@ -305,15 +329,22 @@ pub(crate) fn pick_pad_sink(sinks: &[SinkNode], cards: &[CardDevice]) -> Option<
     if mine.is_empty() {
         return None;
     }
-    // Unpositioned quad first (Pro Audio, or a split parent) — the shape nothing can remix —
-    // then a positioned one, which `stream.dont-remix` makes equivalent.
+    let quad = |s: &&&SinkNode| s.channels == 4;
+    // Public quads first — unpositioned (Pro Audio) ahead of positioned only for determinism,
+    // since `stream.dont-remix` makes the two equivalent to us.
     if let Some(s) = mine
         .iter()
-        .find(|s| s.channels == 4 && is_unpositioned(&s.positions))
+        .filter(|s| !s.internal)
+        .filter(quad)
+        .find(|s| is_unpositioned(&s.positions))
     {
         return Some(PadSinkPick::Node(s.name.clone()));
     }
-    if let Some(s) = mine.iter().find(|s| s.channels == 4) {
+    if let Some(s) = mine.iter().filter(|s| !s.internal).find(quad) {
+        return Some(PadSinkPick::Node(s.name.clone()));
+    }
+    // Only now the hidden parent (see the table above for what this costs the speaker).
+    if let Some(s) = mine.iter().find(quad) {
         return Some(PadSinkPick::Node(s.name.clone()));
     }
     // A split card whose four-channel parent we cannot see in the registry (it is an
@@ -370,14 +401,18 @@ fn walk_graph() -> anyhow::Result<(Vec<SinkNode>, Vec<CardDevice>)> {
                 match g.type_ {
                     pw::types::ObjectType::Node => {
                         // `Audio/Sink` and `Audio/Sink/Internal` alike: the hidden four-channel
-                        // parent behind a split card wears the latter, and it is the node the
-                        // haptics actually want.
-                        if !props
-                            .get("media.class")
-                            .is_some_and(|c| c.starts_with("Audio/Sink"))
-                        {
+                        // parent behind a split card wears the latter, and it is a usable
+                        // (if second-choice) target — see `pick_pad_sink`.
+                        let Some(class) = props.get("media.class") else {
+                            return;
+                        };
+                        if !class.starts_with("Audio/Sink") {
                             return;
                         }
+                        let internal = class.ends_with("/Internal")
+                            || props
+                                .get("api.alsa.split.parent")
+                                .is_some_and(|v| !matches!(v, "false" | "0"));
                         let Some(name) = props.get("node.name") else {
                             return;
                         };
@@ -397,6 +432,7 @@ fn walk_graph() -> anyhow::Result<(Vec<SinkNode>, Vec<CardDevice>)> {
                                 .unwrap_or(positions.len() as u32),
                             split_parent: props.get("api.alsa.split.name").map(str::to_string),
                             ds5: props_say_ds5(vendor, product, name, description),
+                            internal,
                             positions,
                             name: name.to_string(),
                             description: description.to_string(),
@@ -834,7 +870,8 @@ pub fn pad_audio_test(seconds: u64, coils: bool, speaker: bool) -> anyhow::Resul
                 .is_some_and(|id| cards.iter().any(|c| c.id == id && c.ds5))
     }) {
         println!(
-            "sink   device.id={:<7} channels={} position={:<24} {}{}",
+            "{:<7} device.id={:<7} channels={} position={:<24} {}{}",
+            if s.internal { "parent" } else { "sink" },
             s.device_id
                 .map(|d| d.to_string())
                 .unwrap_or_else(|| "-(virtual)".into()),
@@ -1857,6 +1894,7 @@ mod tests {
             },
             split_parent: None,
             ds5: true,
+            internal: false,
         }
     }
 
@@ -1916,6 +1954,66 @@ mod tests {
         assert_eq!(
             pick_pad_sink(&[virtual_sink, real], &cards),
             Some(PadSinkPick::Node("ds5.pro-output-0".into()))
+        );
+    }
+
+    /// The real thing, transcribed from a Steam Deck (SteamOS 3.7, `alsa-ucm-conf` with
+    /// `DualSense-PS5.conf`) with a wired DualSense: the card publishes a four-channel
+    /// `SpeakerHaptic` sink, a one-channel `Speaker` sink, AND a hidden four-channel parent.
+    ///
+    /// Two things this pins. The old name-only matcher would take whichever of the two public
+    /// sinks the registry happened to replay first — a coin flip against a MONO node that
+    /// cannot carry the coils at all. And the parent, despite being the unpositioned/raw one,
+    /// must NOT win: its AUX0 is a dead hardware channel, so index-exact into it drops half
+    /// the speaker signal (see `pick_pad_sink`'s table).
+    #[test]
+    fn pad_sink_pick_on_a_real_steamos_dualsense() {
+        let cards = [CardDevice {
+            id: 140,
+            name: "alsa_card.usb-Sony_Interactive_Entertainment_DualSense_Wireless_Controller-00"
+                .into(),
+            description: "DualSense wireless controller (PS5)".into(),
+            ds5: true,
+        }];
+        let base =
+            "alsa_output.usb-Sony_Interactive_Entertainment_DualSense_Wireless_Controller-00";
+        let mut parent = sink(
+            "alsa_output.hw_Controller_0",
+            4,
+            "AUX0,AUX1,AUX2,AUX3",
+            Some(140),
+        );
+        parent.internal = true;
+        parent.ds5 = false; // the parent's own proplist carries no vendor ids or product name
+        let mut haptic = sink(
+            &format!("{base}.HiFi__SpeakerHaptic__sink"),
+            4,
+            "FL,FR,RL,RR",
+            Some(140),
+        );
+        haptic.split_parent = Some("alsa_output.hw_Controller_0".into());
+        let mut mono = sink(&format!("{base}.HiFi__Speaker__sink"), 1, "MONO", Some(140));
+        mono.split_parent = Some("alsa_output.hw_Controller_0".into());
+
+        // Registry replay order is not ours to choose, so it must not matter.
+        for order in [
+            vec![parent.clone(), haptic.clone(), mono.clone()],
+            vec![mono.clone(), parent.clone(), haptic.clone()],
+            vec![haptic.clone(), mono.clone(), parent.clone()],
+        ] {
+            assert_eq!(
+                pick_pad_sink(&order, &cards),
+                Some(PadSinkPick::Node(format!(
+                    "{base}.HiFi__SpeakerHaptic__sink"
+                ))),
+                "the four-channel public sink must win from any enumeration order"
+            );
+        }
+        // With only the mono sink and the parent visible, the parent is the right fallback —
+        // half a speaker beats no coils.
+        assert_eq!(
+            pick_pad_sink(&[mono, parent], &cards),
+            Some(PadSinkPick::Node("alsa_output.hw_Controller_0".into()))
         );
     }
 
