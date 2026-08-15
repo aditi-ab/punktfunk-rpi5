@@ -1363,6 +1363,14 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
             false,
             false,
         ),
+        // Editing a device's grants/expiry is pairing administration in both lanes: a plugin
+        // must not widen (or cut) another device's access, and a paired client even less so.
+        (
+            "PATCH",
+            "/api/v1/native/clients/{fingerprint}",
+            false,
+            false,
+        ),
         // ---- pairing administration + PIN visibility: the operator's token alone.
         ("GET", "/api/v1/pair", false, false),
         ("POST", "/api/v1/pair/pin", false, false),
@@ -1890,6 +1898,382 @@ async fn pending_devices_approve_and_deny() {
     )
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+fn patch_json(path: &str, body: serde_json::Value) -> axum::http::Request<Body> {
+    axum::http::Request::patch(path)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Host wall clock, unix seconds — for asserting the relative-in/absolute-stored conversion.
+fn wall_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// The WP6 acceptance spine: PATCH a device's access → the list reflects it AND the device's
+/// live-session watch fires — plus the PATCH's partial semantics (each omitted half keeps its
+/// current value; `clear_expiry` makes access permanent) and the `access_level` derivation.
+#[tokio::test]
+async fn patch_native_access_reflects_in_list_and_fires_watch() {
+    use punktfunk_core::quic::{GRANT_GAMEPAD, GRANT_POINTER};
+    let np = Arc::new(
+        crate::native_pairing::NativePairing::load_with(
+            Some(std::env::temp_dir().join(format!("pf-mgmt-patch-{}.json", std::process::id()))),
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let app = test_app_native(test_state(), np.clone());
+
+    np.add("Living Room TV", "aa11").unwrap();
+    // What a live session holds at admission — the edit must reach it within one event.
+    let mut rx = np.subscribe("aa11");
+
+    // Guest preset: controller-only for 2 hours. Case-insensitive fingerprint, like DELETE.
+    let now = wall_now();
+    let (s, b) = send(
+        &app,
+        patch_json(
+            "/api/v1/native/clients/AA11",
+            serde_json::json!({"grants": GRANT_GAMEPAD, "expires_in_secs": 7200}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["grants"], GRANT_GAMEPAD);
+    assert_eq!(b["access_level"], "controller");
+    let deadline = b["expires_unix"].as_i64().unwrap();
+    assert!(
+        (now + 7200..=now + 7202).contains(&deadline),
+        "relative expiry stored as an absolute deadline: {deadline}"
+    );
+    assert!(b["granted_unix"].as_i64().unwrap() >= now, "grant stamped");
+
+    // The list reflects the same record (one derivation, no drift).
+    let (_, list) = send(&app, get_req("/api/v1/native/clients")).await;
+    assert_eq!(list[0]["grants"], GRANT_GAMEPAD);
+    assert_eq!(list[0]["access_level"], "controller");
+    assert_eq!(list[0]["expires_unix"].as_i64().unwrap(), deadline);
+
+    // The watch fired — a live session from aa11 saw the edit.
+    assert!(rx.has_changed().unwrap(), "the access watch must fire");
+    {
+        let state = rx.borrow_and_update();
+        assert_eq!(state.grants, GRANT_GAMEPAD);
+        assert_eq!(state.deadline_unix, Some(deadline));
+        assert!(!state.revoked);
+    }
+
+    // Partial: a new expiry alone keeps the grants.
+    let (s, b) = send(
+        &app,
+        patch_json(
+            "/api/v1/native/clients/aa11",
+            serde_json::json!({"expires_in_secs": 60}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["grants"], GRANT_GAMEPAD, "omitted grants keep current");
+    let short_deadline = b["expires_unix"].as_i64().unwrap();
+    assert!(short_deadline < deadline, "the expiry did change");
+
+    // Partial: new grants alone keep the expiry — exactly, not re-derived.
+    let (s, b) = send(
+        &app,
+        patch_json(
+            "/api/v1/native/clients/aa11",
+            serde_json::json!({"grants": 0}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["access_level"], "view");
+    assert_eq!(
+        b["expires_unix"].as_i64().unwrap(),
+        short_deadline,
+        "omitted expiry keeps current"
+    );
+
+    // `clear_expiry` makes it permanent; grants (still view) survive.
+    let (s, b) = send(
+        &app,
+        patch_json(
+            "/api/v1/native/clients/aa11",
+            serde_json::json!({"clear_expiry": true}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(b["expires_unix"].is_null(), "clear_expiry = permanent");
+    assert_eq!(b["access_level"], "view");
+
+    // A mask that is no preset reads as `custom`.
+    let (_, b) = send(
+        &app,
+        patch_json(
+            "/api/v1/native/clients/aa11",
+            serde_json::json!({"grants": GRANT_GAMEPAD | GRANT_POINTER}),
+        ),
+    )
+    .await;
+    assert_eq!(b["access_level"], "custom");
+}
+
+/// The PATCH's refusals: reserved grant bits and the expiry-field conflict are 400s that change
+/// nothing, an unknown fingerprint is a 404 (editing access is not a way to pair a device), and
+/// no native plane is the usual 503.
+#[tokio::test]
+async fn patch_native_access_validates_and_404s() {
+    use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD};
+    let np = Arc::new(
+        crate::native_pairing::NativePairing::load_with(
+            Some(
+                std::env::temp_dir().join(format!("pf-mgmt-patch-val-{}.json", std::process::id())),
+            ),
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let app = test_app_native(test_state(), np.clone());
+    np.add("Deck", "bb22").unwrap();
+
+    // Reserved bits: 400, never silently cleared — and the record is untouched.
+    let (s, b) = send(
+        &app,
+        patch_json(
+            "/api/v1/native/clients/bb22",
+            serde_json::json!({"grants": GRANT_ALL | (1u32 << 30)}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(b["error"].as_str().unwrap().contains("reserved"));
+    assert_eq!(np.list()[0].grants, None, "a 400 writes nothing");
+
+    // Conflicting expiry instructions: 400.
+    let (s, b) = send(
+        &app,
+        patch_json(
+            "/api/v1/native/clients/bb22",
+            serde_json::json!({"expires_in_secs": 60, "clear_expiry": true}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(b["error"].as_str().unwrap().contains("clear_expiry"));
+
+    // Unknown fingerprint: 404, and no record appears.
+    let (s, _) = send(
+        &app,
+        patch_json(
+            "/api/v1/native/clients/nope99",
+            serde_json::json!({"grants": GRANT_GAMEPAD}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(!np.is_paired("nope99"), "PATCH must never pair a device");
+
+    // No native plane: 503, like every other /native route.
+    let plain = test_app(test_state(), None);
+    let (s, _) = send(
+        &plain,
+        patch_json(
+            "/api/v1/native/clients/bb22",
+            serde_json::json!({"grants": GRANT_GAMEPAD}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// Approve-with-access pins the operator's chosen mask (plan WP6 acceptance): the response is
+/// the stored record — grants, absolute expiry, stamped grant time — enforcement agrees, and a
+/// re-knock from that fingerprint surfaces the stored access in the pending list. A reserved-bit
+/// choice is refused WITHOUT consuming the pending entry.
+#[tokio::test]
+async fn approve_with_access_pins_the_chosen_mask() {
+    use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD};
+    let np = Arc::new(
+        crate::native_pairing::NativePairing::load_with(
+            Some(
+                std::env::temp_dir()
+                    .join(format!("pf-mgmt-approve-acc-{}.json", std::process::id())),
+            ),
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let app = test_app_native(test_state(), np.clone());
+
+    // A fresh (never-paired) knock carries no stored access for the dialog.
+    np.note_pending("Guest Phone", "cc33", None);
+    let (_, pend) = send(&app, get_req("/api/v1/native/pending")).await;
+    assert!(pend[0]["grants"].is_null());
+    assert!(pend[0]["access_level"].is_null());
+    let id = pend[0]["id"].as_u64().unwrap();
+
+    // Reserved bits: 400, and the knock is still there to approve properly.
+    let (s, _) = send(
+        &app,
+        post_json(
+            &format!("/api/v1/native/pending/{id}/approve"),
+            serde_json::json!({"grants": GRANT_ALL | (1u32 << 31)}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(
+        np.pending_contains("cc33"),
+        "a 400 must not consume the knock"
+    );
+    assert!(!np.is_paired("cc33"));
+
+    // The guest preset: controller-only, 4 hours.
+    let now = wall_now();
+    let (s, b) = send(
+        &app,
+        post_json(
+            &format!("/api/v1/native/pending/{id}/approve"),
+            serde_json::json!({"name": "Guest Phone", "grants": GRANT_GAMEPAD, "expires_in_secs": 14400}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["name"], "Guest Phone");
+    assert_eq!(b["grants"], GRANT_GAMEPAD);
+    assert_eq!(b["access_level"], "controller");
+    let deadline = b["expires_unix"].as_i64().unwrap();
+    assert!((now + 14400..=now + 14402).contains(&deadline));
+    assert!(b["granted_unix"].as_i64().unwrap() >= now, "grant stamped");
+    // Enforcement agrees with the payload.
+    assert_eq!(np.effective("cc33", now), Some(GRANT_GAMEPAD));
+
+    // A later re-knock (the expired-guest flow) shows the STORED access to the approve dialog.
+    np.note_pending("Guest Phone", "cc33", None);
+    let (_, pend) = send(&app, get_req("/api/v1/native/pending")).await;
+    assert_eq!(pend[0]["grants"], GRANT_GAMEPAD);
+    assert_eq!(pend[0]["access_level"], "controller");
+    assert_eq!(pend[0]["expires_unix"].as_i64().unwrap(), deadline);
+}
+
+/// Arm-with-access: the armed window carries the operator's choice (relative expiry already made
+/// absolute) and the ceremony inherits it — while a reserved-bit choice is refused BEFORE a
+/// window opens.
+#[tokio::test]
+async fn arm_with_access_ceremony_inherits_the_choice() {
+    use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD};
+    let np = Arc::new(
+        crate::native_pairing::NativePairing::load_with(
+            Some(std::env::temp_dir().join(format!("pf-mgmt-arm-acc-{}.json", std::process::id()))),
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let app = test_app_native(test_state(), np.clone());
+
+    // Reserved bits: 400 and NO window — a rejected request must not leave pairing open.
+    let (s, _) = send(
+        &app,
+        post_json(
+            "/api/v1/native/pair/arm",
+            serde_json::json!({"grants": GRANT_ALL | (1u32 << 29)}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(!np.status().armed, "a 400 must not arm the window");
+
+    let now = wall_now();
+    let (s, b) = send(
+        &app,
+        post_json(
+            "/api/v1/native/pair/arm",
+            serde_json::json!({"ttl_secs": 60, "grants": GRANT_GAMEPAD, "expires_in_secs": 3600}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["armed"], true);
+    let carried = np.armed_access().expect("the window carries the choice");
+    assert_eq!(carried.grants, GRANT_GAMEPAD);
+    let deadline = carried.expires_unix.expect("absolute deadline");
+    assert!((now + 3600..=now + 3602).contains(&deadline));
+
+    // The ceremony choke point consumes `armed_access()` (WP2) — pairing under it inherits the
+    // window's choice, which is then what enforcement sees.
+    np.add_with_access("Guest Deck", "dd44", np.armed_access())
+        .unwrap();
+    assert_eq!(np.effective("dd44", now), Some(GRANT_GAMEPAD));
+    let (_, list) = send(&app, get_req("/api/v1/native/clients")).await;
+    assert_eq!(list[0]["access_level"], "controller");
+    assert_eq!(list[0]["expires_unix"].as_i64().unwrap(), deadline);
+}
+
+/// Back-compat: approve and arm WITHOUT the new access fields behave exactly as before grants
+/// existed — no explicit choice reaches the store (`None`), so a new device gets the legacy
+/// full/permanent record (all access fields absent) and the list derives `full`.
+#[tokio::test]
+async fn approve_and_arm_without_access_fields_keep_todays_behavior() {
+    let np = Arc::new(
+        crate::native_pairing::NativePairing::load_with(
+            Some(
+                std::env::temp_dir()
+                    .join(format!("pf-mgmt-acc-compat-{}.json", std::process::id())),
+            ),
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let app = test_app_native(test_state(), np.clone());
+
+    // Arm with only the legacy fields → the window carries NO access choice.
+    let (s, _) = send(
+        &app,
+        post_json(
+            "/api/v1/native/pair/arm",
+            serde_json::json!({"ttl_secs": 60}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(np.armed_access(), None, "no fields = no choice");
+
+    // Approve with only a name → the stored record is the legacy full/permanent one.
+    np.note_pending("Old Laptop", "ee55", None);
+    let (_, pend) = send(&app, get_req("/api/v1/native/pending")).await;
+    let id = pend[0]["id"].as_u64().unwrap();
+    let (s, b) = send(
+        &app,
+        post_json(
+            &format!("/api/v1/native/pending/{id}/approve"),
+            serde_json::json!({"name": "Old Laptop"}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(
+        b["grants"].is_null(),
+        "no choice = the absent-grants record"
+    );
+    assert!(b["expires_unix"].is_null());
+    assert!(b["granted_unix"].is_null());
+    assert_eq!(b["access_level"], "full", "absent grants read as full");
+    let stored = &np.list()[0];
+    assert_eq!(stored.grants, None);
+    assert_eq!(stored.expires_unix, None);
+    assert_eq!(stored.granted_unix, None);
 }
 
 #[tokio::test]

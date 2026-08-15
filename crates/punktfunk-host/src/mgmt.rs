@@ -326,7 +326,11 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
             native::list_native_clients,
             native::unpair_all_native_clients
         ))
-        .routes(routes!(native::unpair_native_client))
+        // DELETE and PATCH share `/native/clients/{fingerprint}` — one `routes!`, same rule.
+        .routes(routes!(
+            native::unpair_native_client,
+            native::update_native_client_access
+        ))
         .routes(routes!(native::list_pending_devices))
         .routes(routes!(native::approve_pending_device))
         .routes(routes!(native::deny_pending_device))
