@@ -30,10 +30,10 @@ struct AddHostSheet: View {
     @State private var pinnedIDs: Set<String>
     @ObservedObject private var profiles = ProfileStore.shared
     #endif
-    #if os(macOS)
-    /// Share the clipboard with this host (macOS sessions only; design
-    /// clipboard-and-file-transfer.md §5.3). Off by default; honored only when the host
-    /// advertises the capability at connect.
+    #if !os(tvOS)
+    /// Share the clipboard with this host (design clipboard-and-file-transfer.md §5.3). Off by
+    /// default; honored only when the host advertises the capability at connect. Absent on tvOS,
+    /// which has no pasteboard to share.
     @State private var clipboardSync: Bool
     #endif
     #if os(tvOS)
@@ -72,7 +72,7 @@ struct AddHostSheet: View {
         _port = State(initialValue: Int(existing?.port ?? 9777))
         let stored = existing?.macAddresses ?? []
         _mac = State(initialValue: (stored.isEmpty ? suggestedMacs : stored).joined(separator: ", "))
-        #if os(macOS)
+        #if !os(tvOS)
         _clipboardSync = State(initialValue: existing?.clipboardSync ?? false)
         #endif
         #if !os(tvOS)
@@ -144,7 +144,7 @@ struct AddHostSheet: View {
                     #if os(iOS)
                     .textInputAutocapitalization(.never)
                     #endif
-                #if os(macOS)
+                #if !os(tvOS)
                 Toggle("Share clipboard with this host", isOn: $clipboardSync)
                 #endif
                 profileRows
@@ -200,11 +200,11 @@ struct AddHostSheet: View {
     }
 
     #if os(iOS)
-    /// Four fields + the action row — a touch taller than the 3-field add sheet used to be. The
-    /// edit sheet's profile rows are the only thing that can outgrow it, and they say by how much;
-    /// a single fixed number is what clipped them.
+    /// Four fields, the clipboard toggle, and the action row. The edit sheet's profile rows are
+    /// the only thing that can outgrow it, and they say by how much; a single fixed number is what
+    /// clipped them.
     private var sheetHeight: CGFloat {
-        var height: CGFloat = 392
+        var height: CGFloat = 392 + 44 // the fields and action row, plus the clipboard toggle
         if showsProfileRows {
             height += 116 // the Profile picker and its footnote
             height += 96 + CGFloat(profiles.profiles.count) * 44 // the pins, their header + footer
@@ -282,7 +282,7 @@ struct AddHostSheet: View {
         host.address = address.trimmingCharacters(in: .whitespaces)
         host.port = UInt16(clamping: port)
         host.macAddresses = Self.parseMacs(mac)
-        #if os(macOS)
+        #if !os(tvOS)
         // nil when off: the key stays absent from the saved JSON (forward-compat, and "never
         // opted in" and "opted out" read the same — off).
         host.clipboardSync = clipboardSync ? true : nil

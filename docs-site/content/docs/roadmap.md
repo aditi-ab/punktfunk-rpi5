@@ -38,8 +38,8 @@ than de-escalating and staying degraded. The next structural lever is **sub-fram
 overlapping encode and transmit inside a single frame via a direct slice path — which matters most
 at high resolutions.
 
-**Finishing the clipboard.** Text crosses today from a Windows, macOS or Android client to a host
-whose operator turned the feature on, with images on the first two. Two pieces are genuinely
+**Finishing the clipboard.** Text crosses today from a Windows, macOS, iOS, iPadOS or Android
+client to a host whose operator turned the feature on, with images on all but Android. Two pieces are genuinely
 unfinished: the **Linux client's** side of the bridge is a stub, so a Linux client offers and
 applies nothing; and **file transfer** has a wire format and a host-side policy but no client that
 offers files, so a copied file never crosses. See [Clipboard](/docs/clipboard).

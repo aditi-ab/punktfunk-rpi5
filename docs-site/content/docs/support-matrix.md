@@ -504,7 +504,7 @@ text from an IME), are covered in [Input](/docs/input).
 | Linux desktop | ✅ ¹ | ⚠️ ¹³ | ✅ ² | ✅ | ❌ ³ | ✅ |
 | Windows desktop | ✅ ¹ | ⚠️ ¹³ | ✅ ² | ✅ | ⚠️ ⁴ | ✅ |
 | macOS | ⚠️ ⁵ | ⚠️ ⁶ | ✅ ² | ✅ | ✅ ⁷ | ✅ |
-| iPhone · iPad | ⚠️ ⁵ | ⚠️ ⁶ | ✅ ² | ✅ | ❌ ⁸ | ✅ |
+| iPhone · iPad | ⚠️ ⁵ | ⚠️ ⁶ | ✅ ² | ✅ | ✅ ⁷ | ✅ |
 | Apple TV | ⚠️ ⁵ | ⚠️ ⁶ | ✅ ² | ❌ ⁹ | ❌ ⁸ | ✅ |
 | Android · Android TV | ⚠️ ⁵ | ❌ | ✅ ² | ✅ | ⚠️ ¹⁰ | ✅ |
 | Moonlight | ⚠️ ¹¹ | ❌ | ✅ ² | ❌ | ❌ | ❓ ¹² |
@@ -523,8 +523,10 @@ text from an IME), are covered in [Input](/docs/input).
    full-chroma colour conversion, so 4:4:4 needs no encoder probe and resolves on any vendor. See
    [Client settings](/docs/client-settings).
 7. The richest implementation: text, RTF, HTML and images, fetched lazily in both directions.
-   Concealed and transient pasteboard items are skipped.
-8. The clipboard bridge is macOS-only within the Apple app.
+   Concealed and transient pasteboard items are skipped. On iOS one thing is not lazy: because
+   backgrounding the app ends the session, an unpasted host offer is pulled across (up to 8 MiB)
+   as the session ends, so it survives to be pasted in another app.
+8. tvOS has no pasteboard, so there is nothing to share.
 9. tvOS gives apps no microphone input at all.
 10. Text only, by design — and unlike every other client, Android's per-host **Shared clipboard**
     switch starts **on** (the desktop clients and the Apple app default it off). Nothing crosses
@@ -550,7 +552,7 @@ These are negotiated, and either side can be the reason it did not happen:
   host without the clipboard protocol (a gamescope session, for instance). The per-host "Share
   clipboard" switch is edited before you connect, so it is never greyed out — on Linux, Windows,
   Android and the Apple add-host sheet it stays settable against a host that will refuse, and just
-  does nothing. Only macOS reflects the refusal live: the Stream ▸ Share Clipboard menu item is
+  does nothing. Only the Apple app reflects the refusal live: the Stream ▸ Share Clipboard item is
   disabled when the connected host has not advertised the capability.
 - **Pen input** — the host advertises it only if it can really inject: a usable `/dev/uinput` on
   Linux, or synthetic pointer devices on Windows 10 1809+. Without it, clients fold pen into touch.
@@ -574,7 +576,7 @@ capability.
 | **Windows host** | Newest large surface, shipping as an installer with its own virtual-display driver — both signed with Punktfunk's own certificates rather than a publicly trusted one, so Windows warns on install (see [Windows host](/docs/windows-host#about-the-signatures)). NVENC is well trodden; the AMD (AMF) path was validated on real hardware in mid-2026 (Ryzen 7000 iGPU, 1080p120 HDR P010) and the Intel (QSV) path on Arc, but both see far less field time than NVENC — several of QSV's newer arms are still marked unvalidated in the code. One structural constraint that catches people: it must run in the interactive console session, not session 0. |
 | **GameStream / Moonlight plane** | Works, and whether it is on depends on how you installed. Every Linux package (deb, RPM, Arch, the Bazzite sysext) and the SteamOS installer ship the unit as `serve --gamestream`, so GameStream is **on** there; NixOS defaults it on too. The Windows installer's checkbox is unticked, so it is **off** unless you asked for it, and a bare `punktfunk-host serve` is off. It pairs over plain HTTP with weaker legacy encryption — trusted LAN only, and worth turning off if you don't use Moonlight (see [Security](/docs/security#gamestream--moonlight-compatibility-is-the-weak-crypto-path)). It is a compatibility surface, so Punktfunk-only features (profiles, links, clipboard, microphone) are not on it. |
 | **Linux and Windows desktop clients** | Packaged and current. They are one codebase: the same session binary streams for both, and for the Decky plugin and the `punktfunk` CLI. |
-| **Apple client** (macOS · iOS · iPadOS · tvOS) | One universal build, distributed as a **TestFlight beta**; the Mac also has a notarized DMG. Feature-complete apart from the platform gaps named above (no microphone on tvOS, clipboard on macOS only). |
+| **Apple client** (macOS · iOS · iPadOS · tvOS) | One universal build, distributed as a **TestFlight beta**; the Mac also has a notarized DMG. Feature-complete apart from the platform gaps named above (no microphone or clipboard on tvOS). |
 | **Android client** (phone · TV) | Published on **Google Play** as a public listing for releases, with an invite-only Internal testing track for canary, plus a sideloadable APK. The same app in leanback mode is the TV client. |
 | **Decky plugin** (Steam Deck) | Ships through install-from-URL rather than the Decky store, and keeps itself and the client it launches up to date. It is a launcher, not a second client: it starts the Linux client rather than streaming itself, and holds no settings, no library and no host editor of its own — its **Open Punktfunk** button hands all of that to the client's console home. |
 | **Web console** | The full management surface — dashboard and sessions, pairing, library, displays, plugins and the plugin store, logs, stats, settings, and host updates. It cannot yet run a speed test or set a bitrate; the client apps can. |
