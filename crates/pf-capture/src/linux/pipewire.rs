@@ -71,6 +71,19 @@ struct UserData {
     linear_nv12_failed: bool,
     /// Rate-limit counter for the latest-frame-only diagnostic log (see `.process`).
     dbg_log_n: u64,
+    /// WP-A3/B3 — which clock the wire's `pts_ns` comes from, and how clean each one is. See
+    /// [`crate::pts_provenance`]: the delivery stamp this loop used to take unconditionally is
+    /// downstream of the compositor's delivery jitter, so it bakes that jitter into the
+    /// timestamps the client plays back from.
+    pts: crate::pts_provenance::PtsProvenance,
+    /// When the provenance window opened.
+    pts_reported: std::time::Instant,
+    /// `CLOCK_REALTIME − CLOCK_MONOTONIC`, ns — what carries the compositor's monotonic stamp
+    /// into the wire's realtime domain. Re-sampled each reporting window; the two clocks drift
+    /// by µs over 30 s, so this is not a per-frame cost.
+    rt_minus_mono_ns: i64,
+    /// `PUNKTFUNK_CAPTURE_HDR_PTS=0` puts the wire back on the delivery stamp unconditionally.
+    hdr_pts_enabled: bool,
     /// PW4 step 1: the producer-fence wait distribution, measured on this (the PipeWire loop)
     /// thread. Per-session, like the fall-through tally.
     fence_wait: FenceWaitStats,
@@ -790,10 +803,40 @@ impl Drop for DmabufMap {
 ///
 /// `pw_buf` is the buffer's `pw_buffer` handle (`spa_buf`'s owner), used only as the identity a
 /// raw-passthrough publish withholds via [`UserData::try_defer`] — never dereferenced here.
+/// How often the wire-pts provenance line is emitted (WP-A3). Matches the audio plane's stats
+/// cadence so a field log reads as one timeline.
+const PTS_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `CLOCK_REALTIME − CLOCK_MONOTONIC`, ns.
+///
+/// PipeWire stamps `spa_meta_header.pts` in the graph's clock domain (`CLOCK_MONOTONIC`); the wire
+/// — and the client's plausibility gate — speak realtime-since-epoch. Sampling the pair back to
+/// back is what carries one into the other, and the residual is the few hundred nanoseconds
+/// between the two reads against a 50 ms plausibility window. A failed read reports 0, which puts
+/// every rebased stamp outside that window and falls the whole stream back to delivery stamps —
+/// the safe direction.
+fn realtime_minus_monotonic_ns() -> i64 {
+    let rt = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` writes one `timespec` through the pointer and touches nothing else;
+    // `ts` is a live, properly aligned local. A non-zero return leaves it untouched.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return 0;
+    }
+    rt - (ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64)
+}
+
 fn consume_frame(
     ud: &mut UserData,
     spa_buf: *mut spa::sys::spa_buffer,
     pw_buf: *mut pw::sys::pw_buffer,
+    hdr_pts_ns: Option<i64>,
 ) {
     // No active stream: release the buffer without the (expensive at 5K) de-pad.
     if !ud.signals.active.load(Ordering::Relaxed) {
@@ -829,6 +872,54 @@ fn consume_frame(
     let (w, h) = (sz.width as usize, sz.height as usize);
     if w == 0 || h == 0 {
         return; // format not negotiated yet
+    }
+
+    // ONE stamp for this frame, whichever of the three paths below publishes it (WP-B3). Each
+    // used to take its own `SystemTime::now()` at the moment it happened to reach the publish, so
+    // a CPU de-pad's milliseconds landed INSIDE the timestamp and the three paths could drift
+    // apart without anything saying so. Sampled here, before any of that work, the stamp
+    // describes the frame's arrival rather than our handling of it.
+    let delivery_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let hdr_pts_ns = hdr_pts_ns.filter(|&p| p > 0);
+    // Measured on EVERY capture, whether or not the compositor's stamp is the one we ship: the
+    // question "which clock is cleaner on this host" is what decides that, and a diagnostic that
+    // only runs once you already trust the answer cannot inform it.
+    ud.pts.observe(hdr_pts_ns, delivery_ns);
+    let stamp = crate::pts_provenance::wire_pts(
+        ud.hdr_pts_enabled.then_some(hdr_pts_ns).flatten(),
+        delivery_ns,
+        ud.rt_minus_mono_ns,
+    );
+    let pts_ns = stamp.pts_ns;
+    if ud.hdr_pts_enabled && hdr_pts_ns.is_some() && !stamp.from_header {
+        ud.pts.implausible += 1;
+    }
+    if ud.pts_reported.elapsed() >= PTS_REPORT_EVERY {
+        if let Some(r) = ud.pts.report() {
+            tracing::info!(
+                frames = r.frames,
+                with_hdr = r.with_hdr,
+                samples = r.samples,
+                period_us = r.period_us,
+                // THE pair this whole work package exists to compare. Materially tighter on the
+                // left ⇒ the compositor's stamp is worth shipping; equally ragged ⇒ the producer
+                // composes irregularly and no choice of stamp can fix it.
+                hdr_mad_us = r.hdr_mad_us,
+                delivery_mad_us = r.delivery_mad_us,
+                offset_p50_ms = r.offset_p50_ms,
+                implausible = r.implausible,
+                hdr_pts_used = ud.hdr_pts_enabled,
+                "capture wire-pts provenance"
+            );
+        }
+        ud.pts.reset_window();
+        ud.pts_reported = std::time::Instant::now();
+        // The two clocks drift by µs over a window; re-pairing them here keeps the rebase honest
+        // over a multi-hour session without costing anything per frame.
+        ud.rt_minus_mono_ns = realtime_minus_monotonic_ns();
     }
 
     // Implicit-fence wait: Mutter renders into the dmabuf and hands it over at
@@ -985,10 +1076,6 @@ fn consume_frame(
             if dup < 0 {
                 break 'passthrough PassthroughFallback::DupFailed;
             }
-            let pts_ns = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
             let hold = ud.try_defer(pw_buf);
             ud.publish(CapturedFrame {
                 width: w as u32,
@@ -1134,10 +1221,6 @@ fn consume_frame(
                                 "zero-copy: dmabuf imported to CUDA (no CPU copy)"
                             );
                         }
-                        let pts_ns = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_nanos() as u64)
-                            .unwrap_or(0);
                         ud.publish(CapturedFrame {
                             width: w as u32,
                             height: h as u32,
@@ -1342,10 +1425,6 @@ fn consume_frame(
     // the layout isn't packed RGB). This is the CPU path's counterpart to the producer's
     // hardware cursor plane, which stays out of the captured buffer.
     composite_cursor(&mut tight, w, h, fmt, &ud.cursor);
-    let pts_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
     let frame = CapturedFrame {
         width: w as u32,
         height: h as u32,
@@ -1633,6 +1712,10 @@ pub fn pipewire_thread(
         yuv444: want_444,
         linear_nv12_failed: false,
         dbg_log_n: 0,
+        pts: crate::pts_provenance::PtsProvenance::new(),
+        pts_reported: std::time::Instant::now(),
+        rt_minus_mono_ns: realtime_minus_monotonic_ns(),
+        hdr_pts_enabled: std::env::var("PUNKTFUNK_CAPTURE_HDR_PTS").as_deref() != Ok("0"),
         fence_wait: FenceWaitStats::default(),
         pool: PoolCensus::default(),
         passthrough_fallbacks: PassthroughFallbacks::default(),
@@ -1912,6 +1995,18 @@ pub fn pipewire_thread(
                     // while the buffer is still held.
                     unsafe { (*hdr).flags }
                 };
+                // The compositor's OWN stamp for this frame (WP-A3/B3), stamped upstream of the
+                // delivery jitter our `SystemTime::now()` cannot see past. Located here because
+                // the header already is; whether it is worth shipping is what the provenance
+                // line measures.
+                let hdr_pts = if hdr.is_null() {
+                    None
+                } else {
+                    // SAFETY: as for `.flags` — non-null, from a lookup that demanded at least
+                    // `size_of::<spa_meta_header>()` bytes (so `.pts` is in bounds), read while
+                    // the buffer is still held.
+                    Some(unsafe { (*hdr).pts })
+                };
                 // First data chunk's size + flags (used for the diagnostic + CORRUPTED check)
                 // and its data type (a dmabuf legitimately reports chunk size 0, so the size-0
                 // stale skip only applies to mappable SHM buffers).
@@ -1960,7 +2055,7 @@ pub fn pipewire_thread(
                     return;
                 }
 
-                consume_frame(ud, spa_buf, newest);
+                consume_frame(ud, spa_buf, newest, hdr_pts);
             }));
             // Hand `newest` back to the stream exactly once, on EVERY path — normal, corrupted-skip,
             // or a caught panic in the closure above — UNLESS a raw-passthrough publish withheld it
