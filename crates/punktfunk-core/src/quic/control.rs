@@ -664,6 +664,11 @@ pub const CLIP_REASON_POLICY_DISABLED: u8 = 3;
 /// [`ClipState::reason`]: enabled, but the host policy forbids file transfer (`no-files` /
 /// `text-only`) — surfaced so the client greys "Include files" with a footnote.
 pub const CLIP_REASON_NO_FILES: u8 = 4;
+/// [`ClipState::reason`]: the operator policy allows clipboard, but THIS device's access grants
+/// don't (`GRANT_CLIPBOARD` unbit — design/per-client-access.md §5.4). Distinct from
+/// [`CLIP_REASON_POLICY_DISABLED`] so the client can say "not permitted for this device" instead
+/// of "the host has clipboard off".
+pub const CLIP_REASON_NOT_PERMITTED: u8 = 5;
 
 /// [`ClipFetchHdr::status`]: the requested format is being served; data chunks follow until FIN.
 pub const CLIP_FETCH_OK: u8 = 0;
@@ -1394,9 +1399,29 @@ mod tests {
                 policy: CLIP_POLICY_TEXT,
                 reason: CLIP_REASON_NO_FILES,
             },
+            ClipState {
+                enabled: false,
+                policy: CLIP_POLICY_TEXT | CLIP_POLICY_FILES,
+                reason: CLIP_REASON_NOT_PERMITTED,
+            },
         ];
         for m in cases {
             assert_eq!(ClipState::decode(&m.encode()).unwrap(), m);
+        }
+        // The reason vocabulary stays collision-free: a shipped client switches on these bytes,
+        // so a re-used value would mislabel refusals in the field, not fail loudly.
+        let reasons = [
+            CLIP_REASON_OK,
+            CLIP_REASON_BACKEND_UNAVAILABLE,
+            CLIP_REASON_TAKEN_OVER,
+            CLIP_REASON_POLICY_DISABLED,
+            CLIP_REASON_NO_FILES,
+            CLIP_REASON_NOT_PERMITTED,
+        ];
+        for (i, a) in reasons.iter().enumerate() {
+            for b in &reasons[i + 1..] {
+                assert_ne!(a, b, "CLIP_REASON_* values must be distinct");
+            }
         }
         // A ClipControl must not decode as a ClipState (type byte).
         assert!(ClipState::decode(

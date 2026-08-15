@@ -135,6 +135,12 @@ pub(super) async fn negotiate(
     // `stop`; `quit` rides into the display lease).
     quit: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    // Per-client access (design/per-client-access.md §7): the session's effective grant mask and
+    // saturating seconds until its expiry (`0` = permanent), resolved by `serve_session` at
+    // admission. Advertised in the Welcome so the client can gate capture / show the
+    // "Controller only · ends in…" chip; the host enforces the same mask regardless.
+    grants: u32,
+    expires_in_secs: u32,
 ) -> Result<(
     Hello,
     Welcome,
@@ -662,12 +668,11 @@ pub(super) async fn negotiate(
         // advert to find it. `0` on the standalone punktfunk1-host binary (no management API),
         // and the client then keeps its compiled-in default.
         mgmt_port: crate::mgmt::effective_port(),
-        // Per-client access (design/per-client-access.md): full control, no deadline — the
-        // wire-identical default every pre-grants client assumes. The trust store's per-device
-        // mask/expiry replaces these constants when admission starts consulting it (plan WP2/WP3);
-        // until then every admitted session is full-control, exactly today's behavior.
-        grants: punktfunk_core::quic::GRANT_ALL,
-        expires_in_secs: 0,
+        // Per-client access (design/per-client-access.md §7): the trust record's effective mask
+        // and remaining lifetime, resolved by `serve_session` at admission. A full-control
+        // permanent device advertises `GRANT_ALL, 0` — exactly what every pre-grants client assumes.
+        grants,
+        expires_in_secs,
         // The negotiated session AEAD (resolved above) + its 32-byte key toward a ChaCha
         // client; toward everyone else cipher 0 keeps the Welcome byte-identical to the
         // pre-cipher wire form — unless a mgmt port rides along, which forces the cipher

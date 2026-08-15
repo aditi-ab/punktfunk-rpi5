@@ -52,6 +52,13 @@ pub(super) async fn run(
     cursor_client_draws: Arc<AtomicBool>,
     clip_enabled: Arc<AtomicBool>,
     clip: pf_clipboard::ClipCoord,
+    // Per-client access (design/per-client-access.md §5): the session's LIVE grant mask — the
+    // same atomic the datagram filter reads; the deadline/watch task folds console edits into
+    // it, so a `ClipControl` arriving after a mid-session revoke resolves against the new mask.
+    session_grants: Arc<AtomicU32>,
+    // `AccessUpdate`s from the session's deadline/watch task (expiry warnings + mid-session
+    // grant edits) — this task is the control stream's sole writer, so they cross here.
+    mut access_rx: tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::AccessUpdate>,
 ) {
     let pf_clipboard::ClipCoord {
         available: clip_available,
@@ -64,6 +71,9 @@ pub(super) async fn run(
     // Same discipline for the wire-MTU watcher's channel — its bounded lifetime ends mid-session
     // on every healthy path.
     let mut shard_change_closed = false;
+    // …and for the access-update channel: a session with no fingerprint (an `--open` anonymous
+    // client) never spawns the deadline/watch task, so the sender drops immediately.
+    let mut access_closed = false;
     let mut active = initial_mode;
     // Host-side switch rate limit (a backstop against a hostile/broken client spamming
     // Reconfigure into pipeline-rebuild churn — the drain-to-newest in the data plane already
@@ -291,27 +301,14 @@ pub(super) async fn run(
                 } else if let Ok(ctl) = ClipControl::decode(&msg) {
                     // Shared clipboard enable/disable (design/clipboard-and-file-transfer.md
                     // §3.1). Reply with the resolved state; the operator policy is authoritative
-                    // over the client's request. When the policy allows it but no backend bound
-                    // (gamescope / older GNOME), enable is refused with BACKEND_UNAVAILABLE so the
+                    // over the client's request, and the device's CLIPBOARD grant is ANDed into
+                    // it (per-client access §5.4). Refusals carry the honest reason so the
                     // client can say *why*. The resolved `enabled` gates the coordinator.
-                    let policy = pf_clipboard::policy();
-                    let (enabled, resolved_policy, reason) = match policy {
-                        None => (false, 0, punktfunk_core::quic::CLIP_REASON_POLICY_DISABLED),
-                        Some(p) if ctl.enabled && !clip_available => {
-                            (false, p, punktfunk_core::quic::CLIP_REASON_BACKEND_UNAVAILABLE)
-                        }
-                        Some(p) => {
-                            let files_ok = p & punktfunk_core::quic::CLIP_POLICY_FILES != 0;
-                            let wants_files =
-                                ctl.flags & punktfunk_core::quic::CLIP_FLAG_FILES != 0;
-                            let reason = if wants_files && !files_ok {
-                                punktfunk_core::quic::CLIP_REASON_NO_FILES
-                            } else {
-                                punktfunk_core::quic::CLIP_REASON_OK
-                            };
-                            (ctl.enabled, p, reason)
-                        }
-                    };
+                    let granted = session_grants.load(Ordering::Relaxed)
+                        & punktfunk_core::quic::GRANT_CLIPBOARD
+                        != 0;
+                    let (enabled, resolved_policy, reason) =
+                        resolve_clip_control(pf_clipboard::policy(), granted, clip_available, ctl);
                     clip_enabled.store(enabled, Ordering::SeqCst);
                     // Drive the coordinator: enable re-announces the current host clipboard,
                     // disable drops any selection we own. A dropped send (inert handle) is fine.
@@ -375,6 +372,21 @@ pub(super) async fn run(
                     break;
                 }
             }
+            update = access_rx.recv(), if !access_closed => {
+                // Per-client access: an expiry warning (T−5 m / T−1 m) or a mid-session grant
+                // edit from the session's deadline/watch task — forward to the client
+                // (best-effort, latest-wins; an old client ignores the unknown message). `None`
+                // = the task ended (or never existed for an anonymous session): disable this
+                // branch, the `clip_offer_closed` pattern.
+                match update {
+                    Some(u) => {
+                        if io::write_msg(&mut ctrl_send, &u.encode()).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => access_closed = true,
+                }
+            }
             offer = clip_offer_rx.recv(), if !clip_offer_closed => {
                 // Host copied → the coordinator minted a `ClipOffer`; forward it to the client
                 // (only while sync is on — a race with a just-received disable would otherwise
@@ -423,5 +435,105 @@ pub(super) async fn run(
                 }
             }
         }
+    }
+}
+
+/// Resolve a client's [`ClipControl`] against the three authorities, in precedence order:
+/// the operator policy (`None` = clipboard off host-wide), the device's `CLIPBOARD` grant
+/// (per-client access §5.4 — ANDed into the policy, never overriding it), and backend
+/// availability. Returns `(enabled, resolved_policy, reason)` for the [`ClipState`] ack.
+///
+/// The grant refusal still reports the operator policy bits (like the backend refusal): the
+/// client's UI can then say "not permitted for this device" without also greying the file
+/// toggle for the wrong reason.
+fn resolve_clip_control(
+    policy: Option<u8>,
+    granted: bool,
+    clip_available: bool,
+    ctl: ClipControl,
+) -> (bool, u8, u8) {
+    match policy {
+        None => (false, 0, punktfunk_core::quic::CLIP_REASON_POLICY_DISABLED),
+        Some(p) if !granted => (false, p, punktfunk_core::quic::CLIP_REASON_NOT_PERMITTED),
+        Some(p) if ctl.enabled && !clip_available => (
+            false,
+            p,
+            punktfunk_core::quic::CLIP_REASON_BACKEND_UNAVAILABLE,
+        ),
+        Some(p) => {
+            let files_ok = p & punktfunk_core::quic::CLIP_POLICY_FILES != 0;
+            let wants_files = ctl.flags & punktfunk_core::quic::CLIP_FLAG_FILES != 0;
+            let reason = if wants_files && !files_ok {
+                punktfunk_core::quic::CLIP_REASON_NO_FILES
+            } else {
+                punktfunk_core::quic::CLIP_REASON_OK
+            };
+            (ctl.enabled, p, reason)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use punktfunk_core::quic::{
+        CLIP_FLAG_FILES, CLIP_POLICY_FILES, CLIP_POLICY_TEXT, CLIP_REASON_BACKEND_UNAVAILABLE,
+        CLIP_REASON_NOT_PERMITTED, CLIP_REASON_NO_FILES, CLIP_REASON_OK,
+        CLIP_REASON_POLICY_DISABLED,
+    };
+
+    const ON: ClipControl = ClipControl {
+        enabled: true,
+        flags: 0,
+    };
+
+    /// The three-way clipboard resolution (per-client access WP5): operator policy off →
+    /// POLICY_DISABLED; policy on but the device's grant unbit → NOT_PERMITTED (grants AND into
+    /// the policy, and the refusal names the device, not the host); granted + policy on →
+    /// today's backend/files resolution unchanged.
+    #[test]
+    fn clip_resolution_three_way() {
+        let both = CLIP_POLICY_TEXT | CLIP_POLICY_FILES;
+
+        // Operator policy off: the host-wide refusal wins over everything, grant included.
+        assert_eq!(
+            resolve_clip_control(None, false, true, ON),
+            (false, 0, CLIP_REASON_POLICY_DISABLED)
+        );
+        assert_eq!(
+            resolve_clip_control(None, true, true, ON),
+            (false, 0, CLIP_REASON_POLICY_DISABLED)
+        );
+
+        // Policy on, grant unbit: refused as not-permitted — even with a live backend, and for
+        // a DISABLE too (an ungranted device can't "resolve" any clipboard state but off).
+        assert_eq!(
+            resolve_clip_control(Some(both), false, true, ON),
+            (false, both, CLIP_REASON_NOT_PERMITTED)
+        );
+
+        // Granted: the pre-grants resolution, unchanged — backend gate…
+        assert_eq!(
+            resolve_clip_control(Some(both), true, false, ON),
+            (false, both, CLIP_REASON_BACKEND_UNAVAILABLE)
+        );
+        // …files-vs-policy…
+        assert_eq!(
+            resolve_clip_control(
+                Some(CLIP_POLICY_TEXT),
+                true,
+                true,
+                ClipControl {
+                    enabled: true,
+                    flags: CLIP_FLAG_FILES,
+                }
+            ),
+            (true, CLIP_POLICY_TEXT, CLIP_REASON_NO_FILES)
+        );
+        // …and the plain enable.
+        assert_eq!(
+            resolve_clip_control(Some(both), true, true, ON),
+            (true, both, CLIP_REASON_OK)
+        );
     }
 }

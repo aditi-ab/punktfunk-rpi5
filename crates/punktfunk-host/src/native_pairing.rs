@@ -74,6 +74,15 @@ pub(crate) use sanitize::is_spoofy_char;
 /// reaches it there).
 pub(crate) use sanitize::sanitize_device_name;
 
+/// Host wall clock, unix seconds — the clock access deadlines are stored in and evaluated
+/// against (design §4: wall time at each check, so an NTP step moves a deadline with the clock).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Shared native-pairing state: the arming PIN window + the persistent trust store + the
 /// pending-approval queue.
 pub struct NativePairing {
@@ -214,13 +223,28 @@ impl NativePairing {
         self.approval.admit_and_clear(fp_hex);
         // The one choke point every successful pairing passes through (PIN ceremony AND
         // delegated approval), so the lifecycle event fires exactly once per pairing.
+        let device = crate::events::DeviceRef {
+            name: sanitize_device_name(name, fp_hex),
+            fingerprint: fp_hex.to_string(),
+            plane: crate::events::Plane::Native,
+        };
         crate::events::emit(crate::events::EventKind::PairingCompleted {
-            device: crate::events::DeviceRef {
-                name: sanitize_device_name(name, fp_hex),
-                fingerprint: fp_hex.to_string(),
-                plane: crate::events::Plane::Native,
-            },
+            device: device.clone(),
         });
+        // `access.granted` fires only for an EXPLICIT operator choice (approve dialog, arm
+        // window) — this is likewise the one choke point both of those pass through. Read the
+        // stored record back for the payload: the store masked reserved bits and stamped the
+        // grant time, so the event must report what is actually in force. A choice-less pairing
+        // (preserved or default access) emits only `pairing.completed` above.
+        if access.is_some() {
+            if let Some(stored) = self.store.get(fp_hex) {
+                crate::events::emit(crate::events::EventKind::AccessGranted {
+                    device,
+                    grants: stored.grants.unwrap_or(GRANT_ALL) & GRANT_ALL,
+                    expires_unix: stored.expires_unix,
+                });
+            }
+        }
         self.publish_current(fp_hex);
         Ok(())
     }
@@ -232,6 +256,19 @@ impl NativePairing {
     pub fn set_access(&self, fp_hex: &str, access: Access) -> Result<bool> {
         if !self.store.set_access(fp_hex, access)? {
             return Ok(false);
+        }
+        // The edit-sheet choke point (design §6 events): read the stored record back — the store
+        // is what masked reserved bits — so hooks see what is actually in force.
+        if let Some(stored) = self.store.get(fp_hex) {
+            crate::events::emit(crate::events::EventKind::AccessChanged {
+                device: crate::events::DeviceRef {
+                    name: stored.name,
+                    fingerprint: fp_hex.to_ascii_lowercase(),
+                    plane: crate::events::Plane::Native,
+                },
+                grants: stored.grants.unwrap_or(GRANT_ALL) & GRANT_ALL,
+                expires_unix: stored.expires_unix,
+            });
         }
         self.publish_current(fp_hex);
         Ok(true)
@@ -394,9 +431,18 @@ impl NativePairing {
 
     /// Park (async) until an operator decides on a knock identified by `fp_hex`, up to `timeout`.
     /// `knock_seq` is the generation [`Self::note_pending`] returned for THIS connection's knock.
-    /// The store-blind approval queue is handed an `is_paired` closure so it can resolve
+    /// The store-blind approval queue is handed a paired-check closure so it can resolve
     /// [`PairingDecision::Approved`] the instant the fingerprint pairs. See
     /// [`approval::ApprovalQueue::wait_for_decision`] for the full decision contract.
+    ///
+    /// The closure answers with [`Self::effective`], NOT [`Self::is_paired`]: only a knock from
+    /// an *unauthorized* device ever parks here, and an EXPIRED guest's record is still *listed*
+    /// — resolving on the listing would "admit" its knock instantly, before the operator
+    /// re-grants, and the session would then fail admission's own effective-check with a typed
+    /// expiry close. Parking until the record is effective again makes re-approval (which
+    /// refreshes access) — or a console re-grant — the thing that admits, per design §4.
+    /// (Deliberate corollary: a bare PIN re-pair, which preserves an expired record's access
+    /// per §5.7, does not admit a parked knock — the device stays unauthorized either way.)
     pub async fn wait_for_decision(
         &self,
         fp_hex: &str,
@@ -404,7 +450,9 @@ impl NativePairing {
         timeout: Duration,
     ) -> PairingDecision {
         self.approval
-            .wait_for_decision(fp_hex, knock_seq, timeout, |fp| self.store.is_paired(fp))
+            .wait_for_decision(fp_hex, knock_seq, timeout, |fp| {
+                self.store.effective(fp, unix_now()).is_some()
+            })
             .await
     }
 
@@ -616,6 +664,64 @@ mod tests {
             .wait_for_decision("ab01", 0, Duration::from_secs(5))
             .await;
         assert_eq!(d, PairingDecision::Approved);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// An EXPIRED record's knock must PARK (design §4): the record is still *listed*, and a
+    /// paired-check that resolved on the listing would "admit" the knock instantly, before any
+    /// re-grant — the session then just dies on admission's effective-check. Only the operator's
+    /// re-approval (which refreshes access) may resolve the waiter.
+    #[tokio::test]
+    async fn expired_record_parks_until_regrant() {
+        use punktfunk_core::quic::GRANT_GAMEPAD;
+        use std::sync::Arc;
+        let p = temp();
+        let _ = std::fs::remove_file(&p);
+        let np = Arc::new(NativePairing::load_with(Some(p.clone()), None, false).unwrap());
+        np.add_with_access(
+            "Old Guest",
+            "aa77",
+            Some(Access {
+                grants: GRANT_ALL,
+                expires_unix: Some(wall_now() - 10),
+            }),
+        )
+        .unwrap();
+        assert!(np.is_paired("aa77"), "expired but still listed");
+
+        // No re-grant → the waiter times out; the stale listing must not admit it.
+        let seq = np.note_pending("Old Guest", "aa77", None);
+        let d = np
+            .wait_for_decision("aa77", seq, Duration::from_millis(120))
+            .await;
+        assert_eq!(d, PairingDecision::TimedOut);
+
+        // Re-approval with fresh access resolves a parked waiter — re-approval IS the re-grant.
+        let seq = np.note_pending("Old Guest", "aa77", None);
+        let np2 = np.clone();
+        let waiter = tokio::spawn(async move {
+            np2.wait_for_decision("aa77", seq, Duration::from_secs(5))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let id = np
+            .pending()
+            .into_iter()
+            .find(|x| x.fingerprint == "aa77")
+            .unwrap()
+            .id;
+        np.approve_pending(
+            id,
+            None,
+            Some(Access {
+                grants: GRANT_GAMEPAD,
+                expires_unix: Some(wall_now() + 3600),
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(waiter.await.unwrap(), PairingDecision::Approved);
+        assert_eq!(np.effective("aa77", wall_now()), Some(GRANT_GAMEPAD));
         let _ = std::fs::remove_file(&p);
     }
 

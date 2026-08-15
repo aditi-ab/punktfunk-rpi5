@@ -887,6 +887,12 @@ pub(super) fn input_thread(
     inj_tx: std::sync::mpsc::Sender<InputEvent>,
     gamepad: GamepadPref,
     pad_audio_on: bool,
+    // The session's LIVE grant mask (per-client access §5.4). The datagram dispatch already
+    // drops non-granted traffic before it reaches this channel; the guards below are the
+    // deny-at-SETUP layer — without `GRANT_GAMEPAD` no arm that could create a virtual pad (or
+    // spawn a pad-audio streamer) ever runs, so a View-only session holds no uinput/ViGEm node
+    // a dispatch-filter bug could drive. One relaxed load per item.
+    grants: Arc<AtomicU32>,
 ) {
     let mut pads = Pads::new(gamepad);
     // Per-pad 0xD1 audio streamers, live only when the Welcome granted the cap (`pad_audio_on`
@@ -959,7 +965,10 @@ pub(super) fn input_thread(
         match rx.recv_timeout(poll) {
             // Rich input (touchpad / motion) is applied the moment it arrives; the single channel
             // wakes for gyro samples instead of making them wait out the feedback poll interval.
-            Ok(ClientInput::Rich(rich)) => {
+            // Guarded on the pad grant like every gamepad arm below — see the `grants` parameter.
+            Ok(ClientInput::Rich(rich))
+                if grants.load(Ordering::Relaxed) & punktfunk_core::quic::GRANT_GAMEPAD != 0 =>
+            {
                 // Per-pad inter-arrival, unconditionally: one subtraction and one array increment,
                 // cheap enough that a session no longer has to be re-run with debug logging on to
                 // answer "is the gyro feed even arriving evenly". The old instrument grew and
@@ -971,159 +980,182 @@ pub(super) fn input_thread(
                 pads.apply_rich(rich);
             }
             // Stylus batches apply on arrival like rich input — the tracker synthesizes the
-            // transitions, the lazily-created virtual tablet renders them.
-            Ok(ClientInput::Pen(batch)) => pen.apply(&batch),
-            Ok(ClientInput::Event(ev)) => match ev.kind {
-                InputKind::GamepadButton | InputKind::GamepadAxis => {
-                    // A bad index / unknown axis just doesn't update a pad — fall through (no
-                    // `continue`) so the rich-input drain + feedback pump below still run every
-                    // iteration (the DualSense GET_REPORT handshake must be serviced promptly).
-                    let idx = ev.flags as usize;
-                    if idx < MAX_WIRE_PADS && pad_state[idx].apply(&ev) {
-                        pad_mask |= 1 << idx;
-                        let frame = pad_state[idx].frame(idx, pad_mask);
-                        pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
+            // transitions, the lazily-created virtual tablet renders them. The pen plane is
+            // pointer-class (core `classify`), and the guard is also its deny-at-setup: a
+            // session that never passes it never creates the virtual tablet.
+            Ok(ClientInput::Pen(batch))
+                if grants.load(Ordering::Relaxed) & punktfunk_core::quic::GRANT_POINTER != 0 =>
+            {
+                pen.apply(&batch)
+            }
+            // Per-event grant test, the same one the datagram dispatch already ran (one relaxed
+            // load + the exhaustive `classify`): kept here too so the resource-creating arms
+            // below (virtual pads, pad-audio streamers) are unreachable without their grant even
+            // if an upstream filter regresses.
+            Ok(ClientInput::Event(ev))
+                if grants.load(Ordering::Relaxed)
+                    & punktfunk_core::quic::classify(ev.kind).bit()
+                    != 0 =>
+            {
+                match ev.kind {
+                    InputKind::GamepadButton | InputKind::GamepadAxis => {
+                        // A bad index / unknown axis just doesn't update a pad — fall through (no
+                        // `continue`) so the rich-input drain + feedback pump below still run every
+                        // iteration (the DualSense GET_REPORT handshake must be serviced promptly).
+                        let idx = ev.flags as usize;
+                        if idx < MAX_WIRE_PADS && pad_state[idx].apply(&ev) {
+                            pad_mask |= 1 << idx;
+                            let frame = pad_state[idx].frame(idx, pad_mask);
+                            pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
+                        }
                     }
-                }
-                InputKind::GamepadState => {
-                    // Idempotent full-state snapshot from a capable client (see
-                    // `GamepadSnapshot`): applied only when its seq supersedes the last one, so
-                    // a datagram the network reordered can't roll held state backwards. The
-                    // client refreshes touched pads every ~100 ms, so an unchanged refresh is
-                    // the common case — skip the frame emit then (an XInput packet-number bump
-                    // for identical state is pure churn), but always advance the gate.
-                    use punktfunk_core::input::GamepadSnapshot;
-                    if let Some(snap) = GamepadSnapshot::from_event(&ev) {
-                        let idx = snap.pad as usize;
-                        if idx < MAX_WIRE_PADS && GamepadSnapshot::seq_newer(snap.seq, pad_seq[idx])
-                        {
-                            pad_seq[idx] = Some(snap.seq);
-                            let before = pad_state[idx];
-                            pad_state[idx].set_snapshot(&snap);
-                            let first = pad_mask & (1 << idx) == 0;
-                            if first || pad_state[idx] != before {
-                                pad_mask |= 1 << idx;
-                                let frame = pad_state[idx].frame(idx, pad_mask);
-                                pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
+                    InputKind::GamepadState => {
+                        // Idempotent full-state snapshot from a capable client (see
+                        // `GamepadSnapshot`): applied only when its seq supersedes the last one, so
+                        // a datagram the network reordered can't roll held state backwards. The
+                        // client refreshes touched pads every ~100 ms, so an unchanged refresh is
+                        // the common case — skip the frame emit then (an XInput packet-number bump
+                        // for identical state is pure churn), but always advance the gate.
+                        use punktfunk_core::input::GamepadSnapshot;
+                        if let Some(snap) = GamepadSnapshot::from_event(&ev) {
+                            let idx = snap.pad as usize;
+                            if idx < MAX_WIRE_PADS
+                                && GamepadSnapshot::seq_newer(snap.seq, pad_seq[idx])
+                            {
+                                pad_seq[idx] = Some(snap.seq);
+                                let before = pad_state[idx];
+                                pad_state[idx].set_snapshot(&snap);
+                                let first = pad_mask & (1 << idx) == 0;
+                                if first || pad_state[idx] != before {
+                                    pad_mask |= 1 << idx;
+                                    let frame = pad_state[idx].frame(idx, pad_mask);
+                                    pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
+                                }
                             }
                         }
                     }
-                }
-                InputKind::GamepadRemove => {
-                    // Mid-session hot-unplug from a snapshot-capable client (the native plane's
-                    // `activeGamepadMask` equivalent). Seq-gated in the SAME per-pad sequence
-                    // space as snapshots, so a snapshot the network reordered past this removal
-                    // is dropped (older seq) and can't resurrect the pad — while a later re-plug
-                    // on the same index arrives with a still-newer seq and is accepted. Clearing
-                    // the `active_mask` bit and re-emitting the frame fires every backend's
-                    // unplug sweep (`inject/*/gamepad.rs`), tearing down just this pad's device.
-                    let (pad, seq) = punktfunk_core::input::decode_gamepad_remove(ev.flags);
-                    let idx = pad as usize;
-                    if idx < MAX_WIRE_PADS
-                        && punktfunk_core::input::GamepadSnapshot::seq_newer(seq, pad_seq[idx])
-                    {
-                        pad_seq[idx] = Some(seq);
-                        if pad_mask & (1 << idx) != 0 {
-                            pad_mask &= !(1 << idx);
-                            pad_state[idx] = PadState::default();
-                            let frame = pad_state[idx].frame(idx, pad_mask);
-                            pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
-                            tracing::info!(pad = idx, "gamepad unplugged (native detach)");
-                        }
-                        // Fresh feedback bookkeeping so a later re-plug on this index inherits no
-                        // stale rumble lease (a lease still ticking would buzz the new pad).
-                        //
-                        // `rumble_seq` deliberately SURVIVES — do not reset it here. The client's
-                        // rumble reorder gate (`client/pump/datagram_task.rs`) is per-CONNECTION
-                        // and has no reset path, so restarting this counter strands every later
-                        // envelope for the re-plugged pad until the host climbs back past the
-                        // value the client already stored (up to 128 sends ≈ 15 s of continuous
-                        // rumble, or dozens of separate rumble events). The three clears below are
-                        // what actually kill a stale lease; the sibling `pad_seq` gate keeps its
-                        // value across a removal for exactly the same reason (see the comment at
-                        // the top of this arm).
-                        clear_pad_feedback(
-                            &mut rumble_state[idx],
-                            &mut rumble_seen[idx],
-                            &mut rumble_stop_burst[idx],
-                        );
-                        // The unplugged pad's 0xD1 streamer goes with it (seq-gated like the
-                        // rest of this arm, so a reordered stale removal can't kill the
-                        // stream of a re-plugged pad). A re-plug re-arrives and re-spawns.
-                        pad_streams.stop(idx);
-                    }
-                }
-                InputKind::GamepadArrival => {
-                    // Per-pad controller kind declaration (mixed types): route this pad's future
-                    // frames to a backend of the declared kind. `code` = the GamepadPref wire
-                    // byte, `flags` = pad index in the LOW BYTE — bits 8/9 carry the pad's
-                    // audio-render caps (haptics/speaker) from a pad-audio-capable client, so
-                    // the index MUST come from `decode_gamepad_arrival`, never the whole word.
-                    // Applied before the pad's first frame (the client sends it on slot open),
-                    // so the device is built as the right type from the start. The audio caps
-                    // are surfaced here for the 0xD1 capture path (which emits pad audio only
-                    // toward pads that declared a renderer).
-                    let (pad, audio_caps) = punktfunk_core::input::decode_gamepad_arrival(ev.flags);
-                    let idx = pad as usize;
-                    let kind = GamepadPref::from_u8(ev.code as u8);
-                    if audio_caps != 0 {
-                        tracing::debug!(
-                            pad = idx,
-                            haptics = audio_caps & 0x01 != 0,
-                            speaker = audio_caps & 0x02 != 0,
-                            "pad-audio render caps declared (arrival flags bits 8/9)"
-                        );
-                    }
-                    pads.set_kind(idx, kind);
-                    // Pad audio (0xD1): stream toward DualSense-family pads that declared a
-                    // renderer, only on a session that negotiated the cap. Idempotent across
-                    // the arrival re-sends (same kinds keeps the running streamer); a
-                    // re-declare without bits — or as a kind with no pad audio — stops it.
-                    if pad_audio_on {
-                        let want = if matches!(
-                            kind,
-                            GamepadPref::DualSense | GamepadPref::DualSenseEdge
-                        ) {
-                            audio_caps
-                        } else {
-                            0
-                        };
-                        if want != 0 {
-                            pad_streams.ensure(
-                                &conn,
-                                pad,
-                                want,
-                                matches!(kind, GamepadPref::DualSenseEdge),
+                    InputKind::GamepadRemove => {
+                        // Mid-session hot-unplug from a snapshot-capable client (the native plane's
+                        // `activeGamepadMask` equivalent). Seq-gated in the SAME per-pad sequence
+                        // space as snapshots, so a snapshot the network reordered past this removal
+                        // is dropped (older seq) and can't resurrect the pad — while a later re-plug
+                        // on the same index arrives with a still-newer seq and is accepted. Clearing
+                        // the `active_mask` bit and re-emitting the frame fires every backend's
+                        // unplug sweep (`inject/*/gamepad.rs`), tearing down just this pad's device.
+                        let (pad, seq) = punktfunk_core::input::decode_gamepad_remove(ev.flags);
+                        let idx = pad as usize;
+                        if idx < MAX_WIRE_PADS
+                            && punktfunk_core::input::GamepadSnapshot::seq_newer(seq, pad_seq[idx])
+                        {
+                            pad_seq[idx] = Some(seq);
+                            if pad_mask & (1 << idx) != 0 {
+                                pad_mask &= !(1 << idx);
+                                pad_state[idx] = PadState::default();
+                                let frame = pad_state[idx].frame(idx, pad_mask);
+                                pads.handle(&punktfunk_core::input::GamepadEvent::State(frame));
+                                tracing::info!(pad = idx, "gamepad unplugged (native detach)");
+                            }
+                            // Fresh feedback bookkeeping so a later re-plug on this index inherits no
+                            // stale rumble lease (a lease still ticking would buzz the new pad).
+                            //
+                            // `rumble_seq` deliberately SURVIVES — do not reset it here. The client's
+                            // rumble reorder gate (`client/pump/datagram_task.rs`) is per-CONNECTION
+                            // and has no reset path, so restarting this counter strands every later
+                            // envelope for the re-plugged pad until the host climbs back past the
+                            // value the client already stored (up to 128 sends ≈ 15 s of continuous
+                            // rumble, or dozens of separate rumble events). The three clears below are
+                            // what actually kill a stale lease; the sibling `pad_seq` gate keeps its
+                            // value across a removal for exactly the same reason (see the comment at
+                            // the top of this arm).
+                            clear_pad_feedback(
+                                &mut rumble_state[idx],
+                                &mut rumble_seen[idx],
+                                &mut rumble_stop_burst[idx],
                             );
-                        } else {
+                            // The unplugged pad's 0xD1 streamer goes with it (seq-gated like the
+                            // rest of this arm, so a reordered stale removal can't kill the
+                            // stream of a re-plugged pad). A re-plug re-arrives and re-spawns.
                             pad_streams.stop(idx);
                         }
                     }
-                }
-                _ => {
-                    // Track press/release so a mid-press disconnect can be undone below.
-                    match ev.kind {
-                        InputKind::MouseButtonDown if held_buttons.len() < MAX_HELD => {
-                            held_buttons.insert(ev.code);
+                    InputKind::GamepadArrival => {
+                        // Per-pad controller kind declaration (mixed types): route this pad's future
+                        // frames to a backend of the declared kind. `code` = the GamepadPref wire
+                        // byte, `flags` = pad index in the LOW BYTE — bits 8/9 carry the pad's
+                        // audio-render caps (haptics/speaker) from a pad-audio-capable client, so
+                        // the index MUST come from `decode_gamepad_arrival`, never the whole word.
+                        // Applied before the pad's first frame (the client sends it on slot open),
+                        // so the device is built as the right type from the start. The audio caps
+                        // are surfaced here for the 0xD1 capture path (which emits pad audio only
+                        // toward pads that declared a renderer).
+                        let (pad, audio_caps) =
+                            punktfunk_core::input::decode_gamepad_arrival(ev.flags);
+                        let idx = pad as usize;
+                        let kind = GamepadPref::from_u8(ev.code as u8);
+                        if audio_caps != 0 {
+                            tracing::debug!(
+                                pad = idx,
+                                haptics = audio_caps & 0x01 != 0,
+                                speaker = audio_caps & 0x02 != 0,
+                                "pad-audio render caps declared (arrival flags bits 8/9)"
+                            );
                         }
-                        InputKind::MouseButtonUp => {
-                            held_buttons.remove(&ev.code);
+                        pads.set_kind(idx, kind);
+                        // Pad audio (0xD1): stream toward DualSense-family pads that declared a
+                        // renderer, only on a session that negotiated the cap. Idempotent across
+                        // the arrival re-sends (same kinds keeps the running streamer); a
+                        // re-declare without bits — or as a kind with no pad audio — stops it.
+                        if pad_audio_on {
+                            let want = if matches!(
+                                kind,
+                                GamepadPref::DualSense | GamepadPref::DualSenseEdge
+                            ) {
+                                audio_caps
+                            } else {
+                                0
+                            };
+                            if want != 0 {
+                                pad_streams.ensure(
+                                    &conn,
+                                    pad,
+                                    want,
+                                    matches!(kind, GamepadPref::DualSenseEdge),
+                                );
+                            } else {
+                                pad_streams.stop(idx);
+                            }
                         }
-                        InputKind::KeyDown if held_keys.len() < MAX_HELD => {
-                            held_keys.insert(ev.code);
-                        }
-                        InputKind::KeyUp => {
-                            held_keys.remove(&ev.code);
-                        }
-                        _ => {}
                     }
-                    // Pointer/keyboard → the host-lifetime injector service (one persistent
-                    // portal session for every punktfunk/1 session). A send error only means the
-                    // service thread is gone (host shutting down) — dropping the event is fine,
-                    // input is lossy by design.
-                    let _ = inj_tx.send(ev);
+                    _ => {
+                        // Track press/release so a mid-press disconnect can be undone below.
+                        match ev.kind {
+                            InputKind::MouseButtonDown if held_buttons.len() < MAX_HELD => {
+                                held_buttons.insert(ev.code);
+                            }
+                            InputKind::MouseButtonUp => {
+                                held_buttons.remove(&ev.code);
+                            }
+                            InputKind::KeyDown if held_keys.len() < MAX_HELD => {
+                                held_keys.insert(ev.code);
+                            }
+                            InputKind::KeyUp => {
+                                held_keys.remove(&ev.code);
+                            }
+                            _ => {}
+                        }
+                        // Pointer/keyboard → the host-lifetime injector service (one persistent
+                        // portal session for every punktfunk/1 session). A send error only means the
+                        // service thread is gone (host shutting down) — dropping the event is fine,
+                        // input is lossy by design.
+                        let _ = inj_tx.send(ev);
+                    }
                 }
-            },
+            }
+            // An item whose grant guard above didn't hold: dropped. Normally unreachable — the
+            // datagram dispatch filters (and counts, and logs) non-granted traffic before it is
+            // offered to this channel — so no second counter here; this arm only exists to make
+            // the guarded arms above sound.
+            Ok(_) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }

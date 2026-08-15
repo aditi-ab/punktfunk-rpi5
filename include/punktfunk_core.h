@@ -1170,6 +1170,14 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`ClipState::reason`]: the operator policy allows clipboard, but THIS device's access grants
+// don't (`GRANT_CLIPBOARD` unbit — design/per-client-access.md §5.4). Distinct from
+// [`CLIP_REASON_POLICY_DISABLED`] so the client can say "not permitted for this device" instead
+// of "the host has clipboard off".
+#define PUNKTFUNK_CLIP_REASON_NOT_PERMITTED 5
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`ClipFetchHdr::status`]: the requested format is being served; data chunks follow until FIN.
 #define PUNKTFUNK_CLIP_FETCH_OK 0
 #endif
