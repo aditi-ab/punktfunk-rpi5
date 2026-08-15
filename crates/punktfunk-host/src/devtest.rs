@@ -231,11 +231,13 @@ pub fn dualsense_test(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Mint one pad-audio PipeWire sink (the Linux 0xD1 source, `audio::pad_sink`) and capture
-/// from it — the WP3 on-glass gate with no client involved. Verify the identity with
-/// `pactl list sinks` (name/description/proplist) and drive it with
-/// `pw-play --target <node.name> <file>` (or `paplay -d <node.name>`); captured chunks print
-/// a per-second summary here. `--pad N` (default 0), `--edge`, `--seconds N` (default 30).
+/// Mint one pad's audio node graph (the Linux 0xD1 source, `audio::pad_sink`) and capture the
+/// mix — the WP3 on-glass gate with no client involved. Three nodes appear, mirroring the split a
+/// physically connected DualSense presents: a mono `Speaker__sink`, a positioned-quad
+/// `SpeakerHaptic__sink`, and the hidden AUX parent. Verify the identity with `pactl list sinks`
+/// (name/description/proplist) and drive any of them with `pw-play --target <node.name>`;
+/// captured chunks print a per-second summary here. `--pad N` (default 0), `--edge`,
+/// `--seconds N` (default 30).
 #[cfg(target_os = "linux")]
 pub fn pad_sink_test(args: &[String]) -> Result<()> {
     use crate::audio::AudioCapturer as _;
@@ -256,18 +258,26 @@ pub fn pad_sink_test(args: &[String]) -> Result<()> {
     let mut cap = crate::audio::pad_sink::PadSinkCapturer::open(pad, edge)
         .context("mint pad-audio sink (is PipeWire running in this session?)")?;
     println!(
-        "pad sink minted: node.name = {}\n  api.alsa.split.name = {}  (what GE-Proton opens as \
-         pipewire:NODE=…)\n  inspect: pactl list sinks | grep -A25 Speaker__sink\n  \
-         drive it: pw-play --target '{}' --channel-map 'AUX0,AUX1,AUX2,AUX3' <48k-file>\n  \
-         (a POSITIONED wav folds into the speaker pair and never reaches the coils — the \
-         channel-map is not optional)\nCapturing for {secs}s…",
+        "pad nodes minted (the split a real DualSense presents):\n  \
+         speaker sink  = {}    (mono — GE-Proton's is_dualsense_speaker_sink target)\n  \
+         haptic sink   = {}    (4ch POSITIONED FL,FR,RL,RR — the public quad a real pad shows)\n  \
+         parent        = {}    (4ch AUX0..AUX3, hidden — what GE opens as pipewire:NODE=…)\n  \
+         inspect: pactl list sinks | grep -A25 Speaker\n  \
+         drive the coils via the POSITIONED sink (what a real pad's writers use):\n    \
+         pw-play --target '{}' --channel-map 'front-left,front-right,rear-left,rear-right' <48k-file>\n  \
+         drive the coils via the AUX parent (GE's own leg):\n    \
+         pw-play --target '{}' --channel-map 'AUX0,AUX1,AUX2,AUX3' <48k-file>\n  \
+         (a POSITIONED wav aimed at the AUX PARENT still folds into the speaker pair — that is \
+         why the positioned sink exists)\nCapturing for {secs}s…",
         cap.node_name,
+        cap.haptic_name,
         if cap.split_name.is_empty() {
             "(suppressed)"
         } else {
             cap.split_name.as_str()
         },
-        cap.node_name
+        cap.haptic_name,
+        cap.split_name,
     );
     let deadline = Instant::now() + Duration::from_secs(secs);
     let (mut chunks, mut samples) = (0u64, 0u64);
