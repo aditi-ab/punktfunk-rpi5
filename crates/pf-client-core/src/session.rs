@@ -347,6 +347,21 @@ pub enum SessionEvent {
         msg: String,
     },
     Stats(Stats),
+    /// The session's effective access (design/per-client-access.md §7): emitted once right
+    /// after [`Self::Connected`] with the Welcome's advert, then again for every mid-session
+    /// `AccessUpdate` the host sends (a console edit, the T−5 m / T−1 m expiry warnings) —
+    /// latest wins. `notice` is the toast-worthy one-liner for a mid-session change
+    /// ("Access is now Controller only", "Access ends in 5 m"); `None` on the initial
+    /// snapshot and on updates with nothing worth interrupting for.
+    ///
+    /// Courtesy chrome only — the HOST enforces the mask whatever an embedder does with
+    /// this. Embedders use it to gate capture (no pointer lock / keyboard grab without the
+    /// bits) and to wear the overlay chip; a default access (full control, permanent — every
+    /// old host) must render exactly today's look.
+    Access {
+        access: crate::access::SessionAccess,
+        notice: Option<String>,
+    },
 }
 
 /// How many times THIS PROCESS has had a session's codec exhaust the decode ladder — the
@@ -606,6 +621,14 @@ fn pump(
         mode: connector.mode(),
         fingerprint: connector.host_fingerprint,
     });
+    // The Welcome's access advert, straight after Connected so the embedder can gate its
+    // capture BEFORE it engages (design §7 "not capture what can't land"). Old hosts decode
+    // to full-control/permanent and the embedder renders today's look unchanged.
+    let mut access = crate::access::SessionAccess::from_connector(&connector);
+    let _ = ev_tx.send_blocking(SessionEvent::Access {
+        access,
+        notice: None,
+    });
 
     // Build the decoder for the codec the host resolved (never assume HEVC), honoring the
     // Settings backend preference (auto/native-*/software).
@@ -728,30 +751,35 @@ fn pump(
         .flatten();
     // The shared clipboard (design/clipboard-and-file-transfer.md §5): its own thread, since
     // `next_clip` blocks and the OS clipboard calls can wait on other apps. Returns straight
-    // away when the host has no clipboard capability, so spawning is unconditional.
-    let clipboard_thread = params
-        .clipboard
-        .then(|| {
-            let c = connector.clone();
-            let s = stop.clone();
-            std::thread::Builder::new()
-                .name("pf-clipboard".into())
-                .spawn(move || crate::clipboard::run(c, s))
-                .ok()
-        })
-        .flatten();
+    // away when the host has no clipboard capability, so spawning is gated only by the
+    // setting — and by the session's CLIPBOARD grant (the client half of design §5.4
+    // "deny at setup": the host's coordinator never starts for an ungranted session, so a
+    // bridge here would only ever collect NOT_PERMITTED refusals).
+    let clipboard_thread = (params.clipboard
+        && access.allows(punktfunk_core::quic::GRANT_CLIPBOARD))
+    .then(|| {
+        let c = connector.clone();
+        let s = stop.clone();
+        std::thread::Builder::new()
+            .name("pf-clipboard".into())
+            .spawn(move || crate::clipboard::run(c, s))
+            .ok()
+    })
+    .flatten();
     // The uplink, and with it the mute the embedder's chord drives. `set_live` is what makes
-    // the chord (and its indicator) real: a mic turned off in Settings, or a capture device
-    // that wouldn't open, leaves it false and the chord stays an honest no-op.
-    let _mic = params
-        .mic_enabled
+    // the chord (and its indicator) real: a mic turned off in Settings, a capture device
+    // that wouldn't open, OR a session without the MIC grant (the host would drop the
+    // datagrams — don't open the capture device for a plane that can't land) leaves it
+    // false and the chord stays an honest no-op. `mut`: a mid-session AccessUpdate moves
+    // the grant, and the uplink follows it live below.
+    let mut mic_uplink = (params.mic_enabled && access.allows(punktfunk_core::quic::GRANT_MIC))
         .then(|| {
             audio::MicStreamer::spawn(connector.clone(), mic.flag(), params.echo_cancel)
                 .map_err(|e| tracing::warn!(error = %e, "mic uplink disabled"))
                 .ok()
         })
         .flatten();
-    mic.set_live(_mic.is_some());
+    mic.set_live(mic_uplink.is_some());
 
     // Live host↔client clock offset: loaded per frame (Relaxed) so mid-stream re-syncs (an NTP
     // step, drift) keep the capture-clock latency stats honest — never cached at session start.
@@ -872,6 +900,39 @@ fn pump(
                     tracing::warn!(error = ?e, "debug mode switch request failed");
                 }
                 debug_reconfig = None;
+            }
+        }
+        // Mid-session access updates (a console edit, the T−5 m / T−1 m expiry warnings).
+        // Drain the queue and re-read the connector's live truth ONCE — latest wins per
+        // design, and the connector already folded every update before waking us. The mic
+        // uplink follows its grant live: removed → the capture device closes now (the host
+        // is dropping the plane anyway); granted back (and wanted in Settings) → it starts
+        // again without a reconnect.
+        {
+            let mut updated = false;
+            while connector.next_access_update(Duration::ZERO).is_ok() {
+                updated = true;
+            }
+            if updated {
+                let prev = access;
+                access = crate::access::SessionAccess::from_connector(&connector);
+                let notice = crate::access::update_notice(prev.grants, &access, Instant::now());
+                let mic_on = params.mic_enabled && access.allows(punktfunk_core::quic::GRANT_MIC);
+                if !mic_on && mic_uplink.is_some() {
+                    tracing::info!("MIC grant removed mid-session — stopping the mic uplink");
+                    mic_uplink = None;
+                    mic.set_live(false);
+                } else if mic_on && mic_uplink.is_none() {
+                    mic_uplink = audio::MicStreamer::spawn(
+                        connector.clone(),
+                        mic.flag(),
+                        params.echo_cancel,
+                    )
+                    .map_err(|e| tracing::warn!(error = %e, "mic uplink disabled"))
+                    .ok();
+                    mic.set_live(mic_uplink.is_some());
+                }
+                let _ = ev_tx.send_blocking(SessionEvent::Access { access, notice });
             }
         }
         // 20 ms wait: audio has its own thread now, so this only bounds stop-flag
@@ -1270,6 +1331,14 @@ fn pump(
             // line in front of the player for quitting their own game.
             Err(PunktfunkError::Closed) => {
                 use punktfunk_core::client::PunktfunkEndReason as End;
+                // A typed mid-session rejection names itself — today that is the access
+                // expiry (close 0x69, after the host's T−5 m / T−1 m warnings), which
+                // would otherwise file under HostError and render as "the host ended the
+                // session with an error": true, and exactly the wrong sentence. Same
+                // wording as the connect-time path, one vocabulary (design §7).
+                if let Some(reason) = connector.end_reject() {
+                    break Some(crate::trust::connect_reject_message(reason));
+                }
                 break match connector.end_reason() {
                     // The player quit the game the host launched. Nothing to report; a launcher
                     // embedder returns to its library, which is where they were headed anyway.

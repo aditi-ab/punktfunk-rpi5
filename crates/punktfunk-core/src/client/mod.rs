@@ -116,6 +116,23 @@ pub struct MicUplinkStats {
 /// the control task is wedged, which callers treat as a closed session.
 const CTRL_QUEUE: usize = 32;
 
+/// Inbound access-update queue depth. The traffic is a console edit or an expiry warning —
+/// a handful per session at most; the live grants/deadline slots hold the truth, so a full
+/// queue drops news the embedder would re-derive from them anyway.
+const ACCESS_QUEUE: usize = 8;
+
+/// The absolute access deadline (client wall clock, unix seconds) a relative
+/// `expires_in_secs` / `remaining_secs` resolves to at `now_ns`; `0` stays `0` (permanent).
+/// Anchored to the CLIENT's clock on purpose: the wire value is relative, so host/client
+/// skew never moves the countdown a chip renders from this.
+pub(crate) fn access_deadline_from(now_ns: u64, remaining_secs: u32) -> u64 {
+    if remaining_secs == 0 {
+        0
+    } else {
+        now_ns / 1_000_000_000 + u64::from(remaining_secs)
+    }
+}
+
 /// Why a session ended — [`NativeClient::end_reason`], and `punktfunk_connection_end_reason` on the
 /// C surface.
 ///
@@ -234,6 +251,11 @@ pub struct NativeClient {
     cursor_shape: Mutex<Receiver<crate::quic::CursorShape>>,
     /// Inbound per-frame cursor state — `0xD0` datagrams (same negotiation gate as shapes).
     cursor_state: Mutex<Receiver<crate::quic::CursorState>>,
+    /// Inbound mid-session access updates (control-stream [`crate::quic::AccessUpdate`]) —
+    /// the wake-up plane behind [`NativeClient::next_access_update`]. The live TRUTH is
+    /// `access_grants` / `access_deadline_unix` below, already updated when an event lands
+    /// here, so a dropped event (full queue) loses news but never accuracy.
+    access: Mutex<Receiver<crate::quic::AccessUpdate>>,
     input_tx: tokio::sync::mpsc::UnboundedSender<InputEvent>,
     /// Outbound mic frames `(seq, pts_ns, opus)` → encoded as 0xCB datagrams by the worker.
     /// Bounded ([`MIC_QUEUE`]): the pump sheds stale frames oldest-first and a full queue drops
@@ -271,6 +293,16 @@ pub struct NativeClient {
     /// The host's management-API port ([`crate::quic::Welcome::mgmt_port`]), or `0` when the host
     /// did not advertise one — see [`NativeClient::mgmt_port`].
     pub mgmt_port: u16,
+    /// The session's LIVE effective access grants (the [`crate::quic::GRANT_GAMEPAD`] family):
+    /// seeded from the Welcome advert, moved by every mid-session
+    /// [`crate::quic::AccessUpdate`] (latest wins) — see [`NativeClient::access_grants`].
+    access_grants: Arc<AtomicU32>,
+    /// The live access deadline (client wall clock, unix seconds; `0` = permanent) — see
+    /// [`NativeClient::access_deadline_unix`].
+    access_deadline_unix: Arc<AtomicU64>,
+    /// The typed [`crate::reject::RejectReason`] close code a mid-session end carried
+    /// (`0` = none) — see [`NativeClient::end_reject`].
+    end_reject_code: Arc<AtomicU32>,
     /// Speed-test accumulator, shared with the data-plane pump + control task.
     probe: Arc<Mutex<ProbeState>>,
     shutdown: Arc<AtomicBool>,
@@ -577,6 +609,8 @@ impl NativeClient {
             std::sync::mpsc::sync_channel::<crate::quic::CursorShape>(CURSOR_SHAPE_QUEUE);
         let (cursor_state_tx, cursor_state_rx) =
             std::sync::mpsc::sync_channel::<crate::quic::CursorState>(CURSOR_STATE_QUEUE);
+        let (access_tx, access_rx) =
+            std::sync::mpsc::sync_channel::<crate::quic::AccessUpdate>(ACCESS_QUEUE);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Negotiated>>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let end_reason = Arc::new(AtomicU8::new(PunktfunkEndReason::None as u8));
@@ -594,6 +628,12 @@ impl NativeClient {
         let decode_lat = Arc::new(Mutex::new(DecodeLatAcc::default()));
         // Seeded by the pump from the Welcome (before ready_tx), then follows every ack.
         let live_bitrate = Arc::new(AtomicU32::new(0));
+        // Access truth (same seeding discipline as `live_bitrate`): the pump writes the
+        // Welcome advert into both before ready_tx, the control task follows every
+        // AccessUpdate. GRANT_ALL/permanent here is only the pre-handshake placeholder.
+        let access_grants = Arc::new(AtomicU32::new(crate::quic::GRANT_ALL));
+        let access_deadline_unix = Arc::new(AtomicU64::new(0));
+        let end_reject_code = Arc::new(AtomicU32::new(0));
 
         let host = host.to_string();
         let frame_chan_w = frame_chan.clone();
@@ -610,6 +650,9 @@ impl NativeClient {
         let decode_lat_w = decode_lat.clone();
         let live_bitrate_w = live_bitrate.clone();
         let pad_audio_caps_w = pad_audio_caps.clone();
+        let access_grants_w = access_grants.clone();
+        let access_deadline_w = access_deadline_unix.clone();
+        let end_reject_w = end_reject_code.clone();
         let ctrl_tx_pump = ctrl_tx.clone(); // the data-plane pump sends adaptive-FEC LossReports
         let worker = std::thread::Builder::new()
             .name("punktfunk-client".into())
@@ -685,6 +728,10 @@ impl NativeClient {
                     clock_offset: clock_offset_w,
                     decode_lat: decode_lat_w,
                     live_bitrate: live_bitrate_w,
+                    access_grants: access_grants_w,
+                    access_deadline_unix: access_deadline_w,
+                    access_tx,
+                    end_reject_code: end_reject_w,
                 }));
             })
             .map_err(PunktfunkError::Io)?;
@@ -716,6 +763,10 @@ impl NativeClient {
             host_timing: Mutex::new(host_timing_rx),
             cursor_shape: Mutex::new(cursor_shape_rx),
             cursor_state: Mutex::new(cursor_state_rx),
+            access: Mutex::new(access_rx),
+            access_grants,
+            access_deadline_unix,
+            end_reject_code,
             input_tx,
             mic_tx,
             mic_stats,
@@ -981,6 +1032,17 @@ impl NativeClient {
     /// Shorthand for the single most actionable reason: the host's launched game exited.
     pub fn ended_because_game_exited(&self) -> bool {
         self.end_reason() == PunktfunkEndReason::GameExited
+    }
+
+    /// The typed [`crate::reject::RejectReason`] a MID-SESSION close carried, if any — an
+    /// access expiry (`0x69`) being the case this exists for: [`end_reason`](Self::end_reason)
+    /// can only file an unrecognized deliberate close under `HostError`, and "the host ended
+    /// the session with an error" is the wrong sentence for "your access expired". Latches
+    /// with `end_reason` (same ordering discipline); `None` for every ordinary end. The
+    /// CONNECT-time rejections never land here — they surface as
+    /// [`PunktfunkError::Rejected`] from [`connect`](Self::connect) itself.
+    pub fn end_reject(&self) -> Option<crate::reject::RejectReason> {
+        crate::reject::RejectReason::from_close_code(self.end_reject_code.load(Ordering::SeqCst))
     }
 
     /// Register the calling thread as latency-critical so a later
@@ -1392,6 +1454,43 @@ impl NativeClient {
     /// where multicast never worked — no longer has to be assumed to be on 47990.
     pub fn mgmt_port(&self) -> u16 {
         self.mgmt_port
+    }
+
+    /// The session's LIVE effective access grants — the [`crate::quic::GRANT_GAMEPAD`] family,
+    /// seeded from the `Welcome` advert and moved by every mid-session
+    /// [`crate::quic::AccessUpdate`] (latest wins). An old host advertises nothing and this
+    /// reads [`crate::quic::GRANT_ALL`] — full control, the pre-grants behavior, so an
+    /// embedder keying UI off it changes nothing there.
+    ///
+    /// Courtesy truth only: the HOST enforces the mask whatever a client renders. Read it per
+    /// use (one relaxed load), never cache across an [`next_access_update`](Self::next_access_update)
+    /// wake.
+    pub fn access_grants(&self) -> u32 {
+        self.access_grants.load(Ordering::Relaxed)
+    }
+
+    /// When this session's access expires, as CLIENT wall clock unix seconds — `None` =
+    /// permanent (today's default, and everything an old host's Welcome decodes to). Anchored
+    /// client-side from the wire's relative seconds, so host/client clock skew never moves a
+    /// countdown rendered from it; re-anchored by every `AccessUpdate`.
+    pub fn access_deadline_unix(&self) -> Option<u64> {
+        match self.access_deadline_unix.load(Ordering::Relaxed) {
+            0 => None,
+            d => Some(d),
+        }
+    }
+
+    /// Pull the next mid-session [`crate::quic::AccessUpdate`] (a console edit, or the host's
+    /// T−5 m / T−1 m expiry warnings). One consumer, like every plane. The live truth is
+    /// already in [`access_grants`](Self::access_grants) /
+    /// [`access_deadline_unix`](Self::access_deadline_unix) when this wakes — the event is the
+    /// UI's cue to re-gate capture and toast, not the data's source of record.
+    pub fn next_access_update(&self, timeout: Duration) -> Result<crate::quic::AccessUpdate> {
+        match self.access.lock().unwrap().recv_timeout(timeout) {
+            Ok(u) => Ok(u),
+            Err(RecvTimeoutError::Timeout) => Err(PunktfunkError::NoFrame),
+            Err(RecvTimeoutError::Disconnected) => Err(PunktfunkError::Closed),
+        }
     }
 
     /// Enable or disable the shared clipboard for this session (`design/clipboard-and-file-transfer.md`

@@ -76,6 +76,10 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         clock_offset,
         decode_lat,
         live_bitrate,
+        access_grants,
+        access_deadline_unix,
+        access_tx,
+        end_reject_code,
         ..
     } = args;
     // Copies the pump needs after `negotiated` is handed over to `connect`.
@@ -88,6 +92,15 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     // Same discipline for the live encoder target: the Welcome resolve is the starting truth
     // (0 against an old host that reports none); every BitrateChanged ack moves it from there.
     live_bitrate.store(negotiated.bitrate_kbps, Ordering::Relaxed);
+    // …and for the live access truth: the Welcome advert seeds both slots before the embedder
+    // can observe the client, so `access_grants()` never reads a pre-handshake GRANT_ALL on a
+    // limited session. The deadline is anchored to the CLIENT's wall clock here — the wire
+    // carries a relative `expires_in_secs`, so host/client skew never moves the countdown.
+    access_grants.store(negotiated.grants, Ordering::Relaxed);
+    access_deadline_unix.store(
+        access_deadline_from(wall_clock_ns(), negotiated.expires_in_secs),
+        Ordering::Relaxed,
+    );
     // Bumped by the control task each time a re-sync batch is APPLIED; the pump watches it to
     // reset its staleness counters and re-arm the clock-based jump-to-live detector.
     let clock_gen = Arc::new(AtomicU32::new(0));
@@ -166,6 +179,9 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             clip_event_tx: clip_event_tx.clone(),
             cursor_shape_tx,
             mode_gen: mode_gen.clone(),
+            access_grants,
+            access_deadline_unix,
+            access_tx,
         }
         .run(),
     );
@@ -205,6 +221,12 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             // Latch the reason BEFORE `shutdown`: the two are observed by different threads, and a
             // client that reacts to the shutdown flag must never find the reason still unset.
             let reason = crate::client::PunktfunkEndReason::from(&why);
+            // A typed rejection code on a MID-SESSION close (access expiry, and whatever the
+            // vocabulary grows next) rides beside the coarse reason, same ordering discipline,
+            // so the embedder's end path can say the real sentence instead of "host error".
+            if let Some(r) = reject_from_close(&conn) {
+                end_reject_code.store(r.close_code(), Ordering::SeqCst);
+            }
             end_reason.store(reason as u8, Ordering::SeqCst);
             shutdown.store(true, Ordering::SeqCst);
         });

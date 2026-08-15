@@ -42,6 +42,13 @@ pub mod deeplink;
 // state machine every front-end drives, and the session spawn + stdout contract.
 #[cfg(any(target_os = "linux", windows))]
 pub mod orchestrate;
+// The session's effective access, client-side (design/per-client-access.md §7): the
+// snapshot type over the shared grant vocabulary, the derived preset label, the overlay
+// chip's text and the AccessUpdate toast wording. Pure presentation logic — the
+// Apple/Android ports mirror its rules rather than link it. Gated with the session
+// modules only because macOS has no punktfunk-core dependency to name the grants with.
+#[cfg(any(target_os = "linux", windows))]
+pub mod access;
 // The host's OS-identity chain (mDNS `os=` TXT): sanitize + icon-walk order. Pure string
 // logic, built everywhere (the Apple/Android ports mirror it rather than link it).
 pub mod os;

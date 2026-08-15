@@ -56,6 +56,13 @@ pub struct FrameCtx<'a> {
     pub stats: Option<&'a str>,
     /// The capture hint (bottom-center pill, "click to capture…"); `None` = hidden.
     pub hint: Option<&'a str>,
+    /// The access chip (per-client access §7 "say what this session is"): a small standing
+    /// pill — "Controller only · ends in 1 h 58 m" — drawn at every stats tier, `None` for
+    /// a full-control permanent session (today's default look, and every old host).
+    pub access: Option<&'a str>,
+    /// A transient access toast ("Access is now Controller only", "Access ends in 5 m") —
+    /// takes the hint pill's slot with priority while up. The run loop owns its timing.
+    pub notice: Option<&'a str>,
     /// The user muted their microphone mid-stream (Ctrl+Alt+Shift+V). Draws a persistent
     /// badge, deliberately independent of the stats tier: a muted mic is a fact about what
     /// the host is hearing, and "did my mute take?" must be answerable with the overlay off.

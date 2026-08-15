@@ -35,6 +35,17 @@ pub(super) struct ControlTask {
     /// resets the bitrate controller's mode-scoped learned state — the encoder ceiling / compute
     /// knee it was taught belong to the OLD mode.
     pub(super) mode_gen: Arc<AtomicU32>,
+    /// The session's LIVE access grants ([`NativeClient::access_grants`]): every inbound
+    /// [`AccessUpdate`] overwrites it (latest wins) BEFORE the event is forwarded, so a reader
+    /// woken by the event never sees the pre-update mask.
+    pub(super) access_grants: Arc<AtomicU32>,
+    /// The live access deadline (client wall clock, unix seconds; `0` = permanent) — re-anchored
+    /// from every `AccessUpdate`'s relative `remaining_secs`.
+    pub(super) access_deadline_unix: Arc<std::sync::atomic::AtomicU64>,
+    /// Access updates → the embedder's event plane ([`NativeClient::next_access_update`]).
+    /// try_send like the clipboard/cursor planes: a lagging embedder drops the oldest news,
+    /// and the two live slots above already hold the latest truth it would re-derive.
+    pub(super) access_tx: std::sync::mpsc::SyncSender<crate::quic::AccessUpdate>,
 }
 
 impl ControlTask {
@@ -54,6 +65,9 @@ impl ControlTask {
             clip_event_tx,
             cursor_shape_tx,
             mode_gen,
+            access_grants,
+            access_deadline_unix,
+            access_tx,
         } = self;
         // Mid-stream clock re-sync (see [`ClockResync`]): a batch runs every
         // CLOCK_RESYNC_INTERVAL and whenever the pump asks (CtrlRequest::ClockResync after
@@ -275,6 +289,26 @@ impl ControlTask {
                                 "out-of-bounds shard-payload change — ignoring (no ack)"
                             );
                         }
+                    } else if let Ok(upd) = crate::quic::AccessUpdate::decode(&msg) {
+                        // Mid-session access change (a console edit) or an expiry warning
+                        // (T−5 m / T−1 m). Latest-wins per design: fold the update into the
+                        // live slots FIRST, then wake the embedder — the host enforces
+                        // regardless, this is the courtesy that lets the client release a
+                        // grab it no longer backs and warn before the expiry close.
+                        tracing::info!(
+                            grants = upd.grants,
+                            remaining_secs = upd.remaining_secs,
+                            "host updated this session's access"
+                        );
+                        access_grants.store(upd.grants, Ordering::Relaxed);
+                        access_deadline_unix.store(
+                            crate::client::access_deadline_from(
+                                wall_clock_ns(),
+                                upd.remaining_secs,
+                            ),
+                            Ordering::Relaxed,
+                        );
+                        let _ = access_tx.try_send(upd);
                     } else if let Ok(shape) = crate::quic::CursorShape::decode(&msg) {
                         // Pointer bitmap changed (cursor channel, only when negotiated). try_send:
                         // an overflowing ring drops the newest shape — the next change resends.
