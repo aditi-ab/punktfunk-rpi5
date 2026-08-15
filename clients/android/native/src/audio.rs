@@ -851,6 +851,15 @@ fn decode_loop(
     let mut window_peak = 0f32; // loudest |sample| since the last log — tells a tone from silence
     let mut gaps = punktfunk_core::audio::AudioGapTracker::new();
     let mut frame_samples = 0usize; // per-channel samples of the last decoded frame — the PLC unit
+                                    // WP-C1 — the drought half of concealment. The loop below already conceals a SEQ GAP, but only
+                                    // when a later packet arrives to reveal it; when the wire simply goes quiet — Wi-Fi power-save
+                                    // bunching, the shape this preset already runs deeper for — nothing arrives to reveal anything
+                                    // and the ring drains into an underrun and a de-prime whose re-prime is a longer artifact than
+                                    // the audio that was missing.
+    let mut drought = punktfunk_core::audio::DroughtConceal::new(
+        punktfunk_core::audio::JitterTuning::AAUDIO.plc_max_ms(),
+    );
+    let mut last_packet = std::time::Instant::now();
 
     // A/V sync (audio latency overhaul). This thread is the only place holding all three
     // ingredients at once: the packet's host capture `pts_ns`, the ring depth (via the sync cell)
@@ -894,10 +903,15 @@ fn decode_loop(
                     sync.set_target(av.desired_depth(depth));
                     av_offset_out.store(av.offset_ms() as i64, Ordering::Relaxed);
                 }
+                last_packet = std::time::Instant::now();
+                // Anything the drought path already covered is audio the stream now has;
+                // concealing it a second time here would insert samples it never carried and push
+                // everything after them later.
+                let already = drought.packet();
                 // Conceal lost packets (a seq gap) with libopus PLC before decoding the one that
                 // arrived: empty input synthesizes `frame_samples` of interpolation per missing
                 // packet — an inaudible fade instead of the click a hard gap makes in the ring.
-                for _ in 0..gaps.missing_before(pkt.seq) {
+                for _ in 0..gaps.missing_before(pkt.seq).saturating_sub(already) {
                     let plc = frame_samples * channels;
                     if plc == 0 {
                         break; // no decoded frame yet to size the concealment from
@@ -958,13 +972,17 @@ fn decode_loop(
                             // the picture); 0 with sync off, or before it has a video reference.
                             // Logged next to the depth because a deep ring on a jittery link is
                             // correct and only the offset separates that from audio held late.
+                            // `plc_ms` is concealment synthesized for packet droughts: a healthy
+                            // `underruns` bought with a climbing `plc_ms` is a link in trouble,
+                            // not a link that is fine.
                             log::info!(
-                                "audio: opus={count} pcm_frames={} underruns={} buffer_ms={} target_ms={} av_ms={} peak={window_peak:.3}",
+                                "audio: opus={count} pcm_frames={} underruns={} buffer_ms={} target_ms={} av_ms={} plc_ms={} peak={window_peak:.3}",
                                 counters.pcm_written.load(Ordering::Relaxed),
                                 counters.underruns.load(Ordering::Relaxed),
                                 (depth / ms.max(1)) as u64,
                                 counters.target_ms.load(Ordering::Relaxed),
                                 av.offset_ms(),
+                                drought.total_ms(),
                             );
                             window_peak = 0.0;
                         }
@@ -972,7 +990,31 @@ fn decode_loop(
                     Err(e) => log::debug!("audio: opus decode: {e}"),
                 }
             }
-            Err(PunktfunkError::NoFrame) => {} // timeout
+            Err(PunktfunkError::NoFrame) => {
+                // Nothing on the wire. If the ring is draining with it, conceal from the decoder's
+                // own state — the same libopus interpolation the loss path uses, bounded by this
+                // preset's de-prime fuse so a genuinely dead stream is not papered over. ONE frame
+                // per tick, not a burst: this arm fires every 5 ms, which is the rate the callback
+                // drains at, so concealment keeps pace with playout instead of racing ahead of a
+                // depth reading it has already invalidated. `frame_samples` is 0 until something
+                // has decoded — there is no state to extrapolate from before then.
+                let depth_ms = (sync.depth() / ms.max(1)) as u32;
+                if frame_samples > 0 && drought.conceal(last_packet.elapsed(), depth_ms) {
+                    let plc = frame_samples * channels;
+                    if let Ok(samples) = dec.decode_float(&[], &mut pcm[..plc], false) {
+                        let mut buf = free_rx
+                            .try_recv()
+                            .unwrap_or_else(|_| Vec::with_capacity(pcm_scratch));
+                        buf.clear();
+                        buf.extend_from_slice(&pcm[..samples * channels]);
+                        match tx.try_send(buf) {
+                            Ok(()) | Err(TrySendError::Full(_)) => {}
+                            Err(TrySendError::Disconnected(_)) => return DecodeExit::Shutdown,
+                        }
+                    }
+                    sync.publish_plc_ms(drought.total_ms());
+                }
+            }
             Err(_) => return DecodeExit::SessionClosed,
         }
     }

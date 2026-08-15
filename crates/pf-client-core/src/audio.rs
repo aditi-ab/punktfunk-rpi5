@@ -174,6 +174,12 @@ impl Drop for AudioPlayer {
     }
 }
 
+/// This backend's de-jitter tuning. Named once so the decode thread can read the same numbers the
+/// callback runs on — its drought concealment is bounded by this preset's de-prime fuse, and the
+/// two drifting apart is exactly how one platform quietly ends up with a third of another's slack.
+pub(crate) const TUNING: punktfunk_core::audio::JitterTuning =
+    punktfunk_core::audio::JitterTuning::PIPEWIRE;
+
 /// Producer-side state: incoming decoded PCM and the ring the process callback drains.
 struct PlayerData {
     rx: Receiver<Vec<f32>>,
@@ -247,10 +253,7 @@ fn pw_thread(
         rx: pcm_rx,
         recycle: recycle_tx,
         ring: VecDeque::new(),
-        policy: punktfunk_core::audio::JitterPolicy::new(
-            punktfunk_core::audio::JitterTuning::PIPEWIRE,
-            channels as u8,
-        ),
+        policy: punktfunk_core::audio::JitterPolicy::new(TUNING, channels as u8),
         channels,
         underruns: 0,
         sheds: 0,
@@ -361,6 +364,10 @@ fn pw_thread(
                         target_ms = ud.policy.target_ms(),
                         underruns = ud.underruns,
                         drift_sheds = ud.sheds,
+                        // Concealment must be visible next to the underruns it prevented: a
+                        // healthy `underruns` bought with a climbing `plc_ms` is a link in
+                        // trouble, not a link that is fine.
+                        plc_ms = ud.sync.plc_ms(),
                         "audio playback"
                     );
                 }
