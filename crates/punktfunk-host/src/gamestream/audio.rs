@@ -218,12 +218,15 @@ pub fn start(
     params: AudioParams,
     audio_cap: AudioCapSlot,
     on_lost: super::OnSessionLost,
+    owner_ip: Option<std::net::IpAddr>,
 ) {
     let _ = std::thread::Builder::new()
         .name("punktfunk-audio".into())
         .spawn(move || {
             tracing::info!(?params, "audio stream starting");
-            if let Err(e) = run(&running, &gcm_key, rikeyid, params, &audio_cap, &on_lost) {
+            if let Err(e) = run(
+                &running, &gcm_key, rikeyid, params, &audio_cap, &on_lost, owner_ip,
+            ) {
                 tracing::error!(error = %format!("{e:#}"), "audio stream failed");
             }
             running.store(false, Ordering::SeqCst);
@@ -243,6 +246,7 @@ pub fn start(
     _params: AudioParams,
     _audio_cap: AudioCapSlot,
     _on_lost: super::OnSessionLost,
+    _owner_ip: Option<std::net::IpAddr>,
 ) {
     tracing::error!("GameStream audio requires Linux (PipeWire) or Windows (WASAPI) + libopus");
     running.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -256,6 +260,7 @@ fn run(
     params: AudioParams,
     audio_cap: &std::sync::Mutex<Option<Box<dyn AudioCapturer>>>,
     on_lost: &super::OnSessionLost,
+    owner_ip: Option<std::net::IpAddr>,
 ) -> Result<()> {
     let sock = UdpSocket::bind(("0.0.0.0", AUDIO_PORT)).context("bind audio UDP")?;
     // Grow SO_SNDBUF/RCVBUF; the opt-in DSCP/QoS tag happens after connect below (Windows
@@ -265,9 +270,27 @@ fn run(
     sock.set_read_timeout(Some(Duration::from_secs(10)))?;
     tracing::debug!(port = AUDIO_PORT, "audio: awaiting client ping");
     let mut probe = [0u8; 256];
-    let (_, client) = sock
-        .recv_from(&mut probe)
-        .context("audio: no client ping within 10s")?;
+    // Same owner-IP bind as the video plane (LaunchSession::peer_ip): only the launching peer's
+    // pings are honored, so an off-path LAN peer cannot capture the audio endpoint (a DoS here, as
+    // audio payload is AES-CBC under `rikey`). `None` keeps the pre-owner behavior.
+    // security-review 2026-08-15 finding 1.
+    let client = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("audio: no client ping from the launch owner within 10s");
+            }
+            sock.set_read_timeout(Some(remaining))?;
+            let (_, src) = sock
+                .recv_from(&mut probe)
+                .context("audio: no client ping within 10s")?;
+            if owner_ip.is_some_and(|ip| ip != src.ip()) {
+                continue;
+            }
+            break src;
+        }
+    };
     sock.connect(client)
         .context("connect client audio endpoint")?;
     // Opt-in DSCP/QoS-tag this as the audio class (PUNKTFUNK_DSCP=1); the guard keeps the

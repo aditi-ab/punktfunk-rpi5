@@ -363,6 +363,12 @@ jobs:
           envs: REGISTRY_TOKEN
           script: |
             set -euo pipefail
+            # Log out on EVERY exit path: unlike the ephemeral LAN-registry runners, this is a
+            # long-lived internet-facing VM, so a `write:package` PAT left base64-encoded in
+            # ~/.docker/config.json is credential-at-rest on the most exposed host in the estate.
+            # The LAN jobs above already `docker logout`; this one omitted it. security-review
+            # 2026-08-15 finding 14.
+            trap 'docker logout git.unom.io || true' EXIT
             printf '%s' "$REGISTRY_TOKEN" | docker login git.unom.io -u enricobuehler --password-stdin
             cd ~/punktfunk-docs
             docker compose -f compose.production.yml pull docs

@@ -98,7 +98,19 @@ export const ApproveDialog: FC<{
 				<DialogContent className="max-w-md">
 					<DialogHeader>
 						<DialogTitle>{m.pairing_pending_name_title()}</DialogTitle>
-						<DialogDescription>{m.pairing_approve_desc()}</DialogDescription>
+						{/* The name field below is editable text, not a statement of WHICH knock
+						    this is — with two devices waiting the operator would be approving
+						    whichever row they hope they clicked. The fingerprint is the only
+						    thing that stays unique when two devices share a name, so the
+						    description states it (security-review 2026-08-15, carried into the
+						    access dialog that replaced the plain name prompt). */}
+						<DialogDescription>
+							{m.pairing_pending_name_desc({
+								name: device.name,
+								fp: `${device.fingerprint.slice(0, 16)}…`,
+							})}{" "}
+							{m.pairing_approve_desc()}
+						</DialogDescription>
 					</DialogHeader>
 
 					<div className="space-y-2">

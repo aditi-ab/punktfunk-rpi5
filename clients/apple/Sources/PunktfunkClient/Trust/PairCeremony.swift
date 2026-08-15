@@ -49,7 +49,7 @@ final class PairCeremony: ObservableObject {
                 let identity = try ClientIdentityStore.shared.loadForPairing()
                 return try PunktfunkKit.pair(
                     host: address, port: port, identity: identity,
-                    pin: pin, name: name.isEmpty ? "Mac" : name)
+                    pin: pin, name: name.isEmpty ? DeviceName.current : name)
             }
             await MainActor.run {
                 guard !token.cancelled else { return } // screen dismissed mid-ceremony

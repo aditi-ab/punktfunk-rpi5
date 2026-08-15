@@ -66,6 +66,11 @@ pub struct GameLifetime {
     /// Hex cert fingerprint of the paired client that owns the launch, so only it can reclaim its own
     /// game. `None` when the peer cert couldn't be read.
     pub fingerprint: Option<String>,
+    /// Source IP of the launching peer ([`super::LaunchSession::peer_ip`]), enforced when the video
+    /// thread learns its UDP endpoint so an off-path LAN peer cannot win the endpoint race and be
+    /// handed the (plaintext) video stream. `None` keeps the pre-owner behavior. security-review
+    /// 2026-08-15 finding 1.
+    pub owner_ip: Option<std::net::IpAddr>,
     /// Ends the whole session, deliberately — the action for "the launched game exited".
     pub on_game_exit: super::OnSessionLost,
 }
@@ -193,9 +198,27 @@ fn run(
         "video: awaiting client ping to learn endpoint"
     );
     let mut probe = [0u8; 256];
-    let (_, client) = sock
-        .recv_from(&mut probe)
-        .context("video: no client ping within 10s")?;
+    // Bind only to the launch owner's source IP (LaunchSession::peer_ip), the same owner the
+    // RTSP/ENet planes enforce. Video is plaintext by design, so without this an off-path LAN peer
+    // trickling UDP at this port wins the endpoint race in `recv_from` and is handed the desktop.
+    // `None` keeps the pre-owner behavior. security-review 2026-08-15 finding 1.
+    let client = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("video: no client ping from the launch owner within 10s");
+            }
+            sock.set_read_timeout(Some(remaining))?;
+            let (_, src) = sock
+                .recv_from(&mut probe)
+                .context("video: no client ping within 10s")?;
+            if life.owner_ip.is_some_and(|ip| ip != src.ip()) {
+                continue;
+            }
+            break src;
+        }
+    };
     sock.connect(client)
         .context("connect client video endpoint")?;
     // Opt-in DSCP/QoS-tag this as the video class (PUNKTFUNK_DSCP=1); the guard keeps the

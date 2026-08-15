@@ -1,6 +1,5 @@
 package io.unom.punktfunk
 
-import android.os.Build
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -14,6 +13,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
@@ -206,7 +206,9 @@ fun AwaitingApprovalPrompt(gamepadUi: Boolean, hostLabel: String, onCancel: () -
         actions = listOf(DialogAction("Cancel", primary = true, onClick = onCancel)),
         dismissOnOutsideTap = false,
     ) {
-        val deviceName = Build.MODEL ?: "this device"
+        // MUST be the name the connect actually knocked with (`HostConnect`), or this sends the
+        // user looking for a row the console does not show.
+        val label = deviceName(LocalContext.current)
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -222,7 +224,7 @@ fun AwaitingApprovalPrompt(gamepadUi: Boolean, hostLabel: String, onCancel: () -
             )
         }
         PromptText(
-            "Open the host's console (or web UI) and approve “$deviceName”. It connects " +
+            "Open the host's console (or web UI) and approve “$label”. It connects " +
                 "automatically once you approve — no PIN needed.",
             gamepadUi,
         )

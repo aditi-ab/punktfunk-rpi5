@@ -297,9 +297,17 @@ jobs:
           # so the installer ships just bun + a ~75-file .output instead of node + a node_modules forest.
           $ver = 'bun-v1.3.14'
           $url = "https://github.com/oven-sh/bun/releases/download/$ver/bun-windows-x64.zip"
+          # SHA-256 of this exact asset, pinned. GitHub release assets are MUTABLE at a fixed URL, so
+          # the tag alone vouches for nothing — this binary is Authenticode-signed into our installer
+          # and its hash published in the Ed25519 update manifest, i.e. our signature vouches for bytes
+          # we downloaded. Verify them. On a bun bump, update BOTH $ver and $sha (compute:
+          # `shasum -a 256 bun-windows-x64.zip`). security-review 2026-08-15 finding 12.
+          $sha = '0a0620930b6675d7ba440e81f4e0e00d3cfbe096c4b140d3fff02205e9e18922'
           New-Item -ItemType Directory -Force -Path C:\t | Out-Null
           $zip = 'C:\t\bun.zip'; $dst = 'C:\t\bundist'
           Invoke-WebRequest -Uri $url -OutFile $zip
+          $got = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          if ($got -ne $sha) { throw "bun zip sha256 mismatch for ${ver}: got $got, pinned $sha" }
           if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
           Expand-Archive -Path $zip -DestinationPath $dst -Force
           $bun = (Get-ChildItem -Path $dst -Recurse -Filter bun.exe | Select-Object -First 1).FullName

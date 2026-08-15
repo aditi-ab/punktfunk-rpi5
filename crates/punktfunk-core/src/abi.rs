@@ -1811,6 +1811,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex7(
             observed_sha256_out,
             client_cert_pem,
             client_key_pem,
+            std::ptr::null(), // pre-v21 variant: no device name, so the OS default stands
             timeout_ms,
             std::ptr::null_mut(),
         )
@@ -1873,6 +1874,7 @@ pub unsafe extern "C" fn punktfunk_connect_ex8(
             observed_sha256_out,
             client_cert_pem,
             client_key_pem,
+            std::ptr::null(), // pre-v21 variant: no device name, so the OS default stands
             timeout_ms,
             status_out,
         )
@@ -1935,6 +1937,79 @@ pub unsafe extern "C" fn punktfunk_connect_ex9(
             observed_sha256_out,
             client_cert_pem,
             client_key_pem,
+            std::ptr::null(), // pre-v21 variant: no device name, so the OS default stands
+            timeout_ms,
+            status_out,
+        )
+    }
+}
+
+/// Like [`punktfunk_connect_ex9`], plus `device_name` (ABI v21): the human-readable label this
+/// device knocks with — what the host's **pending-approval** list (and the web console's
+/// outstanding-pairings view and its approve dialog) shows for an unpaired client, and what the
+/// trust store files it under once approved. Pass the name the user already recognises this
+/// device by: `Host.current().localizedName` on macOS, `UIDevice.current.name` on iOS/tvOS,
+/// `Settings.Global.DEVICE_NAME` on Android.
+///
+/// NULL / empty = the [`crate::client::device_name`] default, exactly as every earlier variant.
+/// That default is an OS hostname, which no Apple GUI process could reach until v21 — every one
+/// of them knocked as the literal "This device", so a console with three of them pending showed
+/// three identical rows. Longer than [`crate::quic::HELLO_NAME_MAX`] bytes of UTF-8 is truncated
+/// (on a character boundary) rather than rejected: a too-long label is a cosmetic problem, and
+/// failing a connect over it would be a much worse one.
+///
+/// # Safety
+/// Same as [`punktfunk_connect_ex9`]; `device_name`, when non-null, must be a NUL-terminated C
+/// string that stays valid for the duration of the call.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn punktfunk_connect_ex10(
+    host: *const std::os::raw::c_char,
+    port: u16,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    compositor: u32,
+    gamepad: u32,
+    bitrate_kbps: u32,
+    video_caps: u8,
+    audio_channels: u8,
+    video_codecs: u8,
+    preferred_codec: u8,
+    client_caps: u8,
+    launch_id: *const std::os::raw::c_char,
+    pin_sha256: *const u8,
+    observed_sha256_out: *mut u8,
+    client_cert_pem: *const std::os::raw::c_char,
+    client_key_pem: *const std::os::raw::c_char,
+    device_name: *const std::os::raw::c_char,
+    timeout_ms: u32,
+    status_out: *mut i32,
+) -> *mut PunktfunkConnection {
+    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
+    // applies the same ABI contract to them; this shim dereferences nothing itself.
+    unsafe {
+        connect_ex_impl(
+            host,
+            port,
+            client_caps,
+            width,
+            height,
+            refresh_hz,
+            compositor,
+            gamepad,
+            bitrate_kbps,
+            video_caps,
+            audio_channels,
+            video_codecs,
+            preferred_codec,
+            launch_id,
+            pin_sha256,
+            observed_sha256_out,
+            client_cert_pem,
+            client_key_pem,
+            device_name,
             timeout_ms,
             status_out,
         )
@@ -1958,9 +2033,27 @@ pub const PUNKTFUNK_CLIENT_CAP_PHASE_LOCK: u8 = 0x02;
 /// with [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`]. (Mirrors `quic::CLIENT_CAP_PAD_AUDIO`.)
 pub const PUNKTFUNK_CLIENT_CAP_PAD_AUDIO: u8 = 0x08;
 
+/// A [`punktfunk_connect_ex10`] device name cut to what a [`crate::quic::Hello`] carries.
+/// [`crate::quic::HELLO_NAME_MAX`] is a BYTE cap while the cut must land on a character
+/// boundary — "Wohnzimmer-Fernseher überm Sofa" is 33 characters and 34 bytes, and slicing a
+/// name mid-scalar panics. Too long is truncated rather than rejected: the wire encoder would
+/// truncate it anyway, and failing a connect over a cosmetic label would be far worse than
+/// showing a shortened one.
+#[cfg(feature = "quic")]
+fn clamp_device_name(s: &str) -> String {
+    let end = s
+        .char_indices()
+        .map(|(i, c)| i + c.len_utf8())
+        .take_while(|&i| i <= crate::quic::HELLO_NAME_MAX)
+        .last()
+        .unwrap_or(0);
+    s[..end].to_string()
+}
+
 /// Shared body of [`punktfunk_connect_ex7`] / [`punktfunk_connect_ex8`]: `status_out`
 /// (nullable) is written on EVERY path — `Ok`, the mapped [`PunktfunkError`],
-/// `InvalidArg` for bad arguments, `Panic` if the connect panicked.
+/// `InvalidArg` for bad arguments, `Panic` if the connect panicked. `device_name` (nullable,
+/// [`punktfunk_connect_ex10`]) is the label this device knocks with; null = the OS default.
 #[cfg(feature = "quic")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn connect_ex_impl(
@@ -1982,6 +2075,7 @@ unsafe fn connect_ex_impl(
     observed_sha256_out: *mut u8,
     client_cert_pem: *const std::os::raw::c_char,
     client_key_pem: *const std::os::raw::c_char,
+    device_name: *const std::os::raw::c_char,
     timeout_ms: u32,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
@@ -2012,6 +2106,16 @@ unsafe fn connect_ex_impl(
         let launch = match unsafe { opt_cstr(launch_id) } {
             Ok(Some(s)) if !s.is_empty() => Some(s.to_string()),
             _ => None,
+        };
+        // The label the host's pending-approval list shows. Same non-fatal treatment as `launch`:
+        // an absent / empty / bad-UTF-8 name falls back to the OS default rather than failing a
+        // connect over a cosmetic field. Truncation is on a CHARACTER boundary — `HELLO_NAME_MAX`
+        // is a byte cap, and slicing a multi-byte name mid-scalar would panic.
+        // SAFETY: per the ABI contract - a caller-supplied C string, NUL-terminated or null,
+        // borrowed only for this call.
+        let name = match unsafe { opt_cstr(device_name) } {
+            Ok(Some(s)) if !s.trim().is_empty() => clamp_device_name(s.trim()),
+            _ => crate::client::device_name(),
         };
         let mode = crate::config::Mode {
             width,
@@ -2069,15 +2173,15 @@ unsafe fn connect_ex_impl(
             client_caps,
             // The C ABI cannot carry slice-progressive parts yet — `PunktfunkFrame` has no
             // part/completeness fields, so a part would be indistinguishable from a whole AU.
-            // An `ex10` variant adds the opt-in together with those fields when an ABI embedder
+            // An `ex11` variant adds the opt-in together with those fields when an ABI embedder
             // (Apple) grows a partial-feed decode path.
             false,
             launch,
-            // The C ABI has no device-name parameter (only `punktfunk_pair` takes one), so every
-            // embedder gets the OS hostname default — this is what the host's pending-approval
-            // list shows when an unpaired embedder knocks. An `ex10` variant can make it explicit
-            // if an embedder ever wants a custom label (e.g. the platform's marketing name).
-            Some(crate::client::device_name()),
+            // What the host's pending-approval list shows when this embedder knocks unpaired, and
+            // the trust-store label on approval. [`punktfunk_connect_ex10`]'s `device_name` when
+            // the embedder supplied one (the name the USER knows the device by — an Apple app has
+            // it and the OS default cannot reach it), else that OS default.
+            Some(name),
             pin,
             identity,
             std::time::Duration::from_millis(timeout_ms as u64),
@@ -5066,6 +5170,29 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_is_holding(
 #[cfg(all(test, feature = "quic"))]
 mod tests {
     use super::*;
+
+    /// The `ex10` device name is cut to the Hello's BYTE budget on a CHARACTER boundary — the
+    /// naive `s[..HELLO_NAME_MAX]` panics on any multi-byte name that straddles it, and an
+    /// operator naming a device in German or Japanese is not an edge case.
+    #[test]
+    fn device_name_truncates_on_a_character_boundary() {
+        let max = crate::quic::HELLO_NAME_MAX;
+        assert_eq!(clamp_device_name("Enrico's iPad"), "Enrico's iPad");
+
+        // Straddling: 2-byte characters over an odd-length prefix, so the cap lands mid-scalar.
+        let straddle = format!("{}{}", "x".repeat(max - 1), "ü".repeat(4));
+        let cut = clamp_device_name(&straddle);
+        assert!(cut.len() <= max, "{} bytes exceeds the cap", cut.len());
+        assert_eq!(
+            cut,
+            "x".repeat(max - 1),
+            "must drop the whole ü, not half of it"
+        );
+
+        // A name whose FIRST character already exceeds the cap has nothing to keep — the
+        // `unwrap_or(0)` path, which must yield "" rather than panicking on an empty iterator.
+        assert_eq!(clamp_device_name(&"あ".repeat(max)), "あ".repeat(max / 3));
+    }
 
     /// A C embedder writing `ev->kind = 42` must come back as a status code, not UB. The test
     /// stages the event in `MaybeUninit` storage so no `&InputEvent` to an invalid value ever

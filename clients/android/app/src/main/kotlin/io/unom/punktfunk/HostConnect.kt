@@ -1,7 +1,6 @@
 package io.unom.punktfunk
 
 import android.content.Context
-import android.os.Build
 import android.util.Log
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
@@ -82,8 +81,8 @@ suspend fun connectToHost(
             codecBits, preferredCodec, timeoutMs,
             launch,
             // The host's approval-list / trust-store label for this device — the same
-            // Build.MODEL convention the pairing dialogs use for nativePair.
-            Build.MODEL ?: "Android",
+            // user-set device name the pairing dialogs offer for nativePair.
+            deviceName(context),
             // Tier-A pad audio: ask for the 0xD1 plane only when a setting would render it, so a
             // user with it off does not make the host provision endpoints it will never feed.
             settings.padHaptics || settings.padSpeaker,

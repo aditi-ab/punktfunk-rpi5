@@ -114,7 +114,17 @@
 // every existing function keeps its signature and behaviour, and an embedder that never calls it
 // is unchanged. The `Welcome` grew a trailing field, which older peers skip in both directions
 // (see `Welcome::encode`), so [`WIRE_VERSION`] is unchanged.
-// v21: the per-client access surface (`design/per-client-access.md` §7) —
+// v21: added `punktfunk_connect_ex10` — `connect_ex9` plus `device_name`, the label an unpaired
+// client knocks with: what the host's pending-approval list (and the web console's
+// outstanding-pairings view and approve dialog) shows, and the trust-store name on approval. The
+// C ABI had no such parameter, so every embedder took [`client::device_name`]'s OS default —
+// which resolves through `COMPUTERNAME`/`HOSTNAME`, neither of which exists in an Apple GUI
+// process, leaving every Mac, iPad, iPhone and Apple TV knocking as the literal "This device"
+// (a console with three of them pending showed three identical rows). A NEW symbol, not a
+// widened one: `ex9` keeps its parameter list AND its behaviour — it passes a null name, which
+// selects that same default. Additive and client-local: the name rides the `Hello::name` field
+// hosts have read since the pending list existed, so [`WIRE_VERSION`] is unchanged.
+// v22: the per-client access surface (`design/per-client-access.md` §7) —
 // `punktfunk_connection_grants` and `punktfunk_connection_access_expires_in` read the session's
 // LIVE access state (the `PUNKTFUNK_GRANT_*` mask and the countdown to its expiry — Welcome
 // snapshot first, then latest-wins over every mid-session `AccessUpdate` the control task
@@ -127,7 +137,7 @@
 // way). Additive and client-local: the mask, the expiry and the `AccessUpdate` message all
 // shipped with the Welcome's trailing-field append (old peers skip them in both directions),
 // so [`WIRE_VERSION`] is unchanged.
-#define PUNKTFUNK_ABI_VERSION 21
+#define PUNKTFUNK_ABI_VERSION 22
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -2680,6 +2690,47 @@ PunktfunkConnection *punktfunk_connect_ex9(const char *host,
                                            const char *client_key_pem,
                                            uint32_t timeout_ms,
                                            int32_t *status_out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Like [`punktfunk_connect_ex9`], plus `device_name` (ABI v21): the human-readable label this
+// device knocks with — what the host's **pending-approval** list (and the web console's
+// outstanding-pairings view and its approve dialog) shows for an unpaired client, and what the
+// trust store files it under once approved. Pass the name the user already recognises this
+// device by: `Host.current().localizedName` on macOS, `UIDevice.current.name` on iOS/tvOS,
+// `Settings.Global.DEVICE_NAME` on Android.
+//
+// NULL / empty = the [`crate::client::device_name`] default, exactly as every earlier variant.
+// That default is an OS hostname, which no Apple GUI process could reach until v21 — every one
+// of them knocked as the literal "This device", so a console with three of them pending showed
+// three identical rows. Longer than [`crate::quic::HELLO_NAME_MAX`] bytes of UTF-8 is truncated
+// (on a character boundary) rather than rejected: a too-long label is a cosmetic problem, and
+// failing a connect over it would be a much worse one.
+//
+// # Safety
+// Same as [`punktfunk_connect_ex9`]; `device_name`, when non-null, must be a NUL-terminated C
+// string that stays valid for the duration of the call.
+PunktfunkConnection *punktfunk_connect_ex10(const char *host,
+                                            uint16_t port,
+                                            uint32_t width,
+                                            uint32_t height,
+                                            uint32_t refresh_hz,
+                                            uint32_t compositor,
+                                            uint32_t gamepad,
+                                            uint32_t bitrate_kbps,
+                                            uint8_t video_caps,
+                                            uint8_t audio_channels,
+                                            uint8_t video_codecs,
+                                            uint8_t preferred_codec,
+                                            uint8_t client_caps,
+                                            const char *launch_id,
+                                            const uint8_t *pin_sha256,
+                                            uint8_t *observed_sha256_out,
+                                            const char *client_cert_pem,
+                                            const char *client_key_pem,
+                                            const char *device_name,
+                                            uint32_t timeout_ms,
+                                            int32_t *status_out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

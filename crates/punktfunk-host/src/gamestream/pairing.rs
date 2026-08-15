@@ -44,9 +44,27 @@ impl PinGate {
         }
     }
 
-    pub fn submit(&self, pin: String) {
+    /// Deliver the operator's PIN to a parked handshake. Returns `false` (delivering nothing) when
+    /// more than one handshake is parked.
+    ///
+    /// The PIN is a single global slot with no binding to a specific handshake, so with N parked
+    /// waiters whichever polls first takes it. An attacker who floods `getservercert` slots (up to
+    /// `MAX_PARKED_WAITERS - 1`) while the operator is pairing could therefore take the operator's
+    /// PIN, derive the ceremony key from its own salt, and pin its own certificate. Real pairing is
+    /// one operator-driven client at a time, so when the target is ambiguous we refuse rather than
+    /// hand the secret to a racer — the operator retries once the flood clears. This narrows the
+    /// window to a tight post-submit timing race; a full fix keys the gate by `uniqueid` (see the
+    /// design note). security-review 2026-08-15 finding 7.
+    pub fn submit(&self, pin: String) -> bool {
+        if self.waiters.load(Ordering::SeqCst) > 1 {
+            tracing::warn!(
+                "pairing: more than one handshake is awaiting a PIN — refusing an ambiguous submit"
+            );
+            return false;
+        }
         *self.pin.lock().unwrap() = Some(pin);
         self.notify.notify_waiters();
+        true
     }
 
     /// True while a pairing handshake is parked waiting for the user's PIN.
