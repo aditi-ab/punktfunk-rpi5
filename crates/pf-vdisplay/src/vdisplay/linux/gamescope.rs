@@ -164,6 +164,26 @@ const SWITCH_HONOR_GRACE: Duration = Duration::from_secs(120);
 /// [`start_restore_worker`] thread.
 static PENDING_RESTORE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 
+/// Serializes an IN-FLIGHT restore against a (re)connect's takeover. Clearing [`PENDING_RESTORE`]
+/// only cancels a restore that hasn't STARTED; under `keep_alive=off` the debounce is 0 s, so the
+/// worker routinely pops the deadline before the reconnect's cancel arrives, and the restore then
+/// runs CONCURRENTLY with the new takeover. That interleaving is what put a box into
+/// "display manager up + autologin unit masked" (field, .41 2026-08-15): the new takeover found the
+/// autologin unit inactive (the restore hadn't restarted it yet) so [`dm_plan`] correctly refused
+/// to stop the DM for a dead unit — and the in-flight restore then brought SDDM back underneath the
+/// mask, whose Relogin loop churned ~5 sessions/s until someone stopped it by hand (SDDM's helper
+/// execs the session script directly, so the mask stops only the final unit start, never the loop —
+/// see `mask_unit`).
+///
+/// Holding this across [`do_restore_tv_session`] makes the race a plain ordering: either the cancel
+/// wins (no restore starts, warm reuse) or the restore wins (the connect waits, then takes over a
+/// fully restored box — where the autologin unit IS live again, so the DM stop engages normally).
+///
+/// LOCK ORDER: OUTERMOST — taken only at the entry points ([`start_restore_worker`]'s pop,
+/// [`cancel_pending_restore`], [`restore_takeover_now`]), and NEVER while any other static in this
+/// module is held. Everything [`do_restore_tv_session`] locks nests inside it.
+static RESTORE_FLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// How long to wait after the last disconnect before restoring the TV's autologin gaming session —
 /// long enough that a quick reconnect (e.g. a controller hiccup) reuses the warm managed session
 /// instead of triggering a stop/relaunch.
@@ -626,7 +646,10 @@ impl VirtualDisplay for GamescopeDisplay {
 fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<VirtualOutput> {
     // A (re)connect cancels any pending debounced TV-restore: we're about to (re)use the managed
     // session, so the autologin must stay stopped and the warm session stays up (no stop/relaunch).
-    *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // Via [`cancel_pending_restore`], NOT a bare `PENDING_RESTORE` clear — the cancel also waits
+    // out a restore that already popped the deadline (keep_alive=off makes that the COMMON
+    // reconnect case: debounce 0 s), so the takeover below never interleaves with it.
+    cancel_pending_restore();
     // SteamOS (the real Steam Deck) has no session-plus: take over its `gamescope-session.target`
     // headless at the client's mode instead of launching a separate managed session.
     if steamos_session_present() {
@@ -3088,6 +3111,22 @@ fn pid_running(pid: u32) -> bool {
 /// Called from the connect path (native `resolve_compositor`, GameStream `open_gs_virtual_source`).
 /// No-op when nothing is pending; the stopped-unit list stays armed for a later real disconnect.
 pub fn cancel_pending_restore() {
+    // Serialize against an IN-FLIGHT restore (see [`RESTORE_FLIGHT`]): a cancel can only win
+    // before the worker pops the deadline. Once the restore is running, the correct move is to
+    // WAIT it out — the takeover that follows then finds the box fully restored (autologin unit
+    // live again), so it re-takes it through the ordinary path, DM stop included. Racing past it
+    // instead is how a box ended up with SDDM back up underneath a fresh mask (relogin storm).
+    let _flight = match RESTORE_FLIGHT.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            tracing::info!(
+                "gamescope: a TV-session restore is in flight — the (re)connect waits for it, \
+                 then takes the restored session over from scratch"
+            );
+            RESTORE_FLIGHT.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    };
     let mut g = PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner());
     if g.is_some() {
         *g = None;
@@ -3203,6 +3242,10 @@ fn takeover_live() -> bool {
 /// `keep_alive=forever` pins a session for the NEXT client, which is meaningless once the host
 /// that would serve them is exiting. No-op when nothing was taken over.
 pub fn restore_takeover_now() {
+    // Take the flight lock BEFORE reading the takeover state: if the worker's debounced restore is
+    // mid-run, this waits it out and then finds `takeover_live()` false — one restore, not two
+    // interleaved ones (the worker's is bounded by the same verb budgets this one would be).
+    let _flight = RESTORE_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
     if !takeover_live() {
         return;
     }
@@ -3496,18 +3539,31 @@ pub fn start_restore_worker() -> std::sync::Arc<()> {
         .spawn(move || {
             while weak.upgrade().is_some() {
                 std::thread::sleep(Duration::from_millis(100));
-                let due = {
-                    let mut g = PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner());
-                    match *g {
-                        Some(deadline) if Instant::now() >= deadline => {
-                            *g = None;
-                            true
-                        }
-                        _ => false,
-                    }
-                };
+                // PEEK first, POP only under RESTORE_FLIGHT: popping out here re-opens the window
+                // this lock exists to close — a reconnect's cancel between the pop and the restore
+                // would no-op (nothing pending) while the restore still ran against the new
+                // takeover. Under the flight lock the re-check is authoritative: a cancel that got
+                // the lock first has cleared the deadline, and one that arrives later blocks until
+                // this restore is done.
+                let due = PENDING_RESTORE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some_and(|deadline| Instant::now() >= deadline);
                 if due {
-                    do_restore_tv_session();
+                    let _flight = RESTORE_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+                    let still_due = {
+                        let mut g = PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner());
+                        match *g {
+                            Some(deadline) if Instant::now() >= deadline => {
+                                *g = None;
+                                true
+                            }
+                            _ => false,
+                        }
+                    };
+                    if still_due {
+                        do_restore_tv_session();
+                    }
                 }
             }
         })
@@ -4923,16 +4979,18 @@ impl Drop for GamescopeProc {
 #[cfg(test)]
 mod tests {
     use super::{
-        any_output_size_is, cgroup_is_punktfunk_owned, cgroup_under_user_manager,
-        classify_output_size, connected_connector_under, display_manager_unit_under, dm_plan,
-        dm_survives_masked_unit, game_hz, gamescope_output_size, hdr_args, is_steam_launch,
-        mask_unit, missing_flags, mode_mismatch, nested_wrapper_script, our_wsi_layer_dir,
-        plan_bind, release_autologin_mask, script_hardcodes_gamescope, sentinel_advanced,
-        shape_dedicated_command, switch_ends_mask_window, takeover_state_is_live, unmask_unit,
-        xwayland_refusal_marker, BindOff, BindPlan, BoxOutputSize, DmHelperError, SessionBind,
-        TakeoverState, WsiPlan, AUTOLOGIN_MASKED, DISTRO_GAMESCOPE_PATH, STOPPED_AUTOLOGIN,
-        WSI_OFF_ENV, X11_SOCKET_DIR,
+        any_output_size_is, cancel_pending_restore, cgroup_is_punktfunk_owned,
+        cgroup_under_user_manager, classify_output_size, connected_connector_under,
+        display_manager_unit_under, dm_plan, dm_survives_masked_unit, game_hz,
+        gamescope_output_size, hdr_args, is_steam_launch, mask_unit, missing_flags, mode_mismatch,
+        nested_wrapper_script, our_wsi_layer_dir, plan_bind, release_autologin_mask,
+        script_hardcodes_gamescope, sentinel_advanced, shape_dedicated_command,
+        switch_ends_mask_window, takeover_state_is_live, unmask_unit, xwayland_refusal_marker,
+        BindOff, BindPlan, BoxOutputSize, DmHelperError, SessionBind, TakeoverState, WsiPlan,
+        AUTOLOGIN_MASKED, DISTRO_GAMESCOPE_PATH, PENDING_RESTORE, RESTORE_FLIGHT,
+        STOPPED_AUTOLOGIN, WSI_OFF_ENV, X11_SOCKET_DIR,
     };
+    use std::time::{Duration, Instant};
 
     fn argv(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
@@ -5250,6 +5308,41 @@ mod tests {
         // No DM at all (getty autologin): mask+kill, nothing to stop.
         let p = dm_plan(None, true);
         assert!(!p.skip && p.mask && !p.stop_dm);
+    }
+
+    #[test]
+    fn reconnect_cancel_waits_out_an_in_flight_restore() {
+        // The .41 storm (2026-08-15): under keep_alive=off the worker pops the 0 s deadline before
+        // the reconnect's cancel arrives, and the restore then ran CONCURRENTLY with the new
+        // takeover — resurrecting SDDM underneath the fresh mask. The fix is RESTORE_FLIGHT:
+        // while a restore holds it (the worker's do_restore window), `cancel_pending_restore`
+        // must BLOCK, and must complete once the restore releases it. `do_restore_tv_session`
+        // itself shells out to systemctl, so the test models its lock window directly.
+        let flight = RESTORE_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        *PENDING_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Instant::now() + Duration::from_secs(300));
+        let cancel = std::thread::spawn(cancel_pending_restore);
+        // The cancel must not race past the in-flight restore. A sleep-based "still running"
+        // probe is the wrong shape (a slow scheduler passes it vacuously); the load-bearing
+        // assertions are the two below — pending survives while the flight lock is held, and the
+        // cancel completes (no deadlock) and clears it once released.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            PENDING_RESTORE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some(),
+            "cancel cleared the pending restore while the restore was still in flight"
+        );
+        drop(flight);
+        cancel.join().expect("cancel thread panicked");
+        assert!(
+            PENDING_RESTORE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "cancel returned without clearing the pending restore"
+        );
     }
 
     #[test]
