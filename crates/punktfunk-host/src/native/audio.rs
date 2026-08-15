@@ -255,10 +255,12 @@ pub(super) fn audio_thread(
         // Wake on whichever comes first: a capture chunk, or the moment the wire next has
         // something to say. Waiting only on capture is what made a hole cost more than the audio
         // it swallowed — see [`InfillPolicy`].
-        let waited = if infill.exhausted() {
-            // Past the infill budget the host is not glitching, it is QUIET, and there is nothing
-            // to send until real audio returns. Block the way this loop always did rather than
-            // waking two hundred times a second to decide to stay silent.
+        let waited = if infill.exhausted() || !sent_any {
+            // Nothing is owed until real audio returns: either the infill budget is spent (the
+            // host is not glitching, it is QUIET) or nothing has ever been sent, so there is no
+            // continuity to hold. Block the way this loop always did rather than waking two
+            // hundred times a second to decide to stay silent — a session that starts on a quiet
+            // desktop would otherwise spin until the first sound.
             capturer.as_mut().unwrap().next_chunk()
         } else {
             let now = std::time::Instant::now();
@@ -330,7 +332,7 @@ pub(super) fn audio_thread(
                         // leaving it for post-gap samples to complete: one frame carrying audio
                         // from both sides of a hole is a click, and its pts is a lie about when
                         // half of it was captured.
-                        frame_buf.extend(acc.drain(..));
+                        frame_buf.append(&mut acc);
                         frame_buf.resize(frame_len, 0.0);
                     }
                     crate::audio::capture_policy::Infill::Wait
@@ -364,6 +366,9 @@ pub(super) fn audio_thread(
                         prev_frame.extend_from_slice(opus);
                     }
                     seq = seq.wrapping_add(1);
+                    // From here there is a continuity worth protecting, and `next_pts_ns` has a
+                    // real anchor to continue from — both preconditions for synthesizing anything.
+                    sent_any = true;
                 }
                 Err(e) => {
                     opus_encode_errs += 1;

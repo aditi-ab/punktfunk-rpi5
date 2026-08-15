@@ -168,7 +168,13 @@ impl CaptureStats {
         let Some(delta) = since_last else { return };
         if delta > (quantum * 2).max(GAP_FLOOR) {
             self.gaps += 1;
-            self.max_gap_us = self.max_gap_us.max(delta.as_micros() as u64);
+            // The MISSING audio, not the callback delta: one quantum of that delta is the buffer
+            // we were legitimately handed. Reporting the delta would inflate every gap by the
+            // quantum and — worse — mean something different from the Windows feed, which sizes
+            // its holes from the device position and so reports missing audio by construction.
+            self.max_gap_us = self
+                .max_gap_us
+                .max(delta.saturating_sub(quantum).as_micros() as u64);
         }
     }
 
@@ -385,11 +391,13 @@ mod tests {
         one.observe_callback(None, Q); // first callback of the stream — nothing to compare to
         one.observe_callback(Some(Duration::from_secs(2)), Q);
         assert_eq!(one.gaps, 1);
-        assert_eq!(one.max_gap_ms(), 2_000);
+        // Two seconds between callbacks, one quantum of which was audio we were handed.
+        assert_eq!(one.max_gap_ms(), 2_000 - Q.as_millis() as u64);
 
+        // …versus three hundred 8 ms holes, each arriving as a 13 ms callback delta.
         let mut many = CaptureStats::default();
         for _ in 0..300 {
-            many.observe_callback(Some(Duration::from_millis(8)), Q);
+            many.observe_callback(Some(Q + Duration::from_millis(8)), Q);
         }
         assert_eq!(many.gaps, 300);
         assert_eq!(many.max_gap_ms(), 8);

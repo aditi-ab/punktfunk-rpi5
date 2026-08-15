@@ -829,7 +829,7 @@ fn realtime_minus_monotonic_ns() -> i64 {
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
         return 0;
     }
-    rt - (ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64)
+    rt - (ts.tv_sec * 1_000_000_000 + ts.tv_nsec)
 }
 
 fn consume_frame(

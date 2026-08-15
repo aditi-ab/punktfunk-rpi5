@@ -5468,7 +5468,10 @@ mod tests {
             !c.fused,
             "flapping that never engaged must not blow the fuse"
         );
-        for _ in 0..PhaseController::ENGAGE_COHERENT_REPORTS {
+        // The replay ends mid-backoff — a bad patch always does — so recovery costs that backoff
+        // plus the engage proof, ~15 s at the report cadence. That delay IS the trade: every
+        // second of it is spent in today's disengaged default, which adds no latency at all.
+        for _ in 0..PhaseController::REENGAGE_BACKOFF + PhaseController::ENGAGE_COHERENT_REPORTS {
             c.adjust(&report_at(COHERENT, ACTIONABLE_LEAD), SIM_P);
         }
         assert!(

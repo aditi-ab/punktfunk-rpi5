@@ -190,7 +190,7 @@ fn median(v: &mut [i64]) -> i64 {
 
 /// Median absolute deviation about the series' own median — robust to the occasional skipped
 /// tick, which a mean would let dominate and a fixed nominal would mis-score as jitter.
-fn mad(v: &mut Vec<i64>) -> i64 {
+fn mad(v: &mut [i64]) -> i64 {
     if v.is_empty() {
         return 0;
     }
