@@ -48,3 +48,16 @@ KERNEL=="hidraw*", KERNELS=="*28DE:1205*", GROUP="input", MODE="0660", TAG+="uac
 KERNEL=="hidraw*", KERNELS=="*28DE:1102*", GROUP="input", MODE="0660", TAG+="uaccess"
 KERNEL=="hidraw*", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1205", GROUP="input", MODE="0660", TAG+="uaccess"
 KERNEL=="hidraw*", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1102", GROUP="input", MODE="0660", TAG+="uaccess"
+# Steam Controller 2 (Triton): wired 28DE:1302 and the Puck dongle 28DE:1304 — the two identities
+# `steam_backend_product` mints. Steam is the ONLY consumer of this pad: no kernel driver claims
+# the PID (mainline hid-steam stops at the Deck), so its state reports ride a vendor collection
+# that yields no evdev node at all. A hidraw node Steam cannot open is therefore not a degraded
+# controller, it is no controller — the pad enumerates, the kernel reads its report descriptor,
+# and Steam's own device list stays empty (field report 2026-08-15: usbip attached cleanly, the
+# log showed every kernel control transfer and not one SET_REPORT from Steam).
+# Relying on the distro's steam-devices rules is not enough for a pad that shipped in 2026: those
+# lists are per-PID and a host whose copy predates the SC2 leaves the node root-only.
+KERNEL=="hidraw*", KERNELS=="*28DE:1302*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", KERNELS=="*28DE:1304*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1302", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1304", GROUP="input", MODE="0660", TAG+="uaccess"

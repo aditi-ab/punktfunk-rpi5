@@ -380,6 +380,46 @@ It is not only the pad, though: the same group authorizes the helper that stops 
 for a managed **Gaming Mode** takeover, so on a box that autologins into Game Mode, skipping it also
 costs you [the takeover](#game-mode-black-screen-on-connect-or-the-stream-is-stuck-at-the-boxs-resolution).
 
+## A Steam Controller 2 is captured, but Steam's controller list stays empty
+
+The client says everything is fine — the Controllers screen shows **Steam Controller 2, captured,
+streams as-is** — and on the host Steam's **Settings → Controller → Connected Controllers** has
+nothing in it. Buttons do nothing in games, and the trackpads don't move the pointer.
+
+Unlike every other pad Punktfunk presents, the Steam Controller 2 has exactly one consumer:
+**Steam**. No kernel driver claims its product id — mainline `hid-steam` stops at the Deck — and its
+state reports ride a vendor collection, so the pad produces no evdev node for anything else to read.
+If Steam can't open its `hidraw` node, you don't get a degraded controller, you get no controller.
+
+The node is root-only until a udev rule says otherwise, and distro `steam-devices` rule sets are
+per-product-id: a host whose copy predates the SC2 (it shipped in 2026) never grants it. Punktfunk
+ships the rule itself from 0.30.0 on. On an older host, add it by hand:
+
+```sh
+sudo tee /etc/udev/rules.d/61-punktfunk-sc2.rules >/dev/null <<'EOF'
+KERNEL=="hidraw*", KERNELS=="*28DE:1302*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", KERNELS=="*28DE:1304*", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1302", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1304", GROUP="input", MODE="0660", TAG+="uaccess"
+EOF
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Then end the session and reconnect, so the pad re-enumerates under the new rule. `1302` is the wired
+controller and `1304` the Puck dongle — the two identities the host presents.
+
+To confirm this is what you're hitting, look at the host log for one line and one absence: the pad
+attaching (`attached via usbip`), and **no** `answering feature GET` afterwards. That pair means the
+kernel enumerated the controller and Steam never opened it. The everything-else checks — the
+`punktfunk` group, `vhci_hcd`, the `attach` node — are in
+[the virtual Steam Deck section](#the-pad-works-but-arrives-as-an-xbox-360-controller-instead-of-a-steam-deck)
+above; if `attached via usbip` is missing from the log entirely, start there instead.
+
+One more thing that is *not* a bug: with Punktfunk capturing, the trackpads stop working as a mouse
+whenever Steam isn't running. Punktfunk turns the controller's built-in mouse-and-keyboard emulation
+("lizard mode") off so it can read the full report stream, so on this pad Steam is what makes the
+trackpads a pointer — exactly as on a Steam Deck in desktop mode.
+
 ## Copy and paste between host and client does nothing
 
 The shared clipboard needs **two** separate switches on, and turning on only one looks exactly like
