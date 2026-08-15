@@ -1,51 +1,45 @@
-// Shared clipboard, macOS client half (design/clipboard-and-file-transfer.md §5.2).
+// Shared clipboard, client half (design/clipboard-and-file-transfer.md §5.2). One implementation
+// for macOS and iOS/iPadOS; everything that touches an actual pasteboard sits behind
+// `ClipboardPasteboard`.
 //
-// Bridges NSPasteboard.general to the session's QUIC clipboard plane, both directions lazy:
+// Both directions are lazy:
 //
-// * **Local copy → host**: a changeCount poll announces the *format list* (`clipOffer`); the
-//   bytes cross only when a host app pastes (a `.fetchRequest` event, answered from the live
-//   pasteboard by `clipServe`).
-// * **Host copy → local**: a `.remoteOffer` writes one NSPasteboardItem whose
-//   NSPasteboardItemDataProvider fires only when a Mac app actually pastes — the provider then
-//   blocks (on its provider thread, never main) on a `clipFetch` round-trip.
+// * **Local copy → host**: a changeCount poll announces the *format list* (`clipOffer`); the bytes
+//   cross only when a host app pastes (a `.fetchRequest` event, answered from the live pasteboard
+//   by `clipServe`).
+// * **Host copy → local**: a `.remoteOffer` places a pasteboard item whose data provider fires only
+//   when a local app actually pastes — the provider then pulls the bytes over a `clipFetch`.
 //
 // Password-manager respect: pasteboards marked `org.nspasteboard.ConcealedType` or
 // `org.nspasteboard.TransientType` are never announced, never fetchable. Echo suppression: the
 // changeCount of every write WE make is recorded so the announce poll skips it (§3.4).
 //
-// Phase 1 formats only (text / RTF / HTML / PNG). Files (NSFilePromiseProvider) ride Phase 2.
-#if os(macOS)
-import AppKit
+// Phase 1 formats only (text / RTF / HTML / PNG / JPEG / GIF). Files ride Phase 2.
+#if !os(tvOS)
 import Foundation
 
 /// One live session's clipboard bridge. Created by the session model when streaming begins on a
 /// host that advertises `HOST_CAP_CLIPBOARD` and whose per-host toggle is on; `stop()` before the
-/// connection closes. All pasteboard traffic runs on one dedicated drain thread plus the
-/// AppKit-owned provider threads (paste fulfillment).
+/// connection closes. All wire traffic runs on one dedicated drain thread, plus the OS-owned
+/// threads that fulfil a paste.
 public final class ClipboardSync: NSObject {
-    /// Wire MIME ↔ NSPasteboard type for the Phase-1 vocabulary (§3.5), in announce order.
-    private static let wireToPasteboard: [(wire: String, type: NSPasteboard.PasteboardType)] = [
-        ("text/plain;charset=utf-8", .string),
-        ("text/rtf", .rtf),
-        ("text/html", .html),
-        ("image/png", .png),
-        // Original image formats pass through VERBATIM beside the PNG floor — a copied JPEG
-        // never balloons into PNG, a GIF keeps its animation; the destination picks the richest
-        // kind it can place.
-        ("image/jpeg", NSPasteboard.PasteboardType("public.jpeg")),
-        ("image/gif", NSPasteboard.PasteboardType("com.compuserve.gif")),
-    ]
-    /// Pasteboard marker types that must never cross the wire (password managers mark secrets
-    /// with these — see nspasteboard.org).
-    private static let concealed = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
-    private static let transient = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
-
-    /// How long a blocked paste waits for the host's bytes before providing nothing (§5.2).
-    private static let fetchTimeout: TimeInterval = 10
+    /// How long a paste waits for the host's bytes before giving up and providing nothing (§5.2).
+    /// Enforced here, so an adapter that has to block a thread can treat it as a guarantee.
+    static let fetchTimeout: TimeInterval = 10
     /// Serve chunk size for host-side pastes of our data (bounds the per-call ABI copy).
     private static let serveChunk = 4 << 20
+    /// Announce poll interval — how stale a local copy may be before the host hears about it.
+    private static let announceInterval: TimeInterval = 0.5
+    /// Ceiling on what `resolvePendingOffer` will pull. Text and modest images are worth having on
+    /// the chance the user pastes them after the session ends; a 200 MB screenshot is not.
+    private static let resolveBudget = 8 << 20
+    /// And how long that may hold up teardown. Short on purpose — it sits between the user
+    /// leaving and the connection closing, and a LAN round-trip for a few KB of text is
+    /// milliseconds. An offer that cannot be had in this long is one the user does without.
+    private static let resolveTimeout: TimeInterval = 3
 
     private let connection: PunktfunkConnection
+    private let pasteboard: any ClipboardPasteboard
     /// `CLIP_FLAG_*` sent with the enable (`CLIP_FLAG_FILES` when the session permits files —
     /// always 0 in Phase 1).
     private let controlFlags: UInt8
@@ -53,72 +47,91 @@ public final class ClipboardSync: NSObject {
     /// Host `.state` updates, delivered on the main queue — drives the toggle/footnote UI.
     public var onState: ((_ enabled: Bool, _ policy: UInt8, _ reason: UInt8) -> Void)?
 
-    // Drain-thread state (touched only on the drain thread once started).
+    // MARK: Offer bookkeeping
+    //
+    // Read by the drain thread, and written by the thread tearing the sync down too, so it is all
+    // under one lock. Nothing here is held across a fetch or a pasteboard read.
+    private let stateLock = NSLock()
     private var offerSeq: UInt32 = 0
     private var lastSeenChangeCount = 0
-    /// The changeCount of the last pasteboard write WE made (echo suppression + "do we still
-    /// own the pasteboard" on teardown/clear).
+    /// The changeCount of the last pasteboard write WE made (echo suppression, and "do we still
+    /// own the pasteboard" on teardown).
     private var ownedChangeCount = -1
-    /// The host offer currently installed on the local pasteboard (nil = none).
-    private var installedRemoteSeq: UInt32?
+    /// The host offer currently placed on the local pasteboard (nil = none).
+    private var installedRemote: (seq: UInt32, kinds: [PunktfunkConnection.ClipKind])?
+    /// The offer already pulled down to concrete bytes, so teardown neither re-fetches it nor
+    /// takes it back off the pasteboard.
+    private var resolvedSeq: UInt32?
 
-    /// Outbound fetches a blocked paste is waiting on. Guarded by `fetchLock` — appended by the
-    /// drain thread (`.data` events), consumed by AppKit's provider threads.
-    private struct PendingFetch {
+    // MARK: Outbound fetches
+    //
+    // Appended by whichever thread starts a fetch, completed by the drain thread as `.data`
+    // arrives. Guarded by `fetchLock`, which is never held while a completion runs.
+    private final class PendingFetch {
         var buffer = Data()
-        let done = DispatchSemaphore(value: 0)
-        var failed = false
+        let completion: (Data?) -> Void
+        init(completion: @escaping (Data?) -> Void) { self.completion = completion }
     }
     private let fetchLock = NSLock()
     private var pendingFetches: [UInt32: PendingFetch] = [:]
+    /// Fires the deadline that keeps a blocked paste from waiting forever on a host that went
+    /// quiet mid-transfer.
+    private let deadlines = DispatchQueue(label: "io.unom.punktfunk.clipboard.deadline")
+    /// Serves host pastes off the drain thread where a pasteboard read can await a user decision
+    /// (iOS's paste permission alert) — the drain thread must keep running, it is the one that
+    /// would deliver the host's cancel.
+    private let serves = DispatchQueue(label: "io.unom.punktfunk.clipboard.serve")
 
-    private final class StopFlag: @unchecked Sendable {
+    private final class Flag: @unchecked Sendable {
         private let lock = NSLock()
-        private var stopped = false
-        func stop() {
-            lock.lock()
-            stopped = true
-            lock.unlock()
-        }
-        var isStopped: Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            return stopped
-        }
-    }
-    private let flag = StopFlag()
-    private let drainDone = DispatchSemaphore(value: 0)
-    private var started = false
-    /// Set by the app-activation observer, cleared by the drain loop: the user may have copied
-    /// elsewhere and is coming back to paste — announce immediately instead of waiting out the
-    /// poll interval.
-    private final class OneShot: @unchecked Sendable {
-        private let lock = NSLock()
-        private var raised = false
+        private var value = false
         func raise() {
             lock.lock()
-            raised = true
+            value = true
             lock.unlock()
         }
-        func takeIfRaised() -> Bool {
+        var isRaised: Bool {
             lock.lock()
             defer { lock.unlock() }
-            let was = raised
-            raised = false
+            return value
+        }
+        /// Read-and-clear, for the one-shot "check the pasteboard now" nudge.
+        func take() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            let was = value
+            value = false
             return was
         }
     }
-    private let checkNow = OneShot()
-    private var activationObserver: NSObjectProtocol?
+    private let stopped = Flag()
+    /// Raised by the activation observer, taken by the drain loop: the user may have copied
+    /// elsewhere and is coming back to paste — announce now rather than waiting out the poll.
+    private let checkNow = Flag()
+    private let drainDone = DispatchSemaphore(value: 0)
+    private var started = false
 
-    public init(connection: PunktfunkConnection, allowFiles: Bool = false) {
+    /// - Parameter allowFiles: reserved for Phase 2; `CLIP_FLAG_FILES` is never set yet.
+    public convenience init(connection: PunktfunkConnection, allowFiles: Bool = false) {
+        self.init(connection: connection, pasteboard: SystemPasteboard(), allowFiles: allowFiles)
+    }
+
+    /// Designated init, taking the pasteboard so tests can drive the whole state machine against a
+    /// stub without an AppKit/UIKit pasteboard in the way.
+    init(
+        connection: PunktfunkConnection, pasteboard: any ClipboardPasteboard,
+        allowFiles: Bool = false
+    ) {
         self.connection = connection
+        self.pasteboard = pasteboard
         self.controlFlags = 0 // CLIP_FLAG_FILES rides Phase 2
         _ = allowFiles
         super.init()
     }
 
-    deinit { flag.stop() }
+    deinit { stopped.raise() }
+
+    // MARK: - Lifecycle
 
     /// Enable sync with the host and start the drain thread. The host answers the enable with a
     /// `.state` event (surfaced via `onState`) — `BACKEND_UNAVAILABLE` et al. arrive there.
@@ -126,103 +139,105 @@ public final class ClipboardSync: NSObject {
         guard !started else { return }
         started = true
         connection.clipControl(enabled: true, flags: controlFlags)
-        // Baseline: whatever is on the pasteboard when sync starts is announced immediately —
-        // the "copy first, then connect and paste" flow must work.
+        // Baseline: whatever is on the pasteboard when sync starts is announced immediately — the
+        // "copy first, then connect and paste" flow must work.
+        stateLock.lock()
         lastSeenChangeCount = -1
-        activationObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: nil
-        ) { [checkNow] _ in checkNow.raise() }
-        let connection = self.connection
-        let flag = self.flag
-        let thread = Thread { [weak self] in
-            var lastAnnounceCheck = Date.distantPast
-            while !flag.isStopped {
-                // Drain events (bounded burst so a chatty host can't starve the announce poll).
-                var drained = 0
-                while drained < 32, !flag.isStopped {
-                    let ev: PunktfunkConnection.ClipEvent?
-                    do {
-                        ev = try connection.nextClipboard(timeoutMs: drained == 0 ? 200 : 0)
-                    } catch {
-                        flag.stop() // session closed
-                        break
-                    }
-                    guard let ev else { break }
-                    drained += 1
-                    self?.handle(ev)
-                }
-                // Announce poll: every 500 ms, or immediately after app activation (§5.2).
-                let now = Date()
-                if now.timeIntervalSince(lastAnnounceCheck) >= 0.5
-                    || self?.checkNow.takeIfRaised() == true
-                {
-                    lastAnnounceCheck = now
-                    self?.announceIfChanged()
-                }
-            }
-            self?.drainDone.signal()
-        }
+        stateLock.unlock()
+        pasteboard.startObserving(onActivate: { [checkNow] in checkNow.raise() })
+        let thread = Thread { [weak self] in self?.drain() }
         thread.name = "punktfunk-clipboard"
         thread.qualityOfService = .utility
         thread.start()
     }
 
-    /// Disable sync and join the drain thread. Called off-main before `connection.close()`
-    /// (the same discipline as the audio/feedback drains). If the local pasteboard still holds
-    /// our remote-offer items, they are cleared — their providers die with us.
+    /// Disable sync and join the drain thread. Called off-main before `connection.close()` (the
+    /// same discipline as the audio/feedback drains).
+    ///
+    /// A host offer still sitting on the local pasteboard as a promise has to be dealt with here,
+    /// because after this returns nothing can answer it: either it is pulled down to real bytes
+    /// (iOS, where this teardown is the user walking away with something they copied) or it is
+    /// cleared, so a later paste comes up empty rather than silently doing nothing.
     public func stop() {
         guard started else { return }
         started = false
-        if let obs = activationObserver {
-            NotificationCenter.default.removeObserver(obs)
-            activationObserver = nil
+        pasteboard.stopObserving()
+        // Before anything is torn down — the drain thread has to still be running to deliver the
+        // chunks, and the connection still open to carry the fetch.
+        if pasteboard.resolvesPendingOfferOnTeardown {
+            resolvePendingOffer()
         }
         connection.clipControl(enabled: false, flags: 0)
-        flag.stop()
+        stopped.raise()
         drainDone.wait()
-        // Fail every paste still blocked on us so no provider thread waits out its timeout.
-        fetchLock.lock()
-        for (_, pending) in pendingFetches {
-            pending.done.signal()
+        // Fail every paste still blocked on us so nothing waits out its timeout against a dead
+        // session.
+        settleAll(nil)
+        stateLock.lock()
+        let ownsUnresolvedOffer =
+            installedRemote != nil && resolvedSeq != installedRemote?.seq
+            && pasteboard.changeCount == ownedChangeCount
+        installedRemote = nil
+        stateLock.unlock()
+        if ownsUnresolvedOffer {
+            _ = pasteboard.clear()
         }
-        pendingFetches.removeAll()
-        fetchLock.unlock()
-        let pb = NSPasteboard.general
-        if installedRemoteSeq != nil, pb.changeCount == ownedChangeCount {
-            pb.clearContents()
+    }
+
+    private func drain() {
+        var lastAnnounceCheck = Date.distantPast
+        while !stopped.isRaised {
+            // Drain events (bounded burst so a chatty host can't starve the announce poll).
+            var drained = 0
+            while drained < 32, !stopped.isRaised {
+                let ev: PunktfunkConnection.ClipEvent?
+                do {
+                    ev = try connection.nextClipboard(timeoutMs: drained == 0 ? 200 : 0)
+                } catch {
+                    stopped.raise() // session closed
+                    break
+                }
+                guard let ev else { break }
+                drained += 1
+                handle(ev)
+            }
+            let now = Date()
+            if now.timeIntervalSince(lastAnnounceCheck) >= Self.announceInterval
+                || checkNow.take()
+            {
+                lastAnnounceCheck = now
+                announceIfChanged()
+            }
         }
+        drainDone.signal()
     }
 
     // MARK: - Local copy → host (announce)
 
-    /// Announce the local pasteboard's format list when it changed (skipping our own writes and
-    /// concealed/transient pasteboards). Runs on the drain thread.
+    /// Announce the local pasteboard's format list when it changed, skipping our own writes and
+    /// concealed/transient pasteboards. Runs on the drain thread.
     private func announceIfChanged() {
-        let pb = NSPasteboard.general
-        let count = pb.changeCount
-        guard count != lastSeenChangeCount else { return }
-        lastSeenChangeCount = count
-        if count == ownedChangeCount { return } // our own write (a remote offer) — never echo
-        installedRemoteSeq = nil // a local copy replaced the host's offer
-        let types = pb.types ?? []
-        if types.contains(Self.concealed) || types.contains(Self.transient) { return }
-        offerSeq &+= 1
-        var kinds = Self.wireToPasteboard
-            .filter { types.contains($0.type) }
-            .map { PunktfunkConnection.ClipKind(mime: $0.wire) }
-        // PNG floor: announce the portable `image/png` whenever ANY convertible image is present
-        // — native PNG, TIFF/HEIC (screenshots, Preview), or a JPEG/GIF original already being
-        // offered verbatim above. `readWireData` converts at fetch time (lazy, §3.5), so the
-        // fallback costs nothing unless a peer actually pastes it.
-        if !kinds.contains(where: { $0.mime == "image/png" }),
-            types.contains(.tiff)
-                || types.contains(NSPasteboard.PasteboardType("public.heic"))
-                || kinds.contains(where: { $0.mime.hasPrefix("image/") })
-        {
-            kinds.append(PunktfunkConnection.ClipKind(mime: "image/png"))
+        let count = pasteboard.changeCount
+        stateLock.lock()
+        guard count != lastSeenChangeCount else {
+            stateLock.unlock()
+            return
         }
+        lastSeenChangeCount = count
+        guard count != ownedChangeCount else {
+            stateLock.unlock() // our own write (a remote offer) — never echo
+            return
+        }
+        installedRemote = nil // a local copy replaced the host's offer
+        stateLock.unlock()
+
+        guard let kinds = pasteboard.offerKinds else { return } // concealed — never announced
+        stateLock.lock()
+        offerSeq &+= 1
+        let seq = offerSeq
+        stateLock.unlock()
         // Empty = the pasteboard holds nothing we sync (or was cleared) — clears the host side.
-        connection.clipOffer(seq: offerSeq, kinds: kinds)
+        connection.clipOffer(seq: seq, kinds: kinds)
     }
 
     // MARK: - Event handling (drain thread)
@@ -236,93 +251,166 @@ public final class ClipboardSync: NSObject {
         case let .remoteOffer(seq, kinds):
             installRemoteOffer(seq: seq, kinds: kinds)
         case let .fetchRequest(reqId, seq, _, mime):
-            serveFetch(reqId: reqId, seq: seq, mime: mime)
+            serves.async { [weak self] in self?.serveFetch(reqId: reqId, seq: seq, mime: mime) }
         case let .data(xferId, chunk, last):
             fetchLock.lock()
-            if var pending = pendingFetches[xferId] {
-                pending.buffer.append(chunk)
-                pendingFetches[xferId] = pending
-                if last {
-                    pendingFetches[xferId]?.done.signal()
-                }
-            }
+            let pending = pendingFetches[xferId]
+            pending?.buffer.append(chunk)
+            let finished = last ? pendingFetches.removeValue(forKey: xferId) : nil
             fetchLock.unlock()
+            // Outside the lock: a completion may start the next fetch (or wake a thread that will).
+            if let finished {
+                finished.completion(finished.buffer)
+            }
         case let .cancelled(id), let .error(id, _):
-            fetchLock.lock()
-            if var pending = pendingFetches[id] {
-                pending.failed = true
-                pendingFetches[id] = pending
-                pending.done.signal()
-            }
-            fetchLock.unlock()
+            settle(id, nil)
         }
     }
 
-    // MARK: - Host copy → local (lazy install + blocked-paste fetch)
+    // MARK: - Host copy → local (lazy placement + paste-time fetch)
 
-    /// Write one NSPasteboardItem advertising the host's formats, each backed by a lazy data
-    /// provider — bytes cross only when a Mac app pastes. Empty `kinds` = the host cleared its
-    /// clipboard: drop our item if it's still current.
+    /// Place a pasteboard item advertising the host's formats, each backed by a lazy provider —
+    /// bytes cross only when a local app pastes. Empty `kinds` = the host cleared its clipboard:
+    /// drop our item if it's still current.
     private func installRemoteOffer(seq: UInt32, kinds: [PunktfunkConnection.ClipKind]) {
-        let pb = NSPasteboard.general
-        let types = kinds.compactMap { kind in
-            Self.wireToPasteboard.first(where: { $0.wire == kind.mime })?.type
-        }
-        guard !types.isEmpty else {
-            if installedRemoteSeq != nil, pb.changeCount == ownedChangeCount {
-                pb.clearContents()
-                ownedChangeCount = pb.changeCount
-                lastSeenChangeCount = pb.changeCount
+        let utis = ClipboardFormats.placeableUtis(for: kinds)
+        guard !utis.isEmpty else {
+            stateLock.lock()
+            let owned = installedRemote != nil && pasteboard.changeCount == ownedChangeCount
+            installedRemote = nil
+            resolvedSeq = nil
+            if owned {
+                let after = pasteboard.clear()
+                ownedChangeCount = after
+                lastSeenChangeCount = after
             }
-            installedRemoteSeq = nil
+            stateLock.unlock()
             return
         }
-        let item = NSPasteboardItem()
-        item.setDataProvider(RemoteOfferProvider(sync: self, seq: seq), forTypes: types)
-        pb.clearContents()
-        pb.writeObjects([item])
-        installedRemoteSeq = seq
-        ownedChangeCount = pb.changeCount
-        lastSeenChangeCount = pb.changeCount
+        let fetch: ClipboardFetch = { [weak self] wire, done in
+            guard let self else {
+                done(nil)
+                return
+            }
+            self.fetch(seq: seq, wire: wire, completion: done)
+        }
+        let before = pasteboard.changeCount
+        let after = pasteboard.installLazy(utis: utis, fetch: fetch)
+        stateLock.lock()
+        installedRemote = (seq, kinds)
+        resolvedSeq = nil
+        // Only claim the pasteboard if the write actually landed. Recording a change count we did
+        // not cause is the one bookkeeping mistake with no recovery: the announce poll would read
+        // the user's own next copy as our echo and never tell the host about it again.
+        if after != before {
+            ownedChangeCount = after
+            lastSeenChangeCount = after
+        }
+        stateLock.unlock()
     }
 
-    /// Blocked-paste fulfillment: fetch one wire format of host offer `seq` and wait (provider
-    /// thread) for the drain thread to assemble the chunks. Nil on timeout/cancel/error — the
-    /// paste then provides nothing rather than hanging (§3.4).
-    ///
-    /// `fetchLock` is held ACROSS the `clipFetch` so the pending entry exists before the drain
-    /// thread can process the first `.data` event (its `handle` takes `fetchLock` after
-    /// releasing the connection's clipboard lock — no cycle).
-    fileprivate func fetchBlocking(seq: UInt32, wireMime: String) -> Data? {
+    /// Start pulling one wire format of host offer `seq`. `completion` runs exactly once — with
+    /// the bytes, or with nil on a stale offer, a timeout, a cancel, or a closing session.
+    private func fetch(seq: UInt32, wire: String, completion: @escaping (Data?) -> Void) {
         fetchLock.lock()
-        guard let xferId = connection.clipFetch(seq: seq, mime: wireMime) else {
+        guard !stopped.isRaised, let xferId = connection.clipFetch(seq: seq, mime: wire) else {
             fetchLock.unlock()
-            return nil
+            completion(nil)
+            return
         }
-        pendingFetches[xferId] = PendingFetch()
-        let done = pendingFetches[xferId]!.done
+        pendingFetches[xferId] = PendingFetch(completion: completion)
         fetchLock.unlock()
-        let outcome = done.wait(timeout: .now() + Self.fetchTimeout)
+        deadlines.asyncAfter(deadline: .now() + Self.fetchTimeout) { [weak self] in
+            guard let self, self.settle(xferId, nil) else { return }
+            self.connection.clipCancel(id: xferId)
+        }
+    }
+
+    /// Complete one pending fetch if it hasn't been already. Returns whether this call is the one
+    /// that settled it, so a deadline knows whether it still has to cancel the transfer.
+    @discardableResult
+    private func settle(_ xferId: UInt32, _ data: Data?) -> Bool {
         fetchLock.lock()
         let pending = pendingFetches.removeValue(forKey: xferId)
         fetchLock.unlock()
-        if outcome == .timedOut {
-            connection.clipCancel(id: xferId)
-            return nil
+        pending?.completion(data)
+        return pending != nil
+    }
+
+    private func settleAll(_ data: Data?) {
+        fetchLock.lock()
+        let all = pendingFetches
+        pendingFetches.removeAll()
+        fetchLock.unlock()
+        for (_, pending) in all {
+            pending.completion(data)
         }
-        guard let pending, !pending.failed else { return nil }
-        return pending.buffer
+    }
+
+    // MARK: - Resolving a promise before it dies (iOS)
+
+    /// Pull the host's offer down to concrete bytes, replacing the promise on the pasteboard.
+    ///
+    /// A lazy promise is only as good as the ability to answer it, and on iOS that ability ends
+    /// with the session: backgrounding the app disconnects it. Without this, "copy on the host,
+    /// then paste into Safari on the iPad" would hand Safari an empty promise. Everything else
+    /// about the design stays lazy — a user who copies on the host, pastes nothing, and stays in
+    /// the app moves no clipboard bytes at all; this runs once, at the end, for content that is
+    /// still on the pasteboard and still unclaimed.
+    ///
+    /// Runs on the thread calling `stop()` — off-main by contract, and never the drain thread,
+    /// which has to keep running to deliver what this waits for.
+    private func resolvePendingOffer() {
+        stateLock.lock()
+        let offer = installedRemote
+        let unresolved = resolvedSeq != installedRemote?.seq
+        let stillOurs = pasteboard.changeCount == ownedChangeCount
+        stateLock.unlock()
+        guard let offer, unresolved, stillOurs, !stopped.isRaised else { return }
+
+        let deadline = Date().addingTimeInterval(Self.resolveTimeout)
+        var items: [(uti: String, data: Data)] = []
+        var budget = Self.resolveBudget
+        for kind in offer.kinds {
+            guard let uti = ClipboardFormats.uti(forWire: kind.mime) else { continue }
+            // A size hint of 0 means "unknown" — try it, and let the byte count enforce the cap.
+            guard kind.sizeHint <= UInt64(budget), !stopped.isRaised else { continue }
+            let left = deadline.timeIntervalSinceNow
+            guard left > 0 else { break }
+            let box = ClipboardResultBox()
+            fetch(seq: offer.seq, wire: kind.mime) { box.settle($0) }
+            guard let data = box.wait(timeout: left), data.count <= budget else { continue }
+            budget -= data.count
+            items.append((uti, data))
+        }
+        guard !items.isEmpty else { return }
+        // Re-check: the host may have copied again, or the user may have copied locally, while we
+        // were pulling — either way these bytes are no longer what belongs on the pasteboard.
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        let before = pasteboard.changeCount
+        guard installedRemote?.seq == offer.seq, before == ownedChangeCount else { return }
+        let after = pasteboard.installResolved(items)
+        // As in `installRemoteOffer`: a write that did not land leaves the promise in place, so
+        // teardown should still take it back rather than believing these bytes are on the board.
+        guard after != before else { return }
+        resolvedSeq = offer.seq
+        ownedChangeCount = after
+        lastSeenChangeCount = after
     }
 
     // MARK: - Host paste of our data (serve)
 
-    /// Answer a host paste of our offered data from the live pasteboard. A stale `seq` (the
-    /// local clipboard changed since that announce) is cancelled — never serve mismatched bytes.
+    /// Answer a host paste of our offered data from the live pasteboard. A stale `seq` (the local
+    /// clipboard changed since that announce) is cancelled — never serve mismatched bytes.
+    ///
+    /// Runs on `serves`, not the drain thread: reading the pasteboard can block on a user decision
+    /// (iOS's paste permission alert), and the drain thread has to stay live throughout.
     private func serveFetch(reqId: UInt32, seq: UInt32, mime: String) {
-        let pb = NSPasteboard.general
-        guard seq == offerSeq, pb.changeCount == lastSeenChangeCount,
-            let data = Self.readWireData(pb, mime)
-        else {
+        stateLock.lock()
+        let fresh = seq == offerSeq && pasteboard.changeCount == lastSeenChangeCount
+        stateLock.unlock()
+        guard fresh, !stopped.isRaised, let data = pasteboard.read(wire: mime) else {
             connection.clipCancel(id: reqId)
             return
         }
@@ -335,67 +423,6 @@ public final class ClipboardSync: NSObject {
         }
         if data.isEmpty {
             connection.clipServe(reqId: reqId, data: Data(), last: true)
-        }
-    }
-
-    /// Read one wire format from the pasteboard, converting where macOS stores a different
-    /// native type: `image/png` is served from a real `.png` entry when present, else converted
-    /// from whatever image representation the pasteboard holds (TIFF from screenshots/Preview,
-    /// WebP/AVIF/GIF from browsers — `NSImage` decodes them all) into PNG at fetch time.
-    private static func readWireData(_ pb: NSPasteboard, _ mime: String) -> Data? {
-        guard mime == "image/png" else {
-            guard let type = wireToPasteboard.first(where: { $0.wire == mime })?.type else {
-                return nil
-            }
-            return pb.data(forType: type)
-        }
-        if let png = pb.data(forType: .png) {
-            return png
-        }
-        // No native PNG: decode whatever image the pasteboard carries and re-encode.
-        guard let img = NSImage(pasteboard: pb),
-            let tiff = img.tiffRepresentation,
-            let rep = NSBitmapImageRep(data: tiff)
-        else {
-            return nil
-        }
-        return rep.representation(using: .png, properties: [:])
-    }
-}
-
-/// The lazy paste hook: AppKit calls `provideDataForType` only when a Mac app actually pastes;
-/// the fetch then blocks this provider thread (never main) until the host's bytes arrive or the
-/// timeout provides nothing. One provider per installed remote offer — a dead sync (weak) or a
-/// superseded offer provides nothing.
-private final class RemoteOfferProvider: NSObject, NSPasteboardItemDataProvider {
-    private weak var sync: ClipboardSync?
-    private let seq: UInt32
-
-    init(sync: ClipboardSync, seq: UInt32) {
-        self.sync = sync
-        self.seq = seq
-    }
-
-    func pasteboard(
-        _ pasteboard: NSPasteboard?, item: NSPasteboardItem,
-        provideDataForType type: NSPasteboard.PasteboardType
-    ) {
-        guard let sync,
-            let wire = wireMime(for: type),
-            let data = sync.fetchBlocking(seq: seq, wireMime: wire)
-        else { return }
-        item.setData(data, forType: type)
-    }
-
-    private func wireMime(for type: NSPasteboard.PasteboardType) -> String? {
-        switch type {
-        case .string: return "text/plain;charset=utf-8"
-        case .rtf: return "text/rtf"
-        case .html: return "text/html"
-        case .png: return "image/png"
-        case NSPasteboard.PasteboardType("public.jpeg"): return "image/jpeg"
-        case NSPasteboard.PasteboardType("com.compuserve.gif"): return "image/gif"
-        default: return nil
         }
     }
 }

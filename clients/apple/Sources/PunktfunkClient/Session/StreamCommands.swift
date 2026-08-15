@@ -22,8 +22,7 @@ import SwiftUI
 /// `.focusedSceneValue` so the Scene-level commands can drive it.
 struct SessionFocus {
     var isStreaming: Bool
-    /// The connected host advertises `HOST_CAP_CLIPBOARD` (gates the Share Clipboard item —
-    /// macOS-only UI, but the fact is platform-neutral).
+    /// The connected host advertises `HOST_CAP_CLIPBOARD` (gates the Share Clipboard item).
     var clipboardAvailable: Bool
     /// Clipboard sync is live (host-acked) — drives the item's Stop/Share title.
     var clipboardOn: Bool
@@ -78,14 +77,15 @@ struct StreamCommands: Commands {
             }
             .keyboardShortcut("a", modifiers: [.control, .option, .shift])
             .disabled(session?.isStreaming != true || session?.micAvailable != true)
-            #if os(macOS)
             // Mid-session clipboard flip (design/clipboard-and-file-transfer.md §5.3). Greyed
-            // when the host doesn't advertise the cap (older host / operator policy off).
+            // when the host doesn't advertise the cap (older host / operator policy off). On iPad
+            // there is no menu bar to show it in, but a hardware keyboard still reaches it.
             Button(session?.clipboardOn == true ? "Stop Sharing Clipboard" : "Share Clipboard") {
                 session?.toggleClipboard()
             }
             .keyboardShortcut("c", modifiers: [.control, .option, .shift])
             .disabled(session?.isStreaming != true || session?.clipboardAvailable != true)
+            #if os(macOS)
             // Toggle the window's fullscreen. ⌃⌘F is the macOS-standard fullscreen combo; here it's
             // explicit so it's discoverable AND survives capture — while streaming the stream view
             // swallows keys, so InputCapture's monitor detects the same combo and posts the same

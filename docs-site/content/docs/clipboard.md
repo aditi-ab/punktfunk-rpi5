@@ -64,6 +64,7 @@ about *that* machine. You set it in the host's edit sheet, and it is deliberatel
 | Client | Where the switch is | Label | Default |
 |---|---|---|---|
 | macOS | Host card menu → **Edit…** | **Share clipboard with this host** | Off |
+| iOS, iPadOS | Host card menu → **Edit…** | **Share clipboard with this host** | Off |
 | Windows | Host tile menu → **Edit…** | **Share clipboard with this host** | Off |
 | Linux (GTK) | Host card menu → **Edit…** | **Share clipboard** | Off |
 | Android (touch) | Host card menu → **Edit…** | **Shared clipboard** | **On** |
@@ -75,10 +76,12 @@ no clipboard row, so there is nowhere to change it there. It stays on, which is 
 The setting is read when a session starts, so if you change it while streaming, reconnect.
 
 macOS can also flip it mid-session: **Stream ▸ Share Clipboard** (⌃⌥⇧C), which becomes **Stop
-Sharing Clipboard** once the host has acknowledged it.
+Sharing Clipboard** once the host has acknowledged it. On an iPad with a hardware keyboard the same
+combo works, though there is no menu bar to show it in — and only while the pointer is released, as
+a captured session sends the keys to the host instead.
 
-iOS, iPadOS, tvOS and a Steam Deck in Gaming Mode have no clipboard switch — neither the Decky
-panel nor the client's console home has a host edit sheet — see
+tvOS and a Steam Deck in Gaming Mode have no clipboard switch — the Apple TV has no pasteboard to
+share at all, and neither the Decky panel nor the client's console home has a host edit sheet — see
 [what each client does](#which-hosts-and-clients-support-it) below.
 
 ## Nothing crosses until something pastes
@@ -91,16 +94,22 @@ That holds for everything you copy on your own machine, and for both directions 
 does **not** hold for a host copy arriving at a Windows or Android client: those two fetch the
 content straight away and put it on your local clipboard, whether or not you ever paste. On Windows
 that is because the lazy path needs Windows delayed rendering, which the client doesn't implement
-yet; on Android there is no way to satisfy a paste from the network at all. The macOS client is
-lazy in both directions.
+yet; on Android there is no way to satisfy a paste from the network at all. The macOS and iOS
+clients are lazy in both directions.
+
+On iOS there is one deliberate exception. Backgrounding the app ends the session, and a promise
+nobody can answer is worse than no promise at all — so if the host copied something and you have not
+pasted it yet, those bytes are pulled across as the session ends, up to 8 MiB. That is what makes
+"copy on the host, switch to Safari, paste" work on an iPad. Nothing is fetched if you never leave
+the app, or if you already pasted.
 
 A single transfer is capped at 64 MiB. Nothing else limits size, so a very large host-side copy can
 cross to a Windows or Android client for a paste that never happens.
 
-What you copy on the **macOS or Windows client** is filtered for secrets: content marked
-`org.nspasteboard.ConcealedType` or `org.nspasteboard.TransientType` on macOS, or
+What you copy on the **macOS, iOS or Windows client** is filtered for secrets: content marked
+`org.nspasteboard.ConcealedType` or `org.nspasteboard.TransientType` on the Apple clients, or
 `ExcludeClipboardContentFromMonitorProcessing` on Windows — what password managers set — is never
-announced and never served. That check exists only in those two clients. The Android client has no
+announced and never served. That check exists only in those clients. The Android client has no
 equivalent, and neither does the host, so a password copied **on the host** is announced to your
 client like anything else.
 
@@ -128,10 +137,11 @@ when a host application pastes.
 | Client | What crosses |
 |---|---|
 | macOS | Plain text, rich text (RTF), HTML, and PNG, JPEG and GIF images |
+| iOS, iPadOS | Plain text, rich text (RTF), HTML, and PNG, JPEG and GIF images |
 | Windows | Plain text, and PNG images |
 | Android, Android TV | **Plain text only** |
 | Linux (GTK), Steam Deck | Nothing yet — see below |
-| iOS, iPadOS, tvOS | Not implemented |
+| tvOS | Not implemented — tvOS has no pasteboard |
 
 The **Linux client has the switch but no working clipboard bridge**: it enables the plane and then
 has no code to read or write the desktop's own clipboard, so nothing is announced and nothing is

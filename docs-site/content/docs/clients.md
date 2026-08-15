@@ -208,9 +208,9 @@ reach, which app honours which of them, the two mouse modes, the three touch mod
 are all on [Mouse, touch and pen](/docs/input#getting-your-input-back).
 
 Copying between the two machines is a separate opt-in: the host operator allows it in `host.env`
-and you turn it on for that one host in your client. Content crosses today from the macOS, Windows
-and Android apps — the Linux client has the switch but no bridge behind it yet, and iOS, iPadOS and
-tvOS have neither. See [Shared clipboard](/docs/clipboard).
+and you turn it on for that one host in your client. Content crosses today from the macOS, iOS,
+iPadOS, Windows and Android apps — the Linux client has the switch but no bridge behind it yet, and
+tvOS has no pasteboard to share. See [Shared clipboard](/docs/clipboard).
 
 ## Which should I use?
 

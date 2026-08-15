@@ -34,10 +34,10 @@ public struct StoredHost: Identifiable, Codable, Hashable, Sendable {
     /// client can send a magic packet to wake the host later (when it's asleep and no longer
     /// advertising). Optional (same forward-compat reason as `mgmtPort`); nil until first learned.
     public var macAddresses: [String]?
-    /// Share the clipboard with this host (macOS sessions; design/clipboard-and-file-transfer.md
-    /// §5.3). Opt-in per host: nil/false = off (nil also keeps older saved JSON decoding — same
-    /// forward-compat reason as `mgmtPort`). Honored only when the host advertises
-    /// `HOST_CAP_CLIPBOARD`.
+    /// Share the clipboard with this host (macOS and iOS sessions; tvOS has no pasteboard — see
+    /// design/clipboard-and-file-transfer.md §5.3). Opt-in per host: nil/false = off (nil also
+    /// keeps older saved JSON decoding — same forward-compat reason as `mgmtPort`). Honored only
+    /// when the host advertises `HOST_CAP_CLIPBOARD`.
     public var clipboardSync: Bool?
     /// This host's default settings profile (`StreamProfile.id`) — what a plain click/tap uses.
     /// nil, or an id whose profile was deleted, resolves as "Default settings", i.e. exactly
