@@ -719,5 +719,117 @@ final class AudioRingDriftTests: XCTestCase {
         XCTAssertEqual(stats.bufferedMS, 30)
         XCTAssertEqual(stats.avOffsetMS, 37, "positive = audio behind the picture")
     }
+
+    // MARK: - Drought concealment (WP-C1)
+
+    /// Concealment is for a ring that is running OUT. A drought a deep ring can cover is
+    /// inaudible, and synthesizing over it would insert audio the late packets are about to
+    /// duplicate — the stream would then run permanently later and the drift shed would have to
+    /// cut it back out, audibly.
+    ///
+    /// Mirrors `a_drought_is_concealed_only_while_the_ring_is_running_out`.
+    func testADroughtIsConcealedOnlyWhileTheRingIsRunningOut() {
+        var c = DroughtConceal(maxMS: AudioRing.plcMaxMS)
+        let stalledMS = 3 * AudioRing.frameMS
+        XCTAssertFalse(
+            c.conceal(sinceLastPacketMS: stalledMS, depthMS: 40),
+            "a 40 ms ring covers this drought by itself")
+        XCTAssertTrue(
+            c.conceal(sinceLastPacketMS: stalledMS, depthMS: 0), "an empty ring does not")
+        XCTAssertEqual(c.totalMS, AudioRing.frameMS)
+    }
+
+    /// Ordinary arrival jitter is not a drought — this policy must be invisible until the wire has
+    /// genuinely stopped.
+    ///
+    /// Mirrors `ordinary_jitter_is_not_a_drought`.
+    func testOrdinaryJitterIsNotADrought() {
+        var c = DroughtConceal(maxMS: AudioRing.plcMaxMS)
+        for _ in 0..<1_000 {
+            XCTAssertFalse(c.conceal(sinceLastPacketMS: AudioRing.frameMS, depthMS: 0))
+        }
+        XCTAssertEqual(c.totalMS, 0)
+    }
+
+    /// The window is bounded, and bounded in TIME — the whole reason `deprimeMS` stopped being a
+    /// callback count (`testDeprimeFuseIsADurationNotACallbackCount`). Derived from the fuse, so
+    /// it cannot drift away from the thing it protects: an edit to one is an edit to both.
+    ///
+    /// Mirrors `drought_concealment_is_bounded_at_twice_the_deprime_fuse`.
+    func testDroughtConcealmentIsBoundedAtTwiceTheDeprimeFuse() {
+        let deprimeMS = 60 // AudioRing.deprimeMS / JitterTuning::COREAUDIO.deprime_ms
+        XCTAssertEqual(AudioRing.plcMaxMS, 2 * deprimeMS)
+        var c = DroughtConceal(maxMS: AudioRing.plcMaxMS)
+        var ms = 0
+        for _ in 0..<1_000 where c.conceal(sinceLastPacketMS: 2 * AudioRing.frameMS, depthMS: 0) {
+            ms += AudioRing.frameMS
+        }
+        XCTAssertEqual(ms, AudioRing.plcMaxMS, "must use exactly the budget, and stop there")
+        XCTAssertEqual(c.totalMS, AudioRing.plcMaxMS, "and report every millisecond of it")
+    }
+
+    /// A packet ends the drought and hands back a full budget for the next one — a link that
+    /// stalls once a minute must be covered every time, not only the first.
+    ///
+    /// The other half of the Rust `concealment_already_paid_for_is_not_paid_for_twice` — that
+    /// frames a drought already covered are subtracted from the loss concealment the seq path then
+    /// asks for — cannot be tested from here: on this leg the gap tracker lives behind the C ABI,
+    /// and so does the subtraction (`drought_concealment_is_not_charged_again_by_the_loss_path` in
+    /// `punktfunk_core::abi`).
+    func testAPacketEndsTheDroughtAndRefreshesTheBudget() {
+        var c = DroughtConceal(maxMS: AudioRing.plcMaxMS)
+        for _ in 0..<1_000 where c.conceal(sinceLastPacketMS: 2 * AudioRing.frameMS, depthMS: 0) {}
+        XCTAssertEqual(c.totalMS, AudioRing.plcMaxMS, "budget spent")
+        XCTAssertFalse(c.conceal(sinceLastPacketMS: 2 * AudioRing.frameMS, depthMS: 0))
+        c.packet()
+        XCTAssertTrue(
+            c.conceal(sinceLastPacketMS: 2 * AudioRing.frameMS, depthMS: 0),
+            "the next drought must start from a full budget")
+        XCTAssertEqual(
+            c.totalMS, AudioRing.plcMaxMS + AudioRing.frameMS,
+            "the SESSION total keeps counting — it is what the log line reports")
+    }
+
+    /// THE field scenario this exists for, played against the real ring: the wire goes quiet for
+    /// longer than the de-prime fuse (a Wi-Fi delivery stall, or a host whose capture stalled).
+    /// Without concealment the ring drains, starves, and re-primes a whole target's worth of fresh
+    /// silence — an artifact far longer than the audio that was missing. Fed one synthesized frame
+    /// per drain tick instead, playback continues through the whole budget and nobody hears the
+    /// stall at all.
+    func testConcealmentRidesOutAStallThatWouldOtherwiseDeprime() {
+        /// Prime, then stall the wire for `ms`, ticking the drain thread's 5 ms loop and the
+        /// device callback in step. Returns when the first silent callback lands (nil = none).
+        func stall(ms: Int, concealing: Bool) -> Int? {
+            let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
+            let want = 5 * perMS
+            var scratch = [Float](repeating: 0, count: want)
+            let feed = [Float](repeating: 0.5, count: 25 * perMS)
+            feed.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: 25 * perMS) }
+            var drought = DroughtConceal(maxMS: AudioRing.plcMaxMS)
+            for tick in 0..<(ms / AudioRing.frameMS) {
+                if concealing,
+                   drought.conceal(
+                    sinceLastPacketMS: tick * AudioRing.frameMS, depthMS: ring.bufferedMS) {
+                    feed.withUnsafeBufferPointer {
+                        ring.write($0.baseAddress!, count: AudioRing.frameMS * perMS)
+                    }
+                }
+                scratch.withUnsafeMutableBufferPointer {
+                    ring.read(into: $0.baseAddress!, count: want)
+                }
+                if scratch.allSatisfy({ $0 == 0 }) { return tick * AudioRing.frameMS }
+            }
+            return nil
+        }
+        // The defect: 25 ms of ring, a 60 ms fuse — the stall is silent well inside the budget.
+        guard let deprimedAt = stall(ms: AudioRing.plcMaxMS, concealing: false) else {
+            return XCTFail("the unconcealed stall must still de-prime — the ring changed under us")
+        }
+        XCTAssertLessThan(deprimedAt, AudioRing.plcMaxMS)
+        XCTAssertNil(
+            stall(ms: AudioRing.plcMaxMS, concealing: true),
+            "a stall inside the budget must not reach the listener at all (unconcealed: silent "
+                + "after \(deprimedAt) ms)")
+    }
 }
 #endif

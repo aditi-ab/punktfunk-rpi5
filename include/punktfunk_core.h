@@ -137,7 +137,19 @@
 // way). Additive and client-local: the mask, the expiry and the `AccessUpdate` message all
 // shipped with the Welcome's trailing-field append (old peers skip them in both directions),
 // so [`WIRE_VERSION`] is unchanged.
-#define PUNKTFUNK_ABI_VERSION 22
+// v23: added `punktfunk_connection_audio_plc` — one frame of libopus packet-loss concealment,
+// synthesized from the connection's OWN decoder state, for an embedder whose playout ring is
+// draining because nothing is arriving (design/host-source-stutter-fixes.md WP-C1). The three
+// Rust clients conceal a packet drought on their decode thread; Apple's ring is Swift and its
+// decoder sits behind this ABI, so without a call it had no way to reach the one thing that can
+// extrapolate the missing audio — a second decoder would conceal from empty state, because PLC
+// extrapolates from the last decoded frame. A NEW symbol: every existing function keeps its
+// signature and behaviour, and an embedder that never calls it behaves exactly as before (it
+// simply de-primes over droughts, as all four clients used to). Frames it returns carry `seq`
+// and `pts_ns` of `0` — concealed audio was never on the wire and must not reach an A/V-sync
+// observation. Additive and client-local: nothing new is sent or parsed, so [`WIRE_VERSION`] is
+// unchanged.
+#define PUNKTFUNK_ABI_VERSION 23
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -2862,13 +2874,51 @@ PunktfunkStatus punktfunk_connection_end_reason(PunktfunkConnection *c, uint8_t 
 // IN FRONT of the arriving frame in the same buffer — `out->frame_count` then covers the
 // concealed frames plus the real one (`out->seq`/`out->pts_ns` are the real packet's). The
 // embedder just writes the whole buffer to its ring, same as any other frame; gaps arrive
-// pre-healed, exactly as they do on the clients that decode outside core.
+// pre-healed, exactly as they do on the clients that decode outside core. That covers a gap a
+// LATER packet reveals; when the wire goes quiet instead, see
+// [`punktfunk_connection_audio_plc`].
 //
 // # Safety
 // `c` is a valid connection handle; `out` is writable. At most one thread pulls audio.
 PunktfunkStatus punktfunk_connection_next_audio_pcm(PunktfunkConnection *c,
                                                     PunktfunkAudioPcm *out,
                                                     uint32_t timeout_ms);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Synthesize ONE frame of concealment from the in-core decoder's own state — no packet involved,
+// nothing pulled off the wire (design/host-source-stutter-fixes.md, WP-C1).
+//
+// [`punktfunk_connection_next_audio_pcm`] heals a gap the SEQUENCE reveals, which needs a later
+// packet to arrive and reveal it. When the wire simply goes quiet — a delivery stall on a
+// bunching Wi-Fi link, or a host whose capture stalled — nothing arrives to reveal anything: the
+// embedder's playout ring drains to empty, its callback runs short, and its de-jitter policy
+// de-primes and then re-primes a whole target's worth of fresh silence. The artifact is far
+// longer than the audio actually missing.
+//
+// So on a `NO_FRAME` timeout with a DRAINING ring, ask for this instead. The policy stays on the
+// embedder's side because that is where its two ingredients live — the ring depth and the clock
+// since the last packet — and it must be: bounded in TIME (roughly twice the ring's own de-prime
+// fuse), never in callbacks or frames, and gated on the ring genuinely running out. A drought a
+// deep ring covers is inaudible, and concealing it would insert audio the late packets are about
+// to duplicate, pushing the stream permanently later. Core supplies only the mechanism, one frame
+// per call, at the cadence the embedder drains at.
+//
+// Returns [`PunktfunkStatus::NoFrame`] when nothing has decoded yet — PLC extrapolates from the
+// last decoded frame, so before there is one there is no state to extrapolate from — and if
+// libopus declines to interpolate. Both mean "write nothing this tick", exactly like a timeout.
+//
+// `out->seq` and `out->pts_ns` read 0: this frame was never on the wire, so it has no sequence
+// number and no capture instant, and it must never be fed to an A/V-sync observation.
+// `out->samples` borrows connection memory until the next PCM call on this handle — the SAME
+// slot [`punktfunk_connection_next_audio_pcm`] hands out, so call both from the one audio thread.
+//
+// Frames taken this way are subtracted from the concealment the next arriving packet asks for, so
+// a packet genuinely lost inside a covered drought is not concealed twice.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio.
+PunktfunkStatus punktfunk_connection_audio_plc(PunktfunkConnection *c, PunktfunkAudioPcm *out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

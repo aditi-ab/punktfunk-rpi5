@@ -710,6 +710,13 @@ struct AudioPcmState {
     /// frame. 0 until the first decode, which skips concealment (nothing to size it from),
     /// exactly like the other clients.
     frame_samples: usize,
+    /// Frames synthesized for a packet DROUGHT since the last real packet
+    /// ([`punktfunk_connection_audio_plc`]), subtracted from the loss concealment the next packet
+    /// asks for: a packet genuinely lost inside a drought this already covered must not be covered
+    /// twice, which would insert audio the stream never carried and push everything after it
+    /// later. The subtraction has to happen HERE — the gap tracker is on this side of the ABI, so
+    /// the embedder driving the drought cannot see what it is about to be charged for.
+    drought_frames: u32,
 }
 
 #[cfg(feature = "quic")]
@@ -748,8 +755,12 @@ impl AudioPcmState {
         // Conceal lost packets (a seq gap) before decoding the one that arrived: empty input
         // synthesizes `frame_samples` of interpolation per missing packet — an inaudible fade
         // instead of the click a hard gap makes in the ring. Mirrors the Linux/Windows session
-        // pump and the Android native pump; capped by the tracker at 50 ms.
-        let missing = self.gaps.missing_before(seq);
+        // pump and the Android native pump; capped by the tracker at 50 ms. Whatever a drought
+        // already covered comes off the top — that audio is in the embedder's ring already.
+        let missing = self
+            .gaps
+            .missing_before(seq)
+            .saturating_sub(std::mem::take(&mut self.drought_frames));
         let mut filled = 0usize;
         if self.frame_samples > 0 {
             for _ in 0..missing {
@@ -777,6 +788,32 @@ impl AudioPcmState {
             // as on every other client (the tracker has already anchored at this seq).
             Err(_) if filled > 0 => Ok(filled),
             Err(_) => Err(PunktfunkStatus::BadPacket),
+        }
+    }
+
+    /// Synthesize ONE concealment frame with no packet involved — the drought half of concealment
+    /// (see [`punktfunk_connection_audio_plc`] for what asks for it and why).
+    ///
+    /// Returns the interleaved sample count now valid at the front of `pcm`, or `Ok(0)` when
+    /// nothing has decoded yet: libopus PLC extrapolates from the LAST decoded frame, so before
+    /// there is one there is neither state to extrapolate from nor a frame size to ask for.
+    fn conceal(&mut self, channels: u8) -> Result<usize, PunktfunkStatus> {
+        let ch = channels as usize;
+        let plc = self.frame_samples * ch;
+        if plc == 0 {
+            return Ok(0);
+        }
+        let Some(dec) = self.decoder.as_mut() else {
+            return Ok(0);
+        };
+        match dec.decode_float(&[], &mut self.pcm[..plc], false) {
+            Ok(samples) => {
+                self.drought_frames = self.drought_frames.saturating_add(1);
+                Ok(samples * ch)
+            }
+            // libopus declined to interpolate. Nothing to hand out, and the caller's response is
+            // a timeout's: write nothing and let its ring's own underrun path have the drought.
+            Err(_) => Ok(0),
         }
     }
 }
@@ -2577,7 +2614,9 @@ pub struct PunktfunkAudioPcm {
 /// IN FRONT of the arriving frame in the same buffer — `out->frame_count` then covers the
 /// concealed frames plus the real one (`out->seq`/`out->pts_ns` are the real packet's). The
 /// embedder just writes the whole buffer to its ring, same as any other frame; gaps arrive
-/// pre-healed, exactly as they do on the clients that decode outside core.
+/// pre-healed, exactly as they do on the clients that decode outside core. That covers a gap a
+/// LATER packet reveals; when the wire goes quiet instead, see
+/// [`punktfunk_connection_audio_plc`].
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio.
@@ -2621,6 +2660,78 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
                         channels,
                         seq: pkt.seq,
                         pts_ns: pkt.pts_ns,
+                    };
+                }
+                PunktfunkStatus::Ok
+            }
+            Err(status) => status,
+        }
+    })
+}
+
+/// Synthesize ONE frame of concealment from the in-core decoder's own state — no packet involved,
+/// nothing pulled off the wire (design/host-source-stutter-fixes.md, WP-C1).
+///
+/// [`punktfunk_connection_next_audio_pcm`] heals a gap the SEQUENCE reveals, which needs a later
+/// packet to arrive and reveal it. When the wire simply goes quiet — a delivery stall on a
+/// bunching Wi-Fi link, or a host whose capture stalled — nothing arrives to reveal anything: the
+/// embedder's playout ring drains to empty, its callback runs short, and its de-jitter policy
+/// de-primes and then re-primes a whole target's worth of fresh silence. The artifact is far
+/// longer than the audio actually missing.
+///
+/// So on a `NO_FRAME` timeout with a DRAINING ring, ask for this instead. The policy stays on the
+/// embedder's side because that is where its two ingredients live — the ring depth and the clock
+/// since the last packet — and it must be: bounded in TIME (roughly twice the ring's own de-prime
+/// fuse), never in callbacks or frames, and gated on the ring genuinely running out. A drought a
+/// deep ring covers is inaudible, and concealing it would insert audio the late packets are about
+/// to duplicate, pushing the stream permanently later. Core supplies only the mechanism, one frame
+/// per call, at the cadence the embedder drains at.
+///
+/// Returns [`PunktfunkStatus::NoFrame`] when nothing has decoded yet — PLC extrapolates from the
+/// last decoded frame, so before there is one there is no state to extrapolate from — and if
+/// libopus declines to interpolate. Both mean "write nothing this tick", exactly like a timeout.
+///
+/// `out->seq` and `out->pts_ns` read 0: this frame was never on the wire, so it has no sequence
+/// number and no capture instant, and it must never be fed to an A/V-sync observation.
+/// `out->samples` borrows connection memory until the next PCM call on this handle — the SAME
+/// slot [`punktfunk_connection_next_audio_pcm`] hands out, so call both from the one audio thread.
+///
+/// Frames taken this way are subtracted from the concealment the next arriving packet asks for, so
+/// a packet genuinely lost inside a covered drought is not concealed twice.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_audio_plc(
+    c: *mut PunktfunkConnection,
+    out: *mut PunktfunkAudioPcm,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if out.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
+        let channels = crate::audio::normalize_channels(c.inner.audio_channels);
+        let mut state = lock_recover(&c.audio_pcm);
+        match state.conceal(channels) {
+            Ok(0) => PunktfunkStatus::NoFrame,
+            Ok(samples) => {
+                // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
+                // matching `#[repr(C)]` type, written once by value.
+                unsafe {
+                    *out = PunktfunkAudioPcm {
+                        samples: state.pcm.as_ptr(),
+                        frame_count: (samples / channels.max(1) as usize) as u32,
+                        channels,
+                        seq: 0,
+                        pts_ns: 0,
                     };
                 }
                 PunktfunkStatus::Ok
@@ -5293,5 +5404,49 @@ mod tests {
             state.decode_packet(&packet(0.07), 1000, 2),
             Ok((crate::audio::MAX_CONCEAL_PACKETS as usize + 1) * FRAME * 2)
         );
+    }
+
+    /// Drought concealment (WP-C1): the embedder asks for a frame at a time while the wire is
+    /// quiet, and the loss path must then charge only for what the drought did NOT already cover
+    /// — concealing a packet lost inside a covered drought a second time would insert audio the
+    /// stream never carried and push everything after it later. The subtraction lives here
+    /// because the gap tracker does; the embedder driving the drought cannot see it.
+    #[test]
+    fn drought_concealment_is_not_charged_again_by_the_loss_path() {
+        const FRAME: usize = 240; // 5 ms @ 48 kHz, per channel
+        let l = crate::audio::LAYOUT_STEREO;
+        let mut enc = opus::MSEncoder::new(
+            48_000,
+            l.streams,
+            l.coupled,
+            l.mapping,
+            opus::Application::LowDelay,
+        )
+        .expect("MSEncoder");
+        enc.set_vbr(false).unwrap();
+        let mut packet = |tone: f32| {
+            let mut frame = vec![0f32; FRAME * 2];
+            for (i, s) in frame.iter_mut().enumerate() {
+                *s = 0.25 * (i as f32 * tone).sin();
+            }
+            let mut out = vec![0u8; 1500];
+            let n = enc.encode_float(&frame, &mut out).unwrap();
+            out.truncate(n);
+            out
+        };
+
+        let mut state = AudioPcmState::default();
+        // Nothing has decoded: PLC has no state to extrapolate from, and the ABI reports NoFrame.
+        assert_eq!(state.conceal(2), Ok(0));
+
+        assert_eq!(state.decode_packet(&packet(0.05), 0, 2), Ok(FRAME * 2));
+        // The wire goes quiet; the embedder covers four frames of it.
+        for _ in 0..4 {
+            assert_eq!(state.conceal(2), Ok(FRAME * 2));
+        }
+        // It comes back at seq 7 — six packets missing, four of them already in the ring.
+        assert_eq!(state.decode_packet(&packet(0.06), 7, 2), Ok(3 * FRAME * 2));
+        // …and the next drought starts from nothing owed, not from a stale credit.
+        assert_eq!(state.decode_packet(&packet(0.06), 9, 2), Ok(2 * FRAME * 2));
     }
 }
