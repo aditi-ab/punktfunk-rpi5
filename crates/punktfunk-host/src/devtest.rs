@@ -256,9 +256,18 @@ pub fn pad_sink_test(args: &[String]) -> Result<()> {
     let mut cap = crate::audio::pad_sink::PadSinkCapturer::open(pad, edge)
         .context("mint pad-audio sink (is PipeWire running in this session?)")?;
     println!(
-        "pad sink minted: node.name = {}\n  inspect: pactl list sinks | grep -A20 punktfunk-pad\n  \
-         drive it: pw-play --target '{}' <48k-file>\nCapturing for {secs}s…",
-        cap.node_name, cap.node_name
+        "pad sink minted: node.name = {}\n  api.alsa.split.name = {}  (what GE-Proton opens as \
+         pipewire:NODE=…)\n  inspect: pactl list sinks | grep -A25 Speaker__sink\n  \
+         drive it: pw-play --target '{}' --channel-map 'AUX0,AUX1,AUX2,AUX3' <48k-file>\n  \
+         (a POSITIONED wav folds into the speaker pair and never reaches the coils — the \
+         channel-map is not optional)\nCapturing for {secs}s…",
+        cap.node_name,
+        if cap.split_name.is_empty() {
+            "(suppressed)"
+        } else {
+            cap.split_name.as_str()
+        },
+        cap.node_name
     );
     let deadline = Instant::now() + Duration::from_secs(secs);
     let (mut chunks, mut samples) = (0u64, 0u64);
