@@ -1,0 +1,28 @@
+; SELinux drop-in for Bazzite / SteamOS-derived hosts: silence the audit flood Valve's
+; ds_inhibit (inside steamos-manager) produces around ANY `hid-playstation` hidraw —
+; which is exactly what punktfunk's virtual DualSense / DualShock 4 is (ds_inhibit
+; selects by bound driver + touchpad mouse node; it has no VID/PID or virtual filtering).
+;
+; ds_inhibit reacts to every open/close of such a hidraw by walking /proc/*/fd/ to see
+; whether Steam holds the node. The distro policy denies steamos_manager_t the three
+; capabilities that walk needs, so the scan never succeeds, the state machine never
+; latches, and every open/close sprays denials — ~324 AVCs/sec measured on Bazzite 43
+; (2026-08-15). setroubleshootd then amplifies the flood into a box-wide fork storm
+; (267+ procs/sec) that starves the stream: gamescope 0 fps, encode submit ~150 ms/frame.
+;
+; dontaudit, NOT allow: granting another vendor's daemon sys_ptrace/dac_override is not
+; ours to do — silencing the audit noise is. The scan keeps failing quietly and
+; ds_inhibit simply leaves the pad uninhibited, which is what we want anyway (the
+; "inhibit" would disable the touchpad-as-mouse of a pad we created for a game). The
+; underlying gap — steamos_manager_t lacking what its own ds_inhibit needs — is a
+; Bazzite/Valve policy bug; this drop-in is the containment we can ship. A bare,
+; un-amplified AVC is cheap, but with dontaudit not even that remains.
+;
+; Installed idempotently by `punktfunk-sysext` post_merge (and best-effort by the RPM
+; %post) wherever steamos-manager exists; the policy store is host state, so a sysext
+; image cannot carry the module itself — only this source. By hand:
+;   sudo semodule -i punktfunk-ds-inhibit.cil      # remove: sudo semodule -r punktfunk-ds-inhibit
+; ⚠ The installers key idempotence on the module NAME (= this filename): if these rules
+; ever change, rename the file (and every reference) so existing installs converge.
+(dontaudit steamos_manager_t self (capability (dac_override dac_read_search sys_ptrace)))
+(dontaudit steamos_manager_t self (cap_userns (sys_ptrace)))

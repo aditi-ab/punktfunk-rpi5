@@ -140,6 +140,78 @@ fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
     chosen
 }
 
+/// Detection half of [`warn_if_ds_inhibit_storm`], split out for tests: `true` when a process
+/// named `steamos-manager` is running (its full name fits `comm`'s 15-char limit exactly) AND
+/// SELinux is enforcing (the `enforce` file reads `1`). Both halves are required for the storm:
+/// a permissive box logs one denial per walk and moves on, and without steamos-manager there is
+/// no ds_inhibit to trigger.
+#[cfg(target_os = "linux")]
+fn ds_inhibit_storm_risk(proc_root: &std::path::Path, enforce: &std::path::Path) -> bool {
+    let enforcing = std::fs::read_to_string(enforce).is_ok_and(|v| v.trim() == "1");
+    if !enforcing {
+        return false;
+    }
+    std::fs::read_dir(proc_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| {
+            std::fs::read_to_string(e.path().join("comm"))
+                .is_ok_and(|c| c.trim() == "steamos-manager")
+        })
+}
+
+/// One-shot diagnostic for the Bazzite/SteamOS ds_inhibit audit storm: Valve's `steamos-manager`
+/// reacts to every open/close of a `hid-playstation` hidraw — exactly what our virtual
+/// DualSense / DualShock 4 is; it has no VID/PID or virtual/uhid filtering — by walking
+/// `/proc/*/fd/` to see whether Steam holds the node. Under SELinux enforcing that walk is
+/// denied (`steamos_manager_t` lacks `sys_ptrace`/`dac_*`; measured ~324 AVCs/sec on Bazzite),
+/// and `setroubleshootd` amplifies the flood into a box-wide fork storm that starves the stream
+/// (gamescope 0 fps, encode submit ~150 ms/frame). The audit lines read `comm="tokio-rt-worker"`
+/// and look like us — they are steamos-manager's (check `scontext=`).
+///
+/// Warn-only, never degrade: a per-pad fold has no wire channel back to the client
+/// (`Welcome::gamepad` only describes the session default), and it would strip the DS5 feature
+/// set on exactly the platform where users want it. The real fix is the shipped SELinux drop-in;
+/// this warning cannot see the policy store (root-only), so it fires even where that drop-in is
+/// already installed — it names that, and puts the cause in OUR logs so the audit-log trap above
+/// doesn't get someone blaming the encoder again.
+#[cfg(target_os = "linux")]
+fn warn_if_ds_inhibit_storm(chosen: GamepadPref) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ONCE: AtomicBool = AtomicBool::new(true);
+    // Selection criterion is the bound driver (`sony`/`playstation`) plus the touchpad's mouse
+    // node — i.e. the hid-playstation backends. (The kernel registers the touchpad from its own
+    // hardcoded DS5/DS4 handling, so no descriptor shaping can duck the selection.)
+    let playstation = matches!(
+        chosen,
+        GamepadPref::DualSense | GamepadPref::DualSenseEdge | GamepadPref::DualShock4
+    );
+    if !playstation
+        || !ds_inhibit_storm_risk(
+            std::path::Path::new("/proc"),
+            std::path::Path::new("/sys/fs/selinux/enforce"),
+        )
+        || !ONCE.swap(false, Ordering::Relaxed)
+    {
+        return;
+    }
+    tracing::warn!(
+        gamepad = chosen.as_str(),
+        "steamos-manager is running and SELinux is enforcing — its ds_inhibit scans /proc on \
+         every open/close of this pad's hidraw, the scan is denied at hundreds of AVCs/sec, and \
+         setroubleshootd can amplify that into a box-wide stall that starves the stream. Install \
+         the shipped SELinux drop-in (`sudo punktfunk-sysext reapply`, or `sudo semodule -i \
+         /usr/share/punktfunk/selinux/punktfunk-ds-inhibit.cil`) — harmless if already installed. \
+         Masking setroubleshootd (`sudo systemctl mask --now setroubleshootd`) hardens the box \
+         against any audit flood. Details: packaging/bazzite/README.md."
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn warn_if_ds_inhibit_storm(_chosen: GamepadPref) {}
+
 /// The Valve product id (`28DE:xxxx`) a virtual Steam backend enumerates as, or `None` for a
 /// non-Steam backend. This is the identity the conflict gate compares against the *physical* Valve
 /// devices attached to the host: only a genuine duplicate (same VID **and** PID) confuses Steam
@@ -323,6 +395,10 @@ pub(super) fn resolve_gamepad(pref: GamepadPref) -> GamepadPref {
     // The XUSB escape hatch can only present a 360 identity, so the One S / Elite wishes fold when
     // `PUNKTFUNK_XBOX_BACKEND=xusb` is set.
     let chosen = degrade_xbox_identity(chosen);
+    // Bazzite/SteamOS heads-up, warn-only (see the fn for why never a degrade): a
+    // hid-playstation pad on a box running steamos-manager under SELinux enforcing risks the
+    // ds_inhibit audit storm.
+    warn_if_ds_inhibit_storm(chosen);
     match pref {
         GamepadPref::Auto => {
             // The operator's env knob deserves a diagnostic when it didn't drive the
@@ -518,5 +594,39 @@ mod tests {
         assert_eq!(steam_backend_product(DualSense), None);
         assert_eq!(steam_backend_product(Xbox360), None);
         assert_eq!(steam_backend_product(SwitchPro), None);
+    }
+
+    // The ds_inhibit-storm detection needs BOTH halves: steamos-manager running AND SELinux
+    // enforcing. A permissive box logs one denial per walk without storming, and without
+    // steamos-manager there is no ds_inhibit — either alone must stay silent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ds_inhibit_storm_risk_needs_both_halves() {
+        use super::ds_inhibit_storm_risk;
+        let dir = tempfile::tempdir().unwrap();
+        let proc_root = dir.path().join("proc");
+        let enforce = dir.path().join("enforce");
+        std::fs::create_dir_all(proc_root.join("123")).unwrap();
+
+        // Enforcing + steamos-manager present → risk.
+        std::fs::write(proc_root.join("123/comm"), "steamos-manager\n").unwrap();
+        std::fs::write(&enforce, "1\n").unwrap();
+        assert!(ds_inhibit_storm_risk(&proc_root, &enforce));
+
+        // Permissive (or SELinux absent — the enforce file unreadable) → no risk.
+        std::fs::write(&enforce, "0\n").unwrap();
+        assert!(!ds_inhibit_storm_risk(&proc_root, &enforce));
+        assert!(!ds_inhibit_storm_risk(
+            &proc_root,
+            &dir.path().join("missing")
+        ));
+
+        // Enforcing but no steamos-manager (a comm that merely CONTAINS the name must not
+        // match — the scan compares the whole trimmed comm) → no risk.
+        std::fs::write(&enforce, "1\n").unwrap();
+        std::fs::write(proc_root.join("123/comm"), "not-steamos\n").unwrap();
+        assert!(!ds_inhibit_storm_risk(&proc_root, &enforce));
+        std::fs::write(proc_root.join("123/comm"), "steamos-managerX\n").unwrap();
+        assert!(!ds_inhibit_storm_risk(&proc_root, &enforce));
     }
 }

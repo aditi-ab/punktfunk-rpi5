@@ -504,6 +504,29 @@ desktop viewer.
   `ExecStart=/usr/bin/punktfunk-host serve --gamestream` (or bare `serve` for native-only) if needed
   (section 5).
 
+- **Stream lags, then freezes, with a DualSense-type client pad (SELinux enforcing).** The virtual
+  DualSense / DualShock 4 binds the kernel's `hid-playstation` driver, and Valve's `ds_inhibit`
+  (inside `steamos-manager`, shipped on Bazzite) reacts to *any* such hidraw by walking
+  `/proc/*/fd/` on every open/close. SELinux denies `steamos_manager_t` that walk, spraying
+  **~324 `avc: denied` per second**, and `setroubleshootd` amplifies the flood into a box-wide
+  fork storm that starves the stream (gamescope 0 fps, `tx_mbps` collapsing) — measured live on
+  Bazzite 43, 2026-08-15. Two traps while diagnosing: the AVC lines read `comm="tokio-rt-worker"`
+  — that is **steamos-manager, not punktfunk** (check `scontext=…steamos_manager_t…`); and once
+  started the setroubleshootd storm **outlives the denials by 15+ minutes**, so the box stays
+  starved after the pad is gone. Fixes:
+  - punktfunk ships a `dontaudit` SELinux drop-in that silences the flood (ds_inhibit then simply
+    leaves the pad uninhibited — harmless). The sysext installs it automatically on
+    install/update; on an existing install run `sudo punktfunk-sysext reapply`. On a layered or
+    bootc host: `sudo semodule -i /usr/share/punktfunk/selinux/punktfunk-ds-inhibit.cil`
+    (remove with `sudo semodule -r punktfunk-ds-inhibit`).
+  - **Hardening (recommended on any streaming host):** `sudo systemctl mask --now
+    setroubleshootd`. It is purely a desktop alert daemon — nothing depends on it
+    (`systemctl list-dependencies --reverse setroubleshootd` returns only itself) — and masking
+    it makes the box robust against *any* AVC burst, not just this one. Reversible with `unmask`.
+  - Workaround with the feature loss: set the **client's** Controller type to Xbox 360 (uinput,
+    no `hid-playstation`) — costs adaptive triggers, lightbar and touchpad. The host-side
+    `PUNKTFUNK_GAMEPAD` knob does **not** help: an explicit client choice outranks it.
+
 - **Moonlight can't see the host.** Ensure UDP 5353 (mDNS) and the GameStream ports are open
   (section 6) and client + host are on the same L2 LAN segment.
 

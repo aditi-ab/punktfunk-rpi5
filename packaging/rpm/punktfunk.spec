@@ -450,6 +450,13 @@ install -Dm0644 packaging/kde/host.env                 %{buildroot}%{_datadir}/%
 # screencast/virtual-output grant ships as io.unom.Punktfunk.Host.desktop, installed above).
 install -d %{buildroot}%{_datadir}/%{name}/bazzite
 install -Dm0755 packaging/bazzite/kde-desktop-setup.sh %{buildroot}%{_datadir}/%{name}/bazzite/kde-desktop-setup.sh
+# SELinux dontaudit drop-in for Bazzite/SteamOS: Valve's ds_inhibit (steamos-manager) walks
+# /proc/*/fd on every open/close of a hid-playstation hidraw — our virtual DualSense — and the
+# denied walk sprays ~324 AVCs/sec, which setroubleshootd amplifies into a box-wide stall that
+# starves the stream. Shipped as CIL source (the policy STORE is host state); inserted by %%post
+# below / punktfunk-sysext post_merge where steamos-manager exists. See the file's header.
+install -Dm0644 packaging/bazzite/punktfunk-ds-inhibit.cil \
+                %{buildroot}%{_datadir}/%{name}/selinux/punktfunk-ds-inhibit.cil
 # Layered-update helper for rpm-ostree hosts: `rpm-ostree upgrade` only re-resolves layered
 # packages when the BASE changes, so a frozen Bazzite base pins punktfunk forever. The script
 # forces a re-resolve of just this layer (--uninstall + --install of the same names in one
@@ -674,6 +681,17 @@ udevadm trigger --subsystem-match=misc 2>/dev/null || :
 # Apply the UDP socket-buffer tuning (also auto-applied at boot by systemd-sysctl; on rpm-ostree
 # it takes effect on the next boot into the layered deployment).
 sysctl -p %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf >/dev/null 2>&1 || :
+# Bazzite/SteamOS only (keyed on the steamos-manager binary): insert the ds_inhibit dontaudit
+# drop-in — Valve's ds_inhibit walks /proc on every open/close of our virtual DualSense's hidraw,
+# the denied walk sprays AVCs, and setroubleshootd amplifies that into a box-wide stall (see
+# packaging/bazzite/punktfunk-ds-inhibit.cil). Keyed on the module NAME for idempotence (a policy
+# rebuild costs seconds — rename the file if the rules ever change). Best-effort and never fatal:
+# rpm-ostree's scriptlet sandbox may refuse semodule; the sysext post_merge and the README's
+# manual command cover that path.
+if command -v semodule >/dev/null 2>&1 && [ -e /usr/lib/steamos-manager ] &&
+   ! semodule -l 2>/dev/null | grep -qx punktfunk-ds-inhibit; then
+    semodule -i %{_datadir}/%{name}/selinux/punktfunk-ds-inhibit.cil >/dev/null 2>&1 || :
+fi
 echo "punktfunk installed. Add yourself to the 'input' group (sudo usermod -aG input \$USER)"
 # Naming only the usbip pad here is how a Nobara host shipped broken: its owner had no Deck pad, so
 # they correctly skipped this group — and then every managed gamescope takeover degraded silently,
