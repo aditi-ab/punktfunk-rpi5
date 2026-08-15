@@ -119,6 +119,50 @@ pub fn decode_audio_red_datagram(b: &[u8]) -> Option<(u32, u64, &[u8], Option<&[
     Some((seq, pts_ns, primary, (!prev.is_empty()).then_some(prev)))
 }
 
+/// Lossless PCM audio, host → client: `[0xD3][u32 seq LE][u64 pts_ns LE][interleaved LE samples]`.
+///
+/// **Deliberately the same header as [`AUDIO_MAGIC`]**, so
+/// [`AudioGapTracker`](crate::audio::AudioGapTracker) and the pts / A-V-sync plumbing work
+/// unchanged and the only new logic on this plane is the payload format and its concealment
+/// ([`crate::audio::pcm`]).
+///
+/// A session runs `0xC9`/`0xD2` **or** `0xD3`, never both, and never switches mid-session: the
+/// client's output device is open at a fixed rate and depth, so a change means a re-open. If the
+/// capture dies and comes back at a different format the host ends the audio plane rather than
+/// changing tags underneath a client that cannot follow.
+///
+/// One frame per datagram, `audio_frame_us` long, **never fragmented** — the frame duration is
+/// chosen at session start by [`crate::audio::pcm::frame_us_for`] so the payload cannot exceed
+/// the path MTU. Redundancy ([`AUDIO_RED_MAGIC`]) is not defined for this plane and is never
+/// sent with it: it would double a bitrate that is already the largest on the connection, and
+/// `plan_audio_budget`'s ladder would never choose it.
+pub const AUDIO_PCM_MAGIC: u8 = 0xD3;
+
+/// Fixed header length of an [`AUDIO_PCM_MAGIC`] datagram — identical to the [`AUDIO_MAGIC`]
+/// header by design.
+pub const AUDIO_PCM_HEADER: usize = crate::audio::pcm::PCM_HEADER_LEN;
+
+/// Encode one lossless PCM frame. `pcm` is already-quantised interleaved little-endian samples
+/// at the negotiated depth ([`crate::audio::pcm::from_f32`]).
+pub fn encode_audio_pcm_datagram(seq: u32, pts_ns: u64, pcm: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(AUDIO_PCM_HEADER + pcm.len());
+    b.push(AUDIO_PCM_MAGIC);
+    b.extend_from_slice(&seq.to_le_bytes());
+    b.extend_from_slice(&pts_ns.to_le_bytes());
+    b.extend_from_slice(pcm);
+    b
+}
+
+/// Parse a lossless PCM datagram → `(seq, pts_ns, payload)`. `None` on bad tag/length.
+pub fn decode_audio_pcm_datagram(b: &[u8]) -> Option<(u32, u64, &[u8])> {
+    if b.len() < AUDIO_PCM_HEADER || b[0] != AUDIO_PCM_MAGIC {
+        return None;
+    }
+    let seq = u32::from_le_bytes(b[1..5].try_into().unwrap());
+    let pts_ns = u64::from_le_bytes(b[5..13].try_into().unwrap());
+    Some((seq, pts_ns, &b[AUDIO_PCM_HEADER..]))
+}
+
 /// Legacy rumble datagram (v1), host → client: `[0xCA][u16 pad LE][u16 low LE][u16 high LE]`.
 /// Force-feedback state for pad `pad` (0xFFFF amplitudes, 0/0 = stop) as *level-triggered* state
 /// — it persists until superseded, which is why the host re-sends it periodically as its loss
@@ -1132,7 +1176,54 @@ mod tests {
         assert!(decode_audio_red_datagram(&wrong).is_none());
     }
 
-    /// The two audio planes must not alias each other or any neighbouring plane: a client
+    /// The lossless plane round-trips, keeps the `0xC9` header shape so the gap tracker and A/V
+    /// sync need no new code, and refuses a foreign tag.
+    #[test]
+    fn audio_pcm_datagram_roundtrip() {
+        let payload: Vec<u8> = (0..1152u32).map(|i| (i % 251) as u8).collect();
+        let d = encode_audio_pcm_datagram(7, 1_234_567_890, &payload);
+        assert_eq!(d[0], AUDIO_PCM_MAGIC);
+        assert_eq!(d.len(), AUDIO_PCM_HEADER + payload.len());
+        // Same header shape as 0xC9 — seq and pts sit at the same offsets, which is what lets
+        // the gap tracker and the pts plumbing work unchanged.
+        assert_eq!(AUDIO_PCM_HEADER, 13);
+        let (seq, pts, out) = decode_audio_pcm_datagram(&d).expect("decode");
+        assert_eq!((seq, pts), (7, 1_234_567_890));
+        assert_eq!(out, &payload[..]);
+
+        // An empty payload is structurally legal (nothing to say), and a short buffer is not.
+        assert!(decode_audio_pcm_datagram(&encode_audio_pcm_datagram(1, 2, &[])).is_some());
+        assert!(decode_audio_pcm_datagram(&d[..AUDIO_PCM_HEADER - 1]).is_none());
+        let mut wrong = d.clone();
+        wrong[0] = AUDIO_MAGIC;
+        assert!(decode_audio_pcm_datagram(&wrong).is_none());
+    }
+
+    /// The whole point of the frame ladder: whatever it picks must survive the encoder and land
+    /// inside the datagram budget it was given. Cheap to state, and it is the invariant that
+    /// keeps this plane off any fragmentation path.
+    #[test]
+    fn a_ladder_sized_frame_fits_the_datagram_it_was_sized_for() {
+        use crate::audio::pcm;
+        for rate in [48_000u32, 96_000] {
+            for bits in [pcm::BITS_16, pcm::BITS_24] {
+                for budget in [900usize, 1200, 1400] {
+                    let us = pcm::frame_us_for(rate, bits, 2, budget).expect("a rung fits");
+                    let samples = pcm::samples_per_frame(rate, us, 2);
+                    let mut wire = Vec::new();
+                    pcm::from_f32(&vec![0.25f32; samples], bits, &mut wire);
+                    let d = encode_audio_pcm_datagram(0, 0, &wire);
+                    assert!(
+                        d.len() <= budget,
+                        "{rate}/{bits} at {budget} B produced a {} B datagram",
+                        d.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The three audio planes must not alias each other or any neighbouring plane: a client
     /// demultiplexes purely on the first byte.
     #[test]
     fn audio_red_tag_is_disjoint() {
@@ -1145,6 +1236,7 @@ mod tests {
             HDR_META_MAGIC,
             HOST_TIMING_MAGIC,
             CURSOR_STATE_MAGIC,
+            AUDIO_PCM_MAGIC,
             crate::input::INPUT_MAGIC,
         ] {
             assert_ne!(AUDIO_RED_MAGIC, other);
@@ -1155,6 +1247,10 @@ mod tests {
             "0xC9 must not accept a 0xD2"
         );
         let plain = encode_audio_datagram(1, 2, &[9u8; 40]);
+        assert!(
+            decode_audio_pcm_datagram(&plain).is_none(),
+            "0xD3 must not accept a 0xC9"
+        );
         assert!(
             decode_audio_red_datagram(&plain).is_none(),
             "0xD2 must not accept a 0xC9"

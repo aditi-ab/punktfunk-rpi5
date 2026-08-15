@@ -562,6 +562,12 @@ async fn session(args: Args) -> Result<()> {
             // the probe accepts a mid-session shard change (and jumbo growth) up to the
             // receive ceiling — and it's exactly the tool to measure both.
             max_shard_payload: punktfunk_core::config::max_shard_payload() as u16,
+            // Legacy 48 kHz / 16-bit audio request. The probe decodes and validates the host's
+            // Opus frames (that is what `--audio-channels` above exercises); it has no lossless
+            // 0xD3 path and never sets CLIENT_CAP_AUDIO_HIRES, so asking for a rate or depth here
+            // would only make the host spend bandwidth on a plane this tool discards.
+            audio_rate_hz: punktfunk_core::audio::SAMPLE_RATE_HZ,
+            audio_bits: punktfunk_core::audio::pcm::BITS_16,
         }
         .encode(),
     )

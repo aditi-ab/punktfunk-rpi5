@@ -162,6 +162,15 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
                 // (design/shard-payload-reneg.md W0.3 — the host only renegotiates, and only
                 // grows to jumbo, when this advertises it).
                 max_shard_payload: crate::config::max_shard_payload() as u16,
+                // The legacy audio request: Opus at 48 kHz / 16-bit, byte-identical to the
+                // pre-hi-res Hello (encode omits both fields at these values). Asking for the
+                // lossless 0xD3 plane needs CLIENT_CAP_AUDIO_HIRES in `client_caps` as well —
+                // capable AND turned on, the VIDEO_CAP_444 precedent — and the embedder is what
+                // knows both, so the request is plumbed through with the client-side work rather
+                // than guessed here. A NativeClient that asked without being able to open the
+                // output would spend 1.5–4.6 Mbps to play nothing.
+                audio_rate_hz: crate::audio::SAMPLE_RATE_HZ,
+                audio_bits: crate::audio::pcm::BITS_16,
             }
             .encode(),
         )

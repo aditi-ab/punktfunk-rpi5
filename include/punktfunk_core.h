@@ -971,6 +971,45 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::client_caps`] bit: the client can play the LOSSLESS audio plane
+// ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`) at the rate and depth it asked
+// for in [`Hello::audio_rate_hz`](super::handshake::Hello::audio_rate_hz) /
+// [`audio_bits`](super::handshake::Hello::audio_bits).
+//
+// **Capable AND the user turned it on** — the [`VIDEO_CAP_444`] precedent, not a bare capability.
+// This plane costs 1.5–4.6 Mbps against Opus's 256 kbps and is taken off the top of the link
+// (audio rides datagrams outside the ABR loop, so ABR can neither see it nor reclaim it), so it
+// must be asked for on both ends. A client that cannot open an output at the format it is
+// requesting must not set this bit.
+//
+// `0x10` — `0x08` is [`CLIENT_CAP_PAD_AUDIO`], `0x04` is [`CLIENT_CAP_AUDIO_RED`], `0x02` is
+// [`CLIENT_CAP_PHASE_LOCK`], `0x01` is [`CLIENT_CAP_CURSOR`]. `0x20`/`0x40`/`0x80` remain free.
+#define CLIENT_CAP_AUDIO_HIRES 16
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Welcome::host_caps`] bit: the host resolved the session onto the lossless audio plane
+// ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`). Like [`HOST_CAP_AUDIO_RED`]
+// this is a statement about the WIRE rather than an offer: with the bit set the client decodes
+// `0xD3` and MUST open its device from the resolved
+// [`Welcome::audio_rate_hz`](super::handshake::Welcome::audio_rate_hz) /
+// [`audio_bits`](super::handshake::Welcome::audio_bits) /
+// [`audio_frame_us`](super::handshake::Welcome::audio_frame_us), never from what it asked for.
+//
+// Unlike `0xD2`, the host does NOT drop back mid-session: the client's device is open at a fixed
+// format, so a change would mean a re-open. The plane is resolved once, at handshake, by the
+// five-condition gate in `design/hi-res-audio.md` §8.4, and every decline resolves to Opus
+// 48 kHz with a logged reason.
+//
+// ⚠ `0x80` is the **LAST free `host_caps` bit**. The next host capability needs a second byte
+// and an ABI bump — the same wall [`VIDEO_CAP_MULTI_SLICE`] already hit on `video_caps`.
+// `0x40` is [`HOST_CAP_PAD_AUDIO`], `0x20` is [`HOST_CAP_AUDIO_RED`], `0x10` is
+// [`HOST_CAP_PEN`], `0x08` is [`HOST_CAP_CURSOR`], `0x04` is [`HOST_CAP_TEXT_INPUT`],
+// `0x01`/`0x02` are gamepad-state / clipboard.
+#define HOST_CAP_AUDIO_HIRES 128
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 // encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 // advertise this.
@@ -1349,6 +1388,27 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Lossless PCM audio, host → client: `[0xD3][u32 seq LE][u64 pts_ns LE][interleaved LE samples]`.
+//
+// **Deliberately the same header as [`AUDIO_MAGIC`]**, so
+// [`AudioGapTracker`](crate::audio::AudioGapTracker) and the pts / A-V-sync plumbing work
+// unchanged and the only new logic on this plane is the payload format and its concealment
+// ([`crate::audio::pcm`]).
+//
+// A session runs `0xC9`/`0xD2` **or** `0xD3`, never both, and never switches mid-session: the
+// client's output device is open at a fixed rate and depth, so a change means a re-open. If the
+// capture dies and comes back at a different format the host ends the audio plane rather than
+// changing tags underneath a client that cannot follow.
+//
+// One frame per datagram, `audio_frame_us` long, **never fragmented** — the frame duration is
+// chosen at session start by [`crate::audio::pcm::frame_us_for`] so the payload cannot exceed
+// the path MTU. Redundancy ([`AUDIO_RED_MAGIC`]) is not defined for this plane and is never
+// sent with it: it would double a bitrate that is already the largest on the connection, and
+// `plan_audio_budget`'s ladder would never choose it.
+#define AUDIO_PCM_MAGIC 211
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Wire length of a v1 (legacy, level) rumble datagram.
 #define PUNKTFUNK_RUMBLE_V1_LEN 7
 #endif
@@ -1511,6 +1571,43 @@
 // [`Welcome::cipher`] id: ChaCha20-Poly1305 (RFC 8439) — negotiated via
 // [`VIDEO_CAP_CHACHA20`] for clients without hardware AES.
 #define PUNKTFUNK_CIPHER_CHACHA20_POLY1305 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Welcome::audio_codec`] id: **Opus on the `0xC9` plane** — the legacy default, 48 kHz, what
+// every pre-hi-res build sends and what every declined hi-res negotiation resolves back to
+// (`design/hi-res-audio.md` §8.4: a fallback to today's transparent 256 kbps Opus is not a
+// defeat; silence is the one unacceptable outcome). `0`, so an absent field and an older host
+// both read as Opus and the common Welcome stays byte-identical to the pre-hi-res wire form.
+#define AUDIO_CODEC_OPUS 0
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Welcome::audio_codec`] id **reserved for FLAC** on the `0xD3` plane — deliberately reserved
+// and deliberately **unimplemented**.
+//
+// The design doc numbers the audio codecs `0` = Opus, `1` = FLAC, `2` = PCM, and this project has
+// been bitten before by wire ids that drifted from the document that specifies them. The id is
+// therefore burned rather than compacted: `AUDIO_CODEC_PCM` is `2` because the doc says `2`.
+//
+// FLAC lost on the merits, and the reasoning is recorded in `crate::audio::pcm`'s module docs so
+// it does not have to be re-derived: the plane is never fragmented, so a frame must be sized from
+// the codec's WORST case (a FLAC VERBATIM subframe — raw samples plus a header), which means FLAC
+// and PCM negotiate the same frame duration, the same packet rate and the same send-buffer
+// sizing. A codec would buy average bytes on a plane that is provisioned for peak, at the cost of
+// a new dependency in the NDK / xcframework / flatpak / MSIX / Arch packaging targets. No host
+// emits this id and no client should accept it; it exists so that a future one could.
+#define AUDIO_CODEC_FLAC_RESERVED 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Welcome::audio_codec`] id: **raw interleaved LE PCM on the `0xD3` plane** (`crate::audio::pcm`)
+// — the lossless format this negotiation exists to reach, at the resolved
+// [`Welcome::audio_rate_hz`] / [`audio_bits`](Welcome::audio_bits) /
+// [`audio_frame_us`](Welcome::audio_frame_us).
+//
+// `2` rather than `1` because [`AUDIO_CODEC_FLAC_RESERVED`] holds `1` — see there.
+#define AUDIO_CODEC_PCM 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

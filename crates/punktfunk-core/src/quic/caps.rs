@@ -175,6 +175,41 @@ pub const HOST_CAP_AUDIO_RED: u8 = 0x20;
 /// `0x01`/`0x02` are gamepad-state / clipboard.
 pub const HOST_CAP_PAD_AUDIO: u8 = 0x40;
 
+/// [`Hello::client_caps`] bit: the client can play the LOSSLESS audio plane
+/// ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`) at the rate and depth it asked
+/// for in [`Hello::audio_rate_hz`](super::handshake::Hello::audio_rate_hz) /
+/// [`audio_bits`](super::handshake::Hello::audio_bits).
+///
+/// **Capable AND the user turned it on** — the [`VIDEO_CAP_444`] precedent, not a bare capability.
+/// This plane costs 1.5–4.6 Mbps against Opus's 256 kbps and is taken off the top of the link
+/// (audio rides datagrams outside the ABR loop, so ABR can neither see it nor reclaim it), so it
+/// must be asked for on both ends. A client that cannot open an output at the format it is
+/// requesting must not set this bit.
+///
+/// `0x10` — `0x08` is [`CLIENT_CAP_PAD_AUDIO`], `0x04` is [`CLIENT_CAP_AUDIO_RED`], `0x02` is
+/// [`CLIENT_CAP_PHASE_LOCK`], `0x01` is [`CLIENT_CAP_CURSOR`]. `0x20`/`0x40`/`0x80` remain free.
+pub const CLIENT_CAP_AUDIO_HIRES: u8 = 0x10;
+
+/// [`Welcome::host_caps`] bit: the host resolved the session onto the lossless audio plane
+/// ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`). Like [`HOST_CAP_AUDIO_RED`]
+/// this is a statement about the WIRE rather than an offer: with the bit set the client decodes
+/// `0xD3` and MUST open its device from the resolved
+/// [`Welcome::audio_rate_hz`](super::handshake::Welcome::audio_rate_hz) /
+/// [`audio_bits`](super::handshake::Welcome::audio_bits) /
+/// [`audio_frame_us`](super::handshake::Welcome::audio_frame_us), never from what it asked for.
+///
+/// Unlike `0xD2`, the host does NOT drop back mid-session: the client's device is open at a fixed
+/// format, so a change would mean a re-open. The plane is resolved once, at handshake, by the
+/// five-condition gate in `design/hi-res-audio.md` §8.4, and every decline resolves to Opus
+/// 48 kHz with a logged reason.
+///
+/// ⚠ `0x80` is the **LAST free `host_caps` bit**. The next host capability needs a second byte
+/// and an ABI bump — the same wall [`VIDEO_CAP_MULTI_SLICE`] already hit on `video_caps`.
+/// `0x40` is [`HOST_CAP_PAD_AUDIO`], `0x20` is [`HOST_CAP_AUDIO_RED`], `0x10` is
+/// [`HOST_CAP_PEN`], `0x08` is [`HOST_CAP_CURSOR`], `0x04` is [`HOST_CAP_TEXT_INPUT`],
+/// `0x01`/`0x02` are gamepad-state / clipboard.
+pub const HOST_CAP_AUDIO_HIRES: u8 = 0x80;
+
 /// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 /// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 /// advertise this.
@@ -306,6 +341,8 @@ impl Default for ColorInfo {
 
 #[cfg(test)]
 mod tests {
+    use crate::audio::pcm::BITS_16;
+    use crate::audio::SAMPLE_RATE_HZ;
     use crate::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Mode};
     use crate::quic::*;
 
@@ -345,6 +382,10 @@ mod tests {
             expires_in_secs: 0,
             cipher: 0,
             key_chacha: None,
+            audio_codec: AUDIO_CODEC_OPUS,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
+            audio_frame_us: 0,
         };
         let got = Welcome::decode(&w.encode()).unwrap();
         assert_eq!(got.host_caps & HOST_CAP_CLIPBOARD, HOST_CAP_CLIPBOARD);

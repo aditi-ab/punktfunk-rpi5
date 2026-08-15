@@ -90,8 +90,9 @@ pub struct Hello {
     /// disambiguated by REMAINING LENGTH at decode: fewer than `HDR_META_BODY_LEN` bytes after
     /// `preferred_codec` ⇒ no HDR block, the tail bytes are the post-HDR fields directly. This
     /// caps everything after `display_hdr` at `HDR_META_BODY_LEN − 1` bytes total — document any
-    /// future field here and mind the budget (`client_caps` 1 + `max_shard_payload` 2 = 3 of the
-    /// 27 spent). Omitted when zero and by older clients (→ `0`).
+    /// future field here and mind the budget (`client_caps` 1 + `max_shard_payload` 2 +
+    /// `audio_rate_hz` 4 + `audio_bits` 1 = **8 of the 27 spent, 19 free**). Omitted when zero
+    /// and by older clients (→ `0`).
     pub client_caps: u8,
     /// The largest video shard payload this client's receive path accepts — sealed datagrams for
     /// shards up to this size fit its transport buffers ([`crate::config::max_shard_payload`]).
@@ -103,6 +104,35 @@ pub struct Hello {
     /// = legacy: the host must not change the sealed geometry mid-session, and never above
     /// the `Welcome` value).
     pub max_shard_payload: u16,
+    /// The sample rate this client is **asking** the host to capture and send at — `48_000`
+    /// (the legacy rate every build speaks) or `96_000` (`design/hi-res-audio.md` §3; 44.1 kHz
+    /// and its multiples are deferred until [`JitterPolicy`](crate::audio::JitterPolicy)'s
+    /// integer samples-per-millisecond arithmetic is reworked, §4.1).
+    ///
+    /// A request, never a fact. The host resolves it against what its capture path can *genuinely*
+    /// deliver — never by padding an upsampled stream, which is the trap §4.3 exists to prevent —
+    /// and states the resolved value in [`Welcome::audio_rate_hz`]. **The client must open its
+    /// output device from the `Welcome`, not from this.** Meaningless unless the client also set
+    /// [`CLIENT_CAP_AUDIO_HIRES`]: the bit is the opt-in, this is only the parameter.
+    ///
+    /// Appended after `max_shard_payload` as 4 trailing LE bytes (forcing every earlier
+    /// placeholder). `0` on the wire and absence both decode to the legacy
+    /// [`SAMPLE_RATE_HZ`](crate::audio::SAMPLE_RATE_HZ), so an older client always reads as a
+    /// plain 48 kHz request and this field costs the legacy wire form nothing.
+    pub audio_rate_hz: u32,
+    /// The sample depth this client is **asking** for — [`BITS_16`](crate::audio::pcm::BITS_16)
+    /// or [`BITS_24`](crate::audio::pcm::BITS_24). Same request-not-fact discipline as
+    /// [`audio_rate_hz`](Self::audio_rate_hz): the host resolves it and answers in
+    /// [`Welcome::audio_bits`], which is what the client's device must be opened from.
+    ///
+    /// 24-bit is the depth the feature exists for — it is also the one a lossless coder saves
+    /// least on, which is why the plane carries raw PCM rather than a codec
+    /// (`crate::audio::pcm`). Appended after `audio_rate_hz` as a single trailing byte; `0` and
+    /// absence both decode to [`BITS_16`](crate::audio::pcm::BITS_16). This is the LAST field of
+    /// the whole message, so it forces every earlier placeholder (including a 4-byte
+    /// `audio_rate_hz` written as the legacy 48 000) while nothing can force it: a 96 kHz/16-bit
+    /// request emits the rate and stops there.
+    pub audio_bits: u8,
 }
 
 /// QUIC application error code a punktfunk/1 client closes the control connection with on a
@@ -134,6 +164,35 @@ pub const CIPHER_AES_128_GCM: u8 = 0;
 /// [`Welcome::cipher`] id: ChaCha20-Poly1305 (RFC 8439) — negotiated via
 /// [`VIDEO_CAP_CHACHA20`] for clients without hardware AES.
 pub const CIPHER_CHACHA20_POLY1305: u8 = 1;
+
+/// [`Welcome::audio_codec`] id: **Opus on the `0xC9` plane** — the legacy default, 48 kHz, what
+/// every pre-hi-res build sends and what every declined hi-res negotiation resolves back to
+/// (`design/hi-res-audio.md` §8.4: a fallback to today's transparent 256 kbps Opus is not a
+/// defeat; silence is the one unacceptable outcome). `0`, so an absent field and an older host
+/// both read as Opus and the common Welcome stays byte-identical to the pre-hi-res wire form.
+pub const AUDIO_CODEC_OPUS: u8 = 0;
+/// [`Welcome::audio_codec`] id **reserved for FLAC** on the `0xD3` plane — deliberately reserved
+/// and deliberately **unimplemented**.
+///
+/// The design doc numbers the audio codecs `0` = Opus, `1` = FLAC, `2` = PCM, and this project has
+/// been bitten before by wire ids that drifted from the document that specifies them. The id is
+/// therefore burned rather than compacted: `AUDIO_CODEC_PCM` is `2` because the doc says `2`.
+///
+/// FLAC lost on the merits, and the reasoning is recorded in `crate::audio::pcm`'s module docs so
+/// it does not have to be re-derived: the plane is never fragmented, so a frame must be sized from
+/// the codec's WORST case (a FLAC VERBATIM subframe — raw samples plus a header), which means FLAC
+/// and PCM negotiate the same frame duration, the same packet rate and the same send-buffer
+/// sizing. A codec would buy average bytes on a plane that is provisioned for peak, at the cost of
+/// a new dependency in the NDK / xcframework / flatpak / MSIX / Arch packaging targets. No host
+/// emits this id and no client should accept it; it exists so that a future one could.
+pub const AUDIO_CODEC_FLAC_RESERVED: u8 = 1;
+/// [`Welcome::audio_codec`] id: **raw interleaved LE PCM on the `0xD3` plane** (`crate::audio::pcm`)
+/// — the lossless format this negotiation exists to reach, at the resolved
+/// [`Welcome::audio_rate_hz`] / [`audio_bits`](Welcome::audio_bits) /
+/// [`audio_frame_us`](Welcome::audio_frame_us).
+///
+/// `2` rather than `1` because [`AUDIO_CODEC_FLAC_RESERVED`] holds `1` — see there.
+pub const AUDIO_CODEC_PCM: u8 = 2;
 
 /// `host → client`: the complete session offer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -247,6 +306,71 @@ pub struct Welcome {
     /// ever observes an all-zero key. Decode rejects `cipher == 1` with fewer than 32 key
     /// bytes following.
     pub key_chacha: Option<[u8; 32]>,
+    /// Which audio plane this session runs — [`AUDIO_CODEC_OPUS`] (`0`, the default: Opus at
+    /// 48 kHz on `0xC9`, with `0xD2` redundancy when negotiated) or [`AUDIO_CODEC_PCM`] (`2`:
+    /// lossless PCM on [`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`).
+    /// [`AUDIO_CODEC_FLAC_RESERVED`] (`1`) is reserved and never emitted.
+    ///
+    /// A statement about the wire, resolved once at handshake by the five-condition gate in
+    /// `design/hi-res-audio.md` §8.4, and paired with [`HOST_CAP_AUDIO_HIRES`] in `host_caps`.
+    /// A session runs `0xC9`/`0xD2` **or** `0xD3`, never both, and the host does not switch
+    /// mid-session — the client's output device is open at a fixed format, so a change would mean
+    /// a re-open. Every decline resolves back to Opus 48 kHz and is logged with its reason.
+    ///
+    /// This is also the field that decides whether the whole audio tail is on the wire at all:
+    /// anything other than `AUDIO_CODEC_OPUS` forces the four audio fields AND every earlier
+    /// placeholder (`cipher`, `mgmt_port`, `grants`, `expires_in_secs`) to be emitted, so a plain
+    /// Opus session's Welcome stays **byte-identical** to the pre-hi-res wire form. See
+    /// [`Welcome::encode`] — this is the same chain `mgmt_port` and the access advert already
+    /// extend, one link further, and the reason it must hold is unchanged: a field that slips
+    /// into offset 68 is read as `cipher` by every shipped client, whose decode is fail-closed.
+    ///
+    /// Appended after `expires_in_secs`, i.e. at offset **79** in an AES session and **111**
+    /// behind a ChaCha key. Absent (an older host) → [`AUDIO_CODEC_OPUS`].
+    pub audio_codec: u8,
+    /// The **resolved** capture rate — what the host is actually reading off its endpoint, not
+    /// what [`Hello::audio_rate_hz`] asked for. May be lower than requested; that is the whole
+    /// point of "the client asks, the host obliges if it can".
+    ///
+    /// ⚠ **The client opens its output device from THIS, never from its own request.** The
+    /// failure this prevents is the one `design/hi-res-audio.md` §4.3 is written around: WASAPI's
+    /// `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` will happily accept a 96 kHz request against a 48 kHz
+    /// engine and hand back interpolated samples with no error — a session that spends 3.2 Mbps,
+    /// reports 96 kHz everywhere, and carries nothing above 24 kHz. The host is required to read
+    /// its engine's true rate and decline rather than pad, and this field is where that honesty
+    /// surfaces. A client whose device then opens at some *other* rate must say so and fall back
+    /// rather than resample quietly (§9) — the rule is the same at both ends: never claim a rate
+    /// you did not get.
+    ///
+    /// 4 LE bytes after `audio_codec` (80..84, or 112..116 behind a ChaCha key). Absent, or `0`
+    /// on the wire, → the legacy [`SAMPLE_RATE_HZ`](crate::audio::SAMPLE_RATE_HZ).
+    pub audio_rate_hz: u32,
+    /// The **resolved** sample depth — [`BITS_16`](crate::audio::pcm::BITS_16) or
+    /// [`BITS_24`](crate::audio::pcm::BITS_24). Same authority as
+    /// [`audio_rate_hz`](Self::audio_rate_hz): it is what the client unpacks `0xD3` payloads at,
+    /// and getting it wrong desynchronises every sample after the first (a 24-bit payload read at
+    /// 2 bytes per sample is not silence, it is noise).
+    ///
+    /// One byte at 84 (or 116). Absent, `0`, or a depth this plane cannot carry (checked with
+    /// [`depth_is_supported`](crate::audio::pcm::depth_is_supported)) → `BITS_16` — the
+    /// `audio_channels` precedent, so a corrupt byte can never build a decoder at a stride the
+    /// plane does not speak. Only a corrupt or future wire reaches that branch: the Welcome rides
+    /// the pinned-TLS control stream, and the host resolves this from a two-value set.
+    pub audio_bits: u8,
+    /// The **resolved** frame duration in microseconds — how much audio one `0xD3` datagram
+    /// carries. `0` for an Opus session (whose frame length is the fixed 5 ms of the `0xC9`
+    /// plane), and one rung of [`FRAME_US_LADDER`](crate::audio::pcm::FRAME_US_LADDER) otherwise.
+    ///
+    /// ⚠ **Negotiated, never assumed — do not hardcode it.** The host computes it with
+    /// [`frame_us_for`](crate::audio::pcm::frame_us_for) from `(rate, depth, channels,
+    /// conn.max_datagram_size())`, because a datagram over the path MTU is not sent *at all* and
+    /// this plane is never fragmented. At 96 kHz/24-bit the default 1472-byte MTU ceiling only
+    /// leaves room for 2 ms frames, and the host must not ask before QUIC MTU discovery has
+    /// settled or it sizes the whole session against the conservative initial value
+    /// (`design/hi-res-audio.md` §4.2).
+    ///
+    /// 2 LE bytes at 85..87 (or 117..119) — the last field of the message. Absent → `0`.
+    pub audio_frame_us: u16,
 }
 
 /// `client → host`: data plane is bound, begin streaming.
@@ -296,13 +420,23 @@ impl Hello {
         let hdr_present = self.display_hdr.is_some();
         let ccaps_present = self.client_caps != 0;
         let msp_present = self.max_shard_payload != 0;
+        // The hi-res audio request (design/hi-res-audio.md §7). BOTH the wire's `0` and the legacy
+        // value count as "default": decode resolves an absent field to 48 000 / 16 bits, so a
+        // struct carrying those explicitly must produce the same bytes as one left at zero —
+        // otherwise "the legacy request" would have two wire forms, only one of them byte-identical
+        // to the pre-hi-res Hello, and which one you got would depend on how the caller spelled it.
+        let arate_present =
+            self.audio_rate_hz != 0 && self.audio_rate_hz != crate::audio::SAMPLE_RATE_HZ;
+        let abits_present = self.audio_bits != 0 && self.audio_bits != crate::audio::pcm::BITS_16;
+        let audio_present = arate_present || abits_present;
         let need_placeholders = self.video_caps != 0
             || ac_present
             || vcodecs_present
             || pref_present
             || hdr_present
             || ccaps_present
-            || msp_present;
+            || msp_present
+            || audio_present;
         match (&self.name, &self.launch) {
             (None, None) if !need_placeholders => {}
             (name, _) => {
@@ -329,15 +463,22 @@ impl Hello {
             || hdr_present
             || ccaps_present
             || msp_present
+            || audio_present
         {
             b.push(self.audio_channels);
         }
         // video_codecs: emitted when non-zero OR a later field follows.
-        if vcodecs_present || pref_present || hdr_present || ccaps_present || msp_present {
+        if vcodecs_present
+            || pref_present
+            || hdr_present
+            || ccaps_present
+            || msp_present
+            || audio_present
+        {
             b.push(self.video_codecs);
         }
         // preferred_codec: emitted when non-zero OR a later field follows.
-        if pref_present || hdr_present || ccaps_present || msp_present {
+        if pref_present || hdr_present || ccaps_present || msp_present || audio_present {
             b.push(self.preferred_codec);
         }
         // display_hdr: fixed HDR_META_BODY_LEN-byte HdrMeta body; omitted when `None` even if
@@ -348,12 +489,30 @@ impl Hello {
         }
         // client_caps: single byte after the (optional) HDR block. Emitted when non-zero OR a
         // later field follows.
-        if ccaps_present || msp_present {
+        if ccaps_present || msp_present || audio_present {
             b.push(self.client_caps);
         }
-        // max_shard_payload: 2 trailing LE bytes after client_caps. Emitted when non-zero.
-        if msp_present {
+        // max_shard_payload: 2 trailing LE bytes after client_caps. Emitted when non-zero OR a
+        // later field follows.
+        if msp_present || audio_present {
             b.extend_from_slice(&self.max_shard_payload.to_le_bytes());
+        }
+        // audio_rate_hz: 4 trailing LE bytes. Emitted when non-default OR `audio_bits` follows —
+        // in which case it goes out as the legacy 48 000 rather than as `self.audio_rate_hz`,
+        // because a caller that left the rate at the struct's `0` still means "48 kHz" and the
+        // byte a decoder reads must say the same thing the struct does.
+        if audio_present {
+            let rate = if arate_present {
+                self.audio_rate_hz
+            } else {
+                crate::audio::SAMPLE_RATE_HZ
+            };
+            b.extend_from_slice(&rate.to_le_bytes());
+        }
+        // audio_bits: the last byte of the message, so nothing can force it — emitted only when
+        // the depth itself is non-default (a 96 kHz/16-bit request stops after the rate).
+        if abits_present {
+            b.push(self.audio_bits);
         }
         b
     }
@@ -371,6 +530,20 @@ impl Hello {
         let launch_off = 27 + name_len; // launch's length byte
         let launch_len = b.get(launch_off).copied().unwrap_or(0) as usize;
         let tail = launch_off + 1 + launch_len; // first trailing byte: video_caps
+
+        // Where the post-HDR tail starts. `display_hdr` is a FIXED HDR_META_BODY_LEN-byte block
+        // with no placeholder form, so its presence is decided by REMAINING LENGTH: ≥ that many
+        // bytes after `preferred_codec` ⇒ the block is there and the post-HDR fields follow it;
+        // fewer ⇒ there is no block and those bytes ARE the post-HDR fields. Sound only while the
+        // whole post-HDR tail stays under HDR_META_BODY_LEN bytes — the budget documented on
+        // [`Hello::client_caps`] (8 of 27 spent). Computed ONCE: every field from `client_caps` on
+        // reads off it, and four copies of this predicate would be four chances to update three.
+        let has_hdr = b.len().saturating_sub(tail + 4) >= super::datagram::HDR_META_BODY_LEN;
+        let post_hdr = if has_hdr {
+            tail + 4 + super::datagram::HDR_META_BODY_LEN
+        } else {
+            tail + 4
+        };
         Ok(Hello {
             abi_version: u32at(4),
             mode: Mode {
@@ -419,39 +592,46 @@ impl Hello {
             // `0` = no preference; the host decides by precedence.
             preferred_codec: b.get(tail + 3).copied().unwrap_or(0),
             // Optional trailing HdrMeta body (fixed length) — absent on an older client / a
-            // client without an HDR display → `None` (the host keeps its EDID defaults).
-            // Presence is decided by REMAINING LENGTH (there is no placeholder form for the
-            // fixed block): ≥ HDR_META_BODY_LEN bytes after `preferred_codec` ⇒ the block is
-            // there and post-HDR fields follow it; fewer ⇒ no block, the bytes ARE the post-HDR
-            // fields. Sound as long as the post-HDR tail stays under HDR_META_BODY_LEN bytes.
-            display_hdr: (b.len().saturating_sub(tail + 4) >= super::datagram::HDR_META_BODY_LEN)
+            // client without an HDR display → `None` (the host keeps its EDID defaults). See
+            // `has_hdr` above for why presence is a length question rather than a flag.
+            display_hdr: has_hdr
                 .then(|| {
                     b.get(tail + 4..tail + 4 + super::datagram::HDR_META_BODY_LEN)
                         .map(super::datagram::read_hdr_meta_body)
                 })
                 .flatten(),
             // client_caps: the byte after the HDR block when present, else directly at tail+4.
-            client_caps: {
-                let off = if b.len().saturating_sub(tail + 4) >= super::datagram::HDR_META_BODY_LEN
-                {
-                    tail + 4 + super::datagram::HDR_META_BODY_LEN
-                } else {
-                    tail + 4
-                };
-                b.get(off).copied().unwrap_or(0)
-            },
-            // max_shard_payload: 2 LE bytes after client_caps (same post-HDR offset rule).
+            client_caps: b.get(post_hdr).copied().unwrap_or(0),
+            // max_shard_payload: 2 LE bytes after client_caps.
             // Absent on an older client → 0 = no mid-session renegotiation, no jumbo.
-            max_shard_payload: {
-                let off = if b.len().saturating_sub(tail + 4) >= super::datagram::HDR_META_BODY_LEN
-                {
-                    tail + 4 + super::datagram::HDR_META_BODY_LEN
-                } else {
-                    tail + 4
-                };
-                b.get(off + 1..off + 3)
-                    .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
-                    .unwrap_or(0)
+            max_shard_payload: b
+                .get(post_hdr + 1..post_hdr + 3)
+                .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
+                .unwrap_or(0),
+            // The hi-res audio request: 4 LE rate bytes then the depth byte. Absent (an older
+            // client) or an explicit `0` → the legacy 48 kHz / 16-bit, which is what a client
+            // that never heard of this feature is asking for. Resolved to the SEMANTIC default
+            // rather than left as a raw 0 so nothing downstream has to remember that "0 means
+            // 48 000" — the host's gate and the client's device-open both read a real rate.
+            //
+            // Beyond zero the rate is NOT range-checked: the ladder is 48/96 kHz today and grows
+            // once JitterPolicy's integer samples-per-ms arithmetic is reworked, and quietly
+            // rewriting a rate we don't recognise into one we do is the "label right, content
+            // wrong" lie this whole feature is built to avoid. The HOST decides what it can
+            // honour, and answers in `Welcome::audio_rate_hz`.
+            audio_rate_hz: b
+                .get(post_hdr + 3..post_hdr + 7)
+                .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+                .filter(|&hz| hz != 0)
+                .unwrap_or(crate::audio::SAMPLE_RATE_HZ),
+            // The depth IS checked, because it is a byte stride rather than a label: a value the
+            // plane cannot carry would size a `0xD3` unpack wrongly. It can only come off a
+            // corrupt or future wire (this message rides the pinned-TLS control stream), and a
+            // request is only a request — falling back to 16 costs a hi-res session, never
+            // correctness.
+            audio_bits: match b.get(post_hdr + 7).copied() {
+                Some(d) if crate::audio::pcm::depth_is_supported(d) => d,
+                _ => crate::audio::pcm::BITS_16,
             },
         })
     }
@@ -518,19 +698,33 @@ impl Welcome {
         // u32s always land at a deterministic offset. A full-control permanent session
         // (`GRANT_ALL`, no deadline) is what every absent-field decode yields anyway, so it is
         // omitted and the common case stays byte-identical to the pre-grants wire form.
+        // The hi-res audio block (codec + resolved rate/depth/frame) extends the chain one link
+        // further still, and its presence test is the CODEC alone: "this session is not plain
+        // legacy Opus". Deliberately not "any of the four differs from its default" — a hi-res
+        // session at 48 kHz/16-bit would then be indistinguishable on the wire from an Opus one,
+        // and the client would open the wrong plane. Conversely an Opus session never emits the
+        // block whatever the other three say, so today's Welcome stays byte-identical — the
+        // interop guarantee the cipher byte bought and every link since has had to keep.
         let mgmt_present = self.mgmt_port != 0;
         let access_present = self.grants != super::access::GRANT_ALL || self.expires_in_secs != 0;
-        if self.cipher != CIPHER_AES_128_GCM || mgmt_present || access_present {
+        let audio_present = self.audio_codec != AUDIO_CODEC_OPUS;
+        if self.cipher != CIPHER_AES_128_GCM || mgmt_present || access_present || audio_present {
             b.push(self.cipher);
             if let Some(k) = &self.key_chacha {
                 b.extend_from_slice(k);
             }
-            if mgmt_present || access_present {
+            if mgmt_present || access_present || audio_present {
                 b.extend_from_slice(&self.mgmt_port.to_le_bytes());
             }
-            if access_present {
+            if access_present || audio_present {
                 b.extend_from_slice(&self.grants.to_le_bytes());
                 b.extend_from_slice(&self.expires_in_secs.to_le_bytes());
+            }
+            if audio_present {
+                b.push(self.audio_codec);
+                b.extend_from_slice(&self.audio_rate_hz.to_le_bytes());
+                b.push(self.audio_bits);
+                b.extend_from_slice(&self.audio_frame_us.to_le_bytes());
             }
         }
         b
@@ -543,13 +737,16 @@ impl Welcome {
         // bit_depth[59] color.primaries[60] color.transfer[61] color.matrix[62] color.range[63]
         // chroma_format[64] audio_channels[65] codec[66] host_caps[67] cipher[68]
         // key_chacha[69..101] mgmt_port[69..71 | 101..103] grants[71..75 | 103..107]
-        // expires_in_secs[75..79 | 107..111] (everything from compositor on is an
-        // optional trailing byte; an older host stops earlier; cipher/key_chacha are present only
-        // when ChaCha was negotiated). `mgmt_port` and the access pair are the fields whose
-        // offsets are NOT fixed: they follow the cipher block, shifted by 32 when a ChaCha key
-        // precedes them. Emitting a later field forces every earlier one (see `encode`), so
-        // "cipher absent" and "mgmt_port present" — or "mgmt_port absent" and "grants present" —
-        // can never both hold.
+        // expires_in_secs[75..79 | 107..111] audio_codec[79 | 111] audio_rate_hz[80..84 | 112..116]
+        // audio_bits[84 | 116] audio_frame_us[85..87 | 117..119] (everything from compositor on is
+        // an optional trailing byte; an older host stops earlier; cipher/key_chacha are present
+        // only when ChaCha was negotiated). `mgmt_port`, the access pair and the audio block are
+        // the fields whose offsets are NOT fixed: they follow the cipher block, shifted by 32 when
+        // a ChaCha key precedes them — which is why every one of them is read off `mgmt_off`
+        // rather than a constant, and why the tests cover BOTH ciphers. Emitting a later field
+        // forces every earlier one (see `encode`), so "cipher absent" and "mgmt_port present" —
+        // or "grants absent" and "audio_codec present" — can never both hold. Full length: 87
+        // bytes for a hi-res AES session, 119 behind a ChaCha key.
         if b.len() < 53 || &b[0..4] != MAGIC {
             return Err(PunktfunkError::InvalidArg("bad Welcome"));
         }
@@ -600,6 +797,40 @@ impl Welcome {
         let expires_in_secs = b
             .get(grants_off + 4..grants_off + 8)
             .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+            .unwrap_or(0);
+        // The audio block trails the access advert — 79 for AES, 111 behind a ChaCha key. Absent
+        // (an older host, or any session the §8.4 gate resolved back to Opus, which encode omits)
+        // → Opus at the legacy 48 kHz / 16-bit, frame length not applicable. That is exactly what
+        // every pre-hi-res host meant, so nothing has to distinguish "old host" from "declined".
+        let audio_off = grants_off + 8;
+        // The codec id is taken VERBATIM, unlike the rate and depth below. A value we don't know
+        // is not something to fold onto a default: `audio_codec` is what selects the plane, and
+        // silently reporting Opus while the host ships 0xD3 would be silence — the one outcome
+        // §8.4 calls unacceptable. The client cross-checks this against HOST_CAP_AUDIO_HIRES and
+        // refuses a plane it cannot play, which is a decision it must make anyway and can make
+        // loudly. (`1` = FLAC is reserved and emitted by nothing; see AUDIO_CODEC_FLAC_RESERVED.)
+        let audio_codec = b.get(audio_off).copied().unwrap_or(AUDIO_CODEC_OPUS);
+        // The resolved rate. Not clamped to the rates we know: the host states what it actually
+        // opened, and a decoder that "corrected" 44 100 to 48 000 would be manufacturing precisely
+        // the label-right/content-wrong lie §4.3 exists to prevent. Only `0`/absent is resolved,
+        // to the legacy rate.
+        let audio_rate_hz = b
+            .get(audio_off + 1..audio_off + 5)
+            .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+            .filter(|&hz| hz != 0)
+            .unwrap_or(crate::audio::SAMPLE_RATE_HZ);
+        // The resolved depth IS range-checked, because unlike the rate it feeds an unpack stride:
+        // a depth the plane cannot carry would have the client walking a `0xD3` payload at the
+        // wrong step and reading noise, so it folds to 16 — the `audio_channels` precedent. Only a
+        // corrupt or future wire reaches that branch (this rides the pinned-TLS control stream).
+        let audio_bits = match b.get(audio_off + 5).copied() {
+            Some(d) if crate::audio::pcm::depth_is_supported(d) => d,
+            _ => crate::audio::pcm::BITS_16,
+        };
+        // The resolved frame duration. `0` = not applicable (an Opus session, or an older host).
+        let audio_frame_us = b
+            .get(audio_off + 6..audio_off + 8)
+            .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
             .unwrap_or(0);
         Ok(Welcome {
             abi_version: u32at(4),
@@ -673,6 +904,10 @@ impl Welcome {
             expires_in_secs,
             cipher,
             key_chacha,
+            audio_codec,
+            audio_rate_hz,
+            audio_bits,
+            audio_frame_us,
         })
     }
 
@@ -725,6 +960,8 @@ impl Start {
 
 #[cfg(test)]
 mod tests {
+    use crate::audio::pcm::{depth_is_supported, frame_us_for, BITS_16, BITS_24};
+    use crate::audio::SAMPLE_RATE_HZ;
     use crate::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, Mode, Role};
     use crate::quic::*;
 
@@ -762,6 +999,10 @@ mod tests {
             expires_in_secs: 0,
             cipher: 0,
             key_chacha: None,
+            audio_codec: AUDIO_CODEC_OPUS,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
+            audio_frame_us: 0,
         };
         assert_eq!(Welcome::decode(&w.encode()).unwrap(), w);
 
@@ -830,6 +1071,10 @@ mod tests {
             expires_in_secs: 0,
             cipher: CIPHER_AES_128_GCM,
             key_chacha: None,
+            audio_codec: AUDIO_CODEC_OPUS,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
+            audio_frame_us: 0,
         };
         // An AES session's Welcome is byte-identical to the pre-cipher wire form (68 bytes) —
         // the old-client × new-host interop guarantee.
@@ -1083,6 +1328,10 @@ mod tests {
                 expires_in_secs: 0,
                 cipher: 0,
                 key_chacha: None,
+                audio_codec: AUDIO_CODEC_OPUS,
+                audio_rate_hz: SAMPLE_RATE_HZ,
+                audio_bits: BITS_16,
+                audio_frame_us: 0,
             }
             .encode(),
         )
@@ -1113,6 +1362,8 @@ mod tests {
             display_hdr: None,
             client_caps: 0,
             max_shard_payload: 0,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
         };
         let enc = h.encode();
         let dec = Hello::decode(&enc).unwrap();
@@ -1160,6 +1411,10 @@ mod tests {
                 expires_in_secs: 0,
                 cipher: 0,
                 key_chacha: None,
+                audio_codec: AUDIO_CODEC_OPUS,
+                audio_rate_hz: SAMPLE_RATE_HZ,
+                audio_bits: BITS_16,
+                audio_frame_us: 0,
             }
             .encode(),
         )
@@ -1194,6 +1449,8 @@ mod tests {
             display_hdr: None,
             client_caps: 0,
             max_shard_payload: 0,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
         };
         assert_eq!(Hello::decode(&h.encode()).unwrap(), h);
         let s = Start {
@@ -1226,6 +1483,8 @@ mod tests {
             display_hdr: None,
             client_caps: 0,
             max_shard_payload: 0,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
         };
         let enc = h.encode();
         assert_eq!(enc.len(), 26);
@@ -1274,6 +1533,10 @@ mod tests {
             expires_in_secs: 0,
             cipher: 0,
             key_chacha: None,
+            audio_codec: AUDIO_CODEC_OPUS,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
+            audio_frame_us: 0,
         };
         let wenc = w.encode();
         assert_eq!(wenc.len(), 68); // 60 base + 4 colour + chroma + audio-channels + codec + host-caps
@@ -1348,6 +1611,8 @@ mod tests {
             display_hdr: None,
             client_caps: 0,
             max_shard_payload: 0,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
         };
         let enc = base.encode();
         assert_eq!(
@@ -1401,6 +1666,8 @@ mod tests {
             display_hdr: None,
             client_caps: 0,
             max_shard_payload: 0,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
         };
         // launch alone (no name): a zero-length name placeholder keeps the offset deterministic.
         let with_launch = Hello {
@@ -1462,6 +1729,8 @@ mod tests {
             display_hdr: None,
             client_caps: 0,
             max_shard_payload: 0,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
         };
         // A real client-panel volume (P3 primaries, 800-nit peak, 0.05-nit floor, 400-nit FALL).
         let vol = HdrMeta {
@@ -1531,6 +1800,8 @@ mod tests {
                 display_hdr: None,
                 client_caps: 0,
                 max_shard_payload: 0,
+                audio_rate_hz: SAMPLE_RATE_HZ,
+                audio_bits: BITS_16,
             }
             .encode();
             assert!(PairRequest::decode(&h).is_err(), "abi {abi} parsed as pair");
@@ -1565,6 +1836,8 @@ mod tests {
             display_hdr: None,
             client_caps: 0,
             max_shard_payload: 0,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
         };
         let vol = HdrMeta {
             display_primaries: [[13250, 34500], [7500, 3000], [34000, 16000]],
@@ -1635,6 +1908,8 @@ mod tests {
             display_hdr: None,
             client_caps: 0,
             max_shard_payload: 0,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
         };
         // The advertisement alone: every earlier trailing field is emitted as a placeholder
         // so the 2 LE bytes land at a deterministic offset — and the whole thing roundtrips.
@@ -1673,5 +1948,390 @@ mod tests {
                 ..full.clone()
             }
         );
+    }
+
+    /// The audio codec ids are a registry the design doc owns, not a compact enum. Pinned
+    /// because `1` is deliberately burned on an unimplemented format: if someone later
+    /// "tidies" PCM down to `1`, every host and client that already shipped `2` reads the
+    /// wrong plane off the wire, and the failure is silence rather than an error.
+    #[test]
+    fn audio_codec_ids_match_the_design_doc_numbering() {
+        assert_eq!(AUDIO_CODEC_OPUS, 0);
+        assert_eq!(AUDIO_CODEC_FLAC_RESERVED, 1);
+        assert_eq!(AUDIO_CODEC_PCM, 2);
+        // Opus MUST be the zero id — the whole byte-identical-legacy-wire property rests on an
+        // absent field decoding to it.
+        assert_eq!(AUDIO_CODEC_OPUS, 0, "absence decodes to Opus");
+    }
+
+    /// The hi-res audio block on `Welcome` (`design/hi-res-audio.md` §4.7, §7).
+    ///
+    /// ⚠ THE HAZARD THIS PINS: `Welcome`'s tail is CONDITIONAL. `cipher` sits at 68 and the
+    /// 32-byte ChaCha key at 69..101 are emitted only when ChaCha was negotiated, so every field
+    /// appended after them lands at two different offsets — 79 under AES, 111 behind a key. A
+    /// decoder that computed either from a fixed constant, or a test that only covered AES, ships
+    /// a working stream to everyone except the soft-AES clients (webOS) that asked for ChaCha
+    /// precisely because they are the slowest devices in the fleet. §4.7 calls this out by name;
+    /// this test is the answer.
+    #[test]
+    fn welcome_hires_audio_wire_under_both_ciphers() {
+        let base = Welcome {
+            abi_version: 2,
+            udp_port: 7000,
+            mode: Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            },
+            fec: FecConfig {
+                scheme: FecScheme::Gf16,
+                fec_percent: 20,
+                max_data_per_block: 4096,
+            },
+            shard_payload: 1200,
+            encrypt: true,
+            key: [7u8; 16],
+            salt: [9, 8, 7, 6],
+            frames: 0,
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 50_000,
+            bit_depth: 8,
+            color: ColorInfo::SDR_BT709,
+            chroma_format: CHROMA_IDC_420,
+            audio_channels: 2,
+            codec: CODEC_HEVC,
+            host_caps: 0,
+            mgmt_port: 0,
+            grants: GRANT_ALL,
+            expires_in_secs: 0,
+            cipher: CIPHER_AES_128_GCM,
+            key_chacha: None,
+            audio_codec: AUDIO_CODEC_OPUS,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
+            audio_frame_us: 0,
+        };
+        // ── The interop floor: a plain Opus session is byte-identical to the pre-hi-res wire ──
+        //
+        // Everything below only holds because the common case pays nothing. 68 bytes is the
+        // pre-cipher length, and every field appended since (cipher, mgmt_port, the access
+        // advert, and now these four) has had to keep it.
+        assert_eq!(base.encode().len(), 68);
+        assert_eq!(Welcome::decode(&base.encode()).unwrap(), base);
+
+        // …and presence is decided by the CODEC ALONE. A rate/depth that differ from the legacy
+        // values do NOT put the block on the wire: an Opus session has no other format to be in,
+        // and if the other three fields could force the block, an ordinary Opus Welcome would
+        // stop being byte-identical the moment anything set them speculatively.
+        let opus_with_stray_format = Welcome {
+            audio_rate_hz: 96_000,
+            audio_bits: BITS_24,
+            audio_frame_us: 2000,
+            ..base
+        };
+        assert_eq!(
+            opus_with_stray_format.encode().len(),
+            68,
+            "only audio_codec puts the block on the wire"
+        );
+
+        // ── The resolved hi-res session ───────────────────────────────────────────────────────
+        //
+        // The frame duration comes from the ladder, never a constant: at 96 kHz/24-bit stereo a
+        // ~1400 B usable datagram only carries 2 ms, and this plane is never fragmented, so a
+        // hardcoded 2.5 ms would produce datagrams the path silently refuses to send (§4.2).
+        let frame_us = frame_us_for(96_000, BITS_24, 2, 1400).expect("a rung fits the default MTU");
+        assert_eq!(
+            frame_us, 2000,
+            "the documented rung at the default MTU ceiling"
+        );
+        let hires = Welcome {
+            host_caps: HOST_CAP_AUDIO_HIRES,
+            audio_codec: AUDIO_CODEC_PCM,
+            audio_rate_hz: 96_000,
+            audio_bits: BITS_24,
+            audio_frame_us: frame_us as u16,
+            ..base
+        };
+
+        // AES: the block lands at 79..87 — cipher(1) + mgmt(2) + grants(4) + expiry(4) past 68.
+        let enc = hires.encode();
+        assert_eq!(enc.len(), 87, "68 + cipher 1 + mgmt 2 + access 8 + audio 8");
+        assert_eq!(enc[68], CIPHER_AES_128_GCM, "forced cipher placeholder");
+        assert_eq!(&enc[69..71], &0u16.to_le_bytes(), "forced mgmt placeholder");
+        assert_eq!(&enc[71..75], &GRANT_ALL.to_le_bytes(), "forced grants");
+        assert_eq!(&enc[75..79], &0u32.to_le_bytes(), "forced expiry");
+        assert_eq!(enc[79], AUDIO_CODEC_PCM);
+        assert_eq!(&enc[80..84], &96_000u32.to_le_bytes());
+        assert_eq!(enc[84], BITS_24);
+        assert_eq!(&enc[85..87], &(frame_us as u16).to_le_bytes());
+        assert_eq!(Welcome::decode(&enc).unwrap(), hires);
+
+        // ChaCha: the SAME eight bytes, shifted by the 32-byte key — 111..119.
+        let k32: [u8; 32] = core::array::from_fn(|i| i as u8 + 1);
+        let cha = Welcome {
+            cipher: CIPHER_CHACHA20_POLY1305,
+            key_chacha: Some(k32),
+            ..hires
+        };
+        let cenc = cha.encode();
+        assert_eq!(cenc.len(), 119, "87 + the 32-byte ChaCha key");
+        assert_eq!(&cenc[101..103], &0u16.to_le_bytes(), "forced mgmt");
+        assert_eq!(&cenc[103..107], &GRANT_ALL.to_le_bytes(), "forced grants");
+        assert_eq!(&cenc[107..111], &0u32.to_le_bytes(), "forced expiry");
+        assert_eq!(cenc[111], AUDIO_CODEC_PCM);
+        assert_eq!(&cenc[112..116], &96_000u32.to_le_bytes());
+        assert_eq!(cenc[116], BITS_24);
+        assert_eq!(&cenc[117..119], &(frame_us as u16).to_le_bytes());
+        assert_eq!(Welcome::decode(&cenc).unwrap(), cha);
+        // The block is the same eight bytes in both, at a 32-byte offset — which is the whole
+        // claim: the decoder derives its position from `cipher`, not from a constant.
+        assert_eq!(&enc[79..87], &cenc[111..119]);
+
+        // ── The forced placeholders really decode as their own absence ────────────────────────
+        //
+        // Emitting audio drags four earlier fields onto the wire that the session does not
+        // otherwise use. They must read exactly as they would have if omitted, or a hi-res
+        // session would silently acquire a mgmt port / an access mask it never had.
+        for w in [
+            Welcome::decode(&enc).unwrap(),
+            Welcome::decode(&cenc).unwrap(),
+        ] {
+            assert_eq!(w.mgmt_port, 0, "forced placeholder, not an advertised port");
+            assert_eq!(w.grants, GRANT_ALL, "forced placeholder, full control");
+            assert_eq!(w.expires_in_secs, 0, "forced placeholder, permanent");
+            assert!(depth_is_supported(w.audio_bits));
+        }
+
+        // …and the block composes with real values in those slots rather than only with zeros.
+        let guest_hires = Welcome {
+            mgmt_port: 47991,
+            grants: GRANT_PRESET_CONTROLLER_ONLY,
+            expires_in_secs: 4 * 3600,
+            ..hires
+        };
+        let genc = guest_hires.encode();
+        assert_eq!(
+            genc.len(),
+            87,
+            "same length — the placeholders were already paid for"
+        );
+        assert_eq!(&genc[69..71], &47991u16.to_le_bytes());
+        assert_eq!(&genc[71..75], &GRANT_PRESET_CONTROLLER_ONLY.to_le_bytes());
+        assert_eq!(&genc[79..87], &enc[79..87], "the audio block is unmoved");
+        assert_eq!(Welcome::decode(&genc).unwrap(), guest_hires);
+
+        // ── Back-compat: every shorter wire form is a legacy Opus session ─────────────────────
+        //
+        // An older host and a host whose §8.4 gate declined produce the same bytes, and must
+        // therefore decode the same way. Resolving to 48 000/16 rather than to a raw 0 is what
+        // lets a client open its device straight off the Welcome without knowing the difference.
+        let mgmt_era = Welcome {
+            mgmt_port: 47991,
+            ..base
+        }
+        .encode();
+        for old in [&base.encode()[..], &mgmt_era[..], &enc[..79], &cenc[..111]] {
+            let w = Welcome::decode(old).unwrap();
+            assert_eq!(w.audio_codec, AUDIO_CODEC_OPUS);
+            assert_eq!(w.audio_rate_hz, SAMPLE_RATE_HZ);
+            assert_eq!(w.audio_bits, BITS_16);
+            assert_eq!(w.audio_frame_us, 0);
+        }
+        // An access-era reader consuming exactly the prefix it knows sees the base session, plus
+        // the HOST_CAP_AUDIO_HIRES bit — which rides the long-standing `host_caps` byte at 67, not
+        // the appended block. That is the point: nothing BEFORE the block moved, and a cap bit an
+        // older client doesn't recognise is inert.
+        assert_eq!(
+            Welcome::decode(&enc[..79]).unwrap(),
+            Welcome {
+                host_caps: HOST_CAP_AUDIO_HIRES,
+                ..base
+            }
+        );
+
+        // A truncated block is never HALF a rate: cut mid-u32 and the rate reads as the legacy
+        // value, not as two bytes of 96 000 zero-extended.
+        let torn = Welcome::decode(&enc[..82]).unwrap();
+        assert_eq!(torn.audio_codec, AUDIO_CODEC_PCM, "the codec byte survived");
+        assert_eq!(torn.audio_rate_hz, SAMPLE_RATE_HZ);
+        assert_eq!(torn.audio_frame_us, 0);
+
+        // A depth this plane cannot carry folds to 16 rather than being handed to a client that
+        // would then walk a 0xD3 payload at the wrong stride. Only a corrupt wire gets here (the
+        // Welcome rides the pinned-TLS control stream), which is exactly why it is worth pinning.
+        let mut bad_depth = enc.clone();
+        bad_depth[84] = 32;
+        assert_eq!(Welcome::decode(&bad_depth).unwrap().audio_bits, BITS_16);
+        // The RATE, by contrast, is passed through verbatim. Clamping an unrecognised rate to one
+        // we know is the §4.3 lie — label right, content wrong — so a rate outside today's ladder
+        // must reach the client, which refuses it loudly.
+        let mut odd_rate = enc.clone();
+        odd_rate[80..84].copy_from_slice(&44_100u32.to_le_bytes());
+        assert_eq!(Welcome::decode(&odd_rate).unwrap().audio_rate_hz, 44_100);
+    }
+
+    /// The hi-res audio request on `Hello` (`design/hi-res-audio.md` §7) — the placeholder
+    /// discipline, the post-`display_hdr` byte budget, and the legacy defaults in both
+    /// directions.
+    ///
+    /// `Hello` does NOT use `Welcome`'s conditional-tail pattern: every trailing field has a
+    /// placeholder form, so a present field always lands at a deterministic offset. The one
+    /// exception is `display_hdr`, a fixed 28-byte block with NO placeholder whose presence is
+    /// disambiguated by REMAINING LENGTH — which is what caps the whole tail after it at 27
+    /// bytes and makes the budget below load-bearing rather than bookkeeping.
+    #[test]
+    fn hello_hires_audio_request_roundtrip_and_back_compat() {
+        let base = Hello {
+            abi_version: 2,
+            mode: Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            },
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 0,
+            name: None,
+            launch: None,
+            video_caps: 0,
+            audio_channels: 2,
+            video_codecs: 0,
+            preferred_codec: 0,
+            display_hdr: None,
+            client_caps: 0,
+            max_shard_payload: 0,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
+        };
+        // The legacy request costs nothing: still the 26-byte bitrate-era form.
+        assert_eq!(base.encode().len(), 26);
+        assert_eq!(Hello::decode(&base.encode()).unwrap(), base);
+
+        // ── The request forces the whole earlier chain ────────────────────────────────────────
+        //
+        // 26 bitrate-era bytes + 6 single-byte placeholders (name len, launch len, video_caps,
+        // audio_channels, video_codecs, preferred_codec) + client_caps 1 + max_shard_payload 2 +
+        // the 4-byte rate. No HDR block, and no depth byte: 16-bit is the default and nothing
+        // follows it to force it out.
+        let rate_only = Hello {
+            audio_rate_hz: 96_000,
+            ..base.clone()
+        };
+        let enc = rate_only.encode();
+        assert_eq!(enc.len(), 26 + 6 + 1 + 2 + 4);
+        assert_eq!(&enc[26..28], &[0, 0], "name + launch length placeholders");
+        assert_eq!(enc[28], 0, "video_caps placeholder");
+        assert_eq!(enc[29], 2, "audio_channels placeholder = stereo");
+        assert_eq!(
+            &enc[30..32],
+            &[0, 0],
+            "video_codecs + preferred placeholders"
+        );
+        assert_eq!(enc[32], 0, "client_caps placeholder");
+        assert_eq!(
+            &enc[33..35],
+            &0u16.to_le_bytes(),
+            "max_shard_payload placeholder"
+        );
+        assert_eq!(&enc[35..39], &96_000u32.to_le_bytes());
+        let dec = Hello::decode(&enc).unwrap();
+        assert_eq!(dec, rate_only);
+        assert_eq!(
+            dec.client_caps, 0,
+            "the forced placeholder reads as absence"
+        );
+        assert_eq!(dec.max_shard_payload, 0, "…and so does this one");
+        assert_eq!(dec.audio_bits, BITS_16, "absent depth → the legacy 16");
+
+        // The depth is the LAST field, so it forces the rate out ahead of it — as the legacy
+        // 48 000, not as the struct's value, which is the same thing said twice. Without that,
+        // "16-bit at the default rate" and "24-bit at the default rate" would disagree about
+        // where the depth byte lives.
+        let bits_only = Hello {
+            audio_bits: BITS_24,
+            ..base.clone()
+        };
+        let benc = bits_only.encode();
+        assert_eq!(benc.len(), 26 + 6 + 1 + 2 + 4 + 1);
+        assert_eq!(&benc[35..39], &SAMPLE_RATE_HZ.to_le_bytes(), "forced rate");
+        assert_eq!(benc[39], BITS_24);
+        assert_eq!(Hello::decode(&benc).unwrap(), bits_only);
+
+        // The real thing a client sends: capable-and-opted-in, both parameters set.
+        let req = Hello {
+            client_caps: CLIENT_CAP_AUDIO_HIRES,
+            audio_rate_hz: 96_000,
+            audio_bits: BITS_24,
+            ..base.clone()
+        };
+        let renc = req.encode();
+        assert_eq!(Hello::decode(&renc).unwrap(), req);
+        assert_eq!(renc[32], CLIENT_CAP_AUDIO_HIRES);
+        // ⚠ And it must NOT be mistaken for an HdrMeta block. The 8-byte tail is under the
+        // fixed 28-byte block length, so the remaining-length test correctly says "no HDR" —
+        // the budget below is what keeps that true.
+        assert_eq!(Hello::decode(&renc).unwrap().display_hdr, None);
+
+        // ── The budget the tail is spending (documented on `Hello::client_caps`) ──────────────
+        //
+        // Everything after `display_hdr` must stay under HDR_META_BODY_LEN bytes or the
+        // remaining-length disambiguation stops being sound: a tail that long is indistinguishable
+        // from an HDR block, and every field in it decodes as garbage. 8 spent, 19 free.
+        let vol = HdrMeta {
+            display_primaries: [[13250, 34500], [7500, 3000], [34000, 16000]],
+            white_point: [15635, 16450],
+            max_display_mastering_luminance: 8_000_000,
+            min_display_mastering_luminance: 500,
+            max_cll: 0,
+            max_fall: 400,
+        };
+        let full = Hello {
+            display_hdr: Some(vol),
+            client_caps: CLIENT_CAP_AUDIO_HIRES | CLIENT_CAP_CURSOR,
+            max_shard_payload: 8908,
+            audio_rate_hz: 96_000,
+            audio_bits: BITS_24,
+            ..base.clone()
+        };
+        let fenc = full.encode();
+        let post_hdr = fenc.len() - (26 + 6 + HDR_META_BODY_LEN);
+        assert_eq!(
+            post_hdr, 8,
+            "client_caps 1 + max_shard_payload 2 + audio_rate_hz 4 + audio_bits 1"
+        );
+        assert!(
+            post_hdr < HDR_META_BODY_LEN,
+            "the post-display_hdr tail must stay under {HDR_META_BODY_LEN} bytes — \
+             at or past it, a Hello WITHOUT an HDR block is read as one WITH"
+        );
+        // …and with the block actually present, every field after it is still found.
+        assert_eq!(Hello::decode(&fenc).unwrap(), full);
+
+        // ── Back-compat, both directions ──────────────────────────────────────────────────────
+        //
+        // A pre-hi-res client omits both fields; a pre-hi-res HOST truncates its read before
+        // them. Either way the request resolves to 48 kHz / 16-bit — what such a peer means.
+        assert_eq!(
+            Hello::decode(&base.encode()).unwrap().audio_rate_hz,
+            SAMPLE_RATE_HZ
+        );
+        assert_eq!(Hello::decode(&base.encode()).unwrap().audio_bits, BITS_16);
+        let pre_audio = Hello::decode(&renc[..35]).unwrap();
+        assert_eq!(pre_audio.audio_rate_hz, SAMPLE_RATE_HZ);
+        assert_eq!(pre_audio.audio_bits, BITS_16);
+        assert_eq!(pre_audio.max_shard_payload, 0);
+        // A torn rate is never half a rate.
+        assert_eq!(
+            Hello::decode(&renc[..37]).unwrap().audio_rate_hz,
+            SAMPLE_RATE_HZ
+        );
+        // An unsupported depth folds to 16 — a request is only a request, so falling back costs
+        // a hi-res session and never correctness.
+        let mut bad_depth = renc.clone();
+        bad_depth[39] = 32;
+        assert_eq!(Hello::decode(&bad_depth).unwrap().audio_bits, BITS_16);
+        assert!(depth_is_supported(Hello::decode(&renc).unwrap().audio_bits));
     }
 }

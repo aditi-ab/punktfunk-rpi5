@@ -684,6 +684,25 @@ pub(super) async fn negotiate(
             punktfunk_core::quic::CIPHER_AES_128_GCM
         },
         key_chacha,
+        // The resolved audio plane. Opus at 48 kHz / 16-bit — the legacy answer, which encode
+        // omits entirely, so this Welcome stays byte-identical to the pre-hi-res wire form for
+        // every client (the interop property the cipher byte bought and every appended field
+        // since has had to keep).
+        //
+        // The lossless 0xD3 plane is resolved by the five-condition gate in
+        // `design/hi-res-audio.md` §8.4 — the client asked via CLIENT_CAP_AUDIO_HIRES, the
+        // operator allows it, stereo, the capture path can *genuinely* deliver the rate (never
+        // padded — §4.3/§8.2), and the link can afford it off the top of the video budget — and
+        // that gate needs a rate-aware capturer, which is a later work package. Until it exists
+        // the honest answer is the one below: this host does not offer hi-res, and says so rather
+        // than advertising a format it would have to fake. HOST_CAP_AUDIO_HIRES stays clear in
+        // `host_caps` to match.
+        audio_codec: punktfunk_core::quic::AUDIO_CODEC_OPUS,
+        audio_rate_hz: punktfunk_core::audio::SAMPLE_RATE_HZ,
+        audio_bits: punktfunk_core::audio::pcm::BITS_16,
+        // Not applicable on the Opus plane, whose frame length is the fixed 5 ms of 0xC9. A
+        // 0xD3 session fills this from `pcm::frame_us_for` and the settled QUIC datagram size.
+        audio_frame_us: 0,
     };
     io::write_msg(send, &welcome.encode()).await?;
     bringup.mark("welcome");

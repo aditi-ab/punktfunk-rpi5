@@ -3328,6 +3328,11 @@ mod tests {
             display_hdr: None,
             client_caps: 0,
             max_shard_payload: 0,
+            // Legacy audio request — this fixture exercises the per-client access grants, not
+            // the audio plane, and the defaults keep its Hello byte-identical to a pre-hi-res
+            // client's.
+            audio_rate_hz: punktfunk_core::audio::SAMPLE_RATE_HZ,
+            audio_bits: punktfunk_core::audio::pcm::BITS_16,
         };
         io::write_msg(&mut send, &hello.encode())
             .await
