@@ -455,6 +455,18 @@
 // Sample rate of every audio plane in the protocol.
 #define PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ 48000
 
+// The `0xD3` datagram's fixed header: tag + `u32` seq + `u64` pts_ns, the same shape as `0xC9`
+// so the gap tracker and the A/V-sync plumbing work unchanged.
+// `quic::datagram` asserts this against its own encoder.
+#define PCM_HEADER_LEN ((1 + 4) + 8)
+
+// Bit depths the plane carries. 32-bit float is deliberately absent: no source produces detail
+// 24 bits does not capture, and it would cost 33 % more for nothing.
+#define BITS_16 16
+
+// See [`BITS_16`].
+#define BITS_24 24
+
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // The uniform no-TTL-host staleness bound: a legacy host refreshes state every 500 ms, so two
 // missed refreshes = quiet host → silence. Replaces the per-platform zoo (1.6 s / 60 s / 1.5 s /
@@ -2307,6 +2319,22 @@ typedef struct {
 
 
 
+
+// Frame durations the plane may negotiate, longest first.
+//
+// Every rung divides both 48 000 and 96 000 into a whole number of samples, so the host pacer
+// and the client ring never carry a fractional frame:
+//
+// | µs | samples @48 kHz | samples @96 kHz |
+// |---|---|---|
+// | 5000 | 240 | 480 |
+// | 4000 | 192 | 384 |
+// | 3000 | 144 | 288 |
+// | 2500 | 120 | 240 |
+// | 2000 | 96 | 192 |
+// | 1500 | 72 | 144 |
+// | 1000 | 48 | 96 |
+#define FRAME_US_LADDER { 5000, 4000, 3000, 2500, 2000, 1500, 1000, }
 
 // What a controller sitting still, face up, actually puts on the wire: **1 g along the UP
 // axis** — which is index 1 — and nothing on the other two.

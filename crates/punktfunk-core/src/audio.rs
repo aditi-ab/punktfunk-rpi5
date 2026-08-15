@@ -11,6 +11,11 @@
 //!
 //! Channel counts the protocol negotiates: `2` (stereo), `6` (5.1) and `8` (7.1). Anything
 //! else clamps to stereo ([`normalize_channels`]).
+//!
+//! Opus is 48 kHz by construction, so the lossless plane is a SECOND plane rather than a
+//! parameter change to this one — see [`pcm`] and `design/hi-res-audio.md`.
+
+pub mod pcm;
 
 /// Canonical wire channel positions; the index is the channel's slot in the interleaved PCM
 /// frame. A count of N uses positions `0..N` (always a prefix of this 8-channel order).
@@ -664,7 +669,8 @@ const SYNC_BACKOFF_MAX_MS: u32 = 480_000;
 #[derive(Clone, Debug)]
 pub struct JitterPolicy {
     tuning: JitterTuning,
-    /// Interleaved samples per millisecond at the negotiated layout (48 × channels).
+    /// Interleaved samples per millisecond at the negotiated layout (`rate_hz / 1000 × channels`
+    /// — 48 × channels at the default rate, 96 × channels for a 96 kHz hi-res session).
     per_ms: usize,
     /// The live target, in interleaved samples — `base_target_ms` grown by underrun pressure.
     target: usize,
@@ -713,9 +719,34 @@ pub struct JitterPolicy {
 }
 
 impl JitterPolicy {
-    /// `channels` is the negotiated interleaved channel count (2/6/8).
+    /// `channels` is the negotiated interleaved channel count (2/6/8), at the protocol's default
+    /// [`SAMPLE_RATE_HZ`]. Hi-res sessions use [`new_at_rate`](Self::new_at_rate).
     pub fn new(tuning: JitterTuning, channels: u8) -> JitterPolicy {
-        let per_ms = (SAMPLE_RATE_HZ / 1000) as usize * channels.max(1) as usize;
+        Self::new_at_rate(tuning, channels, SAMPLE_RATE_HZ)
+    }
+
+    /// As [`new`](Self::new), at an explicitly negotiated `rate_hz`.
+    ///
+    /// **`rate_hz` must be a whole number of samples per millisecond**, and every figure this
+    /// type computes — target, EWMA depth, shed threshold, hard cap, the de-prime fuse, and the
+    /// `buffer_ms`/`target_ms` a client reports — is `ms * per_ms` with `per_ms` an *integer*.
+    /// 48 000 → 48 and 96 000 → 96 are exact; **44 100 → 44.1 truncates to 44**, a silent 2.3 %
+    /// error in all of them. That is why the hi-res ladder is 48/96 kHz only: 44.1/88.2/176.4
+    /// are deferred behind denominating this policy in a rational `per_ms`, not behind any
+    /// difficulty in carrying them on the wire (`design/hi-res-audio.md` §4.1).
+    ///
+    /// The debug assertion below is that deferral's tripwire — it fires the moment someone adds
+    /// a rate the arithmetic cannot represent, rather than letting the error hide in a buffer
+    /// figure that merely looks 2 % optimistic. The tell in a release build is
+    /// [`depth_ms`](Self::depth_ms)`(target)` not round-tripping to [`target_ms`](Self::target_ms).
+    pub fn new_at_rate(tuning: JitterTuning, channels: u8, rate_hz: u32) -> JitterPolicy {
+        debug_assert_eq!(
+            rate_hz % 1000,
+            0,
+            "JitterPolicy is denominated in integer samples per millisecond; {rate_hz} Hz \
+             truncates and would skew every depth/target figure (see design/hi-res-audio.md §4.1)"
+        );
+        let per_ms = (rate_hz / 1000) as usize * channels.max(1) as usize;
         JitterPolicy {
             tuning,
             per_ms,
@@ -1243,7 +1274,7 @@ const AV_SANE_LIMIT_MS: u32 = 1_000;
 /// out of the listener's stream. See [`JitterPolicy::set_sync_target`].
 #[derive(Clone, Debug)]
 pub struct AvSync {
-    /// Interleaved samples per millisecond at the negotiated layout (48 × channels).
+    /// Interleaved samples per millisecond at the negotiated layout (`rate_hz / 1000 × channels`).
     per_ms: usize,
     /// EWMA of the measured offset in ns. Positive = audio is scheduled to play LATE relative to
     /// the picture it belongs with.
@@ -1272,10 +1303,25 @@ pub struct AvSyncObservation {
 }
 
 impl AvSync {
-    /// `channels` is the negotiated interleaved channel count (2/6/8).
+    /// `channels` is the negotiated interleaved channel count (2/6/8), at the protocol's default
+    /// [`SAMPLE_RATE_HZ`]. Hi-res sessions use [`new_at_rate`](Self::new_at_rate).
     pub fn new(channels: u8) -> AvSync {
+        Self::new_at_rate(channels, SAMPLE_RATE_HZ)
+    }
+
+    /// As [`new`](Self::new), at an explicitly negotiated `rate_hz`. The same integer
+    /// samples-per-millisecond constraint as [`JitterPolicy::new_at_rate`] applies, and for the
+    /// same reason — this type's proposal is denominated in the ring's own units so the two
+    /// agree about what a millisecond is.
+    pub fn new_at_rate(channels: u8, rate_hz: u32) -> AvSync {
+        debug_assert_eq!(
+            rate_hz % 1000,
+            0,
+            "AvSync is denominated in integer samples per millisecond; {rate_hz} Hz truncates \
+             (see design/hi-res-audio.md §4.1)"
+        );
         AvSync {
-            per_ms: (SAMPLE_RATE_HZ / 1000) as usize * channels.max(1) as usize,
+            per_ms: (rate_hz / 1000) as usize * channels.max(1) as usize,
             offset_avg_ns: 0.0,
             observations: 0,
             implausible: false,
@@ -2033,6 +2079,75 @@ mod tests {
         // Once it holds the quantum plus a frame, it may play.
         let s = p.step((40 + FRAME_MS as usize) * pm, want);
         assert!(!s.silence, "quantum + one frame must be enough to start");
+    }
+
+    /// The rate parameter must move SAMPLES without moving MILLISECONDS. A 96 kHz ring holds
+    /// twice the samples for the same latency, and every ms-denominated figure a client reports
+    /// — `target_ms`, `depth_ms`, `avg_depth_ms` — must read identically at both rates. If this
+    /// ever fails, the hi-res plane is buying latency it did not intend to.
+    #[test]
+    fn a_hires_policy_holds_the_same_milliseconds_as_a_48k_one() {
+        for t in [
+            JitterTuning::PIPEWIRE,
+            JitterTuning::WASAPI,
+            JitterTuning::COREAUDIO,
+            JitterTuning::AAUDIO,
+        ] {
+            for ch in [2u8, 6, 8] {
+                let lo = JitterPolicy::new_at_rate(t, ch, 48_000);
+                let hi = JitterPolicy::new_at_rate(t, ch, 96_000);
+                assert_eq!(
+                    lo.target_ms(),
+                    hi.target_ms(),
+                    "96 kHz must start at the same latency as 48 kHz ({t:?}, {ch}ch)"
+                );
+                // …and the sample counts behind those milliseconds really did double.
+                assert_eq!(
+                    hi.depth_ms(2 * lo.per_ms),
+                    lo.depth_ms(lo.per_ms),
+                    "a 96 kHz ring needs twice the samples for the same ms ({t:?}, {ch}ch)"
+                );
+                assert_eq!(hi.per_ms, 2 * lo.per_ms, "per_ms must scale with the rate");
+            }
+        }
+    }
+
+    /// `new` is exactly `new_at_rate` at the protocol default — the property that let every
+    /// existing caller and all 17 policy tests keep their behaviour when the rate became a
+    /// parameter.
+    #[test]
+    fn the_default_constructor_is_the_default_rate() {
+        let a = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
+        let b = JitterPolicy::new_at_rate(JitterTuning::PIPEWIRE, 2, SAMPLE_RATE_HZ);
+        assert_eq!(a.per_ms, b.per_ms);
+        assert_eq!(a.target, b.target);
+        assert_eq!(a.target_ms(), b.target_ms());
+        let x = AvSync::new(2);
+        let y = AvSync::new_at_rate(2, SAMPLE_RATE_HZ);
+        assert_eq!(x.per_ms, y.per_ms);
+    }
+
+    /// §4.1's tripwire, as an assertion rather than a comment: on the shipping ladder the
+    /// ms↔sample conversion round-trips exactly. This is the test that would fail first if
+    /// someone added 44 100 Hz without denominating the policy in a rational `per_ms` — at
+    /// 44.1 samples/ms `per_ms` truncates to 44 and every figure below drifts 2.3 % low.
+    #[test]
+    fn the_shipping_rate_ladder_round_trips_ms_to_samples_exactly() {
+        for rate in [48_000u32, 96_000] {
+            for ch in [2u8, 6, 8] {
+                assert_eq!(
+                    rate as usize / 1000 * ch as usize,
+                    JitterPolicy::new_at_rate(JitterTuning::PIPEWIRE, ch, rate).per_ms,
+                    "{rate} Hz × {ch}ch must be a whole number of samples per ms"
+                );
+                let p = JitterPolicy::new_at_rate(JitterTuning::PIPEWIRE, ch, rate);
+                assert_eq!(
+                    p.depth_ms(p.target),
+                    p.target_ms(),
+                    "depth_ms(target) must round-trip to target_ms at {rate} Hz"
+                );
+            }
+        }
     }
 
     /// Clustered underruns raise the floor (that device needs the slack); a long quiet spell
