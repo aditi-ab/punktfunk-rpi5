@@ -72,6 +72,20 @@ pub trait AudioCapturer: Send {
     /// reopen.
     fn next_chunk(&mut self) -> Result<Vec<f32>>;
 
+    /// [`next_chunk`](Self::next_chunk) with a caller-chosen upper bound on the wait.
+    ///
+    /// The encode loop owes the wire a frame every 5 ms whether or not capture has anything to
+    /// say, and blocking here for as long as the capturer feels like is what made a capture hole
+    /// cost far more than the audio it swallowed: nothing left the host for the hole's whole
+    /// duration, so the client's de-jitter ring drained, underran and de-primed over a gap it
+    /// could otherwise have ridden through (WP-B1). Expiry returns an **empty** chunk — the same
+    /// "no samples right now" the idle timeout reports, and equally not an error.
+    ///
+    /// Backends with no bound of their own just delegate; they simply wake less precisely.
+    fn next_chunk_within(&mut self, _budget: std::time::Duration) -> Result<Vec<f32>> {
+        self.next_chunk()
+    }
+
     /// The interleaved channel count this capturer delivers (what it was opened with).
     fn channels(&self) -> u32 {
         CHANNELS as u32

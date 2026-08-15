@@ -97,6 +97,12 @@ impl FightDamper {
 /// How often the capture loop reports its vitals (WP0.2).
 pub(crate) const STATS_EVERY: Duration = Duration::from_secs(30);
 
+/// Shortest callback-to-callback delta that can be called a gap, whatever the quantum. At the
+/// 5 ms quantum we ask for, `2 × quantum` would be 10 ms anyway; this floor is what stops a
+/// graph running an even smaller quantum (the 2026-08-15 field host negotiated 128 frames =
+/// 2.7 ms) from scoring ordinary scheduling noise as a hole.
+const GAP_FLOOR: Duration = Duration::from_millis(10);
+
 /// One reporting window's worth of capture vitals.
 ///
 /// The point is to make three states that used to look identical in a log tell themselves apart: a
@@ -120,6 +126,18 @@ pub(crate) struct CaptureStats {
     /// the encoder simply concatenates across the hole, so it is a click AND a permanent shift of
     /// everything after it.
     pub(crate) dropped_chunks: u64,
+    /// Windows in which the callback simply did not run on time (WP-A2). `delivered_pct` proves
+    /// audio is missing but structurally cannot say HOW: one 2 s hole and three hundred 8 ms
+    /// hiccups produce the same percentage and want completely different answers (a device or
+    /// graph fault vs. a scheduling fault). The 2026-08-15 field log sat at 84–97 % for 24
+    /// minutes of loud gameplay with `dropped_chunks=0` and no way to tell those apart.
+    pub(crate) gaps: u64,
+    /// The largest of those, µs. Reported in ms; kept in µs so a sub-ms threshold is expressible.
+    pub(crate) max_gap_us: u64,
+    /// Callbacks that ran but carried nothing — no buffer to dequeue, no `datas`, no mapped
+    /// memory. Every one of these used to `return` silently, so a stream that fired its callback
+    /// on time and handed us nothing looked identical to a stream nobody was feeding.
+    pub(crate) missed_dequeues: u64,
 }
 
 impl CaptureStats {
@@ -135,6 +153,30 @@ impl CaptureStats {
         }
     }
 
+    /// Score one callback arrival against the previous one.
+    ///
+    /// `since_last` is `None` for the first callback of a stream — and, deliberately, for the
+    /// first after a state transition: the caller drops its stamp when the stream pauses, so a
+    /// legitimately Paused span is not scored as one enormous hole. (The Paused↔Streaming flaps
+    /// around a format renegotiation stay visible as the state DEBUG lines next to a small
+    /// post-resume gap, which is the honest reading of what happened.)
+    ///
+    /// `quantum` is the NEGOTIATED buffer duration, not the one we asked for: a graph handing us
+    /// 21.3 ms buffers is not gapping when its callbacks are 21.3 ms apart — it is doing exactly
+    /// what it negotiated, and the quantum warning above already said so.
+    pub(crate) fn observe_callback(&mut self, since_last: Option<Duration>, quantum: Duration) {
+        let Some(delta) = since_last else { return };
+        if delta > (quantum * 2).max(GAP_FLOOR) {
+            self.gaps += 1;
+            self.max_gap_us = self.max_gap_us.max(delta.as_micros() as u64);
+        }
+    }
+
+    /// The window's worst gap in whole ms — the unit the log line and the field reports speak.
+    pub(crate) fn max_gap_ms(&self) -> u64 {
+        self.max_gap_us / 1_000
+    }
+
     /// `(peak dBFS, rms dBFS, delivered %)` for this window. Silence reports -120 dB rather than
     /// -inf so the log line stays parseable.
     pub(crate) fn summary(&self, elapsed: Duration, sample_rate: u32) -> (f64, f64, f64) {
@@ -148,6 +190,79 @@ impl CaptureStats {
             db(rms),
             (self.frames as f64 / expected.max(1.0)) * 100.0,
         )
+    }
+}
+
+/// How long a capture hole may run before the wire starts covering it. Two protocol frames: long
+/// enough that ordinary quantum jitter never trips it, short enough that the client's ring never
+/// notices the hole.
+pub(crate) const INFILL_AFTER: Duration = Duration::from_millis(2 * FRAME_MS as u64);
+/// How much silence one hole may be covered with. Past this the host is not glitching, it is
+/// QUIET — a desktop between games is legitimately silent for hours and paying a few kbps to keep
+/// saying so is absurd — so the wire stops, which is exactly the behaviour that shipped before.
+pub(crate) const INFILL_MAX: Duration = Duration::from_millis(500);
+
+/// One protocol audio frame — the wire's unit, and the granularity infill works in.
+const FRAME_MS: u32 = punktfunk_core::audio::FRAME_MS;
+
+/// What the wire owes for the slot that is due now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Infill {
+    /// Nothing: audio is flowing, or the hole is still too young to be worth covering.
+    Wait,
+    /// One frame of silence, on the pacer's schedule and continuous with what came before.
+    Silence,
+    /// The budget is spent. Say nothing — and the next real chunk begins a NEW continuity.
+    Quiet,
+}
+
+/// Whether, and for how long, the wire covers a capture hole with silence (WP-B1).
+///
+/// A hole used to cost far more than the audio it swallowed. `audio_thread` blocked in
+/// `next_chunk` for its whole duration, so nothing at all left the host: the client's de-jitter
+/// ring drained, underran, de-primed, and then had to re-prime — turning a 30 ms hole into a much
+/// longer audible artifact, and doing it 3–16 % of the time on the 2026-08-15 field host. Silence
+/// on the same 5 ms schedule, with continuous `seq` and pts, keeps that ring fed and its playout
+/// anchored, so what the listener loses shrinks to exactly the audio that was genuinely missing.
+///
+/// Time is passed IN, so the policy is pure and its tests run on every platform.
+#[derive(Default)]
+pub(crate) struct InfillPolicy {
+    /// Silence already sent for the open hole. Denominated in TIME rather than in frames or
+    /// callbacks, which is the recorded lesson from the client's de-prime fuse: a count there made
+    /// an iPad give up three times sooner than a Mac for no reason anyone intended.
+    filled_ms: u32,
+    /// Latched once a hole outlives the budget and the wire falls silent.
+    broke: bool,
+}
+
+impl InfillPolicy {
+    /// Decide the slot that is due now. Call EXACTLY once per due frame — it consumes budget.
+    pub(crate) fn decide(&mut self, since_last_chunk: Duration) -> Infill {
+        if since_last_chunk < INFILL_AFTER {
+            return Infill::Wait;
+        }
+        if self.filled_ms as u64 >= INFILL_MAX.as_millis() as u64 {
+            self.broke = true;
+            return Infill::Quiet;
+        }
+        self.filled_ms += FRAME_MS;
+        Infill::Silence
+    }
+
+    /// True once the budget is spent, so the caller can go back to blocking for real audio
+    /// instead of waking every few milliseconds to decide to stay quiet.
+    pub(crate) fn exhausted(&self) -> bool {
+        self.filled_ms as u64 >= INFILL_MAX.as_millis() as u64
+    }
+
+    /// A real chunk arrived. Returns whether the hole it closed BROKE continuity — the wire went
+    /// silent across it, so the redundancy predecessor and any partial frame straddling the hole
+    /// both describe audio from before a discontinuity, and neither may be spliced onto what
+    /// comes next.
+    pub(crate) fn chunk_arrived(&mut self) -> bool {
+        self.filled_ms = 0;
+        std::mem::take(&mut self.broke)
     }
 }
 
@@ -256,5 +371,150 @@ mod tests {
         half.observe(&vec![0.1f32; 48_000], 2); // 0.5 s of stereo in a 1 s window
         let (_, _, pct) = half.summary(Duration::from_secs(1), 48_000);
         assert!((pct - 50.0).abs() < 1.0, "expected ~50 %, got {pct}");
+    }
+
+    /// The 5 ms quantum we ask for — the shape all three gap tests are measured against.
+    const Q: Duration = Duration::from_millis(5);
+
+    /// The product gap the 2026-08-15 field log left open, closed: `delivered_pct` alone reports
+    /// the SAME 93 % for one 2 s hole and for three hundred 8 ms hiccups, and those are different
+    /// faults with different fixes. The counters have to separate them without a second log.
+    #[test]
+    fn gap_accounting_tells_one_long_hole_from_many_short_ones() {
+        let mut one = CaptureStats::default();
+        one.observe_callback(None, Q); // first callback of the stream — nothing to compare to
+        one.observe_callback(Some(Duration::from_secs(2)), Q);
+        assert_eq!(one.gaps, 1);
+        assert_eq!(one.max_gap_ms(), 2_000);
+
+        let mut many = CaptureStats::default();
+        for _ in 0..300 {
+            many.observe_callback(Some(Duration::from_millis(8)), Q);
+        }
+        assert_eq!(many.gaps, 300);
+        assert_eq!(many.max_gap_ms(), 8);
+
+        // Both shapes lose comparable audio; only the counters tell them apart.
+        assert!(
+            one.max_gap_ms() > many.max_gap_ms() * 100,
+            "the discriminator is the SHAPE, not the total"
+        );
+    }
+
+    /// A stream delivering exactly what it negotiated is never a gap — including the clamped
+    /// 21.3 ms quantum a VM's `default.clock.min-quantum` forces, which would otherwise score a
+    /// gap on every single callback and bury the real ones.
+    #[test]
+    fn a_negotiated_cadence_is_never_a_gap() {
+        let mut s = CaptureStats::default();
+        for _ in 0..100 {
+            s.observe_callback(Some(Duration::from_micros(5_100)), Q); // 5 ms + jitter
+        }
+        assert_eq!(s.gaps, 0, "ordinary jitter at the negotiated quantum");
+
+        let clamped = Duration::from_micros(21_333); // 1024 frames @ 48 kHz
+        let mut vm = CaptureStats::default();
+        for _ in 0..100 {
+            vm.observe_callback(Some(clamped), clamped);
+        }
+        assert_eq!(vm.gaps, 0, "a clamped quantum is slow, not gapping");
+        // …and a real hole on that same graph still scores.
+        vm.observe_callback(Some(Duration::from_millis(200)), clamped);
+        assert_eq!(vm.gaps, 1);
+    }
+
+    /// Drive one hole from the moment it opens until the policy gives up on it, the way the
+    /// encode loop does: one decision per due frame slot.
+    fn cover_a_hole(p: &mut InfillPolicy) -> usize {
+        let mut silence = 0usize;
+        let mut open = INFILL_AFTER;
+        loop {
+            match p.decide(open) {
+                Infill::Silence => {
+                    silence += 1;
+                    open += Duration::from_millis(FRAME_MS as u64);
+                }
+                Infill::Quiet => return silence,
+                Infill::Wait => unreachable!("the hole is open — {open:?} is past INFILL_AFTER"),
+            }
+            assert!(silence < 10_000, "the budget must be finite");
+        }
+    }
+
+    /// The wire covers a hole for exactly as long as the budget allows, and then admits the host
+    /// is simply quiet. Both halves matter: without the first, a 30 ms hole costs the client a
+    /// de-prime and a re-prime; without the second, an idle desktop pays for silence datagrams
+    /// forever.
+    #[test]
+    fn infill_covers_a_hole_and_then_admits_the_host_is_quiet() {
+        let mut p = InfillPolicy::default();
+        // Ordinary quantum jitter, not a hole — nothing owed.
+        assert_eq!(p.decide(Duration::ZERO), Infill::Wait);
+        assert_eq!(
+            p.decide(INFILL_AFTER - Duration::from_millis(1)),
+            Infill::Wait
+        );
+
+        let silence = cover_a_hole(&mut p);
+        assert_eq!(
+            silence as u64 * FRAME_MS as u64,
+            INFILL_MAX.as_millis() as u64,
+            "the wire must cover exactly the budget, in frames of {FRAME_MS} ms"
+        );
+        assert!(p.exhausted(), "…and then stop asking");
+    }
+
+    /// A stream that is flowing must never synthesize anything — this policy is invisible until
+    /// something is actually wrong.
+    #[test]
+    fn a_flowing_stream_never_infills() {
+        let mut p = InfillPolicy::default();
+        for _ in 0..1_000 {
+            assert_eq!(
+                p.decide(Duration::from_millis(FRAME_MS as u64)),
+                Infill::Wait
+            );
+        }
+        assert!(!p.exhausted());
+        assert!(!p.chunk_arrived(), "no hole means no discontinuity");
+    }
+
+    /// Only a hole the wire could NOT cover breaks continuity. The distinction is the whole point
+    /// of the budget: across a covered hole `seq` and pts never broke, so the redundancy
+    /// predecessor still describes the frame before this one and the client can keep using it.
+    #[test]
+    fn only_an_uncovered_hole_breaks_continuity() {
+        let mut covered = InfillPolicy::default();
+        for k in 0..20u64 {
+            covered.decide(INFILL_AFTER + Duration::from_millis(FRAME_MS as u64 * k));
+        }
+        assert!(
+            !covered.chunk_arrived(),
+            "a covered hole is continuous — the client heard silence, not a splice"
+        );
+
+        let mut lost = InfillPolicy::default();
+        cover_a_hole(&mut lost);
+        assert!(
+            lost.chunk_arrived(),
+            "past the budget the wire went quiet, so nothing before the hole may be spliced on"
+        );
+        // …and the next hole starts from a clean budget rather than an exhausted one.
+        assert!(!lost.exhausted());
+        assert_eq!(cover_a_hole(&mut lost) as u64 * FRAME_MS as u64, 500);
+    }
+
+    /// A deliberate pause is not a hole. The caller drops its stamp across a state transition, so
+    /// the span reaches us as `None` — without that rule every Paused↔Streaming flap (three of
+    /// them in minute 1 of the field log, around each format renegotiation) would report a gap
+    /// the size of the pause and drown the sub-10 ms ones that actually matter.
+    #[test]
+    fn a_paused_span_is_not_scored() {
+        let mut s = CaptureStats::default();
+        s.observe_callback(Some(Duration::from_millis(5)), Q);
+        s.observe_callback(None, Q); // resumed: the pause spanned an unknowable amount of time
+        s.observe_callback(Some(Duration::from_millis(5)), Q);
+        assert_eq!(s.gaps, 0);
+        assert_eq!(s.max_gap_ms(), 0);
     }
 }

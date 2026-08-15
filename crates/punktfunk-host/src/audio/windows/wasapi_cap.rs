@@ -117,7 +117,10 @@ impl Drop for WasapiLoopbackCapturer {
 
 impl AudioCapturer for WasapiLoopbackCapturer {
     fn next_chunk(&mut self) -> Result<Vec<f32>> {
-        match self.chunks.recv_timeout(Duration::from_secs(5)) {
+        self.next_chunk_within(Duration::from_secs(5))
+    }
+    fn next_chunk_within(&mut self, budget: Duration) -> Result<Vec<f32>> {
+        match self.chunks.recv_timeout(budget) {
             Ok(c) => Ok(c),
             // A quiet sink is NOT a failure — return an empty chunk so the caller keeps the capturer
             // alive. Only a dead capture thread is an Err (→ caller reopens). Matches the Linux path.
@@ -185,6 +188,13 @@ const DEFAULT_CHECK_EVERY: Duration = Duration::from_secs(1);
 const FIRST_OPEN_ATTEMPTS: u32 = 3;
 /// Pause between first-open attempts (endpoint churn settles in well under a second).
 const FIRST_OPEN_RETRY_PAUSE: Duration = Duration::from_secs(1);
+/// How long the packet loop may go without a packet before the next `DATA_DISCONTINUITY` reads as
+/// the endpoint having idled rather than as a capture hole (WP-A2). Classic loopback delivers
+/// nothing at all while nothing renders and then flags the packet that resumes, so scoring that
+/// flag unconditionally would charge a gap — sized by the quiet — to every notification sound on an
+/// otherwise silent host. At the engine's ~10 ms period a whole second without a packet is far
+/// past anything this loop can still tell apart from that.
+const LOOPBACK_IDLE_AFTER: Duration = Duration::from_secs(1);
 
 fn capture_thread(
     tx: SyncSender<Vec<f32>>,
@@ -596,6 +606,16 @@ fn capture_once(
     // and a permanent A/V offset, with nothing in any log).
     let mut stats = CaptureStats::default();
     let mut last_stats = Instant::now();
+    // WP-A2 — where the gap counters come from on Windows. `delivered_pct` proves audio is missing
+    // but not whether it went in one hole or three hundred, and no clock can answer that here: this
+    // is a POLLING loop over a tap that stops delivering entirely while the endpoint idles, so
+    // "time since the last data" — the rule the Linux capture callback uses — would score every
+    // quiet moment on the host as a hole. WASAPI says it outright instead: a packet flagged
+    // discontinuous is one the tap admits is not contiguous with the previous, and the device
+    // position it carries (`next_index` is where the next packet must start if nothing was lost)
+    // sizes the missing audio in the device's own clock, not in how late we happened to poll.
+    let mut last_packet: Option<Instant> = None;
+    let mut next_index: u64 = 0;
     // WP2.4 — damping for the default-playback tug-of-war.
     let mut fight = FightDamper::new(Instant::now());
     loop {
@@ -611,9 +631,34 @@ fn capture_once(
                 Ok(Some(0)) | Ok(None) => break,
                 Ok(Some(_n)) => {
                     saw_packets = true;
-                    capture_client
+                    let before = bytes.len();
+                    let info = capture_client
                         .read_from_device_to_deque(&mut bytes)
                         .context("read loopback")?;
+                    let now = Instant::now();
+                    // Judged BEFORE the stamp moves: a discontinuity on the first packet after a
+                    // packet-less stretch is the tap waking up, which is what an idle endpoint
+                    // does here, not a hole in anything that was playing.
+                    let flowing =
+                        last_packet.is_some_and(|t| now.duration_since(t) < LOOPBACK_IDLE_AFTER);
+                    let frames = ((bytes.len() - before) / block_align) as u64;
+                    if frames == 0 {
+                        // Told a packet was ready, then handed none: the same fault the Linux twin
+                        // counts when a callback runs with no buffer to dequeue, and equally
+                        // invisible before — a tap spinning like this looked exactly like a quiet
+                        // desktop.
+                        stats.missed_dequeues += 1;
+                    } else {
+                        if info.flags.data_discontinuity && flowing {
+                            stats.gaps += 1;
+                            let lost = info.index.saturating_sub(next_index);
+                            stats.max_gap_us = stats
+                                .max_gap_us
+                                .max(lost.saturating_mul(1_000_000) / SAMPLE_RATE as u64);
+                        }
+                        next_index = info.index.saturating_add(frames);
+                        last_packet = Some(now);
+                    }
                 }
                 Err(e) => return Err(anyhow!("get_next_packet_size: {e}")),
             }
@@ -667,6 +712,14 @@ fn capture_once(
                 peak_db = format!("{peak_db:.1}"),
                 rms_db = format!("{rms_db:.1}"),
                 delivered_pct = format!("{delivered_pct:.0}"),
+                // The shape of whatever `delivered_pct` is short by (WP-A2): one long hole and
+                // three hundred short ones read the same in the percentage and mean entirely
+                // different things. Sourced from WASAPI's own discontinuity flag here rather than
+                // from the callback cadence the Linux twin measures, so an endpoint that idles and
+                // resumes is not among them — see [`LOOPBACK_IDLE_AFTER`].
+                gaps = stats.gaps,
+                max_gap_ms = stats.max_gap_ms(),
+                missed_dequeues = stats.missed_dequeues,
                 dropped_chunks = stats.dropped_chunks,
                 "desktop audio capture"
             );
