@@ -33,6 +33,12 @@
 //! share a name; do NOT conflate them.
 #![forbid(unsafe_code)]
 
+/// Which keyboard LAYOUT the box is configured for. Not a `PUNKTFUNK_*` knob — it is read from
+/// what `localectl` recorded — but it is host configuration every input path needs (the injector
+/// compiles its keymap from it; the gamescope backend hands it to the session it launches), and it
+/// lives here so both can reach it without either crate depending on the other.
+pub mod layout;
+
 use std::sync::OnceLock;
 
 /// Whether a `PUNKTFUNK_*` env var reads as ON, or `None` when it is unset — the host's

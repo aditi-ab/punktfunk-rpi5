@@ -29,7 +29,7 @@ mod splash;
 use discovery::{
     check_gamescope_version, find_gamescope_eis_socket, find_gamescope_node, gamescope_bin,
     gamescope_can_composite_external_overlay, gamescope_can_offer_refresh_rates,
-    gamescope_node_present, poll_managed_node, wait_for_node,
+    gamescope_honours_xkb_env, gamescope_node_present, poll_managed_node, wait_for_node,
 };
 pub(crate) use discovery::{
     game_session_exited, gamescope_can_composite_cursor, gamescope_hdr_capable, is_available,
@@ -1228,8 +1228,10 @@ fn write_steamos_dropin(shim_dir: &std::path::Path, mode: Mode, hdr: bool) -> Re
          Environment=PF_H={h}\n\
          Environment=PF_HZ={hz}\n\
          Environment=\"PF_HDR_ARGS={hdr_args}\"\n\
+         {xkb}\
          UnsetEnvironment=DISPLAY WAYLAND_DISPLAY\n",
         shim = shim_dir.display(),
+        xkb = xkb_unit_lines(),
         w = mode.width,
         h = mode.height,
         hz = game_hz(mode.refresh_hz),
@@ -1315,8 +1317,10 @@ fn write_session_plus_dropin(
          {binds}\
          Environment=PF_HZ={hz}\n\
          Environment=\"PF_HDR_ARGS={hdr_args}\"\n\
+         {xkb}\
          {wsi}",
         binds = bind.unit_lines(),
+        xkb = xkb_unit_lines(),
         hz = game_hz(mode.refresh_hz),
         hdr_args = hdr_args(hdr)
             .into_iter()
@@ -3653,6 +3657,85 @@ fn point_injector_at_eis() {
             "gamescope: no connectable gamescope EIS socket found — input won't reach the session"
         ),
     }
+    sync_session_keyboard_layout();
+}
+
+/// Explicit-off kill switch for [`sync_session_keyboard_layout`].
+const LAYOUT_SYNC_ENV: &str = "PUNKTFUNK_SESSION_LAYOUT";
+/// `setxkbmap` talks to a local X server; anything slower than this is a server that is not
+/// answering, and the connecting client is waiting on us.
+const LAYOUT_SYNC_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Align the session's Xwayland servers with the box's configured keyboard layout.
+///
+/// [`xkb_env`] only reaches a session punktfunk LAUNCHES. The common case on a Bazzite / SteamOS
+/// box is the opposite one: the gaming session is already up from autologin, punktfunk ATTACHES to
+/// it, and nothing decided at launch time applies — its Xwayland servers keep the `us` they were
+/// born with. That matters because everything a gamescope session runs (Steam Big Picture, and
+/// every Proton game) is an X11 client of those servers, so their keymap is what turns punktfunk's
+/// US-positional key codes into characters. Without this, a German keyboard types `\` for `#`,
+/// `'` for `ä` and `/` for `-` no matter what `localectl` says.
+///
+/// Best-effort and idempotent — re-applying the layout a server already has is a no-op, so this
+/// runs on every adoption rather than reading the current one back. It does nothing at all when
+/// the box configured no layout (there is nothing to align *to*, and inventing one would be worse
+/// than the default), when no gamescope Xwayland is running, or when `PUNKTFUNK_SESSION_LAYOUT` is
+/// explicitly off.
+///
+/// ⚠ Xwayland only. A Wayland-native client under gamescope takes the compositor's own keymap,
+/// which is [`xkb_env`] plus the `+pfhdr8` patch — the two halves are not interchangeable.
+fn sync_session_keyboard_layout() {
+    if pf_host_config::env_on(LAYOUT_SYNC_ENV) == Some(false) {
+        return;
+    }
+    let resolved = pf_host_config::layout::system_layout();
+    let Some(layout) = resolved.names.layout.as_deref() else {
+        return;
+    };
+    let targets = xwayland_cursor_targets();
+    if targets.is_empty() {
+        return;
+    }
+    let non_empty = |v: &Option<String>| v.as_deref().filter(|s| !s.is_empty()).map(str::to_owned);
+    for (dpy, xauth) in targets {
+        let mut cmd = Command::new("setxkbmap");
+        cmd.args(["-display", &dpy, "-layout", layout]);
+        if let Some(v) = non_empty(&resolved.names.variant) {
+            cmd.args(["-variant", &v]);
+        }
+        if let Some(m) = non_empty(&resolved.names.model) {
+            cmd.args(["-model", &m]);
+        }
+        // Only when configured: `-option ""` is setxkbmap's CLEAR, not its no-op.
+        if let Some(o) = non_empty(&resolved.names.options) {
+            cmd.args(["-option", &o]);
+        }
+        if let Some(xa) = &xauth {
+            cmd.env("XAUTHORITY", xa);
+        }
+        match crate::proc::status_within(&mut cmd, LAYOUT_SYNC_BUDGET) {
+            Ok(st) if st.success() => tracing::info!(
+                display = %dpy,
+                layout = %resolved.names.describe(),
+                source = %resolved.source,
+                "gamescope: aligned the session's keyboard layout with the box"
+            ),
+            Ok(st) => tracing::warn!(
+                display = %dpy,
+                status = ?st.code(),
+                "gamescope: setxkbmap rejected the box's layout — the session keeps its own"
+            ),
+            // Overwhelmingly "setxkbmap is not installed" (it ships in xorg-x11-xkb-utils /
+            // x11-xkb-utils). Not fatal: only a non-US keyboard notices, and it is exactly the
+            // case the +pfhdr8 gamescope handles without any of this.
+            Err(e) => tracing::warn!(
+                display = %dpy,
+                error = %e,
+                layout = %resolved.names.describe(),
+                "gamescope: could not set the session's keyboard layout (is setxkbmap installed?)"
+            ),
+        }
+    }
 }
 
 /// Mirror the physical head this gamescope session is driving (`vdisplay::mirror`'s gamescope arm).
@@ -4553,6 +4636,9 @@ fn launch_session(client: &str, unit_name: &str, mode: Mode, hdr: bool) -> Resul
         for arg in wsi.setenv_args() {
             cmd.arg(arg);
         }
+        for arg in xkb_setenv_args() {
+            cmd.arg(arg);
+        }
         // Same headless-must-not-attach rule as [`spawn`]: the transient unit inherits the
         // user manager env, which can carry a (possibly stale) desktop DISPLAY/WAYLAND_DISPLAY
         // that would abort gamescope at startup.
@@ -4839,6 +4925,68 @@ fn cursor_args() -> Vec<String> {
     args
 }
 
+/// The box's configured keyboard layout as `XKB_DEFAULT_*`, for a gamescope session we launch.
+///
+/// gamescope builds its xkb keymap from exactly these five variables and nothing else — it never
+/// looks at `/etc/X11/xorg.conf.d/00-keyboard.conf`, which is where `localectl set-x11-keymap`
+/// records the choice, because that file belongs to Xorg. Nothing in a systemd user session
+/// exports them either, so a session launched without this runs libxkbcommon's built-in default:
+/// evdev/pc105/**us**.
+///
+/// That matters because punktfunk's key wire is US-POSITIONAL — a client sends the *physical* key
+/// and the session's keymap decides the character — so a US session renders a German keyboard's
+/// ISO keys as their US neighbours (`#`→`\`, `ä`→`'`, `-`→`/`).
+///
+/// ⚠ Empty on a box that configured nothing, so an unconfigured session keeps behaving exactly as
+/// it does today rather than being pinned to an invented layout.
+///
+/// ⚠ This is necessary but not, on its own, sufficient: gamescope only publishes the keymap to its
+/// clients once a keyboard is actually bound to the seat, which on a HEADLESS session (no libinput
+/// devices) needs the `punktfunk-gamescope` patch that gives the seat's stub keyboard the compiled
+/// keymap. Against a stock gamescope these variables are read and then never reach Xwayland.
+fn xkb_env() -> Vec<(&'static str, String)> {
+    let resolved = pf_host_config::layout::system_layout();
+    let pairs = resolved.names.env_pairs();
+    if pairs.is_empty() {
+        return pairs;
+    }
+    // Passed either way — it costs nothing against an older binary and starts working the moment
+    // the box updates — but say so, because "I set the layout and the keys are still US" is
+    // otherwise unexplainable from the outside.
+    if gamescope_honours_xkb_env() {
+        tracing::info!(
+            layout = %resolved.names.describe(),
+            source = %resolved.source,
+            "gamescope session: handing it the box's keyboard layout"
+        );
+    } else {
+        tracing::warn!(
+            layout = %resolved.names.describe(),
+            source = %resolved.source,
+            "gamescope session: this build ignores XKB_DEFAULT_* (needs punktfunk-gamescope \
+             +pfhdr8) — the session will type US characters whatever the box is configured for"
+        );
+    }
+    pairs
+}
+
+/// [`xkb_env`] as `systemd-run --setenv=` arguments — mirrors [`WsiPlan::setenv_args`].
+fn xkb_setenv_args() -> Vec<String> {
+    xkb_env()
+        .into_iter()
+        .map(|(name, value)| format!("--setenv={name}={value}"))
+        .collect()
+}
+
+/// [`xkb_env`] as unit-file lines for a drop-in. Trailing newline included, so whatever the body
+/// puts after it still parses — same contract as [`WsiPlan::unit_lines`].
+fn xkb_unit_lines() -> String {
+    xkb_env()
+        .into_iter()
+        .map(|(name, value)| format!("Environment={name}={value}\n"))
+        .collect()
+}
+
 /// `--custom-refresh-rates <list>` when the resolved gamescope has it (patch level 3+): the rates a
 /// HEADLESS session may offer its clients.
 ///
@@ -4950,6 +5098,8 @@ fn spawn(
     cmd.args(app.split_whitespace())
         // Prefer the NVIDIA GL vendor for the nested session (harmless on a pure-NVIDIA box).
         .env("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+        // The box's keyboard layout — see [`xkb_env`]. Empty on an unconfigured box.
+        .envs(xkb_env())
         // A HEADLESS gamescope must never attach to a parent compositor. A host (re)started after
         // a desktop login inherits the user manager's DISPLAY/WAYLAND_DISPLAY — and a stale
         // WAYLAND_DISPLAY (e.g. a leftover `wayland-kde` in the manager env from a past session)
