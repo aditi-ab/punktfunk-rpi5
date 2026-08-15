@@ -507,6 +507,19 @@ pub(crate) fn gamescope_can_composite_cursor() -> bool {
     gamescope_patch_level() >= 2 && !flags_lost()
 }
 
+/// Does the resolved gamescope actually PUBLISH the keymap it compiles from `XKB_DEFAULT_*`?
+///
+/// Below this level it reads the five variables, builds the keymap, and then hands its clients
+/// nothing: the seat carries a keymap-less stub keyboard that `wlserver_keyboardfocus()` re-binds
+/// on every focus change, so Xwayland and every Wayland client keep their own built-in `us`. A
+/// headless session has no libinput devices to ever put the real keymap on the seat, so it never
+/// recovers. The keys punktfunk injects are US-POSITIONAL and the session's keymap is what turns
+/// them into characters — so on a stock gamescope a German keyboard types its US neighbours
+/// (`#`→`\`, `ä`→`'`, `-`→`/`) no matter how the box is configured.
+pub(crate) fn gamescope_honours_xkb_env() -> bool {
+    gamescope_patch_level() >= 8 && !flags_lost()
+}
+
 /// Does the resolved gamescope let us hand a headless session the list of refresh rates it may
 /// offer (`--custom-refresh-rates`)?
 ///

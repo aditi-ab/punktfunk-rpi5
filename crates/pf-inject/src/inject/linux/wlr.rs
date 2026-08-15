@@ -275,18 +275,37 @@ impl WlrootsInjector {
             pointer_mgr.create_virtual_pointer_with_output(Some(&seat), target.as_ref(), &qh, ());
         let keyboard = keyboard_mgr.create_virtual_keyboard(&seat, &qh, ());
 
-        // The keymap the compositor resolves our raw evdev keycodes with. Empty names defer to
-        // the standard `XKB_DEFAULT_RULES/MODEL/LAYOUT/VARIANT/OPTIONS` env vars, then to
-        // libxkbcommon's built-ins (evdev/pc105/us) — so a non-US host sets e.g.
-        // `XKB_DEFAULT_LAYOUT=de` and the positional wire keys render as its layout (parity with
-        // the libei path, where the session compositor's own keymap applies). Previously this
-        // hardcoded "us", which forced US characters for the OEM/umlaut keys on every layout.
+        // The keymap the compositor resolves our raw evdev keycodes with. The wire keys are
+        // US-POSITIONAL, so this keymap is what decides the character each one finally types —
+        // it has to be the layout printed on the client's keyboard, or ISO keys render as their
+        // US neighbours (`#`→`\`, `ä`→`'`, `-`→`/`).
+        //
+        // Resolved from the box's own configuration (`crate::layout`), NOT from empty names:
+        // empty defers to `XKB_DEFAULT_*`, which nothing on a Wayland session exports, so a
+        // `localectl set-x11-keymap de` host silently compiled evdev/pc105/**us**. (Before that
+        // it hardcoded "us" outright.) `XKB_DEFAULT_*` still wins when an operator sets it.
+        let resolved = pf_host_config::layout::system_layout();
+        let (rules, model, layout, variant, options) = resolved.names.as_args();
         let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        let keymap =
-            xkb::Keymap::new_from_names(&ctx, "", "", "", "", None, xkb::KEYMAP_COMPILE_NO_FLAGS)
-                .context("compile xkb keymap (check XKB_DEFAULT_LAYOUT/VARIANT/RULES if set)")?;
+        let keymap = xkb::Keymap::new_from_names(
+            &ctx,
+            rules,
+            model,
+            layout,
+            variant,
+            options,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .with_context(|| {
+            format!(
+                "compile xkb keymap {} (from {})",
+                resolved.names.describe(),
+                resolved.source
+            )
+        })?;
         tracing::info!(
-            layout = %std::env::var("XKB_DEFAULT_LAYOUT").unwrap_or_else(|_| "us (default)".into()),
+            layout = %resolved.names.describe(),
+            source = %resolved.source,
             "virtual keyboard keymap compiled"
         );
         let keymap_str = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
