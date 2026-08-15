@@ -341,6 +341,8 @@ mod tests {
             codec: CODEC_HEVC,
             host_caps: HOST_CAP_GAMEPAD_STATE | HOST_CAP_CLIPBOARD,
             mgmt_port: 0,
+            grants: GRANT_ALL,
+            expires_in_secs: 0,
             cipher: 0,
             key_chacha: None,
         };

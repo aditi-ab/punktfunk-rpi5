@@ -27,9 +27,10 @@ use punktfunk_core::config::{CompositorPref, FecConfig, FecScheme, GamepadPref, 
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::{FLAG_PIC, FLAG_PROBE, FLAG_SOF};
 use punktfunk_core::quic::{
-    endpoint, io, BitrateChanged, ClockEcho, ClockProbe, ColorInfo, Hello, LossReport, PairRequest,
-    ProbeRequest, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, RfiRequest, SetBitrate,
-    Start, Welcome,
+    classify, endpoint, io, AccessUpdate, BitrateChanged, ClockEcho, ClockProbe, ColorInfo,
+    GrantClass, Hello, LossReport, PairRequest, ProbeRequest, ProbeResult, Reconfigure,
+    Reconfigured, RequestKeyframe, RfiRequest, SetBitrate, Start, Welcome, GRANT_ALL,
+    GRANT_CLIPBOARD, GRANT_GAMEPAD, GRANT_LAUNCH, GRANT_MIC, GRANT_POINTER,
 };
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::Session;
@@ -193,6 +194,25 @@ fn now_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Host wall clock, unix seconds — the clock every per-client-access deadline is stored in and
+/// evaluated against (design/per-client-access.md §4: wall time at each check, no cached
+/// monotonic offset, so an NTP step moves a deadline with the clock).
+fn wall_unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The Welcome/AccessUpdate remaining-lifetime field for a deadline at `now`: saturating whole
+/// seconds with a floor of 1 — `0` means *permanent* on the wire, so a deadline that is due this
+/// very second must still advertise as expiring, never as forever.
+fn remaining_secs_wire(deadline: Option<i64>, now: i64) -> u32 {
+    deadline
+        .map(|d| u32::try_from((d - now).max(1)).unwrap_or(u32::MAX))
         .unwrap_or(0)
 }
 
@@ -636,6 +656,195 @@ fn close_rejected(conn: &quinn::Connection, reason: punktfunk_core::reject::Reje
     conn.close(reason.close_code().into(), reason.to_string().as_bytes());
 }
 
+/// Quiet per-(session, grant-class) enforcement-drop accounting (design/per-client-access.md
+/// §5.5): one counter and ONE `warn!` per class for the whole session — a misbehaving or
+/// malicious client must not turn the log into the DoS — with the totals surfaced once in the
+/// datagram loop's end-of-stream line.
+struct GrantDrops {
+    counts: [AtomicU64; 6],
+    warned: [AtomicBool; 6],
+}
+
+impl GrantDrops {
+    fn new() -> GrantDrops {
+        GrantDrops {
+            counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            warned: std::array::from_fn(|_| AtomicBool::new(false)),
+        }
+    }
+
+    /// A class's slot in the fixed tables — the bit position of its grant, so the layout can
+    /// never drift from the wire vocabulary.
+    fn idx(class: GrantClass) -> usize {
+        class.bit().trailing_zeros() as usize
+    }
+
+    /// Count one dropped item; log only the FIRST drop of each class (the support signal for
+    /// "my keyboard does nothing" against an old client with no grants UX).
+    fn note(&self, class: GrantClass) {
+        let i = Self::idx(class);
+        self.counts[i].fetch_add(1, Ordering::Relaxed);
+        if !self.warned[i].swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                class = ?class,
+                "dropping client input this session's access grants don't cover — counted; \
+                 further drops of this class are silent until the session-end totals"
+            );
+        }
+    }
+
+    /// `Class=count` pairs for the end-of-session line; `"none"` when nothing was dropped.
+    fn summary(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        for class in [
+            GrantClass::Gamepad,
+            GrantClass::Pointer,
+            GrantClass::Keyboard,
+            GrantClass::Clipboard,
+            GrantClass::Mic,
+            GrantClass::Launch,
+        ] {
+            let n = self.counts[Self::idx(class)].load(Ordering::Relaxed);
+            if n != 0 {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                let _ = write!(out, "{class:?}={n}");
+            }
+        }
+        if out.is_empty() {
+            out.push_str("none");
+        }
+        out
+    }
+}
+
+/// The expiry-warning thresholds, seconds before the deadline (design §4: best-effort toasts at
+/// T−5 m and T−1 m; older clients simply miss them).
+const ACCESS_WARN_SECS: [i64; 2] = [300, 60];
+
+/// Which of [`ACCESS_WARN_SECS`] are already *behind* a deadline at `now` — those are marked
+/// spent instead of fired, both at admission (the Welcome just told the client its remaining
+/// time) and after an edit (the pushed `AccessUpdate` just did the same), so a threshold only
+/// ever fires by being CROSSED live.
+fn spent_warnings(deadline: Option<i64>, now: i64) -> [bool; 2] {
+    match deadline {
+        None => [true, true], // permanent — nothing to warn about
+        Some(d) => [
+            d - now <= ACCESS_WARN_SECS[0],
+            d - now <= ACCESS_WARN_SECS[1],
+        ],
+    }
+}
+
+/// How long the access lifecycle task sleeps before re-evaluating: until the next unfired
+/// boundary (warning threshold or the deadline itself), re-derived from `deadline − now` on
+/// EVERY lap and capped at 30 s — the design's wall-clock rule (§4): no cached monotonic
+/// instant, so an NTP step moves the effective deadline with the clock within one cap interval.
+fn access_sleep(deadline: Option<i64>, warned: &[bool; 2], now: i64) -> std::time::Duration {
+    let Some(d) = deadline else {
+        // Permanent access: nothing timed to do — park; the watch/close arms do the waking.
+        return std::time::Duration::from_secs(3600);
+    };
+    let mut next = d;
+    for (i, w) in ACCESS_WARN_SECS.iter().enumerate() {
+        if !warned[i] {
+            next = next.min(d - w);
+        }
+    }
+    std::time::Duration::from_secs((next - now).clamp(1, 30) as u64)
+}
+
+/// The per-session access lifecycle (design §4/§5.6): owns the expiry deadline and the watch
+/// subscription. Sends best-effort `AccessUpdate` warnings at T−5 m / T−1 m and on every grant
+/// edit (the client's chip/toasts track them), folds edits into the session's live mask within
+/// one event, and closes the connection with the typed expiry code at deadline fire, on an
+/// "expire now" edit (a deadline already in the past), or on unpair (`revoked`). Closing only
+/// THIS connection ends only this device's session — the owner's stream is untouched.
+async fn access_lifecycle(
+    conn: quinn::Connection,
+    mut watch_rx: tokio::sync::watch::Receiver<crate::native_pairing::AccessState>,
+    grants: Arc<AtomicU32>,
+    clip_enabled: Arc<AtomicBool>,
+    access_tx: tokio::sync::mpsc::UnboundedSender<AccessUpdate>,
+    mut deadline: Option<i64>,
+    device: crate::events::DeviceRef,
+) {
+    let mut warned = spent_warnings(deadline, wall_unix_now());
+    loop {
+        let now = wall_unix_now();
+        if let Some(d) = deadline {
+            if now >= d {
+                // Evaluated against the WALL CLOCK at fire (design §4): `d − now` was recomputed
+                // each lap rather than cached as a monotonic offset, so an NTP step moved this
+                // moment with the clock. The typed close renders as "your access to this host
+                // has expired" on every client.
+                tracing::info!(
+                    device = %device.name,
+                    fingerprint = %device.fingerprint,
+                    "temporary access expired — closing this device's session"
+                );
+                crate::events::emit(crate::events::EventKind::AccessExpired { device });
+                close_rejected(&conn, punktfunk_core::reject::RejectReason::AccessExpired);
+                return;
+            }
+            let remaining = d - now;
+            for (i, w) in ACCESS_WARN_SECS.iter().enumerate() {
+                if !warned[i] && remaining <= *w {
+                    warned[i] = true;
+                    let _ = access_tx.send(AccessUpdate {
+                        grants: grants.load(Ordering::Relaxed),
+                        remaining_secs: u32::try_from(remaining).unwrap_or(u32::MAX),
+                    });
+                }
+            }
+        }
+        tokio::select! {
+            // Re-loop and re-evaluate; the sleep is a bounded slice of `deadline − now`.
+            () = tokio::time::sleep(access_sleep(deadline, &warned, wall_unix_now())) => {}
+            changed = watch_rx.changed() => {
+                if changed.is_err() {
+                    return; // registry gone — the host is shutting down
+                }
+                let st = *watch_rx.borrow_and_update();
+                if st.revoked {
+                    // Unpair is terminal (design §5.6): end the session, don't merely mute it.
+                    tracing::info!(
+                        device = %device.name,
+                        fingerprint = %device.fingerprint,
+                        "device unpaired — closing its live session"
+                    );
+                    close_rejected(&conn, punktfunk_core::reject::RejectReason::AccessExpired);
+                    return;
+                }
+                // Fold the edit into the live mask immediately — the datagram filter reads it
+                // on the very next event (design §5.6). Resources set up under a wider mask are
+                // starved by that same filter (tearing a live uinput pad down mid-game is churn
+                // for no security: no event can reach it). Clipboard is the cheap exception:
+                // clearing the enable flag stops the coordinator forwarding host copies at once.
+                grants.store(st.grants, Ordering::Relaxed);
+                if st.grants & GRANT_CLIPBOARD == 0 {
+                    clip_enabled.store(false, Ordering::SeqCst);
+                }
+                deadline = st.deadline_unix;
+                let now = wall_unix_now();
+                warned = spent_warnings(deadline, now);
+                // Tell the client so its UI tracks the edit (an "expire now" — deadline already
+                // past — skips straight to the close on the re-loop instead of advertising a
+                // phantom second of access).
+                if deadline.is_none_or(|d| d > now) {
+                    let _ = access_tx.send(AccessUpdate {
+                        grants: st.grants,
+                        remaining_secs: remaining_secs_wire(deadline, now),
+                    });
+                }
+            }
+            _ = conn.closed() => return, // session over — nothing left to guard
+        }
+    }
+}
+
 /// QUIC application error code a client closes with on a **deliberate quit** (a user "stop", not a
 /// network drop). The host reads it off the connection's `ApplicationClosed` reason and tears the
 /// session's virtual display down IMMEDIATELY, skipping the keep-alive linger — an unwanted disconnect
@@ -927,11 +1136,18 @@ async fn serve_session(
             );
         }
         let fp = endpoint::peer_fingerprint(&conn);
-        let known = fp
+        // The admission verb is `effective`, not `is_paired` (the facade's two-verbs contract):
+        // an EXPIRED record is listed but not authorized, so it falls into the delegated-approval
+        // knock below exactly like an unpaired device — the guest's reconnect shows up in the
+        // console as pending and re-approval is the re-grant (design §4).
+        let authorized = fp
             .as_ref()
-            .map(|fp| np.is_paired(&fingerprint_hex(fp)))
+            .map(|fp| {
+                np.effective(&fingerprint_hex(fp), wall_unix_now())
+                    .is_some()
+            })
             .unwrap_or(false);
-        if !known {
+        if !authorized {
             // An anonymous client (no certificate) has no identity to approve — reject outright
             // (the PIN ceremony is its way in). Mirrors the prior behavior for anonymous knocks.
             let Some(fp) = fp else {
@@ -1005,6 +1221,55 @@ async fn serve_session(
     // client this is the original permit; for a just-approved knock it's the re-acquired one.
     let _permit = permit;
 
+    // Per-client access (design/per-client-access.md, WP3): resolve this session's grants ONCE at
+    // admission — the effective mask + raw deadline off the trust record, plus the watch
+    // subscription every later edit/unpair arrives on. An anonymous client (no certificate, only
+    // possible on an `--open` host) and an identity with no record keep today's full control:
+    // grants live on the trust record, and a device without one has nothing to enforce.
+    let session_fp_hex = endpoint::peer_fingerprint(&conn).map(|fp| fingerprint_hex(&fp));
+    let admit_unix = wall_unix_now();
+    let (initial_grants, deadline_unix, access_watch) = match session_fp_hex.as_deref() {
+        Some(fp_hex) => match np.effective(fp_hex, admit_unix) {
+            Some(mask) => {
+                // Subscribe BEFORE reading the deadline off the channel's current value, so an
+                // edit racing this admission lands either in this borrow or as the watch's
+                // first change notification — never in a gap between the two.
+                let rx = np.subscribe(fp_hex);
+                let deadline = rx.borrow().deadline_unix;
+                (mask, deadline, Some(rx))
+            }
+            // The record expired (or was unpaired) between the pairing gate above and here —
+            // a lost race with the deadline on a pairing-required host: close with the typed
+            // expiry so the client renders the real reason instead of a setup error.
+            None if opts.require_pairing => {
+                close_rejected(&conn, punktfunk_core::reject::RejectReason::AccessExpired);
+                anyhow::bail!("access expired between admission and session setup");
+            }
+            // An `--open` host admits unpaired identities with full control (today's behavior);
+            // an expired record there was never gating anything either.
+            None => (GRANT_ALL, None, None),
+        },
+        None => (GRANT_ALL, None, None),
+    };
+    // The one mask every enforcement point reads (design §5.2, one relaxed load per event): the
+    // datagram dispatch filter, the input thread's setup guards, and the control task's
+    // clipboard resolution all share this atomic. The access lifecycle task below is its only
+    // writer after admission.
+    let session_grants = Arc::new(AtomicU32::new(initial_grants));
+    // WP5 launch gate (design §5.4): a session that asked to launch a title without the LAUNCH
+    // grant is refused HERE — before the handshake, so no Welcome is ever sent and the client
+    // shows the typed reason — rather than silently dropped into a bare desktop it didn't ask
+    // for. Decoded only on the ungranted path; the handshake re-decodes for the real session.
+    if initial_grants & GRANT_LAUNCH == 0 && Hello::decode(&first).is_ok_and(|h| h.launch.is_some())
+    {
+        close_rejected(
+            &conn,
+            punktfunk_core::reject::RejectReason::LaunchNotPermitted,
+        );
+        anyhow::bail!("client requested a library launch without the LAUNCH grant");
+    }
+    let expires_in_secs = remaining_secs_wire(deadline_unix, admit_unix);
+
     let source = opts.source;
     let frames = opts.frames;
     let data_port = opts.data_port;
@@ -1054,6 +1319,8 @@ async fn serve_session(
                 &bringup,
                 quit.clone(),
                 stop.clone(),
+                initial_grants,
+                expires_in_secs,
             ),
         )
         .await
@@ -1206,7 +1473,8 @@ async fn serve_session(
     // The session's negotiated rate — the pin PyroWave retarget-refusals ack (§4.6).
     let session_bitrate_kbps = welcome.bitrate_kbps;
     // Shared-clipboard enable state (client `ClipControl` → host). The coordinator reads it to
-    // decide whether to forward host copies; the control task flips it on each `ClipControl`.
+    // decide whether to forward host copies; the control task flips it on each `ClipControl`,
+    // and the access lifecycle task clears it if a mid-session edit revokes CLIPBOARD.
     let clip_enabled = Arc::new(AtomicBool::new(false));
     // Start the host clipboard coordinator. On success it watches the session clipboard, forwards
     // host copies as `ClipOffer`s (`clip.offer_rx` → control task → client), installs client
@@ -1214,8 +1482,29 @@ async fn serve_session(
     // there's no backend (gamescope / older GNOME / an unsupported platform) — the control task
     // then answers `ClipControl` with `BACKEND_UNAVAILABLE` and the decline loop below handles
     // stray fetch streams.
-    let clip = pf_clipboard::start(conn.clone(), clip_enabled.clone(), compositor.is_some()).await;
+    //
+    // Deny-at-setup (per-client access §5.4): without the CLIPBOARD grant the coordinator never
+    // starts — a watcher that doesn't exist can't leak a host copy past a filter bug. The inert
+    // handle (dead channels, `available: false`) keeps the control task's clipboard arms
+    // uniform; `ClipControl` then resolves NOT_PERMITTED, and the decline loop below still
+    // answers stray fetch streams, exactly the disabled-policy behavior.
+    let clip = if initial_grants & GRANT_CLIPBOARD != 0 {
+        pf_clipboard::start(conn.clone(), clip_enabled.clone(), compositor.is_some()).await
+    } else {
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_offer_tx, offer_rx) = tokio::sync::mpsc::unbounded_channel();
+        pf_clipboard::ClipCoord {
+            available: false,
+            cmd_tx,
+            offer_rx,
+        }
+    };
     let clip_available = clip.available;
+    // AccessUpdates (expiry warnings + mid-session grant edits), lifecycle task → control task —
+    // the control task is the control stream's sole writer, so they cross on a channel arm (the
+    // `clip_offer_rx` shape). The sender lives in the access lifecycle task below; for a session
+    // with no fingerprint it's dropped instead and the arm disables itself.
+    let (access_tx, access_rx) = tokio::sync::mpsc::unbounded_channel::<AccessUpdate>();
     tokio::spawn(control::run(
         ctrl_send,
         ctrl_recv,
@@ -1241,9 +1530,45 @@ async fn serve_session(
         shard_ack_tx,
         cursor_shape_rx,
         cursor_client_draws,
-        clip_enabled,
+        clip_enabled.clone(),
         clip,
+        session_grants.clone(),
+        access_rx,
     ));
+    // The access lifecycle task (WP3): owns the session's expiry deadline and folds every watch
+    // edit into the live mask. Only sessions with a fingerprint have a record to watch; dropping
+    // `access_tx` otherwise retires the control task's update arm.
+    match (session_fp_hex.clone(), access_watch) {
+        (Some(fp_hex), Some(watch_rx)) => {
+            // The lifecycle events' device identity: the trust store's operator-curated name for
+            // this fingerprint (a rename at approval wins), else the sanitized Hello name.
+            let device = crate::events::DeviceRef {
+                name: np
+                    .list()
+                    .into_iter()
+                    .find(|c| c.fingerprint == fp_hex)
+                    .map(|c| c.name)
+                    .unwrap_or_else(|| {
+                        crate::native_pairing::sanitize_device_name(
+                            hello.name.as_deref().unwrap_or(""),
+                            &fp_hex,
+                        )
+                    }),
+                fingerprint: fp_hex,
+                plane: crate::events::Plane::Native,
+            };
+            tokio::spawn(access_lifecycle(
+                conn.clone(),
+                watch_rx,
+                session_grants.clone(),
+                clip_enabled.clone(),
+                access_tx,
+                deadline_unix,
+                device,
+            ));
+        }
+        _ => drop(access_tx),
+    }
     // Fetch streams with no backend behind them are answered `CLIP_FETCH_UNAVAILABLE` instead of
     // hanging (the coordinator owns `accept_bi` when a backend is live — exactly one consumer).
     if !clip_available && pf_clipboard::enabled() {
@@ -1290,9 +1615,10 @@ async fn serve_session(
         // the Welcome rather than recomputed, so the input thread's spawns cannot disagree
         // with what the client was told.
         let pad_audio_on = welcome.host_caps & punktfunk_core::quic::HOST_CAP_PAD_AUDIO != 0;
+        let grants = session_grants.clone();
         std::thread::Builder::new()
             .name("punktfunk1-input".into())
-            .spawn(move || input_thread(input_rx, conn, inj_tx, gamepad, pad_audio_on))
+            .spawn(move || input_thread(input_rx, conn, inj_tx, gamepad, pad_audio_on, grants))
             .context("spawn input thread")?
     };
     // One reader for ALL client→host datagrams, demuxed by magic byte (two read_datagram loops
@@ -1301,9 +1627,13 @@ async fn serve_session(
     // 0xC8 → input (also the input thread). The magics are disjoint, so decode order doesn't
     // matter. Unknown tags are ignored.
     let input_conn = conn.clone();
+    let grants_dp = session_grants.clone();
     tokio::spawn(async move {
         let (mut input_count, mut mic_count, mut rich_count) = (0u64, 0u64, 0u64);
         let mut dropped = 0u64;
+        // Per-client-access enforcement drops (design §5.5): counted per class, one warn on the
+        // first drop of each, totals in the end-of-stream line below — never per-event logging.
+        let denied = GrantDrops::new();
         // `try_send` on a full queue drops rather than blocking this loop — blocking here would
         // stall the mic plane and the datagram reader itself. A DISCONNECTED channel is the input
         // thread having gone away, which is the one condition that ends the loop.
@@ -1318,7 +1648,18 @@ async fn serve_session(
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
         };
         while let Ok(d) = input_conn.read_datagram().await {
+            // The enforcement mask (design §5.2): ONE relaxed load per datagram; every plane
+            // below tests it before its item is offered anywhere. The mic/rich/pen planes are
+            // classed by their plane tag before per-event decode (§5.3); the 0xC8 events go
+            // through the exhaustive `classify`.
+            let mask = grants_dp.load(Ordering::Relaxed);
             if let Some((seq, pts, opus)) = punktfunk_core::quic::decode_mic_datagram(&d) {
+                if mask & GRANT_MIC == 0 {
+                    // Dropping here IS the "never attaches to the mic service" setup gate:
+                    // forwarding frames is the only attach this plane has.
+                    denied.note(GrantClass::Mic);
+                    continue;
+                }
                 mic_count += 1;
                 // Host-lifetime mic service (bounded queue): `try_send` drops the frame when the
                 // service is full or gone, never blocking this datagram loop (security-review S6).
@@ -1330,6 +1671,10 @@ async fn serve_session(
                     opus: opus.to_vec(),
                 });
             } else if let Some(rich) = punktfunk_core::quic::RichInput::decode(&d) {
+                if mask & GRANT_GAMEPAD == 0 {
+                    denied.note(GrantClass::Gamepad);
+                    continue;
+                }
                 rich_count += 1;
                 if !offer(&rich_tx, ClientInput::Rich(rich)) {
                     break;
@@ -1338,11 +1683,20 @@ async fn serve_session(
                 // 0xCC kind 0x05 — the stylus plane (RichInput::decode returns None for it by
                 // design; see punktfunk_core::quic::pen). Routed to the same input thread,
                 // which owns the per-session tracker + virtual tablet.
+                if mask & GRANT_POINTER == 0 {
+                    denied.note(GrantClass::Pointer);
+                    continue;
+                }
                 rich_count += 1;
                 if !offer(&rich_tx, ClientInput::Pen(pen)) {
                     break;
                 }
             } else if let Some(mut ev) = InputEvent::decode(&d) {
+                let class = classify(ev.kind);
+                if mask & class.bit() == 0 {
+                    denied.note(class);
+                    continue;
+                }
                 input_count += 1;
                 // Wire hygiene: KEY_FLAG_SEMANTIC_VK is an in-process tag (GameStream ingest
                 // only) — strip it from network events so a client can't flip the host's
@@ -1365,6 +1719,7 @@ async fn serve_session(
             mic = mic_count,
             rich = rich_count,
             dropped,
+            denied = %denied.summary(),
             "client datagram stream ended"
         );
     });
@@ -2639,7 +2994,7 @@ mod tests {
                 pend.name
             );
             np_approve
-                .approve_pending(pend.id, Some("Approved Device"))
+                .approve_pending(pend.id, Some("Approved Device"), None)
                 .unwrap()
                 .expect("pending id must approve");
         });
@@ -2787,6 +3142,542 @@ mod tests {
         );
         let _ = std::fs::remove_file(test_paired_path()); // tidy /tmp
 
+        host.join().unwrap().unwrap();
+    }
+
+    // ---- Per-client access (WP3–WP5) -------------------------------------------------------
+
+    /// The access lifecycle's clock/threshold arithmetic (design §4). All pure — the timed task
+    /// itself is exercised end to end by the session tests below.
+    #[test]
+    fn access_deadline_math() {
+        let now = 1_700_000_000i64;
+        // Wire lifetime: 0 = permanent; a due/past deadline still reads as expiring (floor 1).
+        assert_eq!(remaining_secs_wire(None, now), 0);
+        assert_eq!(remaining_secs_wire(Some(now + 90), now), 90);
+        assert_eq!(remaining_secs_wire(Some(now), now), 1);
+        assert_eq!(remaining_secs_wire(Some(now - 50), now), 1);
+
+        // Thresholds already behind the deadline are spent, not fired.
+        assert_eq!(spent_warnings(None, now), [true, true]);
+        assert_eq!(spent_warnings(Some(now + 400), now), [false, false]);
+        assert_eq!(spent_warnings(Some(now + 120), now), [true, false]);
+        assert_eq!(spent_warnings(Some(now + 30), now), [true, true]);
+
+        // Sleep slices: toward the next unfired boundary, 1..=30 s; permanent parks long.
+        assert_eq!(
+            access_sleep(None, &[true, true], now),
+            std::time::Duration::from_secs(3600)
+        );
+        // 400 s out, T−5 m unfired → boundary in 100 s, capped at the 30 s NTP-staleness bound.
+        assert_eq!(
+            access_sleep(Some(now + 400), &[false, false], now),
+            std::time::Duration::from_secs(30)
+        );
+        // 90 s out, only T−1 m left → its boundary is 30 s away.
+        assert_eq!(
+            access_sleep(Some(now + 90), &[true, false], now),
+            std::time::Duration::from_secs(30)
+        );
+        // 10 s out, all warned → the deadline itself.
+        assert_eq!(
+            access_sleep(Some(now + 10), &[true, true], now),
+            std::time::Duration::from_secs(10)
+        );
+        // Due now → the 1 s floor (the loop head closes; never a busy-spin zero sleep).
+        assert_eq!(
+            access_sleep(Some(now), &[true, true], now),
+            std::time::Duration::from_secs(1)
+        );
+    }
+
+    /// The datagram filter's admission matrix (WP4) is `mask & classify(kind).bit()` — pin the
+    /// preset semantics: Controller-only passes pads and ONLY pads; View-only passes nothing.
+    /// (The exhaustive classify itself is pinned in core's access tests.)
+    #[test]
+    fn input_admission_matrix_and_quiet_drop_accounting() {
+        use punktfunk_core::quic::{GRANT_PRESET_CONTROLLER_ONLY, GRANT_PRESET_VIEW_ONLY};
+        let admitted = |mask: u32, kind: InputKind| mask & classify(kind).bit() != 0;
+
+        for kind in [
+            InputKind::GamepadButton,
+            InputKind::GamepadAxis,
+            InputKind::GamepadState,
+            InputKind::GamepadRemove,
+            InputKind::GamepadArrival,
+        ] {
+            assert!(admitted(GRANT_PRESET_CONTROLLER_ONLY, kind), "{kind:?}");
+            assert!(!admitted(GRANT_PRESET_VIEW_ONLY, kind), "{kind:?}");
+        }
+        for kind in [
+            InputKind::KeyDown,
+            InputKind::KeyUp,
+            InputKind::MouseMove,
+            InputKind::MouseMoveAbs,
+            InputKind::MouseScroll,
+            InputKind::TouchDown,
+        ] {
+            assert!(!admitted(GRANT_PRESET_CONTROLLER_ONLY, kind), "{kind:?}");
+            assert!(!admitted(GRANT_PRESET_VIEW_ONLY, kind), "{kind:?}");
+        }
+        assert!(admitted(GRANT_ALL, InputKind::KeyDown));
+
+        // Quiet-drop accounting (design §5.5): per-class counters, "none" when clean.
+        let drops = GrantDrops::new();
+        assert_eq!(drops.summary(), "none");
+        drops.note(GrantClass::Keyboard);
+        drops.note(GrantClass::Keyboard);
+        drops.note(GrantClass::Mic);
+        assert_eq!(drops.summary(), "Keyboard=2 Mic=1");
+    }
+
+    /// Spawn a pairing-required synthetic host on `port` sharing `np` (the access tests' shape:
+    /// the test edits the trust store while a session is live). `frames` is generous — the
+    /// paced synthetic stream must outlive every timed assertion; the typed close cuts it.
+    fn spawn_access_host(
+        port: u16,
+        max_sessions: u32,
+        np: Arc<NativePairing>,
+    ) -> std::thread::JoinHandle<Result<()>> {
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(serve(
+                Punktfunk1Options {
+                    port,
+                    source: Punktfunk1Source::Synthetic,
+                    seconds: 0,
+                    frames: 3000, // ~50 s at the 60 fps pace — the stop flag cuts it long before
+                    max_sessions,
+                    max_concurrent: 1,
+                    require_pairing: true,
+                    allow_pairing: false,
+                    pairing_pin: None,
+                    paired_store: None, // unused: the shared `np` IS the store handle
+                    data_port: None,
+                    idle_timeout: None,
+                    mdns: false,
+                },
+                0,
+                np,
+                StatsRecorder::new(
+                    std::env::temp_dir()
+                        .join(format!("pf-access-stats-{port}-{}", std::process::id())),
+                ),
+                crate::identity::ephemeral().unwrap(),
+            ))
+        })
+    }
+
+    /// A paired-store temp path per test (the shared-`np` hosts persist through it).
+    fn access_store_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("pf-access-{tag}-{}.json", std::process::id()))
+    }
+
+    /// Minimal RAW punktfunk/1 session (not `NativeClient`): Hello → Welcome → Start, returning
+    /// the streams so a test can read the control plane directly (`AccessUpdate`s) and assert
+    /// the EXACT close code — the typed-close contract `end_reject` builds on client-side.
+    /// The returned `UdpSocket` keeps the advertised video port bound for the session's life.
+    async fn raw_session(
+        port: u16,
+        identity: (&str, &str),
+    ) -> (
+        quinn::Connection,
+        quinn::SendStream,
+        quinn::RecvStream,
+        Welcome,
+        std::net::UdpSocket,
+    ) {
+        let (ep, _observed) = endpoint::client_pinned_with_identity(None, Some(identity));
+        let ep = ep.expect("client endpoint");
+        let conn = ep
+            .connect(format!("127.0.0.1:{port}").parse().unwrap(), "punktfunk")
+            .expect("connect")
+            .await
+            .expect("QUIC handshake");
+        let (mut send, mut recv) = conn.open_bi().await.expect("control stream");
+        let hello = Hello {
+            abi_version: punktfunk_core::WIRE_VERSION,
+            mode: punktfunk_core::Mode {
+                width: 1280,
+                height: 720,
+                refresh_hz: 60,
+            },
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 0,
+            name: Some("access-test".into()),
+            launch: None,
+            video_caps: 0,
+            audio_channels: 2,
+            video_codecs: 0,
+            preferred_codec: 0,
+            display_hdr: None,
+            client_caps: 0,
+            max_shard_payload: 0,
+        };
+        io::write_msg(&mut send, &hello.encode())
+            .await
+            .expect("Hello");
+        let welcome = Welcome::decode(&io::read_msg(&mut recv).await.expect("Welcome read"))
+            .expect("Welcome decode");
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let start = Start {
+            client_udp_port: udp.local_addr().unwrap().port(),
+        };
+        io::write_msg(&mut send, &start.encode())
+            .await
+            .expect("Start");
+        (conn, send, recv, welcome, udp)
+    }
+
+    /// The application close code a connection ended with (panics on a transport-level end —
+    /// these tests expect a deliberate host close).
+    async fn closed_app_code(conn: &quinn::Connection) -> u32 {
+        match conn.closed().await {
+            quinn::ConnectionError::ApplicationClosed(ac) => {
+                u32::try_from(u64::from(ac.error_code)).expect("close code fits u32")
+            }
+            other => panic!("expected an application close, got {other:?}"),
+        }
+    }
+
+    /// WP3 acceptance: a session admitted under a short expiry advertises its real grants and
+    /// remaining lifetime in the Welcome, and at the deadline is closed with the TYPED expiry
+    /// code (0x69 → `RejectReason::AccessExpired`) — evaluated against the wall clock at fire.
+    #[test]
+    fn access_expiry_advertises_and_closes_typed() {
+        let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use punktfunk_core::quic::endpoint;
+
+        let store = access_store_path("expiry");
+        let _ = std::fs::remove_file(&store);
+        let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
+        let (cert, key) = endpoint::generate_identity().unwrap();
+        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        np.add_with_access(
+            "Evening Guest",
+            &fp_hex,
+            Some(crate::native_pairing::Access {
+                grants: GRANT_ALL,
+                expires_unix: Some(wall_unix_now() + 2),
+            }),
+        )
+        .unwrap();
+        let host = spawn_access_host(19782, 1, np.clone());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (conn, _send, _recv, welcome, _udp) =
+                raw_session(19782, (cert.as_str(), key.as_str())).await;
+            assert_eq!(welcome.grants, GRANT_ALL, "the Welcome advertises the mask");
+            assert!(
+                (1..=2).contains(&welcome.expires_in_secs),
+                "a 2 s grant must advertise 1–2 remaining secs, got {}",
+                welcome.expires_in_secs
+            );
+            let code =
+                tokio::time::timeout(std::time::Duration::from_secs(10), closed_app_code(&conn))
+                    .await
+                    .expect("the deadline task must close the session");
+            assert_eq!(
+                code,
+                punktfunk_core::reject::ACCESS_EXPIRED_CLOSE_CODE,
+                "expiry must close with the typed code"
+            );
+        });
+        // The row survives expiry (design §4) — only authorization ends.
+        assert!(np.is_paired(&fp_hex));
+        assert_eq!(np.effective(&fp_hex, wall_unix_now()), None);
+        let _ = std::fs::remove_file(&store);
+        host.join().unwrap().unwrap();
+    }
+
+    /// WP3/WP4/WP5 acceptance, mid-session: a console grant edit reaches the live session as an
+    /// `AccessUpdate` (the enforcement atomic's push mirror), a deadline set inside the T−1 m
+    /// threshold fires the warning, and "expire now" (a deadline already in the past) closes
+    /// with the same typed code — revocation is a clean typed close, not a lingering stream.
+    #[test]
+    fn access_edit_pushes_updates_and_expire_now_closes() {
+        let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use punktfunk_core::quic::endpoint;
+
+        let store = access_store_path("edit");
+        let _ = std::fs::remove_file(&store);
+        let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
+        let (cert, key) = endpoint::generate_identity().unwrap();
+        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        np.add("Edited Device", &fp_hex).unwrap(); // full control, permanent
+        let host = spawn_access_host(19783, 1, np.clone());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (conn, _send, mut recv, welcome, _udp) =
+                raw_session(19783, (cert.as_str(), key.as_str())).await;
+            assert_eq!(welcome.grants, GRANT_ALL);
+            assert_eq!(welcome.expires_in_secs, 0, "permanent access advertises 0");
+
+            // The console edit: controller-only, expiring 62 s out (inside T−5 m, outside
+            // T−1 m — so exactly one warning is still owed, and it fires ~2 s later).
+            let now = wall_unix_now();
+            np.set_access(
+                &fp_hex,
+                crate::native_pairing::Access {
+                    grants: punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY,
+                    expires_unix: Some(now + 62),
+                },
+            )
+            .unwrap()
+            .then_some(())
+            .expect("the fingerprint is paired");
+
+            // Update 1 — the edit itself: new mask + remaining lifetime.
+            let msg =
+                tokio::time::timeout(std::time::Duration::from_secs(5), io::read_msg(&mut recv))
+                    .await
+                    .expect("edit AccessUpdate owed")
+                    .expect("control stream open");
+            let u = AccessUpdate::decode(&msg).expect("an AccessUpdate");
+            assert_eq!(u.grants, punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY);
+            assert!(
+                (55..=62).contains(&u.remaining_secs),
+                "remaining should track the fresh deadline, got {}",
+                u.remaining_secs
+            );
+
+            // Update 2 — the T−1 m warning, fired as the threshold is crossed live.
+            let msg =
+                tokio::time::timeout(std::time::Duration::from_secs(10), io::read_msg(&mut recv))
+                    .await
+                    .expect("T-1m warning owed")
+                    .expect("control stream open");
+            let u = AccessUpdate::decode(&msg).expect("an AccessUpdate");
+            assert!(
+                u.remaining_secs <= 60,
+                "the warning carries the crossed threshold, got {}",
+                u.remaining_secs
+            );
+
+            // "Expire now": a deadline in the past → the same typed close, no phantom update.
+            np.set_access(
+                &fp_hex,
+                crate::native_pairing::Access {
+                    grants: punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY,
+                    expires_unix: Some(wall_unix_now() - 1),
+                },
+            )
+            .unwrap();
+            let code =
+                tokio::time::timeout(std::time::Duration::from_secs(10), closed_app_code(&conn))
+                    .await
+                    .expect("expire-now must close the session");
+            assert_eq!(code, punktfunk_core::reject::ACCESS_EXPIRED_CLOSE_CODE);
+        });
+        let _ = std::fs::remove_file(&store);
+        host.join().unwrap().unwrap();
+    }
+
+    /// WP5 acceptance: a Hello asking to LAUNCH without the grant is refused BEFORE the
+    /// handshake with the typed 0x6A close (`RejectReason::LaunchNotPermitted`) — surfaced by
+    /// the stock client as a connect-time rejection — while the same controller-only device
+    /// WITHOUT a launch request gets its session.
+    #[test]
+    fn launch_refused_without_grant_but_session_admitted() {
+        let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use punktfunk_core::client::NativeClient;
+        use punktfunk_core::quic::endpoint;
+
+        let store = access_store_path("launch");
+        let _ = std::fs::remove_file(&store);
+        let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
+        let (cert, key) = endpoint::generate_identity().unwrap();
+        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        np.add_with_access(
+            "Guest Pad",
+            &fp_hex,
+            Some(crate::native_pairing::Access {
+                grants: punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY,
+                expires_unix: None,
+            }),
+        )
+        .unwrap();
+        // max_sessions counts ACCEPTED connections, and the refused launch connect is one too.
+        let host = spawn_access_host(19784, 2, np.clone());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let timeout = std::time::Duration::from_secs(10);
+        let mode = punktfunk_core::Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        };
+
+        // 1: launch requested without the LAUNCH grant → the typed pre-handshake refusal.
+        // (Matched rather than `expect_err`: `NativeClient` has no Debug impl to unwrap around.)
+        let refused = NativeClient::connect(
+            "127.0.0.1",
+            19784,
+            mode,
+            CompositorPref::Auto,
+            GamepadPref::Auto,
+            0,
+            0,     // video_caps
+            2,     // audio_channels
+            0,     // video_codecs
+            0,     // preferred_codec
+            None,  // display_hdr
+            0,     // client_caps
+            false, // frame_parts
+            Some("steam:570".into()),
+            Some("Guest Pad".into()),
+            None, // pin (TOFU)
+            Some((cert.clone(), key.clone())),
+            timeout,
+        );
+        match refused {
+            Ok(_) => panic!("a launch without the grant must be refused"),
+            Err(punktfunk_core::PunktfunkError::Rejected(r)) => assert_eq!(
+                r,
+                punktfunk_core::reject::RejectReason::LaunchNotPermitted,
+                "the refusal must carry the typed launch reason"
+            ),
+            Err(other) => panic!("expected a typed rejection, got {other:?}"),
+        }
+
+        // 2: the same device without a launch request is admitted, Welcome advertising its mask.
+        let client = NativeClient::connect(
+            "127.0.0.1",
+            19784,
+            mode,
+            CompositorPref::Auto,
+            GamepadPref::Auto,
+            0,
+            0,
+            2,
+            0,
+            0,
+            None,
+            0,
+            false,
+            None, // no launch
+            Some("Guest Pad".into()),
+            None,
+            Some((cert, key)),
+            timeout,
+        )
+        .expect("controller-only session without a launch must be admitted");
+        drop(client);
+        let _ = std::fs::remove_file(&store);
+        host.join().unwrap().unwrap();
+    }
+
+    /// WP3 acceptance: an EXPIRED record is "not paired" at admission — the device falls into
+    /// the existing delegated-approval knock (console pending list) instead of a hard reject,
+    /// and re-approval IS the re-grant: the same held-open connection is admitted with the
+    /// fresh access.
+    #[test]
+    fn expired_record_knocks_into_pending_and_reapproval_regrants() {
+        let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use punktfunk_core::client::NativeClient;
+        use punktfunk_core::quic::endpoint;
+
+        let store = access_store_path("regrant");
+        let _ = std::fs::remove_file(&store);
+        let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
+        let (cert, key) = endpoint::generate_identity().unwrap();
+        let fp_hex = fingerprint_hex(&endpoint::fingerprint_of_pem(&cert).unwrap());
+        // Yesterday's guest: still listed, no longer authorized.
+        np.add_with_access(
+            "Yesterday's Guest",
+            &fp_hex,
+            Some(crate::native_pairing::Access {
+                grants: GRANT_ALL,
+                expires_unix: Some(wall_unix_now() - 3600),
+            }),
+        )
+        .unwrap();
+        assert!(np.is_paired(&fp_hex), "expired but still listed");
+        assert_eq!(np.effective(&fp_hex, wall_unix_now()), None);
+
+        let host = spawn_access_host(19785, 1, np.clone());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Re-approver: the expired device's reconnect must appear as a PENDING knock; approve
+        // it with fresh access while it is parked (the one-click re-grant).
+        let np_approve = np.clone();
+        let fp_approve = fp_hex.clone();
+        let approver = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let pend = loop {
+                if let Some(p) = np_approve
+                    .pending()
+                    .into_iter()
+                    .find(|p| p.fingerprint == fp_approve)
+                {
+                    break p;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "an expired record's reconnect must knock into the pending list"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            };
+            np_approve
+                .approve_pending(
+                    pend.id,
+                    None,
+                    Some(crate::native_pairing::Access {
+                        grants: punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY,
+                        expires_unix: Some(wall_unix_now() + 4 * 3600),
+                    }),
+                )
+                .unwrap()
+                .expect("re-approval");
+        });
+
+        let client = NativeClient::connect(
+            "127.0.0.1",
+            19785,
+            punktfunk_core::Mode {
+                width: 1280,
+                height: 720,
+                refresh_hz: 60,
+            },
+            CompositorPref::Auto,
+            GamepadPref::Auto,
+            0,
+            0,
+            2,
+            0,
+            0,
+            None,
+            0,
+            false,
+            None,
+            Some("Yesterday's Guest".into()),
+            None,
+            Some((cert, key)),
+            std::time::Duration::from_secs(15),
+        )
+        .expect("re-approved mid-park → session admitted with no reconnect");
+        approver.join().unwrap();
+        // The re-grant is in force: controller-only, expiring tonight.
+        assert_eq!(
+            np.effective(&fp_hex, wall_unix_now()),
+            Some(punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY)
+        );
+        drop(client);
+        let _ = std::fs::remove_file(&store);
         host.join().unwrap().unwrap();
     }
 }

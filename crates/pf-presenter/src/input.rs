@@ -27,6 +27,7 @@ use crate::touch::{Abs, Act, Gestures};
 use pf_client_core::trust::{MouseMode, TouchMode};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::input::{InputEvent, InputKind};
+use punktfunk_core::quic::{classify, GRANT_KEYBOARD, GRANT_POINTER};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -70,9 +71,30 @@ pub struct Capture {
     /// Reverse the scroll direction sent to the host ([`Settings::invert_scroll`]).
     invert_scroll: bool,
     gestures: Gestures,
+    /// The session's effective access grants (per-client access §7) — the courtesy gate in
+    /// front of every wire send here, keyed by the SAME `classify()` the host's filter uses:
+    /// an event whose class the mask doesn't cover never leaves this struct (the host would
+    /// drop it anyway; not sending is what keeps "my keyboard does nothing" from being a
+    /// mystery — the run loop pairs this with not grabbing what can't land). Moved live by
+    /// [`Capture::set_grants`] on a mid-session `AccessUpdate`.
+    grants: u32,
 }
 
-fn send(connector: &NativeClient, kind: InputKind, code: u32, x: i32, y: i32, flags: u32) {
+/// Forward one event IF the session's grants cover its class — the client half of the
+/// host's classify-and-drop filter, sharing its exhaustive [`classify`] so a future
+/// `InputKind` can't slip past one side and not the other.
+fn send(
+    connector: &NativeClient,
+    grants: u32,
+    kind: InputKind,
+    code: u32,
+    x: i32,
+    y: i32,
+    flags: u32,
+) {
+    if grants & classify(kind).bit() == 0 {
+        return;
+    }
     let _ = connector.send_input(&InputEvent {
         kind,
         _pad: [0; 3],
@@ -86,12 +108,15 @@ fn send(connector: &NativeClient, kind: InputKind, code: u32, x: i32, y: i32, fl
 impl Capture {
     /// `abs_ok` = the host injector accepts absolute pointer events; without it the
     /// desktop model is unavailable and `mouse_mode` silently resolves to capture.
+    /// `grants` = the session's effective access mask (the Welcome advert — the run loop
+    /// keeps it live through [`Capture::set_grants`]).
     pub fn new(
         connector: Arc<NativeClient>,
         touch_mode: TouchMode,
         invert_scroll: bool,
         mouse_mode: MouseMode,
         abs_ok: bool,
+        grants: u32,
     ) -> Capture {
         Capture {
             connector,
@@ -108,11 +133,79 @@ impl Capture {
             touch_mode,
             invert_scroll,
             gestures: Gestures::new(touch_mode == TouchMode::Trackpad),
+            grants,
         }
     }
 
     pub fn captured(&self) -> bool {
         self.captured
+    }
+
+    /// The session's effective access grants — what the run loop passes to
+    /// `apply_capture` so pointer lock and the keyboard grab track the mask.
+    pub fn grants(&self) -> u32 {
+        self.grants
+    }
+
+    /// Whether engaging capture buys anything at all: with neither POINTER nor KEYBOARD
+    /// granted there is nothing to lock or grab FOR (a view-only or controller-only
+    /// session), so [`Capture::engage`] refuses and the "click to capture" hint stays
+    /// down — the worst failure mode is a locked pointer whose motion lands nowhere.
+    pub fn can_capture(&self) -> bool {
+        self.grants & (GRANT_POINTER | GRANT_KEYBOARD) != 0
+    }
+
+    /// Fold a mid-session `AccessUpdate` into the gate. A class REMOVED while something
+    /// of its kind is held flushes the held state up first, under the OLD mask — the
+    /// host may still honor the ups, and either way nothing stays pressed locally. The
+    /// run loop re-applies pointer lock / keyboard grab (and releases capture entirely
+    /// when [`Capture::can_capture`] went false) right after this.
+    pub fn set_grants(&mut self, grants: u32) {
+        if grants == self.grants {
+            return;
+        }
+        let lost = self.grants & !grants;
+        if lost & GRANT_KEYBOARD != 0 {
+            for vk in self.held_keys.drain() {
+                send(
+                    &self.connector,
+                    self.grants,
+                    InputKind::KeyUp,
+                    vk as u32,
+                    0,
+                    0,
+                    0,
+                );
+            }
+        }
+        if lost & GRANT_POINTER != 0 {
+            self.pending_rel = (0, 0);
+            self.pending_abs = None;
+            for b in self.held_buttons.drain() {
+                send(
+                    &self.connector,
+                    self.grants,
+                    InputKind::MouseButtonUp,
+                    b,
+                    0,
+                    0,
+                    0,
+                );
+            }
+            for slot in self.touch_slots.drain().map(|(_, slot)| slot) {
+                send(
+                    &self.connector,
+                    self.grants,
+                    InputKind::TouchUp,
+                    slot,
+                    0,
+                    0,
+                    0,
+                );
+            }
+            self.gestures.reset();
+        }
+        self.grants = grants;
     }
 
     /// The desktop (absolute, uncaptured) mouse model is active.
@@ -153,10 +246,17 @@ impl Capture {
         !self.captured && !self.user_released
     }
 
-    /// Engage capture. The caller flips SDL relative mouse mode on (pointer lock).
+    /// Engage capture. The caller flips SDL relative mouse mode on (pointer lock) —
+    /// only on `true`: a session whose grants cover neither pointer nor keyboard
+    /// refuses (see [`Capture::can_capture`]), and the caller must leave the pointer
+    /// free rather than lock it over input that can't land.
     pub fn engage(&mut self) -> bool {
+        if !self.can_capture() {
+            return false;
+        }
         self.user_released = false;
-        !std::mem::replace(&mut self.captured, true)
+        self.captured = true;
+        true
     }
 
     /// Release capture, flushing everything held so nothing sticks down on the host.
@@ -172,13 +272,37 @@ impl Capture {
         self.pending_rel = (0, 0); // never flush motion gathered while captured
         self.pending_abs = None;
         for vk in self.held_keys.drain() {
-            send(&self.connector, InputKind::KeyUp, vk as u32, 0, 0, 0);
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::KeyUp,
+                vk as u32,
+                0,
+                0,
+                0,
+            );
         }
         for b in self.held_buttons.drain() {
-            send(&self.connector, InputKind::MouseButtonUp, b, 0, 0, 0);
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::MouseButtonUp,
+                b,
+                0,
+                0,
+                0,
+            );
         }
         for slot in self.touch_slots.drain().map(|(_, slot)| slot) {
-            send(&self.connector, InputKind::TouchUp, slot, 0, 0, 0);
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::TouchUp,
+                slot,
+                0,
+                0,
+                0,
+            );
         }
         // The gesture engine's held left button (a tap-drag in progress) rides in
         // `held_buttons` above, so it was just flushed — here we only forget its state.
@@ -191,11 +315,20 @@ impl Capture {
     pub fn flush_motion(&mut self) {
         let (dx, dy) = std::mem::take(&mut self.pending_rel);
         if dx != 0 || dy != 0 {
-            send(&self.connector, InputKind::MouseMove, 0, dx, dy, 0);
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::MouseMove,
+                0,
+                dx,
+                dy,
+                0,
+            );
         }
         if let Some(a) = self.pending_abs.take() {
             send(
                 &self.connector,
+                self.grants,
                 InputKind::MouseMoveAbs,
                 0,
                 a.x,
@@ -231,7 +364,15 @@ impl Capture {
             // when the key lands (e.g. "press E at the crosshair").
             self.flush_motion();
             self.held_keys.insert(vk);
-            send(&self.connector, InputKind::KeyDown, vk as u32, 0, 0, 0);
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::KeyDown,
+                vk as u32,
+                0,
+                0,
+                0,
+            );
         }
     }
 
@@ -239,7 +380,15 @@ impl Capture {
         if let Some(vk) = keymap_sdl::scancode_to_vk(sc) {
             // Flush-on-release may have beaten us to it — only forward if still held.
             if self.held_keys.remove(&vk) {
-                send(&self.connector, InputKind::KeyUp, vk as u32, 0, 0, 0);
+                send(
+                    &self.connector,
+                    self.grants,
+                    InputKind::KeyUp,
+                    vk as u32,
+                    0,
+                    0,
+                    0,
+                );
             }
         }
     }
@@ -254,7 +403,15 @@ impl Capture {
         self.flush_motion();
         if let Some(gs) = keymap_sdl::mouse_button_to_gs(b) {
             self.held_buttons.insert(gs);
-            send(&self.connector, InputKind::MouseButtonDown, gs, 0, 0, 0);
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::MouseButtonDown,
+                gs,
+                0,
+                0,
+                0,
+            );
         }
     }
 
@@ -262,7 +419,15 @@ impl Capture {
         self.flush_motion(); // the release must not beat the motion before it
         if let Some(gs) = keymap_sdl::mouse_button_to_gs(b) {
             if self.held_buttons.remove(&gs) {
-                send(&self.connector, InputKind::MouseButtonUp, gs, 0, 0, 0);
+                send(
+                    &self.connector,
+                    self.grants,
+                    InputKind::MouseButtonUp,
+                    gs,
+                    0,
+                    0,
+                    0,
+                );
             }
         }
     }
@@ -282,12 +447,28 @@ impl Capture {
         let vy = ay.trunc() as i32;
         if vy != 0 {
             ay -= f64::from(vy);
-            send(&self.connector, InputKind::MouseScroll, 0, vy, 0, 0);
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::MouseScroll,
+                0,
+                vy,
+                0,
+                0,
+            );
         }
         let vx = ax.trunc() as i32;
         if vx != 0 {
             ax -= f64::from(vx);
-            send(&self.connector, InputKind::MouseScroll, 1, vx, 0, 0);
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::MouseScroll,
+                1,
+                vx,
+                0,
+                0,
+            );
         }
         self.scroll_acc = (ax, ay);
     }
@@ -319,6 +500,7 @@ impl Capture {
         let slot = self.touch_slot(finger_id);
         send(
             &self.connector,
+            self.grants,
             InputKind::TouchDown,
             slot,
             x,
@@ -336,6 +518,7 @@ impl Capture {
         if let Some(&slot) = self.touch_slots.get(&finger_id) {
             send(
                 &self.connector,
+                self.grants,
                 InputKind::TouchMove,
                 slot,
                 x,
@@ -350,7 +533,15 @@ impl Capture {
     /// no-ops), but a stray up must never strand a pressed contact on the host.
     pub fn on_touch_up(&mut self, finger_id: u64) {
         if let Some(slot) = self.touch_slots.remove(&finger_id) {
-            send(&self.connector, InputKind::TouchUp, slot, 0, 0, 0);
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::TouchUp,
+                slot,
+                0,
+                0,
+                0,
+            );
         }
     }
 
@@ -409,15 +600,31 @@ impl Capture {
                 if down {
                     self.flush_motion(); // the press lands where the cursor now is
                     self.held_buttons.insert(gs);
-                    send(&self.connector, InputKind::MouseButtonDown, gs, 0, 0, 0);
+                    send(
+                        &self.connector,
+                        self.grants,
+                        InputKind::MouseButtonDown,
+                        gs,
+                        0,
+                        0,
+                        0,
+                    );
                 } else if self.held_buttons.remove(&gs) {
                     self.flush_motion();
-                    send(&self.connector, InputKind::MouseButtonUp, gs, 0, 0, 0);
+                    send(
+                        &self.connector,
+                        self.grants,
+                        InputKind::MouseButtonUp,
+                        gs,
+                        0,
+                        0,
+                        0,
+                    );
                 }
             }
             other => {
                 if let Some((kind, code, x, y, flags)) = other.wire() {
-                    send(&self.connector, kind, code, x, y, flags);
+                    send(&self.connector, self.grants, kind, code, x, y, flags);
                 }
             }
         }

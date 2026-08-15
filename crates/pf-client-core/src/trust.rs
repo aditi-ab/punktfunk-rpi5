@@ -867,6 +867,14 @@ pub fn connect_reject_message(reason: punktfunk_core::reject::RejectReason) -> S
              (web console → Log) has the cause."
                 .into()
         }
+        R::AccessExpired => {
+            "Your access to this host has expired — ask the host's owner to grant it again.".into()
+        }
+        R::LaunchNotPermitted => {
+            "This device isn't permitted to launch games on the host — connect without picking \
+             a game, or ask the host's owner to allow launching."
+                .into()
+        }
     }
 }
 

@@ -77,4 +77,13 @@ pub(crate) struct Negotiated {
     /// advertise one. Surfaced to the embedder via [`crate::NativeClient::mgmt_port`] so a client
     /// can reach the game library without ever having seen an mDNS advert.
     pub(crate) mgmt_port: u16,
+    /// The session's effective access grants ([`crate::quic::Welcome::grants`]) — the
+    /// [`crate::quic::GRANT_GAMEPAD`] family. An old host's Welcome decodes to
+    /// [`crate::quic::GRANT_ALL`], the pre-grants behavior. This is only the STARTING truth:
+    /// a mid-session [`crate::quic::AccessUpdate`] moves the live mask the control task keeps
+    /// (see [`crate::NativeClient::access_grants`]).
+    pub(crate) grants: u32,
+    /// Seconds until this device's access expires ([`crate::quic::Welcome::expires_in_secs`]);
+    /// `0` = permanent. Like `grants`, the connect-time seed for the live deadline.
+    pub(crate) expires_in_secs: u32,
 }

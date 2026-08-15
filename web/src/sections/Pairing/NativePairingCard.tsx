@@ -1,6 +1,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { KeyRound, Smartphone, Timer } from "lucide-react";
-import { type FC, useEffect, useRef } from "react";
+import { type FC, useEffect, useRef, useState } from "react";
+import type { ArmNativePairing } from "@/api/gen/model/armNativePairing";
 import type { NativePairStatus } from "@/api/gen/model/nativePairStatus";
 import {
 	getGetNativePairingQueryKey,
@@ -14,6 +15,12 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
+import {
+	type AccessDraft,
+	AccessControls,
+	draftExpirySecs,
+	GRANT_ALL,
+} from "./access";
 
 /** Seconds → `m:ss`. */
 function fmtTime(secs: number): string {
@@ -52,8 +59,10 @@ export const NativePairingSection: FC = () => {
 
 	const refresh = () =>
 		qc.invalidateQueries({ queryKey: getGetNativePairingQueryKey() });
-	const onArm = () =>
-		arm.mutate({ data: { ttl_secs: 120 } }, { onSuccess: refresh });
+	// `access` carries the window's device-access choice (grants + expiry) — NOT the window TTL;
+	// whichever device completes this window's ceremony gets it.
+	const onArm = (access: Partial<ArmNativePairing>) =>
+		arm.mutate({ data: { ttl_secs: 120, ...access } }, { onSuccess: refresh });
 	const onDisarm = () => disarm.mutate(undefined, { onSuccess: refresh });
 
 	return (
@@ -70,12 +79,32 @@ export const NativePairingSection: FC = () => {
 /** Native (punktfunk/1) pairing: arm a window → DISPLAY the PIN the user enters on their device. */
 export const NativePairingCard: FC<{
 	status: Loadable<NativePairStatus>;
-	onArm: () => void;
+	/** Arm, carrying the chosen device access (empty = today's full/permanent behavior). */
+	onArm: (access: Partial<ArmNativePairing>) => void;
 	onDisarm: () => void;
 	isArming: boolean;
 	isDisarming: boolean;
 }> = ({ status, onArm, onDisarm, isArming, isDisarming }) => {
 	const d = status.data;
+	// What the pairing device will be allowed to do — same defaults as the approve dialog (D1):
+	// Full · Forever, because arming for your OWN next device is the common case.
+	const [draft, setDraft] = useState<AccessDraft>({
+		grants: GRANT_ALL,
+		expiry: "forever",
+		customHours: 4,
+	});
+	const arm = () => {
+		const secs = draftExpirySecs(draft);
+		const access: Partial<ArmNativePairing> = {};
+		// The untouched Full · Forever default is omitted entirely: a re-pairing device then keeps
+		// the access it already has (the API's omitted-fields contract), and an older host that
+		// predates the fields sees exactly yesterday's request.
+		if (draft.grants !== GRANT_ALL || secs != null) {
+			access.grants = draft.grants;
+			if (secs != null) access.expires_in_secs = secs;
+		}
+		onArm(access);
+	};
 	return (
 		<QueryState
 			isLoading={status.isLoading}
@@ -120,7 +149,14 @@ export const NativePairingCard: FC<{
 							<p className="text-sm text-muted-foreground">
 								{m.pairing_native_desc()}
 							</p>
-							<Button disabled={isArming} onClick={onArm}>
+							{/* The window's device-access choice — whichever device completes the
+							    ceremony gets exactly this (design §6.2). */}
+							<AccessControls
+								value={draft}
+								onChange={setDraft}
+								idPrefix="arm"
+							/>
+							<Button disabled={isArming} onClick={arm}>
 								<KeyRound className="size-4" />
 								{m.pairing_native_arm()}
 							</Button>

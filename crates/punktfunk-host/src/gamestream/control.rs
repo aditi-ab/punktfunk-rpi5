@@ -31,7 +31,7 @@ use super::{AppState, CONTROL_PORT};
 use crate::inject::gamepad::GamepadManager;
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::input::InputEvent;
-use punktfunk_core::quic::HdrMeta;
+use punktfunk_core::quic::{classify, GrantClass, HdrMeta, GRANT_ALL};
 use rusty_enet::{Event, Host, HostSettings, Packet, PeerID};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,6 +74,159 @@ struct Running {
     /// socket with it).
     stop: Arc<AtomicBool>,
     thread: std::thread::JoinHandle<()>,
+}
+
+/// The live session's per-client access (design/per-client-access.md §8, WP13), resolved from
+/// the launch owner's cert fingerprint against the shared grants registry
+/// ([`AppState::access`]). The control thread owns it single-threadedly, so a plain `u32`
+/// stands where the native plane's `Arc<AtomicU32>` does — the idiom is otherwise WP4's:
+/// resolve at session start, fold console edits in via the watch (within one 2 ms tick), one
+/// mask test per event, and the wall-clock deadline cuts the session.
+struct SessionAccess {
+    /// The launch owner's fingerprint (lowercase hex) this state was resolved for — a
+    /// different owner (steal/new session) re-resolves from scratch.
+    fp_hex: String,
+    /// Live edits from the console arrive here (`NativePairing::subscribe`); polled per tick.
+    /// `None` when no registry is wired (tests) — then the mask stays ungoverned-full forever.
+    rx: Option<tokio::sync::watch::Receiver<crate::native_pairing::AccessState>>,
+    /// The effective grant mask input is filtered against.
+    mask: u32,
+    /// Absolute expiry, host wall clock, unix seconds; `None` = permanent. Checked each tick.
+    deadline: Option<i64>,
+}
+
+impl SessionAccess {
+    /// Resolve a session owner's access: subscribe FIRST, then fold the channel's current
+    /// value, so a console edit racing this resolution lands either in the borrow or as the
+    /// first change notification — never in a gap between the two (the WP3 admission order).
+    fn resolve(
+        registry: Option<&Arc<crate::native_pairing::NativePairing>>,
+        fp_hex: String,
+    ) -> SessionAccess {
+        let mut access = SessionAccess {
+            fp_hex,
+            rx: None,
+            mask: GRANT_ALL,
+            deadline: None,
+        };
+        if let Some(np) = registry {
+            let rx = np.subscribe(&access.fp_hex);
+            let st = *rx.borrow();
+            access.rx = Some(rx);
+            access.fold(st);
+        }
+        access
+    }
+
+    /// Fold one watch state in — with the Moonlight reading of `revoked` (design §8): a
+    /// fingerprint with no grants record is *ungoverned* (full control), because this plane's
+    /// pairing authority is the GameStream cert list, whose unpair ends the session through
+    /// the mgmt endpoint, not through this watch. A record that exists governs as on the
+    /// native plane: its mask applies and its deadline (checked per tick) cuts the session.
+    fn fold(&mut self, st: crate::native_pairing::AccessState) {
+        if st.revoked {
+            self.mask = GRANT_ALL;
+            self.deadline = None;
+        } else {
+            self.mask = st.grants;
+            self.deadline = st.deadline_unix;
+        }
+    }
+
+    /// Fold any pending watch edit (non-blocking; the control thread is not async).
+    fn poll(&mut self) {
+        if let Some(rx) = self.rx.as_mut() {
+            if rx.has_changed().unwrap_or(false) {
+                let st = *rx.borrow_and_update();
+                self.fold(st);
+            }
+        }
+    }
+
+    /// Whether the deadline has passed at `now` (the deadline second itself is expired — the
+    /// same evaluation as the trust store's `effective`). An "expire now" console edit is just
+    /// a deadline in the past arriving through the watch, so it lands here too.
+    fn expired(&self, now_unix: i64) -> bool {
+        self.deadline.is_some_and(|d| now_unix >= d)
+    }
+}
+
+/// Quiet per-(session, grant-class) enforcement-drop accounting — the GameStream twin of the
+/// native plane's `GrantDrops` (design §5.5): one counter and ONE `warn!` per class for the
+/// whole session (per-event logging is the DoS), totals surfaced once at session end. Plain
+/// integers, not atomics: the control thread is the only writer and reader.
+struct GrantDrops {
+    counts: [u64; 6],
+    warned: [bool; 6],
+}
+
+impl GrantDrops {
+    fn new() -> GrantDrops {
+        GrantDrops {
+            counts: [0; 6],
+            warned: [false; 6],
+        }
+    }
+
+    /// A class's slot in the fixed tables — the bit position of its grant, so the layout can
+    /// never drift from the wire vocabulary.
+    fn idx(class: GrantClass) -> usize {
+        class.bit().trailing_zeros() as usize
+    }
+
+    /// Count one dropped item; log only the FIRST drop of each class — the support signal for
+    /// "my keyboard does nothing" from a Moonlight client, which has no grants UX at all
+    /// (silent enforcement is protocol-inherent here, design §8).
+    fn note(&mut self, class: GrantClass) {
+        let i = Self::idx(class);
+        self.counts[i] += 1;
+        if !self.warned[i] {
+            self.warned[i] = true;
+            tracing::warn!(
+                class = ?class,
+                "gamestream: dropping client input this session's access grants don't cover — \
+                 counted; further drops of this class are silent until the session-end totals"
+            );
+        }
+    }
+
+    /// Log the session's drop totals (if any) and reset for the next session. Called from
+    /// every per-session teardown arm — disconnect, host-side end, thread stop.
+    fn end_of_session(&mut self) {
+        use std::fmt::Write;
+        let mut out = String::new();
+        for class in [
+            GrantClass::Gamepad,
+            GrantClass::Pointer,
+            GrantClass::Keyboard,
+            GrantClass::Clipboard,
+            GrantClass::Mic,
+            GrantClass::Launch,
+        ] {
+            let n = self.counts[Self::idx(class)];
+            if n != 0 {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                let _ = write!(out, "{class:?}={n}");
+            }
+        }
+        if !out.is_empty() {
+            tracing::info!(drops = %out, "gamestream: access-grant drop totals for the session");
+        }
+        *self = GrantDrops::new();
+    }
+}
+
+/// The one mask test standing between a decoded event class and its injector (design §5.3):
+/// `true` = inject; `false` = counted and dropped. Kept a free function so the filter the
+/// session actually runs is the thing the tests exercise.
+fn permitted(mask: u32, class: GrantClass, drops: &mut GrantDrops) -> bool {
+    if mask & class.bit() != 0 {
+        return true;
+    }
+    drops.note(class);
+    false
 }
 
 /// Reconcile the control port to the paired-client list: bound while at least one pairing
@@ -221,6 +374,11 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
             // clears `launch` — and the key lives there — so without this copy the one message that
             // has to go out *because* the session ended could no longer be sealed.
             let mut last_key: Option<[u8; 16]> = None;
+            // Per-client access (WP13): the live session's grant mask + deadline, resolved
+            // from the launch owner's fingerprint; `None` while no session is live. `drops`
+            // is the session's quiet enforcement accounting (counters, never per-event logs).
+            let mut access: Option<SessionAccess> = None;
+            let mut drops = GrantDrops::new();
             loop {
                 // WP0 teardown: the last pairing was removed while we were live. Tell a
                 // connected client the session is over — termination + disconnect, the same
@@ -245,9 +403,42 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                             std::thread::sleep(Duration::from_millis(2));
                         }
                     }
+                    drops.end_of_session();
                     state.end_session("control stream stopped — last pairing removed");
                     tracing::info!(port = CONTROL_PORT, "control: stopped (no paired clients)");
                     return;
+                }
+                // Track the live session's access each tick (2 ms): resolve on a new owner,
+                // fold any console edit in (one watch poll — cheap version check), and cut the
+                // session the tick its deadline passes. Events serviced below read the folded
+                // mask, so an edit reaches enforcement within one tick of the watch publish.
+                let owner_fp = state.launch.lock().unwrap().and_then(|s| s.owner_fp);
+                match owner_fp {
+                    None => access = None,
+                    Some(fp) => {
+                        let fp_hex = hex::encode(fp);
+                        if access.as_ref().is_none_or(|a| a.fp_hex != fp_hex) {
+                            access = Some(SessionAccess::resolve(state.access.get(), fp_hex));
+                        } else if let Some(a) = access.as_mut() {
+                            a.poll();
+                        }
+                        if access
+                            .as_ref()
+                            .is_some_and(|a| a.expired(super::wall_unix_now()))
+                        {
+                            // Expiry (or an "expire now" edit) ends the session as a decision
+                            // — like the mgmt unpair, not like a network drop. `quit_session`
+                            // clears `launch`, and the host-side-ended arm below then sends
+                            // the TERMINATION + disconnect: GameStream has no AccessUpdate
+                            // vocabulary, so that close IS the whole message (design §8). The
+                            // nvhttp gates keep the expired record from re-launching.
+                            tracing::info!(
+                                "gamestream: session access expired — ending the session"
+                            );
+                            state.quit_session("gamestream access expired");
+                            access = None;
+                        }
+                    }
                 }
                 loop {
                     match host.service() {
@@ -291,6 +482,8 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                                 // uinput pen releases any held tool/tip kernel-side).
                                 pads = GamepadManager::new();
                                 pointer = super::pen::GsPointer::new();
+                                // Surface the session's enforcement-drop totals (WP13).
+                                drops.end_of_session();
                                 // The control stream is the session's liveness anchor — Moonlight
                                 // holds it for the whole stream, and ENet detects a vanished peer
                                 // via its reliable-ping timeout (~5–30 s), which ALSO lands here.
@@ -317,6 +510,12 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                                 if peer != Some(p.id()) {
                                     continue;
                                 }
+
+                                // The mask a missing SessionAccess stands in for is FULL:
+                                // input only decrypts under the /launch key, so a decryptable
+                                // event with no resolved access can only be the ≤2 ms sliver
+                                // between `/launch` landing and the next tick's resolve — and
+                                // an ungoverned (recordless) session is full-control anyway.
                                 on_receive(
                                     &state,
                                     channel_id,
@@ -326,6 +525,8 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                                     &inj_tx,
                                     &mut pads,
                                     &mut pointer,
+                                    access.as_ref().map(|a| a.mask).unwrap_or(GRANT_ALL),
+                                    &mut drops,
                                 );
                             }
                         },
@@ -384,6 +585,7 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                         hdr_sent = false;
                         pads = GamepadManager::new();
                         pointer = super::pen::GsPointer::new();
+                        drops.end_of_session();
                     }
                 }
                 // Service the pads' force-feedback protocol every tick (games block inside
@@ -477,7 +679,8 @@ fn decode_rfi_range(pt: &[u8]) -> Option<(i64, i64)> {
 }
 
 /// Handle one received control packet: decrypt it (learning the GCM scheme on the first one),
-/// decode any input event, and inject it into the host session.
+/// decode any input event, classify it against the session's grant mask (WP13 — drops are
+/// counted, not logged), and inject what the grants cover into the host session.
 #[allow(clippy::too_many_arguments)]
 fn on_receive(
     state: &AppState,
@@ -488,6 +691,8 @@ fn on_receive(
     inj_tx: &Sender<InputEvent>,
     pads: &mut GamepadManager,
     pointer: &mut super::pen::GsPointer,
+    grants: u32,
+    drops: &mut GrantDrops,
 ) {
     let Some(key) = state.launch.lock().unwrap().map(|s| s.gcm_key) else {
         return; // control traffic before /launch — no key yet
@@ -552,18 +757,26 @@ fn on_receive(
         }
     }
 
-    // Controller events go to the uinput virtual pads (created on demand per the mask).
+    // Controller events go to the uinput virtual pads (created on demand per the mask) —
+    // gated BEFORE the manager sees them, which is also the deny-at-setup (WP4's idiom): a
+    // session without the GAMEPAD grant never creates a uinput node or a pad-audio streamer,
+    // because the creating event never arrives.
     if let Some(gp) = super::gamepad::decode(&pt) {
-        pads.handle(&gp);
+        if permitted(grants, GrantClass::Gamepad, drops) {
+            pads.handle(&gp);
+        }
         return;
     }
 
     // Pen/touch extension events (Moonlight sends them only after seeing our feature flag):
     // pen drives this session's virtual tablet; touch forwards as ordinary wire touches.
+    // Pointer-class by construction (the plane tag decides, like the native pen plane).
     if let Some(p) = super::input::decode_pointer(&pt) {
-        pointer.apply(&p, |ev| {
-            let _ = inj_tx.send(ev);
-        });
+        if permitted(grants, GrantClass::Pointer, drops) {
+            pointer.apply(&p, |ev| {
+                let _ = inj_tx.send(ev);
+            });
+        }
         return;
     } else if super::input::is_pointer_magic(&pt) {
         // A pointer magic that failed the body parse — a layout mismatch against this
@@ -592,10 +805,14 @@ fn on_receive(
     }
 
     // Forward to the dedicated injector thread (it opens the backend on the first event and
-    // coalesces redundant motion). A closed channel means the injector thread died at startup —
-    // input is lossy, so drop silently rather than spam.
+    // coalesces redundant motion) — each event past one mask test against the exhaustive
+    // classifier (design §5.3), so a Controller-only Moonlight guest's keyboard/mouse is inert
+    // before injection, exactly like the native datagram dispatch. A closed channel means the
+    // injector thread died at startup — input is lossy, so drop silently rather than spam.
     for ev in events {
-        let _ = inj_tx.send(ev);
+        if permitted(grants, classify(ev.kind), drops) {
+            let _ = inj_tx.send(ev);
+        }
     }
 }
 
@@ -988,5 +1205,116 @@ mod tests {
         assert_eq!(pt.len(), 31);
         assert_eq!(&pt[2..4], &27u16.to_le_bytes());
         assert_eq!(pt[4], 0); // disabled
+    }
+
+    /// The WP13 acceptance at filter level: under the Controller-only mask the pad passes and
+    /// keyboard/pointer are counted-and-dropped — the exact test the session's injection arms
+    /// run (`permitted` is what `on_receive` calls). Also pins the quiet-accounting reset.
+    #[test]
+    fn controller_only_mask_passes_the_pad_and_drops_keyboard_and_pointer() {
+        use punktfunk_core::input::InputKind;
+        use punktfunk_core::quic::{classify, GrantClass, GRANT_PRESET_CONTROLLER_ONLY};
+        let mut drops = super::GrantDrops::new();
+        let mask = GRANT_PRESET_CONTROLLER_ONLY;
+        // Pad events inject (and pad creation with them — deny-at-setup is upstream of this).
+        assert!(super::permitted(
+            mask,
+            classify(InputKind::GamepadButton),
+            &mut drops
+        ));
+        // Keyboard (keys + committed text) and every pointer shape are inert.
+        assert!(!super::permitted(
+            mask,
+            classify(InputKind::KeyDown),
+            &mut drops
+        ));
+        assert!(!super::permitted(
+            mask,
+            classify(InputKind::TextInput),
+            &mut drops
+        ));
+        assert!(!super::permitted(
+            mask,
+            classify(InputKind::MouseMove),
+            &mut drops
+        ));
+        // The pen/touch plane is Pointer-class by its plane tag.
+        assert!(!super::permitted(mask, GrantClass::Pointer, &mut drops));
+        assert_eq!(
+            drops.counts[super::GrantDrops::idx(GrantClass::Keyboard)],
+            2
+        );
+        assert_eq!(drops.counts[super::GrantDrops::idx(GrantClass::Pointer)], 2);
+        assert_eq!(drops.counts[super::GrantDrops::idx(GrantClass::Gamepad)], 0);
+        // Session end logs totals once and resets for the next session.
+        drops.end_of_session();
+        assert_eq!(drops.counts, [0u64; 6]);
+    }
+
+    /// The session's live access state (WP13): a fingerprint with NO grants record is
+    /// ungoverned (full control — the back-compat rule for existing Moonlight pairings), a
+    /// record that exists governs, console edits fold in via the watch within one poll, an
+    /// "expire now" edit is a past deadline through the same channel, and deleting the record
+    /// returns the session to ungoverned rather than reading as a revocation (GameStream
+    /// unpair ends sessions through the mgmt endpoint, not through this watch).
+    #[test]
+    fn session_access_resolves_folds_edits_and_expires() {
+        use crate::native_pairing::{Access, NativePairing};
+        use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD};
+        use std::sync::Arc;
+        let x = 0u8;
+        let p = std::env::temp_dir().join(format!(
+            "pf-gs-session-access-{}-{}.json",
+            std::process::id(),
+            &x as *const _ as usize
+        ));
+        let _ = std::fs::remove_file(&p);
+        let np = Arc::new(NativePairing::load_with(Some(p.clone()), None, false).unwrap());
+        let now = super::super::wall_unix_now();
+
+        // No registry wired (an AppState that never went through `serve`): ungoverned forever.
+        let a = super::SessionAccess::resolve(None, "ab12".into());
+        assert_eq!(a.mask, GRANT_ALL);
+        assert!(!a.expired(now + 1_000_000));
+
+        // Registry wired, no record: ungoverned — a stock Moonlight pairing keeps full control.
+        let mut a = super::SessionAccess::resolve(Some(&np), "ab12".into());
+        assert_eq!(a.mask, GRANT_ALL);
+        assert_eq!(a.deadline, None);
+
+        // A record created for this fingerprint (the console path) governs the live session
+        // within one watch poll.
+        np.add_with_access(
+            "Moonlight Deck",
+            "AB12", // registry keys case-insensitively, like the store
+            Some(Access {
+                grants: GRANT_GAMEPAD,
+                expires_unix: Some(now + 60),
+            }),
+        )
+        .unwrap();
+        a.poll();
+        assert_eq!(a.mask, GRANT_GAMEPAD);
+        assert!(!a.expired(now + 59));
+        assert!(a.expired(now + 60), "the deadline second itself is expired");
+
+        // "Expire now" is just a deadline in the past arriving through the same watch.
+        np.set_access(
+            "ab12",
+            Access {
+                grants: GRANT_GAMEPAD,
+                expires_unix: Some(now - 1),
+            },
+        )
+        .unwrap();
+        a.poll();
+        assert!(a.expired(now));
+
+        // Deleting the record: back to ungoverned, session survives.
+        assert!(np.remove("ab12").unwrap());
+        a.poll();
+        assert_eq!(a.mask, GRANT_ALL);
+        assert!(!a.expired(now));
+        let _ = std::fs::remove_file(&p);
     }
 }

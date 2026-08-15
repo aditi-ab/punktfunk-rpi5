@@ -269,6 +269,9 @@ export const nativePairArmed: NativePairStatus = {
 	paired_clients: 2,
 };
 
+/** Fixed "now" for every access countdown in the stories — screenshots must not drift. */
+export const accessNowUnix = 1_755_200_000;
+
 export const pendingDevices: PendingDevice[] = [
 	{
 		id: 1,
@@ -286,16 +289,38 @@ export const pendingDevices: PendingDevice[] = [
 	},
 ];
 
+/** The expired-guest re-knock: already known, stored as Controller only · 4 h (now past). */
+export const pendingGuestReknock: PendingDevice = {
+	id: 3,
+	name: "leons-deck",
+	fingerprint:
+		"0011223344556677889900aabbccddeeff102030405060708090a0b0c0d0e0f0",
+	age_secs: 12,
+	access_level: "controller",
+	grants: 0x01,
+	granted_unix: accessNowUnix - 6 * 3600,
+	expires_unix: accessNowUnix - 2 * 3600,
+};
+
 export const nativeClients: NativeClient[] = [
 	{
 		name: "enricos-macbook",
 		fingerprint:
 			"a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00",
+		access_level: "full",
+		grants: 0x3f,
+		granted_unix: accessNowUnix - 30 * 86400,
+		expires_unix: null,
 	},
 	{
 		name: "living-room-tv",
 		fingerprint:
 			"ff00eeddccbbaa998877665544332211009f8e7d6c5b4a39281706f5e4d3c2b1",
+		access_level: "controller",
+		grants: 0x01,
+		granted_unix: accessNowUnix - 2 * 3600,
+		// 1 h 58 min out — renders as the design's "Controller · 2 h left".
+		expires_unix: accessNowUnix + 7080,
 	},
 ];
 

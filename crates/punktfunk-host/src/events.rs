@@ -184,6 +184,33 @@ pub enum EventKind {
     PairingCompleted { device: DeviceRef },
     #[serde(rename = "pairing.denied")]
     PairingDenied { device: DeviceRef },
+    /// A device was granted access with an explicit operator choice — the approve dialog, the
+    /// arm window's carried choice, or any other `add_with_access(Some)` path
+    /// (design/per-client-access.md §6). A plain pairing with no choice emits only
+    /// `pairing.completed` (its access is the preserved/default record, nothing was *chosen*).
+    #[serde(rename = "access.granted")]
+    AccessGranted {
+        device: DeviceRef,
+        /// The granted mask (the `GRANT_*` bit vocabulary), reserved bits already cleared.
+        grants: u32,
+        /// Absolute expiry, host wall clock unix seconds; absent = permanent.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expires_unix: Option<i64>,
+    },
+    /// A paired device's access was edited after the fact (the console edit sheet / extend /
+    /// "expire now") — the owner's hook can say "the TV is view-only now".
+    #[serde(rename = "access.changed")]
+    AccessChanged {
+        device: DeviceRef,
+        grants: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expires_unix: Option<i64>,
+    },
+    /// A device's temporary access reached its deadline and its live session was closed — "guest
+    /// access ended". Emitted at deadline fire by the expiring session (a device with no live
+    /// session expires silently; the console row flips to "Expired" either way).
+    #[serde(rename = "access.expired")]
+    AccessExpired { device: DeviceRef },
     #[serde(rename = "display.created")]
     DisplayCreated {
         /// The virtual-display backend that minted it (`VirtualDisplay::name`).
@@ -256,6 +283,9 @@ impl EventKind {
             EventKind::PairingPending { .. } => "pairing.pending",
             EventKind::PairingCompleted { .. } => "pairing.completed",
             EventKind::PairingDenied { .. } => "pairing.denied",
+            EventKind::AccessGranted { .. } => "access.granted",
+            EventKind::AccessChanged { .. } => "access.changed",
+            EventKind::AccessExpired { .. } => "access.expired",
             EventKind::DisplayCreated { .. } => "display.created",
             EventKind::DisplayReleased { .. } => "display.released",
             EventKind::LibraryChanged { .. } => "library.changed",
@@ -288,7 +318,10 @@ impl EventKind {
             }
             EventKind::PairingPending { device }
             | EventKind::PairingCompleted { device }
-            | EventKind::PairingDenied { device } => Some(&device.name),
+            | EventKind::PairingDenied { device }
+            | EventKind::AccessGranted { device, .. }
+            | EventKind::AccessChanged { device, .. }
+            | EventKind::AccessExpired { device } => Some(&device.name),
             _ => None,
         }
     }
@@ -300,7 +333,10 @@ impl EventKind {
             | EventKind::ClientDisconnected { client, .. } => client.fingerprint.as_deref(),
             EventKind::PairingPending { device }
             | EventKind::PairingCompleted { device }
-            | EventKind::PairingDenied { device } => Some(&device.fingerprint),
+            | EventKind::PairingDenied { device }
+            | EventKind::AccessGranted { device, .. }
+            | EventKind::AccessChanged { device, .. }
+            | EventKind::AccessExpired { device } => Some(&device.fingerprint),
             _ => None,
         }
     }
@@ -318,7 +354,10 @@ impl EventKind {
             }
             EventKind::PairingPending { device }
             | EventKind::PairingCompleted { device }
-            | EventKind::PairingDenied { device } => Some(device.plane),
+            | EventKind::PairingDenied { device }
+            | EventKind::AccessGranted { device, .. }
+            | EventKind::AccessChanged { device, .. }
+            | EventKind::AccessExpired { device } => Some(device.plane),
             _ => None,
         }
     }
@@ -633,6 +672,55 @@ mod tests {
             serde_json::to_string(&ev).unwrap(),
             r#"{"seq":6,"ts_ms":1700000000000,"schema":1,"kind":"game.exited","game":{"title":"Big Picture","client":"","plane":"gamestream"},"reason":"terminated"}"#
         );
+    }
+
+    /// The `access.*` wire shapes (per-client access, design §6): additive-only like the rest of
+    /// the catalog, and reachable by the same hook/SSE filters (`access.*`).
+    #[test]
+    fn access_event_wire_shapes_and_filters() {
+        let device = DeviceRef {
+            name: "Guest Deck".into(),
+            fingerprint: "ab12".into(),
+            plane: Plane::Native,
+        };
+        let ev = HostEvent {
+            seq: 8,
+            ts_ms: 1_700_000_000_000,
+            schema: 1,
+            kind: EventKind::AccessGranted {
+                device: device.clone(),
+                grants: 1, // GRANT_GAMEPAD — controller-only
+                expires_unix: Some(1_700_000_400),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            r#"{"seq":8,"ts_ms":1700000000000,"schema":1,"kind":"access.granted","device":{"name":"Guest Deck","fingerprint":"ab12","plane":"native"},"grants":1,"expires_unix":1700000400}"#
+        );
+
+        // A permanent grant omits the expiry (not nulled) — the optional-field convention.
+        let ev = HostEvent {
+            seq: 9,
+            ts_ms: 1_700_000_000_000,
+            schema: 1,
+            kind: EventKind::AccessChanged {
+                device: device.clone(),
+                grants: 63,
+                expires_unix: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            r#"{"seq":9,"ts_ms":1700000000000,"schema":1,"kind":"access.changed","device":{"name":"Guest Deck","fingerprint":"ab12","plane":"native"},"grants":63}"#
+        );
+
+        let expired = EventKind::AccessExpired { device };
+        assert_eq!(expired.name(), "access.expired");
+        assert!(kind_matches("access.*", expired.name()));
+        assert!(!kind_matches("pairing.*", expired.name()));
+        assert_eq!(expired.client_name(), Some("Guest Deck"));
+        assert_eq!(expired.fingerprint(), Some("ab12"));
+        assert_eq!(expired.plane(), Some(Plane::Native));
     }
 
     /// The `game.*` events must be reachable by the same hook/SSE filters as every other kind — a

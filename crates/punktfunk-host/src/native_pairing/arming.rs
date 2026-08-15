@@ -19,6 +19,11 @@ struct Armed {
     pin: Option<String>,
     expires_at: Option<Instant>,
     bound_fp: Option<String>,
+    /// The operator's access choice for whichever device completes this window's ceremony
+    /// (design §5.7 — the arm dialog is an authorized grant path). `None` = no choice made
+    /// (the full/permanent default). Wiped with the rest of the window on disarm/expiry, so
+    /// the ceremony must read it BEFORE consuming the single-use PIN.
+    access: Option<super::Access>,
 }
 
 /// The result of resolving the armed PIN for a specific client fingerprint
@@ -56,6 +61,7 @@ impl ArmState {
                 pin: Some(fixed_pin.unwrap_or_else(random_pin)),
                 expires_at: None,
                 bound_fp: None,
+                access: None,
             }
         } else {
             Armed::default()
@@ -67,15 +73,31 @@ impl ArmState {
 
     /// Arm pairing with a fresh random PIN, valid for `ttl`. If `bound_fp` is `Some`, the window is
     /// bound to that device fingerprint: only a pairing attempt from it consumes the window, so an
-    /// unrelated (attacker) fingerprint can neither pair nor burn the window (#9). Returns the PIN.
-    pub(super) fn arm_for(&self, ttl: Duration, bound_fp: Option<String>) -> String {
+    /// unrelated (attacker) fingerprint can neither pair nor burn the window (#9). `access` is
+    /// the operator's choice for whichever device completes this window's ceremony (`None` =
+    /// the full/permanent default). Returns the PIN.
+    pub(super) fn arm_for(
+        &self,
+        ttl: Duration,
+        bound_fp: Option<String>,
+        access: Option<super::Access>,
+    ) -> String {
         let pin = random_pin();
         *self.arm.lock().unwrap() = Armed {
             pin: Some(pin.clone()),
             expires_at: Some(Instant::now() + ttl),
             bound_fp,
+            access,
         };
         pin
+    }
+
+    /// The access choice the current window carries (`None` when disarmed/expired or armed
+    /// without one). Read by the ceremony BEFORE it consumes the window — disarm wipes it.
+    pub(super) fn armed_access(&self) -> Option<super::Access> {
+        let mut arm = self.arm.lock().unwrap();
+        Self::expire(&mut arm);
+        arm.access
     }
 
     /// Resolve the PIN for an attempt from `client_fp_hex`, honoring fingerprint binding (#9):

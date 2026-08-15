@@ -50,6 +50,12 @@ struct Drawn {
     height: u32,
     stats: Option<String>,
     hint: Option<String>,
+    /// The access chip's text ("Controller only · ends in 1 h 58 m"). Its countdown moves
+    /// once a minute, which is exactly one damage redraw a minute — a steady chip costs
+    /// nothing per frame.
+    access: Option<String>,
+    /// The transient access toast (holds the hint pill's slot while up).
+    notice: Option<String>,
     /// The mic-mute badge is up. Part of the damage key like everything else here — the badge
     /// is static once drawn, so a muted stream still re-renders nothing per frame.
     mic_muted: bool,
@@ -465,6 +471,8 @@ impl Overlay for SkiaOverlay {
         let resize_step = resize_phase.map_or(0, |p| (p * 120.0) as u16 + 1);
         if ctx.stats.is_none()
             && ctx.hint.is_none()
+            && ctx.access.is_none()
+            && ctx.notice.is_none()
             && !ctx.mic_muted
             && banner_step == 0
             && resize_step == 0
@@ -480,6 +488,8 @@ impl Overlay for SkiaOverlay {
             height: ctx.height,
             stats: ctx.stats.map(str::to_owned),
             hint: ctx.hint.map(str::to_owned),
+            access: ctx.access.map(str::to_owned),
+            notice: ctx.notice.map(str::to_owned),
             mic_muted: ctx.mic_muted,
             scale_pct: (scale * 100.0).round() as u16,
             banner_step,
@@ -521,7 +531,17 @@ impl Overlay for SkiaOverlay {
         if want.mic_muted {
             draw_mic_muted_badge(canvas, font, ctx.width, scale);
         }
-        if let Some(hint) = &want.hint {
+        // The access chip shares the top-right corner (same tier-independence argument as
+        // the badge — "what may this session do" must survive the stats overlay being
+        // Off), stacking under the badge when both are up.
+        if let Some(access) = &want.access {
+            draw_access_chip(canvas, font, access, ctx.width, want.mic_muted, scale);
+        }
+        // The access toast outranks the capture hint for its few seconds — an "Access
+        // ends in 1 m" must not lose the slot to "click to capture".
+        if let Some(notice) = &want.notice {
+            draw_hint_pill(canvas, font, notice, ctx.width, ctx.height, 1.0, scale);
+        } else if let Some(hint) = &want.hint {
             draw_hint_pill(canvas, font, hint, ctx.width, ctx.height, 1.0, scale);
         } else if banner_step > 0 {
             // The start banner: the leave/stats shortcuts, fading out on its own —
@@ -782,6 +802,48 @@ fn draw_mic_muted_badge(canvas: &Canvas, base_font: &Font, width: u32, scale: f3
             x + pad_x + 2.0 * dot_r + dot_gap,
             y + pad_y - metrics.ascent,
         ),
+        font,
+        &Paint::new(Color4f::new(1.0, 1.0, 1.0, 0.92), None),
+    );
+}
+
+/// The access chip (per-client access §7 "say what this session is"): the session's
+/// derived preset label and its countdown — "Controller only · ends in 1 h 58 m" — on the
+/// same translucent pill as the rest of the chrome, pinned to the TOP-RIGHT corner and
+/// stacked under the mic badge when both are up.
+///
+/// Standing by design, like the badge and unlike the toasts: "why does my keyboard do
+/// nothing" and "when does my access end" must be answerable ten minutes in, at every
+/// stats tier including Off. Never drawn for a full-control permanent session — the run
+/// loop passes `None` and today's default look stays untouched.
+fn draw_access_chip(
+    canvas: &Canvas,
+    base_font: &Font,
+    text: &str,
+    width: u32,
+    below_badge: bool,
+    scale: f32,
+) {
+    // Short line (label + countdown) — fits any window the stream runs in.
+    let font = &chrome_font(base_font, scale);
+    let (_, metrics) = font.metrics();
+    let line_h = metrics.descent - metrics.ascent;
+    let (pad_x, pad_y) = (base::PILL_PAD_X * scale, base::PILL_PAD_Y * scale);
+    let text_w = font.measure_str(text, None).0;
+    let w = text_w + 2.0 * pad_x;
+    let h = line_h + 2.0 * pad_y;
+    let margin = base::OSD_MARGIN * scale;
+    // One row down when the mic badge holds the corner (its height is the same formula,
+    // sans dot — the dot fits inside the shared line height).
+    let y = margin + if below_badge { h + 8.0 * scale } else { 0.0 };
+    let x = width as f32 - w - margin;
+    canvas.draw_rrect(
+        RRect::new_rect_xy(Rect::from_xywh(x, y, w, h), h / 2.0, h / 2.0),
+        &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.62), None),
+    );
+    canvas.draw_str(
+        text,
+        Point::new(x + pad_x, y + pad_y - metrics.ascent),
         font,
         &Paint::new(Color4f::new(1.0, 1.0, 1.0, 0.92), None),
     );

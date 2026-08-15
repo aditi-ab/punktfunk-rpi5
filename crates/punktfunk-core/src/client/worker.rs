@@ -90,6 +90,23 @@ pub(crate) struct WorkerArgs {
     /// The live encoder-target mirror (see [`NativeClient::live_bitrate_kbps`]): the worker seeds
     /// it from the Welcome; the control task updates it on every `BitrateChanged` ack.
     pub(crate) live_bitrate: Arc<AtomicU32>,
+    /// The session's LIVE access grants (see [`NativeClient::access_grants`]): seeded from the
+    /// Welcome advert; every [`crate::quic::AccessUpdate`] moves it (latest wins, per design).
+    pub(crate) access_grants: Arc<AtomicU32>,
+    /// The live access deadline as client wall clock, unix seconds; `0` = permanent. Seeded
+    /// from the Welcome's `expires_in_secs`, re-anchored by every `AccessUpdate` — see
+    /// [`NativeClient::access_deadline_unix`].
+    pub(crate) access_deadline_unix: Arc<AtomicU64>,
+    /// Inbound access updates → the embedder's event plane
+    /// ([`NativeClient::next_access_update`]), pushed by the control task AFTER it folded the
+    /// update into the two live slots above.
+    pub(crate) access_tx: SyncSender<crate::quic::AccessUpdate>,
+    /// The typed close code a MID-SESSION end carried, when it is one of the shared
+    /// [`crate::reject::RejectReason`] vocabulary; `0` = none. Latched by the worker's
+    /// close watch beside `end_reason`, so an access-expiry close (0x69) can render its
+    /// real sentence instead of the generic host-error one — see
+    /// [`NativeClient::end_reject`].
+    pub(crate) end_reject_code: Arc<AtomicU32>,
 }
 
 /// The worker: QUIC handshake, then the input/datagram/control tasks + the blocking

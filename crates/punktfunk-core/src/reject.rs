@@ -39,6 +39,15 @@ pub const WIRE_VERSION_CLOSE_CODE: u32 = 0x67;
 /// code, a setup failure reached the client as a bare dropped connection ("control stream
 /// finished mid-frame") — indistinguishable from transport trouble.
 pub const SETUP_FAILED_CLOSE_CODE: u32 = 0x68;
+/// This device's temporary access ran out (per-client access, `design/per-client-access.md` §4)
+/// — sent when the deadline fires mid-session, and by "Expire now" in the console. Only the
+/// expiring device's sessions close with it; a reconnect lands in the console's pending list
+/// for a one-click re-grant.
+pub const ACCESS_EXPIRED_CLOSE_CODE: u32 = 0x69;
+/// The `Hello.launch` request named a game this device's grants don't cover (no `LAUNCH` bit).
+/// Refused AT the handshake — a crisp typed reason beats silently dropping the user onto a
+/// bare desktop they didn't ask for. Connecting *without* a launch request still works.
+pub const LAUNCH_NOT_PERMITTED_CLOSE_CODE: u32 = 0x6A;
 
 /// Why a host turned a connection away, decoded from the QUIC application close code — the
 /// client-side view of [`PAIR_NOT_ARMED_CLOSE_CODE`]..[`WIRE_VERSION_CLOSE_CODE`] plus
@@ -68,6 +77,10 @@ pub enum RejectReason {
     /// The host admitted the connection but failed to start the stream session (host-side
     /// setup error — the host log has the specific cause).
     SetupFailed,
+    /// This device's temporary access to the host has expired (per-client access).
+    AccessExpired,
+    /// This device's grants don't include launching games (the `LAUNCH` bit is clear).
+    LaunchNotPermitted,
 }
 
 impl RejectReason {
@@ -85,6 +98,8 @@ impl RejectReason {
             WIRE_VERSION_CLOSE_CODE => Self::WireVersionMismatch,
             REJECT_BUSY_CLOSE_CODE => Self::Busy,
             SETUP_FAILED_CLOSE_CODE => Self::SetupFailed,
+            ACCESS_EXPIRED_CLOSE_CODE => Self::AccessExpired,
+            LAUNCH_NOT_PERMITTED_CLOSE_CODE => Self::LaunchNotPermitted,
             _ => return None,
         })
     }
@@ -102,6 +117,8 @@ impl RejectReason {
             Self::WireVersionMismatch => WIRE_VERSION_CLOSE_CODE,
             Self::Busy => REJECT_BUSY_CLOSE_CODE,
             Self::SetupFailed => SETUP_FAILED_CLOSE_CODE,
+            Self::AccessExpired => ACCESS_EXPIRED_CLOSE_CODE,
+            Self::LaunchNotPermitted => LAUNCH_NOT_PERMITTED_CLOSE_CODE,
         }
     }
 
@@ -119,6 +136,8 @@ impl RejectReason {
             Self::WireVersionMismatch => "wire-version",
             Self::Busy => "busy",
             Self::SetupFailed => "setup-failed",
+            Self::AccessExpired => "access-expired",
+            Self::LaunchNotPermitted => "launch-not-permitted",
         }
     }
 }
@@ -138,6 +157,8 @@ impl std::fmt::Display for RejectReason {
             Self::WireVersionMismatch => "client and host versions do not match",
             Self::Busy => "the host is busy with another session",
             Self::SetupFailed => "the host could not start the stream session",
+            Self::AccessExpired => "your access to this host has expired",
+            Self::LaunchNotPermitted => "this device is not permitted to launch games on the host",
         })
     }
 }
@@ -146,7 +167,7 @@ impl std::fmt::Display for RejectReason {
 mod tests {
     use super::*;
 
-    const ALL: [RejectReason; 10] = [
+    const ALL: [RejectReason; 12] = [
         RejectReason::PairingNotArmed,
         RejectReason::PairingBoundToOtherDevice,
         RejectReason::PairingRateLimited,
@@ -157,6 +178,8 @@ mod tests {
         RejectReason::WireVersionMismatch,
         RejectReason::Busy,
         RejectReason::SetupFailed,
+        RejectReason::AccessExpired,
+        RejectReason::LaunchNotPermitted,
     ];
 
     #[test]
@@ -177,8 +200,9 @@ mod tests {
     #[test]
     fn foreign_codes_stay_untyped() {
         // Bare closes, the client's own pair-done codes, and the deliberate-end codes must
-        // never read as a host rejection.
-        for code in [0u32, 1, 0x41, 0x51, 0x52, 0x5f, 0x69, u32::MAX] {
+        // never read as a host rejection. (0x69/0x6A left this list when they became the
+        // access-expired / launch-not-permitted codes; 0x6B is the block's next free id.)
+        for code in [0u32, 1, 0x41, 0x51, 0x52, 0x5f, 0x6B, 0x70, u32::MAX] {
             assert_eq!(RejectReason::from_close_code(code), None);
         }
     }

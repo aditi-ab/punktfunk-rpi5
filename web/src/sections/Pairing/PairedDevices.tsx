@@ -1,18 +1,20 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
-import { Trash2 } from "lucide-react";
-import type { FC } from "react";
+import { SlidersHorizontal, Trash2 } from "lucide-react";
+import { type FC, useState } from "react";
 import {
 	getListPairedClientsQueryKey,
 	useListPairedClients,
 	useUnpairAllClients,
 	useUnpairClient,
 } from "@/api/gen/clients/clients";
+import type { UpdateNativeAccess } from "@/api/gen/model/updateNativeAccess";
 import {
 	getListNativeClientsQueryKey,
 	useListNativeClients,
 	useUnpairAllNativeClients,
 	useUnpairNativeClient,
+	useUpdateNativeClientAccess,
 } from "@/api/gen/native/native";
 import { useDialogs } from "@/components/dialogs";
 import { QueryState } from "@/components/query-state";
@@ -28,6 +30,8 @@ import {
 	TableRow,
 } from "@/components/ui/table";
 import { m } from "@/paraglide/messages";
+import { AccessChip, useNowUnix } from "./access";
+import { EditAccessSheet, type EditAccessTarget } from "./EditAccessSheet";
 
 /** The two pairing protocols a device can be paired over. */
 export type PairedProtocol = "native" | "moonlight";
@@ -38,7 +42,23 @@ export interface PairedRow {
 	fingerprint: string;
 	/** Native devices carry a name; Moonlight clients carry a cert subject; either may be empty. */
 	name: string;
+	/**
+	 * Access fields — native rows only, and only from hosts that have them (the console pairs
+	 * against older hosts: all four stay `undefined` then, and the Access column shows "—").
+	 * `access_level` is the presence sentinel — a current host always derives it for a
+	 * NativeClient, so its absence means the host predates per-client access.
+	 */
+	accessLevel?: string | null;
+	/** Grant bitmask; `null` = a pre-grants record = full control. */
+	grants?: number | null;
+	/** Absolute expiry (unix secs); `null` = permanent. "Expired" is our arithmetic. */
+	expiresUnix?: number | null;
 }
+
+/** Whether the host reported access fields for this row (⇒ the chip and editor exist). */
+const hasAccess = (r: PairedRow): boolean =>
+	r.protocol === "native" &&
+	(r.accessLevel != null || r.grants != null || r.expiresUnix != null);
 
 /**
  * Container: ALL paired devices in one list. Merges the native (punktfunk/1) clients and the
@@ -54,6 +74,13 @@ export const PairedDevicesSection: FC = () => {
 	const unpairMoonlight = useUnpairClient();
 	const unpairAllNative = useUnpairAllNativeClients();
 	const unpairAllMoonlight = useUnpairAllClients();
+	const patchAccess = useUpdateNativeClientAccess();
+	// One clock for every countdown in the card AND the sheet — recomputed client-side from
+	// `expires_unix`, so the tick never refetches anything.
+	const nowUnix = useNowUnix();
+	// The row whose access is being edited — a snapshot, so a background refetch can't yank the
+	// form out from under the operator.
+	const [editing, setEditing] = useState<EditAccessTarget | null>(null);
 
 	const rows: PairedRow[] = [
 		...(native.data ?? []).map(
@@ -61,6 +88,9 @@ export const PairedDevicesSection: FC = () => {
 				protocol: "native",
 				fingerprint: c.fingerprint,
 				name: c.name,
+				accessLevel: c.access_level,
+				grants: c.grants,
+				expiresUnix: c.expires_unix,
 			}),
 		),
 		...(moonlight.data ?? []).map(
@@ -97,6 +127,27 @@ export const PairedDevicesSection: FC = () => {
 				},
 			);
 		}
+	};
+
+	const savedAccess = () => {
+		setEditing(null);
+		qc.invalidateQueries({ queryKey: getListNativeClientsQueryKey() });
+	};
+	const onSaveAccess = (fingerprint: string, body: UpdateNativeAccess) =>
+		patchAccess.mutate(
+			{ fingerprint, data: body },
+			{
+				onSuccess: savedAccess,
+				onError: () => toast.error(m.access_edit_failed()),
+			},
+		);
+	// "Expire now" = the same partial PATCH with a zero relative expiry — cuts live sessions
+	// from this device with the typed AccessExpired close; the row stays listed as "Expired".
+	const onExpireNow = (fingerprint: string) =>
+		onSaveAccess(fingerprint, { expires_in_secs: 0 });
+	const onRemoveFromSheet = (fingerprint: string) => {
+		setEditing(null);
+		void onUnpair("native", fingerprint);
 	};
 
 	/**
@@ -149,19 +200,39 @@ export const PairedDevicesSection: FC = () => {
 		unpairAllNative.isPending || unpairAllMoonlight.isPending;
 
 	return (
-		<PairedDevices
-			rows={rows}
-			isLoading={native.isLoading || moonlight.isLoading}
-			error={native.error ?? moonlight.error}
-			refetch={() => {
-				native.refetch();
-				moonlight.refetch();
-			}}
-			onUnpair={onUnpair}
-			onUnpairAll={onUnpairAll}
-			pendingFingerprint={pendingFingerprint}
-			isUnpairingAll={isUnpairingAll}
-		/>
+		<>
+			<PairedDevices
+				rows={rows}
+				isLoading={native.isLoading || moonlight.isLoading}
+				error={native.error ?? moonlight.error}
+				refetch={() => {
+					native.refetch();
+					moonlight.refetch();
+				}}
+				nowUnix={nowUnix}
+				onEditAccess={(r) =>
+					setEditing({
+						fingerprint: r.fingerprint,
+						name: r.name,
+						grants: r.grants,
+						expiresUnix: r.expiresUnix,
+					})
+				}
+				onUnpair={onUnpair}
+				onUnpairAll={onUnpairAll}
+				pendingFingerprint={pendingFingerprint}
+				isUnpairingAll={isUnpairingAll}
+			/>
+			<EditAccessSheet
+				target={editing}
+				nowUnix={nowUnix}
+				onCancel={() => setEditing(null)}
+				onSave={onSaveAccess}
+				onExpireNow={onExpireNow}
+				onRemove={onRemoveFromSheet}
+				isPending={patchAccess.isPending}
+			/>
+		</>
 	);
 };
 
@@ -171,6 +242,10 @@ export const PairedDevices: FC<{
 	isLoading: boolean;
 	error: unknown;
 	refetch: () => void;
+	/** Wall clock (unix secs) for the countdown chips — ONE ticking value for the whole table. */
+	nowUnix: number;
+	/** Open the access editor for a native row (only offered where `hasAccess`). */
+	onEditAccess: (row: PairedRow) => void;
 	onUnpair: (protocol: PairedProtocol, fingerprint: string) => void;
 	/** Unpair every row, behind one confirmation. */
 	onUnpairAll: () => void;
@@ -183,6 +258,8 @@ export const PairedDevices: FC<{
 	isLoading,
 	error,
 	refetch,
+	nowUnix,
+	onEditAccess,
 	onUnpair,
 	onUnpairAll,
 	pendingFingerprint,
@@ -217,8 +294,9 @@ export const PairedDevices: FC<{
 							<TableRow>
 								<TableHead>{m.clients_name()}</TableHead>
 								<TableHead>{m.pairing_protocol()}</TableHead>
+								<TableHead>{m.pairing_access()}</TableHead>
 								<TableHead>{m.clients_fingerprint()}</TableHead>
-								<TableHead className="w-12" />
+								<TableHead className="w-20" />
 							</TableRow>
 						</TableHeader>
 						<TableBody>
@@ -236,21 +314,61 @@ export const PairedDevices: FC<{
 												: m.pairing_protocol_moonlight()}
 										</Badge>
 									</TableCell>
+									<TableCell>
+										{r.protocol === "moonlight" ? (
+											// Honest: the GameStream plane isn't governed by grants
+											// (yet) — a Moonlight device has full control, and this
+											// chip says so instead of offering a fake editor.
+											<Badge
+												variant="outline"
+												className="whitespace-nowrap text-muted-foreground"
+											>
+												{m.access_ungoverned()}
+											</Badge>
+										) : hasAccess(r) ? (
+											<AccessChip
+												grants={r.grants}
+												expiresUnix={r.expiresUnix}
+												nowUnix={nowUnix}
+											/>
+										) : (
+											// A host older than per-client access reports nothing —
+											// say nothing rather than guessing.
+											<span className="text-muted-foreground">—</span>
+										)}
+									</TableCell>
 									<TableCell className="font-mono text-xs text-muted-foreground">
 										{r.fingerprint.slice(0, 16)}…
 									</TableCell>
 									<TableCell>
-										<Button
-											variant="ghost"
-											size="icon"
-											aria-label={m.action_unpair()}
-											disabled={
-												isUnpairingAll || pendingFingerprint === r.fingerprint
-											}
-											onClick={() => onUnpair(r.protocol, r.fingerprint)}
-										>
-											<Trash2 className="size-4 text-destructive" />
-										</Button>
+										<div className="flex justify-end">
+											{hasAccess(r) && (
+												<Button
+													variant="ghost"
+													size="icon"
+													aria-label={m.access_edit_title()}
+													disabled={
+														isUnpairingAll ||
+														pendingFingerprint === r.fingerprint
+													}
+													onClick={() => onEditAccess(r)}
+												>
+													<SlidersHorizontal className="size-4" />
+												</Button>
+											)}
+											<Button
+												variant="ghost"
+												size="icon"
+												aria-label={m.action_unpair()}
+												disabled={
+													isUnpairingAll ||
+													pendingFingerprint === r.fingerprint
+												}
+												onClick={() => onUnpair(r.protocol, r.fingerprint)}
+											>
+												<Trash2 className="size-4 text-destructive" />
+											</Button>
+										</div>
 									</TableCell>
 								</TableRow>
 							))}

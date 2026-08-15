@@ -124,7 +124,20 @@
 // widened one: `ex9` keeps its parameter list AND its behaviour — it passes a null name, which
 // selects that same default. Additive and client-local: the name rides the `Hello::name` field
 // hosts have read since the pending list existed, so [`WIRE_VERSION`] is unchanged.
-#define PUNKTFUNK_ABI_VERSION 21
+// v22: the per-client access surface (`design/per-client-access.md` §7) —
+// `punktfunk_connection_grants` and `punktfunk_connection_access_expires_in` read the session's
+// LIVE access state (the `PUNKTFUNK_GRANT_*` mask and the countdown to its expiry — Welcome
+// snapshot first, then latest-wins over every mid-session `AccessUpdate` the control task
+// folds in), and `punktfunk_connection_end_reject` reports the typed rejection a mid-session
+// close carried (`PUNKTFUNK_STATUS_REJECTED_*`; `0` = none), because `end_reason` can only
+// file an access-expiry close under HOST_ERROR and that is the wrong sentence for "your
+// access expired". NEW symbols, not widened ones — the same rule v18 states: every existing
+// function keeps its signature and behaviour, and an embedder that never adopts any of the
+// three is unchanged (it simply lacks the courtesy UX; the HOST enforces the grants either
+// way). Additive and client-local: the mask, the expiry and the `AccessUpdate` message all
+// shipped with the Welcome's trailing-field append (old peers skip them in both directions),
+// so [`WIRE_VERSION`] is unchanged.
+#define PUNKTFUNK_ABI_VERSION 22
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -650,6 +663,68 @@
 #define PUNKTFUNK_MIN_STREAM_BLOCK_SHARDS 16
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Controller input: gamepad button/axis/snapshot/remove/arrival events, plus everything that
+// rides with a pad — rich DualSense input (0xCC motion/touchpad), pad-audio, rumble return,
+// and virtual-pad creation itself (deny-at-setup: no bit, no uinput node).
+#define PUNKTFUNK_GRANT_GAMEPAD (1 << 0)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Pointing input: mouse rel/abs + buttons, scroll, touch, and the pen plane.
+#define PUNKTFUNK_GRANT_POINTER (1 << 1)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Key input: key down/up and IME-committed text.
+#define PUNKTFUNK_GRANT_KEYBOARD (1 << 2)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Shared clipboard — ANDed into the operator clipboard policy, never overriding it.
+#define PUNKTFUNK_GRANT_CLIPBOARD (1 << 3)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Mic injection: the mic datagram plane + the per-session mic-service attach.
+#define PUNKTFUNK_GRANT_MIC (1 << 4)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Library launch: `Hello.launch` resolution (and any future in-session launch/end verbs).
+#define PUNKTFUNK_GRANT_LAUNCH (1 << 5)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Every defined grant. Also the value an *absent* mask means — a record from before grants
+// existed (or an old host's Welcome that omits the field) is full control, so existing
+// pairings keep today's behavior.
+#define PUNKTFUNK_GRANT_ALL (((((PUNKTFUNK_GRANT_GAMEPAD | PUNKTFUNK_GRANT_POINTER) | PUNKTFUNK_GRANT_KEYBOARD) | PUNKTFUNK_GRANT_CLIPBOARD) | PUNKTFUNK_GRANT_MIC) | PUNKTFUNK_GRANT_LAUNCH)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The reserved-must-be-zero region: a mask with any of these bits set is invalid today and is
+// rejected at the management API (never silently cleared — the caller meant *something* this
+// host doesn't understand, and clearing would grant less than they asked for without saying so).
+#define PUNKTFUNK_GRANT_RESERVED ~PUNKTFUNK_GRANT_ALL
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Preset: **Full control** — all bits; today's behavior and the default for absent grants.
+#define PUNKTFUNK_GRANT_PRESET_FULL PUNKTFUNK_GRANT_ALL
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Preset: **Controller only** — the guest/co-play preset. Deliberately excludes `LAUNCH`
+// (design §11 D2: in co-play the owner drives what runs).
+#define PUNKTFUNK_GRANT_PRESET_CONTROLLER_ONLY PUNKTFUNK_GRANT_GAMEPAD
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Preset: **View only** — spectator; sees and hears the stream, sends nothing.
+#define PUNKTFUNK_GRANT_PRESET_VIEW_ONLY 0
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) HEVC stream.
 #define PUNKTFUNK_VIDEO_CAP_10BIT 1
 #endif
@@ -1105,6 +1180,14 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`ClipState::reason`]: the operator policy allows clipboard, but THIS device's access grants
+// don't (`GRANT_CLIPBOARD` unbit — design/per-client-access.md §5.4). Distinct from
+// [`CLIP_REASON_POLICY_DISABLED`] so the client can say "not permitted for this device" instead
+// of "the host has clipboard off".
+#define PUNKTFUNK_CLIP_REASON_NOT_PERMITTED 5
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // [`ClipFetchHdr::status`]: the requested format is being served; data chunks follow until FIN.
 #define PUNKTFUNK_CLIP_FETCH_OK 0
 #endif
@@ -1160,6 +1243,14 @@
 // real cursors (typically ≤ 64 px, ≤ 96 px at HiDPI scale); the HOST downscales anything
 // larger before forwarding, so the cap is invisible to clients.
 #define PUNKTFUNK_CURSOR_SHAPE_MAX_SIDE 120
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`AccessUpdate`] (host → client): the session's effective grants or remaining
+// lifetime changed. 0x58: the 0x50 block belongs to the cursor channel (0x50/0x51 taken),
+// so access sits at its top, clear of both the clipboard block (0x40-0x44) and any further
+// cursor growth.
+#define PUNKTFUNK_MSG_ACCESS_UPDATE 88
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1568,6 +1659,17 @@
 // finished mid-frame") — indistinguishable from transport trouble.
 #define PUNKTFUNK_SETUP_FAILED_CLOSE_CODE 104
 
+// This device's temporary access ran out (per-client access, `design/per-client-access.md` §4)
+// — sent when the deadline fires mid-session, and by "Expire now" in the console. Only the
+// expiring device's sessions close with it; a reconnect lands in the console's pending list
+// for a one-click re-grant.
+#define PUNKTFUNK_ACCESS_EXPIRED_CLOSE_CODE 105
+
+// The `Hello.launch` request named a game this device's grants don't cover (no `LAUNCH` bit).
+// Refused AT the handshake — a crisp typed reason beats silently dropping the user onto a
+// bare desktop they didn't ask for. Connecting *without* a launch request still works.
+#define PUNKTFUNK_LAUNCH_NOT_PERMITTED_CLOSE_CODE 106
+
 // Minimum supported multiplier (renders under native, upscaled on present).
 #define PUNKTFUNK_MIN_SCALE 0.5
 
@@ -1602,6 +1704,8 @@ enum PunktfunkStatus
     PUNKTFUNK_STATUS_REJECTED_WIRE_VERSION = -27,
     PUNKTFUNK_STATUS_REJECTED_BUSY = -28,
     PUNKTFUNK_STATUS_REJECTED_SETUP_FAILED = -29,
+    PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED = -30,
+    PUNKTFUNK_STATUS_REJECTED_LAUNCH_NOT_PERMITTED = -31,
     PUNKTFUNK_STATUS_PANIC = -99,
 };
 #ifndef __cplusplus
@@ -3211,6 +3315,60 @@ PunktfunkStatus punktfunk_connection_mgmt_port(const PunktfunkConnection *c, uin
 // # Safety
 // `c` is a valid connection handle; `caps` is writable (NULL is skipped).
 PunktfunkStatus punktfunk_connection_host_caps(const PunktfunkConnection *c, uint8_t *caps);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The session's LIVE effective access grants — a `PUNKTFUNK_GRANT_*` bitmask
+// (per-client access, `design/per-client-access.md` §7): seeded from the `Welcome` advert
+// and moved by every mid-session `AccessUpdate` the host sends (latest wins), so this is
+// current state, NOT a connect-time snapshot. An old host advertises nothing and this reads
+// `PUNKTFUNK_GRANT_ALL` — full control, the pre-grants behavior, so an embedder keying UI
+// off it changes nothing there.
+//
+// Courtesy truth only: the HOST enforces the mask whatever a client renders. Use it to not
+// capture what can't land (no pointer lock / keyboard grab without the bits) and to label
+// the session ("Controller only"). Cheap (one relaxed atomic load) — poll it alongside a
+// stats tick rather than caching it for the session. Safe any time after connect.
+//
+// # Safety
+// `c` is a valid connection handle; `grants` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_grants(const PunktfunkConnection *c, uint32_t *grants);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Seconds until this session's access expires, LIVE — counted down from the `Welcome`'s
+// `expires_in_secs` and re-anchored by every mid-session `AccessUpdate`, so successive reads
+// shrink on their own (render a countdown by polling this, ~1 Hz). `0` = permanent: today's
+// default, and everything an old host's Welcome decodes to — show nothing then. The deadline
+// is anchored to the CLIENT's clock at receipt (the wire carries relative seconds), so
+// host/client skew never moves the countdown.
+//
+// While a deadline exists the value never reads `0`: in the sliver between the deadline
+// passing and the host's typed expiry close (`PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED`
+// via [`punktfunk_connection_end_reject`]) it clamps to `1`, so `0` stays unambiguous.
+// The T−5 m / T−1 m warnings are the embedder's to derive from the countdown crossing
+// those marks. Safe any time after connect.
+//
+// # Safety
+// `c` is a valid connection handle; `secs` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_access_expires_in(const PunktfunkConnection *c,
+                                                       uint32_t *secs);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The typed rejection a MID-SESSION close carried, as its `PUNKTFUNK_STATUS_REJECTED_*`
+// value (`0` = none — every ordinary end). Exists because
+// [`punktfunk_connection_end_reason`] can only file an unrecognized deliberate close under
+// `PUNKTFUNK_END_REASON_HOST_ERROR`, and "the host ended the session with an error" is the
+// wrong sentence for an access expiry (`PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED`) — the
+// case this was added for; any future typed mid-session close surfaces the same way. Ask
+// AFTER the session ended, before freeing the handle, exactly like `end_reason` (the two
+// latch together); connect-time rejections never land here — they come back from the
+// connect call itself.
+//
+// # Safety
+// `c` is a valid connection handle; `status` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_end_reject(const PunktfunkConnection *c, int32_t *status);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

@@ -349,6 +349,16 @@ struct StreamState {
     /// `None` = nothing sent yet. Edge-detected each iteration from the live mouse model, so
     /// the chord, the M3 auto-flip, and engage/release all reconcile through one path.
     sent_client_draws: Option<bool>,
+    /// The session's effective access (per-client access §7): the Welcome's advert, then
+    /// every mid-session `AccessUpdate` (latest wins). Drives the capture gating, the
+    /// overlay chip, and which held state a live edit flushes. The default — full
+    /// control, permanent, what every old host decodes to — renders today's look
+    /// unchanged: no chip, everything enabled.
+    access: pf_client_core::access::SessionAccess,
+    /// A transient access toast ("Access is now Controller only", "Access ends in 5 m")
+    /// and when it went up — cleared after [`ACCESS_NOTICE_S`]. Rides the hint-pill slot
+    /// with priority: an access change outranks "click to capture" for a few seconds.
+    access_notice: Option<(String, Instant)>,
     /// The params this session was started with, kept so a codec fallback can re-dial
     /// with `exclude_codecs` widened — see [`SessionEvent::CodecFallback`]. Cloned once
     /// per session start, so anything the SESSION changed after launch (an accepted mode
@@ -398,6 +408,8 @@ impl StreamState {
             connector: None,
             capture: None,
             cursor_chan: None,
+            access: pf_client_core::access::SessionAccess::default(),
+            access_notice: None,
             last_hint: None,
             hint_override: false,
             sent_client_draws: None,
@@ -779,7 +791,14 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     WindowEvent::FocusLost => {
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.release(false) {
-                                apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts);
+                                apply_capture(
+                                    &mut window,
+                                    &mouse,
+                                    false,
+                                    false,
+                                    inhibit_shortcuts,
+                                    0,
+                                );
                                 tracing::info!("focus lost — input released");
                             }
                         }
@@ -797,14 +816,14 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         // An auto-release (Alt-Tab) undoes itself; a chord release
                         // stays released until the user opts back in.
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
-                            if cap.should_reengage() {
-                                cap.engage();
+                            if cap.should_reengage() && cap.engage() {
                                 apply_capture(
                                     &mut window,
                                     &mouse,
                                     true,
                                     cap.desktop(),
                                     inhibit_shortcuts,
+                                    cap.grants(),
                                 );
                                 tracing::info!("focus gained — input recaptured");
                             }
@@ -864,15 +883,22 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                             if cap.captured() {
                                 cap.release(true);
-                                apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts);
-                            } else {
-                                cap.engage();
+                                apply_capture(
+                                    &mut window,
+                                    &mouse,
+                                    false,
+                                    false,
+                                    inhibit_shortcuts,
+                                    0,
+                                );
+                            } else if cap.engage() {
                                 apply_capture(
                                     &mut window,
                                     &mouse,
                                     true,
                                     cap.desktop(),
                                     inhibit_shortcuts,
+                                    cap.grants(),
                                 );
                             }
                             tracing::info!(captured = cap.captured(), "chord: release/engage");
@@ -894,6 +920,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                                 true,
                                                 desktop,
                                                 inhibit_shortcuts,
+                                                cap.grants(),
                                             );
                                         }
                                         flipped = true;
@@ -917,7 +944,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(st) = &mut stream {
                             tracing::info!("chord: disconnect");
                             st.request_quit();
-                            apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts);
+                            apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts, 0);
                             // The pump emits Ended(None); the end path routes per mode.
                         }
                         continue;
@@ -1000,15 +1027,20 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 Event::MouseButtonDown { mouse_btn, .. } => {
                     if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                         if !cap.captured() {
-                            // The engaging click is suppressed toward the host.
-                            cap.engage();
-                            apply_capture(
-                                &mut window,
-                                &mouse,
-                                true,
-                                cap.desktop(),
-                                inhibit_shortcuts,
-                            );
+                            // The engaging click is suppressed toward the host. `engage`
+                            // refuses on a session whose access covers neither pointer nor
+                            // keyboard — the click then does nothing, which is the honest
+                            // rendering of "there is nothing to capture for".
+                            if cap.engage() {
+                                apply_capture(
+                                    &mut window,
+                                    &mouse,
+                                    true,
+                                    cap.desktop(),
+                                    inhibit_shortcuts,
+                                    cap.grants(),
+                                );
+                            }
                         } else {
                             cap.on_button_down(mouse_btn);
                         }
@@ -1182,6 +1214,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 true,
                                 cap.desktop(),
                                 inhibit_shortcuts,
+                                cap.grants(),
                             );
                             if cap.desktop() {
                                 // Reappear where the host last had the pointer, so the
@@ -1225,7 +1258,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         while escape_rx.try_recv().is_ok() {
             if let Some(cap) = stream.as_mut().and_then(|s| s.capture.as_mut()) {
                 if cap.release(true) {
-                    apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts);
+                    apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts, 0);
                 }
             }
             if fullscreen && !opts.fullscreen {
@@ -1238,7 +1271,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             if let Some(st) = &mut stream {
                 tracing::info!("controller chord: disconnect");
                 st.request_quit();
-                apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts);
+                apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts, 0);
             }
         }
 
@@ -1379,15 +1412,32 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                              (relative-only input) — using capture"
                         );
                     }
+                    // The session's access truth, straight off the Welcome (the pump's
+                    // Access event lands in this same drain, but the capture below must
+                    // be built gated, not re-gated a beat later).
+                    st.access = pf_client_core::access::SessionAccess::from_connector(&c);
                     let mut cap = Capture::new(
                         c.clone(),
                         opts.touch_mode,
                         opts.invert_scroll,
                         opts.mouse_mode,
                         abs_ok,
+                        st.access.grants,
                     );
-                    cap.engage(); // capture engages when the stream starts (ui_stream parity)
-                    apply_capture(&mut window, &mouse, true, cap.desktop(), inhibit_shortcuts);
+                    // Capture engages when the stream starts (ui_stream parity) — unless
+                    // this session's access covers neither pointer nor keyboard (view-only
+                    // / controller-only), where `engage` refuses and the pointer stays
+                    // free over the stream (§7 "not capture what can't land").
+                    if cap.engage() {
+                        apply_capture(
+                            &mut window,
+                            &mouse,
+                            true,
+                            cap.desktop(),
+                            inhibit_shortcuts,
+                            cap.grants(),
+                        );
+                    }
                     st.capture = Some(cap);
                     st.cursor_chan = Some(crate::cursor::CursorChannel::new(&c));
                     // Read the mgmt port BEFORE `c` is moved into `st` — the Welcome's answer to
@@ -1430,6 +1480,44 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     }
                     st.last_stats = Some(s);
                 }
+                // The session's access — the Welcome's advert first, then every
+                // mid-session AccessUpdate (design §7). Re-gate the live capture to the
+                // new mask: a removed POINTER/KEYBOARD bit releases the pointer lock /
+                // keyboard grab it backed, and with neither class left the capture drops
+                // entirely (auto-release, so a later re-grant re-engages on click).
+                // Courtesy chrome — the host enforces the mask regardless.
+                SessionEvent::Access { access, notice } => {
+                    st.access = access;
+                    if let Some(n) = notice {
+                        tracing::info!(notice = %n, "session access changed");
+                        st.access_notice = Some((n, Instant::now()));
+                    }
+                    if let Some(cap) = st.capture.as_mut() {
+                        cap.set_grants(access.grants);
+                        if cap.captured() {
+                            if cap.can_capture() {
+                                apply_capture(
+                                    &mut window,
+                                    &mouse,
+                                    true,
+                                    cap.desktop(),
+                                    inhibit_shortcuts,
+                                    cap.grants(),
+                                );
+                            } else {
+                                cap.release(false);
+                                apply_capture(
+                                    &mut window,
+                                    &mouse,
+                                    false,
+                                    false,
+                                    inhibit_shortcuts,
+                                    0,
+                                );
+                            }
+                        }
+                    }
+                }
                 SessionEvent::Failed {
                     msg,
                     trust_rejected,
@@ -1446,7 +1534,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         if let Some(st) = stream.take() {
                             st.shutdown();
                         }
-                        apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts);
+                        apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts, 0);
                         if let Some(o) = overlay.as_mut() {
                             // A user-canceled dial ends silently — no error scene.
                             if canceled {
@@ -1463,7 +1551,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     if let Some(cap) = &mut st.capture {
                         cap.release(true);
                     }
-                    apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts);
+                    apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts, 0);
                     match &mode {
                         ModeCtl::Single(_) => break 'main Some(Outcome::Ended(reason)),
                         ModeCtl::Browse(_) => {
@@ -1512,7 +1600,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     if let Some(cap) = &mut st.capture {
                         cap.release(true);
                     }
-                    apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts);
+                    apply_capture(&mut window, &mouse, false, false, inhibit_shortcuts, 0);
                     // Widen the exclusion rather than replace it: a second fallback in the
                     // same run must not re-offer what the first one already ruled out.
                     let mut params = st.params.clone();
@@ -1608,17 +1696,32 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             st.resize_overlay.tick(Instant::now());
         }
 
+        // Access toast expiry — before the overlay borrows the stream immutably.
+        if let Some(st) = stream.as_mut() {
+            if st
+                .access_notice
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(ACCESS_NOTICE_S))
+            {
+                st.access_notice = None;
+            }
+        }
+
         // --- Console UI: damage-driven overlay re-render for this iteration --------------
         if let Some(o) = overlay.as_mut() {
             let (pw, ph) = window.size_in_pixels();
             let (stats, hint) = match &stream {
                 Some(st) if st.connector.is_some() => {
+                    // No "click to capture" over a session with nothing to capture FOR
+                    // (view-only / controller-only — the chip says what this session is).
                     let hint = match &st.capture {
-                        Some(cap) if !cap.captured() => Some(if gamepad.active().is_some() {
-                            HINT_WITH_PAD
-                        } else {
-                            HINT_KEYBOARD
-                        }),
+                        Some(cap) if !cap.captured() && cap.can_capture() => {
+                            Some(if gamepad.active().is_some() {
+                                HINT_WITH_PAD
+                            } else {
+                                HINT_KEYBOARD
+                            })
+                        }
                         _ => None,
                     };
                     (
@@ -1629,6 +1732,20 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 }
                 _ => (None, None),
             };
+            // The access chip (design §7 "say what this session is"): a small standing
+            // pill — "Controller only · ends in 1 h 58 m" — in the same overlay family as
+            // the stats HUD, at every stats tier including Off. `None` (and so exactly
+            // today's look) for a full-control permanent session, which is every session
+            // against an old host. The countdown re-derives per pass; the overlay's
+            // damage gate turns its once-a-minute text change into a redraw.
+            let access_chip = match &stream {
+                Some(st) if st.connector.is_some() => st.access.chip_text(Instant::now()),
+                _ => None,
+            };
+            let access_notice = stream
+                .as_ref()
+                .filter(|st| st.connector.is_some())
+                .and_then(|st| st.access_notice.as_ref().map(|(n, _)| n.as_str()));
             let pad = gamepad.active();
             let pads = gamepad.pads();
             let resizing = stream
@@ -1647,6 +1764,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 scale: overlay_scale(window.display_scale(), osd_scale_pref),
                 stats,
                 hint,
+                access: access_chip.as_deref(),
+                notice: access_notice,
                 mic_muted,
                 resizing,
                 pad: pad.as_ref().map(|p| p.name.as_str()),
@@ -2464,16 +2583,29 @@ impl ResizeIndicator {
 /// tracking our absolute sends, is the one you see (until the M2 cursor channel flips
 /// who draws it) — and system chords stay local (a remote desktop is something you
 /// Alt-Tab away from, not into). `desktop` only matters while `on`.
+///
+/// `grants` is the session's effective access mask (per-client access §7 "not capture
+/// what can't land"): no pointer lock without the POINTER bit, no keyboard grab without
+/// KEYBOARD — a locked pointer whose motion the host drops, or grabbed system chords
+/// over dead keys, is the "my input does nothing and nobody says why" failure mode this
+/// exists to prevent. On-sites pass `Capture::grants()`; off-sites pass `0` (with `on`
+/// false every term is off regardless).
 fn apply_capture(
     window: &mut sdl3::video::Window,
     mouse: &sdl3::mouse::MouseUtil,
     on: bool,
     desktop: bool,
     inhibit: bool,
+    grants: u32,
 ) {
-    mouse.set_relative_mouse_mode(window, on && !desktop);
-    mouse.show_cursor(!on);
-    let grab = on && !desktop && inhibit;
+    use punktfunk_core::quic::{GRANT_KEYBOARD, GRANT_POINTER};
+    let pointer = grants & GRANT_POINTER != 0;
+    mouse.set_relative_mouse_mode(window, on && !desktop && pointer);
+    // The local cursor hides only while the HOST's cursor stands in for it — without the
+    // POINTER grant no absolute/relative send lands, so hiding it would leave a
+    // keyboard-only session with no cursor at all.
+    mouse.show_cursor(!(on && pointer));
+    let grab = on && !desktop && inhibit && grants & GRANT_KEYBOARD != 0;
     if !window.set_keyboard_grab(grab) && grab {
         // The one refusal SDL reports is a missing mechanism — a Wayland compositor with no
         // shortcuts-inhibit global. Said once per process: the answer never changes
@@ -2762,6 +2894,10 @@ struct PresentedWindow {
     gated: u32,
     forced: u32,
 }
+
+/// How long an access toast holds the pill slot (an "Access ends in…" warning must be
+/// seen, not studied — the chip keeps the standing truth).
+const ACCESS_NOTICE_S: u64 = 6;
 
 /// The capture hints (`ui_stream` parity — the words the user reads while released).
 const HINT_KEYBOARD: &str = "Click the stream to capture input · Ctrl+Alt+Shift+Q releases · \

@@ -34,6 +34,7 @@ import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.Keymap
 import io.unom.punktfunk.kit.NativeBridge
+import io.unom.punktfunk.kit.SessionAccess
 import io.unom.punktfunk.kit.link.DeepLinkResult
 import io.unom.punktfunk.kit.link.DeepLinks
 import io.unom.punktfunk.kit.link.HostResolution
@@ -85,6 +86,16 @@ class MainActivity : ComponentActivity() {
      * so hardware keys are forwarded to the host regardless of which view holds focus.
      */
     var streamHandle: Long = 0L
+
+    /**
+     * The active session's access-grant mask ([SessionAccess] bits) — set with [streamHandle] by
+     * StreamScreen and kept live by its access poll; back to [SessionAccess.ALL] when the stream
+     * leaves. Consulted only while streaming: the VK keyboard path below goes inert without
+     * [SessionAccess.KEYBOARD] (the keys are consumed, not sent — the host would drop them, and
+     * letting them fall through would drive Android navigation under a live stream). Courtesy
+     * gating; the host enforces regardless.
+     */
+    var streamAccess: Int = SessionAccess.ALL
 
     /**
      * Multi-controller router for the active session (built/released by StreamScreen): assigns each
@@ -596,6 +607,10 @@ class MainActivity : ComponentActivity() {
                         KeyEvent.ACTION_UP -> false
                         else -> return super.dispatchKeyEvent(event)
                     }
+                    // Without the KEYBOARD grant the key path is inert: consumed (so nothing
+                    // drives Android navigation under the stream) but never sent — the host
+                    // would drop it, and the Access chip is what says why. Courtesy gating.
+                    if (streamAccess and SessionAccess.KEYBOARD == 0) return true
                     // Full-event overload: evdev scancode first (positional under ANY selected
                     // physical-keyboard layout), keycode fallback — see Keymap docs.
                     val vk = Keymap.toVk(event)

@@ -51,7 +51,7 @@ class GamepadRouter(
      * claimed by keeping a slot — the Android input stack shares controllers — unlike the USB
      * capture links, which `StreamScreen` does not start at all while this is off.
      */
-    private val forwarding: Boolean = true,
+    forwarding: Boolean = true,
     /**
      * Forward raw guide/QAM presses (`Settings.systemButtons` resolved — auto = forward on
      * Android, where the press reaches the app on most devices; `local` exists for
@@ -69,6 +69,25 @@ class GamepadRouter(
      */
     private val guideGesture: Boolean = false,
 ) {
+
+    /** The ctor's forwarding preference, fixed for the session — one term of [forwarding]. */
+    private val forwardingSetting = forwarding
+
+    /**
+     * Whether this session's access includes the GAMEPAD grant ([SessionAccess.GAMEPAD]) —
+     * seeded from the Welcome and kept live by `StreamScreen`'s access poll (an `AccessUpdate`
+     * can revoke or restore it mid-session, latest-wins). Gates exactly what the forwarding
+     * preference gates: the wire sends, never the slots — the exit/mic/stats chords must keep
+     * working on a Controller-less access level too (they are local controls that happen to be
+     * read off pad buttons). The host enforces regardless; this stops the client paying to send
+     * events that will be dropped. Volatile: the sensor and USB-capture threads read it per
+     * sample through [forwarding].
+     */
+    @Volatile
+    var gamepadGranted: Boolean = true
+
+    /** Send on the wire at all — the forwarding preference AND the session's GAMEPAD grant. */
+    private val forwarding: Boolean get() = forwardingSetting && gamepadGranted
 
     /** One forwarded controller: its stable wire pad index, per-device axis state, and held buttons. */
     private class Slot(
@@ -379,6 +398,13 @@ class GamepadRouter(
 
     /** Whether ANY live slot currently holds wire pad [pad]. Read from the phone-gyro thread. */
     fun padPresent(pad: Int): Boolean = slots.values.any { it.index == pad }
+
+    /**
+     * Whether wire sends are on at all — the forwarding preference AND the session's GAMEPAD
+     * grant. For the writers that ride the pad planes from OUTSIDE this router (the phone-gyro
+     * mirror), which must stand down with it. Read from the sensor thread.
+     */
+    fun sendsEnabled(): Boolean = forwarding
 
     /**
      * Whether wire pad [pad]'s motion already comes from the controller's OWN IMU — either a

@@ -262,6 +262,27 @@ final class SessionModel: ObservableObject {
     /// The host's last `ClipState.reason` (`CLIP_REASON_*`) — why an enable was refused
     /// (backend unavailable / policy disabled / …); 0 = OK.
     @Published private(set) var clipboardReason: UInt8 = 0
+
+    // MARK: - Per-client access (design/per-client-access.md §7)
+
+    /// The session's access preset, derived live from the grants mask (§3.2 — the label is
+    /// never stored). `.fullControl` against every old host and for every full-grant device,
+    /// so nothing below changes today's look there.
+    @Published private(set) var accessLevel: PunktfunkConnection.AccessLevel = .fullControl
+    /// Seconds until this session's access expires; `0` = permanent. Ticks down at the 1 Hz
+    /// stats cadence — the chip's countdown renders straight from it.
+    @Published private(set) var accessRemainingSecs: UInt32 = 0
+    /// Anything about this session's access differs from full-and-permanent — the visibility
+    /// gate for the chip (and the tvOS stats-overlay line). False = today's look, untouched.
+    @Published private(set) var accessLimited = false
+    /// The transient expiry-warning toast ("Access ends in 5 m") — non-nil for a few seconds
+    /// around the T−5 m / T−1 m marks the host also warns at via `AccessUpdate`.
+    @Published private(set) var accessWarning: String?
+    /// One-shot latches for the two warning marks (reset per session).
+    private var accessWarned5m = false
+    private var accessWarned1m = false
+    /// Auto-dismiss for `accessWarning` — held so a newer warning replaces a pending clear.
+    private var accessWarningTimer: Task<Void, Never>?
     #if os(tvOS)
     /// Siri Remote → host pointer while streaming (touch surface moves, press = left click,
     /// Play/Pause = right click) + the remote's deliberate exit (hold Back ≥ 1 s). See
@@ -566,7 +587,9 @@ final class SessionModel: ObservableObject {
         #if os(tvOS)
         return false // no app-accessible microphone — SessionAudio never opens an uplink either
         #else
-        guard settings.micEnabled else { return false }
+        // The session's grants must include MIC (per-client access §7 — hide the mic UI when
+        // ungranted; a mute button over a mic the host drops would be a lie twice over).
+        guard settings.micEnabled, connection?.canUseMic != false else { return false }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized, .notDetermined: return true
         default: return false // denied / restricted — there is no uplink to mute
@@ -611,6 +634,71 @@ final class SessionModel: ObservableObject {
     /// doesn't open the mic behind their back.
     private func applyMicMute() {
         audio?.setMicMuted(micMuted || isBackgrounded)
+    }
+
+    // MARK: - Per-client access (chip state + expiry warnings)
+
+    /// Refresh the published access state from the connection's LIVE grants + countdown —
+    /// called by the 1 Hz stats tick, which is also what makes a mid-session `AccessUpdate`
+    /// (a console edit) reach the chip and the capture gates within a second. The equality
+    /// guards keep a full-and-permanent session (every old host) from publishing anything.
+    private func updateAccessState() {
+        guard let conn = connection else { return }
+        let grants = conn.accessGrants
+        let level = PunktfunkConnection.AccessLevel(grants: grants)
+        let remaining = conn.accessExpiresInSeconds
+        if accessLevel != level { accessLevel = level }
+        if accessRemainingSecs != remaining { accessRemainingSecs = remaining }
+        let limited = level != .fullControl || remaining != 0
+        if accessLimited != limited { accessLimited = limited }
+        // A mid-session edit that removed BOTH input classes releases an engaged capture:
+        // holding a frozen cursor and swallowed keys over input the host now drops is
+        // exactly the "keyboard does nothing and nobody says why" failure §7 exists to
+        // prevent. (Engage is gated at the stream views; this is the live-revoke half.)
+        if mouseCaptured,
+           grants & (PunktfunkConnection.grantPointer | PunktfunkConnection.grantKeyboard) == 0 {
+            NotificationCenter.default.post(name: .punktfunkReleaseCapture, object: nil)
+        }
+        // The T−5 m / T−1 m warning toasts (§7). Derived from the countdown CROSSING the
+        // marks rather than from the AccessUpdate messages alone: the host's warnings
+        // re-anchor the same countdown, so this shows them when they arrive AND still fires
+        // on plain clock progress if a warning datagram never lands. One shot each; an edit
+        // that extends the deadline back above a mark re-arms it.
+        guard remaining != 0 else { return }
+        if remaining > 300 {
+            accessWarned5m = false
+            accessWarned1m = false
+        } else if remaining > 60 {
+            accessWarned1m = false
+            if !accessWarned5m {
+                accessWarned5m = true
+                showAccessWarning("Access ends in \(Self.accessCountdown(remaining))")
+            }
+        } else if !accessWarned1m {
+            accessWarned1m = true
+            accessWarned5m = true
+            showAccessWarning("Access ends in under a minute")
+        }
+    }
+
+    /// Put one warning toast up for a few seconds (the motion hint's pattern: last one wins,
+    /// its timer restarts, teardown cancels a pending clear).
+    private func showAccessWarning(_ text: String) {
+        accessWarning = text
+        accessWarningTimer?.cancel()
+        accessWarningTimer = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.motionHintSeconds))
+            guard !Task.isCancelled else { return }
+            self?.accessWarning = nil
+        }
+    }
+
+    /// "1 h 58 m" / "12 m" / "45 s" — the countdown wording the chip and the warnings share.
+    static func accessCountdown(_ secs: UInt32) -> String {
+        let s = Int(secs)
+        if s >= 3600 { return "\(s / 3600) h \((s % 3600) / 60) m" }
+        if s >= 60 { return "\(s / 60) m" }
+        return "\(s) s"
     }
 
     /// Follow a live stats-overlay cycle (⌃⌥⇧S, the three-finger tap, the Stream menu). Those
@@ -658,6 +746,16 @@ final class SessionModel: ObservableObject {
         motionHintTimer?.cancel()
         motionHintTimer = nil
         motionUnreachableKind = nil
+        // Access state is per-session: back to the invisible full-and-permanent default, and
+        // no warning latch may carry into the next stream (same discipline as the mic mute).
+        accessWarningTimer?.cancel()
+        accessWarningTimer = nil
+        accessWarning = nil
+        accessLevel = .fullControl
+        accessRemainingSecs = 0
+        accessLimited = false
+        accessWarned5m = false
+        accessWarned1m = false
         let audio = self.audio
         self.audio = nil
         // Gamepad capture is main-actor (releases held buttons on the wire while the
@@ -732,6 +830,10 @@ final class SessionModel: ObservableObject {
         let name = activeHost?.displayName ?? "host"
         // WHY it ended, asked while the connection is still up — `disconnect` tears it down.
         let reason = conn.sessionEndReason
+        // A typed mid-session rejection outranks the coarse reason: an access-expiry close
+        // (per-client access §4) files under `.hostError` there, and "ended with an error"
+        // is the wrong sentence for "your access expired".
+        let rejection = conn.endRejection
         // Where a game exit sends us: back into the library this title was launched from, so the
         // next one is a tap away. Only for a launch that CAME from the library — a game exiting in
         // a plain desktop session has no library to return to.
@@ -741,6 +843,11 @@ final class SessionModel: ObservableObject {
         // without naming one, which is what that launch effectively browsed.
         let shelf = launchedShelf ?? activeHost.map { LibraryTarget(host: $0) }
         disconnect(deliberate: false) // host/network ended it — keep the linger for a reconnect
+        if let rejection {
+            // The shared typed-rejection wording ("Your access to this host has expired…").
+            errorMessage = "\(name): \(rejection.userMessage)"
+            return
+        }
         switch reason {
         case .gameExited:
             // The player quit their own game. Not a failure, and they are probably after the next
@@ -795,7 +902,9 @@ final class SessionModel: ObservableObject {
             speakerUID: settings.speakerUID,
             micUID: settings.micUID,
             micChannel: settings.micChannel,
-            micEnabled: settings.micEnabled,
+            // Deny-at-setup for an ungranted mic (per-client access §5): no MIC bit, no
+            // uplink at all — a capture the host would only drop is pure privacy downside.
+            micEnabled: settings.micEnabled && conn.canUseMic,
             echoCancel: settings.echoCancel,
             // The A/V sync reference: `endToEnd` is capture→on-glass, the one figure that says
             // where the picture actually IS, and the audio ring steers its depth to land with it.
@@ -833,9 +942,11 @@ final class SessionModel: ObservableObject {
         gamepadFeedback = feedback
         #if os(macOS)
         // Shared clipboard: opt-in per host AND host-advertised (older hosts / operator-disabled
-        // hosts never see a ClipControl). Same trust gate as audio — nothing is announced
+        // hosts never see a ClipControl) AND granted to this device (per-client access §5 —
+        // without the bit the host would refuse with CLIP_REASON_NOT_PERMITTED anyway; not
+        // asking keeps the UI honest). Same trust gate as audio — nothing is announced
         // during the trust prompt.
-        if activeHost?.clipboardSync == true, conn.hostSupportsClipboard {
+        if activeHost?.clipboardSync == true, conn.hostSupportsClipboard, conn.canUseClipboard {
             startClipboardSync(conn)
         }
         #endif
@@ -875,7 +986,7 @@ final class SessionModel: ObservableObject {
             clipboardEnabled = false
             clipboardReason = 0
             Task.detached { sync.stop() }
-        } else if conn.hostSupportsClipboard {
+        } else if conn.hostSupportsClipboard, conn.canUseClipboard {
             startClipboardSync(conn)
         }
         #endif
@@ -892,6 +1003,9 @@ final class SessionModel: ObservableObject {
                 // success; this only fires after the timeout.
                 self.resizeIndicator.tick(now: Date().timeIntervalSinceReferenceDate)
                 self.resizing = self.resizeIndicator.active
+                // Access chip + expiry warnings: the same tick that drives every other live
+                // readout also walks the countdown and picks up mid-session grant edits.
+                self.updateAccessState()
                 let (frames, bytes, total) = self.meter.drain()
                 self.fps = frames
                 self.mbps = Double(bytes) * 8 / 1_000_000
