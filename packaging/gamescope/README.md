@@ -20,6 +20,7 @@ The patches here add the missing half, and nothing else. See
 | `0007-pipewire-never-leave-pw_buffer-user_data-pointing-at.patch` | Associate `pw_buffer->user_data` with its `pipewire_buffer` for every path out of `add_buffer`, clear it in `remove_buffer` (the last point both halves are known), and null-check the consumers — killing the use-after-free that aborted the session on every capture renegotiation | **Yes** — a plain use-after-free in the PipeWire buffer lifecycle |
 | `0008-steamcompmgr-honor-GAMESCOPE_NO_FOCUS-never-a-focus-.patch` | Honor `GAMESCOPE_NO_FOCUS` (set by hhd-ui and MangoHud, consumed by nobody): such windows are skipped by both focus-candidate collectors, so a mapped-but-unpainted overlay app can no longer win focus and turn the composite black. Compositing is untouched — only focus SELECTION is barred | **Yes** — the atom's setters already exist in the wild; some compositor has to keep the promise |
 | `0009-pipewire-destroy-capture-textures-on-the-compositor-.patch` | Move capture-buffer destruction off the PipeWire thread: `remove_buffer`/stale-push queue the corpse (`bury_buffer`), steamcompmgr reaps on every vblank — including while the stream is paused, which is exactly the linger window. Without it, dropping the last `CVulkanTexture` ref on the PW thread races `vulkan_screenshot` on the same device and SIGSEGVs (NVIDIA `insertBarrier`), so a lingered display is dead and reconnect loses the session. Reported + written by luxus (punktfunk-overlay#9) | **Yes** — the race is upstream's `paint_pipewire` vs `destroy_buffer`; our patches only make the paint path heavier |
+| `0010-wlserver-give-the-seat-s-stub-keyboard-the-compiled-.patch` | Set the compiled keymap on `wlserver.wlr.virtual_keyboard_device` too. gamescope builds a keymap from `XKB_DEFAULT_*` but only puts it on `keyboard_group`, while the SEAT carries the keymap-less stub that `wlserver_keyboardfocus()` re-binds on every focus change — so clients get no keymap and fall back to their own `us`, and a headless session (no libinput devices) never recovers | **Yes** — the stub's own comment says it exists "only to set the keymap"; it just never did |
 
 ### Why the headless patch matters
 
@@ -103,6 +104,7 @@ The number is a **monotonic patch-set revision**, so one probe answers every cap
 | `+pfhdr5` | …and the PipeWire buffer use-after-free is fixed (no new capability) |
 | `+pfhdr6` | …and `GAMESCOPE_NO_FOCUS` windows are never focus candidates (no new capability) |
 | `+pfhdr7` | …and PipeWire teardown cannot SIGSEGV a lingering compositor (no new capability) |
+| `+pfhdr8` | …and the seat's keyboard carries the `XKB_DEFAULT_*` keymap, so the session follows the box's configured layout |
 
 Bump it whenever a patch adds or changes something the host must know about before it spawns.
 

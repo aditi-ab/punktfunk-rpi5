@@ -6,8 +6,9 @@
 //! Sway always advertises. We connect as an ordinary Wayland client (the host process
 //! inherits Sway's `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`), bind the two managers, and translate
 //! events into virtual pointer/keyboard requests. Keyboard codes are Linux evdev; we upload an
-//! xkb keymap (the host's layout via `XKB_DEFAULT_LAYOUT` et al., defaulting to evdev/US) and
-//! track modifier state so the compositor resolves shifted keysyms correctly.
+//! xkb keymap built from the box's configured layout (`pf_host_config::layout` — `XKB_DEFAULT_*`,
+//! then what `localectl` recorded) and track modifier state so the compositor resolves shifted
+//! keysyms correctly.
 //!
 //! Extracted into a subsystem crate (plan §W6): consumes `punktfunk_core::input` (the neutral
 //! event vocabulary) + `pf-driver-proto` (the HID wire contract), never the orchestrator.

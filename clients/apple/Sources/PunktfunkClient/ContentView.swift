@@ -741,9 +741,10 @@ struct ContentView: View {
     /// `libraryTarget` every internal surface writes, so the link lands in whichever presentation
     /// the current mode owns: the gamepad console's in-place library screen, the touch cover, the
     /// macOS sheet, or tvOS's cover. Connect's posture minus the connect itself: a pin conflict
-    /// refuses, a live session is never preempted, and an unsaved host can't be browsed — the
-    /// library fetch rides the paired mTLS identity, so there is nothing to show before the host
-    /// is saved (the notice says what to do instead).
+    /// refuses, a live session is never preempted (same host → the open already foregrounded the
+    /// app, which is all "focus it" can mean mid-stream; different host → say so), and an unsaved
+    /// host can't be browsed — the library fetch rides the paired mTLS identity, so there is
+    /// nothing to show before the host is saved (the notice says what to do instead).
     private func openLibrary(from link: DeepLink) {
         // A `profile=` on a browse link picks the shelf, exactly as it picks the settings on a
         // connect link — and refuses the same way (§10.6): an unknown or ambiguous reference must
@@ -772,9 +773,12 @@ struct ContentView: View {
                 return
             }
             guard model.phase == .idle else {
-                let current = model.activeHost?.displayName ?? "a host"
-                deepLinkNotice = "Already streaming \(current). End that session first."
-                return
+                guard model.activeHost?.id == host.id else {
+                    let current = model.activeHost?.displayName ?? "a host"
+                    deepLinkNotice = "Already streaming \(current). End that session first."
+                    return
+                }
+                return // browsing the host we're already streaming — nothing to do
             }
             libraryTarget = LibraryTarget(host: host, profile: selection)
         case .unknown(let address, _, let name, _):

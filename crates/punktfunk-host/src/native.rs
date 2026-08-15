@@ -1398,6 +1398,10 @@ async fn serve_session(
     let live_bitrate = Arc::new(AtomicU32::new(welcome.bitrate_kbps));
     let encoder_ceiling_kbps = Arc::new(AtomicU32::new(0));
     let cadence_degraded = Arc::new(AtomicBool::new(false));
+    // The live behind-cadence score behind that flag, so the climb-refusal log line carries its
+    // evidence (a refusal without the score left a 23-minute floor-pinned field session with no
+    // trace of why).
+    let cadence_behind_score = Arc::new(AtomicU32::new(0));
     let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
     let (probe_result_tx, probe_result_rx) = tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
     // Mode-switch outcome, data plane → control task (same pattern as `probe_result_tx`): the accept
@@ -1520,6 +1524,7 @@ async fn serve_session(
         live_bitrate.clone(),
         encoder_ceiling_kbps.clone(),
         cadence_degraded.clone(),
+        cadence_behind_score.clone(),
         fec_target_ctl,
         phase_ctl_control,
         reconfig_tx,
@@ -2103,6 +2108,7 @@ async fn serve_session(
                         live_bitrate,
                         encoder_ceiling_kbps,
                         cadence_degraded,
+                        cadence_behind_score,
                         bitrate_auto,
                         bit_depth,
                         chroma,

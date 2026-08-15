@@ -218,6 +218,12 @@ pub(super) fn audio_thread(
     // frame. `sent_any` is what keeps the seed from ever reaching the wire.
     let mut next_pts_ns: u64 = 0;
     let mut pace_due: Option<std::time::Instant> = None;
+    // WP-C — what the wire actually did, as opposed to what the tap handed us. See [`SendStats`]:
+    // until this existed the send path was the one stage of the audio pipeline that could not be
+    // ruled in or out from a field log.
+    let mut send_stats = crate::audio::capture_policy::SendStats::default();
+    let mut last_send_stats = std::time::Instant::now();
+    let mut last_departure: Option<std::time::Instant> = None;
     if capturer.is_some() {
         tracing::info!(
             channels = want,
@@ -315,12 +321,20 @@ pub(super) fn audio_thread(
         // send-time debt.
         loop {
             let now = std::time::Instant::now();
+            // How far past its slot this frame is leaving. Measured before the re-anchor arm can
+            // erase the evidence — that arm is the one that forgives debt silently (WP-C).
+            let mut late = std::time::Duration::ZERO;
             match pace_due {
                 Some(due) if due > now => break, // this frame's slot has not arrived yet
-                Some(due) if now.duration_since(due) > PACE_REANCHOR => pace_due = None,
-                _ => {}
+                Some(due) if now.duration_since(due) > PACE_REANCHOR => {
+                    send_stats.observe_reanchor();
+                    pace_due = None;
+                }
+                Some(due) => late = now.duration_since(due),
+                None => {}
             }
             frame_buf.clear();
+            let mut infilled = false;
             if acc.len() >= frame_len {
                 frame_buf.extend(acc.drain(..frame_len));
             } else if !sent_any {
@@ -328,6 +342,7 @@ pub(super) fn audio_thread(
             } else {
                 match infill.decide(last_chunk_at.elapsed()) {
                     crate::audio::capture_policy::Infill::Silence => {
+                        infilled = true;
                         // Pad the partial frame out with silence and send THAT, rather than
                         // leaving it for post-gap samples to complete: one frame carrying audio
                         // from both sides of a hole is a click, and its pts is a lie about when
@@ -366,6 +381,15 @@ pub(super) fn audio_thread(
                         prev_frame.extend_from_slice(opus);
                     }
                     seq = seq.wrapping_add(1);
+                    // Score the departure against its slot and against the previous one. `now` is
+                    // from the top of this iteration — microseconds earlier and one clock read
+                    // cheaper, 200 times a second.
+                    send_stats.observe_departure(
+                        late,
+                        last_departure.map(|t| now.duration_since(t)),
+                        infilled,
+                    );
+                    last_departure = Some(now);
                     // From here there is a continuity worth protecting, and `next_pts_ns` has a
                     // real anchor to continue from — both preconditions for synthesizing anything.
                     sent_any = true;
@@ -381,6 +405,22 @@ pub(super) fn audio_thread(
                     }
                 }
             }
+        }
+        if last_send_stats.elapsed() >= crate::audio::capture_policy::STATS_EVERY {
+            // Deliberately the same window as the capture line, so the two can be read as a pair:
+            // holes at the tap with clean departures means the host delivered everything it had,
+            // and the search belongs upstream of us.
+            tracing::info!(
+                sent = send_stats.sent,
+                infilled = send_stats.infilled,
+                late = send_stats.late,
+                max_late_ms = send_stats.max_late_ms(),
+                max_spacing_ms = send_stats.max_spacing_ms(),
+                reanchors = send_stats.reanchors,
+                "audio egress"
+            );
+            send_stats = Default::default();
+            last_send_stats = std::time::Instant::now();
         }
     }
     // Park the live capturer for the next session (None if it died and never reopened),

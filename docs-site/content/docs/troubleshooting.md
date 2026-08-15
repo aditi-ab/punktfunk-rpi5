@@ -304,6 +304,36 @@ were holding down is released on the host, so nothing sticks. The rest of the in
 switch mouse mode, disconnect, fullscreen — are in
 [Getting your input back](/docs/input#getting-your-input-back).
 
+## My keyboard types the wrong characters (`#` comes out as `\`)
+
+A German keyboard giving `\` for `#`, `'` for `ä` and `/` for `-`, or `z` and `y` swapped, is a
+**host** layout mismatch — the client is fine.
+
+Punktfunk sends the *physical key you pressed*, not the character, exactly as a keyboard plugged
+into the host would. What that key finally types is decided by the layout the **host session** is
+running, so the host has to be set to the same layout as the keyboard you're typing on. When it
+isn't, every key whose position differs between the two layouts comes out as its neighbour.
+
+On Linux, set the layout the normal way and reconnect:
+
+```sh
+sudo localectl set-x11-keymap de pc105 nodeadkeys   # your layout, model, variant
+```
+
+Punktfunk reads that setting and hands it to the session on the next connect. Two things are worth
+knowing:
+
+- **Wayland desktops don't read it by themselves.** `localectl` writes a file only Xorg opens, so
+  before this release a correctly-configured box could still run a US session. If your compositor
+  is already set to the right layout in its own settings, nothing changes.
+- **Game Mode needs a current `punktfunk-gamescope`.** Gamescope publishes no keyboard layout at
+  all to the apps it runs, so Steam and games saw US whatever the box was set to. Our build fixes
+  that from `+pfhdr8` on — check with `punktfunk-gamescope --version`, and
+  [update](/docs/updating) if it's older.
+
+Nothing here changes which physical key does what in a game: `WASD` stays under the same fingers on
+every layout.
+
 ## A controller is detected but games don't see it
 
 - **Linux.** The host user needs to be in the `input` group. On Bazzite:
