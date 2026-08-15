@@ -10,9 +10,242 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "0.28.1"
+    "version": "0.29.0"
   },
   "paths": {
+    "/api/v1/client-logs": {
+      "get": {
+        "tags": [
+          "logs"
+        ],
+        "summary": "List uploaded client log bundles",
+        "description": "Every stored bundle's metadata, newest first.",
+        "operationId": "clientLogsList",
+        "responses": {
+          "200": {
+            "description": "Stored bundles, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ClientLogMeta"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "logs"
+        ],
+        "summary": "Upload a client log bundle",
+        "description": "A PAIRED DEVICE posts its recent client log as plain text, authenticated by its streaming\ncertificate (the same mTLS identity it pairs and streams with) — no bearer token. Bundles are\ncapped at 1 MiB and only the newest few per device are kept. The operator downloads them from\nthe console's Logs page. This is deliberately write-only for devices: uploading grants no read.",
+        "operationId": "clientLogsUpload",
+        "requestBody": {
+          "description": "The client's log text",
+          "content": {
+            "text/plain": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Bundle stored",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientLogUploaded"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No paired-device certificate on the connection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The device's access has expired (per-client access)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Bundle exceeds the size cap",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Empty body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not store the bundle",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/client-logs/{id}": {
+      "get": {
+        "tags": [
+          "logs"
+        ],
+        "summary": "Download a client log bundle",
+        "description": "The bundle body as plain text, for saving or attaching to a report.",
+        "operationId": "clientLogsGet",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The bundle id (its filename stem)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The bundle body",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No bundle with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The bundle file is unreadable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "logs"
+        ],
+        "summary": "Delete a client log bundle",
+        "description": "Removes the bundle `id` from disk. `404` if there is no such bundle.",
+        "operationId": "clientLogsDelete",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The bundle id (its filename stem)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Bundle deleted"
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No bundle with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Could not delete the bundle",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/clients": {
       "get": {
         "tags": [
@@ -4666,6 +4899,56 @@
             "items": {
               "$ref": "#/components/schemas/SourceView"
             }
+          }
+        }
+      },
+      "ClientLogMeta": {
+        "type": "object",
+        "description": "One stored bundle, as the console lists it.",
+        "required": [
+          "id",
+          "device_name",
+          "fingerprint_prefix",
+          "received_ms",
+          "size_bytes"
+        ],
+        "properties": {
+          "device_name": {
+            "type": "string",
+            "description": "The paired device's name at upload time (sanitized for the filesystem)."
+          },
+          "fingerprint_prefix": {
+            "type": "string",
+            "description": "First 16 hex chars of the device's pairing fingerprint — enough to correlate with the\npaired-devices roster without repeating the full identity in every filename."
+          },
+          "id": {
+            "type": "string",
+            "description": "The bundle id (its filename stem) — pass to the fetch/delete endpoints."
+          },
+          "received_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Upload time (unix ms, from the file's mtime).",
+            "minimum": 0
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bundle size in bytes.",
+            "minimum": 0
+          }
+        }
+      },
+      "ClientLogUploaded": {
+        "type": "object",
+        "description": "Response to a successful upload.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The stored bundle's id."
           }
         }
       },

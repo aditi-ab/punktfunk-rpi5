@@ -457,6 +457,45 @@ impl ServiceState {
                     trust::parse_hex32(&fp_hex),
                 );
             }
+            ConsoleCmd::SendLogs {
+                addr,
+                mgmt,
+                fp_hex,
+                host_name,
+            } => {
+                // Blocking network (5 s connect / 10 s global, the library agent's budgets) —
+                // a worker thread keeps the service loop's host refresh alive meanwhile. The
+                // result lands as a shared-model notice; the shell toasts it on its next sync.
+                let identity = self.identity.clone();
+                let pin = trust::parse_hex32(&fp_hex);
+                let console = self.console.clone();
+                std::thread::Builder::new()
+                    .name("punktfunk-sendlogs".into())
+                    .spawn(move || {
+                        let header = format!(
+                            "punktfunk-session {} ({} {}) — client log bundle",
+                            env!("CARGO_PKG_VERSION"),
+                            std::env::consts::OS,
+                            std::env::consts::ARCH,
+                        );
+                        match pf_client_core::logring::send_to_host(
+                            &addr, mgmt, &identity, pin, &header,
+                        ) {
+                            Ok(id) => {
+                                tracing::info!(host = %host_name, id, "client logs uploaded");
+                                console.set_notice(format!(
+                                    "Logs sent to {host_name} — download them from its web \
+                                     console's Logs page"
+                                ));
+                            }
+                            Err(e) => {
+                                tracing::warn!(host = %host_name, error = %e, "client log upload failed");
+                                console.set_notice(format!("Couldn't send logs — {e}"));
+                            }
+                        }
+                    })
+                    .ok();
+            }
             ConsoleCmd::Pair {
                 addr,
                 port,

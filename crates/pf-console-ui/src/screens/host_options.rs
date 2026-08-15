@@ -25,6 +25,7 @@ use skia_safe::{Canvas, Rect};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Action {
     Wake,
+    SendLogs,
     CopyLink,
     Edit,
     Forget,
@@ -86,6 +87,14 @@ impl HostOptionsScreen {
         if self.host.can_wake && !self.host.online {
             a.push(Action::Wake);
         }
+        // "Send logs" needs a paired identity (the upload authenticates with the streaming
+        // cert) and a reachable host — on anything else the row would only ever toast an
+        // error. This is the log-escape hatch for platforms whose own filesystem the user
+        // can't reach (Deck Gaming Mode, tvOS): the bundle lands on the host, listed in
+        // its web console next to the host's own logs.
+        if self.host.paired && self.host.online {
+            a.push(Action::SendLogs);
+        }
         a.extend([
             Action::CopyLink,
             Action::Edit,
@@ -98,6 +107,7 @@ impl HostOptionsScreen {
     fn label(&self, a: Action) -> String {
         match a {
             Action::Wake => "Wake host".into(),
+            Action::SendLogs => "Send logs to host".into(),
             Action::CopyLink => "Copy link".into(),
             Action::Edit => "Edit\u{2026}".into(),
             Action::Forget if self.armed => "Forget \u{2014} press again".into(),
@@ -166,6 +176,16 @@ impl HostOptionsScreen {
                     key,
                     then_connect: false,
                 });
+                fx.pop();
+            }
+            Action::SendLogs => {
+                fx.cmds.push(ConsoleCmd::SendLogs {
+                    addr: self.host.addr.clone(),
+                    mgmt: self.host.mgmt_port,
+                    fp_hex: self.host.fp_hex.clone(),
+                    host_name: self.host.name.clone(),
+                });
+                fx.toast = Some(format!("Sending logs to {}\u{2026}", self.host.name));
                 fx.pop();
             }
             Action::CopyLink => {

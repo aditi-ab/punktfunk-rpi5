@@ -30,6 +30,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use utoipa_scalar::{Scalar, Servable};
 
 mod auth;
+mod client_logs;
 mod clients;
 mod display;
 mod events;
@@ -181,6 +182,9 @@ pub(crate) struct MgmtState {
     /// Shared streaming-stats recorder — the same handle the streaming loops emit into, so an
     /// operator can arm/stop a capture here and review/list/delete saved recordings.
     stats: Arc<crate::stats_recorder::StatsRecorder>,
+    /// Log bundles paired clients uploaded (`crate::client_logs`) — constructed here (mgmt-only
+    /// state, nothing streams into it) and listed/served back to the console.
+    client_logs: Arc<crate::client_logs::ClientLogStore>,
     /// Whether this host runs the GameStream/Moonlight-compat planes (`--gamestream`). Surfaced in
     /// [`HostInfo`] so the web console can hide the Moonlight-only pairing UI on the secure default
     /// (native-only) host, where a Moonlight PIN can never arrive.
@@ -238,12 +242,14 @@ pub async fn run(
         opts.bind.port(),
         native,
         stats,
+        crate::client_logs::default_dir(),
         gamestream_enabled,
     );
     serve_https(opts.bind, app, tls).await
 }
 
 /// Compose the full management router (also used directly by the handler tests).
+#[allow(clippy::too_many_arguments)] // the composition root wires one state struct; a param per field
 fn app(
     state: Arc<AppState>,
     token: Option<String>,
@@ -251,12 +257,16 @@ fn app(
     port: u16,
     native: Option<Arc<crate::native_pairing::NativePairing>>,
     stats: Arc<crate::stats_recorder::StatsRecorder>,
+    // Where uploaded client log bundles live — a parameter (not `default_dir()` inline) so the
+    // handler tests point it at a temp dir instead of the real config dir.
+    client_logs_dir: std::path::PathBuf,
     gamestream_enabled: bool,
 ) -> Router {
     let shared = Arc::new(MgmtState {
         app: state,
         native,
         stats,
+        client_logs: crate::client_logs::ClientLogStore::new(client_logs_dir),
         gamestream_enabled,
         token,
         plugin_token,
@@ -365,6 +375,14 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
             stats::stats_recording_delete
         ))
         .routes(routes!(stats::logs_get))
+        .routes(routes!(
+            client_logs::client_logs_upload,
+            client_logs::client_logs_list
+        ))
+        .routes(routes!(
+            client_logs::client_logs_get,
+            client_logs::client_logs_delete
+        ))
         .routes(routes!(events::stream_events))
         .routes(routes!(hooks::get_hooks, hooks::set_hooks))
         .routes(routes!(plugins::list_plugins))

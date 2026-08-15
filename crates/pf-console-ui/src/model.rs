@@ -91,6 +91,10 @@ struct ConsoleState {
     hosts_gen: u64,
     pair: PairPhase,
     wake: Option<WakeStatus>,
+    /// A one-shot toast from a service worker (e.g. the log-upload result). The shell
+    /// takes it on its next sync; unlike [`PairPhase`] there is no modal state to track,
+    /// so a plain take-once string is the whole protocol.
+    notice: Option<String>,
 }
 
 /// The shared handle. Service threads write; the shell polls per frame (cheap locks,
@@ -131,6 +135,16 @@ impl ConsoleShared {
     pub(crate) fn wake(&self) -> Option<WakeStatus> {
         self.0.lock().unwrap().wake.clone()
     }
+
+    /// Post a one-shot toast from a service worker. A newer notice replaces an unshown
+    /// older one — the shell polls per frame, so in practice nothing is ever dropped.
+    pub fn set_notice(&self, text: String) {
+        self.0.lock().unwrap().notice = Some(text);
+    }
+
+    pub(crate) fn take_notice(&self) -> Option<String> {
+        self.0.lock().unwrap().notice.take()
+    }
 }
 
 /// Work the shell asks the binary to do. Everything here blocks (network/disk), so it
@@ -149,6 +163,16 @@ pub enum ConsoleCmd {
         port: u16,
         pin: String,
         device_name: String,
+    },
+    /// Upload the client's recent log ring to this PAIRED host's management API — the
+    /// "send logs to host" escape hatch for platforms whose own logs are unreachable
+    /// (Deck Gaming Mode, tvOS). Same transport + trust as `FetchLibrary`; the result
+    /// comes back as a shared-model notice toast.
+    SendLogs {
+        addr: String,
+        mgmt: u16,
+        fp_hex: String,
+        host_name: String,
     },
     /// Save a manually entered host (unpaired) and refresh the rows.
     SaveHost {

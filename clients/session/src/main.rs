@@ -23,6 +23,7 @@
 
 #[cfg(all(any(target_os = "linux", windows), feature = "ui"))]
 mod console;
+mod ring_layer;
 
 /// The session control socket: a line-per-connection unix socket other same-user
 /// processes use to poke the RUNNING stream — today two verbs, `guide` and `qam`, which
@@ -618,14 +619,29 @@ mod session_main {
     }
 
     pub fn run() -> u8 {
-        // Logs to STDERR — stdout is the machine interface (ready/stats/error lines).
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "info".into()),
-            )
-            .init();
+        // Logs to STDERR — stdout is the machine interface (ready/stats/error lines) — plus
+        // the in-process ring (`pf_client_core::logring`, DEBUG+ regardless of RUST_LOG) that
+        // "Send logs to host" uploads. The env filter scopes the STDERR layer only: the ring
+        // exists precisely for the diagnostics nobody enabled before the bug happened.
+        {
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::util::SubscriberInitExt;
+            use tracing_subscriber::Layer;
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(std::io::stderr)
+                        .with_filter(
+                            tracing_subscriber::EnvFilter::try_from_default_env()
+                                .unwrap_or_else(|_| "info".into()),
+                        ),
+                )
+                .with(
+                    crate::ring_layer::RingLayer
+                        .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+                )
+                .init();
+        }
 
         // Before ANY Vulkan call — and that includes the two probe flags below, which is the
         // whole reason this sits at the top of `run` instead of beside the session setup it

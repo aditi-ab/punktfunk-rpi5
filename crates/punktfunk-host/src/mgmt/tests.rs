@@ -51,6 +51,15 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::Ordering;
 use tower::ServiceExt;
 
+/// A throwaway client-logs dir (same shape as [`test_stats`] — never the real config dir).
+fn test_client_logs_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "pf-mgmt-clientlogs-{}-{:p}",
+        std::process::id(),
+        &0u8 as *const u8
+    ))
+}
+
 /// A throwaway stats recorder rooted in a unique temp dir (never touches the real config dir).
 fn test_stats() -> Arc<crate::stats_recorder::StatsRecorder> {
     crate::stats_recorder::StatsRecorder::new(std::env::temp_dir().join(format!(
@@ -94,6 +103,7 @@ fn test_app(state: Arc<AppState>, token: Option<&str>) -> Router {
         DEFAULT_PORT,
         None,
         stats,
+        test_client_logs_dir(),
         // GameStream-compat planes off (the secure default the native-only tests model).
         false,
     )
@@ -110,6 +120,7 @@ fn test_app_native(state: Arc<AppState>, np: Arc<crate::native_pairing::NativePa
         DEFAULT_PORT,
         Some(np),
         stats,
+        test_client_logs_dir(),
         false,
     )
 }
@@ -1347,6 +1358,14 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("GET", "/api/v1/compositors", true, true),
         ("GET", "/api/v1/events", true, false),
         ("GET", "/api/v1/logs", true, false),
+        // ---- client log bundles: the UPLOAD is the cert lane's single write — write-only,
+        // size/quota-capped ("send logs to host" from a Deck in Gaming Mode / tvOS). Reading
+        // bundles back is operator business (they can contain whatever the client logged), so
+        // list/fetch/delete stay bearer-only in both lanes.
+        ("POST", "/api/v1/client-logs", false, true),
+        ("GET", "/api/v1/client-logs", false, false),
+        ("GET", "/api/v1/client-logs/{id}", false, false),
+        ("DELETE", "/api/v1/client-logs/{id}", false, false),
         // ---- paired-device rosters: readable by a plugin, never by another paired client, and
         // removal is pairing administration in both lanes.
         ("GET", "/api/v1/clients", true, false),
