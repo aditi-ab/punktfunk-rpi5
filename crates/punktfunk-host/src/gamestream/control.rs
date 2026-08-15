@@ -119,6 +119,54 @@ pub(crate) fn sync(state: &Arc<AppState>) -> Result<()> {
     }
 }
 
+/// A [`rusty_enet::Socket`] that drops datagrams whose source IP is not the launch owner's.
+///
+/// `rusty_enet` 0.4.0 exposes no setter for `maximum_waiting_data` (the C default of 32 MiB of
+/// per-peer reassembly), so an off-path LAN peer that connects on 47999 can pin ~32 MiB × the
+/// `peer_limit` and occupy peer slots without ever authenticating — and the same unfiltered path
+/// lets an on-path attacker spoof the owner's source to feed the tracked peer. Filtering at the
+/// socket drops those datagrams BEFORE ENet allocates any per-peer state. The owner is read live
+/// from `launch` on each receive: before `/launch` (owner `None`) the filter passes everything,
+/// matching the plane's existing "trust the connect when no owner is captured" fallback used by
+/// the `Event::Connect` arm below. security-review 2026-08-15 findings 2 and 13.
+struct OwnerFilteredSocket {
+    inner: UdpSocket,
+    state: Arc<AppState>,
+}
+
+impl rusty_enet::Socket for OwnerFilteredSocket {
+    type Address = std::net::SocketAddr;
+    type Error = std::io::Error;
+
+    fn init(&mut self, opts: rusty_enet::SocketOptions) -> Result<(), std::io::Error> {
+        rusty_enet::Socket::init(&mut self.inner, opts)
+    }
+
+    fn send(&mut self, address: Self::Address, buffer: &[u8]) -> Result<usize, std::io::Error> {
+        rusty_enet::Socket::send(&mut self.inner, address, buffer)
+    }
+
+    fn receive(
+        &mut self,
+        buffer: &mut [u8; rusty_enet::MTU_MAX],
+    ) -> Result<Option<(Self::Address, rusty_enet::PacketReceived)>, std::io::Error> {
+        // Loop so a dropped non-owner datagram doesn't starve a following owner datagram in the
+        // same drain; the inner socket is non-blocking, so this returns `Ok(None)` on WouldBlock.
+        loop {
+            match rusty_enet::Socket::receive(&mut self.inner, buffer)? {
+                Some((addr, received)) => {
+                    let owner = self.state.launch.lock().unwrap().and_then(|s| s.peer_ip);
+                    if owner.is_some_and(|ip| ip != addr.ip()) {
+                        continue;
+                    }
+                    return Ok(Some((addr, received)));
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
 /// Bind the ENet control host on 47999 and service it on a dedicated thread until `stop`.
 fn spawn(state: Arc<AppState>) -> Result<Running> {
     let socket = UdpSocket::bind(("0.0.0.0", CONTROL_PORT)).context("bind control UDP")?;
@@ -126,7 +174,10 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
         .set_nonblocking(true)
         .context("control socket nonblocking")?;
     let mut host = Host::new(
-        socket,
+        OwnerFilteredSocket {
+            inner: socket,
+            state: state.clone(),
+        },
         HostSettings {
             peer_limit: 4,
             // Moonlight connects with CTRL_CHANNEL_COUNT (0x30) channels and sends gamepad
@@ -252,8 +303,20 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                                 state.end_session("control stream disconnected");
                             }
                             Event::Receive {
-                                channel_id, packet, ..
+                                peer: p,
+                                channel_id,
+                                packet,
                             } => {
+                                // Only the tracked session peer's input is honored. The owner-IP
+                                // socket filter already drops non-owner datagrams once a launch is
+                                // recorded; this is defense-in-depth for the window before the
+                                // owner is captured (and mirrors the `Disconnect` arm's gate) so a
+                                // peer that connected while `owner_ip` was `None` still cannot
+                                // inject keyboard/mouse/gamepad after another peer became the
+                                // session. security-review 2026-08-15 finding 2.
+                                if peer != Some(p.id()) {
+                                    continue;
+                                }
                                 on_receive(
                                     &state,
                                     channel_id,
