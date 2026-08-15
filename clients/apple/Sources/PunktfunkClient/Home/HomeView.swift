@@ -268,7 +268,12 @@ struct HomeView: View {
         let selection: ProfileSelection = pinned.map { .profile($0.id) } ?? .inherit
         // …and browsing is that same connect with a title picked first, so a pinned card opens its
         // OWN shelf: every launch off it carries the card's profile rather than the host's binding.
-        let onBrowseLibrary: (() -> Void)? = libraryEnabled
+        // Gated on a pinned identity, not just the feature toggle: the library plane's
+        // MgmtTransport trust-on-first-use accepts ANY cert for a pin-less host (self-signed, no
+        // SAN — system trust is bypassed), so browsing an unpinned host lets a LAN MITM serve a
+        // forged catalog and harvest the device's pairing identity. Pair first, exactly as the
+        // stream path already refuses an unpinned connect. security-review 2026-08-15 finding 8.
+        let onBrowseLibrary: (() -> Void)? = (libraryEnabled && host.pinnedSHA256 != nil)
             ? { libraryTarget = LibraryTarget(host: host, profile: selection) }
             : nil
         return HostCardView(

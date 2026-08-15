@@ -357,6 +357,17 @@ struct LibraryView: View {
             loading = false
             return
         }
+        // Beyond the client identity, require the HOST's pinned fingerprint. MgmtTransport accepts
+        // ANY cert for a pin-less host (self-signed, no SAN → system trust is bypassed), so browsing
+        // one lets a LAN MITM serve a forged catalog and harvest this device's mTLS identity. A host
+        // can hold a client identity yet no host pin (abandoned pairing, or after "Forget
+        // Identity"), so this is a distinct check. security-review 2026-08-15 finding 8.
+        guard current.pinnedSHA256 != nil else {
+            games = []
+            errorText = "Pair with this host before browsing its library."
+            loading = false
+            return
+        }
         do {
             // `launchersFirst` groups launcher entries ahead of titles once, here, so the grid and
             // the gamepad coverflow both inherit the D4 ordering.
