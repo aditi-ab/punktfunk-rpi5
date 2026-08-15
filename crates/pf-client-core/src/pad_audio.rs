@@ -362,15 +362,76 @@ pub(crate) fn pick_pad_sink(sinks: &[SinkNode], cards: &[CardDevice]) -> Option<
         .map(PadSinkPick::NeedsProfile)
 }
 
-/// One registry roundtrip on a private mainloop: every `Audio/Sink…` node and every `Device`,
-/// reduced to the matcher's shapes. [`crate::audio::devices`]'s discipline (a few ms against a
-/// live daemon, a clean error when there is none) — a separate walk because that one is the
-/// settings picker's and deliberately publishes only name + description.
+/// Read a sink node's facts out of a proplist. Split out because it has to run against the
+/// node's INFO props, not the registry's — see [`walk_graph`].
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn sink_from_props(props: &pipewire::spa::utils::dict::DictRef) -> Option<SinkNode> {
+    // Both spellings: PipeWire's own objects use the `device.`-prefixed keys, the pulse-facing
+    // proplist GE reads uses the bare ones. Cheap to accept both.
+    let vendor = props
+        .get("device.vendor.id")
+        .or_else(|| props.get("vendor.id"));
+    let product = props
+        .get("device.product.id")
+        .or_else(|| props.get("product.id"));
+    // `Audio/Sink` and `Audio/Sink/Internal` alike: the hidden four-channel parent behind a
+    // split card wears the latter, and it is a usable (if second-choice) target.
+    let class = props.get("media.class")?;
+    if !class.starts_with("Audio/Sink") {
+        return None;
+    }
+    let name = props.get("node.name")?;
+    let description = props
+        .get("node.description")
+        .or_else(|| props.get("node.nick"))
+        .unwrap_or(name);
+    let positions: Vec<String> = props
+        .get("audio.position")
+        .map(|p| {
+            p.trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(SinkNode {
+        device_id: props.get("device.id").and_then(|v| v.parse().ok()),
+        channels: props
+            .get("audio.channels")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(positions.len() as u32),
+        split_parent: props.get("api.alsa.split.name").map(str::to_string),
+        ds5: props_say_ds5(vendor, product, name, description),
+        internal: class.ends_with("/Internal")
+            || props
+                .get("api.alsa.split.parent")
+                .is_some_and(|v| !matches!(v, "false" | "0")),
+        positions,
+        name: name.to_string(),
+        description: description.to_string(),
+    })
+}
+
+/// Walk the graph on a private mainloop: every `Audio/Sink…` node and every `Device`, reduced
+/// to the matcher's shapes. [`crate::audio::devices`]'s discipline (a few ms against a live
+/// daemon, a clean error when there is none) — a separate walk because that one is the settings
+/// picker's and deliberately publishes only name + description.
+///
+/// ⚠⚠ **TWO rounds, because a registry `global` event does NOT carry the node's whole
+/// proplist.** It carries a small announce subset — enough for `media.class`, `node.name` and
+/// `device.id`, which is exactly why this looked like it worked — but `audio.channels` and
+/// `audio.position` are NOT in it. Reading them from there yields 0 channels for every node on
+/// a real machine, which then reads as "this card has no four-channel node" and sends the
+/// renderer off to change the card's profile for no reason. They live in the node's INFO
+/// props, so each candidate is bound and its `info` event awaited. (`pw-dump` and `pactl` show
+/// these fields because they bind every object too; that is what made the registry-only version
+/// look plausible against their output.)
 #[cfg(target_os = "linux")]
 fn walk_graph() -> anyhow::Result<(Vec<SinkNode>, Vec<CardDevice>)> {
     use anyhow::Context;
     use pipewire as pw;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     static PW_INIT: std::sync::Once = std::sync::Once::new();
@@ -383,68 +444,70 @@ fn walk_graph() -> anyhow::Result<(Vec<SinkNode>, Vec<CardDevice>)> {
         .context("pw connect (is PipeWire running in this session?)")?;
     let registry = core.get_registry_rc().context("pw registry")?;
 
-    let found: Rc<RefCell<(Vec<SinkNode>, Vec<CardDevice>)>> = Rc::default();
+    let sinks: Rc<RefCell<Vec<SinkNode>>> = Rc::default();
+    let cards: Rc<RefCell<Vec<CardDevice>>> = Rc::default();
+    // The bound node proxies and their listeners have to outlive the callback that made them.
+    let bound: Rc<RefCell<Vec<(pw::node::Node, pw::node::NodeListener)>>> = Rc::default();
+
     let _reg_listener = registry
         .add_listener_local()
         .global({
-            let found = found.clone();
+            let (registry, sinks, cards, bound) = (
+                registry.clone(),
+                sinks.clone(),
+                cards.clone(),
+                bound.clone(),
+            );
             move |g| {
                 let Some(props) = g.props else { return };
-                // Both spellings: PipeWire's own objects use the `device.`-prefixed keys, and
-                // the pulse-facing proplist GE reads uses the bare ones. Cheap to accept both.
-                let vendor = props
-                    .get("device.vendor.id")
-                    .or_else(|| props.get("vendor.id"));
-                let product = props
-                    .get("device.product.id")
-                    .or_else(|| props.get("product.id"));
                 match g.type_ {
                     pw::types::ObjectType::Node => {
-                        // `Audio/Sink` and `Audio/Sink/Internal` alike: the hidden four-channel
-                        // parent behind a split card wears the latter, and it is a usable
-                        // (if second-choice) target — see `pick_pad_sink`.
-                        let Some(class) = props.get("media.class") else {
-                            return;
-                        };
-                        if !class.starts_with("Audio/Sink") {
+                        // The announce subset is enough to know this is a sink; everything the
+                        // matcher weighs comes from the info props below.
+                        if !props
+                            .get("media.class")
+                            .is_some_and(|c| c.starts_with("Audio/Sink"))
+                        {
                             return;
                         }
-                        let internal = class.ends_with("/Internal")
-                            || props
-                                .get("api.alsa.split.parent")
-                                .is_some_and(|v| !matches!(v, "false" | "0"));
-                        let Some(name) = props.get("node.name") else {
+                        let Ok(node) = registry.bind::<pw::node::Node, _>(g) else {
                             return;
                         };
-                        let description = props
-                            .get("node.description")
-                            .or_else(|| props.get("node.nick"))
-                            .unwrap_or(name);
-                        let positions: Vec<String> = props
-                            .get("audio.position")
-                            .map(|p| p.split(',').map(|s| s.trim().to_string()).collect())
-                            .unwrap_or_default();
-                        found.borrow_mut().0.push(SinkNode {
-                            device_id: props.get("device.id").and_then(|v| v.parse().ok()),
-                            channels: props
-                                .get("audio.channels")
-                                .and_then(|v| v.parse().ok())
-                                .unwrap_or(positions.len() as u32),
-                            split_parent: props.get("api.alsa.split.name").map(str::to_string),
-                            ds5: props_say_ds5(vendor, product, name, description),
-                            internal,
-                            positions,
-                            name: name.to_string(),
-                            description: description.to_string(),
-                        });
+                        let listener = node
+                            .add_listener_local()
+                            .info({
+                                let sinks = sinks.clone();
+                                move |info| {
+                                    let Some(p) = info.props() else { return };
+                                    if let Some(s) = sink_from_props(p) {
+                                        let mut v = sinks.borrow_mut();
+                                        // `info` can fire more than once per node; keep one.
+                                        if let Some(old) = v.iter_mut().find(|o| o.name == s.name) {
+                                            *old = s;
+                                        } else {
+                                            v.push(s);
+                                        }
+                                    }
+                                }
+                            })
+                            .register();
+                        bound.borrow_mut().push((node, listener));
                     }
                     pw::types::ObjectType::Device => {
+                        // Cards DO announce their identity keys, and nothing else about them
+                        // is weighed, so these need no second round.
+                        let vendor = props
+                            .get("device.vendor.id")
+                            .or_else(|| props.get("vendor.id"));
+                        let product = props
+                            .get("device.product.id")
+                            .or_else(|| props.get("product.id"));
                         let name = props.get("device.name").unwrap_or_default();
                         let description = props
                             .get("device.description")
                             .or_else(|| props.get("device.nick"))
                             .unwrap_or(name);
-                        found.borrow_mut().1.push(CardDevice {
+                        cards.borrow_mut().push(CardDevice {
                             id: g.id,
                             ds5: props_say_ds5(vendor, product, name, description),
                             name: name.to_string(),
@@ -457,24 +520,28 @@ fn walk_graph() -> anyhow::Result<(Vec<SinkNode>, Vec<CardDevice>)> {
         })
         .register();
 
-    // The registry replays existing globals asynchronously; one core sync marks the point they
-    // have all been delivered — quit there.
-    let pending = core.sync(0).context("pw sync")?;
-    let _core_listener = core
+    // Round 1 delivers the globals (and binds the sinks); round 2 collects the `info` events
+    // those binds provoked. Each round parks its sync seq for the one `done` listener.
+    let awaited: Rc<Cell<Option<pw::spa::utils::result::AsyncSeq>>> = Rc::new(Cell::new(None));
+    let _round_listener = core
         .add_listener_local()
         .done({
-            let mainloop = mainloop.clone();
+            let (mainloop, awaited) = (mainloop.clone(), awaited.clone());
             move |_, seq| {
-                if seq == pending {
+                if awaited.get() == Some(seq) {
                     mainloop.quit();
                 }
             }
         })
         .register();
-    mainloop.run();
-
-    let result = found.borrow().clone();
-    Ok(result)
+    for _ in 0..2 {
+        awaited.set(Some(core.sync(0).context("pw sync")?));
+        mainloop.run();
+    }
+    let out = (sinks.borrow().clone(), cards.borrow().clone());
+    // Drop the bound proxies before the core that owns them.
+    bound.borrow_mut().clear();
+    Ok(out)
 }
 
 // ---- the Pro Audio profile swap (Linux) ------------------------------------------------------
@@ -523,6 +590,12 @@ struct ProfileSwap {
 
 #[cfg(target_os = "linux")]
 static PROFILE_SWAP: Mutex<Option<ProfileSwap>> = Mutex::new(None);
+
+/// Cards whose profile we already moved WITHOUT getting a four-channel node out of it. One
+/// failed swap is information; repeating it on every backoff retry would flip a device in the
+/// user's sound settings back and forth for as long as the session lasts.
+#[cfg(target_os = "linux")]
+static PROFILE_TRIED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// Which profile a [`set_card_profile`] call is after.
 #[cfg(target_os = "linux")]
@@ -804,6 +877,12 @@ pub fn correlate_pad_sink() -> anyhow::Result<String> {
     match pick_pad_sink(&sinks, &cards) {
         Some(PadSinkPick::Node(name)) => Ok(name),
         Some(PadSinkPick::NeedsProfile(device_id)) => {
+            if PROFILE_TRIED.lock().unwrap().contains(&device_id) {
+                return Err(anyhow!(
+                    "the DualSense card has no four-channel node and moving its profile did \
+                     not help earlier this session — not moving it again"
+                ));
+            }
             ensure_pro_audio(device_id)?;
             // The card re-mints its nodes on a profile change; give the graph a moment to
             // publish them rather than failing into the caller's multi-second backoff.
@@ -816,6 +895,10 @@ pub fn correlate_pad_sink() -> anyhow::Result<String> {
                 }
                 last = sinks;
             }
+            // The swap did not help, so it is pure cost to the user: put the card back before
+            // reporting, and remember not to move this one again.
+            PROFILE_TRIED.lock().unwrap().push(device_id);
+            restore_profile();
             // Name what we saw: a card whose nodes publish no `audio.channels` at all looks
             // exactly like a card stuck on stereo from here, and the two want different fixes.
             //
@@ -853,6 +936,15 @@ pub fn correlate_pad_sink() -> anyhow::Result<String> {
 /// pad buzzes, everything below the plane is good.
 #[cfg(target_os = "linux")]
 pub fn pad_audio_test(seconds: u64, coils: bool, speaker: bool) -> anyhow::Result<()> {
+    // Whatever happens in here, the card goes back the way we found it. An early `?` used to
+    // skip the restore and leave a real Deck sitting on Pro Audio.
+    let out = pad_audio_test_inner(seconds, coils, speaker);
+    restore_profile();
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn pad_audio_test_inner(seconds: u64, coils: bool, speaker: bool) -> anyhow::Result<()> {
     let (sinks, cards) = walk_graph()?;
     // The totals first: "no DualSense here" and "this walk saw nothing at all" print the same
     // empty list otherwise, and they are completely different faults.
@@ -929,7 +1021,6 @@ pub fn pad_audio_test(seconds: u64, coils: bool, speaker: bool) -> anyhow::Resul
         std::thread::sleep(Duration::from_millis(10));
     }
     drop(out);
-    restore_profile();
     Ok(())
 }
 
