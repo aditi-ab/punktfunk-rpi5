@@ -29,6 +29,7 @@ pub(super) async fn run(
     live_bitrate: Arc<AtomicU32>,
     encoder_ceiling_kbps: Arc<AtomicU32>,
     cadence_degraded: Arc<AtomicBool>,
+    cadence_behind_score: Arc<AtomicU32>,
     fec_target_ctl: Arc<AtomicU8>,
     // Phase-locked capture bridge: client PhaseReports land here latest-wins; the encode loop's
     // controller drains at its own ~1 Hz cadence (design/phase-locked-capture.md).
@@ -221,6 +222,10 @@ pub(super) async fn run(
                             tracing::info!(
                                 requested_kbps = req.bitrate_kbps,
                                 held_kbps = live,
+                                // The refusal's evidence: without it a field log shows WHAT was
+                                // held but never WHY, and a session at the ABR floor is
+                                // indistinguishable from a network problem.
+                                behind_score = cadence_behind_score.load(Ordering::Relaxed),
                                 "bitrate climb refused — encode is behind cadence"
                             );
                             r = live;

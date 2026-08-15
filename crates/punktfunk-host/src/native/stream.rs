@@ -1314,6 +1314,11 @@ pub(super) struct SessionContext {
     /// session escalated): while set, the control task refuses bitrate CLIMBS — the network
     /// isn't the bottleneck, feeding the encoder more bits deepens the miss.
     pub(super) cadence_degraded: Arc<AtomicBool>,
+    /// The live behind-cadence leaky-bucket score, exported so the control task's climb-refusal
+    /// log line can say WHY (a field session sat at the ABR floor for 23 minutes with no trace
+    /// of what held it there — the score is the missing discriminator between "the detector's
+    /// budget is wrong" and "this encoder genuinely can't hold cadence").
+    pub(super) cadence_behind_score: Arc<AtomicU32>,
     /// The client asked for "Automatic" (`Hello::bitrate_kbps == 0`), so `bitrate_kbps` came from
     /// the host's codec-aware default. For PyroWave that default is the ~1.6 bpp operating point of
     /// the NEGOTIATED MODE (`resolve_bitrate_kbps_for`) — a mid-stream mode switch re-resolves it
@@ -1588,6 +1593,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         live_bitrate,
         encoder_ceiling_kbps,
         cadence_degraded,
+        cadence_behind_score,
         bitrate_auto,
         bit_depth,
         // The resolved chroma is already captured in `plan` (above); ignore the duplicate here.
@@ -2286,6 +2292,26 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     let mut cur_depth: usize = 1;
     let mut behind_score: u32 = 0;
     let mut depth_frames: u64 = 0;
+    // Observed source-delivery period (EMA over REAL frames' arrival spacing, ns) — the budget
+    // the behind test scores encode work against. The negotiated refresh alone is the wrong
+    // deadline when the game delivers slower than the mode: a field session negotiated at
+    // 120 Hz whose game ran 53–74 fps scored every frame against 8.33 ms while its real budget
+    // was ~2× that, so `behind_score` latched, climbs were refused, and the session sat at the
+    // ABR floor for 23 minutes with the encoder comfortably keeping up with every frame that
+    // actually existed. Repeats are excluded (a keepalive re-encode says nothing about the
+    // game's delivery rate); [`cadence_budget`] clamps to [interval, 4×interval] so a source
+    // faster than the mode keeps today's exact deadline and a hitchy/idle one can't disarm
+    // the detector entirely.
+    let mut src_period_ns: Option<u64> = None;
+    let mut last_real_cap: Option<std::time::Instant> = None;
+    // Transition edge + rate limit for the cadence_degraded log lines: around the latch
+    // threshold the score can cross ±1 every other frame, and 60 lines/s in a field log is
+    // worse than none. One line per direction per 5 s window; flips swallowed by the limiter
+    // are counted so an oscillation is still visible in the next line.
+    let mut was_degraded = false;
+    let mut last_cadence_log: Option<std::time::Instant> = None;
+    let mut cadence_flips_suppressed: u32 = 0;
+    const CADENCE_LOG_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(5);
     // Second escalation stage (§7 LN3): once depth is maxed (or was never available — Linux),
     // ask the encoder for pipelined retrieve exactly once. Latched whether it accepts or not.
     let mut pipeline_asked = false;
@@ -2931,6 +2957,20 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             Ok(Some(f)) => {
                 frame = f;
                 diag_new += 1;
+                // Source-cadence estimate (see the declaration above): `t_cap` on the
+                // frame-driven path is taken right after `wait_arrival` wakes, so real-frame
+                // deltas track the game's actual delivery spacing. Deltas past 8×interval are
+                // a gap/hitch (mid-rebuild, alt-tab), not cadence — skipped, not averaged in.
+                if let Some(prev) = last_real_cap {
+                    let d = t_cap.duration_since(prev).as_nanos() as u64;
+                    if d <= interval.as_nanos() as u64 * 8 {
+                        src_period_ns = Some(match src_period_ns {
+                            Some(e) => (e as i64 + (d as i64 - e as i64) / 8) as u64,
+                            None => d,
+                        });
+                    }
+                }
+                last_real_cap = Some(t_cap);
                 // Phase-locked capture: hold the fresh frame so its ARRIVAL at the client lands a
                 // constant small lead before the client's display latch (§3 hold-then-submit; the
                 // capture slot is newest-wins, so a long hold samples fresher content next tick,
@@ -3825,7 +3865,13 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         if idd_adaptive_enabled() {
             depth_frames += 1;
             if depth_frames > DEPTH_WARMUP_FRAMES {
-                let behind = std::time::Instant::now() >= next;
+                // The deadline is `next` (post-submit + negotiated interval) stretched by how
+                // much slower the source actually delivers: encode work only has to beat the
+                // NEXT REAL FRAME's arrival, not a refresh the game never reaches. For a
+                // full-rate source the budget equals the interval and this is bit-for-bit the
+                // old test.
+                let budget = cadence_budget(interval, src_period_ns);
+                let behind = std::time::Instant::now() >= next + (budget - interval);
                 behind_score = if behind {
                     (behind_score + 1).min(DEPTH_BEHIND_CAP)
                 } else {
@@ -3847,10 +3893,44 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 // Escalating exists precisely so cadence CAN be held; once it is (bucket
                 // drained, every frame on time), refusing climbs is refusing the thing that
                 // worked.
-                cadence_degraded.store(
-                    encode_behind_cadence(escalated, behind_score, DEPTH_DEGRADE),
-                    Ordering::Relaxed,
-                );
+                let degraded = encode_behind_cadence(escalated, behind_score, DEPTH_DEGRADE);
+                cadence_degraded.store(degraded, Ordering::Relaxed);
+                cadence_behind_score.store(behind_score, Ordering::Relaxed);
+                // Log every transition (rate-limited, see the state above): a degraded stretch
+                // refuses every ABR climb, so a session can sit at the bitrate floor for its
+                // whole life — that MUST leave a trace saying why, with the numbers needed to
+                // tell "the budget was wrong" from "this encoder genuinely can't keep up".
+                if degraded != was_degraded {
+                    let now = std::time::Instant::now();
+                    if last_cadence_log.is_none_or(|t| now.duration_since(t) >= CADENCE_LOG_MIN_GAP)
+                    {
+                        let budget = cadence_budget(interval, src_period_ns);
+                        if degraded {
+                            tracing::info!(
+                                behind_score,
+                                escalated,
+                                budget_us = budget.as_micros() as u64,
+                                interval_us = interval.as_micros() as u64,
+                                src_period_us =
+                                    src_period_ns.map(|p| p / 1_000).unwrap_or_default(),
+                                flips_suppressed = cadence_flips_suppressed,
+                                "encode behind cadence — ABR climbs will be refused until it \
+                                 recovers"
+                            );
+                        } else {
+                            tracing::info!(
+                                behind_score,
+                                flips_suppressed = cadence_flips_suppressed,
+                                "encode cadence recovered — ABR climbs allowed again"
+                            );
+                        }
+                        last_cadence_log = Some(now);
+                        cadence_flips_suppressed = 0;
+                    } else {
+                        cadence_flips_suppressed += 1;
+                    }
+                    was_degraded = degraded;
+                }
                 if deescalating {
                     // A requested wind-back completes at the encoder's drained safe point —
                     // poll it (the call is a cheap latch check until then).
@@ -4551,6 +4631,24 @@ fn encode_behind_cadence(escalated: bool, behind_score: u32, degrade_at: u32) ->
     behind_score >= degrade_at || (escalated && behind_score > 0)
 }
 
+/// The behind-cadence budget for one frame: how long its work may run before the frame counts as
+/// "behind". This is the OBSERVED source-delivery period, not the negotiated refresh — encode
+/// only has to finish before the next frame that actually exists, and a game delivering 60 fps
+/// on a 120 Hz mode gives every frame twice the interval's budget. Clamped below to the
+/// negotiated interval (a source faster than the mode is paced down to it, so the interval IS
+/// its delivery period) and above to 4× (a hitchy or near-idle source must not disarm the
+/// detector — past 4× the mode is so mismatched that the wider budget is moot anyway).
+/// No estimate yet (startup, an all-repeat stretch) keeps the plain interval.
+fn cadence_budget(
+    interval: std::time::Duration,
+    src_period_ns: Option<u64>,
+) -> std::time::Duration {
+    match src_period_ns {
+        Some(p) => std::time::Duration::from_nanos(p).clamp(interval, interval * 4),
+        None => interval,
+    }
+}
+
 /// Adopt the rate a freshly built pipeline's encoder was actually opened at.
 ///
 /// The session's own `bitrate_kbps` is the number every later decision reads — the ABR controller's
@@ -4865,6 +4963,34 @@ mod tests {
         // for. This is the case that used to stay latched for the rest of the session and pin an
         // Automatic client at its slow-start rate.
         assert!(!encode_behind_cadence(true, 0, DEGRADE));
+    }
+
+    /// The 2026-08-15 field session: negotiated 2560×1440@120 (interval 8333 µs) while the game
+    /// delivered 53–74 fps (observed period 13.5–18.9 ms). Scoring encode work against the bare
+    /// interval marked a keeping-up encoder "behind" on most frames, latched `cadence_degraded`,
+    /// and held the session at the 5000 kbps ABR floor for 23 minutes. The budget must be the
+    /// observed delivery period — bounded so the two failure edges (an overdriven source, a
+    /// hitching source) keep the detector honest.
+    #[test]
+    fn the_behind_budget_tracks_the_source_not_the_negotiated_refresh() {
+        let interval = std::time::Duration::from_micros(8333); // 120 Hz mode
+        let us = |d: std::time::Duration| d.as_micros() as u64;
+
+        // No estimate yet (startup / all-repeat stretch): the plain interval, i.e. the old test.
+        assert_eq!(cadence_budget(interval, None), interval);
+        // The field case: a ~60 fps source on the 120 Hz mode gets its real ~2× budget.
+        assert_eq!(
+            us(cadence_budget(interval, Some(16_600_000))),
+            16_600,
+            "a 60 fps source's frames have 16.6 ms of real budget"
+        );
+        // A source at (or paced to) the negotiated rate: unchanged from today.
+        assert_eq!(us(cadence_budget(interval, Some(8_333_000))), 8_333);
+        // An overdriven source can never SHRINK the budget below the interval — pacing floors
+        // delivery at the negotiated rate, so a smaller estimate is measurement noise.
+        assert_eq!(cadence_budget(interval, Some(4_000_000)), interval);
+        // A hitchy/near-idle source is clamped at 4× — the detector must not be disarmed.
+        assert_eq!(cadence_budget(interval, Some(500_000_000)), interval * 4);
     }
 
     #[test]
