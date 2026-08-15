@@ -82,6 +82,51 @@ pub fn boost_thread_priority(critical: bool) {
     }
 }
 
+/// What the OS is actually giving the CALLING thread: `(policy, rt_priority, nice)`.
+///
+/// Exists because a boost we *asked for* and a boost the hot thread *has* turned out to be
+/// different questions. Callbacks handed to a library — PipeWire's `RT_PROCESS` streams above all
+/// — run on a thread that library created and schedules, so a `boost_thread_priority` call in our
+/// own setup path can log a cheerful success about a thread that never touches audio. A
+/// 2026-08-15 measurement found exactly that shape: our loop thread at SCHED_OTHER/0 while the
+/// data loop actually running the capture callback sat at SCHED_RR/20, both in the same process.
+///
+/// Report this from inside the hot callback, where "the calling thread" is the one that matters.
+#[cfg(target_os = "linux")]
+pub fn current_thread_sched() -> (&'static str, i32, i32) {
+    // SAFETY: all three calls take by-value integers (plus, for `sched_getparam`, a pointer to a
+    // fully-initialised local we own and outlive) and return integers. `0` means "the calling
+    // task" on Linux, so nothing outside this thread is read or written, and no allocation,
+    // locking or blocking happens — which is what makes this callable from an RT callback.
+    unsafe {
+        let policy = libc::sched_getscheduler(0);
+        let mut param: libc::sched_param = std::mem::zeroed();
+        let rt_priority = if libc::sched_getparam(0, &mut param) == 0 {
+            param.sched_priority
+        } else {
+            -1
+        };
+        // `getpriority` legitimately returns -1, so errno is the only way to tell a nice of -1
+        // from a failure.
+        *libc::__errno_location() = 0;
+        let nice = libc::getpriority(libc::PRIO_PROCESS, 0);
+        let nice = if *libc::__errno_location() == 0 {
+            nice
+        } else {
+            0
+        };
+        let policy = match policy {
+            libc::SCHED_FIFO => "SCHED_FIFO",
+            libc::SCHED_RR => "SCHED_RR",
+            libc::SCHED_OTHER => "SCHED_OTHER",
+            libc::SCHED_BATCH => "SCHED_BATCH",
+            libc::SCHED_IDLE => "SCHED_IDLE",
+            _ => "unknown",
+        };
+        (policy, rt_priority, nice)
+    }
+}
+
 /// RealtimeKit fallback for [`boost_thread_priority`]: ask the system-bus broker
 /// (`org.freedesktop.RealtimeKit1`) to renice the calling thread when the direct
 /// `setpriority` was refused. This is how PulseAudio/PipeWire clients get their boosts on a
@@ -119,5 +164,29 @@ mod linux_rtkit {
             &(pid, tid, nice),
         )?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    /// Non-vacuity: the introspection has to come back with something the OS could actually have
+    /// said. A helper whose whole job is to be quoted in a field log is worthless if it can
+    /// quietly report a placeholder, and it only ever runs on hosts nobody can attach a debugger
+    /// to.
+    #[test]
+    fn current_thread_sched_reports_a_real_policy() {
+        let (policy, rt_priority, nice) = super::current_thread_sched();
+        assert!(
+            matches!(
+                policy,
+                "SCHED_OTHER" | "SCHED_RR" | "SCHED_FIFO" | "SCHED_BATCH" | "SCHED_IDLE"
+            ),
+            "unrecognised policy {policy}"
+        );
+        assert!(
+            (0..=99).contains(&rt_priority),
+            "rt priority {rt_priority} outside the kernel's range"
+        );
+        assert!((-20..=19).contains(&nice), "nice {nice} outside PRIO range");
     }
 }

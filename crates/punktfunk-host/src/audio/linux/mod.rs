@@ -691,9 +691,19 @@ fn pw_thread(
     use pw::{properties::properties, spa};
     use spa::param::audio::{AudioFormat, AudioInfoRaw};
     use spa::pod::Pod;
-    // The stream's `process` callbacks run ON this mainloop thread (we never hand PipeWire a
-    // separate data loop), so PipeWire's own client `module-rt` boost of its data loops does not
-    // cover it — the ~2.7 ms capture quantum lives or dies by this thread's scheduling.
+    // ⚠ This boosts the MAINLOOP thread, which is NOT where the capture callback runs.
+    //
+    // The previous comment here asserted the opposite ("we never hand PipeWire a separate data
+    // loop"), and it was wrong: we pass `RT_PROCESS` below, so libpipewire runs `process()` on a
+    // data loop it creates and schedules itself. Measured in one live host process on 2026-08-15
+    // — this thread at SCHED_OTHER/nice 0, `data-loop.0` at SCHED_RR/20. That mattered more than
+    // a stale comment usually does: a field investigation read the boost's success line as
+    // evidence that the audio callback was prioritised, and spent a round concluding priorities
+    // were "engaged but insufficient" when they had never been applied to the thread in question.
+    //
+    // The boost is kept — this thread still dispatches state and format events, and it IS the
+    // capture thread when `PUNKTFUNK_STREAM_SINK=0` selects the legacy monitor path. What replaces
+    // the assumption is a measurement: the callback reports its own scheduling on first entry.
     pf_frame::thread_qos::boost_thread_priority(true);
 
     // Setup errors funnel through the ready handshake (mirrors mic_pw_thread's IIFE).
@@ -796,6 +806,8 @@ fn pw_thread(
             /// A buffer size seen but not yet believed, with how many callbacks in a row have
             /// agreed on it. Stops one short buffer from moving the gap threshold.
             quantum_candidate: Option<(usize, u8)>,
+            /// Whether this open has reported the scheduling of the thread running `process()`.
+            reported_sched: bool,
             /// When the callback last ran (WP-A2), so its CADENCE can be scored and not just its
             /// content. Cleared across a state transition — a deliberate Paused span must not
             /// read as one enormous hole. Lives here rather than in `stats` because the stats
@@ -823,6 +835,7 @@ fn pw_thread(
             last_stats: std::time::Instant::now(),
             quantum_frames: 0,
             quantum_candidate: None,
+            reported_sched: false,
             last_cb: None,
             quantum: Duration::from_micros(
                 CAPTURE_QUANTUM_FRAMES as u64 * 1_000_000 / SAMPLE_RATE as u64,
@@ -916,6 +929,24 @@ fn pw_thread(
                     let since_last = ud.last_cb.map(|t| now.duration_since(t));
                     ud.last_cb = Some(now);
                     ud.stats.observe_callback(since_last, ud.quantum);
+
+                    if !ud.reported_sched {
+                        ud.reported_sched = true;
+                        // Say what the thread that ACTUALLY runs this callback is scheduled as.
+                        // Whether the capture callback is realtime decides whether a Wine shader
+                        // storm can deschedule it for tens of ms at a 2.7 ms quantum, and until
+                        // now no log anywhere carried the answer — only that we had asked for a
+                        // boost, on a different thread. Once per open, off the hot path after
+                        // that.
+                        let (policy, rt_priority, nice) =
+                            pf_frame::thread_qos::current_thread_sched();
+                        tracing::info!(
+                            policy,
+                            rt_priority,
+                            nice,
+                            "audio capture callback scheduling"
+                        );
+                    }
 
                     let Some(mut buffer) = stream.dequeue_buffer() else {
                         ud.stats.missed_dequeues += 1;
