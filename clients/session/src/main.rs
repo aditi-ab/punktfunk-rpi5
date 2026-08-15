@@ -821,6 +821,29 @@ mod session_main {
             };
         }
 
+        // `--pad-audio-test [--seconds N] [--speaker] [--coils]`: the controller-audio
+        // correlation, printed, then a tone driven into the pad. The one tool that separates
+        // "the plane never arrived" from "it arrived and the graph folded the coil pair away"
+        // — no host, no game, no pairing needed, just a wired DualSense.
+        #[cfg(target_os = "linux")]
+        if arg_flag("--pad-audio-test") {
+            let seconds = arg_value("--seconds")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3);
+            // Coils by default: they are the half that silently disappears, so they are the
+            // half worth testing. `--speaker` adds (or, with nothing else, selects) the
+            // speaker pair.
+            let speaker = arg_flag("--speaker");
+            let coils = arg_flag("--coils") || !speaker;
+            return match pf_client_core::pad_audio::pad_audio_test(seconds, coils, speaker) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("pad-audio-test: {e:#}");
+                    EXIT_PRESENTER_FAILED
+                }
+            };
+        }
+
         // `--pair <PIN>`: enrol this machine against a host and exit. DEPRECATED — pairing is
         // a trust ceremony and belongs to the brain, fronted by `punktfunk pair` or a shell
         // (design/client-architecture-split.md §5). It still works, with a notice, for the one

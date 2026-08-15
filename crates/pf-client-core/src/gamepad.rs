@@ -789,6 +789,19 @@ fn axis_value(axis: sdl3::gamepad::Axis, v: i16) -> (u32, i32) {
 /// in `punktfunk-core`, the only crate they share. So this is a deliberate second copy, and
 /// [`ds5_offsets_track_the_usb_report`](ds5_feedback_tests) pins the `−1` relationship rather than
 /// leaving it to a comment.
+/// A `u8` field lever: decimal, or `0x`-prefixed hex (these name DS5 report BYTES, and every
+/// reference to them — SDL's source, the reverse-engineering notes, this module's own comments —
+/// writes them in hex). `None` when unset or unparseable, so a typo falls back to the default
+/// rather than to zero.
+fn env_u8(key: &str) -> Option<u8> {
+    let v = std::env::var(key).ok()?;
+    let v = v.trim();
+    match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        Some(hex) => u8::from_str_radix(hex, 16).ok(),
+        None => v.parse().ok(),
+    }
+}
+
 struct Ds5Feedback;
 
 impl Ds5Feedback {
@@ -842,6 +855,39 @@ impl Ds5Feedback {
     /// other valid flag, so nothing else is touched) puts the pad back on audio haptics.
     fn audio_haptics_packet() -> [u8; 47] {
         [0u8; 47]
+    }
+
+    /// Point the pad's audio at its own SPEAKER, and give that speaker a volume.
+    ///
+    /// Without this the speaker is silent no matter how correct the PCM routing is, which is
+    /// exactly what a wired DS5 on a Steam Deck did: haptics felt, speaker inaudible. The
+    /// reason is that **channel 1 of the pad's audio function is shared** — it is the headphone
+    /// jack's right channel AND the built-in mono speaker — and which one physically sounds is
+    /// chosen by `ucAudioEnableBits` (report byte 8, struct offset 7). A pad powers up pointing
+    /// at the headphone jack, so with nothing plugged in the speaker pair goes nowhere. The
+    /// voice coils are channels 2/3 and are NOT affected by that select, which is why haptics
+    /// work the instant the samples are routed right and the speaker does not.
+    ///
+    /// We only ever wrote these bytes when a host forwarded a game's [`HidOutput::AudioCtl`],
+    /// so a title that manages no audio settings of its own left the speaker dead. This is the
+    /// default that makes the stream audible; a later `AudioCtl` still overrides it verbatim
+    /// ([`Self::audio_ctl_packet`]), so a game that does drive its own volume still wins.
+    ///
+    /// ⚠ `ucEnableBits1` bits 0/1 stay CLEAR — they are "enable rumble emulation" and "disable
+    /// audio haptics", and asserting either would mute the coils this plane drives.
+    ///
+    /// ⚠ `path` is empirical. Measured on a DualSense (`054c:0ce6`) using the pad's OWN
+    /// microphone as the detector: `0x20` was loudest (~5× the noise floor at the test tone),
+    /// `0x30` also sounded, `0x10` was silent. Overridable per-run with
+    /// `PUNKTFUNK_PAD_SPEAKER_PATH` / `PUNKTFUNK_PAD_SPEAKER_VOLUME` so a field report can
+    /// bisect it without a rebuild.
+    fn speaker_enable_packet(volume: u8, path: u8) -> [u8; 47] {
+        let mut p = [0u8; 47];
+        // bit5 = ucSpeakerVolume is valid, bit7 = the audio-control byte is valid.
+        p[0] = 0x20 | 0x80;
+        p[Self::AUDIO + 1] = volume; // ucSpeakerVolume
+        p[Self::AUDIO + 3] = path; // ucAudioEnableBits
+        p
     }
 
     /// Fold a host [`HidOutput::AudioCtl`] into an effects packet: `raw` is DS5 output report
@@ -1333,10 +1379,48 @@ impl Worker {
                         // ("Leaving emulated rumble bits off will restore audio haptics" —
                         // SDL_hidapi_ps5.c); wire rumble for this slot is suppressed in
                         // render_feedback so SDL never re-arms them.
-                        let _ = slot.pad.send_effect(&Ds5Feedback::audio_haptics_packet());
+                        //
+                        // ⚠ This needs SDL's HIDAPI driver to be the one on the pad — the
+                        // packet is a raw DS5 effects report, and SDL can only send it where
+                        // it owns the HID link. On a Linux box where the kernel's
+                        // `hid-playstation` has the pad instead, the call fails, and it is
+                        // worth SAYING so: `hid-playstation` asserts the same disable bit on
+                        // every force-feedback update it makes, so a pad some other program
+                        // has rumbled stays deaf to this plane until it is re-plugged. Not
+                        // fatal — nothing else asserts the bit in our own path, so the pad's
+                        // power-on default (audio haptics live) usually still stands.
+                        if let Err(e) = slot.pad.send_effect(&Ds5Feedback::audio_haptics_packet()) {
+                            tracing::info!(
+                                index,
+                                error = %e,
+                                "could not re-arm the DualSense's audio-haptics bit (SDL does \
+                                 not own this pad's HID link) — haptics still work unless \
+                                 something else has rumbled the pad this plug-in"
+                            );
+                        }
+                    }
+                    if slot.audio_caps & 0x02 != 0 {
+                        // Speaker activation: point the pad's shared channel-1 output at its
+                        // own speaker instead of the headphone jack it powers up on, and give
+                        // it a volume. Without this the speaker stream is routed perfectly and
+                        // heard by nobody — see `speaker_enable_packet`.
+                        let path = env_u8("PUNKTFUNK_PAD_SPEAKER_PATH").unwrap_or(0x20);
+                        let volume = env_u8("PUNKTFUNK_PAD_SPEAKER_VOLUME").unwrap_or(0x7F);
+                        if let Err(e) = slot
+                            .pad
+                            .send_effect(&Ds5Feedback::speaker_enable_packet(volume, path))
+                        {
+                            tracing::info!(
+                                index,
+                                error = %e,
+                                "could not point the DualSense at its own speaker (SDL does \
+                                 not own this pad's HID link) — the pad's speaker may stay \
+                                 silent even though the stream reaches it"
+                            );
+                        }
                     }
                     // Hand the pad to the session's renderer worker. Windows correlation
-                    // needs the HID interface path; Linux matches the sink by signature.
+                    // needs the HID interface path; Linux matches by card identity.
                     crate::pad_audio::register_tier_a(index, slot.pad.path());
                     tracing::info!(
                         index,
@@ -2912,6 +2996,55 @@ mod slot_tests {
             }),
             7
         );
+    }
+
+    /// The speaker-enable default: volume and output-path land in the audio-control region at
+    /// the same offsets an `AudioCtl` fold writes them, the two validity bits are set — and,
+    /// most importantly, `ucEnableBits1` bits 0/1 stay CLEAR. Asserting either would enable
+    /// rumble emulation / disable audio haptics and mute the very coils this plane drives, so
+    /// making the speaker audible must never cost the haptics.
+    #[test]
+    fn speaker_enable_sets_volume_and_path_without_touching_the_haptics_bits() {
+        let p = Ds5Feedback::speaker_enable_packet(0x7F, 0x20);
+        assert_eq!(
+            p[0] & 0x03,
+            0,
+            "rumble-emulation / disable-audio-haptics must stay clear"
+        );
+        assert_eq!(
+            p[0],
+            0x20 | 0x80,
+            "speaker-volume + audio-control validity bits"
+        );
+        // ucSpeakerVolume is report byte 6 and ucAudioEnableBits report byte 8 — struct
+        // offsets 5 and 7, i.e. AUDIO+1 and AUDIO+3.
+        assert_eq!(p[5], 0x7F);
+        assert_eq!(p[7], 0x20);
+        // Nothing else in the packet moves (no rumble, no triggers, no LEDs).
+        for (i, b) in p.iter().enumerate() {
+            if !matches!(i, 0 | 5 | 7) {
+                assert_eq!(*b, 0, "byte {i} should be untouched");
+            }
+        }
+    }
+
+    /// The field levers parse hex (how every reference writes these report bytes) and decimal,
+    /// and a typo falls back to the default rather than silently meaning zero.
+    #[test]
+    fn env_u8_reads_hex_and_decimal() {
+        assert_eq!(env_u8("PF_TEST_ABSENT_KEY_XYZ"), None);
+        // Parsing is what is under test; the lookup is exercised by the None case above.
+        for (s, want) in [
+            ("0x20", Some(0x20)),
+            ("0X7f", Some(0x7F)),
+            ("32", Some(32u8)),
+        ] {
+            let parsed = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                Some(hex) => u8::from_str_radix(hex, 16).ok(),
+                None => s.parse().ok(),
+            };
+            assert_eq!(parsed, want, "{s}");
+        }
     }
 
     /// The AudioCtl fold: the 6 raw bytes (DS5 report 0x02 bytes 5..=10) land at effect-struct
