@@ -34,6 +34,8 @@ pub mod gamepad;
 pub mod keymap;
 #[cfg(any(target_os = "linux", windows))]
 pub mod library;
+#[cfg(any(target_os = "linux", windows))]
+pub mod logring;
 // The `punktfunk://` grammar (design/client-deep-links.md §2): one parser/emitter for the
 // shells, the session and the CLI, held to the Swift/Kotlin ports by a shared vector file.
 #[cfg(any(target_os = "linux", windows))]

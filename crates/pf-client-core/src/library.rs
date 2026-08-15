@@ -298,7 +298,7 @@ pub fn spawn_art_fetch(
     rx
 }
 
-fn classify(e: ureq::Error) -> LibraryError {
+pub(crate) fn classify(e: ureq::Error) -> LibraryError {
     match e {
         ureq::Error::StatusCode(401 | 403) => LibraryError::NotPaired,
         ureq::Error::StatusCode(code) => LibraryError::Http(code),

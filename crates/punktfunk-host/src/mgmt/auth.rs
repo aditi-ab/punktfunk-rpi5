@@ -289,6 +289,13 @@ fn path_matches(pattern: &str, path: &str) -> bool {
 /// a streaming client can't administer the host (unpair others, arm/read the PIN, stop sessions,
 /// edit the library). `/health` is handled separately (always open).
 pub(crate) fn cert_may_access(method: &Method, path: &str) -> bool {
+    // The ONE write on this lane: a paired device uploading its own log bundle for the operator
+    // ("send logs to host" — the only way logs escape a Deck in Gaming Mode or a tvOS box).
+    // Deliberately write-only: the device gets an id back and can read NOTHING — not the bundle
+    // list, not even its own upload. Size- and quota-capped in the handler/store.
+    if method == Method::POST && path == "/api/v1/client-logs" {
+        return true;
+    }
     method == Method::GET
         && (matches!(
             path,

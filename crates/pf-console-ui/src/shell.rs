@@ -278,6 +278,11 @@ impl Shell {
             (self.hosts, self.hosts_gen) = self.console.hosts_snapshot();
         }
 
+        // Service-worker notices (e.g. the log-upload result) become plain toasts.
+        if let Some(text) = self.console.take_notice() {
+            self.show_toast(text);
+        }
+
         let pair = self.console.pair();
         match &pair {
             PairPhase::Idle => {}

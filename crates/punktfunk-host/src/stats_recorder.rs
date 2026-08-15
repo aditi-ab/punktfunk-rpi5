@@ -200,7 +200,8 @@ fn capture_id(unix_ms: u64, width: u32, height: u32) -> String {
 }
 
 /// Civil (Y, M, D) from a count of days since the Unix epoch (Howard Hinnant's `civil_from_days`).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+/// `pub(crate)`: `client_logs::bundle_id` builds its timestamp stem the same way.
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
     let doe = z - era * 146_097; // [0, 146096]
