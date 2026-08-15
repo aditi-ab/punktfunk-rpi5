@@ -194,7 +194,7 @@ struct ReassemblyWindow {
 /// partially-arrived frames of ACTUAL size (≪ max); without this cap, [`HARD_LOSS_WINDOW`]
 /// max-sized declarations from one header-sized packet each could commit gigabytes — an
 /// amplification the old sparse per-shard allocation didn't have.
-const IN_FLIGHT_BUF_FACTOR: usize = 4;
+pub(super) const IN_FLIGHT_BUF_FACTOR: usize = 4;
 
 /// Recovery-shard buffer pool ceiling (shard-sized buffers): enough for several max-recovery
 /// blocks in flight, small enough (~720 KB at a 1408-byte shard) to keep after a loss burst.
@@ -208,7 +208,12 @@ const RECOVERY_POOL_MAX: usize = 512;
 /// can mint thousands of distinct-index blocks while its `FrameBuf::buf` stays pinned near zero —
 /// they must be metered exactly like the buffer, or the firewall meters only half the allocation
 /// (security-review 2026-08-15 finding 11).
-fn block_state_bytes(data_shards: usize, recovery_shards: usize) -> usize {
+///
+/// `pub(super)` so the budget tests can locate the refusal boundary from the cost model itself
+/// rather than from a baked-in frame count — [`BlockState`] gaining a field moves that boundary,
+/// and a test that hard-codes it answers such a change with an arithmetic puzzle instead of the
+/// question actually worth asking.
+pub(super) fn block_state_bytes(data_shards: usize, recovery_shards: usize) -> usize {
     std::mem::size_of::<BlockState>()
         + data_shards // have_data: Vec<bool>
         + recovery_shards * std::mem::size_of::<Option<Vec<u8>>>() // recovery slot table
