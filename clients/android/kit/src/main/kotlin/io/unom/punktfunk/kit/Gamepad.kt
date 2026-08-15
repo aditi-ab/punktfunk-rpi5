@@ -196,6 +196,29 @@ object Gamepad {
     fun firstPad(): InputDevice? = pads().firstOrNull()
 
     /**
+     * True when a Steam Controller 2 is attached as an ORDINARY [InputDevice] — which, for a pad
+     * this client wants to capture, means an uncaptured one still in lizard mode.
+     *
+     * Deliberately not filtered by [isPad]: lizard mode emulates a keyboard and mouse, so an SC2
+     * is never a gamepad source and every other pad-shaped query in the client steps right past
+     * it. That is also why this is worth having — a wired or Puck SC2 is found by enumerating USB
+     * (no permission needed), but a BLE-paired one is invisible until `BLUETOOTH_CONNECT` is
+     * granted, and asking for Bluetooth on the chance that someone might own one is not something
+     * to put in front of every user. This is the permission-free signal that the pad is genuinely
+     * there, so the request can be made to the people it helps and to nobody else.
+     *
+     * A false negative is survivable by design (the Controllers screen offers the grant outright),
+     * so this matches only the identities we know rather than reaching for every Valve device — a
+     * Steam Deck's own controller and a classic Steam Controller are not SC2s and must not
+     * conjure a Bluetooth prompt.
+     */
+    fun sc2InputDevicePresent(): Boolean =
+        InputDevice.getDeviceIds().asSequence().mapNotNull { InputDevice.getDevice(it) }.any {
+            it.vendorId == VID_VALVE &&
+                (it.productId in PID_STEAMCONTROLLER2 || it.productId in PID_STEAMCONTROLLER2_PUCK)
+        }
+
+    /**
      * The [GamepadPref] wire byte to send for the user's [setting] (the persisted gamepad index). A
      * non-Auto setting is passed through unchanged; "Automatic" ([PREF_AUTO]) resolves to a concrete
      * type from the first connected controller via [prefFor] (so the host gets the right pad even

@@ -1,5 +1,6 @@
 package io.unom.punktfunk.kit
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
@@ -9,6 +10,8 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
 import android.util.Log
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
@@ -47,16 +50,33 @@ class Sc2BleLink(
 
     @Volatile private var state = State.IDLE
 
-    /** Bonded devices that look like a Steam Controller (name heuristic — BLE exposes no PID here). */
-    fun pairedControllers(): List<BluetoothDevice> = runCatching {
-        manager.adapter?.bondedDevices.orEmpty().filter { dev ->
-            val n = runCatching { dev.name }.getOrNull() ?: return@filter false
-            NAME_HINTS.any { n.contains(it, ignoreCase = true) }
+    /**
+     * Bonded devices that look like a Steam Controller (name heuristic — BLE exposes no PID here).
+     *
+     * Gates on [permissionGranted] itself rather than trusting callers to: without the permission
+     * `bondedDevices` throws, and the `runCatching` below turns that into an empty list —
+     * indistinguishable from "no controller is paired". A capture that never engaged for want of a
+     * permission nobody had asked for is exactly the silence this logs its way out of.
+     */
+    fun pairedControllers(): List<BluetoothDevice> {
+        if (!permissionGranted(context)) {
+            Log.i(TAG, "BLE controllers not enumerated: $CONNECT_PERMISSION not granted")
+            return emptyList()
         }
-    }.getOrDefault(emptyList())
+        return runCatching {
+            manager.adapter?.bondedDevices.orEmpty().filter { dev ->
+                val n = runCatching { dev.name }.getOrNull() ?: return@filter false
+                NAME_HINTS.any { n.contains(it, ignoreCase = true) }
+            }
+        }.getOrDefault(emptyList())
+    }
 
     /** Connect to the bonded controller at [address]. Reports start flowing once READY. */
     fun start(address: String): Boolean {
+        if (!permissionGranted(context)) {
+            Log.i(TAG, "BLE capture not started: $CONNECT_PERMISSION not granted")
+            return false
+        }
         val adapter = manager.adapter ?: return false
         if (!adapter.isEnabled) return false
         val device = runCatching { adapter.getRemoteDevice(address) }.getOrNull() ?: return false
@@ -222,20 +242,50 @@ class Sc2BleLink(
         return s.substring(0, 8).toLongOrNull(16)
     }
 
-    private companion object {
-        const val TAG = "Sc2BleLink"
+    companion object {
+        private const val TAG = "Sc2BleLink"
 
-        val VALVE_SERVICE: UUID = UUID.fromString("100f6c32-1735-4313-b402-38567131e5f3")
-        const val VALVE_UUID_TAIL = "-1735-4313-b402-38567131e5f3"
-        const val NOTIFY_LOW = 0x100f6c75L
-        const val NOTIFY_HIGH = 0x100f6c7aL
-        const val WRITE_LOW = 0x100f6cb5L
-        const val WRITE_HIGH = 0x100f6cbeL
-        val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        private val VALVE_SERVICE: UUID = UUID.fromString("100f6c32-1735-4313-b402-38567131e5f3")
+        private const val VALVE_UUID_TAIL = "-1735-4313-b402-38567131e5f3"
+        private const val NOTIFY_LOW = 0x100f6c75L
+        private const val NOTIFY_HIGH = 0x100f6c7aL
+        private const val WRITE_LOW = 0x100f6cb5L
+        private const val WRITE_HIGH = 0x100f6cbeL
+        private val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-        val NAME_HINTS = listOf("Steam Ctrl", "Steam Controller", "SteamController", "Valve")
+        private val NAME_HINTS =
+            listOf("Steam Ctrl", "Steam Controller", "SteamController", "Valve")
 
         /** Enough for a state payload (45 B) + ATT header with margin. */
-        const val DESIRED_MTU = 100
+        private const val DESIRED_MTU = 100
+
+        /**
+         * The runtime permission this transport needs, or null where the platform grants Bluetooth
+         * at install time.
+         *
+         * From API 31 both operations a capture makes — reading the bonded list and `connectGatt`
+         * — sit behind the runtime `BLUETOOTH_CONNECT`. Below it the manifest's legacy `BLUETOOTH`
+         * (normal-level, granted on install) covers exactly those two, and `BLUETOOTH_CONNECT` is
+         * not a permission that platform version knows: `checkSelfPermission` answers DENIED for
+         * it and a request is refused without a dialog. Gating on it unconditionally is therefore
+         * not merely redundant on old releases — it is a permanent refusal, which is what this
+         * null arm exists to avoid.
+         */
+        val CONNECT_PERMISSION: String? =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                Manifest.permission.BLUETOOTH_CONNECT
+            } else {
+                null
+            }
+
+        /**
+         * Whether a BLE capture may run: [CONNECT_PERMISSION] held, or not required on this
+         * release. Callers that can offer the user a grant ask this first, so the offer appears
+         * only when it would change something.
+         */
+        fun permissionGranted(context: Context): Boolean {
+            val permission = CONNECT_PERMISSION ?: return true
+            return context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
+        }
     }
 }

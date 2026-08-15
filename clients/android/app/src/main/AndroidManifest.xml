@@ -28,9 +28,14 @@
     <!-- Gamepad rumble feedback. -->
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- Steam Controller 2 over direct BLE (Sc2BleLink talks Valve's vendor GATT service to the
-         bonded pad). A RUNTIME permission (NEARBY_DEVICES group); the capture engages only when
-         already granted — USB capture (wired / Puck dongle) needs no Bluetooth at all. -->
+         bonded pad). A RUNTIME permission (NEARBY_DEVICES group) from API 31 — MainActivity asks
+         for it when a BLE-paired SC2 is actually around, and the Controllers screen offers the
+         grant outright. USB capture (wired / Puck dongle) needs no Bluetooth at all.
+         Below API 31 the same two operations (the bonded list + connectGatt) are covered by the
+         install-time legacy permission instead, which BLUETOOTH_CONNECT does NOT imply — without
+         it every BLE capture on Android 11 and older throws SecurityException. -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
 
     <!-- We target phone + TV from day one: keep the app installable on TV (no touchscreen) and on
          devices without a gamepad. -->

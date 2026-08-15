@@ -34,6 +34,7 @@ import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.Keymap
 import io.unom.punktfunk.kit.NativeBridge
+import io.unom.punktfunk.kit.Sc2BleLink
 import io.unom.punktfunk.kit.SessionAccess
 import io.unom.punktfunk.kit.link.DeepLinkResult
 import io.unom.punktfunk.kit.link.DeepLinks
@@ -42,6 +43,9 @@ import io.unom.punktfunk.kit.security.KnownHostStore
 
 /** Broadcast action for the menu-time SC2 USB-permission grant (see [MainActivity.startSc2MenuNav]). */
 private const val SC2_MENU_PERMISSION = "io.unom.punktfunk.SC2_MENU_USB_PERMISSION"
+
+/** Request code for the SC2's Bluetooth grant (see [MainActivity.maybeAskSc2BtPermission]). */
+private const val REQ_SC2_BLUETOOTH = 0x5C2B
 
 /**
  * Keeps ONE window-insets reader alive for as long as the app's UI exists — the fix for the menus
@@ -192,6 +196,9 @@ class MainActivity : ComponentActivity() {
     private var sc2Receiver: BroadcastReceiver? = null
     private var sc2PermissionAsked = false
 
+    /** Bluetooth asked once this process — a denial must not re-prompt on every resume. */
+    private var sc2BtPermissionAsked = false
+
     /** Sony-pad USB grant asked this attach — a deny doesn't re-nag until a fresh attach (or the
      *  Controllers screen's explicit button). */
     private var dsPermissionAsked = false
@@ -330,7 +337,8 @@ class MainActivity : ComponentActivity() {
      * Engage the menu-time SC2 capture if possible: setting on, not streaming, and a wired/Puck
      * pad attached (asking for USB permission at most once per attach — [forceAsk] re-arms the
      * dialog, for the Controllers screen's explicit grant button) — else an already-paired BLE
-     * controller when BLUETOOTH_CONNECT is granted. Safe to call repeatedly.
+     * controller, asking for Bluetooth access once if one appears to be attached
+     * ([maybeAskSc2BtPermission]). Safe to call repeatedly.
      */
     fun startSc2MenuNav(forceAsk: Boolean = false) {
         if (forceAsk) sc2PermissionAsked = false
@@ -358,10 +366,46 @@ class MainActivity : ComponentActivity() {
                     ),
                 )
             }
-            dev == null && checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) ==
-                PackageManager.PERMISSION_GRANTED -> {
+            dev == null && Sc2BleLink.permissionGranted(this) -> {
                 cap.pairedBleAddress()?.let { cap.startBle(it) }
             }
+            dev == null -> maybeAskSc2BtPermission()
+        }
+    }
+
+    /**
+     * Ask for Bluetooth access when a BLE-paired SC2 looks like it is attached and we cannot see
+     * it — once per process, and never on a device that shows no sign of owning one.
+     *
+     * The permission is the whole reason a Bluetooth SC2 used to go unnoticed: the bonded list and
+     * `connectGatt` both need it from API 31, nothing in the client had ever requested it, and the
+     * bonded-list call answers an empty list rather than an error when it is missing — so the
+     * capture stood down silently and the console UI never flipped to its controller layout, while
+     * the same pad over USB worked (field report, 2026-08-15). Asking is gated on
+     * [Gamepad.sc2InputDevicePresent] because an uncaptured SC2 sits in lizard mode as a
+     * keyboard/mouse [android.view.InputDevice] — visible without any permission at all — so the
+     * prompt reaches the people who have the hardware and nobody else.
+     */
+    private fun maybeAskSc2BtPermission() {
+        val permission = Sc2BleLink.CONNECT_PERMISSION ?: return // granted at install time here
+        if (sc2BtPermissionAsked) return
+        if (!Gamepad.sc2InputDevicePresent()) return
+        sc2BtPermissionAsked = true
+        requestPermissions(arrayOf(permission), REQ_SC2_BLUETOOTH)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        // Engage immediately on the grant — the pad is already paired, so there is nothing else to
+        // wait for and the user just told us what they want it for.
+        if (requestCode == REQ_SC2_BLUETOOTH &&
+            grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED
+        ) {
+            startSc2MenuNav()
         }
     }
 

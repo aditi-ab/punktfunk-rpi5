@@ -12,6 +12,8 @@ import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -54,6 +56,7 @@ import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
 import io.unom.punktfunk.kit.DsDevice
 import io.unom.punktfunk.kit.Gamepad
+import io.unom.punktfunk.kit.Sc2BleLink
 import io.unom.punktfunk.kit.Sc2Capture
 import kotlinx.coroutines.delay
 
@@ -373,12 +376,16 @@ private fun ControllersBody(
         }
         val sc2Probe = remember { Sc2Capture(context) }
         val sc2Usb = remember(usbGeneration) { sc2Probe.findUsbDevice() }
-        val sc2Ble = remember(usbGeneration) {
-            if (context.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) ==
-                android.content.pm.PackageManager.PERMISSION_GRANTED
-            ) sc2Probe.pairedBleAddress() else null
-        }
+        // Answers null without the Bluetooth grant (and logs why) — see Sc2BleLink.
+        val sc2Ble = remember(usbGeneration) { sc2Probe.pairedBleAddress() }
         val sc2Present = sc2Usb != null || sc2Ble != null
+        // A BLE-paired SC2 cannot be seen at all until Bluetooth is granted, so "no controller
+        // detected" would be the wrong thing to print at someone who has one paired. This is the
+        // screen a user opens when a pad is missing, so the grant belongs here — see
+        // [sc2BluetoothGrantOffered] for when it is worth offering, and the lizard-mode
+        // InputDevice probe (no permission of its own) for how we word it.
+        val btPermitted = remember(usbGeneration) { Sc2BleLink.permissionGranted(context) }
+        val sc2OnBluetooth = remember(usbGeneration) { Gamepad.sc2InputDevicePresent() }
         val dsUsb = remember(usbGeneration) {
             (context.getSystemService(Context.USB_SERVICE) as android.hardware.usb.UsbManager)
                 .deviceList.values.firstOrNull {
@@ -398,6 +405,19 @@ private fun ControllersBody(
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+            // After that paragraph on purpose: when nothing was detected, this is the actionable
+            // half of the same answer — the one pad we are blind to rather than one Android has
+            // simply classified oddly.
+            if (
+                sc2BluetoothGrantOffered(
+                    permissionGranted = btPermitted,
+                    usbSc2 = sc2Usb != null,
+                    sc2Attached = sc2OnBluetooth,
+                    anyPadDetected = pads.isNotEmpty(),
+                )
+            ) {
+                Sc2BluetoothRow(attached = sc2OnBluetooth, activity = activity) { usbGeneration++ }
             }
             // Every real controller is forwarded now (Automatic forwards them all, each on its own
             // wire pad index) — not just the first. A joystick-only device Android doesn't classify as
@@ -455,6 +475,90 @@ private fun ControllersBody(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Whether to offer the Bluetooth grant for a directly-paired Steam Controller 2.
+ *
+ * Only when it could change the answer ([permissionGranted] false), and only when there is reason
+ * to think it would: an SC2 is visibly attached in lizard mode ([sc2Attached] — the permission-free
+ * probe), or nothing was detected at all ([anyPadDetected] false) and a Bluetooth SC2 is precisely
+ * the pad this client cannot see without the grant. A [usbSc2] is already captured over USB and
+ * needs no Bluetooth, and someone with working controllers and no sign of an SC2 is shown nothing.
+ */
+fun sc2BluetoothGrantOffered(
+    permissionGranted: Boolean,
+    usbSc2: Boolean,
+    sc2Attached: Boolean,
+    anyPadDetected: Boolean,
+): Boolean = !permissionGranted && !usbSc2 && (sc2Attached || !anyPadDetected)
+
+/**
+ * The Bluetooth grant for a directly-paired Steam Controller 2 — the card that exists because a
+ * BLE SC2 is invisible without it.
+ *
+ * A wired or Puck SC2 is enumerated over USB with no permission at all, so it shows up in this
+ * screen either way; the bonded list a BLE one lives in is behind `BLUETOOTH_CONNECT` from API 31
+ * and answers "nothing is paired" rather than "ask me first" when the permission is missing. Until
+ * this existed, nothing in the client ever requested it, so a Bluetooth SC2 was silently absent
+ * everywhere — no capture, no controller layout, no forwarding — while the same pad over USB
+ * worked (field report, 2026-08-15).
+ *
+ * [attached] distinguishes "we can see one sitting in lizard mode" from "you may have one paired",
+ * which is the difference between a statement and a guess. [onGranted] re-probes the caller's
+ * device state; the menu capture is engaged from here too, so the pad starts driving the UI on the
+ * grant rather than at the next resume.
+ */
+@Composable
+private fun Sc2BluetoothRow(
+    attached: Boolean,
+    activity: MainActivity?,
+    onGranted: () -> Unit,
+) {
+    val context = LocalContext.current
+    val settingOn = remember { SettingsStore(context).load().sc2Capture }
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            activity?.startSc2MenuNav()
+            onGranted()
+        }
+    }
+    val permission = Sc2BleLink.CONNECT_PERMISSION ?: return
+    OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                if (attached) "Steam Controller 2" else "Steam Controller 2 over Bluetooth",
+                style = MaterialTheme.typography.bodyLarge,
+            )
+            Text(
+                when {
+                    !settingOn ->
+                        "Passthrough is disabled in Settings — enable \"Steam Controller 2 " +
+                            "passthrough\" to capture it."
+                    attached ->
+                        "Paired over Bluetooth. Punktfunk needs Bluetooth access to capture it — " +
+                            "until then it stays in its built-in keyboard/mouse mode and no game " +
+                            "sees a controller."
+                    else ->
+                        "A Steam Controller 2 paired over Bluetooth can't be detected without " +
+                            "Bluetooth access. Wired and Puck-dongle controllers need no " +
+                            "permission and are already listed above."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (settingOn) {
+                OutlinedButton(onClick = { launcher.launch(permission) }) {
+                    Text("Grant Bluetooth access")
                 }
             }
         }
