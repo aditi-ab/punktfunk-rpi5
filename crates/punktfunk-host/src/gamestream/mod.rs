@@ -250,6 +250,12 @@ pub struct AppState {
     /// reads `is_armed()` per frame and emits samples; the same `Arc` is shared with the mgmt API
     /// and the native punktfunk/1 loops so one capture spans whichever path is streaming.
     pub stats: Arc<crate::stats_recorder::StatsRecorder>,
+    /// The per-client access grants registry (design/per-client-access.md §8, WP13): the SAME
+    /// registry the native plane's trust store owns, keyed by certificate fingerprint hex — it
+    /// serves both paired stores. Set once by [`serve`] after the native-pairing handle exists;
+    /// unset (tests, exotic embedders) the Moonlight plane treats every paired peer as
+    /// ungoverned — full control, exactly the pre-grants behavior.
+    pub access: std::sync::OnceLock<Arc<crate::native_pairing::NativePairing>>,
 }
 
 /// Session-lost callback the media threads invoke when they detect the client is unreachable
@@ -331,6 +337,7 @@ impl AppState {
             video_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
             audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
             stats,
+            access: std::sync::OnceLock::new(),
         }
     }
 
@@ -350,6 +357,7 @@ impl AppState {
             rfi_range: std::sync::Arc::new(std::sync::Mutex::new(None)),
             audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
             stats,
+            access: std::sync::OnceLock::new(),
         }
     }
 }
@@ -413,6 +421,10 @@ pub fn serve(
         crate::native_pairing::NativePairing::load_with(None, None, false)
             .context("native pairing store")?,
     );
+    // WP13: hand the GameStream planes the grants registry — the nvhttp launch surface and the
+    // ENet control thread resolve a Moonlight fingerprint's mask against the same registry the
+    // native plane enforces (design §8: it keys on fingerprint hex and serves both stores).
+    let _ = state.access.set(np.clone());
     // The identity the native QUIC plane and the mgmt API present (the identity split): P-256 on
     // hosts no native client ever pinned, the legacy RSA cert otherwise — resolved ONCE here so
     // the two planes cannot race the first-run adoption. See `crate::identity`.
@@ -553,6 +565,18 @@ pub fn serve(
         crate::events::emit(crate::events::EventKind::HostStopping);
         served
     })
+}
+
+/// Host wall clock, unix seconds — the clock every per-client-access deadline is stored in and
+/// evaluated against (design/per-client-access.md §4: wall time at each check, no cached
+/// monotonic offset, so an NTP step moves a deadline with the clock). Shared by the nvhttp
+/// launch gates and the control thread's expiry check.
+#[cfg(feature = "gamestream")]
+pub(crate) fn wall_unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// The name this host shows up under everywhere a human sees it: Moonlight's host tile (the

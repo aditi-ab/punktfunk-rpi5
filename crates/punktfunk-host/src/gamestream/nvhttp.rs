@@ -18,6 +18,7 @@ use axum::{
     routing::get,
     Extension, Router,
 };
+use punktfunk_core::quic::{GRANT_ALL, GRANT_LAUNCH};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -67,6 +68,26 @@ fn peer_fp(peer: &Option<Extension<PeerCertFingerprint>>) -> Option<[u8; 32]> {
             .ok()
             .and_then(|v| <[u8; 32]>::try_from(v).ok()),
         _ => None,
+    }
+}
+
+/// The grant mask the verified HTTPS peer is authorized for *right now*, resolved against the
+/// shared grants registry (design/per-client-access.md §8, WP13). `None` = an EXPIRED grants
+/// record — the launch surface fails that closed exactly like an unpaired cert. A fingerprint
+/// with NO record is ungoverned (`Some(GRANT_ALL)`): the Moonlight plane's pairing authority
+/// is its own cert list, so existing pairings keep full control (plan §8 risk table) — but a
+/// record that exists (created via the console) governs. Consulted only AFTER
+/// [`peer_is_paired`], which is why a certless peer resolves to expired-shaped `None` here:
+/// it can never reach this gate with the pairing gate intact, and if it somehow did, failing
+/// closed is the right wrong answer.
+fn peer_grants(peer: &Option<Extension<PeerCertFingerprint>>, st: &AppState) -> Option<u32> {
+    let Some(Extension(PeerCertFingerprint(Some(fp)))) = peer else {
+        return None;
+    };
+    match st.access.get() {
+        Some(np) => np.moonlight_effective(fp, super::wall_unix_now()),
+        // No registry wired (tests / embedders that never call `serve`): pre-grants behavior.
+        None => Some(GRANT_ALL),
     }
 }
 
@@ -158,6 +179,22 @@ async fn h_launch(
         tracing::warn!("launch rejected — client is not paired");
         return xml(error_xml()).into_response();
     }
+    // Per-client access (WP13, design §8): LAUNCH + expiry beside the pairing gate. An expired
+    // grants record fails closed exactly like an unpaired cert; a Controller-only record (no
+    // LAUNCH bit) is refused too — on GameStream, launch IS the session, there is no owner-
+    // launched session to join. The protocol has no reject vocabulary, so the client just sees
+    // the generic error and the story lives in the console (silent enforcement, accepted).
+    match peer_grants(&peer, &st) {
+        Some(g) if g & GRANT_LAUNCH != 0 => {}
+        Some(_) => {
+            tracing::warn!("launch rejected — this client's access grants do not include Launch");
+            return xml(error_xml()).into_response();
+        }
+        None => {
+            tracing::warn!("launch rejected — this client's access has expired");
+            return xml(error_xml()).into_response();
+        }
+    }
     let req_fp: Option<[u8; 32]> = peer_fp(&peer);
 
     // Mode-conflict ADMISSION (Stage 4) — GameStream is single-session (`st.launch`), so a DIFFERENT
@@ -232,6 +269,19 @@ async fn h_resume(
         tracing::warn!("resume rejected — client is not paired");
         return xml(error_xml());
     }
+    // Same access gate as `/launch` (WP13): resuming re-attaches the full input/media planes,
+    // so it needs the same LAUNCH grant, and expiry fails closed like unpaired.
+    match peer_grants(&peer, &st) {
+        Some(g) if g & GRANT_LAUNCH != 0 => {}
+        Some(_) => {
+            tracing::warn!("resume rejected — this client's access grants do not include Launch");
+            return xml(error_xml());
+        }
+        None => {
+            tracing::warn!("resume rejected — this client's access has expired");
+            return xml(error_xml());
+        }
+    }
     if !peer_may_control_session(&peer, &st) {
         tracing::warn!("resume rejected — caller does not own the session");
         return xml(error_xml());
@@ -249,6 +299,15 @@ async fn h_cancel(
 ) -> impl IntoResponse {
     if !peer_is_paired(&peer, &st) {
         tracing::warn!("cancel rejected — client is not paired");
+        return xml(error_xml());
+    }
+    // Expiry gates `/cancel` likewise (an expired record fails closed exactly like unpaired) —
+    // but the LAUNCH bit deliberately does NOT: cancel is Moonlight's "Quit App", a teardown,
+    // and `peer_may_control_session` below already restricts it to the session's owner. Denying
+    // a mid-session-downgraded owner its own quit would only wedge the session it is trying to
+    // end — ending sessions is what enforcement *wants*.
+    if peer_grants(&peer, &st).is_none() {
+        tracing::warn!("cancel rejected — this client's access has expired");
         return xml(error_xml());
     }
     if !peer_may_control_session(&peer, &st) {
@@ -517,5 +576,188 @@ mod tests {
             gamestream_admission(live, None, ModeConflict::Reject),
             GsDecision::Reject
         ));
+    }
+
+    /// A fresh grants registry backed by a per-test temp store.
+    fn test_registry(
+        tag: &str,
+    ) -> (
+        Arc<crate::native_pairing::NativePairing>,
+        std::path::PathBuf,
+    ) {
+        let p = std::env::temp_dir().join(format!(
+            "pf-nvhttp-access-{tag}-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        let np = Arc::new(
+            crate::native_pairing::NativePairing::load_with(Some(p.clone()), None, false).unwrap(),
+        );
+        (np, p)
+    }
+
+    /// WP13's resolution rule at the nvhttp gate: no grants record = ungoverned full control
+    /// (existing Moonlight pairings keep today's behavior); a record that exists governs; an
+    /// expired record resolves `None` — the shape the handlers fail closed exactly like
+    /// unpaired. Certless peers resolve `None` too (they never pass `peer_is_paired` anyway).
+    #[test]
+    fn peer_grants_resolution_rule() {
+        use crate::native_pairing::Access;
+        use punktfunk_core::quic::GRANT_GAMEPAD;
+        let st = test_state();
+        let der = b"grants-client-der".to_vec();
+        let fp_hex = fp_of(&der);
+        let peer = Some(Extension(PeerCertFingerprint(Some(fp_hex.clone()))));
+
+        // No registry wired (an AppState that never went through `serve`): pre-grants behavior.
+        assert_eq!(peer_grants(&peer, &st), Some(GRANT_ALL));
+
+        let (np, store) = test_registry("rule");
+        assert!(st.access.set(np.clone()).is_ok());
+        // Registry wired, no record: ungoverned.
+        assert_eq!(peer_grants(&peer, &st), Some(GRANT_ALL));
+        // A Controller-only record governs — LAUNCH absent.
+        np.add_with_access(
+            "Guest",
+            &fp_hex,
+            Some(Access {
+                grants: GRANT_GAMEPAD,
+                expires_unix: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(peer_grants(&peer, &st), Some(GRANT_GAMEPAD));
+        assert_eq!(peer_grants(&peer, &st).unwrap() & GRANT_LAUNCH, 0);
+        // Expired: the fail-closed shape.
+        np.set_access(
+            &fp_hex,
+            Access {
+                grants: GRANT_ALL,
+                expires_unix: Some(super::super::wall_unix_now() - 5),
+            },
+        )
+        .unwrap();
+        assert_eq!(peer_grants(&peer, &st), None);
+        // Certless peer: `None` — it can never reach the grants gate past `peer_is_paired`,
+        // and failing closed is the right wrong answer if it somehow did.
+        assert_eq!(peer_grants(&None, &st), None);
+        assert_eq!(
+            peer_grants(&Some(Extension(PeerCertFingerprint(None))), &st),
+            None
+        );
+        let _ = std::fs::remove_file(&store);
+    }
+
+    /// The WP13 acceptance at handler level: `/resume` (same gate as `/launch`) works for a
+    /// paired client with no grants record (stock back-compat), refuses a Controller-only
+    /// record (no LAUNCH), refuses an expired record exactly like unpaired — and `/cancel`
+    /// gates on expiry only, so a re-granted limited client can still quit its own session.
+    #[tokio::test]
+    async fn resume_and_cancel_honor_grants_and_expiry() {
+        use crate::native_pairing::Access;
+        use punktfunk_core::quic::GRANT_GAMEPAD;
+
+        async fn body_of(resp: Response) -> String {
+            let b = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            String::from_utf8(b.to_vec()).unwrap()
+        }
+
+        let st = test_state();
+        let der = b"resume-grants-client".to_vec();
+        let fp_hex = fp_of(&der);
+        let owner_fp = punktfunk_core::quic::endpoint::cert_fingerprint(&der);
+        st.paired.lock().unwrap().push(der);
+        let peer = Some(Extension(PeerCertFingerprint(Some(fp_hex.clone()))));
+        let (np, store) = test_registry("resume");
+        assert!(st.access.set(np.clone()).is_ok());
+        let session = LaunchSession {
+            gcm_key: [0; 16],
+            rikeyid: 0,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            appid: 1,
+            peer_ip: None,
+            owner_fp: Some(owner_fp),
+        };
+        *st.launch.lock().unwrap() = Some(session);
+
+        // No grants record: a stock Moonlight pairing resumes exactly as today.
+        let ok = body_of(
+            h_resume(State(st.clone()), peer.clone())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(ok.contains("<resume>1</resume>"), "ungoverned resume: {ok}");
+
+        // Controller-only record: the LAUNCH bit is missing — refused.
+        let now = super::super::wall_unix_now();
+        np.add_with_access(
+            "Guest",
+            &fp_hex,
+            Some(Access {
+                grants: GRANT_GAMEPAD,
+                expires_unix: Some(now + 3600),
+            }),
+        )
+        .unwrap();
+        let no = body_of(
+            h_resume(State(st.clone()), peer.clone())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(!no.contains("<resume>1</resume>"), "no-LAUNCH resume: {no}");
+
+        // Expired full record: fails closed exactly like unpaired — for /resume AND /cancel.
+        np.set_access(
+            &fp_hex,
+            Access {
+                grants: GRANT_ALL,
+                expires_unix: Some(now - 5),
+            },
+        )
+        .unwrap();
+        let no = body_of(
+            h_resume(State(st.clone()), peer.clone())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(!no.contains("<resume>1</resume>"), "expired resume: {no}");
+        let no = body_of(
+            h_cancel(State(st.clone()), peer.clone())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(!no.contains("<cancel>1</cancel>"), "expired cancel: {no}");
+        assert!(
+            st.launch.lock().unwrap().is_some(),
+            "a refused cancel must not tear the session down"
+        );
+
+        // Re-granted Controller-only (unexpired, still no LAUNCH): /cancel is deliberately NOT
+        // LAUNCH-gated — the session's owner may always quit its own app.
+        np.set_access(
+            &fp_hex,
+            Access {
+                grants: GRANT_GAMEPAD,
+                expires_unix: Some(now + 3600),
+            },
+        )
+        .unwrap();
+        let ok = body_of(
+            h_cancel(State(st.clone()), peer.clone())
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(ok.contains("<cancel>1</cancel>"), "owner cancel: {ok}");
+        assert!(st.launch.lock().unwrap().is_none(), "cancel tears down");
+        let _ = std::fs::remove_file(&store);
     }
 }

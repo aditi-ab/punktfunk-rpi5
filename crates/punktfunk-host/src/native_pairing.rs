@@ -202,6 +202,33 @@ impl NativePairing {
         self.store.effective(fp_hex, now_unix)
     }
 
+    /// The Moonlight/GameStream plane's resolution verb (design §8, WP13). The grants registry
+    /// serves BOTH paired stores, keyed on fingerprint hex — but the two planes read an ABSENT
+    /// record oppositely. A native fingerprint with no record is unpaired (fail closed,
+    /// [`Self::effective`]); a GameStream fingerprint's pairing authority is its own cert list
+    /// (`gamestream::AppState::paired`), so no record here means **ungoverned** — an existing
+    /// Moonlight pairing keeps full control (back-compat, plan §8 risk table). A record that
+    /// EXISTS governs exactly as on the native plane: its mask applies (reserved bits cleared)
+    /// and expiry answers `None`, which the caller's gate fails closed like an unpaired cert.
+    ///
+    /// One store snapshot on purpose: an `is_paired` + `effective` pair would race a
+    /// concurrent record deletion into reading "listed but expired" for a record that just
+    /// became ungoverned.
+    pub fn moonlight_effective(&self, fp_hex: &str, now_unix: i64) -> Option<u32> {
+        match self.store.get(fp_hex) {
+            None => Some(GRANT_ALL),
+            // Same evaluation as `TrustStore::effective` (the deadline second itself is
+            // expired; absent grants = full; mask reserved bits on read).
+            Some(c) => {
+                if c.expires_unix.is_some_and(|t| now_unix >= t) {
+                    None
+                } else {
+                    Some(c.grants.unwrap_or(GRANT_ALL) & GRANT_ALL)
+                }
+            }
+        }
+    }
+
     /// Record a successful pairing with no explicit access choice: for a NEW fingerprint, the
     /// full/permanent default; for an existing one, **name-only** — grants and expiry are
     /// preserved, so a limited guest re-running the ceremony cannot escalate itself back to full
@@ -1072,6 +1099,58 @@ mod tests {
 
         // Subscribing to a never-paired fingerprint starts revoked.
         assert!(np.subscribe("zz99").borrow().revoked);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The Moonlight resolution verb reads an absent record OPPOSITELY to the native one
+    /// (design §8): no record = ungoverned full control (the GameStream cert list is that
+    /// plane's pairing authority), while a record that exists governs identically on both —
+    /// including expiry failing closed. If the absent arm ever flips to `None`, every
+    /// pre-grants Moonlight pairing loses launch on upgrade day.
+    #[test]
+    fn moonlight_effective_absent_is_ungoverned_but_a_record_governs() {
+        use punktfunk_core::quic::GRANT_GAMEPAD;
+        let p = temp();
+        let _ = std::fs::remove_file(&p);
+        let np = NativePairing::load_with(Some(p.clone()), None, false).unwrap();
+        let now = wall_now();
+
+        // Absent record: the two verbs disagree by design.
+        assert_eq!(np.effective("ab12", now), None, "native: unpaired");
+        assert_eq!(
+            np.moonlight_effective("ab12", now),
+            Some(GRANT_ALL),
+            "moonlight: ungoverned = full control"
+        );
+
+        // A record that exists governs — identically to `effective`, case-insensitively.
+        np.add_with_access(
+            "Guest Deck",
+            "AB12",
+            Some(Access {
+                grants: GRANT_GAMEPAD,
+                expires_unix: Some(now + 60),
+            }),
+        )
+        .unwrap();
+        assert_eq!(np.moonlight_effective("ab12", now), Some(GRANT_GAMEPAD));
+        assert_eq!(
+            np.moonlight_effective("ab12", now),
+            np.effective("ab12", now)
+        );
+
+        // Expiry fails closed (None), exactly like the native verb — the deadline second
+        // itself is expired.
+        assert_eq!(np.moonlight_effective("ab12", now + 60), None);
+        assert_eq!(
+            np.moonlight_effective("ab12", now + 60),
+            np.effective("ab12", now + 60)
+        );
+
+        // Deleting the record returns the fingerprint to ungoverned (its GameStream pairing —
+        // a separate store — is what an unpair actually severs, via the mgmt endpoint).
+        assert!(np.remove("ab12").unwrap());
+        assert_eq!(np.moonlight_effective("ab12", now), Some(GRANT_ALL));
         let _ = std::fs::remove_file(&p);
     }
 
