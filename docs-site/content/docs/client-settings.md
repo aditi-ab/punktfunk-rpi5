@@ -224,6 +224,20 @@ regular pad). Automatic arms it only where the raw guide press can't reach the h
 Gaming Mode, iPhone/iPad, Apple TV — because the gesture has a cost: a Select *tap* arrives a beat
 late, and a game that expects a *held* Select would trigger it. Set **On** or **Off** to overrule.
 
+**Controller haptics** — *default: on*, and **Controller speaker** — *default: on* on the Linux and
+Windows apps, *off* on Android. The two halves of [controller audio](/docs/controller-audio): a
+DualSense's voice-coil haptics, and the little speaker in the middle of the pad. Both need a
+**wired** DualSense or DualSense Edge — over Bluetooth a controller exposes no audio device at all,
+and both settings quietly do nothing. Neither costs anything without a host that sends them: the
+plane is negotiated, and silence is never encoded or transmitted, so leaving haptics on is free even
+on a pad that never gets any. Turn **Controller speaker** off if you would rather all game audio came
+out of your speakers or headset.
+
+Offered by the Linux, Windows and Android apps. On Linux, the client also switches the controller's
+sound card to Pro Audio while it needs the voice coils, and puts it back afterwards — see
+[the controller-audio page](/docs/controller-audio#on-a-linux-client-the-pads-own-profile-matters-too)
+for why that is necessary and how to turn it off.
+
 **Capture system shortcuts** — *default: on.* Offered by the Linux, Windows and macOS apps and the
 console home; Windows spells the row out as *Capture system shortcuts (Alt+Tab, Win, …)*. On a Deck it
 matters only for a keyboard you attached yourself, for the reason the paragraph below gives: Gaming

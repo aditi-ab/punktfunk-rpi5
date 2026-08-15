@@ -17,8 +17,9 @@ pad's speaker, channels 3–4 are the voice coils.
 - **A DualSense or DualSense Edge plugged in over USB** on the client. Bluetooth pads expose no
   audio interface at all, so they fall back to ordinary rumble — this is a limit of the
   controller, not of Punktfunk.
-- On the client, **Controller haptics** is on by default. **Controller speaker** is opt-in: turn
-  it on if you want game audio coming out of the pad as well as your speakers.
+- On the client, **Controller haptics** is on by default. So is **Controller speaker** on the Linux
+  and Windows apps — turn it off in [client settings](/docs/client-settings#input) if you would
+  rather all game audio came out of your speakers. On Android the speaker is opt-in.
 - On a **Linux host**, a game that speaks DualSense — which in practice means running it under
   **GE-Proton 11-5 or newer**. Stock Proton does not route controller audio.
 - On the host, controller audio is on by default (`PUNKTFUNK_PAD_AUDIO`).
@@ -109,6 +110,52 @@ PROTON_DUALSENSE_SPLIT_AUDIO=1 %command%
 To see which route GE took, launch the game with `WINEDEBUG=+pulse` and look for a line beginning
 `Routing DualSense`. It names the device it chose and how it opened it.
 
+## On a Linux client, the pad's own profile matters too
+
+Everything above is about the host, where the controller-audio device is one Punktfunk mints. On a
+Linux **client** the pad is real, and the same channel-layout problem shows up from the other side:
+the voice coils are physically channels 3 and 4 of the controller's USB sound card, and a
+controller almost never presents as a four-channel device on its own. Depending on your distribution
+it appears as a stereo output, or as a mono *Speaker* plus a stereo *Headphones* pair. Playing into
+any of those puts the haptics in the headphone jack and folds the coil channels away — audio that
+looks perfectly healthy, felt as nothing at all.
+
+**Punktfunk handles this for you.** When it needs the coils and the pad is not already presenting
+four channels, it switches the controller's card to **Pro Audio** for the length of the session and
+puts your setting back afterwards. You will see the profile change in your sound settings while you
+are streaming; that is expected. It is never saved as the card's remembered profile.
+
+If you would rather manage the card yourself, set `PUNKTFUNK_PAD_AUDIO_PROFILE=0` on the client. Then
+Punktfunk uses a four-channel profile if you have already selected one and logs what it needs if you
+have not.
+
+Most systems never reach the switch at all. Where your distribution ships a recent `alsa-ucm-conf` —
+Bazzite and SteamOS among them — a DualSense already exposes its four channels behind its split
+speaker and headphone outputs, and Punktfunk finds them there. The switch is the fallback for
+systems that only offer the older stereo profile. **If you run the client as a Flatpak**, your audio
+manager may not let a sandboxed app change a card's profile; if the log says so, switch the
+controller to Pro Audio yourself, which is the same fix.
+
+### Checking the client side without a host
+
+The client can test the whole path on its own — no host, no game, no pairing. Plug in the
+DualSense and run:
+
+```sh
+punktfunk-session --pad-audio-test
+```
+
+It prints every DualSense object it can see in your audio graph, says which one it chose, and then
+plays a tone into the voice coils for three seconds. **If the pad buzzes, the client side is
+working** and any remaining silence is coming from the host or the game. Add `--speaker` to test
+the pad's speaker instead, and `--seconds N` for a longer run.
+
+On the Steam Deck and other flatpak installs, run it inside the sandbox:
+
+```sh
+flatpak run --command=punktfunk-session io.unom.Punktfunk --pad-audio-test
+```
+
 ## Known limits
 
 - **Bluetooth client pads get rumble, not haptics.** No audio interface exists over BT.
@@ -119,3 +166,11 @@ To see which route GE took, launch the game with `WINEDEBUG=+pulse` and look for
 - **A pad plugged into the host itself can steal the audio.** If a real DualSense is connected to
   the host while you are streaming to a different one, some titles will find the local pad's sound
   card first. Unplug it, or stream from a host that has no pad attached.
+- **The Pro Audio switch on a Linux client renames the pad's microphone too.** Switching a sound
+  card's profile re-creates all of its inputs and outputs, so if you had picked the DualSense's own
+  microphone as your [mic](/docs/client-settings#audio), that session falls back to your default
+  one. Pick a different microphone, or set `PUNKTFUNK_PAD_AUDIO_PROFILE=0` and select a
+  four-channel profile on the card yourself.
+- **A client killed mid-stream leaves the pad on Pro Audio.** The profile is restored when a
+  session ends normally and is never written to your saved settings, so anything that reloads the
+  card — unplugging it, logging out, a reboot — brings your own profile back.

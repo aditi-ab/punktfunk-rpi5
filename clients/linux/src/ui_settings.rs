@@ -1604,21 +1604,42 @@ pub fn show_scoped(
         "Hold Select alone for the host's guide button — a tap still goes through",
         GUIDE_GESTURE_LABELS,
     );
+    // Controller audio (the 0xD1 plane): a wired DualSense's own voice coils and its little
+    // built-in speaker, streamed from the host and rendered on the pad in your hands. Both are
+    // negotiated — they change nothing without a capable host AND a wired DualSense — so the
+    // rows say what they are for rather than promising an effect.
+    //
+    // Deliberately NOT profileable: which pad is in your hands is a property of this device,
+    // not of the host a profile is authored against (the forwarded-pad pin below sits out for
+    // the same reason).
+    let haptics_row = adw::SwitchRow::builder()
+        .title("Controller haptics")
+        .subtitle("Play a DualSense's voice-coil haptics on the pad itself — wired pads only")
+        .build();
+    let pad_speaker_row = adw::SwitchRow::builder()
+        .title("Controller speaker")
+        .subtitle("Play the audio a game sends to the pad's own speaker on the pad, not here")
+        .build();
     // The pad rows only mean something while something is being forwarded (the same
     // relationship mic → echo cancellation draws just above, initial state included: the
-    // seed's `set_active` fires this only when it CHANGES the switch).
+    // seed's `set_active` fires this only when it CHANGES the switch). Controller audio
+    // belongs in that set too — forwarding off never OPENS the pad, so nothing can detect
+    // that it has an audio device, let alone render on it.
     {
         let (f, t) = (forward_row.widget().clone(), pad_row.widget().clone());
         let (sb, gg) = (sysbtn_row.widget().clone(), gesture_row.widget().clone());
-        f.set_sensitive(seed.gamepad_forwarding);
-        t.set_sensitive(seed.gamepad_forwarding);
-        sb.set_sensitive(seed.gamepad_forwarding);
-        gg.set_sensitive(seed.gamepad_forwarding);
+        let (ha, sp) = (haptics_row.clone(), pad_speaker_row.clone());
+        for w in [&f, &t, &sb, &gg] {
+            w.set_sensitive(seed.gamepad_forwarding);
+        }
+        ha.set_sensitive(seed.gamepad_forwarding);
+        sp.set_sensitive(seed.gamepad_forwarding);
         pad_forward_row.connect_active_notify(move |r| {
-            f.set_sensitive(r.is_active());
-            t.set_sensitive(r.is_active());
-            sb.set_sensitive(r.is_active());
-            gg.set_sensitive(r.is_active());
+            for w in [&f, &t, &sb, &gg] {
+                w.set_sensitive(r.is_active());
+            }
+            ha.set_sensitive(r.is_active());
+            sp.set_sensitive(r.is_active());
         });
     }
 
@@ -1632,6 +1653,8 @@ pub fn show_scoped(
         scale_row.set_selected(index::render_scale(s));
         bitrate_row.set_value(f64::from(s.bitrate_kbps) / 1000.0);
         pad_forward_row.set_active(s.gamepad_forwarding);
+        haptics_row.set_active(s.pad_haptics);
+        pad_speaker_row.set_active(pf_client_core::pad_audio::speaker_active(&s.pad_speaker));
         pad_row.set_selected(index::gamepad(s));
         sysbtn_row.set_selected(index::system_buttons(s));
         gesture_row.set_selected(index::guide_gesture(s));
@@ -2088,6 +2111,12 @@ pub fn show_scoped(
     controllers_group.add(pad_row.widget());
     controllers_group.add(sysbtn_row.widget());
     controllers_group.add(gesture_row.widget());
+    // Global scope only — see the rows' own note. In profile scope they would have no
+    // override marker and no way to record a touch, so a toggle would be silently discarded.
+    if !profile_mode {
+        controllers_group.add(&haptics_row);
+        controllers_group.add(&pad_speaker_row);
+    }
     controllers.add(&controllers_group);
 
     // Cap every caption in one pass, after the rows exist: a per-row call would be sixteen
@@ -2163,6 +2192,15 @@ pub fn show_scoped(
             s.inhibit_shortcuts = inhibit_row.is_active();
             s.invert_scroll = invert_row.is_active();
             s.gamepad_forwarding = pad_forward_row.is_active();
+            s.pad_haptics = haptics_row.is_active();
+            // `"mix"` is a stored value this switch cannot express (it renders as off today,
+            // pending the mixer leg), so writing the switch back unconditionally would erase
+            // it just by opening and closing the dialog — the same trap the gamepad-type row
+            // guards above. Only write when the user actually moved it.
+            let want_speaker = pad_speaker_row.is_active();
+            if want_speaker != pf_client_core::pad_audio::speaker_active(&s.pad_speaker) {
+                s.pad_speaker = if want_speaker { "pad" } else { "off" }.to_string();
+            }
             s.mic_enabled = mic_row.is_active();
             s.echo_cancel = echo_row.is_active();
             s.hdr_enabled = hdr_row.is_active();

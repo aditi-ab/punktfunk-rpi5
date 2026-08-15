@@ -1333,10 +1333,28 @@ impl Worker {
                         // ("Leaving emulated rumble bits off will restore audio haptics" —
                         // SDL_hidapi_ps5.c); wire rumble for this slot is suppressed in
                         // render_feedback so SDL never re-arms them.
-                        let _ = slot.pad.send_effect(&Ds5Feedback::audio_haptics_packet());
+                        //
+                        // ⚠ This needs SDL's HIDAPI driver to be the one on the pad — the
+                        // packet is a raw DS5 effects report, and SDL can only send it where
+                        // it owns the HID link. On a Linux box where the kernel's
+                        // `hid-playstation` has the pad instead, the call fails, and it is
+                        // worth SAYING so: `hid-playstation` asserts the same disable bit on
+                        // every force-feedback update it makes, so a pad some other program
+                        // has rumbled stays deaf to this plane until it is re-plugged. Not
+                        // fatal — nothing else asserts the bit in our own path, so the pad's
+                        // power-on default (audio haptics live) usually still stands.
+                        if let Err(e) = slot.pad.send_effect(&Ds5Feedback::audio_haptics_packet()) {
+                            tracing::info!(
+                                index,
+                                error = %e,
+                                "could not re-arm the DualSense's audio-haptics bit (SDL does \
+                                 not own this pad's HID link) — haptics still work unless \
+                                 something else has rumbled the pad this plug-in"
+                            );
+                        }
                     }
                     // Hand the pad to the session's renderer worker. Windows correlation
-                    // needs the HID interface path; Linux matches the sink by signature.
+                    // needs the HID interface path; Linux matches by card identity.
                     crate::pad_audio::register_tier_a(index, slot.pad.path());
                     tracing::info!(
                         index,
