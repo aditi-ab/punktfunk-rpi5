@@ -162,6 +162,28 @@ public final class FrameStore<Frame>: @unchecked Sendable {
         return f
     }
 
+    /// Cadence-driven take: hand back the oldest frame only once its DUE time has arrived, so the
+    /// store's job becomes "hold what is not due yet" instead of "release one per present
+    /// opportunity" (design/presenter-cadence-rework.md §4.3). `due` projects the frame's due
+    /// instant on the same clock as `now`; nil (no cadence estimate for that frame) means due
+    /// immediately.
+    ///
+    /// The preroll gate does not apply here. It exists only to build headroom for a per-slot
+    /// drain, and under cadence targeting the cushion IS the headroom — prerolling on top would
+    /// stack `capacity − 1` frames of standing latency the user never asked for. `underflows` is
+    /// not counted either: an empty store is the normal steady state once frames are held until
+    /// due, so the honest starvation signal is `CadenceHealth.late` (the due time had already
+    /// passed when the frame became presentable), not a run-dry count.
+    func take(dueBy now: CFTimeInterval, due: (Frame) -> CFTimeInterval?) -> Frame? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let oldest = frames.first else { return nil }
+        if let at = due(oldest), at > now { return nil } // held — not due yet
+        if isFifo { return frames.removeFirst() }
+        frames.removeAll(keepingCapacity: true)
+        return oldest
+    }
+
     /// Return a frame the render thread took but could not present (no drawable yet, or a
     /// transient render failure). Newest-wins keeps it only while the slot is still empty — a
     /// newer decoded frame wins; FIFO reinserts it at the FRONT (it is the oldest; a transient
@@ -203,6 +225,269 @@ private final class VsyncClock: @unchecked Sendable {
         if target >= now { return target }
         return target + ceil((now - target) / period) * period
     }
+}
+
+/// Tuning for one cadence loop. Gains are SHIFT COUNTS — the loop is fixed-point Int64
+/// throughout, so it runs identically on every client and in the offline harness, and carries no
+/// float into a present path.
+///
+/// ⚠ **These values are provisional, and saying so is part of the design.** The plan asks for
+/// constants fitted to recorded `(src_pts, received, decoded)` traces (its spike S2), and S2 was
+/// never run. What is here is derived from first principles — a proportional time constant of tens
+/// of frames, an integral an order slower, a cushion of a few mean-absolute-deviations — and the
+/// first real trace should replace them.
+///
+/// ⚠ A hand-written port of `punktfunk_core::phase::CadenceTuning`, exactly as `AudioRing` is a
+/// port of `JitterPolicy`: this pipeline is Swift and does not link that Rust type. **Every
+/// constant and rule here must stay in lockstep with it** — `CadenceClockTests` and the Rust
+/// `phase::tests` assert the two against the same synthetic input, and that agreement IS the
+/// contract.
+struct CadenceTuning: Equatable {
+    /// Proportional gain on the offset estimate: `1 >> offsetShift` of the residual per frame.
+    var offsetShift: UInt8
+    /// Integral gain on the per-frame rate (skew) term: `1 >> skewShift`.
+    var skewShift: UInt8
+    /// EMA weight for the residual mean-absolute-deviation.
+    var jitterShift: UInt8
+    /// Per-sample residual clamp — one outlier must not yank the estimate.
+    var errorClampNs: Int64
+    /// Cushion = `mad * cushionNum / cushionDen`, clamped to
+    /// `[cushionFloorNs, frameIntervalNs]`.
+    var cushionNum: UInt16
+    var cushionDen: UInt16
+    var cushionFloorNs: Int64
+    /// Source-timestamp gap beyond which the loop re-anchors instead of tracking.
+    var reanchorGapNs: Int64
+
+    /// For callers that snap the due time onto a display grid afterwards: the snap-up itself
+    /// carries roughly half a refresh of implicit slack, so the cushion can be small. Every Apple
+    /// present snaps — onto `VsyncClock.nextVsync` under arrival/glass pacing, onto the
+    /// CAMetalDisplayLink's own vend under deadline pacing — so this is the one this client runs.
+    static func snapping() -> CadenceTuning {
+        CadenceTuning(
+            offsetShift: 5, skewShift: 10, jitterShift: 5, errorClampNs: 20_000_000,
+            cushionNum: 2, cushionDen: 1, cushionFloorNs: 500_000,
+            reanchorGapNs: 500_000_000)
+    }
+
+    /// For callers presenting at the due time directly (VRR, direct scanout): no implicit slack,
+    /// so the cushion must cover more of the distribution on its own.
+    static func freeRunning() -> CadenceTuning {
+        var t = snapping()
+        t.cushionNum = 3
+        t.cushionFloorNs = 2_000_000
+        return t
+    }
+}
+
+/// Loop health for the pf-present line — the numbers that say whether the cushion is doing its
+/// job. Mirrors `punktfunk_core::phase::CadenceHealth`.
+///
+/// Residual PERCENTILES are deliberately absent: this type holds no histogram, and the client
+/// stat paths (the latency meters) are where distributions belong.
+struct CadenceHealth: Equatable {
+    /// Frames folded since the last `reset`.
+    var frames: UInt64 = 0
+    /// …of which the due time was already past when the frame became presentable. The direct
+    /// signal that the cushion is too small.
+    var late: UInt64 = 0
+    /// Times the loop gave up tracking and re-anchored (gap, regression, or explicit reset).
+    var reanchors: UInt64 = 0
+    var offsetNs: Int64 = 0
+    var skewNs: Int64 = 0
+    var jitterNs: Int64 = 0
+    var cushionNs: Int64 = 0
+}
+
+/// Plays frames out on the SOURCE's cadence instead of on their arrival instant.
+///
+/// The defect it exists for: every client presents a frame as soon as it is decoded, so the
+/// transport's jitter — and, on a host whose compositor delivers raggedly, the compositor's —
+/// lands on the glass 1:1. The 2026-08-15 Skynet field log has KWin's screencast arriving
+/// 0.11–8.22 ms off its own grid (up to a full 120 Hz period) for 24 minutes on a session with the
+/// bitrate pinned and zero loss. The loop estimates the offset between the source clock and the
+/// present clock and hands back a due time on the source's own timeline plus a cushion sized to
+/// the measured jitter.
+///
+/// **Type-2 on purpose.** It tracks offset *and* per-frame rate, because two free-running crystals
+/// produce a ramp and a proportional-only loop lags a ramp forever.
+///
+/// **It smooths the offset, never the timestamps.** Due is `srcPts + offset + cushion`, so genuine
+/// variation in the source's own cadence — a variable-rate renderer, an irregular capture tick —
+/// passes straight through, and only the transport's contribution to `ready − pts` is filtered.
+/// Anything that made due times more evenly spaced than the source would be a bug.
+///
+/// **Domain-agnostic by construction.** A constant offset between clock domains is absorbed by the
+/// offset estimator, so a caller feeds `readyNs` and reads the due time in ONE domain with no
+/// conversion anywhere in this path. On Apple that domain is `CACurrentMediaTime` — the clock
+/// `presentAtMediaTime` consumes — so the decode-output instant is converted ONCE on the way in
+/// (`Stage2Pipeline.mediaTimeNs(forRealtimeNs:)`) and the due time comes back needing none.
+/// Suspend/resume breaks the constant; the gap re-anchor below is what covers it.
+///
+/// A late frame's due time is returned in the PAST, unclamped: clamping it to `readyNs` would
+/// quietly turn every late frame into a fresh anchor, which is precisely the arrival-driven
+/// presentation this exists to stop being.
+///
+/// Prior art is ordinary and old: MPEG-2 TS PCR recovery and RTP playout scheduling (RFC 3550
+/// §6.4.1 carries the jitter estimator this MAD mirrors).
+///
+/// ⚠ A hand-written port of `punktfunk_core::phase::CadenceClock` — see `CadenceTuning` for the
+/// lockstep contract. Sendable; lock-guarded — the decode-completion thread folds frames while the
+/// render thread reads health.
+final class CadenceClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private let tuning: CadenceTuning
+    /// `ready − srcPts`, smoothed. Absorbs the clock-domain constant.
+    private var offsetNs: Int64 = 0
+    /// Per-frame drift of that offset — the integral term.
+    private var skewNs: Int64 = 0
+    /// EMA of |residual|, the cushion's input.
+    private var madNs: Int64 = 0
+    /// nil until the first sample anchors the loop.
+    private var lastPtsNs: UInt64?
+    /// Last frame interval seen, so `cushionNs` can apply its ceiling.
+    private var frameIntervalNs: Int64 = 0
+    private var counters = CadenceHealth()
+
+    init(tuning: CadenceTuning) {
+        self.tuning = tuning
+    }
+
+    /// Force a re-anchor on the next sample. Call on every discontinuity the client already knows
+    /// about: reanchor, codec rebuild, surface recreate, jump-to-live, resume.
+    func reset() {
+        lock.lock()
+        lastPtsNs = nil
+        skewNs = 0
+        // `madNs` deliberately SURVIVES. It describes the link, not the stream, and a cushion that
+        // collapsed to its floor at every rebuild would spend the next few hundred frames
+        // presenting late — the exact failure the cushion exists to prevent.
+        lock.unlock()
+    }
+
+    /// Fold one presentable frame and return when it is due, in the present clock domain.
+    ///
+    /// `readyNs` is when the frame became presentable; `frameIntervalNs` is the nominal source
+    /// interval and the cushion's ceiling.
+    ///
+    /// The result **may be earlier than `readyNs`** — that is a late frame, and the caller's
+    /// contract is "already due ⇒ present at the next opportunity", never "drag the grid back to
+    /// now".
+    func dueNs(srcPtsNs: UInt64, readyNs: Int64, frameIntervalNs: Int64) -> Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        self.frameIntervalNs = frameIntervalNs
+        counters.frames += 1
+        let pts = Int64(bitPattern: srcPtsNs)
+        let raw = saturatingSub(readyNs, pts)
+
+        let anchored: Bool
+        if let last = lastPtsNs {
+            // Source time going BACKWARDS, or a gap so long the estimate cannot be trusted to
+            // have tracked across it: re-anchor rather than slew for seconds.
+            anchored =
+                !(srcPtsNs < last
+                    || srcPtsNs - last > UInt64(bitPattern: tuning.reanchorGapNs))
+        } else {
+            anchored = false
+        }
+        if anchored {
+            // Advance the estimate one frame on the rate term, then correct it by a bounded
+            // fraction of what the new sample says.
+            offsetNs = saturatingAdd(offsetNs, skewNs)
+            let err = min(
+                max(saturatingSub(raw, offsetNs), -tuning.errorClampNs), tuning.errorClampNs)
+            offsetNs = saturatingAdd(offsetNs, shrTowardZero(err, tuning.offsetShift))
+            skewNs = saturatingAdd(skewNs, shrTowardZero(err, tuning.skewShift))
+            let dev = abs(err) - madNs
+            madNs = saturatingAdd(madNs, shrTowardZero(dev, tuning.jitterShift))
+        } else {
+            offsetNs = raw
+            skewNs = 0
+            counters.reanchors += 1
+        }
+        lastPtsNs = srcPtsNs
+
+        let due = saturatingAdd(saturatingAdd(pts, offsetNs), lockedCushionNs())
+        if due < readyNs { counters.late += 1 }
+        return due
+    }
+
+    /// A frame whose timestamp is not on the source cadence — a repeat the host re-anchored at
+    /// submit, a stamp its plausibility gate replaced with "now", or one that reached us with no
+    /// usable pts at all. Those samples do not lie on the source's timeline, and folding them in
+    /// would drag the offset estimate toward "now" exactly when the stream is idle and the
+    /// estimate matters most.
+    ///
+    /// Returns a due time from the CURRENT estimate, leaving offset, skew and jitter untouched:
+    /// the frame is simply due once it is ready, cushioned like any other.
+    func noteOffCadence(readyNs: Int64, frameIntervalNs: Int64) -> Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        self.frameIntervalNs = frameIntervalNs
+        return saturatingAdd(readyNs, lockedCushionNs())
+    }
+
+    func jitterNs() -> Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return madNs
+    }
+
+    /// How far past the estimate a frame is held, to absorb the measured jitter.
+    ///
+    /// The one-frame-interval ceiling is an INVARIANT, not a tunable: a cushion past a whole frame
+    /// buys latency for smoothness the source cannot supply, and at that point the honest fix is a
+    /// deeper buffer the user asked for, not a loop quietly holding frames.
+    func cushionNs() -> Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return lockedCushionNs()
+    }
+
+    func health() -> CadenceHealth {
+        lock.lock()
+        defer { lock.unlock() }
+        var h = counters
+        h.offsetNs = offsetNs
+        h.skewNs = skewNs
+        h.jitterNs = madNs
+        h.cushionNs = lockedCushionNs()
+        return h
+    }
+
+    private func lockedCushionNs() -> Int64 {
+        let den = Int64(max(tuning.cushionDen, 1))
+        let want = saturatingMul(madNs, Int64(tuning.cushionNum)) / den
+        let ceiling = frameIntervalNs > 0 ? frameIntervalNs : Int64.max
+        return min(max(want, min(tuning.cushionFloorNs, ceiling)), ceiling)
+    }
+}
+
+/// Arithmetic shift that rounds toward ZERO, so a negative residual is damped by exactly as much
+/// as its positive twin. A plain `>>` rounds toward −∞, which biases a loop that spends its whole
+/// life within a few nanoseconds of zero error.
+private func shrTowardZero(_ v: Int64, _ shift: UInt8) -> Int64 {
+    v < 0 ? -((-v) >> shift) : v >> shift
+}
+
+/// The Rust loop is `saturating_*` throughout — a garbage timestamp must clamp the estimate, never
+/// trap the render thread. Swift's operators trap instead of saturating, so the port carries its
+/// own; for every reachable input these are plain `+`, `−`, `×`.
+private func saturatingAdd(_ a: Int64, _ b: Int64) -> Int64 {
+    let (v, overflow) = a.addingReportingOverflow(b)
+    return overflow ? (b > 0 ? Int64.max : Int64.min) : v
+}
+
+private func saturatingSub(_ a: Int64, _ b: Int64) -> Int64 {
+    let (v, overflow) = a.subtractingReportingOverflow(b)
+    return overflow ? (b > 0 ? Int64.min : Int64.max) : v
+}
+
+private func saturatingMul(_ a: Int64, _ b: Int64) -> Int64 {
+    let (v, overflow) = a.multipliedReportingOverflow(by: b)
+    guard overflow else { return v }
+    return (a > 0) == (b > 0) ? Int64.max : Int64.min
 }
 
 /// When a ready frame is pushed to the layer — the stage-2 vs stage-3 presenter split. Same decode
@@ -329,7 +614,8 @@ public final class PresentLinkInfo: @unchecked Sendable {
     }
 }
 
-/// Deadline pacing's staged frame-rate hint. SessionPresenter pushes the stream rate from the
+/// Deadline pacing's staged frame-rate hint, and — on every pacing — the session's nominal source
+/// interval (`sourceIntervalNs`). SessionPresenter pushes the stream rate from the
 /// MAIN thread (session start + every layout/Reconfigure); the link's own thread drains and
 /// applies it, so the CAMetalDisplayLink is only ever touched from the thread that runs it. The
 /// floor is PINNED at the stream rate — no idle ramp-down: with a low floor the link idles toward
@@ -368,6 +654,16 @@ private final class FrameRateHint: @unchecked Sendable {
         let p = pending
         pending = nil
         return p
+    }
+    /// The nominal SOURCE interval in nanoseconds — the cadence clock's cushion ceiling. Read on
+    /// every pacing, not just deadline: this box is where the negotiated stream rate already
+    /// lives, staged from main on session start and every Reconfigure, and the decode-completion
+    /// thread needs it under a lock. 0 = not known yet, which the clock handles by running its
+    /// cushion uncapped (the shared core's own behaviour for a zero interval).
+    func sourceIntervalNs() -> Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return streamHz > 0 ? Int64(1_000_000_000.0 / Double(streamHz)) : 0
     }
     private static func range(hz: Float, boosted: Bool) -> CAFrameRateRange {
         #if os(tvOS)
@@ -663,6 +959,11 @@ final class PresentGate: @unchecked Sendable {
 /// between system-reported on-glass times (vsync-aligned presents show clean refresh-period
 /// multiples; immediate flips scatter). Lock-guarded — `presented` lands on a Metal callback thread.
 private final class PresentDebugStats: @unchecked Sendable {
+    /// The session's cadence loop, for the line's `cadence` segment — `nil` under the latency
+    /// intent, and then the line is emitted exactly as it was before source-timestamp playout
+    /// existed. `late` is the number WP8 gates on: a due time already past when the frame became
+    /// presentable is the direct signal that the cushion is too small.
+    private let cadence: CadenceClock?
     private let lock = NSLock()
     private var last = CACurrentMediaTime()
     private var ok = 0, failed = 0, empty = 0, dropped = 0, gated = 0, noDrawable = 0
@@ -684,6 +985,10 @@ private final class PresentDebugStats: @unchecked Sendable {
     /// 120 Hz panel saturates this at ~maximumDrawableCount; stage-3 pegs it at the gate depth).
     private var inFlight = 0
     private var maxInFlight = 0
+
+    init(cadence: CadenceClock?) {
+        self.cadence = cadence
+    }
 
     func emptyWake() { lock.lock(); empty += 1; lock.unlock() }
 
@@ -743,6 +1048,17 @@ private final class PresentDebugStats: @unchecked Sendable {
         let vendP50 = vends.isEmpty ? 0 : vends[vends.count / 2]
         let vendMax = vends.last ?? 0
         let inflightMax = maxInFlight
+        // Loop health, appended only where a loop exists — `late`/`frames` is WP8's cushion
+        // criterion and `reanchor` says whether the estimate is tracking at all.
+        let loop = cadence?.health()
+        let cadenceLine =
+            loop.map {
+                String(
+                    format: " cadence late=%llu/%llu reanchor=%llu jitterUs=%lld cushionUs=%lld "
+                        + "skewNs=%lld",
+                    $0.late, $0.frames, $0.reanchors, $0.jitterNs / 1000, $0.cushionNs / 1000,
+                    $0.skewNs)
+            } ?? ""
         let line = String(
             format: "pf-present decoded=%d ok=%d fail=%d empty=%d gated=%d noDrawable=%d "
                 + "dropped=%d qDrop=%d qDry=%d maxRenderMs=%.1f inflightMax=%d forced=%d "
@@ -751,7 +1067,7 @@ private final class PresentDebugStats: @unchecked Sendable {
             decoded, ok, failed, empty, gated, noDrawable, dropped,
             smoothing.overflowDrops, smoothing.underflows, maxRenderMs, inflightMax,
             gate?.drainForced() ?? 0, p50, dMax, deltas.count, latchP50, latchMax,
-            vendP50, vendMax)
+            vendP50, vendMax) + cadenceLine
         ok = 0; failed = 0; empty = 0; dropped = 0; gated = 0; noDrawable = 0
         maxRenderMs = 0
         maxInFlight = inFlight // the window peak restarts from the live depth
@@ -806,6 +1122,11 @@ public final class Stage2Pipeline {
     /// at most one per vsync, so the FIFO store drains on the display's cadence rather than on
     /// arrival. Ignored under `.deadline` (the link IS the cadence there).
     private let vsyncPaced: Bool
+    /// Source-timestamp playout for the SMOOTHNESS intent: every decoded frame is stamped with
+    /// when it is due on the host's own cadence, and the present decision aims there instead of at
+    /// the moment the frame happened to decode. `nil` under `latency`, whose path keeps no cadence
+    /// arithmetic in it at all — see the intent gate in `init`.
+    private let cadence: CadenceClock?
     private let endToEndMeter: LatencyMeter?
     private let decodeMeter: LatencyMeter?
     private let displayMeter: LatencyMeter?
@@ -885,12 +1206,23 @@ public final class Stage2Pipeline {
         self.decodeMeter = decodeMeter
         self.displayMeter = displayMeter
         self.presentFloorMeter = presentFloorMeter
+        // The intent gate: source-timestamp playout is what `smooth` MEANS now, and `latency` is
+        // defined as arrival-driven with no cushion — so the store policy, which is the intent's
+        // only other expression (`PresentPriority.storePolicy`: smooth → fifo, latency →
+        // newest-wins), is what decides whether a clock exists at all. A latency session runs the
+        // same present path it ran before this existed.
+        switch storePolicy {
+        case .newestWins: self.cadence = nil
+        case .fifo: self.cadence = CadenceClock(tuning: .snapping())
+        }
         let ring = ring
         let recovery = recovery
         let renderSignal = renderSignal
         let gate = gate
         let decodeReport = decodeReport
         let phaseReporter = phaseReporter
+        let cadence = cadence
+        let rateHint = frameRateHint
         self.decoder = VideoDecoder(
             onDecoded: { frame in
                 // Decode stage = received→decoded, both client CLOCK_REALTIME (offset 0 — no
@@ -911,7 +1243,11 @@ public final class Stage2Pipeline {
                 // present) on a proven clean re-anchor (IDR / RFI anchor / 2nd recovery mark) or the
                 // bounded backstop. decoderKeyframe=false: VT doesn't flag IDRs, the wire FLAG_SOF does.
                 guard gate.onDecoded(flags: frame.flags) else { return }
-                ring.submit(frame)
+                // Decoder OUTPUT is where the cadence loop is sampled — the instant the frame
+                // becomes presentable. Receipt would not model decode at all and could hand back a
+                // due time already past by the moment the frame exists; dequeue would fold the
+                // present path's own wait into the estimate and make the loop chase its output.
+                ring.submit(Stage2Pipeline.dated(frame, by: cadence, hint: rateHint))
                 // FRAME ARRIVAL is the render trigger (never the display link — see the header).
                 renderSignal.signal()
             },
@@ -936,6 +1272,11 @@ public final class Stage2Pipeline {
         decodeReport.bind(connection) // arm the Automatic-bitrate decode signal for this session
         phaseReporter.bind(connection) // arm phase reports (flushed only by the deadline link)
         gate.reseed(framesDropped: connection.framesDropped()) // baseline the freeze to this session
+        // A fresh session is a fresh source clock: re-anchor on its first frame rather than slew
+        // for seconds off the previous host's offset. (Mid-session discontinuities — background
+        // resume, a stream idle under the infinite GOP — arrive as a source-timestamp gap the loop
+        // re-anchors on by itself; this seam covers the one it cannot see.)
+        cadence?.reset()
         token = StopFlag() // fresh token per start — a stop is permanent (like StreamPump)
 
         // Configure the decoder's chroma + the layer's initial colorimetry before the first frame. The
@@ -962,7 +1303,7 @@ public final class Stage2Pipeline {
                 connection: connection, token: token, pumpStopped: pumpStopped,
                 ring: ring, renderSignal: renderSignal,
                 device: presenter.metalDevice, queue: presenter.metalQueue,
-                decodeMeter: decodeMeter,
+                decodeMeter: decodeMeter, cadence: cadence, rateHint: frameRateHint,
                 onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize)
         } else {
             thread = Thread {
@@ -1088,7 +1429,8 @@ public final class Stage2Pipeline {
         // startDeadlinePresenter. The V-Sync policy below doesn't apply there (the link deadline-
         // times every present). Deadline sessions ALWAYS carry the stats (their pf-present line
         // streams to Console.app via presentLog — the on-device pacing decomposition).
-        let debugStats = (presentDebug || pacing == .deadline) ? PresentDebugStats() : nil
+        let debugStats =
+            (presentDebug || pacing == .deadline) ? PresentDebugStats(cadence: cadence) : nil
         if pacing == .deadline {
             startDeadlinePresenter(debugStats: debugStats)
             return
@@ -1118,6 +1460,12 @@ public final class Stage2Pipeline {
         // Stage-3's bounded in-flight present gate; nil = stage-2's present-on-arrival. A local
         // (like the ring) so neither the render thread nor the presented handlers capture `self`.
         let gate: PresentGate? = pacing == .glass ? PresentGate(capacity: gateDepth) : nil
+        // Cadence targeting turns the store into a holding buffer: a frame comes out once it is
+        // DUE, not once a present opportunity exists (§4.3). The latency intent has no clock and
+        // keeps the unconditional take, byte for byte.
+        let takeReady: () -> ReadyFrame? = cadence == nil
+            ? { ring.take() }
+            : { ring.take(dueBy: CACurrentMediaTime(), due: { $0.dueMediaTime }) }
         let renderThread = Thread {
             defer { renderStopped.signal() }
             // macOS smoothness: the vsync this thread last presented onto — at most ONE present
@@ -1150,7 +1498,7 @@ public final class Stage2Pipeline {
                     debugStats?.flushIfDue(ring: ring, gate: gate)
                     return
                 }
-                guard !token.isStopped, let frame = ring.take() else {
+                guard !token.isStopped, let frame = takeReady() else {
                     gate?.release() // armed but nothing to render — don't hold the gate stale
                     debugStats?.emptyWake()
                     debugStats?.flushIfDue(ring: ring, gate: gate)
@@ -1158,8 +1506,14 @@ public final class Stage2Pipeline {
                 }
                 // V-Sync ON: flip on the next predicted vsync (< one period out, stale link ⇒
                 // immediate — see VsyncClock). OFF: flip as soon as the GPU finishes.
+                //
+                // Under cadence targeting the grid is entered at the frame's DUE time rather than
+                // at this instant, so two frames the host emitted one period apart land one period
+                // apart on glass however unevenly they arrived. Never before `now`: a due time in
+                // the past means the frame is late, not that the grid moves back.
+                let now = CACurrentMediaTime()
                 let presentAt = vsyncEnabled
-                    ? vsyncClock.nextVsync(after: CACurrentMediaTime()) : nil
+                    ? vsyncClock.nextVsync(after: max(now, frame.dueMediaTime ?? now)) : nil
                 let renderStarted = CACurrentMediaTime()
                 let issuedNs = Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: renderStarted)
                 let onGlass: (Int64?) -> Void = { presentedNs in
@@ -1238,6 +1592,13 @@ public final class Stage2Pipeline {
         let hint = frameRateHint
         let layer = presenter.layer
         let stash = LatestBox<CAMetalDrawable>()
+        // Cadence targeting under deadline pacing: the link's vend IS the grid snap, so the clock
+        // only has to hold a frame back until it is due and the next update presents it — at most
+        // one refresh later. Same holding-buffer rule as the arrival/glass loop (§4.3); latency
+        // sessions have no clock and take unconditionally.
+        let takeReady: () -> ReadyFrame? = cadence == nil
+            ? { ring.take() }
+            : { ring.take(dueBy: CACurrentMediaTime(), due: { $0.dueMediaTime }) }
 
         // ⭐ Shrink the drawable pool to 2 for THIS pacing — the measured fix for a present floor
         // stuck at two refreshes (field 2026-08-13, Apple TV 4K / tvOS 27: `os present +32.5` at
@@ -1328,7 +1689,7 @@ public final class Stage2Pipeline {
                 // layer's CURRENT config, so drawableSize/format have to be right before a vend
                 // can succeed at all (see reconcileLayer — the session-start bootstrap, where
                 // the layer still has its initial 0×0 size and every vend fails allocation).
-                guard !token.isStopped, let frame = ring.take() else {
+                guard !token.isStopped, let frame = takeReady() else {
                     debugStats?.emptyWake()
                     debugStats?.flushIfDue(ring: ring, gate: nil)
                     return
@@ -1409,8 +1770,9 @@ public final class Stage2Pipeline {
 
     /// MAIN thread (SessionPresenter — session start + every layout/Reconfigure): hint the
     /// deadline link with the stream cadence. Staged; the link's own thread applies it (see
-    /// `FrameRateHint`). No-op under arrival/glass pacing, where the hosting view's CADisplayLink
-    /// is the hinted link.
+    /// `FrameRateHint`). Under arrival/glass pacing no link reads it — the hosting view's
+    /// CADisplayLink is the hinted one there — but the stored rate is still the cadence clock's
+    /// nominal source interval, and hence its cushion ceiling, on every pacing.
     public func setFrameRateHint(hz: Float) {
         frameRateHint.stage(hz: hz)
     }
@@ -1489,7 +1851,7 @@ public final class Stage2Pipeline {
         connection: PunktfunkConnection, token: StopFlag, pumpStopped: DispatchSemaphore,
         ring: FrameStore<ReadyFrame>, renderSignal: DispatchSemaphore,
         device: MTLDevice, queue: MTLCommandQueue,
-        decodeMeter: LatencyMeter?,
+        decodeMeter: LatencyMeter?, cadence: CadenceClock?, rateHint: FrameRateHint,
         onFrame: (@Sendable (AccessUnit) -> Void)?,
         onSessionEnd: (@Sendable () -> Void)?,
         onDecodedSize: (@Sendable (Int, Int) -> Void)?
@@ -1547,10 +1909,15 @@ public final class Stage2Pipeline {
                                 Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
                             decodeMeter?.record(
                                 ptsNs: UInt64(receivedNs), atNs: decodedNs, offsetNs: 0)
+                            // Same cadence sample as the VideoToolbox half: the wavelet decode's
+                            // completion IS this frame's presentable instant.
                             ring.submit(
-                                ReadyFrame(
-                                    ptsNs: ptsNs, receivedNs: receivedNs, decodedNs: decodedNs,
-                                    image: .planar(planes), flags: flags))
+                                Stage2Pipeline.dated(
+                                    ReadyFrame(
+                                        ptsNs: ptsNs, receivedNs: receivedNs,
+                                        decodedNs: decodedNs, image: .planar(planes),
+                                        flags: flags),
+                                    by: cadence, hint: rateHint))
                             renderSignal.signal()
                         }
                         if submitted {
@@ -1584,6 +1951,51 @@ public final class Stage2Pipeline {
         clock_gettime(CLOCK_REALTIME, &ts)
         let realtimeNow = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
         return realtimeNow + Int64((t - caNow) * 1_000_000_000)
+    }
+
+    /// The exact inverse: a client `CLOCK_REALTIME` nanosecond instant (`ReadyFrame.decodedNs`)
+    /// expressed on the `CACurrentMediaTime` timeline the present path schedules against.
+    ///
+    /// It reads the two clocks in the SAME ORDER as `realtimeNs(forDisplayLinkTimestamp:)` above
+    /// and forms the same difference, so the sub-microsecond skew between the two reads is the
+    /// same sign in both and cancels on a round trip.
+    ///
+    /// The cadence loop needs this because its rule is one domain in, SAME domain out: it is fed
+    /// the decode-output instant in media time and its due time comes back in media time, with no
+    /// second conversion anywhere downstream. (A constant realtime↔media offset would be absorbed
+    /// by the loop's own offset estimator and need no conversion at all — but the two clocks
+    /// diverge across device sleep, which is exactly why the conversion is done per frame here
+    /// rather than once per session.)
+    static func mediaTimeNs(forRealtimeNs t: Int64) -> Int64 {
+        let caNow = CACurrentMediaTime()
+        var ts = timespec()
+        clock_gettime(CLOCK_REALTIME, &ts)
+        let realtimeNow = Int64(ts.tv_sec) * 1_000_000_000 + Int64(ts.tv_nsec)
+        return Int64(caNow * 1_000_000_000) + (t - realtimeNow)
+    }
+
+    /// Stamp a decoded frame with when it is DUE on the source's cadence, at the moment it enters
+    /// the ready store. Returns the frame untouched when the session has no clock (the latency
+    /// intent).
+    ///
+    /// A frame whose wire pts did not survive (`ptsNs == 0` — the decoder's "unknown" value) is
+    /// not on the source's timeline at all, so it is folded through `noteOffCadence`: due as soon
+    /// as it is ready, and the estimate left alone. Folding "now" in would drag the offset toward
+    /// this instant precisely when the loop has the least evidence.
+    private static func dated(
+        _ frame: ReadyFrame, by clock: CadenceClock?, hint: FrameRateHint
+    ) -> ReadyFrame {
+        guard let clock else { return frame }
+        let readyNs = mediaTimeNs(forRealtimeNs: frame.decodedNs)
+        let interval = hint.sourceIntervalNs()
+        let dueNs =
+            frame.ptsNs > 0
+            ? clock.dueNs(
+                srcPtsNs: frame.ptsNs, readyNs: readyNs, frameIntervalNs: interval)
+            : clock.noteOffCadence(readyNs: readyNs, frameIntervalNs: interval)
+        var dated = frame
+        dated.dueMediaTime = Double(dueNs) / 1_000_000_000
+        return dated
     }
 }
 #endif
