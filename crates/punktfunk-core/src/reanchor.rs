@@ -20,6 +20,30 @@
 //! VideoToolbox, every FFmpeg rung, which exposes no SEI) simply never calls it and every wire
 //! behaviour above is bit-for-bit unchanged.
 //!
+//! # The one claim a client can REFUTE
+//!
+//! Of the three lifts, two are self-evident to the client and one is pure hearsay. An IDR predicts
+//! from nothing, so "this re-anchors decode" is a property of the picture itself. A recovery mark is
+//! only *half* a re-anchor and the gate says so by requiring two. But
+//! [`USER_FLAG_RECOVERY_ANCHOR`] is the HOST asserting a fact about the CLIENT's decoder — *the
+//! picture I coded this P-frame against is one you still hold, intact* — and until
+//! [`AnchorEvidence`] existed the client took it on faith, on the first occurrence, with no
+//! scrutiny at all.
+//!
+//! When that assertion is wrong the failure is the worst-shaped one in this module: the anchor lifts
+//! the freeze onto a picture predicted from a reference the client had to conceal, so the gray plate
+//! reaches the screen AND the gate stops holding, which means it keeps reaching the screen until
+//! some later signal re-arms. A re-anchor claim the client can refute is therefore worse than no
+//! claim at all — no claim merely holds the last good frame until the backstop.
+//!
+//! So a client whose decoder parses the bitstream corroborates it: it already knows which pictures
+//! this AU predicts from and whether each of those decoded from a complete reference chain, and
+//! [`on_decoded_corroborated`](ReanchorGate::on_decoded_corroborated) refuses an anchor whose
+//! references it can prove were damaged. Refusing can only ever make the gate hold LONGER — the
+//! freeze stays up, the backstop fires on its ORIGINAL deadline, and the client escalates to a real
+//! IDR — which is the direction every other rule here errs in, deliberately. Lanes that cannot
+//! answer pass [`AnchorEvidence::Unavailable`] and behave exactly as they always have.
+//!
 //! [`USER_FLAG_RECOVERY_POINT`]: crate::packet::USER_FLAG_RECOVERY_POINT
 //! [`USER_FLAG_RECOVERY_ANCHOR`]: crate::packet::USER_FLAG_RECOVERY_ANCHOR
 
@@ -97,8 +121,9 @@ pub fn index_gap(expected: u32, got: u32) -> Option<u32> {
 /// Fold one decoded frame into the re-anchor state and decide whether it lifts the post-loss freeze.
 ///
 /// `is_keyframe` — a real IDR (always a clean re-anchor). `has_anchor` — this AU carried
-/// [`USER_FLAG_RECOVERY_ANCHOR`](crate::packet::USER_FLAG_RECOVERY_ANCHOR), the host's definitive
-/// single-frame re-anchor from an LTR-RFI recovery (a clean P-frame coded against a known-good
+/// [`USER_FLAG_RECOVERY_ANCHOR`](crate::packet::USER_FLAG_RECOVERY_ANCHOR) **and the caller did not
+/// refute it** ([`AnchorEvidence`]), the host's definitive single-frame re-anchor from an LTR-RFI
+/// recovery (a clean P-frame coded against a known-good
 /// reference), so it lifts on the FIRST occurrence exactly like an IDR — no two-mark wait. `has_mark` —
 /// this AU carried [`USER_FLAG_RECOVERY_POINT`](crate::packet::USER_FLAG_RECOVERY_POINT), a
 /// host-signalled intra-refresh wave boundary (only *half* a re-anchor). `marks` — recovery marks seen
@@ -156,6 +181,44 @@ impl LocalRecovery {
         sei_here: false,
         is_recovery_point: false,
     };
+}
+
+/// What a client's OWN parser can say about the host's re-anchor claim on one decoded frame — the
+/// corroboration for [`USER_FLAG_RECOVERY_ANCHOR`](crate::packet::USER_FLAG_RECOVERY_ANCHOR).
+///
+/// An anchor is the host asserting something about the CLIENT's decoder: *this P-frame is coded
+/// against a picture you still hold, intact, so decoding it re-anchors you*. The host derives that
+/// from its own slot bookkeeping — which tracks whether the client RECEIVED a frame, not whether it
+/// DECODED that frame from a complete reference chain. Those two differ exactly when the client had
+/// to conceal, and the gap between them is what puts a gray plate on screen with the freeze lifted.
+///
+/// Three states rather than a bool, for the same reason [`LocalRecovery`] is two facts: a lane that
+/// *cannot* answer must be able to say so instead of being folded into "nothing wrong here". Only
+/// [`Self::ReferencesDamaged`] changes any behaviour; the other two are indistinguishable to the
+/// gate and differ only in what they claim at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnchorEvidence {
+    /// This lane has no local bitstream parser, so it cannot corroborate or refute anything — the
+    /// host's claim stands, exactly as it always has. Android MediaCodec, Apple VideoToolbox and
+    /// every lane reached over the C ABI pass this, and their behaviour is bit-for-bit unchanged.
+    #[default]
+    Unavailable,
+    /// Corroborated: every picture this AU predicts from was itself decoded from a fully-available
+    /// reference chain, so the host's claim is consistent with what this decoder actually holds.
+    ReferencesClean,
+    /// Refuted: this AU predicts from a picture that needed concealment. Whatever the host believes,
+    /// decoding this frame cannot re-anchor a decoder whose reference for it is already damaged, so
+    /// the anchor does not lift the freeze.
+    ReferencesDamaged,
+}
+
+impl AnchorEvidence {
+    /// May an [`USER_FLAG_RECOVERY_ANCHOR`](crate::packet::USER_FLAG_RECOVERY_ANCHOR) on this frame
+    /// be honoured? Only an outright refutation withholds it — silence is not refutation, so a lane
+    /// that cannot corroborate never becomes *stricter* than it was.
+    fn honours_anchor(self) -> bool {
+        !matches!(self, AnchorEvidence::ReferencesDamaged)
+    }
 }
 
 /// Whether a decoded frame should be shown or withheld while the gate is (or isn't) frozen.
@@ -333,6 +396,11 @@ impl ReanchorGate {
     /// A decoded frame always clears the no-output streak. When frozen, a live mark stream pushes the
     /// backstop out ([`RECOVERY_MARK_PATIENCE`]) so a healing wave isn't pre-empted by a mid-heal IDR.
     ///
+    /// This is the whole-hearsay entry point: it believes an anchor on sight. A client whose decoder
+    /// parses the bitstream should call
+    /// [`on_decoded_corroborated`](Self::on_decoded_corroborated) instead and let its own parser
+    /// check the host's claim.
+    ///
     /// [`USER_FLAG_RECOVERY_ANCHOR`]: crate::packet::USER_FLAG_RECOVERY_ANCHOR
     /// [`USER_FLAG_RECOVERY_POINT`]: crate::packet::USER_FLAG_RECOVERY_POINT
     pub fn on_decoded(
@@ -341,9 +409,48 @@ impl ReanchorGate {
         decoder_keyframe: bool,
         now: Instant,
     ) -> GateVerdict {
+        self.on_decoded_corroborated(
+            wire_flags,
+            decoder_keyframe,
+            AnchorEvidence::Unavailable,
+            now,
+        )
+    }
+
+    /// [`on_decoded`](Self::on_decoded) for a client that can CHECK the host's re-anchor claim
+    /// against its own decoder — the native-decode lanes, which parse every AU themselves and so
+    /// know both which pictures this one predicts from and whether each of those decoded cleanly.
+    ///
+    /// `evidence` is consulted for exactly one thing: whether a
+    /// [`USER_FLAG_RECOVERY_ANCHOR`](crate::packet::USER_FLAG_RECOVERY_ANCHOR) on THIS frame may
+    /// lift the freeze. [`AnchorEvidence::ReferencesDamaged`] withholds that lift and nothing else,
+    /// and the two exclusions are as deliberate as the rule itself:
+    ///
+    /// * **A real IDR still lifts.** It predicts from nothing, so no evidence about its references
+    ///   can bear on it — and the IDR is precisely the escalation a refused anchor is trying to
+    ///   provoke. Refusing it would turn the fix into the permanent freeze it exists to avoid.
+    /// * **The two-mark [`USER_FLAG_RECOVERY_POINT`](crate::packet::USER_FLAG_RECOVERY_POINT) rule
+    ///   is untouched**, including its [`RECOVERY_MARK_PATIENCE`] deadline push. An intra-refresh
+    ///   wave heals by overwriting stripes rather than by predicting from one named picture, so
+    ///   "this frame's references were damaged" says nothing about whether the wave completed.
+    ///
+    /// A refused anchor also leaves the backstop deadline exactly where the arm put it. That is the
+    /// point rather than an omission: the freeze becomes overdue on its ORIGINAL schedule, [`poll`](Self::poll)
+    /// re-asks, and the client escalates to a real IDR — the recovery the host's anchor failed to
+    /// deliver. Pushing the deadline out on a refusal would reward a host whose anchors do not work
+    /// with a longer wait.
+    pub fn on_decoded_corroborated(
+        &mut self,
+        wire_flags: u32,
+        decoder_keyframe: bool,
+        evidence: AnchorEvidence,
+        now: Instant,
+    ) -> GateVerdict {
         self.no_output_streak = 0;
         let is_keyframe = decoder_keyframe || (wire_flags & FLAG_SOF as u32 != 0);
-        let has_anchor = wire_flags & USER_FLAG_RECOVERY_ANCHOR != 0;
+        // An anchor the client's own parser refutes is not an anchor. Folded in HERE rather than
+        // inside `reanchor_after_frame` so that function stays a pure statement of the wire rules.
+        let has_anchor = wire_flags & USER_FLAG_RECOVERY_ANCHOR != 0 && evidence.honours_anchor();
         let has_mark = wire_flags & USER_FLAG_RECOVERY_POINT != 0;
         if has_mark && self.awaiting {
             self.deadline = Some(now + RECOVERY_MARK_PATIENCE);
@@ -887,5 +994,189 @@ mod tests {
         assert_eq!(g.on_decoded(POINT, false, t), GateVerdict::Hold);
         assert!(!g.poll(0, t + Duration::from_millis(1)));
         assert!(g.is_holding());
+    }
+
+    // ---- the corroborated-anchor path (AnchorEvidence) ----
+
+    use AnchorEvidence::{ReferencesClean, ReferencesDamaged, Unavailable};
+
+    /// The headline. The host says "this P-frame re-anchors you"; the client's own parser says the
+    /// picture it predicts from is one IT had to conceal. Both cannot be true, and the client's
+    /// statement is about its OWN decoder — so the anchor does not lift and the gray plate the
+    /// anchor would have presented never reaches the screen.
+    #[test]
+    fn an_anchor_whose_references_the_decoder_concealed_does_not_lift() {
+        let mut g = ReanchorGate::new(0);
+        let now = t0();
+        g.arm(now);
+        assert_eq!(
+            g.on_decoded_corroborated(ANCHOR, false, ReferencesDamaged, now),
+            GateVerdict::Hold,
+            "a refuted anchor is not a re-anchor"
+        );
+        assert!(g.is_holding(), "and the freeze stays up");
+        // Repeating it changes nothing — a host that keeps sending anchors it cannot honour never
+        // talks its way past the gate.
+        assert_eq!(
+            g.on_decoded_corroborated(ANCHOR, false, ReferencesDamaged, now),
+            GateVerdict::Hold
+        );
+        assert!(g.is_holding());
+    }
+
+    /// The escalation a refusal exists to provoke must still work. An IDR predicts from nothing, so
+    /// no evidence about damaged references can bear on it — refusing it too would convert this fix
+    /// into the permanent freeze it is meant to avoid.
+    #[test]
+    fn a_real_idr_lifts_even_while_the_evidence_refutes_anchors() {
+        // The decoder's own keyframe flag...
+        let mut g = ReanchorGate::new(0);
+        let now = t0();
+        g.arm(now);
+        assert_eq!(
+            g.on_decoded_corroborated(ANCHOR, false, ReferencesDamaged, now),
+            GateVerdict::Hold
+        );
+        assert_eq!(
+            g.on_decoded_corroborated(0, true, ReferencesDamaged, now),
+            GateVerdict::Present,
+            "the IDR re-anchors regardless of what the anchor evidence says"
+        );
+        assert!(!g.is_holding());
+
+        // ...and the wire's FLAG_SOF, for the lanes whose decoder does not flag IDRs.
+        let mut g = ReanchorGate::new(0);
+        g.arm(now);
+        assert_eq!(
+            g.on_decoded_corroborated(SOF, false, ReferencesDamaged, now),
+            GateVerdict::Present
+        );
+        assert!(!g.is_holding());
+    }
+
+    /// A corroborated anchor is still an anchor: the whole point is to refuse the ones the client
+    /// can disprove, not to stop honouring the mechanism.
+    #[test]
+    fn a_corroborated_anchor_lifts_on_the_first_occurrence() {
+        let mut g = ReanchorGate::new(0);
+        let now = t0();
+        g.arm(now);
+        assert_eq!(
+            g.on_decoded_corroborated(0, false, ReferencesClean, now),
+            GateVerdict::Hold,
+            "an ordinary frame is still withheld"
+        );
+        assert_eq!(
+            g.on_decoded_corroborated(ANCHOR, false, ReferencesClean, now),
+            GateVerdict::Present
+        );
+        assert!(!g.is_holding());
+    }
+
+    /// `Unavailable` is the promise made to every lane without a local parser: silence is not
+    /// refutation. This walks the same sequences the wire-path tests above assert and requires the
+    /// identical verdicts through the corroborated entry point.
+    #[test]
+    fn an_uncorroborated_lane_behaves_exactly_as_it_always_has() {
+        // The anchor lift, byte for byte the `a_gap_lifts_on_the_first_rfi_anchor` contract.
+        let mut g = ReanchorGate::new(0);
+        let now = t0();
+        g.arm(now);
+        assert_eq!(
+            g.on_decoded_corroborated(0, false, Unavailable, now),
+            GateVerdict::Hold
+        );
+        assert_eq!(
+            g.on_decoded_corroborated(ANCHOR, false, Unavailable, now),
+            GateVerdict::Present
+        );
+        assert!(!g.is_holding());
+
+        // And `on_decoded` — which every such lane actually calls — must agree with it exactly.
+        let mut wire = ReanchorGate::new(0);
+        let mut corroborated = ReanchorGate::new(0);
+        wire.arm(now);
+        corroborated.arm(now);
+        for flags in [0, POINT, 0, ANCHOR, SOF, 0] {
+            assert_eq!(
+                wire.on_decoded(flags, false, now),
+                corroborated.on_decoded_corroborated(flags, false, Unavailable, now),
+                "flags {flags:#x} diverged between the two entry points"
+            );
+            assert_eq!(wire.is_holding(), corroborated.is_holding());
+        }
+    }
+
+    /// A refused anchor must not buy the host time. The freeze becomes overdue on the deadline the
+    /// ARM set — not one pushed out by the refusal — so the client escalates to the real IDR that
+    /// the failed anchor did not deliver.
+    #[test]
+    fn a_refused_anchor_leaves_the_backstop_on_its_original_deadline() {
+        let mut g = ReanchorGate::new(0);
+        let start = t0();
+        g.arm(start);
+        // Anchors keep arriving and keep being refused, right up to the deadline.
+        for ms in [10, 100, 300, 490] {
+            assert_eq!(
+                g.on_decoded_corroborated(
+                    ANCHOR,
+                    false,
+                    ReferencesDamaged,
+                    start + Duration::from_millis(ms)
+                ),
+                GateVerdict::Hold
+            );
+            assert!(!g.poll(0, start + Duration::from_millis(ms)), "not yet due");
+        }
+        let overdue = start + REANCHOR_FREEZE_MAX + Duration::from_millis(1);
+        assert!(
+            g.poll(0, overdue),
+            "the backstop fires on the arm's own deadline — the refusals did not extend it"
+        );
+        assert!(
+            g.is_holding(),
+            "and it keeps holding, never resuming to gray"
+        );
+    }
+
+    /// Refuting an anchor says nothing about an intra-refresh wave: a wave heals by overwriting
+    /// stripes rather than by predicting from one named picture, so the two-mark rule and its
+    /// patience deadline must be untouched by the evidence.
+    #[test]
+    fn refuted_anchors_do_not_disturb_the_two_mark_rule() {
+        let mut g = ReanchorGate::new(0);
+        let now = t0();
+        g.arm(now);
+        assert_eq!(
+            g.on_decoded_corroborated(POINT, false, ReferencesDamaged, now),
+            GateVerdict::Hold,
+            "mark #1 is still only half a re-anchor"
+        );
+        // An anchor in between is refused and must not consume or reset the mark count.
+        assert_eq!(
+            g.on_decoded_corroborated(ANCHOR, false, ReferencesDamaged, now),
+            GateVerdict::Hold
+        );
+        assert_eq!(
+            g.on_decoded_corroborated(POINT, false, ReferencesDamaged, now),
+            GateVerdict::Present,
+            "mark #2 lifts exactly as it does on the wire path"
+        );
+        assert!(!g.is_holding());
+    }
+
+    /// The evidence is consulted only while an anchor flag is actually present — a refutation on an
+    /// ordinary frame must not become a second, sticky reason to hold.
+    #[test]
+    fn damaged_evidence_alone_neither_holds_nor_arms_an_unfrozen_gate() {
+        let mut g = ReanchorGate::new(0);
+        let now = t0();
+        assert_eq!(
+            g.on_decoded_corroborated(0, false, ReferencesDamaged, now),
+            GateVerdict::Present,
+            "an unfrozen gate presents; the evidence is about anchors, not about frames"
+        );
+        assert!(!g.is_holding());
+        assert!(!g.poll(0, now));
     }
 }

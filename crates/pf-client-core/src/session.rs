@@ -1093,9 +1093,38 @@ fn pump(
                         // `image.is_keyframe()` as the decoder's own IDR belt, applies the two-mark
                         // rule + the mark-patience backstop, clears the no-output streak, and returns
                         // whether to present this frame or withhold it as a post-loss concealment.
-                        let present =
-                            gate.on_decoded(frame.flags, image.is_keyframe(), Instant::now())
-                                == GateVerdict::Present;
+                        //
+                        // CORROBORATED (the grey-frame fix): the wire's RECOVERY_ANCHOR is the host
+                        // asserting something about THIS decoder — "the picture I coded this
+                        // P-frame against is one you still hold, intact" — and it lifts the freeze
+                        // on the FIRST occurrence, no two-mark wait. The host derives that from
+                        // bookkeeping that tracks what the client RECEIVED, not what it managed to
+                        // DECODE, and when those diverge the anchor lifts the freeze onto a
+                        // concealed picture and LEAVES it lifted: grey with motion painted on it
+                        // until some later signal re-arms and the 500 ms backstop extracts a real
+                        // IDR. A rung that planned the AU itself knows better, so it says so here.
+                        //
+                        // What a refusal costs is exactly one thing: the freeze keeps holding the
+                        // last good picture until the backstop fires on its ORIGINAL deadline and
+                        // forces the IDR the anchor failed to be. That is strictly the better half
+                        // of the trade — the alternative is presenting a picture this client can
+                        // prove is damaged — and it is the same direction every rule in the gate
+                        // errs in. Every non-native lane reports `Unavailable` and is untouched.
+                        let evidence = image.anchor_evidence();
+                        if evidence == punktfunk_core::reanchor::AnchorEvidence::ReferencesDamaged
+                            && frame.flags & punktfunk_core::packet::USER_FLAG_RECOVERY_ANCHOR != 0
+                        {
+                            tracing::debug!(
+                                "refused a host recovery anchor: this AU predicts from a picture \
+                                 this decoder had to conceal — holding for a real IDR"
+                            );
+                        }
+                        let present = gate.on_decoded_corroborated(
+                            frame.flags,
+                            image.is_keyframe(),
+                            evidence,
+                            Instant::now(),
+                        ) == GateVerdict::Present;
                         total_frames += 1;
                         // ⚠ The `stats:` decode-path tag is a machine interface —
                         // additive only. M10 removed the rungs whose tags were `vaapi`,
