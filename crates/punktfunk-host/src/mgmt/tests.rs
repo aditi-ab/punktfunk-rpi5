@@ -1358,6 +1358,12 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("GET", "/api/v1/compositors", true, true),
         ("GET", "/api/v1/events", true, false),
         ("GET", "/api/v1/logs", true, false),
+        // ---- diagnostics: OPERATOR ONLY, both lanes denied. The verdicts name the host's user,
+        // its group layout and the state of its device nodes — a paired streaming client has no
+        // business enumerating any of that, and a plugin that wanted to would be asking for a map
+        // of the box's privilege boundaries. The tray gets counts on `/local/summary` instead.
+        ("GET", "/api/v1/diagnostics", false, false),
+        ("POST", "/api/v1/diagnostics/refresh", false, false),
         // ---- client log bundles: the UPLOAD is the cert lane's single write — write-only,
         // size/quota-capped ("send logs to host" from a Deck in Gaming Mode / tvOS). Reading
         // bundles back is operator business (they can contain whatever the client logged), so
@@ -1635,6 +1641,106 @@ fn post_json(path: &str, body: serde_json::Value) -> axum::http::Request<Body> {
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
+}
+
+/// Diagnostics are operator business: the verdicts carry the host user's name, its group layout and
+/// the state of its device nodes.
+#[tokio::test]
+async fn diagnostics_require_the_operator_token() {
+    let app = test_app(test_state(), Some("sekrit"));
+
+    for req in [
+        get_req("/api/v1/diagnostics"),
+        axum::http::Request::post("/api/v1/diagnostics/refresh")
+            .body(Body::empty())
+            .unwrap(),
+    ] {
+        let (status, body) = send(&app, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body["error"].as_str().unwrap().contains("bearer"));
+    }
+}
+
+/// The shape the console renders: a worst-first list in which every registered check appears, `ok`
+/// and `inapplicable` rows included (the troubleshooting page shows what works, and can answer why
+/// a check does not apply here).
+#[tokio::test]
+async fn diagnostics_report_the_registered_checks() {
+    // The registry is a process-global primed at `serve` startup; take the same first reading here
+    // rather than asserting against whatever another test in this binary left behind.
+    crate::diagnostics::preflight();
+    let app = test_app(test_state(), None);
+    let (status, body) = send(&app, get_req("/api/v1/diagnostics")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert!(body["ran_at_unix"].is_number(), "the report is stamped");
+    let checks = body["checks"].as_array().expect("checks array");
+    assert!(
+        !checks.is_empty(),
+        "the v1 catalog is registered at startup"
+    );
+
+    // Ids are the console's i18n keys; a rename silently drops every translation.
+    let ids: Vec<&str> = checks.iter().filter_map(|c| c["id"].as_str()).collect();
+    for expected in [
+        "takeover_privilege",
+        "virtual_deck_vhci",
+        "uinput_access",
+        "server_conflict",
+    ] {
+        assert!(ids.contains(&expected), "missing check {expected}: {ids:?}");
+    }
+
+    // The N/N−1 drift guarantee on the wire, not just in the registry's own unit test: a console
+    // that predates a check has nothing but these strings to render.
+    for check in checks {
+        let id = check["id"].as_str().unwrap();
+        assert!(
+            !check["summary"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .is_empty(),
+            "{id}: summary must never be empty"
+        );
+        assert!(
+            matches!(
+                check["status"].as_str(),
+                Some("ok" | "warn" | "fail" | "inapplicable")
+            ),
+            "{id}: unexpected status {:?}",
+            check["status"]
+        );
+        if check["status"] == "fail" {
+            assert!(
+                !check["remedy"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty(),
+                "{id}: a failing check must tell the operator what to do"
+            );
+        }
+    }
+}
+
+/// Refresh re-runs the probes and answers with the fresh report — the "did that fix it?" button.
+#[tokio::test]
+async fn diagnostics_refresh_reruns_and_returns_the_report() {
+    let app = test_app(test_state(), None);
+    let req = axum::http::Request::post("/api/v1/diagnostics/refresh")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send(&app, req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let checks = body["checks"].as_array().expect("checks array");
+    assert!(!checks.is_empty(), "refresh answers with the full catalog");
+    // NOT asserted here: that every row reports `source: "refresh"`. The registry is a
+    // process-global and a sibling test in this binary primes it with a startup reading, so that
+    // assertion would be a parallel-test race. `source` is pinned on an isolated registry in
+    // `crate::diagnostics::tests::refresh_reruns_every_probe`, which is where it belongs.
+    assert!(checks.iter().all(|c| c["id"].is_string()));
 }
 
 /// The display-management GET surface (presets + effective + the enforced-axes list). READ-ONLY

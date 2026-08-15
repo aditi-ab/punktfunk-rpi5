@@ -3,17 +3,31 @@ import type { FC, ReactNode } from "react";
 import { m } from "@/paraglide/messages";
 
 /**
- * The Logs page LAYOUT — the live page (`index.tsx`) and the Storybook story fill the single
- * `viewer` slot, so the arrangement can never drift between them (same pattern as StatsView).
+ * The Troubleshooting page LAYOUT — the live page (`index.tsx`) and the Storybook stories fill the
+ * slots, so the arrangement can never drift between them (same pattern as StatsView).
+ *
+ * This page is the troubleshooting home: it is where someone already goes when something is wrong,
+ * so the host's health checks meet them here rather than on a nav entry that is empty on a healthy
+ * host. The route stays `/logs` — bookmarks and deep links outlive a label.
+ *
+ * Order is deliberate: checks first (structured, actionable), the log stream underneath. When the
+ * checks are green and something is still broken, the log is the natural next step — now one scroll
+ * away instead of a separate destination.
  */
-export const LogsView: FC<{ viewer: ReactNode }> = ({ viewer }) => (
+export const LogsView: FC<{ checks?: ReactNode; viewer: ReactNode }> = ({
+	checks,
+	viewer,
+}) => (
 	<Section maxWidth={false}>
 		<div className="flex flex-col gap-card">
 			<div className="space-y-1">
-				<h1 className="text-2xl font-semibold">{m.logs_title()}</h1>
-				<p className="text-sm text-muted-foreground">{m.logs_subtitle()}</p>
+				<h1 className="text-2xl font-semibold">{m.troubleshooting_title()}</h1>
+				<p className="text-sm text-muted-foreground">
+					{m.troubleshooting_subtitle()}
+				</p>
 			</div>
 
+			{checks}
 			{viewer}
 		</div>
 	</Section>

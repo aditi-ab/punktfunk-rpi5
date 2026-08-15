@@ -242,6 +242,9 @@ export const LogsCard: FC<{
 			    unless something precedes it. This card used to restore it by hand at both
 			    breakpoints. */}
 			<CardContent className="flex flex-col gap-3">
+				{/* The page heading says "Troubleshooting" now, so this card names itself — otherwise
+				    the log stream is the only section on the page with no label. */}
+				<h2 className="text-lg font-medium">{m.logs_title()}</h2>
 				<div className="flex flex-wrap items-center gap-2">
 					<div className="flex items-center gap-1">
 						{LEVELS.map((l) => (

@@ -105,8 +105,8 @@ pub(crate) mod routing;
 pub use routing::{
     apply_input_env, managed_session_available, preflight_takeover_privilege,
     release_autologin_mask, resolve_gamescope_route, restore_managed_session, restore_takeover_now,
-    restore_takeover_on_startup, start_restore_worker, wants_dedicated_game_session,
-    GamescopeRoute,
+    restore_takeover_on_startup, start_restore_worker, takeover_privilege_verdict,
+    wants_dedicated_game_session, GamescopeRoute, TakeoverInapplicable, TakeoverVerdict,
 };
 #[cfg(target_os = "linux")]
 pub use routing::{

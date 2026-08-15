@@ -565,7 +565,9 @@ pub fn usbip_preferred() -> bool {
 }
 
 /// The `vhci_hcd.0` (or legacy `vhci_hcd`) platform sysfs directory, if present.
-fn vhci_base() -> Option<PathBuf> {
+/// `pub(crate)` so the diagnostics probe ([`crate::vhci_probe`]) asks the same question the attach
+/// path asks, rather than growing a second copy of these paths that can drift from it.
+pub(crate) fn vhci_base() -> Option<PathBuf> {
     for p in [
         "/sys/devices/platform/vhci_hcd.0",
         "/sys/devices/platform/vhci_hcd",

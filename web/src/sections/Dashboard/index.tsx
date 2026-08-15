@@ -13,6 +13,7 @@ import { useDialogs } from "@/components/dialogs";
 import { apiErrorMessage } from "@/lib/errors";
 import { useLocale } from "@/lib/i18n";
 import { m } from "@/paraglide/messages";
+import { AttentionCard } from "./AttentionCard";
 import { DashboardView } from "./view";
 
 export const SectionDashboard: FC = () => {
@@ -106,6 +107,7 @@ export const SectionDashboard: FC = () => {
 		<DashboardView
 			status={status}
 			library={library.data}
+			attention={<AttentionCard />}
 			onStopSession={async () => {
 				if (!(await confirmStopAll())) return;
 				stop.mutate(undefined, {

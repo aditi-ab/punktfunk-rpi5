@@ -396,6 +396,64 @@ pub fn preflight_takeover_privilege() {
 #[cfg(not(target_os = "linux"))]
 pub fn preflight_takeover_privilege() {}
 
+/// Why the managed takeover's `punktfunk`-group prerequisite does not apply to this box. Each of
+/// these alone makes the group irrelevant, so a box in any of these states must not be nagged —
+/// but the reason is kept so a troubleshooting UI can say *which* one, instead of hiding the row
+/// and leaving "why isn't this listed?" unanswerable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TakeoverInapplicable {
+    /// Running as root: the plain system-bus `systemctl` verbs succeed, so the helper — and its
+    /// group check — is never reached.
+    Root,
+    /// No display manager drives this box's logins (getty autologin / an enabled user unit).
+    NoDisplayManager,
+    /// No `gamescope-session-plus`/SteamOS session infrastructure ⇒ no autologin gaming session to
+    /// free ⇒ no takeover.
+    NoManagedSession,
+    /// A tarball/source/Nix install: neither the packaged helper nor the group exists, and the
+    /// hand-written polkit rule from the docs is the route instead.
+    NoPackagedHelper,
+    /// The user's login name could not be resolved, so no usable `usermod` line could be produced.
+    UnknownUser,
+    /// The managed takeover is a Linux path.
+    NotLinux,
+}
+
+/// The takeover's one un-automatable prerequisite, as data.
+///
+/// Defined on every platform (like [`GamescopeRoute`]) because the host maps it into a wire check
+/// regardless of target — off Linux it is always `Inapplicable { why: NotLinux }`. Membership is
+/// the **user database's** answer, matching what `pf-dm-helper` itself asks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TakeoverVerdict {
+    /// A gate excluded this box; `why` names which one.
+    Inapplicable { why: TakeoverInapplicable },
+    /// The takeover applies here and the user is already a member.
+    Ok { user: String, group: &'static str },
+    /// The takeover applies here and the user is **not** a member — every takeover will degrade
+    /// silently to mirroring the box's own session.
+    MissingMembership {
+        user: String,
+        dm: String,
+        helper: &'static str,
+        group: &'static str,
+    },
+}
+
+/// The gated verdict behind [`preflight_takeover_privilege`], for callers that want to render it
+/// rather than log it (the host's diagnostics registry). Computing it does not log.
+#[cfg(target_os = "linux")]
+pub fn takeover_privilege_verdict() -> TakeoverVerdict {
+    gamescope::takeover_privilege_verdict()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn takeover_privilege_verdict() -> TakeoverVerdict {
+    TakeoverVerdict::Inapplicable {
+        why: TakeoverInapplicable::NotLinux,
+    }
+}
+
 /// Give the box its own session back **now**, synchronously, because the host is exiting. Blocks
 /// (it shells out to `systemctl`), so call it off the async runtime. Call from the host's shutdown
 /// path — a takeover that outlives the host leaves the box with no display manager and nobody left

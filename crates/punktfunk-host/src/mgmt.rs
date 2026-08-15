@@ -32,6 +32,7 @@ use utoipa_scalar::{Scalar, Servable};
 mod auth;
 mod client_logs;
 mod clients;
+mod diagnostics;
 mod display;
 mod events;
 mod gpu;
@@ -314,6 +315,10 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
         ))
         .routes(routes!(host::get_status))
         .routes(routes!(host::get_local_summary))
+        // Two paths, so two calls — `routes!` merges the METHODS of one path, and two calls naming
+        // the same path collide.
+        .routes(routes!(diagnostics::get_diagnostics))
+        .routes(routes!(diagnostics::refresh_diagnostics))
         // GET and DELETE share the `/clients` path, so they must be ONE `routes!` — utoipa-axum
         // merges the methods of a single call into one route; two calls collide on the path.
         .routes(routes!(
@@ -429,6 +434,7 @@ pub fn openapi_json() -> String {
     modifiers(&SecurityAddon),
     tags(
         (name = "host", description = "Host identity, capabilities, and liveness"),
+        (name = "diagnostics", description = "Host health checks: what is wrong, what it breaks, and how to fix it (admin lane only)"),
         (name = "gpu", description = "GPU inventory and selection: list the host's GPUs, choose automatic or a preferred GPU, see the one in use"),
         (name = "display", description = "Virtual-display management policy: lifecycle (keep-alive), topology (primary/exclusive), conflict handling, identity, and layout"),
         (name = "clients", description = "Paired Moonlight client management"),
