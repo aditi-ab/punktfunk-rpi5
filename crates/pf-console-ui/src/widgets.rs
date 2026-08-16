@@ -93,6 +93,26 @@ const PRESS_DIP: f64 = 0.97;
 /// showing off.
 const ROW_RISE: f64 = 12.0;
 
+/// The value a step left behind, and everything its half of the crossfade needs to draw.
+struct SlipPrev {
+    /// Which row it belongs to — by index AND label, because the screen rebuilds the row
+    /// set from scratch every frame. A row appearing or dropping above the cursor would
+    /// otherwise hand this text to whatever inherited the index, i.e. slide one setting's
+    /// old value across a different setting's row.
+    row: usize,
+    label: String,
+    text: String,
+    /// Where this text sits RELATIVE to the incoming one (∓[`SLIP_DP`], set from the step
+    /// direction), so the pair keeps travelling the right way round even after the spring
+    /// reverses through zero on an accumulated repeat.
+    offset: f64,
+    /// The slip position the step armed at, and so the span the crossfade divides by.
+    /// Deliberately not [`SLIP_DP`]: a held repeat accumulates as far as [`SLIP_MAX`], and
+    /// normalising that against the smaller constant leaves the INCOMING value at alpha 0
+    /// for the first third of the travel — a fast repeat showing nothing but stale text.
+    arm: f64,
+}
+
 /// The focus list: authoritative cursor, spring recoil at the ends, a scroll offset
 /// that chases the focused row, and a per-row focus amount for the scale/tint ease.
 pub(crate) struct MenuList {
@@ -113,11 +133,9 @@ pub(crate) struct MenuList {
     /// step — its velocity is what makes held repeats accumulate into one travel instead of
     /// restarting the crossfade.
     slip: Spring,
-    /// The value the slip is sliding OUT: `(row, text, offset)`. The offset is where that
-    /// text sits RELATIVE to the incoming one (∓[`SLIP_DP`], set from the step direction),
-    /// so the pair keeps travelling the right way round even after the spring reverses
-    /// through zero on an accumulated repeat.
-    slip_prev: Option<(usize, String, f64)>,
+    /// The value the slip is sliding OUT, and where — `None` whenever nothing is mid-step,
+    /// which is also what tells every OTHER row it has no crossfade to draw.
+    slip_prev: Option<SlipPrev>,
     /// Direction of the step the list last emitted, consumed by the next render. The list
     /// arms the slip ITSELF by noticing the value changed, so no screen has to report it —
     /// and a refused adjust (the value didn't move) correctly produces no slip at all.
@@ -316,20 +334,40 @@ impl MenuList {
         // Arm the value slip. A step went out (`step_dir`) AND the value under the cursor
         // actually changed — comparing what we DREW last frame against what the screen just
         // handed us is what makes a refused adjust produce no motion at all, without any
-        // screen having to report whether its edit landed.
+        // screen having to report whether its edit landed. The direction is taken
+        // unconditionally so a step can never leak into a later frame, but only a row that
+        // ADVERTISES stepping may slip: A and a pointer press arm one whatever the row is, so
+        // a row whose value merely re-reads differently under the press — a profile's "Pinned
+        // to 3 hosts" as the count changes — would otherwise slide its value sideways with no
+        // chevrons on screen ever having promised that it steps.
         let dir = std::mem::take(&mut self.step_dir);
-        if dir != 0 && !reduce {
-            let now = rows
-                .get(self.cursor)
-                .and_then(|r| r.value.as_deref())
-                .unwrap_or_default();
+        let stepped = if dir != 0 && !reduce {
+            rows.get(self.cursor).filter(|r| r.adjustable)
+        } else {
+            None
+        };
+        if let Some(row) = stepped {
+            let now = row.value.as_deref().unwrap_or_default();
             if self.shown.get(self.cursor).is_some_and(|p| p != now) {
                 let prev = self.shown[self.cursor].clone();
                 // ADD rather than set, and never touch `vel`: two fast presses accumulate
                 // into one accelerating travel instead of restarting the crossfade.
                 self.slip.pos =
                     (self.slip.pos + SLIP_DP * f64::from(dir)).clamp(-SLIP_MAX, SLIP_MAX);
-                self.slip_prev = Some((self.cursor, prev, -SLIP_DP * f64::from(dir)));
+                // A step that exactly cancels one still in flight leaves no travel to
+                // crossfade over — and no span to normalise the fade against — so the new
+                // value simply takes the row.
+                self.slip_prev = if self.slip.pos == 0.0 {
+                    None
+                } else {
+                    Some(SlipPrev {
+                        row: self.cursor,
+                        label: row.label.clone(),
+                        text: prev,
+                        offset: -SLIP_DP * f64::from(dir),
+                        arm: self.slip.pos,
+                    })
+                };
             }
         }
         self.slip.step_spec(0.0, springs::FOCUS, dt);
@@ -480,49 +518,90 @@ impl MenuList {
                 };
                 let chevron_w = if row.adjustable { 18.0 * k } else { 0.0 };
                 let caret_w = if row.caret { 8.0 * k } else { 0.0 };
+                // The value FIELD: a fixed right edge and a maximum width, with every string
+                // right-aligned against that edge by its OWN measured width. Sharing one
+                // anchor computed from the incoming value is what threw the outgoing text
+                // off the row: left-aligned on someone else's alignment it started life
+                // displaced by the width difference and hung that far past the field, which
+                // on "PyroWave (wired LAN)" → "Automatic" is most of a hundred px.
                 let vmax = row_w * 0.55;
-                let vw = (fonts.measure(value, W::Medium, 15.0 * k) as f64).min(vmax);
-                let vx = x0 + row_w - 16.0 * k - chevron_w - caret_w - vw;
-                // The sprung slip + crossfade. `slip_prev` names its ROW, so a value that
-                // changed somewhere else (a profile row appearing, a dependent row
-                // re-enabling) can't drag this one's text sideways.
-                let slipping = self.slip_prev.as_ref().filter(|(row, ..)| *row == i);
+                let val_right = x0 + row_w - 16.0 * k - chevron_w - caret_w;
+                let place = |s: &str| val_right - f64::from(fonts.measure(s, W::Medium, 15.0 * k));
+                // The sprung slip + crossfade. `slip_prev` names its ROW — index and label
+                // both, since an index alone is not an identity across a rebuild — so a
+                // value that changed somewhere else (a profile row appearing, a dependent
+                // row re-enabling) can't drag this one's text sideways.
+                let slipping = self
+                    .slip_prev
+                    .as_ref()
+                    .filter(|p| p.row == i && p.label == row.label);
                 let dx = if slipping.is_some() {
                     self.slip.pos * k
                 } else {
                     0.0
                 };
-                let gone = (self.slip.pos.abs() / SLIP_DP).clamp(0.0, 1.0) as f32;
+                // Gated on the SLIPPING row exactly as `dx` above is. There is one slip
+                // spring for the whole list, so an ungated fade read the same spring on
+                // every row and blanked the entire value column each time any one value
+                // stepped. Signed rather than `.abs()`, so the deliberate overshoot back
+                // through zero clamps to nothing instead of fading the ghost in again.
+                let gone = slipping.map_or(0.0, |p| (self.slip.pos / p.arm).clamp(0.0, 1.0) as f32);
                 let alpha =
                     |c: skia_safe::Color4f, a: f32| skia_safe::Color4f::new(c.r, c.g, c.b, c.a * a);
-                if let Some((_, prev, offset)) = slipping {
+                // Head-truncate: keep the END of a long address visible while typing. Done
+                // BEFORE placing, so what is right-aligned is the string actually drawn —
+                // measuring the untruncated one left every long value floating short of the
+                // edge by whatever the ellipsis saved.
+                let shown = truncate_head(fonts, value, W::Medium, 15.0 * k, vmax);
+                // Nothing else confines the pair: the widget's only clip is the LIST rect,
+                // which is the full window width, leaving a couple of hundred px of open
+                // background either side of the row for a sliding value to cross. Only while
+                // there is travel to hide — a settled value fits the field by construction,
+                // and a clip per row per frame is not free.
+                if slipping.is_some() {
+                    canvas.save();
+                    canvas.clip_rect(
+                        Rect::from_ltrb(
+                            (val_right - vmax) as f32,
+                            r.top,
+                            val_right as f32,
+                            r.bottom,
+                        ),
+                        None,
+                        true,
+                    );
+                }
+                if let Some(p) = slipping {
                     // The value being left, sliding out the way the step came from.
-                    let prev_text = truncate_head(fonts, prev, W::Medium, 15.0 * k, vmax);
+                    let prev_text = truncate_head(fonts, &p.text, W::Medium, 15.0 * k, vmax);
                     fonts.draw(
                         canvas,
                         &prev_text,
-                        vx + dx + offset * k,
+                        place(&prev_text) + dx + p.offset * k,
                         baseline,
                         W::Medium,
                         15.0 * k,
                         alpha(vcolor, gone),
                     );
                 }
-                // Head-truncate: keep the END of a long address visible while typing.
-                let shown = truncate_head(fonts, value, W::Medium, 15.0 * k, vmax);
                 fonts.draw(
                     canvas,
                     &shown,
-                    vx + dx,
+                    place(&shown) + dx,
                     baseline,
                     W::Medium,
                     15.0 * k,
                     alpha(vcolor, 1.0 - gone),
                 );
+                if slipping.is_some() {
+                    canvas.restore(); // the value field
+                }
                 if row.caret {
+                    // Rides `dx` so the caret stays welded to the end of the text rather
+                    // than detaching from it mid-slip.
                     canvas.draw_rect(
                         Rect::from_xywh(
-                            (vx + vw + 3.0 * k) as f32,
+                            (val_right + 3.0 * k + dx) as f32,
                             (cy - 9.0 * k) as f32,
                             (2.0 * k) as f32,
                             (18.0 * k) as f32,
@@ -532,7 +611,9 @@ impl MenuList {
                 }
                 if row.adjustable && f > 0.01 {
                     let alpha = 0.6 * f as f32;
-                    chevron(canvas, vx - 11.0 * k, cy, 4.0 * k, true, alpha);
+                    // Drawn after, and outside the field's clip: the chevrons frame the
+                    // value, so a value on the move passes UNDER them.
+                    chevron(canvas, place(&shown) - 11.0 * k, cy, 4.0 * k, true, alpha);
                     chevron(canvas, x0 + row_w - 16.0 * k, cy, 4.0 * k, false, alpha);
                 }
             }
@@ -1195,6 +1276,186 @@ mod tests {
             adjustable: true,
             enabled: true,
         }]
+    }
+
+    /// One row's pixel region to compare across renders: `(row index, (x0, x1), (y0, y1))`.
+    type Band = (usize, (i32, i32), (i32, i32));
+
+    /// A whole COLUMN of steppable value rows — the shape the settings screen actually
+    /// draws, and the one thing a single-row list cannot stand in for: on a one-row list the
+    /// slipping row is the only row, so a crossfade that leaks onto its neighbours has no
+    /// neighbours to leak onto.
+    fn value_rows(values: &[&str]) -> Vec<RowSpec> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| RowSpec {
+                header: None,
+                label: format!("Option {i}"),
+                value: Some((*v).to_string()),
+                value_dim: false,
+                caret: false,
+                adjustable: true,
+                enabled: true,
+            })
+            .collect()
+    }
+
+    fn read_back(surface: &mut skia_safe::Surface, w: i32, h: i32) -> Vec<u8> {
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        let info = skia_safe::ImageInfo::new_n32_premul((w, h), None);
+        assert!(
+            surface.read_pixels(&info, &mut px, (w * 4) as usize, (0, 0)),
+            "raster surface read-back"
+        );
+        px
+    }
+
+    /// How many bytes of one band of two readbacks differ. A COUNT rather than the two
+    /// slices, because `assert_eq!` on a megapixel prints a megapixel.
+    fn band_diff(a: &[u8], b: &[u8], w: i32, x: (i32, i32), y: (i32, i32)) -> usize {
+        let mut differing = 0;
+        for row in y.0..y.1 {
+            let base = (row * w * 4) as usize;
+            let span = base + x.0 as usize * 4..base + x.1 as usize * 4;
+            differing += a[span.clone()]
+                .iter()
+                .zip(&b[span])
+                .filter(|(p, q)| p != q)
+                .count();
+        }
+        differing
+    }
+
+    /// Stepping ONE row's value leaves every other row's pixels exactly as they were.
+    ///
+    /// The list owns a SINGLE slip spring, so the crossfade alpha derived from it has to be
+    /// gated on the slipping row's identity the way its sibling displacement already is.
+    /// Ungated, one press dropped EVERY value in the list to alpha 0 and faded them back
+    /// over ~200 ms while the labels sat still — a whole settings column blinking on one
+    /// step, and worse on a held repeat, where the accumulated slip pins the alpha at zero
+    /// for several consecutive frames.
+    #[test]
+    fn stepping_one_value_leaves_the_other_rows_alone() {
+        let fonts = crate::theme::build_fonts().unwrap();
+        let (w, h) = (900, 600);
+        let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
+        let rect = Rect::from_xywh(0.0, 0.0, w as f32, h as f32);
+        let clear = skia_safe::Color4f::new(0.0, 0.0, 0.0, 1.0);
+        let dt = 1.0 / 60.0;
+        let before = value_rows(&["Native", "Automatic", "20 Mbps", "Balanced", "On", "Off"]);
+        let mut list = MenuList::new();
+        // Settled first: the mount entrance, the scroll and the focus ease all travel on
+        // their own, and the claim under test is that nothing ELSE moves.
+        for _ in 0..240 {
+            surface.canvas().clear(clear);
+            list.render(surface.canvas(), rect, &before, &fonts, 1.0, dt, true);
+        }
+        let bands: Vec<Band> = (1..before.len())
+            .map(|i| {
+                let r = list.row_rect(i).expect("every row is on screen");
+                (
+                    i,
+                    (r.left as i32, r.right as i32),
+                    (r.top as i32, r.bottom as i32),
+                )
+            })
+            .collect();
+        let settled = read_back(&mut surface, w, h);
+
+        // The bands really are where those values live: a row whose value string differs
+        // draws differently in exactly this region, so the equality asserted below is not a
+        // comparison of two identical patches of background.
+        let mut probe = MenuList::new();
+        let probed = value_rows(&["Native", "Automatic", "20 Mbps", "Native", "On", "Off"]);
+        for _ in 0..240 {
+            surface.canvas().clear(clear);
+            probe.render(surface.canvas(), rect, &probed, &fonts, 1.0, dt, true);
+        }
+        let probe_px = read_back(&mut surface, w, h);
+        let (_, px_x, px_y) = bands[2];
+        assert!(
+            band_diff(&probe_px, &settled, w, px_x, px_y) > 0,
+            "row 3's band must contain row 3's value"
+        );
+
+        assert_eq!(
+            list.menu(MenuEvent::Move(MenuDir::Right), before.len()).0,
+            ListMsg::Adjust(1)
+        );
+        let after = value_rows(&[
+            "Match window",
+            "Automatic",
+            "20 Mbps",
+            "Balanced",
+            "On",
+            "Off",
+        ]);
+        let mut armed = false;
+        for frame in 0..12 {
+            surface.canvas().clear(clear);
+            list.render(surface.canvas(), rect, &after, &fonts, 1.0, dt, true);
+            armed |= list.slip_prev.is_some();
+            let px = read_back(&mut surface, w, h);
+            for (i, bx, by) in &bands {
+                assert_eq!(
+                    band_diff(&px, &settled, w, *bx, *by),
+                    0,
+                    "row {i} redrew on frame {frame} of a step made on row 0"
+                );
+            }
+        }
+        assert!(armed, "the step must have animated, or this proves nothing");
+    }
+
+    /// A stepped value stays inside its field, however wide the value it is leaving.
+    ///
+    /// Both halves of the crossfade used to share ONE anchor — the right-alignment computed
+    /// from the INCOMING string's width — so the outgoing text was left-aligned on someone
+    /// else's alignment: it appeared displaced by the width difference and hung that far
+    /// past the field, at full alpha, for the whole spring. Nothing clipped it either; the
+    /// widget's only clip is the LIST rect, which is the full window width. "PyroWave (wired
+    /// LAN)" → "AV1" is most of a hundred px of ghost text sitting on the background.
+    ///
+    /// Asserted on the band OUTSIDE the field, whose ink — the › chevron, the panel's own
+    /// edge — is fixed once the row has settled, so any change there is text that escaped.
+    #[test]
+    fn a_stepped_value_stays_inside_its_field() {
+        let fonts = crate::theme::build_fonts().unwrap();
+        let (w, h) = (900, 600);
+        let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
+        let rect = Rect::from_xywh(0.0, 0.0, w as f32, h as f32);
+        let clear = skia_safe::Color4f::new(0.0, 0.0, 0.0, 1.0);
+        let dt = 1.0 / 60.0;
+        let mut list = MenuList::new();
+        let wide = value_row("PyroWave (wired LAN)");
+        for _ in 0..240 {
+            surface.canvas().clear(clear);
+            list.render(surface.canvas(), rect, &wide, &fonts, 1.0, dt, true);
+        }
+        let r = list.row_rect(0).expect("the row is on screen");
+        // The field's right edge, as `render` computes it: the row's 16 dp gutter plus the
+        // 18 dp the chevrons reserve, at k = 1. Two px of slack for the clip's own edge.
+        let field_right = (f64::from(r.right) - 16.0 - 18.0).ceil() as i32;
+        let outside = (field_right + 2, w);
+        let band_y = (r.top as i32, r.bottom.ceil() as i32);
+        let settled = read_back(&mut surface, w, h);
+
+        list.menu(MenuEvent::Move(MenuDir::Right), 1);
+        let narrow = value_row("AV1");
+        let mut armed = false;
+        for frame in 0..16 {
+            surface.canvas().clear(clear);
+            list.render(surface.canvas(), rect, &narrow, &fonts, 1.0, dt, true);
+            armed |= list.slip_prev.is_some();
+            let px = read_back(&mut surface, w, h);
+            assert_eq!(
+                band_diff(&px, &settled, w, outside, band_y),
+                0,
+                "value ink escaped the field on frame {frame}"
+            );
+        }
+        assert!(armed, "the step must have animated, or this proves nothing");
     }
 
     /// The value slip: armed only when a step actually CHANGED the value, and always
