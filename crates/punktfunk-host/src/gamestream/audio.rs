@@ -304,6 +304,11 @@ fn run(
     // Reuse the persistent capturer when its channel count still matches (drain stale
     // buffered audio); otherwise drop it (clean PipeWire teardown) and open at the new count.
     let want = layout_for(&params).channels as u32;
+    // Always [`SAMPLE_RATE`], and never a negotiated one: this is Moonlight's protocol, whose
+    // audio stream is Opus at 48 kHz by definition (moonlight-common-c has no rate field to
+    // carry anything else, and libopus tops out at 48 kHz anyway). The hi-res `0xD3` plane is
+    // native-only for exactly that reason — `design/hi-res-audio.md` §3 lists this plane as
+    // permanently out of scope rather than merely deferred.
     let mut cap = match audio_cap.lock().unwrap().take() {
         Some(mut c) if c.channels() == want => {
             c.drain();
@@ -316,9 +321,9 @@ fn run(
                 "audio capturer channel count changed — reopening"
             );
             drop(c);
-            audio::open_audio_capture(want).context("open audio capture")?
+            audio::open_audio_capture(want, SAMPLE_RATE).context("open audio capture")?
         }
-        None => audio::open_audio_capture(want).context("open audio capture")?,
+        None => audio::open_audio_capture(want, SAMPLE_RATE).context("open audio capture")?,
     };
     let result = audio_body(&mut *cap, &sock, gcm_key, rikeyid, params, running, on_lost);
     cap.idle(); // parked between sessions — release the routing claim (Linux stream sink)
@@ -724,7 +729,9 @@ mod tests {
     #[test]
     #[ignore]
     fn surround_capture_live() {
-        let mut cap = crate::audio::open_audio_capture(6).expect("open 6ch capture");
+        // 48 kHz, like every other GameStream capture site — Moonlight's protocol (see the
+        // comment at the live open in `audio_stream`).
+        let mut cap = crate::audio::open_audio_capture(6, SAMPLE_RATE).expect("open 6ch capture");
         let layout = &LAYOUT_51;
         let mut enc = opus::MSEncoder::new(
             SAMPLE_RATE,

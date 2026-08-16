@@ -462,8 +462,10 @@ fn build_lanes(kinds: u8) -> Result<Vec<Lane>, opus::Error> {
 /// The per-pad streaming thread: capture of the pad's audio device (`open` builds the
 /// platform's capturer — Windows loopback / Linux minted sink) → framer → per-kind gate/encode
 /// → 0xD1 datagrams. Capture death reopens with the session-audio backoff
-/// ([`INJECTOR_REOPEN_BACKOFF`], encoders + seq kept); a send error ends the thread (the
-/// connection — the session — is gone).
+/// ([`INJECTOR_REOPEN_BACKOFF`], encoders + seq kept); a LOST CONNECTION — or a datagram path
+/// that has gone away for good — ends the thread, while a single oversized datagram costs only
+/// that frame (`design/hi-res-audio.md` §4.8: the four `SendDatagramError` outcomes are not one
+/// outcome, and collapsing them silently ended this plane for the rest of a session).
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn pad_audio_thread<C: crate::audio::AudioCapturer>(
     conn: quinn::Connection,
@@ -494,6 +496,10 @@ fn pad_audio_thread<C: crate::audio::AudioCapturer>(
     // first open ALSO rides this loop, so an open lost to endpoint churn starts late, not never.
     let mut capturer: Option<C> = None;
     let mut last_failed: Option<std::time::Instant> = None;
+    // Datagrams the wire refused as oversized (`design/hi-res-audio.md` §4.8). Vanishingly
+    // unlikely on this plane — a 64 kbps CBR Opus frame at ≤10 ms is ~80 bytes — but it used to
+    // be indistinguishable from the connection ending, which is the actual defect being fixed.
+    let mut oversized_drops: u64 = 0;
     tracing::info!(
         pad,
         haptics = kinds & KIND_BIT_HAPTICS != 0,
@@ -533,9 +539,11 @@ fn pad_audio_thread<C: crate::audio::AudioCapturer>(
                 continue;
             }
         };
-        let mut session_gone = false;
+        // Whether this plane is finished — a lost connection, or a datagram path that will never
+        // carry anything again. NOT set by an oversized frame, which costs exactly that frame.
+        let mut end_plane = false;
         framer.feed(&chunk, |kind, frame| {
-            if session_gone {
+            if end_plane {
                 return;
             }
             let Some(lane) = lanes.iter_mut().find(|l| l.kind == kind) else {
@@ -556,8 +564,40 @@ fn pad_audio_thread<C: crate::audio::AudioCapturer>(
                         pts_ns,
                         &opus_buf[..n],
                     );
-                    if conn.send_datagram(d.into()).is_err() {
-                        session_gone = true; // connection gone — the session is over
+                    // The same four-outcome match the session audio plane makes (§4.8): treating
+                    // every `SendDatagramError` as "the connection is gone" turned a single
+                    // refused frame into the silent end of this pad's audio for the rest of the
+                    // session, with nothing in any log to say so.
+                    match conn.send_datagram(d.into()) {
+                        Ok(()) => {}
+                        // The only outcome that really is "the session is over".
+                        Err(quinn::SendDatagramError::ConnectionLost(_)) => end_plane = true,
+                        // One frame, not the plane. Dropped and counted; `seq` was already taken
+                        // from the lane's gate, so the client sees the gap and its concealment
+                        // handles it exactly as it handles a lost packet.
+                        Err(quinn::SendDatagramError::TooLarge) => {
+                            oversized_drops += 1;
+                            if oversized_drops.is_power_of_two() {
+                                tracing::warn!(
+                                    pad,
+                                    kind,
+                                    count = oversized_drops,
+                                    opus_bytes = n,
+                                    "pad-audio datagram rejected as too large — dropping the \
+                                     frame and continuing"
+                                );
+                            }
+                        }
+                        // Datagrams are gone for this connection's lifetime; nothing this thread
+                        // does will make the next frame land. End the pad's audio plane cleanly.
+                        Err(e) => {
+                            tracing::warn!(
+                                pad,
+                                error = %e,
+                                "the QUIC datagram path is unavailable — ending this pad's audio"
+                            );
+                            end_plane = true;
+                        }
                     }
                 }
                 Err(e) => {
@@ -574,7 +614,7 @@ fn pad_audio_thread<C: crate::audio::AudioCapturer>(
                 }
             }
         });
-        if session_gone {
+        if end_plane {
             break 'session;
         }
     }

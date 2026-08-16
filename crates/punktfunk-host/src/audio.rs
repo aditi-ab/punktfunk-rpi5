@@ -91,6 +91,25 @@ pub trait AudioCapturer: Send {
         CHANNELS as u32
     }
 
+    /// The sample rate this capturer is **actually** delivering — which is not necessarily the
+    /// one it was asked for (`design/hi-res-audio.md` §8.1).
+    ///
+    /// The whole hi-res feature turns on this distinction. Both backends can be handed a rate
+    /// their endpoint does not really run at and will happily resample to it without an error:
+    /// WASAPI's `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` reconciles our format with the engine's in
+    /// whichever direction is needed (§4.3), and PipeWire's resampler does the same in the
+    /// legacy monitor mode (§4.4). A host that reported its *request* would advertise 96 kHz in
+    /// the `Welcome`, spend the bandwidth, and deliver interpolated 48 kHz — the same
+    /// "label right, content wrong" class of bug as the HDR RB-swap, which survived a long time
+    /// precisely because both ends audited clean.
+    ///
+    /// So the contract is: report what was granted, and let the caller decline. The default is
+    /// the legacy rate, which is what every backend that has not been taught to negotiate one
+    /// genuinely opens at.
+    fn sample_rate(&self) -> u32 {
+        SAMPLE_RATE
+    }
+
     /// Discard any buffered chunks (called when a persistent capturer is reused for a new
     /// stream, so the client doesn't hear stale audio captured while idle). On Linux this is
     /// also the session-start hook: the stream-sink capturer re-claims the default sink here
@@ -106,27 +125,30 @@ pub trait AudioCapturer: Send {
 }
 
 /// Open a live capturer for system output via PipeWire, asking for `channels` interleaved
-/// channels. Default: a host-owned stream sink claimed as the default output (the sink
-/// advertises exactly `channels`, so apps can produce real surround); with
+/// channels at `rate_hz`. Default: a host-owned stream sink claimed as the default output (the
+/// sink advertises exactly `channels`, so apps can produce real surround); with
 /// `PUNKTFUNK_STREAM_SINK=0`, the default sink's monitor, where a sink with fewer channels
 /// gets the missing positions filled with silence (zero upmix).
+///
+/// `rate_hz` is a REQUEST, exactly like `channels`. What the graph actually granted is read
+/// back from [`AudioCapturer::sample_rate`] — see that method for why the difference matters.
 #[cfg(target_os = "linux")]
-pub fn open_audio_capture(channels: u32) -> Result<Box<dyn AudioCapturer>> {
-    linux::PwAudioCapturer::open(channels).map(|c| Box::new(c) as Box<dyn AudioCapturer>)
+pub fn open_audio_capture(channels: u32, rate_hz: u32) -> Result<Box<dyn AudioCapturer>> {
+    linux::PwAudioCapturer::open(channels, rate_hz).map(|c| Box::new(c) as Box<dyn AudioCapturer>)
 }
 
 #[cfg(target_os = "windows")]
-pub fn open_audio_capture(channels: u32) -> Result<Box<dyn AudioCapturer>> {
+pub fn open_audio_capture(channels: u32, rate_hz: u32) -> Result<Box<dyn AudioCapturer>> {
     // The capture thread runs the audio wiring plan itself (audio_control::wire_now) before
     // resolving its endpoint — a fresh plan per open, because Windows endpoints churn — and
     // parks the default playback device on the plan's loopback endpoint (a silent sink by
     // default: audio plays on the client only) until the capturer is dropped.
-    wasapi_cap::WasapiLoopbackCapturer::open(channels)
+    wasapi_cap::WasapiLoopbackCapturer::open(channels, rate_hz)
         .map(|c| Box::new(c) as Box<dyn AudioCapturer>)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-pub fn open_audio_capture(_channels: u32) -> Result<Box<dyn AudioCapturer>> {
+pub fn open_audio_capture(_channels: u32, _rate_hz: u32) -> Result<Box<dyn AudioCapturer>> {
     anyhow::bail!("audio capture requires Linux + PipeWire or Windows + WASAPI")
 }
 

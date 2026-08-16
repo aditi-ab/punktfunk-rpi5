@@ -1,7 +1,9 @@
 //! WASAPI loopback capture of the desktop mix (system output) — the Windows analogue of the
-//! PipeWire sink-monitor backend. Delivers interleaved f32 PCM at 48 kHz in the requested
-//! channel count (stereo / 5.1 / 7.1, canonical wire order FL FR FC LFE RL RR SL SR via the
-//! explicit `dwChannelMask`), ready for the Opus path with NO resampling (WASAPI shared-mode
+//! PipeWire sink-monitor backend. Delivers interleaved f32 PCM at the requested rate (48 kHz
+//! unless a hi-res session negotiated more, and only ever as high as the endpoint's own engine
+//! genuinely runs — see [`WasapiLoopbackCapturer::opened_rate`]) in the requested channel count
+//! (stereo / 5.1 / 7.1, canonical wire order FL FR FC LFE RL RR SL SR via the explicit
+//! `dwChannelMask`), ready for the encode path with NO resampling in Rust (WASAPI shared-mode
 //! autoconvert does any SRC + up/downmix to the requested layout). WASAPI objects are
 //! COM-apartment-bound and not `Send`, so they live on a dedicated thread (mirrors
 //! `linux::PwAudioCapturer`); only the channel + stop flag + join handle are in the struct.
@@ -31,7 +33,7 @@ use super::capture_policy::{CaptureStats, FightDamper, FIGHT_BACKOFF, STATS_EVER
 use super::{audio_control, wiring_plan, AudioCapturer, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -52,14 +54,25 @@ pub struct WasapiLoopbackCapturer {
     /// Linux twin by a 2026-08-13 field log (100 % drop rate across session gaps); the parking
     /// call sites are platform-independent, so this half had the same defect.
     active: Arc<AtomicBool>,
+    /// The rate the endpoint was ACTUALLY opened at, written by the capture thread before it
+    /// reports ready and read back by [`AudioCapturer::sample_rate`].
+    ///
+    /// This is the whole Windows half of `design/hi-res-audio.md`: in shared mode the engine's
+    /// mix format is authoritative and `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` reconciles our
+    /// request with it silently, in either direction. Asking a 48 kHz engine for 96 kHz
+    /// therefore SUCCEEDS and hands back interpolated samples (§4.3). So the open declines
+    /// instead of padding, and states here what it settled for — the caller compares it against
+    /// what it promised the client and resolves the plane from the answer (§8.2).
+    opened_rate: Arc<AtomicU32>,
 }
 
 impl WasapiLoopbackCapturer {
-    pub fn open(channels: u32) -> Result<WasapiLoopbackCapturer> {
+    pub fn open(channels: u32, rate_hz: u32) -> Result<WasapiLoopbackCapturer> {
         anyhow::ensure!(
             matches!(channels, 2 | 6 | 8),
             "WASAPI loopback backend supports 2/6/8 channels (got {channels})"
         );
+        anyhow::ensure!(rate_hz > 0, "audio capture rate must be positive");
         let (tx, rx) = sync_channel::<Vec<f32>>(64);
         let stop = Arc::new(AtomicBool::new(false));
         // Bring-up handshake: report open success/failure before returning, so a missing render
@@ -70,10 +83,22 @@ impl WasapiLoopbackCapturer {
         // Opens at session start, so the consumer is live from the first chunk.
         let active = Arc::new(AtomicBool::new(true));
         let active_t = active.clone();
+        // Seeded with the request: it is the honest answer until the endpoint has been read, and
+        // on the overwhelmingly common 48 kHz path it is also the final one.
+        let opened_rate = Arc::new(AtomicU32::new(rate_hz));
+        let opened_rate_t = opened_rate.clone();
         let join = thread::Builder::new()
             .name("punktfunk-wasapi-audio".into())
             .spawn(move || {
-                if let Err(e) = capture_thread(tx, stop_t, ready_tx, channels, active_t) {
+                if let Err(e) = capture_thread(
+                    tx,
+                    stop_t,
+                    ready_tx,
+                    channels,
+                    rate_hz,
+                    active_t,
+                    opened_rate_t,
+                ) {
                     tracing::error!(error = %format!("{e:#}"), "wasapi loopback thread failed");
                 }
             })
@@ -82,13 +107,21 @@ impl WasapiLoopbackCapturer {
         // driver installs, ~5 s of settling each) before the endpoint exists.
         match ready_rx.recv_timeout(Duration::from_secs(30)) {
             Ok(Ok(())) => {
-                tracing::info!(channels, "WASAPI loopback capture: 48 kHz f32");
+                // The rate the thread SETTLED on, which is not necessarily `rate_hz` — see
+                // `opened_rate`. Reported here rather than as a fixed "48 kHz" string so a log
+                // can never say one rate while the stream carries another.
+                tracing::info!(
+                    channels,
+                    rate_hz = opened_rate.load(Ordering::Relaxed),
+                    "WASAPI loopback capture: f32"
+                );
                 Ok(WasapiLoopbackCapturer {
                     chunks: rx,
                     channels,
                     stop,
                     join: Some(join),
                     active,
+                    opened_rate,
                 })
             }
             Ok(Err(e)) => Err(e),
@@ -130,6 +163,9 @@ impl AudioCapturer for WasapiLoopbackCapturer {
     }
     fn channels(&self) -> u32 {
         self.channels
+    }
+    fn sample_rate(&self) -> u32 {
+        self.opened_rate.load(Ordering::Relaxed)
     }
     fn drain(&mut self) {
         while self.chunks.try_recv().is_ok() {}
@@ -201,7 +237,9 @@ fn capture_thread(
     stop: Arc<AtomicBool>,
     ready: SyncSender<Result<()>>,
     channels: u32,
+    rate_hz: u32,
     active: Arc<AtomicBool>,
+    opened_rate: Arc<AtomicU32>,
 ) -> Result<()> {
     // COM must be initialized on THIS thread (MTA), before any device call.
     if let Err(e) = wasapi::initialize_mta()
@@ -227,7 +265,16 @@ fn capture_thread(
     // is said once per topology — the field log drowned in 256+ copies of the same line.
     let mut unsat_logged: Option<u64> = None;
     while !stop.load(Ordering::Relaxed) {
-        match capture_once(&tx, &stop, &mut ready, channels, mode, &active) {
+        match capture_once(
+            &tx,
+            &stop,
+            &mut ready,
+            channels,
+            rate_hz,
+            mode,
+            &active,
+            &opened_rate,
+        ) {
             Ok(Next::Stopped) => break,
             Ok(Next::Reopen(m)) => {
                 mode = m;
@@ -390,13 +437,16 @@ fn default_render(en: &DeviceEnumerator) -> Option<(Device, String)> {
 /// One endpoint open + capture loop. Returns how to continue ([`Next`]) or an error (first open:
 /// retried [`FIRST_OPEN_ATTEMPTS`] times, then fatal via the `ready` handshake; later: reopen
 /// with capped backoff — or, for a typed [`PlanUnsatisfiable`], an endpoint-set wait).
+#[allow(clippy::too_many_arguments)]
 fn capture_once(
     tx: &SyncSender<Vec<f32>>,
     stop: &AtomicBool,
     ready: &mut Option<SyncSender<Result<()>>>,
     channels: u32,
+    rate_hz: u32,
     mode: TargetMode,
     active: &AtomicBool,
+    opened_rate: &AtomicU32,
 ) -> Result<Next> {
     // Interleaved f32: channels * 4 bytes per frame.
     let block_align = channels as usize * 4;
@@ -502,7 +552,70 @@ fn capture_once(
     };
 
     let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
-    // 48 kHz f32 interleaved in the requested channel layout; autoconvert lets WASAPI's
+    // WP0.1 — the endpoint's ACTUAL engine mix format, read BEFORE we initialize. Everything the
+    // old log printed ("48 kHz f32 channels=2") was our REQUEST; with `autoconvert` WASAPI
+    // silently converts from whatever the endpoint really runs, so a voice-carrier endpoint
+    // narrowing the desktop mix to mono or 24 kHz was invisible in a 3,600-line field log. This
+    // line is what makes an audio-quality report triageable without a round trip.
+    let engine = audio_client.get_mixformat().ok();
+    // …and, since the hi-res plane exists, this reading is no longer merely diagnostic — it
+    // DECIDES the rate we open at (`design/hi-res-audio.md` §4.3/§8.2).
+    //
+    // In shared mode the engine's mix format is authoritative, and
+    // `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` exists to reconcile our format with it in whichever
+    // direction is needed. So asking a 48 kHz engine for 96 kHz does not fail: it succeeds,
+    // returns no error, and hands back interpolated samples with nothing above 24 kHz in them —
+    // and the session would then advertise 96 000 in its `Welcome`, spend 3–4 Mbps, and be
+    // wrong in exactly the way the HDR RB-swap was wrong (both ends audit clean, the content is
+    // a lie). NEVER pad: open at the engine's own rate and say so, so the caller can decline
+    // hi-res rather than ship interpolation labelled as detail.
+    //
+    // Only an UPWARD request is refused. Asking for LESS than the engine runs at is an ordinary
+    // downsample — the legacy 48 kHz behaviour on a 96 kHz endpoint, which is what this host has
+    // always done and is lossy only in the way every previous release already was.
+    //
+    // ⚠ …and the floor is the LEGACY rate, never the engine's. An endpoint configured at
+    // 44 100 Hz is an ordinary Windows configuration, and this host has always asked it for
+    // 48 kHz and let autoconvert upsample — it has to, since libopus accepts nothing else and
+    // the `0xC9` plane is 48 kHz by definition. Declining down to 44 100 there would break the
+    // plane that works today in order to protect a plane that is not even running. So only a
+    // HI-RES request can lose here; 48 kHz is the baseline claim every session already makes.
+    //
+    // The operator's lever is Windows' own device properties: set the endpoint to 96 kHz there
+    // and the host sees it here and honours it. Driving the engine format FROM the host would
+    // fight the OS and every other application on the box.
+    let engine_hz = engine.as_ref().map(|f| f.get_samplespersec());
+    let open_hz = match engine_hz {
+        Some(hz) if hz > 0 && rate_hz > hz.max(SAMPLE_RATE) => {
+            let settled = hz.max(SAMPLE_RATE);
+            tracing::info!(
+                device = %dev_name,
+                engine_hz = hz,
+                requested = rate_hz,
+                opening_at = settled,
+                "engine rate is below the requested capture rate — hi-res declined; opening at \
+                 the engine rate rather than letting WASAPI autoconvert upsample it (set this \
+                 endpoint's rate in Windows' device properties to raise it)"
+            );
+            settled
+        }
+        // No mix format readable: the endpoint is answering nothing about itself, so the only
+        // defensible rate is the legacy one. Declining here costs a hi-res session and can
+        // never cost a working 48 kHz one.
+        None if rate_hz != SAMPLE_RATE => {
+            tracing::info!(
+                device = %dev_name,
+                requested = rate_hz,
+                "endpoint mix format unreadable — hi-res declined; opening at the legacy rate"
+            );
+            SAMPLE_RATE
+        }
+        _ => rate_hz,
+    };
+    // Published BEFORE the initialize can fail, because it is the answer to "what did we settle
+    // for" and that answer is already decided. `sample_rate()` reads it back.
+    opened_rate.store(open_hz, Ordering::Relaxed);
+    // f32 interleaved at `open_hz` in the requested channel layout; autoconvert lets WASAPI's
     // shared-mode SRC match the engine mix format to ours (incl. up/downmix to the requested
     // channel count), so we never resample/remix in Rust. The explicit dwChannelMask pins the
     // wire order (FL FR FC LFE RL RR SL SR; 7.1 = 0x63F, not 0xFF). Loopback is implied by
@@ -512,16 +625,10 @@ fn capture_once(
         32,
         32,
         &SampleType::Float,
-        SAMPLE_RATE as usize,
+        open_hz as usize,
         channels as usize,
         Some(mask),
     );
-    // WP0.1 — the endpoint's ACTUAL engine mix format, read BEFORE we initialize. Everything the
-    // old log printed ("48 kHz f32 channels=2") was our REQUEST; with `autoconvert` WASAPI
-    // silently converts from whatever the endpoint really runs, so a voice-carrier endpoint
-    // narrowing the desktop mix to mono or 24 kHz was invisible in a 3,600-line field log. This
-    // line is what makes an audio-quality report triageable without a round trip.
-    let engine = audio_client.get_mixformat().ok();
     // NB the plan's WP4.5 ("open the loopback at the MINIMUM device period, worth ~5–10 ms") is
     // deliberately NOT done here, because its premise is wrong: in shared mode
     // `IAudioClient::Initialize` cannot change the engine period at all — `hnsBufferDuration` sizes
@@ -551,6 +658,11 @@ fn capture_once(
     tracing::info!(device = %dev_name,
         follow = matches!(mode, TargetMode::Follow) || keep_default,
         last_resort,
+        // What we asked for, and what we settled on — the two differ only when the engine
+        // refused an upward request (see the decline above), and a reader has to be able to
+        // see which happened without inferring it.
+        requested_hz = rate_hz,
+        opened_hz = open_hz,
         // The endpoint's own format — NOT the one we asked for.
         engine_hz = engine.as_ref().map(|f| f.get_samplespersec()),
         engine_ch = engine.as_ref().map(|f| f.get_nchannels()),
@@ -654,7 +766,7 @@ fn capture_once(
                             let lost = info.index.saturating_sub(next_index);
                             stats.max_gap_us = stats
                                 .max_gap_us
-                                .max(lost.saturating_mul(1_000_000) / SAMPLE_RATE as u64);
+                                .max(lost.saturating_mul(1_000_000) / open_hz.max(1) as u64);
                         }
                         next_index = info.index.saturating_add(frames);
                         last_packet = Some(now);
@@ -698,7 +810,7 @@ fn capture_once(
             }
         }
         if last_stats.elapsed() >= STATS_EVERY {
-            let (peak_db, rms_db, delivered_pct) = stats.summary(last_stats.elapsed(), SAMPLE_RATE);
+            let (peak_db, rms_db, delivered_pct) = stats.summary(last_stats.elapsed(), open_hz);
             if stats.dropped_chunks > 0 {
                 tracing::warn!(
                     device = %dev_name,
@@ -874,7 +986,7 @@ mod tests {
         if std::env::var("PUNKTFUNK_WASAPI_LIVE").is_err() {
             return;
         }
-        let mut cap = match WasapiLoopbackCapturer::open(2) {
+        let mut cap = match WasapiLoopbackCapturer::open(2, SAMPLE_RATE) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("no render endpoint on this box ({e:#}) — skipping");
@@ -882,6 +994,9 @@ mod tests {
             }
         };
         assert_eq!(cap.channels(), 2);
+        // Asking for the legacy rate can never be declined — no engine runs below it in a way
+        // that would make 48 kHz an upward request — so the settled rate must be what we asked.
+        assert_eq!(cap.sample_rate(), SAMPLE_RATE);
         match cap.next_chunk() {
             Ok(samples) => assert!(
                 samples.len() % 2 == 0,
