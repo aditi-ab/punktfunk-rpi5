@@ -1,0 +1,4 @@
+• New lossless audio option — stream sound uncompressed, up to 176.4 kHz / 24-bit, when your host and network can carry it.
+• The picture is smoother: frames now play out on the host's own timing instead of the instant they arrive.
+• The library works by touch, remembers where you were, badges games already running, and wakes a sleeping host as you browse.
+• A Steam Controller 2 paired over Bluetooth is detected at last — the app never asked for the permission it needed.

@@ -12,6 +12,724 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ---
 
+## v0.30.0
+
+175 commits since v0.29.0 (131 non-merge).
+
+Two large surfaces landed in this cycle and both are **additive**: a lossless PCM audio plane
+alongside Opus, and per-client access grants on the trust record. Between them the C ABI moves
+**20 → 24** in four steps, every one of them a new symbol — no existing function changed its
+signature or its behaviour, and no `#[repr(C)]` struct grew a field. `WIRE_VERSION` stays **2**:
+everything new rides the trailing-field append discipline the `Welcome` has used since v20, so an
+older peer stops reading earlier and negotiates exactly what it always did. Every 0.29.x host,
+client, driver and plugin keeps interoperating in both directions, with no re-pairing.
+
+Three things need a hand rather than merely an update. The keyboard-layout fix needs a gamescope
+rebuilt at `+pfhdr8`; two Windows hardening changes alter what the service will adopt out of
+`%ProgramData%\punktfunk\host.env`; and two **defaults flipped** — the host now serves the lossless
+audio plane unless told not to, and the "Show game library" client setting is gone along with the
+field behind it.
+
+### Versions
+
+| | v0.29.0 | v0.30.0 | Notes |
+|---|---|---|---|
+| Wire protocol | 2 | **2** | unchanged — `Hello` and `Welcome` grew trailing fields older peers never read, and one new control message took a free type byte (below) |
+| C ABI | 20 | **24** | four additive steps: 21 `connect_ex10`, 22 access, 23 `audio_plc`, 24 `connect_ex11` (below) |
+| Rust edition | 2024 | **2024** | unchanged |
+| MSRV (`rust-version`) | 1.85 | **1.85** | unchanged |
+| Workspace crate dirs | 27 | **27** | unchanged |
+| Virtual-display driver protocol | 6 | **6** | unchanged (minimum accepted still 3); `pf-driver-proto` shows no diff against the v0.29.0 tag |
+| Windows virtual-gamepad channel | 3 | **3** | unchanged |
+| Plugin index schema | 1 | **1** | unchanged |
+| `api/openapi.json` | 0.28.0 | **0.29.0** | regenerated for diagnostics, client-log bundles, access grants and the game-lifetime fields; it keeps the stamp it was regenerated under. ⚠ The ungated `docs-site/public/openapi.json` copy had drifted (see below) and is re-synced byte-identical in this release commit |
+| gamescope patch level (`+pfhdrN`) | 7 | **8** | patch 0010 puts the compiled keymap on the seat's stub keyboard (below) |
+| `@punktfunk/host` (SDK) | 0.1.4 | **0.1.4** | unchanged |
+| `@punktfunk/plugin-kit` | 0.4.1 | **0.4.2** | the Steam art scan learned the newer filenames and the flat layout |
+
+### ⚠ Breaking changes
+
+- **C ABI 20 → 24, addition only.** Four bumps landed in one cycle; each adds symbols and removes
+  nothing. An embedder that compares `PUNKTFUNK_ABI_VERSION` at build time rebuilds against the new
+  header and is done; one that adopts none of the new calls behaves exactly as it did on 20.
+  - **v21 — `punktfunk_connect_ex10`**: `connect_ex9` plus `device_name`, the label an unpaired
+    client knocks with. The C ABI had no such parameter, so every embedder took the OS default,
+    which resolves through `COMPUTERNAME`/`HOSTNAME` — neither of which exists in an Apple GUI
+    process, leaving every Mac, iPad, iPhone and Apple TV knocking as the literal "This device".
+    `ex9` keeps its parameter list *and* its behaviour (it passes a null name, selecting that same
+    default). The name rides `Hello::name`, which hosts have read since the pending list existed.
+  - **v22 — the per-client access surface**: `punktfunk_connection_grants` and
+    `punktfunk_connection_access_expires_in` read the session's live access state; 
+    `punktfunk_connection_end_reject` reports the typed rejection a mid-session close carried
+    (`PUNKTFUNK_STATUS_REJECTED_*`, `0` = none), because `end_reason` can only file an
+    access-expiry close under `HOST_ERROR` and that is the wrong sentence for "your access
+    expired". The host enforces grants either way — an embedder that never adopts these simply
+    lacks the courtesy UX.
+  - **v23 — `punktfunk_connection_audio_plc`**: one frame of libopus packet-loss concealment
+    synthesized from the connection's *own* decoder state, for an embedder whose playout ring is
+    draining because nothing is arriving. A second decoder is not a substitute: PLC extrapolates
+    from the last decoded frame, so a fresh instance conceals from empty state. Frames it returns
+    carry `seq` and `pts_ns` of `0` — concealed audio was never on the wire and must not reach an
+    A/V-sync observation.
+  - **v24 — the lossless plane's client surface**: `punktfunk_connect_ex11` asks for a sample rate
+    and depth; `punktfunk_connection_audio_sample_rate` / `punktfunk_connection_audio_bits` report
+    what the host actually **resolved**, which may be lower;
+    `punktfunk_connection_next_audio_pcm` decodes both planes behind one call.
+    ⚠ **The format is read through accessors, never through a struct field, and the distinction has
+    teeth here.** The natural home for a rate is a field on `PunktfunkAudioPcm`, which is
+    `#[repr(C)]` with no `struct_size` guard and is allocated **by value** by every C embedder —
+    growing it would change its layout under all of them at once. `PunktfunkStats` is in the same
+    position. This is the rule v18 set with `next_rumble_cmd2`.
+    `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ` keeps its value and its meaning as the **default/legacy** rate,
+    so a ring sized from it stays correct for every session that resolves to Opus — which is every
+    session an ABI-23 embedder can ask for.
+- **`PUNKTFUNK_AUDIO_HIRES` on the host defaults ON — explicit-off grammar (operator-visible).** The
+  host's half of the lossless gate was an operator opt-in; it is now `0`/`false`/`off`/`no` to
+  refuse and anything else to allow, the same shape as `PUNKTFUNK_444`, `PUNKTFUNK_CHACHA20` and
+  `PUNKTFUNK_10BIT`. The field stops being the one `Option<bool>` in `pf-host-config` read as
+  `unwrap_or(false)` and becomes a plain `bool`. The old default rested on "this spends bandwidth
+  the host's owner never agreed to" — every clause of which is still true, except that the operator
+  is not who spends it: the *client's* menu choice is, and that still ships OFF. What actually
+  protects a link is mechanical rather than consent-based (the capture path must honestly deliver
+  the rate, the cost must fit a quarter of the session's video bitrate, and a frame must fit a
+  datagram at that channel count), so the operator gate was not keeping modest links safe — it was
+  keeping the feature unreachable. **No wire or ABI movement:** `HOST_CAP_AUDIO_HIRES` is set only
+  when a session actually resolved to PCM, so it remains a statement about that session's wire
+  rather than a capability advert, and an ordinary session without `CLIENT_CAP_AUDIO_HIRES` is
+  byte-identical to before. ⚠ The Android comments warning that sending `48000/16` as a stand-in for
+  "default" silently opts a user into PCM described the blast radius as "any host with
+  `PUNKTFUNK_AUDIO_HIRES=1`" — that is now every host that has not deliberately opted out, so the
+  `0`/`0` sentinel is load-bearing in a way it was not before.
+- **`trust::Settings::library_enabled` is removed, and the "Show game library" row with it.** The
+  console never read the field — its row rendered a value and flipped a bool while every library
+  affordance in that shell was gated on pairing alone, so it showed "Game library · Off" and handed
+  you the library on Y anyway. What the flag *actually* gated was GTK and WinUI, which hid
+  "Browse library…" unless it was on, with a stored default of `false`. Deleting only the row would
+  therefore have left every user who never found the switch with a hidden library in the desktop
+  apps. **Migration is by construction, not by luck:** `Settings` is `#[serde(default)]` with a
+  `#[serde(flatten)] extra` map, so a stored `"library_enabled": false` parses into `extra`,
+  round-trips untouched and is ignored — everyone who had it off now has the library, and a
+  downgraded binary still finds its old value under the same key. A test pins that contract. At the
+  four GTK/WinUI menu sites the flag is replaced by the **pairing** predicate rather than dropped
+  for an unconditional item: the library fetch authenticates with the paired identity, and GTK's
+  saved cards include trusted-but-unpaired hosts, so an unconditional entry would promote a latent
+  "fetch that cannot authenticate" into the default experience. Apple and Android keep their own
+  toggles for now, deliberately — both already default TRUE, so nobody there loses anything.
+- **Windows: `host.env` keys are now allow-listed into the service environment (operator-visible).**
+  `load_host_env` used to import **every** key of `%ProgramData%\punktfunk\host.env` into the
+  LocalSystem service's own environment. `%ProgramData%` lets `BUILTIN\Users` pre-create the
+  directory, so an unprivileged user could plant `host.env` before install; a planted `SystemRoot`
+  then redirected the absolute `icacls.exe`/`powershell.exe` paths the host builds from it — code
+  execution as SYSTEM. Only the `PUNKTFUNK_*` and `RUST_LOG` keys the child already allow-lists at
+  the spawn boundary are imported now. **An operator who kept unrelated keys in `host.env` will find
+  they no longer reach the service.**
+- **Windows: a non-admin-owned `host.env` or `web-password` is no longer trusted (operator-visible).**
+  A `host.env` whose owner SID is not privileged is renamed aside and the default written over it; a
+  non-admin-owned console-password file is rotated to a fresh random instead of being kept as an
+  "upgrade". A file from a prior privileged install is Administrators-owned and is kept untouched.
+  If you hand-authored either file as a normal user, re-create it from an elevated prompt.
+- **gamescope must be rebuilt at `+pfhdr8` for the keyboard-layout fix (packager-visible).** The
+  host hands the session `XKB_DEFAULT_*` on all four gamescope launch paths, gated behind a
+  `+pfhdr8` probe — an older binary gets a warning naming the reason rather than a silent
+  US keymap. The patch series applies `git am`-clean at the pinned `5fb8dce4`.
+- **GameStream's UDP/ENet media plane now binds to the launch owner.** The Moonlight-compat video
+  and audio endpoints used to bind to the first datagram from anyone, and any ENet peer could hold a
+  connection (pinning per-peer reassembly memory). Source IPs that are not the launch owner's are
+  now discarded until the 10 s learn budget is spent, and non-owner datagrams are dropped before
+  ENet allocates per-peer state. GameStream is runtime opt-in and off in the shipped unit.
+- **Re-pairing can no longer escalate access.** `TrustStore::add()` used to *replace* the record; it
+  is name-only on re-pair now, so a device that was approved as a guest cannot re-pair its way to
+  full control. Records with no grants recorded — every record written before this release — read as
+  full and permanent, so nothing changes for an existing install.
+
+### The lossless audio plane: PCM on `0xD3`, alongside Opus
+
+Opus is 48 kHz *by construction* (`opus_encoder_create` rejects 96 000), so hi-res was never a
+constant to raise. A second audio plane carries interleaved little-endian PCM under
+`AUDIO_CODEC_PCM` (`0xD3`); `AUDIO_CODEC_OPUS` (`0xC9`) and its `0xD2` redundancy are untouched and
+remain the default for every session that does not ask.
+
+- **Rates and depths.** `audio::pcm::rate_is_supported` admits 44 100, 48 000, 88 200, 96 000 and
+  176 400 Hz, at 16 or 24 bits, including hi-res surround. The 44.1 kHz family took a fix to reach:
+  the rate was divided before it was multiplied, and `rate_hz / 1_000_000` is 0 for every rate below
+  a megahertz.
+- **Frames are sized from RAW worst case, not from a coded estimate.** A datagram over the path MTU
+  is not sent at all and this plane is never fragmented. The real ladder at default MTU is
+  48/16 → 5 ms, 48/24 → 4 ms, 96/16 → 3 ms, **96/24 → 2 ms**. ⚠ A frame carries a whole number of
+  samples *per channel*, so `frame_us` is a **label, not a duration** — at 44 100 Hz a nominal 5 ms
+  frame is 220 samples per channel, which is 4 988 662 ns. Size from `samples_per_frame`; take time
+  from `frame_duration_ns`, never from `frame_us`.
+- **FLAC was planned and deliberately not shipped.** It buys nothing structural here: its worst case
+  is a VERBATIM subframe (raw + header), so it gets the same frame duration, packet rate and
+  send-buffer sizing and saves *average* bytes only — while this plane rides outside the ABR loop
+  and is therefore provisioned for peak. The host also quantises f32 → 24-bit without dither, so the
+  low bits barely compress; at 24 bits a lossless coder saves least. `AUDIO_CODEC_FLAC_RESERVED = 1`
+  keeps the numbering so FLAC stays purely additive later.
+- **Capability bits.** `HOST_CAP_AUDIO_HIRES = 0x80` and `CLIENT_CAP_AUDIO_HIRES = 0x10`.
+  ⚠ **`0x80` was the LAST free `host_caps` bit** — `video_caps` was already full, so the next host
+  capability needs a second byte and an ABI bump. ⚠ `Hello`'s post-HDR tail is capped at 27 bytes
+  (with no HDR block the decoder disambiguates by remaining length, so a 28-byte tail is misread
+  *as* an HDR block); **8 of those 27 are now spent**.
+- **The host serves it by default; the client's menu choice is the opt-in.** See the breaking-changes
+  entry above — `PUNKTFUNK_AUDIO_HIRES=0` is now the refusal, and the decline log names the opt-out
+  and the value it must have rather than sending people looking for something to enable.
+- **Cost and the affordability rule.** The plane costs **1.4–8.5 Mbps** in stereo — up to **33.9** for
+  176.4 kHz/24-bit 7.1 — against Opus's 256 kbps, and it rides QUIC datagrams **outside the ABR
+  loop**, off the top of the link where ABR can neither see it nor claw it back. A session therefore
+  gets it only if the cost fits **a quarter of that session's video bitrate**: a 5 Mbps session can
+  afford no rung at all. On game content it is very unlikely to be *audible* — 256 kbps Opus is
+  already effectively transparent and nothing above 24 kHz is hearable — so the win is
+  **bit-exactness**: no lossy stage anywhere, and no resample for a host whose interface genuinely
+  runs at 96 kHz.
+- **The host's gate, and what it can and cannot promise.** Every decline lands back on
+  Opus at 48 kHz. ⚠ The gate checks format validity, not delivery: on Linux, PipeWire ships
+  `clock.allowed-rates = [ 48000 ]`, and a rate that is not listed is **resampled into the running
+  graph rather than switched to** — so a sink declaring 96 kHz on a stock box gets resampled and the
+  gate does not catch it. Add the rates to `clock.allowed-rates` to make the sink the graph driver.
+  (`clock.rate` in the settings metadata is the *default*, not the live graph rate; read `pw-top`.)
+  On Windows the decline is floored at 48 kHz so only a hi-res request can lose — declining whenever
+  `engine_hz < requested` would open capture at 44 100 on an ordinary endpoint, which libopus
+  rejects, regressing the shipped Opus path.
+- **Client-side gating happens before the connect, because that is the last point at which declining
+  is free.** Windows reads the render endpoint's own mix format and withholds the capability bit
+  when the engine cannot carry the rate (`autoconvert` would otherwise silently downsample a 96 kHz
+  stream on arrival while every log line agreed the session was hi-res). Android probes an AAudio
+  stream at the requested rate, reads back what was granted and closes it without starting it —
+  AAudio never substitutes a rate, so a 48 kHz rung under a 96 kHz session could only ever produce
+  2× playback. The ladder is 96 → 48-keeping-depth → the legacy pair.
+- ⚠ **48 kHz/16-bit lossless is unreachable through the parameter pair** — that request is
+  byte-identical to a legacy one, and the capability is derived from "asked for a non-default
+  format". 48/24 is the real bottom rung.
+- **Settings vocabulary is shared across all four clients** under the key `audio_format`, so a
+  profile round-trips between a phone, a TV and the desktop. ⚠ **The menus are not all the same
+  length.** Apple and Android list the full ladder — `opus`, `lossless441`, `lossless48`,
+  `lossless882`, `lossless96`, `lossless1764` — while `pf_client_core::AUDIO_FORMATS` (Linux,
+  Windows and the Gaming Mode console) lists only `opus`, `lossless48`, `lossless96`. A value a
+  build does not recognise resolves to Opus rather than refusing the connect, which is what makes
+  the shorter list safe. On the desktop clients `PUNKTFUNK_AUDIO_HIRES` overrides the setting in
+  **both** directions with a richer grammar (`1`, a bare rate, `<rate>/<bits>`, or `0`); an
+  unparseable value warns and is ignored rather than meaning "off". ⚠ Note the two spellings of the
+  same variable name: on a box that is both host and client one line configures both halves, and
+  `0` is the one value that means *off* to each.
+- ⚠ **`pf-client-core` filters a surround request out before it reaches the wire**, so the desktop
+  clients and the Gaming Mode console stay on Opus whenever `audio_channels != 2` — even though the
+  host's `channels != 2` decline is gone and the arithmetic supports surround (at 48 kHz both 5.1
+  and 7.1 fit a 1 ms frame). Apple reaches the host through `connect_ex11` directly and is not
+  subject to it. Delete the arm when the client-side filter learns the ladder, not when the host
+  rule changes — the comment at the site says so.
+
+### Per-client access: grants on the trust record
+
+Six bits, an exhaustive classifier and a `Welcome` advert. `PUNKTFUNK_GRANT_GAMEPAD`, `_POINTER`,
+`_KEYBOARD`, `_CLIPBOARD`, `_MIC`, `_LAUNCH`; `PUNKTFUNK_GRANT_ALL` is their union and
+`PUNKTFUNK_GRANT_RESERVED` its complement. Presets: `_PRESET_FULL` (= ALL), `_PRESET_CONTROLLER_ONLY`
+(= GAMEPAD), `_PRESET_VIEW_ONLY` (= 0).
+
+- **Storage is back-compatible by absence.** The grant mask and `expires_unix` are optional serde
+  fields on `PairedClient` in `punktfunk1-paired.json`; absent means full and permanent.
+- **Enforcement is default-deny and happens at setup**, not per-event: no uinput pads are created,
+  no mic is attached, no clipboard coordinator is started for a device that lacks the bit. Launch is
+  refused at the handshake with a typed reject. QoS messages (reconfigure, bitrate) are deliberately
+  ungoverned.
+- **Expiry is wall-clock**, warned at T−5m and T−1m over a new `AccessUpdate` control message, and
+  closed with `RejectReason::AccessExpired` (`ACCESS_EXPIRED_CLOSE_CODE = 0x69`). An expired device
+  falls into the knock path for one-click re-grant.
+- **The mgmt API carries grants in its payloads**, with `PATCH` to change them live; a per-fingerprint
+  watch pushes the edit into any running session. ⚠ `PATCH` 404s on a Moonlight client with no
+  registry record — the console shows those as "Full (ungoverned)" until the mgmt upsert lands.
+- **Moonlight/GameStream**: an absent registry record is ungoverned `GRANT_ALL`; an existing record
+  governs launch, input and the clock.
+- ⚠ **Three limits are documented rather than papered over** (`docs-site` → Access levels):
+  shared-desktop visibility is not isolation, Moonlight rows are ungoverned until they have a
+  record, and older clients are *enforced* but get none of the chrome (no chip, no countdown).
+
+### The presentation clock: play frames out on the source's cadence
+
+Every client used to present a frame the moment it was decoded, so the transport's jitter landed on
+the glass 1:1. `CadenceClock` estimates the offset between the source clock and the present clock
+and returns a due time on the source's own timeline plus a cushion sized to the measured jitter.
+
+- It is **type-2** (offset *and* per-frame rate) because two free-running crystals produce a ramp and
+  a proportional-only loop lags a ramp forever. Fixed-point `i64` throughout, so it runs identically
+  on every client and in the offline harness.
+- **It smooths the OFFSET, never the timestamps.** Genuine variation in the source's own cadence — a
+  variable-rate renderer, an irregular capture tick — passes straight through. Anything that made due
+  times more evenly spaced than the source would be a bug, and `preserves_source_cadence` is the test
+  that says so.
+- **Domain-agnostic by construction**: a constant offset between clock domains is absorbed by the
+  offset estimator, so each client feeds `ready_ns` and reads `due_ns` in one domain with no
+  conversion anywhere in the path.
+- **VRR stops being merely not-worse.** Where the presenter has *measured* variable refresh (the
+  existing `CadenceProbe` verdict, not a capability bit), the snap is skipped and the frame is
+  presented at its due time under `free_running()` tuning. `Unknown` reverts to snapping — the
+  absence of a measurement is not a measurement.
+- **The host half is the prerequisite, not the alternative.** All three Linux publish sites stamped
+  `pts_ns` with `SystemTime::now()` inside *our* PipeWire process callback — the instant the buffer
+  was delivered to us, not the instant the compositor produced it. Source-timestamp playout would
+  have faithfully reproduced that jitter. The compositor's `spa_meta_header.pts` is now rebased into
+  the wire's realtime domain from a re-sampled clock pair, with a per-frame plausibility gate falling
+  back to the delivery stamp (counted, never silent) beyond 50 ms. `PUNKTFUNK_CAPTURE_HDR_PTS=0`
+  restores delivery stamps.
+- ⚠ **`host_us` and `e2e` now read HIGHER** by the delivery delay that was previously not counted.
+  The numbers moved because they got truer.
+- ⚠ One-present-per-slot is now `PresentGate`'s job. Where present timing is live that is strictly
+  better; where it is unavailable the gate is inert and a faster-than-panel stream can submit two
+  presents into one vblank. That was already `latency`'s behaviour on those boxes but it is new for
+  `smooth`.
+
+### Audio robustness: droughts, holes and what the counters actually mean
+
+- **Drought concealment on the decode thread.** The decode path already concealed a *seq gap*, but
+  that only fires when a later packet arrives to reveal it. When the wire simply goes quiet the ring
+  drains, the callback runs short, and the de-jitter policy de-primes and re-primes a whole target's
+  worth of fresh silence — an artifact far longer than the audio actually missing. `DroughtConceal`
+  is bounded by `JitterTuning::plc_max_ms()`, **twice the preset's own de-prime fuse, derived rather
+  than added as a fifth field** so it cannot drift from the thing it protects. Denominated in
+  **time**, never in frames or callbacks — that is the recorded lesson from this very fuse, where a
+  count gave an iPad a third of a Mac's slack. `plc_ms=` joins the 10 s playback line at all three
+  Rust sites; Apple reaches the same behaviour through ABI 23's `audio_plc`.
+- **A capture hole cost more than itself.** `audio_thread` blocked in `next_chunk` for the whole
+  duration of a hole and nothing left the host. The loop is deadline-driven now
+  (`next_chunk_within`) and covers a hole with silence frames on the existing pacer schedule,
+  continuous in `seq` and `pts`, for up to 500 ms. Past that the host is not glitching, it is quiet.
+  The capture counters deliberately measure *upstream* of the infill, so infill can never make that
+  line look healthy.
+- **`delivered_pct` could not distinguish an outage from starvation.** `CaptureStats` gains
+  `gaps`/`max_gap_ms`/`missed_dequeues`, and `pauses`/`paused_ms` beside the percentage they explain
+  — a 16.2 s `Paused` span scored `gaps=0` correctly and hid the outage inside `delivered_pct`,
+  because the reporting window is flushed from the process callback and stretches by exactly the
+  time we were absent. The negotiated quantum now tracks what the graph actually hands over (a new
+  size must survive three callbacks before it is believed) instead of latching the first callback.
+- **`audio egress` is a new 30 s line** — `sent`/`infilled`/`late`/`max_late_ms`/`max_spacing_ms`/
+  `reanchors`. The send path had no periodic metric of any kind, which left "the host paces audio
+  badly" unfalsifiable. Note `reanchors` in particular: the pacer forgives accumulated debt
+  silently, and that is precisely the event that leaves no trace and then gets blamed on the network.
+- **The minted sink sets `session.suspend-timeout-seconds=0`** — deliberately *not*
+  `node.always-process`, which would keep the node scheduled with nothing connected and run its
+  callback 200 times a second on a host sitting between sessions.
+- **The capture phase lock stops flapping.** Engagement now needs five consecutive coherent reports,
+  each incoherent cycle backs off longer than the last (10 ticks doubling to 320), and a host that
+  has torn down an engaged grid eight times parks the lock for the session. Only a disengage that
+  tore down an *engaged* grid counts toward the fuse, so a launch-time shader storm cannot fuse a
+  host that then locks perfectly for hours. The disengage line gains `coherence_milli`.
+
+### ABR: the behind-cadence deadline was the negotiated refresh
+
+A frame's encode work was scored against the negotiated interval (8.33 ms at 120 Hz), but a frame's
+real budget is the arrival of the next frame that actually exists — a 60 fps source gives every
+frame twice that. An encoder keeping up with every real frame could be marked behind on most of
+them, latch `behind_score` past `DEPTH_DEGRADE` and refuse every climb the client asked for. The
+budget is now the **observed source-delivery period**: an EMA over real frames' arrival spacing
+(repeats excluded), clamped to `[interval, 4 × interval]` so a source at or above the negotiated
+rate keeps today's deadline bit-for-bit and a hitchy source cannot disarm the detector. Every
+`cadence_degraded` transition now logs `behind_score`, `escalated` and budget/interval/observed
+period, rate-limited to one line per 5 s with suppressed flips counted; the climb-refusal line
+carries the live `behind_score`.
+
+### ABR, client side: a host-local rebuild is no longer read as congestion
+
+A Windows exclusive-topology eviction rebuilds the capture ring and encoder in place — a few hundred
+milliseconds, entirely host-local, not one packet lost. The client decides on 750 ms windows, so a
+window straddling that rebuild sees almost no stream: the 0.29 field log shows 401 ms of rebuild
+producing `actual_kbps=390` against a 20 000 target with `loss_ppm=0`, read as congestion, costing
+×0.7 plus slow start and three minutes at ~15 Mbps on a link that never dropped a packet. Three
+independent changes:
+
+- **`PipelineGap` — a new control message, type byte `10` (`0x0A`).** It extends the video/rate-control
+  block (`0x01`–`0x09`) it belongs to, because its only consumer is the same ABR controller
+  `LossReport`, `SetBitrate` and `BitrateChanged` already feed — deliberately **not** in the `0x30`
+  clock block, since it carries a *duration* precisely so that no clock domain is involved. The host
+  is the one party that knows, and it now says so; the client already knew how to throw a window
+  away (`discard_abr_window` feeds the controller nothing, sends no `LossReport` so a bogus window
+  cannot spike the host's adaptive FEC, and closes the standing-latency detector as not-loss-free).
+  That path had exactly one cause — the tail of the client's own speed test — and this is its second.
+  ⚠ The header gains `PUNKTFUNK_MSG_PIPELINE_GAP` as a `#define`; a message-type constant is additive
+  and takes a free type byte, so neither `PUNKTFUNK_ABI_VERSION` nor `WIRE_VERSION` moves.
+- **A starved window cannot report the encoder as slow.** `encode_us` is a per-AU host measurement
+  averaged over the window; when almost no AUs flowed, the mean is taken over the handful that
+  straddled whatever interrupted them and carries that interruption rather than the cost of encoding
+  at this rate. It is not a measurement, so it is now withheld entirely when the window is `STARVED`
+  — passed as **absent** rather than ignored, so it cannot teach the rolling-minimum baseline either.
+  Deliberately narrow: loss, a flush and a dropped frame describe what reached the *client* and mean
+  the same thing however little flowed, so those still back off on one window as
+  `STARVED_DELIVERY_DIV`'s own comment requires. Only the host-encode signal is withheld, because
+  only it is measured over AUs that did not exist.
+- **The learned climb ceiling is bounded by what the stream could plausibly use.** The ceiling was
+  pure link capacity (`delivered_kbps * 0.7`) with no term for resolution, frame rate, codec or bit
+  depth, and the utilization gate cannot supply one — a hardware encoder in CBR mode genuinely fills
+  whatever target it is handed, so the field log shows 99 % utilization the whole way up. On a
+  gigabit LAN the probe measured 939 Mbps and the session walked to **657 Mbps for 1440p120** — 1.49
+  bits per pixel — in 37 seconds, taking client decode latency from 0.78 ms to 10 ms.
+  `stream_ceiling_kbps` computes a bound from pixel rate and a bits-per-pixel allowance varying by
+  codec generation, bit depth and chroma; `set_ceiling` holds the measured link ceiling to it and
+  logs both numbers whenever it binds. Deliberately generous — a bound on the absurd, not a quality
+  opinion: 1440p120 HEVC Main10 lands at ~414 Mbps while 1080p60 HEVC keeps ~93 Mbps. It binds only
+  what the probe **learns**: a negotiated start rate is a number the host resolved on purpose, and an
+  explicit bitrate and every PyroWave session are outside the controller entirely.
+
+### AV1 never decoded on AMD, because the bit reader refused 32-bit reads
+
+Every AV1 session on an AMD host died after ~287 frames and silently fell back to H.265 — the client
+log named it on the first access unit ("AV1 parse: more than 31 (32) bits were requested") and then
+"No sequence header parsed yet" for every AU after, because the sequence header never parsed and each
+new keyframe re-hit the same wall. The vendored cros-codecs `BitReader` refused any read wider than
+31 bits "because that would break the `read_bits_signed()` function" — true of the signed path's
+`i32` accumulator, and misplaced: AV1 needs 32 bits in five places (`timing_info`'s
+`num_units_in_display_tick` and `time_scale`, `decoder_model_info`'s `num_units_in_decoding_tick`,
+and the variable-width buffer-delay and `buffer_removal_time` fields). **AMF sets
+`timing_info_present_flag`; NVENC does not** — which is why the rung's own evidence string ("one
+vendor, no soak") described a codec that had never once decoded on AMD.
+
+Relaxing the guard alone would have been worse than the bug; three edits are required together: the
+trailing mask is `u32::MAX` at 32 (`1u32 << 32` overflows — a debug panic, and in release a mask of
+zero, i.e. a silent `0`); the byte cursor is advanced before the accumulation loop when it sits at
+zero remaining bits (at ≤31 bits the mask discarded those bits, so it was invisible); and
+`read_bits_signed` keeps its own `> 31` guard, which is the limit the original comment was actually
+protecting. That last guard made a latent panic reachable by test — the sign extension
+`-1 ^ ((1 << num_bits) - 1)` overflows at `num_bits == 31`, rewritten as `-1i32 << num_bits`.
+**Blast radius is provably AV1-only**: neither H.264 nor H.265 has a read wider than 31 bits, literal
+or variable, and every dynamic-width call site in the vendored tree is in the AV1 parser. The 52
+upstream conformance tests still pass unchanged. Recorded as PROVENANCE deviation 8; owed upstream as
+a cros-codecs issue.
+
+### Game lifetime: a lease nothing is watching now says so
+
+Quitting a game mid-stream could leave the session up and the console showing it as "running"
+forever, with no setting that made any difference — because a lease with nothing to recognise its
+game by set its **own** state to `Running`, on the reasoning that the host had just launched it. That
+made three situations indistinguishable: a game being watched, a game that quit and was never
+noticed, and a game the host cannot see at all. `session_on_game_exit` can never fire for a lease
+nothing is watching, which is why no setting helped.
+
+- **`GameState::Untracked`** — surfaced in `/status`, the console card and the tray label. Keyed on
+  "is anything watching this" rather than on the lease kind, so a nested gamescope lease (whose exit
+  the capture loop catches) still correctly reads `running`.
+- **`LeaseRequest::spawned`** carries the pid Windows already knew and discarded, pinned to its start
+  time by a new `Scanner::resolve` so a recycled pid cannot impersonate it. Windows never holds a
+  `Child`, so a title whose provider published no detect hint had *nothing* identifying it: its exit
+  went unseen and `POST /game/end` had no pid to signal, while the same title on Linux was fully
+  tracked through its child. The same fix closes a second defect — a launch that adopted nothing
+  answered `Unknown`, fell back to the 90-second in-flight window, and past it started a **second**
+  copy, which is why "click the game that is already running" resumed on Linux and relaunched on
+  Windows.
+- **`game_on_new_launch` (`keep`|`end`, default `keep`)** — close this client's previous game before
+  starting a different one. Its own axis rather than a fourth `game_on_session_end` value: wanting a
+  game to survive a disconnect says nothing about wanting it kept when you deliberately pick another.
+  Four safety rules, made pure and unit-tested — never another client's game, never one the player
+  started themselves, never the title being launched, and never a record whose liveness is merely
+  `Unknown`. Scoped to launches this host performed itself (`crate::launchreg`).
+
+### The virtual DualSense can arrive as a real USB device (opt-in)
+
+A game that drives DualSense haptics pairs "my controller" with "my controller's speaker" by Windows
+`ContainerId`, and wine derives that by walking the HID device through udev up to a `usb_device`
+parent. Our pad is uhid, so its sysfs chain has no USB ancestor anywhere: winebus logs "Failed to get
+parent device" and every endpoint registers as `GUID_NULL`. Measured against Spider-Man Remastered
+under GE-Proton11-5, the game resolves both endpoints, reads their `FriendlyName` and
+`PhysicalSpeakers`, and then declines to open either. The same missing fact blocks GE's other route:
+its haptic path enumerates real **ALSA cards** (`snd_card_next` → `snd_ctl_pcm_next_device` →
+`snd_pcm_open` demanding 48 kHz / S16 / 4 channels), and minted PipeWire nodes are not ALSA cards
+however faithfully their proplist impersonates one — in the field log that scan never ran at all.
+
+So `PUNKTFUNK_DUALSENSE_USBIP=1` presents the pad over `vhci_hcd`, reproducing the hardware's own
+4-interface composite layout from an lsusb capture of a wired `054c:0ce6` — audio control, audio
+streaming out (isochronous, S16LE 4ch 48 kHz: haptics + speaker), audio streaming in (the headset
+mic), and HID. Because interfaces 0–2 are a genuine UAC 1.0 device, `snd-usb-audio` binds them and
+mints a real ALSA card, and PipeWire's ALSA monitor builds the `HiFi__Speaker__sink` /
+`HiFi__SpeakerHaptic__sink` nodes itself from the distro's DualSense UCM — the node graph stops being
+impersonated. The transport rides the ladder `steam_controller` already established (usbip → uhid,
+degrading on failure) and reuses the udev grant packaging already ships for the virtual Deck, so it
+needs no new privilege, module or packaging. The descriptor set is pinned by test against the
+hardware's published `wTotalLength` of `0x00E3`.
+
+Pad-audio capture follows the pad: with the usbip pad the host mints nothing, so capture moves to the
+**isochronous OUT endpoint** — the same point a physical pad's samples reach, which is what makes any
+route a game takes land in one place. The `0xD1` wire path downstream is untouched; only the source
+moves. The two capture modes are mutually exclusive by construction and the choice is read from the
+transport flag rather than from whether a stream happens to have been published, or the race between
+pad arrival and the streamer thread starting would decide it. `pad-usbip-test` is the on-glass gate
+with no client and no game involved.
+
+⚠ **Opt-in while it awaits on-glass verification** — it changes the pad's whole kernel presentation,
+including superseding the minted pad-audio sinks with a real card. The uhid pad remains the
+long-validated default.
+
+### Recovery anchors are now corroborated
+
+`USER_FLAG_RECOVERY_ANCHOR` is the host asserting a fact about the *client's* decoder — "the picture
+I coded this P-frame against is one you still hold, intact" — and the gate took it on faith, on the
+first occurrence. The host derives that claim from bookkeeping that tracks what the client
+**received**, not what it managed to **decode**, and those diverge exactly when the client had to
+conceal. `pf-bitstream`'s planners now carry a per-picture clean bit (damage propagates down the
+prediction chain), surfaced as `PicturePlan::references_clean` and carried on `DecodedVkFrame`; the
+gate gains `AnchorEvidence` and refuses an anchor whose references the client can prove were damaged.
+Refusing can only ever hold **longer** — the freeze stays up and the backstop fires on its original
+deadline. Lanes with no local parser pass `Unavailable` and are bit-for-bit unchanged; all 29
+pre-existing reanchor tests pass untouched. On the host side, the slot-family RFI backends no longer
+pick an anchor over damage the client has already reported.
+
+⚠ **The H.264 decoder reached parity here, having been the only one of the three that failed OPEN**:
+a DPB slot with no bound image was traced and decoded anyway, `reference_count` was computed after
+the held-slot loop so a dropped reference silently took an unrelated slot's picture, and there was no
+`RecoveryLatch`. Both latches landed with HEVC and AV1 in August; H.264 predates them and was never
+retro-fitted.
+
+### New management API surface
+
+- `GET /api/v1/diagnostics` and `POST /api/v1/diagnostics/refresh` — **admin lane only**, because
+  these verdicts carry the host user's name, its group layout and device-node state. `inapplicable`
+  is a first-class status rather than an absent row, so the console can answer "why isn't this check
+  relevant here?" instead of silently hiding it. Probes stay in their owning crates
+  (`pf-vdisplay`, `pf-inject`) and export plain verdict enums; the host does the mapping, so there is
+  no reverse dependency. A check id the console has never heard of still renders, from the host's
+  English `summary`/`impact`/`remedy.text` — that is what makes console N paired with host N+1
+  survivable, and it is enforced as a test.
+- `POST /api/v1/client-logs` — **the cert lane's first and only WRITE.** Paired mTLS devices may
+  upload (write-only: no read of anything, not even their own bundle), while list/fetch/delete stay
+  on the loopback bearer lane; the lane matrix pins all four rows. The gate uses `effective()`, so an
+  expired guest's upload is refused (403) while any live-authorized device — including a view-only
+  guest — may send. No input grant is required: uploading one's own diagnostics is not an input
+  capability. Storage is a bounded file store under `<config-dir>/client-logs` (traversal-proof ids,
+  newest 5 bundles per device, 1 MiB cap) and deliberately **not** the log ring, which a
+  multi-thousand-line bundle would evict.
+- `PUT /api/v1/library/provider/{p}` now runs the console-password gate. It had no BFF handler and
+  fell through to the `/api/**` catch-all, which injects the full admin bearer — so a bare session
+  cookie could plant a persistent `prep`/`launch.kind:command` entry without the password.
+- **Schema additions**: `GameOnNewLaunch` (`keep`|`end`) with the `game_on_new_launch` settings field,
+  and `untracked` joins the game-state enum described on `/status`. ⚠ A client reading the state enum
+  must tolerate `untracked` — the console and the Rust/Android clients treat it and `grace` as "up",
+  and only a confirmed `exited` as not.
+- ⚠ **`docs-site/public/openapi.json` had drifted from `api/openapi.json` and is re-synced here.**
+  The mgmt drift test compares the *live route table* against the generated document, not the two
+  on-disk copies, and nothing else gates the docs-site mirror — so the game-lifetime regeneration
+  updated `api/openapi.json` alone and CI stayed green while the published API reference silently
+  described the previous release. The two are byte-identical again as of this commit. **Regenerating
+  one means copying it to the other**; there is no build step that does it for you.
+
+### New environment variables
+
+| Variable | Effect |
+|---|---|
+| `PUNKTFUNK_AUDIO_HIRES` | Forces the lossless plane on or off, overriding the stored `audio_format` setting in both directions |
+| `PUNKTFUNK_CAPTURE_HDR_PTS=0` | Puts Linux capture back on delivery stamps instead of the compositor's own `spa_meta_header.pts` |
+| `PUNKTFUNK_SESSION_LAYOUT=0` | Disables `sync_session_keyboard_layout()` — the leg that points an adopted gamescope session's Xwayland at the box's configured layout |
+| `PUNKTFUNK_PAD_AUDIO_PROFILE=0` | Stops the Linux client moving a DualSense card to Pro Audio when no four-channel node exists |
+| `PUNKTFUNK_PAD_SINK_SPLIT_NAME` | Overrides or drops the host sink's `api.alsa.split.name` (GE-Proton's haptic-leg target) |
+| `PUNKTFUNK_PAD_SPEAKER_PATH` / `_VOLUME` | Field levers for the DualSense speaker-enable packet — hex or decimal. The path byte is empirical (SDL's vendored `SDL_hidapi_ps5.c` pins the struct layout but never writes these fields) but is now settled on glass at a ~300× margin |
+| `PUNKTFUNK_DUALSENSE_USBIP=1` | Presents the virtual DualSense over `vhci_hcd` as a real USB device with its own ALSA card, instead of uhid. Opt-in; changes the pad's whole kernel presentation |
+
+### Keyboard layout: the wire is US-positional, and nothing carried the host's layout
+
+The key wire is US-positional **by design** — a client sends the physical key, `vk_to_evdev` turns it
+into an evdev code, and the session's keymap picks the character. So the contract is "host layout ==
+the layout on the client's keyboard", and nothing was upholding it. `localectl set-x11-keymap de`
+writes a file only Xorg reads, libxkbcommon's fallback chain stops at `XKB_DEFAULT_*`, and no session
+manager sets them — so a properly configured German box compiled `evdev/pc105/us`, silently.
+`pf_host_config::layout` now resolves what the box actually recorded (`XKB_DEFAULT_*`, then
+`xorg.conf.d`, then vconsole's `XKBLAYOUT` — **never** vconsole's `KEYMAP`, whose names are console
+names that do not map onto xkb's). The wlroots injector compiles its uploaded keymap from that, all
+four gamescope launch paths export `XKB_DEFAULT_*`, and `sync_session_keyboard_layout()` covers the
+adopted-autologin case where no launch-time decision applies.
+
+gamescope patch **0010** is the other half: gamescope builds a keymap from `XKB_DEFAULT_*` but puts
+it only on `keyboard_group`, while the *seat* carries `virtual_keyboard_device` — a stub whose own
+comment says it exists "only to set the keymap" and which never gets one. `wlserver_keyboardfocus()`
+rebinds that stub on every focus change, and the real group only reaches the seat from a libinput key
+event, which a `--backend headless` session never has.
+
+### Controller audio on Linux: what a real DualSense actually presents
+
+We minted a single `AUX0..AUX3` node wearing the mono sink's `Speaker__sink` name. A game that
+renders DS5 haptics writes a **positioned** FL/FR/RL/RR quad — the only public 4-channel surface a
+physically connected pad publishes — so that write was position-remixed on arrival and the coil pair
+folded away, measured at `peak_speaker=0.2441` with `peak_coils=0.0000`. Nothing errored, nothing
+logged. The host now mints the three-node split a real pad presents (a 4-channel `AUX` parent, a
+positioned `HiFi__SpeakerHaptic__sink`, a mono `HiFi__Speaker__sink`), all summed onto one hardware
+quad. The profile suffix is `-00.HiFi__Speaker__sink`, because GE-Proton's
+`is_dualsense_speaker_sink()` is a substring test for `Speaker__sink` and three separate behaviours
+hang off it; `api.alsa.split.name` is published, without which `get_dualsense_haptic_target()`
+returns NULL and the leg cannot engage at all. `device.vendor.id`/`device.product.id` gained the
+`0x` prefix the specimen publishes — `strtoul(s,_,0)` reads a bare `054c` as octal, stops at the `c`
+and yields 44.
+
+The client half matched a sink by name signature alone and had the same folding problem. Correlation
+now walks nodes **and** devices, requires `device.id` (which is also what keeps a Punktfunk host's own
+minted pad sink out, since it carries the full DualSense identity on purpose), prefers unpositioned
+AUX quads, and falls back to moving the card to Pro Audio for the session. The stream sets
+`stream.dont-remix` with `AUX0..AUX3`, so channel *k* reaches channel *k* whatever the node
+advertises. `punktfunk-session --pad-audio-test` prints every DualSense object in the graph, the node
+it chose, and drives a tone into the coils — separating "the plane never arrived" from "it arrived
+and the graph folded it away" with no host, no game and no pairing.
+
+⚠ **Channel 1 of the DualSense's audio function is the headphone jack's right channel *and* the
+built-in mono speaker**, and which one physically sounds is chosen by `ucAudioEnableBits` (report
+byte 8). A pad powers up pointing at the jack, so with nothing plugged in the speaker pair went
+nowhere — which is why haptics worked the instant routing was right and the speaker did not. A tier-A
+slot with the speaker capability now sends a default speaker-enable packet; a game's own `AudioCtl`
+still overrides it verbatim.
+
+**The path byte is now settled, and was not when it first landed.** `0x20` was originally chosen from
+a sweep that cleared the pad-mic noise floor by only ~5×, and was recorded as unsettled. A second
+sweep on glass (DS5 wired to a Steam Deck client, 330 Hz into the speaker pair) swept the whole byte
+at a **~300×** margin: `0x20` and `0x30` sound, `0x10`/`0x40`/`0x50` do not — so **bit 5 is the
+speaker-path enable and bit 4 alone does nothing**. `0x20` stays the default over the marginally
+louder `0x30`, which asserts a second path bit whose effect on the headphone leg was never measured.
+Two properties the one-shot depends on were measured the same day: the setting persists (unchanged
+40 s after a single write) and survives the pad's USB audio stream stopping and restarting, so it
+needs no re-assertion when the renderer opens its output. Verified end to end — forcing the pad to
+`0x00` dropped the pad mic to the `0.000000` floor and silenced the speaker; a fresh slot open
+restored it.
+
+### Bazzite: our virtual DualSense triggers an SELinux audit storm
+
+The virtual DualSense/DualShock 4 binds `hid-playstation`, and Valve's `ds_inhibit`
+(steamos-manager) reacts to every open/close of any such hidraw by walking `/proc/*/fd` — with no
+VID/PID or virtual filtering. SELinux denies `steamos_manager_t` that walk at ~324 AVCs/sec, and
+`setroubleshootd` amplifies it into a box-wide fork storm (267+ procs/sec, a core burned, RSS
+climbing for 15+ minutes *after* the denials stop) that starves the stream to 0 fps and session
+death. Punktfunk is the trigger, not the defect — but we ship the trigger.
+`packaging/bazzite/punktfunk-ds-inhibit.cil` is a **dontaudit** drop-in, not an `allow`: granting
+another vendor's daemon `sys_ptrace`/`dac_*` is not ours to do, and the scan failing quietly leaves
+the pad uninhibited, which is what we want anyway. The RPM ships the source under
+`/usr/share/punktfunk/selinux/` (the policy *store* is host state, so a sysext image can only carry
+source) and it is inserted idempotently by `punktfunk-sysext post_merge`/`reapply` and best-effort by
+the RPM `%post`, both keyed on the steamos-manager binary and the module name. ⚠ **Rename the `.cil`
+if its rules ever change, or existing installs never converge.** `warn_if_ds_inhibit_storm` puts the
+cause in *our* logs, because the AVC lines read `comm="tokio-rt-worker"` and look like us.
+
+### udev: the virtual Steam Controller 2's hidraw node was root-only
+
+`60-punktfunk.rules` grants hidraw access per product id and never listed the SC2 identities the host
+mints — wired `28DE:1302` and Puck `28DE:1304`. For any other pad that would be a degradation; for
+this one it is total, because no kernel driver claims the PID (mainline `hid-steam` stops at the
+Deck) and the state reports ride a vendor collection, so there is no evdev node either. Steam is the
+only consumer there is. Both identities are added in the same two forms the Deck uses (`KERNELS` for
+the UHID shape, `ATTRS` for the usbip/gadget one). Single source of truth: every distro installs this
+file, and the NixOS module takes it from the package.
+
+### Other embedder-visible notes
+
+- **Android**: `NativeBridge` and the audio path gained the format vocabulary; every Opus session was
+  previously advertising the lossless capability, and the ABI doc told it to. The CI test filter is
+  an allowlist and eleven classes sat outside it, including the audio HUD ones — all eleven pass,
+  but nothing was gating them. They are listed explicitly now.
+- **`pf-client-core` still filters a surround request out before it reaches the wire**, so the
+  console's audio-format row stays gated under 5.1 even though the host's `channels != 2` decline is
+  gone and the arithmetic supports surround at 48 kHz.
+- **Reassembly memory is metered per block.** The reassembler's firewall counted only `FrameBuf::buf`
+  bytes; `BlockState` (have-data + recovery vectors, both sized from attacker-declared header fields)
+  was unmetered, so a slice-streamed frame could mint thousands of distinct-index blocks and commit
+  multiple GB against a ~13 MB accounted figure. `block_state_bytes()`/`frame_cost()` now gate each
+  new block on the same `IN_FLIGHT_BUF_FACTOR × max_frame_bytes` budget.
+- **PyroWave**: a duplicate `block_index` with `payload_words == 0` spun the client decode thread at
+  100 % CPU forever, inside FFI with no allocation and no timeout. The minimum-size check is hoisted
+  into `push_packet` before `decode_packet` is consulted. Carried as vendored patch 0008.
+- **Apple**: `HTTPResponse` overflowed `bodyStart + length` on a malicious `Content-Length`, and Swift
+  integer overflow **traps** rather than throwing. `art_path_is_confined`'s UNC guard was a leading
+  double-*backslash* string test, so `//server/share` and mixed forms slipped past and
+  `canonicalize()` would coerce the SYSTEM host into outbound SMB auth.
+- **CI**: `ci.yml`'s cargo-home cache shared an unnamespaced key with the signed release builds, so a
+  fork PR could poison a release artifact through `registry/src`. The key is namespaced to
+  `cargo-home-ci-`. The pinned `bun-windows-x64.zip` is now sha256-verified before it is staged and
+  Authenticode-signed. ⚠ The Linux `curl|bash` sites (arch/rpm/deb + builder Dockerfiles) still need
+  version+hash pinning.
+- **`@punktfunk/plugin-kit` 0.4.2**: `library_capsule.jpg` is the newer name for the 2:3 cover and
+  `header.jpg` the newer name for the header — measured against a real 779-app `librarycache`, 46
+  appids carry only the former and 594 carry the latter, with **no appid carrying both spellings of
+  either**. The `<appid>/<name>` layout with no hash directory is the **majority** (623 of 779), and
+  `findLocalArtFile` walked only `<appid>/<hash>/<name>` and the oldest `<appid>_<name>`. Per-appid
+  art found locally went portrait 25 → 328, hero 75 → 323, header 86 → 716, logo 66 → 295. ⚠ Each
+  plugin vendors its own nested copy of the kit, so a plugin only picks this up when it is
+  republished.
+
+### Console UI: nothing was anti-aliased, and cover art sampled nearest
+
+Reported from a Steam Deck, where a 1280×800 panel gives sub-pixel error nowhere to hide. Two
+independent causes, both API defaults. **`SkPaint`'s default constructor sets `fAntiAlias = false`**,
+and skia-safe's `Paint::new(colour, None)` is that constructor with a colour on it — so the terse,
+natural spelling of a draw call silently produces hard-stepped edges. The crate had 70 paint sites
+and 15 were anti-aliased, in an exact pattern: paints that got *mutated* for some other reason picked
+up a `set_anti_alias(true)` on the way past, and every inline argument did not. The console drew
+smooth 1 px rings on top of jagged fills, which looks worse than no ring — the smooth edge gives the
+eye a reference for how wrong the fill is. Text was never affected, since glyph anti-aliasing is
+`SkFont::Edging` and defaults on. Separately, **`Canvas::draw_image_rect` samples with
+`SamplingOptions::default()`, which is `FilterMode::Nearest` with no mipmaps** — every 600×900 poster
+minified into a ~180×270 Deck cell simply discarded rows and columns.
+
+`theme::fill`, `stroke`, `shaded`, `shaded_stroke` and `layer` are now the only sanctioned paint
+constructors and all 70 sites go through them; `theme::art_sampling` (linear + linear mipmaps) covers
+the three image draws. ⚠ **`shaded` earns its place the hard way: Skia modulates a shader's output by
+the PAINT's alpha**, so building a gradient paint from a transparent placeholder draws *nothing* —
+not dimmer, absent. `Paint::default()` happened to be opaque black, which is the only reason the
+console's gradients and the SkSL aurora never met the rule; building them transparently erased the
+backdrop, badge, vignette and skeleton sheen at once, **and all 124 tests still passed**, because a
+test that only renders a frame cannot tell a missing layer from a dark one. `shaded` is opaque by
+construction so the trap cannot be set again. Three tests pin it, each verified to fail with the fix
+backed out — including one that scans the crate's own source, because the aliased spelling is the
+natural one and will be written again by whoever adds the next draw call.
+
+### Other client and console notes
+
+- **Client log bundles merge into the host log viewer** rather than sitting in a table beneath it.
+  The Logs page had two axes fighting: `All | Host | Plugins` was a filter over one stream, while
+  uploaded bundles were a different artifact kind stacked underneath. The format itself resolved it —
+  the session ring layer writes `<ISO8601-Z> <LEVEL> <target> <msg>`, the same four fields as a host
+  `LogEntry` and wall-clock stamped precisely so a bundle correlates with the host log. The source
+  control is now multi-select chips over one merged pane with devices as peers of Host and Plugins,
+  so "the client stalled at 12:03:47, what was the host doing?" is expressible for the first time.
+  Bundles were previously undiscoverable twice over (the card returned null when empty, and when
+  non-empty sat below a 65vh viewer) and could not be **read** in the console at all, only downloaded.
+- **The library round-trip reached Android and the Gaming Mode console** — catalog cached per host
+  and rendered immediately marked stale (keyed on the pinned fingerprint, so a new DHCP lease is
+  still the same host), the host woken on library **entry** with the fetch retried across the boot
+  window rather than at CONNECT which is too late to help, titles already up badged Resume and
+  sorted first from `/status`, running-first ordering **within** each group only (`GridShape` lays
+  launcher entries out as a prefix, so a running game jumping the fence would put the cursor
+  arithmetic and the renderer on two different fields), and the grid returning to the last title
+  *opened* rather than a pixel offset. Forgetting a host now drops its cached catalog. ⚠ **Item 1 of
+  that set was reverted at review**: a host card's primary press stays "connect" on both carousels,
+  because Y already opened the library there with a legend hint — the flip spent entrenched muscle
+  memory on an affordance that already existed one press away.
+- **A masked-color I-beam was forwarded as a fully transparent pointer** on Windows capture: `AND=1`
+  plus a non-zero colour pixel is *invert*, not transparent, so treating it as a simple alpha mask
+  dropped the text cursor and the client installed nothing over every text field.
+- **The Apple client's settings captions went from 2 097 words to 973.** The rule applied throughout:
+  one clause of what the setting does, one of what it costs. Numbers survive; rationale moves to the
+  code comment above each caption. ⚠ The lossless gate riders are gone from all five rows and said
+  **once** in the Audio section footer — that footer sentence is now the only thing keeping
+  `audioFormatCaption` honest about the design's rule that the picker must never read as a promise of
+  the *resolved* format, and its doc comment says so. `bitrateFooter` lost its speed-test sentence
+  entirely rather than being shortened: that string is tvOS-only and directed Apple TV users to a
+  context menu, and tvOS has no context menus.
+- **An encode worker that died before the `Hello` landed reported `EPIPE`** instead of naming the
+  handshake, and `pf-win-display`'s EDID unlock logged its expected no-op as a warning.
+- **Flatpak CI: 21 minutes → 9.** The job reinstalled its whole toolchain every run (now a baked
+  builder image), pulled 3.84 GB to publish 28 MB, and — the real defect — its "offline" build step
+  **re-fetched every git source**, so one upstream 503 killed the build.
+
+### Verification status
+
+Gates green on the release tree: `cargo fmt --all --check`, `cargo metadata --locked`,
+`cargo test -p punktfunk-core` including the C ABI harness, the whatsnew character and uniqueness
+gates, and the release-notes voice scan.
+
+⚠ **Not verified on hardware by this cut**, and named rather than left to be discovered: the 96 kHz
+lossless path on Apple and Android devices (§13.2's on-glass tone check passed host → Mac at
+96 kHz/24-bit, but the mobile legs gate on hardware); the on-glass guest rehearsal for per-client
+access and a real-Moonlight run; a BLE-paired Steam Controller 2 on Android; and the diagnostics page
+against the real `.181` box in all three vhci states.
+
+⚠ **Verified by reading only** — these compile nowhere available to the cutting host, so a CI runner
+is their first compiler: the WinUI half of the library-toggle removal (`punktfunk-client-windows` is
+`cfg(windows)`), and the Apple library-browse pin gate.
+
+⚠ **`PUNKTFUNK_DUALSENSE_USBIP` is opt-in precisely because it is unverified on glass.** It changes
+the pad's whole kernel presentation and supersedes the minted pad-audio sinks with a real ALSA card;
+`pad-usbip-test` exists to be the gate that closes this, and it has not been run against real
+hardware. The uhid pad remains the default and is unaffected.
+
+---
+
 ## v0.29.0
 
 53 commits since v0.28.1 (36 non-merge).
