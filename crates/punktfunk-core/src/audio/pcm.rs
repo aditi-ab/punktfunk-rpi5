@@ -366,6 +366,93 @@ fn raised_cosine_tail(buf: &mut [f32], n: usize) {
 mod tests {
     use super::*;
 
+    /// Energy at one frequency, by the Goertzel algorithm — a single-bin DFT, which is all this
+    /// needs and costs no dependency. Returns the magnitude relative to a full-scale sine, so 1.0
+    /// is "the whole signal is this tone" and 0.0 is "nothing here".
+    fn tone_energy(samples: &[f32], rate_hz: u32, freq_hz: f32) -> f32 {
+        let n = samples.len();
+        let k = (n as f32 * freq_hz / rate_hz as f32).round();
+        let w = 2.0 * std::f32::consts::PI * k / n as f32;
+        let coeff = 2.0 * w.cos();
+        let (mut s1, mut s2) = (0.0f32, 0.0f32);
+        for &x in samples {
+            let s0 = x + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        let power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+        2.0 * power.max(0.0).sqrt() / n as f32
+    }
+
+    /// **The claim hi-res makes, tested rather than assumed.** A tone above 24 kHz cannot exist on
+    /// the Opus plane — Opus is 48 kHz by construction, so anything above Nyquist is gone before
+    /// the encoder sees it, and that is the entire reason this second plane exists. So the plane
+    /// has to be shown to carry one.
+    ///
+    /// This is the SOFTWARE half of `design/hi-res-audio.md` §13.2. The full check is "play a
+    /// >24 kHz tone on the host and confirm it arrives", and its other half — that the host's
+    /// CAPTURE did not silently resample on the way in — cannot be tested here, because that is
+    /// WASAPI autoconvert and PipeWire's resampler, which need a host and an interface. What this
+    /// proves is the part that is ours: once a 30 kHz tone is in the pipeline, the `0xD3` payload
+    /// carries it out intact.
+    ///
+    /// A brick wall at 24 kHz in the on-glass spectrum therefore indicts the capture path, not the
+    /// transport — this test is what makes that inference sound.
+    #[test]
+    fn a_tone_above_the_opus_ceiling_survives_the_plane() {
+        // 30 kHz: comfortably above the 24 kHz Nyquist limit of the Opus plane, and inside what
+        // a 96 kHz session can represent (Nyquist 48 kHz).
+        const TONE_HZ: f32 = 30_000.0;
+        for rate in [96_000u32, 176_400] {
+            let n = rate as usize / 10; // 100 ms, plenty of bins at 30 kHz
+            let src: Vec<f32> = (0..n)
+                .map(|i| {
+                    (2.0 * std::f32::consts::PI * TONE_HZ * i as f32 / rate as f32).sin() * 0.5
+                })
+                .collect();
+
+            let before = tone_energy(&src, rate, TONE_HZ);
+            assert!(
+                before > 0.45,
+                "{rate} Hz: the source tone is not there ({before})"
+            );
+            // The detector has to DISCRIMINATE, or every assertion below is vacuous: a bin that
+            // reads high everywhere would "prove" the tone survived a pipeline that deleted it.
+            // 12 kHz is silent in this signal and must read as such.
+            let absent = tone_energy(&src, rate, 12_000.0);
+            assert!(
+                absent < 0.01,
+                "{rate} Hz: the tone detector reads {absent} where there is no tone, so it \
+                 cannot tell survival from loss"
+            );
+
+            let mut wire = Vec::new();
+            from_f32(&src, BITS_24, &mut wire);
+            let mut out = Vec::new();
+            to_f32(&wire, BITS_24, &mut out).expect("whole samples");
+
+            let after = tone_energy(&out, rate, TONE_HZ);
+            assert!(
+                (after - before).abs() < 0.001,
+                "{rate} Hz: 30 kHz tone lost {:.4} of its energy crossing the plane \
+                 (before {before:.4}, after {after:.4})",
+                before - after
+            );
+
+            // And it is not merely *present* — 24-bit quantisation is far below anything audible,
+            // so the reconstruction must be sample-accurate, not just spectrally similar.
+            let worst = src
+                .iter()
+                .zip(&out)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst < 1.0 / full_scale(BITS_24) as f32,
+                "{rate} Hz: worst sample error {worst} exceeds one 24-bit code"
+            );
+        }
+    }
+
     /// The claim the whole plane exists to make. Every representable code at both depths must
     /// survive wire → f32 → wire unchanged; anything less and "lossless" is marketing.
     #[test]
