@@ -3,12 +3,13 @@
 //! on the shell's stack. B pops back to the host list; A launches the focused title in
 //! the same window. The shell owns the aurora, chrome, and the connecting overlay.
 
-use crate::anim::Spring;
+use crate::anim::{entrances, Entrance, EntranceAt, Spring};
 use crate::glyphs::{Hint, HintKey};
 use crate::library::{
     card_matrix, initials, step_cursor, store_label, LibraryGame, LibraryPhase, LibraryShared,
-    StepResult, BUMP_C, BUMP_K, BUMP_PX, FOCUS_GAP, JUMP, PERSPECTIVE, POSTER_H, POSTER_W,
-    RECEDE_DIM, RECEDE_SCALE, ROTATE_DEG, SIDE_SPACING, SPRING_C, SPRING_K, VISIBLE_RANGE,
+    StepResult, BUMP_C, BUMP_K, BUMP_PX, ENTER_RISE, ENTER_SCALE, ENTER_TURN_DEG, FOCUS_GAP, JUMP,
+    PERSPECTIVE, POSTER_H, POSTER_W, RECEDE_DIM, RECEDE_SCALE, ROTATE_DEG, SIDE_SPACING, SPRING_C,
+    SPRING_K, VISIBLE_RANGE,
 };
 use crate::model::{ConsoleCmd, HostRow, ProfileChip};
 use crate::pointer::{Pointer, PointerKind};
@@ -43,6 +44,13 @@ pub(crate) struct LibraryScreen {
     bump: Spring,
     /// Decoded posters by game id (decode once; Skia uploads lazily on first draw).
     art: HashMap<String, Image>,
+    /// The shelf's entrance, and when `Ready` first landed. Unlike the home carousel this
+    /// one waits for CONTENT: the choreography exists to show off artwork, and fanning open
+    /// a rank of grey placeholder faces is worse than not animating at all. See
+    /// [`Self::arm_entrance`].
+    entrance: Option<Entrance>,
+    entrance_armed: bool,
+    ready_at: Option<f64>,
 }
 
 impl LibraryScreen {
@@ -63,6 +71,35 @@ impl LibraryScreen {
             anim: Spring::rest(0.0),
             bump: Spring::rest(0.0),
             art: HashMap::new(),
+            entrance: None,
+            entrance_armed: false,
+            ready_at: None,
+        }
+    }
+
+    /// Arm the shelf entrance once the coverflow has something worth showing: the cards
+    /// around the cursor have posters, or 400 ms have gone by and they clearly aren't
+    /// coming. Art streams in per title after the list lands, so without the wait the
+    /// entrance would reliably play over placeholders — the fetch is the slow part, not
+    /// the list.
+    ///
+    /// The deadline matters as much as the gate: a library of art-less custom entries
+    /// still gets its entrance, just 400 ms later.
+    fn arm_entrance(&mut self, t: f64) {
+        if self.entrance_armed || !matches!(self.phase, LibraryPhase::Ready) {
+            return;
+        }
+        let since = *self.ready_at.get_or_insert(t);
+        let cursor = self.cursor.max(0) as usize;
+        // The cards actually on screen at rest — the ones the fan opens around.
+        let lo = cursor.saturating_sub(2);
+        let hi = (cursor + 3).min(self.games.len());
+        let have_art = self.games[lo..hi]
+            .iter()
+            .any(|g| self.art.contains_key(&g.id));
+        if have_art || t - since >= 0.4 {
+            self.entrance_armed = true;
+            self.entrance = Some(Entrance::new(entrances::CARDS, cursor, t));
         }
     }
 
@@ -113,6 +150,12 @@ impl LibraryScreen {
                 self.anim = Spring::rest(0.0);
                 self.bump = Spring::rest(0.0);
                 self.art.clear();
+                // A different set of titles is a different shelf, so it gets its own
+                // arrival. This is also the FIRST one: the screen mounts on `Loading` with
+                // no games, and the list landing is the moment the coverflow appears.
+                self.entrance = None;
+                self.entrance_armed = false;
+                self.ready_at = None;
             }
             self.cursor = self.cursor.clamp(0, (self.games.len() as i32 - 1).max(0));
         }
@@ -324,7 +367,11 @@ impl LibraryScreen {
                 if crate::theme::reduce_motion() {
                     self.bump = Spring::rest(0.0);
                 }
-                self.draw_carousel(canvas, rect, k, fonts);
+                self.arm_entrance(ctx.t);
+                if self.entrance.is_some_and(|e| e.done(ctx.t)) {
+                    self.entrance = None;
+                }
+                self.draw_carousel(canvas, rect, k, fonts, ctx.t);
             }
             LibraryPhase::Loading => {
                 crate::theme::spinner(canvas, cx, cy_all - 24.0 * k, 16.0 * k, ctx.t);
@@ -386,7 +433,7 @@ impl LibraryScreen {
         }
     }
 
-    fn draw_carousel(&mut self, canvas: &Canvas, rect: Rect, k: f64, fonts: &Fonts) {
+    fn draw_carousel(&mut self, canvas: &Canvas, rect: Rect, k: f64, fonts: &Fonts, t: f64) {
         let (card_w, card_h) = (POSTER_W * k, POSTER_H * k);
         let w = f64::from(rect.width());
         // The strip rides slightly above center; the detail block gets the band below.
@@ -432,14 +479,24 @@ impl LibraryScreen {
                 continue;
             }
             let prox = a.min(1.0);
-            let scale = 1.0 - prox * RECEDE_SCALE;
-            let angle = -d.clamp(-1.0, 1.0) * ROTATE_DEG;
+            // The entrance rides the card's REAL Y-rotation — the whole reason Apple had to
+            // fake its turn with a cos-squeeze is that SwiftUI can't snapshot a rotated
+            // layer to glass, and Skia has no such constraint here. Cards turn away in the
+            // direction they sit from the anchor, so the strip fans open like a book.
+            let ent = self.entrance.map_or(EntranceAt::SETTLED, |e| e.at(i, t));
+            let arrive = ENTER_SCALE + (1.0 - ENTER_SCALE) * ent.travel;
+            let turn = (1.0 - ent.travel)
+                * ENTER_TURN_DEG
+                * if (i as i32) < self.cursor { -1.0 } else { 1.0 };
+            let scale = (1.0 - prox * RECEDE_SCALE) * arrive;
+            let angle = -d.clamp(-1.0, 1.0) * ROTATE_DEG + turn;
             let offset = if a <= 1.0 {
                 d * FOCUS_GAP * k
             } else {
                 d.signum() * (FOCUS_GAP + (a - 1.0) * SIDE_SPACING) * k
             };
             let ccx = f64::from(rect.left) + w / 2.0 + offset + bump;
+            let cy = cy + (1.0 - ent.travel) * ENTER_RISE * k;
             self.geom[i] = Rect::from_xywh(
                 (ccx - card_w * scale / 2.0) as f32,
                 (cy - card_h * scale / 2.0) as f32,
@@ -454,6 +511,16 @@ impl LibraryScreen {
             let crect = Rect::from_wh(card_w as f32, card_h as f32);
             let rr = RRect::new_rect_xy(crect, 16.0 * k as f32, 16.0 * k as f32);
             canvas.clip_rrect(rr, None, true);
+            // A layer ONLY while this card is still fading in. The coverflow's steady state
+            // deliberately has none — side cards OVERLAP, so it dims them with an opaque
+            // veil rather than whole-card alpha — and gating on `fade` keeps the resting
+            // frame exactly as cheap as it was. Raised after the clip so `None` bounds mean
+            // the CARD, not the screen: a full-screen layer per arriving card is the one
+            // way this could have cost real time on a Deck.
+            let fading = ent.fade < 1.0;
+            if fading {
+                canvas.save_layer_alpha_f(None, ent.fade as f32);
+            }
             match self.art.get(&game.id) {
                 Some(img) => {
                     // Cover-fit: center-crop the source to the card's 2:3.
@@ -566,6 +633,9 @@ impl LibraryScreen {
                         None,
                     ),
                 );
+            }
+            if fading {
+                canvas.restore(); // the entrance layer
             }
             canvas.restore();
         }

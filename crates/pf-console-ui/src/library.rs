@@ -30,6 +30,13 @@ pub const PERSPECTIVE: f64 = 800.0;
 pub const RECEDE_DIM: f64 = 0.30;
 /// Boundary recoil: a refused move deflects the strip this many px against the push.
 pub const BUMP_PX: f64 = 16.0;
+/// Mount entrance (see [`crate::anim::Entrance`]): a card arrives at this scale, this many
+/// design units below its berth, and — where the surface can turn a card at all — this many
+/// degrees away from the viewer. Shared by the home carousel and the library coverflow so
+/// the two read as one console arriving, not two widgets each with its own idea.
+pub const ENTER_SCALE: f64 = 0.74;
+pub const ENTER_RISE: f64 = 34.0;
+pub const ENTER_TURN_DEG: f64 = 62.0;
 /// L1/R1 jump distance.
 pub const JUMP: i32 = 5;
 

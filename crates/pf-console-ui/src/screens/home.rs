@@ -5,9 +5,11 @@
 //! chases it, and the focus pop (scale/brightness/fade) reads off the LIVE sprung
 //! distance so the look always matches the strip mid-motion.
 
-use crate::anim::Spring;
+use crate::anim::{entrances, Entrance, EntranceAt, Spring};
 use crate::glyphs::{Hint, HintKey};
-use crate::library::{step_cursor, StepResult, BUMP_C, BUMP_K, BUMP_PX, SPRING_C, SPRING_K};
+use crate::library::{
+    step_cursor, StepResult, BUMP_C, BUMP_K, BUMP_PX, ENTER_RISE, ENTER_SCALE, SPRING_C, SPRING_K,
+};
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox, Screen};
@@ -34,6 +36,11 @@ pub(crate) struct HomeScreen {
     /// carousel culled. Scaled to match: side tiles draw at 0.88, and a press near their
     /// edge would otherwise pick a neighbour.
     geom: Vec<Rect>,
+    /// The mount entrance, playing out. `None` before the first frame (the shell clock
+    /// isn't in scope until then) and again once it has finished, so the steady state pays
+    /// nothing at all for it; [`Self::entrance_armed`] is what stops it re-arming.
+    entrance: Option<Entrance>,
+    entrance_armed: bool,
 }
 
 impl HomeScreen {
@@ -44,6 +51,8 @@ impl HomeScreen {
             bump: Spring::rest(0.0),
             keys: Vec::new(),
             geom: Vec::new(),
+            entrance: None,
+            entrance_armed: false,
         }
     }
 
@@ -253,6 +262,20 @@ impl HomeScreen {
         if crate::theme::reduce_motion() {
             self.bump = Spring::rest(0.0);
         }
+        // Arm the mount entrance on the first frame — the constructor has no clock, and
+        // "first frame after a push" is the same moment. Anchored on the CURSOR, so a
+        // restored selection assembles around the eye rather than sweeping in from an end.
+        if !self.entrance_armed {
+            self.entrance_armed = true;
+            self.entrance = Some(Entrance::new(
+                entrances::CARDS,
+                self.cursor.max(0) as usize,
+                ctx.t,
+            ));
+        }
+        if self.entrance.is_some_and(|e| e.done(ctx.t)) {
+            self.entrance = None;
+        }
 
         let w = f64::from(rect.width());
         let tile_w = (TILE_W * k).min(w * 0.84);
@@ -272,15 +295,25 @@ impl HomeScreen {
                 continue;
             }
             let f = 1.0 - d.abs().min(1.0); // 1 at focus → 0 one slot out
-            let scale = 0.88 + 0.12 * f;
-            let alpha = 0.78 + 0.22 * f;
+                                            // The entrance folds into the transform and the layer alpha this tile already
+                                            // applies — no extra pass, and once it's over the arithmetic is `* 1.0`.
+            let ent = self
+                .entrance
+                .map_or(EntranceAt::SETTLED, |e| e.at(i, ctx.t));
+            let arrive = ENTER_SCALE + (1.0 - ENTER_SCALE) * ent.travel;
+            let scale = (0.88 + 0.12 * f) * arrive;
+            let alpha = (0.78 + 0.22 * f) * ent.fade;
             let cx = cx0 + d * pitch;
+            let cy = cy + (1.0 - ent.travel) * ENTER_RISE * k;
             let tile = Rect::from_xywh(
                 (cx - tile_w / 2.0) as f32,
                 (cy - tile_h / 2.0) as f32,
                 tile_w as f32,
                 tile_h as f32,
             );
+            // Hit boxes track the DRAWN geometry, entrance included: the tile is off its
+            // berth by up to 34 dp while arriving, and a press in that second must land on
+            // the card the eye sees, not on where it is about to be.
             self.geom[i] = Rect::from_xywh(
                 (cx - tile_w * scale / 2.0) as f32,
                 (cy - tile_h * scale / 2.0) as f32,

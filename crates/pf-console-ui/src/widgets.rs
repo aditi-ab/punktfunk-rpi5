@@ -4,7 +4,7 @@
 //! springs and scroll, the SCREEN owns the domain (row content and what an activation
 //! means), and every frame the screen hands the widget fresh row specs.
 
-use crate::anim::{approach, springs, Spring, TRAY_C, TRAY_K};
+use crate::anim::{approach, entrances, springs, Entrance, EntranceAt, Spring, TRAY_C, TRAY_K};
 use crate::library::{BUMP_C, BUMP_K};
 use crate::pointer::{Pointer, PointerKind};
 use crate::theme::{accent, fg, Fonts, PanelStroke, W};
@@ -88,6 +88,10 @@ const SLIP_DP: f64 = 14.0;
 const SLIP_MAX: f64 = 22.0;
 /// The confirm dip's floor — the visual sibling of the haptic that already fires.
 const PRESS_DIP: f64 = 0.97;
+/// How far a row rises into place on mount. A twelfth of the carousel's travel: same
+/// language, but a settings list that fans open like a shelf of box art is a settings list
+/// showing off.
+const ROW_RISE: f64 = 12.0;
 
 /// The focus list: authoritative cursor, spring recoil at the ends, a scroll offset
 /// that chases the focused row, and a per-row focus amount for the scale/tint ease.
@@ -121,6 +125,13 @@ pub(crate) struct MenuList {
     /// Each row's value string as last drawn — the "before" half of the crossfade, and how
     /// the list detects that an adjust actually landed.
     shown: Vec<String>,
+    /// The mount entrance and the clock it runs on. Deliberately NOT replayed on a tab
+    /// switch: `jump_to` already seats everything instantly (chasing through rows that no
+    /// longer exist reads as a glitch), and re-fanning the rows on every L1/R1 would turn a
+    /// skim through the sections into a flicker.
+    entrance: Option<Entrance>,
+    entrance_armed: bool,
+    age: f64,
     /// Next render, seat the scroll and the focus ease instantly instead of chasing — see
     /// [`MenuList::jump_to`].
     snap: bool,
@@ -143,6 +154,9 @@ impl MenuList {
             slip_prev: None,
             step_dir: 0,
             shown: Vec::new(),
+            entrance: None,
+            entrance_armed: false,
+            age: 0.0,
             snap: true,
             geom: Vec::new(),
         }
@@ -247,6 +261,16 @@ impl MenuList {
         active: bool,
     ) {
         let reduce = crate::theme::reduce_motion();
+        // The list keeps its own clock: `render` is handed `dt` but never the shell's `t`,
+        // and a per-MOUNT animation wants a per-mount clock anyway.
+        self.age += dt;
+        if !self.entrance_armed {
+            self.entrance_armed = true;
+            self.entrance = Some(Entrance::new(entrances::ROWS, self.cursor, self.age));
+        }
+        if self.entrance.is_some_and(|e| e.done(self.age)) {
+            self.entrance = None;
+        }
         if self.snap {
             // A replaced row set has no shared history with the old one — start every row's
             // focus ease from scratch so the new cursor is simply THERE. The slip goes with
@@ -357,6 +381,12 @@ impl MenuList {
             {
                 continue;
             }
+            // Culled first, then the entrance: an off-screen row costs nothing to not
+            // animate, and the rise is far smaller than the 8 dp cull margin either way.
+            let ent = self
+                .entrance
+                .map_or(EntranceAt::SETTLED, |e| e.at(i, self.age));
+            let top = top + (1.0 - ent.travel) * ROW_RISE * k;
             if let Some(header) = row.header {
                 fonts.draw_tracked(
                     canvas,
@@ -384,6 +414,15 @@ impl MenuList {
             canvas.translate((cx as f32, cy as f32));
             canvas.scale((scale as f32, scale as f32));
             canvas.translate((-cx as f32, -cy as f32));
+            // One layer per row, only while it is still arriving — a row is a panel plus
+            // two text runs, so a whole-row fade genuinely needs one. Bounded to the row's
+            // own rect so it never becomes a full-screen pass.
+            let fading = ent.fade < 1.0;
+            if fading {
+                let bounds =
+                    Rect::from_xywh(x0 as f32, top as f32, row_w as f32, (ROW_H * k) as f32);
+                canvas.save_layer_alpha_f(bounds, ent.fade as f32);
+            }
             let r = Rect::from_xywh(x0 as f32, top as f32, row_w as f32, (ROW_H * k) as f32);
             // The untransformed rect: the focus scale is a 2 % breath about the centre, far
             // inside the slop a finger brings, and clicking must not depend on the ease.
@@ -491,6 +530,9 @@ impl MenuList {
                     chevron(canvas, vx - 11.0 * k, cy, 4.0 * k, true, alpha);
                     chevron(canvas, x0 + row_w - 16.0 * k, cy, 4.0 * k, false, alpha);
                 }
+            }
+            if fading {
+                canvas.restore(); // the entrance layer
             }
             canvas.restore();
         }
@@ -1246,6 +1288,33 @@ mod tests {
         // The focus channel still ARRIVES — reduced motion is not "unfocused".
         assert_eq!(list.focus_pop[0].pos, 1.0);
         crate::theme::set_reduce_motion(false);
+    }
+
+    /// The mount entrance arms once, retires when it is over (so the steady state pays
+    /// nothing for it at all), and is NOT replayed by a tab switch — re-fanning the rows on
+    /// every L1/R1 would turn a skim through the sections into a flicker.
+    #[test]
+    fn menu_list_entrance_plays_once_and_retires() {
+        let fonts = crate::theme::build_fonts().unwrap();
+        let mut surface = skia_safe::surfaces::raster_n32_premul((900, 600)).unwrap();
+        let rect = Rect::from_xywh(0.0, 0.0, 900.0, 600.0);
+        let dt = 1.0 / 60.0;
+        let rows: Vec<RowSpec> = (0..6)
+            .map(|i| RowSpec::action(format!("Row {i}"), true))
+            .collect();
+        let mut list = MenuList::new();
+
+        list.render(surface.canvas(), rect, &rows, &fonts, 1.0, dt, true);
+        assert!(list.entrance.is_some(), "armed on the first frame");
+
+        for _ in 0..90 {
+            list.render(surface.canvas(), rect, &rows, &fonts, 1.0, dt, true);
+        }
+        assert!(list.entrance.is_none(), "retired once it played out");
+
+        list.jump_to(3);
+        list.render(surface.canvas(), rect, &rows, &fonts, 1.0, dt, true);
+        assert!(list.entrance.is_none(), "a tab switch must not replay it");
     }
 
     #[test]

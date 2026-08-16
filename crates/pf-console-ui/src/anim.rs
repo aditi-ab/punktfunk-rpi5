@@ -112,6 +112,124 @@ impl Spring {
 pub(crate) const TRAY_K: f64 = 385.0;
 pub(crate) const TRAY_C: f64 = 33.7;
 
+// --- Entrance choreography ------------------------------------------------------------
+
+/// Ease-out-back: crosses 1.0 near the end and settles back onto it, so an arriving card
+/// reads as THROWN into place rather than slid. `c1` is 1.2 rather than the CSS-standard
+/// 1.70158 — at full strength the overshoot reads as a bounce, which is a different (and
+/// sillier) gesture.
+pub(crate) fn ease_out_back(t: f64) -> f64 {
+    const C1: f64 = 1.2;
+    const C3: f64 = C1 + 1.0;
+    let u = t.clamp(0.0, 1.0) - 1.0;
+    1.0 + C3 * u * u * u + C1 * u * u
+}
+
+/// The share of an item's window spent fading in. Short on purpose: the card is solid
+/// well before it stops moving, so what you read is the motion and not a dissolve.
+const FADE_SHARE: f64 = 0.34;
+
+/// How a staggered entrance is shaped.
+#[derive(Clone, Copy)]
+pub(crate) struct EntranceSpec {
+    /// How long ONE item takes to arrive.
+    pub window: f64,
+    /// Delay added per step of distance from the anchor.
+    pub stagger: f64,
+    /// Ceiling on that delay. Without it a 400-title shelf would still be arriving a
+    /// minute later; with it, everything past ~6 items away starts together.
+    pub cap: f64,
+}
+
+pub(crate) mod entrances {
+    use super::EntranceSpec;
+
+    /// Carousel and coverflow cards — the loud one, and the reason this exists.
+    pub(crate) const CARDS: EntranceSpec = EntranceSpec {
+        window: 0.6,
+        stagger: 0.07,
+        cap: 0.42,
+    };
+    /// Menu rows. Same language, deliberately quieter: a settings list that fans open like
+    /// a shelf of box art is a settings list showing off.
+    pub(crate) const ROWS: EntranceSpec = EntranceSpec {
+        window: 0.42,
+        stagger: 0.03,
+        cap: 0.24,
+    };
+}
+
+/// One item's place in an entrance.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct EntranceAt {
+    /// 0 → 1 travel on [`ease_out_back`]. The SCREEN decides what travels (a card's
+    /// scale, its Y-turn, a row's rise) — this only says how far along it is.
+    pub travel: f64,
+    /// 0 → 1 opacity.
+    pub fade: f64,
+}
+
+impl EntranceAt {
+    /// At rest and fully opaque — what every item reads once the entrance is over.
+    pub(crate) const SETTLED: EntranceAt = EntranceAt {
+        travel: 1.0,
+        fade: 1.0,
+    };
+}
+
+/// The staggered card entrance, as a pure function of the shell clock: a screen holds ONE
+/// of these and asks it per item, so there is no per-card state to keep in step with a
+/// list that churns under discovery.
+///
+/// Armed once per screen MOUNT (the first frame after a push), not per frame-loop — the
+/// desktop equivalent of arming on `onAppear`.
+#[derive(Clone, Copy)]
+pub(crate) struct Entrance {
+    spec: EntranceSpec,
+    anchor: usize,
+    t0: f64,
+    /// Snapshotted when the entrance is armed rather than read per item, so one entrance
+    /// plays one way even if the setting is stepped while it runs.
+    reduced: bool,
+}
+
+impl Entrance {
+    /// Arm at `t0`, fanning out from `anchor` — which callers pass as the CURSOR, so a
+    /// restored selection assembles around the eye instead of sweeping in from a corner.
+    pub(crate) fn new(spec: EntranceSpec, anchor: usize, t0: f64) -> Entrance {
+        Entrance {
+            spec,
+            anchor,
+            t0,
+            reduced: crate::theme::reduce_motion(),
+        }
+    }
+
+    pub(crate) fn at(&self, i: usize, t: f64) -> EntranceAt {
+        let elapsed = t - self.t0;
+        if self.reduced {
+            // A plain crossfade: no travel, no stagger, everything together.
+            return EntranceAt {
+                travel: 1.0,
+                fade: (elapsed / self.spec.window).clamp(0.0, 1.0),
+            };
+        }
+        let delay = (self.anchor.abs_diff(i) as f64 * self.spec.stagger).min(self.spec.cap);
+        let w = ((elapsed - delay) / self.spec.window).clamp(0.0, 1.0);
+        EntranceAt {
+            travel: ease_out_back(w),
+            fade: ease_out_cubic(w / FADE_SHARE),
+        }
+    }
+
+    /// Has every item landed? The farthest one starts at `cap` and takes `window`, so the
+    /// whole thing is over at their sum whatever `len` is — which is why callers can drop
+    /// the entrance entirely (and stop paying for its transforms) without counting items.
+    pub(crate) fn done(&self, t: f64) -> bool {
+        t - self.t0 >= self.spec.cap + self.spec.window
+    }
+}
+
 /// A clamped 0→1 timer for fire-and-forget choreography. `advance` returns the RAW
 /// progress — callers apply their easing so one Progress can drive several curves.
 #[derive(Clone, Copy)]
@@ -198,6 +316,82 @@ mod tests {
             (c - TRAY_C).abs() / TRAY_C < 0.003,
             "c: spec says {c}, TRAY_C is {TRAY_C}"
         );
+    }
+
+    /// The entrance envelope's four load-bearing properties. Asserted on FADE rather than
+    /// travel wherever "further along" is the question: travel rides an ease-out-BACK, so
+    /// it crosses 1.0 and comes back, and a card at 80 % of its window can legitimately be
+    /// further displaced than one that has already landed. Fade is the monotone channel.
+    #[test]
+    fn entrance_envelope() {
+        let e = Entrance::new(entrances::CARDS, 5, 0.0);
+
+        // The anchor leads. It is the cursor, so the strip assembles around the eye.
+        for t in [0.05, 0.2, 0.4, 0.7, 1.1] {
+            let anchor = e.at(5, t).fade;
+            for i in 0..14 {
+                assert!(
+                    e.at(i, t).fade <= anchor + 1e-9,
+                    "item {i} beat the anchor at t={t}"
+                );
+            }
+            // …and symmetric neighbours arrive together.
+            assert_eq!(e.at(3, t), e.at(7, t));
+        }
+
+        // The cap holds: past cap/stagger = 6 steps out, everything starts at once. This is
+        // what keeps a 400-title shelf from still arriving a minute later.
+        assert_eq!(e.at(5 + 7, 0.3), e.at(5 + 250, 0.3));
+
+        // Monotone once started, and never outside 0..=1.
+        let mut last = 0.0;
+        for step in 0..=120 {
+            let at = e.at(9, f64::from(step) * 0.01);
+            assert!(at.fade >= last - 1e-9, "fade went backwards at step {step}");
+            assert!((0.0..=1.0).contains(&at.fade));
+            last = at.fade;
+        }
+
+        // Identity at the end — the whole thing is over at cap + window, whatever `len` is,
+        // which is what lets a screen drop the entrance instead of counting items.
+        let over = entrances::CARDS.cap + entrances::CARDS.window;
+        assert!(e.done(over));
+        assert!(!e.done(over - 0.01));
+        for i in [5, 9, 400] {
+            assert_eq!(e.at(i, over), EntranceAt::SETTLED, "item {i} never landed");
+        }
+    }
+
+    /// Ease-out-back must overshoot — that is the difference between a card being thrown
+    /// into place and slid there — and must still land exactly on 1.0.
+    #[test]
+    fn ease_out_back_overshoots_then_lands() {
+        // To a tolerance at 0, not exactly: the polynomial is `1 − 2.2 + 1.2`, which is
+        // zero in real arithmetic and −2.2e−16 in f64. The contract is "starts where the
+        // card starts", and a fifth of a femto-unit is that.
+        assert!(ease_out_back(0.0).abs() < 1e-12);
+        assert_eq!(ease_out_back(1.0), 1.0);
+        assert_eq!(ease_out_back(2.0), 1.0, "clamped");
+        let peak = (0..=100)
+            .map(|i| ease_out_back(f64::from(i) / 100.0))
+            .fold(f64::MIN, f64::max);
+        assert!(peak > 1.0, "no overshoot at all: {peak}");
+        assert!(peak < 1.12, "overshoot reads as a bounce: {peak}");
+    }
+
+    /// Reduced motion turns the entrance into a plain crossfade: no travel, no stagger.
+    /// Snapshotted at arm time, so one entrance plays one way even if the setting moves.
+    #[test]
+    fn entrance_under_reduced_motion_is_a_staggerless_crossfade() {
+        crate::theme::set_reduce_motion(true);
+        let e = Entrance::new(entrances::CARDS, 5, 0.0);
+        crate::theme::set_reduce_motion(false);
+        for t in [0.0, 0.1, 0.3, 0.6] {
+            let a = e.at(5, t);
+            assert_eq!(a.travel, 1.0, "nothing travels");
+            assert_eq!(a, e.at(200, t), "and nothing staggers");
+        }
+        assert_eq!(e.at(0, 0.6), EntranceAt::SETTLED);
     }
 
     /// Peak of a unit step as a fraction over the target — 0.0 when the spring never
