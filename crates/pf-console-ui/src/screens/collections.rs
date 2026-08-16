@@ -20,10 +20,10 @@ use crate::library::{
 use crate::model::HostRow;
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{Ctx, Outbox, Screen};
-use crate::theme::{accent, fg, Fonts, PanelStroke, W};
+use crate::theme::{accent, art_sampling, fg, fill, Fonts, PanelStroke, W};
 use crate::widgets::TabStrip;
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
-use skia_safe::{Canvas, Color4f, Image, Paint, RRect, Rect};
+use skia_safe::{Canvas, Color4f, Image, RRect, Rect};
 use std::collections::HashMap;
 
 const TILE_W: f64 = 300.0;
@@ -304,7 +304,7 @@ impl CollectionsScreen {
             canvas.scale((scale as f32, scale as f32));
             canvas.translate((-cxx as f32, -cyy as f32));
             let recede = 1.0 - f;
-            let mut lp = Paint::default();
+            let mut lp = crate::theme::layer();
             lp.set_alpha_f(alpha as f32);
             if recede > 0.001 {
                 lp.set_color_filter(skia_safe::color_filters::matrix_row_major(
@@ -367,7 +367,7 @@ impl CollectionsScreen {
             let badge = Rect::from_xywh(l as f32, t as f32, thumb_w as f32, thumb_h as f32);
             canvas.draw_rrect(
                 RRect::new_rect_xy(badge, (10.0 * k) as f32, (10.0 * k) as f32),
-                &Paint::new(Color4f::new(0.118, 0.118, 0.145, 1.0), None),
+                &fill(Color4f::new(0.118, 0.118, 0.145, 1.0)),
             );
             let mono = initials(&g.label);
             let size = thumb_h * 0.3;
@@ -380,7 +380,7 @@ impl CollectionsScreen {
                     badge.center_y() + (size * 0.36) as f32,
                 ),
                 &font,
-                &Paint::new(fg(0.45), None),
+                &fill(fg(0.45)),
             );
         } else {
             for (n, img) in have.iter().enumerate() {
@@ -401,11 +401,12 @@ impl CollectionsScreen {
                     let sh = iw / aspect;
                     Rect::from_xywh(0.0, (ih - sh) / 2.0, iw, sh)
                 };
-                canvas.draw_image_rect(
+                canvas.draw_image_rect_with_sampling_options(
                     *img,
                     Some((&src, skia_safe::canvas::SrcRectConstraint::Fast)),
                     cell,
-                    &Paint::default(),
+                    art_sampling(),
+                    &fill(fg(1.0)),
                 );
                 canvas.restore();
             }

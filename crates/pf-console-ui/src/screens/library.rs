@@ -14,9 +14,9 @@ use crate::library::{
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox, Screen};
-use crate::theme::{accent, fg, Fonts, W};
+use crate::theme::{accent, art_sampling, fg, fill, Fonts, W};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
-use skia_safe::{Canvas, Color4f, Data, Image, Paint, Point, RRect, Rect, M44};
+use skia_safe::{Canvas, Color4f, Data, Image, Point, RRect, Rect, M44};
 use std::collections::HashMap;
 
 /// How wide a margin the grid keeps at each side of the field.
@@ -109,7 +109,7 @@ fn draw_skeleton(canvas: &Canvas, rect: Rect, k: f64, t: f64, view: LibraryView,
     for cell in &cells {
         canvas.draw_rrect(
             RRect::new_rect_xy(*cell, (14.0 * k) as f32, (14.0 * k) as f32),
-            &Paint::new(fg(0.06), None),
+            &fill(fg(0.06)),
         );
     }
     // The sheen: a narrow bright band travelling left to right on a 1.6 s cycle.
@@ -120,7 +120,7 @@ fn draw_skeleton(canvas: &Canvas, rect: Rect, k: f64, t: f64, view: LibraryView,
     };
     let span = w * 0.45;
     let head = f64::from(rect.left) - span + (w + 2.0 * span) * phase;
-    let mut sheen = Paint::default();
+    let mut sheen = crate::theme::shaded();
     let stops = [fg(0.0), fg(0.09), fg(0.0)];
     sheen.set_shader(skia_safe::gradient::shaders::linear_gradient(
         (
@@ -164,7 +164,7 @@ fn draw_poster_placeholder(
         Some(g) if g.launcher => Color4f::new(0.153, 0.137, 0.267, 1.0),
         _ => Color4f::new(0.118, 0.118, 0.145, 1.0),
     };
-    canvas.draw_rect(rect, &Paint::new(face, None));
+    canvas.draw_rect(rect, &fill(face));
     let Some(game) = game else { return };
     // The launcher's brand mark IS the poster when we ship one for it. Inset to ~44 % of
     // the card so it reads as a mark on a face rather than a cropped cover; `launcher_mark`
@@ -185,7 +185,7 @@ fn draw_poster_placeholder(
         })
         .flatten();
     if let Some(path) = mark {
-        canvas.draw_path(&path, &Paint::new(fg(0.85), None));
+        canvas.draw_path(&path, &fill(fg(0.85)));
         return;
     }
     // Sized off the CARD rather than off `k`: the grid's cells are two-thirds the shelf's,
@@ -212,7 +212,7 @@ fn draw_poster_placeholder(
             rect.center_y() + (size * 0.36) as f32,
         ),
         &font,
-        &Paint::new(ink, None),
+        &fill(ink),
     );
 }
 
@@ -991,11 +991,12 @@ impl LibraryScreen {
                         let sh = iw / aspect;
                         Rect::from_xywh(0.0, (ih - sh) / 2.0, iw, sh)
                     };
-                    canvas.draw_image_rect(
+                    canvas.draw_image_rect_with_sampling_options(
                         img,
                         Some((&src, skia_safe::canvas::SrcRectConstraint::Fast)),
                         cell,
-                        &Paint::default(),
+                        art_sampling(),
+                        &fill(fg(1.0)),
                     );
                 }
                 None => draw_poster_placeholder(canvas, fonts, self.game(i), cell, k),
@@ -1117,7 +1118,7 @@ impl LibraryScreen {
             let fading = ent.fade < 1.0;
             let layered = fading || prox > 0.001;
             if layered {
-                let mut lp = Paint::default();
+                let mut lp = crate::theme::layer();
                 lp.set_alpha_f(ent.fade as f32);
                 if prox > 0.001 {
                     lp.set_color_filter(skia_safe::color_filters::matrix_row_major(
@@ -1140,11 +1141,12 @@ impl LibraryScreen {
                         let sh = iw / card_aspect;
                         Rect::from_xywh(0.0, (ih - sh) / 2.0, iw, sh)
                     };
-                    canvas.draw_image_rect(
+                    canvas.draw_image_rect_with_sampling_options(
                         img,
                         Some((&src, skia_safe::canvas::SrcRectConstraint::Fast)),
                         crect,
-                        &Paint::default(),
+                        art_sampling(),
+                        &fill(fg(1.0)),
                     );
                 }
                 None => draw_poster_placeholder(canvas, fonts, Some(game), crect, k),
@@ -1169,7 +1171,7 @@ impl LibraryScreen {
                         (bh / 2.0) as f32,
                         (bh / 2.0) as f32,
                     ),
-                    &Paint::new(pill, None),
+                    &fill(pill),
                 );
                 fonts.draw(
                     canvas,
@@ -1185,10 +1187,7 @@ impl LibraryScreen {
             if prox > 0.0 {
                 canvas.draw_rect(
                     crect,
-                    &Paint::new(
-                        Color4f::new(0.0, 0.0, 0.0, (prox * RECEDE_DIM) as f32),
-                        None,
-                    ),
+                    &fill(Color4f::new(0.0, 0.0, 0.0, (prox * RECEDE_DIM) as f32)),
                 );
             }
             if layered {

@@ -13,9 +13,9 @@ use crate::library::{
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox, Screen};
-use crate::theme::{accent, fg, Fonts, PanelStroke, ONLINE_GREEN, W};
+use crate::theme::{accent, fg, fill, stroke, Fonts, PanelStroke, ONLINE_GREEN, W};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
-use skia_safe::{Canvas, Color4f, MaskFilter, Paint, PathBuilder, Point, RRect, Rect};
+use skia_safe::{Canvas, Color4f, MaskFilter, PathBuilder, Point, RRect, Rect};
 
 const TILE_W: f64 = 340.0;
 const TILE_H: f64 = 224.0;
@@ -364,7 +364,7 @@ impl HomeScreen {
             // The layer carries the fade AND the colour recede: one matrix per card, built
             // and thrown away here, which is free next to the aurora behind it.
             let recede = 1.0 - f;
-            let mut lp = Paint::default();
+            let mut lp = crate::theme::layer();
             lp.set_alpha_f(alpha as f32);
             if recede > 0.001 {
                 lp.set_color_filter(skia_safe::color_filters::matrix_row_major(
@@ -398,7 +398,7 @@ impl HomeScreen {
                 let veil = (1.0 - f) as f32 * 0.12;
                 canvas.draw_rrect(
                     RRect::new_rect_xy(tile, (TILE_CORNER * k) as f32, (TILE_CORNER * k) as f32),
-                    &Paint::new(Color4f::new(0.0, 0.0, 0.0, veil), None),
+                    &fill(Color4f::new(0.0, 0.0, 0.0, veil)),
                 );
             }
             canvas.restore(); // layer
@@ -443,17 +443,19 @@ fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f6
     if h.online {
         let r = 4.5 * k;
         let center = Point::new((sx - r) as f32, (t + 9.0 * k) as f32);
-        let mut glow = Paint::new(
-            Color4f::new(ONLINE_GREEN.r, ONLINE_GREEN.g, ONLINE_GREEN.b, 0.7),
-            None,
-        );
+        let mut glow = fill(Color4f::new(
+            ONLINE_GREEN.r,
+            ONLINE_GREEN.g,
+            ONLINE_GREEN.b,
+            0.7,
+        ));
         glow.set_mask_filter(MaskFilter::blur(
             skia_safe::BlurStyle::Normal,
             (5.0 * k) as f32,
             None,
         ));
         canvas.draw_circle(center, r as f32, &glow);
-        canvas.draw_circle(center, r as f32, &Paint::new(ONLINE_GREEN, None));
+        canvas.draw_circle(center, r as f32, &fill(ONLINE_GREEN));
         sx -= 2.0 * r + 9.0 * k;
     }
     if h.paired {
@@ -575,22 +577,15 @@ fn draw_action_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64, kind: Ac
     let badge = Rect::from_xywh(l as f32, t as f32, (52.0 * k) as f32, (52.0 * k) as f32);
     canvas.draw_rrect(
         RRect::new_rect_xy(badge, (15.0 * k) as f32, (15.0 * k) as f32),
-        &Paint::new(accent(0.16), None),
+        &fill(accent(0.16)),
     );
-    let mut ring = Paint::new(accent(0.5), None);
-    ring.set_style(skia_safe::PaintStyle::Stroke);
-    ring.set_stroke_width(1.0);
-    ring.set_anti_alias(true);
     canvas.draw_rrect(
         RRect::new_rect_xy(badge, (15.0 * k) as f32, (15.0 * k) as f32),
-        &ring,
+        &stroke(accent(0.5), 1.0),
     );
     let (bcx, bcy) = (l + 26.0 * k, t + 26.0 * k);
-    let mut p = Paint::new(accent(1.0), None);
-    p.set_style(skia_safe::PaintStyle::Stroke);
-    p.set_stroke_width((3.0 * k) as f32);
+    let mut p = stroke(accent(1.0), (3.0 * k) as f32);
     p.set_stroke_cap(skia_safe::PaintCap::Round);
-    p.set_anti_alias(true);
     let r = 9.0 * k;
     match kind {
         ActionTile::AddHost => {
@@ -628,7 +623,7 @@ fn draw_action_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64, kind: Ac
             tip.line_to(((hx + head * 0.5) as f32, (hy - head * 1.1) as f32));
             tip.line_to(((hx + head * 0.2) as f32, (hy + head * 0.7) as f32));
             tip.close();
-            canvas.draw_path(&tip.detach(), &Paint::new(accent(1.0), None));
+            canvas.draw_path(&tip.detach(), &fill(accent(1.0)));
         }
     }
 
@@ -685,7 +680,7 @@ fn draw_badge(
     let badge = Rect::from_xywh(x as f32, y as f32, (52.0 * k) as f32, (52.0 * k) as f32);
     let rr = RRect::new_rect_xy(badge, (15.0 * k) as f32, (15.0 * k) as f32);
     if filled {
-        let mut p = Paint::default();
+        let mut p = crate::theme::shaded();
         let colors = [accent(1.0), accent(0.68)];
         p.set_shader(skia_safe::gradient::shaders::linear_gradient(
             (
@@ -704,12 +699,8 @@ fn draw_badge(
         ));
         canvas.draw_rrect(rr, &p);
     } else {
-        canvas.draw_rrect(rr, &Paint::new(accent(0.16), None));
-        let mut ring = Paint::new(accent(0.5), None);
-        ring.set_style(skia_safe::PaintStyle::Stroke);
-        ring.set_stroke_width(1.0);
-        ring.set_anti_alias(true);
-        canvas.draw_rrect(rr, &ring);
+        canvas.draw_rrect(rr, &fill(accent(0.16)));
+        canvas.draw_rrect(rr, &stroke(accent(0.5), 1.0));
     }
     let ink = if filled { fg(1.0) } else { accent(1.0) };
     // Inset to ~54 % of the badge so the mark reads as a mark ON a badge rather than a
@@ -723,7 +714,7 @@ fn draw_badge(
         side as f32,
     );
     if let Some(path) = crate::os_marks::os_mark(os, inner) {
-        canvas.draw_path(&path, &Paint::new(ink, None));
+        canvas.draw_path(&path, &fill(ink));
         return;
     }
     let letter: String = name
@@ -757,12 +748,9 @@ fn draw_lock(canvas: &Canvas, x: f64, y: f64, k: f64) {
             (2.0 * k) as f32,
             (2.0 * k) as f32,
         ),
-        &Paint::new(ink, None),
+        &fill(ink),
     );
-    let mut p = Paint::new(ink, None);
-    p.set_style(skia_safe::PaintStyle::Stroke);
-    p.set_stroke_width((1.6 * k) as f32);
-    p.set_anti_alias(true);
+    let p = stroke(ink, (1.6 * k) as f32);
     let mut shackle = PathBuilder::new();
     let (cx, r) = (x + body_w / 2.0, 3.2 * k);
     shackle.move_to(((cx - r) as f32, body_top as f32));

@@ -7,7 +7,7 @@
 use crate::anim::{approach, entrances, springs, Entrance, EntranceAt, Spring, TRAY_C, TRAY_K};
 use crate::library::{BUMP_C, BUMP_K};
 use crate::pointer::{Pointer, PointerKind};
-use crate::theme::{accent, fg, Fonts, PanelStroke, W};
+use crate::theme::{accent, fg, fill, stroke, Fonts, PanelStroke, W};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Paint, PathBuilder, RRect, Rect};
 
@@ -527,7 +527,7 @@ impl MenuList {
                             (2.0 * k) as f32,
                             (18.0 * k) as f32,
                         ),
-                        &Paint::new(accent(1.0), None),
+                        &fill(accent(1.0)),
                     );
                 }
                 if row.adjustable && f > 0.01 {
@@ -698,11 +698,8 @@ fn truncate_head(fonts: &Fonts, text: &str, w: W, size: f64, max_w: f64) -> Stri
 
 fn chevron(canvas: &Canvas, x: f64, cy: f64, r: f64, left: bool, alpha: f32) {
     let dir = if left { -1.0 } else { 1.0 };
-    let mut p = Paint::new(fg(alpha), None);
-    p.set_style(skia_safe::PaintStyle::Stroke);
-    p.set_stroke_width((1.8 * r / 4.0) as f32);
+    let mut p = stroke(fg(alpha), (1.8 * r / 4.0) as f32);
     p.set_stroke_cap(skia_safe::PaintCap::Round);
-    p.set_anti_alias(true);
     let mut path = PathBuilder::new();
     path.move_to(((x - dir * r / 2.0) as f32, (cy - r) as f32));
     path.line_to(((x + dir * r / 2.0) as f32, cy as f32));
@@ -927,7 +924,7 @@ impl Keyboard {
                 let focused = r == self.row && c == self.col;
                 let kr = Rect::from_xywh(x as f32, y as f32, key_w as f32, key_h as f32);
                 self.keys.push((kr, *key));
-                let fill = if focused {
+                let face = if focused {
                     let mut b = accent(1.0);
                     if self.key_flash > 0.02 {
                         // A just-typed key flashes brighter, then eases back.
@@ -945,7 +942,7 @@ impl Keyboard {
                 };
                 canvas.draw_rrect(
                     RRect::new_rect_xy(kr, (9.0 * k) as f32, (9.0 * k) as f32),
-                    &Paint::new(fill, None),
+                    &fill(face),
                 );
                 // The focused key is filled with the accent, so its letter needs ink that
                 // reads on THAT, not on the field.
@@ -995,13 +992,12 @@ impl Keyboard {
     }
 }
 
+/// A round-capped, round-joined stroke — the console's hand-drawn marks (chevrons, ticks,
+/// the pad silhouettes) all want those, so they get their own wrapper over `theme::stroke`.
 fn stroke_paint(ink: skia_safe::Color4f, width: f32) -> Paint {
-    let mut p = Paint::new(ink, None);
-    p.set_style(skia_safe::PaintStyle::Stroke);
-    p.set_stroke_width(width);
+    let mut p = stroke(ink, width);
     p.set_stroke_cap(skia_safe::PaintCap::Round);
     p.set_stroke_join(skia_safe::PaintJoin::Round);
-    p.set_anti_alias(true);
     p
 }
 

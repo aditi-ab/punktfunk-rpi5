@@ -14,6 +14,83 @@ use skia_safe::{
     RRect, Rect, TileMode, Typeface,
 };
 
+// --- Paint ----------------------------------------------------------------------------------
+
+/// A filled paint, ANTI-ALIASED. Build every fill in this crate here.
+///
+/// Skia's `SkPaint` defaults `fAntiAlias` to **false**, and `Paint::new(colour, None)` is that
+/// default constructor with a colour on it — so the natural, terse way to write a Skia draw call
+/// (`canvas.draw_rrect(rr, &Paint::new(c, None))`) silently produces HARD-STEPPED geometry. That
+/// is the wrong default for this crate twice over: the console draws almost nothing axis-aligned
+/// (round-rects, circles, arcs, D-pad and stick paths), and it is read from a couch on a 1280×800
+/// Deck panel, where a stair-stepped 16 px glyph circle reads as a visible octagon.
+///
+/// The bug this exists to prevent is specific and it already happened: paints that got MUTATED
+/// for some other reason (a stroke style, a width) collected a `set_anti_alias(true)` along the
+/// way, while every inline `&Paint::new(…)` argument did not. The console therefore shipped
+/// smooth 1 px rings drawn on top of jagged fills — which is worse-looking than no ring at all,
+/// because the smooth edge gives the eye a reference for how wrong the fill is.
+///
+/// `theme::fill`/[`stroke`]/[`layer`] are the only sanctioned constructors, and
+/// `shell::tests::paints_are_built_by_the_theme_constructors` fails the build if a bare
+/// `Paint::new`/`Paint::default` reappears anywhere outside this file.
+pub(crate) fn fill(color: Color4f) -> Paint {
+    let mut p = Paint::new(color, None);
+    p.set_anti_alias(true);
+    p
+}
+
+/// A stroking paint of `width` DEVICE pixels, anti-aliased. Callers scaling by `k` pass
+/// `width * k` — nothing here knows about design units.
+pub(crate) fn stroke(color: Color4f, width: f32) -> Paint {
+    let mut p = fill(color);
+    p.set_style(skia_safe::PaintStyle::Stroke);
+    p.set_stroke_width(width);
+    p
+}
+
+/// A paint whose colour comes from a SHADER — a gradient, or the aurora's runtime effect.
+/// Anti-aliased, and OPAQUE by construction, which is the whole point of it existing.
+///
+/// The colour channel is unused once a shader is attached, so the obvious thing is to build
+/// one of these from a transparent placeholder and let the shader supply everything. That is
+/// a trap: Skia modulates a shader's output by the PAINT'S ALPHA, so an alpha-0 placeholder
+/// draws nothing whatever the shader says. It is a silent, total failure — the element simply
+/// is not there — and it is invisible to a test that only asserts a frame renders without
+/// panicking. `Paint::default` happened to be opaque black and so never showed the problem;
+/// anything replacing it has to be deliberately opaque, so that is what this is.
+pub(crate) fn shaded() -> Paint {
+    fill(Color4f::new(0.0, 0.0, 0.0, 1.0))
+}
+
+/// [`shaded`]'s stroking twin — a gradient hairline, opaque so the gradient survives.
+pub(crate) fn shaded_stroke(width: f32) -> Paint {
+    let mut p = shaded();
+    p.set_style(skia_safe::PaintStyle::Stroke);
+    p.set_stroke_width(width);
+    p
+}
+
+/// The paint for a `save_layer` — it carries alpha and colour filters, and never any geometry
+/// of its own, so anti-aliasing has nothing to act on. Its own constructor so the AA guard (and
+/// a reader) can tell a compositing paint from a drawing one without reading the call site.
+pub(crate) fn layer() -> Paint {
+    Paint::default()
+}
+
+/// How the console samples bitmap art (poster/cover images, launcher icons).
+///
+/// `Canvas::draw_image_rect`'s default is `SamplingOptions::default()` — `FilterMode::Nearest`
+/// with `MipmapMode::None`, i.e. NO filtering at all. Every cover in the library is minified
+/// hard (a 600×900 poster into a ~180×270 Deck cell), and nearest-neighbour minification drops
+/// whole rows and columns of source pixels: box-art lettering breaks up, edges crawl as the
+/// shelf scrolls, and the result reads as "low resolution" no matter what the panel is. Linear
+/// with a linear mipmap chain is the fix — the mip level does the bulk of the reduction, so the
+/// filter is never asked to shrink by more than 2×, which is the one thing bilinear does well.
+pub(crate) fn art_sampling() -> skia_safe::SamplingOptions {
+    skia_safe::SamplingOptions::new(skia_safe::FilterMode::Linear, skia_safe::MipmapMode::Linear)
+}
+
 // --- Ink ----------------------------------------------------------------------------------
 
 /// The error/status red (the GTK client's #ff938a). Fixed: a warning must not change meaning
@@ -169,14 +246,14 @@ pub(crate) fn panel(
     k: f32,
 ) {
     let rr = RRect::new_rect_xy(rect, corner * k, corner * k);
-    canvas.draw_rrect(rr, &Paint::new(ink().glass, None));
+    canvas.draw_rrect(rr, &fill(ink().glass));
     if let Some(tint) = tint {
-        canvas.draw_rrect(rr, &Paint::new(tint, None));
+        canvas.draw_rrect(rr, &fill(tint));
     }
-    let mut sp = Paint::default();
-    sp.set_style(skia_safe::PaintStyle::Stroke);
-    sp.set_stroke_width(1.0);
-    sp.set_anti_alias(true);
+    // Opaque to start with: the Plain/Brand arms overwrite the colour outright, and the
+    // gradient arms attach a shader whose output this paint's alpha would otherwise scale
+    // away to nothing.
+    let mut sp = shaded_stroke(1.0);
     match stroke {
         PanelStroke::Plain(alpha) => {
             sp.set_color4f(fg(alpha), None);
@@ -272,10 +349,7 @@ const RECEDE_BRIGHTNESS: f64 = 0.24;
 /// instead of hiding it behind a default.
 pub(crate) fn panel_highlight(canvas: &Canvas, rect: Rect, corner: f32, k: f32) {
     let inset = rect.with_inset((0.5 * k, 0.5 * k));
-    let mut p = Paint::default();
-    p.set_style(skia_safe::PaintStyle::Stroke);
-    p.set_stroke_width(k.max(1.0));
-    p.set_anti_alias(true);
+    let mut p = shaded_stroke(k.max(1.0));
     let colors = [fg(0.10), fg(0.0)];
     p.set_shader(gradient::shaders::linear_gradient(
         (
@@ -299,7 +373,7 @@ pub(crate) fn focus_halo(canvas: &Canvas, rect: Rect, corner: f32, k: f32, f: f3
     if f <= 0.01 {
         return;
     }
-    let mut p = Paint::new(accent(0.28 * f), None);
+    let mut p = fill(accent(0.28 * f));
     p.set_mask_filter(MaskFilter::blur(
         skia_safe::BlurStyle::Normal,
         18.0 * k,
@@ -312,7 +386,7 @@ pub(crate) fn focus_halo(canvas: &Canvas, rect: Rect, corner: f32, k: f32, f: f3
 }
 
 pub(crate) fn drop_shadow(canvas: &Canvas, rect: Rect, corner: f32, k: f32, alpha: f32) {
-    let mut p = Paint::new(Color4f::new(0.0, 0.0, 0.0, alpha), None);
+    let mut p = fill(Color4f::new(0.0, 0.0, 0.0, alpha));
     p.set_mask_filter(MaskFilter::blur(
         skia_safe::BlurStyle::Normal,
         10.0 * k,
@@ -333,11 +407,8 @@ pub(crate) fn drop_shadow(canvas: &Canvas, rect: Rect, corner: f32, k: f32, alph
 /// The loading/connecting spinner: a rotating 270° arc driven by the shell clock.
 pub(crate) fn spinner(canvas: &Canvas, cx: f64, cy: f64, r: f64, t: f64) {
     let start = (t * 300.0) % 360.0;
-    let mut paint = Paint::new(fg(0.85), None);
-    paint.set_style(skia_safe::PaintStyle::Stroke);
-    paint.set_stroke_width((r / 5.0) as f32);
+    let mut paint = stroke(fg(0.85), (r / 5.0) as f32);
     paint.set_stroke_cap(skia_safe::PaintCap::Round);
-    paint.set_anti_alias(true);
     canvas.draw_arc(
         Rect::from_xywh(
             (cx - r) as f32,
@@ -445,7 +516,7 @@ impl Fonts {
             text,
             Point::new(x as f32, baseline as f32),
             &font,
-            &Paint::new(color, None),
+            &fill(color),
         );
         font.measure_str(text, None).0
     }
@@ -465,7 +536,7 @@ impl Fonts {
         color: Color4f,
     ) {
         let font = self.font(w, size);
-        let paint = Paint::new(color, None);
+        let paint = fill(color);
         let mut pen = x as f32;
         let mut buf = [0u8; 4];
         for ch in text.chars() {

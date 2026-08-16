@@ -19,7 +19,7 @@ use anyhow::{anyhow, Result};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse, PadInfo};
 use pf_client_core::trust;
 use pf_presenter::overlay::OverlayAction;
-use skia_safe::{Canvas, Color4f, Data, Paint, Rect, RuntimeEffect};
+use skia_safe::{Canvas, Color4f, Data, Rect, RuntimeEffect};
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -883,7 +883,7 @@ impl Shell {
         let bytes = unsafe { std::slice::from_raw_parts(uniforms.as_ptr().cast::<u8>(), 48) };
         match self.mesh.make_shader(Data::new_copy(bytes), &[], None) {
             Some(shader) => {
-                let mut paint = Paint::default();
+                let mut paint = crate::theme::shaded();
                 paint.set_shader(shader);
                 canvas.draw_rect(Rect::from_wh(w as f32, h as f32), &paint);
             }

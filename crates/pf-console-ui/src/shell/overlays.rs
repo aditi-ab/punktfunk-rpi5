@@ -2,15 +2,14 @@
 
 use crate::anim::{approach, springs};
 use crate::glyphs::{hint_bar, Hint, HintKey};
-use crate::theme::{fg, Fonts, PanelStroke, W};
-use skia_safe::{gradient, Canvas, Color4f, Paint, PathBuilder, Point, Rect, TileMode};
+use crate::theme::{fg, fill, Fonts, PanelStroke, W};
+use skia_safe::{gradient, Canvas, Color4f, PathBuilder, Point, Rect, TileMode};
 
 use super::{Shell, ToastMark, BOTTOM_BAND};
 
 /// The toast's leading mark, centred on `(cx, cy)` in a ~13 dp box.
 fn draw_toast_mark(canvas: &Canvas, mark: ToastMark, cx: f64, cy: f64, k: f64, ink: Color4f) {
-    let mut p = Paint::new(ink, None);
-    p.set_anti_alias(true);
+    let mut p = fill(ink);
     match mark {
         ToastMark::Dot => {
             canvas.draw_circle((cx as f32, cy as f32), (3.4 * k) as f32, &p);
@@ -172,7 +171,7 @@ impl Shell {
             let rect = Rect::from_xywh(bx as f32, by as f32, bw as f32, bh as f32);
             canvas.draw_rrect(
                 skia_safe::RRect::new_rect_xy(rect, (bh / 2.0) as f32, (bh / 2.0) as f32),
-                &Paint::new(crate::theme::shade(0.6), None),
+                &fill(crate::theme::shade(0.6)),
             );
             crate::theme::panel(
                 canvas,
@@ -192,7 +191,7 @@ impl Shell {
             );
             canvas.draw_rrect(
                 skia_safe::RRect::new_rect_xy(hair, (hair_w / 2.0) as f32, (hair_w / 2.0) as f32),
-                &Paint::new(tint, None),
+                &fill(tint),
             );
             draw_toast_mark(
                 canvas,
@@ -242,7 +241,7 @@ impl Shell {
         self.draw_aurora(canvas, w, h, t, 0.0);
         // A soft pool of shade under the centre seats the text against a bright field —
         // dark on a dark palette, light on a pale one, so it always separates.
-        let mut vignette = Paint::default();
+        let mut vignette = crate::theme::shaded();
         let shades = [crate::theme::shade(0.5), crate::theme::shade(0.0)];
         vignette.set_shader(gradient::shaders::radial_gradient(
             (

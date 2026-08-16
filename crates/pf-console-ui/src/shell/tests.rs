@@ -988,3 +988,161 @@ fn dump_console_screens() {
     s.session_failed("Connection timed out");
     dump(&mut s, 10, 8, "10-toast", true);
 }
+
+/// The console's geometry is ANTI-ALIASED — the defect this pins shipped in the overhaul and
+/// was only caught by looking at a Deck.
+///
+/// Skia defaults `SkPaint::fAntiAlias` to FALSE, so `Paint::new(colour, None)` — the terse and
+/// obvious way to write a draw call — produces hard-stepped edges. The console drew nearly
+/// everything that way: glass panels, the badge round-rects, the online pip, the D-pad and
+/// PlayStation glyph paths. Only paints that happened to be mutated for some other reason (a
+/// stroke style, a width) had picked up a `set_anti_alias(true)` along the way, which is why
+/// the console shipped smooth 1 px rings sitting on top of jagged fills.
+///
+/// Asserted on a SHAPE rather than on a screen: a full render is a poor witness here — one
+/// jagged corner is a few dozen pixels in 1.02 M, and no threshold that catches it survives an
+/// unrelated palette tweak. A lone circle on a blank field is unambiguous. With AA its boundary
+/// is a ring of PARTIAL coverage; without it every pixel is one of exactly two values.
+#[test]
+fn geometry_is_anti_aliased() {
+    let (w, h) = (64, 64);
+    let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
+    surface
+        .canvas()
+        .clear(skia_safe::Color4f::new(0.0, 0.0, 0.0, 1.0));
+    // Deliberately off the pixel grid: a circle centred on a half-pixel has an edge that
+    // cannot be represented exactly, which is when AA is the whole difference.
+    surface.canvas().draw_circle(
+        skia_safe::Point::new(31.5, 31.5),
+        20.3,
+        &crate::theme::fill(skia_safe::Color4f::new(1.0, 1.0, 1.0, 1.0)),
+    );
+
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    let info = skia_safe::ImageInfo::new_n32_premul((w, h), None);
+    assert!(
+        surface.read_pixels(&info, &mut pixels, (w * 4) as usize, (0, 0)),
+        "raster surface read-back"
+    );
+    // Red channel alone — the fill is white on black, so all three agree.
+    let partial = pixels
+        .chunks_exact(4)
+        .filter(|px| (8..248).contains(&px[0]))
+        .count();
+    assert!(
+        partial > 40,
+        "an anti-aliased circle of r≈20 has a boundary ring of partially covered pixels; found \
+         {partial}, which is what `Paint::new`'s aliased default looks like"
+    );
+}
+
+/// A shader-painted element actually PAINTS — the second trap in the same corner, and the one
+/// that cost a whole screenshot round.
+///
+/// Skia modulates a shader's output by the paint's ALPHA. `Paint::default` is opaque black, so
+/// the console's gradients and the aurora's runtime effect never noticed the rule existed; the
+/// moment those paints were rebuilt from a "the shader supplies the colour anyway" transparent
+/// placeholder, every one of them drew NOTHING. Not dimmer, not wrong-coloured — absent: the
+/// backdrop, the badge, the vignette and the skeleton sheen all vanished at once, and all 124
+/// tests still passed, because a test that only renders a frame cannot tell a missing layer
+/// from a dark one. `theme::shaded` is opaque by construction; this holds it to that.
+#[test]
+fn a_shaded_paint_is_opaque_enough_to_draw() {
+    let (w, h) = (32, 32);
+    let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
+    surface
+        .canvas()
+        .clear(skia_safe::Color4f::new(0.0, 0.0, 0.0, 1.0));
+    let mut p = crate::theme::shaded();
+    let stops = [
+        skia_safe::Color4f::new(1.0, 1.0, 1.0, 1.0),
+        skia_safe::Color4f::new(1.0, 1.0, 1.0, 1.0),
+    ];
+    p.set_shader(skia_safe::gradient::shaders::linear_gradient(
+        (
+            skia_safe::Point::new(0.0, 0.0),
+            skia_safe::Point::new(0.0, h as f32),
+        ),
+        &skia_safe::gradient::Gradient::new(
+            skia_safe::gradient::Colors::new_evenly_spaced(
+                &stops,
+                skia_safe::TileMode::Clamp,
+                None,
+            ),
+            skia_safe::gradient::Interpolation::default(),
+        ),
+        None,
+    ));
+    surface
+        .canvas()
+        .draw_rect(skia_safe::Rect::from_wh(w as f32, h as f32), &p);
+
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    let info = skia_safe::ImageInfo::new_n32_premul((w, h), None);
+    assert!(
+        surface.read_pixels(&info, &mut pixels, (w * 4) as usize, (0, 0)),
+        "raster surface read-back"
+    );
+    let lit = pixels.chunks_exact(4).filter(|px| px[0] > 200).count();
+    assert_eq!(
+        lit,
+        (w * h) as usize,
+        "an opaque white gradient over the whole surface should light every pixel; a paint \
+         whose own alpha is 0 scales the shader away and leaves the field black"
+    );
+}
+
+/// …and every paint in the crate is built by `theme::fill`/`stroke`/`layer`, so the assertion
+/// above keeps holding for code written after it.
+///
+/// A pixel test can only witness the shapes it happens to draw; this witnesses the CLASS. The
+/// trap is that the aliased spelling is the NATURAL one — `&Paint::new(c, None)` passed inline
+/// as an argument, no binding, no obvious place to hang a flag — so it reappears whenever a new
+/// draw call is written, in whichever file is being worked on that day. Reading the crate's own
+/// source is the only check that scales to that.
+#[test]
+fn paints_are_built_by_the_theme_constructors() {
+    // Split so the needles do not appear literally in this file — the scan reads its own
+    // source too, and a self-match is the first thing this test did.
+    let needles = [concat!("Paint", "::new("), concat!("Paint", "::default()")];
+    let mut offenders = Vec::new();
+    let mut stack = vec![std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src"
+    ))];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("the crate's own src is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            // theme.rs holds the sanctioned constructors, and is the one place the raw ones
+            // are allowed.
+            if path.file_name().is_some_and(|f| f == "theme.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("source is UTF-8");
+            for (n, line) in text.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") || code.starts_with('*') {
+                    continue;
+                }
+                if needles.iter().any(|needle| code.contains(needle)) {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    offenders.push(format!("{name}:{}: {code}", n + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these build a Skia paint directly, which means anti-aliasing is OFF on whatever they \
+         draw — use `theme::fill`, `theme::stroke`, or `theme::layer` for a `save_layer` \
+         paint:\n  {}",
+        offenders.join("\n  ")
+    );
+}

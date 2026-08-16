@@ -11,7 +11,7 @@ use crate::model::{ConsoleBus, ConsoleShared, HostRow};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::Screen;
 use crate::shell::{ConsoleOptions, Shell};
-use crate::theme::{match_first_family, Fonts};
+use crate::theme::{fill, match_first_family, Fonts};
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk as avk;
 use ash::vk::Handle as _;
@@ -22,7 +22,7 @@ use pf_presenter::overlay::{
 };
 use skia_safe::gpu::vk as skvk;
 use skia_safe::gpu::{self, DirectContext, SurfaceOrigin};
-use skia_safe::{Canvas, Color4f, Font, FontMgr, Paint, Point, RRect, Rect, Surface};
+use skia_safe::{Canvas, Color4f, Font, FontMgr, Point, RRect, Rect, Surface};
 use std::time::Instant;
 
 /// Skia's GPU resource budget — poster art plus a few screen layers; 64 MB fits
@@ -751,9 +751,9 @@ fn draw_osd_panel(canvas: &Canvas, base_font: &Font, text: &str, width: u32, sca
     let radius = base::OSD_RADIUS * scale;
     canvas.draw_rrect(
         RRect::new_rect_xy(panel, radius, radius),
-        &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.62), None),
+        &fill(Color4f::new(0.0, 0.0, 0.0, 0.62)),
     );
-    let text_paint = Paint::new(Color4f::new(1.0, 1.0, 1.0, 0.92), None);
+    let text_paint = fill(Color4f::new(1.0, 1.0, 1.0, 0.92));
     for (i, line) in lines.iter().enumerate() {
         canvas.draw_str(
             line,
@@ -789,12 +789,12 @@ fn draw_mic_muted_badge(canvas: &Canvas, base_font: &Font, width: u32, scale: f3
     let (x, y) = (width as f32 - w - margin, margin);
     canvas.draw_rrect(
         RRect::new_rect_xy(Rect::from_xywh(x, y, w, h), h / 2.0, h / 2.0),
-        &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.62), None),
+        &fill(Color4f::new(0.0, 0.0, 0.0, 0.62)),
     );
     canvas.draw_circle(
         Point::new(x + pad_x + dot_r, y + h / 2.0),
         dot_r,
-        &Paint::new(crate::theme::ERROR, None),
+        &fill(crate::theme::ERROR),
     );
     canvas.draw_str(
         LABEL,
@@ -803,7 +803,7 @@ fn draw_mic_muted_badge(canvas: &Canvas, base_font: &Font, width: u32, scale: f3
             y + pad_y - metrics.ascent,
         ),
         font,
-        &Paint::new(Color4f::new(1.0, 1.0, 1.0, 0.92), None),
+        &fill(Color4f::new(1.0, 1.0, 1.0, 0.92)),
     );
 }
 
@@ -839,13 +839,13 @@ fn draw_access_chip(
     let x = width as f32 - w - margin;
     canvas.draw_rrect(
         RRect::new_rect_xy(Rect::from_xywh(x, y, w, h), h / 2.0, h / 2.0),
-        &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.62), None),
+        &fill(Color4f::new(0.0, 0.0, 0.0, 0.62)),
     );
     canvas.draw_str(
         text,
         Point::new(x + pad_x, y + pad_y - metrics.ascent),
         font,
-        &Paint::new(Color4f::new(1.0, 1.0, 1.0, 0.92), None),
+        &fill(Color4f::new(1.0, 1.0, 1.0, 0.92)),
     );
 }
 
@@ -868,7 +868,7 @@ fn draw_resize_scrim(
     let (wf, hf) = (width as f32, height as f32);
     canvas.draw_rect(
         Rect::from_wh(wf, hf),
-        &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.55), None),
+        &fill(Color4f::new(0.0, 0.0, 0.0, 0.55)),
     );
     // Spinner slightly above center; the label sits below it.
     let (cx, cy) = (f64::from(width) / 2.0, f64::from(height) / 2.0);
@@ -881,7 +881,7 @@ fn draw_resize_scrim(
         label,
         Point::new((wf - tw) / 2.0, (cy + r * 0.9) as f32 - metrics.ascent),
         font,
-        &Paint::new(Color4f::new(1.0, 1.0, 1.0, 0.9), None),
+        &fill(Color4f::new(1.0, 1.0, 1.0, 0.9)),
     );
 }
 
@@ -914,12 +914,12 @@ fn draw_hint_pill(
     let y = height as f32 - h - base::PILL_BOTTOM * scale;
     canvas.draw_rrect(
         RRect::new_rect_xy(Rect::from_xywh(x, y, w, h), h / 2.0, h / 2.0),
-        &Paint::new(Color4f::new(0.0, 0.0, 0.0, 0.62 * alpha), None),
+        &fill(Color4f::new(0.0, 0.0, 0.0, 0.62 * alpha)),
     );
     canvas.draw_str(
         text,
         Point::new(x + pad_x, y + pad_y - metrics.ascent),
         font,
-        &Paint::new(Color4f::new(1.0, 1.0, 1.0, 0.92 * alpha), None),
+        &fill(Color4f::new(1.0, 1.0, 1.0, 0.92 * alpha)),
     );
 }
