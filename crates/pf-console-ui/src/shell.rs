@@ -453,6 +453,39 @@ impl Shell {
                 }
             }
         }
+
+        self.collections_handover();
+    }
+
+    /// "Start in collections": a shelf that has just learned it holds more than one collection
+    /// stands aside for the collections screen.
+    ///
+    /// It lives here rather than in the screen because a screen cannot replace ITSELF — the
+    /// decision needs the library model and the settings, which the shelf has, but the swap
+    /// needs the stack, which only the shell has. The shelf answers the question and hands
+    /// back a screen; this puts it where the shelf was standing.
+    ///
+    /// Guarded on a settled transition. Mid-flight the stack's top is not yet what the user
+    /// is looking at, and swapping under a push the user has already reversed with B would
+    /// land them on the collections of a host they just backed out of.
+    fn collections_handover(&mut self) {
+        if !matches!(self.motion, Motion::None) {
+            return;
+        }
+        // Field borrows rather than clones: this runs every frame for the life of the shelf,
+        // and `Settings` is a struct of owned Strings. `stack` is borrowed mutably while
+        // `library` and `settings` are borrowed shared — disjoint fields, so the shelf can
+        // read both while it is itself being held.
+        let upgraded = match self.stack.last_mut() {
+            Some(Screen::Library(shelf)) => {
+                shelf.collections_upgrade(&self.library, &self.settings)
+            }
+            _ => None,
+        };
+        if let Some(screen) = upgraded {
+            let n = self.stack.len();
+            self.stack[n - 1] = Screen::Collections(screen);
+        }
     }
 
     fn start_connect(&mut self, intent: ConnectIntent) {
