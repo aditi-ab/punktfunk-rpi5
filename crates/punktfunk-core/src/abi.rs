@@ -691,15 +691,70 @@ pub struct PunktfunkConnection {
     last_cursor_shape: std::sync::Mutex<Option<crate::quic::CursorShape>>,
 }
 
-/// Lazily-initialized in-core Opus decode state. A coupled-1-stream multistream decoder is
-/// equivalent to a plain stereo decoder, so one [`opus::MSDecoder`] handles 2/6/8 channels.
+/// The session's resolved audio format, as the in-core decode path needs it.
+///
+/// Gathered into one value rather than threaded as four more parameters because the two decode
+/// entry points below take it whole, and because the four fields are only meaningful together: a
+/// rate without the codec cannot tell a 48 kHz PCM session from a 48 kHz Opus one.
+///
+/// Read fresh off the connection on every call, which is free and cannot drift: the format is
+/// resolved once at handshake and the host never changes it mid-session (the client's output
+/// device is open at a fixed format, so a change would mean a re-open).
+#[cfg(feature = "quic")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct AudioFormat {
+    /// [`crate::quic::AUDIO_CODEC_OPUS`] (`0xC9`) or [`crate::quic::AUDIO_CODEC_PCM`] (`0xD3`) —
+    /// what SELECTS the decoder below, and the only field that can.
+    codec: u8,
+    /// The resolved sample rate. 48 000 on every Opus session; 48 000 or 96 000 on the lossless
+    /// plane.
+    rate_hz: u32,
+    /// The resolved sample depth (16 or 24) — the stride `0xD3` payloads are unpacked at.
+    /// Meaningless on the Opus plane, which decodes to f32 regardless.
+    bits: u8,
+    /// The resolved channel count, already through [`crate::audio::normalize_channels`].
+    channels: u8,
+}
+
+#[cfg(feature = "quic")]
+impl AudioFormat {
+    fn of(c: &crate::client::NativeClient) -> AudioFormat {
+        AudioFormat {
+            codec: c.audio_codec,
+            // A zero rate is inexpressible off the wire — `Welcome::decode` folds both absence
+            // and a literal 0 to the legacy 48 kHz — but the buffer sizing below divides by
+            // 1000 and uses "buffer is non-empty" as its already-sized latch, so a 0 here would
+            // mean a zero-length buffer that re-sizes (and so reallocates) on every packet.
+            // That is the one invariant on this type that must not depend on a peer's honesty.
+            rate_hz: if c.audio_sample_rate_hz == 0 {
+                crate::audio::SAMPLE_RATE_HZ
+            } else {
+                c.audio_sample_rate_hz
+            },
+            bits: c.audio_bits,
+            channels: crate::audio::normalize_channels(c.audio_channels),
+        }
+    }
+
+    /// True when this session runs the lossless `0xD3` plane rather than Opus on `0xC9`.
+    fn is_pcm(&self) -> bool {
+        self.codec == crate::quic::AUDIO_CODEC_PCM
+    }
+}
+
+/// Lazily-initialized in-core decode state, for either audio plane.
+///
+/// On Opus (`0xC9`) a coupled-1-stream multistream decoder is equivalent to a plain stereo
+/// decoder, so one [`opus::MSDecoder`] handles 2/6/8 channels. On the lossless plane (`0xD3`)
+/// there is no decoder at all — [`crate::audio::pcm::to_f32`] unpacks the samples — and no
+/// libopus PLC either, which is why [`crate::audio::pcm::PcmConceal`] rides alongside.
 #[cfg(feature = "quic")]
 #[derive(Default)]
 struct AudioPcmState {
     decoder: Option<opus::MSDecoder>,
-    /// Interleaved f32 PCM, wire channel order. Pre-sized in `decode_packet` for the largest
-    /// legal Opus frame plus a full concealment run, so decode never reallocates (which would
-    /// dangle the pointer handed to the embedder).
+    /// Interleaved f32 PCM, wire channel order. Pre-sized ONCE by `ensure_buffer` for the largest
+    /// frame its plane can present plus a full concealment run, so decode never reallocates
+    /// (which would dangle the pointer handed to the embedder).
     pcm: Vec<f32>,
     /// Loss detector — the same seq-gap accounting the other clients run in their own decode
     /// loops (`pf-client-core`'s session pump, Android's native pump), here for the one decoder
@@ -717,13 +772,136 @@ struct AudioPcmState {
     /// later. The subtraction has to happen HERE — the gap tracker is on this side of the ABI, so
     /// the embedder driving the drought cannot see what it is about to be charged for.
     drought_frames: u32,
+    /// Concealment for the lossless plane, where libopus PLC does not exist and cannot: there is
+    /// nothing in a raw frame from which to synthesize its successor (`design/hi-res-audio.md`
+    /// §4.5). Unused on an Opus session, which keeps using the decoder's own PLC.
+    conceal_pcm: crate::audio::pcm::PcmConceal,
+    /// Staging for one `0xD3` frame — decoded into here, then COPIED into `pcm` at the right
+    /// offset. The indirection is what preserves the no-realloc invariant:
+    /// [`crate::audio::pcm::to_f32`] clears and reserves its output, either of which would move
+    /// `pcm` out from under the pointer the embedder is still holding, and it always writes from
+    /// index 0 — where a concealed frame may already be sitting.
+    scratch_pcm: Vec<f32>,
 }
 
 #[cfg(feature = "quic")]
 impl AudioPcmState {
-    /// Decode one arriving audio packet into `self.pcm`, synthesizing libopus packet-loss
-    /// concealment for any packets the sequence says went missing immediately before it — the
-    /// concealed frames land first, the real frame after, one contiguous interleaved buffer.
+    /// Size `pcm` once, from the negotiated format, and never again.
+    ///
+    /// ⚠ **The buffer must NEVER be reallocated after this.** The embedder is handed a raw
+    /// pointer INTO it by [`punktfunk_connection_next_audio_pcm`] and reads it until its next
+    /// call, so a later `Vec` growth would leave that pointer dangling — a use-after-free the
+    /// embedder cannot see coming and which would not reproduce on a machine whose allocator
+    /// happened to grow in place. Everything downstream therefore writes into a fixed-length
+    /// slice and CLAMPS to it rather than extending: `decode_float` is given a bounded
+    /// subslice, and the PCM path copies through `scratch_pcm`.
+    ///
+    /// "Already sized" is `!pcm.is_empty()`, which is why [`AudioFormat::of`] refuses to produce
+    /// a zero rate: a zero-length buffer would re-enter this function on every packet.
+    fn ensure_buffer(&mut self, fmt: AudioFormat) {
+        if !self.pcm.is_empty() {
+            return;
+        }
+        let ch = fmt.channels.max(1) as usize;
+        // Per-channel samples in the largest frame this plane can ever hand out. The two planes
+        // differ by 24×, so they are sized separately rather than both to the Opus worst case:
+        //
+        // - Opus: the largest legal frame is 120 ms (5760 samples/ch at 48 kHz).
+        // - `0xD3`: the longest rung of `FRAME_US_LADDER`, because the frame duration is chosen
+        //   from the path MTU at session start and the plane is never fragmented, so nothing
+        //   longer can arrive from a conforming host. (A non-conforming one is bounded anyway —
+        //   every copy into `pcm` below is clamped to what is left.)
+        let per_ch = if fmt.is_pcm() {
+            crate::audio::pcm::samples_per_frame(
+                fmt.rate_hz,
+                crate::audio::pcm::FRAME_US_LADDER[0],
+                1,
+            )
+        } else {
+            fmt.rate_hz as usize / 1000 * 120
+        };
+        // A gap can owe up to MAX_CONCEAL_PACKETS concealed frames of the same size in front of
+        // the real one, and they are handed out as one contiguous buffer.
+        self.pcm =
+            vec![0f32; (1 + crate::audio::MAX_CONCEAL_PACKETS as usize) * per_ch.max(1) * ch];
+    }
+
+    /// Copy `n` samples of `scratch_pcm` into `pcm` at `filled`, returning how many actually
+    /// landed. The clamp is load-bearing, not defensive tidiness: it is what makes an oversized
+    /// or malformed datagram a truncated frame instead of a buffer overrun or a reallocation.
+    fn stage_scratch(&mut self, filled: usize, n: usize) -> usize {
+        let n = n.min(self.scratch_pcm.len()).min(self.pcm.len() - filled);
+        self.pcm[filled..filled + n].copy_from_slice(&self.scratch_pcm[..n]);
+        n
+    }
+
+    /// The lossless (`0xD3`) half of [`decode_packet`](Self::decode_packet): unpack interleaved
+    /// LE samples, with [`crate::audio::pcm::PcmConceal`] standing in for the PLC a lossless
+    /// format cannot have. Shape-for-shape the Opus path — concealed frames first, the real one
+    /// after, one contiguous buffer, same return contract — so the ABI above needs no branch.
+    fn decode_pcm_packet(
+        &mut self,
+        data: &[u8],
+        seq: u32,
+        fmt: AudioFormat,
+    ) -> Result<usize, PunktfunkStatus> {
+        let ch = fmt.channels.max(1) as usize;
+        self.ensure_buffer(fmt);
+
+        // Same accounting as the Opus path, including the drought credit: whatever the embedder
+        // already covered while the wire was quiet comes off the top.
+        let missing = self
+            .gaps
+            .missing_before(seq)
+            .saturating_sub(std::mem::take(&mut self.drought_frames));
+        let mut filled = 0usize;
+        for _ in 0..missing {
+            if !self.conceal_pcm.conceal(&mut self.scratch_pcm) {
+                break; // nothing has arrived yet — nothing to build a repeat from
+            }
+            let n = self.scratch_pcm.len();
+            let staged = self.stage_scratch(filled, n);
+            filled += staged;
+            if staged < n {
+                break; // buffer full: stop rather than emit a torn frame
+            }
+        }
+
+        if data.is_empty() {
+            // No host emits an empty `0xD3` payload — PCM has no DTX — but a torn datagram can
+            // present as one, and it must NOT reach `PcmConceal::accept`: accepting an empty
+            // frame would clear the last good frame and leave the next loss with nothing to
+            // conceal from. Treated exactly like the Opus DTX marker: the slot is accounted (so
+            // it is never itself "concealed" later) and any concealment owed still goes out.
+            return Ok(filled);
+        }
+        match crate::audio::pcm::to_f32(data, fmt.bits, &mut self.scratch_pcm) {
+            Some(n) => {
+                let staged = self.stage_scratch(filled, n);
+                // The next loss is concealed from what the embedder actually HEARD — the staged
+                // frame, not the decoded one. They differ only for an oversized datagram no
+                // conforming host sends, and taking the staged length there keeps the
+                // concealment source bounded by the same fixed buffer as everything else.
+                self.conceal_pcm.accept(&self.scratch_pcm[..staged]);
+                self.frame_samples = staged / ch;
+                Ok(filled + staged)
+            }
+            // Not a whole number of samples at this depth — a truncated or hostile datagram.
+            // Same disposal as an undecodable Opus packet: hand out the concealment the gap
+            // before it earned rather than dropping that with the packet.
+            None if filled > 0 => Ok(filled),
+            None => Err(PunktfunkStatus::BadPacket),
+        }
+    }
+
+    /// Decode one arriving audio packet into `self.pcm`, synthesizing packet-loss concealment for
+    /// any packets the sequence says went missing immediately before it — the concealed frames
+    /// land first, the real frame after, one contiguous interleaved buffer.
+    ///
+    /// `fmt` selects the plane: Opus off `0xC9` (libopus, and libopus PLC for the gaps) or
+    /// lossless PCM off `0xD3` (a stride unpack, and [`crate::audio::pcm::PcmConceal`] for the
+    /// gaps — a lossless format has no PLC to borrow). The return contract is identical either
+    /// way, so the C surface above never branches on the plane.
     ///
     /// Returns the interleaved sample count now valid at the front of `pcm`; `Ok(0)` means
     /// nothing to hand out this call (a DTX silence marker with no loss before it). An empty
@@ -734,17 +912,24 @@ impl AudioPcmState {
         &mut self,
         data: &[u8],
         seq: u32,
-        channels: u8,
+        fmt: AudioFormat,
     ) -> Result<usize, PunktfunkStatus> {
+        if fmt.is_pcm() {
+            return self.decode_pcm_packet(data, seq, fmt);
+        }
+        let channels = fmt.channels;
         let ch = channels as usize;
         if self.decoder.is_none() {
             let layout = crate::audio::layout_for(channels, false);
-            match opus::MSDecoder::new(48_000, layout.streams, layout.coupled, layout.mapping) {
+            // The negotiated rate, not a constant. On this plane it is always 48 000 — libopus
+            // accepts only 8/12/16/24/48 kHz and rejects 96 000 outright, which is the entire
+            // reason `0xD3` exists — so passing it through costs nothing and makes libopus itself
+            // the validator: a host that claimed Opus at a rate libopus cannot open fails loudly
+            // here instead of quietly decoding at the wrong one.
+            match opus::MSDecoder::new(fmt.rate_hz, layout.streams, layout.coupled, layout.mapping)
+            {
                 Ok(d) => {
-                    // Largest legal Opus frame is 120 ms = 5760 samples/ch, and a gap can owe up
-                    // to MAX_CONCEAL_PACKETS concealed frames of the same size in front of it.
-                    self.pcm =
-                        vec![0f32; (1 + crate::audio::MAX_CONCEAL_PACKETS as usize) * 5760 * ch];
+                    self.ensure_buffer(fmt);
                     self.decoder = Some(d);
                 }
                 Err(_) => return Err(PunktfunkStatus::Unsupported),
@@ -795,10 +980,26 @@ impl AudioPcmState {
     /// (see [`punktfunk_connection_audio_plc`] for what asks for it and why).
     ///
     /// Returns the interleaved sample count now valid at the front of `pcm`, or `Ok(0)` when
-    /// nothing has decoded yet: libopus PLC extrapolates from the LAST decoded frame, so before
-    /// there is one there is neither state to extrapolate from nor a frame size to ask for.
-    fn conceal(&mut self, channels: u8) -> Result<usize, PunktfunkStatus> {
-        let ch = channels as usize;
+    /// nothing has decoded yet: both concealers extrapolate from the LAST decoded frame, so
+    /// before there is one there is neither state to extrapolate from nor a frame size to ask for.
+    fn conceal(&mut self, fmt: AudioFormat) -> Result<usize, PunktfunkStatus> {
+        if fmt.is_pcm() {
+            // `PcmConceal`, never libopus PLC. There is no decoder on this plane to ask, and even
+            // if one were built it would be extrapolating from nothing: a lossless frame carries
+            // no model of the signal, only the signal. `conceal` returns false before the first
+            // real frame — the same "nothing to hand out" the Opus arm reports below.
+            if !self.conceal_pcm.conceal(&mut self.scratch_pcm) {
+                return Ok(0);
+            }
+            let n = self.scratch_pcm.len();
+            let staged = self.stage_scratch(0, n);
+            if staged == 0 {
+                return Ok(0);
+            }
+            self.drought_frames = self.drought_frames.saturating_add(1);
+            return Ok(staged);
+        }
+        let ch = fmt.channels as usize;
         let plc = self.frame_samples * ch;
         if plc == 0 {
             return Ok(0);
@@ -1363,6 +1564,18 @@ pub const PUNKTFUNK_HOST_CAP_PEN: u8 = 0x10;
 /// declared capable via [`punktfunk_connection_set_pad_audio_caps`]. Set only when the client
 /// asked via [`PUNKTFUNK_CLIENT_CAP_PAD_AUDIO`]. (Mirrors `quic::HOST_CAP_PAD_AUDIO`.)
 pub const PUNKTFUNK_HOST_CAP_PAD_AUDIO: u8 = 0x40;
+/// Host-capability bit in [`punktfunk_connection_host_caps`]: the host resolved this session onto
+/// the LOSSLESS audio plane (`0xD3`) instead of Opus. Set only when the client asked via
+/// [`punktfunk_connect_ex11`]; it is a statement about the wire, not an offer to decline — the
+/// session runs one plane or the other for its whole life.
+///
+/// A C embedder needs it for exactly one thing: telling the two planes apart when it drains raw
+/// frames through [`punktfunk_connection_next_audio`], because a 48 kHz/16-bit lossless session
+/// and a 48 kHz Opus session report identical rate, depth and channels. Embedders on
+/// [`punktfunk_connection_next_audio_pcm`] never need it — core decodes both planes behind it —
+/// but they should still read [`punktfunk_connection_audio_sample_rate`] to size their ring.
+/// (Mirrors `quic::HOST_CAP_AUDIO_HIRES`.)
+pub const PUNKTFUNK_HOST_CAP_AUDIO_HIRES: u8 = 0x80;
 
 /// Pad-audio `kind` ([`punktfunk_connection_next_pad_audio`]): the BACK channel pair — DualSense
 /// voice-coil haptics, 5 ms Opus frames. (Mirrors `quic::PAD_AUDIO_KIND_HAPTICS`.)
@@ -1392,7 +1605,9 @@ const _: () = {
     assert!(PUNKTFUNK_HOST_CAP_CLIPBOARD == crate::quic::HOST_CAP_CLIPBOARD);
     assert!(PUNKTFUNK_HOST_CAP_PEN == crate::quic::HOST_CAP_PEN);
     assert!(PUNKTFUNK_HOST_CAP_PAD_AUDIO == crate::quic::HOST_CAP_PAD_AUDIO);
+    assert!(PUNKTFUNK_HOST_CAP_AUDIO_HIRES == crate::quic::HOST_CAP_AUDIO_HIRES);
     assert!(PUNKTFUNK_CLIENT_CAP_PAD_AUDIO == crate::quic::CLIENT_CAP_PAD_AUDIO);
+    assert!(PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES == crate::quic::CLIENT_CAP_AUDIO_HIRES);
     assert!(PUNKTFUNK_PAD_AUDIO_KIND_HAPTICS == crate::quic::PAD_AUDIO_KIND_HAPTICS);
     assert!(PUNKTFUNK_PAD_AUDIO_KIND_SPEAKER == crate::quic::PAD_AUDIO_KIND_SPEAKER);
     // The setter's caps bits are the arrival flags bits 8/9 shifted down (the wire packing
@@ -1849,6 +2064,10 @@ pub unsafe extern "C" fn punktfunk_connect_ex7(
             client_cert_pem,
             client_key_pem,
             std::ptr::null(), // pre-v21 variant: no device name, so the OS default stands
+            // pre-v24 variant: the legacy audio request (Opus, 48 kHz, 16-bit), which is also
+            // what makes the Hello byte-identical to what every earlier variant sent.
+            crate::audio::SAMPLE_RATE_HZ,
+            crate::audio::pcm::BITS_16,
             timeout_ms,
             std::ptr::null_mut(),
         )
@@ -1912,6 +2131,10 @@ pub unsafe extern "C" fn punktfunk_connect_ex8(
             client_cert_pem,
             client_key_pem,
             std::ptr::null(), // pre-v21 variant: no device name, so the OS default stands
+            // pre-v24 variant: the legacy audio request (Opus, 48 kHz, 16-bit), which is also
+            // what makes the Hello byte-identical to what every earlier variant sent.
+            crate::audio::SAMPLE_RATE_HZ,
+            crate::audio::pcm::BITS_16,
             timeout_ms,
             status_out,
         )
@@ -1975,6 +2198,10 @@ pub unsafe extern "C" fn punktfunk_connect_ex9(
             client_cert_pem,
             client_key_pem,
             std::ptr::null(), // pre-v21 variant: no device name, so the OS default stands
+            // pre-v24 variant: the legacy audio request (Opus, 48 kHz, 16-bit), which is also
+            // what makes the Hello byte-identical to what every earlier variant sent.
+            crate::audio::SAMPLE_RATE_HZ,
+            crate::audio::pcm::BITS_16,
             timeout_ms,
             status_out,
         )
@@ -2047,6 +2274,95 @@ pub unsafe extern "C" fn punktfunk_connect_ex10(
             client_cert_pem,
             client_key_pem,
             device_name,
+            // pre-v24 variant: the legacy audio request (Opus, 48 kHz, 16-bit), which is also
+            // what makes the Hello byte-identical to what every earlier variant sent.
+            crate::audio::SAMPLE_RATE_HZ,
+            crate::audio::pcm::BITS_16,
+            timeout_ms,
+            status_out,
+        )
+    }
+}
+
+/// Like [`punktfunk_connect_ex10`], plus the audio format this client is **asking** for (ABI v24):
+/// `audio_rate_hz` (`48000` or `96000`) and `audio_bits` (`16` or `24`).
+///
+/// Passing anything other than `48000`/`16` sets `CLIENT_CAP_AUDIO_HIRES` in the `Hello` and asks
+/// the host for the LOSSLESS `0xD3` plane — bit-exact PCM instead of Opus. That is an opt-in on
+/// both ends, and it is meant to be: it costs **1.5–4.6 Mbps** taken off the top of the link
+/// (audio rides QUIC datagrams outside the ABR loop, so ABR can neither see it nor reclaim it),
+/// against the ~256 kbps Opus this replaces. Only call it with a non-default format when the
+/// user turned the feature on AND this embedder can genuinely open an output device at it.
+///
+/// **The request is not the answer.** The host runs a five-condition gate
+/// (`design/hi-res-audio.md` §8.4 — client asked, operator policy allows, stereo, the capture
+/// path can *really* deliver the rate, and the link can afford it) and any failure resolves the
+/// session back to Opus at 48 kHz. That is not an error and the connect still succeeds. Read
+/// [`punktfunk_connection_audio_sample_rate`] / [`punktfunk_connection_audio_bits`] afterwards
+/// and open the device from THOSE — opening at what you asked for is
+/// `design/hi-res-audio.md` §4.3's failure repeated at the client end.
+///
+/// Passing `48000`/`16` is exactly [`punktfunk_connect_ex10`], byte-for-byte on the wire.
+/// 44.1 kHz and its multiples are not offered at all: they are a whole number of samples per
+/// millisecond in no arithmetic core uses, so the ladder is 48/96 kHz only (§4.1).
+///
+/// A NEW symbol, not a widened one — `ex10` keeps its parameter list AND its behaviour.
+///
+/// # Safety
+/// Same as [`punktfunk_connect_ex10`].
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn punktfunk_connect_ex11(
+    host: *const std::os::raw::c_char,
+    port: u16,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    compositor: u32,
+    gamepad: u32,
+    bitrate_kbps: u32,
+    video_caps: u8,
+    audio_channels: u8,
+    audio_rate_hz: u32,
+    audio_bits: u8,
+    video_codecs: u8,
+    preferred_codec: u8,
+    client_caps: u8,
+    launch_id: *const std::os::raw::c_char,
+    pin_sha256: *const u8,
+    observed_sha256_out: *mut u8,
+    client_cert_pem: *const std::os::raw::c_char,
+    client_key_pem: *const std::os::raw::c_char,
+    device_name: *const std::os::raw::c_char,
+    timeout_ms: u32,
+    status_out: *mut i32,
+) -> *mut PunktfunkConnection {
+    // SAFETY: the pointer arguments are forwarded UNCHANGED to the versioned entry point, which
+    // applies the same ABI contract to them; this shim dereferences nothing itself.
+    unsafe {
+        connect_ex_impl(
+            host,
+            port,
+            client_caps,
+            width,
+            height,
+            refresh_hz,
+            compositor,
+            gamepad,
+            bitrate_kbps,
+            video_caps,
+            audio_channels,
+            video_codecs,
+            preferred_codec,
+            launch_id,
+            pin_sha256,
+            observed_sha256_out,
+            client_cert_pem,
+            client_key_pem,
+            device_name,
+            audio_rate_hz,
+            audio_bits,
             timeout_ms,
             status_out,
         )
@@ -2070,6 +2386,18 @@ pub const PUNKTFUNK_CLIENT_CAP_PHASE_LOCK: u8 = 0x02;
 /// with [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`]. (Mirrors `quic::CLIENT_CAP_PAD_AUDIO`.)
 pub const PUNKTFUNK_CLIENT_CAP_PAD_AUDIO: u8 = 0x08;
 
+/// [`punktfunk_connect_ex9`] `client_caps` bit: ask for the LOSSLESS audio plane (`0xD3`).
+///
+/// **Normally you do not set this by hand** — pass a non-default `audio_rate_hz`/`audio_bits` to
+/// [`punktfunk_connect_ex11`] and core sets it for you, which keeps "the bit" and "the format it
+/// is asking for" from ever disagreeing. The one case that needs it explicitly is asking for
+/// lossless at the DEFAULT 48 kHz/16-bit, whose parameters are indistinguishable from a legacy
+/// request; core ORs the derived bit into what you pass rather than replacing it, so setting it
+/// here works. Do it only if this embedder can genuinely open a 48 kHz/16-bit output and its user
+/// asked for lossless — 1.5 Mbps to sound like transparent 256 kbps Opus is a poor trade, and
+/// 24-bit is where the plane earns its bandwidth. (Mirrors `quic::CLIENT_CAP_AUDIO_HIRES`.)
+pub const PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES: u8 = 0x10;
+
 /// A [`punktfunk_connect_ex10`] device name cut to what a [`crate::quic::Hello`] carries.
 /// [`crate::quic::HELLO_NAME_MAX`] is a BYTE cap while the cut must land on a character
 /// boundary — "Wohnzimmer-Fernseher überm Sofa" is 33 characters and 34 bytes, and slicing a
@@ -2091,6 +2419,9 @@ fn clamp_device_name(s: &str) -> String {
 /// (nullable) is written on EVERY path — `Ok`, the mapped [`PunktfunkError`],
 /// `InvalidArg` for bad arguments, `Panic` if the connect panicked. `device_name` (nullable,
 /// [`punktfunk_connect_ex10`]) is the label this device knocks with; null = the OS default.
+/// `audio_rate_hz`/`audio_bits` ([`punktfunk_connect_ex11`]) are the audio format being asked
+/// for; every earlier variant passes the legacy 48 kHz/16-bit pair, which is what keeps their
+/// `Hello` byte-identical to the pre-hi-res one.
 #[cfg(feature = "quic")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn connect_ex_impl(
@@ -2113,6 +2444,8 @@ unsafe fn connect_ex_impl(
     client_cert_pem: *const std::os::raw::c_char,
     client_key_pem: *const std::os::raw::c_char,
     device_name: *const std::os::raw::c_char,
+    audio_rate_hz: u32,
+    audio_bits: u8,
     timeout_ms: u32,
     status_out: *mut i32,
 ) -> *mut PunktfunkConnection {
@@ -2189,7 +2522,7 @@ unsafe fn connect_ex_impl(
                 return std::ptr::null_mut();
             }
         };
-        match crate::client::NativeClient::connect(
+        match crate::client::NativeClient::connect_with_audio_format(
             host,
             port,
             mode,
@@ -2198,6 +2531,13 @@ unsafe fn connect_ex_impl(
             bitrate_kbps,
             video_caps,
             crate::audio::normalize_channels(audio_channels),
+            // The audio format asked for ([`punktfunk_connect_ex11`]); the legacy 48 kHz/16-bit
+            // pair from every earlier variant. Passed through UNVALIDATED on purpose: a rate or
+            // depth this plane cannot carry is the host's to decline (it answers with what it
+            // resolved, and the client opens from that), and rejecting a connect over an audio
+            // preference would be a far worse failure than a session that plays Opus.
+            audio_rate_hz,
+            audio_bits,
             video_codecs,
             preferred_codec,
             // No display-HDR-volume parameter in the C ABI yet: Apple/Android clients tone-map
@@ -2449,8 +2789,16 @@ pub unsafe extern "C" fn punktfunk_connection_next_au(
     })
 }
 
-/// One Opus audio packet pulled off a `punktfunk/1` connection (48 kHz stereo, 5 ms frames).
+/// One audio packet pulled off a `punktfunk/1` connection — an Opus frame (48 kHz, 5 ms) on
+/// every ordinary session, or one lossless PCM frame on a session that resolved the `0xD3` plane.
 /// `data` borrows connection memory until the next `punktfunk_connection_next_audio` call.
+///
+/// Nothing here says which: the plane is a property of the SESSION, read once via
+/// `punktfunk_connection_host_caps() & PUNKTFUNK_HOST_CAP_AUDIO_HIRES` (with the format itself
+/// from [`punktfunk_connection_audio_sample_rate`] / [`punktfunk_connection_audio_bits`]). An
+/// embedder that never asks for the lossless plane can only ever be handed Opus, so this struct's
+/// meaning is unchanged for it — and one that does is far better off on
+/// [`punktfunk_connection_next_audio_pcm`], which decodes both planes in core.
 #[cfg(feature = "quic")]
 #[repr(C)]
 pub struct PunktfunkAudioPacket {
@@ -2460,11 +2808,12 @@ pub struct PunktfunkAudioPacket {
     pub pts_ns: u64,
 }
 
-/// Pull the next Opus audio packet, waiting up to `timeout_ms`. Returns
-/// [`PunktfunkStatus::NoFrame`] on timeout and [`PunktfunkStatus::Closed`] once the session ended.
-/// On `Ok`, `out->data` borrows connection memory **until the next audio call** on this
-/// handle (independent of the video slot). Drain from a dedicated audio thread — packets
-/// arrive every 5 ms and the internal queue holds 320 ms.
+/// Pull the next audio packet (see [`PunktfunkAudioPacket`] for what it holds), waiting up to
+/// `timeout_ms`. Returns [`PunktfunkStatus::NoFrame`] on timeout and [`PunktfunkStatus::Closed`]
+/// once the session ended. On `Ok`, `out->data` borrows connection memory **until the next audio
+/// call** on this handle (independent of the video slot). Drain from a dedicated audio thread —
+/// Opus packets arrive every 5 ms (lossless ones every 1–5 ms, per the negotiated frame length)
+/// and the internal queue holds 320 ms.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio —
@@ -2542,6 +2891,87 @@ pub unsafe extern "C" fn punktfunk_connection_audio_channels(
     })
 }
 
+/// Read the sample rate the host resolved for this session (from its Welcome): `48000` for every
+/// Opus session — and for every host older than the lossless plane — or the rate a hi-res session
+/// actually landed on, which may be LOWER than the client asked for. `*out` is filled when
+/// non-NULL. Available immediately after a successful connect; it never changes mid-session.
+///
+/// ⚠ **Open the output device from this, not from `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ`.** That
+/// compile-time constant keeps its value and its meaning — it is the DEFAULT/legacy rate, and
+/// every ring sized from it is still correct for every session that resolves to Opus — but on a
+/// hi-res session it is simply not the rate on the wire. Opening at 96 kHz because you asked for
+/// 96 kHz, when the host answered 48 kHz, is `design/hi-res-audio.md` §4.3's failure repeated at
+/// the other end of the link: everything audits clean and the content is wrong.
+///
+/// An ACCESSOR rather than a field on [`PunktfunkAudioPcm`] or `PunktfunkStats`: both are
+/// `#[repr(C)]` with no `struct_size` guard and are allocated by value by C embedders, so growing
+/// either would break every one of them at once. Same rule ABI 18 set with
+/// `punktfunk_connection_next_rumble_cmd2` — added, not widened — so an embedder that never calls
+/// this behaves exactly as it did before it existed.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is NULL or writable for one `u32`.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_audio_sample_rate(
+    c: *mut PunktfunkConnection,
+    out: *mut u32,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if !out.is_null() {
+            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u32`.
+            unsafe { *out = c.inner.audio_sample_rate_hz };
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
+/// Read the sample depth the host resolved for this session (from its Welcome): `16` on every
+/// Opus session and every older host, `16` or `24` on the lossless plane. `*out` is filled when
+/// non-NULL. Available immediately after a successful connect; it never changes mid-session.
+///
+/// Only sessions on the lossless plane can report `24`, and only they need it: the depth is the
+/// stride the `0xD3` payload is unpacked at, and [`punktfunk_connection_next_audio_pcm`] already
+/// does that unpacking in core — it hands out f32 either way. This is here so an embedder can
+/// *report* the format honestly (a UI that says "24-bit" while the host declined is the same
+/// class of lie as claiming a rate you did not get) and so one draining raw frames through
+/// [`punktfunk_connection_next_audio`] can unpack them itself. Which PLANE a session is on is
+/// `punktfunk_connection_host_caps() & PUNKTFUNK_HOST_CAP_AUDIO_HIRES`, not this: 48 kHz/16-bit
+/// reads identically on both.
+///
+/// ADDED, not widened — see [`punktfunk_connection_audio_sample_rate`] for why.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_audio_bits(
+    c: *mut PunktfunkConnection,
+    out: *mut u8,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if !out.is_null() {
+            // SAFETY: `out` is non-null and the caller guarantees it is writable for one `u8`.
+            unsafe { *out = c.inner.audio_bits };
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
 /// WHY this session ended: `*out` receives a [`PunktfunkEndReason`] byte
 /// (`PUNKTFUNK_END_REASON_*`). The return status reports only whether the handle was usable.
 ///
@@ -2582,9 +3012,19 @@ pub unsafe extern "C" fn punktfunk_connection_end_reason(
 }
 
 /// One decoded audio frame from [`punktfunk_connection_next_audio_pcm`]: interleaved 32-bit
-/// float PCM at 48 kHz, in the canonical wire channel order `FL FR FC LFE RL RR SL SR` (the
-/// first `channels` of it). `samples` points at `frame_count * channels` floats and borrows
+/// float PCM in the canonical wire channel order `FL FR FC LFE RL RR SL SR` (the first
+/// `channels` of it). `samples` points at `frame_count * channels` floats and borrows
 /// connection memory **until the next PCM call** on this handle.
+///
+/// **The sample rate is not in this struct and never will be.** It was 48 kHz for every session
+/// until the lossless plane, and it is still 48 kHz for every Opus one — but a hi-res session
+/// resolves its own rate and depth, and this is a `#[repr(C)]` type with no `struct_size` guard
+/// that C embedders allocate BY VALUE. Adding a field would silently change its layout under
+/// every one of them. So the format is read through
+/// [`punktfunk_connection_audio_sample_rate`] / [`punktfunk_connection_audio_bits`] instead —
+/// accessors ADDED, not structs widened, which is the rule ABI 18 set with
+/// `punktfunk_connection_next_rumble_cmd2`. An embedder that never calls them keeps sizing its
+/// ring for 48 kHz, which is exactly right for the sessions it can already play.
 #[cfg(feature = "quic")]
 #[repr(C)]
 pub struct PunktfunkAudioPcm {
@@ -2609,14 +3049,25 @@ pub struct PunktfunkAudioPcm {
 /// [`punktfunk_connection_next_audio`] on a given connection, from one dedicated audio thread —
 /// not both (they share the underlying queue).
 ///
+/// **Both audio planes come out of this one call.** On a session that resolved the lossless
+/// `0xD3` plane there is no Opus decoder at all — the samples are unpacked at the negotiated
+/// depth — but the output is the same interleaved f32 in the same borrowed buffer, so an embedder
+/// needs no branch. It DOES need [`punktfunk_connection_audio_sample_rate`] to size its ring and
+/// open its device: `frame_count` is samples per channel, and at 96 kHz they arrive twice as fast.
+///
 /// **Loss concealment**: packets the wire lost (a gap in the sequence, after the redundant-plane
-/// recovery has had its chance) are synthesized via libopus packet-loss concealment and returned
-/// IN FRONT of the arriving frame in the same buffer — `out->frame_count` then covers the
-/// concealed frames plus the real one (`out->seq`/`out->pts_ns` are the real packet's). The
-/// embedder just writes the whole buffer to its ring, same as any other frame; gaps arrive
-/// pre-healed, exactly as they do on the clients that decode outside core. That covers a gap a
-/// LATER packet reveals; when the wire goes quiet instead, see
-/// [`punktfunk_connection_audio_plc`].
+/// recovery has had its chance) are synthesized and returned IN FRONT of the arriving frame in
+/// the same buffer — `out->frame_count` then covers the concealed frames plus the real one
+/// (`out->seq`/`out->pts_ns` are the real packet's). The embedder just writes the whole buffer to
+/// its ring, same as any other frame; gaps arrive pre-healed, exactly as they do on the clients
+/// that decode outside core. That covers a gap a LATER packet reveals; when the wire goes quiet
+/// instead, see [`punktfunk_connection_audio_plc`].
+///
+/// What synthesizes them differs by plane, and has to: Opus gaps use libopus PLC, which
+/// extrapolates from the decoder's model of the signal. A lossless frame has no such model — only
+/// the signal — so `0xD3` gaps are concealed by repeating the last good frame under a raised-cosine
+/// fade, decaying to silence across a sustained gap (`design/hi-res-audio.md` §4.5). Same shape,
+/// same buffer, same cap; only the material differs.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable. At most one thread pulls audio.
@@ -2638,7 +3089,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
         if out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
-        let channels = crate::audio::normalize_channels(c.inner.audio_channels);
+        let fmt = AudioFormat::of(&c.inner);
+        let channels = fmt.channels;
         let pkt = match c
             .inner
             .next_audio(std::time::Duration::from_millis(timeout_ms as u64))
@@ -2647,7 +3099,7 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
             Err(e) => return e.status(),
         };
         let mut state = lock_recover(&c.audio_pcm);
-        match state.decode_packet(&pkt.data, pkt.seq, channels) {
+        match state.decode_packet(&pkt.data, pkt.seq, fmt) {
             // Nothing to hand out this call: a DTX silence marker with no loss owed before it.
             Ok(0) => PunktfunkStatus::NoFrame,
             Ok(samples) => {
@@ -2687,9 +3139,13 @@ pub unsafe extern "C" fn punktfunk_connection_next_audio_pcm(
 /// to duplicate, pushing the stream permanently later. Core supplies only the mechanism, one frame
 /// per call, at the cadence the embedder drains at.
 ///
-/// Returns [`PunktfunkStatus::NoFrame`] when nothing has decoded yet — PLC extrapolates from the
-/// last decoded frame, so before there is one there is no state to extrapolate from — and if
-/// libopus declines to interpolate. Both mean "write nothing this tick", exactly like a timeout.
+/// Works on both audio planes, using each one's own concealer — libopus PLC on `0xC9`, the
+/// repeat-and-fade of [`crate::audio::pcm::PcmConceal`] on `0xD3` (a lossless frame carries no
+/// model of the signal for PLC to extrapolate from; `design/hi-res-audio.md` §4.5).
+///
+/// Returns [`PunktfunkStatus::NoFrame`] when nothing has decoded yet — both concealers build on
+/// the last decoded frame, so before there is one there is nothing to build from — and if libopus
+/// declines to interpolate. Both mean "write nothing this tick", exactly like a timeout.
 ///
 /// `out->seq` and `out->pts_ns` read 0: this frame was never on the wire, so it has no sequence
 /// number and no capture instant, and it must never be fed to an A/V-sync observation.
@@ -2718,9 +3174,10 @@ pub unsafe extern "C" fn punktfunk_connection_audio_plc(
         if out.is_null() {
             return PunktfunkStatus::NullPointer;
         }
-        let channels = crate::audio::normalize_channels(c.inner.audio_channels);
+        let fmt = AudioFormat::of(&c.inner);
+        let channels = fmt.channels;
         let mut state = lock_recover(&c.audio_pcm);
-        match state.conceal(channels) {
+        match state.conceal(fmt) {
             Ok(0) => PunktfunkStatus::NoFrame,
             Ok(samples) => {
                 // SAFETY: per the ABI contract - `out` is a caller-owned writable slot of the
@@ -5357,6 +5814,246 @@ mod tests {
         );
     }
 
+    /// The legacy audio format: Opus on `0xC9`, 48 kHz, 16-bit, stereo. What every session ran
+    /// before the lossless plane existed, and what every embedder that does not call
+    /// `punktfunk_connect_ex11` still gets.
+    const OPUS_48K: AudioFormat = AudioFormat {
+        codec: crate::quic::AUDIO_CODEC_OPUS,
+        rate_hz: crate::audio::SAMPLE_RATE_HZ,
+        bits: crate::audio::pcm::BITS_16,
+        channels: 2,
+    };
+
+    /// A lossless session at the depth the feature exists for.
+    const PCM_48K_24: AudioFormat = AudioFormat {
+        codec: crate::quic::AUDIO_CODEC_PCM,
+        rate_hz: crate::audio::SAMPLE_RATE_HZ,
+        bits: crate::audio::pcm::BITS_24,
+        channels: 2,
+    };
+
+    /// One `0xD3` payload of `n` interleaved stereo samples at `bits`, built from a deterministic
+    /// ramp across the full code range so any stride or sign-extension error is visible.
+    fn pcm_frame(n: usize, bits: u8) -> (Vec<f32>, Vec<u8>) {
+        let mut samples = Vec::with_capacity(n);
+        for i in 0..n {
+            samples.push((i as f32 / n as f32) * 1.8 - 0.9);
+        }
+        let mut wire = Vec::new();
+        crate::audio::pcm::from_f32(&samples, bits, &mut wire);
+        // Quantised once, so the expectation is what the wire really carries rather than the
+        // pre-quantisation floats.
+        let mut expect = Vec::new();
+        crate::audio::pcm::to_f32(&wire, bits, &mut expect).expect("whole samples");
+        (expect, wire)
+    }
+
+    /// The claim the lossless plane exists to make, at the ABI boundary an embedder actually sees:
+    /// what `next_audio_pcm` hands out must be the samples the host quantised, not merely
+    /// something close to them. Anything less and the plane is spending 2.3 Mbps for a label.
+    #[test]
+    fn the_pcm_plane_decodes_bit_exactly() {
+        for bits in [crate::audio::pcm::BITS_16, crate::audio::pcm::BITS_24] {
+            let fmt = AudioFormat { bits, ..PCM_48K_24 };
+            // 5 ms at 48 kHz stereo — the longest rung of the ladder.
+            let (expect, wire) = pcm_frame(240 * 2, bits);
+            let mut state = AudioPcmState::default();
+            let n = state.decode_packet(&wire, 0, fmt).expect("decodes");
+            assert_eq!(n, expect.len(), "{bits}-bit: sample count");
+            assert_eq!(
+                &state.pcm[..n],
+                &expect[..],
+                "{bits}-bit PCM must reach the embedder unchanged"
+            );
+
+            // …and it stays exact packet after packet, at the buffer offsets a real session uses.
+            let (expect2, wire2) = pcm_frame(240 * 2, bits);
+            let n2 = state.decode_packet(&wire2, 1, fmt).expect("decodes");
+            assert_eq!(&state.pcm[..n2], &expect2[..]);
+        }
+    }
+
+    /// A missing `0xD3` frame must be concealed by `PcmConceal`, NOT by libopus PLC — there is no
+    /// decoder on this plane to ask, and a lossless frame carries no model of the signal to
+    /// extrapolate from (`design/hi-res-audio.md` §4.5). The tell is structural rather than
+    /// aesthetic: no Opus decoder is ever constructed, and the concealed frame is built from the
+    /// last real one (first sample equal, tail faded) rather than synthesized.
+    #[test]
+    fn a_missing_pcm_frame_is_concealed_without_libopus() {
+        let bits = crate::audio::pcm::BITS_24;
+        let (expect, wire) = pcm_frame(240 * 2, bits);
+        let mut state = AudioPcmState::default();
+        assert_eq!(state.decode_packet(&wire, 0, PCM_48K_24), Ok(expect.len()));
+
+        // Seq 2 is lost: one concealed frame lands in front of the real one, contiguously — the
+        // same shape the Opus path produces, so nothing downstream branches on the plane.
+        let (expect3, wire3) = pcm_frame(240 * 2, bits);
+        let n = state.decode_packet(&wire3, 2, PCM_48K_24).expect("decodes");
+        assert_eq!(
+            n,
+            2 * expect3.len(),
+            "one concealed frame, then the real one"
+        );
+        assert!(
+            state.decoder.is_none(),
+            "a libopus decoder must never be built on the lossless plane"
+        );
+        // The concealed frame is the previous one faded, so it starts essentially where the real
+        // audio was (the raised cosine is ~1.0 at the head) and ends at silence. A PLC-synthesized
+        // frame would match neither end.
+        assert!(
+            (state.pcm[0] - expect[0]).abs() < 1e-3,
+            "concealment must repeat the last good frame, got {} vs {}",
+            state.pcm[0],
+            expect[0]
+        );
+        let tail = state.pcm[expect.len() - 1];
+        assert!(
+            tail.abs() < 0.01,
+            "the fade must land on silence, got {tail}"
+        );
+        // And the real frame follows it, still bit-exact.
+        assert_eq!(&state.pcm[expect3.len()..n], &expect3[..]);
+
+        // The drought path takes the same route: PcmConceal, one frame, credited against the
+        // next arrival's loss so the gap is never concealed twice.
+        let before = state.drought_frames;
+        assert_eq!(state.conceal(PCM_48K_24), Ok(expect.len()));
+        assert_eq!(state.drought_frames, before + 1);
+        assert!(state.decoder.is_none());
+    }
+
+    /// ⚠ The buffer the embedder holds a pointer INTO must never be reallocated: a `Vec` growth
+    /// would dangle it, on a path where the embedder is reading concurrently and the failure
+    /// would not reproduce wherever the allocator happened to grow in place. Pin both halves —
+    /// the allocation never moves, and an oversized/malformed datagram truncates instead of
+    /// extending it.
+    #[test]
+    fn the_pcm_buffer_is_never_reallocated() {
+        for fmt in [OPUS_48K, PCM_48K_24] {
+            let mut state = AudioPcmState::default();
+            let (_, wire) = pcm_frame(240 * 2, fmt.bits);
+            // Prime it. (On the Opus arm the payload is undecodable, which is fine: the buffer is
+            // sized before the packet is looked at, which is the property under test.)
+            let _ = state.decode_packet(&wire, 0, fmt);
+            let ptr = state.pcm.as_ptr();
+            let len = state.pcm.len();
+            assert!(len > 0, "sizing must have happened on the first packet");
+
+            // A datagram far longer than any rung of the ladder — the case that would otherwise
+            // grow the buffer.
+            let (_, huge) = pcm_frame(200_000, fmt.bits);
+            let _ = state.decode_packet(&huge, 1, fmt);
+            // A long concealment run, at the far end of the buffer.
+            for seq in 2..40 {
+                let _ = state.decode_packet(&wire, seq * 7, fmt);
+                let _ = state.conceal(fmt);
+            }
+            assert_eq!(state.pcm.as_ptr(), ptr, "the buffer moved");
+            assert_eq!(state.pcm.len(), len, "the buffer was resized");
+        }
+    }
+
+    /// A truncated `0xD3` payload — not a whole number of samples at the negotiated depth — must
+    /// be refused rather than decoded as a shifted frame, which would desync every sample after
+    /// it. Same disposal as an undecodable Opus packet: concealment already earned still goes out.
+    #[test]
+    fn a_torn_pcm_datagram_is_refused_not_shifted() {
+        let mut state = AudioPcmState::default();
+        let (_, wire) = pcm_frame(240 * 2, crate::audio::pcm::BITS_24);
+        assert_eq!(
+            state.decode_packet(&wire[..wire.len() - 1], 0, PCM_48K_24),
+            Err(PunktfunkStatus::BadPacket)
+        );
+        // With a gap owed, the concealment survives the bad packet instead of dying with it.
+        assert_eq!(state.decode_packet(&wire, 1, PCM_48K_24), Ok(240 * 2));
+        assert_eq!(
+            state.decode_packet(&wire[..wire.len() - 1], 3, PCM_48K_24),
+            Ok(240 * 2),
+            "the gap before a torn packet is still concealed"
+        );
+        // An empty payload must NOT wipe the concealment source: PCM has no DTX, so this is a
+        // torn datagram, and clearing `prev` would leave the next loss with nothing to repeat.
+        assert_eq!(state.decode_packet(&[], 4, PCM_48K_24), Ok(0));
+        assert_eq!(
+            state.decode_packet(&wire, 6, PCM_48K_24),
+            Ok(2 * 240 * 2),
+            "the frame before the empty one must still be there to conceal from"
+        );
+    }
+
+    /// A legacy session must be untouched by all of the above: the same libopus decoder at the
+    /// same 48 kHz, the same buffer geometry, and `PcmConceal` never involved. This is the
+    /// regression the whole hi-res pass has to not cause.
+    #[test]
+    fn an_opus_session_is_unaffected_by_the_lossless_plane() {
+        let l = crate::audio::LAYOUT_STEREO;
+        let mut enc = opus::MSEncoder::new(
+            48_000,
+            l.streams,
+            l.coupled,
+            l.mapping,
+            opus::Application::LowDelay,
+        )
+        .expect("MSEncoder");
+        enc.set_vbr(false).unwrap();
+        let mut frame = vec![0f32; 240 * 2];
+        for (i, s) in frame.iter_mut().enumerate() {
+            *s = 0.25 * (i as f32 * 0.05).sin();
+        }
+        let mut out = vec![0u8; 1500];
+        let n = enc.encode_float(&frame, &mut out).unwrap();
+        out.truncate(n);
+
+        let mut state = AudioPcmState::default();
+        assert_eq!(state.decode_packet(&out, 0, OPUS_48K), Ok(240 * 2));
+        assert!(state.decoder.is_some(), "still a libopus decoder");
+        // Byte-for-byte the pre-hi-res geometry: 120 ms of Opus plus a full concealment run.
+        assert_eq!(
+            state.pcm.len(),
+            (1 + crate::audio::MAX_CONCEAL_PACKETS as usize) * 5760 * 2
+        );
+        // Gaps and droughts still go through libopus PLC, and PcmConceal is never fed.
+        assert_eq!(state.decode_packet(&out, 2, OPUS_48K), Ok(2 * 240 * 2));
+        assert_eq!(state.conceal(OPUS_48K), Ok(240 * 2));
+        assert_eq!(state.conceal_pcm.run(), 0, "PcmConceal must be untouched");
+        assert!(state.scratch_pcm.is_empty());
+
+        // And the format an old embedder sees is exactly the legacy one — the accessors report
+        // 48 kHz / 16-bit, which is what `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ` has always said.
+        assert_eq!(OPUS_48K.rate_hz, crate::audio::SAMPLE_RATE_HZ);
+        assert!(!OPUS_48K.is_pcm());
+    }
+
+    /// 96 kHz doubles every sample count, and the buffer has to follow the negotiated rate rather
+    /// than the 48 kHz constant it used to hardcode — otherwise a hi-res session's concealment run
+    /// would be clamped to half the audio it owes.
+    #[test]
+    fn the_buffer_follows_the_negotiated_rate() {
+        let hi = AudioFormat {
+            rate_hz: 96_000,
+            ..PCM_48K_24
+        };
+        let mut state = AudioPcmState::default();
+        // The longest ladder rung at 96 kHz is 5 ms = 480 samples/ch.
+        let (expect, wire) = pcm_frame(480 * 2, hi.bits);
+        assert_eq!(state.decode_packet(&wire, 0, hi), Ok(expect.len()));
+        assert_eq!(&state.pcm[..expect.len()], &expect[..]);
+        assert_eq!(
+            state.pcm.len(),
+            (1 + crate::audio::MAX_CONCEAL_PACKETS as usize) * 480 * 2,
+            "sized from 96 kHz, not from the 48 kHz default"
+        );
+        // A full concealment run fits, which is the point of sizing it that way.
+        let n = state
+            .decode_packet(&wire, 1 + crate::audio::MAX_CONCEAL_PACKETS, hi)
+            .expect("decodes");
+        assert_eq!(
+            n,
+            (1 + crate::audio::MAX_CONCEAL_PACKETS as usize) * expect.len()
+        );
+    }
+
     /// The in-core PCM decoder heals seq gaps with concealment, exactly like the decode loops
     /// the other clients run themselves: a lost packet's worth of PLC lands in front of the
     /// arriving frame, DTX markers advance the accounting without being decoded, and a gap is
@@ -5387,21 +6084,36 @@ mod tests {
 
         let mut state = AudioPcmState::default();
         // In-order packets decode to exactly one frame each.
-        assert_eq!(state.decode_packet(&packet(0.05), 0, 2), Ok(FRAME * 2));
-        assert_eq!(state.decode_packet(&packet(0.05), 1, 2), Ok(FRAME * 2));
+        assert_eq!(
+            state.decode_packet(&packet(0.05), 0, OPUS_48K),
+            Ok(FRAME * 2)
+        );
+        assert_eq!(
+            state.decode_packet(&packet(0.05), 1, OPUS_48K),
+            Ok(FRAME * 2)
+        );
         // Seq 2 lost: one concealed frame precedes the real one, contiguously.
-        assert_eq!(state.decode_packet(&packet(0.06), 3, 2), Ok(2 * FRAME * 2));
+        assert_eq!(
+            state.decode_packet(&packet(0.06), 3, OPUS_48K),
+            Ok(2 * FRAME * 2)
+        );
         // A duplicate conceals nothing.
-        assert_eq!(state.decode_packet(&packet(0.06), 3, 2), Ok(FRAME * 2));
+        assert_eq!(
+            state.decode_packet(&packet(0.06), 3, OPUS_48K),
+            Ok(FRAME * 2)
+        );
         // DTX marker, nothing lost before it: nothing to emit (the ABI maps 0 to NoFrame)...
-        assert_eq!(state.decode_packet(&[], 4, 2), Ok(0));
+        assert_eq!(state.decode_packet(&[], 4, OPUS_48K), Ok(0));
         // ...but a DTX marker AFTER a loss still flushes the concealment owed (seq 5 lost).
-        assert_eq!(state.decode_packet(&[], 6, 2), Ok(FRAME * 2));
+        assert_eq!(state.decode_packet(&[], 6, OPUS_48K), Ok(FRAME * 2));
         // And the DTX slot itself was accounted, not treated as a loss.
-        assert_eq!(state.decode_packet(&packet(0.07), 7, 2), Ok(FRAME * 2));
+        assert_eq!(
+            state.decode_packet(&packet(0.07), 7, OPUS_48K),
+            Ok(FRAME * 2)
+        );
         // A huge gap is capped at MAX_CONCEAL_PACKETS of concealment.
         assert_eq!(
-            state.decode_packet(&packet(0.07), 1000, 2),
+            state.decode_packet(&packet(0.07), 1000, OPUS_48K),
             Ok((crate::audio::MAX_CONCEAL_PACKETS as usize + 1) * FRAME * 2)
         );
     }
@@ -5437,16 +6149,25 @@ mod tests {
 
         let mut state = AudioPcmState::default();
         // Nothing has decoded: PLC has no state to extrapolate from, and the ABI reports NoFrame.
-        assert_eq!(state.conceal(2), Ok(0));
+        assert_eq!(state.conceal(OPUS_48K), Ok(0));
 
-        assert_eq!(state.decode_packet(&packet(0.05), 0, 2), Ok(FRAME * 2));
+        assert_eq!(
+            state.decode_packet(&packet(0.05), 0, OPUS_48K),
+            Ok(FRAME * 2)
+        );
         // The wire goes quiet; the embedder covers four frames of it.
         for _ in 0..4 {
-            assert_eq!(state.conceal(2), Ok(FRAME * 2));
+            assert_eq!(state.conceal(OPUS_48K), Ok(FRAME * 2));
         }
         // It comes back at seq 7 — six packets missing, four of them already in the ring.
-        assert_eq!(state.decode_packet(&packet(0.06), 7, 2), Ok(3 * FRAME * 2));
+        assert_eq!(
+            state.decode_packet(&packet(0.06), 7, OPUS_48K),
+            Ok(3 * FRAME * 2)
+        );
         // …and the next drought starts from nothing owed, not from a stale credit.
-        assert_eq!(state.decode_packet(&packet(0.06), 9, 2), Ok(2 * FRAME * 2));
+        assert_eq!(
+            state.decode_packet(&packet(0.06), 9, OPUS_48K),
+            Ok(2 * FRAME * 2)
+        );
     }
 }

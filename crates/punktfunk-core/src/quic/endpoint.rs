@@ -46,6 +46,28 @@ fn stream_transport_idle(idle: std::time::Duration) -> Arc<quinn::TransportConfi
     // standing delay that never drains while video stays live. Capping the buffer makes the
     // plane latest-wins at the source — ~200 ms of stereo Opus (proportionally less at
     // surround bitrates), so sustained congestion costs concealable drops, never lag.
+    //
+    // THE LOSSLESS PLANE SHARES THIS BUFFER, and its frames are ~10× larger: a 48 kHz/24-bit
+    // stereo frame is 1 152 B against Opus's ~100 B, so 4 KiB is ~3.5 PCM frames (~14 ms) where
+    // it is ~40 Opus frames (~200 ms). That is deliberately NOT raised, for two reasons.
+    //
+    // (a) It stays faithful to the rule above. Fewer frames of slack is still "shed oldest under
+    //     congestion", and one shed PCM frame is exactly what `audio::pcm::PcmConceal` exists to
+    //     cover. Trading it for lag would invert the property this cap was introduced to get.
+    // (b) A blanket raise would REGRESS the Opus plane. Sizing for six PCM frames (~16 KiB) would
+    //     make an Opus session's worst-case backlog ~800 ms — four times what this line was
+    //     written to prevent — and the two planes cannot be sized separately here, because
+    //     `TransportConfig` is built before the handshake resolves which plane the session runs.
+    //     Sizing it per-session means building the transport config after negotiation, which is a
+    //     larger change than the hi-res programme needed.
+    //
+    // ⚠ AND THE EVICTION IS INVISIBLE. `Connection::send_datagram` calls `send(data, drop=true)`,
+    // which silently evicts the oldest queued datagrams at the cap and returns `Ok(())` — "buffer
+    // full" is not one of `SendDatagramError`'s four variants (`UnsupportedByPeer`, `Disabled`,
+    // `TooLarge`, `ConnectionLost`). So no caller can count these drops today; the host's audio
+    // egress counters cover `TooLarge` only. Observing them needs `datagram_send_buffer_space()`
+    // before the send, or `send_datagram_wait`. Worth knowing before anyone reads a clean drop
+    // counter as proof the plane is not shedding.
     t.datagram_send_buffer_size(4 * 1024);
     // MTU discovery probes up to EXACTLY the sealed size of a full IPv4 video datagram (1472)
     // instead of quinn's stock 1452. Two reasons: (a) on a clean 1500-MTU path QUIC gets the

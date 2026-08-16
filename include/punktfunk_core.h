@@ -149,7 +149,29 @@
 // and `pts_ns` of `0` — concealed audio was never on the wire and must not reach an A/V-sync
 // observation. Additive and client-local: nothing new is sent or parsed, so [`WIRE_VERSION`] is
 // unchanged.
-#define PUNKTFUNK_ABI_VERSION 23
+// v24: the lossless audio plane's client surface (`design/hi-res-audio.md` §7) —
+// `punktfunk_connect_ex11` asks for a sample rate and depth (48/96 kHz, 16/24-bit; anything but
+// the legacy pair also sets `CLIENT_CAP_AUDIO_HIRES`), and `punktfunk_connection_audio_sample_rate`
+// / `punktfunk_connection_audio_bits` report what the host actually RESOLVED — which may be
+// lower, because the host runs a five-condition gate and every decline lands back on Opus at
+// 48 kHz. `punktfunk_connection_next_audio_pcm` decodes both planes behind the same call, using
+// `pcm::PcmConceal` for gaps on the lossless one (libopus PLC extrapolates from a decoder's
+// model of the signal, and a raw frame has none).
+//
+// ADDED, not widened, and this time the distinction has teeth: the natural place for a rate is a
+// field on `PunktfunkAudioPcm`, which is `#[repr(C)]` with no `struct_size` guard and is
+// allocated BY VALUE by every C embedder — growing it would change its layout under all of them
+// at once. `PunktfunkStats` is in the same position. So the format is read through accessors, the
+// same rule v18 set with `next_rumble_cmd2`, and `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ` keeps its value
+// and its meaning as the DEFAULT/legacy rate — a ring sized from it stays correct for every
+// session that resolves to Opus, which is every session an ABI-23 embedder can ask for. An
+// embedder that adopts none of this behaves exactly as before.
+//
+// Client-local in the C sense but NOT wire-free in the usual one: the `Hello`/`Welcome` fields
+// this reads and writes landed with the plane itself, appended behind the existing trailing-field
+// discipline (old peers skip them in both directions, and a legacy request encodes byte-identical
+// to the pre-hi-res messages), so [`WIRE_VERSION`] is still unchanged.
+#define PUNKTFUNK_ABI_VERSION 24
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -379,6 +401,19 @@
 // asked via [`PUNKTFUNK_CLIENT_CAP_PAD_AUDIO`]. (Mirrors `quic::HOST_CAP_PAD_AUDIO`.)
 #define PUNKTFUNK_HOST_CAP_PAD_AUDIO 64
 
+// Host-capability bit in [`punktfunk_connection_host_caps`]: the host resolved this session onto
+// the LOSSLESS audio plane (`0xD3`) instead of Opus. Set only when the client asked via
+// [`punktfunk_connect_ex11`]; it is a statement about the wire, not an offer to decline — the
+// session runs one plane or the other for its whole life.
+//
+// A C embedder needs it for exactly one thing: telling the two planes apart when it drains raw
+// frames through [`punktfunk_connection_next_audio`], because a 48 kHz/16-bit lossless session
+// and a 48 kHz Opus session report identical rate, depth and channels. Embedders on
+// [`punktfunk_connection_next_audio_pcm`] never need it — core decodes both planes behind it —
+// but they should still read [`punktfunk_connection_audio_sample_rate`] to size their ring.
+// (Mirrors `quic::HOST_CAP_AUDIO_HIRES`.)
+#define PUNKTFUNK_HOST_CAP_AUDIO_HIRES 128
+
 // Pad-audio `kind` ([`punktfunk_connection_next_pad_audio`]): the BACK channel pair — DualSense
 // voice-coil haptics, 5 ms Opus frames. (Mirrors `quic::PAD_AUDIO_KIND_HAPTICS`.)
 #define PUNKTFUNK_PAD_AUDIO_KIND_HAPTICS 0
@@ -411,6 +446,18 @@
 // [`punktfunk_connection_set_pad_audio_caps`]; the host emits pad audio only when it answers
 // with [`PUNKTFUNK_HOST_CAP_PAD_AUDIO`]. (Mirrors `quic::CLIENT_CAP_PAD_AUDIO`.)
 #define PUNKTFUNK_CLIENT_CAP_PAD_AUDIO 8
+
+// [`punktfunk_connect_ex9`] `client_caps` bit: ask for the LOSSLESS audio plane (`0xD3`).
+//
+// **Normally you do not set this by hand** — pass a non-default `audio_rate_hz`/`audio_bits` to
+// [`punktfunk_connect_ex11`] and core sets it for you, which keeps "the bit" and "the format it
+// is asking for" from ever disagreeing. The one case that needs it explicitly is asking for
+// lossless at the DEFAULT 48 kHz/16-bit, whose parameters are indistinguishable from a legacy
+// request; core ORs the derived bit into what you pass rather than replacing it, so setting it
+// here works. Do it only if this embedder can genuinely open a 48 kHz/16-bit output and its user
+// asked for lossless — 1.5 Mbps to sound like transparent 256 kbps Opus is a poor trade, and
+// 24-bit is where the plane earns its bandwidth. (Mirrors `quic::CLIENT_CAP_AUDIO_HIRES`.)
+#define PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES 16
 
 // `*ttl_ms` sentinel written by [`punktfunk_connection_next_rumble2`] for a legacy (v1) rumble
 // datagram — an old host that sent no self-termination lease. The client then falls back to its
@@ -458,14 +505,14 @@
 // The `0xD3` datagram's fixed header: tag + `u32` seq + `u64` pts_ns, the same shape as `0xC9`
 // so the gap tracker and the A/V-sync plumbing work unchanged.
 // `quic::datagram` asserts this against its own encoder.
-#define PCM_HEADER_LEN ((1 + 4) + 8)
+#define PUNKTFUNK_AUDIO_PCM_HEADER_LEN ((1 + 4) + 8)
 
 // Bit depths the plane carries. 32-bit float is deliberately absent: no source produces detail
 // 24 bits does not capture, and it would cost 33 % more for nothing.
-#define BITS_16 16
+#define PUNKTFUNK_AUDIO_BITS_16 16
 
 // See [`BITS_16`].
-#define BITS_24 24
+#define PUNKTFUNK_AUDIO_BITS_24 24
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // The uniform no-TTL-host staleness bound: a legacy host refreshes state every 500 ms, so two
@@ -984,7 +1031,7 @@
 //
 // `0x10` — `0x08` is [`CLIENT_CAP_PAD_AUDIO`], `0x04` is [`CLIENT_CAP_AUDIO_RED`], `0x02` is
 // [`CLIENT_CAP_PHASE_LOCK`], `0x01` is [`CLIENT_CAP_CURSOR`]. `0x20`/`0x40`/`0x80` remain free.
-#define CLIENT_CAP_AUDIO_HIRES 16
+#define PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES 16
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1006,7 +1053,7 @@
 // `0x40` is [`HOST_CAP_PAD_AUDIO`], `0x20` is [`HOST_CAP_AUDIO_RED`], `0x10` is
 // [`HOST_CAP_PEN`], `0x08` is [`HOST_CAP_CURSOR`], `0x04` is [`HOST_CAP_TEXT_INPUT`],
 // `0x01`/`0x02` are gamepad-state / clipboard.
-#define HOST_CAP_AUDIO_HIRES 128
+#define PUNKTFUNK_HOST_CAP_AUDIO_HIRES 128
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1405,7 +1452,7 @@
 // the path MTU. Redundancy ([`AUDIO_RED_MAGIC`]) is not defined for this plane and is never
 // sent with it: it would double a bitrate that is already the largest on the connection, and
 // `plan_audio_budget`'s ladder would never choose it.
-#define AUDIO_PCM_MAGIC 211
+#define PUNKTFUNK_AUDIO_PCM_MAGIC 211
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1579,7 +1626,7 @@
 // (`design/hi-res-audio.md` §8.4: a fallback to today's transparent 256 kbps Opus is not a
 // defeat; silence is the one unacceptable outcome). `0`, so an absent field and an older host
 // both read as Opus and the common Welcome stays byte-identical to the pre-hi-res wire form.
-#define AUDIO_CODEC_OPUS 0
+#define PUNKTFUNK_AUDIO_CODEC_OPUS 0
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1597,7 +1644,7 @@
 // sizing. A codec would buy average bytes on a plane that is provisioned for peak, at the cost of
 // a new dependency in the NDK / xcframework / flatpak / MSIX / Arch packaging targets. No host
 // emits this id and no client should accept it; it exists so that a future one could.
-#define AUDIO_CODEC_FLAC_RESERVED 1
+#define PUNKTFUNK_AUDIO_CODEC_FLAC_RESERVED 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1607,7 +1654,7 @@
 // [`audio_frame_us`](Welcome::audio_frame_us).
 //
 // `2` rather than `1` because [`AUDIO_CODEC_FLAC_RESERVED`] holds `1` — see there.
-#define AUDIO_CODEC_PCM 2
+#define PUNKTFUNK_AUDIO_CODEC_PCM 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -2116,8 +2163,16 @@ typedef struct {
 } PunktfunkStats;
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// One Opus audio packet pulled off a `punktfunk/1` connection (48 kHz stereo, 5 ms frames).
+// One audio packet pulled off a `punktfunk/1` connection — an Opus frame (48 kHz, 5 ms) on
+// every ordinary session, or one lossless PCM frame on a session that resolved the `0xD3` plane.
 // `data` borrows connection memory until the next `punktfunk_connection_next_audio` call.
+//
+// Nothing here says which: the plane is a property of the SESSION, read once via
+// `punktfunk_connection_host_caps() & PUNKTFUNK_HOST_CAP_AUDIO_HIRES` (with the format itself
+// from [`punktfunk_connection_audio_sample_rate`] / [`punktfunk_connection_audio_bits`]). An
+// embedder that never asks for the lossless plane can only ever be handed Opus, so this struct's
+// meaning is unchanged for it — and one that does is far better off on
+// [`punktfunk_connection_next_audio_pcm`], which decodes both planes in core.
 typedef struct {
     const uint8_t *data;
     uintptr_t len;
@@ -2128,9 +2183,19 @@ typedef struct {
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // One decoded audio frame from [`punktfunk_connection_next_audio_pcm`]: interleaved 32-bit
-// float PCM at 48 kHz, in the canonical wire channel order `FL FR FC LFE RL RR SL SR` (the
-// first `channels` of it). `samples` points at `frame_count * channels` floats and borrows
+// float PCM in the canonical wire channel order `FL FR FC LFE RL RR SL SR` (the first
+// `channels` of it). `samples` points at `frame_count * channels` floats and borrows
 // connection memory **until the next PCM call** on this handle.
+//
+// **The sample rate is not in this struct and never will be.** It was 48 kHz for every session
+// until the lossless plane, and it is still 48 kHz for every Opus one — but a hi-res session
+// resolves its own rate and depth, and this is a `#[repr(C)]` type with no `struct_size` guard
+// that C embedders allocate BY VALUE. Adding a field would silently change its layout under
+// every one of them. So the format is read through
+// [`punktfunk_connection_audio_sample_rate`] / [`punktfunk_connection_audio_bits`] instead —
+// accessors ADDED, not structs widened, which is the rule ABI 18 set with
+// `punktfunk_connection_next_rumble_cmd2`. An embedder that never calls them keeps sizing its
+// ring for 48 kHz, which is exactly right for the sessions it can already play.
 typedef struct {
     // Interleaved f32 samples (wire channel order), `frame_count * channels` long.
     const float *samples;
@@ -2431,7 +2496,7 @@ typedef struct {
 // | 2000 | 96 | 192 |
 // | 1500 | 72 | 144 |
 // | 1000 | 48 | 96 |
-#define FRAME_US_LADDER { 5000, 4000, 3000, 2500, 2000, 1500, 1000, }
+#define PUNKTFUNK_AUDIO_FRAME_US_LADDER { 5000, 4000, 3000, 2500, 2000, 1500, 1000, }
 
 // What a controller sitting still, face up, actually puts on the wire: **1 g along the UP
 // axis** — which is index 1 — and nothing on the other two.
@@ -2871,6 +2936,58 @@ PunktfunkConnection *punktfunk_connect_ex10(const char *host,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Like [`punktfunk_connect_ex10`], plus the audio format this client is **asking** for (ABI v24):
+// `audio_rate_hz` (`48000` or `96000`) and `audio_bits` (`16` or `24`).
+//
+// Passing anything other than `48000`/`16` sets `CLIENT_CAP_AUDIO_HIRES` in the `Hello` and asks
+// the host for the LOSSLESS `0xD3` plane — bit-exact PCM instead of Opus. That is an opt-in on
+// both ends, and it is meant to be: it costs **1.5–4.6 Mbps** taken off the top of the link
+// (audio rides QUIC datagrams outside the ABR loop, so ABR can neither see it nor reclaim it),
+// against the ~256 kbps Opus this replaces. Only call it with a non-default format when the
+// user turned the feature on AND this embedder can genuinely open an output device at it.
+//
+// **The request is not the answer.** The host runs a five-condition gate
+// (`design/hi-res-audio.md` §8.4 — client asked, operator policy allows, stereo, the capture
+// path can *really* deliver the rate, and the link can afford it) and any failure resolves the
+// session back to Opus at 48 kHz. That is not an error and the connect still succeeds. Read
+// [`punktfunk_connection_audio_sample_rate`] / [`punktfunk_connection_audio_bits`] afterwards
+// and open the device from THOSE — opening at what you asked for is
+// `design/hi-res-audio.md` §4.3's failure repeated at the client end.
+//
+// Passing `48000`/`16` is exactly [`punktfunk_connect_ex10`], byte-for-byte on the wire.
+// 44.1 kHz and its multiples are not offered at all: they are a whole number of samples per
+// millisecond in no arithmetic core uses, so the ladder is 48/96 kHz only (§4.1).
+//
+// A NEW symbol, not a widened one — `ex10` keeps its parameter list AND its behaviour.
+//
+// # Safety
+// Same as [`punktfunk_connect_ex10`].
+PunktfunkConnection *punktfunk_connect_ex11(const char *host,
+                                            uint16_t port,
+                                            uint32_t width,
+                                            uint32_t height,
+                                            uint32_t refresh_hz,
+                                            uint32_t compositor,
+                                            uint32_t gamepad,
+                                            uint32_t bitrate_kbps,
+                                            uint8_t video_caps,
+                                            uint8_t audio_channels,
+                                            uint32_t audio_rate_hz,
+                                            uint8_t audio_bits,
+                                            uint8_t video_codecs,
+                                            uint8_t preferred_codec,
+                                            uint8_t client_caps,
+                                            const char *launch_id,
+                                            const uint8_t *pin_sha256,
+                                            uint8_t *observed_sha256_out,
+                                            const char *client_cert_pem,
+                                            const char *client_key_pem,
+                                            const char *device_name,
+                                            uint32_t timeout_ms,
+                                            int32_t *status_out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Generate a persistent client identity: a self-signed certificate + private key, both
 // PEM, NUL-terminated, written into the caller's buffers. Generate ONCE, store both
 // strings (Keychain etc.), pass them to [`punktfunk_pair`] and every
@@ -2935,11 +3052,12 @@ PunktfunkStatus punktfunk_connection_next_au(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pull the next Opus audio packet, waiting up to `timeout_ms`. Returns
-// [`PunktfunkStatus::NoFrame`] on timeout and [`PunktfunkStatus::Closed`] once the session ended.
-// On `Ok`, `out->data` borrows connection memory **until the next audio call** on this
-// handle (independent of the video slot). Drain from a dedicated audio thread — packets
-// arrive every 5 ms and the internal queue holds 320 ms.
+// Pull the next audio packet (see [`PunktfunkAudioPacket`] for what it holds), waiting up to
+// `timeout_ms`. Returns [`PunktfunkStatus::NoFrame`] on timeout and [`PunktfunkStatus::Closed`]
+// once the session ended. On `Ok`, `out->data` borrows connection memory **until the next audio
+// call** on this handle (independent of the video slot). Drain from a dedicated audio thread —
+// Opus packets arrive every 5 ms (lossless ones every 1–5 ms, per the negotiated frame length)
+// and the internal queue holds 320 ms.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is writable. At most one thread pulls audio —
@@ -2960,6 +3078,52 @@ PunktfunkStatus punktfunk_connection_next_audio(PunktfunkConnection *c,
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
 PunktfunkStatus punktfunk_connection_audio_channels(PunktfunkConnection *c, uint8_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Read the sample rate the host resolved for this session (from its Welcome): `48000` for every
+// Opus session — and for every host older than the lossless plane — or the rate a hi-res session
+// actually landed on, which may be LOWER than the client asked for. `*out` is filled when
+// non-NULL. Available immediately after a successful connect; it never changes mid-session.
+//
+// ⚠ **Open the output device from this, not from `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ`.** That
+// compile-time constant keeps its value and its meaning — it is the DEFAULT/legacy rate, and
+// every ring sized from it is still correct for every session that resolves to Opus — but on a
+// hi-res session it is simply not the rate on the wire. Opening at 96 kHz because you asked for
+// 96 kHz, when the host answered 48 kHz, is `design/hi-res-audio.md` §4.3's failure repeated at
+// the other end of the link: everything audits clean and the content is wrong.
+//
+// An ACCESSOR rather than a field on [`PunktfunkAudioPcm`] or `PunktfunkStats`: both are
+// `#[repr(C)]` with no `struct_size` guard and are allocated by value by C embedders, so growing
+// either would break every one of them at once. Same rule ABI 18 set with
+// `punktfunk_connection_next_rumble_cmd2` — added, not widened — so an embedder that never calls
+// this behaves exactly as it did before it existed.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is NULL or writable for one `u32`.
+PunktfunkStatus punktfunk_connection_audio_sample_rate(PunktfunkConnection *c,
+                                                       uint32_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Read the sample depth the host resolved for this session (from its Welcome): `16` on every
+// Opus session and every older host, `16` or `24` on the lossless plane. `*out` is filled when
+// non-NULL. Available immediately after a successful connect; it never changes mid-session.
+//
+// Only sessions on the lossless plane can report `24`, and only they need it: the depth is the
+// stride the `0xD3` payload is unpacked at, and [`punktfunk_connection_next_audio_pcm`] already
+// does that unpacking in core — it hands out f32 either way. This is here so an embedder can
+// *report* the format honestly (a UI that says "24-bit" while the host declined is the same
+// class of lie as claiming a rate you did not get) and so one draining raw frames through
+// [`punktfunk_connection_next_audio`] can unpack them itself. Which PLANE a session is on is
+// `punktfunk_connection_host_caps() & PUNKTFUNK_HOST_CAP_AUDIO_HIRES`, not this: 48 kHz/16-bit
+// reads identically on both.
+//
+// ADDED, not widened — see [`punktfunk_connection_audio_sample_rate`] for why.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
+PunktfunkStatus punktfunk_connection_audio_bits(PunktfunkConnection *c, uint8_t *out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -2994,14 +3158,25 @@ PunktfunkStatus punktfunk_connection_end_reason(PunktfunkConnection *c, uint8_t 
 // [`punktfunk_connection_next_audio`] on a given connection, from one dedicated audio thread —
 // not both (they share the underlying queue).
 //
+// **Both audio planes come out of this one call.** On a session that resolved the lossless
+// `0xD3` plane there is no Opus decoder at all — the samples are unpacked at the negotiated
+// depth — but the output is the same interleaved f32 in the same borrowed buffer, so an embedder
+// needs no branch. It DOES need [`punktfunk_connection_audio_sample_rate`] to size its ring and
+// open its device: `frame_count` is samples per channel, and at 96 kHz they arrive twice as fast.
+//
 // **Loss concealment**: packets the wire lost (a gap in the sequence, after the redundant-plane
-// recovery has had its chance) are synthesized via libopus packet-loss concealment and returned
-// IN FRONT of the arriving frame in the same buffer — `out->frame_count` then covers the
-// concealed frames plus the real one (`out->seq`/`out->pts_ns` are the real packet's). The
-// embedder just writes the whole buffer to its ring, same as any other frame; gaps arrive
-// pre-healed, exactly as they do on the clients that decode outside core. That covers a gap a
-// LATER packet reveals; when the wire goes quiet instead, see
-// [`punktfunk_connection_audio_plc`].
+// recovery has had its chance) are synthesized and returned IN FRONT of the arriving frame in
+// the same buffer — `out->frame_count` then covers the concealed frames plus the real one
+// (`out->seq`/`out->pts_ns` are the real packet's). The embedder just writes the whole buffer to
+// its ring, same as any other frame; gaps arrive pre-healed, exactly as they do on the clients
+// that decode outside core. That covers a gap a LATER packet reveals; when the wire goes quiet
+// instead, see [`punktfunk_connection_audio_plc`].
+//
+// What synthesizes them differs by plane, and has to: Opus gaps use libopus PLC, which
+// extrapolates from the decoder's model of the signal. A lossless frame has no such model — only
+// the signal — so `0xD3` gaps are concealed by repeating the last good frame under a raised-cosine
+// fade, decaying to silence across a sustained gap (`design/hi-res-audio.md` §4.5). Same shape,
+// same buffer, same cap; only the material differs.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is writable. At most one thread pulls audio.
@@ -3029,9 +3204,13 @@ PunktfunkStatus punktfunk_connection_next_audio_pcm(PunktfunkConnection *c,
 // to duplicate, pushing the stream permanently later. Core supplies only the mechanism, one frame
 // per call, at the cadence the embedder drains at.
 //
-// Returns [`PunktfunkStatus::NoFrame`] when nothing has decoded yet — PLC extrapolates from the
-// last decoded frame, so before there is one there is no state to extrapolate from — and if
-// libopus declines to interpolate. Both mean "write nothing this tick", exactly like a timeout.
+// Works on both audio planes, using each one's own concealer — libopus PLC on `0xC9`, the
+// repeat-and-fade of [`crate::audio::pcm::PcmConceal`] on `0xD3` (a lossless frame carries no
+// model of the signal for PLC to extrapolate from; `design/hi-res-audio.md` §4.5).
+//
+// Returns [`PunktfunkStatus::NoFrame`] when nothing has decoded yet — both concealers build on
+// the last decoded frame, so before there is one there is nothing to build from — and if libopus
+// declines to interpolate. Both mean "write nothing this tick", exactly like a timeout.
 //
 // `out->seq` and `out->pts_ns` read 0: this frame was never on the wire, so it has no sequence
 // number and no capture instant, and it must never be fed to an A/V-sync observation.

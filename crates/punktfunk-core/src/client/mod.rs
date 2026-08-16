@@ -426,6 +426,37 @@ pub struct NativeClient {
     /// host that omits it (→ `2`) yields working stereo. The `0xC9` audio frames are encoded with the
     /// matching layout.
     pub audio_channels: u8,
+    /// Which audio plane the host resolved for this session ([`Welcome::audio_codec`]):
+    /// [`quic::AUDIO_CODEC_OPUS`] — Opus frames on `0xC9` (with `0xD2` redundancy when
+    /// negotiated), the default and what every older host yields — or [`quic::AUDIO_CODEC_PCM`]
+    /// — lossless interleaved PCM on `0xD3` ([`crate::audio::pcm`]).
+    ///
+    /// This is the field that SELECTS the decoder, and nothing else can: a 48 kHz/16-bit lossless
+    /// session and a 48 kHz Opus session agree on every other resolved value. A session runs one
+    /// plane or the other for its whole life — the host never switches mid-session, because the
+    /// client's output device is open at a fixed format.
+    pub audio_codec: u8,
+    /// The sample rate the host resolved ([`Welcome::audio_rate_hz`]) — `48_000` for every Opus
+    /// session and for an older host, or the rate a hi-res session actually landed on, which may
+    /// be lower than the client asked for.
+    ///
+    /// ⚠ **Open the output device from THIS, never from the request.** A client that asks for
+    /// 96 kHz, is answered 48 kHz, and opens at 96 kHz anyway is the exact failure
+    /// `design/hi-res-audio.md` §4.3 is written around, one end further along.
+    pub audio_sample_rate_hz: u32,
+    /// The sample depth the host resolved ([`Welcome::audio_bits`]) — 16 or 24. Meaningful only
+    /// on the `0xD3` plane, where it is the stride payloads are unpacked at; `16` on every Opus
+    /// session (whose samples reach the embedder as f32 regardless).
+    pub audio_bits: u8,
+    /// How much audio one `0xD3` datagram carries, in microseconds ([`Welcome::audio_frame_us`]);
+    /// `0` on an Opus session, whose frames are the `0xC9` plane's fixed 5 ms.
+    ///
+    /// Negotiated from the path MTU rather than assumed, so it must not be hardcoded — at
+    /// 96 kHz/24-bit the default MTU ceiling only leaves room for 2 ms frames. Exposed here for
+    /// Rust embedders sizing a playout ring; the C surface deliberately has no accessor for it,
+    /// because [`crate::abi::punktfunk_connection_next_audio_pcm`] decodes in core and reports
+    /// each frame's real length in `frame_count`.
+    pub audio_frame_us: u16,
     /// The video codec the host resolved and will emit ([`Welcome::codec`]) — [`quic::CODEC_H264`],
     /// [`quic::CODEC_HEVC`] (default / older host), or [`quic::CODEC_AV1`]. The client builds its
     /// decoder from THIS, never assuming HEVC.
@@ -563,6 +594,39 @@ fn os_hostname() -> Option<String> {
     None
 }
 
+/// The `client_caps` a session actually advertises: what the embedder passed, plus the two bits
+/// core decides for itself. A named function rather than an expression inside `connect` because
+/// this one line decides whether a client asks a host for 1.5–4.6 Mbps of extra bandwidth, and
+/// the rule deserves to be pinnable by a test.
+///
+/// - [`quic::CLIENT_CAP_AUDIO_RED`] is set **always**. Redundancy is a pure "I can decode it": the
+///   recovery happens inside core's own datagram demux and re-inserts the rebuilt frame into the
+///   same queue, so every embedder benefits without knowing the plane exists and none of them can
+///   forget to opt in. It costs ~1 %, and the host still decides whether to spend it.
+/// - [`quic::CLIENT_CAP_AUDIO_HIRES`] is set **only when the caller asked for a non-default
+///   format**. It means *capable **and** the user turned it on* (the `VIDEO_CAP_444` precedent),
+///   it costs 1.5–4.6 Mbps taken off the top of a link ABR can neither see nor reclaim, and it is
+///   answered by the host re-formatting the wire — so a client that advertised it without being
+///   able to open the output would spend that bandwidth to play nothing. Only the embedder knows
+///   whether its device can open at the format, so only the embedder can ask, and asking IS
+///   calling [`NativeClient::connect_with_audio_format`] with a non-default one.
+///
+/// The derived bit is OR'd into the caller's rather than replacing it, which is what leaves the
+/// 48 kHz/16-bit lossless request expressible at all: those parameters are indistinguishable from
+/// the legacy ones, so an embedder that genuinely wants that (rare — 24-bit is where the plane
+/// earns its bandwidth) sets the bit itself and is not overridden.
+fn advertised_client_caps(client_caps: u8, audio_rate_hz: u32, audio_bits: u8) -> u8 {
+    let hires =
+        audio_rate_hz != crate::audio::SAMPLE_RATE_HZ || audio_bits != crate::audio::pcm::BITS_16;
+    client_caps
+        | crate::quic::CLIENT_CAP_AUDIO_RED
+        | if hires {
+            crate::quic::CLIENT_CAP_AUDIO_HIRES
+        } else {
+            0
+        }
+}
+
 impl NativeClient {
     /// Connect to a `punktfunk/1` host and start the session at (up to) `mode`. Blocks until the
     /// handshake completes or `timeout` elapses.
@@ -574,6 +638,13 @@ impl NativeClient {
     /// `identity`: this client's persistent self-signed identity (PEM cert + PKCS#8 key,
     /// see [`endpoint::generate_identity`]), presented via TLS client auth so a host can
     /// recognize a paired client. `None` = anonymous (rejected by hosts requiring pairing).
+    ///
+    /// Requests the legacy audio format — Opus at 48 kHz / 16-bit, the plane every build has
+    /// spoken — so the `Hello` this produces is byte-identical to the pre-hi-res one. An embedder
+    /// whose user turned the lossless plane on calls
+    /// [`connect_with_audio_format`](Self::connect_with_audio_format) instead; this stays as it
+    /// is so that every existing caller (four clients, the CLI, the host's own integration tests)
+    /// keeps compiling and keeps behaving identically.
     #[allow(clippy::too_many_arguments)]
     pub fn connect(
         host: &str,
@@ -615,6 +686,84 @@ impl NativeClient {
         // pending-approval list shows when an unpaired client knocks, and what its trust store
         // files the device under on delegated approval. `None` = the host falls back to a
         // fingerprint-derived "device abcd1234" label. Embedders usually pass [`device_name`].
+        name: Option<String>,
+        pin: Option<[u8; 32]>,
+        identity: Option<(String, String)>,
+        timeout: Duration,
+    ) -> Result<NativeClient> {
+        Self::connect_with_audio_format(
+            host,
+            port,
+            mode,
+            compositor,
+            gamepad,
+            bitrate_kbps,
+            video_caps,
+            audio_channels,
+            crate::audio::SAMPLE_RATE_HZ,
+            crate::audio::pcm::BITS_16,
+            video_codecs,
+            preferred_codec,
+            display_hdr,
+            client_caps,
+            frame_parts,
+            launch,
+            name,
+            pin,
+            identity,
+            timeout,
+        )
+    }
+
+    /// [`connect`](Self::connect), plus the audio format this client is **asking** for:
+    /// `audio_rate_hz` (48 000 or 96 000) and `audio_bits` (16 or 24).
+    ///
+    /// Everything else is identical. What the pair actually does is decide whether the `Hello`
+    /// carries [`quic::CLIENT_CAP_AUDIO_HIRES`], and the rule is deliberately narrow:
+    ///
+    /// **The bit is set exactly when the caller asks for something other than 48 kHz / 16-bit.**
+    /// It is NOT set unconditionally, and that is the whole difference between it and
+    /// [`quic::CLIENT_CAP_AUDIO_RED`] — which core ORs in for every session below, because
+    /// redundancy is a pure "I can decode it" that costs ~1 % and is recovered inside core where
+    /// no embedder can forget to opt in. Hi-res is the opposite on both counts: it means *capable
+    /// **and** the user turned it on* (the `VIDEO_CAP_444` precedent), it costs 1.5–4.6 Mbps taken
+    /// off the top of a link ABR can neither see nor reclaim, and it is answered by the host
+    /// re-formatting the wire — so a client that advertised it without being able to open the
+    /// output would spend that bandwidth to play nothing. Only the embedder knows whether its
+    /// device can open at the format, so only the embedder can ask, and asking is exactly what
+    /// calling this function with a non-default format IS.
+    ///
+    /// Two consequences worth stating rather than discovering:
+    ///
+    /// - **48 kHz/16-bit lossless is not reachable through this parameter pair** — that request is
+    ///   byte-identical to the legacy one, so it stays Opus. Ask for 48 kHz/**24**-bit to get
+    ///   lossless at the default rate (the depth is where lossless earns its keep anyway, and
+    ///   16-bit PCM would spend 1.5 Mbps to sound like transparent 256 kbps Opus). An embedder
+    ///   that genuinely wants 48/16 on the `0xD3` plane can still set
+    ///   [`quic::CLIENT_CAP_AUDIO_HIRES`] in `client_caps` itself — the bit derived here is OR'd
+    ///   into what the caller passed, never substituted for it.
+    /// - The host may still answer Opus. It resolves the five-condition gate in
+    ///   `design/hi-res-audio.md` §8.4 and a decline is not a failure; read
+    ///   [`audio_codec`](Self::audio_codec) / [`audio_sample_rate_hz`](Self::audio_sample_rate_hz)
+    ///   / [`audio_bits`](Self::audio_bits) afterwards and open the device from those.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_with_audio_format(
+        host: &str,
+        port: u16,
+        mode: Mode,
+        compositor: CompositorPref,
+        gamepad: GamepadPref,
+        bitrate_kbps: u32,
+        video_caps: u8,
+        audio_channels: u8,
+        audio_rate_hz: u32,
+        audio_bits: u8,
+        video_codecs: u8,
+        preferred_codec: u8,
+        display_hdr: Option<HdrMeta>,
+        client_caps: u8,
+        frame_parts: bool,
+        launch: Option<String>,
         name: Option<String>,
         pin: Option<[u8; 32]>,
         identity: Option<(String, String)>,
@@ -716,6 +865,8 @@ impl NativeClient {
                     bitrate_kbps,
                     video_caps,
                     audio_channels,
+                    audio_rate_hz,
+                    audio_bits,
                     video_codecs,
                     preferred_codec,
                     display_hdr,
@@ -725,7 +876,10 @@ impl NativeClient {
                     // embedder benefits without knowing the plane exists — and none of them can
                     // forget to opt in. The bit is a pure "I can decode it"; the host still
                     // decides whether to spend the extra ~1 %.
-                    client_caps: client_caps | crate::quic::CLIENT_CAP_AUDIO_RED,
+                    //
+                    // CLIENT_CAP_AUDIO_HIRES deliberately does NOT join it unconditionally — see
+                    // `advertised_client_caps` for the rule and why the two bits differ.
+                    client_caps: advertised_client_caps(client_caps, audio_rate_hz, audio_bits),
                     frame_parts,
                     launch,
                     name,
@@ -850,6 +1004,10 @@ impl NativeClient {
             color: negotiated.color,
             chroma_format: negotiated.chroma_format,
             audio_channels: negotiated.audio_channels,
+            audio_codec: negotiated.audio_codec,
+            audio_sample_rate_hz: negotiated.audio_rate_hz,
+            audio_bits: negotiated.audio_bits,
+            audio_frame_us: negotiated.audio_frame_us,
             codec: negotiated.codec,
         })
     }
@@ -1719,5 +1877,53 @@ mod host_port_tests {
         assert!(join_host_port("fd00::1", 4770)
             .parse::<std::net::SocketAddr>()
             .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod client_caps_tests {
+    use super::advertised_client_caps;
+    use crate::audio::pcm::{BITS_16, BITS_24};
+    use crate::audio::SAMPLE_RATE_HZ;
+    use crate::quic::{CLIENT_CAP_AUDIO_HIRES, CLIENT_CAP_AUDIO_RED, CLIENT_CAP_CURSOR};
+
+    /// The one line that decides whether a client asks a host to spend 1.5–4.6 Mbps on audio.
+    /// Redundancy is unconditional (core recovers it, so nobody can forget to opt in); hi-res is
+    /// not, because it means "capable AND turned on" and only a non-default request expresses
+    /// that. A regression here is silent in every test that does not look for it: the session
+    /// still works, it just costs several megabits nobody asked for.
+    #[test]
+    fn hires_is_advertised_only_when_the_caller_asked_for_a_non_default_format() {
+        // The legacy request: redundancy on, hi-res off, the embedder's own bits untouched.
+        let legacy = advertised_client_caps(CLIENT_CAP_CURSOR, SAMPLE_RATE_HZ, BITS_16);
+        assert_eq!(legacy & CLIENT_CAP_AUDIO_RED, CLIENT_CAP_AUDIO_RED);
+        assert_eq!(legacy & CLIENT_CAP_AUDIO_HIRES, 0);
+        assert_eq!(legacy & CLIENT_CAP_CURSOR, CLIENT_CAP_CURSOR);
+        // …and with no embedder bits at all, which is what every `connect` caller produces.
+        assert_eq!(
+            advertised_client_caps(0, SAMPLE_RATE_HZ, BITS_16),
+            CLIENT_CAP_AUDIO_RED
+        );
+
+        // Either half of the format being non-default is a request.
+        for (rate, bits) in [
+            (SAMPLE_RATE_HZ, BITS_24),
+            (96_000, BITS_16),
+            (96_000, BITS_24),
+        ] {
+            let caps = advertised_client_caps(0, rate, bits);
+            assert_eq!(
+                caps & CLIENT_CAP_AUDIO_HIRES,
+                CLIENT_CAP_AUDIO_HIRES,
+                "{rate} Hz / {bits}-bit must ask for the lossless plane"
+            );
+            assert_eq!(caps & CLIENT_CAP_AUDIO_RED, CLIENT_CAP_AUDIO_RED);
+        }
+
+        // The escape hatch: 48 kHz/16-bit is indistinguishable from a legacy request, so an
+        // embedder that wants lossless AT the default format sets the bit itself — and is not
+        // overridden, because the derived bit is OR'd in rather than substituted.
+        let explicit = advertised_client_caps(CLIENT_CAP_AUDIO_HIRES, SAMPLE_RATE_HZ, BITS_16);
+        assert_eq!(explicit & CLIENT_CAP_AUDIO_HIRES, CLIENT_CAP_AUDIO_HIRES);
     }
 }

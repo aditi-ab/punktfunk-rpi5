@@ -2,6 +2,14 @@
 
 /// Audio packets buffered for the embedder: 64 × 5 ms = 320 ms of slack. A lagging
 /// embedder drops the newest packet (the audio renderer conceals the gap).
+///
+/// Counted in PACKETS, not milliseconds, and the lossless `0xD3` plane shares it — so on a
+/// session whose negotiated frame is shorter than 5 ms the same 64 entries are proportionally
+/// less time (128 ms at the 2 ms frame 96 kHz/24-bit lands on at the default MTU). Left as a
+/// packet count deliberately: 128 ms is still far above the 15–90 ms the de-jitter policy
+/// targets, and a depth that changed with the negotiated format would make the overflow
+/// behaviour session-dependent for no measured gain. Worth knowing before anyone reads "320 ms"
+/// as a guarantee.
 pub(crate) const AUDIO_QUEUE: usize = 64;
 
 /// Rumble updates buffered for the embedder. Overflow drops the NEWEST update (same
@@ -56,11 +64,22 @@ pub(crate) const CURSOR_SHAPE_QUEUE: usize = 8;
 /// newest (try_send), healed by the very next frame's datagram.
 pub(crate) const CURSOR_STATE_QUEUE: usize = 8;
 
-/// One Opus packet from the host's audio datagram stream (48 kHz stereo, 5 ms frames).
+/// One packet from the host's audio datagram stream — an Opus frame off `0xC9`/`0xD2`
+/// (48 kHz, 5 ms) or one lossless PCM frame off `0xD3`, at the negotiated rate/depth and one
+/// rung of [`crate::audio::pcm::FRAME_US_LADDER`] long.
+///
+/// The two planes share this type and the queue that carries it because they share a header:
+/// `seq` and `pts_ns` mean the same thing on both. What they do NOT share is how `data` is read,
+/// and nothing per-packet says which — the session's
+/// [`NativeClient::audio_codec`](crate::client::NativeClient::audio_codec) does, once, for the
+/// whole session.
 #[derive(Clone, Debug)]
 pub struct AudioPacket {
     pub seq: u32,
     pub pts_ns: u64,
-    /// The raw Opus payload — feed it to an Opus decoder as one frame.
+    /// The frame's payload: a raw Opus packet to hand a decoder as one frame, or — on an
+    /// [`AUDIO_CODEC_PCM`](crate::quic::AUDIO_CODEC_PCM) session — interleaved little-endian
+    /// integer samples to unpack with [`crate::audio::pcm::to_f32`]. Empty is a DTX silence
+    /// marker on the Opus plane.
     pub data: Vec<u8>,
 }
