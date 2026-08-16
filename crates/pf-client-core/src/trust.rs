@@ -1319,6 +1319,16 @@ pub struct Settings {
     /// [`library_sort`](Self::library_sort).
     #[serde(default)]
     pub library_view: String,
+    /// Open a host's library on its COLLECTIONS — platforms and stores as tiles — instead of
+    /// the whole shelf. Presentation only, same rules as [`library_sort`](Self::library_sort).
+    ///
+    /// Ignored by a library with fewer than two collections (see `pf-console-ui`'s
+    /// `collate::worth_browsing`): a screen that opens onto a single tile is a press the user
+    /// pays for nothing, so that library opens on its shelf whatever this says. Default off,
+    /// like every key in this family — an existing install must not have the screen its
+    /// deep links land on changed under it.
+    #[serde(default)]
+    pub library_collections: bool,
     /// Send Wake-on-LAN before connecting to a saved host and wait for it to boot (the
     /// Apple client's "Auto-wake on connect"). Default ON — that was the unconditional
     /// behavior before this became a setting. Off is for hosts reached over a VPN, where
@@ -1526,6 +1536,7 @@ impl Default for Settings {
             reduce_motion: false,
             library_sort: String::new(),
             library_view: String::new(),
+            library_collections: false,
             auto_wake: true,
             invert_scroll: false,
             speaker_device: String::new(),

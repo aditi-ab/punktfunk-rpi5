@@ -137,6 +137,7 @@ impl Shell {
             (
                 Motion::Nav {
                     kind: NavKind::Push,
+                    leaving,
                     ..
                 },
                 Some(p),
@@ -144,15 +145,18 @@ impl Shell {
                 let n = self.stack.len();
                 let enter_scale = zoom(NAV_ENTER_SCALE + (1.0 - NAV_ENTER_SCALE) * p);
                 let enter_slide = slide(NAV_SLIDE_DP * k * (1.0 - p));
+                let recede = zoom(1.0 - (1.0 - NAV_EXIT_SCALE) * p);
                 // Outgoing recedes underneath…
-                if n >= 2 {
+                if let Some(replaced) = leaving.as_mut() {
+                    // A REPLACE carries the screen it swapped out, because that screen is no
+                    // longer on the stack to be found under the incoming one. Painting the
+                    // stack's own n-2 here would recede the replaced screen's PARENT, which
+                    // is how choosing "Edit…" in a host menu used to flash the host list.
+                    env.paint(replaced.as_mut(), 1.0 - p, 0.0, recede);
+                    env.paint(&mut self.stack[n - 1], p, enter_slide, enter_scale);
+                } else if n >= 2 {
                     let (below, top) = self.stack.split_at_mut(n - 1);
-                    env.paint(
-                        &mut below[n - 2],
-                        1.0 - p,
-                        0.0,
-                        zoom(1.0 - (1.0 - NAV_EXIT_SCALE) * p),
-                    );
+                    env.paint(&mut below[n - 2], 1.0 - p, 0.0, recede);
                     // …while the incoming slides up out of a fade.
                     env.paint(&mut top[0], p, enter_slide, enter_scale);
                 } else {

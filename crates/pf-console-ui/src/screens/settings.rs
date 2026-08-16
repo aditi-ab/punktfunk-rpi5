@@ -71,12 +71,17 @@ enum RowId {
     /// beside the palette row for the same reason it does: both are presentation, and the
     /// effect of stepping this one is visible on the backdrop behind it.
     ReduceMotion,
-    /// How the game library arranges its titles — see `library::LibraryView`. Lives beside
-    /// the other presentation rows rather than on a face button in the library itself: the
-    /// library's five hints are already spoken for (A play, X copy link, Y collections,
-    /// L1/R1 jump, B back), and this is a preference you set once, not a thing you toggle
-    /// while browsing.
+    /// How the game library arranges its titles — see `library::LibraryView`. The library
+    /// changes it in place now, from the bar over its own field, which is where an
+    /// arrangement you want to SEE the effect of belongs; this row stays because both
+    /// surfaces write the one `library_view` key, so it is the same setting reached from a
+    /// list, and it is where the explanation of the two arrangements lives.
     LibraryView,
+    /// Whether opening a host's library lands on its collections rather than on the whole
+    /// shelf — see `trust::Settings::library_collections`. Beside the view row because both
+    /// answer "what does the library look like when I get there", and this one is the only
+    /// way to reach the collections screen without the shelf's Y.
+    LibraryCollections,
 }
 
 // The couch-relevant subset grew 2026-07-31: this screen is the ONLY settings editor in
@@ -147,6 +152,7 @@ const TABS: [(&str, &[RowId]); 7] = [
             RowId::Palette,
             RowId::ReduceMotion,
             RowId::LibraryView,
+            RowId::LibraryCollections,
             RowId::Stats,
             RowId::Fullscreen,
             RowId::AutoWake,
@@ -742,6 +748,11 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
                 .label()
                 .into(),
         ),
+        RowId::LibraryCollections => (
+            None,
+            "Start in collections",
+            on_off(s.library_collections).into(),
+        ),
         RowId::Stats => (
             None,
             "Statistics overlay",
@@ -865,7 +876,13 @@ fn detail(id: RowId) -> &'static str {
         }
         RowId::LibraryView => {
             "Shelf shows one cover at a time, big. Grid shows about eighteen at once — \
-             for when you already know what you are looking for."
+             for when you already know what you are looking for. The library's own bar \
+             switches it while you browse, along with the sort."
+        }
+        RowId::LibraryCollections => {
+            "Opening a host's library goes straight to its collections — platforms and \
+             stores as tiles — instead of the whole shelf. A library with only one \
+             collection opens on the shelf as usual."
         }
         RowId::Stats => {
             "How much the overlay shows: Compact (one line) → Normal → Detailed. \
@@ -1075,6 +1092,7 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             let at = all.iter().position(|v| *v == cur);
             step_option(at, all.len(), delta, wrap).map(|i| s.library_view = all[i].id().into())
         }
+        RowId::LibraryCollections => toggle(&mut s.library_collections, delta, wrap),
         RowId::Fullscreen => toggle(&mut s.fullscreen_on_stream, delta, wrap),
         RowId::AutoWake => toggle(&mut s.auto_wake, delta, wrap),
         // Navigation rows, handled before the settings path in `menu` — never a value edit.
@@ -1085,7 +1103,17 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
 
 /// The shared stepping rule: clamp when adjusting, wrap when cycling; an unknown
 /// current value snaps to the first option on any step.
-fn step_option(current: Option<usize>, len: usize, delta: i32, wrap: bool) -> Option<usize> {
+///
+/// Reachable from the sibling screens because the library's own view/sort bar edits two of
+/// the very values this screen's rows edit, and "◀ ▶ stops at the ends" is a grammar the
+/// console states once. A second copy of it there would be a second place for the boundary
+/// thud to go missing.
+pub(super) fn step_option(
+    current: Option<usize>,
+    len: usize,
+    delta: i32,
+    wrap: bool,
+) -> Option<usize> {
     if len == 0 {
         return None;
     }
@@ -1116,7 +1144,7 @@ fn toggle(value: &mut bool, delta: i32, wrap: bool) -> Option<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use pf_client_core::trust::Settings;
 
@@ -1150,7 +1178,12 @@ mod tests {
     /// Point the settings store at a throwaway HOME. `apply_row` rebases on the FILE
     /// before a mutating press and saves after it, so a test driving that path against the
     /// real `$HOME` would rewrite the developer's own console settings.
-    fn fake_home() {
+    ///
+    /// Shared with the library screen's tests, which drive the same `Settings::save` through
+    /// the library bar: one `OnceLock` for the whole binary is what keeps the write to the
+    /// environment sound, and a second copy of this would be exactly the race the SAFETY note
+    /// below rules out.
+    pub(crate) fn fake_home() {
         use std::sync::OnceLock;
         static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
         HOME.get_or_init(|| {
@@ -1705,13 +1738,68 @@ mod tests {
         // The pre-tab flat list, plus the palette row, the lossless-audio row and the
         // reduce-motion row later passes added, minus the game-library toggle: this screen
         // never read it, and the library is offered on any paired host now.
-        assert_eq!(seen.len(), 32, "{seen:?}");
+        assert_eq!(seen.len(), 33, "{seen:?}");
         assert!(seen.contains(&RowId::Palette));
         assert!(seen.contains(&RowId::ReduceMotion));
         assert!(seen.contains(&RowId::AudioFormat));
         // The catalog rows belong to the trailing tab, which builds them at render time.
         assert!(TABS[PROFILES_TAB].1.is_empty());
         assert_eq!(TABS[PROFILES_TAB].0, "Profiles");
+    }
+
+    /// The collections entry is a plain off-by-default toggle, and it sits directly under the
+    /// row that says what the library looks like — the two are one decision read in two
+    /// halves, and a user who wants the tiles goes looking beside the arrangement.
+    ///
+    /// Off by default matters more than the placement: this key decides where a deep link
+    /// lands, so an install that never opens this screen must keep the shelf it has.
+    #[test]
+    fn the_collections_entry_sits_with_the_library_view_and_ships_off() {
+        let (mut settings, pads) = ctx_parts();
+        assert!(!settings.library_collections, "off by default");
+        let interface = TABS
+            .iter()
+            .find(|(name, _)| *name == "Interface")
+            .expect("the Interface tab")
+            .1;
+        let view = interface
+            .iter()
+            .position(|id| *id == RowId::LibraryView)
+            .expect("the library view row");
+        assert_eq!(interface.get(view + 1), Some(&RowId::LibraryCollections));
+
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            pads: &pads,
+            deck: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        assert!(
+            !adjust(RowId::LibraryCollections, -1, false, &mut ctx),
+            "already off = thud"
+        );
+        assert!(adjust(RowId::LibraryCollections, 1, false, &mut ctx));
+        assert!(ctx.settings.library_collections);
+        assert_eq!(
+            row_spec(RowId::LibraryCollections, &ctx, &[])
+                .value
+                .as_deref(),
+            Some("On"),
+            "the row says what the key holds"
+        );
+        assert!(
+            !adjust(RowId::LibraryCollections, 1, false, &mut ctx),
+            "on = thud"
+        );
+        assert!(
+            adjust(RowId::LibraryCollections, 1, true, &mut ctx),
+            "A flips it back"
+        );
+        assert!(!ctx.settings.library_collections);
     }
 
     /// L1/R1 wrap around the strip and each tab keeps its own cursor, so a detour into

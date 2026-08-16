@@ -382,6 +382,59 @@ fn a_secondary_press_goes_back() {
     ));
 }
 
+/// A REPLACE recedes the screen it replaced, not that screen's parent.
+///
+/// Reported from a Deck: choosing "Edit…" in a host's menu flashed the host LIST for the
+/// length of the transition before the editor arrived. The cause is that a push paints the
+/// screen beneath the incoming one as its receding layer, while a replace had already popped
+/// and dropped the screen being swapped out — so "beneath" was the menu's parent, one level
+/// too far, and the transition animated the editor in over Home.
+///
+/// Asserted on the carried screen rather than on pixels: the defect is entirely a question of
+/// WHICH screen the motion holds, and a frame diff would pin the particular look of a
+/// transition instead of the thing that was wrong with it.
+#[test]
+fn a_replace_carries_the_screen_it_replaced() {
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.handle_menu(MenuEvent::Move(MenuDir::Up));
+    assert!(matches!(s.stack.last(), Some(Screen::HostOptions(_))));
+    finish_motion(&mut s);
+
+    // Walk to "Edit…" and take it. The first fixture host is paired and online and cannot
+    // wake, so its menu is [Send logs, Copy link, Edit…, Forget, Cancel] — Edit is two down.
+    // Pressed exactly rather than searched, so that reordering the menu fails HERE instead of
+    // quietly landing this test's Confirm on "Forget".
+    s.handle_menu(MenuEvent::Move(MenuDir::Down));
+    s.handle_menu(MenuEvent::Move(MenuDir::Down));
+    s.handle_menu(MenuEvent::Confirm);
+    assert!(
+        matches!(s.stack.last(), Some(Screen::AddHost(_))),
+        "Edit… opens the host editor"
+    );
+    assert_eq!(s.stack.len(), 2, "the menu was swapped out, not stacked on");
+    match &s.motion {
+        Motion::Nav {
+            kind: NavKind::Push,
+            leaving: Some(carried),
+            ..
+        } => assert!(
+            matches!(carried.as_ref(), Screen::HostOptions(_)),
+            "the receding layer must be the MENU; carrying nothing leaves the renderer to \
+             recede the menu's parent, which is the reported flash"
+        ),
+        _ => panic!("a replace must be a push CARRYING its predecessor"),
+    }
+
+    // …and reversing it puts the menu back, because that is the screen the user watched
+    // recede and then return.
+    s.handle_menu(MenuEvent::Back);
+    finish_motion(&mut s);
+    assert!(
+        matches!(s.stack.last(), Some(Screen::HostOptions(_))),
+        "a reversed replace lands where the user actually was"
+    );
+}
+
 /// Up on a saved tile opens that host's menu; a discovered-but-unsaved one has none.
 #[test]
 fn up_opens_host_options_for_saved_tiles_only() {

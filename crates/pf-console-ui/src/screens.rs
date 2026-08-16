@@ -6,11 +6,24 @@
 pub(crate) mod add_host;
 pub(crate) mod collections;
 pub(crate) mod home;
-pub(crate) mod host_options;
 pub(crate) mod library;
+pub(crate) mod options;
 pub(crate) mod pair;
 pub(crate) mod pin_hosts;
 pub(crate) mod settings;
+
+/// The context menu under the name the home carousel still opens it by. Home predates the
+/// generalisation and spells both the module and the type "host options"; it is the same
+/// screen, and this goes the moment that call site says [`options::OptionsScreen::for_host`].
+pub(crate) mod host_options {
+    pub(crate) use super::options::OptionsScreen as HostOptionsScreen;
+
+    impl HostOptionsScreen {
+        pub(crate) fn new(host: &crate::model::HostRow) -> HostOptionsScreen {
+            HostOptionsScreen::for_host(host)
+        }
+    }
+}
 
 use crate::glyphs::Hint;
 use crate::library::LibraryShared;
@@ -102,6 +115,18 @@ impl Outbox {
     pub(crate) fn replace(&mut self, screen: Screen) {
         self.nav = Some(Nav::Replace(Box::new(screen)));
     }
+
+    /// Raise the context menu on what the screen is focused on — the console's one door for
+    /// per-item actions. The screen names the SUBJECT
+    /// ([`options::OptionsScreen::for_host`], [`options::OptionsScreen::for_game`]) and the
+    /// menu owns the verbs, so the next action is a row there rather than another button in a
+    /// legend that already holds six.
+    ///
+    /// Two callers: the home carousel's ▲, and the library's X. Both hand it a subject and
+    /// neither names the screen variant, which is the point of the door.
+    pub(crate) fn options(&mut self, menu: options::OptionsScreen) {
+        self.push(Screen::HostOptions(menu));
+    }
 }
 
 /// A saved host's `punktfunk://` link, built from the STORE so it carries the fingerprint
@@ -145,9 +170,10 @@ pub(crate) enum Screen {
     AddHost(add_host::AddHostScreen),
     Pair(pair::PairScreen),
     PinHosts(pin_hosts::PinHostsScreen),
-    /// A saved host's own actions (Wake / Copy link / Edit / Forget) — the console's
-    /// answer to the touch clients' host-card overflow menu.
-    HostOptions(host_options::HostOptionsScreen),
+    /// The context menu: a subject and the actions that apply to it — a host's Wake / Copy
+    /// link / Edit / Forget, a title's Copy link — raised by [`Outbox::options`]. It still
+    /// carries the host menu's name because [`host_options`] does; both are one rename.
+    HostOptions(options::OptionsScreen),
 }
 
 impl Screen {

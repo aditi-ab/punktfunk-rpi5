@@ -9,6 +9,13 @@
 //! snapshot, and opening one pushes a `LibraryScreen` with a FILTER rather than a filtered
 //! copy of the library — so the art pump, the fetch flow and the shared model never learn
 //! that collections exist.
+//!
+//! It is reached two ways, and the difference is one flag ([`CollectionsScreen::root`]).
+//! From a shelf's Y there is a shelf underneath it, holding the covers and waiting for the
+//! B. Opened as the host's library — the "Start in collections" setting, where the shelf
+//! hands over the moment it knows there is more than one collection
+//! (`LibraryScreen::collections_upgrade`) — there is nothing underneath, so this screen
+//! feeds itself from the model's poster queue and offers Y as the way to the whole library.
 
 use crate::anim::{entrances, Entrance, EntranceAt, Spring};
 use crate::collate::{collate, GroupBy, GroupKey, SortKey};
@@ -20,8 +27,8 @@ use crate::library::{
 use crate::model::HostRow;
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{Ctx, Outbox, Screen};
-use crate::theme::{accent, art_sampling, fg, fill, stroke, Fonts, PanelStroke, W};
-use crate::widgets::TabStrip;
+use crate::theme::{accent, art_sampling, fg, fill, stroke, Fonts, PanelStroke, EDGE_INSET, W};
+use crate::widgets::{TabStrip, TAB_STRIP_H};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Color4f, Image, Matrix, Point, RRect, Rect, TileMode};
 use std::collections::HashMap;
@@ -83,6 +90,15 @@ pub(crate) struct CollectionsScreen {
     /// yet simply fans nothing and shows its monogram, which is also what a platform of
     /// art-less ROM entries looks like permanently.
     art: HashMap<String, Image>,
+    /// The scale `art` was decoded for — the last frame's `k`, published by `render` before
+    /// it syncs, exactly as the shelf publishes its own.
+    art_k: f64,
+    /// This screen stands where the library's SHELF would have stood: it was opened as the
+    /// host's library ("Start in collections"), not from a shelf's Y. Two things follow, and
+    /// both are wrong the other way round — it feeds itself from the model's poster queue
+    /// (there is no shelf beneath it to do that), and it offers the way to the whole library
+    /// (there is no shelf beneath it to go back to).
+    root: bool,
     geom: Vec<Rect>,
     entrance: Option<Entrance>,
     entrance_armed: bool,
@@ -92,8 +108,24 @@ struct GroupTile {
     key: GroupKey,
     label: String,
     count: usize,
-    /// Up to [`FAN`] game ids whose posters, if decoded, fan across the tile.
-    fan: Vec<String>,
+    /// Up to [`FAN`] titles whose covers fan across the tile.
+    fan: Vec<FanCard>,
+}
+
+/// One card in a tile's deck — what it takes to DRAW that title's cover without holding the
+/// title.
+///
+/// The id alone was not enough, and a launcher group is where that showed: a launcher has no
+/// poster, its cover IS its brand mark, and the mark is drawn from `icon` rather than looked
+/// up in the art map. Fanning ids only, the deck found no image for any of them and drew a
+/// rank of empty ghosts — reported from a Deck as the Launchers collection showing covers
+/// with no logos in them.
+struct FanCard {
+    id: String,
+    /// The launcher's icon key (`steam`, `playnite`, …), empty for an ordinary game. Carried
+    /// rather than resolved at collate time because the mark is a PATH built to fit the rect
+    /// it is drawn into, and the tile's card rect is not known here.
+    icon: String,
 }
 
 impl CollectionsScreen {
@@ -108,6 +140,10 @@ impl CollectionsScreen {
             groups: Vec::new(),
             generation: u64::MAX,
             art: HashMap::new(),
+            // Seated at the design scale; the first frame publishes the real one, and it
+            // does so before the first `sync` can decode anything against it.
+            art_k: 1.0,
+            root: false,
             geom: Vec::new(),
             entrance: None,
             entrance_armed: false,
@@ -122,32 +158,74 @@ impl CollectionsScreen {
     /// sort changed. Cheap enough to do on a generation bump: collation is one pass and
     /// the tiles hold labels and ids, not games.
     fn sync(&mut self, library: &LibraryShared) {
-        if library.generation() == self.generation {
-            return;
+        if library.generation() != self.generation {
+            let (_, games, generation) = library.snapshot();
+            self.generation = generation;
+            self.groups = collate(&games, self.sort, Some(GroupBy::Platform))
+                .into_iter()
+                .map(|g| GroupTile {
+                    count: g.games.len(),
+                    fan: g
+                        .games
+                        .iter()
+                        .filter_map(|&i| games.get(i))
+                        .map(|game: &LibraryGame| FanCard {
+                            id: game.id.clone(),
+                            icon: game.icon.clone(),
+                        })
+                        .take(FAN)
+                        .collect(),
+                    key: g.key,
+                    label: g.label,
+                })
+                .collect();
+            self.cursor = self.cursor.clamp(0, (self.groups.len() as i32 - 1).max(0));
         }
-        let (_, games, generation) = library.snapshot();
-        self.generation = generation;
-        self.groups = collate(&games, self.sort, Some(GroupBy::Platform))
-            .into_iter()
-            .map(|g| GroupTile {
-                count: g.games.len(),
-                fan: g
-                    .games
-                    .iter()
-                    .filter_map(|&i| games.get(i))
-                    .map(|game: &LibraryGame| game.id.clone())
-                    .take(FAN)
-                    .collect(),
-                key: g.key,
-                label: g.label,
-            })
-            .collect();
-        self.cursor = self.cursor.clamp(0, (self.groups.len() as i32 - 1).max(0));
+        // Outside the generation guard: the list settles in one bump and the art streams in
+        // for seconds afterwards.
+        if self.root {
+            self.pump_art(library);
+        }
     }
 
-    /// Adopt whatever posters the library screen has already decoded. Read from the shared
-    /// model's art queue would be wrong — that queue is drained by the shelf — so this
-    /// takes a snapshot handed down at construction time instead.
+    /// Decode the covers this screen FANS, and only those.
+    ///
+    /// Only as the library's root, and even then only by name. The shelf drains the model's
+    /// queue wholesale because it eventually draws everything in it; this screen draws three
+    /// covers per group. The bytes are pushed once per fetch and never re-sent, so a
+    /// wholesale drain here would take four hundred posters, keep a dozen, and leave the
+    /// shelf a tile opens with monograms for the rest of the session.
+    fn pump_art(&mut self, library: &LibraryShared) {
+        let want: std::collections::HashSet<String> = self
+            .groups
+            .iter()
+            .flat_map(|g| g.fan.iter())
+            .filter(|c| c.icon.is_empty() && !self.art.contains_key(&c.id))
+            .map(|c| c.id.clone())
+            .collect();
+        if want.is_empty() {
+            return;
+        }
+        for (id, bytes) in library.take_art_for(&want, super::library::ART_DECODES_PER_FRAME) {
+            match super::library::decode_poster(&bytes, self.art_k) {
+                Some(img) => {
+                    self.art.insert(id, img);
+                }
+                None => tracing::debug!(%id, "undecodable poster"),
+            }
+        }
+    }
+
+    /// Stand in for the shelf this screen was opened INSTEAD of — see [`Self::root`].
+    pub(crate) fn own_library(&mut self) {
+        self.root = true;
+    }
+
+    /// Adopt whatever posters the library screen has already decoded. Reading the shared
+    /// model's art queue would be wrong on the drill-in path — that queue is drained by the
+    /// shelf this screen is standing on — so this takes a snapshot handed down at
+    /// construction time instead. As the library's own root there is no shelf to read it
+    /// from either, and [`Self::pump_art`] takes over from here.
     pub(crate) fn adopt_art(&mut self, art: HashMap<String, Image>) {
         self.art = art;
     }
@@ -176,8 +254,7 @@ impl CollectionsScreen {
         let at = all.iter().position(|s| *s == self.sort).unwrap_or(0);
         let next = (at as i32 + delta).rem_euclid(all.len() as i32) as usize;
         self.sort = all[next];
-        ctx.settings.library_sort = self.sort.id().to_string();
-        ctx.settings.save();
+        super::library::store_sort(self.sort, ctx);
         // Force a re-collate: the sort changed, not the library.
         self.generation = u64::MAX;
         Some(MenuPulse::Move)
@@ -207,6 +284,18 @@ impl CollectionsScreen {
                 fx.push(Screen::Library(shelf));
                 Some(MenuPulse::Confirm)
             }
+            // Y is the way to the whole library — and it exists only when this screen IS the
+            // library, because then there is no shelf underneath and one alphabetical list
+            // of everything would otherwise be reachable only by turning the setting off.
+            // Opened from a shelf's own Y, that shelf is one B away and this would be a
+            // second, deeper copy of it.
+            MenuEvent::Secondary if self.root => {
+                let mut shelf = super::library::LibraryScreen::new(&self.host);
+                shelf.all_titles();
+                shelf.adopt_art(self.art.clone());
+                fx.push(Screen::Library(shelf));
+                Some(MenuPulse::Confirm)
+            }
             MenuEvent::Back => {
                 fx.pop();
                 None
@@ -227,8 +316,7 @@ impl CollectionsScreen {
                     let all = SortKey::ALL;
                     if let Some(&s) = all.get(i) {
                         self.sort = s;
-                        ctx.settings.library_sort = s.id().to_string();
-                        ctx.settings.save();
+                        super::library::store_sort(s, ctx);
                         self.generation = u64::MAX;
                     }
                     return true;
@@ -252,11 +340,15 @@ impl CollectionsScreen {
     }
 
     pub(crate) fn hints(&self, _ctx: &Ctx) -> Vec<Hint> {
-        vec![
-            Hint::new(HintKey::Confirm, "Open"),
-            Hint::new(HintKey::Shoulders, "Sort"),
-            Hint::new(HintKey::Back, "Back"),
-        ]
+        let mut hints = vec![Hint::new(HintKey::Confirm, "Open")];
+        // Offered on exactly the condition the press answers to, so the legend never
+        // advertises a button that would do nothing.
+        if self.root {
+            hints.push(Hint::new(HintKey::Secondary, "All titles"));
+        }
+        hints.push(Hint::new(HintKey::Shoulders, "Sort"));
+        hints.push(Hint::new(HintKey::Back, "Back"));
+        hints
     }
 
     pub(crate) fn render(
@@ -268,15 +360,30 @@ impl CollectionsScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        // Published before the sync that reads it: a poster is cached against the scale it
+        // will be drawn at, and a decode is not something this can redo.
+        self.art_k = k;
         self.sync(ctx.library);
         let labels: Vec<&str> = SortKey::ALL.iter().map(|s| s.label()).collect();
         let selected = SortKey::ALL
             .iter()
             .position(|s| *s == self.sort)
             .unwrap_or(0);
-        let strip = Rect::from_xywh(rect.left, rect.top, rect.width(), (46.0 * k) as f32);
-        self.sort_tabs
-            .render(canvas, strip, &labels, selected, fonts, k, dt);
+        let strip = Rect::from_xywh(rect.left, rect.top, rect.width(), (TAB_STRIP_H * k) as f32);
+        // Captioned, the way the library's own bar captions the identical row: four pills
+        // reading "Default · A–Z · Platform · Store" are a sort only once something says so,
+        // and this screen and the shelf behind it are showing the SAME key.
+        let cap_x = f64::from(strip.left) + EDGE_INSET * k;
+        let pills = cap_x + super::library::strip_caption(canvas, fonts, "SORT", strip, cap_x, k);
+        self.sort_tabs.render(
+            canvas,
+            Rect::from_ltrb(pills as f32, strip.top, strip.right, strip.bottom),
+            &labels,
+            selected,
+            fonts,
+            k,
+            dt,
+        );
 
         let field = Rect::from_ltrb(rect.left, strip.bottom, rect.right, rect.bottom);
         self.anim
@@ -431,7 +538,19 @@ impl CollectionsScreen {
             (COVER_CORNER * fk) as f32,
             (COVER_CORNER * fk) as f32,
         );
-        let have: Vec<&Image> = g.fan.iter().filter_map(|id| self.art.get(id)).collect();
+        // What each slot actually draws. A launcher has no poster and never will — its cover
+        // is its brand mark — so it is a face in its own right rather than a slot still
+        // waiting for art. Compacted like the posters: a gap in the middle would read as a
+        // rendering fault.
+        let have: Vec<Face<'_>> = g
+            .fan
+            .iter()
+            .filter_map(|c| match self.art.get(&c.id) {
+                Some(img) => Some(Face::Poster(img)),
+                None if !c.icon.is_empty() => Some(Face::Launcher(&c.icon)),
+                None => None,
+            })
+            .collect();
         // Never deeper than the group has titles: a one-game platform must not pretend to
         // be a stack of three. `have` compacts (a missing poster in the middle would read
         // as a rendering bug), so covers fill from the front and ghosts trail behind.
@@ -447,9 +566,12 @@ impl CollectionsScreen {
             canvas.save();
             canvas.concat(&fan_matrix(front, n, fk));
             match have.get(n) {
-                Some(img) => {
+                Some(face) => {
                     plate(canvas, rr, fk);
-                    draw_cover(canvas, img, front, rr);
+                    match face {
+                        Face::Poster(img) => draw_cover(canvas, img, front, rr),
+                        Face::Launcher(icon) => draw_launcher_face(canvas, icon, front, rr),
+                    }
                     // Back cards move TOWARD THE GROUND — `shade` is black on a dark
                     // palette and white on a pale one, the same rule `recede_matrix`
                     // follows. A colour filter would read better still and costs a
@@ -585,6 +707,35 @@ fn plate(canvas: &Canvas, rr: RRect, k: f64) {
 /// One cover, centre-cropped to the card's 2:3 and drawn as a single shader-filled
 /// round-rect.
 ///
+/// What one slot of the deck draws.
+enum Face<'a> {
+    /// A decoded poster, adopted from the shelf that opened this screen.
+    Poster(&'a Image),
+    /// A launcher's brand mark, drawn from its icon key. Not a missing poster — a launcher
+    /// entry has no cover art and never will, so this is its finished appearance.
+    Launcher(&'a str),
+}
+
+/// A launcher's card: the brand face the library's own placeholder uses, with its mark
+/// centred on it. Kept in step with `screens::library::draw_poster_placeholder` on purpose —
+/// the same launcher appears as a card in the shelf and as a cover in this deck, and two
+/// recipes would have it two colours.
+fn draw_launcher_face(canvas: &Canvas, icon: &str, front: Rect, rr: RRect) {
+    canvas.draw_rrect(rr, &fill(crate::theme::card_face(0.38)));
+    // ~44 % of the card, letterboxed by `launcher_mark` itself, so a non-square master keeps
+    // its proportions rather than stretching to the 2:3.
+    let side = front.width().min(front.height()) * 0.44;
+    let box_ = Rect::from_xywh(
+        front.left + (front.width() - side) / 2.0,
+        front.top + (front.height() - side) / 2.0,
+        side,
+        side,
+    );
+    if let Some(path) = crate::launcher_icons::launcher_mark(icon, box_) {
+        canvas.draw_path(&path, &fill(fg(0.85)));
+    }
+}
+
 /// Not `clip_rrect` + `draw_image_rect`, which is what this replaced: it is a save, a clip
 /// and a draw where this is one draw, and — the load-bearing part — a rotated round-rect
 /// FILL stays on Skia's analytic path, where a rotated round-rect CLIP is no longer
@@ -652,6 +803,157 @@ fn draw_monogram(canvas: &Canvas, fonts: &Fonts, label: &str, front: Rect, rr: R
 mod tests {
     use super::*;
 
+    fn host() -> HostRow {
+        HostRow {
+            key: "aa".into(),
+            name: "Desk".into(),
+            addr: "10.0.0.5".into(),
+            port: 9777,
+            fp_hex: "aa".into(),
+            paired: true,
+            saved: true,
+            online: true,
+            mgmt_port: 9778,
+            can_wake: false,
+            last_used: None,
+            os: String::new(),
+            pin: None,
+            bound_profile: None,
+        }
+    }
+
+    /// Two platforms of four titles each — more per group than the deck's [`FAN`] three, so
+    /// some covers belong to no tile and the queue has something to be left with.
+    fn two_platforms() -> LibraryShared {
+        let library = LibraryShared::default();
+        library.set_games(
+            (0..8)
+                .map(|i| LibraryGame {
+                    id: format!("g{i}"),
+                    title: format!("Game {i}"),
+                    store: "steam".into(),
+                    launcher: false,
+                    icon: String::new(),
+                    platform: Some(if i < 4 { "PS2".into() } else { "PS3".into() }),
+                })
+                .collect(),
+        );
+        let bytes = {
+            let mut surface =
+                skia_safe::surfaces::raster_n32_premul((6, 9)).expect("a raster surface");
+            surface.canvas().clear(Color4f::new(0.2, 0.4, 0.6, 1.0));
+            surface
+                .image_snapshot()
+                .encode(None, skia_safe::EncodedImageFormat::PNG, 100)
+                .expect("a PNG encoder")
+                .as_bytes()
+                .to_vec()
+        };
+        for i in 0..8 {
+            library.push_art(format!("g{i}"), bytes.clone());
+        }
+        library
+    }
+
+    /// As the library's root this screen feeds itself — and takes ONLY the covers it fans.
+    ///
+    /// The poster bytes are pushed once per fetch and never re-sent, so every one taken by a
+    /// screen that cannot draw it is a monogram on the shelf a tile opens. A wholesale drain
+    /// here would look right on this screen and gut the next one.
+    #[test]
+    fn as_the_librarys_root_it_takes_only_the_covers_it_fans() {
+        let library = two_platforms();
+        let mut s = CollectionsScreen::new(&host(), SortKey::HostOrder);
+        s.own_library();
+        // Bounded per frame, like the shelf's own pump: several frames to take six covers.
+        for _ in 0..8 {
+            s.sync(&library);
+        }
+        // Only the poster-backed slots: a launcher's card is drawn from its icon and must
+        // never be fetched, which is the other half of what this test is holding.
+        let mut fanned: Vec<String> = s
+            .groups
+            .iter()
+            .flat_map(|g| g.fan.iter())
+            .filter(|c| c.icon.is_empty())
+            .map(|c| c.id.clone())
+            .collect();
+        fanned.sort();
+        assert_eq!(
+            fanned.len(),
+            2 * FAN,
+            "the fixture stopped exercising the deck"
+        );
+        let mut decoded: Vec<String> = s.art.keys().cloned().collect();
+        decoded.sort();
+        assert_eq!(decoded, fanned, "it decoded something it never draws");
+        let left: Vec<String> = library
+            .drain_art(99)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            left,
+            ["g3", "g7"],
+            "the covers no tile fans must survive for the shelf"
+        );
+    }
+
+    /// Opened from a shelf's Y, that shelf is still under this screen and still expects the
+    /// queue it has been draining all along. Touching it here would starve it.
+    #[test]
+    fn a_drill_in_from_a_shelf_leaves_the_queue_alone() {
+        let library = two_platforms();
+        let mut s = CollectionsScreen::new(&host(), SortKey::HostOrder);
+        for _ in 0..8 {
+            s.sync(&library);
+        }
+        assert!(s.art.is_empty(), "it took art the shelf below is fed by");
+        assert_eq!(
+            library.drain_art(99).len(),
+            8,
+            "the whole queue is still there"
+        );
+    }
+
+    /// The way to the whole library exists exactly where the whole library is otherwise
+    /// unreachable — as the root, with no shelf beneath. Opened from a shelf's Y it would be
+    /// a second, deeper copy of the screen one B away.
+    #[test]
+    fn the_way_to_all_titles_exists_only_where_there_is_no_shelf() {
+        let library = two_platforms();
+        let mut settings = pf_client_core::trust::Settings::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            pads: &[],
+            deck: false,
+            device_name: "test",
+            t: 0.0,
+        };
+        let mut drilled = CollectionsScreen::new(&host(), SortKey::HostOrder);
+        let mut fx = Outbox::default();
+        assert!(drilled
+            .menu(MenuEvent::Secondary, &mut ctx, &mut fx)
+            .is_none());
+        assert!(fx.nav.is_none(), "Y pushed a shelf that was already below");
+        assert!(!drilled
+            .hints(&ctx)
+            .iter()
+            .any(|h| h.key == HintKey::Secondary));
+
+        let mut root = CollectionsScreen::new(&host(), SortKey::HostOrder);
+        root.own_library();
+        let mut fx = Outbox::default();
+        assert!(root.menu(MenuEvent::Secondary, &mut ctx, &mut fx).is_some());
+        assert!(
+            matches!(&fx.nav, Some(crate::screens::Nav::Push(s)) if matches!(**s, Screen::Library(_))),
+            "Y did not open the whole library"
+        );
+        assert!(root.hints(&ctx).iter().any(|h| h.key == HintKey::Secondary));
+    }
+
     /// The tile at `k`, laid out the way [`CollectionsScreen::render`] lays it out.
     fn tile(k: f64) -> Rect {
         Rect::from_xywh(100.0, 60.0, (TILE_W * k) as f32, (TILE_H * k) as f32)
@@ -709,6 +1011,64 @@ mod tests {
                 deck.bottom
             );
         }
+    }
+
+    /// A launcher's slot is a FACE, not a slot still waiting for a poster.
+    ///
+    /// Reported from a Deck: the Launchers collection fanned covers "which don't actually
+    /// contain their logos" — blank cards. A launcher entry carries no poster and never will;
+    /// its cover is a brand mark drawn from its icon key. The deck only ever looked in the art
+    /// map, found nothing for any of them, and drew the ghost that means "not arrived yet".
+    ///
+    /// Asserted on what the tile CARRIES rather than on pixels: the defect was the fan losing
+    /// the icon on its way out of collation, and a rendered frame cannot tell a mark that was
+    /// never asked for from one that failed to draw.
+    #[test]
+    fn a_launcher_fans_its_mark_and_is_never_fetched() {
+        let library = LibraryShared::default();
+        library.set_games(vec![
+            LibraryGame {
+                id: "steam".into(),
+                title: "Steam".into(),
+                store: "steam".into(),
+                launcher: true,
+                icon: "steam".into(),
+                platform: Some("Launchers".into()),
+            },
+            LibraryGame {
+                id: "g0".into(),
+                title: "Game 0".into(),
+                store: "steam".into(),
+                launcher: false,
+                icon: String::new(),
+                platform: Some("PS3".into()),
+            },
+        ]);
+        let mut s = CollectionsScreen::new(&host(), SortKey::HostOrder);
+        s.own_library();
+        s.sync(&library);
+
+        let launchers = s
+            .groups
+            .iter()
+            .find(|g| g.label == "Launchers")
+            .expect("the launcher group");
+        let card = launchers.fan.first().expect("one card");
+        assert_eq!(
+            card.icon, "steam",
+            "the fan must carry the icon, or the deck has no way to draw the mark"
+        );
+        assert!(
+            crate::launcher_icons::launcher_mark(&card.icon, Rect::from_xywh(0.0, 0.0, 40.0, 40.0))
+                .is_some(),
+            "and the icon it carries must actually resolve to a mark"
+        );
+        // …and it is never queued for a fetch: a launcher has no poster to wait for, so
+        // asking for one would be a request that can only ever fail.
+        assert!(
+            !s.art.contains_key("steam"),
+            "a launcher's cover is drawn, not fetched"
+        );
     }
 
     /// Every card further back must be smaller, higher AND further right. One cue alone is

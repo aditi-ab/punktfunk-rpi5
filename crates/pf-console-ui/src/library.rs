@@ -896,6 +896,32 @@ impl LibraryShared {
         let n = max.min(s.art_in.len());
         s.art_in.drain(..n).collect()
     }
+
+    /// Take at most `max` queued posters FROM `want`, leaving every other one where it is.
+    ///
+    /// The collections screen is the caller, and it is the only screen that draws a handful
+    /// of named covers rather than whatever arrives. Draining the queue wholesale there
+    /// would be a quiet disaster: the bytes are pushed once per fetch and never re-sent, so
+    /// everything it took and could not fan would be gone before the shelf a tile opens ever
+    /// asked — a library of monograms, one screen further in. This takes the dozen covers
+    /// that tile the collections and leaves the other four hundred queued for the shelf.
+    pub(crate) fn take_art_for(
+        &self,
+        want: &std::collections::HashSet<String>,
+        max: usize,
+    ) -> Vec<(String, Vec<u8>)> {
+        let mut s = self.0.lock().unwrap();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < s.art_in.len() && out.len() < max {
+            if want.contains(&s.art_in[i].0) {
+                out.extend(s.art_in.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
 }
 
 /// Store id → display label (the GTK `ui_library` table).
@@ -1023,6 +1049,51 @@ mod tests {
             "asking for more than is there is fine"
         );
         assert!(shared.drain_art(2).is_empty());
+    }
+
+    /// A selective take is the collections screen's whole art story: it takes the few covers
+    /// it fans and LEAVES everything else queued, in order, for the shelf that opens next.
+    /// The property is what stays behind — the poster bytes are pushed once per fetch and
+    /// never re-sent, so anything taken by a screen that cannot draw it is lost for good.
+    #[test]
+    fn a_selective_take_leaves_everything_it_did_not_ask_for() {
+        let shared = LibraryShared::default();
+        for i in 0..6 {
+            shared.push_art(format!("g{i}"), vec![i as u8]);
+        }
+        let want = ["g1".to_string(), "g4".to_string(), "g9".to_string()]
+            .into_iter()
+            .collect();
+        let took: Vec<String> = shared
+            .take_art_for(&want, 8)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            took,
+            ["g1", "g4"],
+            "an id that never arrived is not an error"
+        );
+        let rest: Vec<String> = shared.drain_art(9).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(rest, ["g0", "g2", "g3", "g5"], "the rest is untouched");
+    }
+
+    /// …and it is bounded the same way the plain drain is: the caller DECODES what it takes,
+    /// on the render thread, so a library that lands all at once must not become one frame.
+    #[test]
+    fn a_selective_take_is_bounded_too() {
+        let shared = LibraryShared::default();
+        for i in 0..6 {
+            shared.push_art(format!("g{i}"), vec![i as u8]);
+        }
+        let want: std::collections::HashSet<String> = (0..6).map(|i| format!("g{i}")).collect();
+        assert_eq!(shared.take_art_for(&want, 2).len(), 2);
+        assert_eq!(shared.take_art_for(&want, 2).len(), 2);
+        assert_eq!(
+            shared.take_art_for(&want, 9).len(),
+            2,
+            "and then it is empty"
+        );
     }
 
     /// The GTK launcher's cursor tests, ported with the math.

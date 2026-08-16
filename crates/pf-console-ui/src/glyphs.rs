@@ -144,7 +144,9 @@ pub(crate) enum HintKey {
     Shoulders,
     /// ◀ ▶ — left/right adjusts the focused value.
     Adjust,
-    /// ▲ — up opens the focused item's own menu.
+    /// ▲ — up raises the focused item's context menu, on a screen with up to spare. Where
+    /// there isn't (the library grid spends up on rows) the same menu hangs off
+    /// [`HintKey::Tertiary`] instead; the button differs, the word "Options" does not.
     Up,
     Key(&'static str),
 }
