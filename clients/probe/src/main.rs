@@ -106,6 +106,19 @@ struct Args {
     /// multistream-decodes the host's frames and asserts the per-channel sample count, so it's the
     /// headless validator for the surround encode path.
     audio_channels: u8,
+    /// `--audio-format opus|lossless48|lossless96|<rate>/<bits>` — what to ask the host for on the
+    /// audio plane. `opus` (default) sends the UNSPECIFIED sentinel and keeps the legacy `0xC9`
+    /// wire; anything else asks for the lossless `0xD3` plane at that rate and depth. The rate set
+    /// is [`punktfunk_core::audio::pcm::rate_is_supported`] — the probe does not restate it.
+    audio_format: Option<(u32, u8)>,
+    /// `--audio-out FILE` — write the DECODED audio to `FILE` as raw interleaved `f32` little-endian
+    /// at the resolved rate and channel count, for offline analysis.
+    ///
+    /// This is what makes `design/hi-res-audio.md` §13.2 a command instead of a listening session:
+    /// play a >24 kHz tone on the host, run the probe with `--audio-format lossless96 --audio-out`,
+    /// and look for energy above 24 kHz in the result. A brick wall there means the host's capture
+    /// resampled and the session is claiming a rate its content does not have.
+    audio_out: Option<String>,
     /// `--codec h264|hevc|av1|auto` — the preferred video codec (soft; the host honors it when it can
     /// emit it, else falls back). The probe always advertises it can decode all three; this just sets
     /// the preference byte. `auto` (default) = no preference (host decides). `0` = auto.
@@ -288,6 +301,30 @@ fn parse_args() -> Args {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2),
         ),
+        audio_format: match get("--audio-format").unwrap_or("opus") {
+            "opus" => None,
+            "lossless48" => Some((punktfunk_core::audio::SAMPLE_RATE_HZ, 24)),
+            "lossless96" => Some((96_000, 24)),
+            spec => {
+                let (r, b) = spec.split_once('/').unwrap_or((spec, "24"));
+                match (r.parse::<u32>(), b.parse::<u8>()) {
+                    (Ok(r), Ok(b))
+                        if punktfunk_core::audio::pcm::rate_is_supported(r)
+                            && punktfunk_core::audio::pcm::depth_is_supported(b) =>
+                    {
+                        Some((r, b))
+                    }
+                    _ => {
+                        eprintln!(
+                            "--audio-format: expected opus | lossless48 | lossless96 | \
+                             <rate>/<bits>, got {spec:?}"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+        },
+        audio_out: get("--audio-out").map(String::from),
         preferred_codec: match get("--codec").unwrap_or("auto") {
             "h264" | "avc" => punktfunk_core::quic::CODEC_H264,
             "hevc" | "h265" => punktfunk_core::quic::CODEC_HEVC,
@@ -562,12 +599,17 @@ async fn session(args: Args) -> Result<()> {
             // the probe accepts a mid-session shard change (and jumbo growth) up to the
             // receive ceiling — and it's exactly the tool to measure both.
             max_shard_payload: punktfunk_core::config::max_shard_payload() as u16,
-            // Legacy 48 kHz / 16-bit audio request. The probe decodes and validates the host's
-            // Opus frames (that is what `--audio-channels` above exercises); it has no lossless
-            // 0xD3 path and never sets CLIENT_CAP_AUDIO_HIRES, so asking for a rate or depth here
-            // would only make the host spend bandwidth on a plane this tool discards.
-            audio_rate_hz: punktfunk_core::audio::SAMPLE_RATE_HZ,
-            audio_bits: punktfunk_core::audio::pcm::BITS_16,
+            // `0`/`0` is UNSPECIFIED, and that distinction is load-bearing rather than cosmetic:
+            // `advertised_client_caps` sets CLIENT_CAP_AUDIO_HIRES when EITHER field is non-zero,
+            // because it keys on "the caller specified a format" — otherwise 48 kHz/16-bit, the
+            // cheapest lossless rung, would be the one format nobody could request. So the
+            // explicit `SAMPLE_RATE_HZ`/`BITS_16` this used to send was a genuine hi-res request:
+            // against a host with the operator policy on, the probe advertised the capability,
+            // was given the `0xD3` plane, and then silently counted nothing — its decode arm only
+            // handled `0xC9`. The comment here even claimed it "never sets
+            // CLIENT_CAP_AUDIO_HIRES", which made the bug invisible to a reader.
+            audio_rate_hz: args.audio_format.map(|(r, _)| r).unwrap_or(0),
+            audio_bits: args.audio_format.map(|(_, b)| b).unwrap_or(0),
         }
         .encode(),
     )
@@ -1249,17 +1291,68 @@ async fn session(args: Args) -> Result<()> {
         // Build a multistream decoder for the host-RESOLVED layout so the probe actually decodes
         // the surround stream (not just counts bytes) — the headless validator for the encode path.
         let audio_channels = welcome.audio_channels;
+        // The RESOLVED format, off the Welcome — never what was asked for. The host may decline
+        // hi-res for any of the reasons in §8.4 and answer Opus, and a probe that assumed its own
+        // request would then mis-parse every datagram it was actually sent.
+        let audio_codec = welcome.audio_codec;
+        let audio_rate_hz = welcome.audio_rate_hz;
+        let audio_bits = welcome.audio_bits;
+        let audio_out_path = args.audio_out.clone();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             let mut hdr_logged = false;
             let mut rumble_logged = false;
+            let lossless = audio_codec == punktfunk_core::quic::AUDIO_CODEC_PCM;
             let layout = punktfunk_core::audio::layout_for(audio_channels, false);
-            let mut audio_dec =
-                opus::MSDecoder::new(48_000, layout.streams, layout.coupled, layout.mapping).ok();
+            let mut audio_dec = (!lossless)
+                .then(|| {
+                    opus::MSDecoder::new(48_000, layout.streams, layout.coupled, layout.mapping)
+                        .ok()
+                })
+                .flatten();
             let mut pcm = vec![0f32; 5760 * audio_channels as usize];
+            let mut lossless_pcm: Vec<f32> = Vec::new();
             let mut audio_decoded_logged = false;
+            let mut audio_out = audio_out_path.as_deref().and_then(|p| {
+                std::fs::File::create(p)
+                    .map(std::io::BufWriter::new)
+                    .map_err(|e| tracing::error!(path = p, error = %e, "cannot open --audio-out"))
+                    .ok()
+            });
+            // Raw interleaved f32 LE, so the reader needs no container — the rate and channel
+            // count are on the stats line and in this log.
+            let write_pcm = move |samples: &[f32], w: &mut Option<_>| {
+                if let Some(f) = w.as_mut() {
+                    let mut bytes = Vec::with_capacity(samples.len() * 4);
+                    for s in samples {
+                        bytes.extend_from_slice(&s.to_le_bytes());
+                    }
+                    let _ = std::io::Write::write_all(f, &bytes);
+                }
+            };
             while let Ok(d) = conn2.read_datagram().await {
-                if let Some((_, _, opus)) = punktfunk_core::quic::decode_audio_datagram(&d) {
+                if let Some((_, _, pcm_wire)) =
+                    punktfunk_core::quic::decode_audio_pcm_datagram(&d).filter(|_| lossless)
+                {
+                    a.fetch_add(1, Relaxed);
+                    ab.fetch_add(pcm_wire.len() as u64, Relaxed);
+                    if punktfunk_core::audio::pcm::to_f32(pcm_wire, audio_bits, &mut lossless_pcm)
+                        .is_some()
+                    {
+                        if !audio_decoded_logged {
+                            audio_decoded_logged = true;
+                            tracing::info!(
+                                channels = audio_channels,
+                                rate_hz = audio_rate_hz,
+                                bits = audio_bits,
+                                samples_per_channel =
+                                    lossless_pcm.len() / audio_channels.max(1) as usize,
+                                "audio decoded (lossless PCM, 0xD3)"
+                            );
+                        }
+                        write_pcm(&lossless_pcm, &mut audio_out);
+                    }
+                } else if let Some((_, _, opus)) = punktfunk_core::quic::decode_audio_datagram(&d) {
                     a.fetch_add(1, Relaxed);
                     ab.fetch_add(opus.len() as u64, Relaxed);
                     // Decode + validate: the per-channel sample count must be a legal Opus frame
@@ -1273,8 +1366,14 @@ async fn session(args: Args) -> Result<()> {
                                     samples_per_channel = samples,
                                     "audio decoded (Opus multistream)"
                                 );
+                                write_pcm(
+                                    &pcm[..samples * audio_channels as usize],
+                                    &mut audio_out,
+                                );
                             }
-                            Ok(_) => {}
+                            Ok(samples) => {
+                                write_pcm(&pcm[..samples * audio_channels as usize], &mut audio_out)
+                            }
                             Err(e) => tracing::debug!(error = %e, "probe audio decode"),
                         }
                     }
