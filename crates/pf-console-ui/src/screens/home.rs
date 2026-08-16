@@ -363,16 +363,32 @@ impl HomeScreen {
             canvas.translate((-cx as f32, -cy as f32));
             // The layer carries the fade AND the colour recede: one matrix per card, built
             // and thrown away here, which is free next to the aurora behind it.
+            //
+            // BOUNDED, and raised only when it has something to carry. An unbounded
+            // `save_layer` allocates an offscreen the size of the whole SURFACE and composites
+            // it back, so the strip was paying several full-screen offscreens a frame — one of
+            // them for the focused tile, whose alpha is 1 and whose recede is 0, i.e. a layer
+            // that does nothing at all. The bounds are the tile grown by the reach of what is
+            // drawn INSIDE the layer: the halo (outset 4 k, sigma 10 k) and the shadow's 10 k
+            // drop. Bound it to the bare tile instead and the layer would clip both away.
             let recede = 1.0 - f;
-            let mut lp = crate::theme::layer();
-            lp.set_alpha_f(alpha as f32);
-            if recede > 0.001 {
-                lp.set_color_filter(skia_safe::color_filters::matrix_row_major(
-                    &crate::theme::recede_matrix(recede),
-                    None,
-                ));
+            let layered = alpha < 0.999 || recede > 0.001;
+            if layered {
+                let mut lp = crate::theme::layer();
+                lp.set_alpha_f(alpha as f32);
+                if recede > 0.001 {
+                    lp.set_color_filter(skia_safe::color_filters::matrix_row_major(
+                        &crate::theme::recede_matrix(recede),
+                        None,
+                    ));
+                }
+                let bounds = tile.with_outset(((36.0 * k) as f32, (36.0 * k) as f32));
+                canvas.save_layer(
+                    &skia_safe::canvas::SaveLayerRec::default()
+                        .bounds(&bounds)
+                        .paint(&lp),
+                );
             }
-            canvas.save_layer(&skia_safe::canvas::SaveLayerRec::default().paint(&lp));
             // The focused tile gets a palette-tinted glow UNDER its shadow — the mark that
             // reads from a sofa, where a 12 % scale difference does not.
             crate::theme::focus_halo(canvas, tile, TILE_CORNER as f32, k as f32, f as f32);
@@ -403,7 +419,9 @@ impl HomeScreen {
                     &fill(crate::theme::shade(veil)),
                 );
             }
-            canvas.restore(); // layer
+            if layered {
+                canvas.restore(); // layer
+            }
             canvas.restore(); // transform
         }
 

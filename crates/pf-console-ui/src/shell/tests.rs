@@ -960,7 +960,45 @@ fn dump_console_screens() {
     };
     s2.handle_menu(MenuEvent::Move(MenuDir::Right));
     s2.handle_menu(MenuEvent::Move(MenuDir::Right));
-    dump(&mut s2, 40, 8, "07-library", true);
+    // 80 frames, not 40: this shelf carries no art, so it takes the entrance's 400 ms
+    // art-wait deadline, and until that expires the screen is deliberately the loading
+    // spinner. At 40×8 ms the dump could finish inside the wait and shoot the SPINNER while
+    // claiming to be the coverflow — a screenshot that lies is worse than a missing one.
+    dump(&mut s2, 80, 8, "07-library", true);
+
+    // Collections, the drill-in, on a library that actually has PLATFORMS — the scene above
+    // has none, so collating it would yield one group and witness nothing.
+    //
+    // The order below is load-bearing, and the reason there was no collections scene until a
+    // tile redesign needed one. `adopt_art` is a ONE-SHOT snapshot taken the moment Y is
+    // pressed, so art has to be pushed AND the shelf given frames to decode it BEFORE the
+    // press. Press first and every tile renders its monogram, and a deck of covers looks
+    // exactly like a deck that was never built.
+    //
+    // That same ordering — art before the game list — is what the fake-library dev hook does,
+    // and it MASKS the shelf's entrance defect (art is already decoded on the first Ready
+    // frame, so the entrance arms immediately). These scenes are evidence about the collection
+    // TILE and nothing else; do not read them as saying the entrance is well.
+    for (name, palette) in [
+        ("07b-collections", "violet"),
+        ("07b-collections-mint", "mint"),
+    ] {
+        let (mut s3, _c3, _l3) = collections_shell();
+        s3.settings.ui_palette = palette.to_string();
+        dump(&mut s3, 12, 8, &format!("_{name}-decode"), true);
+        s3.handle_menu(MenuEvent::Secondary);
+        dump(&mut s3, 40, 8, name, true);
+    }
+    // …and the same screen with NOTHING decoded: the ghost slots and the monogram badge, which
+    // is the permanent look of a platform full of art-less ROM entries rather than a loading
+    // state. Pale, because that is where a hardcoded face strands its own initials.
+    {
+        let (mut s3, _c3, _l3) = collections_shell_no_art();
+        s3.settings.ui_palette = "mint".to_string();
+        dump(&mut s3, 12, 8, "_noart-settle", true);
+        s3.handle_menu(MenuEvent::Secondary);
+        dump(&mut s3, 40, 8, "07b-collections-noart", true);
+    }
 
     // The wake and connecting overlays + a toast.
     console.set_wake(Some(WakeStatus {
@@ -987,6 +1025,106 @@ fn dump_console_screens() {
     s.set_connecting(None);
     s.session_failed("Connection timed out");
     dump(&mut s, 10, 8, "10-toast", true);
+}
+
+/// A 2:3 poster, PNG-encoded, in a colour derived from `seed`.
+///
+/// Real encoded bytes rather than a stub, because the thing under test is the decode path:
+/// `LibraryScreen` feeds these to `Image::from_encoded`, and a shape that fails to decode is
+/// indistinguishable in a screenshot from a tile that chose to draw no cover.
+fn poster_png(seed: usize) -> Vec<u8> {
+    let mut surface = skia_safe::surfaces::raster_n32_premul((60, 90)).unwrap();
+    let hue = [
+        (0.85, 0.30, 0.35),
+        (0.30, 0.55, 0.85),
+        (0.35, 0.75, 0.45),
+        (0.85, 0.65, 0.25),
+    ][seed % 4];
+    surface
+        .canvas()
+        .clear(skia_safe::Color4f::new(hue.0, hue.1, hue.2, 1.0));
+    // A darker band across the lower third, so a cover is visibly ORIENTED — a flat colour
+    // would hide a cover drawn upside-down or with its aspect wrong.
+    surface.canvas().draw_rect(
+        skia_safe::Rect::from_xywh(0.0, 62.0, 60.0, 28.0),
+        &crate::theme::fill(skia_safe::Color4f::new(
+            hue.0 * 0.45,
+            hue.1 * 0.45,
+            hue.2 * 0.45,
+            1.0,
+        )),
+    );
+    surface
+        .image_snapshot()
+        .encode(None, skia_safe::EncodedImageFormat::PNG, 100)
+        .unwrap()
+        .as_bytes()
+        .to_vec()
+}
+
+/// Games across four platforms — what the collections screen is for, and what the flat
+/// `platform: None` library above cannot produce.
+fn platform_games() -> Vec<crate::library::LibraryGame> {
+    [
+        ("Gran Turismo 6", "PlayStation 3"),
+        ("The Last of Us", "PlayStation 3"),
+        ("Demon's Souls", "PlayStation 3"),
+        ("Halo 3", "Xbox 360"),
+        ("Fable II", "Xbox 360"),
+        ("Super Metroid", "SNES"),
+        ("Chrono Trigger", "SNES"),
+        ("Sonic 2", "Mega Drive"),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, (title, platform))| crate::library::LibraryGame {
+        id: format!("rom:{i}"),
+        title: (*title).to_string(),
+        store: "rom-manager".into(),
+        launcher: false,
+        icon: String::new(),
+        platform: Some((*platform).to_string()),
+    })
+    .collect()
+}
+
+fn collections_shell_inner(
+    with_art: bool,
+) -> (Shell, ConsoleShared, crate::library::LibraryShared) {
+    fake_home();
+    let library = crate::library::LibraryShared::default();
+    let games = platform_games();
+    if with_art {
+        for (i, g) in games.iter().enumerate() {
+            library.push_art(g.id.clone(), poster_png(i));
+        }
+    }
+    library.set_games(games);
+    let console = ConsoleShared::default();
+    console.set_hosts(hosts());
+    let sh = Shell::new(
+        console.clone(),
+        library.clone(),
+        ConsoleBus::default(),
+        ConsoleOptions {
+            device_name: "deck".into(),
+            deck: false,
+        },
+        vec![
+            Screen::Home(HomeScreen::new()),
+            Screen::Library(LibraryScreen::new(&hosts()[0])),
+        ],
+    )
+    .unwrap();
+    (sh, console, library)
+}
+
+fn collections_shell() -> (Shell, ConsoleShared, crate::library::LibraryShared) {
+    collections_shell_inner(true)
+}
+
+fn collections_shell_no_art() -> (Shell, ConsoleShared, crate::library::LibraryShared) {
+    collections_shell_inner(false)
 }
 
 /// The console's geometry is ANTI-ALIASED — the defect this pins shipped in the overhaul and
@@ -1043,8 +1181,8 @@ fn geometry_is_anti_aliased() {
 /// the console's gradients and the aurora's runtime effect never noticed the rule existed; the
 /// moment those paints were rebuilt from a "the shader supplies the colour anyway" transparent
 /// placeholder, every one of them drew NOTHING. Not dimmer, not wrong-coloured — absent: the
-/// backdrop, the badge, the vignette and the skeleton sheen all vanished at once, and all 124
-/// tests still passed, because a test that only renders a frame cannot tell a missing layer
+/// backdrop, the badge, the vignette and the panel's gradient stroke all vanished at once, and
+/// every test still passed, because a test that only renders a frame cannot tell a missing layer
 /// from a dark one. `theme::shaded` is opaque by construction; this holds it to that.
 #[test]
 fn a_shaded_paint_is_opaque_enough_to_draw() {
