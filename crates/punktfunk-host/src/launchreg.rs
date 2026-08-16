@@ -264,6 +264,73 @@ fn reg() -> &'static Reg {
     })
 }
 
+/// One of this client's earlier launches that is still running — the input to
+/// [`crate::session_settings::GameOnNewLaunch::End`].
+pub struct StillRunning {
+    /// The store-qualified library id it was launched as.
+    pub game_id: String,
+    /// The processes its lease adopted, as last published. Re-verified by the caller immediately
+    /// before anything is signalled, so a pid recycled since is never hit (rule 2).
+    pub procs: Vec<crate::procscan::ProcRef>,
+}
+
+/// Every **other** title this client has running on this host from a launch the host performed.
+///
+/// The safety of ending-on-new-launch rests entirely on where this list comes from, so it is worth
+/// being explicit about what it can never contain:
+///
+/// * **another client's game.** Records are keyed by cert fingerprint, and this filters on it — so
+///   one device picking a new title can never close a game somebody else is mid-way through.
+/// * **a game the player started themselves.** Only the host's own launches are recorded here at
+///   all; a copy started at the machine was never written, so it cannot be read back out (rule 1,
+///   preserved by construction rather than by a check).
+/// * **the title being launched now.** Filtered by `keep_game_id`, so relaunching what is already
+///   running still resolves to [`Plan::Adopt`] rather than closing the game and starting it again.
+/// * **anything already gone.** Liveness is re-verified per record, and only [`Liveness::Running`]
+///   qualifies — `Unknown` is deliberately excluded, because "no opinion" must never authorize
+///   signalling a process.
+pub fn others_still_running(
+    fingerprint: Option<&str>,
+    keep_game_id: Option<&str>,
+) -> Vec<StillRunning> {
+    let Some(fp) = fingerprint else {
+        // An anonymous client (TOFU/`--open`, and the whole GameStream plane) owns no records, and
+        // must not be able to reach anyone else's.
+        return Vec::new();
+    };
+    reg()
+        .records
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|r| is_other_running(r, fp, keep_game_id, liveness(r)))
+        .map(|r| StillRunning {
+            game_id: r.key.game_id.clone(),
+            procs: r
+                .procs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .collect(),
+        })
+        .collect()
+}
+
+/// The filter behind [`others_still_running`] — pure, so the four rules that make ending-on-launch
+/// safe can be tested without a registry, a process table or a clock.
+///
+/// The caller supplies the liveness verdict for the same reason [`covers`] takes one.
+fn is_other_running(rec: &Record, fp: &str, keep_game_id: Option<&str>, live: Liveness) -> bool {
+    rec.key.fingerprint == fp
+        && Some(rec.key.game_id.as_str()) != keep_game_id
+        && rec.launched
+        // `Unknown` deliberately does NOT qualify. It is the verdict for a launch that adopted
+        // nothing — a title with no detect signals, or a platform with no matcher — and "no opinion
+        // about what is running" must never authorize signalling a process.
+        && live == Liveness::Running
+}
+
 /// Decide what this session must do about its launch, and claim the answer.
 ///
 /// `fresh_stamp` is this session's own [`crate::gamelease::launch_clock`] reading, taken before
@@ -463,6 +530,66 @@ mod tests {
         }
     }
 
+    /// The four rules that keep `GameOnNewLaunch::End` from closing something it must not.
+    ///
+    /// Each line here is a game somebody could otherwise lose mid-play, so they are asserted
+    /// individually rather than through one composite case.
+    #[test]
+    fn ending_on_a_new_launch_only_ever_reaches_this_clients_other_live_games() {
+        let mut r = rec(true, 0, None);
+        r.key.game_id = "steam:1".into();
+
+        // The case it exists for: same client, a different title, still up.
+        assert!(is_other_running(
+            &r,
+            "fp",
+            Some("steam:2"),
+            Liveness::Running
+        ));
+
+        // Another device's game — one client picking a new title must never close someone else's.
+        assert!(!is_other_running(
+            &r,
+            "other-fp",
+            Some("steam:2"),
+            Liveness::Running
+        ));
+
+        // The title being launched right now: that is a relaunch, which `Plan::Adopt` handles by
+        // keeping the game. Closing and restarting it would be the opposite of the intent.
+        assert!(!is_other_running(
+            &r,
+            "fp",
+            Some("steam:1"),
+            Liveness::Running
+        ));
+
+        // A launch that never actually happened has nothing running behind it.
+        let never = rec(false, 0, None);
+        assert!(!is_other_running(
+            &never,
+            "fp",
+            Some("steam:2"),
+            Liveness::Running
+        ));
+
+        // Already gone, and — the one that matters most — NO OPINION. `Unknown` means nothing was
+        // ever adopted, so there is no verified pid set to signal.
+        assert!(!is_other_running(&r, "fp", Some("steam:2"), Liveness::Gone));
+        assert!(!is_other_running(
+            &r,
+            "fp",
+            Some("steam:2"),
+            Liveness::Unknown
+        ));
+    }
+
+    /// An anonymous client owns no records, and must not be able to reach anybody else's.
+    #[test]
+    fn an_anonymous_client_can_never_end_another_clients_game() {
+        assert!(others_still_running(None, Some("steam:2")).is_empty());
+    }
+
     /// Identity is the record's key, and a launch that can't be keyed is never reclaimed.
     #[test]
     fn a_launch_is_keyed_by_both_the_client_and_the_title() {
@@ -511,6 +638,43 @@ mod tests {
         assert!(covers(&old, Liveness::Unknown, inside, window));
         // ...but a return long after the window, with nothing ever seen running, is a new launch.
         assert!(!covers(&old, Liveness::Unknown, outside, window));
+    }
+
+    /// Why "click the game that is already running" resumes on some hosts and started a **second
+    /// copy** on others — and what fixed it.
+    ///
+    /// The rule above is authoritative only where liveness has an opinion, and liveness comes from
+    /// the processes a launch's lease actually adopted. A lease that adopts nothing publishes
+    /// nothing, answers `Unknown`, and so falls back to the 90-second window — past which the same
+    /// title launches again.
+    ///
+    /// That is precisely the state a Windows launch used to be stuck in for any title whose
+    /// provider published no detect signals: no child, no matched processes, nothing to publish.
+    /// Carrying the spawned pid (`gamelease::LeaseRequest::spawned`) is what moves such a launch
+    /// from the left column to the right one here.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn only_a_launch_that_adopted_something_stays_adoptable_past_the_window() {
+        let t0 = Instant::now();
+        let window = Duration::from_secs(90);
+        let outside = t0 + Duration::from_secs(600);
+
+        // Adopted nothing: no opinion, so past the window this launches a second copy.
+        let blind = rec(true, 0, Some(t0));
+        assert_eq!(liveness(&blind), Liveness::Unknown);
+        assert!(!covers(&blind, liveness(&blind), outside, window));
+
+        // Adopted a process that is demonstrably alive — this very test binary — so the record
+        // answers `Running` and stays adoptable however long ago its session let go.
+        let seeing = rec(true, 0, Some(t0));
+        let self_ref = crate::procscan::resolve(std::process::id())
+            .expect("this process must be resolvable by the scanner");
+        seeing.procs.lock().unwrap().push(self_ref);
+        assert_eq!(liveness(&seeing), Liveness::Running);
+        assert!(
+            covers(&seeing, liveness(&seeing), outside, window),
+            "a launch whose game is still up must resume, not start a second copy"
+        );
     }
 
     /// The sweep drops what nobody can reclaim and keeps what somebody can.

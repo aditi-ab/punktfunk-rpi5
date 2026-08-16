@@ -659,6 +659,84 @@ fn mixed_library(library: &LibraryShared) {
     ]);
 }
 
+/// "Start in collections" actually starts in collections — asserted on the SHELL, because
+/// the shelf was never the part that was broken.
+///
+/// The handover shipped dead: `LibraryScreen::collections_upgrade` was written, documented and
+/// unit-tested for its DECISION, and then nothing ever called it. It carried an
+/// `#[allow(dead_code)]`, which is precisely what stopped the compiler from saying so, and the
+/// shelf's own tests passed throughout because they called it directly. The setting was on,
+/// the shelf agreed it should stand aside, and the library opened on the shelf anyway.
+///
+/// So this drives `Shell::sync` and asserts on the STACK. A screen cannot replace itself —
+/// only the shell owns the stack — so the shell is where the wiring has to be witnessed.
+#[test]
+fn the_setting_hands_a_multi_platform_library_over_to_collections() {
+    let games: Vec<crate::library::LibraryGame> = platform_games();
+    for (want_collections, enabled) in [(true, true), (false, false)] {
+        let (mut s, _console, library) = shell(vec![
+            Screen::Home(HomeScreen::new()),
+            Screen::Library(LibraryScreen::new(&hosts()[0])),
+        ]);
+        s.settings.library_collections = enabled;
+
+        // The shelf must see its OWN fetch go out before it will read the model: a library
+        // that is Ready before the fetch is the PREVIOUS host's, still sitting in the shared
+        // model. A default library is Loading, so this frame is that proof.
+        s.sync();
+        assert!(
+            matches!(s.stack.last(), Some(Screen::Library(_))),
+            "nothing to hand over to while the fetch is still out"
+        );
+
+        library.set_games(games.clone());
+        s.sync();
+
+        if want_collections {
+            assert!(
+                matches!(s.stack.last(), Some(Screen::Collections(_))),
+                "the setting is on and the library has four platforms — it must open on them"
+            );
+            assert_eq!(
+                s.stack.len(),
+                2,
+                "it REPLACES the shelf, never stacks on it"
+            );
+        } else {
+            assert!(
+                matches!(s.stack.last(), Some(Screen::Library(_))),
+                "with the setting off the library opens on its shelf"
+            );
+        }
+    }
+}
+
+/// …and a library with only ONE collection opens on its shelf whatever the setting says,
+/// because a collections screen listing a single tile is a press that buys nothing.
+#[test]
+fn one_collection_is_not_worth_a_screen() {
+    let (mut s, _console, library) = shell(vec![
+        Screen::Home(HomeScreen::new()),
+        Screen::Library(LibraryScreen::new(&hosts()[0])),
+    ]);
+    s.settings.library_collections = true;
+    s.sync();
+    library.set_games(
+        platform_games()
+            .into_iter()
+            .map(|mut g| {
+                g.platform = Some("PlayStation 3".into());
+                g
+            })
+            .collect(),
+    );
+    s.sync();
+    assert!(
+        matches!(s.stack.last(), Some(Screen::Library(_))),
+        "one platform is not a set of collections"
+    );
+}
+
 /// The user's flow, verbatim: group by platform, walk the platforms, pick PS3, see its
 /// games — and get back out again. This is the whole point of Part C, so it is asserted
 /// end to end rather than in pieces.

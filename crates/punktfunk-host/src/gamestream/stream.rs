@@ -331,6 +331,22 @@ fn run(
         // `spawned_now` is what actually happened — the record is settled from it below.
         #[allow(unused_mut)]
         let mut spawned_now = false;
+        // Windows hands back a pid rather than a child; kept for the lease (see the native plane
+        // and `gamelease::LeaseRequest::spawned`). `None` elsewhere and when nothing was spawned.
+        #[allow(unused_mut)]
+        let mut spawned_pid: Option<u32> = None;
+        // Close this client's previous game first, when the operator asked for that — the compat
+        // plane's half of `GameOnNewLaunch`. Moonlight clients are cert-paired, so they carry the
+        // fingerprint the launch records are keyed by and the policy applies to them exactly as it
+        // does on the native plane.
+        if !adopt_launch {
+            if let Some(t) = target.as_ref() {
+                crate::gamelease::end_others_for_new_launch(
+                    life.fingerprint.as_deref(),
+                    t.game.id.as_deref(),
+                );
+            }
+        }
         #[cfg(windows)]
         if let Some(t) = target.as_ref() {
             if adopt_launch {
@@ -343,12 +359,16 @@ fn run(
                 // A library title launches by its store-qualified id (the interactive-session spawner
                 // resolves the store's own recipe); an operator-typed command runs as itself.
                 let launched = match (t.game.id.as_deref(), t.command.as_deref()) {
-                    (Some(id), _) => crate::library::launch_gamestream_library(id),
-                    (None, Some(cmd)) => crate::library::launch_gamestream_command(cmd),
-                    (None, None) => Ok(()),
+                    (Some(id), _) => crate::library::launch_gamestream_library(id).map(Some),
+                    (None, Some(cmd)) => crate::library::launch_gamestream_command(cmd).map(Some),
+                    // Nothing to start (a target that names neither) — not a spawn, so no pid.
+                    (None, None) => Ok(None),
                 };
                 match launched {
-                    Ok(()) => spawned_now = true,
+                    Ok(pid) => {
+                        spawned_pid = pid;
+                        spawned_now = true;
+                    }
                     Err(e) => {
                         tracing::warn!(title = %t.game.title, error = %e, "gamestream: could not launch app")
                     }
@@ -450,6 +470,7 @@ fn run(
                     nested,
                     launcher: t.launcher,
                     child,
+                    spawned: spawned_pid,
                     launch_stamp,
                     // For an adopted launch this is the ORIGINAL launch's slot, so the record keeps
                     // tracking the same processes across the handover.

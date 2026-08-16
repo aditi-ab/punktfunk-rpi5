@@ -183,8 +183,13 @@ fn command_for(spec: &LaunchSpec) -> Option<String> {
 ///
 /// Wired into the data plane *after* capture is live, so the title renders onto the already-captured
 /// desktop and grabs foreground.
+///
+/// Returns the **pid of the process it started**, which is what the caller hands to
+/// [`crate::gamelease::LeaseRequest::spawned`]. It used to be logged and discarded, and that was the
+/// whole of Windows' disadvantage against Linux here: with no `Child` to hold and no pid kept, a
+/// title whose provider supplied no detect hint left the lease nothing to watch or signal.
 #[cfg(windows)]
-pub fn launch_title(id: &str) -> Result<()> {
+pub fn launch_title(id: &str) -> Result<u32> {
     let entry = all_games()
         .into_iter()
         .find(|g| g.id == id)
@@ -206,7 +211,7 @@ pub fn launch_title(id: &str) -> Result<()> {
     let pid = crate::interactive::spawn_in_active_session(&cmdline, workdir.as_deref())
         .with_context(|| format!("launch '{id}' in the interactive session"))?;
     tracing::info!(launch_id = id, %cmdline, pid, "launched library title in the interactive session");
-    Ok(())
+    Ok(pid)
 }
 
 /// Windows: map a resolved [`LaunchSpec`] to a `(command line, working dir)` to spawn into the
@@ -739,7 +744,7 @@ pub(crate) fn gog_spawn(value: &str) -> Option<(String, Option<PathBuf>)> {
 /// interactive Windows user session, AFTER capture is up (the host is SYSTEM). The Linux paths go
 /// through the compositor-aware [`launch_session_command`] instead.
 #[cfg(windows)]
-pub fn launch_gamestream_command(cmd: &str) -> Result<()> {
+pub fn launch_gamestream_command(cmd: &str) -> Result<u32> {
     let cmd = cmd.trim();
     anyhow::ensure!(!cmd.is_empty(), "empty command");
     // cmd.exe /c is fine here: the value is the host operator's own apps.json command, not a
@@ -747,7 +752,9 @@ pub fn launch_gamestream_command(cmd: &str) -> Result<()> {
     let pid = crate::interactive::spawn_in_active_session(&format!("cmd.exe /c {cmd}"), None)
         .context("spawn gamestream command in the interactive session")?;
     tracing::info!(command = %cmd, pid, "gamestream: launched app in the interactive session");
-    Ok(())
+    // The `cmd.exe` shim's own pid: it exits the moment it has started the real program, which the
+    // lease reads as a hand-off (inside its shim window) rather than as the game exiting.
+    Ok(pid)
 }
 
 /// Launch a library title chosen from the **GameStream `/applist`** (the store-qualified id is carried
@@ -756,7 +763,7 @@ pub fn launch_gamestream_command(cmd: &str) -> Result<()> {
 /// only ever pick an existing title — never inject a command. Linux resolves the id via
 /// [`resolve_launch`] and goes through [`launch_session_command`] instead.
 #[cfg(windows)]
-pub fn launch_gamestream_library(id: &str) -> Result<()> {
+pub fn launch_gamestream_library(id: &str) -> Result<u32> {
     launch_title(id)
 }
 

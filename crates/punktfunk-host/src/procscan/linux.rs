@@ -115,6 +115,17 @@ impl Scanner {
         out
     }
 
+    /// Pin a pid the host itself just spawned to *this* process, by reading its start time.
+    ///
+    /// The one legitimate way into rule 2 from a bare pid: it is safe here, and only here, because
+    /// the caller spawned the process and is resolving it immediately, so there is no window in
+    /// which the number could have been recycled. Everything downstream then re-verifies the pair
+    /// through [`Self::alive`] like any other adopted process.
+    pub fn resolve(&self, pid: u32) -> Option<ProcRef> {
+        let start = self.start_ticks(&self.root.join(pid.to_string()))?;
+        Some(ProcRef { pid, start })
+    }
+
     /// Which of `procs` are still the same live processes — pid present **and** start time unchanged,
     /// so a recycled pid is never reported alive (rule 2).
     pub fn alive(&self, procs: &[ProcRef]) -> Vec<ProcRef> {

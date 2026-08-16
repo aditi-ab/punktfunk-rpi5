@@ -647,7 +647,34 @@ pub(crate) struct TabStrip {
     pills: Vec<Rect>,
 }
 
+/// A pill's label size and its padding either side, in design units.
+const PILL_TEXT: f64 = 13.0;
+const PILL_PAD_X: f64 = 13.0;
+/// Air between two pills.
+const PILL_GAP: f64 = 7.0;
+
+/// Each pill's width and the run's total, in device px.
+///
+/// Shared with [`TabStrip::width`] rather than computed twice, because a caller that
+/// RIGHT-ALIGNS a strip has to know the run's width before the strip draws itself — and a
+/// second copy of this arithmetic would put the measured edge somewhere the drawn edge is not.
+fn pill_widths(labels: &[&str], fonts: &Fonts, k: f64) -> (Vec<f64>, f64) {
+    let size = PILL_TEXT * k;
+    let widths: Vec<f64> = labels
+        .iter()
+        .map(|l| f64::from(fonts.measure(l, W::SemiBold, size)) + 2.0 * PILL_PAD_X * k)
+        .collect();
+    let total = widths.iter().sum::<f64>() + PILL_GAP * k * (labels.len().saturating_sub(1)) as f64;
+    (widths, total)
+}
+
 impl TabStrip {
+    /// How wide this run of pills draws. For a caller placing the strip against a TRAILING
+    /// edge, where the position depends on the width.
+    pub(crate) fn width(labels: &[&str], fonts: &Fonts, k: f64) -> f64 {
+        pill_widths(labels, fonts, k).1
+    }
+
     pub(crate) fn new() -> TabStrip {
         TabStrip {
             indicator: None,
@@ -686,15 +713,10 @@ impl TabStrip {
         if labels.is_empty() {
             return;
         }
-        let size = 13.0 * k;
-        let pad_x = 13.0 * k;
-        let gap = 7.0 * k;
         let pill_h = 30.0 * k;
-        let widths: Vec<f64> = labels
-            .iter()
-            .map(|l| f64::from(fonts.measure(l, W::SemiBold, size)) + 2.0 * pad_x)
-            .collect();
-        let total: f64 = widths.iter().sum::<f64>() + gap * (labels.len() - 1) as f64;
+        let size = PILL_TEXT * k;
+        let (widths, total) = pill_widths(labels, fonts, k);
+        let gap = PILL_GAP * k;
         // Leading, under the heading it belongs to — a strip centred beneath a left-aligned
         // title reads as two unrelated pieces of chrome. Both callers hand this widget the
         // full content width, so the inset is measured here rather than baked into the band.

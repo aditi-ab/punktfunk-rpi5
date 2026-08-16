@@ -1911,6 +1911,26 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // below, so a launch that did not happen can never be inherited by a later session.
     #[allow(unused_mut)]
     let mut spawned_now = false;
+    // The pid Windows hands back for the process it started, kept so the lease has something of its
+    // own to watch and to signal even when the title carries no detect signals at all (see
+    // `gamelease::LeaseRequest::spawned`). `None` on every other platform and whenever nothing was
+    // spawned.
+    #[allow(unused_mut)]
+    let mut spawned_pid: Option<u32> = None;
+    // Close whatever this client had running before, if the operator asked for that
+    // (`GameOnNewLaunch`). Before the spawn, and blocking, so the old game has released the display,
+    // the audio device and the gamepad before the new one asks for them. A no-op on the default
+    // policy, on an adopted launch (same title — nothing to close), and for an anonymous client.
+    if !adopt_launch {
+        if let Some(t) = launch_target.as_ref() {
+            crate::gamelease::end_others_for_new_launch(
+                endpoint::peer_fingerprint(&conn)
+                    .map(hex::encode)
+                    .as_deref(),
+                t.game.id.as_deref(),
+            );
+        }
+    }
     #[cfg(target_os = "windows")]
     if let Some(id) = launch.as_deref() {
         if adopt_launch {
@@ -1919,10 +1939,16 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 "this client's copy of this title is already running from an earlier session — not \
                  starting a second one"
             );
-        } else if let Err(e) = crate::library::launch_title(id) {
-            tracing::warn!(launch_id = id, error = %e, "could not launch requested library title");
         } else {
-            spawned_now = true;
+            match crate::library::launch_title(id) {
+                Ok(pid) => {
+                    spawned_pid = Some(pid);
+                    spawned_now = true;
+                }
+                Err(e) => {
+                    tracing::warn!(launch_id = id, error = %e, "could not launch requested library title")
+                }
+            }
         }
     }
     #[cfg(target_os = "linux")]
@@ -2025,6 +2051,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 nested,
                 launcher: target.launcher,
                 child,
+                spawned: spawned_pid,
                 launch_stamp,
                 // For an adopted launch this is the ORIGINAL launch's slot, so the record keeps
                 // tracking the same processes across the handover.

@@ -2,7 +2,11 @@ import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
 import { type FC, type ReactNode, useEffect, useState } from "react";
 import { ApiError } from "@/api/fetcher";
-import type { GameOnSessionEnd, SessionSettings } from "@/api/gen/model";
+import type {
+	GameOnNewLaunch,
+	GameOnSessionEnd,
+	SessionSettings,
+} from "@/api/gen/model";
 import {
 	getGetSessionSettingsQueryKey,
 	useGetSessionSettings,
@@ -18,6 +22,7 @@ import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages";
 
 const END_POLICIES: GameOnSessionEnd[] = ["keep", "on_quit", "always"];
+const NEW_LAUNCH_POLICIES: GameOnNewLaunch[] = ["keep", "end"];
 
 /**
  * Whether a launched game and its streaming session share a fate
@@ -135,6 +140,34 @@ export const SessionGameCard: FC = () => {
 								</p>
 							</Field>
 
+							{/* Its own axis rather than a fourth end-policy: that one asks what a
+							    session owes its game, this one asks what a new launch owes the last
+							    one — and wanting a game to survive a disconnect says nothing about
+							    wanting it kept when you deliberately pick something else. */}
+							<Field
+								label={m.session_game_new_launch()}
+								help={m.session_game_new_launch_help()}
+								group
+							>
+								<div className="flex flex-wrap gap-2">
+									{NEW_LAUNCH_POLICIES.map((p) => (
+										<Choice
+											key={p}
+											selected={(server.game_on_new_launch ?? "keep") === p}
+											disabled={busy || !acts("game_on_new_launch")}
+											onClick={() => apply({ game_on_new_launch: p })}
+										>
+											{NEW_LAUNCH_LABEL[p]()}
+										</Choice>
+									))}
+								</div>
+								{(server.game_on_new_launch ?? "keep") === "end" && (
+									<p className="max-w-prose text-xs text-muted-foreground">
+										{m.session_game_new_launch_scope()}
+									</p>
+								)}
+							</Field>
+
 							{(server.game_on_session_end ?? "keep") === "always" && (
 								<Field
 									label={m.session_game_grace()}
@@ -199,6 +232,11 @@ const END_POLICY_LABEL: Record<GameOnSessionEnd, () => string> = {
 	keep: () => m.session_game_end_keep(),
 	on_quit: () => m.session_game_end_on_quit(),
 	always: () => m.session_game_end_always(),
+};
+
+const NEW_LAUNCH_LABEL: Record<GameOnNewLaunch, () => string> = {
+	keep: () => m.session_game_new_launch_keep(),
+	end: () => m.session_game_new_launch_end(),
 };
 
 /**

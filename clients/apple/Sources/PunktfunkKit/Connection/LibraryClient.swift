@@ -1,7 +1,7 @@
-// Game library client (experimental, plan step 3). Fetches the host's unified game library
-// from the management REST API (`GET /api/v1/library`) — the same payload the web console's
-// /library page renders. Read-only on the client for now; launching a chosen title is a later
-// step. Gated behind `DefaultsKey.libraryEnabled` in the UI.
+// Game library client. Fetches the host's unified game library from the management REST API
+// (`GET /api/v1/library`) — the same payload the web console's /library page renders — and what it
+// currently has running (`GET /api/v1/status`), so a title the player can return to can be marked
+// as such. Gated behind `DefaultsKey.libraryEnabled` in the UI.
 //
 // The management API serves HTTPS on a port distinct from the punktfunk/1 data plane (default
 // 47990, also advertised in the host's mDNS `mgmt` TXT). A paired client is authorized for the
@@ -131,6 +131,37 @@ public enum LibraryError: LocalizedError {
     }
 }
 
+/// One game the host currently has launched, from `/api/v1/status`.
+///
+/// A deliberately partial mirror of the host's `ActiveGame`: only the fields a client can act on.
+/// The console's own view of this payload carries more (which session, which plane, the grace
+/// countdown), and none of that is a player's business from the library screen.
+public struct RunningGame: Codable, Hashable, Sendable {
+    /// Store-qualified library id (`steam:570`) — the key that lines this up with a `GameEntry`.
+    /// Absent for an operator-typed GameStream command, which has no catalog entry behind it.
+    public var appID: String?
+    public var title: String
+    /// `launching` | `running` | `exited` | `untracked` | `grace`. A plain String on purpose: the
+    /// host owns the vocabulary and adds to it (`untracked` arrived in 0.30), so an unknown value
+    /// must never fail the decode of the whole list.
+    public var state: String
+
+    private enum CodingKeys: String, CodingKey {
+        case appID = "app_id"
+        case title
+        case state
+    }
+
+    /// Is this title *up on the host right now* — i.e. would picking it take the player back into
+    /// it rather than start it?
+    ///
+    /// `untracked` counts: the host cannot follow that process, but it did launch it and has no
+    /// evidence it stopped. `grace` counts too — its session is gone but the game is still running,
+    /// which is precisely the case where getting back in promptly matters most. Only a confirmed
+    /// `exited` does not.
+    public var isUp: Bool { state != "exited" }
+}
+
 /// Stateless fetcher for a host's library.
 public enum LibraryClient {
     /// `GET https://<address>:<port>/api/v1/library`, authenticated by **mTLS**: the client
@@ -169,6 +200,40 @@ public enum LibraryClient {
         default:
             throw LibraryError.http(response.status)
         }
+    }
+
+    /// What the host currently has running, from `GET /api/v1/status`.
+    ///
+    /// Same lane, same identity, no new host work: `/status` is already on the paired-certificate
+    /// allowlist (the host's `mgmt::auth::cert_may_access`) alongside `/library`, and has carried a
+    /// `games[]` array since the session⇄game lifetime work. The client simply never read it — so a
+    /// player had no way to see, from the device they browse on, that something was already up.
+    ///
+    /// Best-effort by contract: an older host, an unreachable one, or a shape we don't recognize
+    /// yields an empty list rather than an error. Nothing here is worth failing a library screen
+    /// over — the worst case is a Resume badge that doesn't appear.
+    public static func running(
+        address: String,
+        port: UInt16 = punktfunkDefaultMgmtPort,
+        certPEM: String,
+        keyPEM: String,
+        hostFingerprint: Data?
+    ) async -> [RunningGame] {
+        guard let identity = try? clientIdentity(certPEM: certPEM, keyPEM: keyPEM),
+              let response = try? await send(
+                  path: "/api/v1/status", address: address, port: port,
+                  identity: identity, hostFingerprint: hostFingerprint),
+              response.status == 200,
+              let status = try? JSONDecoder().decode(HostStatus.self, from: response.body)
+        else { return [] }
+        return status.games ?? []
+    }
+
+    /// Just the slice of `/status` this client reads. Everything else on that payload is the
+    /// operator console's business, and decoding only what we use keeps an unrelated schema change
+    /// on the host from breaking the library screen.
+    private struct HostStatus: Decodable {
+        var games: [RunningGame]?
     }
 
     /// `https://addr:port`, IPv6 literals bracketed — the mirror of the Rust client's `base_url`.
