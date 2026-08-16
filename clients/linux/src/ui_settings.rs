@@ -16,6 +16,11 @@
 use crate::trust::Settings;
 use adw::prelude::*;
 use pf_client_core::profiles::{ProfilesFile, SettingsOverlay, StreamProfile};
+// The audio-format table lives in the session crate, not here, because the same three stored
+// values also have to reach the wire — and they are shared verbatim with the Apple and Android
+// clients so one profile round-trips. A second copy of the spellings in this file is exactly the
+// drift the shared table exists to prevent.
+use pf_client_core::session::AUDIO_FORMATS;
 use pf_client_core::trust::StatsVerbosity;
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -151,6 +156,15 @@ mod index {
             8 => 2,
             _ => 0,
         }
+    }
+
+    /// An unknown stored value (a newer client's row, via a shared profile) reads as row 0 —
+    /// Opus — which is also what the session resolves it to, so the row and the wire agree.
+    pub fn audio_format(s: &Settings) -> u32 {
+        AUDIO_FORMATS
+            .iter()
+            .position(|(v, _)| *v == s.audio_format)
+            .unwrap_or(0) as u32
     }
 
     pub fn gamepad(s: &Settings) -> u32 {
@@ -631,6 +645,9 @@ fn commit_profile(active: &StreamProfile, touched: &Touched, values: &Settings) 
     }
     if touched.has("audio_channels") {
         o.audio_channels = Some(values.audio_channels);
+    }
+    if touched.has("audio_format") {
+        o.audio_format = Some(values.audio_format.clone());
     }
     if touched.has("mic_enabled") {
         o.mic_enabled = Some(values.mic_enabled);
@@ -1432,6 +1449,28 @@ pub fn show_scoped(
         "Stereo or surround — the host downmixes if its output has fewer",
         &["Stereo", "5.1 Surround", "7.1 Surround"],
     );
+    let audio_format_labels: Vec<&str> = AUDIO_FORMATS.iter().map(|(_, l)| *l).collect();
+    let audio_format_row = ChoiceRow::new(
+        &dialog,
+        inline,
+        "Audio format",
+        "Lossless is uncompressed PCM — 2.3–4.6 Mb/s off the top of the link, and the host has \
+         its own switch",
+        &audio_format_labels,
+    );
+    {
+        // Stereo-only, and insensitive rather than hidden under surround: a lossless surround
+        // frame does not fit one QUIC datagram at the default MTU, so the host declines it
+        // outright (design/hi-res-audio.md §4.2). Greying it keeps the reason visible next to the
+        // channel row that caused it — a row that vanished would read as a missing feature.
+        //
+        // Insensitivity covers the whole row including a profile scope's per-row Reset, exactly
+        // as the mic-dependent rows above do: an audio_format override can only be reset while
+        // the channels row says Stereo.
+        let w = audio_format_row.widget().clone();
+        w.set_sensitive(surround_row.selected() == 0);
+        surround_row.connect_changed(move |i| w.set_sensitive(i == 0));
+    }
     let mic_row = adw::SwitchRow::builder()
         .title("Stream microphone")
         .subtitle("Sends your microphone to the host's virtual mic — Ctrl+Alt+Shift+V mutes it mid-stream")
@@ -1683,6 +1722,12 @@ pub fn show_scoped(
         chroma_row.set_active(s.enable_444);
         library_row.set_active(s.library_enabled);
         surround_row.set_selected(index::surround(s));
+        audio_format_row.set_selected(index::audio_format(s));
+        // `set_selected` never fires the changed hook, so mirror the stereo gate here — the same
+        // rule the smooth-buffer row's visibility follows a few lines down.
+        audio_format_row
+            .widget()
+            .set_sensitive(index::surround(s) == 0);
         let codec_i = index::codec(s);
         codec_row.set_selected(codec_i);
         set_row_subtitle(codec_row.widget(), codec_caption(codec_i));
@@ -1890,6 +1935,12 @@ pub fn show_scoped(
             o.audio_channels.is_some(),
             index::surround
         );
+        choice!(
+            audio_format_row,
+            "audio_format",
+            o.audio_format.is_some(),
+            index::audio_format
+        );
         choice!(pad_row, "gamepad", o.gamepad.is_some(), index::gamepad);
         choice!(
             sysbtn_row,
@@ -2057,8 +2108,10 @@ pub fn show_scoped(
     let audio = page("Audio", "audio-volume-high-symbolic");
     let audio_group = group("", "Applies from the next session.");
     audio_group.add(surround_row.widget());
+    audio_group.add(audio_format_row.widget());
     // The speaker/mic endpoint pickers below are this device's audio routing (tier G) — they
-    // render only in the defaults scope; the surround + mic-uplink rows above are profileable.
+    // render only in the defaults scope; the surround/format + mic-uplink rows above are
+    // profileable.
 
     if let (Some(r), false) = (&speaker_row, profile_mode) {
         audio_group.add(r.widget());
@@ -2210,6 +2263,13 @@ pub fn show_scoped(
                 2 => 8,
                 _ => 2,
             };
+            // Written back whatever the channel row says. The stored choice is a preference, not
+            // a live request — clearing it because the user is on 5.1 today would lose it the
+            // moment they went back to stereo, and the session filters the pair anyway.
+            s.audio_format = AUDIO_FORMATS
+                [(audio_format_row.selected() as usize).min(AUDIO_FORMATS.len() - 1)]
+            .0
+            .to_string();
             s.codec = CODECS[(codec_row.selected() as usize).min(CODECS.len() - 1)].to_string();
             s.present_priority = PRESENT_PRIORITIES
                 [(present_row.selected() as usize).min(PRESENT_PRIORITIES.len() - 1)]

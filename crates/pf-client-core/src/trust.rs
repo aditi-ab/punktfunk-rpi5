@@ -1181,6 +1181,32 @@ pub struct Settings {
     /// Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
     /// can capture; the resolved count drives the decoder + playback layout.
     pub audio_channels: u8,
+    /// Requested audio format — the cross-client `audio_format` key, whose stored values are shared
+    /// verbatim with the Apple and Android clients (`crate::session::AUDIO_FORMATS`):
+    /// [`crate::session::AUDIO_FORMAT_OPUS`] (the default, and byte for byte the session every
+    /// build before the lossless plane ran), `..._LOSSLESS_48` or `..._LOSSLESS_96`.
+    ///
+    /// Off by default and deliberately: lossless takes 2.3–4.6 Mbps off the top of the link,
+    /// OUTSIDE the ABR loop that manages the video budget, against the ~256 kbps Opus it replaces —
+    /// so it has to be asked for at BOTH ends (`PUNKTFUNK_AUDIO_HIRES` is the host's half, also off
+    /// by default). A REQUEST, never a fact: the host runs a five-condition gate and may answer
+    /// Opus anyway, and this client downgrades it further if the output device will not open the
+    /// rate. What actually happened is the OSD's `audio lossless …` line, and the log's
+    /// "negotiated audio format".
+    ///
+    /// Stereo-only: a lossless surround frame does not fit one QUIC datagram at the default MTU
+    /// and the host declines it (`design/hi-res-audio.md` §4.2). Both desktop settings UIs take
+    /// the picker away under 5.1/7.1 — GTK greys the row (its per-row profile Reset lives on the
+    /// row, and an insensitive row is the idiom its mic-dependent rows already use), the WinUI
+    /// shell drops it from the rendered card (its idiom for a row that does not apply). The
+    /// session filters the pair AGAIN whatever either UI did, because the two fields are
+    /// independent profile overrides and can disagree — and the env override answers to no UI.
+    ///
+    /// A `String`, not an enum, for the same reason [`codec`](Self::codec) is: it is read out of a
+    /// file a newer client may have written, and an unrecognized value resolves to Opus rather than
+    /// ending a session over a dropdown. `default` so pre-existing stores load on the Opus plane.
+    #[serde(default = "default_audio_format")]
+    pub audio_format: String,
     /// Preferred video codec: `"auto"` (host decides), `"hevc"`, `"h264"`, or `"av1"`. A soft
     /// preference — the host honors it when it can emit it, else falls back to the best shared codec.
     #[serde(default = "default_codec")]
@@ -1333,6 +1359,13 @@ fn default_codec() -> String {
     "auto".into()
 }
 
+/// The Opus plane — every session before the lossless one existed, and the one a store written by
+/// an older client must load as. Named from `session` so the default and the menu's first row can
+/// never be two different strings.
+fn default_audio_format() -> String {
+    crate::session::AUDIO_FORMAT_OPUS.into()
+}
+
 fn default_auto() -> String {
     "auto".into()
 }
@@ -1452,6 +1485,7 @@ impl Default for Settings {
             mic_enabled: false,
             echo_cancel: true,
             audio_channels: 2,
+            audio_format: default_audio_format(),
             codec: "auto".into(),
             decoder: "auto".into(),
             adapter: String::new(),

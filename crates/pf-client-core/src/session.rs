@@ -31,6 +31,19 @@ pub struct SessionParams {
     pub bitrate_kbps: u32,
     /// Requested audio channel count (2/6/8); the host echoes the resolved value.
     pub audio_channels: u8,
+    /// The requested audio format — a stored [`AUDIO_FORMATS`] value
+    /// ([`crate::trust::Settings::audio_format`]), `"opus"` for every ordinary session.
+    ///
+    /// A REQUEST, never a fact. It is filtered here against what this box can play and what
+    /// [`audio_channels`](Self::audio_channels) resolved to, then the HOST runs its own
+    /// five-condition gate and may answer Opus anyway — read `NativeClient::audio_codec` /
+    /// `_sample_rate_hz` / `_bits` for what actually happened. A `String` rather than an enum
+    /// because it comes straight out of a settings file a newer client may have written; an
+    /// unknown value resolves to Opus rather than refusing a connect over a dropdown.
+    ///
+    /// `PUNKTFUNK_AUDIO_HIRES` overrides it — see `requested_audio_format` (not linked: it is
+    /// private, and a public item may not link into the crate's internals).
+    pub audio_format: String,
     /// The user's preferred video codec (a `quic::CODEC_*` bit, `0` = auto). Soft — the host honors
     /// it when it can emit it, else falls back; the resolved codec drives the decoder.
     pub preferred_codec: u8,
@@ -224,6 +237,24 @@ pub struct Stats {
     /// overhaul is judged by — an absolute buffer depth cannot distinguish "deep because the link
     /// needs it" from "deep and therefore late".
     pub audio_av_offset_ms: i32,
+    /// The host RESOLVED the lossless `0xD3` PCM plane for this session (`AUDIO_CODEC_PCM`);
+    /// false on the Opus plane every ordinary session runs.
+    ///
+    /// The RESOLVED format, emphatically not the requested one — the whole reason it is published.
+    /// The Settings screen shows what this device ASKED for, and the host's five-condition gate
+    /// (`design/hi-res-audio.md` §8.4, and its own switch is off by default) can decline every one
+    /// of them, leaving a session that looks, sounds and measures exactly like a granted one. An
+    /// OSD reading "lossless" on a session the host refused is §4.3's bug wearing a different hat,
+    /// and this is the only surface that can answer it.
+    pub audio_lossless: bool,
+    /// The RESOLVED sample rate (Hz) and sample depth (bits) of the audio plane — what the decoder
+    /// and the output device were actually built from, straight off the Welcome.
+    ///
+    /// `0` means the host said nothing, which an old host always does; a renderer must treat that
+    /// as "no reading" rather than as a rate (`spawn_audio` folds it to the legacy 48 kHz for its
+    /// own arithmetic, but the OSD has nothing honest to print).
+    pub audio_rate_hz: u32,
+    pub audio_bits: u8,
     /// The decode path frames actually took this window (`"vaapi"`/`"software"`, empty
     /// until the first frame) — the OSD's trailing tag; tracks a mid-session fallback.
     pub decoder: &'static str,
@@ -604,36 +635,116 @@ impl AudioDec {
     }
 }
 
-/// The lossless format this client ASKS the host for, from `PUNKTFUNK_AUDIO_HIRES` —
-/// `Some((rate_hz, bits))` when the user turned it on, `None` for the legacy Opus plane.
+/// The `audio_format` setting's stored value for the Opus plane — the default, and byte for byte
+/// the session every build before the lossless plane ran.
+pub const AUDIO_FORMAT_OPUS: &str = "opus";
+
+/// Bit-exact PCM at 48 kHz / 24-bit (~2.3 Mbps). The honest win even without a hi-res interface:
+/// no lossy stage at all, and no double resample on a host whose engine already runs at 48 kHz.
+pub const AUDIO_FORMAT_LOSSLESS_48: &str = "lossless48";
+
+/// Bit-exact PCM at 96 kHz / 24-bit (~4.6 Mbps), and only real if the host's capture endpoint
+/// genuinely runs at 96 kHz — the host declines rather than upsampling to meet the request.
+pub const AUDIO_FORMAT_LOSSLESS_96: &str = "lossless96";
+
+/// `(stored value, label)` for the requested audio format — the cross-client table both desktop
+/// settings UIs render, so the two shells can never drift from each other or from the wire.
 ///
-/// Accepted spellings: `1`/`true`/`on`/`yes` → 96 kHz / 24-bit (the flagship rung); `96000` → that
-/// rate at 24-bit; `<48000|96000>/<16|24>` → an explicit pair, `48000/16` included — that is the
-/// cheapest lossless rung and it is genuinely reachable, see [`AUDIO_FORMAT_UNSPECIFIED`]. Unset,
-/// `0`, or anything this cannot parse → off, with a warning for the last case (a typo that
-/// silently disables a feature the user turned on is the worst of the three outcomes).
+/// ⚠ **The stored values are shared VERBATIM with the Apple client's `AudioFormatChoice` raw
+/// values and the Android client's `AUDIO_FORMAT_*`.** One profile catalog round-trips through all
+/// four clients (`profiles.rs`), and a spelling that differs by a single character fails in the
+/// worst possible way: the key is carried through untouched, so a profile written on a phone would
+/// keep working on a TV and silently inherit the global default here. Change these only in lockstep
+/// with `clients/apple/Sources/PunktfunkShared/EffectiveSettings.swift` and
+/// `clients/android/app/src/main/kotlin/io/unom/punktfunk/Settings.kt`.
 ///
-/// **An env var rather than a Settings toggle, deliberately.** The design puts the client-side
-/// switch in the profiles work rather than shipping it as a one-off (§10), and `SessionParams` —
-/// filled by struct literal in `clients/session`, outside this crate — has no field for it yet.
-/// This is the same route the speaker/microphone device picks already take into this crate
-/// (`PUNKTFUNK_AUDIO_SINK`/`_SOURCE`, written by session main out of `Settings`), so the eventual
-/// toggle either sets this var or adds the field; nothing below has to move either way.
-fn requested_audio_format() -> Option<(u32, u8)> {
-    let raw = std::env::var("PUNKTFUNK_AUDIO_HIRES").ok()?;
-    match parse_audio_format(&raw) {
+/// **The ladder is 48/96 kHz only, and that is arithmetic rather than bandwidth.** Core's jitter
+/// policy sizes every buffer as `ms × samples-per-ms` with an INTEGER per-ms: 48 000 → 48 and
+/// 96 000 → 96 are exact, 44 100 → 44.1 truncates to 44 — a silent 2.3 % error in every target and
+/// every reported depth. 44.1 kHz and its multiples are deferred behind reworking that arithmetic
+/// (`design/hi-res-audio.md` §4.1), and the host would decline them regardless.
+///
+/// Lossless at 48 kHz / **16**-bit is deliberately absent from the menu even though the env
+/// override below can still ask for it: it spends ~1.5 Mbps to sound like the transparent 256 kbps
+/// Opus it replaces. 24-bit is where the plane earns its bandwidth.
+pub const AUDIO_FORMATS: &[(&str, &str)] = &[
+    (AUDIO_FORMAT_OPUS, "Standard (Opus)"),
+    (AUDIO_FORMAT_LOSSLESS_48, "Lossless 48 kHz / 24-bit"),
+    (AUDIO_FORMAT_LOSSLESS_96, "Lossless 96 kHz / 24-bit"),
+];
+
+/// The `(rate_hz, bits)` a stored [`AUDIO_FORMATS`] value asks the host for; `None` = the Opus
+/// plane, which the caller must turn into the unspecified `0`/`0` pair on the wire rather than an
+/// explicit 48 000/16 — core reads any non-zero pair as "this client is asking for the lossless
+/// plane", so a literal legacy pair would advertise hi-res on every ordinary session.
+///
+/// An unrecognized value — a newer client's row, or a corrupted settings file — resolves to Opus
+/// rather than blocking the connect, matching what the Apple and Android ports do with the same
+/// string. Deriving the pair FROM the stored value is what stops the menu row and the format ever
+/// disagreeing.
+pub fn audio_format_wire(setting: &str) -> Option<(u32, u8)> {
+    use punktfunk_core::audio::pcm::BITS_24;
+    match setting {
+        AUDIO_FORMAT_LOSSLESS_48 => Some((48_000, BITS_24)),
+        AUDIO_FORMAT_LOSSLESS_96 => Some((96_000, BITS_24)),
+        _ => None,
+    }
+}
+
+/// The lossless format this client ASKS the host for — `Some((rate_hz, bits))` when it is on,
+/// `None` for the legacy Opus plane.
+///
+/// Two inputs, and **the environment wins**: `PUNKTFUNK_AUDIO_HIRES` overrides `setting` (the
+/// user's stored [`AUDIO_FORMATS`] choice, already resolved through any settings profile).
+///
+/// That direction, not the reverse, for two reasons. It is how this crate treats every other
+/// `PUNKTFUNK_*` lever — `PUNKTFUNK_DECODER` beats `Settings::decoder`, `PUNKTFUNK_NO_AEC` beats
+/// `echo_cancel`, `PUNKTFUNK_CLIENT_PEAK_NITS` beats the panel's own volume — and a lever that
+/// lost to whatever a stale profile happened to hold would be useless for the thing operators
+/// actually use it for (A/B-ing one session against a field report). And the surfaces do not
+/// overlap: a headless box, a Gaming-Mode kiosk and the CI probe have no settings UI at all, which
+/// is exactly why the var is documented for operators rather than being removed here.
+///
+/// Env grammar: `1`/`true`/`on`/`yes` → 96 kHz / 24-bit (the flagship rung); `96000` → that rate at
+/// 24-bit; `<48000|96000>/<16|24>` → an explicit pair, `48000/16` included — that is the cheapest
+/// lossless rung and it is genuinely reachable, see [`AUDIO_FORMAT_UNSPECIFIED`], though no menu
+/// row offers it. `0`/`off`/`false`/`no` force the Opus plane even when the setting asks for
+/// lossless: an override that could only ever turn the feature ON would be half a lever.
+///
+/// ⚠ An UNSET var and an UNPARSEABLE one are not the same thing, and neither is "off". Unset means
+/// the operator said nothing, so the setting decides. A typo is not an instruction either — it is
+/// warned about and then IGNORED, so the setting still decides; the alternative (the pre-settings
+/// behaviour, where garbage meant off) would silently defeat a switch the user had turned on in the
+/// UI, which is the worse of the two failures now that there IS a UI.
+fn requested_audio_format(setting: &str) -> Option<(u32, u8)> {
+    resolve_audio_format(
+        std::env::var("PUNKTFUNK_AUDIO_HIRES").ok().as_deref(),
+        setting,
+    )
+}
+
+/// The precedence half of [`requested_audio_format`], split out so the env-beats-setting rule is
+/// testable without mutating the process environment — the same reason [`parse_audio_format`] is
+/// its own function.
+fn resolve_audio_format(env: Option<&str>, setting: &str) -> Option<(u32, u8)> {
+    let Some(raw) = env else {
+        return audio_format_wire(setting);
+    };
+    match parse_audio_format(raw) {
         AudioRequest::Legacy => None,
         AudioRequest::Hires(rate, bits) => Some((rate, bits)),
         AudioRequest::Unsupported => {
-            // Loud, because the user turned a switch on and is not getting it — the same reason
-            // the 4:4:4 fallback in `clients/session` shouts. A typo that silently disables an
-            // opt-in feature is worse than either of the two honest outcomes.
+            // Loud, because the user set a lever and is not getting it — the same reason the
+            // 4:4:4 fallback in `clients/session` shouts. What it falls back TO is the Settings
+            // choice, which is why the message names it rather than promising Opus.
             tracing::warn!(
                 value = %raw,
+                setting,
                 "PUNKTFUNK_AUDIO_HIRES is not a format this client can ask for — use 1, \
-                 96000, or <48000|96000>/<16|24>; streaming with the default Opus plane"
+                 96000, 0, or <48000|96000>/<16|24>; ignoring it and using the audio-format \
+                 setting instead"
             );
-            None
+            audio_format_wire(setting)
         }
     }
 }
@@ -744,11 +855,16 @@ fn pump(
     // top of a link ABR can neither see nor reclaim, to play interpolation (`hi-res-audio.md` §7).
     // `Some` past this block is exactly "ask", and asking IS what sets the bit — core derives it
     // from the format pair being specified at all (see `AUDIO_FORMAT_UNSPECIFIED`).
-    let hires = requested_audio_format().filter(|&(rate, _)| {
+    let hires = requested_audio_format(&params.audio_format).filter(|&(rate, _)| {
         if params.audio_channels != 2 {
             // §4.2: a hi-res surround frame does not fit one datagram at the default MTU and this
             // plane is never fragmented, so the host's gate declines it. Saying so here, where the
             // user's two settings are both visible, beats a decline logged on the other machine.
+            //
+            // ⚠ Not redundant with the settings UIs hiding the picker under surround. The two
+            // fields are INDEPENDENT overlay keys: a profile can pin `audio_format` while the
+            // global — or another profile — moves `audio_channels` to 5.1, and the env override
+            // below answers to no UI at all. This is the one place both are known.
             tracing::warn!(
                 channels = params.audio_channels,
                 "lossless audio is stereo-only — a surround frame does not fit one QUIC \
@@ -1761,6 +1877,11 @@ fn pump(
                 mic_dropped,
                 audio_buffer_ms: connector.audio_buffer_ms(),
                 audio_av_offset_ms: connector.audio_av_offset_ms() as i32,
+                // Read off the connector, not off `params`: these three are the Welcome's answer,
+                // and the request lives one struct away precisely so they cannot be confused.
+                audio_lossless: connector.audio_codec == punktfunk_core::quic::AUDIO_CODEC_PCM,
+                audio_rate_hz: connector.audio_sample_rate_hz,
+                audio_bits: connector.audio_bits,
                 decoder: dec_path,
                 target_kbps: connector.current_bitrate_kbps(),
                 auto_rate,
@@ -2186,6 +2307,87 @@ mod tests {
                 "{bad:?} should not parse"
             );
         }
+    }
+
+    /// The Settings choice's stored values and the pair each asks for. The SPELLINGS are the
+    /// point: they are shared verbatim with the Apple `AudioFormatChoice` raw values and the
+    /// Android `AUDIO_FORMAT_*`, so one profile catalog round-trips through all four clients. A
+    /// typo here fails silently — the key survives a load→save (it lands in `SettingsOverlay`'s
+    /// `extra`), so the profile keeps working on the other clients and only this one ignores it.
+    #[test]
+    fn the_audio_format_setting_speaks_the_cross_client_spellings() {
+        use punktfunk_core::audio::pcm::BITS_24;
+        assert_eq!(AUDIO_FORMAT_OPUS, "opus");
+        assert_eq!(AUDIO_FORMAT_LOSSLESS_48, "lossless48");
+        assert_eq!(AUDIO_FORMAT_LOSSLESS_96, "lossless96");
+        // The menu order every client shows, defaulting to the Opus row.
+        assert_eq!(
+            AUDIO_FORMATS.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+            [
+                AUDIO_FORMAT_OPUS,
+                AUDIO_FORMAT_LOSSLESS_48,
+                AUDIO_FORMAT_LOSSLESS_96
+            ]
+        );
+
+        assert_eq!(audio_format_wire(AUDIO_FORMAT_OPUS), None);
+        // Both lossless rows are 24-bit: 16-bit PCM would spend 1.5 Mbps to sound like the
+        // transparent 256 kbps Opus it replaces, which is why no row offers it.
+        assert_eq!(
+            audio_format_wire(AUDIO_FORMAT_LOSSLESS_48),
+            Some((48_000, BITS_24))
+        );
+        assert_eq!(
+            audio_format_wire(AUDIO_FORMAT_LOSSLESS_96),
+            Some((96_000, BITS_24))
+        );
+        // A newer client's row, and a corrupted store: Opus, never a refused connect.
+        assert_eq!(audio_format_wire("lossless192"), None);
+        assert_eq!(audio_format_wire(""), None);
+    }
+
+    /// Precedence: `PUNKTFUNK_AUDIO_HIRES` overrides the setting in BOTH directions, an unset var
+    /// leaves the setting alone, and a typo is ignored rather than being read as "off".
+    ///
+    /// The last one is the case that changed when the setting arrived. Before it, garbage meant
+    /// off, which was the honest answer when the var was the only switch there was; now it would
+    /// silently defeat a choice the user made in the UI, so the var stands down instead.
+    #[test]
+    fn the_env_override_beats_the_setting_in_both_directions() {
+        use punktfunk_core::audio::pcm::{BITS_16, BITS_24};
+
+        // Unset: the setting decides, which is the ordinary path on every desktop.
+        assert_eq!(resolve_audio_format(None, AUDIO_FORMAT_OPUS), None);
+        assert_eq!(
+            resolve_audio_format(None, AUDIO_FORMAT_LOSSLESS_96),
+            Some((96_000, BITS_24))
+        );
+
+        // Set: it wins, including OVER a lossless setting and including turning it off — a lever
+        // that could only ever switch the feature on would be half a lever.
+        assert_eq!(
+            resolve_audio_format(Some("1"), AUDIO_FORMAT_OPUS),
+            Some((96_000, BITS_24))
+        );
+        assert_eq!(
+            resolve_audio_format(Some("48000/16"), AUDIO_FORMAT_LOSSLESS_96),
+            Some((48_000, BITS_16)),
+            "the env rung the menu does not offer is still reachable"
+        );
+        for off in ["0", "off", "false"] {
+            assert_eq!(
+                resolve_audio_format(Some(off), AUDIO_FORMAT_LOSSLESS_96),
+                None,
+                "{off:?} must force Opus over a lossless setting"
+            );
+        }
+
+        // A typo is not an instruction: warned about and ignored, so the setting still decides.
+        assert_eq!(
+            resolve_audio_format(Some("96 kHz"), AUDIO_FORMAT_LOSSLESS_48),
+            Some((48_000, BITS_24))
+        );
+        assert_eq!(resolve_audio_format(Some("44100"), AUDIO_FORMAT_OPUS), None);
     }
 
     /// The lossless arm's contract: interleaved counts (not per-channel), concealment that says

@@ -3184,6 +3184,26 @@ fn stats_text(
             text.push_str(&format!(" · a/v {:+} ms", s.audio_av_offset_ms));
         }
     }
+    // The RESOLVED audio format — `audio lossless 96 kHz / 24-bit`, the same wording the Apple and
+    // Android HUDs use. NOT gated to Detailed, unlike the latency line above it, and deliberately:
+    // it is the one thing a user who turned lossless on needs to see. The Settings screen shows
+    // what this device REQUESTED, and the host's five-condition gate can decline every one of them
+    // (its own switch is off by default) — leaving a session that costs 2.3–4.6 Mbps off the top
+    // of the link and delivers nothing, indistinguishable from success without this line
+    // (design/hi-res-audio.md §4.3, §10).
+    //
+    // Silent on Opus rather than printing `audio opus 48 kHz`: that is what every session has
+    // always been, so a line stating it would be noise on the HUD of every user who never touched
+    // the setting. A zero rate/depth is an old host that reported neither — no reading, so nothing
+    // to print, rather than a fabricated 48 kHz.
+    if s.audio_lossless && s.audio_rate_hz > 0 && s.audio_bits > 0 {
+        let rate = if s.audio_rate_hz % 1000 == 0 {
+            format!("{} kHz", s.audio_rate_hz / 1000)
+        } else {
+            format!("{} Hz", s.audio_rate_hz)
+        };
+        text.push_str(&format!("\naudio lossless {rate} / {}-bit", s.audio_bits));
+    }
     // Decode integrity (M4) — the native lane's answer to "was that stream actually
     // clean?". Appended LAST and only when it has something to say, which keeps it
     // additive for the stdout `stats:` line's parsers (a machine interface: every
@@ -3562,6 +3582,11 @@ mod tests {
                 mic_dropped: 0,
                 audio_buffer_ms: 0,
                 audio_av_offset_ms: 0,
+                // The Opus plane every ordinary session runs, so the tier texts below stay
+                // exactly what they were before the lossless line existed.
+                audio_lossless: false,
+                audio_rate_hz: 0,
+                audio_bits: 0,
                 // The decode-path tag as the session actually spells it since M10 — the
                 // ladder's rung names (`NativeRung::name`), not the deleted libavcodec
                 // ones. A fixture carrying a tag no client emits would let this test go on
@@ -3980,6 +4005,44 @@ mod tests {
         );
         s.mic_dropped = 7;
         assert!(text(&s, StatsVerbosity::Detailed).contains("mic 100 f/s · dropped 7"));
+    }
+
+    /// The RESOLVED audio format line: silent on Opus, silent when the host reported no format at
+    /// all, and — unlike every other audio figure here — visible from Normal up.
+    ///
+    /// That tier choice is the test's real subject. The line exists because a declined lossless
+    /// session is indistinguishable from a granted one: it costs the bandwidth either way, and the
+    /// Settings screen can only show what was ASKED for. Hiding the one honest answer behind the
+    /// Detailed tier would leave the common case (a user who turned it on and wants to know)
+    /// looking at a HUD that says nothing.
+    #[test]
+    fn stats_text_audio_format_line() {
+        let (mut s, p) = sample();
+        let text = |s: &Stats, v| stats_text(v, "m", s, &p, false, false, false, None);
+        assert!(
+            !text(&s, StatsVerbosity::Detailed).contains("audio lossless"),
+            "the Opus plane every ordinary session runs says nothing"
+        );
+
+        s.audio_lossless = true;
+        s.audio_rate_hz = 96_000;
+        s.audio_bits = 24;
+        assert!(text(&s, StatsVerbosity::Normal).contains("\naudio lossless 96 kHz / 24-bit"));
+        assert!(text(&s, StatsVerbosity::Detailed).contains("\naudio lossless 96 kHz / 24-bit"));
+        // Compact is one line by definition, and Off renders nothing at all.
+        assert!(!text(&s, StatsVerbosity::Compact).contains("audio"));
+        assert!(text(&s, StatsVerbosity::Off).is_empty());
+
+        s.audio_rate_hz = 48_000;
+        assert!(text(&s, StatsVerbosity::Normal).contains("\naudio lossless 48 kHz / 24-bit"));
+
+        // An old host reported no format: no reading, so nothing is printed — a fabricated
+        // "48 kHz" would be the same class of claim the line exists to prevent.
+        s.audio_rate_hz = 0;
+        assert!(!text(&s, StatsVerbosity::Detailed).contains("audio lossless"));
+        s.audio_rate_hz = 96_000;
+        s.audio_bits = 0;
+        assert!(!text(&s, StatsVerbosity::Detailed).contains("audio lossless"));
     }
 
     /// Compact omits the latency term until the presenter's first e2e window lands.

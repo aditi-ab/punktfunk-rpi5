@@ -15,6 +15,11 @@ use super::style::*;
 use super::{AppCtx, Screen};
 use crate::trust::{KnownHosts, Settings};
 use pf_client_core::profiles::{ProfilesFile, StreamProfile};
+// The audio-format table lives in the session crate, not here: the same three stored values also
+// have to reach the wire, and they are shared verbatim with the Apple and Android clients so one
+// profile round-trips. A second copy of the spellings in this file is exactly the drift the
+// shared table exists to prevent — which is why this row has no `const` beside AUDIO_CHANNELS.
+use pf_client_core::session::AUDIO_FORMATS;
 use pf_client_core::trust::StatsVerbosity;
 use punktfunk_core::config::GamepadPref;
 use std::sync::Arc;
@@ -484,6 +489,7 @@ struct OverrideFlags {
     enable_444: bool,
     compositor: bool,
     audio_channels: bool,
+    audio_format: bool,
     mic_enabled: bool,
     echo_cancel: bool,
     touch_mode: bool,
@@ -519,6 +525,7 @@ impl OverrideFlags {
             enable_444: o.enable_444.is_some(),
             compositor: o.compositor.is_some(),
             audio_channels: o.audio_channels.is_some(),
+            audio_format: o.audio_format.is_some(),
             mic_enabled: o.mic_enabled.is_some(),
             echo_cancel: o.echo_cancel.is_some(),
             touch_mode: o.touch_mode.is_some(),
@@ -1052,6 +1059,13 @@ pub(crate) fn settings_page(
     let channels_combo = setting_combo(ctx, scope, (rev, set_rev), ac_names, ac_i, |s, i| {
         s.audio_channels = AUDIO_CHANNELS[i].0;
     });
+    // The lossless-audio opt-in. An unknown stored value (a newer client's row, arriving through a
+    // shared profile) shows as Opus — which is what the session resolves it to as well, so the row
+    // and the wire agree rather than the combo silently rewriting the user's choice on save.
+    let (af_names, af_i) = presets(AUDIO_FORMATS, |v| *v == s.audio_format);
+    let format_combo = setting_combo(ctx, scope, (rev, set_rev), af_names, af_i, |s, i| {
+        s.audio_format = AUDIO_FORMATS[i].0.to_string();
+    });
     let mic_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.mic_enabled, |s, on| {
         s.mic_enabled = on
     });
@@ -1506,6 +1520,30 @@ pub(crate) fn settings_page(
                         "The speaker layout requested from the host. It downmixes if its own \
                          output has fewer channels.",
                     )),
+                    // Stereo-only, so the row is HIDDEN under 5.1/7.1 rather than offered and
+                    // declined: a lossless surround frame does not fit one QUIC datagram at the
+                    // default MTU, and the host refuses it outright (design/hi-res-audio.md §4.2).
+                    // The stored value survives the hide — it is a preference, not a live request,
+                    // and going back to Stereo brings it back exactly as it was.
+                    //
+                    // ⚠ Hidden means its per-row Reset is unreachable too. That is the same
+                    // trade the mic-dependent rows make, and it is the lesser evil: a visible
+                    // control for a request this session cannot make is the worse lie.
+                    (s.audio_channels == 2).then(|| {
+                        described_overridable(
+                            (rev, set_rev),
+                            scope,
+                            "audio_format",
+                            "Audio format",
+                            over.audio_format,
+                            format_combo,
+                            "Lossless sends uncompressed PCM instead of Opus \u{2014} bit-exact, \
+                             at 2.3\u{2013}4.6 Mb/s taken off the top of the link and outside \
+                             the automatic-bitrate loop. The host has its own switch, off by \
+                             default, and quietly stays on Opus if it can\u{2019}t deliver the \
+                             rate; the stats overlay names what the session actually got.",
+                        )
+                    }),
                     // The endpoint picks are facts about THIS device's hardware — never
                     // per profile, like Decoder/GPU.
                     (!profile_mode)
@@ -1999,6 +2037,18 @@ mod tests {
         let f3 = OverrideFlags::of(Some(&p3));
         assert!(f3.echo_cancel);
         assert!(!f3.mic_enabled);
+
+        // Channels and format are likewise independent — a "lossless on this host" profile that
+        // leaves the layout following the global is valid, and the two are separate keys in the
+        // catalog every client shares.
+        let mut p3b = StreamProfile::new("t3b".to_string());
+        p3b.overrides = SettingsOverlay {
+            audio_format: Some(pf_client_core::session::AUDIO_FORMAT_LOSSLESS_96.into()),
+            ..Default::default()
+        };
+        let f3b = OverrideFlags::of(Some(&p3b));
+        assert!(f3b.audio_format);
+        assert!(!f3b.audio_channels);
 
         // The presentation pair, likewise independent: pinning the intent doesn't claim
         // the buffer (a "Smoothness, whatever the global buffer is" profile is valid).
