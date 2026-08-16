@@ -162,6 +162,15 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
                 // (design/shard-payload-reneg.md W0.3 — the host only renegotiates, and only
                 // grows to jumbo, when this advertises it).
                 max_shard_payload: crate::config::max_shard_payload() as u16,
+                // The audio format this client is ASKING for. At the legacy 48 kHz / 16-bit pair
+                // (what every `connect` caller gets) the encoder omits both fields and the Hello
+                // stays byte-identical to the pre-hi-res wire form. Anything else came from
+                // `connect_with_audio_format`, which is also what set CLIENT_CAP_AUDIO_HIRES in
+                // `client_caps` — capable AND turned on, the VIDEO_CAP_444 precedent. The two
+                // travel together on purpose: the bit is the opt-in and these are only its
+                // parameters, so neither is meaningful without the other.
+                audio_rate_hz: args.audio_rate_hz,
+                audio_bits: args.audio_bits,
             }
             .encode(),
         )
@@ -252,6 +261,17 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
                 color: welcome.color,
                 chroma_format: welcome.chroma_format,
                 audio_channels: welcome.audio_channels,
+                // The RESOLVED audio format, taken straight off the Welcome and never reconciled
+                // with what we asked for: the host may legitimately answer lower (or plain Opus)
+                // and its answer is the only authority — the rule at both ends is "never claim a
+                // rate you did not get" (`design/hi-res-audio.md` §4.3/§9). A default Opus
+                // session decodes these as `AUDIO_CODEC_OPUS` / 48 000 / 16 / 0, which is exactly
+                // what an older host that omits the whole tail also yields, so the legacy path
+                // reaches the embedder unchanged.
+                audio_codec: welcome.audio_codec,
+                audio_rate_hz: welcome.audio_rate_hz,
+                audio_bits: welcome.audio_bits,
+                audio_frame_us: welcome.audio_frame_us,
                 codec: welcome.codec,
                 shard_payload: welcome.shard_payload,
                 host_caps: welcome.host_caps,

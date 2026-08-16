@@ -41,6 +41,16 @@ suspend fun connectToHost(
     val hdrEnabled = settings.hdrEnabled && displaySupportsHdr(context)
     // "Automatic" resolves to a concrete pad type from the connected controller's VID/PID.
     val gamepadPref = Gamepad.resolvePref(settings.gamepad)
+    // The requested audio format as the two Hello fields — `0`/`0` when the user chose Standard,
+    // which is what keeps the lossless capability bit OFF (see `audioFormatWire`).
+    //
+    // Sent at every channel count, including surround. This used to be clamped to Opus on 5.1/7.1
+    // because a lossless surround frame did not fit one QUIC datagram, but the frame ladder is
+    // channel-aware: a 5.1 session simply negotiates a shorter frame (and pays for it in packet
+    // rate) and 96/24 5.1 fits nothing and is declined. That is the host's decision to make with the
+    // connection's real datagram size in hand, not one to pre-empt from here with an MTU this side
+    // never measured.
+    val (audioRateHz, audioBits) = settings.audioFormatWire()
     return withContext(Dispatchers.IO) {
         // Transport-level half of "Low-latency mode (experimental)" (DSCP marking on the media
         // sockets) — must be applied before connect, since sockets are tagged at creation.
@@ -75,6 +85,11 @@ suspend fun connectToHost(
             hdrEnabled, multiSlice,
             frameParts,
             settings.audioChannels,
+            // The audio format this session asks for. Only ever a request: the host's own gate
+            // may resolve it back to Opus, and the native side downgrades it first if AAudio on
+            // this device will not open the rate — a rate the wire has committed to cannot be
+            // rescued afterwards, so the fallback has to happen before the Hello.
+            audioRateHz, audioBits,
             // What this device can decode (H.264|HEVC always, AV1 when a real decoder exists) +
             // the soft codec preference (user choice, or the Automatic AV1 rule above) — the
             // host resolves the emitted codec from both.

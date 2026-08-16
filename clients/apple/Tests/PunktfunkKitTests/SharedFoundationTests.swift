@@ -597,4 +597,71 @@ final class SharedFoundationTests: XCTestCase {
 
         defaults.removePersistentDomain(forName: "io.unom.punktfunk.tests.effective")
     }
+
+    // MARK: - The audio format a profile carries
+
+    /// `AudioFormatChoice`'s raw values are a CROSS-CLIENT contract, not an implementation detail:
+    /// they are what a profile stores, and the desktop clients (`pf_client_core::session::
+    /// AUDIO_FORMATS`) and Android (`Settings.kt`'s `AUDIO_FORMAT_*`) key the same table off the
+    /// same strings, so one profile catalog has to round-trip through all four. Renaming one fails
+    /// in the worst possible way: the key is carried through untouched, so the profile keeps
+    /// "working" on the other client and silently inherits its global default — the setting does
+    /// not error, the session just quietly costs less and sounds worse.
+    ///
+    /// So every value is frozen here character by character, including the naming rule the 44.1 kHz
+    /// family follows: the kHz figure with the decimal point dropped.
+    func testAudioFormatRawValuesAreTheCrossClientContract() {
+        XCTAssertEqual(AudioFormatChoice.opus.rawValue, "opus")
+        XCTAssertEqual(AudioFormatChoice.lossless48.rawValue, "lossless48")
+        XCTAssertEqual(AudioFormatChoice.lossless96.rawValue, "lossless96")
+        XCTAssertEqual(AudioFormatChoice.lossless441.rawValue, "lossless441")
+        XCTAssertEqual(AudioFormatChoice.lossless882.rawValue, "lossless882")
+        XCTAssertEqual(AudioFormatChoice.lossless1764.rawValue, "lossless1764")
+
+        // Ordered by rate, which is the order the settings row lists them in — and the same order
+        // as the Android and desktop tables, so the three menus read alike. Pinned as a whole so a
+        // case added here is a case somebody had to look at `SettingsOptions.audioFormats` for:
+        // that table is in the app target and cannot be reached from these tests.
+        XCTAssertEqual(
+            AudioFormatChoice.allCases.map(\.rawValue),
+            ["opus", "lossless441", "lossless48", "lossless882", "lossless96", "lossless1764"])
+    }
+
+    /// Every lossless row must reach the wire as the rate it names, at 24-bit — and `opus` must
+    /// stay exactly `48 000`/`16`, which is byte-for-byte a pre-lossless request and is what keeps
+    /// the default session on the legacy connect path.
+    ///
+    /// The five rates are `punktfunk_core::audio::pcm::rate_is_supported`. 44.1/88.2/176.4 were
+    /// absent until the jitter policy stopped dividing by 1 000 before it multiplied
+    /// (design/hi-res-audio.md §4.1); nothing else ever blocked them.
+    func testAudioFormatWireMappingCoversBothRateFamilies() {
+        XCTAssertEqual(AudioFormatChoice.opus.wire.rateHz, 48_000)
+        XCTAssertEqual(AudioFormatChoice.opus.wire.bits, 16)
+        XCTAssertFalse(AudioFormatChoice.opus.isLossless)
+
+        let expected: [(AudioFormatChoice, UInt32)] = [
+            (.lossless441, 44_100), (.lossless48, 48_000), (.lossless882, 88_200),
+            (.lossless96, 96_000), (.lossless1764, 176_400),
+        ]
+        for (choice, rateHz) in expected {
+            XCTAssertEqual(choice.wire.rateHz, rateHz, "\(choice.rawValue)")
+            XCTAssertEqual(choice.wire.bits, 24, "\(choice.rawValue): 24-bit earns the bandwidth")
+            XCTAssertTrue(choice.isLossless, "\(choice.rawValue)")
+        }
+        XCTAssertEqual(
+            expected.count + 1, AudioFormatChoice.allCases.count,
+            "a case with no wire pair here would connect at whatever the switch fell through to")
+    }
+
+    /// A stored value this build does not know — a newer build's, or a corrupted pref — resolves to
+    /// Opus rather than blocking the connect, which is what the desktop `audio_format_wire` and the
+    /// Android `audioFormatWire` do with the same string.
+    func testUnknownAudioFormatFallsBackToOpus() {
+        for stored in ["", "lossless192", "lossless44", "lossless44_1", "LOSSLESS48", "flac"] {
+            XCTAssertEqual(
+                AudioFormatChoice(setting: stored), .opus,
+                "\(stored) must not block the connect")
+        }
+        XCTAssertEqual(AudioFormatChoice(setting: "lossless441"), .lossless441)
+    }
 }

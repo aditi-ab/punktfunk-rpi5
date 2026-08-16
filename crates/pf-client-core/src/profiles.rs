@@ -59,6 +59,13 @@ pub struct SettingsOverlay {
     pub compositor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_channels: Option<u8>,
+    /// The requested audio format (`crate::session::AUDIO_FORMATS`' stored value). Profileable
+    /// because it is about how a HOST is streamed — a wired desktop on the LAN can afford the
+    /// 2.3–4.6 Mbps lossless takes off the top of the link, the same laptop on a hotel Wi-Fi
+    /// cannot — rather than about this device's hardware. Apple and Android carry it under the
+    /// same key, so one catalog covers all four clients.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mic_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,6 +145,9 @@ impl SettingsOverlay {
         }
         if let Some(v) = self.audio_channels {
             s.audio_channels = v;
+        }
+        if let Some(v) = &self.audio_format {
+            s.audio_format = v.clone();
         }
         if let Some(v) = self.mic_enabled {
             s.mic_enabled = v;
@@ -238,6 +248,9 @@ impl SettingsOverlay {
         if after.audio_channels != before.audio_channels {
             self.audio_channels = Some(after.audio_channels);
         }
+        if after.audio_format != before.audio_format {
+            self.audio_format = Some(after.audio_format.clone());
+        }
         if after.mic_enabled != before.mic_enabled {
             self.mic_enabled = Some(after.mic_enabled);
         }
@@ -310,6 +323,7 @@ impl SettingsOverlay {
             "enable_444" => self.enable_444 = None,
             "compositor" => self.compositor = None,
             "audio_channels" => self.audio_channels = None,
+            "audio_format" => self.audio_format = None,
             "mic_enabled" => self.mic_enabled = None,
             "echo_cancel" => self.echo_cancel = None,
             "touch_mode" => self.touch_mode = None,
@@ -654,6 +668,55 @@ mod tests {
         assert!(o.clear("echo_cancel"));
         assert_eq!(o.echo_cancel, None);
         assert!(o.is_empty());
+    }
+
+    /// `audio_format` is a first-class overlay field, not an `extra` passenger: it applies,
+    /// absorbs, clears, and serialises under the `audio_format` key with the exact raw values the
+    /// Apple and Android clients write — one catalog has to round-trip through all four.
+    ///
+    /// The failure this pins is silent. An unmodelled key survives a load→save (that is what
+    /// `extra` is for), so a profile authored on a phone would keep working on a TV and keep
+    /// round-tripping through this client while quietly never applying — a "lossless on the
+    /// living-room host" profile that streams Opus, with nothing anywhere saying so.
+    #[test]
+    fn audio_format_is_a_first_class_override() {
+        let base = Settings::default();
+        assert_eq!(
+            base.audio_format,
+            crate::session::AUDIO_FORMAT_OPUS,
+            "the setting ships off"
+        );
+
+        let mut o = SettingsOverlay::default();
+        let before = o.apply(&base);
+        let mut after = before.clone();
+        after.audio_format = crate::session::AUDIO_FORMAT_LOSSLESS_96.into();
+        o.absorb(&before, &after);
+        assert_eq!(o.audio_format.as_deref(), Some("lossless96"));
+        assert_eq!(o.apply(&base).audio_format, "lossless96");
+        assert!(
+            o.extra.is_empty(),
+            "modelled fields must never land in the passthrough"
+        );
+
+        // Serialised under the shared key, and read back from a foreign client's file — the two
+        // spellings a phone/TV profile can hold.
+        let text = serde_json::to_string(&o).unwrap();
+        assert!(text.contains("\"audio_format\":\"lossless96\""), "{text}");
+        let from_android: SettingsOverlay =
+            serde_json::from_str(r#"{"audio_channels":2,"audio_format":"lossless48"}"#).unwrap();
+        assert_eq!(from_android.audio_format.as_deref(), Some("lossless48"));
+        assert!(from_android.extra.is_empty());
+        assert_eq!(from_android.apply(&base).audio_format, "lossless48");
+
+        assert!(o.clear("audio_format"));
+        assert_eq!(o.audio_format, None);
+        assert!(o.is_empty());
+        // Back to inheriting the global — not a remembered "lossless96".
+        assert_eq!(
+            o.apply(&base).audio_format,
+            crate::session::AUDIO_FORMAT_OPUS
+        );
     }
 
     /// The presentation cluster is first-class, not `extra` passengers: it applies,

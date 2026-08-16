@@ -67,6 +67,23 @@ pub(crate) struct Negotiated {
     pub(crate) chroma_format: u8,
     /// Resolved audio channel count (2/6/8) — what the Opus decoders must be built from.
     pub(crate) audio_channels: u8,
+    /// Which audio plane the host resolved ([`crate::quic::Welcome::audio_codec`]):
+    /// [`crate::quic::AUDIO_CODEC_OPUS`] — Opus on `0xC9`, every legacy session — or
+    /// [`crate::quic::AUDIO_CODEC_PCM`] — lossless PCM on `0xD3`. It is what SELECTS the
+    /// decoder, and nothing else can: a 48 kHz/16-bit PCM session and a 48 kHz Opus session
+    /// are identical in every other resolved field.
+    pub(crate) audio_codec: u8,
+    /// Resolved sample rate (Hz) — what the host is actually capturing, which may be lower
+    /// than the client asked for. The client opens its output device from THIS, never from
+    /// its request (`design/hi-res-audio.md` §4.3).
+    pub(crate) audio_rate_hz: u32,
+    /// Resolved sample depth (16 or 24) — the stride `0xD3` payloads are unpacked at. Reading
+    /// a 24-bit payload at 2 bytes per sample is not silence, it is noise.
+    pub(crate) audio_bits: u8,
+    /// Resolved `0xD3` frame duration (µs); `0` on an Opus session, whose frames are the
+    /// `0xC9` plane's fixed 5 ms. Negotiated from the path MTU, never assumed — see
+    /// [`crate::quic::Welcome::audio_frame_us`].
+    pub(crate) audio_frame_us: u16,
     /// The single codec the host will emit (`quic::CODEC_*`).
     pub(crate) codec: u8,
     /// The host capability bitfield ([`crate::quic::Welcome::host_caps`]):

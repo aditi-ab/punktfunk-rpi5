@@ -214,6 +214,17 @@ struct StreamHUDView: View {
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.tertiary)
             }
+            // The RESOLVED audio format, and only when it is worth a line: `audioFormatLabel` is
+            // nil on the Opus plane every ordinary session runs. Unlike the numbers above it is
+            // NOT gated to the detailed tier — it is the one thing a user who turned lossless on
+            // needs to see, because the failure this guards against (design/hi-res-audio.md §4.3)
+            // is a session that costs the bandwidth and delivers nothing, and that is
+            // indistinguishable from success without a surface naming what the HOST resolved.
+            if let format = model.audioFormatLabel {
+                Text("audio \(format)")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
             if model.lostFrames > 0 {
                 // Unrecoverable network drops this window; hidden while the link is clean.
                 // String(format:) rather than specifier interpolation: the literal % would

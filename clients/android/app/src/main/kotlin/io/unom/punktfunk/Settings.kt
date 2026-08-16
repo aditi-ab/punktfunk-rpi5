@@ -62,6 +62,19 @@ data class Settings(
     /** Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
      * can capture; the resolved count drives the decoder + AAudio layout. */
     val audioChannels: Int = 2,
+    /**
+     * Requested audio format — the cross-client `audio_format` key: [AUDIO_FORMAT_OPUS] (the
+     * default, and byte-for-byte the session every build before the lossless plane ran) or one of
+     * the lossless rows in [AUDIO_FORMAT_OPTIONS], which span both rate families.
+     *
+     * Off by default and deliberately: lossless takes 2.1–8.5 Mbps off the top of the link,
+     * OUTSIDE the ABR loop that manages the video budget, against the ~256 kbps Opus it replaces —
+     * so it has to be asked for at both ends (`PUNKTFUNK_AUDIO_HIRES` is the host's half, also off
+     * by default). A REQUEST, never a fact: the host runs its gate and may answer Opus anyway, and
+     * the native side downgrades the rate first if THIS device will not open it. What actually
+     * happened is on the stats HUD, and in logcat's `audio: plane codec=… rate=…` line.
+     */
+    val audioFormat: String = AUDIO_FORMAT_OPUS,
     /** Preferred video codec: `"auto"` (host decides), `"hevc"`, `"h264"`, or `"av1"`. A soft
      * preference — the host emits it when it can, else falls back. AMediaCodec decodes whichever
      * the host resolves (AV1 is only advertised/offered when the device has a real AV1 decoder). */
@@ -295,6 +308,7 @@ class SettingsStore(context: Context) {
         systemButtons = prefs.getString(K_SYSTEM_BUTTONS, "auto") ?: "auto",
         guideGesture = prefs.getString(K_GUIDE_GESTURE, "auto") ?: "auto",
         audioChannels = prefs.getInt(K_AUDIO_CH, 2),
+        audioFormat = prefs.getString(K_AUDIO_FORMAT, AUDIO_FORMAT_OPUS) ?: AUDIO_FORMAT_OPUS,
         codec = prefs.getString(K_CODEC, "auto") ?: "auto",
         micEnabled = prefs.getBoolean(K_MIC, false),
         echoCancel = prefs.getBoolean(K_ECHO_CANCEL, true),
@@ -350,6 +364,7 @@ class SettingsStore(context: Context) {
             .putString(K_SYSTEM_BUTTONS, s.systemButtons)
             .putString(K_GUIDE_GESTURE, s.guideGesture)
             .putInt(K_AUDIO_CH, s.audioChannels)
+            .putString(K_AUDIO_FORMAT, s.audioFormat)
             .putString(K_CODEC, s.codec)
             .putBoolean(K_MIC, s.micEnabled)
             .putBoolean(K_ECHO_CANCEL, s.echoCancel)
@@ -387,6 +402,7 @@ class SettingsStore(context: Context) {
         const val K_SYSTEM_BUTTONS = "system_buttons"
         const val K_GUIDE_GESTURE = "guide_gesture"
         const val K_AUDIO_CH = "audio_channels"
+        const val K_AUDIO_FORMAT = "audio_format"
         const val K_CODEC = "codec"
         const val K_MIC = "mic_enabled"
         const val K_ECHO_CANCEL = "echo_cancel"
@@ -690,6 +706,118 @@ val AUDIO_CHANNEL_OPTIONS = listOf(
     6 to "5.1 Surround",
     8 to "7.1 Surround",
 )
+
+/** Opus 48 kHz — the default, and byte-for-byte the session every earlier build ran. */
+const val AUDIO_FORMAT_OPUS = "opus"
+
+/**
+ * Bit-exact PCM at 44.1 kHz / 24-bit (~2.1 Mbps). The CD family's base rate: what an ordinary
+ * Windows endpoint or a 44.1 kHz interface reports as its own engine rate, and the request that
+ * spares such a host a resample it would otherwise do on the way out.
+ */
+const val AUDIO_FORMAT_LOSSLESS_441 = "lossless441"
+
+/**
+ * Bit-exact PCM at 48 kHz / 24-bit (~2.3 Mbps). The honest win even without a hi-res interface:
+ * no lossy stage at all, and no double resample on a host whose engine already runs at 48 kHz.
+ */
+const val AUDIO_FORMAT_LOSSLESS_48 = "lossless48"
+
+/** Bit-exact PCM at 88.2 kHz / 24-bit (~4.2 Mbps) — 96 kHz's counterpart in the 44.1 family. */
+const val AUDIO_FORMAT_LOSSLESS_882 = "lossless882"
+
+/**
+ * Bit-exact PCM at 96 kHz / 24-bit (~4.6 Mbps), and only real if the host's capture endpoint
+ * genuinely runs at 96 kHz — the host declines rather than upsampling to meet the request.
+ */
+const val AUDIO_FORMAT_LOSSLESS_96 = "lossless96"
+
+/**
+ * Bit-exact PCM at 176.4 kHz / 24-bit — **8.5 Mbps**, and the one row far more likely to be
+ * declined than granted. Three separate things have to go right: the host's bandwidth gate gives
+ * audio at most a quarter of the video budget, so the session needs ~34 Mbps of video before it
+ * will even consider it; a stereo frame only fits a QUIC datagram on the ladder's shortest rung
+ * (1 ms — a thousand datagrams a second — at ~1 069 B, so the first connection with a smaller
+ * datagram declines it), and a surround one fits no rung at all; and very few Android outputs will
+ * open the rate, which the native probe settles before the handshake. Offered because it is
+ * reachable, not because it is likely — the HUD's `audio lossless …` line is what says which
+ * happened.
+ */
+const val AUDIO_FORMAT_LOSSLESS_1764 = "lossless1764"
+
+/**
+ * (stored value, label) for the requested audio format — the cross-client table, matching the
+ * Apple client's `AudioFormatChoice` raw values and the desktop `AUDIO_FORMATS` so a profile
+ * written on any of them is honoured on the others.
+ *
+ * ⚠ **The stored values are shared VERBATIM and must never be renamed.** A profile carries the key
+ * through untouched, so a spelling that differs by one character fails in the worst possible way:
+ * the profile keeps "working" on the other client and silently inherits its global default
+ * instead. The naming rule is the kHz figure with the decimal point dropped — `lossless48`,
+ * `lossless96`, and for the 44.1 family `lossless441` / `lossless882` / `lossless1764`.
+ *
+ * **Both rate families are here now.** They were not: every buffer figure in the shared jitter
+ * policy used to be `ms × perMs` with `perMs` an INTEGER number of samples per millisecond, which
+ * made 44 100 → 44.1 truncate to 44 — a silent 2.3 % error in every target, every de-prime fuse
+ * and every reported buffer depth, and the whole reason the 44.1 family was deferred rather than
+ * refused (design/hi-res-audio.md §4.1). Core now multiplies before it divides, which is exact at
+ * every rate, so the deferral is lifted.
+ *
+ * A row being offered is not a promise it can be delivered: the host's gate, this device's own
+ * output, and the path MTU each get a veto, and the ones at the top of the list get vetoed often.
+ * What actually happened is on the HUD.
+ *
+ * Lossless at **16**-bit is deliberately absent at every rate: it spends ~1.4–1.5 Mbps to sound
+ * like the transparent 256 kbps Opus it replaces, and it is the one lossless request whose wire
+ * parameters are indistinguishable from a legacy one. 24-bit is where the plane earns its
+ * bandwidth.
+ */
+val AUDIO_FORMAT_OPTIONS = listOf(
+    AUDIO_FORMAT_OPUS to "Standard (Opus)",
+    AUDIO_FORMAT_LOSSLESS_441 to "Lossless 44.1 kHz / 24-bit",
+    AUDIO_FORMAT_LOSSLESS_48 to "Lossless 48 kHz / 24-bit",
+    AUDIO_FORMAT_LOSSLESS_882 to "Lossless 88.2 kHz / 24-bit",
+    AUDIO_FORMAT_LOSSLESS_96 to "Lossless 96 kHz / 24-bit",
+    AUDIO_FORMAT_LOSSLESS_1764 to "Lossless 176.4 kHz / 24-bit",
+)
+
+/**
+ * The `(rateHz, bits)` pair [audioFormat] asks the host for, in `nativeConnect`'s terms.
+ *
+ * ⚠⚠ **Opus is `0`/`0`, the "did not ask" sentinel — NOT `48000`/`16`.** Core sets
+ * `CLIENT_CAP_AUDIO_HIRES` when either field is non-zero, because it keys on *a format was
+ * specified* rather than *the format differs from the default*: 48 kHz/16-bit is the cheapest
+ * lossless rung as well as the legacy pair, so the other rule would make it the one rung nobody
+ * could ask for. Sending `48000`/`16` for a user who chose Standard therefore advertises the
+ * capability, and any host with `PUNKTFUNK_AUDIO_HIRES=1` hands that user 1.5 Mbps of lossless PCM
+ * instead of 256 kbps of Opus. This returned that pair until all four clients were compared.
+ *
+ * The zeroes are also what keeps a default `Hello` byte-identical to a pre-lossless one — the wire
+ * encodes an explicit 48 000/16 the same as absent, and the whole difference is the capability bit.
+ *
+ * Deriving the pair FROM the stored format is what stops the two ever disagreeing. An unrecognized
+ * stored value — a newer build's, or a corrupted pref — resolves to Opus rather than blocking the
+ * connect.
+ *
+ * The rate this returns is only the REQUEST. The native side runs it down a fallback ladder first
+ * (`session::connect::rate_fallback_ladder`), because AAudio grants an explicitly-asked rate or
+ * fails the open and never substitutes — so a rate this device cannot play must never reach the
+ * wire.
+ */
+fun Settings.audioFormatWire(): Pair<Int, Int> = when (audioFormat) {
+    AUDIO_FORMAT_LOSSLESS_441 -> 44_100 to 24
+    AUDIO_FORMAT_LOSSLESS_48 -> 48_000 to 24
+    AUDIO_FORMAT_LOSSLESS_882 -> 88_200 to 24
+    AUDIO_FORMAT_LOSSLESS_96 -> 96_000 to 24
+    AUDIO_FORMAT_LOSSLESS_1764 -> 176_400 to 24
+    else -> AUDIO_FORMAT_WIRE_UNSPECIFIED
+}
+
+/**
+ * The `(rateHz, bits)` that mean "this session is not asking for the lossless plane" — see
+ * [audioFormatWire] for why it is a pair of zeroes rather than the legacy 48 000/16.
+ */
+val AUDIO_FORMAT_WIRE_UNSPECIFIED = 0 to 0
 
 /**
  * (stored value, label) for the preferred video codec — the cross-client table (the Rust

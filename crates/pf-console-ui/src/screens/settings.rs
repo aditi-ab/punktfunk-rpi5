@@ -18,6 +18,7 @@ use crate::screens::{Ctx, Outbox, Screen};
 use crate::theme::{fg, Fonts, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec, TabStrip, TAB_STRIP_H};
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
+use pf_client_core::session::{AUDIO_FORMATS, AUDIO_FORMAT_OPUS};
 use pf_client_core::trust::{MouseMode, StatsVerbosity, TouchMode};
 use skia_safe::{Canvas, Rect};
 
@@ -44,6 +45,10 @@ enum RowId {
     Vsync,
     AllowVrr,
     Audio,
+    /// The lossless-PCM opt-in — the cross-client `audio_format` key. Off (Opus) by default, and
+    /// tied to the channel count above it for a reason that is NOT the one the design doc gives;
+    /// see the `enabled` note in [`row_spec`].
+    AudioFormat,
     Mic,
     EchoCancel,
     PadForward,
@@ -99,7 +104,15 @@ const TABS: [(&str, &[RowId]); 7] = [
             RowId::AllowVrr,
         ],
     ),
-    ("Audio", &[RowId::Audio, RowId::Mic, RowId::EchoCancel]),
+    (
+        "Audio",
+        &[
+            RowId::Audio,
+            RowId::AudioFormat,
+            RowId::Mic,
+            RowId::EchoCancel,
+        ],
+    ),
     (
         "Controller",
         &[
@@ -541,14 +554,32 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
         _ => {}
     }
     let s = &ctx.settings;
-    // Two rows follow a switch a line or two above them: echo cancellation only means
-    // anything while the mic streams, and the pad rows only while any controller is
-    // forwarded at all. Both go dim and inert otherwise — the same relationship the desktop
-    // shells draw by greying a row out, and dimming (not dropping) is what shows the
-    // relationship. The smoothness buffer used to be listed here too; it is dropped from the
-    // list instead now — see [`row_applies`] for why that one is different.
+    // Three rows follow a switch a line or two above them: echo cancellation only means
+    // anything while the mic streams, the audio format only while the stream is stereo, and
+    // the pad rows only while any controller is forwarded at all. All go dim and inert
+    // otherwise — the same relationship the desktop shells draw by greying a row out, and
+    // dimming (not dropping) is what shows the relationship. The smoothness buffer used to be
+    // listed here too; it is dropped from the list instead now — see [`row_applies`] for why
+    // that one is different.
     let enabled = match id {
         RowId::EchoCancel => s.mic_enabled,
+        // ⚠ Lossless follows the channel count for a reason that has MOVED, and the old reason
+        // is still written down in several places that are now wrong (`hi-res-audio.md` §4.2's
+        // blanket "surround does not fit a datagram", and `trust::Settings::audio_format`'s doc
+        // quoting it). The HOST's `channels != 2` decline is deleted: `pcm::frame_us_for` is
+        // channel-aware, so 48 kHz/24-bit 5.1 and 7.1 simply negotiate a SHORTER frame and fit
+        // an ordinary datagram — only 96 kHz surround has nowhere left on the ladder. The Apple
+        // and Android console screens dropped their gates on the strength of that, and this row
+        // would too if it could.
+        //
+        // It cannot, yet: `pf_client_core::session` still filters `audio_channels != 2` out of
+        // the request BEFORE it reaches the wire, so a lossless choice made here under 5.1/7.1
+        // is never even asked for — the session logs "lossless audio is stereo-only" and runs
+        // Opus. A live row would be a control that changes nothing, which is exactly the lie
+        // this screen dims rows to avoid, and it would also disagree with the GTK dialog
+        // reading the same settings file on this same machine. Delete this arm when that
+        // client-side filter learns the frame ladder — not before.
+        RowId::AudioFormat => s.audio_channels == 2,
         RowId::Pad | RowId::PadType | RowId::SystemButtons | RowId::GuideGesture => {
             s.gamepad_forwarding
         }
@@ -638,6 +669,11 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
                 .find(|(v, _)| *v == s.audio_channels)
                 .map_or("Stereo", |(_, l)| l)
                 .into(),
+        ),
+        RowId::AudioFormat => (
+            None,
+            "Audio quality",
+            audio_format_label(&s.audio_format).into(),
         ),
         RowId::Mic => (None, "Microphone", on_off(s.mic_enabled).into()),
         RowId::EchoCancel => (None, "Echo cancellation", on_off(s.echo_cancel).into()),
@@ -755,6 +791,11 @@ fn detail(id: RowId) -> &'static str {
              a fixed cadence. Applies to fullscreen sessions; harmless on a fixed screen."
         }
         RowId::Audio => "The speaker layout requested from the host.",
+        RowId::AudioFormat => {
+            "Bit-exact PCM instead of Opus — 2.3 Mb/s at 48 kHz, 4.6 at 96, off the top of the \
+             link. The host has its own switch and stays on Opus if it can't deliver the rate; \
+             the stats overlay names what the session got. Stereo only."
+        }
         RowId::Mic => {
             "Send this device's microphone to the host's virtual mic. \
              Ctrl+Alt+Shift+V mutes and unmutes it while streaming."
@@ -836,6 +877,21 @@ fn label_for<'a>(options: &'a [(&str, &'a str)], value: &str) -> &'a str {
         .map_or("—", |(_, l)| l)
 }
 
+/// The label for a stored `audio_format` value — [`label_for`] with a different miss, on purpose.
+///
+/// An unrecognized value is not a corrupt one here: the key travels verbatim through a profile
+/// catalog shared with the Apple and Android clients, so a rung a NEWER client offers can land in
+/// this file. The session resolves anything it doesn't know to Opus
+/// (`pf_client_core::session::audio_format_wire`), so the row says Opus too. `label_for`'s "—"
+/// would name a format no session on this box will ever run.
+fn audio_format_label(value: &str) -> &'static str {
+    AUDIO_FORMATS
+        .iter()
+        .find(|(v, _)| *v == value)
+        .or_else(|| AUDIO_FORMATS.iter().find(|(v, _)| *v == AUDIO_FORMAT_OPUS))
+        .map_or("", |(_, l)| *l)
+}
+
 /// Step (`wrap=false`, clamped — false = boundary) or cycle (`wrap=true`) a row's
 /// value. Toggles read left = off, right = on; a no-op is a boundary.
 fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
@@ -911,6 +967,16 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         RowId::Audio => {
             let cur = AUDIO.iter().position(|(v, _)| *v == s.audio_channels);
             step_option(cur, AUDIO.len(), delta, wrap).map(|i| s.audio_channels = AUDIO[i].0)
+        }
+        // Inert under surround — a boundary thud, matching what the dimmed row shows. The gate is
+        // this client's own request filter rather than anything about the plane; the `enabled`
+        // note in `row_spec` is where that is written down, and where it gets deleted.
+        RowId::AudioFormat => {
+            if s.audio_channels == 2 {
+                step_str(AUDIO_FORMATS, &mut s.audio_format, delta, wrap)
+            } else {
+                None
+            }
         }
         RowId::Mic => toggle(&mut s.mic_enabled, delta, wrap),
         // Inert while the mic is off — a boundary thud, matching what the dimmed row shows.
@@ -1603,9 +1669,10 @@ mod tests {
                 seen.push(*id);
             }
         }
-        // The pre-tab flat list, plus the palette row this change added.
-        assert_eq!(seen.len(), 30, "{seen:?}");
+        // The pre-tab flat list, plus the palette row and the lossless-audio row later passes added.
+        assert_eq!(seen.len(), 31, "{seen:?}");
         assert!(seen.contains(&RowId::Palette));
+        assert!(seen.contains(&RowId::AudioFormat));
         // The catalog rows belong to the trailing tab, which builds them at render time.
         assert!(TABS[PROFILES_TAB].1.is_empty());
         assert_eq!(TABS[PROFILES_TAB].0, "Profiles");
@@ -1645,6 +1712,89 @@ mod tests {
         assert_eq!(s.tab, 0);
         // Switching sections is navigation, never a settings write.
         assert!(fx.nav.is_none() && fx.cmds.is_empty());
+    }
+
+    /// The lossless opt-in: it ships OFF, steps the cross-client table verbatim, sits directly
+    /// under the channel count, and follows it — dim and inert under 5.1/7.1, because this
+    /// client's session refuses to ASK for lossless surround (see the `enabled` note in
+    /// [`row_spec`]; the host's own decline is gone). Every value is asserted against
+    /// `pf_client_core::session`'s constants rather than restated, so a spelling change there
+    /// reds this test instead of quietly making the console write a key nobody reads.
+    #[test]
+    fn audio_format_ships_off_and_follows_the_channel_count() {
+        use pf_client_core::session::{AUDIO_FORMAT_LOSSLESS_48, AUDIO_FORMAT_LOSSLESS_96};
+        let (mut settings, pads) = ctx_parts();
+        assert_eq!(settings.audio_format, AUDIO_FORMAT_OPUS, "off by default");
+        assert_eq!(settings.audio_channels, 2, "…and the gate starts open");
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            pads: &pads,
+            deck: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        let mut s = SettingsScreen::with_profiles(Vec::new());
+        s.tab = TABS
+            .iter()
+            .position(|(name, _)| *name == "Audio")
+            .expect("the Audio tab");
+        let audio = s.row_ids(&ctx);
+        let channels = audio
+            .iter()
+            .position(|id| *id == RowId::Audio)
+            .expect("the channels row");
+        assert_eq!(
+            audio.get(channels + 1),
+            Some(&RowId::AudioFormat),
+            "the row sits directly under the one that dims it, like every other pair here"
+        );
+
+        // Steps the shared table in order, clamping at both ends…
+        assert!(
+            !adjust(RowId::AudioFormat, -1, false, &mut ctx),
+            "already Opus = thud"
+        );
+        assert!(adjust(RowId::AudioFormat, 1, false, &mut ctx));
+        assert_eq!(ctx.settings.audio_format, AUDIO_FORMAT_LOSSLESS_48);
+        assert!(adjust(RowId::AudioFormat, 1, false, &mut ctx));
+        assert_eq!(ctx.settings.audio_format, AUDIO_FORMAT_LOSSLESS_96);
+        assert!(
+            !adjust(RowId::AudioFormat, 1, false, &mut ctx),
+            "last = thud"
+        );
+        // …and A wraps home, so every rung is reachable one-handed.
+        assert!(adjust(RowId::AudioFormat, 1, true, &mut ctx));
+        assert_eq!(ctx.settings.audio_format, AUDIO_FORMAT_OPUS);
+
+        // Surround dims it AND refuses the write. A row that accepted a change the session
+        // throws away is the same lie as an enabled-looking control.
+        ctx.settings.audio_format = AUDIO_FORMAT_LOSSLESS_48.into();
+        ctx.settings.audio_channels = 6;
+        assert!(!row_spec(RowId::AudioFormat, &ctx, &[]).enabled);
+        assert!(
+            !adjust(RowId::AudioFormat, 1, false, &mut ctx),
+            "surround = thud"
+        );
+        assert!(!adjust(RowId::AudioFormat, 1, true, &mut ctx), "A too");
+        assert_eq!(
+            ctx.settings.audio_format, AUDIO_FORMAT_LOSSLESS_48,
+            "and nothing was written — the stored preference survives the gate"
+        );
+        // Dimmed, never dropped: it stays visible beside the row that dimmed it.
+        assert!(s.row_ids(&ctx).contains(&RowId::AudioFormat));
+        ctx.settings.audio_channels = 2;
+        assert!(row_spec(RowId::AudioFormat, &ctx, &[]).enabled);
+
+        // A rung this build has no row for — a newer client's, arriving through a shared profile
+        // catalog — reads as the Opus the session will actually run, not as a blank "—".
+        ctx.settings.audio_format = AUDIO_FORMAT_OPUS.into();
+        let opus = row_spec(RowId::AudioFormat, &ctx, &[]).value;
+        assert!(opus.is_some());
+        ctx.settings.audio_format = "lossless192".into();
+        assert_eq!(row_spec(RowId::AudioFormat, &ctx, &[]).value, opus);
     }
 
     /// The palette row steps the shared `ui_palette` key through the table and wraps on A,

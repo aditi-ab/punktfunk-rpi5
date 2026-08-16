@@ -5,6 +5,14 @@
 // AVAudioConverter handles both as single-packet AVAudioCompressedBuffers with explicit
 // packet descriptions.
 //
+// ⚠ **The 48 kHz in this file is CORRECT and must not be "fixed" for hi-res.** Opus is 48 kHz by
+// construction — it has no other internal rate — which is the whole reason the lossless plane
+// exists (design/hi-res-audio.md §2). Nothing on that plane comes through here: `0xD3` frames are
+// unpacked in core and arrive as f32 via `nextAudioPcm`, and the only surviving user of this file
+// in the app is `OpusEncoder` on the mic UPLINK, which §3 keeps at 48 kHz deliberately (voice,
+// 10 ms frames, unchanged). `OpusDecoder` is exercised by the codec tests; the playback path stopped
+// using it when decoding moved into core.
+//
 // Both classes are single-threaded by contract (one per direction, owned by their
 // drain/capture pipelines).
 

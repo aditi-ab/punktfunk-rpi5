@@ -174,12 +174,13 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
 }
 
 /// `NativeBridge.nativeVideoStats(handle): DoubleArray?` — drain ~1 s of decode stats for the HUD
-/// (unified stats spec, `design/stats-unification.md`). Returns 35 doubles
+/// (unified stats spec, `design/stats-unification.md`). Returns 38 doubles
 /// `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skewCorrected, width, height, refreshHz, framesLost,
 /// bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms,
 /// netP50Ms, lostWindow, skippedWindow, fecWindow, framesWindow, dispValid, displayP50Ms,
 /// e2eDispP50Ms, e2eDispP95Ms, paceP50Ms, latchP50Ms, presentsWindow, presenterActive,
-/// feedP50Ms, codecP50Ms, skippedOverflowWindow, audioBufferMs, audioAvOffsetMs]`
+/// feedP50Ms, codecP50Ms, skippedOverflowWindow, audioBufferMs, audioAvOffsetMs, audioCodec,
+/// audioRateHz, audioBits]`
 /// (the flags are 1.0/0.0; indexes 0–21 match the previous 22-double layout — 0–13 the original
 /// 14-double one with the latency pair re-based to the end-to-end capture→decoded headline, 14/15
 /// the stage p50s tiling it: `host+network` = capture→received, `decode` = received→decoded; 16/17
@@ -202,8 +203,13 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStopVideo(
 /// parked-AU overflow subset of the window's `skipped` at 19 (decoder fell behind, vs benign
 /// newest-wins pacing); 33/34 are the AUDIO plane's latency — the playback ring's live depth in ms
 /// and the A/V sync loop's smoothed offset in ms (positive = audio behind the picture) — both live
-/// gauges rather than windowed samples, like the cumulative drop total at 9), or `null` when no
-/// decode thread is running.
+/// gauges rather than windowed samples, like the cumulative drop total at 9; 35–37 are the audio
+/// FORMAT the host resolved at the handshake — `audioCodec` (`0` = Opus on `0xC9`, `2` = lossless
+/// PCM on `0xD3`), the resolved rate in Hz and the resolved depth in bits. Static for the session,
+/// and here because `design/hi-res-audio.md` §10 requires a surface for the RESOLVED format rather
+/// than the requested one: a session that spends 4.6 Mbps and a session whose host quietly
+/// declined look identical from the outside, which is §4.3's failure wearing a UI hat), or `null`
+/// when no decode thread is running.
 /// Poll ~1 Hz from the UI; each call
 /// resets the measurement window. Not android-gated — pure `jni` + connector reads, so it links on
 /// the host build too (Kotlin only ever calls it on device).
@@ -227,7 +233,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats<
             .drain(h.client.frames_dropped(), h.client.fec_recovered_shards());
         let mode = h.client.mode();
         let color = h.client.color;
-        let buf: [f64; 35] = [
+        let buf: [f64; 38] = [
             snap.fps,
             snap.mbps,
             snap.e2e_p50_ms,
@@ -290,6 +296,16 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoStats<
             // high" report had no instrument behind it at all.
             h.client.audio_buffer_ms() as f64,
             h.client.audio_av_offset_ms() as f64,
+            // The audio format the host RESOLVED (`Welcome`), not what this device asked for.
+            // A lossless session and a session whose host declined lossless are indistinguishable
+            // from the outside — same picture, same latency figures, one of them quietly spending
+            // 2.3–4.6 Mbps of the link on nothing — so the HUD has to be able to name which
+            // (`design/hi-res-audio.md` §10, and §4.3 for why it matters). Static for the session:
+            // the plane is settled at the handshake and the host never switches it underneath a
+            // client whose output device is already open.
+            h.client.audio_codec as f64,
+            h.client.audio_sample_rate_hz as f64,
+            h.client.audio_bits as f64,
         ];
         let arr = env.new_double_array(buf.len())?;
         arr.set_region(env, 0, &buf)?;

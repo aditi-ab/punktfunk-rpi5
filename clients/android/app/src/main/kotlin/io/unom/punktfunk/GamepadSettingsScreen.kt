@@ -917,6 +917,19 @@ internal fun buildSettingsRows(
             "The speaker layout requested from the host.",
             AUDIO_CHANNEL_OPTIONS, s.audioChannels,
         ) { update(s.copy(audioChannels = it)) },
+        // Live at every channel count now. It used to dim on 5.1/7.1 because a lossless surround
+        // frame did not fit one datagram at the default MTU; the frame ladder is channel-aware, so
+        // a surround session negotiates a shorter frame instead — only the top of the list fits
+        // nothing, and that is the host's call to make rather than this row's.
+        choice(
+            "audioFormat", GpTab.AUDIO, null, "Audio quality",
+            "Lossless sends bit-exact PCM instead of compressed audio, on top of the video — " +
+                "2.3 Mbps at 48 kHz, 4.6 at 96, 8.5 at 176.4. It must be enabled on the host " +
+                "too, this device's output has to accept the rate, and the link has to fit the " +
+                "frames; otherwise the session falls back to Standard. The stats overlay says " +
+                "which.",
+            AUDIO_FORMAT_OPTIONS, s.audioFormat,
+        ) { update(s.copy(audioFormat = it)) },
         toggle(
             "mic", GpTab.AUDIO, null, "Microphone",
             "Send this device's microphone to the host's virtual mic.",

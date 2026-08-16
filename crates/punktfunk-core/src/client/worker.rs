@@ -19,6 +19,13 @@ pub(crate) struct WorkerArgs {
     pub(crate) bitrate_kbps: u32,
     pub(crate) video_caps: u8,
     pub(crate) audio_channels: u8,
+    /// The sample rate/depth this client is ASKING for ([`crate::quic::Hello::audio_rate_hz`] /
+    /// [`audio_bits`](crate::quic::Hello::audio_bits)) — a request, never a fact. Anything other
+    /// than the legacy 48 kHz/16-bit pair also sets [`crate::quic::CLIENT_CAP_AUDIO_HIRES`] (see
+    /// [`NativeClient::connect_with_audio_format`]); the host resolves both and answers in its
+    /// `Welcome`, which is what the client must actually open its device from.
+    pub(crate) audio_rate_hz: u32,
+    pub(crate) audio_bits: u8,
     pub(crate) video_codecs: u8,
     pub(crate) preferred_codec: u8,
     pub(crate) display_hdr: Option<HdrMeta>,

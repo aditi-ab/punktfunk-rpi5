@@ -68,6 +68,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.micEnabled) var micEnabled = true
     @AppStorage(DefaultsKey.echoCancel) var echoCancel = true
     @AppStorage(DefaultsKey.audioChannels) var audioChannels = 2
+    @AppStorage(DefaultsKey.audioFormat) var audioFormat = AudioFormatChoice.opus.rawValue
     @AppStorage(DefaultsKey.codec) var codec = "auto"
     // The overlay tier's raw string (the pickers tag by rawValue); the absent-key default runs
     // the legacy-hudEnabled migration (same pattern as ContentView/StreamCommands).
@@ -475,6 +476,21 @@ struct SettingsView: View {
                     title: "Audio channels",
                     options: SettingsOptions.audioChannels,
                     selection: $audioChannels)
+                // Offered at every channel count — the lossless plane is no longer stereo-only,
+                // because the frame ladder is sized per channel count and surround simply
+                // negotiates a shorter frame (see SettingsOptions.audioFormats).
+                TVSelectionRow(
+                    title: "Audio quality",
+                    options: SettingsOptions.audioFormats,
+                    selection: $audioFormat)
+                tvCaption("Lossless sends bit-exact PCM instead of compressed audio — 2.1 to 8.5 "
+                    + "Mbps on top of the video for stereo, three times that for 5.1 and four for "
+                    + "7.1. It also has to be enabled on the host, the host's own interface has "
+                    + "to run the rate, and the Apple TV's output has to accept it. The top of "
+                    + "the ladder needs room the network may not have: 176.4 kHz sends a thousand "
+                    + "packets a second, and surround above 48 kHz does not fit at all. Anything "
+                    + "missing falls back to Standard — the stats overlay shows what the session "
+                    + "actually got.")
                 TVSelectionRow(
                     title: "Auto-wake on connect",
                     options: [("On", "on"), ("Off", "off")], selection: autoWakeEnabledTag)

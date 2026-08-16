@@ -82,6 +82,7 @@ struct GamepadSettingsView: View {
     @AppStorage(DefaultsKey.guideGesture) private var guideGesture = "auto"
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
     @AppStorage(DefaultsKey.audioChannels) private var audioChannels = 2
+    @AppStorage(DefaultsKey.audioFormat) private var audioFormat = AudioFormatChoice.opus.rawValue
     @AppStorage(DefaultsKey.hdrEnabled) private var hdrEnabled = true
     @AppStorage(DefaultsKey.enable444) private var enable444 = false
     @AppStorage(DefaultsKey.codec) private var codec = "auto"
@@ -855,6 +856,22 @@ struct GamepadSettingsView: View {
                 detail: "The speaker layout requested from the host.",
                 options: SettingsOptions.audioChannels, current: audioChannels
             ) { audioChannels = $0 },
+            // No longer chained to the row above. The lossless plane was stereo-only because a
+            // surround frame did not fit one datagram; the frame ladder is sized per channel
+            // count, so 5.1/7.1 negotiate a SHORTER frame instead — a higher packet rate, not an
+            // impossibility — and only the top of the rate ladder genuinely has nowhere to go.
+            choiceRow(
+                id: "audioFormat", tab: .audio, icon: "waveform.badge.magnifyingglass",
+                label: "Audio quality",
+                detail: "Lossless sends bit-exact PCM instead of compressed audio — 2.1 to 8.5 "
+                    + "Mbps on top of the video for stereo, three times that for 5.1 and four for "
+                    + "7.1. It must be enabled on the host too, the host's own interface has to "
+                    + "run the rate, and this device's output has to accept it. The top of the "
+                    + "ladder needs room the network may not have: 176.4 kHz sends a thousand "
+                    + "packets a second, and surround above 48 kHz does not fit at all. Anything "
+                    + "missing falls back to Standard.",
+                options: SettingsOptions.audioFormats, current: audioFormat
+            ) { audioFormat = $0 },
             toggleRow(
                 id: "mic", tab: .audio, icon: "mic", label: "Microphone",
                 detail: "Send this device's microphone to the host's virtual mic.",

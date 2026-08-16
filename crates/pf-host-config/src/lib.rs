@@ -230,6 +230,36 @@ pub struct HostConfig {
     /// (the default) = automatic: sent only to a client that asked for it, and only while the link
     /// is actually losing packets.
     pub audio_redundancy: Option<bool>,
+    /// `PUNKTFUNK_AUDIO_HIRES` — host policy gate for the lossless `0xD3` audio plane
+    /// (44.1/48/88.2/96/176.4 kHz, 16/24-bit PCM, stereo through 7.1;
+    /// `design/hi-res-audio.md` §10). The rate set lives in
+    /// [`punktfunk_core::audio::pcm::rate_is_supported`] and the channel count is decided by
+    /// whether a frame fits a datagram, not by a list — so neither is restated here.
+    ///
+    /// **Default OFF, and deliberately unlike every other `Option<bool>` knob here** — the use
+    /// site is `unwrap_or(false)`, not `unwrap_or(true)`. `audio_redundancy` above defaults ON
+    /// because it costs a few hundred kbps and buys loss resilience on a plane the user already
+    /// agreed to; hi-res costs **1.4–8.5 Mbps in stereo, up to 33.9 in 7.1** and rides QUIC
+    /// datagrams OUTSIDE the ABR loop,
+    /// so it is taken off the top of the link and adaptive bitrate can neither see nor reclaim
+    /// it (§4.6). That is bandwidth nobody consented to, on a link the host cannot re-negotiate
+    /// afterwards — so it must be asked for at BOTH ends: the client sets
+    /// `CLIENT_CAP_AUDIO_HIRES` (its own user-facing toggle, also default off) and the operator
+    /// sets this.
+    ///
+    /// `None` (unset) and an explicit off are therefore the same answer at the use site; the
+    /// tri-state is kept only so a future status/diagnostics reader can tell "the operator turned
+    /// it off" from "the operator never said". Explicit-off grammar for symmetry with its
+    /// neighbours.
+    ///
+    /// ⚠ **The desktop CLIENTS read a variable of this same name with a RICHER grammar** — see
+    /// `pf_client_core::session`, which takes `1`/`on`, a bare rate such as `96000`, or an explicit
+    /// `<rate>/<bits>`. A box that is both host and client therefore configures both halves from
+    /// one environment line, and they compose only because [`env_on`] reads everything that is not
+    /// `0`/`false`/`off`/`no` as *on*: a client-shaped `96000/24` happens to say *allow* here too.
+    /// That is an accident that works, not a shared grammar — `1` is the only spelling that means
+    /// the same thing at both ends, which is why it is the one the docs give.
+    pub audio_hires: Option<bool>,
     /// `PUNKTFUNK_PERF` — per-stage timing instrumentation.
     pub perf: bool,
     /// `PUNKTFUNK_VIDEO_SOURCE` — GameStream video source select. `virtual` (the default — a
@@ -435,6 +465,9 @@ impl HostConfig {
             audio_output_mode: AudioOutputMode::from_env(),
             audio_quality: val("PUNKTFUNK_AUDIO_QUALITY").map(|s| s.trim().to_lowercase()),
             audio_redundancy: env_on("PUNKTFUNK_AUDIO_REDUNDANCY"),
+            // Tri-state like its neighbour, but read as `unwrap_or(FALSE)` at the use site —
+            // see the field doc for why this one knob inverts the house default.
+            audio_hires: env_on("PUNKTFUNK_AUDIO_HIRES"),
             perf: flag("PUNKTFUNK_PERF"),
             // Default ON while the interval-stutter field program runs (see the field doc).
             stall_probes: env_on("PUNKTFUNK_STALL_PROBES").unwrap_or(true),

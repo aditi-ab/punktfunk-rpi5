@@ -390,6 +390,11 @@ mod session_main {
             },
             bitrate_kbps: settings.bitrate_kbps,
             audio_channels: settings.audio_channels,
+            // The lossless-audio opt-in, AS STORED — the pump is what filters it, because only it
+            // knows whether this box's output device will open the rate and what the host
+            // answered. `PUNKTFUNK_AUDIO_HIRES` still overrides it there (a headless box or a
+            // Gaming-Mode kiosk has no settings UI), which is why nothing is resolved here.
+            audio_format: settings.audio_format.clone(),
             preferred_codec: settings.preferred_codec(),
             // Nothing excluded on a fresh dial. Only the run loop's codec-fallback retry
             // sets this, and it does so on a CLONE of these params — a Settings-level

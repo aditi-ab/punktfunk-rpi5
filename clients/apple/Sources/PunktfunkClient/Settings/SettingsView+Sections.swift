@@ -575,6 +575,18 @@ extension SettingsView {
                     }
                 }
             }
+            // Offered at every channel count. This row used to be hidden unless the session was
+            // stereo; the frame ladder is channel-aware, so surround negotiates a shorter frame
+            // rather than being impossible, and the caption is where the cases that genuinely do
+            // not fit are stated (see `audioFormatCaption`). A hidden row silently discards a
+            // choice and explains nothing.
+            described(audioFormatCaption, field: "audio_format") {
+                Picker("Audio quality", selection: scoped(SettingsFields.audioFormat)) {
+                    ForEach(SettingsOptions.audioFormats, id: \.tag) { option in
+                        Text(option.label).tag(option.tag)
+                    }
+                }
+            }
             #if os(macOS)
             // Which speaker THIS Mac plays through is this device's audio routing (tier G).
             if !inProfileScope {
@@ -637,6 +649,84 @@ extension SettingsView {
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
+    }
+
+    /// The SELECTED audio format explained, and honest about the ways it can come to nothing: the
+    /// host has its own switch (off by default) and its own capture gate, this device's output has
+    /// to be able to open the rate, and the frame has to fit one QUIC datagram. Every failure
+    /// resolves back to Opus — a good outcome, but not the one the row's label promises, so the
+    /// caption says so before the user goes looking.
+    ///
+    /// ⚠ The rule this caption exists to keep is the design's: **the UI states the RESOLVED
+    /// format, never the requested one.** Nothing here may read as a guarantee — the HUD's
+    /// `audioFormatLabel` is built from the connection's `Welcome`, and that is the only place a
+    /// format is asserted as fact.
+    private var audioFormatCaption: String {
+        let choice = AudioFormatChoice(setting: effective.audioFormat)
+        guard choice != .opus else {
+            return "Compressed audio at 256 kbps — effectively transparent, and what every "
+                + "session used before lossless existed."
+        }
+        // Stereo cost at 24-bit, from `pcm::bitrate_kbps`. 5.1 is three times it and 7.1 four, so
+        // the surround rider below states the multiplier rather than repeating the table.
+        let head: String
+        switch choice {
+        case .opus:
+            head = "" // unreachable — the guard above returns
+        case .lossless441:
+            head = "Bit-exact 44.1 kHz / 24-bit PCM — about 2.1 Mbps on top of the video. The "
+                + "rate to pick when the host's own endpoint runs at 44.1 kHz, since it is then "
+                + "the one that avoids a resample."
+        case .lossless48:
+            head = "Bit-exact 48 kHz / 24-bit PCM — no lossy stage at all. Costs about 2.3 Mbps "
+                + "on top of the video, and is the rate a game host's engine usually already runs "
+                + "at."
+        case .lossless882:
+            head = "Bit-exact 88.2 kHz / 24-bit PCM — about 4.2 Mbps on top of the video, and "
+                + "only real if the host's interface genuinely runs at 88.2 kHz."
+        case .lossless96:
+            head = "Bit-exact 96 kHz / 24-bit PCM — about 4.6 Mbps on top of the video, and only "
+                + "real if the host's interface genuinely runs at 96 kHz."
+        case .lossless1764:
+            // The one row that is honest about being mostly unreachable. Offering it is fine;
+            // presenting it as if it will be granted is not. Three vetoes, and the numbers behind
+            // them: the host gives audio at most a QUARTER of the video budget (8.5 Mbps of audio
+            // therefore needs ~34 Mbps of video), a stereo frame fits a datagram only on the
+            // ladder's shortest 1 ms rung at ~1 069 B, and a surround one fits no rung at all.
+            //
+            // Plain prose, no markdown: `described` hands this to `Text(String)`, which does NOT
+            // parse markup — asterisks would render as asterisks.
+            head = "Bit-exact 176.4 kHz / 24-bit PCM — 8.5 Mbps on top of the video, and far more "
+                + "likely to be declined than granted. The host caps audio at a quarter of the "
+                + "video bitrate, so it needs a session of about 34 Mbps or more; and each packet "
+                + "has to shrink to 1 ms of audio, a thousand a second, which only fits on a "
+                + "network with room to spare."
+        }
+        // The host's switch is off by default and its capture gate is about the world, not policy;
+        // this device's output is the third way a granted rate still is not what reaches a speaker
+        // (a Bluetooth route has no 96 kHz mode to give, and the session log says so).
+        let gates = " Needs lossless enabled on the host as well, and an output here that accepts "
+            + "the rate; anything missing resolves the session back down and the log says which."
+        guard effective.audioChannels > 2 else { return head + gates }
+        // Surround is no longer hidden, so what it costs has to be said out loud. The plane sends
+        // one frame per datagram and never fragments, so more channels buy a SHORTER frame rather
+        // than a bigger packet — a packet rate, not an impossibility, right up until no rung on the
+        // ladder fits at all. Where that line falls, at 24-bit and the default datagram size
+        // (`pcm::frame_us_for` against ~1 387 B of payload): 44.1 kHz 5.1/7.1 and 48 kHz 7.1 land
+        // on the 1 ms rung, 48 kHz 5.1 on 1.5 ms, and 88.2 kHz upward fit NOTHING. Two different
+        // sentences, because "it will cost you" and "it will not happen" are two different things
+        // to tell someone.
+        let layout = effective.audioChannels == 6 ? "5.1" : "7.1"
+        let multiple = effective.audioChannels == 6 ? "three" : "four"
+        let fitsSurround = choice == .lossless441 || choice == .lossless48
+        guard fitsSurround else {
+            return head + gates + " And on \(layout) this rate does not fit an ordinary network's "
+                + "packets at any length, so the session resolves back to Standard — 48 kHz or "
+                + "44.1 kHz is as far up as surround goes here."
+        }
+        return head + gates + " On \(layout) it costs \(multiple) times that, and the host shortens "
+            + "each packet to about 1–1.5 ms of audio to keep it inside one datagram — roughly "
+            + "650 to 1 000 packets a second."
     }
 
     /// Honest about the macOS escape hatch: the voice processor only follows the system

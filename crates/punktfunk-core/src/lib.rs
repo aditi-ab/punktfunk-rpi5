@@ -220,7 +220,33 @@ pub use stats::Stats;
 /// and `pts_ns` of `0` — concealed audio was never on the wire and must not reach an A/V-sync
 /// observation. Additive and client-local: nothing new is sent or parsed, so [`WIRE_VERSION`] is
 /// unchanged.
-pub const ABI_VERSION: u32 = 23;
+/// v24: the lossless audio plane's client surface (`design/hi-res-audio.md` §7) —
+/// `punktfunk_connect_ex11` asks for a sample rate and depth (whatever
+/// `audio::pcm::rate_is_supported` admits — 48/96 kHz plus the 44.1 kHz family — and 16/24-bit;
+/// the accepted rates grew after v24 shipped, which is not an ABI change: no symbol, signature or
+/// struct moved, an older header stays correct, and a host that cannot carry a rate declines it to
+/// Opus exactly as it always has. Anything but
+/// the legacy pair also sets `CLIENT_CAP_AUDIO_HIRES`), and `punktfunk_connection_audio_sample_rate`
+/// / `punktfunk_connection_audio_bits` report what the host actually RESOLVED — which may be
+/// lower, because the host runs a five-condition gate and every decline lands back on Opus at
+/// 48 kHz. `punktfunk_connection_next_audio_pcm` decodes both planes behind the same call, using
+/// `pcm::PcmConceal` for gaps on the lossless one (libopus PLC extrapolates from a decoder's
+/// model of the signal, and a raw frame has none).
+///
+/// ADDED, not widened, and this time the distinction has teeth: the natural place for a rate is a
+/// field on `PunktfunkAudioPcm`, which is `#[repr(C)]` with no `struct_size` guard and is
+/// allocated BY VALUE by every C embedder — growing it would change its layout under all of them
+/// at once. `PunktfunkStats` is in the same position. So the format is read through accessors, the
+/// same rule v18 set with `next_rumble_cmd2`, and `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ` keeps its value
+/// and its meaning as the DEFAULT/legacy rate — a ring sized from it stays correct for every
+/// session that resolves to Opus, which is every session an ABI-23 embedder can ask for. An
+/// embedder that adopts none of this behaves exactly as before.
+///
+/// Client-local in the C sense but NOT wire-free in the usual one: the `Hello`/`Welcome` fields
+/// this reads and writes landed with the plane itself, appended behind the existing trailing-field
+/// discipline (old peers skip them in both directions, and a legacy request encodes byte-identical
+/// to the pre-hi-res messages), so [`WIRE_VERSION`] is still unchanged.
+pub const ABI_VERSION: u32 = 24;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

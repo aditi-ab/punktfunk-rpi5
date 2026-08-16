@@ -179,6 +179,45 @@ final class SessionModel: ObservableObject {
     @Published var audioBufferMs = 0
     @Published var audioAvOffsetMs = 0
     @Published var audioValid = false
+    /// The audio format the host RESOLVED, for the HUD — `nil` on an ordinary Opus session, where
+    /// there is nothing to say and a line saying "48 kHz" would be noise.
+    ///
+    /// The resolved format, emphatically not the requested one. A UI that reads "96 kHz" because
+    /// the user picked 96 kHz, on a session the host declined, is the exact bug
+    /// design/hi-res-audio.md §4.3 names wearing a different hat — and it is the one place a user
+    /// would ever look to check that the bandwidth they are spending is buying anything.
+    @Published var audioFormatLabel: String?
+
+    /// A resolved sample rate as the kHz figure a listener recognises: `48`, `96`, and — since the
+    /// 44.1 kHz family was admitted — `44.1`, `88.2`, `176.4`.
+    ///
+    /// ⚠ This exists because `rateHz / 1000` is INTEGER division, and a HUD reading "44 kHz" on a
+    /// 44 100 Hz session would be the one surface whose whole job is naming what the host resolved,
+    /// naming it wrong.
+    ///
+    /// Built from integer parts rather than `String(format: "%.1f", …)` for the reason the Android
+    /// port records at its own copy of this: that formatter renders through the current locale and
+    /// would print "44,1 kHz" across most of Europe, a decimal comma facing a settings row that
+    /// says "44.1 kHz" — and this line exists precisely to be compared at a glance with what was
+    /// asked for. Interpolating `Int`s is locale-independent, and every rate the plane carries is a
+    /// whole number of hundreds of hertz, so the tenths digit is exact.
+    private static func kHzLabel(_ rateHz: UInt32) -> String {
+        let whole = rateHz / 1000
+        let tenths = (rateHz % 1000) / 100 // 44 100 → 1, 176 400 → 4; 0 for the 48 kHz family
+        return tenths == 0 ? "\(whole)" : "\(whole).\(tenths)"
+    }
+
+    /// The resolved speaker layout, spelled the way the settings row spells it. Named on this line
+    /// because the lossless plane is no longer stereo-only: what a surround lossless session costs
+    /// is three or four times the stereo figure, so "which layout did I actually get" is now part
+    /// of "is the bandwidth I am spending buying anything".
+    private static func layoutLabel(_ channels: UInt8) -> String {
+        switch channels {
+        case 6: return "5.1"
+        case 8: return "7.1"
+        default: return "stereo"
+        }
+    }
 
     /// The floor-shaved values every HUD tier displays (raw − floor, never below 0). Identical
     /// to the raw values whenever no floor is measured.
@@ -358,6 +397,22 @@ final class SessionModel: ObservableObject {
             rawValue: UInt32(clamping: effective.compositor)) ?? .auto
         let bitrateKbps = UInt32(clamping: effective.bitrateKbps)
         let audioChannels = UInt8(clamping: effective.audioChannels)
+        // The audio format this session ASKS for — the user's choice, at every channel count.
+        //
+        // This used to be forced to Opus for 5.1/7.1, on the reasoning that a lossless surround
+        // frame does not fit one datagram. That was a statement about ONE frame length: the ladder
+        // is sized from `(rate, depth, channels, max_datagram)`, so a surround session negotiates a
+        // shorter frame rather than failing, and only the top of the rate ladder has no rung that
+        // fits. Deciding that here, from a rule this side cannot measure, meant a client guess
+        // standing in for the host's measurement — and guessing "no" costs a session that would
+        // have worked. The host's gate is the one place that knows the connection's real datagram
+        // size; asking and being declined is one `Welcome` field, and it is the honest shape.
+        //
+        // **The request is never the answer.** `resolvedAudioRateHz`/`resolvedAudioBits`/
+        // `isLosslessAudio` on the connection are what the host actually granted, SessionAudio
+        // opens the device from THOSE, and `audioFormatLabel` below reports THOSE.
+        let audioFormat = effective.audioFormatChoice
+        let (audioRateHz, audioBits) = audioFormat.wire
         let hdrEnabled = effective.hdrEnabled
         let preferredCodec = PunktfunkConnection.codecByte(effective.codec)
         let pin = host.pinnedSHA256
@@ -452,6 +507,7 @@ final class SessionModel: ObservableObject {
                 pinSHA256: pin, identity: identity, compositor: compositor,
                 gamepad: gamepad, bitrateKbps: bitrateKbps, videoCaps: videoCaps,
                 audioChannels: audioChannels,
+                audioRateHz: audioRateHz, audioBits: audioBits,
                 videoCodecs: videoCodecs, preferredCodec: preferredCodec,
                 clientCaps: clientCaps, launchID: launchID,
                 // Delegated approval: the host holds this connect open until the operator approves
@@ -820,6 +876,7 @@ final class SessionModel: ObservableObject {
         // link may never come up (a non-deadline rung has none at all).
         PresentLinkInfo.shared.clear()
         audioValid = false
+        audioFormatLabel = nil
         lostFrames = 0
         lostPct = 0
         mouseCaptured = false
@@ -917,6 +974,13 @@ final class SessionModel: ObservableObject {
             // correctly declines to correct.
             videoLatency: endToEnd)
         self.audio = audio
+        // Only when the session is genuinely on the lossless plane — the HUD says nothing for an
+        // ordinary Opus one. Read from the connection's Welcome, so a request the host's gate
+        // declined shows the fallback it actually landed on rather than what was asked for.
+        audioFormatLabel = conn.isLosslessAudio
+            ? "lossless \(Self.kHzLabel(conn.resolvedAudioRateHz)) kHz / "
+                + "\(conn.resolvedAudioBits)-bit \(Self.layoutLabel(conn.resolvedAudioChannels))"
+            : nil
         // Gamepads: forward every controller GamepadManager selected — each on its own wire pad
         // index (a pin forwards only one, Automatic forwards all) — and render the host's feedback
         // back to the pad it's addressed to (rumble always; lightbar/player-LEDs/adaptive-triggers

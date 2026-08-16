@@ -86,6 +86,80 @@ pub(crate) fn mix_format_of(ep: &Endpoint) -> Option<MixFormat> {
     })
 }
 
+/// §8.4 condition 4 on Windows (`design/hi-res-audio.md` §4.3 / §8.2) — the ENGINE rate the
+/// desktop-audio loopback would really capture at, answered before the `Welcome` and without
+/// opening a capture stream.
+///
+/// The rule §8.2 states is `requested > engine.rate → decline, never pad`, and the number it
+/// turns on is [`mix_format_of`]'s: a shared-mode `IAudioClient` opened with
+/// `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` reconciles our request with the engine's mix format in
+/// whichever direction is needed, so asking a 48 kHz engine for 96 kHz succeeds, returns no
+/// error, and hands back interpolation. An operator who genuinely wants 96 kHz sets the
+/// endpoint's own rate in Windows' device properties; the host then sees it here and honours it.
+///
+/// **Read-only, deliberately.** This runs mid-handshake, before any session decision has been
+/// taken, so it must leave the box exactly as it found it: it enumerates, runs the PURE
+/// [`plan_with_formats`], and reads one mix format. It is NOT [`wire_now_full`], which parks the
+/// operator's default devices through `IPolicyConfig`, mints endpoints and logs a plan — none of
+/// which may happen for a session that is about to resolve to Opus anyway.
+///
+/// ⚠ The plan inputs below MIRROR [`wire_now_full`]'s, and must keep mirroring them: the whole
+/// point is to name the endpoint the capture open will pick a moment later, so a divergence here
+/// reads the format of a device we do not end up capturing. They are all process-stable env/state
+/// reads, which is what makes recomputing them safe. The real probe (not [`wiring_plan::no_formats`])
+/// is load-bearing for the same reason — narrowing DEMOTES a candidate below real hardware, so a
+/// format-blind plan can name a different endpoint than the session's.
+///
+/// Every failure is [`CaptureRate::Unknown`](super::CaptureRate::Unknown) — i.e. decline. Unlike
+/// the wiring plan, where an unknown format means "assume it is fine", an unknown format here
+/// means "we cannot prove the content matches the label", and this feature exists to refuse
+/// exactly that.
+///
+/// Must run on a COM-initialized thread; it initializes MTA itself because its caller is a tokio
+/// blocking-pool thread that has no COM state of its own. A repeat init on a reused pool thread
+/// returns `S_FALSE`, which is a success — the same pattern every WASAPI worker here uses.
+pub(crate) fn probe_capture_rate() -> super::CaptureRate {
+    if let Err(e) = wasapi::initialize_mta().ok() {
+        tracing::debug!(error = %e, "hi-res capture-rate probe: CoInitializeEx (MTA) failed");
+        return super::CaptureRate::Unknown;
+    }
+    let renders = list_endpoints(Direction::Render);
+    let captures = list_endpoints(Direction::Capture);
+    let want = std::env::var("PUNKTFUNK_MIC_DEVICE")
+        .ok()
+        .map(|s| s.to_lowercase());
+    let pad_ids = pad_render_ids(&renders);
+    let wiring = plan_with_formats(
+        &renders,
+        &captures,
+        want.as_deref(),
+        host_audio_requested(),
+        &mix_format_of,
+        // Stereo — the only count hi-res carries at all (§3), and the same floor `wire_now_full`
+        // plans against.
+        2,
+        &pad_ids,
+        &super::minted::minted_ids(),
+    );
+    let Some(ep) = wiring.loopback_render else {
+        tracing::debug!("hi-res capture-rate probe: no desktop-audio loopback endpoint is planned");
+        return super::CaptureRate::Unknown;
+    };
+    // One more activation of the endpoint the plan just chose. `plan_with_formats` asked for this
+    // format too, but only to rank candidates — it returns the ranking, not the numbers — and
+    // threading a cache through it to save one `GetMixFormat` on an opt-in path would buy nothing
+    // but a second way for the two to disagree.
+    match mix_format_of(&ep) {
+        Some(f) => super::CaptureRate::Engine(f.rate_hz),
+        None => {
+            tracing::debug!(device = %ep.0,
+                "hi-res capture-rate probe: the planned loopback endpoint would not report its \
+                 mix format");
+            super::CaptureRate::Unknown
+        }
+    }
+}
+
 /// `(friendly_name, endpoint_id)` for every ACTIVE endpoint in direction `dir`.
 fn list_endpoints(dir: Direction) -> Vec<Endpoint> {
     let mut out = Vec::new();

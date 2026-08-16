@@ -1809,9 +1809,16 @@ async fn serve_session(
             welcome.bitrate_kbps,
             channels,
         );
+        // …and the resolved audio FORMAT read back the same way, for the same reason. The
+        // client opens its output device from these four Welcome fields, so the capture rate,
+        // the samples-per-frame and the wire tag the encode loop uses have to come from the
+        // identical bytes rather than from a second evaluation of the §8.4 gate — which reads
+        // process configuration and a live connection property, neither of which is guaranteed
+        // to answer the same way twice.
+        let audio_plane = handshake::AudioPlane::from_welcome(&welcome);
         std::thread::Builder::new()
             .name("punktfunk1-audio".into())
-            .spawn(move || audio_thread(conn, stop, cap, channels, budget))
+            .spawn(move || audio_thread(conn, stop, cap, channels, budget, audio_plane))
             .map_err(|e| tracing::warn!(error = %e, "audio thread spawn failed — session continues without audio"))
             .ok()
     } else {
@@ -3328,6 +3335,11 @@ mod tests {
             display_hdr: None,
             client_caps: 0,
             max_shard_payload: 0,
+            // Legacy audio request — this fixture exercises the per-client access grants, not
+            // the audio plane, and the defaults keep its Hello byte-identical to a pre-hi-res
+            // client's.
+            audio_rate_hz: punktfunk_core::audio::SAMPLE_RATE_HZ,
+            audio_bits: punktfunk_core::audio::pcm::BITS_16,
         };
         io::write_msg(&mut send, &hello.encode())
             .await

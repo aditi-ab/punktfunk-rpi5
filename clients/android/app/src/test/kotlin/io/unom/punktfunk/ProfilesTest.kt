@@ -50,6 +50,7 @@ class ProfilesTest {
             hdrEnabled = false,
             compositor = 4,
             audioChannels = 6,
+            audioFormat = AUDIO_FORMAT_LOSSLESS_96,
             micEnabled = true,
             touchMode = TouchMode.POINTER,
             mouseMode = MouseMode.CAPTURE,
@@ -67,6 +68,7 @@ class ProfilesTest {
         assertFalse(out.hdrEnabled)
         assertEquals(4, out.compositor)
         assertEquals(6, out.audioChannels)
+        assertEquals(AUDIO_FORMAT_LOSSLESS_96, out.audioFormat)
         assertTrue(out.micEnabled)
         assertEquals(TouchMode.POINTER, out.touchMode)
         assertEquals(MouseMode.CAPTURE, out.mouseMode)
@@ -234,6 +236,124 @@ class ProfilesTest {
         assertEquals(PROFILE_ACCENTS[2], nextAccent(made.filter { it.accent != PROFILE_ACCENTS[2] }))
         // The colour is presentation, so it never reaches the resolved settings.
         assertEquals(base, made.first().overrides.apply(base))
+    }
+
+    /**
+     * The audio-format setting is a STRING, and the two numbers it turns into are what the `Hello`
+     * carries — get the mapping wrong and the session either spends 8.5 Mbps it was not asked for
+     * or silently declines to ask for what it was. The Opus row is the load-bearing one: it must
+     * be the `0`/`0` "did not ask" sentinel, because core sets `CLIENT_CAP_AUDIO_HIRES` on ANY
+     * non-zero field — see [theOpusSettingDoesNotAdvertiseTheLosslessCapability].
+     */
+    @Test
+    fun theAudioFormatSettingMapsToTheWireFieldsItClaims() {
+        assertEquals(
+            AUDIO_FORMAT_WIRE_UNSPECIFIED,
+            base.copy(audioFormat = AUDIO_FORMAT_OPUS).audioFormatWire(),
+        )
+        // Both rate families. The 44.1 one was deferred only for as long as the shared jitter
+        // policy divided by 1 000 before it multiplied (44 100 → 44 samples/ms, every buffer
+        // figure 2.3 % out); core multiplies first now, so these are simply rates.
+        assertEquals(
+            44_100 to 24,
+            base.copy(audioFormat = AUDIO_FORMAT_LOSSLESS_441).audioFormatWire(),
+        )
+        assertEquals(
+            48_000 to 24,
+            base.copy(audioFormat = AUDIO_FORMAT_LOSSLESS_48).audioFormatWire(),
+        )
+        assertEquals(
+            88_200 to 24,
+            base.copy(audioFormat = AUDIO_FORMAT_LOSSLESS_882).audioFormatWire(),
+        )
+        assertEquals(
+            96_000 to 24,
+            base.copy(audioFormat = AUDIO_FORMAT_LOSSLESS_96).audioFormatWire(),
+        )
+        assertEquals(
+            176_400 to 24,
+            base.copy(audioFormat = AUDIO_FORMAT_LOSSLESS_1764).audioFormatWire(),
+        )
+        // The default is the legacy request — a fresh install asks for exactly what it always did.
+        assertEquals(AUDIO_FORMAT_WIRE_UNSPECIFIED, Settings().audioFormatWire())
+        // A newer build's value (or a corrupted pref) falls back to Opus rather than reaching the
+        // host as an unrepresentable rate: a settings string must never be able to block a connect.
+        assertEquals(
+            AUDIO_FORMAT_WIRE_UNSPECIFIED,
+            base.copy(audioFormat = "lossless192").audioFormatWire(),
+        )
+    }
+
+    /**
+     * ⚠⚠ **A user who chose Standard (Opus) must not advertise `CLIENT_CAP_AUDIO_HIRES`**, and the
+     * only thing standing between them and 1.5 Mbps of PCM they did not ask for is that this pair
+     * is `0`/`0`.
+     *
+     * Core's `advertised_client_caps` sets the bit when EITHER field is non-zero — it keys on "a
+     * format was specified", not on "the format differs from the default", because 48 kHz/16-bit is
+     * both the legacy pair AND the cheapest lossless rung and the other rule would make that rung
+     * unrequestable. The host's gate then accepts 48 kHz/16-bit as a perfectly supported format. So
+     * a client that sends the legacy-looking numbers as its stand-in for "default" opts every one of
+     * its users in, on every host running `PUNKTFUNK_AUDIO_HIRES=1`, with no surface anywhere saying
+     * so — a declined session and a silently granted one look identical from the settings screen.
+     *
+     * This client did exactly that until the four clients were compared. The rule is restated here
+     * rather than reached through core because Kotlin cannot call it; core's own tests pin the other
+     * half.
+     */
+    @Test
+    fun theOpusSettingDoesNotAdvertiseTheLosslessCapability() {
+        // Core's rule, verbatim: `audio_rate_hz != 0 || audio_bits != 0`.
+        fun asksForHiRes(wire: Pair<Int, Int>) = wire.first != 0 || wire.second != 0
+
+        assertFalse(asksForHiRes(base.copy(audioFormat = AUDIO_FORMAT_OPUS).audioFormatWire()))
+        assertFalse(asksForHiRes(Settings().audioFormatWire()))
+        assertFalse(asksForHiRes(base.copy(audioFormat = "lossless192").audioFormatWire()))
+        // …and every row that IS a lossless choice must ask, or the setting does nothing at all.
+        // That asymmetry is the whole contract.
+        for ((value, _) in AUDIO_FORMAT_OPTIONS.drop(1)) {
+            assertTrue(value, asksForHiRes(base.copy(audioFormat = value).audioFormatWire()))
+        }
+    }
+
+    /**
+     * The stored values are a CROSS-CLIENT contract, shared verbatim with the Apple client's
+     * `AudioFormatChoice` raw values and the desktop `AUDIO_FORMATS`. A profile carries the key
+     * through untouched, so a rename here does not break a round trip loudly — it breaks it
+     * silently, by leaving the other client to fall back to its own global default on a profile
+     * that looks like it applied. Spelled out as literals rather than referenced through the
+     * constants, because a test that reads the constant cannot detect the constant changing.
+     *
+     * The naming rule for anything added later is the kHz figure with the decimal point dropped.
+     */
+    @Test
+    fun theStoredAudioFormatValuesAreTheOnesEveryOtherClientStores() {
+        assertEquals("opus", AUDIO_FORMAT_OPUS)
+        assertEquals("lossless441", AUDIO_FORMAT_LOSSLESS_441)
+        assertEquals("lossless48", AUDIO_FORMAT_LOSSLESS_48)
+        assertEquals("lossless882", AUDIO_FORMAT_LOSSLESS_882)
+        assertEquals("lossless96", AUDIO_FORMAT_LOSSLESS_96)
+        assertEquals("lossless1764", AUDIO_FORMAT_LOSSLESS_1764)
+        // Opus first (the default), then the lossless rows by ascending rate.
+        assertEquals(
+            listOf(
+                AUDIO_FORMAT_OPUS,
+                AUDIO_FORMAT_LOSSLESS_441,
+                AUDIO_FORMAT_LOSSLESS_48,
+                AUDIO_FORMAT_LOSSLESS_882,
+                AUDIO_FORMAT_LOSSLESS_96,
+                AUDIO_FORMAT_LOSSLESS_1764,
+            ),
+            AUDIO_FORMAT_OPTIONS.map { it.first },
+        )
+        // Every offered row resolves to a DISTINCT request — a duplicate would be a menu entry the
+        // wire cannot tell from its neighbour — every lossless one is 24-bit, and exactly one row
+        // (Opus, the first) is the "did not ask" sentinel.
+        val wire = AUDIO_FORMAT_OPTIONS.map { base.copy(audioFormat = it.first).audioFormatWire() }
+        assertEquals(wire.size, wire.toSet().size)
+        assertTrue(wire.drop(1).all { it.second == 24 })
+        assertEquals(1, wire.count { it == AUDIO_FORMAT_WIRE_UNSPECIFIED })
+        assertEquals(AUDIO_FORMAT_WIRE_UNSPECIFIED, wire.first())
     }
 
     @Test

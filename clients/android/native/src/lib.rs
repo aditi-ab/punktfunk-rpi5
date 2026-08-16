@@ -30,6 +30,13 @@ use jni::EnvUnowned;
 mod adpf;
 #[cfg(target_os = "android")]
 mod audio;
+// The RESOLVED audio format + its ms ⇄ sample arithmetic, split out of `audio` and — unlike it —
+// ungated, because that arithmetic is what a rate the ladder does not divide gets wrong (44 100 Hz
+// used to come out 2.3 % off in every direction at once) and it must be provable without a phone.
+// Nothing in it touches AAudio. `test`-gated for the host build on top of the Android one so the
+// off-device leg still compiles and runs the proof; `audio` is its only non-test user.
+#[cfg(any(target_os = "android", test))]
+mod audio_format;
 #[cfg(target_os = "android")]
 mod decode;
 // Ungated: pure `mdns-sd` + `jni`, so the browse + its JNI seam link into the host workspace build

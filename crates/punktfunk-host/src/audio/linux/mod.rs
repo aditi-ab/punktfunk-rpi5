@@ -27,13 +27,14 @@
 //! surround session can replace a stereo capturer without leaking a PipeWire consumer (see
 //! CLAUDE.md: a wedged link head-blocks the daemon).
 
+mod monitor_rate;
 pub(crate) mod pad_sink;
 mod stream_sink;
 
 use super::{AudioCapturer, MicBackendStats, VirtualMic, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread;
@@ -50,6 +51,58 @@ fn stream_sink_enabled() -> bool {
     std::env::var("PUNKTFUNK_STREAM_SINK")
         .map(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
         .unwrap_or(true)
+}
+
+/// §8.4 condition 4 on Linux (`design/hi-res-audio.md` §4.4 / §8.3). The two capture modes give
+/// structurally different answers, and that difference is the whole content of §4.4:
+///
+/// * **Stream-sink mode (the default).** We register the `Audio/Sink` node ourselves and
+///   [`pw_thread`] declares its format, so applications render into it at that rate natively.
+///   The rate we claim is the rate we get, by construction — there is no upstream resampler in
+///   the path to lie about it, so the answer is yes for every rate the plane supports, and no
+///   probe of any kind is needed to say so.
+/// * **`PUNKTFUNK_STREAM_SINK=0` (monitor mode).** We capture somebody else's sink through
+///   PipeWire's resampler, which reports a clean rate whatever the node upstream of it really
+///   runs at — the same blindness WASAPI's autoconvert has. So the answer cannot come from our
+///   own stream; it comes from the MONITORED NODE, read out of the registry by
+///   [`monitor_rate::monitored_sink_rate`]. A rate that can be read is an
+///   [`Engine`](super::CaptureRate::Engine) answer, exactly as a Windows endpoint's mix format
+///   is, and the gate compares the request against it.
+///
+/// ⚠ **The two failure directions are not symmetric, and the code leans on that.** An unreadable
+/// rate — a suspended sink, an unset metadata key, a node that vanished, a graph that did not
+/// answer inside the probe's timeout — is [`Unknown`](super::CaptureRate::Unknown), which
+/// declines and costs the session nothing but today's excellent Opus 48 kHz. A *guessed* rate
+/// that turns out wrong costs a session that advertises 96 kHz, spends 4.6 Mbps on it, and
+/// carries interpolated 48 kHz with both ends auditing clean. So this never guesses: there is no
+/// "assume the graph default", no reading `EnumFormat` (a capability, not a fact), and no
+/// falling back to the rate we asked for.
+///
+/// Note the asymmetry with Windows on purpose: there *every* answer needs a device query, here
+/// only the monitor mode does, because in the default mode the host is the one declaring the
+/// format.
+pub(super) fn probe_capture_rate() -> super::CaptureRate {
+    if stream_sink_enabled() {
+        return super::CaptureRate::Declared;
+    }
+    match monitor_rate::monitored_sink_rate() {
+        Ok(rate_hz) => {
+            tracing::debug!(
+                rate_hz,
+                "hi-res capture-rate probe: the sink this host would monitor runs at this rate"
+            );
+            super::CaptureRate::Engine(rate_hz)
+        }
+        Err(e) => {
+            tracing::debug!(
+                reason = %format!("{e:#}"),
+                "hi-res capture-rate probe: the monitored sink's own rate is not readable — \
+                 declining hi-res (PUNKTFUNK_STREAM_SINK=0 captures through PipeWire's resampler, \
+                 so the rate our own stream reports proves nothing)"
+            );
+            super::CaptureRate::Unknown
+        }
+    }
 }
 
 pub struct PwAudioCapturer {
@@ -73,14 +126,25 @@ pub struct PwAudioCapturer {
     /// meaningless. Distinct from `claimed`, which tracks the sink-routing claim and only
     /// exists when the stream sink is enabled at all.
     active: Arc<AtomicBool>,
+    /// The rate the graph actually NEGOTIATED, written by the format callback on the PipeWire
+    /// thread and read back by [`AudioCapturer::sample_rate`].
+    ///
+    /// Seeded with the rate we asked for, because that is the honest answer until the graph has
+    /// said otherwise — and in stream-sink mode it is nearly always the final one, since the
+    /// host owns the sink and declares its format (`design/hi-res-audio.md` §4.4). In legacy
+    /// monitor mode the value is a weaker claim: it is the rate of the resampled stream we are
+    /// handed, not of the node upstream of it, which is why the §8.3 gate reads the monitored
+    /// node's own rate out of the registry ([`monitor_rate`]) rather than trusting this number.
+    negotiated_rate: Arc<AtomicU32>,
 }
 
 impl PwAudioCapturer {
-    pub fn open(channels: u32) -> Result<PwAudioCapturer> {
+    pub fn open(channels: u32, rate_hz: u32) -> Result<PwAudioCapturer> {
         anyhow::ensure!(
             matches!(channels, 1 | 2 | 6 | 8),
             "unsupported audio channel count {channels} (want 2, 6 or 8)"
         );
+        anyhow::ensure!(rate_hz > 0, "audio capture rate must be positive");
         // Unique per capturer: overlapping instances (mid-session reopen, concurrent sessions)
         // must never alias in metadata claims, and a fresh name gets fresh (unity) WirePlumber
         // volume state instead of whatever a previous run left behind.
@@ -105,6 +169,8 @@ impl PwAudioCapturer {
         // the first chunk.
         let active = Arc::new(AtomicBool::new(true));
         let thread_active = Arc::clone(&active);
+        let negotiated_rate = Arc::new(AtomicU32::new(rate_hz));
+        let thread_rate = Arc::clone(&negotiated_rate);
         thread::Builder::new()
             .name("punktfunk-pw-audio".into())
             .spawn(move || {
@@ -112,9 +178,11 @@ impl PwAudioCapturer {
                     tx,
                     quit_rx,
                     channels,
+                    rate_hz,
                     thread_sink_name,
                     ready_tx,
                     thread_active,
+                    thread_rate,
                 ) {
                     tracing::error!(error = %format!("{e:#}"), "pipewire audio thread failed");
                 }
@@ -141,6 +209,7 @@ impl PwAudioCapturer {
             sink_name,
             claimed,
             active,
+            negotiated_rate,
         })
     }
 }
@@ -177,6 +246,10 @@ impl AudioCapturer for PwAudioCapturer {
 
     fn channels(&self) -> u32 {
         self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.negotiated_rate.load(Ordering::Relaxed)
     }
 
     fn drain(&mut self) {
@@ -394,6 +467,19 @@ const MIC_STALE: Duration = Duration::from_secs(1);
 /// the request was honoured cannot drift apart — the check is only meaningful while it compares
 /// against the same number the ask used.
 const CAPTURE_QUANTUM_FRAMES: u32 = 240;
+
+/// [`CAPTURE_QUANTUM_FRAMES`] restated at `rate_hz` — the same 5 ms of wall time, whatever the
+/// rate. A hi-res session captures at 96 kHz (`design/hi-res-audio.md` §3), where asking for a
+/// flat 240 frames would silently halve the quantum to 2.5 ms and double the callback rate for
+/// no reason anyone intended; the ask is a LATENCY, and latency is what has to stay constant.
+///
+/// The desktop-capture site is the only one that takes a negotiated rate. The virtual mic
+/// (voice, always 48 kHz) and the pad sinks (DualSense hardware is 48 kHz) keep the constant.
+fn capture_quantum_frames(rate_hz: u32) -> u32 {
+    // Integer maths on both shipping rates: 48 000/48 000 × 240 = 240, 96 000/48 000 × 240 = 480.
+    // `max(1)` only guards a nonsense rate from producing a zero-frame ask.
+    ((CAPTURE_QUANTUM_FRAMES as u64 * rate_hz as u64 / SAMPLE_RATE as u64) as u32).max(1)
+}
 
 /// Callbacks that must agree on a new buffer size before it replaces the one gaps are scored
 /// against. Three is enough to reject a boundary artefact and still adopt a genuine re-plan
@@ -679,13 +765,16 @@ fn mic_pw_thread(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pw_thread(
     tx: std::sync::mpsc::SyncSender<Vec<f32>>,
     quit_rx: pipewire::channel::Receiver<Terminate>,
     channels: u32,
+    rate_hz: u32,
     sink_name: Option<String>,
     ready: std::sync::mpsc::SyncSender<Result<()>>,
     active: Arc<AtomicBool>,
+    negotiated_rate: Arc<AtomicU32>,
 ) -> Result<()> {
     use pipewire as pw;
     use pw::{properties::properties, spa};
@@ -739,6 +828,11 @@ fn pw_thread(
 
         // Which source the negotiated format below actually describes — see the note there.
         let sink_mode = sink_name.is_some();
+        // The `NODE_LATENCY` ask, built at run time because the rate is now a session value:
+        // `<quantum frames>/<rate>` is how PipeWire spells a latency, and both halves move
+        // together so the ask stays 5 ms at 48 kHz and at 96 kHz alike. Formatted once here
+        // rather than at each use so the two property arms cannot drift apart.
+        let node_latency = format!("{}/{}", capture_quantum_frames(rate_hz), rate_hz);
         let props = match &sink_name {
             // Stream-sink mode: this stream IS the sink (media.class + Direction::Input). Apps
             // play into it, PipeWire mixes them, process() receives the mix. Mirrors the
@@ -751,9 +845,6 @@ fn pw_thread(
                     *pw::keys::MEDIA_CLASS      => "Audio/Sink",
                     *pw::keys::NODE_DESCRIPTION => "Punktfunk Stream Speaker",
                     *pw::keys::NODE_VIRTUAL     => "true",
-                    // Ask for a ~5ms quantum (= one Opus frame) so buffers arrive smoothly
-                    // rather than in bursts the client's jitter buffer would hear as glitching.
-                    *pw::keys::NODE_LATENCY     => "240/48000",
                     // LOW priority — the opposite of the mic's 3000: between sessions the sink
                     // node stays alive (parked capturer) but must never win WirePlumber's auto
                     // default election against real hardware; session routing comes from the
@@ -773,16 +864,24 @@ fn pw_thread(
                     "session.suspend-timeout-seconds" => "0",
                 };
                 p.insert(*pw::keys::NODE_NAME, name.as_str());
+                // Ask for a ~5 ms quantum (= one protocol audio frame) so buffers arrive
+                // smoothly rather than in bursts the client's jitter buffer would hear as
+                // glitching. Inserted rather than written in the `properties!` literal because
+                // the rate is negotiated — same reason as `NODE_NAME` above.
+                p.insert(*pw::keys::NODE_LATENCY, node_latency.as_str());
                 p
             }
             // Legacy: capture the default sink's monitor (system output), not a microphone.
-            None => properties! {
-                *pw::keys::MEDIA_TYPE          => "Audio",
-                *pw::keys::MEDIA_CATEGORY      => "Capture",
-                *pw::keys::MEDIA_ROLE          => "Music",
-                *pw::keys::STREAM_CAPTURE_SINK => "true",
-                *pw::keys::NODE_LATENCY        => "240/48000",
-            },
+            None => {
+                let mut p = properties! {
+                    *pw::keys::MEDIA_TYPE          => "Audio",
+                    *pw::keys::MEDIA_CATEGORY      => "Capture",
+                    *pw::keys::MEDIA_ROLE          => "Music",
+                    *pw::keys::STREAM_CAPTURE_SINK => "true",
+                };
+                p.insert(*pw::keys::NODE_LATENCY, node_latency.as_str());
+                p
+            }
         };
         let stream = pw::stream::StreamBox::new(&core, "punktfunk-audio", props)
             .context("pw audio Stream")?;
@@ -827,6 +926,12 @@ fn pw_thread(
             /// When the stream last left `Streaming`, so the span can be charged to the window
             /// that the span itself stretched. `None` while streaming.
             paused_since: Option<std::time::Instant>,
+            /// The rate every frames↔time conversion below is denominated in. A session value
+            /// now, not the module constant: at 96 kHz a hardcoded 48 000 would report every
+            /// quantum as twice its real duration and `delivered_pct` as half of what arrived.
+            rate_hz: u32,
+            /// Shared with the capturer — see [`PwAudioCapturer::negotiated_rate`].
+            negotiated_rate: Arc<AtomicU32>,
         }
         let ud = CapUd {
             tx,
@@ -838,11 +943,13 @@ fn pw_thread(
             reported_sched: false,
             last_cb: None,
             quantum: Duration::from_micros(
-                CAPTURE_QUANTUM_FRAMES as u64 * 1_000_000 / SAMPLE_RATE as u64,
+                capture_quantum_frames(rate_hz) as u64 * 1_000_000 / rate_hz as u64,
             ),
             negotiated: None,
             active,
             paused_since: None,
+            rate_hz,
+            negotiated_rate,
         };
         let _listener = stream
             .add_local_listener_with_user_data(ud)
@@ -901,15 +1008,27 @@ fn pw_thread(
                         return;
                     }
                     ud.negotiated = Some(now);
+                    // Report what was GRANTED, not what was asked for
+                    // (`design/hi-res-audio.md` §8.1). Everything downstream — the `Welcome`'s
+                    // resolved rate, the encode loop's samples-per-frame, the client's device
+                    // open — has to follow the same number, and this callback is the only place
+                    // the graph ever states it. A rate of `0` means the pod carried none;
+                    // keeping the previous value is right there, because "unstated" is not a
+                    // claim that the rate changed.
+                    if now.1 != 0 {
+                        ud.rate_hz = now.1;
+                        ud.negotiated_rate.store(now.1, Ordering::Relaxed);
+                    }
                     // `stream_sink` says WHICH source this format describes, and that changes how
                     // much it is worth. In stream-sink mode the host owns the sink, so this IS the
                     // format apps render into and the desktop mix cannot have been narrowed before
                     // we saw it. In LEGACY monitor mode we are capturing someone else's sink
                     // through PipeWire's resampler: a 16 kHz Bluetooth headset upstream would
                     // still be reported here as a clean 48 kHz, exactly the way WASAPI's
-                    // autoconvert hid the same thing on Windows (the 2026-08-03 report). Reading
-                    // the monitored node's OWN rate needs a registry lookup this stream does not
-                    // do — recorded as an open gap rather than implied to be covered.
+                    // autoconvert hid the same thing on Windows (the 2026-08-03 report). So this
+                    // line is a fact about OUR stream and never about the content in legacy mode
+                    // — the monitored node's own rate is a registry lookup, and it lives in
+                    // `monitor_rate`, where the hi-res gate reads it before the `Welcome`.
                     tracing::info!(
                         format = ?info.format(),
                         rate = info.rate(),
@@ -994,11 +1113,11 @@ fn pw_thread(
                             ud.quantum_candidate = None;
                             // What a gap is measured against from here on — see `CapUd::quantum`.
                             ud.quantum = Duration::from_micros(
-                                frames as u64 * 1_000_000 / SAMPLE_RATE as u64,
+                                frames as u64 * 1_000_000 / ud.rate_hz.max(1) as u64,
                             );
-                            let want = CAPTURE_QUANTUM_FRAMES as usize;
+                            let want = capture_quantum_frames(ud.rate_hz) as usize;
                             let negotiated_ms =
-                                format!("{:.1}", frames as f32 * 1000.0 / SAMPLE_RATE as f32);
+                                format!("{:.1}", frames as f32 * 1000.0 / ud.rate_hz.max(1) as f32);
                             if was != 0 {
                                 // A mid-open change. Rare, and worth a line of its own: it moves
                                 // the gap threshold under a reader who is comparing windows.
@@ -1062,7 +1181,7 @@ fn pw_thread(
                     }
                     if ud.last_stats.elapsed() >= crate::audio::capture_policy::STATS_EVERY {
                         let (peak_db, rms_db, delivered_pct) =
-                            ud.stats.summary(ud.last_stats.elapsed(), SAMPLE_RATE);
+                            ud.stats.summary(ud.last_stats.elapsed(), ud.rate_hz);
                         if ud.stats.dropped_chunks > 0 {
                             tracing::warn!(
                                 dropped_chunks = ud.stats.dropped_chunks,
@@ -1100,12 +1219,18 @@ fn pw_thread(
             .register()
             .context("register audio stream listener")?;
 
-        // Request F32LE, 48 kHz, at the session's channel count with explicit positions. In
+        // Request F32LE at the session's rate + channel count with explicit positions. In
         // legacy mode PipeWire's channel-mixer up/downmixes the sink monitor to this layout;
-        // in stream-sink mode this IS the sink's advertised layout (apps mix/route to it).
+        // in stream-sink mode this IS the sink's advertised layout (apps mix/route to it) —
+        // which is exactly why hi-res is structurally honest there and has to be PROVEN in
+        // monitor mode (`design/hi-res-audio.md` §4.4): a sink we OWN renders at the rate we
+        // declare, while a monitor tap is handed a resampled copy that reports a clean rate
+        // whatever ran upstream, so that configuration's rate comes from the registry
+        // (`monitor_rate`) and not from here. What was actually granted comes back through
+        // `param_changed` above.
         let mut info = AudioInfoRaw::new();
         info.set_format(AudioFormat::F32LE);
-        info.set_rate(SAMPLE_RATE);
+        info.set_rate(rate_hz);
         info.set_channels(channels);
         info.set_position(spa_positions(channels));
         let obj = pw::spa::pod::Object {

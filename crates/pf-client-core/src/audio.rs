@@ -2,10 +2,15 @@
 //! (PipeWire capture → Opus → 0xCB datagrams, the inverse of the host's virtual mic).
 //!
 //! Playback mirrors the host's virtual-mic producer (`punktfunk-host::audio::linux`) with
-//! the same adaptive jitter buffer: the session pump pushes 5 ms Opus-decoded chunks on
-//! the network clock; PipeWire pulls whole quanta on the device clock. Prime to ~3
-//! quanta before producing, cap the ring so latency stays bounded, re-prime after a real
-//! drain.
+//! the same adaptive jitter buffer: the session pump pushes one decoded frame per network
+//! arrival; PipeWire pulls whole quanta on the device clock. Prime to ~3 quanta before
+//! producing, cap the ring so latency stays bounded, re-prime after a real drain.
+//!
+//! The stream is opened at the format the session NEGOTIATED ([`PlaybackFormat`]), not at a
+//! constant: 48 kHz Opus frames of 5 ms on the `0xC9` plane, or 48/96 kHz lossless PCM frames of
+//! 1–5 ms on `0xD3` (`design/hi-res-audio.md`). The graph format stays F32LE at every rate and
+//! depth — core decodes both planes to f32, and the reason that is deliberate rather than an
+//! oversight is argued at the `stride` in the process callback.
 
 use anyhow::{Context, Result};
 use punktfunk_core::client::NativeClient;
@@ -13,6 +18,9 @@ use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 
+/// The protocol's default rate — and, now that playback takes its rate from the `Welcome`
+/// ([`PlaybackFormat`]), the MIC uplink's rate and nothing else. Voice is Opus, and libopus is
+/// 48 kHz by construction, so the uplink has no reason to move and no way to.
 const SAMPLE_RATE: u32 = 48_000;
 /// Mic capture is MONO: voice is mono at the source, the host accepts any Opus channel
 /// layout (its stereo decoder upmixes), and half the samples halve the encode + wire cost.
@@ -100,6 +108,40 @@ pub fn devices() -> Result<(Vec<AudioDevice>, Vec<AudioDevice>)> {
     Ok(result)
 }
 
+/// The playback format a session RESOLVED, straight off the `Welcome` — never what the client
+/// asked for. Passed as one value rather than three positional `u32`s because all three are `u32`
+/// and transposing them would open the device at a plausible-looking wrong format.
+///
+/// (Declared in both audio backends rather than shared: `audio.rs` and `audio_wasapi.rs` are twins
+/// by design — same public surface, picked by `lib.rs`'s `#[path]` — and every other item on that
+/// surface is already spelled out in each.)
+#[derive(Clone, Copy, Debug)]
+pub struct PlaybackFormat {
+    /// Interleaved channel count (2/6/8), canonical wire order FL FR FC LFE RL RR SL SR.
+    pub channels: u32,
+    /// The negotiated sample rate: 48 000 on every Opus session, 48 000 or 96 000 on a lossless
+    /// one (`design/hi-res-audio.md` §3 — 44.1 kHz and its multiples are deferred, because they
+    /// truncate `JitterPolicy`'s integer samples-per-millisecond arithmetic).
+    pub rate_hz: u32,
+    /// One protocol frame in microseconds: 5 000 on the Opus plane, and whatever the lossless
+    /// plane negotiated from the path MTU (§4.2 — 4 ms at 48/24, 2 ms at 96/24 by default). It
+    /// sizes the graph quantum we ask for and the policy's shed/floor arithmetic.
+    pub frame_us: u32,
+}
+
+impl PlaybackFormat {
+    /// Frames (per channel) in one protocol frame — the graph quantum to ask for. Computed in µs
+    /// so a sub-millisecond rung does not truncate: 2 500 µs at 48 kHz is 120 frames, not 96.
+    fn quantum_frames(&self) -> u32 {
+        ((self.rate_hz as u64 * self.frame_us as u64 / 1_000_000) as u32).max(1)
+    }
+
+    /// Frames (per channel) per millisecond — 48 at the protocol default, 96 at 96 kHz.
+    fn frames_per_ms(&self) -> usize {
+        (self.rate_hz / 1000).max(1) as usize
+    }
+}
+
 pub struct AudioPlayer {
     pcm_tx: SyncSender<Vec<f32>>,
     /// Drained chunk Vecs coming back from the PipeWire consumer for reuse (the pool half
@@ -113,11 +155,14 @@ pub struct AudioPlayer {
 }
 
 impl AudioPlayer {
-    /// Spawn the PipeWire playback thread for `channels` (2/6/8, canonical wire order
-    /// FL FR FC LFE RL RR SL SR). Failure (no PipeWire in the session) is survivable — the
-    /// caller streams video-only.
-    pub fn spawn(channels: u32) -> Result<AudioPlayer> {
-        // 64 × 5 ms = 320 ms of slack between the pump and the PipeWire loop.
+    /// Spawn the PipeWire playback thread at the session's RESOLVED format. Failure (no PipeWire
+    /// in the session) is survivable — the caller streams video-only.
+    pub fn spawn(fmt: PlaybackFormat) -> Result<AudioPlayer> {
+        // 64 queued chunks of slack between the pump and the PipeWire loop — 320 ms at the Opus
+        // plane's 5 ms frame, proportionally less on a lossless session's shorter one (128 ms at
+        // 2 ms), which is still far above anything the de-jitter policy targets. Left as a chunk
+        // COUNT rather than scaled to the negotiated frame, matching core's own `AUDIO_QUEUE`,
+        // whose comment records the same trade.
         let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
         // Return path: the process callback sends each drained Vec back for reuse, so
         // steady-state playback stops allocating (~200 chunks/s otherwise). Same capacity
@@ -129,7 +174,7 @@ impl AudioPlayer {
         let thread = std::thread::Builder::new()
             .name("punktfunk-audio".into())
             .spawn(move || {
-                if let Err(e) = pw_thread(pcm_rx, recycle_tx, quit_rx, channels as usize, sync_cb) {
+                if let Err(e) = pw_thread(pcm_rx, recycle_tx, quit_rx, fmt, sync_cb) {
                     tracing::warn!(error = %e, "audio playback thread ended");
                 }
             })
@@ -180,6 +225,25 @@ impl Drop for AudioPlayer {
 pub(crate) const TUNING: punktfunk_core::audio::JitterTuning =
     punktfunk_core::audio::JitterTuning::PIPEWIRE;
 
+/// Can this client render a `rate_hz` stream? — the gate on advertising `CLIENT_CAP_AUDIO_HIRES`,
+/// which means *capable **and** the user turned it on* (`design/hi-res-audio.md` §7).
+///
+/// **Always true here, and that is a statement about PipeWire, not a shortcut.** A playback stream
+/// declares its own format and the graph inserts an adapter to reconcile it with the sink, so this
+/// client can always OPEN at the resolved rate and always renders every sample the host sends. The
+/// WASAPI twin genuinely can fail this test, because shared-mode autoconvert reconciles in the
+/// other direction — silently, against an engine format we do not control.
+///
+/// What PipeWire does NOT promise is that the SINK runs at that rate: a 96 kHz stream into a
+/// 48 kHz sink is resampled in the graph, and the detail above 24 kHz is gone. That is the
+/// client-side shape of the monitor-mode blind spot in §4.4, and reading the sink's own rate needs
+/// a registry lookup this crate does not do. The stream logs what the graph actually granted (its
+/// `param_changed` handler) so the waste is at least visible; the remedy is the user's own audio
+/// configuration, exactly as the endpoint rate is on Windows.
+pub fn can_render_at(_rate_hz: u32) -> bool {
+    true
+}
+
 /// Producer-side state: incoming decoded PCM and the ring the process callback drains.
 struct PlayerData {
     rx: Receiver<Vec<f32>>,
@@ -193,6 +257,12 @@ struct PlayerData {
     policy: punktfunk_core::audio::JitterPolicy,
     /// Interleaved channel count this stream was opened with (2/6/8).
     channels: usize,
+    /// The format this stream was opened at, so the callback can report its quantum in
+    /// milliseconds and `param_changed` can check what the graph actually granted against it.
+    fmt: PlaybackFormat,
+    /// What `param_changed` last saw, so a graph RESUME (which re-announces the same format) is
+    /// not logged as a format change — the host's virtual sink learned the same lesson.
+    negotiated: Option<(u32, u32)>,
     /// Diagnostics (WP0.3), logged ~every 10 s: the audio plane used to be entirely silent in a
     /// client log, so a latency or dropout report had nothing to go on.
     underruns: u64,
@@ -206,7 +276,7 @@ fn pw_thread(
     pcm_rx: Receiver<Vec<f32>>,
     recycle_tx: SyncSender<Vec<f32>>,
     quit_rx: pipewire::channel::Receiver<Terminate>,
-    channels: usize,
+    fmt: PlaybackFormat,
     sync: Arc<punktfunk_core::audio::AudioSyncCell>,
 ) -> Result<()> {
     use pipewire as pw;
@@ -216,6 +286,8 @@ fn pw_thread(
 
     static PW_INIT: std::sync::Once = std::sync::Once::new();
     PW_INIT.call_once(pw::init);
+
+    let channels = fmt.channels as usize;
 
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw MainLoop")?;
     let context = pw::context::ContextRc::new(&mainloop, None).context("pw Context")?;
@@ -228,15 +300,22 @@ fn pw_thread(
         move |_| mainloop.quit()
     });
 
+    // The `NODE_LATENCY` ask — one protocol frame, so the graph hands us whole frames and the ring
+    // (and so the latency) stays small. `<frames>/<rate>` is how PipeWire spells a latency and BOTH
+    // halves move with the session: this was the string literal `"240/48000"`, which on a 96 kHz
+    // lossless session would have asked for 240 frames = 2.5 ms — a different quantum than the one
+    // the frame duration was negotiated for, at double the callback rate, for no reason anyone
+    // intended. Built at run time for exactly that reason; the `properties!` macro takes literals
+    // only, so it goes in with `insert` (the same shape as the host's sink-name property).
+    let node_latency = format!("{}/{}", fmt.quantum_frames(), fmt.rate_hz);
     let mut props = properties! {
         *pw::keys::MEDIA_TYPE       => "Audio",
         *pw::keys::MEDIA_CATEGORY   => "Playback",
         *pw::keys::MEDIA_ROLE       => "Game",
         *pw::keys::NODE_NAME        => "punktfunk-client",
         *pw::keys::NODE_DESCRIPTION => "Punktfunk Stream",
-        // ~5 ms quantum (one Opus frame) keeps the ring — and so the latency — small.
-        *pw::keys::NODE_LATENCY     => "240/48000",
     };
+    props.insert(*pw::keys::NODE_LATENCY, node_latency.as_str());
     // The Settings speaker pick (session main maps `Settings::speaker_device` here);
     // unset/empty = PipeWire's default routing.
     if let Ok(target) = std::env::var("PUNKTFUNK_AUDIO_SINK") {
@@ -253,8 +332,24 @@ fn pw_thread(
         rx: pcm_rx,
         recycle: recycle_tx,
         ring: VecDeque::new(),
-        policy: punktfunk_core::audio::JitterPolicy::new(TUNING, channels as u8),
+        policy: {
+            // Both at the RESOLVED format: `new_at_rate` denominates every depth/target/shed
+            // figure — and the `buffer_ms`/`target_ms` this client reports — in the right
+            // samples-per-millisecond, and `set_frame_us` tells the two frame-denominated
+            // decisions (the floor under the effective target, and the one-frame smooth shed) how
+            // long a frame is here. Left at the defaults, a 96 kHz session would shed 2.5 frames
+            // at a time and crossfade across a whole one.
+            let mut p = punktfunk_core::audio::JitterPolicy::new_at_rate(
+                TUNING,
+                fmt.channels as u8,
+                fmt.rate_hz,
+            );
+            p.set_frame_us(fmt.frame_us);
+            p
+        },
         channels,
+        fmt,
+        negotiated: None,
         underruns: 0,
         sheds: 0,
         callbacks: 0,
@@ -265,6 +360,45 @@ fn pw_thread(
         .add_local_listener_with_user_data(ud)
         .state_changed(|_s, _ud, old, new| {
             tracing::debug!(?old, ?new, "pipewire playback stream state");
+        })
+        // What the graph GRANTED, not what we asked for (`design/hi-res-audio.md` §9's "read back
+        // the actual rate and do not assume"). ⚠ Read it for what it is: this is OUR port's
+        // format, and a playback stream's adapter converts it to the sink — so a rate that comes
+        // back changed means the graph refused our ask outright, while a rate that comes back
+        // UNCHANGED still says nothing about the sink behind it. The sink's own rate is a registry
+        // lookup this stream does not do (`can_render_at`).
+        .param_changed(|_s, ud, id, param| {
+            let Some(param) = param else { return };
+            if id != pw::spa::param::ParamType::Format.as_raw() {
+                return;
+            }
+            let mut info = AudioInfoRaw::default();
+            if info.parse(param).is_err() {
+                return;
+            }
+            let now = (info.rate(), info.channels());
+            // A resume re-announces the format we already had; that is the graph waking us, not
+            // the stream changing.
+            if ud.negotiated == Some(now) {
+                return;
+            }
+            ud.negotiated = Some(now);
+            if now.0 != 0 && now.0 != ud.fmt.rate_hz {
+                tracing::warn!(
+                    granted_hz = now.0,
+                    resolved_hz = ud.fmt.rate_hz,
+                    "PipeWire granted a different playback rate than the session negotiated — \
+                     audio will be resampled and the A/V-sync depth arithmetic is denominated in \
+                     the negotiated rate"
+                );
+            } else {
+                tracing::info!(
+                    format = ?info.format(),
+                    rate = now.0,
+                    channels = now.1,
+                    "playback format negotiated"
+                );
+            }
         })
         .process(|stream, ud| {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -287,7 +421,14 @@ fn pw_thread(
                 // rule, sync was FORBIDDEN from draining it. Capacity is only the ceiling;
                 // `requested == 0` (no adapter suggestion) falls back to it.
                 let requested = usize::try_from(buffer.requested()).unwrap_or(0);
-                let stride = 4 * ud.channels; // F32LE interleaved
+                // F32LE interleaved, at EVERY rate and depth this client plays — deliberately,
+                // and not an oversight left behind by the lossless plane. Core decodes 16- and
+                // 24-bit PCM to f32 (`pcm::to_f32`) precisely so one graph format serves both
+                // planes; carrying S24 to PipeWire instead would rewrite this whole callback (the
+                // stride, the ring, the crossfade helper, the policy's sample arithmetic) to
+                // deliver bits that are already exact in the f32 they arrived in. f32 holds all
+                // 24 bits of mantissa with room to spare, so nothing is lost by the choice.
+                let stride = 4 * ud.channels;
                 let datas = buffer.datas_mut();
                 if datas.is_empty() {
                     return;
@@ -308,7 +449,11 @@ fn pw_thread(
                         requested_frames = requested,
                         capacity_frames = max_frames,
                         write_frames = want_frames,
-                        write_ms = want_frames / 48,
+                        // From the session's rate, not from 48: a 96 kHz quantum divided by 48
+                        // reads as twice the latency it is, in the one line an on-glass latency
+                        // report is triaged from.
+                        write_ms = want_frames / ud.fmt.frames_per_ms(),
+                        rate_hz = ud.fmt.rate_hz,
                         "audio playback quantum"
                     );
                 }
@@ -385,7 +530,7 @@ fn pw_thread(
 
     let mut info = AudioInfoRaw::new();
     info.set_format(AudioFormat::F32LE);
-    info.set_rate(SAMPLE_RATE);
+    info.set_rate(fmt.rate_hz);
     info.set_channels(channels as u32);
     // Channel positions in canonical wire order (FL FR FC LFE RL RR SL SR) so PipeWire routes each
     // slot to the matching speaker (and downmixes when the sink has fewer). Identity, no permute.
@@ -681,4 +826,49 @@ fn mic_thread(
     mainloop.run();
     tracing::debug!("pipewire mic capture loop exited");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fmt(rate_hz: u32, frame_us: u32) -> PlaybackFormat {
+        PlaybackFormat {
+            channels: 2,
+            rate_hz,
+            frame_us,
+        }
+    }
+
+    /// `NODE_LATENCY` is `<frames>/<rate>` and BOTH halves have to move with the session, or the
+    /// graph quantum stops being one protocol frame. The 48 kHz/5 ms row is the literal `240/48000`
+    /// this replaced — it must still come out byte-identical, because every Opus session depends on
+    /// it and none of them may change.
+    #[test]
+    fn the_graph_quantum_is_one_protocol_frame_at_every_rung() {
+        // (rate, frame_us) → frames per channel.
+        for (rate, us, want) in [
+            (48_000, 5_000, 240), // the Opus plane, unchanged
+            (48_000, 4_000, 192), // 48 kHz / 24-bit lossless at the default MTU
+            // The fractional-millisecond rung: 2.5 ms is 120 frames at 48 kHz, and computing it
+            // in whole milliseconds would truncate to 2 ms and ask for 96.
+            (48_000, 2_500, 120),
+            (96_000, 5_000, 480),
+            (96_000, 3_000, 288), // 96 kHz / 16-bit
+            (96_000, 2_000, 192), // 96 kHz / 24-bit
+        ] {
+            assert_eq!(fmt(rate, us).quantum_frames(), want, "{rate} Hz / {us} µs");
+        }
+    }
+
+    /// The one-shot quantum log divides by this, and reading it off a constant is how a 96 kHz
+    /// session reports twice the latency it actually has in the line a report is triaged from.
+    #[test]
+    fn frames_per_ms_follows_the_negotiated_rate() {
+        assert_eq!(fmt(48_000, 5_000).frames_per_ms(), 48);
+        assert_eq!(fmt(96_000, 2_000).frames_per_ms(), 96);
+        // A nonsense rate must not divide by zero in a log line.
+        assert_eq!(fmt(0, 5_000).frames_per_ms(), 1);
+        assert_eq!(fmt(0, 0).quantum_frames(), 1);
+    }
 }

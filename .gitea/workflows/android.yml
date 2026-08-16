@@ -222,6 +222,19 @@ jobs:
       # screenshot scenes, which are a release-artifact job (android-screenshots.yml, gated to v*
       # tags) and have no business adding a minute to every push. The filter is what lets the
       # contract gate here without dragging the rest of the app suite in with it.
+      #
+      # ⚠ The filter is an ALLOWLIST, so a test class that is not named here does not run — it
+      # reads as coverage in the tree and gates nothing. `ProfilesTest` and `StatsOverlayAudioTest`
+      # sat outside it and were only noticed when the hi-res audio work added cases to both; the
+      # HUD ones had never run in CI at all. Adding a test class to `app/src/test` is therefore
+      # only half the job: add it here too, or it is decoration.
+      #
+      # That audit found NINE more in the same state (gamepad palette/rows/UI, OS icons, render
+      # scale, safe area, SC2 bluetooth grant, settings scope, speed test) — every one of them
+      # passing, so nothing was hiding, but none of them gating either. They are all listed now.
+      # The list is deliberately explicit rather than a package glob: the unfiltered task also
+      # drags in the ~20 Roborazzi screenshot scenes above, and a glob would quietly re-admit them
+      # the moment someone added one.
       - name: console parity vectors + app-module logic tests
         working-directory: clients/android
         run: >-
@@ -231,6 +244,17 @@ jobs:
           --tests 'io.unom.punktfunk.GamepadSettingsLayoutTest'
           --tests 'io.unom.punktfunk.ConsoleSubScreenRowsTest'
           --tests 'io.unom.punktfunk.ConsoleSubScreenRoutesTest'
+          --tests 'io.unom.punktfunk.ProfilesTest'
+          --tests 'io.unom.punktfunk.StatsOverlayAudioTest'
+          --tests 'io.unom.punktfunk.GamepadPaletteTest'
+          --tests 'io.unom.punktfunk.GamepadSettingsRowsTest'
+          --tests 'io.unom.punktfunk.GamepadUiTest'
+          --tests 'io.unom.punktfunk.OsIconsTest'
+          --tests 'io.unom.punktfunk.RenderScaleTest'
+          --tests 'io.unom.punktfunk.SafeAreaTest'
+          --tests 'io.unom.punktfunk.Sc2BluetoothGrantTest'
+          --tests 'io.unom.punktfunk.SettingsScopeTest'
+          --tests 'io.unom.punktfunk.SpeedTestTest'
           --stacktrace
 
       - name: assembleDebug (cargo-ndk → jniLibs → APK)

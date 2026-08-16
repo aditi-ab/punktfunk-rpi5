@@ -56,6 +56,26 @@ object NativeBridge {
          *  decode loop then feeds slices with `BUFFER_FLAG_PARTIAL_FRAME` as they arrive). */
         framePartsOk: Boolean,
         audioChannels: Int,
+        /** Requested audio sample rate: **`0` (with [audioBits] `0`) for the legacy Opus plane**, or
+         *  any rung of the lossless ladder — `44100`, `48000`, `88200`, `96000`, `176400`, both rate
+         *  families.
+         *
+         *  ⚠⚠ **`48000`/`16` is NOT "the default" — it is the cheapest lossless rung.** Core sets
+         *  `CLIENT_CAP_AUDIO_HIRES` when either field is non-zero (it keys on "a format was
+         *  specified", so that 48/16 lossless is requestable at all), and the host's gate accepts
+         *  48 kHz/16-bit as a supported format. Passing it as a stand-in for "unset" opts every
+         *  session into the `0xD3` plane on any host with `PUNKTFUNK_AUDIO_HIRES=1`. Send `0`/`0`.
+         *
+         *  A request on BOTH counts. The host runs its gate (its own `PUNKTFUNK_AUDIO_HIRES` switch
+         *  among them, plus whether a frame of this format fits one datagram at all) and may answer
+         *  Opus; and the native side first proves THIS device can open the rate — AAudio grants an
+         *  explicit rate or fails the open, and there is no recovery once the wire is negotiated —
+         *  walking a fallback ladder and downgrading the request if it cannot. */
+        audioRateHz: Int,
+        /** Requested audio sample depth: `0` alongside a `0` [audioRateHz] for the legacy Opus
+         *  plane, else `16` or `24`. See [audioRateHz] for why `16` is a request rather than a
+         *  default; 24-bit is where lossless earns its bandwidth. */
+        audioBits: Int,
         /** `quic::CODEC_*` bitfield of codecs this device decodes ([VideoDecoders.decodableCodecBits]);
          *  `0` falls back to H.264|HEVC. The host resolves the emitted codec from this ∩ its GPU. */
         videoCodecs: Int,
@@ -275,12 +295,13 @@ object NativeBridge {
 
     /**
      * Drain ~1 s of live decode stats for the on-stream HUD, or `null` when no decode thread runs.
-     * Returns 35 doubles (unified stats spec, `design/stats-unification.md`):
+     * Returns 38 doubles (unified stats spec, `design/stats-unification.md`):
      * `[fps, mbps, e2eP50Ms, e2eP95Ms, latValid, skewCorrected, width, height, refreshHz, framesLost,
      * bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc, hostNetP50Ms, decodeP50Ms, hostP50Ms,
      * netP50Ms, lostWindow, skippedWindow, fecWindow, framesWindow, dispValid, displayP50Ms,
      * e2eDispP50Ms, e2eDispP95Ms, paceP50Ms, latchP50Ms, presentsWindow, presenterActive,
-     * feedP50Ms, codecP50Ms, skippedOverflowWindow, audioBufferMs, audioAvOffsetMs]`
+     * feedP50Ms, codecP50Ms, skippedOverflowWindow, audioBufferMs, audioAvOffsetMs, audioCodec,
+     * audioRateHz, audioBits]`
      * (the flags are 1.0/0.0; indexes 2/3 are the end-to-end capture→decoded headline; 10–13
      * describe the negotiated video feed — bit depth 8/10, CICP primaries/transfer, and the HEVC
      * chroma_format_idc 1=4:2:0 / 3=4:4:4; 14/15 are the stage p50s tiling the headline —
@@ -299,7 +320,12 @@ object NativeBridge {
      * `skipped` (19), i.e. the decoder falling behind rather than benign newest-wins pacing;
      * 33/34 are the AUDIO plane — the playback ring's live depth in ms and the A/V sync loop's
      * smoothed offset in ms, positive meaning audio plays BEHIND the picture. Those two are live
-     * gauges, not windowed samples, and the offset reads 0 until the loop has a video reference).
+     * gauges, not windowed samples, and the offset reads 0 until the loop has a video reference;
+     * 35–37 are the audio FORMAT the host RESOLVED at the handshake — `audioCodec` 0 = Opus on
+     * `0xC9`, 2 = lossless PCM on `0xD3` — plus the resolved rate in Hz and depth in bits. Static
+     * for the session, and separate from 33/34 because they answer a different question: not "how
+     * late is the audio" but "is this the format the user asked for", which nothing else can tell
+     * apart — a declined lossless session looks exactly like a granted one from the outside).
      * Poll ~1 Hz; each call resets the measurement window.
      */
     external fun nativeVideoStats(handle: Long): DoubleArray?
