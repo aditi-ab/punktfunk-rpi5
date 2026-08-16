@@ -7,11 +7,17 @@
 //! WinUI shell's own audio path; that shell's built-in streaming path has since been deleted,
 //! so this is now the only WASAPI client ring.
 //!
-//! Playback: the session pump pushes 5 ms Opus-decoded chunks on the network clock; the WASAPI
-//! render thread pulls whole event-driven quanta on the device clock. The depth policy between
-//! them is the SHARED `punktfunk_core::audio::JitterPolicy` (`JitterTuning::WASAPI`) — target in
+//! Playback: the session pump pushes one decoded frame per network arrival; the WASAPI render
+//! thread pulls whole event-driven quanta on the device clock. The depth policy between them is
+//! the SHARED `punktfunk_core::audio::JitterPolicy` (`JitterTuning::WASAPI`) — target in
 //! milliseconds, crossfaded drift correction, de-prime hysteresis — so all four clients behave
 //! the same way and none of them can ratchet latency upward.
+//!
+//! The endpoint is opened at the format the session NEGOTIATED ([`PlaybackFormat`]), not at a
+//! constant: 48 kHz Opus frames of 5 ms on the `0xC9` plane, or 48/96 kHz lossless PCM frames of
+//! 1–5 ms on `0xD3` (`design/hi-res-audio.md`). ⚠ Shared-mode `autoconvert` means an over-rate
+//! stream is DOWNSAMPLED on arrival with no error — see [`can_render_at`], which is what keeps
+//! the capability advertisement honest, and the engine-rate reading in the render thread.
 //!
 //! WASAPI objects are COM-apartment-bound and not `Send`, so they live on a dedicated
 //! thread (the same discipline as the host's `wasapi_cap`); only the channels + stop flag
@@ -29,6 +35,9 @@ use wasapi::{
     WaveFormat,
 };
 
+/// The protocol's default rate — and, now that render takes its rate from the `Welcome`
+/// ([`PlaybackFormat`]), the MIC uplink's rate and nothing else. Voice is Opus, and libopus is
+/// 48 kHz by construction, so the uplink has no reason to move and no way to.
 const SAMPLE_RATE: usize = 48_000;
 /// Mic capture requests STEREO from WASAPI (autoconvert matrixes any endpoint layout down to
 /// it — the proven path; `read_from_device_to_deque` then delivers our requested format) and
@@ -165,6 +174,105 @@ fn pick_device(
         .context("default endpoint")
 }
 
+/// The playback format a session RESOLVED, straight off the `Welcome` — never what the client
+/// asked for. Passed as one value rather than three positional `u32`s because all three are `u32`
+/// and transposing them would open the endpoint at a plausible-looking wrong format.
+///
+/// (Declared in both audio backends rather than shared: `audio.rs` and `audio_wasapi.rs` are twins
+/// by design — same public surface, picked by `lib.rs`'s `#[path]` — and every other item on that
+/// surface is already spelled out in each.)
+#[derive(Clone, Copy, Debug)]
+pub struct PlaybackFormat {
+    /// Interleaved channel count (2/6/8), canonical wire order FL FR FC LFE RL RR SL SR.
+    pub channels: u32,
+    /// The negotiated sample rate: 48 000 on every Opus session, 48 000 or 96 000 on a lossless
+    /// one (`design/hi-res-audio.md` §3 — 44.1 kHz and its multiples are deferred, because they
+    /// truncate `JitterPolicy`'s integer samples-per-millisecond arithmetic).
+    pub rate_hz: u32,
+    /// One protocol frame in microseconds: 5 000 on the Opus plane, and whatever the lossless
+    /// plane negotiated from the path MTU (§4.2 — 4 ms at 48/24, 2 ms at 96/24 by default). It
+    /// feeds the policy's shed/floor arithmetic, which is denominated in frames.
+    pub frame_us: u32,
+}
+
+/// The render endpoint's own engine rate, or `None` when nothing readable answered.
+///
+/// ⚠ **This is the client-side twin of the capture trap in `design/hi-res-audio.md` §4.3, and it
+/// is the reason this function exists at all.** The render client below initialises with
+/// `autoconvert: true`, and in shared mode the ENGINE's mix format is authoritative: autoconvert
+/// exists to reconcile our format with the engine's, in whichever direction is needed. So handing
+/// a 48 kHz engine a 96 kHz stream does not fail — it succeeds, returns no error, and plays
+/// interpolated-back-down samples, while the session spends 3–4 Mbps carrying detail that is
+/// discarded on arrival. Both ends would audit clean and the content would be wrong, which is
+/// exactly the shape of bug this project has been burned by before.
+///
+/// Runs on a short-lived MTA thread, like [`devices`]: the caller is the session pump, whose COM
+/// apartment is not ours to claim for the rest of the process.
+fn render_engine_rate_hz() -> Option<u32> {
+    std::thread::Builder::new()
+        .name("pf-audio-engine".into())
+        .spawn(|| -> Option<u32> {
+            if wasapi::initialize_mta().ok().is_err() {
+                return None;
+            }
+            let enumerator = DeviceEnumerator::new().ok()?;
+            // The endpoint the render thread WILL pick, not the default — a picked USB DAC and
+            // the system default routinely run at different rates.
+            let device =
+                pick_device(&enumerator, &Direction::Render, "PUNKTFUNK_AUDIO_SINK").ok()?;
+            let client = device.get_iaudioclient().ok()?;
+            client.get_mixformat().ok().map(|f| f.get_samplespersec())
+        })
+        .ok()?
+        .join()
+        .ok()?
+}
+
+/// Can this client render a `rate_hz` stream? — the gate on advertising `CLIENT_CAP_AUDIO_HIRES`,
+/// which means *capable **and** the user turned it on* (`design/hi-res-audio.md` §7). A client
+/// that advertised it without being able to render it would spend bandwidth off the top of a link
+/// ABR can neither see nor reclaim, to play interpolation.
+///
+/// Answered from the endpoint's own mix format — never assumed, never padded. An engine below
+/// the asked-for rate, or an endpoint that will not say what it runs at, both DECLINE: refusing
+/// here costs a hi-res session and can never cost a working 48 kHz one, which is the same trade
+/// the host makes at the other end (§8.2). The operator's lever is Windows' own device
+/// properties — set the endpoint's rate there and this sees it. Driving the engine format from the
+/// client would fight the OS and every other application on the box.
+///
+/// BLOCKS on COM while it asks (the [`devices`] discipline — a few ms against a healthy audio
+/// service), and runs on the connect path, so the early return below matters: only a request
+/// ABOVE the legacy rate ever touches the endpoint. Every ordinary session, and every 48 kHz
+/// lossless one, answers without opening anything.
+pub fn can_render_at(rate_hz: u32) -> bool {
+    if rate_hz <= SAMPLE_RATE as u32 {
+        return true; // the baseline claim every session already makes
+    }
+    match render_engine_rate_hz() {
+        Some(hz) if hz >= rate_hz => true,
+        Some(hz) => {
+            tracing::warn!(
+                engine_hz = hz,
+                requested = rate_hz,
+                "the render endpoint's audio engine runs below the requested rate — not asking \
+                 for lossless audio, because WASAPI's shared-mode autoconvert would downsample it \
+                 on arrival and the bandwidth would buy nothing (raise the rate in Windows' Sound \
+                 → Device properties → Advanced to change this)"
+            );
+            false
+        }
+        None => {
+            tracing::warn!(
+                requested = rate_hz,
+                "the render endpoint would not report its engine mix format — not asking for \
+                 lossless audio, because there is no way to tell whether it would be downsampled \
+                 on arrival"
+            );
+            false
+        }
+    }
+}
+
 pub struct AudioPlayer {
     pcm_tx: SyncSender<Vec<f32>>,
     /// Drained chunk Vecs coming back from the render thread for reuse (the pool half of
@@ -178,35 +286,47 @@ pub struct AudioPlayer {
 }
 
 impl AudioPlayer {
-    /// Spawn the WASAPI render thread for `channels` (2/6/8, canonical wire order
-    /// FL FR FC LFE RL RR SL SR). Failure (no render endpoint on this box) is survivable — the
-    /// caller streams video-only.
-    pub fn spawn(channels: u32) -> Result<AudioPlayer> {
-        // 64 × 5 ms = 320 ms of slack between the pump and the WASAPI loop.
+    /// Spawn the WASAPI render thread at the session's RESOLVED format. Failure (no render
+    /// endpoint on this box) is survivable — the caller streams video-only.
+    pub fn spawn(fmt: PlaybackFormat) -> Result<AudioPlayer> {
+        // 64 queued chunks of slack between the pump and the WASAPI loop — 320 ms at the Opus
+        // plane's 5 ms frame, proportionally less on a lossless session's shorter one (128 ms at
+        // 2 ms), which is still far above anything the de-jitter policy targets. Left as a chunk
+        // COUNT rather than scaled to the negotiated frame, matching core's own `AUDIO_QUEUE`,
+        // whose comment records the same trade.
         let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
         // Return path: the render thread sends each drained Vec back for reuse, so
         // steady-state playback stops allocating (~200 chunks/s otherwise). Same capacity
         // as the data channel; a full pool just drops the Vec (plain deallocation).
         let (recycle_tx, recycle_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
         let stop = Arc::new(AtomicBool::new(false));
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
+        // The engine rate the render thread read, so the line below reports what this stream is
+        // actually up against rather than a constant. `None` = the endpoint said nothing.
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<Option<u32>>>(1);
         let stop_t = stop.clone();
         let sync: Arc<punktfunk_core::audio::AudioSyncCell> = Arc::default();
         let sync_t = sync.clone();
         let thread = std::thread::Builder::new()
             .name("punktfunk-audio".into())
             .spawn(move || {
-                if let Err(e) =
-                    render_thread(pcm_rx, recycle_tx, stop_t, ready_tx, channels as u8, sync_t)
-                {
+                if let Err(e) = render_thread(pcm_rx, recycle_tx, stop_t, ready_tx, fmt, sync_t) {
                     tracing::warn!(error = %format!("{e:#}"), "audio playback thread ended");
                 }
             })
             .context("spawn audio thread")?;
         match ready_rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(Ok(())) => {
-                // Default endpoint unless PUNKTFUNK_AUDIO_SINK picked one (logged there).
-                tracing::info!(channels, "WASAPI render: 48 kHz f32");
+            Ok(Ok(engine_hz)) => {
+                // Default endpoint unless PUNKTFUNK_AUDIO_SINK picked one (logged there). Every
+                // number here is the one this stream really opened with — the line used to read
+                // "48 kHz f32" from a constant, which on a 96 kHz session would have been the
+                // label-right/content-wrong shape the whole hi-res design is written against.
+                tracing::info!(
+                    channels = fmt.channels,
+                    rate_hz = fmt.rate_hz,
+                    frame_us = fmt.frame_us,
+                    engine_hz,
+                    "WASAPI render: 32-bit float"
+                );
                 Ok(AudioPlayer {
                     pcm_tx,
                     recycle_rx,
@@ -257,8 +377,8 @@ fn render_thread(
     pcm_rx: Receiver<Vec<f32>>,
     recycle_tx: SyncSender<Vec<f32>>,
     stop: Arc<AtomicBool>,
-    ready: SyncSender<Result<()>>,
-    channels: u8,
+    ready: SyncSender<Result<Option<u32>>>,
+    fmt: PlaybackFormat,
     sync: Arc<punktfunk_core::audio::AudioSyncCell>,
 ) -> Result<()> {
     if let Err(e) = wasapi::initialize_mta()
@@ -268,14 +388,55 @@ fn render_thread(
         let _ = ready.send(Err(e));
         return Ok(());
     }
-    let res = (|| -> Result<()> {
-        // F32LE interleaved: channels × 4 bytes/sample. Stereo (channels == 2) is byte-identical
+    let res = (|| -> Result<Option<u32>> {
+        let channels = fmt.channels.clamp(1, 8) as u8;
+        // 32-bit float interleaved: channels × 4 bytes/sample, at EVERY rate and depth this client
+        // plays — deliberately, and not an oversight left behind by the lossless plane. Core
+        // decodes 16- and 24-bit PCM to f32 (`pcm::to_f32`) precisely so one render format serves
+        // both planes; asking WASAPI for a 24-bit integer format instead would rewrite this whole
+        // loop (block align, the ring, the crossfade helper, the policy's sample arithmetic) to
+        // deliver bits that are already exact in the f32 they arrived in. Stereo is byte-identical
         // to the old fixed path (mask 0x3, block align 8).
         let block_align = channels as usize * 4;
         let enumerator = DeviceEnumerator::new().context("DeviceEnumerator")?;
         let device = pick_device(&enumerator, &Direction::Render, "PUNKTFUNK_AUDIO_SINK")
             .context("render endpoint")?;
         let mut audio_client = device.get_iaudioclient().context("IAudioClient")?;
+        // The endpoint's ACTUAL engine mix format, read BEFORE we initialise — the client-side
+        // twin of the capture reading in `design/hi-res-audio.md` §4.3/§8.2, and the one §9 asks
+        // for by name. `autoconvert` below makes an over-rate stream succeed silently, so without
+        // this line the session could carry 96 kHz, log 96 kHz, spend the bandwidth, and render
+        // 48 kHz interpolation with nothing above 24 kHz in it.
+        //
+        // This is a REPORT, not a gate: by the time this thread runs the wire format is already
+        // negotiated and the session is streaming, so declining would only mean silence. The gate
+        // is `can_render_at`, which runs BEFORE the connect and is what keeps the capability bit
+        // honest; reaching a mismatch here means the endpoint changed under us (a picked device
+        // unplugged, a shared-mode rate changed mid-session), which is worth a loud line.
+        let engine_hz = audio_client
+            .get_mixformat()
+            .ok()
+            .map(|f| f.get_samplespersec())
+            .filter(|&hz| hz > 0);
+        if let Some(hz) = engine_hz {
+            if hz < fmt.rate_hz {
+                tracing::warn!(
+                    engine_hz = hz,
+                    stream_hz = fmt.rate_hz,
+                    endpoint = %device.get_friendlyname().unwrap_or_default(),
+                    "the render endpoint's audio engine runs BELOW this session's negotiated \
+                     rate — WASAPI's shared-mode autoconvert is downsampling every frame on \
+                     arrival, so the extra bandwidth is being spent for nothing (raise the rate \
+                     in Windows' Sound → Device properties → Advanced, then reconnect)"
+                );
+            }
+        } else if fmt.rate_hz != SAMPLE_RATE as u32 {
+            tracing::warn!(
+                stream_hz = fmt.rate_hz,
+                "the render endpoint would not report its engine mix format — there is no way to \
+                 tell whether this session's audio is being downsampled on arrival"
+            );
+        }
         // The explicit dwChannelMask is the wire order (FL FR FC LFE RL RR SL SR); 5.1 = 0x3F,
         // 7.1 = 0x63F. WASAPI delivers channels in ascending mask-bit order, which equals the wire
         // order, so the render mapping is the identity — no permute. `autoconvert` (below) lets the
@@ -284,7 +445,7 @@ fn render_thread(
             32,
             32,
             &SampleType::Float,
-            SAMPLE_RATE,
+            fmt.rate_hz as usize,
             channels as usize,
             Some(punktfunk_core::audio::wasapi_channel_mask(channels)),
         );
@@ -302,7 +463,7 @@ fn render_thread(
             .get_audiorenderclient()
             .context("IAudioRenderClient")?;
         audio_client.start_stream().context("start render stream")?;
-        let _ = ready.send(Ok(()));
+        let _ = ready.send(Ok(engine_hz));
 
         // De-jitter ring, in interleaved f32 SAMPLES (it used to be raw bytes, which made the
         // depth arithmetic byte-vs-sample and kept it from sharing the policy and the crossfade
@@ -312,7 +473,16 @@ fn render_thread(
         // returns to target instead of ratcheting, and de-prime hysteresis — the last replacing
         // the old `if ring.is_empty()`, where a single transient drain manufactured a whole
         // target's worth of fresh silence.
-        let mut policy = punktfunk_core::audio::JitterPolicy::new(TUNING, channels);
+        //
+        // Both at the RESOLVED format: `new_at_rate` denominates every depth/target/shed figure —
+        // and the `buffer_ms`/`target_ms` this client reports — in the right samples-per-
+        // millisecond, and `set_frame_us` tells the two frame-denominated decisions (the floor
+        // under the effective target, and the one-frame smooth shed) how long a frame is here.
+        // Left at the defaults, a 96 kHz session would shed 2.5 frames at a time and crossfade
+        // across a whole one.
+        let mut policy =
+            punktfunk_core::audio::JitterPolicy::new_at_rate(TUNING, channels, fmt.rate_hz);
+        policy.set_frame_us(fmt.frame_us);
         let mut out = Vec::new(); // per-quantum scratch, reused across iterations
         let (mut underruns, mut sheds, mut callbacks) = (0u64, 0u64, 0u64);
 
@@ -383,12 +553,12 @@ fn render_thread(
                 .context("write_to_device")?;
         }
         audio_client.stop_stream().ok();
-        Ok(())
+        Ok(engine_hz)
     })();
     if let Err(ref e) = res {
         let _ = ready.send(Err(anyhow!("{e:#}")));
     }
-    res
+    res.map(|_| ())
 }
 
 /// The microphone uplink: capture the default input device, Opus-encode 10 ms mono chunks,
