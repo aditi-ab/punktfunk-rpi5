@@ -452,6 +452,49 @@ public final class PunktfunkConnection {
     /// PCM from `nextAudioPcm` is interleaved in the canonical wire order FL FR FC LFE RL RR SL SR.
     public private(set) var resolvedAudioChannels: UInt8 = 2
 
+    /// The sample rate the host RESOLVED for this session: `48000` on every Opus session and every
+    /// host older than the lossless plane, or the rate a hi-res session actually landed on — which
+    /// may be LOWER than `audioRateHz` asked for, because the host runs a five-condition gate
+    /// (design/hi-res-audio.md §8.4) and any failure resolves the session back to Opus at 48 kHz.
+    ///
+    /// **Open the output device and size the jitter ring from THIS, never from the request.**
+    /// Opening at 96 kHz because we asked for 96 kHz, when the host answered 48 kHz, is §4.3's
+    /// failure repeated at the client end: everything audits clean and the content is wrong. The
+    /// samples `nextAudioPcm` hands back are at this rate, so it is also what every ms↔sample
+    /// conversion in `AudioRing`/`AvSync` has to be denominated in.
+    public private(set) var resolvedAudioRateHz: UInt32 = 48_000
+
+    /// The sample depth the host resolved: `16` on every Opus session and every older host, `16` or
+    /// `24` on the lossless plane. Reporting only — `nextAudioPcm` unpacks either depth in core and
+    /// hands back f32 regardless. It exists so a UI can state the format HONESTLY; a client that
+    /// says "24-bit" while the host declined is the same class of lie as claiming a rate it did not
+    /// get. Which PLANE a session runs is `hostCaps & PUNKTFUNK_HOST_CAP_AUDIO_HIRES`, not this:
+    /// 48 kHz/16-bit reads identically on both.
+    public private(set) var resolvedAudioBits: UInt8 = 16
+
+    /// How much audio one datagram carries, in MICROSECONDS — `5000` on the Opus plane and every
+    /// host older than the lossless one, `4000` at 48 kHz/24-bit and `2000` at 96 kHz/24-bit under
+    /// the default MTU (the lossless plane sizes its frame so the payload fits one datagram).
+    ///
+    /// Microseconds, not milliseconds, because the ladder has sub-millisecond rungs and a frame
+    /// that goes through integer ms truncates: 2 500 µs at 48 kHz stereo is 240 interleaved
+    /// samples, and 2 ms would make it 192.
+    ///
+    /// Needed only because this client ports the de-jitter policy into Swift rather than letting
+    /// core run it. Two of the policy's decisions are denominated in FRAMES, not milliseconds — the
+    /// smooth shed drops exactly one, and the effective-target floor is a device quantum plus one —
+    /// so a ring compiled against 5 ms sheds two and a half frames at a time on a 96 kHz session.
+    /// **Not derivable from `nextAudioPcm`**: concealed frames are prepended into the same buffer,
+    /// so `frameCount` answers "how many samples did I get", not "how long is one frame".
+    public private(set) var resolvedAudioFrameUs: UInt16 = UInt16(PUNKTFUNK_AUDIO_FRAME_MS * 1000)
+
+    /// True when this session resolved the LOSSLESS `0xD3` plane (`HOST_CAP_AUDIO_HIRES`) rather
+    /// than Opus — the one honest answer to "is this bit-exact?", which the rate and depth alone
+    /// cannot give (48 kHz/16-bit is a legal resolution on both planes).
+    public var isLosslessAudio: Bool {
+        hostCaps & UInt8(PUNKTFUNK_HOST_CAP_AUDIO_HIRES) != 0
+    }
+
     /// The video codec the host resolved for this session (`Welcome.codec`, `PUNKTFUNK_CODEC_*`):
     /// `2` = HEVC (default / older host), `1` = H.264, `4` = AV1, `8` = PyroWave (only when this
     /// client opted in). Build the decoder from THIS. The resolved value honors the client's
@@ -733,6 +776,13 @@ public final class PunktfunkConnection {
     /// `bitrateKbps`: requested video encoder bitrate (0 = host default; the host clamps
     /// to its supported range). Check `resolvedBitrateKbps` afterwards — a speed test
     /// (`startSpeedTest`) is how a client picks an informed value.
+    ///
+    /// `audioRateHz`/`audioBits`: the audio format to ASK for (48 000/16 = today's Opus plane, the
+    /// default and the only pair that is byte-for-byte identical on the wire to every session
+    /// before the lossless plane existed). Anything else asks for the bit-exact `0xD3` plane and
+    /// takes 1.5–4.6 Mbps off the top of the link, outside ABR — so it is a deliberate user opt-in
+    /// on both ends, never a default. **The request is not the answer**: read `resolvedAudioRateHz`
+    /// / `resolvedAudioBits` afterwards and open the output device from those.
     public init(
         host: String, port: UInt16 = 9777,
         width: UInt32, height: UInt32, refreshHz: UInt32,
@@ -743,6 +793,8 @@ public final class PunktfunkConnection {
         bitrateKbps: UInt32 = 0,
         videoCaps: UInt8 = 0,
         audioChannels: UInt8 = 2,
+        audioRateHz: UInt32 = 48_000,
+        audioBits: UInt8 = 16,
         videoCodecs: UInt8 = 0x02, // PUNKTFUNK_CODEC_HEVC — the codecs this client can decode
         preferredCodec: UInt8 = 0, // 0 = auto; else PUNKTFUNK_CODEC_* soft preference
         clientCaps: UInt8 = 0, // ABI v11: PUNKTFUNK_CLIENT_CAP_CURSOR = render the host cursor locally
@@ -766,26 +818,39 @@ public final class PunktfunkConnection {
         // device pending approval reads "This device".
         let override = deviceName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let label = override.isEmpty ? DeviceName.current : override
+        // `ex11` only when a NON-DEFAULT audio format is being asked for. 48 000/16 through `ex11`
+        // is documented as byte-for-byte identical to `ex10` on the wire, but staying on the older
+        // entry point for the default keeps that identity a property of this client rather than a
+        // promise it relies on — and it is the overwhelmingly common path. `ex11` also derives
+        // `CLIENT_CAP_AUDIO_HIRES` from the format itself and ORs it into `clientCaps`, so the bit
+        // and the format it advertises can never disagree; nothing here sets it by hand.
+        let wantsHiRes = audioRateHz != 48_000 || audioBits != 16
         handle = host.withCString { cs in
             withOptionalCString(identity?.certPEM) { cert in
                 withOptionalCString(identity?.keyPEM) { key in
                     withOptionalCString(launchID) { launch in
                         label.withCString { name in
-                            if let pin = pinSHA256 {
-                                return pin.withUnsafeBytes { p in
-                                    punktfunk_connect_ex10(
+                            func dial(_ pin: UnsafePointer<UInt8>?) -> OpaquePointer? {
+                                if wantsHiRes {
+                                    return punktfunk_connect_ex11(
                                         cs, port, width, height, refreshHz, compositor.rawValue,
                                         gamepad.rawValue, bitrateKbps, videoCaps, audioChannels,
+                                        audioRateHz, audioBits,
                                         videoCodecs, preferredCodec, clientCaps, launch,
-                                        p.bindMemory(to: UInt8.self).baseAddress, &observed,
-                                        cert, key, name, timeoutMs, &connectStatus)
+                                        pin, &observed, cert, key, name, timeoutMs, &connectStatus)
+                                }
+                                return punktfunk_connect_ex10(
+                                    cs, port, width, height, refreshHz, compositor.rawValue,
+                                    gamepad.rawValue, bitrateKbps, videoCaps, audioChannels,
+                                    videoCodecs, preferredCodec, clientCaps, launch,
+                                    pin, &observed, cert, key, name, timeoutMs, &connectStatus)
+                            }
+                            if let pin = pinSHA256 {
+                                return pin.withUnsafeBytes { p in
+                                    dial(p.bindMemory(to: UInt8.self).baseAddress)
                                 }
                             }
-                            return punktfunk_connect_ex10(
-                                cs, port, width, height, refreshHz, compositor.rawValue,
-                                gamepad.rawValue, bitrateKbps, videoCaps, audioChannels,
-                                videoCodecs, preferredCodec, clientCaps, launch,
-                                nil, &observed, cert, key, name, timeoutMs, &connectStatus)
+                            return dial(nil)
                         }
                     }
                 }
@@ -828,6 +893,24 @@ public final class PunktfunkConnection {
         var ac: UInt8 = 2
         _ = punktfunk_connection_audio_channels(handle, &ac)
         resolvedAudioChannels = ac
+        // The format the host RESOLVED, which may be below what `audioRateHz`/`audioBits` asked
+        // for — the five-condition gate declines to Opus 48 kHz rather than failing the connect.
+        // The defaults survive a status the accessors never fill (an older core), which is the
+        // right answer: every session such a core can run IS 48 kHz/16-bit.
+        var rate: UInt32 = 48_000
+        _ = punktfunk_connection_audio_sample_rate(handle, &rate)
+        resolvedAudioRateHz = rate
+        var bits: UInt8 = 16
+        _ = punktfunk_connection_audio_bits(handle, &bits)
+        resolvedAudioBits = bits
+        // `0` is the accessor's "the host stated nothing" — an older host, or an Opus session that
+        // never needed to say. Both mean the protocol's default frame, so map it here rather than
+        // letting a zero reach the ring, where it would be a zero-length shed unit.
+        var frameUs: UInt16 = 0
+        _ = punktfunk_connection_audio_frame_us(handle, &frameUs)
+        resolvedAudioFrameUs = frameUs == 0
+            ? UInt16(PUNKTFUNK_AUDIO_FRAME_MS * 1000)
+            : frameUs
         var codec: UInt8 = 2 // PUNKTFUNK_CODEC_HEVC
         _ = punktfunk_connection_codec(handle, &codec)
         resolvedCodec = codec

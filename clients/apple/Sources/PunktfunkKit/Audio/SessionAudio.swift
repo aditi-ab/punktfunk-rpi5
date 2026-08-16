@@ -1,14 +1,20 @@
 // Session audio, both directions:
 //
-//   host → speaker: a drain thread pulls Opus packets (nextAudio, its own plane in the
-//   core), decodes via OpusDecoder, and writes PCM into a jitter ring; an
-//   AVAudioSourceNode pulls from the ring (silence on underrun with re-priming, so a
-//   network gap costs one dip, not permanent crackle).
+//   host → speaker: a drain thread pulls audio packets off their own plane in the core, which
+//   decodes them there (nextAudioPcm) and hands back interleaved f32, and writes that into a
+//   jitter ring; an AVAudioSourceNode pulls from the ring (silence on underrun with re-priming,
+//   so a network gap costs one dip, not permanent crackle).
 //
 //   mic → host: a tap on the input node folds the capture to one mono bus (the chosen channel
 //   of a multi-channel interface, or a sum of all channels), resamples to 48 kHz mono, slices
 //   10 ms chunks, Opus-encodes, and sendMic()s each packet — the host feeds them into a
 //   virtual PipeWire source.
+//
+// The downlink's FORMAT is negotiated, not assumed. `connection.resolvedAudioRateHz` is 48 kHz
+// for every Opus session and every host older than the lossless plane, and 48 or 96 kHz on
+// `0xD3` — and it is what the ring, the A/V sync loop and the render graph's AVAudioFormat are
+// all built from (design/hi-res-audio.md §9). The UPLINK is deliberately untouched: Opus is
+// 48 kHz by construction and the mic carries voice, so §3 excludes it.
 //
 // Engine topology. With the mic enabled and echo cancellation on (both defaults), BOTH
 // directions run on ONE AVAudioEngine with the system voice processor engaged
@@ -216,11 +222,31 @@ public final class SessionAudio {
         #endif
     }
 
+    /// The rate the samples on the wire are actually at — `Welcome`'s RESOLVED figure, not what
+    /// this client asked for. 48 000 on every Opus session and every host older than the lossless
+    /// plane; 48 000 or 96 000 on `0xD3`. Everything that turns samples into time — the ring's
+    /// `perMS`, the A/V sync loop's, and the `AVAudioFormat` the render graph is built at — is
+    /// denominated in this, because it is what `nextAudioPcm` hands back.
+    private var wireRateHz: Int { Int(connection.resolvedAudioRateHz) }
+
+    /// How much audio one datagram carries, in MICROSECONDS — `Welcome`'s resolved
+    /// `audio_frame_us`. 5 000 on every Opus session; 4 000 at 48 kHz/24-bit and 2 000 at
+    /// 96 kHz/24-bit on the lossless plane, which sizes its frame so the payload fits one datagram.
+    /// Microseconds because the ladder has sub-millisecond rungs (`AudioRing.setFrameUs`).
+    private var wireFrameUs: Int { Int(connection.resolvedAudioFrameUs) }
+
+    /// The same figure rounded UP to whole milliseconds, for the one consumer that can only express
+    /// itself in them: the drain thread's poll timeout. Rounding up rather than down keeps it "at
+    /// most one frame" — a 2 500 µs frame polls at 3 ms, never 2, so the loop cannot spin a wake-up
+    /// per frame for nothing. Never below 1.
+    private var wireFrameMS: Int { max(1, (wireFrameUs + 999) / 1000) }
+
     #if !os(macOS)
     /// Route + policy live in the session, not per-engine: stereo playback, mic capture when
     /// enabled, Bluetooth allowed. Failure is non-fatal (defaults). Runs on `sessionQueue`.
     private func activateAudioSession(micEnabled: Bool) {
         let session = AVAudioSession.sharedInstance()
+        let wanted = Double(wireRateHz)
         do {
             #if os(iOS)
             if micEnabled {
@@ -272,22 +298,32 @@ public final class SessionAudio {
                 // measures the fuse in ms), but there is still no reason to ask for a quantum
                 // finer than the packets we send.
                 try? session.setPreferredIOBufferDuration(0.010)
-                try? session.setPreferredSampleRate(48_000)
             } else {
                 try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             }
             #else // tvOS — no app-accessible mic
             try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             #endif
+            // The session's rate, asked for on EVERY branch — the `.playback` ones (mic off, and
+            // all of tvOS) used to ask for nothing at all, which was invisible while the answer
+            // was always 48 kHz and is the difference between real and resampled hi-res now. Set
+            // BEFORE `setActive`: the hardware is configured on activation, and a preference
+            // expressed after it only takes effect at the next route change.
+            //
+            // Best-effort by API contract, and genuinely refused in practice — a Bluetooth route
+            // has no 96 kHz mode to give (§9's iOS caveat). Which is why nothing downstream reads
+            // this back as permission: `noteOutputRate` checks what the graph was ACTUALLY built
+            // on, and the honest statement is made there.
+            try? session.setPreferredSampleRate(wanted)
             try session.setActive(true)
-            // What we were actually GRANTED, not what we asked for. Both are best-effort, and the
-            // ring's behaviour depends on the quantum it really gets — without this, a report of
+            // What we were actually GRANTED, not what we asked for. All three are best-effort, and
+            // the ring's behaviour depends on the quantum it really gets — without this, a report of
             // audio jitter arrives with no way to tell a 10 ms session from a 5 ms or a 23 ms one,
             // which is exactly the gap that made the last round of this take a simulation to close.
             log.info("""
                 AVAudioSession active: io_buffer_ms=\
                 \(session.ioBufferDuration * 1000, format: .fixed(precision: 2)) \
-                sample_rate=\(Int(session.sampleRate)) \
+                sample_rate=\(Int(session.sampleRate)) wire_rate=\(Int(wanted)) \
                 route=\(session.currentRoute.outputs.first?.portType.rawValue ?? "none")
                 """)
             #if os(iOS)
@@ -923,28 +959,45 @@ public final class SessionAudio {
         -> (ring: AudioRing, source: AVAudioSourceNode, format: AVAudioFormat)?
     {
         // Build the playback layout from the host-RESOLVED channel count (never the request):
-        // 2 = stereo / 6 = 5.1 / 8 = 7.1, canonical wire order FL FR FC LFE RL RR SL SR.
+        // 2 = stereo / 6 = 5.1 / 8 = 7.1, canonical wire order FL FR FC LFE RL RR SL SR. Same rule
+        // for the rate — `resolvedAudioRateHz`, never the 96 kHz this client may have asked for.
         let channels = Int(connection.resolvedAudioChannels)
-        // 1 s interleaved capacity, scaled by the channel count. The de-jitter depth itself is
+        let rateHz = wireRateHz
+        // One SECOND of interleaved capacity at the session's format. The de-jitter depth itself is
         // the ring's own business now (`AudioRing.targetMS`, mirroring `JitterTuning::COREAUDIO`)
         // rather than a prefill passed in here.
         stateLock.lock()
-        let ring = self.ring ?? AudioRing(capacity: 48_000 * channels, channels: channels)
+        let ring = self.ring ?? AudioRing(seconds: 1, channels: channels, rateHz: rateHz)
         self.ring = ring
         stateLock.unlock()
+        // The session's REAL frame, which the ring cannot know at construction and must not assume:
+        // the shed drops exactly one frame and the target floor is a device quantum plus one, so a
+        // ring left on the 5 ms default sheds two and a half frames at a time on a 96 kHz session
+        // and fades across a whole one. Idempotent, so the rebuild path that reuses this very ring
+        // simply sets it again.
+        ring.setFrameUs(wireFrameUs)
 
         // Engine-native deinterleaved float; the render block deinterleaves from the ring. Surround
         // uses an explicit wire-order channel layout; the mixer downmixes to the output device when
         // it has fewer speakers (e.g. an iPhone's stereo built-ins). (Explicit if/else rather than
         // map/flatMap so it's correct whether the channelLayout initializer is failable or not.)
+        //
+        // The rate here describes the SAMPLES, not the hardware: it is the rate `nextAudioPcm`
+        // hands them back at, and the engine converts from it to whatever the output device runs
+        // at. Declaring the device's rate instead would play a 96 kHz stream at half speed — which
+        // is why the honesty check about a device that refused the rate (`noteOutputRate`) reports
+        // rather than re-formats. Resampling in the mixer is the fallback; claiming hi-res while it
+        // happens is the thing §9 forbids.
+        let rate = Double(rateHz)
         var format: AVAudioFormat?
         if channels == 2 {
-            format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)
+            format = AVAudioFormat(standardFormatWithSampleRate: rate, channels: 2)
         } else if let layout = wireChannelLayout(channels: channels) {
-            format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channelLayout: layout)
+            format = AVAudioFormat(standardFormatWithSampleRate: rate, channelLayout: layout)
         }
         guard let format else {
-            log.error("could not build \(channels)-channel audio format — audio disabled")
+            log.error(
+                "could not build \(channels)-channel \(rateHz) Hz audio format — audio disabled")
             return nil
         }
         let scratch = ScratchBuffer() // block-owned; freed with the closure
@@ -964,6 +1017,35 @@ public final class SessionAudio {
             return noErr
         }
         return (ring, source, format)
+    }
+
+    /// Say — out loud, in the log — what rate this engine is REALLY rendering at, and whether it is
+    /// the one the session negotiated. Call it after `prepare()`, when the output node has settled
+    /// on the device's format; on iOS/tvOS that follows the AVAudioSession, on macOS the HAL device.
+    ///
+    /// This is §9's "never claim a rate you did not get", at the client end. The whole hi-res
+    /// exercise is contingent on the samples reaching a converter-free path, and every layer here
+    /// will happily hide a failure to do so: `setPreferredSampleRate` is advisory and a Bluetooth
+    /// route simply has no 96 kHz mode, `AVAudioEngine`'s mixer resamples silently between any two
+    /// formats, and the stream keeps playing perfectly. The session would then cost 3.2 Mbps,
+    /// report 96 kHz on the HUD, and carry nothing above 24 kHz — which is precisely the shape of
+    /// bug design/hi-res-audio.md §4.3 exists to name, wearing the client's hat instead of the
+    /// host's. Nothing here re-formats the graph (see `makePlaybackChain`): the samples are what
+    /// they are, the mixer's conversion is the correct fallback, and the only thing missing was
+    /// somebody saying so.
+    private func noteOutputRate(_ engine: AVAudioEngine, wireRateHz: Int) {
+        let deviceRate = Int(engine.outputNode.outputFormat(forBus: 0).sampleRate)
+        // 0 = the node has no device yet (a start that is about to fail) — nothing to compare.
+        guard deviceRate > 0 else { return }
+        guard deviceRate != wireRateHz else {
+            log.info("audio output opened at \(wireRateHz) Hz — the negotiated rate")
+            return
+        }
+        log.warning("""
+            audio output is \(deviceRate) Hz but the session negotiated \(wireRateHz) Hz — the \
+            engine is resampling. Playback is correct; this session is NOT \(wireRateHz) Hz at the \
+            speaker, whatever the host resolved
+            """)
     }
 
     private func startPlayback(speakerUID: String) {
@@ -990,6 +1072,7 @@ public final class SessionAudio {
             log.error("playback engine failed to start: \(error.localizedDescription)")
             return
         }
+        noteOutputRate(engine, wireRateHz: wireRateHz)
         stateLock.lock()
         if flag.isStopped {
             stateLock.unlock()
@@ -1026,10 +1109,16 @@ public final class SessionAudio {
         let videoLatency = syncEnabled ? self.videoLatency : nil
         if !syncEnabled { log.info("A/V sync disabled by PUNKTFUNK_NO_AV_SYNC") }
         let channels = Int(connection.resolvedAudioChannels)
+        let rateHz = wireRateHz
+        // Read on the caller's thread, not inside the closure: `self` is deliberately not captured
+        // by the drain thread (it holds the connection strongly and self not at all — see
+        // `deinit`), so anything derived from the connection has to be resolved out here.
+        let frameUs = wireFrameUs
+        let frameMS = wireFrameMS
         let thread = Thread { [connection, flag, drainDone] in
             defer { drainDone.signal() }
             var drained = 0
-            var av = AvSync(channels: channels)
+            var av = AvSync(channels: channels, rateHz: rateHz)
             // WP-C1 — the drought half of concealment. Core heals a SEQ GAP, but only when a later
             // packet arrives to reveal it; when the wire simply goes quiet nothing arrives to
             // reveal anything, and the ring drains into an underrun and a de-prime whose re-prime
@@ -1050,9 +1139,10 @@ public final class SessionAudio {
                 do {
                     // Wait at most one frame WHILE there is a stream to protect: the drought
                     // decision has to be made on the wire's schedule, not whenever the next packet
-                    // happens to turn up.
+                    // happens to turn up. The SESSION's frame, so a lossless plane sending every
+                    // 2 ms is not judged on a 5 ms clock.
                     pcm = try connection.nextAudioPcm(
-                        timeoutMs: decoded ? UInt32(AudioRing.frameMS) : 100)
+                        timeoutMs: decoded ? UInt32(frameMS) : 100)
                 } catch {
                     return false // session closed
                 }
@@ -1114,17 +1204,20 @@ public final class SessionAudio {
                         ring.write(base, count: pcm.frameCount * pcm.channels)
                     }
                 }
-                // Periodic vitals (~10 s at the protocol's 5 ms frames). The other three clients
-                // log buffer depth and underruns; without this an Apple audio report — latency or
-                // dropout — arrives with no numbers at all, which is the position every platform
-                // was in before the 2026-08 audio work. `plc_ms` rides along because a healthy
+                // Periodic vitals (~10 s at the protocol's 5 ms frames; proportionally sooner on a
+                // lossless plane, whose frames are 2–4 ms). The other three clients log buffer
+                // depth and underruns; without this an Apple audio report — latency or dropout —
+                // arrives with no numbers at all, which is the position every platform was in
+                // before the 2026-08 audio work. `plc_ms` rides along because a healthy
                 // `underruns` bought with a climbing `plc_ms` is a link in trouble, not a link
-                // that is fine.
+                // that is fine. `rate_hz`/`frame_us` lead it so a field log says which plane the
+                // session was on, and on what frame the shed and target floor were sized, without
+                // needing the connect lines above it.
                 drained += 1
                 if drained % 2_000 == 0 {
                     let s = ring.stats
                     log.info(
-                        "audio: buffer_ms=\(s.bufferedMS) target_ms=\(s.targetMS) underruns=\(s.underruns) drift_sheds=\(s.sheds) av_offset_ms=\(s.avOffsetMS) plc_ms=\(s.plcMS)"
+                        "audio: rate_hz=\(rateHz) frame_us=\(frameUs) buffer_ms=\(s.bufferedMS) target_ms=\(s.targetMS) underruns=\(s.underruns) drift_sheds=\(s.sheds) av_offset_ms=\(s.avOffsetMS) plc_ms=\(s.plcMS)"
                     )
                 }
                 return true
@@ -1250,6 +1343,10 @@ public final class SessionAudio {
         let muted = micMuted // latched before this engine existed (a mute during the prompt)
         stateLock.unlock()
         apply(micMuted: muted, capture: nil, combined: engine)
+        // Worth its own read on this path rather than only the plain one: the voice processor picks
+        // its OWN formats when it engages (that is why the mic tap reads them after `prepare()`),
+        // and a VPIO unit is the least likely thing in the graph to have honoured a 96 kHz request.
+        noteOutputRate(engine, wireRateHz: wireRateHz)
         startDrain(into: ring)
         log.info("audio engines joined — voice processing (echo cancellation) active")
     }

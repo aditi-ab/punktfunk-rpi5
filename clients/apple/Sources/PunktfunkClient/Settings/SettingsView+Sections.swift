@@ -575,6 +575,18 @@ extension SettingsView {
                     }
                 }
             }
+            // Stereo only — a lossless surround frame does not fit one datagram at the default
+            // MTU, so the host would decline every such request. Hiding the row beats offering a
+            // choice that silently resolves back to Opus.
+            if effective.audioChannels == 2 {
+                described(audioFormatCaption, field: "audio_format") {
+                    Picker("Audio quality", selection: scoped(SettingsFields.audioFormat)) {
+                        ForEach(SettingsOptions.audioFormats, id: \.tag) { option in
+                            Text(option.label).tag(option.tag)
+                        }
+                    }
+                }
+            }
             #if os(macOS)
             // Which speaker THIS Mac plays through is this device's audio routing (tier G).
             if !inProfileScope {
@@ -636,6 +648,27 @@ extension SettingsView {
             Text("Applies from the next session.")
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    /// The SELECTED audio format explained, and honest about the two ways it can come to nothing:
+    /// the host has its own switch (off by default) and its own capture gate, and this device's
+    /// output has to be able to open the rate. Both resolve back to Opus — a good outcome, but not
+    /// the one the row's label promises, so the caption says so before the user goes looking.
+    private var audioFormatCaption: String {
+        switch AudioFormatChoice(setting: effective.audioFormat) {
+        case .opus:
+            return "Compressed audio at 256 kbps — effectively transparent, and what every "
+                + "session used before lossless existed."
+        case .lossless48:
+            return "Bit-exact 48 kHz / 24-bit PCM — no lossy stage at all. Costs about 2.3 Mbps "
+                + "on top of the video, and needs lossless enabled on the host too; the session "
+                + "falls back to Standard if it isn't."
+        case .lossless96:
+            return "Bit-exact 96 kHz / 24-bit PCM — about 4.6 Mbps on top of the video. Needs "
+                + "lossless enabled on the host, a host interface genuinely running at 96 kHz, "
+                + "and an output here that accepts it (Bluetooth generally will not). Anything "
+                + "missing resolves the session back down, and the log says which."
         }
     }
 

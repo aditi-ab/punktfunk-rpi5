@@ -20,7 +20,7 @@ final class AudioRingDriftTests: XCTestCase {
     /// Run `ms` of audio through the ring at a `quantumMS` device where the producer delivers
     /// `driftPPM` more than the consumer takes. Returns `(final ms, peak ms, silent callbacks)`.
     private func simulate(ms: Int, quantumMS: Int, driftPPM: Int) -> (Int, Int, Int) {
-        let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
+        let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
         let want = quantumMS * perMS
         var scratch = [Float](repeating: 0, count: want)
         // Non-zero so a silent callback is distinguishable from real audio.
@@ -81,7 +81,7 @@ final class AudioRingDriftTests: XCTestCase {
     /// One transient drain must not manufacture a whole target's worth of fresh silence: the ring
     /// de-primes only after a RUN of short reads.
     func testSingleShortReadDoesNotDeprime() {
-        let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
+        let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
         let want = 5 * perMS
         var scratch = [Float](repeating: 0, count: want)
         // Prime well past target.
@@ -120,7 +120,7 @@ final class AudioRingDriftTests: XCTestCase {
         let quanta = [5, 8, 10, 16, 21]
         var deprimedAt: [Int: Int] = [:]
         for quantumMS in quanta {
-            let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
+            let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
             let want = quantumMS * perMS
             var scratch = [Float](repeating: 0, count: want)
             // Prime DEEP: the depth average is seeded with the refill, so `hollow` stays false for
@@ -184,7 +184,7 @@ final class AudioRingDriftTests: XCTestCase {
     /// runs DEEP: a knife-edge refill (exactly what each read takes) leaves the ring within a
     /// frame of empty every callback, which now correctly reads as pressure, not quiet.
     func testTargetGrowsOnUnderrunsAndRelaxesWhenQuiet() {
-        let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
+        let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
         let want = 5 * perMS
         var scratch = [Float](repeating: 0, count: want)
         let feed = [Float](repeating: 0.5, count: 60 * perMS)
@@ -232,7 +232,7 @@ final class AudioRingDriftTests: XCTestCase {
     /// Growth is capped at `maxTargetMS`, exactly like `JitterPolicy` respects
     /// `JitterTuning.max_target_ms`.
     func testTargetGrowthRespectsTheCap() {
-        let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
+        let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
         let want = 5 * perMS
         var scratch = [Float](repeating: 0, count: want)
         let feed = [Float](repeating: 0.5, count: 25 * perMS)
@@ -254,7 +254,7 @@ final class AudioRingDriftTests: XCTestCase {
     /// forever; the adaptive floor must deepen until the bunching rides through, and the tail of
     /// the session must be silence-free.
     func testWifiBunchingConvergesToSilenceFree() {
-        let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
+        let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
         let want = 5 * perMS
         var scratch = [Float](repeating: 0, count: want)
         var pending = 0 // ms produced by the host but still "in flight"
@@ -306,8 +306,11 @@ final class AudioRingDriftTests: XCTestCase {
     /// Build an observation whose measured offset is exactly `offsetMS` (positive = audio late).
     /// Mirrors the Rust `obs` helper: pin now/skew/pts so the only free term is the buffered depth,
     /// then choose the video figure so the difference lands where we want it.
-    private func obs(offsetMS: Int, depth: Int) -> AvSync.Observation {
-        let bufferedMS = depth / perMS
+    ///
+    /// `rateHz` must match the `AvSync` under test — the depth→ms conversion here has to be the
+    /// same one the type does internally, or the observation asks for an offset it isn't building.
+    private func obs(offsetMS: Int, depth: Int, rateHz: Int = 48_000) -> AvSync.Observation {
+        let bufferedMS = depth / ((rateHz / 1000) * channels)
         let audioE2eMS = bufferedMS + 40 // 40 ms of transport, arbitrary but fixed
         let videoE2eMS = audioE2eMS - offsetMS
         return AvSync.Observation(
@@ -319,12 +322,16 @@ final class AudioRingDriftTests: XCTestCase {
     }
 
     /// Fold `n` identical observations in.
-    private func settle(_ sync: inout AvSync, offsetMS: Int, depth: Int, count: Int = 100) {
-        for _ in 0..<count { sync.observe(obs(offsetMS: offsetMS, depth: depth)) }
+    private func settle(
+        _ sync: inout AvSync, offsetMS: Int, depth: Int, count: Int = 100, rateHz: Int = 48_000
+    ) {
+        for _ in 0..<count {
+            sync.observe(obs(offsetMS: offsetMS, depth: depth, rateHz: rateHz))
+        }
     }
 
     func testAvSyncNeedsEvidenceBeforeActing() {
-        var s = AvSync(channels: channels)
+        var s = AvSync(channels: channels, rateHz: 48_000)
         // One sample is never enough — the skew estimate and the video figure both settle after
         // connect, and acting on the first would chase the handshake, not the stream.
         XCTAssertNil(s.observe(obs(offsetMS: 50, depth: 30 * perMS)))
@@ -338,7 +345,7 @@ final class AudioRingDriftTests: XCTestCase {
     /// arrive. This is the state every session starts in, and the one the stage-1 fallback
     /// presenter stays in for its whole life.
     func testAvSyncWithoutAVideoReferenceNeverActs() {
-        var s = AvSync(channels: channels)
+        var s = AvSync(channels: channels, rateHz: 48_000)
         for _ in 0..<500 {
             s.observe(AvSync.Observation(
                 ptsNs: 1_000_000_000, nowLocalNs: 1_040_000_000, clockOffsetNs: 0,
@@ -350,7 +357,7 @@ final class AudioRingDriftTests: XCTestCase {
 
     func testAvSyncAimsShallowerWhenAudioIsLate() {
         let depth = 60 * perMS
-        var s = AvSync(channels: channels)
+        var s = AvSync(channels: channels, rateHz: 48_000)
         settle(&s, offsetMS: 40, depth: depth, count: 400)
         guard let want = s.desiredDepth(currentDepth: depth) else {
             return XCTFail("a 40 ms offset is actionable")
@@ -364,7 +371,7 @@ final class AudioRingDriftTests: XCTestCase {
 
     func testAvSyncAimsDeeperWhenAudioIsEarly() {
         let depth = 20 * perMS
-        var s = AvSync(channels: channels)
+        var s = AvSync(channels: channels, rateHz: 48_000)
         settle(&s, offsetMS: -30, depth: depth, count: 400)
         guard let want = s.desiredDepth(currentDepth: depth) else {
             return XCTFail("a 30 ms offset is actionable")
@@ -375,7 +382,7 @@ final class AudioRingDriftTests: XCTestCase {
 
     func testAvSyncDeadbandsWhatNoOneCanHear() {
         let depth = 30 * perMS
-        var s = AvSync(channels: channels)
+        var s = AvSync(channels: channels, rateHz: 48_000)
         settle(&s, offsetMS: 8, depth: depth, count: 400) // inside the 10 ms deadband
         XCTAssertNil(
             s.desiredDepth(currentDepth: depth),
@@ -388,7 +395,7 @@ final class AudioRingDriftTests: XCTestCase {
     /// refused outright and the running average is left untouched.
     func testAvSyncRejectsTheImplausibleInsteadOfClampingIt() {
         let depth = 30 * perMS
-        var s = AvSync(channels: channels)
+        var s = AvSync(channels: channels, rateHz: 48_000)
         settle(&s, offsetMS: 30, depth: depth, count: 400)
         let before = s.offsetMS
         // Built directly rather than through `obs`: that helper floors the video figure at zero,
@@ -413,7 +420,7 @@ final class AudioRingDriftTests: XCTestCase {
     /// stream, it aborts the process, from the audio drain thread. The guard's short-circuit
     /// ordering is what makes the sanity check itself safe to run.
     func testAvSyncRefusesAnOffsetItCannotEvenCompute() {
-        var s = AvSync(channels: channels)
+        var s = AvSync(channels: channels, rateHz: 48_000)
         let wild = AvSync.Observation(
             ptsNs: 1 << 63, nowLocalNs: 40_000_000, clockOffsetNs: 0,
             bufferedAhead: 0, videoE2eNs: 40_000_000)
@@ -435,13 +442,13 @@ final class AudioRingDriftTests: XCTestCase {
     /// effective target. Without this the whole feature could ship as unreachable code with every
     /// other test still green — which is exactly how the previous drift correction shipped dead.
     func testSyncActuallyMovesTheTarget() {
-        let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
+        let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
         primeQuantum(ring, quantumMS: 5)
         XCTAssertEqual(ring.stats.targetMS, 20, "base target (JitterTuning.COREAUDIO)")
 
         // Audio 30 ms EARLY at a 20 ms depth ⇒ aim 50 ms deep: above the floor, under the 90 ms
         // cap, so the ring has no reason to refuse.
-        var s = AvSync(channels: channels)
+        var s = AvSync(channels: channels, rateHz: 48_000)
         settle(&s, offsetMS: -30, depth: 20 * perMS, count: 400)
         ring.setSyncTarget(s.desiredDepth(currentDepth: 20 * perMS))
         XCTAssertEqual(ring.stats.targetMS, 50, "the ring must adopt a legal request")
@@ -456,7 +463,7 @@ final class AudioRingDriftTests: XCTestCase {
     /// not just the base, because the floor sync is most likely to argue with is the one a bad link
     /// earned.
     func testSyncCanNeverStarveTheRing() {
-        let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
+        let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
         let want = 5 * perMS
         var scratch = [Float](repeating: 0, count: want)
         let feed = [Float](repeating: 0.5, count: 25 * perMS)
@@ -497,7 +504,7 @@ final class AudioRingDriftTests: XCTestCase {
     /// back the cap — quietly below the floor, inverting the whole ordering — on exactly the
     /// awkward hardware this code exists to survive.
     func testAHugeDeviceQuantumDoesNotInvertTheClamp() {
-        let ring = AudioRing(capacity: 48_000 * channels * 2, channels: channels)
+        let ring = AudioRing(seconds: 2, channels: channels, rateHz: 48_000)
         let quantumMS = 500 // absurd, but not a reason to starve the callback
         primeQuantum(ring, quantumMS: quantumMS)
         ring.setSyncTarget(0)
@@ -550,12 +557,12 @@ final class AudioRingDriftTests: XCTestCase {
             return reads
         }
 
-        let slow = AudioRing(capacity: 48_000 * channels, channels: channels)
+        let slow = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
         grow(slow)
         slow.setSyncTarget(nil)
         let slowReads = quietToRelax(slow)
 
-        let fast = AudioRing(capacity: 48_000 * channels, channels: channels)
+        let fast = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
         grow(fast)
         fast.setSyncTarget(perMS) // strictly shallower than the grown target
         let fastReads = quietToRelax(fast)
@@ -571,7 +578,7 @@ final class AudioRingDriftTests: XCTestCase {
     /// depth every five quiet seconds and paid an audible starvation event each time it was wrong,
     /// forever — the 0.25.0 MacBook field report.
     func testAFailedShrinkProbeIsUndoneAtOnceAndBacksTheSyncLoopOff() {
-        let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
+        let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
         let want = 5 * perMS
         var scratch = [Float](repeating: 0, count: want)
         let feed = [Float](repeating: 0.5, count: 60 * perMS)
@@ -637,7 +644,7 @@ final class AudioRingDriftTests: XCTestCase {
     /// bunching period indefinitely. The average, not the instant, is what separates a hollow ring
     /// from one late packet (`testSingleShortReadDoesNotDeprime` pins that side).
     func testAHollowRingReprimesOnItsFirstClick() {
-        let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
+        let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
         let want = 5 * perMS
         var scratch = [Float](repeating: 0, count: want)
         let feed = [Float](repeating: 0.5, count: 60 * perMS)
@@ -681,8 +688,8 @@ final class AudioRingDriftTests: XCTestCase {
     /// did. `nil` is the default, so this pins the initializer too — and every other test in this
     /// file runs without a sync target, which is the real guard that nothing moved underneath them.
     func testNoSyncTargetLeavesTheRingExactlyAsItWas() {
-        let a = AudioRing(capacity: 48_000 * channels, channels: channels)
-        let b = AudioRing(capacity: 48_000 * channels, channels: channels)
+        let a = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
+        let b = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
         b.setSyncTarget(nil)
         let want = 5 * perMS
         var sa = [Float](repeating: 0, count: want)
@@ -707,12 +714,12 @@ final class AudioRingDriftTests: XCTestCase {
     /// a depth on its own cannot distinguish "deep because the link needs it" from "deep and
     /// therefore late". This is the number the HUD and the 1 Hz log line read.
     func testAvOffsetIsReportedAlongsideTheDepth() {
-        let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
+        let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
         XCTAssertEqual(ring.stats.avOffsetMS, 0, "no evidence yet reads as zero, not as noise")
         let feed = [Float](repeating: 0.5, count: 30 * perMS)
         feed.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: 30 * perMS) }
 
-        var s = AvSync(channels: channels)
+        var s = AvSync(channels: channels, rateHz: 48_000)
         settle(&s, offsetMS: 37, depth: 30 * perMS, count: 400)
         ring.noteAvOffset(s.offsetMS)
         let stats = ring.stats
@@ -800,7 +807,7 @@ final class AudioRingDriftTests: XCTestCase {
         /// Prime, then stall the wire for `ms`, ticking the drain thread's 5 ms loop and the
         /// device callback in step. Returns when the first silent callback lands (nil = none).
         func stall(ms: Int, concealing: Bool) -> Int? {
-            let ring = AudioRing(capacity: 48_000 * channels, channels: channels)
+            let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
             let want = 5 * perMS
             var scratch = [Float](repeating: 0, count: want)
             let feed = [Float](repeating: 0.5, count: 25 * perMS)
@@ -830,6 +837,193 @@ final class AudioRingDriftTests: XCTestCase {
             stall(ms: AudioRing.plcMaxMS, concealing: true),
             "a stall inside the budget must not reach the listener at all (unconcealed: silent "
                 + "after \(deprimedAt) ms)")
+    }
+
+    // MARK: - The negotiated rate
+
+    /// The rate REACHES the arithmetic — every ms↔sample conversion in the ring, not just its
+    /// capacity. Pinned because the failure mode is silent in both directions: a ring left at 48
+    /// while the wire runs at 96 reports (and targets, and sheds at) double the milliseconds it
+    /// really holds, and a capacity left as the old `48_000 * channels` literal is half a second of
+    /// ring on the one plane that most needs the overflow headroom. Neither throws, warns, or
+    /// sounds wrong until a link goes bad.
+    func testRateDrivesEveryMsConversionAndTheCapacity() {
+        let fast = AudioRing(seconds: 1, channels: channels, rateHz: 96_000)
+        // The base target is a TIME (JitterTuning.COREAUDIO's 20 ms) and must read as one at any
+        // rate — while costing twice the samples at 96 kHz, which is the whole point.
+        XCTAssertEqual(fast.stats.targetMS, 20, "the target is denominated in ms, not samples")
+
+        // 20 ms of 96 kHz audio is 1 920 frames; at 48 kHz the same sample count would read 40 ms.
+        let ms20 = 20 * 96 * channels
+        let feed = [Float](repeating: 0.5, count: ms20)
+        feed.withUnsafeBufferPointer { fast.write($0.baseAddress!, count: ms20) }
+        XCTAssertEqual(fast.bufferedMS, 20, "depth must be ms at the NEGOTIATED rate")
+
+        // Capacity is a second of audio at the NEGOTIATED rate, not a second's worth of the old
+        // `48_000 * channels` literal. Probed through `write`'s over-capacity guard, which drops a
+        // too-large write whole rather than wrapping it: one second exactly must be taken, one
+        // sample more must not. On a ring still sized from the 48 000 literal the first of these
+        // would be the one silently dropped — which is the half-second-ring defect, expressed as
+        // something a test can see.
+        let empty = AudioRing(seconds: 1, channels: channels, rateHz: 96_000)
+        let overflow = [Float](repeating: 0.5, count: 96_000 * channels + channels)
+        overflow.withUnsafeBufferPointer { empty.write($0.baseAddress!, count: overflow.count) }
+        XCTAssertEqual(empty.bufferedMS, 0, "an over-capacity write is dropped, not wrapped")
+        overflow.withUnsafeBufferPointer {
+            empty.write($0.baseAddress!, count: 96_000 * channels)
+        }
+        XCTAssertGreaterThan(
+            empty.bufferedMS, 0,
+            "one second of 96 kHz audio must fit — a ring sized from a 48 000 literal holds half, "
+                + "and would have dropped this write entirely")
+
+        // And the sync loop agrees about what a millisecond is: a 30 ms correction has to be 30 ms
+        // of samples in the ring's own units, or the depth it proposes means something else.
+        var s = AvSync(channels: channels, rateHz: 96_000)
+        settle(&s, offsetMS: 30, depth: 40 * 96 * channels, count: 400, rateHz: 96_000)
+        XCTAssertEqual(
+            s.desiredDepth(currentDepth: 40 * 96 * channels), 10 * 96 * channels,
+            "audio 30 ms late at a 40 ms depth ⇒ aim 10 ms, in 96 kHz samples")
+    }
+
+    // MARK: - The negotiated frame length
+
+    /// The Swift half of core's `the_shed_follows_the_negotiated_frame_length`. Two of this ring's
+    /// decisions are denominated in FRAMES, not milliseconds — the smooth shed drops exactly one,
+    /// and the effective-target floor is a device quantum plus one — and both were written when
+    /// 5 ms was the only frame the protocol had. The lossless plane negotiates 4 ms at 48 kHz/24-bit
+    /// and 2 ms at 96 kHz/24-bit, so a ring left on the constant sheds two and a half frames at a
+    /// time and fades across an entire one.
+    func testFrameGeometryFollowsTheNegotiatedFrameLength() {
+        // Default: one 5 ms frame, a 2 ms fade — exactly the pre-hi-res numbers, which is what
+        // keeps every Opus session (and the twenty-nine tests above) bit-identical.
+        let base = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
+        XCTAssertEqual(base.frameGeometry.frame, AudioRing.frameMS * perMS)
+        XCTAssertEqual(base.frameGeometry.crossfade, 2 * perMS)
+
+        // A 2 ms lossless frame sheds 2 ms, and the fade is capped at HALF of it rather than
+        // consuming the whole dropped frame — a fade as long as the material it fades is not a
+        // crossfade, it is a ramp replacing the seam.
+        let short = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
+        short.setFrameUs(2_000)
+        XCTAssertEqual(short.frameGeometry.frame, 2 * perMS)
+        XCTAssertEqual(short.frameGeometry.crossfade, perMS, "fade must be half a 2 ms frame")
+        XCTAssertLessThan(
+            short.frameGeometry.crossfade, short.frameGeometry.frame,
+            "a fade as long as the frame is not a crossfade")
+
+        // Sub-millisecond precision: 2 500 µs at 48 kHz stereo is 240 interleaved samples, and must
+        // not truncate to 192 by going through integer milliseconds on the way. This is the whole
+        // reason the accessor is denominated in µs.
+        let half = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
+        half.setFrameUs(2_500)
+        XCTAssertEqual(half.frameGeometry.frame, 240, "2 500 µs must not truncate to 2 ms")
+
+        // At 96 kHz the same 2 ms frame is twice the samples for the same duration.
+        let hires = AudioRing(seconds: 1, channels: channels, rateHz: 96_000)
+        hires.setFrameUs(2_000)
+        XCTAssertEqual(hires.frameGeometry.frame, 2 * 96 * channels)
+
+        // A degenerate value must not produce a zero-length frame — the shed would become an
+        // infinite no-op and the target floor would lose its packet of slack.
+        let zero = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
+        zero.setFrameUs(0)
+        XCTAssertGreaterThanOrEqual(zero.frameGeometry.frame, 1)
+    }
+
+    /// The frame reaches the EFFECTIVE TARGET FLOOR, not just a getter. A large-quantum device
+    /// cannot sustain a target below its own callback, so the floor is `quantum + one frame` — and
+    /// on a 2 ms session that packet of slack should be 2 ms, not the 5 a constant would give.
+    func testTargetFloorCarriesOneNegotiatedFrameOverTheDeviceQuantum() {
+        func floorMS(frameUs: Int?) -> Int {
+            let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
+            if let frameUs { ring.setFrameUs(frameUs) }
+            // One oversized callback is all it takes: `renderQuantum` is a high-water mark, and
+            // 30 ms exceeds the 20 ms base target so the lift is what decides the floor.
+            var scratch = [Float](repeating: 0, count: 30 * perMS)
+            scratch.withUnsafeMutableBufferPointer {
+                ring.read(into: $0.baseAddress!, count: $0.count)
+            }
+            return ring.stats.targetMS
+        }
+        XCTAssertEqual(floorMS(frameUs: nil), 35, "30 ms quantum + the default 5 ms frame")
+        XCTAssertEqual(floorMS(frameUs: 2_000), 32, "30 ms quantum + a 2 ms lossless frame")
+        XCTAssertEqual(floorMS(frameUs: 4_000), 34, "30 ms quantum + a 4 ms lossless frame")
+    }
+
+    /// The half-frame cap reaches the SAMPLES. Driven through the hard-cap trim rather than the
+    /// slow drift shed because they share `dropFront`, and the trim is the drop that actually fires
+    /// in the field (a bunching link trims far more often than it sheds).
+    ///
+    /// The ring is filled with silence where the trim will cut and full scale after it, so every
+    /// blended sample is strictly below full scale and the fade length is simply countable.
+    func testTheSeamCrossfadeIsCappedAtHalfTheNegotiatedFrame() {
+        func fadeLength(frameUs: Int?) -> Int {
+            let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
+            if let frameUs { ring.setFrameUs(frameUs) }
+            // A fresh ring's cap is target(20) + headroom(30) = 50 ms, so 60 ms of audio trims
+            // exactly 10 ms off the front — comfortably more than any fade under test.
+            var feed = [Float](repeating: 1, count: 60 * perMS)
+            for i in 0..<(10 * perMS) { feed[i] = 0 }
+            feed.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: feed.count) }
+
+            // Read one 5 ms callback: small enough to stay primed (the floor needs quantum + a
+            // frame ≤ the 50 ms banked), large enough to contain any fade under test.
+            var out = [Float](repeating: -1, count: 5 * perMS)
+            out.withUnsafeMutableBufferPointer {
+                ring.read(into: $0.baseAddress!, count: $0.count)
+            }
+            return out.prefix { $0 < 1 }.count
+        }
+        // Default: the flat 2 ms fade, well under half of a 5 ms frame.
+        XCTAssertEqual(fadeLength(frameUs: nil), 2 * perMS)
+        // A 2 ms frame caps the fade at 1 ms — without the cap it would be the whole frame.
+        XCTAssertEqual(fadeLength(frameUs: 2_000), perMS, "half of a 2 ms frame")
+        // 4 ms leaves the flat 2 ms fade untouched: half of 4 is exactly 2, so the cap binds
+        // without shortening it — the boundary worth pinning.
+        XCTAssertEqual(fadeLength(frameUs: 4_000), 2 * perMS)
+    }
+
+    /// The NEAR-MISS margin follows the frame too — a read that leaves more than one frame in hand
+    /// is not a near miss and must not grow the target.
+    ///
+    /// ⚠ This is the one place the Swift ring deliberately DIVERGES from core, which still measures
+    /// the margin against the constant `NEAR_MISS_MARGIN_MS`. The two agree exactly on every Opus
+    /// session (both mean 5 ms) and part company only on the lossless plane, where a margin frozen
+    /// at 5 ms against a 2 ms frame stops meaning "one packet in hand" and starts meaning "two and
+    /// a half" — growing the target on a ring that was never close to starving, which is the
+    /// opposite of what the near-miss exists to detect. Pinned here so the divergence stays a
+    /// decision rather than becoming drift.
+    func testNearMissMarginFollowsTheNegotiatedFrame() {
+        func targetAfterLeaving(_ leftover: Int, frameUs: Int?) -> Int {
+            let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
+            if let frameUs { ring.setFrameUs(frameUs) }
+            // Bank 25 ms — over the 20 ms base target, under the 50 ms hard cap, so nothing trims.
+            let feed = [Float](repeating: 0.5, count: 25 * perMS)
+            feed.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: feed.count) }
+            // A 5 ms callback primes the ring and leaves 20 ms — nowhere near any margin.
+            var prime = [Float](repeating: 0, count: 5 * perMS)
+            prime.withUnsafeMutableBufferPointer {
+                ring.read(into: $0.baseAddress!, count: $0.count)
+            }
+            // Then serve one FULL read that leaves exactly `leftover` samples in hand.
+            var out = [Float](repeating: 0, count: 20 * perMS - leftover)
+            out.withUnsafeMutableBufferPointer {
+                ring.read(into: $0.baseAddress!, count: $0.count)
+            }
+            return ring.stats.targetMS
+        }
+        // 300 samples ≈ 3.1 ms: MORE than a 2 ms frame, LESS than the 5 ms constant. With the
+        // margin tied to the frame this is an ordinary read; tied to the constant it is a near
+        // miss and buys a 10 ms growth step.
+        XCTAssertEqual(
+            targetAfterLeaving(300, frameUs: 2_000), 20,
+            "3.1 ms left over is more than a 2 ms frame — not a near miss, no growth")
+        // The same read against the DEFAULT 5 ms frame genuinely is a near miss, which is what
+        // keeps this test honest: it is not simply asserting that growth never happens.
+        XCTAssertEqual(
+            targetAfterLeaving(300, frameUs: nil), 30,
+            "3.1 ms left over IS inside a 5 ms frame — one growth step")
     }
 }
 #endif

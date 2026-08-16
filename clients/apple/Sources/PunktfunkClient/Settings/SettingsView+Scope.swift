@@ -94,6 +94,10 @@ enum SettingsFields {
         .init(name: "audio_channels", key: DefaultsKey.audioChannels,
               overlay: \.audioChannels, effective: \.audioChannels)
     }
+    static var audioFormat: SettingsField<String> {
+        .init(name: "audio_format", key: DefaultsKey.audioFormat,
+              overlay: \.audioFormat, effective: \.audioFormat)
+    }
     static var micEnabled: SettingsField<Bool> {
         .init(name: "mic_enabled", key: DefaultsKey.micEnabled,
               overlay: \.micEnabled, effective: \.micEnabled)
@@ -194,6 +198,7 @@ extension SettingsView {
         base.enable444 = enable444
         base.compositor = compositor
         base.audioChannels = audioChannels
+        base.audioFormat = audioFormat
         base.micEnabled = micEnabled
         base.echoCancel = echoCancel
         base.gamepadType = gamepadType

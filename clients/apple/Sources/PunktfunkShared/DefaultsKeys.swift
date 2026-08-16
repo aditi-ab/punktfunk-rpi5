@@ -62,6 +62,15 @@ public enum DefaultsKey {
     /// Requested audio channel count: 2 (stereo), 6 (5.1) or 8 (7.1). The host clamps to what it
     /// can capture; the resolved count drives the in-core decode + AVAudioEngine layout.
     public static let audioChannels = "punktfunk.audioChannels"
+    /// Requested audio format — `AudioFormatChoice`'s raw value: `"opus"` (the default, and every
+    /// session before the lossless plane existed), `"lossless48"` or `"lossless96"`.
+    ///
+    /// Off by default and deliberately: lossless takes 1.5–4.6 Mbps off the top of the link,
+    /// OUTSIDE the ABR loop that manages the video budget, against the ~256 kbps Opus it replaces —
+    /// so it must be asked for on both ends (`PUNKTFUNK_AUDIO_HIRES` is the host's half, also off
+    /// by default). A REQUEST: the host's five-condition gate may resolve the session back to Opus,
+    /// and `PunktfunkConnection.resolvedAudioRateHz`/`resolvedAudioBits` are what actually happened.
+    public static let audioFormat = "punktfunk.audioFormat"
     /// Preferred video codec: `"auto"` (host decides), `"hevc"`, `"h264"`, `"av1"`, or
     /// `"pyrowave"` (the opt-in wired-LAN wavelet codec — picking it advertises AND prefers it,
     /// and forces the session SDR). A soft preference — the host emits it when it can, else

@@ -28,6 +28,9 @@ public struct EffectiveSettings: Equatable, Sendable {
     public var hdrEnabled = true
     public var compositor = 0
     public var audioChannels = 2
+    /// An `AudioFormatChoice` raw value. `"opus"` — the default — is byte-for-byte the session
+    /// every build before the lossless plane ran.
+    public var audioFormat = AudioFormatChoice.opus.rawValue
     public var micEnabled = true
     public var echoCancel = true
     public var touchMode = "trackpad"
@@ -95,6 +98,7 @@ public struct EffectiveSettings: Equatable, Sendable {
         hdrEnabled = bool(DefaultsKey.hdrEnabled, hdrEnabled)
         compositor = int(DefaultsKey.compositor, compositor)
         audioChannels = int(DefaultsKey.audioChannels, audioChannels)
+        audioFormat = str(DefaultsKey.audioFormat, audioFormat)
         micEnabled = bool(DefaultsKey.micEnabled, micEnabled)
         echoCancel = bool(DefaultsKey.echoCancel, echoCancel)
         touchMode = str(DefaultsKey.touchMode, touchMode)
@@ -176,6 +180,7 @@ public struct EffectiveSettings: Equatable, Sendable {
         if let v = overlay.hdrEnabled { s.hdrEnabled = v }
         if let v = overlay.compositor { s.compositor = v }
         if let v = overlay.audioChannels { s.audioChannels = v }
+        if let v = overlay.audioFormat { s.audioFormat = v }
         if let v = overlay.micEnabled { s.micEnabled = v }
         if let v = overlay.echoCancel { s.echoCancel = v }
         if let v = overlay.touchMode { s.touchMode = v }
@@ -225,6 +230,60 @@ public struct EffectiveSettings: Equatable, Sendable {
         out.profileAccent = profile.accent
         return out
     }
+}
+
+// MARK: - Audio format
+
+/// The audio format a session ASKS the host for (`DefaultsKey.audioFormat`) — one choice rather
+/// than a free rate/depth pair, so the states that cannot be asked for are unrepresentable rather
+/// than merely validated.
+///
+/// **The ladder is 48/96 kHz only, and that is arithmetic, not bandwidth.** Every buffer figure in
+/// the jitter policy — at both ends and in all four clients — is `ms × perMS` with `perMS` an
+/// integer number of samples per millisecond. 48 000 → 48 and 96 000 → 96 are exact; 44 100 → 44.1
+/// truncates to 44, a silent 2.3 % error in every target, every de-prime fuse and every reported
+/// `buffer_ms`. 44.1 kHz and its multiples are therefore deferred behind denominating that policy
+/// in a rational `perMS`, not behind any difficulty in carrying them (design/hi-res-audio.md §4.1).
+///
+/// Lossless at the DEFAULT 48 kHz/16-bit is deliberately not offered: it spends ~1.5 Mbps to sound
+/// like the transparent 256 kbps Opus it replaces, and it is the one lossless request whose wire
+/// parameters are indistinguishable from a legacy one (it needs `CLIENT_CAP_AUDIO_HIRES` set by
+/// hand — see the C ABI's note on that constant). 24-bit is where the plane earns its bandwidth.
+public enum AudioFormatChoice: String, CaseIterable, Sendable {
+    /// Opus 48 kHz — the default, and byte-for-byte the session every earlier build ran.
+    case opus
+    /// Bit-exact PCM at 48 kHz / 24-bit. ~2.3 Mbps. The honest win even without a hi-res
+    /// interface: no lossy stage at all, and no double resample on a 48 kHz host.
+    case lossless48
+    /// Bit-exact PCM at 96 kHz / 24-bit. ~4.6 Mbps, and only real if the host's capture endpoint
+    /// genuinely runs at 96 kHz — the host declines rather than upsampling, and this client says so
+    /// rather than claiming a rate its own output device refused.
+    case lossless96
+
+    /// The stored raw value, falling back to `.opus` for anything a newer build wrote.
+    public init(setting: String) {
+        self = AudioFormatChoice(rawValue: setting) ?? .opus
+    }
+
+    /// The `Hello` fields this choice asks for. `48 000`/`16` is exactly a pre-lossless request and
+    /// keeps the legacy connect path; anything else asks core for the `0xD3` plane and lets it
+    /// derive `CLIENT_CAP_AUDIO_HIRES` from the format, so the bit and the format can never
+    /// disagree.
+    public var wire: (rateHz: UInt32, bits: UInt8) {
+        switch self {
+        case .opus: return (48_000, 16)
+        case .lossless48: return (48_000, 24)
+        case .lossless96: return (96_000, 24)
+        }
+    }
+
+    /// True for the lossless plane — the gate for anything that spends the extra bandwidth.
+    public var isLossless: Bool { self != .opus }
+}
+
+public extension EffectiveSettings {
+    /// This session's requested format, resolved from the stored string.
+    var audioFormatChoice: AudioFormatChoice { AudioFormatChoice(setting: audioFormat) }
 }
 
 /// What a single connect was told to use, before any store is consulted.

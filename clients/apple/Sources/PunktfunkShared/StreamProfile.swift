@@ -104,6 +104,15 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
     public var hdrEnabled: Bool?
     public var compositor: Int?
     public var audioChannels: Int?
+    /// An `AudioFormatChoice` raw value — the audio format this profile asks the host for.
+    /// Profileable because it is about how a HOST is streamed (a wired desktop can afford
+    /// lossless; a phone on cellular cannot), not about this device's hardware.
+    ///
+    /// ⚠ The one key here with **no counterpart in the Rust overlay yet**
+    /// (`pf-client-core::profiles`): Apple is the first client to carry it. `audio_format` is the
+    /// name the others should adopt, and until they do a profile written here round-trips through
+    /// their unknown-key carry-through untouched rather than being honoured.
+    public var audioFormat: String?
     public var micEnabled: Bool?
     public var echoCancel: Bool?
     public var touchMode: String?
@@ -149,6 +158,7 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         case hdrEnabled = "hdr_enabled"
         case compositor
         case audioChannels = "audio_channels"
+        case audioFormat = "audio_format"
         case micEnabled = "mic_enabled"
         case echoCancel = "echo_cancel"
         case touchMode = "touch_mode"
@@ -186,6 +196,7 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         hdrEnabled = bool(.hdrEnabled)
         compositor = int(.compositor)
         audioChannels = int(.audioChannels)
+        audioFormat = str(.audioFormat)
         micEnabled = bool(.micEnabled)
         echoCancel = bool(.echoCancel)
         touchMode = str(.touchMode)
@@ -225,6 +236,7 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         try c.encodeIfPresent(hdrEnabled, forKey: AnyKey(Key.hdrEnabled.rawValue))
         try c.encodeIfPresent(compositor, forKey: AnyKey(Key.compositor.rawValue))
         try c.encodeIfPresent(audioChannels, forKey: AnyKey(Key.audioChannels.rawValue))
+        try c.encodeIfPresent(audioFormat, forKey: AnyKey(Key.audioFormat.rawValue))
         try c.encodeIfPresent(micEnabled, forKey: AnyKey(Key.micEnabled.rawValue))
         try c.encodeIfPresent(echoCancel, forKey: AnyKey(Key.echoCancel.rawValue))
         try c.encodeIfPresent(touchMode, forKey: AnyKey(Key.touchMode.rawValue))
@@ -282,6 +294,7 @@ public enum OverlayField {
         case "hdr_enabled": overlay.hdrEnabled = nil
         case "compositor": overlay.compositor = nil
         case "audio_channels": overlay.audioChannels = nil
+        case "audio_format": overlay.audioFormat = nil
         case "mic_enabled": overlay.micEnabled = nil
         case "echo_cancel": overlay.echoCancel = nil
         case "touch_mode": overlay.touchMode = nil
@@ -321,6 +334,7 @@ public enum OverlayField {
         case "hdr_enabled": return o.hdrEnabled != nil
         case "compositor": return o.compositor != nil
         case "audio_channels": return o.audioChannels != nil
+        case "audio_format": return o.audioFormat != nil
         case "mic_enabled": return o.micEnabled != nil
         case "echo_cancel": return o.echoCancel != nil
         case "touch_mode": return o.touchMode != nil

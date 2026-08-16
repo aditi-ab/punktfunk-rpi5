@@ -8,13 +8,14 @@ import os
 /// chronically out-demand the prefill and oscillate prime → dropout → re-prime).
 /// All counts stay whole frames (multiples of `channels`), so the interleave can never slip.
 ///
-/// **Drift correction.** Both ends run at 48 kHz but on different crystals, so backlog from a
-/// network stall or plain host-vs-DAC skew never drains on its own: without correction one 300 ms
-/// hiccup leaves audio 300 ms behind video for the rest of the session. This used to be handled by
-/// a `highWater` shed that dropped a whole `2 × prefill` at once — its own comment called that "one
-/// audible blip". It is now the same two-stage scheme the Rust clients share
-/// (`punktfunk_core::audio::JitterPolicy`): a slow depth average that sits above target for a
-/// sustained window sheds ONE 5 ms frame with a crossfade, and the hard cap is only a backstop.
+/// **Drift correction.** Both ends run at the same nominal rate but on different crystals, so
+/// backlog from a network stall or plain host-vs-DAC skew never drains on its own: without
+/// correction one 300 ms hiccup leaves audio 300 ms behind video for the rest of the session. This
+/// used to be handled by a `highWater` shed that dropped a whole `2 × prefill` at once — its own
+/// comment called that "one audible blip". It is now the same two-stage scheme the Rust clients
+/// share (`punktfunk_core::audio::JitterPolicy`): a slow depth average that sits above target for a
+/// sustained window sheds exactly ONE audio frame with a crossfade — the session's real frame, see
+/// `setFrameUs` — and the hard cap is only a backstop.
 ///
 /// **Adaptive depth.** The target is a floor, not a constant: a NEAR-MISS — a read served with
 /// less than one frame left over — grows it a step BEFORE anything was audible, repeated genuine
@@ -57,7 +58,19 @@ final class AudioRing: @unchecked Sendable {
     /// Floor in callbacks under `deprimeMS`, so a large-quantum device keeps real hysteresis
     /// instead of de-priming on the first short read. Mirrors `MIN_DEPRIME_CALLBACKS`.
     private static let minDeprimeCallbacks = 2
-    /// The protocol's frame: the shed unit, and the slack added over a large device quantum.
+    /// The protocol's DEFAULT frame — the Opus plane's 5 ms, mirroring `PUNKTFUNK_AUDIO_FRAME_MS`.
+    ///
+    /// The frame a session actually runs is RESOLVED, not assumed: the lossless plane sizes it to
+    /// the path MTU because a 5 ms hi-res frame does not fit one QUIC datagram — 4 ms at
+    /// 48 kHz/24-bit, 2 ms at 96 kHz/24-bit under the default ceiling (design/hi-res-audio.md
+    /// §4.2). `setFrameUs` takes that figure from `punktfunk_connection_audio_frame_us`; this
+    /// constant is what a ring keeps until somebody calls it, which is exactly right for every
+    /// Opus session and for the tests that pin the pre-hi-res behaviour.
+    ///
+    /// Still the right unit for the two policies that are NOT frame-denominated and stay on the
+    /// constant in core too — `DroughtConceal`'s trigger/floor and `AvSync`'s EWMA weight. Both are
+    /// tolerances on arrival jitter rather than counts of frames, and both are quoted here as
+    /// `2 × frameMS` / one `frameMS` precisely so they read as "about a couple of packets".
     static let frameMS = 5
     /// Depth average must exceed target by this before drift correction fires — the middle of the
     /// headroom band, so the smooth shed always gets its chance BEFORE the hard cap trims.
@@ -83,11 +96,6 @@ final class AudioRing: @unchecked Sendable {
     /// a measurement saying the extra depth is costing alignment right now — so a smaller target
     /// gets tested sooner. Mirrors `SHRINK_QUIET_SYNC_MS`.
     private static let shrinkQuietSyncMS = 5_000
-    /// Post-read depth below which a served callback counts as a NEAR-MISS: the device got its
-    /// samples, but with less than one protocol frame left in hand — the same evidence as an
-    /// underrun, except nobody heard it yet, so the target grows BEFORE the click instead of
-    /// after the third one. Mirrors `NEAR_MISS_MARGIN_MS`.
-    private static let nearMissMarginMS = frameMS
     /// How long a shrink remains a PROBE, in consumed audio: an underrun or near-miss inside
     /// this window means the shrink was wrong, and the previous target is restored at once.
     /// Mirrors `SHRINK_PROBE_MS`.
@@ -135,8 +143,8 @@ final class AudioRing: @unchecked Sendable {
     /// `nil` — the default, and what an un-wired session keeps — reproduces the pre-sync
     /// behaviour exactly, so this ring could adopt sync without the other three diverging.
     private var syncTarget: Int?
-    /// This read was served with less than `nearMissMarginMS` left over (set in `read`,
-    /// consumed by `noteRead`).
+    /// This read was served with less than one frame left over (set in `read`, consumed by
+    /// `noteRead`).
     private var nearMiss = false
     /// A near-miss already grew the target this window — one step per window, so a bunching
     /// episode (a RUN of consecutive near-misses while the ring refills) buys one measured
@@ -163,15 +171,79 @@ final class AudioRing: @unchecked Sendable {
     private var plcMS = 0
     private let channels: Int
     private let perMS: Int
+    /// One protocol audio frame in MICROSECONDS — see `setFrameUs`. Guarded by `lock`, like
+    /// everything else the render callback reads.
+    private var frameUs = AudioRing.frameMS * 1_000
     private let lock = OSAllocatedUnfairLock()
 
-    /// `capacity` in samples (interleaved — `channels` per frame, a whole number of frames).
-    /// The de-jitter depth is the ring's own business (`targetMS`), not a caller's prefill.
-    init(capacity: Int, channels: Int) {
-        buf = [Float](repeating: 0, count: capacity)
+    /// A ring holding `seconds` of audio at the session's negotiated format. The de-jitter depth
+    /// is the ring's own business (`targetMS`), not a caller's prefill.
+    ///
+    /// Sized in TIME rather than in a sample count, because the sample count is `rateHz × channels`
+    /// and the two were indistinguishable while every session ran at 48 kHz: this was
+    /// `capacity: 48_000 * channels`, where the literal was silently doing double duty as
+    /// samples-per-second. At 96 kHz that same expression is half a second of ring — no error, no
+    /// warning, just half the overflow headroom on the plane that needs it most.
+    ///
+    /// **`rateHz` must be a whole number of samples per millisecond.** `perMS` is an INTEGER and
+    /// every figure here — target, EWMA depth, shed threshold, hard cap, the de-prime fuse, and
+    /// the `bufferedMS`/`targetMS` the HUD reports — is `ms * perMS`. 48 000 → 48 and 96 000 → 96
+    /// are exact; **44 100 → 44.1 truncates to 44**, a silent 2.3 % error in all of them. That is
+    /// why the hi-res ladder is 48/96 kHz only, and it is a property of this arithmetic rather
+    /// than of the wire: 44.1/88.2/176.4 are deferred behind denominating the policy in a rational
+    /// `perMS`, on both sides. Exactly the constraint `JitterPolicy::new_at_rate` documents and
+    /// debug-asserts — keep the two in step (design/hi-res-audio.md §4.1).
+    init(seconds: Int, channels: Int, rateHz: Int) {
         self.channels = channels
-        perMS = 48 * channels
+        perMS = (rateHz / 1000) * max(channels, 1)
+        buf = [Float](repeating: 0, count: max(seconds, 1) * rateHz * max(channels, 1))
         targetLive = Self.targetMS * perMS
+    }
+
+    /// Tell the ring how long one audio frame actually is, in microseconds
+    /// (`punktfunk_connection_audio_frame_us`). Mirrors `JitterPolicy::set_frame_us`.
+    ///
+    /// Two of this ring's decisions are denominated in FRAMES rather than milliseconds — the floor
+    /// under the effective target (a device quantum plus one frame) and the smooth shed (drop
+    /// exactly one frame) — and both were written when `frameMS` was the only frame this protocol
+    /// had. The lossless plane negotiates shorter ones: 4 ms at 48 kHz/24-bit, 2 ms at
+    /// 96 kHz/24-bit under the default MTU. Left unset, a 96 kHz session would shed two and a half
+    /// frames at a time and fade across an entire frame.
+    ///
+    /// A SETTER rather than an initialiser parameter, exactly as core has it: the default keeps
+    /// every Opus session — and every test in `AudioRingDriftTests`, which pins the pre-hi-res
+    /// numbers — bit-identical, and a caller that never learned the figure cannot accidentally pass
+    /// a wrong one. Idempotent, so the engine-rebuild path that reuses a live ring can simply call
+    /// it again.
+    ///
+    /// Clamped to ≥ 1 µs so a degenerate value can never make `frameSamples` zero and turn the
+    /// shed into an infinite no-op.
+    func setFrameUs(_ us: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        frameUs = max(us, 1)
+    }
+
+    /// One frame in interleaved samples. Computed in µs so a sub-millisecond frame does not
+    /// truncate: 2 500 µs at 48 kHz stereo is 240 samples, not the 192 that routing it through
+    /// integer milliseconds first would give. Mirrors `JitterPolicy::frame_samples`; caller holds
+    /// the lock.
+    private var frameSamples: Int { max(perMS * frameUs / 1_000, 1) }
+
+    /// The seam crossfade, capped at HALF a frame. `crossfadeMS`'s flat 2 ms is a comfortable slice
+    /// of a 5 ms Opus frame and the whole of a 2 ms lossless one — and a fade as long as the
+    /// material it is fading is not a crossfade, it is a wholesale replacement of the seam with a
+    /// ramp. Mirrors `JitterPolicy::crossfade_samples`; caller holds the lock.
+    private var crossfadeSamples: Int { min(Self.crossfadeMS * perMS, frameSamples / 2) }
+
+    /// The two frame-denominated quantities, taken under the lock — for `AudioRingDriftTests`,
+    /// which pins them the same way core's `the_shed_follows_the_negotiated_frame_length` pins its
+    /// side. Locked, unlike the computed properties it wraps: those are only ever read from paths
+    /// that already hold it.
+    var frameGeometry: (frame: Int, crossfade: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (frameSamples, crossfadeSamples)
     }
 
     /// Effective target depth in interleaved samples: the (adaptively grown) live target, lifted
@@ -199,7 +271,7 @@ final class AudioRing: @unchecked Sendable {
     /// oversized read would otherwise inflate the debt threshold forever and turn the very next
     /// late packet into a full re-prime.
     private func target(lift quantum: Int) -> Int {
-        let floor = max(targetLive, quantum + Self.frameMS * perMS)
+        let floor = max(targetLive, quantum + frameSamples)
         guard let want = syncTarget else { return floor }
         let cap = max(Self.hardCapMS * perMS, floor)
         return min(max(want, floor), cap)
@@ -344,7 +416,17 @@ final class AudioRing: @unchecked Sendable {
         }
         // Near-miss: served in full, but with less than one frame left over — the next callback
         // starves unless a packet lands within one frame time.
-        nearMiss = n == count && writeIdx - readIdx < Self.nearMissMarginMS * perMS
+        //
+        // ⚠ A DELIBERATE divergence from core, which still measures this against the constant
+        // `NEAR_MISS_MARGIN_MS` (itself defined as `FRAME_MS`) rather than the resolved frame. Both
+        // express the same intent — "less than one packet in hand" — and they are identical on
+        // every Opus session; they part company only on the lossless plane, where a margin frozen
+        // at 5 ms against a 2 ms frame no longer means "one packet" but "two and a half", and grows
+        // the target on a ring that was never actually close to starving. The whole point of the
+        // near-miss is that it is the same evidence as an underrun heard by nobody, so it has to
+        // track the thing that would cause one. Core should follow; until it does, this is the
+        // one place the two policies differ, and it differs only above 48 kHz Opus.
+        nearMiss = n == count && writeIdx - readIdx < frameSamples
         noteRead(ranShort: n < count, count: count)
     }
 
@@ -451,8 +533,10 @@ final class AudioRing: @unchecked Sendable {
         }
     }
 
-    /// Drop one protocol frame from the front — the smooth drift correction.
-    private func shedOneFrame() { dropFront(Self.frameMS * perMS) }
+    /// Drop one audio frame from the front — the smooth drift correction. The session's REAL frame
+    /// (`setFrameUs`), so a lossless session sheds its own 2–4 ms rather than two and a half of
+    /// them.
+    private func shedOneFrame() { dropFront(frameSamples) }
 
     /// Drop `drop` interleaved samples from the front, linearly crossfading the seam so the
     /// correction is inaudible rather than a click. Mirrors `punktfunk_core::audio::crossfade_drop`;
@@ -463,10 +547,13 @@ final class AudioRing: @unchecked Sendable {
     /// ARRIVALS, not the samples either side of the seam, which are ordinary continuous audio. It
     /// is also the drop that actually fires here: a bunching Wi-Fi link trims far more often than
     /// drift sheds, so the one path left unfaded was the audible one.
+    ///
+    /// The fade is `crossfadeSamples` — capped at half a frame — then clamped again to what this
+    /// particular drop can actually spare on either side of the seam.
     private func dropFront(_ drop: Int) {
         let available = writeIdx - readIdx
         guard drop > 0, available > drop else { return }
-        let fade = min(Self.crossfadeMS * perMS, min(drop, available - drop))
+        let fade = min(crossfadeSamples, min(drop, available - drop))
         let capacity = buf.count
         if fade > 0 {
             // The tail of what we discard fades out into the head of what survives.
@@ -564,10 +651,14 @@ struct AvSync {
     /// would empty or overfill it outright. Beyond this the loop reports and waits rather than acts.
     private static let saneLimitMS = 1_000
     /// The protocol's frame, in ms — the EWMA is weighted by it so the time constant means the
-    /// same thing however often the caller observes.
-    private static let frameMS = 5
+    /// same thing however often the caller observes. Shares `AudioRing.frameMS`'s caveat: on the
+    /// lossless plane the real frame is shorter, so observations arrive more often than this
+    /// weight assumes and the average settles proportionally faster. It is a time constant on a
+    /// loop with a 100-observation settling gate, so faster is harmless; see that constant.
+    private static let frameMS = AudioRing.frameMS
 
-    /// Interleaved samples per millisecond at the negotiated layout (48 × channels).
+    /// Interleaved samples per millisecond at the negotiated format (`rateHz / 1000 × channels` —
+    /// 48 × channels at the default rate, 96 × channels on a 96 kHz hi-res session).
     private let perMS: Int
     /// EWMA of the measured offset in ns. Positive = audio is scheduled to play LATE relative to
     /// the picture it belongs with.
@@ -576,9 +667,13 @@ struct AvSync {
     /// Set once an observation lands outside `saneLimitMS`, for reporting.
     private(set) var implausible = false
 
-    /// `channels` is the negotiated interleaved channel count (2/6/8).
-    init(channels: Int) {
-        perMS = 48 * max(channels, 1)
+    /// `channels` is the negotiated interleaved channel count (2/6/8), `rateHz` the negotiated
+    /// sample rate. The SAME integer samples-per-millisecond rule as `AudioRing.init` applies, and
+    /// for the same reason: this type's proposal is denominated in the ring's own units, so the two
+    /// have to agree about what a millisecond is or the depth it asks for means something
+    /// different from the depth the ring reads back.
+    init(channels: Int, rateHz: Int) {
+        perMS = (rateHz / 1000) * max(channels, 1)
     }
 
     /// One measurement handed to `observe`. Every field is in the units its source already

@@ -82,6 +82,7 @@ struct GamepadSettingsView: View {
     @AppStorage(DefaultsKey.guideGesture) private var guideGesture = "auto"
     @AppStorage(DefaultsKey.bitrateKbps) private var bitrateKbps = 0
     @AppStorage(DefaultsKey.audioChannels) private var audioChannels = 2
+    @AppStorage(DefaultsKey.audioFormat) private var audioFormat = AudioFormatChoice.opus.rawValue
     @AppStorage(DefaultsKey.hdrEnabled) private var hdrEnabled = true
     @AppStorage(DefaultsKey.enable444) private var enable444 = false
     @AppStorage(DefaultsKey.codec) private var codec = "auto"
@@ -855,6 +856,19 @@ struct GamepadSettingsView: View {
                 detail: "The speaker layout requested from the host.",
                 options: SettingsOptions.audioChannels, current: audioChannels
             ) { audioChannels = $0 },
+            // Follows the row above rather than hiding, the same relationship the four pad rows
+            // draw with the forwarding switch: the lossless plane is stereo-only at the default
+            // MTU, so on 5.1/7.1 there is nothing here to choose.
+            choiceRow(
+                id: "audioFormat", tab: .audio, icon: "waveform.badge.magnifyingglass",
+                label: "Audio quality",
+                detail: "Lossless sends bit-exact PCM instead of compressed audio — 2.3 Mbps at "
+                    + "48 kHz, 4.6 at 96 — on top of the video. It must be enabled on the host "
+                    + "too, and this device's output has to accept the rate; otherwise the "
+                    + "session falls back to Standard.",
+                options: SettingsOptions.audioFormats, current: audioFormat,
+                enabled: audioChannels == 2
+            ) { audioFormat = $0 },
             toggleRow(
                 id: "mic", tab: .audio, icon: "mic", label: "Microphone",
                 detail: "Send this device's microphone to the host's virtual mic.",

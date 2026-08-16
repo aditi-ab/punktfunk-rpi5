@@ -25,6 +25,19 @@ enum SettingsOptions {
         ("7.1 Surround", 8),
     ]
 
+    /// Audio format (`DefaultsKey.audioFormat`) — the `tag` is an `AudioFormatChoice` raw value.
+    /// Standard is the default; the two lossless rows are a per-session opt-in that spends real
+    /// bandwidth outside the ABR loop, and the host has its own switch which is also off by
+    /// default. Offered only for STEREO — the lossless plane is stereo-only at the default MTU
+    /// (a 2.5 ms 5.1 frame is ~3 000 B and does not fit one datagram), so the surround rows and
+    /// these are mutually exclusive by construction; the surface hides this picker rather than
+    /// offering a request the host would decline.
+    static let audioFormats: [(label: String, tag: String)] = [
+        ("Standard (Opus)", AudioFormatChoice.opus.rawValue),
+        ("Lossless 48 kHz / 24-bit", AudioFormatChoice.lossless48.rawValue),
+        ("Lossless 96 kHz / 24-bit", AudioFormatChoice.lossless96.rawValue),
+    ]
+
     /// Virtual-pad types — the `tag` is the wire value (`PunktfunkConnection.GamepadType` raw).
     static let padTypes: [(label: String, tag: Int)] = [
         ("Automatic", 0),

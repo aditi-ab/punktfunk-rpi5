@@ -68,6 +68,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.micEnabled) var micEnabled = true
     @AppStorage(DefaultsKey.echoCancel) var echoCancel = true
     @AppStorage(DefaultsKey.audioChannels) var audioChannels = 2
+    @AppStorage(DefaultsKey.audioFormat) var audioFormat = AudioFormatChoice.opus.rawValue
     @AppStorage(DefaultsKey.codec) var codec = "auto"
     // The overlay tier's raw string (the pickers tag by rawValue); the absent-key default runs
     // the legacy-hudEnabled migration (same pattern as ContentView/StreamCommands).
@@ -475,6 +476,17 @@ struct SettingsView: View {
                     title: "Audio channels",
                     options: SettingsOptions.audioChannels,
                     selection: $audioChannels)
+                // Stereo only (the lossless plane is — see SettingsOptions.audioFormats).
+                if audioChannels == 2 {
+                    TVSelectionRow(
+                        title: "Audio quality",
+                        options: SettingsOptions.audioFormats,
+                        selection: $audioFormat)
+                    tvCaption("Lossless sends bit-exact PCM instead of compressed audio, at 2.3 "
+                        + "(48 kHz) or 4.6 (96 kHz) Mbps on top of the video. It also has to be "
+                        + "enabled on the host, and the Apple TV's output has to accept the "
+                        + "rate — otherwise the session falls back to Standard.")
+                }
                 TVSelectionRow(
                     title: "Auto-wake on connect",
                     options: [("On", "on"), ("Off", "off")], selection: autoWakeEnabledTag)

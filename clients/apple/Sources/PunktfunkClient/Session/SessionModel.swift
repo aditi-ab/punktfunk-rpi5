@@ -179,6 +179,14 @@ final class SessionModel: ObservableObject {
     @Published var audioBufferMs = 0
     @Published var audioAvOffsetMs = 0
     @Published var audioValid = false
+    /// The audio format the host RESOLVED, for the HUD — `nil` on an ordinary Opus session, where
+    /// there is nothing to say and a line saying "48 kHz" would be noise.
+    ///
+    /// The resolved format, emphatically not the requested one. A UI that reads "96 kHz" because
+    /// the user picked 96 kHz, on a session the host declined, is the exact bug
+    /// design/hi-res-audio.md §4.3 names wearing a different hat — and it is the one place a user
+    /// would ever look to check that the bandwidth they are spending is buying anything.
+    @Published var audioFormatLabel: String?
 
     /// The floor-shaved values every HUD tier displays (raw − floor, never below 0). Identical
     /// to the raw values whenever no floor is measured.
@@ -358,6 +366,13 @@ final class SessionModel: ObservableObject {
             rawValue: UInt32(clamping: effective.compositor)) ?? .auto
         let bitrateKbps = UInt32(clamping: effective.bitrateKbps)
         let audioChannels = UInt8(clamping: effective.audioChannels)
+        // The audio format this session ASKS for. Stereo-gated: the lossless plane carries one
+        // frame per datagram and a surround frame does not fit at the default MTU, so a 5.1/7.1
+        // session asks for Opus whatever the (hidden) picker last held — better than sending a
+        // request the host will decline. `resolvedAudioRateHz`/`resolvedAudioBits` on the
+        // connection are what the host actually granted, and SessionAudio opens from THOSE.
+        let audioFormat = audioChannels == 2 ? effective.audioFormatChoice : .opus
+        let (audioRateHz, audioBits) = audioFormat.wire
         let hdrEnabled = effective.hdrEnabled
         let preferredCodec = PunktfunkConnection.codecByte(effective.codec)
         let pin = host.pinnedSHA256
@@ -452,6 +467,7 @@ final class SessionModel: ObservableObject {
                 pinSHA256: pin, identity: identity, compositor: compositor,
                 gamepad: gamepad, bitrateKbps: bitrateKbps, videoCaps: videoCaps,
                 audioChannels: audioChannels,
+                audioRateHz: audioRateHz, audioBits: audioBits,
                 videoCodecs: videoCodecs, preferredCodec: preferredCodec,
                 clientCaps: clientCaps, launchID: launchID,
                 // Delegated approval: the host holds this connect open until the operator approves
@@ -820,6 +836,7 @@ final class SessionModel: ObservableObject {
         // link may never come up (a non-deadline rung has none at all).
         PresentLinkInfo.shared.clear()
         audioValid = false
+        audioFormatLabel = nil
         lostFrames = 0
         lostPct = 0
         mouseCaptured = false
@@ -917,6 +934,12 @@ final class SessionModel: ObservableObject {
             // correctly declines to correct.
             videoLatency: endToEnd)
         self.audio = audio
+        // Only when the session is genuinely on the lossless plane — the HUD says nothing for an
+        // ordinary Opus one. Read from the connection's Welcome, so a request the host's gate
+        // declined shows the fallback it actually landed on rather than what was asked for.
+        audioFormatLabel = conn.isLosslessAudio
+            ? "lossless \(conn.resolvedAudioRateHz / 1000) kHz / \(conn.resolvedAudioBits)-bit"
+            : nil
         // Gamepads: forward every controller GamepadManager selected — each on its own wire pad
         // index (a pin forwards only one, Automatic forwards all) — and render the host's feedback
         // back to the pad it's addressed to (rumble always; lightbar/player-LEDs/adaptive-triggers
