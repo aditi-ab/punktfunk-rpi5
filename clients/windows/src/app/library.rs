@@ -334,10 +334,37 @@ fn poster_tile(
         .vertical_alignment(VerticalAlignment::Top)
         .margin(uniform(6.0))
         .into(),
-        // This entry's own actions, opposite the store badge. A button rather than a
-        // right-click context flyout because the reactor hangs `menu_flyout` off buttons
-        // only — and a menu you cannot see is one a mouse user never finds. Its click is
-        // handled by the button, so it never reaches the tile's launch backstop.
+    ]))
+    .corner_radius(8.0)
+    .border_brush(if game.launcher {
+        ThemeRef::Accent
+    } else {
+        ThemeRef::CardStroke
+    })
+    .border_thickness(uniform(1.0));
+
+    let tappable = border(
+        vstack((
+            framed,
+            text_block(&game.title)
+                .font_size(12.0)
+                .wrap()
+                .margin(edges(2.0, 6.0, 2.0, 0.0)),
+        ))
+        .spacing(0.0),
+    )
+    .background(hit_test_backstop())
+    .on_tapped(on_tap);
+
+    // This entry's own actions, opposite the store badge. A button rather than a right-click
+    // context flyout because the reactor hangs `menu_flyout` off buttons only — and a menu a
+    // mouse user cannot see is one they never find.
+    //
+    // A SIBLING of the tappable area, not a child of it: `host_tile` on the hosts page splits
+    // the two exactly this way, and that split is what keeps a click on the overflow from also
+    // launching the title underneath it.
+    grid(vec![
+        tappable.into(),
         button("")
             .icon(Symbol::More)
             .subtle()
@@ -351,29 +378,9 @@ fn poster_tile(
             })
             .horizontal_alignment(HorizontalAlignment::Right)
             .vertical_alignment(VerticalAlignment::Top)
-            .margin(uniform(2.0))
+            .margin(edges(0.0, 4.0, 4.0, 0.0))
             .into(),
-    ]))
-    .corner_radius(8.0)
-    .border_brush(if game.launcher {
-        ThemeRef::Accent
-    } else {
-        ThemeRef::CardStroke
-    })
-    .border_thickness(uniform(1.0));
-
-    border(
-        vstack((
-            framed,
-            text_block(&game.title)
-                .font_size(12.0)
-                .wrap()
-                .margin(edges(2.0, 6.0, 2.0, 0.0)),
-        ))
-        .spacing(0.0),
-    )
-    .background(hit_test_backstop())
-    .on_tapped(on_tap)
+    ])
     .into()
 }
 
