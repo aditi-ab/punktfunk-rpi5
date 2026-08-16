@@ -116,10 +116,9 @@ fn build(
         .valign(gtk::Align::Start)
         .build();
     // Click/keyboard activation fires `child-activated` on the FlowBox, not the child's own
-    // `activate` — bridge it so each poster's connect handler (below) runs on click.
-    flow.connect_child_activated(|_, child| {
-        child.activate();
-    });
+    // `activate` — bridge it so each poster's connect handler (below) runs on click. The
+    // bridge must be the guarded one: bare, it recurses until the stack overflows.
+    crate::ui_flow::bridge_child_activation(&flow);
     // The launcher shelf: same tile geometry as the games grid, its own FlowBox so the two
     // groups never interleave and each wraps on its own.
     let launcher_flow = gtk::FlowBox::builder()
@@ -132,9 +131,7 @@ fn build(
         .row_spacing(18)
         .valign(gtk::Align::Start)
         .build();
-    launcher_flow.connect_child_activated(|_, child| {
-        child.activate();
-    });
+    crate::ui_flow::bridge_child_activation(&launcher_flow);
     let launchers_heading = gtk::Label::new(Some("Launchers"));
     launchers_heading.add_css_class("pf-group-heading");
     launchers_heading.set_halign(gtk::Align::Start);

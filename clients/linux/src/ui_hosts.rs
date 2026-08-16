@@ -781,18 +781,11 @@ impl SimpleComponent for HostsPage {
 
         // A pointer click (and keyboard activate) emits `child-activated` on the
         // *FlowBox*, never the child's own `activate` signal — bridge it back to the
-        // child, where each card wires its connect handler. The re-entrancy flag breaks
-        // the child-activated ↔ activate ping-pong that otherwise recurses forever
-        // (a real stack overflow on every card click; see the ignored display test).
+        // child, where each card wires its connect handler. The guard inside the bridge
+        // breaks the child-activated ↔ activate ping-pong that otherwise recurses forever
+        // (a real stack overflow on every card click; see `ui_flow`'s display test).
         for flow in [saved.widget(), discovered.widget()] {
-            let activating = std::cell::Cell::new(false);
-            flow.connect_child_activated(move |_, child| {
-                if activating.replace(true) {
-                    return;
-                }
-                child.activate();
-                activating.set(false);
-            });
+            crate::ui_flow::bridge_child_activation(flow);
         }
 
         // Shown under the discovered heading while no (unsaved) advert is live yet.
@@ -1464,51 +1457,5 @@ impl HostsPage {
             });
         }
         dialog.present(Some(&self.widgets.stack));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use adw::prelude::*;
-    use std::cell::Cell;
-    use std::rc::Rc;
-
-    // Reproduces the exact FlowBox/FlowBoxChild wiring from `init()`: `child-activated`
-    // bridges to `child.activate()`, whose own default handler re-emits
-    // `child-activated` — that ping-pong recursed forever (stack overflow on every
-    // host-card click/Enter) until the re-entrancy guard was added.
-    #[test]
-    #[ignore = "needs a Wayland/X display"]
-    fn flow_box_activation_bridge_does_not_recurse() {
-        assert!(gtk::init().is_ok(), "no display");
-
-        let flow = gtk::FlowBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .activate_on_single_click(true)
-            .build();
-        let activating = Cell::new(false);
-        flow.connect_child_activated(move |_, child| {
-            if activating.replace(true) {
-                return;
-            }
-            child.activate();
-            activating.set(false);
-        });
-
-        let child = gtk::FlowBoxChild::new();
-        flow.insert(&child, -1);
-        let fired = Rc::new(Cell::new(0u32));
-        {
-            let fired = fired.clone();
-            child.connect_activate(move |_| fired.set(fired.get() + 1));
-        }
-
-        flow.emit_by_name::<()>("child-activated", &[&child]);
-
-        assert_eq!(
-            fired.get(),
-            1,
-            "the per-card handler should fire exactly once"
-        );
     }
 }
