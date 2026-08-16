@@ -36,6 +36,10 @@ pub(super) struct DataPump {
     /// The rate the host actually configured (echoed in Welcome).
     pub(super) resolved_bitrate_kbps: u32,
     pub(super) negotiated_codec: u8,
+    /// What this session's mode + codec could plausibly use (see
+    /// [`crate::abr::stream_ceiling_kbps`]) — the bound the probe-measured link ceiling is held
+    /// to. Computed where the negotiated geometry lives, so this module stays codec-agnostic.
+    pub(super) stream_cap_kbps: u32,
 }
 
 impl DataPump {
@@ -59,6 +63,7 @@ impl DataPump {
             bitrate_kbps,
             resolved_bitrate_kbps,
             negotiated_codec,
+            stream_cap_kbps,
         } = self;
         pin_thread_user_interactive(); // feeds the frame channel → the user-interactive video pump
         register_hot_tid(&pump_hot_tids); // this thread does UDP receive + FEC reassembly — hint it
@@ -100,6 +105,11 @@ impl DataPump {
         } else {
             0
         });
+        // Bound whatever the capacity probe measures by what this stream's shape could plausibly
+        // use. Without it the climb ceiling is pure link capacity, and a fat LAN authorizes rates
+        // no inter-coded stream benefits from — the field session walked to 657 Mbps for 1440p120
+        // and drove the client's decode latency from 0.8 ms to 10 ms getting there.
+        abr.set_stream_cap(stream_cap_kbps);
         // Startup link-capacity probe (Automatic sessions): the controller's ceiling is the
         // negotiated start rate — the conservative 20 Mbps default, historically a box Automatic
         // could NEVER climb out of. One speed-test burst shortly after the stream settles

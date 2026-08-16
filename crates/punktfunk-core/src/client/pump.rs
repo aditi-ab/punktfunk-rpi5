@@ -86,6 +86,17 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     let clock_rtt_ns = negotiated.clock_rtt_ns;
     let resolved_bitrate_kbps = negotiated.bitrate_kbps;
     let negotiated_codec = negotiated.codec;
+    // What this session's mode + codec could plausibly use — the bound the ABR holds its
+    // probe-measured link ceiling to. Computed here because this is where the Welcome-resolved
+    // geometry lives; the data pump stays codec-agnostic.
+    let stream_cap_kbps = crate::abr::stream_ceiling_kbps(
+        negotiated.mode.width,
+        negotiated.mode.height,
+        negotiated.mode.refresh_hz,
+        negotiated.codec,
+        negotiated.bit_depth,
+        negotiated.chroma_format,
+    );
     // Seed the live offset with the connect-time estimate BEFORE the embedder can observe the
     // client (ready_tx): clock_offset_now_ns() never reads a pre-handshake 0 on a skewed pair.
     clock_offset.store(negotiated.clock_offset_ns, Ordering::Relaxed);
@@ -252,6 +263,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         bitrate_kbps,
         resolved_bitrate_kbps,
         negotiated_codec,
+        stream_cap_kbps,
     };
     let _ = tokio::task::spawn_blocking(move || pump.run()).await;
 
