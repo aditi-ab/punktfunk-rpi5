@@ -1,8 +1,6 @@
 package io.unom.punktfunk
 
 import android.Manifest
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -96,12 +94,13 @@ fun ConnectScreen(
     // screen that can land in the defaults layer (design/client-settings-profiles.md §5.3).
     onSettingsChange: (Settings) -> Unit = {},
     // Console (gamepad) mode: render the host carousel instead of the touch grid, sharing all of this
-    // screen's connect/trust/discovery logic. [onOpenSettings]/[onOpenLibrary] are the X/Y actions the
-    // gamepad shell owns (the touch UI reaches Settings via the bottom bar and has no library button).
+    // screen's connect/trust/discovery logic. [onOpenSettings] is the console's X action (the touch
+    // UI reaches Settings via the bottom bar).
     gamepadUi: Boolean = false,
     onOpenSettings: () -> Unit = {},
     // (host, pinned profile id) — a pinned host+profile card opens ITS shelf, and the id is the
     // one-off every launch off that shelf runs with (design §5.2a). Null = the host's own tile.
+    // BOTH homes raise it: Y on a console tile, and "Browse library…" in a touch card's overflow.
     onOpenLibrary: (KnownHost, String?) -> Unit = { _, _ -> },
     navGate: Boolean = true, // false while the console home is cross-fading out
     // A `punktfunk://` URL to route (design/client-deep-links.md §3). This screen owns it because
@@ -635,15 +634,8 @@ fun ConnectScreen(
     // host's binding, exactly like a tap on it does.
     fun copyLink(kh: KnownHost, pin: StreamProfile?) {
         val url = DeepLinks.forHost(kh, profile = pin?.id).toUrl()
-        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-        val copied = clipboard != null && runCatching {
-            clipboard.setPrimaryClip(ClipData.newPlainText("Punktfunk link", url))
-        }.isSuccess
-        // Android 13 draws its own clipboard confirmation, and stacking a second one on top of it is
-        // the platform's own documented anti-pattern. Below it nothing visible happens at all unless
-        // we say so — a silent menu item reads as a broken one.
-        if (copied && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) return
-        val message = if (copied) "Link copied." else "Couldn't copy the link to the clipboard."
+        val copied = putLinkOnClipboard(context, url)
+        val message = linkCopyMessage(copied) ?: return
         // The console home renders neither the notice nor the status banner, so there it has to be a
         // toast; the touch grid has both, and a success dressed as an error banner is a small lie.
         when {
@@ -823,6 +815,8 @@ fun ConnectScreen(
             onSpeedTest = { kh -> startSpeedTest(HostCardEntry(kh, null)) },
             onCopyLink = { kh, pin -> copyLink(kh, pin) },
             onTogglePin = { kh, p -> togglePin(kh, p) },
+            libraryEnabled = settings.libraryEnabled,
+            onBrowseLibrary = { kh, pin -> onOpenLibrary(kh, pin?.id) },
             onRescan = { discovery.restart() },
             onAddHost = { showManualSheet = true },
         )

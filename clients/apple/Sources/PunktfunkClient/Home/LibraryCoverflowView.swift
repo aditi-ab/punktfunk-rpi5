@@ -29,6 +29,11 @@ struct LibraryCoverflowView: View {
     /// Button B (back) — dismisses the library screen. No touch equivalent needed here (the toolbar
     /// Close button already covers that); this is what makes gamepad-only exit possible.
     var onDismiss: (() -> Void)?
+    /// Button X — copy the centered title's `punktfunk://` link. The coverflow's answer to the
+    /// touch grid's context menu: a controller has no right-click, so the one per-game action
+    /// there is gets a face button and a legend entry rather than a menu holding a single row.
+    /// nil where the platform has no clipboard (tvOS), which also drops the hint.
+    var onCopyLink: ((GameEntry) -> Void)?
     /// Whether the carousel owns the controller — the in-place shell gates it (mid-transition,
     /// and under the connect takeover after A launches a title, where this coverflow used to
     /// keep polling underneath). Cover/sheet presentations keep the default.
@@ -44,6 +49,11 @@ struct LibraryCoverflowView: View {
     private let compact = false // no size classes on macOS
     #endif
     @State private var selection: String?
+    /// The copy hint's acknowledgement. There is no toast on this surface, so the legend entry
+    /// says it itself — the same answer `GamepadHostOptionsView` gives, in the place the user is
+    /// already looking. Transient here (the screen stays up, unlike that menu), and cleared the
+    /// moment the strip moves, since "Copied" was about the cover that WAS centred.
+    @State private var copied = false
     /// How many covers have settled (art loaded, or every candidate exhausted).
     @State private var artSettled = 0
     /// The backstop below has fired: play the entrance regardless of what the art is doing.
@@ -79,6 +89,14 @@ struct LibraryCoverflowView: View {
             try? await Task.sleep(for: .milliseconds(700))
             artWaitOver = true
         }
+        // "Copied" is an acknowledgement, not a state — it goes away on its own, and at once if
+        // the strip moves off the cover it was about.
+        .task(id: copied) {
+            guard copied else { return }
+            try? await Task.sleep(for: .milliseconds(1600))
+            withAnimation(.smooth(duration: 0.2)) { copied = false }
+        }
+        .onChange(of: selection) { _, _ in copied = false }
     }
 
     @ViewBuilder private func content(for size: CGSize) -> some View {
@@ -109,6 +127,7 @@ struct LibraryCoverflowView: View {
             itemWidth: coverWidth,
             spacing: 34,
             onActivate: { onLaunch?($0.id) },
+            onTertiary: onCopyLink.map { copy in { copyCentered(copy) } },
             onBack: { onDismiss?() },
             shoulderJump: 5,
             isActive: controllerActive,
@@ -158,6 +177,14 @@ struct LibraryCoverflowView: View {
                     .brightness(bright)
                     .opacity(fade)
             }
+    }
+
+    /// Hand the CENTERED title to the copy action. Read at press time, not when the legend or
+    /// the carousel was built (the same rule A's hint follows), and inert with nothing centred.
+    private func copyCentered(_ copy: (GameEntry) -> Void) {
+        guard let game = games.first(where: { $0.id == selection }) else { return }
+        copy(game)
+        withAnimation(.smooth(duration: 0.2)) { copied = true }
     }
 
     /// Does this library have both groups? Only then does the heading earn its row — a
@@ -216,6 +243,12 @@ struct LibraryCoverflowView: View {
                 // launcher's twin) — and does nothing with no title centred, which is exactly
                 // what A does.
                 action: { if let id = selection { onLaunch(id) } }))
+        }
+        if let onCopyLink {
+            hints.append(.init(
+                glyph: buttonGlyph(\.buttonX, fallback: "x.circle"),
+                text: copied ? "Copied" : "Copy link",
+                action: { copyCentered(onCopyLink) }))
         }
         hints.append(.init(
             glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Close",
