@@ -295,30 +295,82 @@ pub fn normalize_channels(requested: u8) -> u8 {
 ///
 /// Reorders and duplicates conceal nothing (the plane has no reorder buffer; playing a late
 /// packet where it lands is the existing behaviour), and a gap is capped at
-/// [`MAX_CONCEAL_PACKETS`] (50 ms at the protocol's 5 ms frames) — libopus PLC fades to silence
-/// after a few frames anyway, so past the cap the ring's underrun/re-prime path takes over as
-/// before.
-#[derive(Debug, Default)]
+/// [`MAX_CONCEAL_MS`] of audio — libopus PLC fades to silence after a few frames anyway, so past
+/// the cap the ring's underrun/re-prime path takes over as before.
+#[derive(Debug)]
 pub struct AudioGapTracker {
     /// Sequence of the newest packet seen (`None` until the first).
     last_seq: Option<u32>,
+    /// One frame, in microseconds — what turns [`MAX_CONCEAL_MS`] into the packet count this type
+    /// actually caps at. [`FRAME_MS`] unless [`set_frame_us`](Self::set_frame_us) says otherwise.
+    frame_us: u32,
 }
 
-/// Most packets a single gap will ask concealment for (50 ms at the protocol's 5 ms frames).
-/// Crate-internal: callers only ever see `missing_before`'s already-capped count (and cbindgen
-/// must not export it — it's not part of the C ABI). `pub(crate)` for the in-core PCM decoder
-/// (`abi.rs`), which sizes its no-realloc output buffer from it.
-pub(crate) const MAX_CONCEAL_PACKETS: u32 = 10;
+impl Default for AudioGapTracker {
+    fn default() -> Self {
+        AudioGapTracker {
+            last_seq: None,
+            frame_us: FRAME_MS * 1000,
+        }
+    }
+}
+
+/// Longest gap a single loss event will synthesize concealment for, in MILLISECONDS.
+///
+/// It used to be a flat count of ten packets, documented as "50 ms at the protocol's 5 ms frames"
+/// — which it was, right up until the lossless plane started negotiating shorter ones. On a 2 ms
+/// frame the same ten packets are **20 ms**, so the cap silently tightened by two and a half times
+/// on precisely the sessions whose packet rate went up. Same family as the drought fuse
+/// ([`DroughtConceal::new_at_frame_us`]) and the near-miss margin, and the same cure: state the
+/// bound in time and derive the count from the frame that was actually resolved.
+///
+/// Crate-internal: callers only ever see [`AudioGapTracker::missing_before`]'s already-capped
+/// count, and cbindgen must not export either of these — they are not part of the C ABI.
+pub(crate) const MAX_CONCEAL_MS: u32 = 50;
+
+/// [`MAX_CONCEAL_MS`] as a packet count at a given frame length: 10 at the Opus plane's 5 ms
+/// (bit-identical to the constant this replaced), 25 at a 2 ms lossless frame.
+///
+/// Floors, so the cap is never *more* than the milliseconds it promises, with a floor of one
+/// frame — a cap of zero would disable concealment outright on an absurd `frame_us`.
+///
+/// `pub(crate)` for the in-core PCM decoder (`abi.rs`), which sizes its no-realloc output buffer
+/// from this and must be told the SAME frame length, or the buffer and the cap disagree about how
+/// many frames can arrive at once.
+pub(crate) const fn max_conceal_packets(frame_us: u32) -> u32 {
+    let us = if frame_us == 0 {
+        FRAME_MS * 1000
+    } else {
+        frame_us
+    };
+    let n = MAX_CONCEAL_MS * 1000 / us;
+    if n == 0 {
+        1
+    } else {
+        n
+    }
+}
 
 impl AudioGapTracker {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Tell the tracker how long one audio frame actually is, in microseconds — the resolved
+    /// `audio_frame_us` on a lossless session, unset (and so [`FRAME_MS`]) on every Opus one.
+    ///
+    /// Defaulted rather than taken in the constructor for the same reason
+    /// [`JitterPolicy::set_frame_us`] is: every Opus session and every existing caller stays
+    /// bit-identical, and the value only becomes known after the `Welcome`.
+    pub fn set_frame_us(&mut self, frame_us: u32) {
+        self.frame_us = frame_us.max(1);
+    }
+
     /// Feed the next received packet's sequence; returns how many packets are missing immediately
     /// before it (`0` for in-order, the first packet, duplicates, and reorders), capped at
-    /// [`MAX_CONCEAL_PACKETS`]. Wrapping-safe: a sequence in the backward half of the u32 space is
-    /// a reorder, not a 2³¹-packet gap.
+    /// [`MAX_CONCEAL_MS`] of audio at the frame length this tracker was told about.
+    /// Wrapping-safe: a sequence in the backward half of the u32 space is a reorder, not a
+    /// 2³¹-packet gap.
     pub fn missing_before(&mut self, seq: u32) -> u32 {
         let Some(last) = self.last_seq else {
             self.last_seq = Some(seq);
@@ -329,7 +381,7 @@ impl AudioGapTracker {
             return 0; // duplicate, or a reorder older than the newest — nothing to conceal
         }
         self.last_seq = Some(seq);
-        (delta - 1).min(MAX_CONCEAL_PACKETS)
+        (delta - 1).min(max_conceal_packets(self.frame_us))
     }
 }
 
@@ -699,6 +751,61 @@ const _: () = assert!(MIN_DEPRIME_CALLBACKS >= 2);
 const SYNC_BACKOFF_MS: u32 = 60_000;
 const SYNC_BACKOFF_MAX_MS: u32 = 480_000;
 
+// ---- the ms ⇄ interleaved-sample conversion both the policy and the sync loop run on ---------
+//
+// **Multiply first, divide last.** This is the whole of `design/hi-res-audio.md` §4.1: the two
+// types below used to precompute `per_ms = rate_hz / 1000 * channels` and express every figure
+// they own as `ms * per_ms`. That division happens FIRST, so 44 100 Hz became 44 samples per
+// millisecond and every depth, target, shed threshold, hard cap, de-prime fuse and reported
+// `buffer_ms`/`target_ms` came out **2.3 % low** — quietly, permanently, and in exactly the
+// subsystem two previous programs spent their time making trustworthy. 48 000 and 96 000 were
+// exact only because they happen to divide.
+//
+// Keeping `rate_hz` and `channels` as the two numbers they are, and doing the divide last, is
+// exact for every rate. That is all the rework §4.1 deferred the 44.1 kHz family behind; it costs
+// one integer division per conversion and buys three more rates.
+
+/// Interleaved samples per second at a negotiated layout — the denominator both conversions
+/// share. `u64` because it is a factor in products that reach 10¹² below.
+const fn interleaved_per_sec(rate_hz: u32, channels: u8) -> u64 {
+    // `max(1)` on both: a degenerate layout must not divide by zero in a realtime callback. The
+    // constructors already clamp, so this is the belt to that pair of braces.
+    let hz = if rate_hz == 0 { 1 } else { rate_hz };
+    let ch = if channels == 0 { 1 } else { channels };
+    hz as u64 * ch as u64
+}
+
+/// `ms` milliseconds of audio, in interleaved samples.
+///
+/// u64 intermediates because the product is large where a `usize` may be 32 bits:
+/// [`SYNC_BACKOFF_MAX_MS`] (480 000 ms) at 176 400 Hz × 8 ch is 6.8 × 10¹¹ before the divide
+/// brings it back to 6.8 × 10⁸. Saturating rather than wrapping, because a wrapped window is a
+/// *tiny* one — a fuse that blows instantly instead of one that never blows.
+fn ms_to_samples(rate_hz: u32, channels: u8, ms: u32) -> usize {
+    let n = ms as u64 * interleaved_per_sec(rate_hz, channels) / 1000;
+    if n > u32::MAX as u64 {
+        u32::MAX as usize
+    } else {
+        n as usize
+    }
+}
+
+/// Interleaved samples back to whole milliseconds — the exact inverse of [`ms_to_samples`], and
+/// the reason `depth_ms(target)` round-trips to `target_ms()` at every rate on the ladder. §4.1
+/// names that round trip as the tell that this rework is incomplete, so it is also the shape of
+/// the test that guards it.
+///
+/// u128 because `samples` arrives from a caller through [`JitterPolicy::depth_ms`] and nothing
+/// bounds it: `usize::MAX * 1000` overflows a u64 on a 64-bit target.
+fn samples_to_ms(rate_hz: u32, channels: u8, samples: usize) -> u32 {
+    let ms = samples as u128 * 1000 / interleaved_per_sec(rate_hz, channels) as u128;
+    if ms > u32::MAX as u128 {
+        u32::MAX
+    } else {
+        ms as u32
+    }
+}
+
 /// The playback de-jitter state machine shared by every client's audio ring.
 ///
 /// **The defect it exists to fix.** Every client's ring primed *up* to a target and clamped at a
@@ -716,9 +823,11 @@ const SYNC_BACKOFF_MAX_MS: u32 = 480_000;
 #[derive(Clone, Debug)]
 pub struct JitterPolicy {
     tuning: JitterTuning,
-    /// Interleaved samples per millisecond at the negotiated layout (`rate_hz / 1000 × channels`
-    /// — 48 × channels at the default rate, 96 × channels for a 96 kHz hi-res session).
-    per_ms: usize,
+    /// The negotiated sample rate and interleaved channel count, kept as the two numbers they are
+    /// rather than pre-divided into samples-per-millisecond — see the conversion helpers above for
+    /// why that division was the defect. Both are clamped to ≥ 1 by the constructor.
+    rate_hz: u32,
+    channels: u8,
     /// One protocol audio frame, in microseconds. [`FRAME_MS`] for the Opus plane; the lossless
     /// plane negotiates shorter frames ([`pcm::frame_us_for`]). Set via
     /// [`set_frame_us`](Self::set_frame_us); the default keeps every Opus session bit-identical.
@@ -778,31 +887,32 @@ impl JitterPolicy {
 
     /// As [`new`](Self::new), at an explicitly negotiated `rate_hz`.
     ///
-    /// **`rate_hz` must be a whole number of samples per millisecond**, and every figure this
-    /// type computes — target, EWMA depth, shed threshold, hard cap, the de-prime fuse, and the
-    /// `buffer_ms`/`target_ms` a client reports — is `ms * per_ms` with `per_ms` an *integer*.
-    /// 48 000 → 48 and 96 000 → 96 are exact; **44 100 → 44.1 truncates to 44**, a silent 2.3 %
-    /// error in all of them. That is why the hi-res ladder is 48/96 kHz only: 44.1/88.2/176.4
-    /// are deferred behind denominating this policy in a rational `per_ms`, not behind any
-    /// difficulty in carrying them on the wire (`design/hi-res-audio.md` §4.1).
+    /// **Every rate on the lossless ladder is exact here** — 44 100 / 48 000 / 88 200 / 96 000 /
+    /// 176 400 ([`pcm::rate_is_supported`]). It was not always: every figure this type computes —
+    /// target, EWMA depth, shed threshold, hard cap, the de-prime fuse, and the
+    /// `buffer_ms`/`target_ms` a client reports — used to be `ms × (rate_hz / 1000 × channels)`,
+    /// and that leading division truncated 44 100 Hz to 44 samples/ms and put all of them 2.3 %
+    /// low. The 44.1 kHz family was deferred behind fixing exactly that, and nothing else
+    /// (`design/hi-res-audio.md` §4.1). The conversions now multiply first and divide last, so
+    /// there is no rate this type cannot represent and no tripwire left to trip.
     ///
-    /// The debug assertion below is that deferral's tripwire — it fires the moment someone adds
-    /// a rate the arithmetic cannot represent, rather than letting the error hide in a buffer
-    /// figure that merely looks 2 % optimistic. The tell in a release build is
+    /// The tell that a future change has broken it again is still the one §4.1 named:
     /// [`depth_ms`](Self::depth_ms)`(target)` not round-tripping to [`target_ms`](Self::target_ms).
+    /// That is asserted for the whole ladder in
+    /// `the_shipping_rate_ladder_round_trips_ms_to_samples_exactly`.
+    ///
+    /// A `rate_hz` or `channels` of zero is clamped to 1 rather than rejected: this type is built
+    /// from wire-supplied values on a path that must not panic in a realtime callback, and it used
+    /// to divide by `per_ms` unguarded.
     pub fn new_at_rate(tuning: JitterTuning, channels: u8, rate_hz: u32) -> JitterPolicy {
-        debug_assert_eq!(
-            rate_hz % 1000,
-            0,
-            "JitterPolicy is denominated in integer samples per millisecond; {rate_hz} Hz \
-             truncates and would skew every depth/target figure (see design/hi-res-audio.md §4.1)"
-        );
-        let per_ms = (rate_hz / 1000) as usize * channels.max(1) as usize;
+        let rate_hz = rate_hz.max(1);
+        let channels = channels.max(1);
         JitterPolicy {
             tuning,
-            per_ms,
+            rate_hz,
+            channels,
             frame_us: FRAME_MS * 1000,
-            target: tuning.base_target_ms as usize * per_ms,
+            target: ms_to_samples(rate_hz, channels, tuning.base_target_ms),
             primed: false,
             empties: 0,
             empties_run: 0,
@@ -840,17 +950,36 @@ impl JitterPolicy {
         self.frame_us = frame_us.max(1);
     }
 
-    /// One frame in interleaved samples. Computed in µs so a sub-millisecond frame does not
+    /// `ms` of audio in interleaved samples at this session's layout — see [`ms_to_samples`].
+    fn ms_samples(&self, ms: u32) -> usize {
+        ms_to_samples(self.rate_hz, self.channels, ms)
+    }
+
+    /// The inverse, for the figures this type reports — see [`samples_to_ms`].
+    fn samples_ms(&self, samples: usize) -> u32 {
+        samples_to_ms(self.rate_hz, self.channels, samples)
+    }
+
+    /// One frame in interleaved samples.
+    ///
+    /// Taken from [`pcm::samples_per_frame`] rather than re-derived from `frame_us`, because that
+    /// function is the single source of truth for how many samples a frame carries and the host
+    /// fills its buffers from it. The two figures are only interchangeable when the rate divides
+    /// the frame: at 44 100 Hz a 5 ms frame is 220 samples per channel, not 220.5, and a policy
+    /// that computed 441 interleaved samples where the wire delivers 440 would put the near-miss
+    /// margin and the shed size — both of which mean *exactly one packet* — one sample away from
+    /// the packet they are describing. Computed in µs, so a sub-millisecond frame does not
     /// truncate: 2 500 µs at 48 kHz stereo is 240 samples, not 192.
     fn frame_samples(&self) -> usize {
-        (self.per_ms * self.frame_us as usize / 1000).max(1)
+        pcm::samples_per_frame(self.rate_hz, self.frame_us, self.channels).max(1)
     }
 
     /// The seam crossfade, capped at half a frame. [`SHED_CROSSFADE_MS`]'s flat 2 ms is a
     /// comfortable slice of a 5 ms Opus frame and the whole of a 2 ms lossless one, and a fade
     /// as long as the material it is fading is not a crossfade.
     fn crossfade_samples(&self) -> usize {
-        (SHED_CROSSFADE_MS as usize * self.per_ms).min(self.frame_samples() / 2)
+        self.ms_samples(SHED_CROSSFADE_MS)
+            .min(self.frame_samples() / 2)
     }
 
     /// Hand the ring the depth the A/V sync loop wants ([`AvSync::desired_depth`]), or `None` to
@@ -872,18 +1001,18 @@ impl JitterPolicy {
 
     /// The live target depth in ms (grows under underrun pressure; never below the base).
     pub fn target_ms(&self) -> u32 {
-        (self.target / self.per_ms) as u32
+        self.samples_ms(self.target)
     }
 
     /// Convert a ring depth in interleaved samples to milliseconds — for stats/HUD reporting.
     pub fn depth_ms(&self, depth: usize) -> u32 {
-        (depth / self.per_ms) as u32
+        self.samples_ms(depth)
     }
 
     /// Smoothed ring depth in ms — what drift correction actually reacts to, and the honest
     /// number to publish as "audio buffer" (the instantaneous depth swings by a whole quantum).
     pub fn avg_depth_ms(&self) -> u32 {
-        (self.depth_avg.max(0.0) as usize / self.per_ms) as u32
+        self.samples_ms(self.depth_avg.max(0.0) as usize)
     }
 
     pub fn is_primed(&self) -> bool {
@@ -909,7 +1038,7 @@ impl JitterPolicy {
             // reasoning `step` already applies when it computes its own cap with `.max(target +
             // want)`.
             Some(s) => {
-                let cap = (self.tuning.hard_cap_ms as usize * self.per_ms).max(floor);
+                let cap = self.ms_samples(self.tuning.hard_cap_ms).max(floor);
                 s.clamp(floor, cap)
             }
             None => floor,
@@ -924,13 +1053,13 @@ impl JitterPolicy {
 
         // Track depth with a callback-rate-independent EWMA: weighting by `want` keeps the time
         // constant at EWMA_TAU_MS whether the device pulls 5 ms or 20 ms at a time.
-        let alpha = (want as f32 / (EWMA_TAU_MS as usize * self.per_ms) as f32).clamp(0.0, 1.0);
+        let alpha = (want as f32 / self.ms_samples(EWMA_TAU_MS) as f32).clamp(0.0, 1.0);
         self.depth_avg += (depth as f32 - self.depth_avg) * alpha;
 
         // The hard cap must always leave room to serve this callback, or a large-quantum device
         // would trim itself into a permanent underrun.
-        let cap = (target + self.tuning.headroom_ms as usize * self.per_ms)
-            .min(self.tuning.hard_cap_ms as usize * self.per_ms)
+        let cap = (target + self.ms_samples(self.tuning.headroom_ms))
+            .min(self.ms_samples(self.tuning.hard_cap_ms))
             .max(target + want);
 
         let mut out = JitterStep::default();
@@ -945,11 +1074,9 @@ impl JitterPolicy {
                 .crossfade_samples()
                 .min(depth.saturating_sub(out.drop_front));
             self.over_run = 0;
-        } else if self.depth_avg
-            > (target + self.tuning.shed_excess_ms() as usize * self.per_ms) as f32
-        {
+        } else if self.depth_avg > (target + self.ms_samples(self.tuning.shed_excess_ms())) as f32 {
             self.over_run += want;
-            if self.over_run >= SHED_SUSTAIN_MS as usize * self.per_ms {
+            if self.over_run >= self.ms_samples(SHED_SUSTAIN_MS) {
                 out.drop_front = self.frame_samples().min(depth);
                 out.crossfade = self
                     .crossfade_samples()
@@ -995,8 +1122,8 @@ impl JitterPolicy {
         // but the depth was never re-banked (see `DEPRIME_DEBT_MS`). Judged on the average, not
         // this instant: a single late packet empties the ring for a callback without making it
         // hollow, and must keep the consecutive-empties hysteresis.
-        self.hollow = self.primed
-            && (self.depth_avg as usize + DEPRIME_DEBT_MS as usize * self.per_ms) < target;
+        self.hollow =
+            self.primed && (self.depth_avg as usize + self.ms_samples(DEPRIME_DEBT_MS)) < target;
         out
     }
 
@@ -1013,7 +1140,7 @@ impl JitterPolicy {
         let want = self.last_want.max(1);
         let near_miss = std::mem::take(&mut self.near_miss);
         self.window_run += want;
-        if self.window_run >= GROW_WINDOW_MS as usize * self.per_ms {
+        if self.window_run >= self.ms_samples(GROW_WINDOW_MS) {
             self.window_run = 0;
             self.underruns = 0;
             self.near_miss_grown = false;
@@ -1032,7 +1159,7 @@ impl JitterPolicy {
                 // is no longer at, so growing past the proven target on top would overshoot.
                 self.probe_run = 0;
                 self.target = self.target.max(self.probe_prev_target);
-                self.sync_backoff_run = self.sync_backoff_ms as usize * self.per_ms;
+                self.sync_backoff_run = self.ms_samples(self.sync_backoff_ms);
                 self.sync_backoff_ms = (self.sync_backoff_ms * 2).min(SYNC_BACKOFF_MAX_MS);
                 restored = true;
             } else if self.probe_run == 0 {
@@ -1049,7 +1176,7 @@ impl JitterPolicy {
             // Both, because either alone is wrong at one end of the quantum range: time alone is a
             // hair trigger on a device whose single quantum already exceeds the window, and a
             // callback count alone is the platform-dependent fuse this replaced.
-            let starved = self.empties_run >= self.tuning.deprime_ms as usize * self.per_ms
+            let starved = self.empties_run >= self.ms_samples(self.tuning.deprime_ms)
                 && self.empties >= MIN_DEPRIME_CALLBACKS;
             if starved || self.hollow {
                 // The starvation hysteresis protects a FULL ring from one late packet. A hollow
@@ -1070,8 +1197,8 @@ impl JitterPolicy {
                 // depth) is what the fixed 40 ms Android floor was.
                 self.underruns = 0;
                 self.window_run = 0;
-                let grown = self.target + GROW_STEP_MS as usize * self.per_ms;
-                self.target = grown.min(self.tuning.max_target_ms as usize * self.per_ms);
+                let grown = self.target + self.ms_samples(GROW_STEP_MS);
+                self.target = grown.min(self.ms_samples(self.tuning.max_target_ms));
             }
         } else if near_miss {
             // Came within one frame of an underrun — the same evidence as one, heard by no one.
@@ -1085,8 +1212,8 @@ impl JitterPolicy {
             self.empties_run = 0;
             if !self.near_miss_grown && !restored {
                 self.near_miss_grown = true;
-                let grown = self.target + GROW_STEP_MS as usize * self.per_ms;
-                self.target = grown.min(self.tuning.max_target_ms as usize * self.per_ms);
+                let grown = self.target + self.ms_samples(GROW_STEP_MS);
+                self.target = grown.min(self.ms_samples(self.tuning.max_target_ms));
             }
         } else {
             self.empties = 0;
@@ -1106,18 +1233,18 @@ impl JitterPolicy {
             } else {
                 SHRINK_QUIET_MS
             };
-            if self.quiet_run >= quiet_needed as usize * self.per_ms {
+            if self.quiet_run >= self.ms_samples(quiet_needed) {
                 // Long quiet spell: give a grown target one step back, so a single bad minute
                 // doesn't cost latency for the rest of the session.
                 self.quiet_run = 0;
-                let base = self.tuning.base_target_ms as usize * self.per_ms;
+                let base = self.ms_samples(self.tuning.base_target_ms);
                 let prev = self.target;
                 self.target = self
                     .target
-                    .saturating_sub(GROW_STEP_MS as usize * self.per_ms)
+                    .saturating_sub(self.ms_samples(GROW_STEP_MS))
                     .max(base);
                 if self.target < prev {
-                    self.probe_run = SHRINK_PROBE_MS as usize * self.per_ms;
+                    self.probe_run = self.ms_samples(SHRINK_PROBE_MS);
                     self.probe_prev_target = prev;
                 }
             }
@@ -1368,8 +1495,11 @@ const AV_SANE_LIMIT_MS: u32 = 1_000;
 /// out of the listener's stream. See [`JitterPolicy::set_sync_target`].
 #[derive(Clone, Debug)]
 pub struct AvSync {
-    /// Interleaved samples per millisecond at the negotiated layout (`rate_hz / 1000 × channels`).
-    per_ms: usize,
+    /// The negotiated layout, in the same two numbers [`JitterPolicy`] keeps and for the same
+    /// reason — this type's proposal is denominated in the ring's own units, so the two have to
+    /// agree about what a millisecond is down to the sample.
+    rate_hz: u32,
+    channels: u8,
     /// EWMA of the measured offset in ns. Positive = audio is scheduled to play LATE relative to
     /// the picture it belongs with.
     offset_avg_ns: f32,
@@ -1403,23 +1533,23 @@ impl AvSync {
         Self::new_at_rate(channels, SAMPLE_RATE_HZ)
     }
 
-    /// As [`new`](Self::new), at an explicitly negotiated `rate_hz`. The same integer
-    /// samples-per-millisecond constraint as [`JitterPolicy::new_at_rate`] applies, and for the
-    /// same reason — this type's proposal is denominated in the ring's own units so the two
-    /// agree about what a millisecond is.
+    /// As [`new`](Self::new), at an explicitly negotiated `rate_hz` — every rate on the lossless
+    /// ladder, exactly, for the reason [`JitterPolicy::new_at_rate`] gives: the ms ⇄ sample
+    /// conversion multiplies before it divides, so the 44.1 kHz family is representable here too
+    /// and the depth this type proposes lands in the same units the ring measures itself in.
     pub fn new_at_rate(channels: u8, rate_hz: u32) -> AvSync {
-        debug_assert_eq!(
-            rate_hz % 1000,
-            0,
-            "AvSync is denominated in integer samples per millisecond; {rate_hz} Hz truncates \
-             (see design/hi-res-audio.md §4.1)"
-        );
         AvSync {
-            per_ms: (rate_hz / 1000) as usize * channels.max(1) as usize,
+            rate_hz: rate_hz.max(1),
+            channels: channels.max(1),
             offset_avg_ns: 0.0,
             observations: 0,
             implausible: false,
         }
+    }
+
+    /// Interleaved samples to whole milliseconds — see [`samples_to_ms`].
+    fn samples_ms(&self, samples: usize) -> u32 {
+        samples_to_ms(self.rate_hz, self.channels, samples)
     }
 
     /// Fold one measurement. Returns the smoothed offset in ns once there is enough evidence to
@@ -1434,7 +1564,11 @@ impl AvSync {
         // When this frame's samples will actually reach the speaker, expressed in the host's
         // capture clock — the same clock, and the same shape, as the video figure it is compared
         // against.
-        let buffered_ns = (o.buffered_ahead / self.per_ms.max(1)) as i128 * 1_000_000;
+        // Deliberately still rounded to whole MILLISECONDS rather than converted straight to ns:
+        // it keeps every 48/96 kHz session bit-identical to the shipped behaviour, and the
+        // ≤ 1 ms it discards is an order of magnitude inside [`AV_DEADBAND_MS`], which is the
+        // resolution this loop acts on at all. The conversion itself is now exact at every rate.
+        let buffered_ns = self.samples_ms(o.buffered_ahead) as i128 * 1_000_000;
         let play_at_host = o.now_local_ns + buffered_ns + o.clock_offset_ns as i128;
         let audio_e2e_ns = play_at_host - o.pts_ns as i128;
         let offset_ns = audio_e2e_ns - video_e2e_ns as i128;
@@ -1487,7 +1621,14 @@ impl AvSync {
         if offset_ms.abs() < AV_DEADBAND_MS as f32 {
             return None;
         }
-        let delta = (offset_ms * self.per_ms as f32) as i64;
+        // One millisecond of samples as a float, so a fractional offset scales smoothly. The
+        // division is done on the constant, not on the product: `x * 96000.0 / 1000.0` rounds
+        // twice and can land one ulp — and so one sample — away from the `x * 96.0` every shipped
+        // 48 kHz session computes today. This way it is exactly 96.0 / 192.0 there, and correctly
+        // 88.2 at 44 100 Hz stereo, where the old integer `per_ms` said 88 and steered every
+        // correction 0.23 % short.
+        let per_ms = interleaved_per_sec(self.rate_hz, self.channels) as f32 / 1000.0;
+        let delta = (offset_ms * per_ms) as i64;
         Some((current_depth as i64 - delta).max(0) as usize)
     }
 }
@@ -1554,8 +1695,41 @@ mod tests {
         assert_eq!(t.missing_before(103), 0, "late reorder conceals nothing");
         assert_eq!(t.missing_before(105), 0, "reorder didn't move the anchor");
         // A huge gap is capped; the stream continues from the new anchor.
-        assert_eq!(t.missing_before(105 + 1000), MAX_CONCEAL_PACKETS);
+        assert_eq!(t.missing_before(105 + 1000), 10);
         assert_eq!(t.missing_before(105 + 1001), 0);
+    }
+
+    /// The cap is 50 ms of audio, not ten packets — and it was ten packets, documented as "50 ms
+    /// at the protocol's 5 ms frames", which was true until the lossless plane negotiated 2 ms and
+    /// quietly made it 20 ms. The default must stay bit-identical (every Opus session and every
+    /// existing caller depends on it) and a short frame must buy the milliseconds it says.
+    #[test]
+    fn the_conceal_cap_is_fifty_milliseconds_of_the_negotiated_frame() {
+        // The Opus plane: ten 5 ms frames, exactly the flat count this replaced.
+        assert_eq!(max_conceal_packets(FRAME_MS * 1000), 10);
+        let mut t = AudioGapTracker::new();
+        t.missing_before(0);
+        assert_eq!(t.missing_before(9_999), 10);
+
+        // A 2 ms lossless frame: twenty-five frames for the same 50 ms, not ten.
+        assert_eq!(max_conceal_packets(2_000), 25);
+        let mut p = AudioGapTracker::new();
+        p.set_frame_us(2_000);
+        p.missing_before(0);
+        assert_eq!(p.missing_before(9_999), 25);
+
+        // Every rung of the ladder buys at most 50 ms and never zero frames.
+        for &us in &pcm::FRAME_US_LADDER {
+            let n = max_conceal_packets(us);
+            assert!(n >= 1, "{us} µs must conceal at least one frame");
+            assert!(
+                n as u64 * us as u64 <= MAX_CONCEAL_MS as u64 * 1000,
+                "{us} µs × {n} frames exceeds the {MAX_CONCEAL_MS} ms this cap promises"
+            );
+        }
+        // A degenerate frame length must not divide by zero or disable concealment.
+        assert_eq!(max_conceal_packets(0), 10, "0 µs falls back to the default");
+        assert_eq!(max_conceal_packets(u32::MAX), 1);
     }
 
     #[test]
@@ -2197,11 +2371,15 @@ mod tests {
                 );
                 // …and the sample counts behind those milliseconds really did double.
                 assert_eq!(
-                    hi.depth_ms(2 * lo.per_ms),
-                    lo.depth_ms(lo.per_ms),
+                    hi.depth_ms(2 * lo.ms_samples(1)),
+                    lo.depth_ms(lo.ms_samples(1)),
                     "a 96 kHz ring needs twice the samples for the same ms ({t:?}, {ch}ch)"
                 );
-                assert_eq!(hi.per_ms, 2 * lo.per_ms, "per_ms must scale with the rate");
+                assert_eq!(
+                    hi.ms_samples(1),
+                    2 * lo.ms_samples(1),
+                    "a millisecond must scale with the rate"
+                );
             }
         }
     }
@@ -2325,35 +2503,133 @@ mod tests {
     fn the_default_constructor_is_the_default_rate() {
         let a = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
         let b = JitterPolicy::new_at_rate(JitterTuning::PIPEWIRE, 2, SAMPLE_RATE_HZ);
-        assert_eq!(a.per_ms, b.per_ms);
+        assert_eq!(a.ms_samples(1), b.ms_samples(1));
         assert_eq!(a.target, b.target);
         assert_eq!(a.target_ms(), b.target_ms());
         let x = AvSync::new(2);
         let y = AvSync::new_at_rate(2, SAMPLE_RATE_HZ);
-        assert_eq!(x.per_ms, y.per_ms);
+        assert_eq!((x.rate_hz, x.channels), (y.rate_hz, y.channels));
     }
 
-    /// §4.1's tripwire, as an assertion rather than a comment: on the shipping ladder the
-    /// ms↔sample conversion round-trips exactly. This is the test that would fail first if
-    /// someone added 44 100 Hz without denominating the policy in a rational `per_ms` — at
-    /// 44.1 samples/ms `per_ms` truncates to 44 and every figure below drifts 2.3 % low.
+    /// §4.1's tripwire, as an assertion rather than a comment — and now the proof that the
+    /// deferral it guarded is lifted.
+    ///
+    /// §4.1 named exactly one tell for "the rework is incomplete": `depth_ms(target)` not
+    /// round-tripping to `target_ms()`. Under the old `per_ms = rate_hz / 1000 × channels` that
+    /// held at 48 000 and 96 000 by luck of divisibility and failed at 44 100, where 44.1
+    /// samples/ms truncated to 44 and put every depth, target, shed threshold, hard cap, de-prime
+    /// fuse and reported buffer figure 2.3 % low. Multiplying before dividing makes it hold for
+    /// the whole ladder, which is the entire claim.
     #[test]
     fn the_shipping_rate_ladder_round_trips_ms_to_samples_exactly() {
-        for rate in [48_000u32, 96_000] {
+        let presets = [
+            JitterTuning::PIPEWIRE,
+            JitterTuning::WASAPI,
+            JitterTuning::COREAUDIO,
+            JitterTuning::AAUDIO,
+        ];
+        for rate in [44_100u32, 48_000, 88_200, 96_000, 176_400] {
+            assert!(
+                pcm::rate_is_supported(rate),
+                "{rate} Hz must be on the ladder"
+            );
             for ch in [2u8, 6, 8] {
-                assert_eq!(
-                    rate as usize / 1000 * ch as usize,
-                    JitterPolicy::new_at_rate(JitterTuning::PIPEWIRE, ch, rate).per_ms,
-                    "{rate} Hz × {ch}ch must be a whole number of samples per ms"
-                );
-                let p = JitterPolicy::new_at_rate(JitterTuning::PIPEWIRE, ch, rate);
-                assert_eq!(
-                    p.depth_ms(p.target),
-                    p.target_ms(),
-                    "depth_ms(target) must round-trip to target_ms at {rate} Hz"
-                );
+                for t in presets {
+                    let p = JitterPolicy::new_at_rate(t, ch, rate);
+                    // §4.1's named tell.
+                    assert_eq!(
+                        p.depth_ms(p.target),
+                        p.target_ms(),
+                        "depth_ms(target) must round-trip to target_ms at {rate} Hz / {ch}ch"
+                    );
+                    assert_eq!(
+                        p.target_ms(),
+                        t.base_target_ms,
+                        "the base target must be exactly the preset's ms at {rate} Hz / {ch}ch"
+                    );
+                    // And so does every other ms the preset names — each is a threshold something
+                    // in `step`/`note_read` compares a sample count against. A rate that skewed
+                    // 2.3 % skewed all of them together, which is what kept the defect invisible.
+                    for ms in [
+                        t.base_target_ms,
+                        t.max_target_ms,
+                        t.headroom_ms,
+                        t.hard_cap_ms,
+                        t.deprime_ms,
+                        t.plc_max_ms(),
+                        GROW_STEP_MS,
+                        GROW_WINDOW_MS,
+                        SHRINK_QUIET_MS,
+                        SYNC_BACKOFF_MAX_MS,
+                        EWMA_TAU_MS,
+                    ] {
+                        assert_eq!(
+                            p.samples_ms(p.ms_samples(ms)),
+                            ms,
+                            "{ms} ms does not survive ms → samples → ms at {rate} Hz / {ch}ch"
+                        );
+                    }
+                    // The conversion itself, against the arithmetic done the honest way rather
+                    // than against itself: `ms × rate × ch` and only THEN the divide by 1000.
+                    for ms in [1u32, 12, 15, 47, 1000, SYNC_BACKOFF_MAX_MS] {
+                        let want = ms as u64 * rate as u64 * ch as u64 / 1000;
+                        assert_eq!(
+                            p.ms_samples(ms) as u64,
+                            want,
+                            "{ms} ms at {rate} Hz / {ch}ch"
+                        );
+                    }
+                }
             }
         }
+
+        // The worked example, spelled out, so the 2.3 % is a number rather than an adjective.
+        let p = JitterPolicy::new_at_rate(JitterTuning::PIPEWIRE, 2, 44_100);
+        assert_eq!(p.ms_samples(15), 1_323, "15 ms of 44.1 kHz stereo");
+        assert_eq!(15 * (44_100 / 1000) * 2, 1_320, "what it used to compute");
+
+        // ⚠ Exact is not the same as lossless-in-both-directions, and the difference is worth
+        // stating rather than discovering. A millisecond is 88.2 samples at 44 100 Hz stereo, so
+        // an ms figure that is not a multiple of 5 genuinely has no whole-sample answer:
+        // `shed_excess_ms()` of 12 ms lands on 1 058 samples, which reads back as 11 ms. That is a
+        // floor of at most ONE SAMPLE on a threshold inside a 25 ms band — as opposed to the 2.3 %
+        // the old arithmetic was wrong by on EVERY figure, in the same direction, permanently.
+        assert_eq!(JitterTuning::PIPEWIRE.shed_excess_ms(), 12);
+        assert_eq!(p.ms_samples(12), 1_058); // the true 1 058.4, floored
+        assert_eq!(p.samples_ms(1_058), 11);
+    }
+
+    /// The policy's idea of a frame must be the WIRE's idea of a frame, at a rate where the two
+    /// are no longer the same arithmetic.
+    ///
+    /// A frame carries a whole number of samples per channel, so 5 ms at 44 100 Hz stereo is 440
+    /// interleaved samples — not the 441 that `frame_us × samples-per-ms` produces. Both the
+    /// near-miss margin and the shed size mean *exactly one packet*, so a policy that computed its
+    /// own answer would be describing a packet that does not exist. Delegating to
+    /// `pcm::samples_per_frame` is what makes them agree by construction.
+    #[test]
+    fn the_policys_frame_is_the_wires_frame() {
+        for rate in [44_100u32, 48_000, 88_200, 96_000, 176_400] {
+            for &us in &pcm::FRAME_US_LADDER {
+                for ch in [2u8, 6] {
+                    let mut p = JitterPolicy::new_at_rate(JitterTuning::PIPEWIRE, ch, rate);
+                    p.set_frame_us(us);
+                    assert_eq!(
+                        p.frame_samples(),
+                        pcm::samples_per_frame(rate, us, ch),
+                        "{rate} Hz / {ch}ch at {us} µs"
+                    );
+                }
+            }
+        }
+        // The concrete disagreement this prevents: five milliseconds of 44.1 kHz stereo audio is
+        // 441 interleaved samples, and a five-millisecond FRAME of it carries 440 — because the
+        // frame has to be whole in each channel and 220.5 is not a sample count. Those are two
+        // different questions with two different answers, and only one of them is the packet.
+        let mut p = JitterPolicy::new_at_rate(JitterTuning::PIPEWIRE, 2, 44_100);
+        p.set_frame_us(5_000);
+        assert_eq!(p.frame_samples(), 440, "220 samples per channel, not 220.5");
+        assert_eq!(p.ms_samples(5), 441, "5 ms of audio, which is not a frame");
     }
 
     /// Clustered underruns raise the floor (that device needs the slack); a long quiet spell

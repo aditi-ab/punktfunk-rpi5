@@ -706,14 +706,20 @@ struct AudioFormat {
     /// [`crate::quic::AUDIO_CODEC_OPUS`] (`0xC9`) or [`crate::quic::AUDIO_CODEC_PCM`] (`0xD3`) —
     /// what SELECTS the decoder below, and the only field that can.
     codec: u8,
-    /// The resolved sample rate. 48 000 on every Opus session; 48 000 or 96 000 on the lossless
-    /// plane.
+    /// The resolved sample rate. 48 000 on every Opus session; any rate
+    /// [`crate::audio::pcm::rate_is_supported`] admits on the lossless plane.
     rate_hz: u32,
     /// The resolved sample depth (16 or 24) — the stride `0xD3` payloads are unpacked at.
     /// Meaningless on the Opus plane, which decodes to f32 regardless.
     bits: u8,
     /// The resolved channel count, already through [`crate::audio::normalize_channels`].
     channels: u8,
+    /// One frame in microseconds: the negotiated `audio_frame_us` on the lossless plane, the
+    /// `0xC9` plane's fixed 5 ms otherwise. Carried because the concealment CAP is a duration
+    /// (`crate::audio::MAX_CONCEAL_MS`) and only this turns it into the frame count `ensure_buffer`
+    /// has to leave room for — the two must be computed from the same number or the cap can outrun
+    /// the buffer.
+    frame_us: u32,
 }
 
 #[cfg(feature = "quic")]
@@ -733,6 +739,14 @@ impl AudioFormat {
             },
             bits: c.audio_bits,
             channels: crate::audio::normalize_channels(c.audio_channels),
+            // `audio_frame_us` is `0` on an Opus session and from any host older than the
+            // lossless plane, which is not a frame length — fold it to the `0xC9` plane's fixed
+            // 5 ms so the concealment cap below is computed against something real either way.
+            frame_us: if c.audio_frame_us == 0 {
+                crate::audio::FRAME_MS * 1000
+            } else {
+                c.audio_frame_us as u32
+            },
         }
     }
 
@@ -820,10 +834,22 @@ impl AudioPcmState {
         } else {
             fmt.rate_hz as usize / 1000 * 120
         };
-        // A gap can owe up to MAX_CONCEAL_PACKETS concealed frames of the same size in front of
-        // the real one, and they are handed out as one contiguous buffer.
-        self.pcm =
-            vec![0f32; (1 + crate::audio::MAX_CONCEAL_PACKETS as usize) * per_ch.max(1) * ch];
+        // A gap can owe a whole concealment run of frames in front of the real one, and they are
+        // handed out as one contiguous buffer.
+        //
+        // ⚠ The COUNT comes from the session's resolved frame (the cap is 50 ms of audio, so a
+        // 2 ms frame owes 25 of them, not 10) while the SIZE comes from the longest rung the
+        // ladder can offer. Deliberately mismatched, and only in the safe direction: sizing the
+        // frames from `fmt.frame_us` too would be tighter, but it would make a host that
+        // negotiated 2 ms and then sent 5 ms truncate audio instead of merely wasting memory, and
+        // this buffer can never be grown to recover from that.
+        let run = crate::audio::max_conceal_packets(fmt.frame_us) as usize;
+        self.pcm = vec![0f32; (1 + run) * per_ch.max(1) * ch];
+        // The tracker must cap at exactly the run this buffer was sized for. It is set HERE, under
+        // the same one-shot latch, because a cap that outran the buffer would be silently
+        // truncated frames — and a buffer sized for a run the tracker never asks for is dead
+        // memory nobody would notice.
+        self.gaps.set_frame_us(fmt.frame_us);
     }
 
     /// Copy `n` samples of `scratch_pcm` into `pcm` at `filled`, returning how many actually
@@ -2297,7 +2323,8 @@ pub unsafe extern "C" fn punktfunk_connect_ex10(
 }
 
 /// Like [`punktfunk_connect_ex10`], plus the audio format this client is **asking** for (ABI v24):
-/// `audio_rate_hz` (`48000` or `96000`) and `audio_bits` (`16` or `24`).
+/// `audio_rate_hz` — `48000`, `96000`, or the 44.1 kHz family `44100` / `88200` / `176400` — and
+/// `audio_bits` (`16` or `24`).
 ///
 /// Passing anything other than `48000`/`16` sets `CLIENT_CAP_AUDIO_HIRES` in the `Hello` and asks
 /// the host for the LOSSLESS `0xD3` plane — bit-exact PCM instead of Opus. That is an opt-in on
@@ -2315,8 +2342,15 @@ pub unsafe extern "C" fn punktfunk_connect_ex10(
 /// `design/hi-res-audio.md` §4.3's failure repeated at the client end.
 ///
 /// Passing `48000`/`16` is exactly [`punktfunk_connect_ex10`], byte-for-byte on the wire.
-/// 44.1 kHz and its multiples are not offered at all: they are a whole number of samples per
-/// millisecond in no arithmetic core uses, so the ladder is 48/96 kHz only (§4.1).
+///
+/// The 44.1 kHz family is on the ladder, and was not always: core's de-jitter policy divided the
+/// rate by 1 000 before it multiplied, which made 44 100 Hz "44 samples per millisecond" and every
+/// buffer figure 2.3 % low, so §4.1 deferred those rates behind fixing that arithmetic. It is
+/// fixed. Note what it does NOT buy: at 44 100 Hz **no** rung of the frame ladder is a whole
+/// number of samples, so [`punktfunk_connection_audio_frame_us`] becomes a nominal length rather
+/// than a duration. An embedder that advances any clock by it runs 0.23 % fast forever; the honest
+/// figure is the samples it actually rendered, divided by
+/// [`punktfunk_connection_audio_sample_rate`].
 ///
 /// A NEW symbol, not a widened one — `ex10` keeps its parameter list AND its behaviour.
 ///
@@ -2995,6 +3029,14 @@ pub unsafe extern "C" fn punktfunk_connection_audio_bits(
 ///
 /// Microseconds rather than milliseconds because the ladder has sub-millisecond rungs; `0` means
 /// the host did not state one, in which case `PUNKTFUNK_AUDIO_FRAME_MS × 1000` is correct.
+///
+/// ⚠⚠ **A NOMINAL length, not a duration, and on the 44.1 kHz family they differ.** A frame
+/// carries a whole number of samples per channel, and 44 100 Hz divides no rung of the ladder: a
+/// 5 ms frame there is 220 samples per channel, which is 4 988 662 ns. Sizing a ring from this is
+/// right (that is what it is for); advancing a **clock** by it is not — it invents 2.3 ms of time
+/// per second, indefinitely, and every stat downstream will agree with the lie because the
+/// timestamps stay self-consistent. Derive elapsed time from the samples rendered and
+/// [`punktfunk_connection_audio_sample_rate`] instead.
 ///
 /// **Not derivable from `next_audio_pcm`'s `frame_count`.** That call prepends concealed frames
 /// into the same buffer, so its count is "how many samples you got", not "how long one frame is".
@@ -5875,6 +5917,7 @@ mod tests {
         rate_hz: crate::audio::SAMPLE_RATE_HZ,
         bits: crate::audio::pcm::BITS_16,
         channels: 2,
+        frame_us: crate::audio::FRAME_MS * 1000,
     };
 
     /// A lossless session at the depth the feature exists for.
@@ -5883,7 +5926,12 @@ mod tests {
         rate_hz: crate::audio::SAMPLE_RATE_HZ,
         bits: crate::audio::pcm::BITS_24,
         channels: 2,
+        frame_us: crate::audio::pcm::FRAME_US_LADDER[0],
     };
+
+    /// The concealment run a 5 ms session owes: ten frames — exactly the flat count the cap used
+    /// to be, which is what keeps every geometry assertion below the pre-hi-res one.
+    const CONCEAL_RUN: u32 = crate::audio::max_conceal_packets(crate::audio::FRAME_MS * 1000);
 
     /// One `0xD3` payload of `n` interleaved stereo samples at `bits`, built from a deterministic
     /// ramp across the full code range so any stride or sign-extension error is visible.
@@ -6062,10 +6110,7 @@ mod tests {
         assert_eq!(state.decode_packet(&out, 0, OPUS_48K), Ok(240 * 2));
         assert!(state.decoder.is_some(), "still a libopus decoder");
         // Byte-for-byte the pre-hi-res geometry: 120 ms of Opus plus a full concealment run.
-        assert_eq!(
-            state.pcm.len(),
-            (1 + crate::audio::MAX_CONCEAL_PACKETS as usize) * 5760 * 2
-        );
+        assert_eq!(state.pcm.len(), (1 + CONCEAL_RUN as usize) * 5760 * 2);
         // Gaps and droughts still go through libopus PLC, and PcmConceal is never fed.
         assert_eq!(state.decode_packet(&out, 2, OPUS_48K), Ok(2 * 240 * 2));
         assert_eq!(state.conceal(OPUS_48K), Ok(240 * 2));
@@ -6094,16 +6139,54 @@ mod tests {
         assert_eq!(&state.pcm[..expect.len()], &expect[..]);
         assert_eq!(
             state.pcm.len(),
-            (1 + crate::audio::MAX_CONCEAL_PACKETS as usize) * 480 * 2,
+            (1 + CONCEAL_RUN as usize) * 480 * 2,
             "sized from 96 kHz, not from the 48 kHz default"
         );
         // A full concealment run fits, which is the point of sizing it that way.
         let n = state
-            .decode_packet(&wire, 1 + crate::audio::MAX_CONCEAL_PACKETS, hi)
+            .decode_packet(&wire, 1 + CONCEAL_RUN, hi)
             .expect("decodes");
-        assert_eq!(
-            n,
-            (1 + crate::audio::MAX_CONCEAL_PACKETS as usize) * expect.len()
+        assert_eq!(n, (1 + CONCEAL_RUN as usize) * expect.len());
+    }
+
+    /// The concealment run is 50 ms of audio, so a SHORT frame owes more frames — 25 at 2 ms, not
+    /// 10 — and this buffer has to have been sized for the run the tracker will actually ask for.
+    ///
+    /// ⚠ This is the invariant with teeth: [`punktfunk_connection_next_audio_pcm`] hands the
+    /// embedder a raw pointer INTO `pcm` and it reads from there until its next call, so the `Vec`
+    /// must never grow. A cap that outran the buffer would not crash — `stage_scratch` clamps —
+    /// it would silently truncate a concealment run, which is exactly the kind of quiet
+    /// almost-right this plane is being built against. Driven at 44 100 Hz because that is the
+    /// rate where a frame is no longer `rate × µs`: the frames are 88 samples per channel.
+    #[test]
+    fn a_short_frame_owes_more_concealment_and_the_buffer_was_sized_for_it() {
+        let short = AudioFormat {
+            rate_hz: 44_100,
+            frame_us: 2_000,
+            ..PCM_48K_24
+        };
+        let run = crate::audio::max_conceal_packets(short.frame_us);
+        assert_eq!(run, 25, "50 ms of 2 ms frames");
+
+        // 2 ms at 44 100 Hz stereo: 88 samples per channel, NOT 88.2.
+        let frame = crate::audio::pcm::samples_per_frame(44_100, 2_000, 2);
+        assert_eq!(frame, 176);
+        let (expect, wire) = pcm_frame(frame, short.bits);
+
+        let mut state = AudioPcmState::default();
+        assert_eq!(state.decode_packet(&wire, 0, short), Ok(expect.len()));
+        // Sized for the run at THIS frame, from the longest rung's frame size (5 ms = 220/ch).
+        assert_eq!(state.pcm.len(), (1 + run as usize) * 220 * 2);
+        let base = state.pcm.as_ptr();
+
+        // A maximal gap: 25 concealed frames plus the real one, contiguous, and the buffer did
+        // not move under the embedder's pointer.
+        let n = state.decode_packet(&wire, 1 + run, short).expect("decodes");
+        assert_eq!(n, (1 + run as usize) * expect.len());
+        assert!(n <= state.pcm.len(), "the run must fit what was allocated");
+        assert!(
+            std::ptr::eq(base, state.pcm.as_ptr()),
+            "pcm was reallocated"
         );
     }
 
@@ -6164,10 +6247,10 @@ mod tests {
             state.decode_packet(&packet(0.07), 7, OPUS_48K),
             Ok(FRAME * 2)
         );
-        // A huge gap is capped at MAX_CONCEAL_PACKETS of concealment.
+        // A huge gap is capped at 50 ms of concealment — ten frames at this session's 5 ms.
         assert_eq!(
             state.decode_packet(&packet(0.07), 1000, OPUS_48K),
-            Ok((crate::audio::MAX_CONCEAL_PACKETS as usize + 1) * FRAME * 2)
+            Ok((CONCEAL_RUN as usize + 1) * FRAME * 2)
         );
     }
 

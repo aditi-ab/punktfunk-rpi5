@@ -150,7 +150,11 @@
 // observation. Additive and client-local: nothing new is sent or parsed, so [`WIRE_VERSION`] is
 // unchanged.
 // v24: the lossless audio plane's client surface (`design/hi-res-audio.md` §7) —
-// `punktfunk_connect_ex11` asks for a sample rate and depth (48/96 kHz, 16/24-bit; anything but
+// `punktfunk_connect_ex11` asks for a sample rate and depth (whatever
+// `audio::pcm::rate_is_supported` admits — 48/96 kHz plus the 44.1 kHz family — and 16/24-bit;
+// the accepted rates grew after v24 shipped, which is not an ABI change: no symbol, signature or
+// struct moved, an older header stays correct, and a host that cannot carry a rate declines it to
+// Opus exactly as it always has. Anything but
 // the legacy pair also sets `CLIENT_CAP_AUDIO_HIRES`), and `punktfunk_connection_audio_sample_rate`
 // / `punktfunk_connection_audio_bits` report what the host actually RESOLVED — which may be
 // lower, because the host runs a five-condition gate and every decline lands back on Opus at
@@ -2496,10 +2500,10 @@ typedef struct {
 
 // Frame durations the plane may negotiate, longest first.
 //
-// Every rung divides both 48 000 and 96 000 into a whole number of samples, so the host pacer
-// and the client ring never carry a fractional frame:
+// Every rung divides the **48 kHz family** into a whole number of samples per channel, so on
+// those rates the host pacer and the client ring carry an exact frame:
 //
-// | µs | samples @48 kHz | samples @96 kHz |
+// | µs | samples/ch @48 kHz | samples/ch @96 kHz |
 // |---|---|---|
 // | 5000 | 240 | 480 |
 // | 4000 | 192 | 384 |
@@ -2508,6 +2512,25 @@ typedef struct {
 // | 2000 | 96 | 192 |
 // | 1500 | 72 | 144 |
 // | 1000 | 48 | 96 |
+//
+// ⚠⚠ **The 44.1 kHz family does not divide, and this doc used to claim every rate did.** A rung
+// lands on a whole sample only when `rate_hz × µs` is a multiple of 1 000 000, which needs a
+// multiple of **10 000 µs** at 44 100 Hz, **5 000 µs** at 88 200 and **2 500 µs** at 176 400. So
+// of the seven rungs, 44 100 has **none**, 88 200 has only 5 000, and 176 400 has 5 000 and
+// 2 500. Every other pairing carries [`samples_per_frame`]'s FLOOR and is therefore *shorter*
+// than the rung it is labelled with: 5 ms at 44 100 Hz is 220 samples per channel — 4 988 662 ns,
+// 0.23 % short.
+//
+// That is safe for the two things this ladder decides, and unsafe for a third:
+//
+// - **Payload sizing** — a floored frame is *fewer* bytes, so [`frame_us_for`]'s fit against the
+//   datagram holds with margin rather than being eroded (the payload must never exceed the
+//   datagram; that invariant is absolute and this rounds the right way for it).
+// - **Buffer sizing** — both ends size from [`samples_per_frame`], so they agree by construction.
+// - **⚠ Timing — no.** A rung is a *nominal* length for the wire and the ring, never a duration.
+//   Anything advancing a `pts_ns` must use [`frame_duration_ns`] of the frame's real sample
+//   count; adding 5 000 µs to a frame that carries 4 988 662 ns runs the clock 0.23 % fast
+//   forever, and the A/V sync loop will fight that drift and never win.
 #define PUNKTFUNK_AUDIO_FRAME_US_LADDER { 5000, 4000, 3000, 2500, 2000, 1500, 1000, }
 
 // What a controller sitting still, face up, actually puts on the wire: **1 g along the UP
@@ -2949,7 +2972,8 @@ PunktfunkConnection *punktfunk_connect_ex10(const char *host,
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Like [`punktfunk_connect_ex10`], plus the audio format this client is **asking** for (ABI v24):
-// `audio_rate_hz` (`48000` or `96000`) and `audio_bits` (`16` or `24`).
+// `audio_rate_hz` — `48000`, `96000`, or the 44.1 kHz family `44100` / `88200` / `176400` — and
+// `audio_bits` (`16` or `24`).
 //
 // Passing anything other than `48000`/`16` sets `CLIENT_CAP_AUDIO_HIRES` in the `Hello` and asks
 // the host for the LOSSLESS `0xD3` plane — bit-exact PCM instead of Opus. That is an opt-in on
@@ -2967,8 +2991,15 @@ PunktfunkConnection *punktfunk_connect_ex10(const char *host,
 // `design/hi-res-audio.md` §4.3's failure repeated at the client end.
 //
 // Passing `48000`/`16` is exactly [`punktfunk_connect_ex10`], byte-for-byte on the wire.
-// 44.1 kHz and its multiples are not offered at all: they are a whole number of samples per
-// millisecond in no arithmetic core uses, so the ladder is 48/96 kHz only (§4.1).
+//
+// The 44.1 kHz family is on the ladder, and was not always: core's de-jitter policy divided the
+// rate by 1 000 before it multiplied, which made 44 100 Hz "44 samples per millisecond" and every
+// buffer figure 2.3 % low, so §4.1 deferred those rates behind fixing that arithmetic. It is
+// fixed. Note what it does NOT buy: at 44 100 Hz **no** rung of the frame ladder is a whole
+// number of samples, so [`punktfunk_connection_audio_frame_us`] becomes a nominal length rather
+// than a duration. An embedder that advances any clock by it runs 0.23 % fast forever; the honest
+// figure is the samples it actually rendered, divided by
+// [`punktfunk_connection_audio_sample_rate`].
 //
 // A NEW symbol, not a widened one — `ex10` keeps its parameter list AND its behaviour.
 //
@@ -3150,6 +3181,14 @@ PunktfunkStatus punktfunk_connection_audio_bits(PunktfunkConnection *c, uint8_t 
 //
 // Microseconds rather than milliseconds because the ladder has sub-millisecond rungs; `0` means
 // the host did not state one, in which case `PUNKTFUNK_AUDIO_FRAME_MS × 1000` is correct.
+//
+// ⚠⚠ **A NOMINAL length, not a duration, and on the 44.1 kHz family they differ.** A frame
+// carries a whole number of samples per channel, and 44 100 Hz divides no rung of the ladder: a
+// 5 ms frame there is 220 samples per channel, which is 4 988 662 ns. Sizing a ring from this is
+// right (that is what it is for); advancing a **clock** by it is not — it invents 2.3 ms of time
+// per second, indefinitely, and every stat downstream will agree with the lie because the
+// timestamps stay self-consistent. Derive elapsed time from the samples rendered and
+// [`punktfunk_connection_audio_sample_rate`] instead.
 //
 // **Not derivable from `next_audio_pcm`'s `frame_count`.** That call prepends concealed frames
 // into the same buffer, so its count is "how many samples you got", not "how long one frame is".

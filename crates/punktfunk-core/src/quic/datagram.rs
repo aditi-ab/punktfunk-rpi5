@@ -1205,10 +1205,16 @@ mod tests {
     #[test]
     fn a_ladder_sized_frame_fits_the_datagram_it_was_sized_for() {
         use crate::audio::pcm;
-        for rate in [48_000u32, 96_000] {
+        // Both rate families — the 44.1 kHz one carries a FRACTIONAL number of samples in most
+        // rungs, so its frame is the floor and the fit has margin rather than being eroded.
+        for rate in [44_100u32, 48_000, 88_200, 96_000, 176_400] {
             for bits in [pcm::BITS_16, pcm::BITS_24] {
                 for budget in [900usize, 1200, 1400] {
-                    let us = pcm::frame_us_for(rate, bits, 2, budget).expect("a rung fits");
+                    let Some(us) = pcm::frame_us_for(rate, bits, 2, budget) else {
+                        // 176 400/24-bit needs 1 069 B for even a 1 ms frame; a budget that small
+                        // declines the plane outright, exactly as it declines hi-res surround.
+                        continue;
+                    };
                     let samples = pcm::samples_per_frame(rate, us, 2);
                     let mut wire = Vec::new();
                     pcm::from_f32(&vec![0.25f32; samples], bits, &mut wire);

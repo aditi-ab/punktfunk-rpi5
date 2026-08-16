@@ -221,7 +221,11 @@ pub use stats::Stats;
 /// observation. Additive and client-local: nothing new is sent or parsed, so [`WIRE_VERSION`] is
 /// unchanged.
 /// v24: the lossless audio plane's client surface (`design/hi-res-audio.md` §7) —
-/// `punktfunk_connect_ex11` asks for a sample rate and depth (48/96 kHz, 16/24-bit; anything but
+/// `punktfunk_connect_ex11` asks for a sample rate and depth (whatever
+/// `audio::pcm::rate_is_supported` admits — 48/96 kHz plus the 44.1 kHz family — and 16/24-bit;
+/// the accepted rates grew after v24 shipped, which is not an ABI change: no symbol, signature or
+/// struct moved, an older header stays correct, and a host that cannot carry a rate declines it to
+/// Opus exactly as it always has. Anything but
 /// the legacy pair also sets `CLIENT_CAP_AUDIO_HIRES`), and `punktfunk_connection_audio_sample_rate`
 /// / `punktfunk_connection_audio_bits` report what the host actually RESOLVED — which may be
 /// lower, because the host runs a five-condition gate and every decline lands back on Opus at

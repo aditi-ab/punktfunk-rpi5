@@ -452,10 +452,14 @@ pub struct NativeClient {
     /// `0` on an Opus session, whose frames are the `0xC9` plane's fixed 5 ms.
     ///
     /// Negotiated from the path MTU rather than assumed, so it must not be hardcoded — at
-    /// 96 kHz/24-bit the default MTU ceiling only leaves room for 2 ms frames. Exposed here for
-    /// Rust embedders sizing a playout ring; the C surface deliberately has no accessor for it,
-    /// because [`crate::abi::punktfunk_connection_next_audio_pcm`] decodes in core and reports
-    /// each frame's real length in `frame_count`.
+    /// 96 kHz/24-bit the default MTU ceiling only leaves room for 2 ms frames. The C surface
+    /// exposes the same figure as [`crate::abi::punktfunk_connection_audio_frame_us`].
+    ///
+    /// ⚠ **Nominal, not a duration.** A frame carries a whole number of samples per channel, and
+    /// the 44.1 kHz family divides no rung of the ladder — a 5 ms frame at 44 100 Hz is 220
+    /// samples per channel, 4 988 662 ns. Size rings from this (that is what it is for) and take
+    /// timing from [`crate::audio::pcm::frame_duration_ns`] of the real sample count; advancing a
+    /// clock by this figure invents 2.3 ms per second, forever.
     pub audio_frame_us: u16,
     /// The video codec the host resolved and will emit ([`Welcome::codec`]) — [`quic::CODEC_H264`],
     /// [`quic::CODEC_HEVC`] (default / older host), or [`quic::CODEC_AV1`]. The client builds its
@@ -750,7 +754,8 @@ impl NativeClient {
     }
 
     /// [`connect`](Self::connect), plus the audio format this client is **asking** for:
-    /// `audio_rate_hz` (48 000 or 96 000) and `audio_bits` (16 or 24).
+    /// `audio_rate_hz` (any rate [`crate::audio::pcm::rate_is_supported`] admits — 48 000, 96 000,
+    /// and the 44.1 kHz family 44 100 / 88 200 / 176 400) and `audio_bits` (16 or 24).
     ///
     /// Everything else is identical. What the pair actually does is decide whether the `Hello`
     /// carries [`quic::CLIENT_CAP_AUDIO_HIRES`], and the rule is deliberately narrow:

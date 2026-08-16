@@ -104,10 +104,12 @@ pub struct Hello {
     /// = legacy: the host must not change the sealed geometry mid-session, and never above
     /// the `Welcome` value).
     pub max_shard_payload: u16,
-    /// The sample rate this client is **asking** the host to capture and send at — `48_000`
-    /// (the legacy rate every build speaks) or `96_000` (`design/hi-res-audio.md` §3; 44.1 kHz
-    /// and its multiples are deferred until [`JitterPolicy`](crate::audio::JitterPolicy)'s
-    /// integer samples-per-millisecond arithmetic is reworked, §4.1).
+    /// The sample rate this client is **asking** the host to capture and send at — `48_000` (the
+    /// legacy rate every build speaks) or any other rate
+    /// [`pcm::rate_is_supported`](crate::audio::pcm::rate_is_supported) admits: `96_000`, and the
+    /// 44.1 kHz family `44_100` / `88_200` / `176_400` (`design/hi-res-audio.md` §3/§4.1 — the
+    /// family was deferred only until [`JitterPolicy`](crate::audio::JitterPolicy) stopped
+    /// dividing by 1 000 before it multiplied, which it no longer does).
     ///
     /// A request, never a fact. The host resolves it against what its capture path can *genuinely*
     /// deliver — never by padding an upsampled stream, which is the trap §4.3 exists to prevent —
