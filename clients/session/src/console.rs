@@ -1,7 +1,9 @@
 //! `--browse [host[:port]]` — the console shell. Bare `--browse` opens the host list
 //! (discovery, pairing, settings, wake — the whole couch flow); with a target it opens
 //! straight into that host's library (the Decky per-host launch), B backing out to the
-//! list. A launches in the SAME window (no gamescope window handoff — the whole point
+//! list — one press either way, because with "Start in collections" on it is the shelf
+//! that hands over to the collections screen rather than a second screen being stacked on
+//! it. A launches in the SAME window (no gamescope window handoff — the whole point
 //! of one process), the session's end returns to the console, B at the root quits to
 //! Gaming Mode.
 //!

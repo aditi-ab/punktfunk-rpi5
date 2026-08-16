@@ -87,7 +87,7 @@ pub(crate) enum Screen {
     /// Per-host network speed test (probe burst + recommended bitrate).
     SpeedTest,
     /// The target host's game library (poster grid; tap-to-launch) — paired hosts only,
-    /// behind the "Show game library" experimental toggle.
+    /// since the fetch authenticates with the pairing identity.
     Library,
 }
 

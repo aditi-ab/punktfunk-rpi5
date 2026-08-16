@@ -5,9 +5,9 @@
 //! no pad at all the legend swaps to keyboard keycaps — the console stays fully
 //! drivable either way.
 
-use crate::theme::{fg, Fonts, W};
+use crate::theme::{fg, fill, stroke, Fonts, W};
 use punktfunk_core::config::GamepadPref;
-use skia_safe::{Canvas, Paint, PathBuilder, Point, RRect, Rect};
+use skia_safe::{Canvas, PathBuilder, Point, RRect, Rect};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum GlyphStyle {
@@ -43,8 +43,7 @@ pub(crate) fn pad_mark(
     k: f64,
     ink: skia_safe::Color4f,
 ) {
-    let mut p = Paint::new(ink, None);
-    p.set_anti_alias(true);
+    let mut p = fill(ink);
     if style == GlyphStyle::Keyboard {
         // A keycap: the same shape the hint bar draws for a key, at chip size.
         let h = w * 0.72;
@@ -96,10 +95,7 @@ pub(crate) fn battery_pip(
     } else {
         crate::theme::fg(0.7)
     };
-    let mut outline = Paint::new(ink, None);
-    outline.set_anti_alias(true);
-    outline.set_style(skia_safe::PaintStyle::Stroke);
-    outline.set_stroke_width((1.2 * k) as f32);
+    let outline = stroke(ink, (1.2 * k) as f32);
     let r = (2.0 * k) as f32;
     canvas.draw_rrect(RRect::new_rect_xy(cell, r, r), &outline);
     // The terminal nub, so the cell reads as a battery and not as a text field.
@@ -114,7 +110,7 @@ pub(crate) fn battery_pip(
             r,
             r,
         ),
-        &Paint::new(ink, None),
+        &fill(ink),
     );
     // Four segments, rounded UP so a pad with any charge left always shows at least one —
     // an empty-looking cell on a pad that still works reads as broken.
@@ -132,7 +128,7 @@ pub(crate) fn battery_pip(
                 seg_w - 0.8 * k as f32,
                 cell.height() - 2.0 * pad,
             ),
-            &Paint::new(ink, None),
+            &fill(ink),
         );
     }
 }
@@ -148,7 +144,9 @@ pub(crate) enum HintKey {
     Shoulders,
     /// ◀ ▶ — left/right adjusts the focused value.
     Adjust,
-    /// ▲ — up opens the focused item's own menu.
+    /// ▲ — up raises the focused item's context menu, on a screen with up to spare. Where
+    /// there isn't (the library grid spends up on rows) the same menu hangs off
+    /// [`HintKey::Tertiary`] instead; the button differs, the word "Options" does not.
     Up,
     Key(&'static str),
 }
@@ -221,7 +219,7 @@ pub(crate) fn hint_bar(
     let corner = (h / 2.0 / k) as f32;
     canvas.draw_rrect(
         RRect::new_rect_xy(rect, (h / 2.0) as f32, (h / 2.0) as f32),
-        &Paint::new(crate::theme::shade(0.30), None),
+        &fill(crate::theme::shade(0.30)),
     );
     crate::theme::panel(
         canvas,
@@ -348,12 +346,8 @@ fn draw_glyph(
         Resolved::Badge(face) => {
             let r = BADGE_D * k / 2.0;
             let center = Point::new((x + r) as f32, cy as f32);
-            canvas.draw_circle(center, r as f32, &Paint::new(fg(0.10), None));
-            let mut ring = Paint::new(fg(0.32), None);
-            ring.set_style(skia_safe::PaintStyle::Stroke);
-            ring.set_stroke_width((1.2 * k) as f32);
-            ring.set_anti_alias(true);
-            canvas.draw_circle(center, r as f32, &ring);
+            canvas.draw_circle(center, r as f32, &fill(fg(0.10)));
+            canvas.draw_circle(center, r as f32, &stroke(fg(0.32), (1.2 * k) as f32));
             if style == GlyphStyle::Shapes {
                 draw_ps_shape(canvas, face, center, (4.6 * k) as f32, (1.7 * k) as f32);
             } else {
@@ -384,7 +378,7 @@ fn draw_glyph(
                 let rect = Rect::from_xywh(pen as f32, (cy - h / 2.0) as f32, w as f32, h as f32);
                 canvas.draw_rrect(
                     RRect::new_rect_xy(rect, (4.0 * k) as f32, (4.0 * k) as f32),
-                    &Paint::new(fg(0.10), None),
+                    &fill(fg(0.10)),
                 );
                 let size = 10.0 * k;
                 let tw = fonts.measure(label, W::SemiBold, size) as f64;
@@ -410,7 +404,7 @@ fn draw_glyph(
             up.line_to((cx - tw, cyf + th));
             up.line_to((cx + tw, cyf + th));
             up.close();
-            canvas.draw_path(&up.detach(), &Paint::new(fg(0.85), None));
+            canvas.draw_path(&up.detach(), &fill(fg(0.85)));
         }
         Resolved::Adjust => {
             // ◀ ▶ — two small solid triangles.
@@ -418,7 +412,7 @@ fn draw_glyph(
             let (cx, cyf) = ((x + r) as f32, cy as f32);
             let (tw, th) = ((4.5 * k) as f32, (5.5 * k) as f32);
             let gap = (2.6 * k) as f32;
-            let paint = Paint::new(fg(0.85), None);
+            let paint = fill(fg(0.85));
             let mut left = PathBuilder::new();
             left.move_to((cx - gap, cyf - th));
             left.line_to((cx - gap - tw, cyf));
@@ -438,15 +432,11 @@ fn draw_glyph(
             let rect = Rect::from_xywh(x as f32, (cy - h / 2.0) as f32, w as f32, h as f32);
             canvas.draw_rrect(
                 RRect::new_rect_xy(rect, (5.0 * k) as f32, (5.0 * k) as f32),
-                &Paint::new(fg(0.10), None),
+                &fill(fg(0.10)),
             );
-            let mut ring = Paint::new(fg(0.28), None);
-            ring.set_style(skia_safe::PaintStyle::Stroke);
-            ring.set_stroke_width(1.0);
-            ring.set_anti_alias(true);
             canvas.draw_rrect(
                 RRect::new_rect_xy(rect, (5.0 * k) as f32, (5.0 * k) as f32),
-                &ring,
+                &stroke(fg(0.28), 1.0),
             );
             let size = 11.0 * k;
             let tw = fonts.measure(text, W::SemiBold, size) as f64;
@@ -465,12 +455,9 @@ fn draw_glyph(
 
 /// The PlayStation face shapes, stroked inside the badge: Confirm=✕, Back=○, X-position
 /// =□, Y-position=△ (the DualSense's physical layout).
-fn draw_ps_shape(canvas: &Canvas, face: Face, center: Point, r: f32, stroke: f32) {
-    let mut p = Paint::new(fg(0.92), None);
-    p.set_style(skia_safe::PaintStyle::Stroke);
-    p.set_stroke_width(stroke);
+fn draw_ps_shape(canvas: &Canvas, face: Face, center: Point, r: f32, width: f32) {
+    let mut p = stroke(fg(0.92), width);
     p.set_stroke_cap(skia_safe::PaintCap::Round);
-    p.set_anti_alias(true);
     let (cx, cy) = (center.x, center.y);
     match face {
         Face::A => {

@@ -1394,13 +1394,6 @@ pub fn show_scoped(
         "Compact = fps · latency · bitrate in one line — Ctrl+Alt+Shift+S cycles the tiers live",
         &["Off", "Compact", "Normal", "Detailed"],
     );
-    let library_row = adw::SwitchRow::builder()
-        .title("Show game library")
-        .subtitle(
-            "Adds “Browse library…” to paired hosts — list their Steam and custom games \
-             and launch one directly. No extra host setup",
-        )
-        .build();
 
     // ---- Input ----
     let touch_row = ChoiceRow::new(
@@ -1720,7 +1713,6 @@ pub fn show_scoped(
         echo_row.set_active(s.echo_cancel);
         hdr_row.set_active(s.hdr_enabled);
         chroma_row.set_active(s.enable_444);
-        library_row.set_active(s.library_enabled);
         surround_row.set_selected(index::surround(s));
         audio_format_row.set_selected(index::audio_format(s));
         // `set_selected` never fires the changed hook, so mirror the stereo gate here — the same
@@ -2054,12 +2046,6 @@ pub fn show_scoped(
     stats_group.add(stats_row.widget());
     general.add(&session_group);
     general.add(&stats_group);
-    // The library browser is an app-level toggle for this device, not a per-profile one.
-    if !profile_mode {
-        let library_group = group("Library", "");
-        library_group.add(&library_row);
-        general.add(&library_group);
-    }
 
     let display = page("Display", "video-display-symbolic");
     let resolution_group = group("Resolution", "");
@@ -2279,7 +2265,6 @@ pub fn show_scoped(
                 (buffer_row.selected() as u8).min(SMOOTH_BUFFER_LABELS.len() as u8 - 1);
             s.vsync = vsync_row.is_active();
             s.allow_vrr = vrr_row.is_active();
-            s.library_enabled = library_row.is_active();
         };
 
         match &active {

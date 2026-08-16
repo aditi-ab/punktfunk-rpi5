@@ -26,11 +26,16 @@ pub const RECEDE_SCALE: f64 = 0.24;
 pub const ROTATE_DEG: f64 = 38.0;
 /// Perspective depth for the tilt, px (CSS `perspective()` semantics).
 pub const PERSPECTIVE: f64 = 800.0;
-/// The darkening veil's max opacity (side cards stay opaque — they overlap). HALVED when
-/// the colour recede landed: this used to carry the whole "further away" reading on its
-/// own and had to be heavy for it, and is now left doing the one job a flat darkening is
-/// good at — separating cards that overlap. See `theme::recede_matrix`.
-pub const RECEDE_DIM: f64 = 0.15;
+/// The recede veil's max opacity (side cards stay opaque — they overlap). Cut twice: first
+/// when the colour recede landed and this stopped having to carry the whole "further away"
+/// reading on its own, and again when the three stacked mechanisms turned out to be summing
+/// to literal black on a receded card. It is left doing the one job a flat wash is good at —
+/// separating cards that overlap. See `theme::recede_matrix`.
+///
+/// No longer necessarily a DARKENING: the call site washes toward `theme::shade`, which is
+/// black on a dark palette and white on a pale one, so this reinforces the matrix's direction
+/// at both poles instead of greying out the lift on the six pale ones.
+pub const RECEDE_DIM: f64 = 0.10;
 /// Boundary recoil: a refused move deflects the strip this many px against the push.
 pub const BUMP_PX: f64 = 16.0;
 /// Mount entrance (see [`crate::anim::Entrance`]): a card arrives at this scale, this many
@@ -162,34 +167,166 @@ pub enum GridDir {
 /// How many rows a shoulder press jumps.
 pub const GRID_PAGE_ROWS: i32 = 3;
 
-/// Cursor arithmetic for a 2-D grid, `cols` wide.
+/// The grid's layout, in the one place both the cursor arithmetic and the renderer read it.
 ///
-/// Left/right walk WITHIN a row and refuse at its ends, which is the shelf's rule and the
-/// one a thumb already knows — wrapping to the next row would make a held Right scan the
-/// whole library, and there are shoulders for that.
+/// A field of covers is not a uniform grid: the launcher prefix (design D4) is given rows of
+/// its own and the games section restarts at column 0 underneath it. While navigation did
+/// that sum for itself — index modulo `cols` — the two models agreed only when the launcher
+/// count happened to be a multiple of the column count, which with a Deck's seven columns and
+/// the usual two launchers means never. Down out of a launcher landed five columns to the
+/// right of the tile it sat under, Up out of the games band slid sideways instead of leaving
+/// it, and a row end refused mid-row. Sharing the shape is the fix; the arithmetic below is
+/// only its consequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridShape {
+    /// Cells per row. A RENDER fact — it depends on the window — so the shape is built from
+    /// what the last frame actually drew rather than derived twice from two widths.
+    pub cols: usize,
+    /// How many cells there are: the FILTERED count, the one the cursor indexes.
+    pub len: usize,
+    /// Where the games section starts, or 0 when the field is one continuous run.
+    pub split: usize,
+}
+
+impl GridShape {
+    /// `launchers` is the leading launcher run. The section only exists when BOTH halves do —
+    /// an all-launcher or launcher-less field is a plain grid, and giving it a heading band
+    /// and a gap it has no second group for would be a rule showing off.
+    pub fn new(len: usize, cols: usize, launchers: usize) -> GridShape {
+        let split = if launchers > 0 && launchers < len {
+            launchers
+        } else {
+            0
+        };
+        GridShape { cols, len, split }
+    }
+
+    /// The first row of the games section (meaningless when there is no split).
+    pub fn split_row(&self) -> usize {
+        self.split.div_ceil(self.cols.max(1))
+    }
+
+    /// Which cell an index is drawn in.
+    pub fn cell_of(&self, i: usize) -> (usize, usize) {
+        let cols = self.cols.max(1);
+        if self.split > 0 && i >= self.split {
+            let j = i - self.split;
+            (self.split_row() + j / cols, j % cols)
+        } else {
+            (i / cols, i % cols)
+        }
+    }
+
+    pub fn rows(&self) -> usize {
+        let cols = self.cols.max(1);
+        if self.split > 0 {
+            self.split_row() + (self.len - self.split).div_ceil(cols)
+        } else {
+            self.len.div_ceil(cols)
+        }
+    }
+
+    /// The index of a row's first cell.
+    pub fn row_start(&self, row: usize) -> usize {
+        let cols = self.cols.max(1);
+        if self.split > 0 && row >= self.split_row() {
+            self.split + (row - self.split_row()) * cols
+        } else {
+            row * cols
+        }
+    }
+
+    /// How many cells a row actually holds — the launcher section's last row stops where the
+    /// games section begins, and the field's last row stops at the end of the library.
+    pub fn row_len(&self, row: usize) -> usize {
+        let start = self.row_start(row);
+        let end = if self.split > 0 && row + 1 == self.split_row() {
+            self.split
+        } else {
+            self.len
+        };
+        end.saturating_sub(start).min(self.cols.max(1))
+    }
+}
+
+/// Cursor arithmetic for the grid, against the shape the renderer is drawing.
 ///
-/// Up/down move by a whole row and CLAMP into the tail row rather than refusing. A short
-/// last row is a layout accident, not a boundary the user chose to hit: pressing Down from
-/// above the gap should land on the last title, not thud.
-pub fn grid_step(cursor: i32, len: usize, cols: usize, dir: GridDir) -> StepResult {
-    if len == 0 || cols == 0 {
+/// ONE rule, because an accretion of special cases is how this broke: horizontal moves walk
+/// the row and refuse at THAT ROW's true ends; vertical moves and pages change row only,
+/// carrying `col_hint` and clamping it into the target row's length. The only boundary is a
+/// move that would leave the grid.
+///
+/// Left/right refusing rather than wrapping is the shelf's rule and the one a thumb already
+/// knows — a held Right that wrapped would scan the whole library, and there are shoulders
+/// for that. Vertical moves clamp instead of refusing because a short row is a layout
+/// accident, not a boundary anyone chose to hit: Down from above the gap should land on the
+/// last title, not thud.
+///
+/// `col_hint` is the column the user last CHOSE (see [`grid_col_hint`]) rather than the one
+/// they happen to be standing in, so crossing a two-wide launcher row and coming back returns
+/// to the column the crossing started from.
+pub fn grid_step(cursor: i32, shape: GridShape, col_hint: usize, dir: GridDir) -> StepResult {
+    if shape.len == 0 || shape.cols == 0 {
         return StepResult::Boundary;
     }
-    let (max, cols_i) = (len as i32 - 1, cols as i32);
-    let col = cursor.rem_euclid(cols_i);
-    let target = match dir {
-        GridDir::Left if col > 0 => cursor - 1,
-        GridDir::Right if col < cols_i - 1 => cursor + 1,
-        GridDir::Left | GridDir::Right => return StepResult::Boundary,
-        GridDir::Up => cursor - cols_i,
-        GridDir::Down => (cursor + cols_i).min(max),
-        GridDir::PageBack => (cursor - cols_i * GRID_PAGE_ROWS).max(0),
-        GridDir::PageForward => (cursor + cols_i * GRID_PAGE_ROWS).min(max),
+    // A cursor outside the field is a stale one (the library shortened under us); reading it
+    // as the nearest real cell makes the next press heal it instead of compounding it.
+    let (row, col) = shape.cell_of((cursor.max(0) as usize).min(shape.len - 1));
+    let moved = |i: usize| {
+        if i as i32 == cursor {
+            StepResult::Boundary
+        } else {
+            StepResult::Moved(i as i32)
+        }
     };
-    if target == cursor || target < 0 || target > max {
-        StepResult::Boundary
-    } else {
-        StepResult::Moved(target)
+    match dir {
+        GridDir::Left => {
+            if col == 0 {
+                StepResult::Boundary
+            } else {
+                moved(shape.row_start(row) + col - 1)
+            }
+        }
+        GridDir::Right => {
+            if col + 1 >= shape.row_len(row) {
+                StepResult::Boundary
+            } else {
+                moved(shape.row_start(row) + col + 1)
+            }
+        }
+        GridDir::Up | GridDir::Down | GridDir::PageBack | GridDir::PageForward => {
+            let (d, paging) = match dir {
+                GridDir::Up => (-1, false),
+                GridDir::Down => (1, false),
+                GridDir::PageBack => (-GRID_PAGE_ROWS, true),
+                _ => (GRID_PAGE_ROWS, true),
+            };
+            let target = (row as i32 + d).clamp(0, shape.rows() as i32 - 1) as usize;
+            if target == row {
+                // A STEP at the edge refuses. A PAGE is a "take me there", so it lands on the
+                // end of the row it is already on — the same reading `step_cursor`'s clamped
+                // mode has, and the one the shoulders have always had here.
+                if !paging {
+                    return StepResult::Boundary;
+                }
+                let c = if d > 0 { shape.row_len(row) - 1 } else { 0 };
+                return moved(shape.row_start(row) + c);
+            }
+            let c = col_hint.min(shape.row_len(target) - 1);
+            moved(shape.row_start(target) + c)
+        }
+    }
+}
+
+/// The remembered column after a move.
+///
+/// A horizontal step CHOOSES a column; a vertical one only borrows it. Keeping the rule here
+/// rather than at the call site is what stops the screen from holding a cursor and a column
+/// that disagree — the same reason the layout itself is one shared shape.
+pub fn grid_col_hint(shape: GridShape, prev: usize, dir: GridDir, landed: i32) -> usize {
+    match dir {
+        GridDir::Left | GridDir::Right => shape.cell_of(landed.max(0) as usize).1,
+        _ => prev,
     }
 }
 
@@ -747,8 +884,43 @@ impl LibraryShared {
         (s.phase.clone(), s.games.clone(), s.generation)
     }
 
-    pub(crate) fn drain_art(&self) -> Vec<(String, Vec<u8>)> {
-        self.0.lock().unwrap().art_in.drain(..).collect()
+    /// Take at most `max` newly fetched posters, leaving the rest queued.
+    ///
+    /// Bounded because the renderer DECODES what this hands it, on the render thread. A
+    /// library whose art all lands at once — the fake-library dev hook reads it off local
+    /// disk, and a warm host proxy is nearly as fast — would otherwise put two hundred JPEG
+    /// decodes in one frame. What stays behind costs the queue its ENCODED bytes, two orders
+    /// of magnitude smaller than the raster they become.
+    pub(crate) fn drain_art(&self, max: usize) -> Vec<(String, Vec<u8>)> {
+        let mut s = self.0.lock().unwrap();
+        let n = max.min(s.art_in.len());
+        s.art_in.drain(..n).collect()
+    }
+
+    /// Take at most `max` queued posters FROM `want`, leaving every other one where it is.
+    ///
+    /// The collections screen is the caller, and it is the only screen that draws a handful
+    /// of named covers rather than whatever arrives. Draining the queue wholesale there
+    /// would be a quiet disaster: the bytes are pushed once per fetch and never re-sent, so
+    /// everything it took and could not fan would be gone before the shelf a tile opens ever
+    /// asked — a library of monograms, one screen further in. This takes the dozen covers
+    /// that tile the collections and leaves the other four hundred queued for the shelf.
+    pub(crate) fn take_art_for(
+        &self,
+        want: &std::collections::HashSet<String>,
+        max: usize,
+    ) -> Vec<(String, Vec<u8>)> {
+        let mut s = self.0.lock().unwrap();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < s.art_in.len() && out.len() < max {
+            if want.contains(&s.art_in[i].0) {
+                out.extend(s.art_in.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        out
     }
 }
 
@@ -858,6 +1030,72 @@ mod tests {
         }
     }
 
+    /// The art queue hands the renderer a BOUNDED batch and keeps the rest, in arrival
+    /// order. The renderer decodes what it takes, on the render thread, so an unbounded
+    /// drain is a frame as long as the library is big — and the first frame after a fast
+    /// host answered is exactly when the whole library lands at once.
+    #[test]
+    fn art_drains_in_bounded_batches_and_keeps_the_order() {
+        let shared = LibraryShared::default();
+        for i in 0..5 {
+            shared.push_art(format!("g{i}"), vec![i as u8]);
+        }
+        let first: Vec<String> = shared.drain_art(2).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(first, ["g0", "g1"]);
+        let rest: Vec<String> = shared.drain_art(9).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            rest,
+            ["g2", "g3", "g4"],
+            "asking for more than is there is fine"
+        );
+        assert!(shared.drain_art(2).is_empty());
+    }
+
+    /// A selective take is the collections screen's whole art story: it takes the few covers
+    /// it fans and LEAVES everything else queued, in order, for the shelf that opens next.
+    /// The property is what stays behind — the poster bytes are pushed once per fetch and
+    /// never re-sent, so anything taken by a screen that cannot draw it is lost for good.
+    #[test]
+    fn a_selective_take_leaves_everything_it_did_not_ask_for() {
+        let shared = LibraryShared::default();
+        for i in 0..6 {
+            shared.push_art(format!("g{i}"), vec![i as u8]);
+        }
+        let want = ["g1".to_string(), "g4".to_string(), "g9".to_string()]
+            .into_iter()
+            .collect();
+        let took: Vec<String> = shared
+            .take_art_for(&want, 8)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            took,
+            ["g1", "g4"],
+            "an id that never arrived is not an error"
+        );
+        let rest: Vec<String> = shared.drain_art(9).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(rest, ["g0", "g2", "g3", "g5"], "the rest is untouched");
+    }
+
+    /// …and it is bounded the same way the plain drain is: the caller DECODES what it takes,
+    /// on the render thread, so a library that lands all at once must not become one frame.
+    #[test]
+    fn a_selective_take_is_bounded_too() {
+        let shared = LibraryShared::default();
+        for i in 0..6 {
+            shared.push_art(format!("g{i}"), vec![i as u8]);
+        }
+        let want: std::collections::HashSet<String> = (0..6).map(|i| format!("g{i}")).collect();
+        assert_eq!(shared.take_art_for(&want, 2).len(), 2);
+        assert_eq!(shared.take_art_for(&want, 2).len(), 2);
+        assert_eq!(
+            shared.take_art_for(&want, 9).len(),
+            2,
+            "and then it is empty"
+        );
+    }
+
     /// The GTK launcher's cursor tests, ported with the math.
     #[test]
     fn step_refuses_the_ends() {
@@ -867,66 +1105,235 @@ mod tests {
         assert_eq!(step_cursor(0, 0, 1, false), StepResult::Boundary);
     }
 
-    /// The grid's two different boundary rules, which is the whole subtlety of this
-    /// function: a row END refuses (like the shelf), a short TAIL row clamps.
+    /// Every shape the grid can take: the launcher-less field, a Deck's seven columns with
+    /// the usual two launchers, a launcher run that fills a row and a half, the degenerate
+    /// two-cell sections, and a single column.
+    const SHAPES: [(usize, usize, usize); 9] = [
+        (11, 4, 0),
+        (40, 5, 0),
+        (30, 7, 2),
+        (20, 4, 6),
+        (4, 4, 2),
+        (9, 3, 3),
+        (7, 3, 7),
+        (1, 3, 1),
+        (13, 1, 2),
+    ];
+
+    /// The invariant the two old layout models broke: a cell's coordinates and its row's
+    /// start have to be the same statement. Rows tile `0..len` in order, no index is in two
+    /// of them, and none is in none — which is what makes "the ring is where the scroll
+    /// says it is" true by construction rather than by coincidence.
     #[test]
-    fn grid_rows_refuse_at_their_ends_but_the_tail_row_clamps() {
-        // 11 items, 4 columns: rows of 4, 4, 3.
-        let (len, cols) = (11, 4);
-        // Within a row.
+    fn grid_rows_tile_the_field_exactly_once() {
+        for (len, cols, launchers) in SHAPES {
+            let s = GridShape::new(len, cols, launchers);
+            let mut next = 0usize;
+            for row in 0..s.rows() {
+                let n = s.row_len(row);
+                assert!((1..=cols).contains(&n), "{s:?} row {row} holds {n} cells");
+                for col in 0..n {
+                    let i = s.row_start(row) + col;
+                    assert_eq!(i, next, "{s:?} row {row} does not follow the one above");
+                    assert_eq!(s.cell_of(i), (row, col), "{s:?} disagrees about index {i}");
+                    next += 1;
+                }
+            }
+            assert_eq!(next, len, "{s:?} left cells in no row at all");
+        }
+    }
+
+    /// The grid's two different boundary rules, which is the whole subtlety of the
+    /// horizontal step: a row END refuses (like the shelf), and it is the row's TRUE end —
+    /// not `cols`, which is a different number in every partial row and in the whole games
+    /// section under a launcher prefix.
+    #[test]
+    fn grid_horizontal_moves_walk_the_row_and_refuse_its_true_ends() {
+        for (len, cols, launchers) in SHAPES {
+            let s = GridShape::new(len, cols, launchers);
+            for i in 0..len {
+                let (row, col) = s.cell_of(i);
+                let want = |first: bool, to: i32| {
+                    if first {
+                        StepResult::Boundary
+                    } else {
+                        StepResult::Moved(to)
+                    }
+                };
+                let i = i as i32;
+                // The hint must not reach a horizontal move: it is the column you WOULD
+                // return to, not the one you are walking out of.
+                for hint in 0..cols {
+                    assert_eq!(
+                        grid_step(i, s, hint, GridDir::Left),
+                        want(col == 0, i - 1),
+                        "{s:?} Left from {i}"
+                    );
+                    assert_eq!(
+                        grid_step(i, s, hint, GridDir::Right),
+                        want(col + 1 == s.row_len(row), i + 1),
+                        "{s:?} Right from {i}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Vertical moves change the ROW and nothing else. A move that has a row to go to always
+    /// goes there — never sideways within the row it is already in, which is what crossing
+    /// the launcher/games boundary used to do — and it arrives in the remembered column,
+    /// clamped into whatever that row can hold.
+    #[test]
+    fn grid_vertical_moves_change_row_and_carry_the_column() {
+        const VERTICAL: [(GridDir, i32); 4] = [
+            (GridDir::Up, -1),
+            (GridDir::Down, 1),
+            (GridDir::PageBack, -GRID_PAGE_ROWS),
+            (GridDir::PageForward, GRID_PAGE_ROWS),
+        ];
+        for (len, cols, launchers) in SHAPES {
+            let s = GridShape::new(len, cols, launchers);
+            for i in 0..len {
+                let (row, _) = s.cell_of(i);
+                for hint in 0..cols {
+                    for (dir, d) in VERTICAL {
+                        let want_row = (row as i32 + d).clamp(0, s.rows() as i32 - 1) as usize;
+                        let what = format!("{s:?} {dir:?} from {i} with hint {hint}");
+                        match grid_step(i as i32, s, hint, dir) {
+                            StepResult::Moved(to) => {
+                                let (r, c) = s.cell_of(to as usize);
+                                assert_eq!(r, want_row, "{what} landed in row {r}");
+                                if r != row {
+                                    assert_eq!(c, hint.min(s.row_len(r) - 1), "{what} column");
+                                }
+                            }
+                            // Only the field's own edges refuse; a page already at the edge
+                            // still travels along the row it is on, so it refuses only from
+                            // that row's end.
+                            StepResult::Boundary => assert_eq!(want_row, row, "{what} refused"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Both sections stay reachable from anywhere in the other, in a bounded number of
+    /// presses. This is the user's actual complaint — a launcher row you could see but not
+    /// get back into — stated as a property.
+    #[test]
+    fn every_row_is_reachable_by_stepping() {
+        for (len, cols, launchers) in SHAPES {
+            let s = GridShape::new(len, cols, launchers);
+            for i in 0..len {
+                for (dir, end) in [(GridDir::Up, 0), (GridDir::Down, s.rows() - 1)] {
+                    let mut cursor = i as i32;
+                    for _ in 0..=s.rows() {
+                        match grid_step(cursor, s, 0, dir) {
+                            StepResult::Moved(to) => cursor = to,
+                            StepResult::Boundary => break,
+                        }
+                    }
+                    let (row, _) = s.cell_of(cursor as usize);
+                    assert_eq!(row, end, "{s:?} {dir:?} from {i} stalled in row {row}");
+                }
+            }
+        }
+    }
+
+    /// The Deck, exactly: 1280×800 gives seven columns, and a host with the usual two
+    /// launchers puts them alone on row 0 with the games restarting at column 0 under them.
+    /// Every value here is one the uniform-grid arithmetic got wrong.
+    #[test]
+    fn the_launcher_row_sits_squarely_above_the_games() {
+        let s = GridShape::new(30, 7, 2);
+        assert_eq!(s.rows(), 5);
+        assert_eq!((s.row_len(0), s.row_len(1)), (2, 7));
+        // Down from a launcher lands on the cover UNDER it, not five columns to the right.
+        assert_eq!(grid_step(0, s, 0, GridDir::Down), StepResult::Moved(2));
+        assert_eq!(grid_step(1, s, 1, GridDir::Down), StepResult::Moved(3));
+        // …and Up out of the games band leaves it, rather than sliding along it.
+        assert_eq!(grid_step(2, s, 0, GridDir::Up), StepResult::Moved(0));
+        assert_eq!(grid_step(3, s, 1, GridDir::Up), StepResult::Moved(1));
+        assert_eq!(grid_step(6, s, 4, GridDir::Up), StepResult::Moved(1));
+        // The games row's true ends are 2 and 8 — 6 and 7 are mid-row, and 8 is the end.
+        assert_eq!(grid_step(6, s, 4, GridDir::Right), StepResult::Moved(7));
+        assert_eq!(grid_step(7, s, 5, GridDir::Left), StepResult::Moved(6));
+        assert_eq!(grid_step(8, s, 6, GridDir::Right), StepResult::Boundary);
+        assert_eq!(grid_step(2, s, 0, GridDir::Left), StepResult::Boundary);
+    }
+
+    /// The remembered column is what makes a crossing reversible: stepping down through a
+    /// two-wide launcher row and back must return to the column you set out from, not pin
+    /// you to the column the narrow row could hold.
+    #[test]
+    fn a_crossing_returns_to_the_column_it_started_from() {
+        use GridDir::{Down, Right, Up};
+        let s = GridShape::new(30, 7, 2);
+        // The screen's own rule, in one place: `LibraryScreen::grid_move` steps the cursor
+        // and re-reads the hint through exactly these two calls.
+        let walk = |start: i32, dirs: &[GridDir]| {
+            let (mut cursor, mut hint) = (start, s.cell_of(start.max(0) as usize).1);
+            for &dir in dirs {
+                if let StepResult::Moved(to) = grid_step(cursor, s, hint, dir) {
+                    hint = grid_col_hint(s, hint, dir, to);
+                    cursor = to;
+                }
+            }
+            cursor
+        };
+        assert_eq!(walk(0, &[Down, Right, Right, Right, Right]), 6);
+        // Up parks in the launcher row's only reachable column…
+        assert_eq!(walk(0, &[Down, Right, Right, Right, Right, Up]), 1);
+        // …and Down restores the column, twice over — a vertical move never spends it.
+        assert_eq!(walk(0, &[Down, Right, Right, Right, Right, Up, Down]), 6);
         assert_eq!(
-            grid_step(1, len, cols, GridDir::Right),
-            StepResult::Moved(2)
+            walk(0, &[Down, Right, Right, Right, Right, Up, Down, Up, Down]),
+            6
         );
-        assert_eq!(grid_step(2, len, cols, GridDir::Left), StepResult::Moved(1));
-        // At a row's ends: refused, NOT wrapped onto the neighbouring row.
-        assert_eq!(
-            grid_step(3, len, cols, GridDir::Right),
-            StepResult::Boundary
-        );
-        assert_eq!(grid_step(4, len, cols, GridDir::Left), StepResult::Boundary);
-        // Down from the top row lands directly below.
-        assert_eq!(grid_step(1, len, cols, GridDir::Down), StepResult::Moved(5));
-        // Down into the SHORT tail row clamps to the last item rather than thudding —
-        // index 7 would map to 11, which does not exist.
-        assert_eq!(
-            grid_step(7, len, cols, GridDir::Down),
-            StepResult::Moved(10)
-        );
-        // …and once there, Down really is the end.
-        assert_eq!(
-            grid_step(10, len, cols, GridDir::Down),
-            StepResult::Boundary
-        );
-        assert_eq!(grid_step(2, len, cols, GridDir::Up), StepResult::Boundary);
-        assert_eq!(grid_step(6, len, cols, GridDir::Up), StepResult::Moved(2));
     }
 
     #[test]
     fn grid_pages_by_rows_and_lands_on_the_ends() {
-        let (len, cols) = (40, 5);
+        let s = GridShape::new(40, 5, 0);
         assert_eq!(
-            grid_step(0, len, cols, GridDir::PageForward),
+            grid_step(0, s, 0, GridDir::PageForward),
             StepResult::Moved(15)
         );
         // A page past the end lands ON the end rather than refusing — a jump is a
         // "take me there", the same reading `step_cursor`'s clamped mode has.
         assert_eq!(
-            grid_step(35, len, cols, GridDir::PageForward),
+            grid_step(35, s, 0, GridDir::PageForward),
             StepResult::Moved(39)
         );
         assert_eq!(
-            grid_step(39, len, cols, GridDir::PageForward),
+            grid_step(39, s, 4, GridDir::PageForward),
             StepResult::Boundary
         );
-        assert_eq!(
-            grid_step(3, len, cols, GridDir::PageBack),
-            StepResult::Moved(0)
-        );
-        assert_eq!(
-            grid_step(0, len, cols, GridDir::PageBack),
-            StepResult::Boundary
-        );
+        assert_eq!(grid_step(3, s, 3, GridDir::PageBack), StepResult::Moved(0));
+        assert_eq!(grid_step(0, s, 0, GridDir::PageBack), StepResult::Boundary);
+    }
+
+    /// The launcher-less grid, unchanged: this is the field the old arithmetic got right,
+    /// and the proof that sharing the shape did not move it.
+    #[test]
+    fn grid_rows_refuse_at_their_ends_but_the_tail_row_clamps() {
+        // 11 items, 4 columns: rows of 4, 4, 3.
+        let s = GridShape::new(11, 4, 0);
+        assert_eq!(grid_step(1, s, 1, GridDir::Right), StepResult::Moved(2));
+        assert_eq!(grid_step(2, s, 2, GridDir::Left), StepResult::Moved(1));
+        // At a row's ends: refused, NOT wrapped onto the neighbouring row.
+        assert_eq!(grid_step(3, s, 3, GridDir::Right), StepResult::Boundary);
+        assert_eq!(grid_step(4, s, 0, GridDir::Left), StepResult::Boundary);
+        // Down from the top row lands directly below.
+        assert_eq!(grid_step(1, s, 1, GridDir::Down), StepResult::Moved(5));
+        // Down into the SHORT tail row clamps to the last item rather than thudding —
+        // column 3 does not exist down there.
+        assert_eq!(grid_step(7, s, 3, GridDir::Down), StepResult::Moved(10));
+        // …and once there, Down really is the end.
+        assert_eq!(grid_step(10, s, 3, GridDir::Down), StepResult::Boundary);
+        assert_eq!(grid_step(2, s, 2, GridDir::Up), StepResult::Boundary);
+        assert_eq!(grid_step(6, s, 2, GridDir::Up), StepResult::Moved(2));
     }
 
     /// The persisted view name is a FILE FORMAT, and an unknown one must land on the shelf
@@ -945,11 +1352,22 @@ mod tests {
 
     #[test]
     fn grid_step_is_safe_on_a_degenerate_grid() {
-        assert_eq!(grid_step(0, 0, 4, GridDir::Right), StepResult::Boundary);
-        assert_eq!(grid_step(0, 5, 0, GridDir::Right), StepResult::Boundary);
+        let empty = GridShape::new(0, 4, 0);
+        assert_eq!(grid_step(0, empty, 0, GridDir::Right), StepResult::Boundary);
+        let colless = GridShape::new(5, 0, 0);
+        assert_eq!(
+            grid_step(0, colless, 0, GridDir::Right),
+            StepResult::Boundary
+        );
         // One column: left/right are always refused, up/down still walk.
-        assert_eq!(grid_step(1, 5, 1, GridDir::Right), StepResult::Boundary);
-        assert_eq!(grid_step(1, 5, 1, GridDir::Down), StepResult::Moved(2));
+        let thin = GridShape::new(5, 1, 0);
+        assert_eq!(grid_step(1, thin, 0, GridDir::Right), StepResult::Boundary);
+        assert_eq!(grid_step(1, thin, 0, GridDir::Down), StepResult::Moved(2));
+        // A cursor the library outgrew reads as the nearest real cell, so the next press
+        // heals it rather than compounding it.
+        let s = GridShape::new(6, 3, 2);
+        assert_eq!(grid_step(99, s, 0, GridDir::Up), StepResult::Moved(2));
+        assert_eq!(grid_step(-4, s, 0, GridDir::Right), StepResult::Moved(1));
     }
 
     /// Design D4: launcher entries lead the shelf, and the host's title order survives within

@@ -41,9 +41,9 @@ into a "no" on your machine:
   and deliberately so: the host resolves the chroma *before* the Welcome and names the losing gate
   in its log, and the client's stats overlay prints `4:4:4→4:2:0` rather than letting you assume
   you got what you asked for.
-- **Default on / opt-in / operator-gated** — HDR and 10-bit are attempted by default; the game
-  library is off by default on the desktop clients; the shared clipboard is off on the host until
-  an operator turns it on.
+- **Default on / opt-in / operator-gated** — HDR and 10-bit are attempted by default; lossless audio
+  stays on Opus until a client asks for it; the shared clipboard is off on the host until an
+  operator turns it on.
 
 One more thing a table cannot show: a few capabilities **latch off for the rest of the host
 process** after a failure — a lost HDR negotiation, a repeatedly dying zero-copy import worker, a
@@ -395,8 +395,8 @@ macOS, iOS/iPadOS and tvOS. Android is one app, with Android TV being the same a
 
 | Client | Profiles | `punktfunk://` links | Game library | Speed test | Wake-on-LAN | Updates itself |
 |---|---|---|---|---|---|---|
-| Linux desktop | ✅ | ✅ | ⚠️ ¹ | ✅ | ✅ | ⚠️ ² |
-| Windows desktop | ✅ | ✅ | ⚠️ ¹ | ✅ | ✅ | ❌ ³ |
+| Linux desktop | ✅ | ✅ | ✅ ¹ | ✅ | ✅ | ⚠️ ² |
+| Windows desktop | ✅ | ✅ | ✅ ¹ | ✅ | ✅ | ❌ ³ |
 | macOS | ✅ | ✅ | ✅ ⁴ | ✅ | ✅ | ❌ ³ |
 | iPhone · iPad | ✅ | ✅ | ✅ ⁴ | ✅ | ✅ | ❌ ³ |
 | Apple TV | ⚠️ ⁵ | ✅ | ✅ ⁴ | ✅ | ✅ | ❌ ³ |
@@ -405,10 +405,9 @@ macOS, iOS/iPadOS and tvOS. Android is one app, with Android TV being the same a
 | `punktfunk` CLI | ✅ | ✅ ⁹ | ✅ | ✅ | ✅ | ❌ |
 | Moonlight | ❌ ¹⁰ | ❌ ¹⁰ | ✅ ¹¹ | ❓ ¹² | ❓ ¹² | ❓ ¹² |
 
-1. **Off by default.** Turn on the library in Preferences before "Browse library…" appears. It also
-   needs a paired host to return anything — Windows hides the entry until the host is paired; the
-   GTK client shows it either way and the fetch then fails. See
-   [Game library](/docs/game-library).
+1. **Any paired host.** "Browse library…" sits on a saved host's card with nothing to turn on first.
+   It stays hidden on a host that is only trusted, not yet paired: the fetch authenticates with the
+   pairing identity and would come back refused. See [Game library](/docs/game-library).
 2. One of two clients with a self-updater (the Decky plugin is the other), and what `--apply-update`
    can do depends on how you
    installed it: Flatpak updates itself, system packages go through a packaged helper, image-based

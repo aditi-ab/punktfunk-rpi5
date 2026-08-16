@@ -559,8 +559,6 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
         set: props.set_hover.clone(),
     };
     let known = KnownHosts::load();
-    // The experimental library gate ("Show game library" in Settings) — GTK/Apple parity.
-    let library_enabled = ctx.settings.lock().unwrap().library_enabled;
 
     // Responsive column count from the live window width (re-renders on resize): as many
     // TILE_MIN_WIDTH columns as fit the page's content width, at least one.
@@ -763,9 +761,8 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
 
                         items.push(menu_separator());
                         // The library surfaces — mouse/KB page and the gamepad console UI — for
-                        // paired hosts only (the mgmt API needs the paired identity); the page
-                        // additionally sits behind the experimental toggle.
-                        if library_enabled && k.paired {
+                        // paired hosts only, because the mgmt API needs the paired identity.
+                        if k.paired {
                             items.push(menu_item(MENU_LIBRARY));
                         }
                         items.push(menu_item(MENU_SPEED));
@@ -956,8 +953,8 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         .menu_flyout({
                             let mut items = Vec::new();
                             // Same gate as the primary tile's: the mgmt API needs the paired
-                            // identity, and the page is behind the experimental toggle.
-                            if library_enabled && k.paired {
+                            // identity, so an unpaired host has nothing to show.
+                            if k.paired {
                                 items.push(menu_item(MENU_LIBRARY));
                             }
                             items.push(menu_item(MENU_COPY_LINK));

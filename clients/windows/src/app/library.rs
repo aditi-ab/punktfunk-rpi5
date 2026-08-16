@@ -3,9 +3,8 @@
 //! `ui_library.rs`, sharing its service layer (mTLS fetch against the host's management
 //! API, pre-classified errors, the 3-worker art pipeline) and its four states
 //! (loading / error+retry / empty / grid). Reached from a paired host's "…" menu
-//! ("Browse library…", behind the Settings "Show game library" experimental toggle);
-//! picking a title starts a normal stream carrying `--launch id` — the host launches the
-//! app during the connect handshake.
+//! ("Browse library…"); picking a title starts a normal stream carrying `--launch id` —
+//! the host launches the app during the connect handshake.
 //!
 //! Poster bytes land in a small disk cache (`%LOCALAPPDATA%\punktfunk\art-cache`) and the
 //! `Image` widget loads `file:///` URIs from it — reactor's `ImageSource` has no

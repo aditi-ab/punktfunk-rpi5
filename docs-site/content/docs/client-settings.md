@@ -274,11 +274,10 @@ client, which reads this setting like any other connect. The console home also o
 explicit action on an offline host, whatever the toggle says. See
 [Wake-on-LAN](/docs/wake-on-lan).
 
-**Show game library** — *default: off on Linux and Windows; on in the Apple and Android apps.* Browse
-a paired host's games and launch one directly; the Windows app still labels it experimental. The
-console home has the toggle too, and it governs the desktop clients that share the store — the
-console's own **Library** button is offered on any paired host either way. See
-[Game library](/docs/game-library).
+**Show game library** — *Apple and Android only, default: on.* Browse a paired host's games and
+launch one directly. The Linux and Windows apps have nothing to switch on — **Browse library…** sits
+on every paired host's card — and neither does the console home, whose **Library** button was always
+offered on any paired host. See [Game library](/docs/game-library).
 
 **Start streams in fullscreen** — *default: on.* On Linux and Windows, F11 or Alt+Enter leaves
 fullscreen live. On a Mac the setting is **Fullscreen while streaming**, and the window comes back
@@ -350,8 +349,8 @@ stay global and **cannot be put in a settings profile**:
   preference and can live in a profile; which pad you hold cannot. **Forward controllers** is a
   preference too, and does live in a profile — a work profile can decline to forward what a game
   profile forwards.
-- **Auto-wake on connect** and **Show game library** — decisions about this device and this network,
-  not about how a given host is streamed.
+- **Auto-wake on connect**, and **Show game library** where it still exists (the Apple and Android
+  apps) — decisions about this device and this network, not about how a given host is streamed.
 - Everything under **Interface** — **Gamepad-optimized browsing**, **Show it** and **Background**.
   How this client looks and which layout it wears has nothing to do with how a host streams to it,
   so binding them to a host would only make the same device change appearance depending on what it

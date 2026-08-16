@@ -382,6 +382,59 @@ fn a_secondary_press_goes_back() {
     ));
 }
 
+/// A REPLACE recedes the screen it replaced, not that screen's parent.
+///
+/// Reported from a Deck: choosing "Edit…" in a host's menu flashed the host LIST for the
+/// length of the transition before the editor arrived. The cause is that a push paints the
+/// screen beneath the incoming one as its receding layer, while a replace had already popped
+/// and dropped the screen being swapped out — so "beneath" was the menu's parent, one level
+/// too far, and the transition animated the editor in over Home.
+///
+/// Asserted on the carried screen rather than on pixels: the defect is entirely a question of
+/// WHICH screen the motion holds, and a frame diff would pin the particular look of a
+/// transition instead of the thing that was wrong with it.
+#[test]
+fn a_replace_carries_the_screen_it_replaced() {
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.handle_menu(MenuEvent::Move(MenuDir::Up));
+    assert!(matches!(s.stack.last(), Some(Screen::HostOptions(_))));
+    finish_motion(&mut s);
+
+    // Walk to "Edit…" and take it. The first fixture host is paired and online and cannot
+    // wake, so its menu is [Send logs, Copy link, Edit…, Forget, Cancel] — Edit is two down.
+    // Pressed exactly rather than searched, so that reordering the menu fails HERE instead of
+    // quietly landing this test's Confirm on "Forget".
+    s.handle_menu(MenuEvent::Move(MenuDir::Down));
+    s.handle_menu(MenuEvent::Move(MenuDir::Down));
+    s.handle_menu(MenuEvent::Confirm);
+    assert!(
+        matches!(s.stack.last(), Some(Screen::AddHost(_))),
+        "Edit… opens the host editor"
+    );
+    assert_eq!(s.stack.len(), 2, "the menu was swapped out, not stacked on");
+    match &s.motion {
+        Motion::Nav {
+            kind: NavKind::Push,
+            leaving: Some(carried),
+            ..
+        } => assert!(
+            matches!(carried.as_ref(), Screen::HostOptions(_)),
+            "the receding layer must be the MENU; carrying nothing leaves the renderer to \
+             recede the menu's parent, which is the reported flash"
+        ),
+        _ => panic!("a replace must be a push CARRYING its predecessor"),
+    }
+
+    // …and reversing it puts the menu back, because that is the screen the user watched
+    // recede and then return.
+    s.handle_menu(MenuEvent::Back);
+    finish_motion(&mut s);
+    assert!(
+        matches!(s.stack.last(), Some(Screen::HostOptions(_))),
+        "a reversed replace lands where the user actually was"
+    );
+}
+
 /// Up on a saved tile opens that host's menu; a discovered-but-unsaved one has none.
 #[test]
 fn up_opens_host_options_for_saved_tiles_only() {
@@ -960,7 +1013,45 @@ fn dump_console_screens() {
     };
     s2.handle_menu(MenuEvent::Move(MenuDir::Right));
     s2.handle_menu(MenuEvent::Move(MenuDir::Right));
-    dump(&mut s2, 40, 8, "07-library", true);
+    // 80 frames, not 40: this shelf carries no art, so it takes the entrance's 400 ms
+    // art-wait deadline, and until that expires the screen is deliberately the loading
+    // spinner. At 40×8 ms the dump could finish inside the wait and shoot the SPINNER while
+    // claiming to be the coverflow — a screenshot that lies is worse than a missing one.
+    dump(&mut s2, 80, 8, "07-library", true);
+
+    // Collections, the drill-in, on a library that actually has PLATFORMS — the scene above
+    // has none, so collating it would yield one group and witness nothing.
+    //
+    // The order below is load-bearing, and the reason there was no collections scene until a
+    // tile redesign needed one. `adopt_art` is a ONE-SHOT snapshot taken the moment Y is
+    // pressed, so art has to be pushed AND the shelf given frames to decode it BEFORE the
+    // press. Press first and every tile renders its monogram, and a deck of covers looks
+    // exactly like a deck that was never built.
+    //
+    // That same ordering — art before the game list — is what the fake-library dev hook does,
+    // and it MASKS the shelf's entrance defect (art is already decoded on the first Ready
+    // frame, so the entrance arms immediately). These scenes are evidence about the collection
+    // TILE and nothing else; do not read them as saying the entrance is well.
+    for (name, palette) in [
+        ("07b-collections", "violet"),
+        ("07b-collections-mint", "mint"),
+    ] {
+        let (mut s3, _c3, _l3) = collections_shell();
+        s3.settings.ui_palette = palette.to_string();
+        dump(&mut s3, 12, 8, &format!("_{name}-decode"), true);
+        s3.handle_menu(MenuEvent::Secondary);
+        dump(&mut s3, 40, 8, name, true);
+    }
+    // …and the same screen with NOTHING decoded: the ghost slots and the monogram badge, which
+    // is the permanent look of a platform full of art-less ROM entries rather than a loading
+    // state. Pale, because that is where a hardcoded face strands its own initials.
+    {
+        let (mut s3, _c3, _l3) = collections_shell_no_art();
+        s3.settings.ui_palette = "mint".to_string();
+        dump(&mut s3, 12, 8, "_noart-settle", true);
+        s3.handle_menu(MenuEvent::Secondary);
+        dump(&mut s3, 40, 8, "07b-collections-noart", true);
+    }
 
     // The wake and connecting overlays + a toast.
     console.set_wake(Some(WakeStatus {
@@ -987,4 +1078,348 @@ fn dump_console_screens() {
     s.set_connecting(None);
     s.session_failed("Connection timed out");
     dump(&mut s, 10, 8, "10-toast", true);
+}
+
+/// A 2:3 poster, PNG-encoded, in a colour derived from `seed`.
+///
+/// Real encoded bytes rather than a stub, because the thing under test is the decode path:
+/// `LibraryScreen` feeds these to `Image::from_encoded`, and a shape that fails to decode is
+/// indistinguishable in a screenshot from a tile that chose to draw no cover.
+fn poster_png(seed: usize) -> Vec<u8> {
+    let mut surface = skia_safe::surfaces::raster_n32_premul((60, 90)).unwrap();
+    let hue = [
+        (0.85, 0.30, 0.35),
+        (0.30, 0.55, 0.85),
+        (0.35, 0.75, 0.45),
+        (0.85, 0.65, 0.25),
+    ][seed % 4];
+    surface
+        .canvas()
+        .clear(skia_safe::Color4f::new(hue.0, hue.1, hue.2, 1.0));
+    // A darker band across the lower third, so a cover is visibly ORIENTED — a flat colour
+    // would hide a cover drawn upside-down or with its aspect wrong.
+    surface.canvas().draw_rect(
+        skia_safe::Rect::from_xywh(0.0, 62.0, 60.0, 28.0),
+        &crate::theme::fill(skia_safe::Color4f::new(
+            hue.0 * 0.45,
+            hue.1 * 0.45,
+            hue.2 * 0.45,
+            1.0,
+        )),
+    );
+    surface
+        .image_snapshot()
+        .encode(None, skia_safe::EncodedImageFormat::PNG, 100)
+        .unwrap()
+        .as_bytes()
+        .to_vec()
+}
+
+/// Games across four platforms — what the collections screen is for, and what the flat
+/// `platform: None` library above cannot produce.
+fn platform_games() -> Vec<crate::library::LibraryGame> {
+    [
+        ("Gran Turismo 6", "PlayStation 3"),
+        ("The Last of Us", "PlayStation 3"),
+        ("Demon's Souls", "PlayStation 3"),
+        ("Halo 3", "Xbox 360"),
+        ("Fable II", "Xbox 360"),
+        ("Super Metroid", "SNES"),
+        ("Chrono Trigger", "SNES"),
+        ("Sonic 2", "Mega Drive"),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, (title, platform))| crate::library::LibraryGame {
+        id: format!("rom:{i}"),
+        title: (*title).to_string(),
+        store: "rom-manager".into(),
+        launcher: false,
+        icon: String::new(),
+        platform: Some((*platform).to_string()),
+    })
+    .collect()
+}
+
+fn collections_shell_inner(
+    with_art: bool,
+) -> (Shell, ConsoleShared, crate::library::LibraryShared) {
+    fake_home();
+    let library = crate::library::LibraryShared::default();
+    let games = platform_games();
+    if with_art {
+        for (i, g) in games.iter().enumerate() {
+            library.push_art(g.id.clone(), poster_png(i));
+        }
+    }
+    library.set_games(games);
+    let console = ConsoleShared::default();
+    console.set_hosts(hosts());
+    let sh = Shell::new(
+        console.clone(),
+        library.clone(),
+        ConsoleBus::default(),
+        ConsoleOptions {
+            device_name: "deck".into(),
+            deck: false,
+        },
+        vec![
+            Screen::Home(HomeScreen::new()),
+            Screen::Library(LibraryScreen::new(&hosts()[0])),
+        ],
+    )
+    .unwrap();
+    (sh, console, library)
+}
+
+fn collections_shell() -> (Shell, ConsoleShared, crate::library::LibraryShared) {
+    collections_shell_inner(true)
+}
+
+fn collections_shell_no_art() -> (Shell, ConsoleShared, crate::library::LibraryShared) {
+    collections_shell_inner(false)
+}
+
+/// The bounding box of everything lit on a raster surface, in pixels: `(left, right, bottom)`.
+/// White ink on a cleared black field, so any channel answers.
+fn ink_bounds(surface: &mut skia_safe::Surface, w: i32, h: i32) -> (i32, i32, i32) {
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    let info = skia_safe::ImageInfo::new_n32_premul((w, h), None);
+    assert!(
+        surface.read_pixels(&info, &mut pixels, (w * 4) as usize, (0, 0)),
+        "raster surface read-back"
+    );
+    let (mut left, mut right, mut bottom) = (i32::MAX, i32::MIN, i32::MIN);
+    for (i, px) in pixels.chunks_exact(4).enumerate() {
+        if px[0] > 60 {
+            let (x, y) = (i as i32 % w, i as i32 / w);
+            left = left.min(x);
+            right = right.max(x);
+            bottom = bottom.max(y);
+        }
+    }
+    assert!(left <= right, "nothing was drawn");
+    (left, right, bottom)
+}
+
+/// A screen heading starts on its column and stays on ONE line.
+///
+/// Both halves are the defect this replaced. The heading used to be centred, which read as a
+/// floating label rather than as a section heading — every other punktfunk client anchors it
+/// to the leading edge — and, being a wrapping paragraph, a long host name grew a SECOND line
+/// downward into the screen's content. Asserted against a control render of the same string
+/// with room to spare rather than against a pixel row, so the line box is Geist's to define:
+/// the clamped heading must occupy the same one line the unclamped one does.
+#[test]
+fn a_heading_starts_on_its_column_and_never_takes_a_second_line() {
+    let fonts = crate::theme::build_fonts().unwrap();
+    let (w, h) = (1200, 200);
+    let (x, y, size) = (crate::theme::EDGE_INSET, 18.0, 30.0);
+    let title = "Living Room PC · Performance · PlayStation 3";
+    let render = |max_w: f64| {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
+        surface
+            .canvas()
+            .clear(skia_safe::Color4f::new(0.0, 0.0, 0.0, 1.0));
+        fonts.heading(
+            surface.canvas(),
+            title,
+            crate::theme::W::Bold,
+            size,
+            skia_safe::Color4f::new(1.0, 1.0, 1.0, 1.0),
+            x,
+            y,
+            max_w,
+        );
+        ink_bounds(&mut surface, w, h)
+    };
+
+    // Room to spare: one line, and the ink begins at the column (a cap's left sidebearing
+    // puts it a pixel or two right of the paragraph's origin, never left of it).
+    let (loose_left, loose_right, loose_bottom) = render(1100.0);
+    assert!(
+        (loose_left as f64) >= x - 1.0 && (loose_left as f64) < x + 0.1 * 1100.0,
+        "heading ink starts at {loose_left}, which is not the {x} column"
+    );
+    assert!(
+        loose_right < w,
+        "the control render was clipped by the surface"
+    );
+
+    // Squeezed: it ellipsizes inside the budget instead of wrapping, so its ink ends where
+    // the budget does and its bottom stays on the control's single line.
+    let budget = 300.0;
+    let (tight_left, tight_right, tight_bottom) = render(budget);
+    assert_eq!(
+        tight_left, loose_left,
+        "clamping the width must not move the heading's left edge"
+    );
+    assert!(
+        (tight_right as f64) <= x + budget + 1.0,
+        "heading ran to {tight_right}, past its {} budget",
+        x + budget
+    );
+    assert!(
+        tight_bottom <= loose_bottom + 1,
+        "heading wrapped to a second line: it reaches {tight_bottom} where one line ends at \
+         {loose_bottom}"
+    );
+}
+
+/// The console's geometry is ANTI-ALIASED — the defect this pins shipped in the overhaul and
+/// was only caught by looking at a Deck.
+///
+/// Skia defaults `SkPaint::fAntiAlias` to FALSE, so `Paint::new(colour, None)` — the terse and
+/// obvious way to write a draw call — produces hard-stepped edges. The console drew nearly
+/// everything that way: glass panels, the badge round-rects, the online pip, the D-pad and
+/// PlayStation glyph paths. Only paints that happened to be mutated for some other reason (a
+/// stroke style, a width) had picked up a `set_anti_alias(true)` along the way, which is why
+/// the console shipped smooth 1 px rings sitting on top of jagged fills.
+///
+/// Asserted on a SHAPE rather than on a screen: a full render is a poor witness here — one
+/// jagged corner is a few dozen pixels in 1.02 M, and no threshold that catches it survives an
+/// unrelated palette tweak. A lone circle on a blank field is unambiguous. With AA its boundary
+/// is a ring of PARTIAL coverage; without it every pixel is one of exactly two values.
+#[test]
+fn geometry_is_anti_aliased() {
+    let (w, h) = (64, 64);
+    let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
+    surface
+        .canvas()
+        .clear(skia_safe::Color4f::new(0.0, 0.0, 0.0, 1.0));
+    // Deliberately off the pixel grid: a circle centred on a half-pixel has an edge that
+    // cannot be represented exactly, which is when AA is the whole difference.
+    surface.canvas().draw_circle(
+        skia_safe::Point::new(31.5, 31.5),
+        20.3,
+        &crate::theme::fill(skia_safe::Color4f::new(1.0, 1.0, 1.0, 1.0)),
+    );
+
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    let info = skia_safe::ImageInfo::new_n32_premul((w, h), None);
+    assert!(
+        surface.read_pixels(&info, &mut pixels, (w * 4) as usize, (0, 0)),
+        "raster surface read-back"
+    );
+    // Red channel alone — the fill is white on black, so all three agree.
+    let partial = pixels
+        .chunks_exact(4)
+        .filter(|px| (8..248).contains(&px[0]))
+        .count();
+    assert!(
+        partial > 40,
+        "an anti-aliased circle of r≈20 has a boundary ring of partially covered pixels; found \
+         {partial}, which is what `Paint::new`'s aliased default looks like"
+    );
+}
+
+/// A shader-painted element actually PAINTS — the second trap in the same corner, and the one
+/// that cost a whole screenshot round.
+///
+/// Skia modulates a shader's output by the paint's ALPHA. `Paint::default` is opaque black, so
+/// the console's gradients and the aurora's runtime effect never noticed the rule existed; the
+/// moment those paints were rebuilt from a "the shader supplies the colour anyway" transparent
+/// placeholder, every one of them drew NOTHING. Not dimmer, not wrong-coloured — absent: the
+/// backdrop, the badge, the vignette and the panel's gradient stroke all vanished at once, and
+/// every test still passed, because a test that only renders a frame cannot tell a missing layer
+/// from a dark one. `theme::shaded` is opaque by construction; this holds it to that.
+#[test]
+fn a_shaded_paint_is_opaque_enough_to_draw() {
+    let (w, h) = (32, 32);
+    let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
+    surface
+        .canvas()
+        .clear(skia_safe::Color4f::new(0.0, 0.0, 0.0, 1.0));
+    let mut p = crate::theme::shaded();
+    let stops = [
+        skia_safe::Color4f::new(1.0, 1.0, 1.0, 1.0),
+        skia_safe::Color4f::new(1.0, 1.0, 1.0, 1.0),
+    ];
+    p.set_shader(skia_safe::gradient::shaders::linear_gradient(
+        (
+            skia_safe::Point::new(0.0, 0.0),
+            skia_safe::Point::new(0.0, h as f32),
+        ),
+        &skia_safe::gradient::Gradient::new(
+            skia_safe::gradient::Colors::new_evenly_spaced(
+                &stops,
+                skia_safe::TileMode::Clamp,
+                None,
+            ),
+            skia_safe::gradient::Interpolation::default(),
+        ),
+        None,
+    ));
+    surface
+        .canvas()
+        .draw_rect(skia_safe::Rect::from_wh(w as f32, h as f32), &p);
+
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    let info = skia_safe::ImageInfo::new_n32_premul((w, h), None);
+    assert!(
+        surface.read_pixels(&info, &mut pixels, (w * 4) as usize, (0, 0)),
+        "raster surface read-back"
+    );
+    let lit = pixels.chunks_exact(4).filter(|px| px[0] > 200).count();
+    assert_eq!(
+        lit,
+        (w * h) as usize,
+        "an opaque white gradient over the whole surface should light every pixel; a paint \
+         whose own alpha is 0 scales the shader away and leaves the field black"
+    );
+}
+
+/// …and every paint in the crate is built by `theme::fill`/`stroke`/`layer`, so the assertion
+/// above keeps holding for code written after it.
+///
+/// A pixel test can only witness the shapes it happens to draw; this witnesses the CLASS. The
+/// trap is that the aliased spelling is the NATURAL one — `&Paint::new(c, None)` passed inline
+/// as an argument, no binding, no obvious place to hang a flag — so it reappears whenever a new
+/// draw call is written, in whichever file is being worked on that day. Reading the crate's own
+/// source is the only check that scales to that.
+#[test]
+fn paints_are_built_by_the_theme_constructors() {
+    // Split so the needles do not appear literally in this file — the scan reads its own
+    // source too, and a self-match is the first thing this test did.
+    let needles = [concat!("Paint", "::new("), concat!("Paint", "::default()")];
+    let mut offenders = Vec::new();
+    let mut stack = vec![std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src"
+    ))];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("the crate's own src is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            // theme.rs holds the sanctioned constructors, and is the one place the raw ones
+            // are allowed.
+            if path.file_name().is_some_and(|f| f == "theme.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("source is UTF-8");
+            for (n, line) in text.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") || code.starts_with('*') {
+                    continue;
+                }
+                if needles.iter().any(|needle| code.contains(needle)) {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    offenders.push(format!("{name}:{}: {code}", n + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these build a Skia paint directly, which means anti-aliasing is OFF on whatever they \
+         draw — use `theme::fill`, `theme::stroke`, or `theme::layer` for a `save_layer` \
+         paint:\n  {}",
+        offenders.join("\n  ")
+    );
 }

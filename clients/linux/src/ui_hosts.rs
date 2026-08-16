@@ -75,7 +75,6 @@ enum CardKind {
         host: KnownHost,
         online: bool,
         recent: bool,
-        library_enabled: bool,
         /// The profile catalog as `(id, name)`, for this card's menus and chip. Shared per
         /// refresh rather than re-read per card.
         profiles: Rc<Vec<Profile>>,
@@ -293,7 +292,6 @@ impl relm4::factory::FactoryComponent for HostCard {
                 host: k,
                 online,
                 recent,
-                library_enabled,
                 profiles,
                 pinned,
             } => {
@@ -470,7 +468,9 @@ impl relm4::factory::FactoryComponent for HostCard {
                     // START this card, not a property of the host, so it belongs to a shortcut
                     // as much as Connect does — and the card's request carries its profile, so
                     // what launches from that grid is this card's profile, not the binding.
-                    if *library_enabled {
+                    // Paired only: the fetch authenticates as this device, so on a merely
+                    // trusted host it can only come back refused.
+                    if k.paired {
                         launch.append(Some("Browse library\u{2026}"), Some("card.library"));
                     }
                     menu.append_section(None, &launch);
@@ -513,8 +513,10 @@ impl relm4::factory::FactoryComponent for HostCard {
                     }
 
                     let look = gio::Menu::new();
-                    // Experimental (Preferences gate): browse the host's game library.
-                    if *library_enabled {
+                    // Browse the host's game library — offered on any paired host, but only a
+                    // paired one: a saved card can be merely "Trusted" (the pill above), and
+                    // the fetch authenticates as this device, so there it would only be refused.
+                    if k.paired {
                         look.append(Some("Browse library\u{2026}"), Some("card.library"));
                     }
                     look.append(Some("Test network speed\u{2026}"), Some("card.speed"));
@@ -677,7 +679,6 @@ pub struct HostsPage {
     /// [`saved_key`]. OR'd with live-advert presence to drive the Online pip.
     probed: HashMap<String, bool>,
     connecting: Option<String>,
-    settings: Rc<RefCell<Settings>>,
     saved: FactoryVecDeque<HostCard>,
     discovered: FactoryVecDeque<HostCard>,
     widgets: PageWidgets,
@@ -701,7 +702,7 @@ pub enum HostsMsg {
     AdvertRemoved {
         fullname: String,
     },
-    /// Reload the disk store and re-render (fresh pairings, renames, the library gate).
+    /// Reload the disk store and re-render (fresh pairings, renames).
     Refresh,
     /// Re-query mDNS *and* re-render — the header's Refresh button. Distinct from [`Self::Refresh`],
     /// which only re-reads local state: after a while `mdns-sd` re-queries about once an hour, so a
@@ -745,7 +746,10 @@ impl SimpleComponent for HostsPage {
     }
 
     fn init(
-        settings: Self::Init,
+        // The shared settings store, which this page no longer reads: its card menus follow
+        // pairing alone now that the library is offered on every paired host. It stays in
+        // `Init` because the shell hands the same store to every page it launches.
+        _settings: Self::Init,
         page: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
@@ -941,7 +945,6 @@ impl SimpleComponent for HostsPage {
             adverts: HashMap::new(),
             probed: HashMap::new(),
             connecting: None,
-            settings,
             saved,
             discovered,
             widgets: PageWidgets {
@@ -1064,7 +1067,6 @@ impl HostsPage {
             .filter_map(|h| h.last_used.map(|t| (h.fp_hex.clone(), t)))
             .max_by_key(|&(_, t)| t)
             .map(|(fp, _)| fp);
-        let library_enabled = self.settings.borrow().library_enabled;
         // One catalog read per refresh, shared by every card's menus and chip.
         let profiles: Rc<Vec<Profile>> = Rc::new(
             pf_client_core::profiles::ProfilesFile::load()
@@ -1120,7 +1122,6 @@ impl HostsPage {
                         online,
                         profiles: profiles.clone(),
                         recent: most_recent.as_deref() == Some(k.fp_hex.as_str()),
-                        library_enabled,
                         pinned: None,
                     },
                 });
@@ -1141,7 +1142,6 @@ impl HostsPage {
                             online,
                             profiles: profiles.clone(),
                             recent: false,
-                            library_enabled,
                             pinned: Some((id, name)),
                         },
                     });

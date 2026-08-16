@@ -14,6 +14,83 @@ use skia_safe::{
     RRect, Rect, TileMode, Typeface,
 };
 
+// --- Paint ----------------------------------------------------------------------------------
+
+/// A filled paint, ANTI-ALIASED. Build every fill in this crate here.
+///
+/// Skia's `SkPaint` defaults `fAntiAlias` to **false**, and `Paint::new(colour, None)` is that
+/// default constructor with a colour on it — so the natural, terse way to write a Skia draw call
+/// (`canvas.draw_rrect(rr, &Paint::new(c, None))`) silently produces HARD-STEPPED geometry. That
+/// is the wrong default for this crate twice over: the console draws almost nothing axis-aligned
+/// (round-rects, circles, arcs, D-pad and stick paths), and it is read from a couch on a 1280×800
+/// Deck panel, where a stair-stepped 16 px glyph circle reads as a visible octagon.
+///
+/// The bug this exists to prevent is specific and it already happened: paints that got MUTATED
+/// for some other reason (a stroke style, a width) collected a `set_anti_alias(true)` along the
+/// way, while every inline `&Paint::new(…)` argument did not. The console therefore shipped
+/// smooth 1 px rings drawn on top of jagged fills — which is worse-looking than no ring at all,
+/// because the smooth edge gives the eye a reference for how wrong the fill is.
+///
+/// `theme::fill`/[`stroke`]/[`layer`] are the only sanctioned constructors, and
+/// `shell::tests::paints_are_built_by_the_theme_constructors` fails the build if a bare
+/// `Paint::new`/`Paint::default` reappears anywhere outside this file.
+pub(crate) fn fill(color: Color4f) -> Paint {
+    let mut p = Paint::new(color, None);
+    p.set_anti_alias(true);
+    p
+}
+
+/// A stroking paint of `width` DEVICE pixels, anti-aliased. Callers scaling by `k` pass
+/// `width * k` — nothing here knows about design units.
+pub(crate) fn stroke(color: Color4f, width: f32) -> Paint {
+    let mut p = fill(color);
+    p.set_style(skia_safe::PaintStyle::Stroke);
+    p.set_stroke_width(width);
+    p
+}
+
+/// A paint whose colour comes from a SHADER — a gradient, or the aurora's runtime effect.
+/// Anti-aliased, and OPAQUE by construction, which is the whole point of it existing.
+///
+/// The colour channel is unused once a shader is attached, so the obvious thing is to build
+/// one of these from a transparent placeholder and let the shader supply everything. That is
+/// a trap: Skia modulates a shader's output by the PAINT'S ALPHA, so an alpha-0 placeholder
+/// draws nothing whatever the shader says. It is a silent, total failure — the element simply
+/// is not there — and it is invisible to a test that only asserts a frame renders without
+/// panicking. `Paint::default` happened to be opaque black and so never showed the problem;
+/// anything replacing it has to be deliberately opaque, so that is what this is.
+pub(crate) fn shaded() -> Paint {
+    fill(Color4f::new(0.0, 0.0, 0.0, 1.0))
+}
+
+/// [`shaded`]'s stroking twin — a gradient hairline, opaque so the gradient survives.
+pub(crate) fn shaded_stroke(width: f32) -> Paint {
+    let mut p = shaded();
+    p.set_style(skia_safe::PaintStyle::Stroke);
+    p.set_stroke_width(width);
+    p
+}
+
+/// The paint for a `save_layer` — it carries alpha and colour filters, and never any geometry
+/// of its own, so anti-aliasing has nothing to act on. Its own constructor so the AA guard (and
+/// a reader) can tell a compositing paint from a drawing one without reading the call site.
+pub(crate) fn layer() -> Paint {
+    Paint::default()
+}
+
+/// How the console samples bitmap art (poster/cover images, launcher icons).
+///
+/// `Canvas::draw_image_rect`'s default is `SamplingOptions::default()` — `FilterMode::Nearest`
+/// with `MipmapMode::None`, i.e. NO filtering at all. Every cover in the library is minified
+/// hard (a 600×900 poster into a ~180×270 Deck cell), and nearest-neighbour minification drops
+/// whole rows and columns of source pixels: box-art lettering breaks up, edges crawl as the
+/// shelf scrolls, and the result reads as "low resolution" no matter what the panel is. Linear
+/// with a linear mipmap chain is the fix — the mip level does the bulk of the reduction, so the
+/// filter is never asked to shrink by more than 2×, which is the one thing bilinear does well.
+pub(crate) fn art_sampling() -> skia_safe::SamplingOptions {
+    skia_safe::SamplingOptions::new(skia_safe::FilterMode::Linear, skia_safe::MipmapMode::Linear)
+}
+
 // --- Ink ----------------------------------------------------------------------------------
 
 /// The error/status red (the GTK client's #ff938a). Fixed: a warning must not change meaning
@@ -132,6 +209,26 @@ pub(crate) fn shade(alpha: f32) -> Color4f {
     Color4f::new(s.r, s.g, s.b, alpha * s.a)
 }
 
+/// An OPAQUE card face, `tint` of the way from the ground side of the field toward the
+/// palette's accent — the backdrop for a cover we have no art for.
+///
+/// Opaque is the constraint that rules the alternatives out: coverflow side cards OVERLAP, so
+/// a glass face would show its neighbour through it, and `accent(0.20)` over nothing is
+/// exactly that. Mixing the same tint into a base the field's own lean chooses (black under a
+/// dark palette, white under a pale one, which is what [`Ink::scrim`] already knows) gets the
+/// accent tint with no alpha spent.
+///
+/// The pairing with [`fg`] is the point of it. A fixed near-black face carrying `fg()` ink was
+/// legible on the seven dark palettes and ABSENT on the six pale ones, where `fg()` is itself a
+/// near-black tinted toward the ground — the two composited to 1.03:1. Face and ink now move in
+/// opposite directions with the palette, so they separate at both poles by construction.
+pub(crate) fn card_face(tint: f32) -> Color4f {
+    let a = ink().accent;
+    let base = if ink().scrim.r > 0.5 { 1.0 } else { 0.0 };
+    let mix = |c: f32| c * tint + base * (1.0 - tint);
+    Color4f::new(mix(a.r), mix(a.g), mix(a.b), 1.0)
+}
+
 /// Ink that reads ON the accent (a filled key, a selected pill): whichever of black or white
 /// the accent has more room for. Chosen by luminance rather than by `light`, because an accent
 /// is picked for contrast against the GLASS, not against the field.
@@ -169,14 +266,14 @@ pub(crate) fn panel(
     k: f32,
 ) {
     let rr = RRect::new_rect_xy(rect, corner * k, corner * k);
-    canvas.draw_rrect(rr, &Paint::new(ink().glass, None));
+    canvas.draw_rrect(rr, &fill(ink().glass));
     if let Some(tint) = tint {
-        canvas.draw_rrect(rr, &Paint::new(tint, None));
+        canvas.draw_rrect(rr, &fill(tint));
     }
-    let mut sp = Paint::default();
-    sp.set_style(skia_safe::PaintStyle::Stroke);
-    sp.set_stroke_width(1.0);
-    sp.set_anti_alias(true);
+    // Opaque to start with: the Plain/Brand arms overwrite the colour outright, and the
+    // gradient arms attach a shader whose output this paint's alpha would otherwise scale
+    // away to nothing.
+    let mut sp = shaded_stroke(1.0);
     match stroke {
         PanelStroke::Plain(alpha) => {
             sp.set_color4f(fg(alpha), None);
@@ -205,7 +302,6 @@ pub(crate) fn panel(
     canvas.draw_rrect(rr, &sp);
 }
 
-/// The soft drop shadow under a focused tile — a blurred black round-rect behind it.
 /// The colour half of the focus recede: neighbours lose SATURATION and BRIGHTNESS with
 /// distance `d` (0 = focused, 1 = fully receded), as one 4×5 row-major matrix.
 ///
@@ -215,9 +311,8 @@ pub(crate) fn panel(
 /// its old strength, doing the job it is actually good at — separating overlapping cards.
 ///
 /// Row-major `[r…, g…, b…, a…]`, each row `[R G B A offset]`. The RGB rows are a standard
-/// luminance-weighted saturation matrix (Rec. 709 weights) scaled by `sat`, with the
-/// brightness shift in the offset column — SwiftUI's `.brightness()` is additive, and
-/// matching it keeps the two codebases' recede comparable by eye.
+/// luminance-weighted saturation matrix (Rec. 709 weights) scaled by `sat`, the whole of it
+/// then LERPED toward the ground: `out = (1 − b)·sat_mix(c) + ground·b`.
 pub(crate) fn recede_matrix(d: f64) -> [f32; 20] {
     let d = d.clamp(0.0, 1.0);
     let sat = (1.0 - RECEDE_SATURATION * d) as f32;
@@ -228,27 +323,37 @@ pub(crate) fn recede_matrix(d: f64) -> [f32; 20] {
     // which way the field leans (it tends to black on a dark palette, white on a pale
     // one), so the recede borrows its direction.
     let toward_light = ink().scrim.r > 0.5;
-    let bright = (RECEDE_BRIGHTNESS * d) as f32 * if toward_light { 1.0 } else { -1.0 };
+    // A FRACTION of the way to the ground, not a level offset. SwiftUI's `.brightness()` is
+    // additive and this matched it, which meant −0.24 was −61/255 on every channel and
+    // Skia's colour matrix clamps: the coverflow's own #1E1E25 placeholder came out at
+    // literal #000000, the whole side stack a single black slab with no depth in it and no
+    // cover-art detail left to see. A lerp cannot clip at either pole, and it is also the
+    // arithmetic "receding into the field" actually means — a fixed subtraction is a
+    // different amount of recede for every card and total annihilation for a dark one.
+    let b = (RECEDE_BRIGHTNESS * d) as f32;
+    let ground = if toward_light { 1.0f32 } else { 0.0 };
+    let keep = 1.0 - b;
+    let offset = ground * b;
     const LR: f32 = 0.2126;
     const LG: f32 = 0.7152;
     const LB: f32 = 0.0722;
     let (ir, ig, ib) = (LR * (1.0 - sat), LG * (1.0 - sat), LB * (1.0 - sat));
     [
-        ir + sat,
-        ig,
-        ib,
+        keep * (ir + sat),
+        keep * ig,
+        keep * ib,
         0.0,
-        bright,
-        ir,
-        ig + sat,
-        ib,
+        offset,
+        keep * ir,
+        keep * (ig + sat),
+        keep * ib,
         0.0,
-        bright,
-        ir,
-        ig,
-        ib + sat,
+        offset,
+        keep * ir,
+        keep * ig,
+        keep * (ib + sat),
         0.0,
-        bright,
+        offset,
         0.0,
         0.0,
         0.0,
@@ -257,10 +362,16 @@ pub(crate) fn recede_matrix(d: f64) -> [f32; 20] {
     ]
 }
 
-/// How much colour a fully receded neighbour loses…
-const RECEDE_SATURATION: f64 = 0.42;
-/// …and how much light. Both ported from the Apple gamepad UI's focus recede.
-const RECEDE_BRIGHTNESS: f64 = 0.24;
+/// How much colour a fully receded neighbour loses. Gentle enough that a side card still
+/// reads as the artwork it is — drain more and the shelf looks like a filter was applied to
+/// it rather than like the cards are standing further away. Cannot go below 0.125 while the
+/// brightness term is 0.20: `recede_matrix_drains_colour_and_light_but_never_alpha` wants
+/// the channel spread cut by 30 %, and spread scales exactly as `(1 − b)·sat`.
+const RECEDE_SATURATION: f64 = 0.34;
+/// …and how far it travels toward the ground, as a FRACTION of the distance — never as a
+/// level offset, whatever the Apple gamepad UI's `.brightness()` does. See
+/// [`recede_matrix`]: an additive term clips, and a card dark enough clips to nothing.
+const RECEDE_BRIGHTNESS: f64 = 0.20;
 
 /// The lit top edge that makes glass read as a material rather than as a tinted rectangle:
 /// a 1 px inner stroke fading from `fg(0.10)` to nothing over the top 40 % of the panel,
@@ -272,10 +383,7 @@ const RECEDE_BRIGHTNESS: f64 = 0.24;
 /// instead of hiding it behind a default.
 pub(crate) fn panel_highlight(canvas: &Canvas, rect: Rect, corner: f32, k: f32) {
     let inset = rect.with_inset((0.5 * k, 0.5 * k));
-    let mut p = Paint::default();
-    p.set_style(skia_safe::PaintStyle::Stroke);
-    p.set_stroke_width(k.max(1.0));
-    p.set_anti_alias(true);
+    let mut p = shaded_stroke(k.max(1.0));
     let colors = [fg(0.10), fg(0.0)];
     p.set_shader(gradient::shaders::linear_gradient(
         (
@@ -299,20 +407,54 @@ pub(crate) fn focus_halo(canvas: &Canvas, rect: Rect, corner: f32, k: f32, f: f3
     if f <= 0.01 {
         return;
     }
-    let mut p = Paint::new(accent(0.28 * f), None);
+    // Every pale palette's accent is DARK — mint 0.34 luma, sunset 0.26, opal 0.33 — so a
+    // blurred accent on a pale field is a smudge, and the focused tile came out the dirtiest
+    // thing in the row while its unfocused neighbours stayed clean and light: the focus mark
+    // inverted. Mixing halfway to the scrim (white there) keeps the palette's own hue while
+    // making the mark read as light. It needs a little more body to register once lightened.
+    let (a, s) = (ink().accent, ink().scrim);
+    let (c, alpha) = if s.r > 0.5 {
+        let mix = |x: f32, y: f32| x + (y - x) * 0.5;
+        (
+            Color4f::new(mix(a.r, s.r), mix(a.g, s.g), mix(a.b, s.b), 1.0),
+            0.24 * f,
+        )
+    } else {
+        (a, 0.20 * f)
+    };
+    let mut p = fill(Color4f::new(c.r, c.g, c.b, alpha));
+    // Outer, not Normal: Normal keeps the blurred shape's INTERIOR, so the halo also filled
+    // the card's own footprint at full accent. On the home and collections tiles the panel
+    // glass over it is translucent (α 0.62 dark, 0.66 pale), so a third of that came through
+    // the face and the focused card read as a lit blob rather than as a card with light
+    // spilling around it.
     p.set_mask_filter(MaskFilter::blur(
-        skia_safe::BlurStyle::Normal,
-        18.0 * k,
+        skia_safe::BlurStyle::Outer,
+        10.0 * k,
         None,
     ));
     // Grown slightly rather than offset: a halo is light spilling out of the card on every
-    // side, where the shadow below it is the card's weight falling in one direction.
-    let spread = rect.with_outset((6.0 * k, 6.0 * k));
+    // side, where the shadow below it is the card's weight falling in one direction. The
+    // reach is outset + 3σ and it has to stay INSIDE the gap to the next card: at 6 + 3·18
+    // it overran the coverflow's 58 dp focused-to-neighbour gap, and since the strip paints
+    // farthest-first the focused card's corona landed on top of its neighbours — which is
+    // what made every card look like it was glowing.
+    let spread = rect.with_outset((4.0 * k, 4.0 * k));
     canvas.draw_rrect(RRect::new_rect_xy(spread, corner * k, corner * k), &p);
 }
 
 pub(crate) fn drop_shadow(canvas: &Canvas, rect: Rect, corner: f32, k: f32, alpha: f32) {
-    let mut p = Paint::new(Color4f::new(0.0, 0.0, 0.0, alpha), None);
+    // Black under a tile is WEIGHT on a dark field and DIRT on a pale one, where it is the
+    // heaviest mark on the screen: on `holo` and `sunset` the focused tile sat in a muddy
+    // grey-brown ring while every unfocused tile stayed clean. Scaled back at the pale pole
+    // the same way the scrim already scales itself, so the caller's alpha keeps meaning
+    // "dark-field strength" and no call site has to know which palette is up.
+    let alpha = if ink().scrim.r > 0.5 {
+        alpha * 0.40
+    } else {
+        alpha
+    };
+    let mut p = fill(Color4f::new(0.0, 0.0, 0.0, alpha));
     p.set_mask_filter(MaskFilter::blur(
         skia_safe::BlurStyle::Normal,
         10.0 * k,
@@ -333,11 +475,8 @@ pub(crate) fn drop_shadow(canvas: &Canvas, rect: Rect, corner: f32, k: f32, alph
 /// The loading/connecting spinner: a rotating 270° arc driven by the shell clock.
 pub(crate) fn spinner(canvas: &Canvas, cx: f64, cy: f64, r: f64, t: f64) {
     let start = (t * 300.0) % 360.0;
-    let mut paint = Paint::new(fg(0.85), None);
-    paint.set_style(skia_safe::PaintStyle::Stroke);
-    paint.set_stroke_width((r / 5.0) as f32);
+    let mut paint = stroke(fg(0.85), (r / 5.0) as f32);
     paint.set_stroke_cap(skia_safe::PaintCap::Round);
-    paint.set_anti_alias(true);
     canvas.draw_arc(
         Rect::from_xywh(
             (cx - r) as f32,
@@ -351,6 +490,21 @@ pub(crate) fn spinner(canvas: &Canvas, cx: f64, cy: f64, r: f64, t: f64) {
         &paint,
     );
 }
+
+// --- Layout -------------------------------------------------------------------------------
+
+/// How far in from a screen's edge its CHROME sits, design units — the heading, the section
+/// strip under it and the controller chip on the right all share this one column.
+///
+/// The number is the other clients' verbatim: Apple pads every gamepad heading and its tab
+/// strip `.horizontal, 24`, Android names it `ConsoleEdgeInset = 24.dp`. It is deliberately
+/// NOT the legend's 18 — that is a PILL's edge, whose first glyph lands at 31, so matching it
+/// would misalign the very thing it was copied from.
+///
+/// It is a screen inset, not a content margin: the rows, the carousel and the coverflow are
+/// all CENTRED columns, so aligning a heading to one would mean tracking `(width − column)/2`,
+/// which is an artefact of the window size rather than a margin anyone chose.
+pub(crate) const EDGE_INSET: f64 = 24.0;
 
 // --- Typography ---------------------------------------------------------------------------
 
@@ -445,7 +599,7 @@ impl Fonts {
             text,
             Point::new(x as f32, baseline as f32),
             &font,
-            &Paint::new(color, None),
+            &fill(color),
         );
         font.measure_str(text, None).0
     }
@@ -465,7 +619,7 @@ impl Fonts {
         color: Color4f,
     ) {
         let font = self.font(w, size);
-        let paint = Paint::new(color, None);
+        let paint = fill(color);
         let mut pen = x as f32;
         let mut buf = [0u8; 4];
         for ch in text.chars() {
@@ -475,6 +629,10 @@ impl Fonts {
         }
     }
 
+    /// `clamp` caps the paragraph at that many lines and ellipsizes what doesn't fit; `None`
+    /// wraps freely. A heading has to clamp — an over-long one used to grow DOWNWARD into the
+    /// screen's content, which is why both other clients pin theirs to one line.
+    #[allow(clippy::too_many_arguments)]
     fn paragraph(
         &self,
         text: &str,
@@ -483,9 +641,14 @@ impl Fonts {
         color: Color4f,
         align: TextAlign,
         max_w: f64,
+        clamp: Option<usize>,
     ) -> skia_safe::textlayout::Paragraph {
         let mut style = ParagraphStyle::new();
         style.set_text_align(align);
+        if let Some(lines) = clamp {
+            style.set_max_lines(lines);
+            style.set_ellipsis("\u{2026}");
+        }
         let mut ts = TextStyle::new();
         ts.set_font_families(&["Geist"]);
         ts.set_font_size(size as f32);
@@ -525,8 +688,51 @@ impl Fonts {
         y: f64,
         max_w: f64,
     ) {
-        let p = self.paragraph(text, w, size, color, TextAlign::Center, max_w);
+        let p = self.paragraph(text, w, size, color, TextAlign::Center, max_w, None);
         p.paint(canvas, Point::new((cx - max_w / 2.0) as f32, y as f32));
+    }
+
+    /// [`centered`](Self::centered)'s LEFT-ALIGNED twin: `x` is the text's left edge, `y` its
+    /// top. Same paragraph path, so it shapes and falls back for CJK exactly as `centered`
+    /// does — which is why the screen chrome cannot use `draw`/`draw_clipped` instead.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn leading(
+        &self,
+        canvas: &Canvas,
+        text: &str,
+        w: W,
+        size: f64,
+        color: Color4f,
+        x: f64,
+        y: f64,
+        max_w: f64,
+    ) {
+        let p = self.paragraph(text, w, size, color, TextAlign::Left, max_w, None);
+        p.paint(canvas, Point::new(x as f32, y as f32));
+    }
+
+    /// A screen's heading: left-aligned at `x`, top edge at `y`, clamped to ONE ellipsized
+    /// line at `max_w`.
+    ///
+    /// Every punktfunk client anchors its console heading to the leading edge — Apple's
+    /// carries the note that a centred one "read as a floating label" rather than as a
+    /// section heading, Android's `ConsoleHeader` pins it to `ConsoleEdgeInset`. The single
+    /// line is not cosmetic either: left-aligned, a long host name would otherwise wrap under
+    /// the controller chip and push a second line into the content.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn heading(
+        &self,
+        canvas: &Canvas,
+        text: &str,
+        w: W,
+        size: f64,
+        color: Color4f,
+        x: f64,
+        y: f64,
+        max_w: f64,
+    ) {
+        let p = self.paragraph(text, w, size, color, TextAlign::Left, max_w, Some(1));
+        p.paint(canvas, Point::new(x as f32, y as f32));
     }
 
     /// A single shaped line, middle-ellipsized to `max_w`, drawn at a baseline. For
@@ -671,6 +877,31 @@ mod tests {
         assert!(spread(dark_side) < spread(card));
         assert!(spread(pale_side) < spread(card));
 
+        set_ink(DARK_INK);
+    }
+
+    /// The recede must never CLAMP. The other three assertions here are all relative and
+    /// none of them feeds the matrix a dark input, which is exactly how a brightness term
+    /// that subtracted 61/255 in the offset column shipped: the coverflow's own placeholder
+    /// face came out at literal #000000 on every card a slot or more from the focus, so the
+    /// side stack was one black slab with no depth and no cover-art detail in it. `apply`
+    /// omits Skia's clamp deliberately, so a channel below zero here IS the shipped bug.
+    #[test]
+    fn a_dark_card_face_survives_a_full_recede() {
+        // Every dark palette's coverless card, at the quieter of the two tints
+        // `screens::library::draw_poster_placeholder` draws — the darkest face the shelf has.
+        for p in crate::library::PALETTES.iter().filter(|p| !p.light) {
+            set_ink(Ink::of(p));
+            let f = card_face(0.20);
+            let out = apply(&recede_matrix(1.0), [f.r, f.g, f.b, 1.0]);
+            for c in &out[..3] {
+                assert!(
+                    *c > 0.05,
+                    "the recede crushed {}'s card face to black: {out:?}",
+                    p.id
+                );
+            }
+        }
         set_ink(DARK_INK);
     }
 }

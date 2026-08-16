@@ -19,7 +19,7 @@ use anyhow::{anyhow, Result};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse, PadInfo};
 use pf_client_core::trust;
 use pf_presenter::overlay::OverlayAction;
-use skia_safe::{Canvas, Color4f, Data, Paint, Rect, RuntimeEffect};
+use skia_safe::{Canvas, Color4f, Data, Rect, RuntimeEffect};
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -79,8 +79,10 @@ enum Motion {
         /// undone. Only a push is ever retargeted to 0.0 (see [`Shell::nav_back`]).
         target: f64,
         kind: NavKind,
-        /// The screen being dismissed. `Some` only for a pop — a push leaves its parent on
-        /// the stack, so there is nothing to carry.
+        /// The screen leaving the stack, when it is no longer ON the stack to be drawn from.
+        /// A pop always carries one. A plain push never does — its parent stays put and the
+        /// renderer finds it at `n - 2` — but a REPLACE does, because the screen it swapped
+        /// out is gone and `n - 2` is that screen's parent, a level too far.
         leaving: Option<Box<Screen>>,
     },
 }
@@ -573,7 +575,7 @@ impl Shell {
         }
         if p.press() {
             if let Some((key, _)) = self.hint_rects.iter().find(|(_, r)| p.hits(*r)) {
-                // Only the face-button hints are actions. Shoulders and Adjust describe a
+                // A hint is clickable when it names an ACTION. Shoulders and Adjust name a
                 // DIRECTION, and the thing they steer — the tab strip, a row's value — is
                 // already under the pointer's finger; inventing a side for a click here
                 // would just be a worse way to press what it can already press.
@@ -582,6 +584,11 @@ impl Shell {
                     crate::glyphs::HintKey::Back => Some(MenuEvent::Back),
                     crate::glyphs::HintKey::Secondary => Some(MenuEvent::Secondary),
                     crate::glyphs::HintKey::Tertiary => Some(MenuEvent::Tertiary),
+                    // ▲ is drawn as a direction and read as one, but it steers nothing: the
+                    // only screen that publishes it is the home carousel, where up is not
+                    // navigation but "open this tile's menu". Without this the context menu —
+                    // and with it the only way to copy a host's link — is pad-only.
+                    crate::glyphs::HintKey::Up => Some(MenuEvent::Move(MenuDir::Up)),
                     _ => None,
                 };
                 if let Some(ev) = ev {
@@ -730,11 +737,19 @@ impl Shell {
             Nav::Replace(screen) => {
                 // Swap under the SAME push choreography: the outgoing screen is dropped
                 // rather than parked, so Back from the incoming one lands where the
-                // replaced screen was reached from — and so does a Back that REVERSES this
-                // push, which pops to the same parent.
-                self.stack.pop();
+                // replaced screen was reached from.
+                //
+                // It is CARRIED through the transition rather than dropped on the spot,
+                // which is the whole difference between this reading right and reading
+                // wrong. A push paints the screen BENEATH the incoming one as its receding
+                // layer; drop the replaced screen first and that is its parent, so choosing
+                // "Edit…" in a host's menu animated the editor in over HOME — the host list
+                // flashing up for the length of the transition, as if the menu had been
+                // dismissed and something else opened. Handing it over as the leaving layer
+                // means the menu itself recedes, which is what actually happened.
+                let leaving = self.stack.pop().map(Box::new);
                 self.stack.push(*screen);
-                self.begin_nav(NavKind::Push, None);
+                self.begin_nav(NavKind::Push, leaving);
             }
             Nav::Pop => {
                 if self.stack.len() > 1 {
@@ -827,13 +842,25 @@ impl Shell {
 
     /// A settled transition's bookkeeping. Called once the spring has landed on its target.
     fn finish_nav(&mut self) {
-        if let Motion::Nav { kind, target, .. } = &self.motion {
+        if let Motion::Nav {
+            kind,
+            target,
+            leaving,
+            ..
+        } = &mut self.motion
+        {
             // A push that was reversed mid-flight never happened: take its screen back off.
-            // For a `Replace` this lands on the same parent a settled Back would have, so
-            // the two agree. Guarded on length because the root must never be popped here —
-            // `nav_back` refuses to reverse there, and this is the belt to that's braces.
+            // Guarded on length because the root must never be popped here — `nav_back`
+            // refuses to reverse there, and this is the belt to that's braces.
             if *kind == NavKind::Push && *target == 0.0 && self.stack.len() > 1 {
                 self.stack.pop();
+                // A reversed REPLACE puts back what it swapped out. The transition showed
+                // that screen receding and then coming home again, so landing anywhere else
+                // would contradict what was on glass — and "undo that navigation" means the
+                // menu you were standing in, not the screen one level further out.
+                if let Some(back) = leaving.take() {
+                    self.stack.push(*back);
+                }
             }
         }
         // A completed pop drops the screen it was carrying, exactly as before.
@@ -883,7 +910,7 @@ impl Shell {
         let bytes = unsafe { std::slice::from_raw_parts(uniforms.as_ptr().cast::<u8>(), 48) };
         match self.mesh.make_shader(Data::new_copy(bytes), &[], None) {
             Some(shader) => {
-                let mut paint = Paint::default();
+                let mut paint = crate::theme::shaded();
                 paint.set_shader(shader);
                 canvas.draw_rect(Rect::from_wh(w as f32, h as f32), &paint);
             }

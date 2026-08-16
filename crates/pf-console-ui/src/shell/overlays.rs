@@ -2,15 +2,14 @@
 
 use crate::anim::{approach, springs};
 use crate::glyphs::{hint_bar, Hint, HintKey};
-use crate::theme::{fg, Fonts, PanelStroke, W};
-use skia_safe::{gradient, Canvas, Color4f, Paint, PathBuilder, Point, Rect, TileMode};
+use crate::theme::{fg, fill, Fonts, PanelStroke, W};
+use skia_safe::{gradient, Canvas, Color4f, PathBuilder, Point, Rect, TileMode};
 
 use super::{Shell, ToastMark, BOTTOM_BAND};
 
 /// The toast's leading mark, centred on `(cx, cy)` in a ~13 dp box.
 fn draw_toast_mark(canvas: &Canvas, mark: ToastMark, cx: f64, cy: f64, k: f64, ink: Color4f) {
-    let mut p = Paint::new(ink, None);
-    p.set_anti_alias(true);
+    let mut p = fill(ink);
     match mark {
         ToastMark::Dot => {
             canvas.draw_circle((cx as f32, cy as f32), (3.4 * k) as f32, &p);
@@ -162,17 +161,21 @@ impl Shell {
             let size = 13.0 * k;
             let tw = f64::from(fonts.measure(&toast.text, W::Medium, size));
             let (pad_x, bh) = (16.0 * k, 34.0 * k);
-            // Leading run: hairline, air, mark, air — then the text.
-            let (hair_w, mark_w, gap) = (3.0 * k, 13.0 * k, 9.0 * k);
-            let lead = hair_w + gap + mark_w + gap;
-            let bw = lead + tw + 2.0 * pad_x;
+            // Leading run: the kind mark, air, then the text. The mark carries the kind by
+            // itself — a hairline in the same tint used to stand beside it, saying the same
+            // thing twice and reading as a rendering seam rather than as meaning. Its pad is
+            // shy of `pad_x` because nothing drawn in the 13 dp box fills it, and an equal pad
+            // leaves the pill visibly left-heavy in air.
+            let (mark_pad, mark_w, gap) = (13.0 * k, 13.0 * k, 9.0 * k);
+            let lead = mark_pad + mark_w + gap;
+            let bw = lead + tw + pad_x;
             let bx = (w - bw) / 2.0;
             let by = h - BOTTOM_BAND * k - bh - 8.0 * k + (1.0 - slide) * 12.0 * k;
             canvas.save_layer_alpha_f(None, alpha);
             let rect = Rect::from_xywh(bx as f32, by as f32, bw as f32, bh as f32);
             canvas.draw_rrect(
                 skia_safe::RRect::new_rect_xy(rect, (bh / 2.0) as f32, (bh / 2.0) as f32),
-                &Paint::new(crate::theme::shade(0.6), None),
+                &fill(crate::theme::shade(0.6)),
             );
             crate::theme::panel(
                 canvas,
@@ -183,29 +186,12 @@ impl Shell {
                 k as f32,
             );
             let cy = by + bh / 2.0;
-            // The hairline: the kind, readable from a couch without reading the words.
-            let hair = Rect::from_xywh(
-                (bx + pad_x) as f32,
-                (cy - 8.0 * k) as f32,
-                hair_w as f32,
-                (16.0 * k) as f32,
-            );
-            canvas.draw_rrect(
-                skia_safe::RRect::new_rect_xy(hair, (hair_w / 2.0) as f32, (hair_w / 2.0) as f32),
-                &Paint::new(tint, None),
-            );
-            draw_toast_mark(
-                canvas,
-                mark,
-                bx + pad_x + hair_w + gap + mark_w / 2.0,
-                cy,
-                k,
-                tint,
-            );
+            // Tinted by kind, so a toast is readable from a couch without reading the words.
+            draw_toast_mark(canvas, mark, bx + mark_pad + mark_w / 2.0, cy, k, tint);
             fonts.draw(
                 canvas,
                 &toast.text,
-                bx + pad_x + lead,
+                bx + lead,
                 cy + size * 0.36,
                 W::Medium,
                 size,
@@ -242,7 +228,7 @@ impl Shell {
         self.draw_aurora(canvas, w, h, t, 0.0);
         // A soft pool of shade under the centre seats the text against a bright field —
         // dark on a dark palette, light on a pale one, so it always separates.
-        let mut vignette = Paint::default();
+        let mut vignette = crate::theme::shaded();
         let shades = [crate::theme::shade(0.5), crate::theme::shade(0.0)];
         vignette.set_shader(gradient::shaders::radial_gradient(
             (

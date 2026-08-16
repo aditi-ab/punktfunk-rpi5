@@ -6,17 +6,19 @@
 use crate::anim::{entrances, Entrance, EntranceAt, Spring};
 use crate::glyphs::{Hint, HintKey};
 use crate::library::{
-    card_matrix, initials, step_cursor, store_label, GridDir, LibraryGame, LibraryPhase,
-    LibraryShared, LibraryView, StepResult, BUMP_C, BUMP_K, BUMP_PX, ENTER_RISE, ENTER_SCALE,
-    ENTER_TURN_DEG, FOCUS_GAP, GRID_GAP, GRID_H, GRID_W, JUMP, PERSPECTIVE, POSTER_H, POSTER_W,
-    RECEDE_DIM, RECEDE_SCALE, ROTATE_DEG, SIDE_SPACING, SPRING_C, SPRING_K, VISIBLE_RANGE,
+    card_matrix, grid_col_hint, grid_step, initials, step_cursor, store_label, GridDir, GridShape,
+    LibraryGame, LibraryPhase, LibraryShared, LibraryView, StepResult, BUMP_C, BUMP_K, BUMP_PX,
+    ENTER_RISE, ENTER_SCALE, ENTER_TURN_DEG, FOCUS_GAP, GRID_GAP, GRID_H, GRID_W, JUMP,
+    PERSPECTIVE, POSTER_H, POSTER_W, RECEDE_DIM, RECEDE_SCALE, ROTATE_DEG, SIDE_SPACING, SPRING_C,
+    SPRING_K, VISIBLE_RANGE,
 };
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox, Screen};
-use crate::theme::{accent, fg, Fonts, W};
+use crate::theme::{accent, art_sampling, fg, fill, Fonts, EDGE_INSET, W};
+use crate::widgets::{TabStrip, TAB_STRIP_H};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
-use skia_safe::{Canvas, Color4f, Data, Image, Paint, Point, RRect, Rect, M44};
+use skia_safe::{Canvas, Color4f, Data, Image, Matrix, Point, RRect, Rect, TileMode, M44};
 use std::collections::HashMap;
 
 /// How wide a margin the grid keeps at each side of the field.
@@ -28,10 +30,97 @@ const GRID_LABEL: f64 = 10.0;
 const GRID_HEADING: f64 = 30.0;
 /// The band the focused title's name and store occupy under either arrangement.
 const DETAIL_BAND: f64 = 84.0;
+/// The corner on the view/sort bar's own glass, once it has focus.
+const BAR_CORNER: f64 = 14.0;
+/// Air between the bar and the field under it. The shelf centres its cards and would never
+/// notice; the GRID starts its first row at the very top of what it is given, and a rank of
+/// covers flush against a band of chrome reads as one clipped object rather than two.
+const BAR_GAP: f64 = 12.0;
+/// Where the bar's arrangement column starts, in design units, when the band is too narrow
+/// to split down the middle: the sort's caption and its four pills, plus air. Measured from
+/// the widest they can be — the labels are compile-time constants — so this is a floor on
+/// the column, not a guess at it.
+const BAR_VIEW_COL: f64 = 430.0;
 /// How many decoded posters stay resident. Roughly nine grid rows' worth — enough that
 /// paging back and forth over the same stretch never re-decodes, small enough that a
 /// 400-title library cannot accumulate all of it. See `LibraryScreen::evict_art`.
+///
+/// These are RASTER images now, not encoded bytes with a promise to decode: at the cached
+/// size (see [`ART_CACHE_W`]) that is ~0.7 MB each at Deck scale, so this number is also the
+/// screen's memory ceiling and not only its re-decode policy.
 const ART_BUDGET: usize = 160;
+/// The box a poster is KEPT in, in design units — twice the grid cell, scaled by the live
+/// `k` at [`decode_poster`].
+///
+/// The host sends Steam's 600×900 capsule (SteamGridDB portraits run to 1000×1500) and
+/// nothing here ever draws one at that size: the largest destination in the crate is the
+/// shelf's focused card, `POSTER_W · k`. What the draw actually samples is the mip chain
+/// [`crate::theme::art_sampling`] asks for — at a 150 dp grid cell the 150-wide level, at a
+/// 220 dp shelf card the levels either side of it — so a cache base of twice the grid cell
+/// carries exactly the levels both arrangements read today, out of a quarter of the pixels.
+/// Larger would only feed a level 0 no draw reaches; smaller would put the shelf on a
+/// MAGNIFIED level, which is the softness this must not trade the stutter for.
+const ART_CACHE_W: f64 = GRID_W * 2.0;
+const ART_CACHE_H: f64 = GRID_H * 2.0;
+/// How many arrived posters are decoded per frame.
+///
+/// The decode is real work — a 600×900 JPEG is ~10 ms on a Deck core — and it has to happen
+/// somewhere; this is the bound on how much of it lands in one frame. Two per frame is 120
+/// posters a second, comfortably ahead of what the fetch pool's three workers deliver over a
+/// LAN, so the art still streams in as fast as it arrives while no single frame pays more
+/// than one dropped frame's worth of it.
+pub(super) const ART_DECODES_PER_FRAME: usize = 2;
+
+/// The size a fetched poster is cached at: fitted into the [`ART_CACHE_W`]×[`ART_CACHE_H`]
+/// box at scale `k`, aspect preserved, never enlarged.
+///
+/// The aspect is the SOURCE's, not the card's. A title with no portrait capsule falls back
+/// to its 460×215 header ([`pf_client_core::library::Artwork::poster_candidates`]), and
+/// squeezing that into the cards' 2:3 would stretch an image the draw's own centre-crop is
+/// already there to handle.
+fn art_cache_size(src: (i32, i32), k: f64) -> (i32, i32) {
+    let (iw, ih) = (f64::from(src.0), f64::from(src.1));
+    if iw <= 0.0 || ih <= 0.0 {
+        return src;
+    }
+    // Never UP: the source is the ceiling on how sharp any of this can be, and storing a
+    // small poster large only spends memory to magnify it sooner.
+    let s = (ART_CACHE_W * k / iw).min(ART_CACHE_H * k / ih).min(1.0);
+    (
+        (iw * s).round().max(1.0) as i32,
+        (ih * s).round().max(1.0) as i32,
+    )
+}
+
+/// One arrived poster, decoded and reduced to what the console will actually sample.
+///
+/// Forces the decode HERE — the whole point (see [`LibraryScreen`]'s `art` field) — and does
+/// it at [`art_cache_size`], which is a quarter of the pixels a Steam capsule arrives with
+/// and the difference between a screenful of posters fitting Skia's GPU budget and thrashing
+/// it. The mip chain is baked at the same time, so even a purge under some other screen's
+/// pressure costs an upload rather than a decode or a regeneration pass.
+///
+/// A free function rather than the shelf's own, because the collections screen decodes the
+/// covers it fans when it is the library's root, and two answers to "how big is a cached
+/// poster" would be one cache that draws soft and one that thrashes.
+pub(super) fn decode_poster(bytes: &[u8], k: f64) -> Option<Image> {
+    let img = Image::from_encoded(Data::new_copy(bytes))?;
+    let want = art_cache_size((img.width(), img.height()), k);
+    let scaled = if want == (img.width(), img.height()) {
+        None
+    } else {
+        // The destination's own info: the console's render targets are `new_n32_premul`
+        // with no colour space (`skia_overlay::ensure_slot`), so this is the format the
+        // poster is headed for and no conversion happens at draw time either way.
+        let info = skia_safe::ImageInfo::new_n32_premul(want, None);
+        img.make_scaled(&info, art_sampling())
+    };
+    // A scale Skia refused leaves the poster at full size — the old behaviour for one
+    // cover, rather than no cover.
+    let out = scaled.unwrap_or_else(|| img.clone());
+    let mipped = out.with_default_mipmaps();
+    Some(mipped.unwrap_or(out))
+}
 
 /// Which decoded posters to drop, coldest first, once more than [`ART_BUDGET`] are live.
 ///
@@ -45,7 +134,9 @@ fn art_to_evict(live: &[String], seen: &HashMap<String, u64>) -> Vec<String> {
     let mut by_age: Vec<(u64, &String)> = live
         .iter()
         // A poster decoded but never yet DRAWN stamps 0 and goes first. That is right: it
-        // is off-screen by definition, and re-decoding costs one frame of grey.
+        // is off-screen by definition, and dropping it costs nothing that was on show. It
+        // does not come back, though — the encoded bytes were consumed by the decode — so
+        // this is a trim of the coldest, never a cache that refills itself.
         .map(|id| (seen.get(id).copied().unwrap_or(0), id))
         .collect();
     by_age.sort_unstable();
@@ -56,101 +147,67 @@ fn art_to_evict(live: &[String], seen: &HashMap<String, u64>) -> Vec<String> {
         .collect()
 }
 
-/// The loading state: placeholder cards in the arrangement the real ones will arrive in,
-/// with a sheen travelling across them.
+/// The library's ONE waiting state: the shell's spinner with a line of text under it,
+/// centred in the field.
 ///
-/// One animated linear gradient over the whole run rather than a shader or a per-card
-/// animation — the sweep is the only thing that says "still working", and it costs one
-/// paint. Frozen under reduced motion, where a still skeleton says the same thing.
-fn draw_skeleton(canvas: &Canvas, rect: Rect, k: f64, t: f64, view: LibraryView, cols: usize) {
+/// There are two waits here and the user is meant to read them as one. The list is in flight
+/// (`LibraryPhase::Loading`), and then the shelf holds — for up to 400 ms — for the first
+/// posters, because the entrance exists to show artwork off and fanning open a rank of grey
+/// faces is worse than not animating at all (see [`LibraryScreen::arm_entrance`]). The second
+/// wait used to draw the FINISHED shelf, which is what made the cards appear, blink out and
+/// animate in again. One continuous spinner covers both, so nothing appears until it is the
+/// entrance's first frame.
+///
+/// This replaced a skeleton shelf — placeholder cells in the arrangement the real cards would
+/// arrive in, under a travelling sheen. The shape argument for it only ever answered the FIRST
+/// wait, and a rank of grey rectangles that then has to be swept away is a second thing to
+/// dismiss rather than a preview of the first.
+fn draw_loading(canvas: &Canvas, rect: Rect, k: f64, fonts: &Fonts, t: f64) {
     let w = f64::from(rect.width());
-    let cy = f64::from(rect.top) + (f64::from(rect.height()) - DETAIL_BAND * k) / 2.0;
-    let mut cells: Vec<Rect> = Vec::new();
-    match view {
-        LibraryView::Shelf => {
-            // The coverflow's arrangement, without its perspective: a big centre card and
-            // two receded neighbours each side.
-            let (cw, ch) = (POSTER_W * k, POSTER_H * k);
-            for d in -2i32..=2 {
-                let s = 1.0 - f64::from(d.abs()).min(1.0) * RECEDE_SCALE;
-                let off = if d.abs() <= 1 {
-                    f64::from(d) * FOCUS_GAP * k
-                } else {
-                    f64::from(d.signum()) * (FOCUS_GAP + SIDE_SPACING) * k
-                };
-                let cx = f64::from(rect.left) + w / 2.0 + off;
-                cells.push(Rect::from_xywh(
-                    (cx - cw * s / 2.0) as f32,
-                    (cy - ch * s / 2.0) as f32,
-                    (cw * s) as f32,
-                    (ch * s) as f32,
-                ));
-            }
-        }
-        LibraryView::Grid => {
-            let (cw, ch) = (GRID_W * k, GRID_H * k);
-            let pitch_x = cw + GRID_GAP * k;
-            let grid_w = cols as f64 * pitch_x - GRID_GAP * k;
-            let x0 = f64::from(rect.left) + (w - grid_w) / 2.0;
-            let rows = 2;
-            let y0 = cy - (rows as f64 * (ch + GRID_GAP * k) - GRID_GAP * k) / 2.0;
-            for r in 0..rows {
-                for c in 0..cols {
-                    cells.push(Rect::from_xywh(
-                        (x0 + c as f64 * pitch_x) as f32,
-                        (y0 + r as f64 * (ch + GRID_GAP * k)) as f32,
-                        cw as f32,
-                        ch as f32,
-                    ));
-                }
-            }
-        }
-    }
-    for cell in &cells {
-        canvas.draw_rrect(
-            RRect::new_rect_xy(*cell, (14.0 * k) as f32, (14.0 * k) as f32),
-            &Paint::new(fg(0.06), None),
-        );
-    }
-    // The sheen: a narrow bright band travelling left to right on a 1.6 s cycle.
-    let phase = if crate::theme::reduce_motion() {
-        0.35
+    let cx = f64::from(rect.left) + w / 2.0;
+    let cy = f64::from(rect.top) + f64::from(rect.height()) / 2.0;
+    // The connect takeover's arc, at its size, over its own gap to the line beneath
+    // (`shell::overlays::draw_takeover`): the console waits in one shape everywhere. It turns
+    // under reduced motion like the other three spinners in the crate do — a frozen arc reads
+    // as a hung screen, which is the one thing this must not say.
+    fonts.centered(
+        canvas,
+        "Loading library…",
+        W::Regular,
+        14.0 * k,
+        fg(0.55),
+        cx,
+        cy + 26.0 * k,
+        w * 0.8,
+    );
+    crate::theme::spinner(canvas, cx, cy - 26.0 * k, 22.0 * k, t);
+}
+
+/// How much accent a coverless card's face carries — see [`crate::theme::card_face`], which
+/// mixes it into the ground side of the field so the face stays OPAQUE.
+///
+/// A launcher gets the louder one. Its face is the cue that survives being three cards deep
+/// in the coverflow's recede, and it is the whole reason the two faces differ: a launcher
+/// without a poster is not a game whose cover failed to load.
+const FACE_TINT: f32 = 0.20;
+const LAUNCHER_FACE_TINT: f32 = 0.38;
+
+/// The face a coverless card sits on. Its own function because the palette contrast test is
+/// an assertion about THIS colour, and a test that re-derived it would only prove itself.
+fn placeholder_face(launcher: bool) -> Color4f {
+    crate::theme::card_face(if launcher {
+        LAUNCHER_FACE_TINT
     } else {
-        (t / 1.6).fract()
-    };
-    let span = w * 0.45;
-    let head = f64::from(rect.left) - span + (w + 2.0 * span) * phase;
-    let mut sheen = Paint::default();
-    let stops = [fg(0.0), fg(0.09), fg(0.0)];
-    sheen.set_shader(skia_safe::gradient::shaders::linear_gradient(
-        (
-            Point::new(head as f32, rect.top),
-            Point::new((head + span) as f32, rect.bottom),
-        ),
-        &skia_safe::gradient::Gradient::new(
-            skia_safe::gradient::Colors::new_evenly_spaced(
-                &stops,
-                skia_safe::TileMode::Clamp,
-                None,
-            ),
-            skia_safe::gradient::Interpolation::default(),
-        ),
-        None,
-    ));
-    for cell in &cells {
-        canvas.draw_rrect(
-            RRect::new_rect_xy(*cell, (14.0 * k) as f32, (14.0 * k) as f32),
-            &sheen,
-        );
-    }
+        FACE_TINT
+    })
 }
 
 /// A cover we have no art for, drawn into `rect`.
 ///
 /// A LAUNCHER without a poster is not a game whose cover failed to load, and must not read
 /// like one: it gets the brand-tinted face and its launcher's mark (or name), where a game
-/// gets the darker face and a title monogram. `None` is the skeleton case — a cell that is
-/// still waiting for the library itself.
+/// gets the quieter face and a title monogram. `None` is the stale-order case — a cell whose
+/// index no longer names a title.
 fn draw_poster_placeholder(
     canvas: &Canvas,
     fonts: &Fonts,
@@ -159,12 +216,10 @@ fn draw_poster_placeholder(
     k: f64,
 ) {
     // Solid, never glass: coverflow side cards OVERLAP, so a translucent face would show
-    // its neighbour through it.
-    let face = match game {
-        Some(g) if g.launcher => Color4f::new(0.153, 0.137, 0.267, 1.0),
-        _ => Color4f::new(0.118, 0.118, 0.145, 1.0),
-    };
-    canvas.draw_rect(rect, &Paint::new(face, None));
+    // its neighbour through it. `card_face` gets the accent tint without spending alpha on
+    // it, which a plain `accent(0.20)` could not.
+    let launcher = matches!(game, Some(g) if g.launcher);
+    canvas.draw_rect(rect, &fill(placeholder_face(launcher)));
     let Some(game) = game else { return };
     // The launcher's brand mark IS the poster when we ship one for it. Inset to ~44 % of
     // the card so it reads as a mark on a face rather than a cropped cover; `launcher_mark`
@@ -185,23 +240,25 @@ fn draw_poster_placeholder(
         })
         .flatten();
     if let Some(path) = mark {
-        canvas.draw_path(&path, &Paint::new(fg(0.85), None));
+        canvas.draw_path(&path, &fill(fg(0.85)));
         return;
     }
     // Sized off the CARD rather than off `k`: the grid's cells are two-thirds the shelf's,
     // and a monogram scaled for a poster would not fit one.
-    let (glyph, size, ink) = if game.launcher {
+    //
+    // ONE rung for both, the same `fg(0.85)` on the same accent-tinted face the collections
+    // deck's monogram now uses — a game's fallback and a group's fallback sit a screen apart
+    // and must not read as two different ideas. A game's monogram used to sit at 0.45, which
+    // measured 2.5:1 against this face on the pale palettes: what separates a game from a
+    // launcher here is the face and the glyph's SIZE, neither of which the palette can take
+    // away.
+    let (glyph, size) = if game.launcher {
         (
             store_label(&game.store).to_string(),
             f64::from(rect.height()) * 0.067,
-            fg(0.85),
         )
     } else {
-        (
-            initials(&game.title),
-            f64::from(rect.height()) * 0.115,
-            fg(0.45),
-        )
+        (initials(&game.title), f64::from(rect.height()) * 0.115)
     };
     let font = fonts.font(W::Bold, size.max(9.0 * k));
     let tw = font.measure_str(&glyph, None).0;
@@ -212,8 +269,89 @@ fn draw_poster_placeholder(
             rect.center_y() + (size * 0.36) as f32,
         ),
         &font,
-        &Paint::new(ink, None),
+        &fill(fg(0.85)),
     );
+}
+
+/// Persist the library's sort, from wherever it was chosen.
+///
+/// Deliberately writes the SETTING and nothing else. Every screen that shows the library
+/// re-reads `library_sort` each frame (`LibraryScreen::adopt_settings`,
+/// `CollectionsScreen::sync`), so one key is the state and the screens are mirrors of it —
+/// which is what makes a sort chosen on the shelf true on the collections behind it, and
+/// what stops the console from having two answers to "what is the sort".
+pub(super) fn store_sort(sort: crate::collate::SortKey, ctx: &mut Ctx) {
+    ctx.settings.library_sort = sort.id().to_string();
+    ctx.settings.save();
+}
+
+/// Persist the library's arrangement. The Settings → Interface row writes this same key, so
+/// the row and the bar cannot drift: whichever moved last is what both read next frame.
+fn store_view(view: LibraryView, ctx: &mut Ctx) {
+    ctx.settings.library_view = view.id().to_string();
+    ctx.settings.save();
+}
+
+/// The caption over a strip of pills, drawn at `x` on the pill row's own centre line, and
+/// the width it took.
+///
+/// A row reading "Default · A–Z · Platform · Store" only answers "what is the sort" once
+/// something names it, and the console now shows that row on two screens. Tracked caps at
+/// the section-header rung, so it is the same kind of mark as the shelf's own LAUNCHERS /
+/// GAMES headings rather than a label of its own invention.
+///
+/// The caller adds the returned width to `x` and hands the REST of the band to
+/// [`TabStrip::render`], which insets itself from whatever rect it is given — so neither
+/// side has to be told how wide the other came out.
+pub(super) fn strip_caption(
+    canvas: &Canvas,
+    fonts: &Fonts,
+    label: &str,
+    band: Rect,
+    x: f64,
+    k: f64,
+) -> f64 {
+    let size = 11.0 * k;
+    let track = 1.4 * k;
+    // The pill row's centre, which `TabStrip` seats 2 dp into the band and draws 30 dp tall.
+    // The BAND's centre would put the caption half a pill below the labels beside it.
+    let baseline = f64::from(band.top) + 17.0 * k + size * 0.36;
+    fonts.draw_tracked(
+        canvas,
+        label,
+        x,
+        baseline,
+        W::SemiBold,
+        size,
+        track,
+        fg(0.45),
+    );
+    // `draw_tracked` adds tracking after every character including the last, so the ink ends
+    // one gap short of the pen.
+    f64::from(fonts.measure(label, W::SemiBold, size))
+        + track * (label.chars().count().saturating_sub(1)) as f64
+}
+
+/// The view/sort bar's own state.
+///
+/// One struct rather than three fields on the screen because it is one control: the focus is
+/// the WHOLE bar, not a cell inside it — while it is up, ◀ ▶ step the sort and the shoulders
+/// pick the arrangement — and the two strips own nothing but their sprung highlight, since
+/// the persisted settings are the state and these only draw it and hit-test a click.
+struct LibraryBar {
+    focus: bool,
+    sort_tabs: TabStrip,
+    view_tabs: TabStrip,
+}
+
+impl LibraryBar {
+    fn new() -> LibraryBar {
+        LibraryBar {
+            focus: false,
+            sort_tabs: TabStrip::new(),
+            view_tabs: TabStrip::new(),
+        }
+    }
 }
 
 pub(crate) struct LibraryScreen {
@@ -245,6 +383,25 @@ pub(crate) struct LibraryScreen {
     /// re-derived, because `GroupKey::Store("Steam")` and `GroupKey::Platform("Steam")` both
     /// read "Steam" and the collation that produced the label is gone by then.
     filter_label: Option<String>,
+    /// This shelf was reached FROM the collections screen — as one group, or as its "All
+    /// titles" way back out to the whole library. It is what makes Y refuse: a drill-in from
+    /// a drill-in would collate a set that is already one group, and from the unfiltered way
+    /// out it would bounce the user between the two screens for ever.
+    ///
+    /// A superset of `filter.is_some()`, which used to carry this on its own and could not
+    /// speak for the unfiltered case.
+    drilled: bool,
+    /// This shelf has not yet decided whether it should have been the collections screen —
+    /// see [`Self::collections_upgrade`]. Consumed exactly once, whichever way the answer
+    /// goes, because a rescan that later grows the library to two collections must not yank
+    /// the user off a shelf they are already browsing.
+    pending_collections: bool,
+    /// This shelf has seen the fetch it was pushed with go out. Between the push and the
+    /// fetch reaching the service thread the shared model still holds the PREVIOUS host's
+    /// titles, ready and all — and deciding the entry on those would open one host's library
+    /// on another's collections. Every entry raises a fetch and every fetch begins by
+    /// setting the model loading, so this is the honest "the list I am looking at is mine".
+    fetch_seen: bool,
     // Navigation: the integer cursor is the authority; the eased position chases it.
     cursor: i32,
     /// Each card's rect as last drawn (axis-aligned, scale applied — the perspective tilt
@@ -254,16 +411,52 @@ pub(crate) struct LibraryScreen {
     bump: Spring,
     /// Which arrangement is drawing (persisted as `library_view`).
     view_mode: LibraryView,
+    /// The view/sort bar over the field. Boxed because `Screen` is moved by value on every
+    /// push and pop and the library is already its largest variant: of everything this screen
+    /// holds, the bar is the part that is pure chrome, so it is the part that pays for an
+    /// indirection rather than the cursor, the display order or the poster cache.
+    bar: Box<LibraryBar>,
     /// The grid's vertical scroll, in device px, chasing the focused row.
     scroll: Spring,
     /// Seat the scroll instead of chasing it on the next frame — used when the arrangement
     /// changes, where "gliding from the old position" is meaningless.
     snap_scroll: bool,
-    /// Columns the last frame actually drew. Navigation reads THIS rather than recomputing,
-    /// so the cursor arithmetic and the layout can never disagree about the grid's shape.
-    grid_cols_last: usize,
-    /// Decoded posters by game id (decode once; Skia uploads lazily on first draw).
+    /// Columns the last frame actually drew, `None` until the grid has drawn a frame.
+    /// Navigation reads THIS rather than recomputing, so the cursor arithmetic and the
+    /// layout can never disagree about the grid's shape.
+    ///
+    /// Honest about not knowing, because the alternative is worse than a swallowed press:
+    /// this used to be seeded at four while a Deck draws seven, so the first press after
+    /// entering the grid — before its first frame — moved by a column count nothing had
+    /// drawn.
+    grid_cols_last: Option<usize>,
+    /// The column the user last CHOSE, carried across vertical moves (see
+    /// [`crate::library::grid_col_hint`]). Without it, one pass through the two-wide
+    /// launcher row would pin the cursor to column 1 for the rest of the library.
+    grid_col: usize,
+    /// Which axis the boundary recoil deflects along — the grid refuses in two dimensions,
+    /// and a vertical thud that nudged the field sideways would read as a mis-move rather
+    /// than as an edge.
+    bump_vertical: bool,
+    /// Posters by game id: RASTER images, decoded once on arrival and reduced to the size
+    /// they are drawn at, with their mip chain already built ([`decode_poster`]).
+    ///
+    /// Every part of that sentence is load-bearing, and the shelf shipped with none of it.
+    /// `Image::from_encoded` does not decode — skia-safe's own doc says it defers "until the
+    /// image is actually used", and that a purge makes "the next draw of the image have to
+    /// re-decode". A grid full of full-resolution posters overruns Skia's GPU resource
+    /// budget, so that purge came round every frame and most of the covers on screen were
+    /// re-decoded from JPEG, on the render thread, per frame. That was the grid's slideshow,
+    /// and it is why it only appeared once the screen was FULL: a half-filled grid fits.
     art: HashMap<String, Image>,
+    /// The scale the posters in `art` were decoded for — the last frame's `k`, published by
+    /// `render` before it syncs. Kept because the cache is sized against what will be DRAWN,
+    /// and `sync` (which also runs from `menu`) has no window of its own to ask.
+    ///
+    /// A window that GROWS leaves the posters already cached at the smaller size: the
+    /// encoded bytes are gone by then, and there is nothing to decode again from. That costs
+    /// a re-entry to the shelf to put right, and only after a resolution change.
+    art_k: f64,
     /// Frame stamp of each decoded poster's last DRAW, and the frame counter behind it.
     ///
     /// The grid is what forces this. A 400-title library paged through in the shelf touched
@@ -279,6 +472,10 @@ pub(crate) struct LibraryScreen {
     /// [`Self::arm_entrance`].
     entrance: Option<Entrance>,
     entrance_armed: bool,
+    /// The index the live entrance fans out from. [`Entrance`] keeps its own copy and asks
+    /// for a distance in ITEMS; the grid measures that distance in CELLS instead (see
+    /// [`Self::entrance_at`]), so it needs the anchor back.
+    entrance_anchor: usize,
     ready_at: Option<f64>,
 }
 
@@ -294,19 +491,29 @@ impl LibraryScreen {
             sort: crate::collate::SortKey::default(),
             filter: None,
             filter_label: None,
+            drilled: false,
+            pending_collections: true,
+            fetch_seen: false,
             cursor: 0,
             geom: Vec::new(),
             anim: Spring::rest(0.0),
             bump: Spring::rest(0.0),
             view_mode: LibraryView::default(),
+            bar: Box::new(LibraryBar::new()),
             scroll: Spring::rest(0.0),
             snap_scroll: true,
-            grid_cols_last: 4,
+            grid_cols_last: None,
+            grid_col: 0,
+            bump_vertical: false,
             art: HashMap::new(),
+            // Seated at the design scale; the first frame publishes the real one, and it
+            // does so before the first `sync` can decode anything against it.
+            art_k: 1.0,
             art_seen: HashMap::new(),
             frame: 0,
             entrance: None,
             entrance_armed: false,
+            entrance_anchor: 0,
             ready_at: None,
         }
     }
@@ -331,9 +538,38 @@ impl LibraryScreen {
         let have_art = (lo..hi)
             .filter_map(|i| self.game(i))
             .any(|g| self.art.contains_key(&g.id));
-        if have_art || t - since >= 0.4 {
+        // An EMPTY shelf — a collection whose filter matches nothing — has no art coming and
+        // nothing to fan, so it must not spend the deadline waiting for either. Without this
+        // it holds the spinner for 400 ms over a shelf that was never going to have a card.
+        if have_art || self.len() == 0 || t - since >= 0.4 {
             self.entrance_armed = true;
+            self.entrance_anchor = cursor;
             self.entrance = Some(Entrance::new(entrances::CARDS, cursor, t));
+        }
+    }
+
+    /// One item's place in the entrance, `steps` of fan away from the anchor.
+    ///
+    /// [`Entrance`] measures the fan as the distance between two INDICES, which is the right
+    /// unit for a strip and the wrong one for a field: the stagger caps five steps out, so a
+    /// seven-wide grid indexed linearly exhausts the whole fan inside its first row and every
+    /// cell after that starts at once. The grid passes a distance in CELLS instead and the
+    /// entrance opens diagonally out from the focused cover.
+    ///
+    /// THREE states in two variables, and reading two of them as one is what made the shelf
+    /// flash: `entrance == None` means "already over" only once the entrance has been ARMED.
+    /// Before that it means "not begun", and answering `SETTLED` there drew the finished shelf
+    /// for as long as the arming waited on art — then the entrance armed and every card blinked
+    /// out to play it. Nothing draws while un-armed today ([`Self::render`] shows the spinner
+    /// instead), and this is the same answer stated where the state actually lives.
+    fn entrance_at(&self, steps: usize, t: f64) -> EntranceAt {
+        match self.entrance {
+            Some(e) => e.at(self.entrance_anchor + steps, t),
+            None if self.entrance_armed => EntranceAt::SETTLED,
+            None => EntranceAt {
+                travel: 0.0,
+                fade: 0.0,
+            },
         }
     }
 
@@ -368,6 +604,27 @@ impl LibraryScreen {
         (((avail + GRID_GAP * k) / pitch).floor() as i64).clamp(2, 8) as usize
     }
 
+    /// The grid as the last frame drew it — the shape navigation and the renderer share, and
+    /// the reason they can no longer disagree about which cover the cursor is on. `None`
+    /// until the grid has drawn once: the column count is a fact about the window, and
+    /// inventing one is exactly the divergence this exists to prevent.
+    fn grid_shape(&self) -> Option<GridShape> {
+        Some(GridShape::new(
+            self.len(),
+            self.grid_cols_last?,
+            self.launcher_count(),
+        ))
+    }
+
+    /// Re-seat the remembered column on wherever the cursor now is. For everything that
+    /// moves the cursor without CHOOSING a column — a re-sort, a press, a resize — where it
+    /// landed is the only honest answer to "which column would Up and Down return to".
+    fn seat_grid_col(&mut self) {
+        if let Some(shape) = self.grid_shape() {
+            self.grid_col = shape.cell_of(self.cursor.max(0) as usize).1;
+        }
+    }
+
     /// Rebuild the display order after anything that could change it: a new game list, a
     /// new sort, a new filter. The cursor is clamped rather than followed by identity — a
     /// re-sort moves everything, so "keep the same index" and "keep the same title" are
@@ -375,6 +632,7 @@ impl LibraryScreen {
     fn recollate(&mut self) {
         self.view = crate::collate::filtered(&self.games, self.sort, self.filter.as_ref());
         self.cursor = self.cursor.clamp(0, (self.view.len() as i32 - 1).max(0));
+        self.seat_grid_col();
     }
 
     /// The game at a DISPLAY index (`None` past the end, or if the order went stale).
@@ -420,19 +678,93 @@ impl LibraryScreen {
     pub(crate) fn set_filter(&mut self, key: crate::collate::GroupKey, label: String) {
         self.filter = Some(key);
         self.filter_label = Some(label);
+        self.drilled = true;
         self.recollate();
     }
 
-    /// One title's self-emitted link: this shelf's host, this shelf's pinned profile (so a
-    /// link taken off a pinned card's shelf streams the way that card does), and the game.
-    fn game_link(&self, id: &str) -> Option<String> {
-        crate::screens::saved_host_link(
-            &self.host.fp_hex,
-            &self.host.addr,
-            self.host.port,
-            self.host.pin.as_ref().map(|p| p.id.as_str()),
-            Some(id),
-        )
+    /// Show the WHOLE library, reached from the collections screen — its "All titles" way
+    /// out, and the only shelf that is drilled without being filtered.
+    pub(crate) fn all_titles(&mut self) {
+        self.drilled = true;
+    }
+
+    /// Become the collections screen, if that is what this library was opened as.
+    ///
+    /// Nothing here can be decided where the screen is pushed: the list arrives from a
+    /// worker thread long afterwards, and "has this library more than one collection?" is
+    /// only answerable once it has. Nor can it be decided in `render`, which has no way to
+    /// navigate. So the shell asks this once a frame, beside the pairing pop it already
+    /// makes for the same reason — `Some` means "put this screen where this shelf stands".
+    ///
+    /// Keeping the shelf as the screen that is PUSHED, and letting it hand over only once it
+    /// knows, is what leaves Loading, Empty and the error card's Retry in the one place that
+    /// has ever had them.
+    ///
+    /// No caller yet: the one that belongs here is `Shell::sync`, which asks
+    /// the top screen once a frame and swaps the returned screen in where the shelf stands —
+    /// guarded on a settled transition, or a swap can land on a push the user has already
+    /// reversed with B and put them on the collections instead of home.
+    #[allow(dead_code)]
+    pub(crate) fn collections_upgrade(
+        &mut self,
+        library: &LibraryShared,
+        settings: &pf_client_core::trust::Settings,
+    ) -> Option<super::collections::CollectionsScreen> {
+        // FIRST, and O(1). This is called from a per-frame sync for the life of the screen,
+        // and everything below it collates the whole library — 400 titles, at 60 Hz, for
+        // ever, if the decided case is ever allowed to fall through.
+        if !self.pending_collections {
+            return None;
+        }
+        if !settings.library_collections || self.drilled {
+            self.pending_collections = false;
+            return None;
+        }
+        // Adopt the model NOW rather than at render time: the decision is about the list,
+        // and this is the frame it may have landed on.
+        self.sync(library);
+        // Loading, Empty and Error decide nothing. A fetch that failed keeps this screen and
+        // its Retry — and a retry that lands still upgrades, because the pending bit is only
+        // spent on a ready library. Any of them also proves the fetch is this shelf's own.
+        if !matches!(self.phase, LibraryPhase::Ready) {
+            self.fetch_seen = true;
+            return None;
+        }
+        // Ready before the fetch even went out is the PREVIOUS host's library, still in the
+        // model — wait for one that belongs to this shelf.
+        if !self.fetch_seen {
+            return None;
+        }
+        self.pending_collections = false;
+        // The same predicate Y and the legend ask, so the three can never disagree about
+        // whether there is anything to collect. One collection is not worth a screen: that
+        // library opens on its shelf, exactly as it does with the setting off.
+        if !crate::collate::worth_browsing(&self.games) {
+            return None;
+        }
+        // From the SETTING, not from `self.sort`: `adopt_settings` runs from `menu` and
+        // `render`, and this can fire before either, so the field may still hold the default
+        // while the user's stored sort says A–Z.
+        let mut screen = super::collections::CollectionsScreen::new(
+            &self.host,
+            crate::collate::SortKey::parse(&settings.library_sort),
+        );
+        // It stands in for this shelf now: whatever posters arrived while the list was in
+        // flight go with it, and it takes over feeding itself from the model's queue.
+        screen.adopt_art(std::mem::take(&mut self.art));
+        screen.own_library();
+        Some(screen)
+    }
+
+    /// Inherit posters that are already decoded, from the screen that pushed this one.
+    ///
+    /// The counterpart to `CollectionsScreen::adopt_art`, and the same reasoning running the
+    /// other way. The shared model's art queue is DRAINED by whoever reads it first, so by the
+    /// time a collection drill-in builds its shelf the bytes are long gone — the drill-in would
+    /// sit out the entrance's whole art deadline and then show monogram cards permanently, for
+    /// covers the console had decoded two screens ago and is still holding.
+    pub(crate) fn adopt_art(&mut self, art: HashMap<String, Image>) {
+        self.art = art;
     }
 
     fn fetch_cmd(&self) -> ConsoleCmd {
@@ -458,6 +790,11 @@ impl LibraryScreen {
             let (phase, games, generation) = shared.snapshot();
             let fresh = self.games.len() != games.len()
                 || self.games.iter().zip(&games).any(|(a, b)| a.id != b.id);
+            // Whether this is the shelf's FIRST list or a later one — the difference between
+            // "the screen just mounted" and "the library moved under it", which `fresh`
+            // alone cannot tell apart because a screen that holds no games is different from
+            // every list there is.
+            let was_empty = self.games.is_empty();
             self.phase = phase;
             self.games = games;
             self.generation = generation;
@@ -465,19 +802,34 @@ impl LibraryScreen {
                 self.cursor = 0;
                 self.anim = Spring::rest(0.0);
                 self.bump = Spring::rest(0.0);
-                self.art.clear();
-                self.art_seen.clear();
+                // Everything else here is reset on the first list too, but the posters are
+                // INHERITED on it: a shelf pushed by the collections screen is handed the
+                // covers that screen already decoded, and the queue those bytes came from
+                // was emptied long before. Clearing on arrival made the hand-over a silent
+                // no-op and left every drill-in on monograms for good. A LATER list is a
+                // different library, and does clear.
+                if !was_empty {
+                    self.art.clear();
+                    self.art_seen.clear();
+                }
                 // A different set of titles is a different shelf, so it gets its own
                 // arrival. This is also the FIRST one: the screen mounts on `Loading` with
                 // no games, and the list landing is the moment the coverflow appears.
                 self.entrance = None;
                 self.entrance_armed = false;
                 self.ready_at = None;
+                // The bar is drawn over a field, so focus cannot be left up there while the
+                // field goes back to a spinner — a rescan would otherwise strand the pad on
+                // furniture nothing is drawing.
+                self.bar.focus = false;
             }
             self.recollate();
         }
-        for (id, bytes) in shared.drain_art() {
-            match Image::from_encoded(Data::new_copy(&bytes)) {
+        // A bounded handful per frame: this is where the decode happens now, and a burst of
+        // arrivals must not become one long frame (see `ART_DECODES_PER_FRAME`).
+        let k = self.art_k;
+        for (id, bytes) in shared.drain_art(ART_DECODES_PER_FRAME) {
+            match decode_poster(&bytes, k) {
                 Some(img) => {
                     self.art.insert(id, img);
                 }
@@ -494,6 +846,15 @@ impl LibraryScreen {
     ) -> Option<MenuPulse> {
         self.sync(ctx.library);
         self.adopt_settings(ctx);
+        // The bar answers first, ABOVE the phase match: while it holds the pad, Confirm must
+        // not be able to reach `ready_action` and start a session on a press the user spent
+        // on a sort.
+        if self.bar.focus {
+            if self.bar_shown() {
+                return self.bar_menu(ev, ctx);
+            }
+            self.bar.focus = false; // the field went away under it
+        }
         match &self.phase {
             // The GRID reads the same events through 2-D arithmetic. The shelf is a line, so
             // it has up/down to spare and shoulders that jump along it; the grid spends
@@ -501,7 +862,15 @@ impl LibraryScreen {
             LibraryPhase::Ready if self.view_mode == LibraryView::Grid => match ev {
                 MenuEvent::Move(MenuDir::Left) => self.grid_move(GridDir::Left),
                 MenuEvent::Move(MenuDir::Right) => self.grid_move(GridDir::Right),
-                MenuEvent::Move(MenuDir::Up) => self.grid_move(GridDir::Up),
+                // Up out of the TOP row reaches the bar — asked of the same shape the
+                // renderer laid the field out with, so this is exactly the press that used
+                // to do nothing but thud, and never one from the middle of the field.
+                MenuEvent::Move(MenuDir::Up) => match self.grid_shape() {
+                    Some(shape) if shape.cell_of(self.cursor.max(0) as usize).0 == 0 => {
+                        self.focus_bar()
+                    }
+                    _ => self.grid_move(GridDir::Up),
+                },
                 MenuEvent::Move(MenuDir::Down) => self.grid_move(GridDir::Down),
                 MenuEvent::JumpBack => self.grid_move(GridDir::PageBack),
                 MenuEvent::JumpForward => self.grid_move(GridDir::PageForward),
@@ -510,6 +879,10 @@ impl LibraryScreen {
             LibraryPhase::Ready => match ev {
                 MenuEvent::Move(MenuDir::Left) => self.step(-1, false),
                 MenuEvent::Move(MenuDir::Right) => self.step(1, false),
+                // A coverflow is a line, so up is the direction it has spare — and the bar
+                // is drawn directly above it, which is what makes this a move rather than a
+                // shortcut worth a hint of its own.
+                MenuEvent::Move(MenuDir::Up) => self.focus_bar(),
                 MenuEvent::JumpBack => self.step(-JUMP, true),
                 MenuEvent::JumpForward => self.step(JUMP, true),
                 _ => self.ready_action(ev, fx),
@@ -535,21 +908,107 @@ impl LibraryScreen {
         }
     }
 
+    /// Is the view/sort bar on screen? Only over a drawn field: under `Loading`, an error or
+    /// the entrance's art wait the screen is a spinner, and a sort control over nothing is a
+    /// lie the pointer would still answer for. One condition, read by the draw, the pad, the
+    /// mouse and the legend, so the four cannot disagree about whether the bar is there.
+    fn bar_shown(&self) -> bool {
+        matches!(self.phase, LibraryPhase::Ready) && self.entrance_armed
+    }
+
+    /// Move focus up into the bar.
+    fn focus_bar(&mut self) -> Option<MenuPulse> {
+        if !self.bar_shown() {
+            return None;
+        }
+        self.bar.focus = true;
+        Some(MenuPulse::Move)
+    }
+
+    /// What a press means while the bar holds the pad.
+    ///
+    /// Both controls apply IMMEDIATELY, and both apply by writing the SETTING:
+    /// [`Self::adopt_settings`] re-reads it at the top of the very next call — this frame's
+    /// `render` — and re-collates or re-seats the scroll from there. So the field re-sorts
+    /// and re-arranges under the strip while it is still up, which is the whole point of
+    /// putting the controls here rather than on a pushed screen. Assigning `self.sort` or
+    /// `self.view_mode` directly would be reverted a frame later AND would leave the
+    /// Settings row saying something the screen disagrees with.
+    fn bar_menu(&mut self, ev: MenuEvent, ctx: &mut Ctx) -> Option<MenuPulse> {
+        match ev {
+            // ◀ ▶ steps the sort, CLAMPED — the settings screen's own grammar for a value,
+            // and the reason a held direction stops at the end rather than wrapping through
+            // the whole-file settings writer six times a second.
+            MenuEvent::Move(MenuDir::Left) => self.step_sort(-1, ctx),
+            MenuEvent::Move(MenuDir::Right) => self.step_sort(1, ctx),
+            // The shoulders pick the arrangement outright: there are two of them and two
+            // arrangements, so L1 is the shelf and R1 is the grid. They do NOT wrap the way
+            // the console's other shoulder pairs do (settings' sections, the collections'
+            // sort) — over two values wrapping would make both buttons the same button, and
+            // an auto-repeating one would flip the field back and forth while it was held.
+            // Jumping the cards is meaningless while the thumb is not steering them.
+            MenuEvent::JumpBack => self.step_view(-1, ctx),
+            MenuEvent::JumpForward => self.step_view(1, ctx),
+            // Down, B and A all mean "done". The value is live the moment it changes, so
+            // there is nothing here to confirm and nothing to cancel — and B must land here
+            // rather than popping the screen, or leaving the bar would leave the library.
+            MenuEvent::Move(MenuDir::Down) | MenuEvent::Back | MenuEvent::Confirm => {
+                self.bar.focus = false;
+                Some(MenuPulse::Move)
+            }
+            MenuEvent::Move(MenuDir::Up) => Some(MenuPulse::Boundary),
+            MenuEvent::Secondary | MenuEvent::Tertiary => None,
+        }
+    }
+
+    fn step_sort(&mut self, delta: i32, ctx: &mut Ctx) -> Option<MenuPulse> {
+        let all = crate::collate::SortKey::ALL;
+        let at = all.iter().position(|s| *s == self.sort);
+        match super::settings::step_option(at, all.len(), delta, false) {
+            Some(i) => {
+                store_sort(all[i], ctx);
+                Some(MenuPulse::Move)
+            }
+            None => Some(MenuPulse::Boundary),
+        }
+    }
+
+    fn step_view(&mut self, delta: i32, ctx: &mut Ctx) -> Option<MenuPulse> {
+        let all = LibraryView::ALL;
+        let at = all.iter().position(|v| *v == self.view_mode);
+        match super::settings::step_option(at, all.len(), delta, false) {
+            Some(i) => {
+                store_view(all[i], ctx);
+                Some(MenuPulse::Move)
+            }
+            None => Some(MenuPulse::Boundary),
+        }
+    }
+
     /// Move the grid cursor, seating the boundary recoil the same way the shelf does.
     fn grid_move(&mut self, dir: GridDir) -> Option<MenuPulse> {
-        // The column count is a RENDER fact (it depends on the window), so navigation reads
+        // The grid's shape is a RENDER fact (it depends on the window), so navigation reads
         // the last frame's. One frame of staleness after a resize is invisible; deriving it
-        // twice from different widths would not be.
-        match crate::library::grid_step(self.cursor, self.len(), self.grid_cols_last, dir) {
+        // twice from two widths would not be — and before the first grid frame there is no
+        // grid to move in, so the press is dropped rather than answered by a guess.
+        let shape = self.grid_shape()?;
+        match grid_step(self.cursor, shape, self.grid_col, dir) {
             StepResult::Moved(c) => {
+                self.grid_col = grid_col_hint(shape, self.grid_col, dir, c);
                 self.cursor = c;
                 Some(MenuPulse::Move)
             }
             StepResult::Boundary => {
+                // Against the push, along the axis it was pushed on. The old sign expression
+                // deflected only Right and Down and left every other refusal with a recoil of
+                // exactly zero — a refused press that moves nothing on screen is what makes an
+                // edge read as a dropped input.
+                let forward = matches!(dir, GridDir::Right | GridDir::Down | GridDir::PageForward);
                 self.bump = Spring {
-                    pos: -BUMP_PX * f64::from(matches!(dir, GridDir::Right | GridDir::Down) as i8),
+                    pos: -BUMP_PX * if forward { 1.0 } else { -1.0 },
                     vel: 0.0,
                 };
+                self.bump_vertical = !matches!(dir, GridDir::Left | GridDir::Right);
                 Some(MenuPulse::Boundary)
             }
         }
@@ -581,22 +1040,22 @@ impl LibraryScreen {
                 });
                 Some(MenuPulse::Confirm)
             }
-            // X copies the focused title's own `punktfunk://` link — the same
-            // self-emitted URL a host tile's "Copy link" hands out, plus this game's
-            // `launch=` id, so pasting it into Playnite or a Stream Deck macro boots
-            // straight into the title. Direct rather than behind an options screen:
-            // it is the only per-game action there is, and a menu holding one row is
-            // a press the user pays for nothing.
+            // X raises the focused title's OPTIONS — the console's one context menu, the
+            // same screen a host tile opens, with the subject swapped. "Copy link" is a row
+            // in it rather than this button's whole meaning.
+            //
+            // It used to copy the link outright, on the argument that a menu holding one row
+            // is a press the user pays for nothing. True of a menu that will only ever hold
+            // one row; this one is where a title's next action lands, and a console that
+            // copies a link on X here while asking for a menu on ▲ two screens away has two
+            // idioms for the same verb. The press buys the pattern.
+            //
+            // X and not ▲: the grid arrangement spends Up on row navigation, so ▲ would open
+            // a menu in the shelf and move the cursor in the grid — one gesture meaning two
+            // things inside one screen.
             MenuEvent::Tertiary => {
                 let g = self.focused()?;
-                match self.game_link(&g.id) {
-                    Some(url) => {
-                        fx.copy = Some(url);
-                        fx.toast = Some("Link copied".into());
-                    }
-                    // Only if the host left the store while the shelf was open.
-                    None => fx.toast = Some("This host isn't saved any more".into()),
-                }
+                fx.options(super::options::OptionsScreen::for_game(&self.host, g));
                 Some(MenuPulse::Confirm)
             }
             MenuEvent::Back => {
@@ -607,10 +1066,12 @@ impl LibraryScreen {
             // silence — when there is nothing to collect, which is the same condition that
             // keeps the hint off the legend, so the button and its label never disagree.
             //
-            // Already inside a collection, Y is refused too: a drill-in from a drill-in
-            // would collate a set that is already one group and open onto a single tile.
+            // Reached FROM the collections screen, Y is refused too: a drill-in from a
+            // drill-in would collate a set that is already one group, and from the "All
+            // titles" way out — which is not filtered, and so cannot be recognised by its
+            // filter — it would bounce the user between the two screens for ever.
             MenuEvent::Secondary => {
-                if self.filter.is_some() || !crate::collate::worth_browsing(&self.games) {
+                if self.drilled || !crate::collate::worth_browsing(&self.games) {
                     return Some(MenuPulse::Boundary);
                 }
                 let mut screen = super::collections::CollectionsScreen::new(&self.host, self.sort);
@@ -639,6 +1100,38 @@ impl LibraryScreen {
                 true
             }
             PointerKind::Press => {
+                // The bar's pills are checked BEFORE the field, the order the Collections
+                // screen already uses: they sit over it, and a press on a pill is never
+                // meant for a card. Only while the bar is drawn — a `TabStrip` keeps the
+                // pills it last drew, and a shelf that has gone back to a spinner must not
+                // answer for furniture that is no longer on screen.
+                //
+                // This is also the pointer's only route to a VALUE. Clicking the legend's ▲
+                // reaches the bar (the shell turns that hint into a `Move(Up)`), but focus is
+                // not a choice — a mouse picks a sort by pressing the pill it wants, which is
+                // why both strips hit-test themselves rather than leaning on the legend.
+                let (sort_hit, view_hit) = if self.bar_shown() {
+                    (
+                        self.bar
+                            .sort_tabs
+                            .pointer(p)
+                            .and_then(|i| crate::collate::SortKey::ALL.get(i).copied()),
+                        self.bar
+                            .view_tabs
+                            .pointer(p)
+                            .and_then(|i| LibraryView::ALL.get(i).copied()),
+                    )
+                } else {
+                    (None, None)
+                };
+                if let Some(sort) = sort_hit {
+                    store_sort(sort, ctx);
+                    return true;
+                }
+                if let Some(view) = view_hit {
+                    store_view(view, ctx);
+                    return true;
+                }
                 // The cards OVERLAP, and the ones nearest the cursor are drawn on top —
                 // so among the rects a press falls in, the topmost is the nearest. Picking
                 // the first by index would hand the press to a card buried underneath.
@@ -658,6 +1151,10 @@ impl LibraryScreen {
                     }
                     Some(i) => {
                         self.cursor = i as i32;
+                        // A press CHOOSES a cell, and with it the column Up and Down will
+                        // return to — the alternative is a grid that walks back to wherever
+                        // the stick last was.
+                        self.seat_grid_col();
                         true
                     }
                     None => false,
@@ -678,6 +1175,7 @@ impl LibraryScreen {
                     pos: -BUMP_PX * f64::from(delta.signum()),
                     vel: 0.0,
                 };
+                self.bump_vertical = false; // the shelf is a line, and it runs across
                 Some(MenuPulse::Boundary)
             }
         }
@@ -695,13 +1193,25 @@ impl LibraryScreen {
 
     /// Is the focused entry a launcher? (Drives the confirm hint: you *open* Steam, you *play* a
     /// game.)
+    ///
+    /// Through [`Self::focused`], because the cursor indexes the DISPLAY order: reading
+    /// `games` with it agrees only under the default sort, and told you "Open" over a game
+    /// under any other one.
     fn focused_is_launcher(&self) -> bool {
-        self.games
-            .get(self.cursor as usize)
-            .is_some_and(|g| g.launcher)
+        self.focused().is_some_and(|g| g.launcher)
     }
 
     pub(crate) fn hints(&self, _ctx: &Ctx) -> Vec<Hint> {
+        // The bar's legend REPLACES the field's rather than extending it: while it holds the
+        // pad, Play and Copy link would be advertising presses that go nowhere. Three
+        // entries, every one of them true.
+        if self.bar.focus && self.bar_shown() {
+            return vec![
+                Hint::new(HintKey::Adjust, "Sort"),
+                Hint::new(HintKey::Shoulders, "View"),
+                Hint::new(HintKey::Back, "Done"),
+            ];
+        }
         match &self.phase {
             LibraryPhase::Ready => {
                 let mut hints = vec![Hint::new(
@@ -712,14 +1222,20 @@ impl LibraryScreen {
                         "Play"
                     },
                 )];
-                // Only offered when there is something to browse, and never from inside a
-                // collection — the same two conditions the button itself checks, so the
-                // legend never advertises a press that would only thud.
-                if self.filter.is_none() && crate::collate::worth_browsing(&self.games) {
+                // Only offered when there is something to browse, and never on a shelf the
+                // collections screen itself opened — the same two conditions the button
+                // checks, so the legend never advertises a press that would only thud.
+                if !self.drilled && crate::collate::worth_browsing(&self.games) {
                     hints.push(Hint::new(HintKey::Secondary, "Collections"));
                 }
-                hints.push(Hint::new(HintKey::Tertiary, "Copy link"));
+                hints.push(Hint::new(HintKey::Tertiary, "Options"));
                 hints.push(Hint::new(HintKey::Shoulders, "Jump"));
+                // Named where it leads rather than by the gesture: the bar is already on
+                // screen showing both values, and this says which press reaches it. Gated on
+                // the bar being drawn, so hint and press agree while the field is a spinner.
+                if self.bar_shown() {
+                    hints.push(Hint::new(HintKey::Up, "Sort & view"));
+                }
                 hints.push(Hint::new(HintKey::Back, "Back"));
                 hints
             }
@@ -742,6 +1258,9 @@ impl LibraryScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        // Published before the sync that reads it: the poster cache is sized against the
+        // scale its covers will be drawn at, and a decode is not something this can redo.
+        self.art_k = k;
         self.sync(ctx.library);
         self.adopt_settings(ctx);
         self.frame = self.frame.wrapping_add(1);
@@ -762,40 +1281,52 @@ impl LibraryScreen {
                     self.bump = Spring::rest(0.0);
                 }
                 self.arm_entrance(ctx.t);
+                if !self.entrance_armed {
+                    // Still holding for the first posters, so the shelf has NOT appeared yet.
+                    // Drawing it settled here is what made the cards flash: the finished
+                    // coverflow sat on glass for up to 400 ms, blinked out the frame the
+                    // entrance armed, and only then animated in. Same spinner as the list
+                    // wait, so the two waits have no seam between them.
+                    //
+                    // The geometry has to go with them — `pointer` reads `geom` a frame late,
+                    // and a press must not land on a card nothing drew. `grid_cols_last` is
+                    // deliberately left alone: it is what the last frame DREW, no frame has
+                    // drawn a grid yet, and `grid_move` already declines rather than guessing.
+                    self.geom.clear();
+                    draw_loading(canvas, rect, k, fonts, ctx.t);
+                    return;
+                }
                 if self.entrance.is_some_and(|e| e.done(ctx.t)) {
                     self.entrance = None;
                 }
+                // The bar takes its band off the TOP of the field. The detail band keeps the
+                // full rect — it is anchored to the bottom — and so does the loading path
+                // above, which is centred in a field the bar is not part of.
+                let bar = Rect::from_ltrb(
+                    rect.left,
+                    rect.top,
+                    rect.right,
+                    rect.top + (TAB_STRIP_H * k) as f32,
+                );
+                let field = Rect::from_ltrb(
+                    rect.left,
+                    bar.bottom + (BAR_GAP * k) as f32,
+                    rect.right,
+                    rect.bottom,
+                );
                 match self.view_mode {
-                    LibraryView::Shelf => self.draw_carousel(canvas, rect, k, fonts, ctx.t),
-                    LibraryView::Grid => self.draw_grid(canvas, rect, k, fonts, ctx.t),
+                    LibraryView::Shelf => self.draw_carousel(canvas, field, k, fonts, ctx.t),
+                    LibraryView::Grid => self.draw_grid(canvas, field, k, fonts, ctx.t),
                 }
+                // After the cards, like the detail band: it is the screen's readout, and a
+                // short window must not let an arriving cover paint over the answer.
+                self.draw_bar(canvas, bar, k, fonts, dt);
                 self.draw_detail_band(canvas, rect, k, fonts);
                 self.evict_art();
             }
-            // A skeleton shelf rather than a spinner and a line of text. The wait is for a
-            // LIST, and its shape is known before its contents are — so showing that shape
-            // is both more honest and less startling than a blank field that suddenly
-            // becomes a coverflow.
-            LibraryPhase::Loading => {
-                draw_skeleton(
-                    canvas,
-                    rect,
-                    k,
-                    ctx.t,
-                    self.view_mode,
-                    self.grid_cols(rect, k),
-                );
-                fonts.centered(
-                    canvas,
-                    "Loading library…",
-                    W::Regular,
-                    14.0 * k,
-                    fg(0.55),
-                    cx,
-                    f64::from(rect.bottom) - 40.0 * k,
-                    w * 0.8,
-                );
-            }
+            // The same spinner the Ready arm shows while it holds for art — one wait, drawn
+            // one way, so the list landing does not change what the screen is saying.
+            LibraryPhase::Loading => draw_loading(canvas, rect, k, fonts, ctx.t),
             LibraryPhase::Empty => {
                 fonts.centered(
                     canvas,
@@ -855,6 +1386,87 @@ impl LibraryScreen {
         }
     }
 
+    /// The bar over the field: what this library is sorted by, what it is arranged as, and
+    /// the control for both.
+    ///
+    /// Drawn whether or not it has focus, because the SORT is the thing the field cannot
+    /// say. A coverflow under `Platform` and one under `A–Z` are the same screen with the
+    /// cards in a different order, and until this band existed the only place that answer
+    /// lived was the Collections screen — which a single-store library is never offered at
+    /// all ([`crate::collate::worth_browsing`]). The arrangement IS visible in the field, and
+    /// is named here anyway: one strip that answers both questions the same way is a control
+    /// the user finds once.
+    fn draw_bar(&mut self, canvas: &Canvas, bar: Rect, k: f64, fonts: &Fonts, dt: f64) {
+        // Focused, the WHOLE band lifts — the two rows are one control here (◀ ▶ step the
+        // sort, the shoulders pick the arrangement), so a ring around one pill row would
+        // name a focus the input model does not have. The glass and the brand hairline are
+        // the same pair the grid's focused cell uses, so this reads as focus rather than as
+        // a new kind of chrome.
+        if self.bar.focus {
+            crate::theme::focus_halo(canvas, bar, BAR_CORNER as f32, k as f32, 1.0);
+            crate::theme::panel(
+                canvas,
+                bar,
+                BAR_CORNER as f32,
+                None,
+                crate::theme::PanelStroke::Brand(0.9),
+                k as f32,
+            );
+        }
+        // Two columns. The sort leads, at the same inset and in the same place the
+        // Collections screen puts the identical pills, so a user who has seen one has seen
+        // the other; the arrangement takes the trailing column, where the shoulders that
+        // change it are also the trailing pair.
+        //
+        // Halfway, but never nearer than the sort's own column is wide. The console's scale
+        // follows the window's HEIGHT alone (`shell::render`), so on a tall narrow window a
+        // plain half would land the VIEW caption in the middle of the sort's pills. Pushed
+        // out instead, the arrangement's pills run off the trailing edge on a window that
+        // narrow — the shoulders still change it and the legend still says so, where two
+        // overlapping rows would leave neither readable.
+        let half = bar
+            .center_x()
+            .max(bar.left + (BAR_VIEW_COL * k) as f32)
+            .min(bar.right);
+        let sort_x = f64::from(bar.left) + EDGE_INSET * k;
+        let sort_left = sort_x + strip_caption(canvas, fonts, "SORT", bar, sort_x, k);
+        let view_x = f64::from(half);
+        let view_left = view_x + strip_caption(canvas, fonts, "VIEW", bar, view_x, k);
+
+        let sorts: Vec<&str> = crate::collate::SortKey::ALL
+            .iter()
+            .map(|s| s.label())
+            .collect();
+        let sort_at = crate::collate::SortKey::ALL
+            .iter()
+            .position(|s| *s == self.sort)
+            .unwrap_or(0);
+        self.bar.sort_tabs.render(
+            canvas,
+            Rect::from_ltrb(sort_left as f32, bar.top, half, bar.bottom),
+            &sorts,
+            sort_at,
+            fonts,
+            k,
+            dt,
+        );
+
+        let views: Vec<&str> = LibraryView::ALL.iter().map(|v| v.label()).collect();
+        let view_at = LibraryView::ALL
+            .iter()
+            .position(|v| *v == self.view_mode)
+            .unwrap_or(0);
+        self.bar.view_tabs.render(
+            canvas,
+            Rect::from_ltrb(view_left as f32, bar.top, bar.right, bar.bottom),
+            &views,
+            view_at,
+            fonts,
+            k,
+            dt,
+        );
+    }
+
     /// The grid: a scrolling field of posters, `cols` wide.
     ///
     /// Shares everything that makes the shelf the shelf — the same cursor, the same
@@ -863,46 +1475,47 @@ impl LibraryScreen {
     /// forked any of those would be a second screen pretending to be a view.
     fn draw_grid(&mut self, canvas: &Canvas, rect: Rect, k: f64, fonts: &Fonts, t: f64) {
         let cols = self.grid_cols(rect, k);
-        self.grid_cols_last = cols;
+        // Publishing the shape is what navigation waits for. A resize is a DIFFERENT grid, so
+        // the column the cursor remembers belonged to the old one and is re-seated on where
+        // the cursor actually is — which is also how the very first grid frame seats it.
+        if self.grid_cols_last != Some(cols) {
+            self.grid_cols_last = Some(cols);
+            self.seat_grid_col();
+        }
+        // The same shape `grid_move` reads. Two copies of this arithmetic — one here, one in
+        // the cursor — is what put the focus ring in a different column from the cover the
+        // scroll had just brought up.
+        let shape = GridShape::new(self.len(), cols, self.launcher_count());
         let (cw, ch) = (GRID_W * k, GRID_H * k);
         let pitch_x = cw + GRID_GAP * k;
         let pitch_y = ch + GRID_GAP * k + GRID_LABEL * k;
-        let launchers = self.launcher_count();
         // The launcher prefix keeps its own band, which is how design D4 reads in two
         // dimensions: the shelf says it with a heading that changes as the cursor crosses,
         // a grid says it with a gap and a heading over each half.
-        let split_row = if launchers > 0 && launchers < self.len() {
-            Some(launchers.div_ceil(cols))
-        } else {
-            None
-        };
+        let split_row = (shape.split > 0).then(|| shape.split_row());
         let heading_h = GRID_HEADING * k;
+        // The grid's top inset is UNCONDITIONAL, and that is the fix rather than the tidy-up
+        // it looks like. It used to be spelled `if split_row.is_some() { heading_h }`, so the
+        // one band was doing two jobs — the LAUNCHERS heading, and the air the first row needs
+        // above it. A collection filtered to a single platform has no launcher prefix, so the
+        // term went to zero and row 0 sat flush against the viewport's clip: the focus scale,
+        // the entrance lift and the halo all got sliced off along the top edge. Reported from a
+        // Deck as the cards being cut off, and only inside a collection, which is exactly the
+        // shape a condition on `split_row` would give it.
+        //
+        // The second band, before GAMES, stays conditional — that one really is a heading.
         let row_top = |row: usize| -> f64 {
-            let extra = match split_row {
+            let section_gap = match split_row {
                 Some(s) if row >= s => heading_h,
                 _ => 0.0,
             };
-            row as f64 * pitch_y + extra + if split_row.is_some() { heading_h } else { 0.0 }
-        };
-        // Launchers occupy whole rows of their own, so a game never shares a row with one.
-        let cell_of = |i: usize| -> (usize, usize) {
-            match split_row {
-                Some(s) if i >= launchers => {
-                    let j = i - launchers;
-                    (s + j / cols, j % cols)
-                }
-                _ => (i / cols, i % cols),
-            }
+            row as f64 * pitch_y + heading_h + section_gap
         };
 
-        let rows_total = match split_row {
-            Some(s) => s + (self.len() - launchers).div_ceil(cols),
-            None => self.len().div_ceil(cols),
-        };
-        let content_h = row_top(rows_total.saturating_sub(1)) + ch;
+        let content_h = row_top(shape.rows().saturating_sub(1)) + ch;
         // The detail band keeps its place at the bottom; the grid scrolls above it.
         let view_h = f64::from(rect.height()) - DETAIL_BAND * k;
-        let (focus_row, _) = cell_of(self.cursor.max(0) as usize);
+        let (focus_row, _) = shape.cell_of(self.cursor.max(0) as usize);
         // The focused row rides the upper-middle band rather than an edge, so there is
         // always a row of context above and below it.
         let want = (row_top(focus_row) - view_h * 0.34).clamp(0.0, (content_h - view_h).max(0.0));
@@ -914,8 +1527,19 @@ impl LibraryScreen {
             self.scroll.settle(want, 0.05, 0.5);
         }
 
+        // The boundary recoil, deflected along the axis the refused press pushed on.
+        // `draw_carousel` has always drawn this; the grid computed it, integrated it and then
+        // drew nothing with it — which is what makes an edge in the field read as a swallowed
+        // press rather than as an edge.
+        let bump = self.bump.pos * k;
+        let (bump_x, scroll) = if self.bump_vertical {
+            (0.0, self.scroll.pos - bump)
+        } else {
+            (bump, self.scroll.pos)
+        };
+
         let grid_w = cols as f64 * pitch_x - GRID_GAP * k;
-        let x0 = f64::from(rect.left) + (f64::from(rect.width()) - grid_w) / 2.0;
+        let x0 = f64::from(rect.left) + (f64::from(rect.width()) - grid_w) / 2.0 + bump_x;
         let y0 = f64::from(rect.top);
         let viewport = Rect::from_xywh(rect.left, rect.top, rect.width(), (view_h.max(0.0)) as f32);
 
@@ -936,21 +1560,38 @@ impl LibraryScreen {
                     fg(0.45),
                 );
             };
-            head(canvas, "LAUNCHERS", y0 + heading_h * 0.62 - self.scroll.pos);
+            head(canvas, "LAUNCHERS", y0 + heading_h * 0.62 - scroll);
             head(
                 canvas,
                 "GAMES",
-                y0 + row_top(split_row.expect("checked")) - heading_h * 0.38 - self.scroll.pos,
+                y0 + row_top(split_row.expect("checked")) - heading_h * 0.38 - scroll,
             );
         }
 
+        // What a cell can reach BEYOND its berth, and so how far outside the viewport one
+        // still has to be drawn: the entrance carries a card up from below its berth, and
+        // the focused cell swells 6 %. Only while the entrance is running — once it is over
+        // a card sits exactly on its berth, and the cull can be as tight as the clip.
+        //
+        // It used to keep a whole extra card height at BOTH edges unconditionally, which is
+        // a third more posters resident than the screen ever shows. That is a third more of
+        // the one resource this screen is short of.
+        let reach = if self.entrance.is_some() {
+            ENTER_RISE * k + 0.06 * ch
+        } else {
+            0.0
+        };
+        // Where the entrance fans FROM, as a cell — the anchor is an index, and a field's
+        // idea of "next" is not its list's. See `entrance_at`.
+        let (anchor_row, anchor_col) =
+            shape.cell_of(self.entrance_anchor.min(self.len().saturating_sub(1)));
         for i in 0..self.len() {
-            let (row, col) = cell_of(i);
-            let top = y0 + row_top(row) - self.scroll.pos;
-            if top + ch < f64::from(rect.top) - ch || top > y0 + view_h + ch {
+            let (row, col) = shape.cell_of(i);
+            let top = y0 + row_top(row) - scroll;
+            if top + ch + reach < f64::from(rect.top) || top > y0 + view_h {
                 continue; // off-screen: not drawn, and deliberately not art-stamped either
             }
-            let ent = self.entrance.map_or(EntranceAt::SETTLED, |e| e.at(i, t));
+            let ent = self.entrance_at(anchor_row.abs_diff(row) + anchor_col.abs_diff(col), t);
             let f = if i == self.cursor.max(0) as usize {
                 1.0
             } else {
@@ -973,15 +1614,21 @@ impl LibraryScreen {
             let id = game.id.clone();
 
             crate::theme::focus_halo(canvas, cell, 12.0, k as f32, f as f32);
-            let fading = ent.fade < 1.0;
-            if fading {
+            let art = self.art.get(&id);
+            let rr = RRect::new_rect_xy(cell, (12.0 * k) as f32, (12.0 * k) as f32);
+            // The entrance fade goes through the PAINT wherever a cell is a single draw, and
+            // raises a layer only where it has several overlapping pieces to fade as one: a
+            // placeholder's face and monogram, or the focused cell's ring and glass (which
+            // `theme::panel` mixes itself and has no alpha for). A layer per visible card was
+            // thirty-odd offscreen allocations a frame, paid for exactly the second the
+            // screen is arriving in.
+            let layered = ent.fade < 1.0 && (art.is_none() || f > 0.0);
+            if layered {
                 canvas.save_layer_alpha_f(cell, ent.fade as f32);
             }
-            let rr = RRect::new_rect_xy(cell, (12.0 * k) as f32, (12.0 * k) as f32);
-            canvas.save();
-            canvas.clip_rrect(rr, None, true);
-            match self.art.get(&id) {
+            match art {
                 Some(img) => {
+                    // Cover-fit: center-crop the source to the cell's 2:3.
                     let (iw, ih) = (img.width() as f32, img.height() as f32);
                     let aspect = cell.width() / cell.height();
                     let src = if iw / ih > aspect {
@@ -991,18 +1638,41 @@ impl LibraryScreen {
                         let sh = iw / aspect;
                         Rect::from_xywh(0.0, (ih - sh) / 2.0, iw, sh)
                     };
-                    canvas.draw_image_rect(
-                        img,
-                        Some((&src, skia_safe::canvas::SrcRectConstraint::Fast)),
-                        cell,
-                        &Paint::default(),
-                    );
+                    // One shader-filled round-rect, not a clip plus an image draw — the same
+                    // picture out of one draw, with the corner getting real coverage AA
+                    // instead of an AA clip, and no clip-stack element per card across a
+                    // screenful of them. `collections::draw_cover` is the same move.
+                    let (sx, sy) = (cell.width() / src.width(), cell.height() / src.height());
+                    let mut local = Matrix::scale((sx, sy));
+                    local.post_translate((cell.left - src.left * sx, cell.top - src.top * sy));
+                    if let Some(shader) = img.to_shader(
+                        (TileMode::Clamp, TileMode::Clamp),
+                        art_sampling(),
+                        Some(&local),
+                    ) {
+                        // OPAQUE by construction — Skia modulates a shader by the paint's
+                        // alpha, so a transparent placeholder here would draw literally
+                        // nothing (theme.rs:52-64). Which is also what makes the fade below
+                        // work: the cover is exactly what the paint's alpha scales.
+                        let mut p = crate::theme::shaded();
+                        p.set_shader(shader);
+                        if !layered {
+                            p.set_alpha_f(ent.fade as f32);
+                        }
+                        canvas.draw_rrect(rr, &p);
+                    }
                 }
-                None => draw_poster_placeholder(canvas, fonts, self.game(i), cell, k),
+                // The placeholder paints a square face and a monogram over it, so it still
+                // needs the rounded clip to come out a card.
+                None => {
+                    canvas.save();
+                    canvas.clip_rrect(rr, None, true);
+                    draw_poster_placeholder(canvas, fonts, self.game(i), cell, k);
+                    canvas.restore();
+                }
             }
-            canvas.restore();
-            // The focus ring goes OUTSIDE the clip, so it reads as a ring around the cover
-            // rather than a border painted onto it.
+            // The focus ring goes OUTSIDE the cover, so it reads as a ring around it rather
+            // than a border painted onto it.
             if f > 0.0 {
                 crate::theme::panel(
                     canvas,
@@ -1013,7 +1683,7 @@ impl LibraryScreen {
                     k as f32,
                 );
             }
-            if fading {
+            if layered {
                 canvas.restore();
             }
             self.art_seen.insert(id, self.frame);
@@ -1074,7 +1744,11 @@ impl LibraryScreen {
             // fake its turn with a cos-squeeze is that SwiftUI can't snapshot a rotated
             // layer to glass, and Skia has no such constraint here. Cards turn away in the
             // direction they sit from the anchor, so the strip fans open like a book.
-            let ent = self.entrance.map_or(EntranceAt::SETTLED, |e| e.at(i, t));
+            // A strip's fan IS its index distance, so the steps are the distance to the
+            // anchor — the same number `e.at(i, t)` used to work out for itself. Through
+            // `entrance_at` all the same, so there is one place that knows what an absent
+            // entrance means and the coverflow cannot drift from the grid on it.
+            let ent = self.entrance_at(i.abs_diff(self.entrance_anchor), t);
             let arrive = ENTER_SCALE + (1.0 - ENTER_SCALE) * ent.travel;
             let turn = (1.0 - ent.travel)
                 * ENTER_TURN_DEG
@@ -1101,7 +1775,7 @@ impl LibraryScreen {
             // transform: it is light spilling AROUND the card, so it cannot live inside the
             // rounded rect the card clips itself to. Fades with the sprung proximity rather
             // than snapping on the integer cursor, so it travels with the strip. The few
-            // degrees of perspective it misses are invisible on an 18 dp blur.
+            // degrees of perspective it misses are invisible on a 10 dp blur.
             crate::theme::focus_halo(canvas, self.geom[i], 16.0, k as f32, (1.0 - prox) as f32);
             canvas.save();
             canvas.concat_44(&M44::row_major(&m));
@@ -1117,7 +1791,7 @@ impl LibraryScreen {
             let fading = ent.fade < 1.0;
             let layered = fading || prox > 0.001;
             if layered {
-                let mut lp = Paint::default();
+                let mut lp = crate::theme::layer();
                 lp.set_alpha_f(ent.fade as f32);
                 if prox > 0.001 {
                     lp.set_color_filter(skia_safe::color_filters::matrix_row_major(
@@ -1140,11 +1814,12 @@ impl LibraryScreen {
                         let sh = iw / card_aspect;
                         Rect::from_xywh(0.0, (ih - sh) / 2.0, iw, sh)
                     };
-                    canvas.draw_image_rect(
+                    canvas.draw_image_rect_with_sampling_options(
                         img,
                         Some((&src, skia_safe::canvas::SrcRectConstraint::Fast)),
                         crect,
-                        &Paint::default(),
+                        art_sampling(),
+                        &fill(fg(1.0)),
                     );
                 }
                 None => draw_poster_placeholder(canvas, fonts, Some(game), crect, k),
@@ -1169,7 +1844,7 @@ impl LibraryScreen {
                         (bh / 2.0) as f32,
                         (bh / 2.0) as f32,
                     ),
-                    &Paint::new(pill, None),
+                    &fill(pill),
                 );
                 fonts.draw(
                     canvas,
@@ -1181,14 +1856,15 @@ impl LibraryScreen {
                     fg(1.0),
                 );
             }
-            // The brightness recede: an opaque-black veil, never whole-card alpha.
+            // The separating veil: an opaque wash toward the GROUND, never whole-card alpha.
+            // Hardcoded black cancelled itself out on the six pale palettes — it greyed back
+            // the lift `recede_matrix` had just applied and left a receded card muddier than
+            // the focused one — so it goes through the scrim, which is black on a dark field
+            // and white on a pale one and so pushes the same direction the matrix does.
             if prox > 0.0 {
                 canvas.draw_rect(
                     crect,
-                    &Paint::new(
-                        Color4f::new(0.0, 0.0, 0.0, (prox * RECEDE_DIM) as f32),
-                        None,
-                    ),
+                    &fill(crate::theme::shade((prox * RECEDE_DIM) as f32)),
                 );
             }
             if layered {
@@ -1247,6 +1923,465 @@ impl LibraryScreen {
 mod tests {
     use super::*;
 
+    fn host() -> HostRow {
+        HostRow {
+            key: "aa".into(),
+            name: "Desk".into(),
+            addr: "10.0.0.5".into(),
+            port: 9777,
+            fp_hex: "aa".into(),
+            paired: true,
+            saved: true,
+            online: true,
+            mgmt_port: 9778,
+            can_wake: false,
+            last_used: None,
+            os: String::new(),
+            pin: None,
+            bound_profile: None,
+        }
+    }
+
+    /// A shelf on a LIVE shared model, with its entrance already over.
+    ///
+    /// Both halves matter for the input tests: `menu` re-syncs from the model on every press,
+    /// and a shelf built by hand would be wiped by the first one; the bar exists only over a
+    /// drawn field, which off-screen means "the entrance has armed".
+    ///
+    /// The titles are deliberately not in alphabetical order, so a sort is something the
+    /// display order can be asked about rather than a setting that happens to change nothing.
+    fn live_shelf() -> (LibraryScreen, LibraryShared) {
+        // The bar persists on every step, and `Settings::save` rewrites the whole console
+        // settings file — so the store is pointed at a throwaway HOME before any of these
+        // tests can reach it. Shared with the settings screen's tests, which need it for the
+        // same reason and own the one write to the environment.
+        crate::screens::settings::tests::fake_home();
+        let library = LibraryShared::default();
+        library.set_games(
+            ["Zeta", "Alpha", "Nimbus", "Bravo", "Kilo", "Delta"]
+                .iter()
+                .enumerate()
+                .map(|(i, t)| LibraryGame {
+                    id: format!("g{i}"),
+                    title: (*t).to_string(),
+                    store: "steam".into(),
+                    launcher: false,
+                    icon: String::new(),
+                    platform: None,
+                })
+                .collect(),
+        );
+        let mut s = LibraryScreen::new(&host());
+        s.sync(&library);
+        s.entrance_armed = true;
+        (s, library)
+    }
+
+    fn ctx<'a>(
+        library: &'a LibraryShared,
+        settings: &'a mut pf_client_core::trust::Settings,
+    ) -> Ctx<'a> {
+        Ctx {
+            hosts: &[],
+            library,
+            settings,
+            pads: &[],
+            deck: false,
+            device_name: "test",
+            t: 0.0,
+        }
+    }
+
+    /// One press, with the settings the test owns standing in for the console's.
+    fn press(
+        s: &mut LibraryScreen,
+        library: &LibraryShared,
+        settings: &mut pf_client_core::trust::Settings,
+        ev: MenuEvent,
+    ) -> (Option<MenuPulse>, Outbox) {
+        let mut fx = Outbox::default();
+        let pulse = s.menu(ev, &mut ctx(library, settings), &mut fx);
+        (pulse, fx)
+    }
+
+    fn hint_keys(
+        s: &LibraryScreen,
+        library: &LibraryShared,
+        settings: &mut pf_client_core::trust::Settings,
+    ) -> Vec<HintKey> {
+        s.hints(&ctx(library, settings))
+            .iter()
+            .map(|h| h.key)
+            .collect()
+    }
+
+    /// The bar takes the pad while it is up, and the press that matters is A.
+    ///
+    /// A Confirm that reached `ready_action` from here would START A SESSION on a button the
+    /// user spent choosing a sort — the one mistake this bar could make that costs anything,
+    /// and the reason its branch sits above the phase match rather than inside it.
+    #[test]
+    fn the_bar_owns_the_pad_and_confirm_cannot_launch_from_it() {
+        let (mut s, library) = live_shelf();
+        let mut settings = pf_client_core::trust::Settings::default();
+        let (pulse, _) = press(
+            &mut s,
+            &library,
+            &mut settings,
+            MenuEvent::Move(MenuDir::Up),
+        );
+        assert!(matches!(pulse, Some(MenuPulse::Move)));
+        assert!(s.bar.focus, "up from the shelf reaches the bar");
+
+        let cursor = s.cursor;
+        let (_, fx) = press(&mut s, &library, &mut settings, MenuEvent::Confirm);
+        assert!(fx.connect.is_none(), "A in the bar launched a game");
+        assert!(fx.nav.is_none(), "and pushed a screen");
+        assert!(!s.bar.focus, "A means done");
+        assert_eq!(s.cursor, cursor, "and the field never moved under it");
+    }
+
+    /// Left and right belong to the bar while it has focus — the cards must not walk along
+    /// underneath the value the thumb is choosing.
+    #[test]
+    fn the_field_does_not_move_while_the_bar_is_up() {
+        let (mut s, library) = live_shelf();
+        let mut settings = pf_client_core::trust::Settings::default();
+        press(
+            &mut s,
+            &library,
+            &mut settings,
+            MenuEvent::Move(MenuDir::Up),
+        );
+        press(
+            &mut s,
+            &library,
+            &mut settings,
+            MenuEvent::Move(MenuDir::Right),
+        );
+        assert_eq!(
+            s.cursor, 0,
+            "the shelf stepped on a press meant for the sort"
+        );
+    }
+
+    /// The bar changes the SETTING, never the screen — which is the entire mechanism.
+    ///
+    /// Every surface that shows the library re-reads `library_sort` each frame, so writing
+    /// the key is what makes the field re-order live under the strip AND what stops the
+    /// Settings screen from disagreeing with it. Assigning `self.sort` here would look right
+    /// for exactly one frame and would then be reverted by the next `adopt_settings`.
+    #[test]
+    fn stepping_the_bar_writes_the_setting_and_the_field_follows() {
+        let (mut s, library) = live_shelf();
+        let mut settings = pf_client_core::trust::Settings::default();
+        press(
+            &mut s,
+            &library,
+            &mut settings,
+            MenuEvent::Move(MenuDir::Up),
+        );
+        press(
+            &mut s,
+            &library,
+            &mut settings,
+            MenuEvent::Move(MenuDir::Right),
+        );
+        assert_eq!(
+            settings.library_sort,
+            crate::collate::SortKey::Title.id(),
+            "the sort is persisted, not held on the screen"
+        );
+
+        s.adopt_settings(&ctx(&library, &mut settings));
+        assert_eq!(s.sort, crate::collate::SortKey::Title);
+        assert_eq!(
+            s.game(0).map(|g| g.title.as_str()),
+            Some("Alpha"),
+            "the display order did not follow the sort"
+        );
+        // …and the cursor still indexes the DISPLAY order, so the shelf is showing the
+        // first title of the new order rather than a stale index into the old one.
+        assert_eq!(s.focused().map(|g| g.title.as_str()), Some("Alpha"));
+
+        // Left goes back, and the first sort is the end of the run: it thuds rather than
+        // wrapping round to Store, exactly as a settings value row does.
+        press(
+            &mut s,
+            &library,
+            &mut settings,
+            MenuEvent::Move(MenuDir::Left),
+        );
+        assert_eq!(
+            settings.library_sort,
+            crate::collate::SortKey::HostOrder.id()
+        );
+        let (pulse, _) = press(
+            &mut s,
+            &library,
+            &mut settings,
+            MenuEvent::Move(MenuDir::Left),
+        );
+        assert!(matches!(pulse, Some(MenuPulse::Boundary)));
+        assert_eq!(
+            settings.library_sort,
+            crate::collate::SortKey::HostOrder.id()
+        );
+    }
+
+    /// The shoulders pick the arrangement outright, and stop rather than wrap: over two
+    /// values a wrapping pair is one button pressed twice, and a held one would flip the
+    /// whole field back and forth.
+    #[test]
+    fn the_shoulders_swap_the_arrangement_and_stop_at_the_ends() {
+        let (mut s, library) = live_shelf();
+        let mut settings = pf_client_core::trust::Settings::default();
+        press(
+            &mut s,
+            &library,
+            &mut settings,
+            MenuEvent::Move(MenuDir::Up),
+        );
+        let (pulse, _) = press(&mut s, &library, &mut settings, MenuEvent::JumpForward);
+        assert!(matches!(pulse, Some(MenuPulse::Move)));
+        assert_eq!(settings.library_view, LibraryView::Grid.id());
+
+        s.adopt_settings(&ctx(&library, &mut settings));
+        assert_eq!(s.view_mode, LibraryView::Grid);
+        assert!(
+            s.snap_scroll,
+            "the two arrangements do not share a scroll, so the new one seats"
+        );
+
+        let (pulse, _) = press(&mut s, &library, &mut settings, MenuEvent::JumpForward);
+        assert!(
+            matches!(pulse, Some(MenuPulse::Boundary)),
+            "already the grid"
+        );
+        press(&mut s, &library, &mut settings, MenuEvent::JumpBack);
+        assert_eq!(settings.library_view, LibraryView::Shelf.id());
+    }
+
+    /// B leaves the bar before it leaves the library. Standard sub-focus behaviour, and the
+    /// thing that lets the bar be a place rather than a mode you escape twice by accident.
+    #[test]
+    fn back_leaves_the_bar_before_it_leaves_the_library() {
+        let (mut s, library) = live_shelf();
+        let mut settings = pf_client_core::trust::Settings::default();
+        press(
+            &mut s,
+            &library,
+            &mut settings,
+            MenuEvent::Move(MenuDir::Up),
+        );
+        let (_, fx) = press(&mut s, &library, &mut settings, MenuEvent::Back);
+        assert!(fx.nav.is_none(), "B in the bar popped the screen");
+        assert!(!s.bar.focus);
+        let (_, fx) = press(&mut s, &library, &mut settings, MenuEvent::Back);
+        assert!(
+            matches!(fx.nav, Some(crate::screens::Nav::Pop)),
+            "…and B on the field still leaves"
+        );
+    }
+
+    /// In the grid, up reaches the bar from the TOP DRAWN row and only from there — anywhere
+    /// else it is row navigation, which is the press it must not steal. Asked of the same
+    /// [`GridShape`] the renderer lays the field out with, so the launcher split cannot make
+    /// the two disagree about which row a cover is on.
+    #[test]
+    fn up_reaches_the_bar_from_the_grids_top_row_only() {
+        let (mut s, library) = live_shelf();
+        let mut settings = pf_client_core::trust::Settings {
+            library_view: LibraryView::Grid.id().to_string(),
+            ..Default::default()
+        };
+        // The grid's shape is what the last frame DREW, and no test draws one.
+        s.grid_cols_last = Some(3);
+        press(
+            &mut s,
+            &library,
+            &mut settings,
+            MenuEvent::Move(MenuDir::Down),
+        );
+        assert_eq!(s.view_mode, LibraryView::Grid);
+        assert_eq!(s.cursor, 3, "down moved a row");
+
+        let (pulse, _) = press(
+            &mut s,
+            &library,
+            &mut settings,
+            MenuEvent::Move(MenuDir::Up),
+        );
+        assert!(matches!(pulse, Some(MenuPulse::Move)));
+        assert!(!s.bar.focus, "up out of the second row is a row move");
+        assert_eq!(s.cursor, 0);
+
+        press(
+            &mut s,
+            &library,
+            &mut settings,
+            MenuEvent::Move(MenuDir::Up),
+        );
+        assert!(s.bar.focus, "…and from the top row it reaches the bar");
+    }
+
+    /// Legend and press agree in BOTH focus states. The bar's legend replaces the field's
+    /// rather than extending it — while it is up, Play and Copy link would be advertising
+    /// presses that go nowhere.
+    #[test]
+    fn the_legend_swaps_with_the_focus() {
+        let (mut s, library) = live_shelf();
+        let mut settings = pf_client_core::trust::Settings::default();
+        let closed = hint_keys(&s, &library, &mut settings);
+        assert!(closed.contains(&HintKey::Up), "nothing leads to the bar");
+        assert!(closed.contains(&HintKey::Confirm) && closed.contains(&HintKey::Tertiary));
+
+        press(
+            &mut s,
+            &library,
+            &mut settings,
+            MenuEvent::Move(MenuDir::Up),
+        );
+        let open = hint_keys(&s, &library, &mut settings);
+        assert!(open.contains(&HintKey::Adjust) && open.contains(&HintKey::Shoulders));
+        assert!(
+            !open.contains(&HintKey::Confirm) && !open.contains(&HintKey::Tertiary),
+            "the bar's legend still offered the field's actions"
+        );
+        assert!(
+            open.len() <= 4,
+            "the legend is read from a sofa: {} entries",
+            open.len()
+        );
+    }
+
+    /// No bar over a spinner. The screen is `Ready` for the whole of the entrance's art
+    /// wait, and a sort control over a field that has not appeared is a lie the legend would
+    /// advertise and the pointer would answer for.
+    #[test]
+    fn there_is_no_bar_until_there_is_a_field() {
+        let (mut s, library) = live_shelf();
+        s.entrance_armed = false;
+        let mut settings = pf_client_core::trust::Settings::default();
+        assert!(!hint_keys(&s, &library, &mut settings).contains(&HintKey::Up));
+        let (pulse, _) = press(
+            &mut s,
+            &library,
+            &mut settings,
+            MenuEvent::Move(MenuDir::Up),
+        );
+        assert!(pulse.is_none(), "the shelf's dead press became a live one");
+        assert!(!s.bar.focus);
+    }
+
+    /// A shelf whose list has landed but whose art has not — the state the fix is about.
+    fn waiting_shelf() -> LibraryScreen {
+        let mut s = LibraryScreen::new(&host());
+        s.phase = LibraryPhase::Ready;
+        s.games = (0..6)
+            .map(|i| LibraryGame {
+                id: format!("g{i}"),
+                title: format!("Game {i}"),
+                store: "steam".into(),
+                launcher: false,
+                icon: String::new(),
+                platform: None,
+            })
+            .collect();
+        s.recollate();
+        s
+    }
+
+    /// The shelf must never be drawn ARRIVED before it has arrived.
+    ///
+    /// `entrance == None` is two states, not one — "not begun" and "already over" — and the
+    /// draw code read both as settled. Since the arming deliberately waits for art or 400 ms,
+    /// that put the finished coverflow on screen, blinked it out and then played its entrance.
+    /// The property is that the first thing a card is ever drawn at is frame one of its own
+    /// entrance: invisible, and never full opacity before it.
+    #[test]
+    fn a_shelf_is_hidden_until_its_entrance_begins_not_settled() {
+        let mut s = waiting_shelf();
+        // No art, no deadline yet: it declines to arm, and every card reads as absent.
+        s.arm_entrance(10.0);
+        assert!(!s.entrance_armed, "armed with nothing to show");
+        for steps in 0..s.len() {
+            let at = s.entrance_at(steps, 10.0);
+            assert_eq!(
+                (at.travel, at.fade),
+                (0.0, 0.0),
+                "card {steps} was drawn before the entrance began"
+            );
+        }
+        s.arm_entrance(10.39);
+        assert!(!s.entrance_armed, "the deadline is 400 ms");
+
+        // The deadline: it arms, and the very frame it arms on is still invisible.
+        s.arm_entrance(10.4);
+        assert!(s.entrance_armed);
+        assert_eq!(s.entrance_at(0, 10.4).fade, 0.0, "the shelf flashed");
+
+        // …and once it is over, `None` means settled again.
+        s.entrance = None;
+        assert_eq!(s.entrance_at(3, 99.0), EntranceAt::SETTLED);
+    }
+
+    /// Art on any card in the neighbourhood arms it immediately — the deadline is the
+    /// fallback, not the path.
+    #[test]
+    fn decoded_art_arms_the_entrance_without_waiting_out_the_deadline() {
+        let mut s = waiting_shelf();
+        s.arm_entrance(4.0);
+        assert!(!s.entrance_armed);
+        let mut surface = skia_safe::surfaces::raster_n32_premul((2, 2)).expect("2×2 raster");
+        s.art.insert("g1".into(), surface.image_snapshot());
+        s.arm_entrance(4.05);
+        assert!(s.entrance_armed, "a decoded poster is the whole point");
+    }
+
+    fn over(src: Color4f, dst: Color4f) -> Color4f {
+        let m = |s: f32, d: f32| s * src.a + d * (1.0 - src.a);
+        Color4f::new(m(src.r, dst.r), m(src.g, dst.g), m(src.b, dst.b), 1.0)
+    }
+
+    /// WCAG's own arithmetic: sRGB to linear, then Rec. 709 relative luminance.
+    fn contrast(a: Color4f, b: Color4f) -> f32 {
+        let lin = |c: f32| {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let lum = |c: Color4f| 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// A title with no cover shows its initials, and that has to hold on ALL THIRTEEN
+    /// palettes rather than on the one anybody screenshots.
+    ///
+    /// The face was a hardcoded near-black under `fg()` ink. On the six PALE palettes `fg()`
+    /// is itself a near-black tinted toward the ground, so the two landed on top of each
+    /// other — `mint` measured 1.03:1, which is an absent monogram, not a dim one — and it hit
+    /// every coverless card in both the grid and the coverflow. Only an assertion that fails
+    /// before and passes after is worth writing, and this is that assertion.
+    #[test]
+    fn a_coverless_card_reads_on_every_palette() {
+        for p in &crate::library::PALETTES {
+            crate::theme::set_ink(crate::theme::Ink::of(p));
+            for launcher in [false, true] {
+                let face = placeholder_face(launcher);
+                // OPAQUE, and load-bearing: the coverflow's side cards overlap, so any alpha
+                // here would show the neighbour through the card in front of it.
+                assert_eq!(face.a, 1.0, "{} face is translucent", p.id);
+                let c = contrast(over(fg(0.85), face), face);
+                assert!(c > 3.0, "the monogram is unreadable on {}: {c:.2}:1", p.id);
+            }
+        }
+        crate::theme::set_ink(crate::theme::Ink::of(crate::library::palette("violet")));
+    }
+
     /// Eviction must never take a cover that is ON SCREEN. That is the whole point of
     /// stamping after the draw rather than on arrival: a 400-title library paged end to end
     /// touches every decode, and an LRU keyed on arrival would happily drop the six the
@@ -1277,6 +2412,77 @@ mod tests {
         assert!(art_to_evict(&live, &HashMap::new()).is_empty());
     }
 
+    /// The cache is sized against what is DRAWN, in both directions.
+    ///
+    /// Too small and a cached poster is being MAGNIFIED onto the shelf's focused card — the
+    /// soft, "low-resolution" look the sampling work exists to have removed, and the one way
+    /// a memory fix could quietly trade one artefact for another. Too large and it is feeding
+    /// a mip level no draw reaches, which is what put a screenful of covers over Skia's GPU
+    /// budget in the first place. The source is the ceiling over both: nothing is ever
+    /// enlarged, and the aspect is the source's, so a title whose only art is a 460×215
+    /// header is not stretched into the cards' 2:3 on its way in.
+    #[test]
+    fn a_cached_poster_is_bounded_by_the_size_it_is_drawn_at() {
+        for k in [0.75, 1.0, 1.25, 1.5, 1.8, 2.7, 3.0] {
+            for src in [(600, 900), (1000, 1500), (460, 215), (300, 450), (64, 64)] {
+                let (w, h) = art_cache_size(src, k);
+                assert!(
+                    w <= src.0 && h <= src.1,
+                    "{src:?} at k={k} was enlarged to {w}×{h}"
+                );
+                // The shelf's focused card is the largest a poster is ever drawn.
+                let drawn = (POSTER_W * k).min(f64::from(src.0));
+                assert!(
+                    f64::from(w) >= drawn - 1.0,
+                    "{src:?} at k={k} cached {w} px wide, under the {drawn:.0} px drawn"
+                );
+                assert!(
+                    f64::from(w) <= ART_CACHE_W * k + 1.0 && f64::from(h) <= ART_CACHE_H * k + 1.0,
+                    "{src:?} at k={k} cached {w}×{h}, outside the cache box"
+                );
+                let (want, got) = (
+                    f64::from(src.0) / f64::from(src.1),
+                    f64::from(w) / f64::from(h),
+                );
+                assert!(
+                    (want - got).abs() < 0.02,
+                    "{src:?} at k={k} came back {w}×{h} — aspect {got:.3} for a {want:.3} source"
+                );
+            }
+        }
+    }
+
+    /// A screenful of covers has to FIT Skia's GPU resource budget. When it doesn't, the
+    /// cache evicts a third of them on every submit and the next frame re-decodes them from
+    /// JPEG on the render thread — which is not a slow frame, it is a slideshow, and it
+    /// arrives as a cliff the moment the grid fills rather than as a gradual sag.
+    #[test]
+    fn a_screenful_of_covers_fits_the_gpu_budget() {
+        // The most cells the grid can put on screen: `grid_cols` clamps at eight columns, and
+        // the cull keeps a little over three rows at any scale — `k` is the panel's height
+        // over 800, so the row COUNT barely moves with resolution. Six rows is generous.
+        const SCREENFUL: usize = 8 * 6;
+        // Four bytes a pixel, and a third again for the mip chain `decode_poster` bakes in.
+        let bytes = |(w, h): (i32, i32)| (w as usize) * (h as usize) * 4 * 4 / 3;
+        // Up to a 1440p panel; `skia_overlay::RESOURCE_CACHE_BYTES` names the one case past
+        // it (4K fed 1000×1500 art) that the budget does not claim to cover.
+        for k in [0.75, 1.0, 1.35, 1.8] {
+            for src in [(600, 900), (1000, 1500)] {
+                let covers = bytes(art_cache_size(src, k)) * SCREENFUL;
+                // The console holds two render targets of the panel's own size as well.
+                let targets = 2 * (1280.0 * k) as usize * (800.0 * k) as usize * 4;
+                let budget = crate::skia_overlay::RESOURCE_CACHE_BYTES;
+                assert!(
+                    covers + targets < budget,
+                    "{src:?} art at k={k}: {} MB of covers + {} MB of targets over a {} MB budget",
+                    covers >> 20,
+                    targets >> 20,
+                    budget >> 20
+                );
+            }
+        }
+    }
+
     /// A poster decoded but never drawn is the FIRST to go — it is off-screen by
     /// definition, whatever else the stamps say.
     #[test]
@@ -1289,5 +2495,185 @@ mod tests {
         assert_eq!(dropped.len(), 2);
         assert!(dropped.contains(&"g7".to_string()));
         assert!(dropped.contains(&"g9".to_string()));
+    }
+
+    /// Titles by name and platform; a platform-less Steam title collates as its STORE, so
+    /// `[None, None]` is one collection and `[Some, None]` is two.
+    fn games(spec: &[(&str, Option<&str>)]) -> Vec<LibraryGame> {
+        spec.iter()
+            .enumerate()
+            .map(|(i, (title, platform))| LibraryGame {
+                id: format!("g{i}"),
+                title: (*title).to_string(),
+                store: "steam".into(),
+                launcher: false,
+                icon: String::new(),
+                platform: platform.map(str::to_string),
+            })
+            .collect()
+    }
+
+    fn setting_on() -> pf_client_core::trust::Settings {
+        pf_client_core::trust::Settings {
+            library_collections: true,
+            ..Default::default()
+        }
+    }
+
+    /// A freshly pushed shelf that has watched its own fetch go out — the state every entry
+    /// is in a frame or two after the push, and the only one the entry decision is taken in.
+    /// The model starts `Loading`, which is exactly what a queued fetch puts it back to.
+    fn pushed_shelf(
+        library: &LibraryShared,
+        settings: &pf_client_core::trust::Settings,
+    ) -> LibraryScreen {
+        let mut s = LibraryScreen::new(&host());
+        s.collections_upgrade(library, settings);
+        s
+    }
+
+    /// The entry decision, in one place: the setting says yes AND the library has more than
+    /// one collection. Either half missing and the shelf stays a shelf — which is what makes
+    /// "collections enabled, one collection" a no-op rather than a screen holding one tile.
+    ///
+    /// One-shot in both directions. A shelf that decided against upgrading must not be asked
+    /// again — that answer costs a full collate — and a shelf that decided FOR it must not
+    /// hand over twice.
+    #[test]
+    fn the_shelf_hands_over_only_when_the_setting_and_the_library_agree() {
+        let mixed = games(&[("Ico", Some("PS2")), ("Journey", None)]);
+        let one = games(&[("Ico", None), ("Journey", None)]);
+
+        let off = pf_client_core::trust::Settings::default();
+        let library = LibraryShared::default();
+        library.set_games(mixed.clone());
+        let mut s = LibraryScreen::new(&host());
+        assert!(
+            s.collections_upgrade(&library, &off).is_none(),
+            "setting off"
+        );
+        assert!(!s.pending_collections, "and it is not asked again");
+
+        let library = LibraryShared::default();
+        let mut s = pushed_shelf(&library, &setting_on());
+        library.set_games(one);
+        assert!(
+            s.collections_upgrade(&library, &setting_on()).is_none(),
+            "one collection is not worth a screen"
+        );
+        assert!(!s.pending_collections);
+        assert!(!s.drilled, "…and the shelf it stayed still offers Y");
+
+        let library = LibraryShared::default();
+        let mut s = pushed_shelf(&library, &setting_on());
+        library.set_games(mixed);
+        assert!(s.collections_upgrade(&library, &setting_on()).is_some());
+        assert!(
+            s.collections_upgrade(&library, &setting_on()).is_none(),
+            "handed over twice"
+        );
+    }
+
+    /// The model still holds the host the user just backed out of, and it is READY — for the
+    /// frames between this shelf being pushed and the fetch it queued reaching the service
+    /// thread. Deciding there opens one host's library on another host's collections, and on
+    /// the common path (browse a host, back, open the next) it is the normal case, not a
+    /// race that needs losing.
+    #[test]
+    fn a_shelf_never_hands_over_on_the_library_it_inherited() {
+        let mixed = games(&[("Ico", Some("PS2")), ("Journey", None)]);
+        let library = LibraryShared::default();
+        library.set_games(mixed.clone()); // the host the user was just on
+        let mut s = LibraryScreen::new(&host());
+        assert!(s.collections_upgrade(&library, &setting_on()).is_none());
+        assert!(
+            s.pending_collections,
+            "the decision was deferred, not spent"
+        );
+
+        library.set_phase(LibraryPhase::Loading); // …and now this shelf's own fetch goes out
+        assert!(s.collections_upgrade(&library, &setting_on()).is_none());
+        library.set_games(mixed);
+        assert!(s.collections_upgrade(&library, &setting_on()).is_some());
+    }
+
+    /// A fetch that failed keeps the shelf — the error card and its Retry live here and
+    /// nowhere else — and the decision is deferred rather than spent, so the retry that
+    /// lands still opens on the collections.
+    #[test]
+    fn a_failed_fetch_keeps_the_shelf_and_still_hands_over_on_retry() {
+        let library = LibraryShared::default();
+        library.set_phase(LibraryPhase::Error {
+            title: "Couldn't load the library".into(),
+            body: "refused".into(),
+            can_retry: true,
+        });
+        let mut s = LibraryScreen::new(&host());
+        assert!(s.collections_upgrade(&library, &setting_on()).is_none());
+        assert!(
+            s.pending_collections,
+            "the decision was deferred, not spent"
+        );
+        assert!(
+            matches!(s.phase, LibraryPhase::Error { .. }),
+            "the retry is still here"
+        );
+
+        library.set_games(games(&[("Ico", Some("PS2")), ("Journey", None)]));
+        assert!(s.collections_upgrade(&library, &setting_on()).is_some());
+    }
+
+    /// A shelf the collections screen opened never offers the collections back — filtered to
+    /// one group it would collate a set that is already one group, and unfiltered ("All
+    /// titles") it would bounce the user between the two screens for ever.
+    #[test]
+    fn a_drilled_shelf_neither_hands_over_nor_offers_y() {
+        let library = LibraryShared::default();
+        library.set_games(games(&[("Ico", Some("PS2")), ("Journey", None)]));
+        let mut settings = setting_on();
+        for drill in [0, 1] {
+            let mut s = LibraryScreen::new(&host());
+            if drill == 0 {
+                s.set_filter(
+                    crate::collate::GroupKey::Platform("PS2".into()),
+                    "PS2".into(),
+                );
+            } else {
+                s.all_titles();
+            }
+            assert!(s.collections_upgrade(&library, &settings).is_none());
+            let (pulse, fx) = press(&mut s, &library, &mut settings, MenuEvent::Secondary);
+            assert!(matches!(pulse, Some(MenuPulse::Boundary)), "Y was answered");
+            assert!(fx.nav.is_none(), "…and pushed a screen");
+            assert!(
+                !hint_keys(&s, &library, &mut settings).contains(&HintKey::Secondary),
+                "the legend offered a press that only thuds"
+            );
+        }
+    }
+
+    /// Posters handed to a shelf survive its FIRST list and are dropped by any later one.
+    ///
+    /// The hand-over is the only way a drill-in ever has covers: the encoded bytes are
+    /// pushed once per fetch and the queue they came from was emptied by the screen above.
+    /// Clearing on the first sync — which is always "fresh", because a new screen holds no
+    /// games — made every hand-over a silent no-op and left the drill-in on monograms.
+    #[test]
+    fn handed_over_posters_survive_the_first_list_and_only_that_one() {
+        let poster = || {
+            skia_safe::surfaces::raster_n32_premul((4, 6))
+                .expect("a raster surface")
+                .image_snapshot()
+        };
+        let library = LibraryShared::default();
+        library.set_games(games(&[("Ico", Some("PS2")), ("Journey", None)]));
+        let mut s = LibraryScreen::new(&host());
+        s.adopt_art(HashMap::from([("g0".to_string(), poster())]));
+        s.sync(&library);
+        assert_eq!(s.art.len(), 1, "the hand-over was wiped by the first list");
+
+        library.set_games(games(&[("Rez", Some("PS2"))]));
+        s.sync(&library);
+        assert!(s.art.is_empty(), "a different library kept the old covers");
     }
 }
