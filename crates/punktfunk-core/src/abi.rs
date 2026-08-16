@@ -2064,10 +2064,13 @@ pub unsafe extern "C" fn punktfunk_connect_ex7(
             client_cert_pem,
             client_key_pem,
             std::ptr::null(), // pre-v21 variant: no device name, so the OS default stands
-            // pre-v24 variant: the legacy audio request (Opus, 48 kHz, 16-bit), which is also
-            // what makes the Hello byte-identical to what every earlier variant sent.
-            crate::audio::SAMPLE_RATE_HZ,
-            crate::audio::pcm::BITS_16,
+            // pre-v24 variant: the audio format is UNSPECIFIED (0/0), not "48 kHz/16-bit". The
+            // distinction is load-bearing — `advertised_client_caps` reads any non-zero value as
+            // "the caller asked for the lossless plane", so passing an explicit 48 000/16 here
+            // would make every legacy C embedder start requesting it. 0/0 is what keeps this
+            // variant's Hello byte-identical to what it has always sent.
+            0,
+            0,
             timeout_ms,
             std::ptr::null_mut(),
         )
@@ -2131,10 +2134,13 @@ pub unsafe extern "C" fn punktfunk_connect_ex8(
             client_cert_pem,
             client_key_pem,
             std::ptr::null(), // pre-v21 variant: no device name, so the OS default stands
-            // pre-v24 variant: the legacy audio request (Opus, 48 kHz, 16-bit), which is also
-            // what makes the Hello byte-identical to what every earlier variant sent.
-            crate::audio::SAMPLE_RATE_HZ,
-            crate::audio::pcm::BITS_16,
+            // pre-v24 variant: the audio format is UNSPECIFIED (0/0), not "48 kHz/16-bit". The
+            // distinction is load-bearing — `advertised_client_caps` reads any non-zero value as
+            // "the caller asked for the lossless plane", so passing an explicit 48 000/16 here
+            // would make every legacy C embedder start requesting it. 0/0 is what keeps this
+            // variant's Hello byte-identical to what it has always sent.
+            0,
+            0,
             timeout_ms,
             status_out,
         )
@@ -2198,10 +2204,13 @@ pub unsafe extern "C" fn punktfunk_connect_ex9(
             client_cert_pem,
             client_key_pem,
             std::ptr::null(), // pre-v21 variant: no device name, so the OS default stands
-            // pre-v24 variant: the legacy audio request (Opus, 48 kHz, 16-bit), which is also
-            // what makes the Hello byte-identical to what every earlier variant sent.
-            crate::audio::SAMPLE_RATE_HZ,
-            crate::audio::pcm::BITS_16,
+            // pre-v24 variant: the audio format is UNSPECIFIED (0/0), not "48 kHz/16-bit". The
+            // distinction is load-bearing — `advertised_client_caps` reads any non-zero value as
+            // "the caller asked for the lossless plane", so passing an explicit 48 000/16 here
+            // would make every legacy C embedder start requesting it. 0/0 is what keeps this
+            // variant's Hello byte-identical to what it has always sent.
+            0,
+            0,
             timeout_ms,
             status_out,
         )
@@ -2274,10 +2283,13 @@ pub unsafe extern "C" fn punktfunk_connect_ex10(
             client_cert_pem,
             client_key_pem,
             device_name,
-            // pre-v24 variant: the legacy audio request (Opus, 48 kHz, 16-bit), which is also
-            // what makes the Hello byte-identical to what every earlier variant sent.
-            crate::audio::SAMPLE_RATE_HZ,
-            crate::audio::pcm::BITS_16,
+            // pre-v24 variant: the audio format is UNSPECIFIED (0/0), not "48 kHz/16-bit". The
+            // distinction is load-bearing — `advertised_client_caps` reads any non-zero value as
+            // "the caller asked for the lossless plane", so passing an explicit 48 000/16 here
+            // would make every legacy C embedder start requesting it. 0/0 is what keeps this
+            // variant's Hello byte-identical to what it has always sent.
+            0,
+            0,
             timeout_ms,
             status_out,
         )

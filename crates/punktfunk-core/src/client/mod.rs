@@ -463,6 +463,30 @@ pub struct NativeClient {
     pub codec: u8,
 }
 
+impl NativeClient {
+    /// What the audio plane costs, in kbps — the figure a stats line or HUD should show so a user
+    /// who turned the lossless plane on can see what it took (`design/hi-res-audio.md` §4.6).
+    ///
+    /// `Some` only for the lossless plane, where the answer is **exact rather than measured**:
+    /// PCM is constant-bitrate by construction, so `rate × depth × channels` IS the wire rate and
+    /// a byte counter would only add sampling noise to a number already known precisely. `None`
+    /// for Opus, which is VBR and whose ladder position is chosen host-side by
+    /// [`crate::audio::plan_audio_budget`] — the client has no honest figure to report, and
+    /// inventing one from a short window would read as jitter.
+    ///
+    /// Payload only: the 13-byte per-datagram header and QUIC's own framing are not counted, on
+    /// the grounds that the same is true of every other bitrate this project quotes.
+    pub fn audio_kbps(&self) -> Option<u32> {
+        (self.audio_codec == crate::quic::AUDIO_CODEC_PCM).then(|| {
+            crate::audio::pcm::bitrate_kbps(
+                self.audio_sample_rate_hz,
+                self.audio_bits,
+                self.audio_channels,
+            )
+        })
+    }
+}
+
 /// Pin the calling thread to the user-interactive QoS class on Apple targets.
 ///
 /// The Apple client drains every plane on `.userInteractive` Thread s (video pump, audio,
@@ -616,8 +640,15 @@ fn os_hostname() -> Option<String> {
 /// the legacy ones, so an embedder that genuinely wants that (rare — 24-bit is where the plane
 /// earns its bandwidth) sets the bit itself and is not overridden.
 fn advertised_client_caps(client_caps: u8, audio_rate_hz: u32, audio_bits: u8) -> u8 {
-    let hires =
-        audio_rate_hz != crate::audio::SAMPLE_RATE_HZ || audio_bits != crate::audio::pcm::BITS_16;
+    // The bit means "the caller SPECIFIED a format", not "the format differs from the default".
+    //
+    // Those two rules agree everywhere except one place, and that place matters: 48 kHz/16-bit is
+    // the cheapest lossless rung (1.5 Mbps against Opus's 256 kbps) and is also the default, so a
+    // "differs from the default" rule makes it the one format on the ladder that cannot be asked
+    // for. `0` is the unspecified value — [`NativeClient::connect`] passes it, and the wire encodes
+    // an explicit 48 000/16 identically to absent — so keying on "non-zero" separates *asking for
+    // 48/16 lossless* from *not asking at all* without costing a wire byte.
+    let hires = audio_rate_hz != 0 || audio_bits != 0;
     client_caps
         | crate::quic::CLIENT_CAP_AUDIO_RED
         | if hires {
@@ -700,8 +731,11 @@ impl NativeClient {
             bitrate_kbps,
             video_caps,
             audio_channels,
-            crate::audio::SAMPLE_RATE_HZ,
-            crate::audio::pcm::BITS_16,
+            // 0/0 = UNSPECIFIED, which is what keeps this path's `Hello` byte-identical to the
+            // pre-hi-res one. Passing an explicit 48 000/16 here would read as "asked for the
+            // cheapest lossless rung" under the rule in `advertised_client_caps`.
+            0,
+            0,
             video_codecs,
             preferred_codec,
             display_hdr,
@@ -721,7 +755,10 @@ impl NativeClient {
     /// Everything else is identical. What the pair actually does is decide whether the `Hello`
     /// carries [`quic::CLIENT_CAP_AUDIO_HIRES`], and the rule is deliberately narrow:
     ///
-    /// **The bit is set exactly when the caller asks for something other than 48 kHz / 16-bit.**
+    /// **The bit is set exactly when the caller SPECIFIES a format at all** (either argument
+    /// non-zero; `0` means unspecified, which is what [`connect`](Self::connect) passes).
+    /// Deliberately not "differs from 48 kHz/16-bit": that rule would make the cheapest lossless
+    /// rung — 48 kHz/16-bit, 1.5 Mbps — the one format on the ladder nobody could request.
     /// It is NOT set unconditionally, and that is the whole difference between it and
     /// [`quic::CLIENT_CAP_AUDIO_RED`] — which core ORs in for every session below, because
     /// redundancy is a pure "I can decode it" that costs ~1 % and is recovered inside core where
@@ -1893,23 +1930,32 @@ mod client_caps_tests {
     /// that. A regression here is silent in every test that does not look for it: the session
     /// still works, it just costs several megabits nobody asked for.
     #[test]
-    fn hires_is_advertised_only_when_the_caller_asked_for_a_non_default_format() {
-        // The legacy request: redundancy on, hi-res off, the embedder's own bits untouched.
-        let legacy = advertised_client_caps(CLIENT_CAP_CURSOR, SAMPLE_RATE_HZ, BITS_16);
+    fn hires_is_advertised_only_when_the_caller_specified_a_format() {
+        // The legacy request is UNSPECIFIED (0/0): redundancy on, hi-res off, the embedder's own
+        // bits untouched. This is what `connect` and every pre-v24 C entry point pass.
+        let legacy = advertised_client_caps(CLIENT_CAP_CURSOR, 0, 0);
         assert_eq!(legacy & CLIENT_CAP_AUDIO_RED, CLIENT_CAP_AUDIO_RED);
         assert_eq!(legacy & CLIENT_CAP_AUDIO_HIRES, 0);
         assert_eq!(legacy & CLIENT_CAP_CURSOR, CLIENT_CAP_CURSOR);
         // …and with no embedder bits at all, which is what every `connect` caller produces.
+        assert_eq!(advertised_client_caps(0, 0, 0), CLIENT_CAP_AUDIO_RED);
+
+        // The rung this rule exists for: 48 kHz/16-bit is the DEFAULT and also the cheapest
+        // lossless format. Asking for it explicitly must be a request, or it is the one point on
+        // the ladder no caller can reach.
         assert_eq!(
-            advertised_client_caps(0, SAMPLE_RATE_HZ, BITS_16),
-            CLIENT_CAP_AUDIO_RED
+            advertised_client_caps(0, SAMPLE_RATE_HZ, BITS_16) & CLIENT_CAP_AUDIO_HIRES,
+            CLIENT_CAP_AUDIO_HIRES,
+            "explicit 48 kHz/16-bit is a lossless request, not a legacy one"
         );
 
-        // Either half of the format being non-default is a request.
+        // Specifying either half alone is still a request.
         for (rate, bits) in [
             (SAMPLE_RATE_HZ, BITS_24),
             (96_000, BITS_16),
             (96_000, BITS_24),
+            (0, BITS_24),
+            (96_000, 0),
         ] {
             let caps = advertised_client_caps(0, rate, bits);
             assert_eq!(

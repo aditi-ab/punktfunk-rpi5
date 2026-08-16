@@ -603,6 +603,11 @@ const EWMA_TAU_MS: u32 = 1_000;
 /// thing here a listener could ever notice, so it must never fire on a transient.
 const SHED_SUSTAIN_MS: u32 = 2_000;
 /// Linear crossfade applied across a drift shed's seam.
+///
+/// Sized against the protocol's 5 ms Opus frame, where 2 ms is a comfortable fraction of what a
+/// shed drops. The lossless plane negotiates SHORTER frames — 2 ms at 96 kHz/24-bit under the
+/// default MTU — where a flat 2 ms would be the entire dropped frame. See
+/// [`JitterPolicy::set_frame_us`], which caps the fade at half a frame for exactly that reason.
 const SHED_CROSSFADE_MS: u32 = 2;
 /// Underruns inside [`GROW_WINDOW_MS`] before the live target grows.
 const GROW_UNDERRUNS: u32 = 3;
@@ -672,6 +677,10 @@ pub struct JitterPolicy {
     /// Interleaved samples per millisecond at the negotiated layout (`rate_hz / 1000 × channels`
     /// — 48 × channels at the default rate, 96 × channels for a 96 kHz hi-res session).
     per_ms: usize,
+    /// One protocol audio frame, in microseconds. [`FRAME_MS`] for the Opus plane; the lossless
+    /// plane negotiates shorter frames ([`pcm::frame_us_for`]). Set via
+    /// [`set_frame_us`](Self::set_frame_us); the default keeps every Opus session bit-identical.
+    frame_us: u32,
     /// The live target, in interleaved samples — `base_target_ms` grown by underrun pressure.
     target: usize,
     primed: bool,
@@ -750,6 +759,7 @@ impl JitterPolicy {
         JitterPolicy {
             tuning,
             per_ms,
+            frame_us: FRAME_MS * 1000,
             target: tuning.base_target_ms as usize * per_ms,
             primed: false,
             empties: 0,
@@ -769,6 +779,36 @@ impl JitterPolicy {
             sync_backoff_run: 0,
             sync_backoff_ms: SYNC_BACKOFF_MS,
         }
+    }
+
+    /// Tell the policy how long one audio frame actually is, in microseconds.
+    ///
+    /// Two of its decisions are denominated in *frames* rather than milliseconds — the floor under
+    /// the effective target (a device quantum plus one frame) and the smooth shed (drop exactly one
+    /// frame) — and both were written when [`FRAME_MS`] was the only frame this protocol had. The
+    /// lossless plane negotiates shorter ones: 4 ms at 48 kHz/24-bit, 2 ms at 96 kHz/24-bit under
+    /// the default MTU. Left unset, a 96 kHz session would shed 2.5 frames at a time and fade
+    /// across an entire frame.
+    ///
+    /// Defaulting to [`FRAME_MS`] rather than taking this in the constructor is deliberate: every
+    /// Opus session, and all seventeen policy tests, stay bit-identical, and the value that matters
+    /// here (`audio_frame_us`) is resolved by the host and only known to the client after the
+    /// `Welcome` — later than the ring is built.
+    pub fn set_frame_us(&mut self, frame_us: u32) {
+        self.frame_us = frame_us.max(1);
+    }
+
+    /// One frame in interleaved samples. Computed in µs so a sub-millisecond frame does not
+    /// truncate: 2 500 µs at 48 kHz stereo is 240 samples, not 192.
+    fn frame_samples(&self) -> usize {
+        (self.per_ms * self.frame_us as usize / 1000).max(1)
+    }
+
+    /// The seam crossfade, capped at half a frame. [`SHED_CROSSFADE_MS`]'s flat 2 ms is a
+    /// comfortable slice of a 5 ms Opus frame and the whole of a 2 ms lossless one, and a fade
+    /// as long as the material it is fading is not a crossfade.
+    fn crossfade_samples(&self) -> usize {
+        (SHED_CROSSFADE_MS as usize * self.per_ms).min(self.frame_samples() / 2)
     }
 
     /// Hand the ring the depth the A/V sync loop wants ([`AvSync::desired_depth`]), or `None` to
@@ -813,7 +853,7 @@ impl JitterPolicy {
     /// quantum, a legacy AAudio path) lifts it to `want` plus one protocol frame rather than
     /// oscillating prime → dropout → re-prime forever.
     fn effective_target(&self, want: usize) -> usize {
-        let floor = self.target.max(want + FRAME_MS as usize * self.per_ms);
+        let floor = self.target.max(want + self.frame_samples());
         match self.sync_target {
             // Continuity outranks sync — see `set_sync_target`. The loop may pull the ring
             // shallower to catch the picture up, or push it deeper when audio runs early, but
@@ -859,7 +899,8 @@ impl JitterPolicy {
             // that was backwards.
             out.drop_front = depth - cap;
             out.hard_trim = true;
-            out.crossfade = (SHED_CROSSFADE_MS as usize * self.per_ms)
+            out.crossfade = self
+                .crossfade_samples()
                 .min(depth.saturating_sub(out.drop_front));
             self.over_run = 0;
         } else if self.depth_avg
@@ -867,8 +908,9 @@ impl JitterPolicy {
         {
             self.over_run += want;
             if self.over_run >= SHED_SUSTAIN_MS as usize * self.per_ms {
-                out.drop_front = (FRAME_MS as usize * self.per_ms).min(depth);
-                out.crossfade = (SHED_CROSSFADE_MS as usize * self.per_ms)
+                out.drop_front = self.frame_samples().min(depth);
+                out.crossfade = self
+                    .crossfade_samples()
                     .min(depth.saturating_sub(out.drop_front));
                 self.over_run = 0;
             }
@@ -2110,6 +2152,51 @@ mod tests {
                 assert_eq!(hi.per_ms, 2 * lo.per_ms, "per_ms must scale with the rate");
             }
         }
+    }
+
+    /// The shed drops exactly ONE frame and fades across part of it. Both were written when 5 ms
+    /// was the only frame this protocol had; the lossless plane negotiates shorter ones. The
+    /// default must stay bit-identical (every Opus session depends on it), and a short frame must
+    /// shed a short frame rather than 2.5 of them.
+    #[test]
+    fn the_shed_follows_the_negotiated_frame_length() {
+        let pm = per_ms(2);
+
+        // Default: one 5 ms frame dropped, a 2 ms fade — exactly the pre-hi-res numbers.
+        let p = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
+        assert_eq!(p.frame_samples(), FRAME_MS as usize * pm);
+        assert_eq!(p.crossfade_samples(), SHED_CROSSFADE_MS as usize * pm);
+
+        // A 2 ms lossless frame sheds 2 ms, and the fade is capped at half of it rather than
+        // consuming the whole dropped frame.
+        let mut q = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
+        q.set_frame_us(2_000);
+        assert_eq!(q.frame_samples(), 2 * pm);
+        assert_eq!(q.crossfade_samples(), pm, "fade must be half a 2 ms frame");
+        assert!(
+            q.crossfade_samples() < q.frame_samples(),
+            "a fade as long as the frame is not a crossfade"
+        );
+
+        // Sub-millisecond precision: 2 500 µs at 48 kHz stereo is 240 interleaved samples, and
+        // must not truncate to 192 by going through integer milliseconds first.
+        let mut r = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
+        r.set_frame_us(2_500);
+        assert_eq!(r.frame_samples(), 240);
+
+        // At 96 kHz the same 2 ms frame is twice the samples for the same duration.
+        let mut h = JitterPolicy::new_at_rate(JitterTuning::PIPEWIRE, 2, 96_000);
+        h.set_frame_us(2_000);
+        assert_eq!(h.frame_samples(), 2 * per_ms_at(96_000, 2));
+
+        // A degenerate value must not panic or produce a zero-length frame.
+        let mut z = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
+        z.set_frame_us(0);
+        assert!(z.frame_samples() >= 1);
+    }
+
+    fn per_ms_at(rate: u32, channels: u8) -> usize {
+        (rate / 1000) as usize * channels as usize
     }
 
     /// `new` is exactly `new_at_rate` at the protocol default — the property that let every
