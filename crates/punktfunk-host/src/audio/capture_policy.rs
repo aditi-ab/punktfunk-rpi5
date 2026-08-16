@@ -234,10 +234,6 @@ impl CaptureStats {
     }
 }
 
-/// A departure this far past its slot is a slip worth counting rather than ordinary jitter: one
-/// whole protocol frame, so a frame that merely rounds late never scores.
-const LATE_DEPARTURE: Duration = Duration::from_millis(FRAME_MS as u64);
-
 /// One reporting window of AUDIO EGRESS vitals (WP-C).
 ///
 /// Capture has been instrumented since WP-A2 and the send path has not, so a field log could show
@@ -249,13 +245,26 @@ const LATE_DEPARTURE: Duration = Duration::from_millis(FRAME_MS as u64);
 /// The point of these counters is to be *boring*. If departures are clean while capture reports
 /// holes, the pacing rework introduced in v0.25 is acquitted permanently and the search moves
 /// upstream for good.
-#[derive(Default)]
+///
+/// **Denominated in the SESSION's frame**, like [`InfillPolicy`] and for the same reason — see
+/// [`SendStats::new`].
 pub(crate) struct SendStats {
+    /// One protocol frame of THIS session, and therefore the SLIP THRESHOLD: a departure at least
+    /// this far past its paced slot is a slip worth counting rather than ordinary jitter, so a
+    /// frame that merely rounds late never scores.
+    ///
+    /// Carried rather than read from the Opus [`FRAME_MS`](punktfunk_core::audio::FRAME_MS), which
+    /// is what this threshold used to be. The RULE was always "one whole protocol frame"; only the
+    /// arithmetic assumed there was one such thing. On a lossless plane pacing 1 ms frames a
+    /// session could miss every slot by four whole frames and still report `late=0` — a counter
+    /// reading clean for a plane that is not, which is worse than no counter at all given why
+    /// these exist (an unfalsifiable suspect stays on the list forever).
+    frame: Duration,
     pub(crate) sent: u64,
     /// Frames synthesized to cover a capture hole. Wire continuity and captured continuity are
     /// different claims and a log that conflates them cannot be used to judge either.
     pub(crate) infilled: u64,
-    /// Departures that missed their paced slot by at least [`LATE_DEPARTURE`].
+    /// Departures that missed their paced slot by at least one whole [`frame`](Self::frame).
     pub(crate) late: u64,
     /// The worst such miss, µs — kept even when the count is zero, because "never late" and
     /// "never late by a whole frame" are different statements.
@@ -270,6 +279,30 @@ pub(crate) struct SendStats {
 }
 
 impl SendStats {
+    /// A fresh window for a session pacing `frame_us`-long frames — `audio_frame_us` from the
+    /// `Welcome` on the lossless plane, 5 000 on the Opus one. The same value [`InfillPolicy`] and
+    /// the encode loop's pacer are built from, so all three agree on what a frame is.
+    ///
+    /// A 5 ms session is bit-identical to the pre-hi-res behaviour: the slip threshold is the 5 ms
+    /// it always was.
+    ///
+    /// Replaces `Default`, which is not merely absent but WRONG here: a zero frame makes
+    /// `late >= self.frame` true for every departure, so a window built by mistake would report
+    /// 100 % slipped slots. Windows are re-made on every flush, so that would not have been a
+    /// once-per-session error either.
+    pub(crate) fn new(frame_us: u32) -> SendStats {
+        SendStats {
+            // Same floor, and same reason, as `InfillPolicy::new`'s.
+            frame: Duration::from_micros(frame_us.max(1) as u64),
+            sent: 0,
+            infilled: 0,
+            late: 0,
+            max_late_us: 0,
+            max_spacing_us: 0,
+            reanchors: 0,
+        }
+    }
+
     /// Score one frame leaving the host. `late` is how far past its paced slot it went (zero when
     /// the schedule is unanchored), `since_prev` the spacing from the previous departure.
     pub(crate) fn observe_departure(
@@ -283,7 +316,8 @@ impl SendStats {
             self.infilled += 1;
         }
         self.max_late_us = self.max_late_us.max(late.as_micros() as u64);
-        if late >= LATE_DEPARTURE {
+        // One whole frame of THIS session — inclusive, exactly as the old constant comparison was.
+        if late >= self.frame {
             self.late += 1;
         }
         if let Some(gap) = since_prev {
@@ -304,17 +338,26 @@ impl SendStats {
     }
 }
 
-/// How long a capture hole may run before the wire starts covering it. Two protocol frames: long
-/// enough that ordinary quantum jitter never trips it, short enough that the client's ring never
-/// notices the hole.
-pub(crate) const INFILL_AFTER: Duration = Duration::from_millis(2 * FRAME_MS as u64);
 /// How much silence one hole may be covered with. Past this the host is not glitching, it is
 /// QUIET — a desktop between games is legitimately silent for hours and paying a few kbps to keep
 /// saying so is absurd — so the wire stops, which is exactly the behaviour that shipped before.
+///
+/// Deliberately NOT re-derived from the frame duration, unlike everything else in
+/// [`InfillPolicy`]: this is a statement about WALL CLOCK — how long a hole stays worth covering
+/// before we admit the desktop is simply quiet — and half a second is half a second whether the
+/// plane sends 100 or 500 frames into it. What did have to change is the ACCOUNTING: the budget
+/// used to be spent in units of the Opus frame whatever the session's real frame was, so a 1 ms
+/// lossless frame burned the whole 500 ms in 100 ms of real time (`design/hi-res-audio.md` §4.2 —
+/// the lossless plane's frames are shorter than 5 ms by construction).
 pub(crate) const INFILL_MAX: Duration = Duration::from_millis(500);
 
-/// One protocol audio frame — the wire's unit, and the granularity infill works in.
-const FRAME_MS: u32 = punktfunk_core::audio::FRAME_MS;
+// NB there is no module-scope frame constant here any more, deliberately. Both figures that used
+// to be written against `punktfunk_core::audio::FRAME_MS` — the infill threshold and the egress
+// slip threshold — are now carried by the policy that uses them ([`InfillPolicy::new`],
+// [`SendStats::new`]), because that constant is the OPUS plane's frame and only its frame: the
+// lossless `0xD3` plane's is whatever the handshake negotiated. Anything denominated in it up here
+// would be measuring one plane with the other's ruler. The tests below keep a local copy to write
+// the "a 5 ms session is unchanged" assertions against.
 
 /// What the wire owes for the slot that is due now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -337,34 +380,75 @@ pub(crate) enum Infill {
 /// anchored, so what the listener loses shrinks to exactly the audio that was genuinely missing.
 ///
 /// Time is passed IN, so the policy is pure and its tests run on every platform.
-#[derive(Default)]
+///
+/// **Denominated in the SESSION's frame, not in [`FRAME_MS`]** — see [`InfillPolicy::new`]. Every
+/// figure here used to be written against the Opus 5 ms frame, which was correct for as long as
+/// 5 ms was the only frame there was.
 pub(crate) struct InfillPolicy {
+    /// One protocol frame of THIS session: the fixed 5 ms of the Opus `0xC9` plane, or the
+    /// negotiated `audio_frame_us` of the lossless `0xD3` one. The two are not interchangeable —
+    /// a 96/24 session paces 1 ms frames, so a policy written in 5 ms units would be off by 5×
+    /// in both directions at once (covering a hole a fifth as long, and spending its budget five
+    /// times as fast).
+    frame: Duration,
     /// Silence already sent for the open hole. Denominated in TIME rather than in frames or
     /// callbacks, which is the recorded lesson from the client's de-prime fuse: a count there made
-    /// an iPad give up three times sooner than a Mac for no reason anyone intended.
-    filled_ms: u32,
+    /// an iPad give up three times sooner than a Mac for no reason anyone intended. Exactly the
+    /// bug this field's `u32` millisecond predecessor had, one layer down: it counted `FRAME_MS`
+    /// per *actual* frame, so the same 500 ms budget meant a different amount of real time on
+    /// every rung of the lossless frame ladder.
+    filled: Duration,
     /// Latched once a hole outlives the budget and the wire falls silent.
     broke: bool,
 }
 
 impl InfillPolicy {
+    /// `frame_us` is the session's RESOLVED frame duration: `audio_frame_us` from the `Welcome`
+    /// on the lossless plane, 5 000 on the Opus one — the same value the encode loop paces and
+    /// stamps `pts_ns` with, so the wire and this policy cannot disagree about what a frame is.
+    ///
+    /// A 5 ms session is bit-identical to the pre-hi-res behaviour: [`Self::after`] is the 10 ms
+    /// it always was, and the budget is still exactly 100 frames of silence.
+    ///
+    /// The `max(1)` is a floor against a malformed plane, not a real case — the §8.4 gate never
+    /// resolves a zero-length frame, and the encode loop applies the same floor to its pacer. A
+    /// zero here would leave [`Self::decide`] unable to spend the budget at all, so a hole would
+    /// be covered with silence forever.
+    pub(crate) fn new(frame_us: u32) -> InfillPolicy {
+        InfillPolicy {
+            frame: Duration::from_micros(frame_us.max(1) as u64),
+            filled: Duration::ZERO,
+            broke: false,
+        }
+    }
+
+    /// How long a capture hole may run before the wire starts covering it. Two protocol frames:
+    /// long enough that ordinary quantum jitter never trips it, short enough that the client's
+    /// ring never notices the hole. Two frames of THIS session — the client's ring is sized in
+    /// its own frames, so that is what "before it notices" is measured in.
+    pub(crate) fn after(&self) -> Duration {
+        self.frame * 2
+    }
+
     /// Decide the slot that is due now. Call EXACTLY once per due frame — it consumes budget.
     pub(crate) fn decide(&mut self, since_last_chunk: Duration) -> Infill {
-        if since_last_chunk < INFILL_AFTER {
+        if since_last_chunk < self.after() {
             return Infill::Wait;
         }
-        if self.filled_ms as u64 >= INFILL_MAX.as_millis() as u64 {
+        if self.filled >= INFILL_MAX {
             self.broke = true;
             return Infill::Quiet;
         }
-        self.filled_ms += FRAME_MS;
+        // One frame of silence costs one frame of budget — the identity that was missing, and the
+        // whole of the fix. Nothing else in this file needs to know what a frame is worth.
+        self.filled += self.frame;
         Infill::Silence
     }
 
     /// True once the budget is spent, so the caller can go back to blocking for real audio
     /// instead of waking every few milliseconds to decide to stay quiet.
     pub(crate) fn exhausted(&self) -> bool {
-        self.filled_ms as u64 >= INFILL_MAX.as_millis() as u64
+        self.filled >= INFILL_MAX
     }
 
     /// A real chunk arrived. Returns whether the hole it closed BROKE continuity — the wire went
@@ -372,7 +456,7 @@ impl InfillPolicy {
     /// both describe audio from before a discontinuity, and neither may be spliced onto what
     /// comes next.
     pub(crate) fn chunk_arrived(&mut self) -> bool {
-        self.filled_ms = 0;
+        self.filled = Duration::ZERO;
         std::mem::take(&mut self.broke)
     }
 }
@@ -536,19 +620,29 @@ mod tests {
         assert_eq!(vm.gaps, 1);
     }
 
+    /// One OPUS protocol frame — the `0xC9` plane's fixed 5 ms. Test-scope on purpose: nothing in
+    /// the policies above is denominated in it any more (see the note by [`INFILL_MAX`]), and the
+    /// only thing it is still good for is writing the "a 5 ms session is unchanged" assertions.
+    const FRAME_MS: u32 = punktfunk_core::audio::FRAME_MS;
+    /// The same, in µs — what [`InfillPolicy::new`] and [`SendStats::new`] are handed for a `0xC9`
+    /// session.
+    const OPUS_FRAME_US: u32 = FRAME_MS * 1_000;
+
     /// Drive one hole from the moment it opens until the policy gives up on it, the way the
-    /// encode loop does: one decision per due frame slot.
-    fn cover_a_hole(p: &mut InfillPolicy) -> usize {
+    /// encode loop does: one decision per due frame slot, `frame` apart.
+    fn cover_a_hole(p: &mut InfillPolicy, frame: Duration) -> usize {
         let mut silence = 0usize;
-        let mut open = INFILL_AFTER;
+        let mut open = p.after();
         loop {
             match p.decide(open) {
                 Infill::Silence => {
                     silence += 1;
-                    open += Duration::from_millis(FRAME_MS as u64);
+                    open += frame;
                 }
                 Infill::Quiet => return silence,
-                Infill::Wait => unreachable!("the hole is open — {open:?} is past INFILL_AFTER"),
+                Infill::Wait => {
+                    unreachable!("the hole is open — {open:?} is past the infill threshold")
+                }
             }
             assert!(silence < 10_000, "the budget must be finite");
         }
@@ -560,15 +654,13 @@ mod tests {
     /// forever.
     #[test]
     fn infill_covers_a_hole_and_then_admits_the_host_is_quiet() {
-        let mut p = InfillPolicy::default();
+        let frame = Duration::from_millis(FRAME_MS as u64);
+        let mut p = InfillPolicy::new(OPUS_FRAME_US);
         // Ordinary quantum jitter, not a hole — nothing owed.
         assert_eq!(p.decide(Duration::ZERO), Infill::Wait);
-        assert_eq!(
-            p.decide(INFILL_AFTER - Duration::from_millis(1)),
-            Infill::Wait
-        );
+        assert_eq!(p.decide(p.after() - Duration::from_millis(1)), Infill::Wait);
 
-        let silence = cover_a_hole(&mut p);
+        let silence = cover_a_hole(&mut p, frame);
         assert_eq!(
             silence as u64 * FRAME_MS as u64,
             INFILL_MAX.as_millis() as u64,
@@ -577,11 +669,59 @@ mod tests {
         assert!(p.exhausted(), "…and then stop asking");
     }
 
+    /// **The gate on re-deriving these policies from `audio_frame_us`.** A 5 ms Opus session must
+    /// behave exactly as it did when all three figures were written against `FRAME_MS` — same
+    /// 10 ms infill threshold, same 100 frames of cover, same 5 ms slip threshold — or a change
+    /// made for the lossless plane has silently retuned the plane every shipping client uses.
+    #[test]
+    fn a_five_millisecond_opus_session_is_unchanged() {
+        let mut p = InfillPolicy::new(OPUS_FRAME_US);
+        assert_eq!(p.after(), Duration::from_millis(10), "two 5 ms frames");
+        assert_eq!(
+            cover_a_hole(&mut p, Duration::from_millis(FRAME_MS as u64)),
+            100,
+            "500 ms of budget in 5 ms frames"
+        );
+
+        // …and the egress side's slip threshold, which was the same constant. BOTH sides of the
+        // boundary, because one alone pins nothing: "4.999 ms is not late" also passes for a
+        // threshold of infinity, and "5 ms is late" also passes for a threshold of zero.
+        let mut s = SendStats::new(OPUS_FRAME_US);
+        s.observe_departure(Duration::from_micros(4_999), None, false);
+        assert_eq!(s.late, 0, "just under a 5 ms frame is jitter");
+        s.observe_departure(Duration::from_millis(5), None, false);
+        assert_eq!(s.late, 1, "one whole 5 ms frame is a slipped slot");
+    }
+
+    /// …and the point of the exercise: every rung of the lossless frame ladder gets the SAME
+    /// wall-clock budget, rather than the same frame COUNT. Denominated in `FRAME_MS`, a 1 ms
+    /// frame spent all 500 ms of budget in 100 ms of real time — the wire fell silent five times
+    /// sooner than the policy says it should, on the one plane that has no PLC to hide it.
+    #[test]
+    fn every_lossless_frame_length_gets_the_same_wall_clock_budget() {
+        for frame_us in punktfunk_core::audio::pcm::FRAME_US_LADDER {
+            let frame = Duration::from_micros(frame_us as u64);
+            let mut p = InfillPolicy::new(frame_us);
+            assert_eq!(p.after(), frame * 2, "{frame_us} µs: two of its own frames");
+            let silence = cover_a_hole(&mut p, frame);
+            // Covered to within ONE frame, not exactly: a frame is atomic, so a rung that does
+            // not divide 500 ms (3 ms → 167 frames = 501 ms) rounds up by less than one frame
+            // rather than stopping short. The 5 ms Opus rung divides it exactly, which is what
+            // keeps that plane bit-identical.
+            let covered = frame * silence as u32;
+            assert!(
+                covered >= INFILL_MAX && covered < INFILL_MAX + frame,
+                "{frame_us} µs covered {silence} frames = {covered:?}, want {INFILL_MAX:?} \
+                 rounded up by under one frame"
+            );
+        }
+    }
+
     /// A stream that is flowing must never synthesize anything — this policy is invisible until
     /// something is actually wrong.
     #[test]
     fn a_flowing_stream_never_infills() {
-        let mut p = InfillPolicy::default();
+        let mut p = InfillPolicy::new(OPUS_FRAME_US);
         for _ in 0..1_000 {
             assert_eq!(
                 p.decide(Duration::from_millis(FRAME_MS as u64)),
@@ -597,24 +737,25 @@ mod tests {
     /// predecessor still describes the frame before this one and the client can keep using it.
     #[test]
     fn only_an_uncovered_hole_breaks_continuity() {
-        let mut covered = InfillPolicy::default();
-        for k in 0..20u64 {
-            covered.decide(INFILL_AFTER + Duration::from_millis(FRAME_MS as u64 * k));
+        let frame = Duration::from_millis(FRAME_MS as u64);
+        let mut covered = InfillPolicy::new(OPUS_FRAME_US);
+        for k in 0..20u32 {
+            covered.decide(covered.after() + frame * k);
         }
         assert!(
             !covered.chunk_arrived(),
             "a covered hole is continuous — the client heard silence, not a splice"
         );
 
-        let mut lost = InfillPolicy::default();
-        cover_a_hole(&mut lost);
+        let mut lost = InfillPolicy::new(OPUS_FRAME_US);
+        cover_a_hole(&mut lost, frame);
         assert!(
             lost.chunk_arrived(),
             "past the budget the wire went quiet, so nothing before the hole may be spliced on"
         );
         // …and the next hole starts from a clean budget rather than an exhausted one.
         assert!(!lost.exhausted());
-        assert_eq!(cover_a_hole(&mut lost) as u64 * FRAME_MS as u64, 500);
+        assert_eq!(cover_a_hole(&mut lost, frame) as u64 * FRAME_MS as u64, 500);
     }
 
     /// A deliberate pause is not a hole. The caller drops its stamp across a state transition, so
@@ -695,7 +836,7 @@ mod tests {
     /// produce a line a reader can dismiss at a glance.
     #[test]
     fn a_healthy_pacer_reports_nothing_alarming() {
-        let mut s = SendStats::default();
+        let mut s = SendStats::new(OPUS_FRAME_US);
         let frame = Duration::from_millis(FRAME_MS as u64);
         for i in 0..200 {
             s.observe_departure(Duration::ZERO, (i > 0).then_some(frame), false);
@@ -712,16 +853,43 @@ mod tests {
     /// "never late" and "never late by a whole frame" become the same report.
     #[test]
     fn sub_frame_lateness_is_measured_without_being_counted() {
-        let mut s = SendStats::default();
+        let mut s = SendStats::new(OPUS_FRAME_US);
         s.observe_departure(Duration::from_micros(3_400), None, false);
         assert_eq!(s.late, 0, "3.4 ms has not slipped a whole 5 ms slot");
         assert_eq!(s.max_late_ms(), 3, "…and it is still on the record");
     }
 
+    /// The egress twin of `every_lossless_frame_length_gets_the_same_wall_clock_budget`: a slipped
+    /// slot is one frame of WHATEVER this session paces.
+    ///
+    /// Written against the Opus 5 ms constant, a 96/24 session pacing 1 ms frames could miss every
+    /// single slot by four whole frames and still report `late=0` — the log line's most load-bearing
+    /// number reading clean for a plane that is not, which is the exact opposite of why [`SendStats`]
+    /// was added. The lossless plane makes that reachable; nothing about it was reachable before.
+    #[test]
+    fn a_slipped_slot_is_one_frame_of_whatever_this_session_paces() {
+        for frame_us in punktfunk_core::audio::pcm::FRAME_US_LADDER {
+            let frame = Duration::from_micros(frame_us as u64);
+            let mut s = SendStats::new(frame_us);
+            // One microsecond under a frame is jitter; the frame itself is a slip — inclusive,
+            // exactly as the `>= LATE_DEPARTURE` comparison always was.
+            s.observe_departure(frame - Duration::from_micros(1), None, false);
+            assert_eq!(s.late, 0, "{frame_us} µs: sub-frame lateness is jitter");
+            s.observe_departure(frame, None, false);
+            assert_eq!(
+                s.late, 1,
+                "{frame_us} µs: one whole frame is a slipped slot"
+            );
+            // …and both were MEASURED regardless, which is the property that makes "never late"
+            // and "never late by a whole frame" different reports.
+            assert_eq!(s.max_late_us, frame.as_micros() as u64);
+        }
+    }
+
     /// A slot missed by a whole frame or more is the event the field logs could never show.
     #[test]
     fn a_slipped_slot_is_counted_and_its_worst_case_kept() {
-        let mut s = SendStats::default();
+        let mut s = SendStats::new(OPUS_FRAME_US);
         s.observe_departure(Duration::from_millis(6), None, false);
         s.observe_departure(
             Duration::from_millis(41),
@@ -741,7 +909,7 @@ mod tests {
     /// looks perfect on every other counter, and must not be readable as healthy audio.
     #[test]
     fn synthesized_frames_stay_distinguishable_from_captured_ones() {
-        let mut s = SendStats::default();
+        let mut s = SendStats::new(OPUS_FRAME_US);
         let frame = Duration::from_millis(FRAME_MS as u64);
         for _ in 0..100 {
             s.observe_departure(Duration::ZERO, Some(frame), true);

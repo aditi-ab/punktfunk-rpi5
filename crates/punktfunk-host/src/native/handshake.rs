@@ -165,14 +165,19 @@ const HIRES_MAX_VIDEO_SHARE_PCT: u32 = 25;
 /// 3. Stereo only. A hi-res 5.1 frame does not fit one datagram at the default MTU, and this
 ///    plane is never fragmented — see §4.2. (On an opted-in jumbo path it would fit, so this is a
 ///    restriction to relax later, not a wire limitation.)
-/// 4. The requested format is one the plane can carry: a supported depth, and 48 or 96 kHz.
-///    44.1 kHz and its multiples are absent on purpose — they break `JitterPolicy`'s integer
-///    samples-per-millisecond arithmetic (§4.1), which is a rework, not a table entry.
+/// 4. `capture_rate` — the capture path can GENUINELY deliver the requested rate (§8.2 / §8.3).
+///    Not "did the open succeed": both backends accept a rate their endpoint does not run at and
+///    resample to it without an error, so the question has to be put to the DEVICE before the
+///    `Welcome` is built. See [`CaptureRate`](crate::audio::CaptureRate) for what each OS can
+///    honestly answer and why an unknown answer declines.
 /// 5. The link can afford it — see [`HIRES_MAX_VIDEO_SHARE_PCT`].
 ///
-/// …plus one that is not a policy at all: a frame duration must EXIST for the negotiated format
-/// at this connection's datagram size. `max_datagram` is `None` when the peer does not do
-/// datagrams (in which case there is no audio plane of any kind to argue about).
+/// …plus two that are not policies at all. The requested format must be one the plane can carry
+/// at all: a supported depth, and 48 or 96 kHz — 44.1 kHz and its multiples are absent on
+/// purpose, because they break `JitterPolicy`'s integer samples-per-millisecond arithmetic
+/// (§4.1), which is a rework, not a table entry. And a frame duration must EXIST for the
+/// negotiated format at this connection's datagram size; `max_datagram` is `None` when the peer
+/// does not do datagrams (in which case there is no audio plane of any kind to argue about).
 ///
 /// **Not a downgrade ladder, on purpose.** A client asking for 96/24 on a link that only affords
 /// 48/24 is declined rather than quietly handed the cheaper rung. The wire would carry it
@@ -180,14 +185,16 @@ const HIRES_MAX_VIDEO_SHARE_PCT: u32 = 25;
 /// choosing a *different* quality on the user's behalf is a product decision, and this pass makes
 /// only the mechanical one. The log line names the cost, so the operator can see what to change.
 ///
-/// Pure, so the whole gate is unit-testable: the operator policy is passed in rather than read
-/// from the process environment.
+/// Pure, so the whole gate is unit-testable: the operator policy AND the capture probe are passed
+/// in rather than read from the process environment or the audio subsystem.
+#[allow(clippy::too_many_arguments)] // one parameter per §8.4 condition; a struct would only rename them
 pub(super) fn resolve_audio_plane(
     client_asked: bool,
     operator_allows: bool,
     requested_rate_hz: u32,
     requested_bits: u8,
     channels: u8,
+    capture_rate: crate::audio::CaptureRate,
     video_kbps: u32,
     max_datagram: Option<usize>,
 ) -> AudioPlane {
@@ -225,6 +232,24 @@ pub(super) fn resolve_audio_plane(
             requested_bits,
             "hi-res audio was requested at a format this host does not carry (48 or 96 kHz, 16 \
              or 24-bit) — the session uses Opus 48 kHz"
+        );
+        return AudioPlane::opus();
+    }
+    // §8.4 condition 4, and the one condition that is about the world rather than about policy.
+    // It is checked HERE, before the `Welcome`, rather than left for the audio thread to discover
+    // at capture-open: by then the client has been promised a rate and has opened its device at
+    // it, and the only remaining move is to end the lossless plane — which is the silence outcome
+    // §8.4 calls the one unacceptable one. Declining here costs the session nothing but Opus.
+    if !capture_rate.can_deliver(requested_rate_hz) {
+        tracing::info!(
+            requested_rate_hz,
+            requested_bits,
+            ?capture_rate,
+            "hi-res audio was requested but this host's capture path cannot honestly deliver \
+             that rate — the session uses Opus 48 kHz. On Windows the endpoint's own engine rate \
+             is authoritative (autoconvert would silently hand us an upsampled copy), so set the \
+             rate in that device's Windows properties; on Linux the rate is only knowable in \
+             stream-sink mode, so PUNKTFUNK_STREAM_SINK=0 declines by construction"
         );
         return AudioPlane::opus();
     }
@@ -270,6 +295,10 @@ pub(super) fn resolve_audio_plane(
         cost_kbps,
         video_kbps,
         max_datagram,
+        // The evidence behind condition 4, not just its verdict: `Declared` and `Engine(96000)`
+        // are very different grounds for the same "yes", and a field report that claims the rate
+        // was padded is answered by which of them this session had.
+        ?capture_rate,
         "hi-res audio resolved — the session runs the lossless 0xD3 PCM plane"
     );
     AudioPlane {
@@ -762,12 +791,34 @@ pub(super) async fn negotiate(
     // wire message that restates `audio_frame_us` before the client opens its output. Both are
     // wire/sequencing changes well beyond this pass; neither is needed for 48 kHz, where the
     // conservative answer already lands on the longest rung.
+    let hires_asked = hello.client_caps & punktfunk_core::quic::CLIENT_CAP_AUDIO_HIRES != 0;
+    let hires_allowed = pf_host_config::config().audio_hires.unwrap_or(false);
+    // §8.4 condition 4 — what the capture path can HONESTLY deliver, asked of the device rather
+    // than inferred from a successful open (§4.3/§4.4: both backends resample a rate they cannot
+    // run at, without an error). Blocking on Windows (an endpoint enumeration plus an
+    // `IAudioClient` activation per candidate), so it runs off the reactor like the 10-bit and
+    // 4:4:4 probes above.
+    //
+    // Short-circuited behind the two cheap policy conditions, which is the same discipline those
+    // probes use: an ordinary session — every session with every shipping client today — must not
+    // pay COM work for a feature nobody asked for. The value is not merely unused in that case
+    // but unreachable, since the gate returns on condition 1 or 2 before it looks at this one;
+    // `Unknown` is nonetheless the correct thing to pass, because "we did not ask" and "we asked
+    // and could not tell" both mean the same thing to the gate: decline.
+    let capture_rate = if hires_asked && hires_allowed {
+        tokio::task::spawn_blocking(crate::audio::probe_capture_rate)
+            .await
+            .context("audio capture-rate probe task")?
+    } else {
+        crate::audio::CaptureRate::Unknown
+    };
     let audio_plane = resolve_audio_plane(
-        hello.client_caps & punktfunk_core::quic::CLIENT_CAP_AUDIO_HIRES != 0,
-        pf_host_config::config().audio_hires.unwrap_or(false),
+        hires_asked,
+        hires_allowed,
         hello.audio_rate_hz,
         hello.audio_bits,
         audio_channels,
+        capture_rate,
         bitrate_kbps,
         conn.max_datagram_size(),
     );
@@ -1056,6 +1107,10 @@ mod tests {
     const DGRAM: usize = 1400;
     /// Comfortably above the 25 % allowance for every rung on the ladder (96/24 needs 18.4).
     const FAT_LINK_KBPS: u32 = 40_000;
+    /// A capture path that can carry anything the plane asks for — Linux stream-sink mode, where
+    /// the host declares the format itself (§4.4). The condition-4 tests vary this; every other
+    /// test holds it here so it is never the thing that made them pass or fail.
+    const HONEST_CAPTURE: crate::audio::CaptureRate = crate::audio::CaptureRate::Declared;
 
     /// The happy path, so every decline test below is a difference from something that works.
     #[test]
@@ -1066,7 +1121,16 @@ mod tests {
             (96_000, pcm::BITS_16),
             (96_000, pcm::BITS_24),
         ] {
-            let p = resolve_audio_plane(true, true, rate, bits, 2, FAT_LINK_KBPS, Some(DGRAM));
+            let p = resolve_audio_plane(
+                true,
+                true,
+                rate,
+                bits,
+                2,
+                HONEST_CAPTURE,
+                FAT_LINK_KBPS,
+                Some(DGRAM),
+            );
             assert!(p.is_pcm(), "{rate}/{bits} should have resolved to PCM");
             assert_eq!(p.rate_hz, rate);
             assert_eq!(p.bits, bits);
@@ -1090,6 +1154,7 @@ mod tests {
             96_000,
             pcm::BITS_24,
             2,
+            HONEST_CAPTURE,
             FAT_LINK_KBPS,
             Some(DGRAM),
         );
@@ -1106,6 +1171,7 @@ mod tests {
             48_000,
             pcm::BITS_24,
             2,
+            HONEST_CAPTURE,
             FAT_LINK_KBPS,
             Some(DGRAM),
         );
@@ -1130,6 +1196,7 @@ mod tests {
                 48_000,
                 pcm::BITS_24,
                 ch,
+                HONEST_CAPTURE,
                 FAT_LINK_KBPS,
                 Some(DGRAM),
             );
@@ -1137,10 +1204,10 @@ mod tests {
         }
     }
 
-    /// §8.4 condition 4 — a format the plane cannot carry. 44.1 kHz is the one worth pinning:
-    /// it is absent because it breaks `JitterPolicy`'s integer samples-per-ms arithmetic (§4.1),
-    /// not because it is hard to encode, and quietly rounding it to 48 000 would be the exact
-    /// "label right, content wrong" lie this feature is built to avoid.
+    /// A format the plane cannot carry at all. 44.1 kHz is the one worth pinning: it is absent
+    /// because it breaks `JitterPolicy`'s integer samples-per-ms arithmetic (§4.1), not because
+    /// it is hard to encode, and quietly rounding it to 48 000 would be the exact "label right,
+    /// content wrong" lie this feature is built to avoid.
     #[test]
     fn an_unsupported_format_gets_opus() {
         for rate in [44_100u32, 88_200, 176_400, 192_000, 16_000] {
@@ -1150,15 +1217,141 @@ mod tests {
                 rate,
                 pcm::BITS_24,
                 2,
+                HONEST_CAPTURE,
                 FAT_LINK_KBPS,
                 Some(DGRAM),
             );
             assert_eq!(p, AudioPlane::opus(), "{rate} Hz");
         }
         for bits in [8u8, 20, 32] {
-            let p = resolve_audio_plane(true, true, 48_000, bits, 2, FAT_LINK_KBPS, Some(DGRAM));
+            let p = resolve_audio_plane(
+                true,
+                true,
+                48_000,
+                bits,
+                2,
+                HONEST_CAPTURE,
+                FAT_LINK_KBPS,
+                Some(DGRAM),
+            );
             assert_eq!(p, AudioPlane::opus(), "{bits}-bit");
         }
+    }
+
+    /// §8.4 condition 4 — the capture path cannot deliver the rate, so the request is declined
+    /// BEFORE the `Welcome` states one.
+    ///
+    /// This is the condition the design cares about most (§4.3, §13 item 2): every other gate
+    /// failing produces a session that is merely not hi-res, whereas this one failing *silently*
+    /// produces a session that says 96 kHz, spends 4.6 Mbps saying it, and carries interpolated
+    /// 48 kHz. Both ends would audit clean.
+    #[test]
+    fn a_capture_path_that_cannot_deliver_the_rate_gets_opus() {
+        use crate::audio::CaptureRate;
+        // Windows, §8.2: the endpoint's engine runs at 48 kHz. `AUTOCONVERTPCM` would accept a
+        // 96 kHz request and upsample — so 96 declines and 48 is honoured, which is exactly the
+        // `requested > engine.rate` rule and not a blanket refusal.
+        let engine_48 = CaptureRate::Engine(48_000);
+        assert_eq!(
+            resolve_audio_plane(
+                true,
+                true,
+                96_000,
+                pcm::BITS_24,
+                2,
+                engine_48,
+                FAT_LINK_KBPS,
+                Some(DGRAM)
+            ),
+            AudioPlane::opus(),
+            "96 kHz on a 48 kHz engine must decline rather than pad"
+        );
+        assert!(
+            resolve_audio_plane(
+                true,
+                true,
+                48_000,
+                pcm::BITS_24,
+                2,
+                engine_48,
+                FAT_LINK_KBPS,
+                Some(DGRAM)
+            )
+            .is_pcm(),
+            "48 kHz on a 48 kHz engine is bit-exact and must be honoured"
+        );
+        // An engine ABOVE the request is fine: 96 → 48 is a real resample down to a rate that
+        // genuinely carries every sample the client will be told about. §8.2 declines only when
+        // the request is higher than the engine.
+        assert!(resolve_audio_plane(
+            true,
+            true,
+            48_000,
+            pcm::BITS_16,
+            2,
+            CaptureRate::Engine(96_000),
+            FAT_LINK_KBPS,
+            Some(DGRAM)
+        )
+        .is_pcm());
+        // A narrow endpoint (a headset's hands-free profile, Steam's voice-carrier sink) cannot
+        // even do the base rate.
+        assert_eq!(
+            resolve_audio_plane(
+                true,
+                true,
+                48_000,
+                pcm::BITS_16,
+                2,
+                CaptureRate::Engine(24_000),
+                FAT_LINK_KBPS,
+                Some(DGRAM)
+            ),
+            AudioPlane::opus()
+        );
+        // Unknown — Linux `PUNKTFUNK_STREAM_SINK=0` monitor mode (§8.3), or a probe that could
+        // not reach the endpoint. Declines every rung: an unprovable claim is not a claim.
+        for (rate, bits) in [
+            (48_000u32, pcm::BITS_16),
+            (48_000, pcm::BITS_24),
+            (96_000, pcm::BITS_16),
+            (96_000, pcm::BITS_24),
+        ] {
+            assert_eq!(
+                resolve_audio_plane(
+                    true,
+                    true,
+                    rate,
+                    bits,
+                    2,
+                    CaptureRate::Unknown,
+                    FAT_LINK_KBPS,
+                    Some(DGRAM)
+                ),
+                AudioPlane::opus(),
+                "{rate}/{bits} with an unknowable capture rate"
+            );
+        }
+    }
+
+    /// The probe's own arithmetic, pinned away from the gate so a future backend answering
+    /// [`CaptureRate`](crate::audio::CaptureRate) has the contract stated rather than inferred.
+    #[test]
+    fn capture_rate_answers_only_what_it_can_prove() {
+        use crate::audio::CaptureRate;
+        // The host owns the sink and declares its format — honest by construction at any rate
+        // the plane supports (§4.4).
+        assert!(CaptureRate::Declared.can_deliver(48_000));
+        assert!(CaptureRate::Declared.can_deliver(96_000));
+        // At-or-below the engine only, and the boundary is inclusive: an engine at exactly the
+        // requested rate is the *normal* passing case, not an edge to be conservative about.
+        assert!(CaptureRate::Engine(96_000).can_deliver(96_000));
+        assert!(CaptureRate::Engine(96_000).can_deliver(48_000));
+        assert!(!CaptureRate::Engine(48_000).can_deliver(96_000));
+        assert!(!CaptureRate::Engine(44_100).can_deliver(48_000));
+        // Never yes without evidence.
+        assert!(!CaptureRate::Unknown.can_deliver(48_000));
+        assert!(!CaptureRate::Unknown.can_deliver(96_000));
     }
 
     /// §8.4 condition 5 — the link cannot afford it. The plane rides outside the ABR loop, so
@@ -1172,21 +1365,56 @@ mod tests {
             (96_000, pcm::BITS_16),
             (96_000, pcm::BITS_24),
         ] {
-            let p = resolve_audio_plane(true, true, rate, bits, 2, 5_000, Some(DGRAM));
+            let p = resolve_audio_plane(
+                true,
+                true,
+                rate,
+                bits,
+                2,
+                HONEST_CAPTURE,
+                5_000,
+                Some(DGRAM),
+            );
             assert_eq!(p, AudioPlane::opus(), "{rate}/{bits} on a 5 Mbps session");
         }
         // 10 Mbps affords 48 kHz at either depth and neither 96 kHz rung — and the boundary is
         // the one the constant's doc claims, not one a reader has to re-derive.
-        assert!(
-            resolve_audio_plane(true, true, 48_000, pcm::BITS_24, 2, 10_000, Some(DGRAM)).is_pcm()
-        );
+        assert!(resolve_audio_plane(
+            true,
+            true,
+            48_000,
+            pcm::BITS_24,
+            2,
+            HONEST_CAPTURE,
+            10_000,
+            Some(DGRAM)
+        )
+        .is_pcm());
         assert_eq!(
-            resolve_audio_plane(true, true, 96_000, pcm::BITS_16, 2, 10_000, Some(DGRAM)),
+            resolve_audio_plane(
+                true,
+                true,
+                96_000,
+                pcm::BITS_16,
+                2,
+                HONEST_CAPTURE,
+                10_000,
+                Some(DGRAM)
+            ),
             AudioPlane::opus()
         );
         // A session with no video bitrate at all can never afford it, and must not divide by it.
         assert_eq!(
-            resolve_audio_plane(true, true, 48_000, pcm::BITS_16, 2, 0, Some(DGRAM)),
+            resolve_audio_plane(
+                true,
+                true,
+                48_000,
+                pcm::BITS_16,
+                2,
+                HONEST_CAPTURE,
+                0,
+                Some(DGRAM)
+            ),
             AudioPlane::opus()
         );
     }
@@ -1197,7 +1425,16 @@ mod tests {
     #[test]
     fn a_datagram_that_cannot_carry_a_frame_gets_opus() {
         assert_eq!(
-            resolve_audio_plane(true, true, 48_000, pcm::BITS_16, 2, FAT_LINK_KBPS, None),
+            resolve_audio_plane(
+                true,
+                true,
+                48_000,
+                pcm::BITS_16,
+                2,
+                HONEST_CAPTURE,
+                FAT_LINK_KBPS,
+                None
+            ),
             AudioPlane::opus()
         );
         // 96/24 at the shortest rung (1000 µs) is 96 × 2 × 3 = 576 B + 13 of header.
@@ -1208,6 +1445,7 @@ mod tests {
                 96_000,
                 pcm::BITS_24,
                 2,
+                HONEST_CAPTURE,
                 FAT_LINK_KBPS,
                 Some(200)
             ),

@@ -239,7 +239,12 @@ pub(super) fn audio_thread(
     // [`InfillPolicy`]: before this, a hole meant the loop simply blocked in `next_chunk` and
     // NOTHING left the host for its duration, so the client's ring drained → underran →
     // de-primed → re-primed, and a 30 ms hole became a much longer audible artifact.
-    let mut infill = crate::audio::capture_policy::InfillPolicy::default();
+    //
+    // Built from THIS session's frame, like the pacer above it. Both of the policy's figures used
+    // to be written against the Opus 5 ms frame — correct for as long as 5 ms was the only frame
+    // there was, and off by up to 5× on the lossless plane, whose frames are shorter by
+    // construction (§4.2).
+    let mut infill = crate::audio::capture_policy::InfillPolicy::new(frame_us);
     let mut last_chunk_at = std::time::Instant::now();
     // Nothing may be synthesized before the first real frame: there is no continuity to protect
     // yet, and the wire clock has no anchor to continue from.
@@ -287,7 +292,11 @@ pub(super) fn audio_thread(
     // WP-C — what the wire actually did, as opposed to what the tap handed us. See [`SendStats`]:
     // until this existed the send path was the one stage of the audio pipeline that could not be
     // ruled in or out from a field log.
-    let mut send_stats = crate::audio::capture_policy::SendStats::default();
+    //
+    // Built from this session's frame, like the pacer and the infill policy: its `late` counter is
+    // "missed its slot by a whole protocol frame", and the lossless plane's frame is as short as
+    // 1 ms. Against the Opus constant this session could miss every slot and still report zero.
+    let mut send_stats = crate::audio::capture_policy::SendStats::new(frame_us);
     let mut last_send_stats = std::time::Instant::now();
     let mut last_departure: Option<std::time::Instant> = None;
     // §4.8 — datagrams the wire refused. Counted, not merely survived: an uncounted drop is what
@@ -349,13 +358,29 @@ pub(super) fn audio_thread(
         // ⚠ Never ship a rate we did not get (`design/hi-res-audio.md` §9: "never claim a rate
         // you did not get" — the rule is the same at both ends).
         //
-        // The `Welcome` has already promised the client `rate_hz`, and its output device is open
-        // at exactly that; every pts, every frame length and the client's whole de-jitter ring
-        // are denominated in it. On the LOSSLESS plane a capturer delivering something else
-        // cannot be reconciled: we cannot switch the wire to Opus mid-session (§6 — a session
-        // runs one plane, and changing it means re-opening the client's device), and sending
-        // wrongly-clocked samples under the promised label is precisely the "label right,
-        // content wrong" failure this feature exists to avoid. So that plane ENDS, loudly.
+        // **BELT AND BRACES, not the mechanism.** §8.4 condition 4 now asks the capture path what
+        // rate it can honestly deliver BEFORE the `Welcome` is built
+        // (`handshake::resolve_audio_plane` + `crate::audio::probe_capture_rate`), so the Windows
+        // §8.2 decline and the Linux §8.3 one both land as an ordinary "the session uses Opus
+        // 48 kHz" with a logged reason. This check is no longer how either of those is reached,
+        // and it is no longer expected to fire at all.
+        //
+        // What is left for it is the race the gate structurally cannot close: the probe reads the
+        // device, and the capture opens some milliseconds later. An endpoint whose format an
+        // operator changes in between, a hotplug that re-plans onto a different endpoint, or a
+        // graph that renegotiates mid-session all land here. That is a much smaller and much
+        // rarer set than "every 96 kHz request on a 48 kHz box", which is what it used to catch.
+        //
+        // The ACTION stays the same, because there is still only one correct one. The `Welcome`
+        // has already promised the client `rate_hz` and its output device is open at exactly
+        // that; every pts, every frame length and the client's whole de-jitter ring are
+        // denominated in it. We cannot switch the wire to Opus mid-session (§6 — a session runs
+        // one plane, and changing it means re-opening the client's device), and sending
+        // wrongly-clocked samples under the promised label is precisely the "label right, content
+        // wrong" failure this feature exists to avoid. So the lossless plane ENDS. What changed
+        // is the message: it no longer tells the operator to go and set a device rate, because
+        // the gate says that up front now — reaching here means something moved underneath a
+        // session the gate had already vetted.
         //
         // The Opus plane only WARNS, and deliberately: it is 48 kHz by definition, every
         // capturer has always been asked for 48 kHz, and both backends resample to it rather
@@ -369,20 +394,17 @@ pub(super) fn audio_thread(
         // their rate at open time: PipeWire's `param_changed` may land a moment after the ready
         // handshake, and either backend can renegotiate mid-session. An atomic load a few hundred
         // times a second costs nothing next to the encode.
-        //
-        // Reachable in practice only for a 96 kHz session whose endpoint turns out to run at
-        // 48 kHz — the Windows §8.2 decline, which happens at capture-open and therefore AFTER
-        // the Welcome was sent. See the note in `handshake::negotiate`.
         let live_rate = capturer.as_ref().unwrap().sample_rate();
         if live_rate != rate_hz {
             if pcm_plane {
                 tracing::warn!(
                     promised_hz = rate_hz,
                     capture_hz = live_rate,
-                    "the capture path is not delivering the rate this session's Welcome promised \
-                     — ending the lossless audio plane rather than sending samples under a label \
-                     that is not theirs. Reconnect to renegotiate; on Windows, set the endpoint's \
-                     own rate in its device properties if hi-res was wanted"
+                    "the capture path changed rate under a session the hi-res gate had already \
+                     vetted — ending the lossless audio plane rather than sending samples under \
+                     a label that is not theirs (video continues). Reconnect: the gate re-runs \
+                     against the capture path as it now is, and resolves either the real rate or \
+                     Opus 48 kHz"
                 );
                 break 'session;
             }
@@ -413,7 +435,7 @@ pub(super) fn audio_thread(
             // the due time would spin through the window between them.
             let ready_at = match pace_due {
                 Some(due) if acc.len() >= frame_len => due,
-                Some(due) => due.max(last_chunk_at + crate::audio::capture_policy::INFILL_AFTER),
+                Some(due) => due.max(last_chunk_at + infill.after()),
                 None => now + frame_interval,
             };
             let budget = ready_at.saturating_duration_since(now).min(PACE_MAX_SLEEP);
@@ -643,7 +665,11 @@ pub(super) fn audio_thread(
                 oversized_drops,
                 "audio egress"
             );
-            send_stats = Default::default();
+            // The frame rides into the fresh window too — `Default` would have reset it to zero,
+            // which is why `SendStats` no longer has one: a zero frame makes every departure
+            // "late by a whole frame", and this is the line that would have said so, every 30 s,
+            // for the rest of the session.
+            send_stats = crate::audio::capture_policy::SendStats::new(frame_us);
             last_send_stats = std::time::Instant::now();
         }
     }

@@ -557,6 +557,27 @@ INFO  punktfunk/1 audio streaming … tier=high kbps=512 redundancy=true
 
 `standard` reproduces the pre-0.25 encoder exactly if you want to A/B it.
 
+If what you want is **no lossy stage at all**, there is a third knob — but read what it costs
+first:
+
+```ini
+PUNKTFUNK_AUDIO_HIRES=1         # allow the lossless PCM audio plane (default off)
+```
+
+That replaces Opus with uncompressed 48/96 kHz, 16/24-bit stereo PCM. It has to be turned on at
+**both** ends — the client has its own toggle, also off by default — because it costs 1.5–4.6 Mbps
+against Opus's 256 kbps, and like every other audio setting here that comes off the top of the
+link, where adaptive bitrate can neither see it nor reclaim it.
+
+It is also unlikely to fix the problem *this* section is about: a lossless copy of a 24 kHz mono
+mix is still a 24 kHz mono mix, so fix the endpoint first. What it buys is bit-exactness rather
+than audibly better sound — on game content, 256 kbps Opus is already effectively transparent. On
+Windows the host reads the endpoint's own engine rate (the `engine_hz` line above) and refuses to
+pad, so 96 kHz means setting that device to 96 kHz in Windows' own sound properties. Whenever any
+condition fails — the client didn't ask, the session isn't stereo, the capture path can't
+genuinely deliver the rate, or the link can't spare it — the session quietly stays on Opus and the
+log says which one lost.
+
 ## Audio lags behind the picture
 
 The client buffers a little audio to absorb network jitter. Since 0.25 that buffer **corrects

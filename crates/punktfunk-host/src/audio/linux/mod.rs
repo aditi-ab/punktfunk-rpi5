@@ -52,6 +52,33 @@ fn stream_sink_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// §8.4 condition 4 on Linux (`design/hi-res-audio.md` §4.4 / §8.3) — answered from the CAPTURE
+/// TOPOLOGY alone, with no PipeWire connection at all.
+///
+/// The two modes give structurally different answers, and that is the whole content of §4.4:
+///
+/// * **Stream-sink mode (the default).** We register the `Audio/Sink` node ourselves and
+///   [`pw_thread`] declares its format, so applications render into it at that rate natively.
+///   The rate we claim is the rate we get, by construction — there is no upstream resampler in
+///   the path to lie about it, so the answer is yes for every rate the plane supports and no
+///   probe is needed to say so.
+/// * **`PUNKTFUNK_STREAM_SINK=0` (monitor mode).** We capture somebody else's sink through
+///   PipeWire's resampler, which reports a clean rate whatever the node upstream of it really
+///   runs at — the same blindness WASAPI's autoconvert has. The rate is therefore NOT knowable
+///   here, and §8.3 says to decline rather than trust it. (Reading the monitored node's own rate
+///   out of the registry would answer it; that lookup does not exist yet, and it is the
+///   prerequisite this configuration is waiting on.)
+///
+/// Note the asymmetry with Windows on purpose: there the honest answer needs a device query,
+/// here it needs none, because the host is the one declaring the format.
+pub(super) fn probe_capture_rate() -> super::CaptureRate {
+    if stream_sink_enabled() {
+        super::CaptureRate::Declared
+    } else {
+        super::CaptureRate::Unknown
+    }
+}
+
 pub struct PwAudioCapturer {
     chunks: Receiver<Vec<f32>>,
     channels: u32,

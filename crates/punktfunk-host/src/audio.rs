@@ -124,6 +124,88 @@ pub trait AudioCapturer: Send {
     fn idle(&mut self) {}
 }
 
+/// What the capture path can honestly promise about its sample rate, answered **before** a
+/// capturer exists (`design/hi-res-audio.md` §8.4 condition 4).
+///
+/// The gate that decides a session's audio plane runs inside the handshake, and the capturer is
+/// not opened until the audio thread starts — well after the `Welcome` has already promised the
+/// client a rate and the client has opened its output device at it. Discovering the truth there
+/// is too late: the only thing the audio thread can then do is end the lossless plane, and
+/// §8.4 is explicit that silence is the one unacceptable outcome. So the question has to be
+/// answerable from a DEVICE-LEVEL query that costs no stream — which is what each backend
+/// answers below.
+///
+/// Deliberately three-valued rather than a `bool` or an `Option<u32>`: "the host declares the
+/// rate" and "the device runs at 48 kHz" are different facts with different consequences, and
+/// collapsing either into "unknown" would decline hi-res on the one configuration (§4.4) where
+/// it is honest by construction.
+///
+/// Exactly ONE of the first two variants is ever constructed on a given target, so each carries
+/// the `dead_code` allow for the platforms that never build it — the same `cfg_attr` this module
+/// already puts on `wiring_plan` and `capture_policy`, and for the same reason: the crate root's
+/// blanket `#![allow(dead_code)]` covers it today, and a local marker is what keeps this honest
+/// if that scaffold-era allow is ever narrowed. Per-variant rather than on the enum, so a
+/// genuinely dead variant added later would still be caught.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureRate {
+    /// The HOST declares the rate to the graph and applications render into it natively, so
+    /// whatever is asked for is what arrives — there is no upstream resampler to be fooled by.
+    /// Linux stream-sink mode, the default (§4.4).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Declared,
+    /// The device's engine runs at exactly this rate, and asking it for anything else succeeds
+    /// anyway by resampling: WASAPI's `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` reconciles our
+    /// format with the engine's in whichever direction is needed, with no error (§4.3). Only a
+    /// request at or below this is honest; above it we would advertise a rate, spend the
+    /// bandwidth, and deliver interpolation.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    Engine(u32),
+    /// Not answerable without opening the capture — Linux `PUNKTFUNK_STREAM_SINK=0` monitor
+    /// mode (we capture someone else's sink THROUGH PipeWire's resampler, which reports a clean
+    /// rate whatever is upstream — §8.3), a Windows probe that could not reach the endpoint, or
+    /// a platform with no capture backend at all. Hi-res declines.
+    Unknown,
+}
+
+impl CaptureRate {
+    /// Whether a session capturing at `rate_hz` would GENUINELY be captured at `rate_hz`.
+    ///
+    /// The pessimistic direction is deliberate everywhere: an unknown answer declines, because
+    /// the cost of being wrong is a session that says 96 kHz, spends 4.6 Mbps saying it, and
+    /// carries interpolated 48 kHz — the same "both ends audit clean, the content is wrong"
+    /// class as the HDR RB-swap, which survived a long time for exactly that reason.
+    pub fn can_deliver(self, rate_hz: u32) -> bool {
+        match self {
+            CaptureRate::Declared => true,
+            CaptureRate::Engine(hz) => rate_hz <= hz,
+            CaptureRate::Unknown => false,
+        }
+    }
+}
+
+/// Ask the capture path what rate it can honestly deliver, WITHOUT opening a capture stream and
+/// without changing anything about the box — see [`CaptureRate`].
+///
+/// Blocking (Windows enumerates endpoints and activates an `IAudioClient` per candidate), so
+/// callers on the async path run it off the reactor. Called only when hi-res is actually on the
+/// table: an ordinary session must not pay for a feature nobody asked for.
+#[cfg(target_os = "linux")]
+pub fn probe_capture_rate() -> CaptureRate {
+    linux::probe_capture_rate()
+}
+
+#[cfg(target_os = "windows")]
+pub fn probe_capture_rate() -> CaptureRate {
+    audio_control::probe_capture_rate()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn probe_capture_rate() -> CaptureRate {
+    // No capture backend at all — `open_audio_capture` bails on this target, so there is no
+    // plane to promise a rate for.
+    CaptureRate::Unknown
+}
+
 /// Open a live capturer for system output via PipeWire, asking for `channels` interleaved
 /// channels at `rate_hz`. Default: a host-owned stream sink claimed as the default output (the
 /// sink advertises exactly `channels`, so apps can produce real surround); with
