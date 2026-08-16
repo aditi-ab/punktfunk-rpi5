@@ -1317,6 +1317,11 @@ pub struct Settings {
     /// value is a newer client's key, and the right answer to one is the default shelf.
     #[serde(default)]
     pub library_sort: String,
+    /// How the console's game library is arranged: `"shelf"` (the coverflow — the default,
+    /// and unknown values read as it) or `"grid"`. Presentation only, same rules as
+    /// [`library_sort`](Self::library_sort).
+    #[serde(default)]
+    pub library_view: String,
     /// Send Wake-on-LAN before connecting to a saved host and wait for it to boot (the
     /// Apple client's "Auto-wake on connect"). Default ON — that was the unconditional
     /// behavior before this became a setting. Off is for hosts reached over a VPN, where
@@ -1524,6 +1529,7 @@ impl Default for Settings {
             ui_palette: default_ui_palette(),
             reduce_motion: false,
             library_sort: String::new(),
+            library_view: String::new(),
             auto_wake: true,
             invert_scroll: false,
             speaker_device: String::new(),
