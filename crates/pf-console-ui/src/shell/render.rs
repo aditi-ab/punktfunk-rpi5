@@ -1,6 +1,6 @@
 //! The console shell's per-frame screen compose/transition render path.
 
-use crate::anim::{approach, ease_out_cubic};
+use crate::anim::approach;
 use crate::glyphs::{hint_bar, GlyphStyle};
 use crate::library::LibraryShared;
 use crate::model::HostRow;
@@ -11,7 +11,10 @@ use pf_client_core::trust;
 use skia_safe::{Canvas, Rect};
 use std::time::Instant;
 
-use super::{Motion, Shell, BOTTOM_BAND, TOP_BAND};
+use super::{
+    Motion, NavKind, Shell, BOTTOM_BAND, NAV_ENTER_SCALE, NAV_EXIT_SCALE, NAV_REVEAL_ALPHA,
+    NAV_SLIDE_DP, TOP_BAND,
+};
 
 impl Shell {
     #[allow(clippy::too_many_arguments)]
@@ -52,30 +55,11 @@ impl Shell {
         let k = (h / 800.0).clamp(0.75, 3.0);
         let t = self.t();
 
-        // Advance the transition; a finished pop finally drops its leaving screen.
-        let motion_p = match &mut self.motion {
-            Motion::None => None,
-            Motion::Push(p) => {
-                p.advance(dt);
-                let v = p.value();
-                if p.done() {
-                    self.motion = Motion::None;
-                    None
-                } else {
-                    Some(v)
-                }
-            }
-            Motion::Pop { t, .. } => {
-                t.advance(dt);
-                let v = t.value();
-                if t.done() {
-                    self.motion = Motion::None;
-                    None
-                } else {
-                    Some(v)
-                }
-            }
-        };
+        // Advance the transition. `None` means "settled" — which is also what makes the
+        // hint-rect invariant below still hold: with a spring, "settled" is
+        // `Motion::None`, exactly as it was with a timer. A reversed push takes its screen
+        // back off the stack here; a completed pop drops the one it was carrying.
+        let motion_p = self.advance_nav(dt);
 
         // The backdrop settles into (or out of) calm with the screen transition. It is the
         // SAME living field either way — a form screen quiets it, it doesn't replace it —
@@ -128,42 +112,53 @@ impl Shell {
         // travel: no slide, no scale.
         let slide = |dy: f64| if reduce { 0.0 } else { dy };
         let zoom = |s: f64| if reduce { 1.0 } else { s };
+        // The geometry below is UNCHANGED from the tween: same 36 dp slide, same
+        // 0.985/0.96 scales, same 0.4 reveal alpha. Only the time-course differs — `p` is
+        // now the spring's position where it used to be `ease_out_cubic(elapsed)`.
         match (&mut self.motion, motion_p) {
-            (Motion::Push(_), Some(raw)) => {
-                let p = ease_out_cubic(raw);
+            (
+                Motion::Nav {
+                    kind: NavKind::Push,
+                    ..
+                },
+                Some(p),
+            ) => {
                 let n = self.stack.len();
+                let enter_scale = zoom(NAV_ENTER_SCALE + (1.0 - NAV_ENTER_SCALE) * p);
+                let enter_slide = slide(NAV_SLIDE_DP * k * (1.0 - p));
                 // Outgoing recedes underneath…
                 if n >= 2 {
                     let (below, top) = self.stack.split_at_mut(n - 1);
-                    env.paint(&mut below[n - 2], 1.0 - p, 0.0, zoom(1.0 - 0.04 * p));
+                    env.paint(
+                        &mut below[n - 2],
+                        1.0 - p,
+                        0.0,
+                        zoom(1.0 - (1.0 - NAV_EXIT_SCALE) * p),
+                    );
                     // …while the incoming slides up out of a fade.
-                    env.paint(
-                        &mut top[0],
-                        p,
-                        slide(36.0 * k * (1.0 - p)),
-                        zoom(0.985 + 0.015 * p),
-                    );
+                    env.paint(&mut top[0], p, enter_slide, enter_scale);
                 } else {
-                    env.paint(
-                        &mut self.stack[0],
-                        p,
-                        slide(36.0 * k * (1.0 - p)),
-                        zoom(0.985 + 0.015 * p),
-                    );
+                    env.paint(&mut self.stack[0], p, enter_slide, enter_scale);
                 }
             }
-            (Motion::Pop { leaving, .. }, Some(raw)) => {
-                let p = ease_out_cubic(raw);
+            (
+                Motion::Nav {
+                    kind: NavKind::Pop,
+                    leaving: Some(leaving),
+                    ..
+                },
+                Some(p),
+            ) => {
                 // The revealed screen grows back in…
                 let n = self.stack.len();
                 env.paint(
                     &mut self.stack[n - 1],
-                    0.4 + 0.6 * p,
+                    NAV_REVEAL_ALPHA + (1.0 - NAV_REVEAL_ALPHA) * p,
                     0.0,
-                    zoom(0.96 + 0.04 * p),
+                    zoom(NAV_EXIT_SCALE + (1.0 - NAV_EXIT_SCALE) * p),
                 );
                 // …while the leaving one slides down into a fade.
-                env.paint(leaving.as_mut(), 1.0 - p, slide(36.0 * k * p), 1.0);
+                env.paint(leaving.as_mut(), 1.0 - p, slide(NAV_SLIDE_DP * k * p), 1.0);
             }
             _ => {
                 let n = self.stack.len();

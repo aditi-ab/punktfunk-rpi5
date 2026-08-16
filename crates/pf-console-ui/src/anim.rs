@@ -1,9 +1,18 @@
-//! The console shell's motion vocabulary. Two kinds of movement, deliberately kept
-//! apart: **springs** (`Spring`, wrapping `library::spring_advance`) for anything the
-//! user pushes around — cursors, trays, recoil — where velocity must carry across
-//! retargets; and **timed progressions** (`Progress` + the easing functions) for
-//! fire-and-forget choreography — screen entrances/exits, fades — where a deterministic
-//! duration matters more than momentum.
+//! The console shell's motion vocabulary. Two kinds of movement, deliberately kept apart:
+//!
+//! **Springs** ([`Spring`], wrapping `library::spring_advance`) for anything the user
+//! pushes around — cursors, trays, recoil, and now the screen transitions themselves —
+//! where velocity must carry across a retarget. [`SpringSpec`] and the [`springs`] table
+//! are how a feel is named rather than spelled out as a `k`/`c` pair.
+//!
+//! **Timed choreography** ([`Entrance`] + the easing functions) for the fire-and-forget
+//! kind, where the shape over a fixed window matters more than momentum and there is
+//! nothing to interrupt. An entrance is a pure function of the clock, so a screen holds
+//! one and asks it per item instead of keeping per-item state.
+//!
+//! There used to be a general-purpose `Progress` timer here. It went when the screen
+//! transition — its last caller — became a spring: reversing a timer mid-flight means
+//! either a snap or a second animation, which is the whole reason that work happened.
 
 use crate::library::spring_advance;
 
@@ -55,7 +64,15 @@ impl SpringSpec {
 pub(crate) mod springs {
     use super::SpringSpec;
 
-    /// Row and tile focus. Deliberately the loosest of the three: the whisker of overshoot
+    /// Screen push/pop. Just under critical — a whole screen that visibly bounces reads as
+    /// broken rather than alive — but sprung rather than tweened because the velocity has
+    /// to carry: a Back pressed mid-push retargets this spring to 0 and the screen turns
+    /// around where it is, which a time-based curve cannot do without snapping.
+    pub(crate) const NAV: SpringSpec = SpringSpec {
+        response: 0.42,
+        damping: 0.88,
+    };
+    /// Row and tile focus. Deliberately the loosest of the table: the whisker of overshoot
     /// IS the pop that makes a focused row feel picked up rather than merely tinted.
     pub(crate) const FOCUS: SpringSpec = SpringSpec {
         response: 0.30,
@@ -230,33 +247,6 @@ impl Entrance {
     }
 }
 
-/// A clamped 0→1 timer for fire-and-forget choreography. `advance` returns the RAW
-/// progress — callers apply their easing so one Progress can drive several curves.
-#[derive(Clone, Copy)]
-pub(crate) struct Progress {
-    t: f64,
-    duration: f64,
-}
-
-impl Progress {
-    pub(crate) fn new(duration: f64) -> Progress {
-        Progress { t: 0.0, duration }
-    }
-
-    pub(crate) fn advance(&mut self, dt: f64) -> f64 {
-        self.t = (self.t + dt / self.duration).min(1.0);
-        self.t
-    }
-
-    pub(crate) fn value(&self) -> f64 {
-        self.t
-    }
-
-    pub(crate) fn done(&self) -> bool {
-        self.t >= 1.0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,17 +267,6 @@ mod tests {
             assert!(v <= 1.0);
         }
         assert!((v - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn progress_completes_on_time() {
-        let mut p = Progress::new(0.3);
-        let mut steps = 0;
-        while !p.done() {
-            p.advance(1.0 / 60.0);
-            steps += 1;
-        }
-        assert!((17..=19).contains(&steps), "{steps}"); // 0.3 s at 60 Hz
     }
 
     #[test]
@@ -420,6 +399,8 @@ mod tests {
             indicator < 0.01,
             "INDICATOR must not visibly overshoot, got {indicator}"
         );
+        let nav = peak_overshoot(springs::NAV);
+        assert!(nav < 0.01, "NAV must not visibly overshoot, got {nav}");
         assert!(
             peak_overshoot(springs::PRESS) > focus,
             "PRESS is the loosest of the table"

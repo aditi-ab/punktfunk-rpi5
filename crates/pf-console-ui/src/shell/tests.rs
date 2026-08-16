@@ -6,42 +6,58 @@ use punktfunk_core::config::GamepadPref;
 
 /// The screen-transition contract, against the shared vectors. Every client re-implements this
 /// motion in its own animation system, so the numbers exist in three places and drifted in two of
-/// them before this test.
+/// them before there was a test.
 ///
-/// The EASING is sampled rather than compared as control points, and that is the point of it:
-/// this side is the analytic `1 − (1−t)³`, Android reproduces it exactly, and SwiftUI can only
-/// approximate it with a Bézier. Worse, two different Béziers are published under the name
-/// "easeOutCubic" — `(0.215, 0.61, 0.355, 1)` and `(0.33, 1, 0.68, 1)` — and neither IS this
-/// curve; they differ from it by up to ~0.08 at the midpoint, which is visible on a 260 ms
-/// transition. Samples with a tolerance are the only form all three runtimes can meet.
+/// This side reads `motion_spring` (vectors version 2). The v1 `motion` block is still in the
+/// file and still correct — the Android client's `ConsoleVectorsTest` pins it, and the Apple
+/// client's `GamepadShell` mirrors its constants — but the desktop console's transition is a
+/// damped spring now rather than a 0.26 s ease-out-cubic, so it no longer implements that block
+/// and says so here rather than quietly passing a test about a curve it does not run.
+///
+/// Springs are INTEGRATOR-dependent, which is why v2 pins parameters where v1 pinned sampled
+/// positions: two runtimes that both honour `response`/`damping` agree to the eye and disagree
+/// in the third decimal, and sampling would pin the disagreement instead of the feel.
 #[test]
 fn motion_matches_the_shared_vectors() {
     let raw = include_str!("../../../../clients/shared/console-vectors.json");
     let file: serde_json::Value =
         serde_json::from_str(raw).expect("console-vectors.json must parse");
-    let motion = &file["motion"];
-    let want_s = motion["transition_s"].as_f64().expect("transition_s");
-    assert!(
-        (TRANSITION_S - want_s).abs() < 1e-9,
-        "TRANSITION_S is {TRANSITION_S}, vectors say {want_s}"
+    assert_eq!(
+        file["version"].as_u64(),
+        Some(2),
+        "the spring block arrived with version 2"
     );
 
-    let curve = &motion["ease_out_cubic"];
-    let tol = curve["tolerance"].as_f64().expect("tolerance");
-    let samples = curve["samples"].as_array().expect("samples");
-    assert!(
-        samples.len() >= 5,
-        "the curve needs enough samples to pin it"
-    );
-    for s in samples {
-        let t = s["t"].as_f64().expect("t");
-        let want = s["p"].as_f64().expect("p");
-        let got = crate::anim::ease_out_cubic(t);
+    let m = &file["motion_spring"];
+    let num = |key: &str| m[key].as_f64().unwrap_or_else(|| panic!("{key} missing"));
+    let close = |what: &str, got: f64, want: f64| {
         assert!(
-            (got - want).abs() <= tol,
-            "ease_out_cubic({t}) is {got}, vectors say {want} (±{tol})"
+            (got - want).abs() < 1e-9,
+            "{what} is {got}, vectors say {want}"
         );
-    }
+    };
+    close(
+        "response",
+        crate::anim::springs::NAV.response,
+        num("response"),
+    );
+    close("damping", crate::anim::springs::NAV.damping, num("damping"));
+    close("push slide", NAV_SLIDE_DP, num("push_slide_dp"));
+    close("enter scale", NAV_ENTER_SCALE, num("enter_scale"));
+    close("exit scale", NAV_EXIT_SCALE, num("exit_scale"));
+    close("reveal alpha", NAV_REVEAL_ALPHA, num("reveal_alpha"));
+    assert_eq!(
+        m["interruptible"].as_bool(),
+        Some(true),
+        "this client's transitions accept Back mid-flight; the block must say so"
+    );
+
+    // The v1 block stays put until the last client migrates, and stays MARKED so nobody
+    // reads it as live. Deleting it here would silently red Android's test instead.
+    assert!(
+        file["motion"]["$deprecated"].is_string(),
+        "the v1 motion block must carry its deprecation note while other clients read it"
+    );
 }
 
 /// Point the settings/known-hosts stores at a throwaway HOME — the settings screen
@@ -179,8 +195,28 @@ fn connect_flow_raises_launch_and_cancel() {
 }
 
 fn finish_motion(s: &mut Shell) {
-    // Transitions block input; tests fast-forward them.
-    s.motion = Motion::None;
+    // Tests fast-forward transitions. Seats the spring on its target and runs the REAL
+    // settle, rather than wishing the motion away — otherwise a reversed push would skip
+    // the bookkeeping that takes its screen back off the stack.
+    if let Motion::Nav { spring, target, .. } = &mut s.motion {
+        spring.pos = *target;
+        spring.vel = 0.0;
+    }
+    s.finish_nav();
+}
+
+/// Step the transition at a fixed `dt` until it settles, collecting every position it
+/// passed through. Bounded so a spring that never settles fails the test instead of
+/// hanging it.
+fn run_motion(s: &mut Shell) -> Vec<f64> {
+    let mut path = Vec::new();
+    for _ in 0..600 {
+        match s.advance_nav(1.0 / 120.0) {
+            Some(p) => path.push(p),
+            None => return path,
+        }
+    }
+    panic!("transition never settled");
 }
 
 /// A pinned host+profile card's library launches with THAT profile (design §5.2a).
@@ -335,7 +371,13 @@ fn a_secondary_press_goes_back() {
         kind: crate::pointer::PointerKind::Back,
     }));
     // The pop runs through the same transition a B press does.
-    assert!(matches!(s.motion, Motion::Pop { .. }));
+    assert!(matches!(
+        s.motion,
+        Motion::Nav {
+            kind: NavKind::Pop,
+            ..
+        }
+    ));
 }
 
 /// Up on a saved tile opens that host's menu; a discovered-but-unsaved one has none.
@@ -397,6 +439,138 @@ fn every_settings_tab_rasters() {
     s.render(surface.canvas(), 640, 400, &fonts, None, None, &pads);
 }
 
+/// The work package's whole reason for existing: Back pressed mid-push is HEARD, and it
+/// turns the screen around rather than queuing a second animation behind the first.
+///
+/// The continuity assertion is the important half. A naive "cancel and play a pop" reads
+/// as a snap because the two recipes disagree about where things are; retargeting the same
+/// spring cannot snap, because position is carried and only the target moved. This asserts
+/// the position never jumps by more than a frame's worth of the travel it was already
+/// doing.
+#[test]
+fn back_mid_push_turns_the_screen_around() {
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    s.handle_menu(MenuEvent::Tertiary); // X → Settings
+    assert_eq!(s.stack.len(), 2);
+
+    // Let it get properly under way, then interrupt.
+    let mut before = 0.0;
+    for _ in 0..12 {
+        before = s.advance_nav(1.0 / 120.0).expect("still in flight");
+    }
+    assert!(before > 0.05 && before < 0.95, "mid-flight, got {before}");
+    assert!(s.nav_back(), "Back is answered by the transition itself");
+    assert_eq!(
+        s.stack.len(),
+        2,
+        "the screen is still on the stack while it flies back"
+    );
+
+    let path = run_motion(&mut s);
+    assert!(!path.is_empty(), "the reversal actually animated");
+    // No snap: the first sample after the retarget continues from where it was.
+    assert!(
+        (path[0] - before).abs() < 0.05,
+        "jumped from {before} to {}",
+        path[0]
+    );
+    // And it goes DOWN — the screen is leaving, having briefly been arriving.
+    assert!(*path.last().expect("non-empty") < before);
+    assert_eq!(
+        s.stack.len(),
+        1,
+        "the reversed push took its screen back off"
+    );
+    assert!(matches!(s.motion, Motion::None));
+}
+
+/// Back at the ROOT is not a reversal — there is no parent to fall back to, and B there
+/// means quit. The transition declines it so the normal path can answer.
+#[test]
+fn back_mid_push_at_the_root_is_left_to_the_normal_path() {
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    // A Replace at the root pushes without deepening the stack.
+    s.apply_nav(crate::screens::Nav::Replace(Box::new(Screen::Home(
+        HomeScreen::new(),
+    ))));
+    assert_eq!(s.stack.len(), 1);
+    s.advance_nav(1.0 / 120.0);
+    assert!(!s.nav_back(), "nothing to reverse into");
+    finish_motion(&mut s);
+    assert_eq!(s.stack.len(), 1, "and the root survived");
+}
+
+/// A mid-pop A is refused: activating a half-dismissed screen is a mis-tap, not intent.
+/// A mid-pop BACK, on the other hand, is exactly what a held B is — it starts the next pop
+/// at once, which is the stutter this work package removes.
+#[test]
+fn mid_pop_refuses_confirm_but_honours_another_back() {
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    s.handle_menu(MenuEvent::Tertiary); // → Settings
+    finish_motion(&mut s);
+    s.handle_menu(MenuEvent::Move(MenuDir::Down)); // a row that would push if activated
+    s.handle_menu(MenuEvent::Back); // start the pop
+    assert!(matches!(s.motion, Motion::Nav { .. }));
+    let mid = s.advance_nav(1.0 / 120.0).expect("in flight");
+    assert!(mid < NAV_INPUT_OPENS, "the test needs an early sample");
+
+    let depth = s.stack.len();
+    assert!(
+        s.handle_menu(MenuEvent::Confirm).is_none(),
+        "A mid-pop does nothing"
+    );
+    assert_eq!(s.stack.len(), depth, "and pushes nothing");
+
+    // Back again, though, walks out another level — here that is the root, so it quits.
+    s.handle_menu(MenuEvent::Back);
+    finish_motion(&mut s);
+    assert!(matches!(s.take_action(), Some(OverlayAction::Quit)));
+}
+
+/// A completed pop frees the screen it was carrying, and hint rects are published only
+/// once the shell is settled — the invariant that predates springs and survives them,
+/// because "settled" is still exactly `Motion::None`.
+#[test]
+fn a_completed_pop_frees_its_screen_and_republishes_hints() {
+    let fonts = crate::theme::build_fonts().unwrap();
+    let pads: Vec<PadInfo> = Vec::new();
+    let (w, h) = (640u32, 400u32);
+    let mut surface = skia_safe::surfaces::raster_n32_premul((w as i32, h as i32)).unwrap();
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    s.handle_menu(MenuEvent::Tertiary);
+    finish_motion(&mut s);
+    s.handle_menu(MenuEvent::Back);
+
+    // Mid-pop: a screen is being carried, and the legend is not clickable.
+    assert!(
+        matches!(
+            &s.motion,
+            Motion::Nav {
+                leaving: Some(_),
+                ..
+            }
+        ),
+        "the popped screen is parked on the motion"
+    );
+    s.render(surface.canvas(), w, h, &fonts, None, None, &pads);
+    assert!(
+        s.hint_rects.is_empty(),
+        "mid-transition the drawn rects are slid and scaled, so none are published"
+    );
+
+    run_motion(&mut s);
+    assert!(matches!(s.motion, Motion::None));
+    s.render(surface.canvas(), w, h, &fonts, None, None, &pads);
+    assert!(
+        !s.hint_rects.is_empty(),
+        "settled, the legend is clickable again"
+    );
+}
+
 /// The three toast kinds must be tellable apart WITHOUT reading the words — that is the
 /// whole reason the kind exists. In particular the error tint is fixed rather than
 /// palette-derived: `moss`'s accent is a green and `ember`'s is an orange, and reporting a
@@ -445,11 +619,19 @@ fn reduce_motion_freezes_the_field_and_shortens_the_transition() {
 
     assert!(!s.settings.reduce_motion, "off by default");
     assert_eq!(s.field_clock(12.5), 12.5);
-    assert_eq!(s.transition_s(), TRANSITION_S);
+    assert_eq!(s.nav_spec().damping, crate::anim::springs::NAV.damping);
 
     s.settings.reduce_motion = true;
     assert_eq!(s.field_clock(12.5), 0.0, "the field stops drifting");
-    assert_eq!(s.transition_s(), REDUCED_TRANSITION_S);
+    let spec = s.nav_spec();
+    assert_eq!(
+        spec.damping, 1.0,
+        "critically damped: it arrives, never bounces"
+    );
+    assert!(
+        spec.response < crate::anim::springs::NAV.response,
+        "and quicker"
+    );
     // …and a frame still draws (the shader runs at t = 0 like any other phase).
     s.render(surface.canvas(), w, h, &fonts, None, None, &pads);
 
