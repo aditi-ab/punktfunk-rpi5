@@ -165,6 +165,11 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     // outbound `CtrlRequest::Keyframe` — the one choke point all emitters funnel through — and
     // the pump drains the count per report window.
     let recovery_kf = Arc::new(AtomicU32::new(0));
+    // Host-announced capture/encode pipeline rebuilds (`PipelineGap`): the control task parks the
+    // gap's length here and the pump drains it every iteration, discarding the report window in
+    // flight. A host-local rebuild starves a window of stream without the link doing anything
+    // wrong, and the controller cannot tell that apart from congestion on its own.
+    let pipeline_gap = Arc::new(AtomicU32::new(0));
     // Host-encode-latency accumulator (the ABR encode signal, see [`EncodeLatAcc`]): the
     // datagram task adds one sample per 0xCF; the pump drains a window mean per report tick.
     let encode_lat = Arc::new(Mutex::new(super::frame_channel::EncodeLatAcc::default()));
@@ -185,6 +190,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             bitrate_ack: bitrate_ack.clone(),
             live_bitrate,
             recovery_kf: recovery_kf.clone(),
+            pipeline_gap: pipeline_gap.clone(),
             clock_offset: clock_offset.clone(),
             clock_gen: clock_gen.clone(),
             clip_event_tx: clip_event_tx.clone(),
@@ -260,6 +266,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         fec_recovered,
         bitrate_ack,
         recovery_kf,
+        pipeline_gap,
         bitrate_kbps,
         resolved_bitrate_kbps,
         negotiated_codec,

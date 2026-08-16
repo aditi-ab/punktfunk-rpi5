@@ -1343,6 +1343,10 @@ pub(super) struct SessionContext {
     /// Host-initiated bitrate re-target → control task → the client's `BitrateChanged`. Fired
     /// by [`adopt_built_bitrate`] when a rebuild lands on a rate the client wasn't told about.
     pub(super) retarget_tx: tokio::sync::mpsc::UnboundedSender<u32>,
+    /// Pipeline-gap announcement → control task → the client's
+    /// [`punktfunk_core::quic::PipelineGap`]. Fired by [`announce_pipeline_gap`] after a rebuild
+    /// that kept the session up, carrying how long the stream was stopped.
+    pub(super) gap_tx: tokio::sync::mpsc::UnboundedSender<u32>,
     /// Adaptive-FEC target the control task updates from the client's loss reports.
     pub(super) fec_target: Arc<AtomicU8>,
     /// The QUIC control connection (carries host→client 0xCE source-HDR metadata mid-stream).
@@ -1604,6 +1608,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         probe_result_tx,
         reconfig_result_tx,
         retarget_tx,
+        gap_tx,
         fec_target,
         conn,
         timing_conn,
@@ -2596,6 +2601,26 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 encoder_resets = 0;
                 last_forced_idr = Some(std::time::Instant::now()); // fresh encoder opens on an IDR — anchor the cooldown
                 resize_trace.finish("pipeline_rebuilt");
+                // A mode switch stops the stream for the same few hundred milliseconds the
+                // eviction recovery does, so the client's straddling report window is damaged the
+                // same way — announce it here too.
+                //
+                // This does not duplicate the mode-switch reset the client already does, because
+                // that reset only PARTLY covers this. The accepted `Reconfigured` bumps the
+                // client's `mode_gen`, which runs `BitrateController::on_mode_switch`: it clears
+                // what the OLD mode taught — the learned host and decode caps, the three latency
+                // baselines, the proven-throughput mark. Emptying the baselines does mute the
+                // OWD/decode/encode signals for the next few windows, which is real coverage.
+                //
+                // What it does NOT do is stop the straddling window being scored at all, and it
+                // touches neither the rate nor slow start (`current_kbps`, `probing` and
+                // `bad_windows` all survive it). Every signal that needs no baseline — an
+                // unrecoverable frame, a jump-to-live flush, heavy loss over a near-empty
+                // denominator, a keyframe-ask storm — still scores that window, and any one of
+                // them at the severe tier costs a ×0.7 plus slow start for the session. Whether a
+                // given rebuild trips one of those is not something this side can know; the
+                // announcement costs a 9-byte message when it doesn't.
+                announce_pipeline_gap(&gap_tx, resize_trace.total_slot().load(Ordering::Relaxed));
             }
         }
         // Exclusive-topology eviction recovery (Windows IDD-push): the vdisplay watchdog just
@@ -2639,6 +2664,13 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     encoder_resets = 0;
                     last_forced_idr = Some(std::time::Instant::now());
                     trace.finish("pipeline_rebuilt");
+                    // …and tell the client the stream just stopped for that long. The trace's own
+                    // total is the span (it stops in `finish` above), so the `gap_ms` the client
+                    // logs is the `total_ms` on this host's trace line — one number, checkable
+                    // from either end of a field report. Announced only on the SUCCESS path: the
+                    // failure arm below ends the session, and the reconnect re-baselines
+                    // everything the controller learned anyway.
+                    announce_pipeline_gap(&gap_tx, trace.total_slot().load(Ordering::Relaxed));
                 } else {
                     return Err(anyhow!(
                         "exclusive-topology eviction recovery failed — ending the session for a \
@@ -4711,6 +4743,28 @@ fn adopt_built_bitrate(
     *current = built;
     live.store(built, Ordering::Relaxed);
     let _ = retarget.send(built); // control task gone ⇒ the session is ending anyway
+}
+
+/// Tell the client the stream just stopped for `gap_ms` because WE rebuilt the pipeline
+/// ([`punktfunk_core::quic::PipelineGap`]). Called after a rebuild that kept the session up — a
+/// mode switch, or the Windows exclusive-topology eviction recovery — with the span the transition
+/// trace measured, so the number the client logs is the number this host logs.
+///
+/// The client's adaptive-bitrate controller decides on 750 ms report windows, and a window that
+/// straddles a few hundred milliseconds of nothing looks exactly like a link that collapsed:
+/// almost no throughput, and a host encode mean taken over the handful of AUs that carried the
+/// interruption. It has no way to tell that apart from congestion, and one such verdict retires
+/// its slow start for the session — the 0.29 field log's 401 ms eviction recovery cost three
+/// minutes at ~15 Mbps on a link that never dropped a packet. We are the only party that knows it
+/// was us.
+///
+/// A gap of 0 is not announced: there was no discontinuity to report, and the message exists to
+/// make the client throw a window away.
+fn announce_pipeline_gap(gap: &tokio::sync::mpsc::UnboundedSender<u32>, gap_ms: u32) {
+    if gap_ms == 0 {
+        return;
+    }
+    let _ = gap.send(gap_ms); // control task gone ⇒ the session is ending anyway
 }
 
 /// Encode-stall recovery: rebuild the encoder in place (keeping capture + the session up) and

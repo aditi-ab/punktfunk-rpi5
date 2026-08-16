@@ -23,6 +23,11 @@ pub(super) struct ControlTask {
     /// every emitter funnels through (embedder, `note_frame_index`, the pump's own asks) — the
     /// pump drains the count per report window as the ABR's recovery signal.
     pub(super) recovery_kf: Arc<AtomicU32>,
+    /// The last host-announced pipeline gap in ms ([`crate::quic::PipelineGap`]), `0` = none
+    /// pending. Written here on arrival, drained by the pump, which discards the report window in
+    /// flight — a host-local capture/encoder rebuild is not congestion (the `bitrate_ack` pattern,
+    /// as an atomic because the value is a plain number the pump only ever swaps out).
+    pub(super) pipeline_gap: Arc<AtomicU32>,
     pub(super) clock_offset: Arc<std::sync::atomic::AtomicI64>,
     pub(super) clock_gen: Arc<AtomicU32>,
     /// Clipboard metadata events (ClipState/ClipOffer) feed the same event plane the
@@ -60,6 +65,7 @@ impl ControlTask {
             bitrate_ack,
             live_bitrate,
             recovery_kf,
+            pipeline_gap,
             clock_offset,
             clock_gen,
             clip_event_tx,
@@ -194,6 +200,26 @@ impl ControlTask {
                             live_bitrate.store(ack.bitrate_kbps, Ordering::Relaxed);
                         }
                         *bitrate_ack.lock().unwrap() = Some(ack.bitrate_kbps);
+                    } else if let Ok(gap) = crate::quic::PipelineGap::decode(&msg) {
+                        // The host rebuilt its capture ring + encoder in place and nothing flowed
+                        // while it did. Park it for the pump, which discards the report window in
+                        // flight: that window carries almost no stream through no fault of the
+                        // link, and one such "congestion" verdict ends slow start for the session
+                        // (the 0.29 field log: 401 ms of rebuild cost three minutes at ~15 Mbps).
+                        // Latest-wins — a second gap inside one window is still one window to
+                        // discard, and the newer number is the one worth logging. Floored at 1
+                        // because 0 is the slot's "nothing pending": the ANNOUNCEMENT is what
+                        // arms the discard, so a host that rounds its measurement down to zero
+                        // must not silently disarm it.
+                        //
+                        // info, not debug: this is the forensic trail that separates a host-local
+                        // stall from a link event in a field log, and it is rare by construction.
+                        tracing::info!(
+                            gap_ms = gap.gap_ms,
+                            "host rebuilt its capture/encode pipeline — discarding the report \
+                             window in flight"
+                        );
+                        pipeline_gap.store(gap.gap_ms.max(1), Ordering::Relaxed);
                     } else if let Ok(echo) = ClockEcho::decode(&msg) {
                         match resync.on_echo(&echo, wall_clock_ns()) {
                             ResyncStep::MoreRounds => {

@@ -31,6 +31,10 @@ pub(super) struct DataPump {
     /// Outbound decode-recovery keyframe asks, counted by the control task at its send choke
     /// point; drained per report window as the ABR's recovery signal.
     pub(super) recovery_kf: Arc<AtomicU32>,
+    /// The host announced a capture/encode pipeline rebuild ([`crate::quic::PipelineGap`]): the
+    /// gap's length in ms, `0` = none pending. Drained every iteration — see
+    /// [`take_pipeline_gap`].
+    pub(super) pipeline_gap: Arc<AtomicU32>,
     /// The embedder's REQUESTED rate (0 = Automatic — the only case the ABR arms).
     pub(super) bitrate_kbps: u32,
     /// The rate the host actually configured (echoed in Welcome).
@@ -60,6 +64,7 @@ impl DataPump {
             fec_recovered,
             bitrate_ack,
             recovery_kf: pump_recovery_kf,
+            pipeline_gap: pump_pipeline_gap,
             bitrate_kbps,
             resolved_bitrate_kbps,
             negotiated_codec,
@@ -143,14 +148,22 @@ impl DataPump {
         // in; the embedder path had neither, so an unanswered request wedged the report tick and a
         // finished one left the ABR window anchored before the burst.
         let mut was_probing = false;
-        // Set when a probe ends: the FIRST post-probe report window is discarded outright (no
-        // LossReport, no standing-latency close, no ABR feed). The `last_*` rebase below cannot
-        // fully clean it — probe frames still pending in the reassembler age out as
-        // `frames_dropped` for another LOSS_WINDOW (~120 ms) AFTER the rebase, and the burst may
-        // have latched `flush_in_window` — and either reads as SEVERE congestion. The 2026-07
-        // field report's Automatic session backed off 20→14 Mb/s one second in (exactly one
-        // report tick after its capacity probe) and, with slow start dead from that first
-        // "congestion", crawled additively for the entire match.
+        // The window this closes is discarded outright: no LossReport, no standing-latency close,
+        // no ABR feed. Two causes, both of them "this window's signals describe something other
+        // than the link, and one bogus congestion verdict here ends slow start for good":
+        //
+        //  * a probe just ended. The `last_*` rebase below cannot fully clean the tail — probe
+        //    frames still pending in the reassembler age out as `frames_dropped` for another
+        //    LOSS_WINDOW (~120 ms) AFTER the rebase, and the burst may have latched
+        //    `flush_in_window` — and either reads as SEVERE congestion. The 2026-07 field
+        //    report's Automatic session backed off 20→14 Mb/s one second in (exactly one report
+        //    tick after its capacity probe) and, with slow start dead from that first
+        //    "congestion", crawled additively for the entire match.
+        //  * the HOST announced that it rebuilt its capture ring and encoder in place
+        //    ([`crate::quic::PipelineGap`], drained just below). Nothing flowed while it did, so
+        //    the straddling window carries a fraction of its target with zero loss — the 0.29
+        //    field log's 401 ms exclusive-topology eviction, which cost that session three
+        //    minutes at ~15 Mbps.
         let mut discard_abr_window = false;
         let mut probe_watchdog: Option<Instant> = None;
         let (mut owd_sum_ns, mut owd_frames) = (0i128, 0u32);
@@ -199,6 +212,30 @@ impl DataPump {
                     clock_detector_armed = true;
                     tracing::info!("clock re-sync applied — clock-based jump-to-live re-armed");
                 }
+            }
+            // A host-announced capture/encode rebuild (see `discard_abr_window` above). Drained
+            // here rather than at the report tick so the flag is set before the tick that closes
+            // the window the gap landed in — that is the window whose signals the rebuild
+            // corrupted, and it is the one we can still do something about.
+            //
+            // A rebuild long enough to straddle a window boundary damaged the PREVIOUS window
+            // too, and that one is already decided: it was fed to the controller and its
+            // LossReport is on the wire. Retracting it would mean holding every window back by a
+            // window in case a gap follows, which trades a rare over-reaction for a permanent one.
+            // So the limitation is deliberate: only the window in flight is discarded. The host
+            // sends this the moment the rebuild completes, so the announcement lands inside the
+            // damaged window whenever the rebuild is shorter than a window — the 401 ms field case
+            // against 750 ms windows, and every case observed so far. A rebuild that outlasts a
+            // window still leaks its first one: the controller's two-window confirmation holds the
+            // RATE unless that window also cleared a severe tier, but ANY bad window retires slow
+            // start, so a leak still costs the doubling climb.
+            if let Some(gap_ms) = take_pipeline_gap(&pump_pipeline_gap) {
+                discard_abr_window = true;
+                tracing::debug!(
+                    gap_ms,
+                    window_ms = last_report.elapsed().as_millis() as u64,
+                    "host pipeline gap — the report window in flight is discarded"
+                );
             }
             // Mirror the reassembler's unrecoverable-drop count for the client's keyframe-recovery
             // loop, and (during a speed test) the packet-level receive counters for the throughput
@@ -366,12 +403,15 @@ impl DataPump {
                     window_dropped,
                 );
                 if discard {
-                    // Probe-tail residue (see `discard_abr_window`): a LossReport from this
-                    // window would also spike the host's adaptive FEC off deliberate overload.
+                    // See `discard_abr_window` for the two causes. The LossReport goes with it
+                    // either way: from a probe tail it would spike the host's adaptive FEC off
+                    // deliberate overload, and across a host rebuild `loss_ppm` is computed over a
+                    // window that received almost nothing — a denominator near zero, where one
+                    // aged-out shard reads as several percent (see `window_loss_ppm`'s own tests).
                     tracing::debug!(
                         loss_ppm,
                         window_dropped,
-                        "discarding the first post-probe ABR window (probe-tail residue)"
+                        "discarding this ABR window (probe tail or a host pipeline gap)"
                     );
                 } else {
                     let _ = ctrl_tx.try_send(CtrlRequest::Loss(LossReport { loss_ppm }));
@@ -702,5 +742,208 @@ impl DataPump {
         // `next_frame` with a Closed signal instead of a spurious timeout (the old mpsc did this
         // implicitly when the sender dropped).
         frames.close();
+    }
+}
+
+/// Take the host's pending pipeline gap, if one landed since the last call: `Some(gap_ms)` = the
+/// host finished rebuilding its capture ring and encoder, so the report window in flight must be
+/// discarded. Drains the slot (the control task writes it; `0` = nothing pending), which is what
+/// makes the discard cover exactly ONE window — a rebuild announced once must not go on poisoning
+/// windows that were never near it.
+fn take_pipeline_gap(slot: &AtomicU32) -> Option<u32> {
+    match slot.swap(0, Ordering::Relaxed) {
+        0 => None,
+        gap_ms => Some(gap_ms),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pipeline_gap_is_taken_exactly_once() {
+        let slot = AtomicU32::new(0);
+        assert_eq!(
+            take_pipeline_gap(&slot),
+            None,
+            "an idle session announces nothing"
+        );
+        slot.store(401, Ordering::Relaxed);
+        assert_eq!(take_pipeline_gap(&slot), Some(401));
+        // The drain is what bounds the damage to ONE window: a rebuild announced once must not
+        // keep discarding windows that were nowhere near it (each discarded window is also a
+        // LossReport the host never gets, and its adaptive FEC reads that silence as a clean link).
+        assert_eq!(take_pipeline_gap(&slot), None);
+    }
+
+    /// A client-role session over a loopback that carries nothing — the pump under test is not
+    /// being asked about frames, only about what it does at its report tick.
+    fn idle_client_session() -> (crate::transport::LoopbackTransport, Session) {
+        let (host_tp, client_tp) = crate::transport::loopback_pair(0, 0);
+        let cfg = crate::config::Config {
+            role: crate::config::Role::Client,
+            phase: crate::config::ProtocolPhase::P2Punktfunk,
+            fec: crate::config::FecConfig {
+                scheme: crate::config::FecScheme::Gf16,
+                fec_percent: 25,
+                max_data_per_block: 32,
+            },
+            shard_payload: 1024,
+            max_frame_bytes: 1 << 20,
+            encrypt: false,
+            key: crate::crypto::SessionKey::Aes128Gcm([7u8; 16]),
+            salt: [1, 2, 3, 4],
+            loopback_drop_period: 0,
+        };
+        // The host end is returned rather than dropped so the link stays whole for the pump's
+        // whole run — a half-torn transport is a different test than this one.
+        (host_tp, Session::new(cfg, Box::new(client_tp)).unwrap())
+    }
+
+    /// The client half of the host-rebuild repair, end to end: a real [`PipelineGap`] arrives on a
+    /// real control stream, the real control task parks it, and the real pump throws away the
+    /// report window it landed in.
+    ///
+    /// What the assertions watch is the window's LOSS REPORT, because that is the discarded
+    /// window's only externally visible product on an idle session — the ABR feed it also
+    /// suppresses is the very next branch off the same `discard`, and the controller can't be
+    /// coaxed into a visible verdict without traffic to decide about. The suppression matters in
+    /// its own right too: across a gap the window's `loss_ppm` is computed over a denominator of
+    /// nearly nothing, and reporting that figure would have the host raise FEC against a link that
+    /// never dropped anything.
+    ///
+    /// The second window is asserted too, and is half the point: the discard must cover the window
+    /// the gap landed in and then get out of the way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_host_pipeline_gap_discards_the_report_window_in_flight() {
+        let server = crate::quic::endpoint::server("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = crate::quic::endpoint::client_insecure().unwrap();
+        let accept = tokio::spawn(async move {
+            let incoming = server.accept().await.expect("incoming");
+            (server, incoming.await.expect("host side connects"))
+        });
+        let client_conn = client.connect(addr, "punktfunk").unwrap().await.unwrap();
+        let (_server_ep, host_conn) = accept.await.unwrap();
+        // The host opens the control stream here (in a session the client opens it during the
+        // handshake) purely because this test's host end only ever WRITES: a stream the client
+        // opened would stay invisible to a peer that never sends.
+        let accept_ctrl = tokio::spawn(async move { client_conn.accept_bi().await.unwrap() });
+        let (mut host_send, _host_recv) = host_conn.open_bi().await.unwrap();
+        io::write_msg(&mut host_send, &crate::quic::RequestKeyframe.encode())
+            .await
+            .expect("open the stream with a message the client ignores");
+        let (ctrl_send, ctrl_recv) = accept_ctrl.await.unwrap();
+
+        // The slot the control task writes and the pump drains — the whole subject of the test.
+        let pipeline_gap = Arc::new(AtomicU32::new(0));
+        // The control task's own outbound channel: its sender is held to the end of the test so
+        // the task doesn't exit on a closed request channel mid-run.
+        let (_task_ctrl_tx, task_ctrl_rx) = tokio::sync::mpsc::channel::<CtrlRequest>(8);
+        let (clip_event_tx, _clip_event_rx) = std::sync::mpsc::sync_channel(8);
+        let (cursor_shape_tx, _cursor_shape_rx) = std::sync::mpsc::sync_channel(8);
+        let (access_tx, _access_rx) = std::sync::mpsc::sync_channel(8);
+        tokio::spawn(
+            super::super::control_task::ControlTask {
+                ctrl_rx: task_ctrl_rx,
+                ctrl_send,
+                ctrl_recv: io::MsgReader::new(ctrl_recv),
+                clock_rtt_ns: None, // no connect handshake ⇒ no re-sync batches to interleave
+                mode_slot: Arc::new(Mutex::new(crate::config::Mode {
+                    width: 1920,
+                    height: 1080,
+                    refresh_hz: 60,
+                })),
+                probe: Arc::new(Mutex::new(ProbeState::default())),
+                bitrate_ack: Arc::new(Mutex::new(None)),
+                live_bitrate: Arc::new(AtomicU32::new(0)),
+                recovery_kf: Arc::new(AtomicU32::new(0)),
+                pipeline_gap: pipeline_gap.clone(),
+                clock_offset: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+                clock_gen: Arc::new(AtomicU32::new(0)),
+                clip_event_tx,
+                cursor_shape_tx,
+                mode_gen: Arc::new(AtomicU32::new(0)),
+                access_grants: Arc::new(AtomicU32::new(0)),
+                access_deadline_unix: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                access_tx,
+            }
+            .run(),
+        );
+
+        // The pump. An EXPLICIT bitrate (not Automatic) keeps both the controller and the startup
+        // capacity probe out of this: the probe would fire at 2 s and discard a window of its own,
+        // which is the other cause of the very flag under test.
+        let (pump_ctrl_tx, mut pump_ctrl_rx) = tokio::sync::mpsc::channel::<CtrlRequest>(8);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_host_tp, session) = idle_client_session();
+        let pump = DataPump {
+            session,
+            frames: Arc::new(FrameChannel::new()),
+            ctrl_tx: pump_ctrl_tx,
+            shutdown: shutdown.clone(),
+            probe: Arc::new(Mutex::new(ProbeState::default())),
+            hot_tids: Arc::new(Mutex::new(Vec::new())),
+            clock_offset: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            clock_gen: Arc::new(AtomicU32::new(0)),
+            decode_lat: Arc::new(Mutex::new(DecodeLatAcc::default())),
+            encode_lat: Arc::new(Mutex::new(Default::default())),
+            mode_gen: Arc::new(AtomicU32::new(0)),
+            frames_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fec_recovered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            bitrate_ack: Arc::new(Mutex::new(None)),
+            recovery_kf: Arc::new(AtomicU32::new(0)),
+            pipeline_gap: pipeline_gap.clone(),
+            bitrate_kbps: 20_000,
+            resolved_bitrate_kbps: 20_000,
+            negotiated_codec: crate::quic::CODEC_HEVC,
+            stream_cap_kbps: 100_000,
+        };
+        let started = Instant::now();
+        let pump_thread = std::thread::spawn(move || pump.run());
+
+        // Mid-window, the way a rebuild actually lands: 200 ms into a 750 ms window.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        io::write_msg(
+            &mut host_send,
+            &crate::quic::PipelineGap { gap_ms: 401 }.encode(),
+        )
+        .await
+        .unwrap();
+
+        // Past the first report tick (750 ms), nowhere near the second (1500 ms): the window the
+        // gap landed in must have produced NOTHING. A pump that ignored the gap reports here.
+        tokio::time::sleep_until(
+            tokio::time::Instant::from_std(started) + Duration::from_millis(1_150),
+        )
+        .await;
+        assert!(
+            pump_ctrl_rx.try_recv().is_err(),
+            "the window the host's rebuild landed in must be discarded, not reported"
+        );
+        assert_eq!(
+            pipeline_gap.load(Ordering::Relaxed),
+            0,
+            "and the announcement must be drained, so it can't discard a second window"
+        );
+
+        // The NEXT window is clean and must report normally — the discard is one window wide, and
+        // a pump that had wedged instead of discarding would fail here rather than pass above.
+        let reported = tokio::time::timeout(Duration::from_millis(1_500), pump_ctrl_rx.recv())
+            .await
+            .expect("the window after the gap reports on schedule");
+        assert!(
+            matches!(reported, Some(CtrlRequest::Loss(_))),
+            "the window after the gap must produce a loss report — an idle session's only \
+             outbound request"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(1_400),
+            "and it must be the SECOND window's report, not a late first"
+        );
+
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        pump_thread.join().unwrap();
     }
 }
