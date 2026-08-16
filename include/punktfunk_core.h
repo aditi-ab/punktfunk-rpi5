@@ -3139,6 +3139,29 @@ PunktfunkStatus punktfunk_connection_audio_bits(PunktfunkConnection *c, uint8_t 
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// The resolved audio frame length in MICROSECONDS — how much audio one datagram carries.
+//
+// `PUNKTFUNK_AUDIO_FRAME_MS` is the Opus plane's 5 ms and stays that way, but the lossless plane
+// sizes its frame to the path MTU: 4 ms at 48 kHz/24-bit and 2 ms at 96 kHz/24-bit under the
+// default ceiling. An embedder that ports the de-jitter policy (rather than draining
+// [`punktfunk_connection_next_audio_pcm`] and letting core do it) needs the real figure — the
+// shed drops exactly one frame and the target floor is a device quantum plus one frame, so a
+// policy compiled against 5 ms sheds 2.5 frames at a time on a 96 kHz session.
+//
+// Microseconds rather than milliseconds because the ladder has sub-millisecond rungs; `0` means
+// the host did not state one, in which case `PUNKTFUNK_AUDIO_FRAME_MS × 1000` is correct.
+//
+// **Not derivable from `next_audio_pcm`'s `frame_count`.** That call prepends concealed frames
+// into the same buffer, so its count is "how many samples you got", not "how long one frame is".
+//
+// ADDED, not widened — see [`punktfunk_connection_audio_sample_rate`] for why.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is NULL or writable for one `u16`.
+PunktfunkStatus punktfunk_connection_audio_frame_us(PunktfunkConnection *c, uint16_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // WHY this session ended: `*out` receives a [`PunktfunkEndReason`] byte
 // (`PUNKTFUNK_END_REASON_*`). The return status reports only whether the handle was usable.
 //
