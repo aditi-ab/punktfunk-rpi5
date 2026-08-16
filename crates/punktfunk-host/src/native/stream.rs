@@ -2893,15 +2893,46 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             let rfi_echo = last_rfi.is_some_and(|t| t.elapsed() < RFI_ECHO_WINDOW)
                 && rfi_echo_swallowed < RFI_ECHO_MAX_SWALLOWED;
             if idr_recent {
-                tracing::debug!("keyframe request coalesced — within the IDR cooldown");
+                // Coalesced, and the client is STILL reporting damage — so whatever the in-flight
+                // IDR will repair, it has not repaired yet, and until it lands no reference in the
+                // table can honestly be called known-good to this client. Withdraw anchor trust for
+                // the duration: without it, a frame-index gap arriving inside this window is
+                // answered with an RFI anchor picked over exactly that unrepaired damage, and the
+                // anchor lifts the client's post-loss freeze on its first occurrence — grey frames,
+                // presented, freeze lifted. The cost is bounded to nothing that matters: the IDR
+                // this branch is waiting on rebuilds trust from scratch when it lands (it flushes
+                // the DPB), and prediction never used the wire domain in the first place.
+                enc.distrust_references();
+                tracing::debug!(
+                    "keyframe request coalesced — within the IDR cooldown; RFI anchor trust \
+                     withdrawn until the IDR repairs the client"
+                );
             } else if rfi_echo {
+                // Deliberately NO distrust here, and it is the one branch where that would be
+                // wrong. This branch's whole premise is that the request is the client's ECHO of
+                // the loss the RFI just repaired — the recovery frame is still in flight. Withdraw
+                // trust on the first echo and every successful RFI recovery poisons the table for
+                // the next one, so RFI could never fire twice running and a sustained-loss session
+                // falls straight back to the IDR path this block exists to keep it off. The premise
+                // is a guess, and `RFI_ECHO_MAX_SWALLOWED` is already its hedge: when the client
+                // keeps asking past the budget the guess was wrong, and the `else` arm below both
+                // serves the IDR and withdraws trust then — on evidence rather than on suspicion.
                 rfi_echo_swallowed += 1;
                 tracing::debug!(
                     swallowed = rfi_echo_swallowed,
                     "keyframe request coalesced — echo of an RFI-recovered loss"
                 );
             } else {
-                tracing::debug!("forcing keyframe (client decode recovery)");
+                // Did we get here THROUGH exhausted echo-swallowing? Then this episode's RFI
+                // anchor demonstrably did not heal the client: we presumed its requests were
+                // echoes, swallowed them, and it kept asking anyway. Serving the IDR (below) fixes
+                // this loss; withdrawing trust is what stops the same un-healing reference being
+                // picked as the anchor for the NEXT one. Read before the reset that follows.
+                let rfi_unhealed = rfi_echo_swallowed > 0;
+                tracing::debug!(rfi_unhealed, "forcing keyframe (client decode recovery)");
+                if rfi_unhealed {
+                    enc.distrust_references();
+                }
                 enc.request_keyframe();
                 last_forced_idr = Some(now);
                 rfi_echo_swallowed = 0; // the IDR resets the episode — echoes of IT coalesce via the cooldown

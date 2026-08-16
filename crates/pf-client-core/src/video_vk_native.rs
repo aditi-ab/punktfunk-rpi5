@@ -741,6 +741,12 @@ fn project_frame(frame: &DecodedVkFrame, guard: NativeReleaseGuard) -> NativeVkF
             sei_here: frame.recovery.sei_here,
             is_recovery_point: frame.recovery.is_recovery_point,
         },
+        // Whether this picture's own references decoded cleanly — the corroboration
+        // the shared gate weighs a host `USER_FLAG_RECOVERY_ANCHOR` against. The
+        // planner already knows it (it is the one party that resolved this AU's
+        // reference lists), and it is the only thing that can catch the host
+        // asserting a re-anchor over a picture THIS decoder had to conceal.
+        references_clean: frame.references_clean,
         // Which side of a loss this picture was DECODED on. Carried beside the
         // recovery mark because the mark is worthless without it: a post-failure
         // DPB flush delivers pre-loss pictures after the loss, and their marks
@@ -1690,6 +1696,11 @@ mod tests {
                 sei_here: true,
                 is_recovery_point: true,
             },
+            // SET, per this fixture's no-boolean-is-false rule — and it earns the
+            // rule: a projection that dropped this would default it to `false`,
+            // which reads as "this picture's references were concealed" and would
+            // make the gate refuse EVERY host recovery anchor on a healthy stream.
+            references_clean: true,
             // Distinct from every other number here for the same reason: a
             // projection that dropped the decode ordinal would make every frame
             // look pre-loss (0) and silently disable the local-recovery path.
@@ -1792,6 +1803,7 @@ mod tests {
             keyframe,
             poc,
             recovery,
+            references_clean,
             decode_order,
             guard: _,
         } = p;
@@ -1837,6 +1849,12 @@ mod tests {
             },
             "the recovery point SEI's verdict reaches the gate — it is the ONLY \
              clean point an intra-refresh session has"
+        );
+        assert!(
+            references_clean,
+            "the reference-cleanliness verdict rides along — without it the gate \
+             cannot refute a host recovery anchor that names a picture this decoder \
+             had to conceal, which is the grey-with-motion field report"
         );
         assert_eq!(
             decode_order, 17,
@@ -2150,6 +2168,7 @@ mod tests {
             keyframe: true,
             poc: 0,
             recovery: punktfunk_core::reanchor::LocalRecovery::NONE,
+            references_clean: true,
             decode_order: 1,
             guard: NativeReleaseGuard::new(
                 tx,

@@ -1114,6 +1114,7 @@ impl VkAv1Decoder {
                 is_idr: plan.picture.is_key,
                 recovery: crate::recovery::RecoveryMark::NONE,
                 decode_order,
+                references_clean: plan.picture.references_clean,
             },
         );
 

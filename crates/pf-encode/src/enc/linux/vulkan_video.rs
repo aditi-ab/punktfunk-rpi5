@@ -3991,6 +3991,35 @@ impl Encoder for VulkanVideoEncoder {
         }
     }
 
+    /// Withdraw anchor trust from every resident reference (trait docs carry the why).
+    ///
+    /// The mechanism is this backend's half of the split `enc::rfi` documents: blank `slot_wire`
+    /// ONLY. `slot_poc` MUST keep naming every physically-resident DPB picture — it is what
+    /// [`build_h265_rps_s0`] retains the RPS from, and an RPS that stops naming a resident lets a
+    /// conforming decoder mark it "unused for reference" and reclaim it (8.3.2), so a later anchor
+    /// would reference a picture the client has already dropped. That is its own grey-screen bug,
+    /// documented on `build_h265_rps_s0`, and it is the exact failure this method exists to
+    /// prevent — so getting the two domains the wrong way round here would trade one for the other.
+    /// `slot_wire` is the RFI/loss domain; `slot_poc` is the reference-delta domain.
+    ///
+    /// `pending_loss` is deliberately left armed, matching this backend's decline arm: a stale arm
+    /// is re-resolved at frame-build, where the re-pick now finds nothing trusted and forces the
+    /// IDR that heals the stream. Clearing it here would ship an untagged plain P instead.
+    ///
+    /// Ordinary prediction is untouched — it runs off `prev_slot`, an index, not a wire.
+    fn distrust_references(&mut self) {
+        let trusted = self.slot_wire.iter().filter(|&&w| w >= 0).count();
+        if trusted == 0 {
+            return; // already fully distrusted — nothing to log or clear
+        }
+        self.slot_wire.iter_mut().for_each(|w| *w = -1);
+        tracing::debug!(
+            trusted,
+            "vulkan-encode: client reported unrepaired damage — withdrawing RFI anchor trust from \
+             every resident reference (prediction and the RPS are unaffected)"
+        );
+    }
+
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
         // Backpressure-drained frames (already read, oldest) come out first, then the oldest slot
         // still in flight — both in submission order. BLOCKING, per the depth-1 pump contract

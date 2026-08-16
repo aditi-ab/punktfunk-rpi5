@@ -365,14 +365,10 @@ pub(crate) fn pick_pad_sink(sinks: &[SinkNode], cards: &[CardDevice]) -> Option<
 /// Read a sink node's facts out of a proplist. Split out because it has to run against the
 /// node's INFO props, not the registry's — see [`walk_graph`].
 ///
-/// Linux ONLY, unlike its neighbours in this module. They carry `cfg(any(target_os = "linux",
-/// test))` so their pure-logic halves stay testable on any dev box, but this one takes a
-/// `pipewire::` type in its signature and `pipewire` is a Linux-only dependency — so a bare
-/// `test` arm compiles it in test configuration on EVERY platform and fails to resolve on
-/// Windows. It builds green in release (the fn is not reachable there) and only breaks under
-/// `clippy --all-targets`, which is why it reached main: the Windows client's release build
-/// passes and its clippy lane is the one that goes red. Its sole caller, [`walk_graph`], is
-/// already Linux-only, and no test calls it.
+/// Linux-only, unlike its pure-logic neighbours: `DictRef` comes from `pipewire`, which is a
+/// `cfg(target_os = "linux")` dependency. Widening this to `any(…, test)` the way the testable
+/// helpers around it do puts the item into the Windows `lib test` target, where the crate does
+/// not exist — E0433, visible only under `--all-targets`, and so only on the Windows CI leg.
 #[cfg(target_os = "linux")]
 pub(crate) fn sink_from_props(props: &pipewire::spa::utils::dict::DictRef) -> Option<SinkNode> {
     // Both spellings: PipeWire's own objects use the `device.`-prefixed keys, the pulse-facing

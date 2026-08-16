@@ -228,6 +228,37 @@ fn initials(title: &str) -> String {
         .collect()
 }
 
+/// The tile overflow's only entry today — the per-GAME half of the pairing the host tiles
+/// already offer (design/client-deep-links.md §5 names the library game context menu as an
+/// attach point for exactly this).
+const MENU_COPY_LINK: &str = "Copy link";
+
+/// One title's self-emitted `punktfunk://` link: this page's host with the game's own
+/// `launch=` id attached, so the URL boots straight into that title rather than the desktop.
+/// Built from the STORE — the stable id and the fingerprint live there, not on the target —
+/// which is what makes a link taken here identical to one taken off the host tile.
+///
+/// A library opened from a "Connect with" one-off carries that profile into the link, so a
+/// copied URL streams the way the shelf it came from does. `None` only when the host has
+/// left the store while the page was open.
+fn game_link(target: &super::Target, game_id: &str) -> Option<String> {
+    let known = crate::trust::KnownHosts::load();
+    let host = target
+        .fp_hex
+        .as_deref()
+        .filter(|fp| !fp.is_empty())
+        .and_then(|fp| known.find_by_fp(fp))
+        .or_else(|| known.find_by_addr(&target.addr, target.port))?;
+    Some(
+        pf_client_core::deeplink::DeepLink::for_host(
+            host,
+            Some(game_id),
+            target.profile.as_deref().filter(|p| !p.is_empty()),
+        )
+        .to_url(),
+    )
+}
+
 /// A small group label above a tile grid ("Launchers" / "Games"). Only drawn when the page shows
 /// both groups — a single unlabelled grid is what every launcher-less library looked like before.
 fn group_heading(text: &str) -> Element {
@@ -246,6 +277,7 @@ fn poster_tile(
     art_uri: Option<&str>,
     poster_h: f64,
     on_tap: Box<dyn Fn()>,
+    on_copy_link: Box<dyn Fn()>,
 ) -> Element {
     let poster: Element = match art_uri {
         Some(uri) => Image::new_with_uri(uri)
@@ -311,7 +343,7 @@ fn poster_tile(
     })
     .border_thickness(uniform(1.0));
 
-    border(
+    let tappable = border(
         vstack((
             framed,
             text_block(&game.title)
@@ -322,7 +354,33 @@ fn poster_tile(
         .spacing(0.0),
     )
     .background(hit_test_backstop())
-    .on_tapped(on_tap)
+    .on_tapped(on_tap);
+
+    // This entry's own actions, opposite the store badge. A button rather than a right-click
+    // context flyout because the reactor hangs `menu_flyout` off buttons only — and a menu a
+    // mouse user cannot see is one they never find.
+    //
+    // A SIBLING of the tappable area, not a child of it: `host_tile` on the hosts page splits
+    // the two exactly this way, and that split is what keeps a click on the overflow from also
+    // launching the title underneath it.
+    grid(vec![
+        tappable.into(),
+        button("")
+            .icon(Symbol::More)
+            .subtle()
+            .tooltip("More options")
+            .automation_name(format!("More options for {}", game.title))
+            .menu_flyout(vec![menu_item(MENU_COPY_LINK)])
+            .on_item_clicked(move |item: String| {
+                if item == MENU_COPY_LINK {
+                    on_copy_link();
+                }
+            })
+            .horizontal_alignment(HorizontalAlignment::Right)
+            .vertical_alignment(VerticalAlignment::Top)
+            .margin(edges(0.0, 4.0, 4.0, 0.0))
+            .into(),
+    ])
     .into()
 }
 
@@ -394,11 +452,19 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
             let tile = |g: &Game| -> Element {
                 let (ctx2, ss, st) = (ctx.clone(), ss.clone(), st.clone());
                 let (target, id) = (target.clone(), g.id.clone());
+                let (link_target, link_id) = (target.clone(), id.clone());
                 poster_tile(
                     g,
                     props.state.art.get(&g.id).map(String::as_str),
                     poster_h,
                     Box::new(move || initiate_launch(&ctx2, target.clone(), id.clone(), &ss, &st)),
+                    // Silent on success, exactly like the host tile's "Copy link" on the
+                    // hosts page — this shell has no toast, and the two must not disagree
+                    // about what copying a link looks like.
+                    Box::new(move || match game_link(&link_target, &link_id) {
+                        Some(url) => pf_client_core::clipboard::set_text(&url),
+                        None => tracing::warn!(id = %link_id, "no saved host to build a link from"),
+                    }),
                 )
             };
             // Design D4: launcher entries get their own shelf above the titles, never

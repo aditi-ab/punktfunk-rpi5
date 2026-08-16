@@ -61,6 +61,13 @@ const CSS: &str = "
 .pf-poster { border-radius: 10px; background: alpha(currentColor, 0.08); }
 .pf-poster-monogram { font-size: 2.4em; font-weight: bold; color: alpha(currentColor, 0.45); }
 .pf-store-badge { color: white; background: rgba(0, 0, 0, 0.55); }
+/* The poster's own overflow menu button. It sits ON artwork, so it needs the badge's dark
+   scrim to read at all — a flat button inherits the page's foreground and vanishes into a
+   pale cover. Small and round so it balances the store badge opposite it rather than
+   competing with the art. (No quotes in here — see the top of this string.) */
+.pf-poster-menu { color: white; background: rgba(0, 0, 0, 0.55); border-radius: 999px;
+                  min-width: 24px; min-height: 24px; padding: 0; margin: 6px; }
+.pf-poster-menu:hover { background: rgba(0, 0, 0, 0.75); }
 /* Launcher entries (design D4) open the launcher itself. They rarely have poster art, so an
    art-less one must not read as a game whose cover failed to load: accent face, the launcher
    named instead of a title monogram, and an accent badge. */

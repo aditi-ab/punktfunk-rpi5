@@ -165,6 +165,9 @@ struct LibraryView: View {
                 LibraryCoverflowView(
                     games: games, artLoader: artLoader, onLaunch: onLaunch,
                     onDismiss: { (onClose ?? { dismiss() })() },
+                    // Nil where there is nothing to copy into (tvOS), which is what drops the
+                    // hint from the legend rather than leaving a button that does nothing.
+                    onCopyLink: LinkClipboard.isAvailable ? { copyLink($0) } : nil,
                     controllerActive: controllerActive)
             } else {
                 grid
@@ -270,18 +273,42 @@ struct LibraryView: View {
     private func tiles(_ entries: [GameEntry]) -> some View {
         LazyVGrid(columns: columns, spacing: 18) {
             ForEach(entries) { game in
-                if let onLaunch {
-                    Button { onLaunch(game.id) } label: {
+                Group {
+                    if let onLaunch {
+                        Button { onLaunch(game.id) } label: {
+                            GameCard(game: game, artLoader: artLoader, selected: isKeyCursor(game))
+                        }
+                        .buttonStyle(.plain)
+                    } else {
                         GameCard(game: game, artLoader: artLoader, selected: isKeyCursor(game))
                     }
-                    .buttonStyle(.plain)
-                    .id(game.id)
-                } else {
-                    GameCard(game: game, artLoader: artLoader, selected: isKeyCursor(game))
-                        .id(game.id)
                 }
+                .id(game.id)
+                // Right-click / long-press a poster for that TITLE's own actions — the same
+                // gesture a host card answers to, one level down. `.contextMenu` doesn't exist
+                // on tvOS, which is also the one platform with no clipboard to copy into.
+                #if !os(tvOS)
+                .contextMenu {
+                    if LinkClipboard.isAvailable {
+                        Button("Copy Link") { copyLink(game) }
+                    }
+                }
+                #endif
             }
         }
+    }
+
+    /// Put this title's self-emitted `punktfunk://` link on the clipboard: the shelf's host,
+    /// the pinned card's profile when a pin opened it, and the game's own `launch=` id — so
+    /// the URL boots straight into the title, the way a host card's link opens the desktop
+    /// (design/client-deep-links.md §5).
+    ///
+    /// Addressed to the STORE's current record rather than the one the shelf was opened with,
+    /// so a host re-addressed while browsing hands out the address it actually has now.
+    private func copyLink(_ game: GameEntry) {
+        let current = store.hosts.first { $0.id == host.id } ?? host
+        LinkClipboard.copy(
+            DeepLink.forHost(current, launch: game.id, profile: target.pinnedProfileID).urlString)
     }
 
     /// Whether the keyboard cursor is on this tile (always false where there is no keyboard

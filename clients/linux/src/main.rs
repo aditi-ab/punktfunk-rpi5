@@ -22,6 +22,9 @@ mod cli;
 mod shortcuts;
 #[cfg(target_os = "linux")]
 mod spawn;
+// The guarded FlowBox `child-activated → activate` bridge every card grid needs.
+#[cfg(target_os = "linux")]
+mod ui_flow;
 #[cfg(target_os = "linux")]
 mod ui_hosts;
 #[cfg(target_os = "linux")]

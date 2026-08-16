@@ -277,6 +277,19 @@ pub struct PicturePlan {
     /// Colour signalling, per picture and never latched — the same rule the other two
     /// planners follow, because a host can switch an HDR desktop to PQ/BT.2020 in band.
     pub colour: ColourDescription,
+    /// Every picture this frame predicts from was itself decoded from a fully-available
+    /// reference chain — so a host claim that this frame is a clean re-anchor
+    /// (`USER_FLAG_RECOVERY_ANCHOR`) can be corroborated rather than taken on trust.
+    /// `true` for a key or intra-only frame (nothing to predict from) and for any
+    /// frame whose whole reference chain is clean; `false` from the moment this frame
+    /// — or anything it descends from — needed concealment.
+    ///
+    /// On a `show_existing_frame` this describes the picture being DISPLAYED, which is
+    /// the only thing such a frame puts on the screen: it decodes nothing of its own.
+    ///
+    /// Purely additive observation. See [`crate::clean`] for why it propagates and why
+    /// every rule errs toward `false`.
+    pub references_clean: bool,
 }
 
 /// One planned access unit.
@@ -329,6 +342,35 @@ pub enum PlanWarning {
     TruncatedAu { offset: usize },
 }
 
+impl PlanWarning {
+    /// Does this warning mean the PICTURE is damaged? The AV1 twin of
+    /// [`crate::h264::PlanWarning::is_integrity`], and
+    /// `pf_vkdecode::is_integrity_warning_av1` delegates here.
+    ///
+    /// Every variant AV1 has IS damage, and that is a fact about the codec rather than
+    /// an oversight: AV1 puts nothing in this channel resembling h265's
+    /// `NonZeroReorder` or h264's `Mmco5Rebase`. It has no reorder envelope to report
+    /// (no bumping process, no `max_num_reorder_pics`) and no MMCO to rebase — the
+    /// frame header states the whole reference update outright — so the only things
+    /// left to warn about are pictures that went missing and an OBU walk that stopped
+    /// early.
+    ///
+    /// `MissingShowExisting` is the one that could be argued, and it is damage: a
+    /// `show_existing_frame` naming an empty slot means the picture the STREAM chose
+    /// to display was lost upstream. Nothing is displayed for that frame, so the
+    /// screen keeps the previous one — exactly the "silently stale picture" state a
+    /// re-anchor exists to end.
+    ///
+    /// Exhaustive with no wildcard, for the reason the H.264 twin spells out.
+    pub fn is_integrity(&self) -> bool {
+        match self {
+            PlanWarning::MissingReference { .. }
+            | PlanWarning::MissingShowExisting { .. }
+            | PlanWarning::TruncatedAu { .. } => true,
+        }
+    }
+}
+
 /// Why an access unit cannot be planned at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
@@ -366,6 +408,10 @@ pub struct Av1Planner {
     slots: [Option<RefPic>; NUM_REF_SLOTS],
     next_id: PicId,
     sequence: Option<Rc<SequenceHeaderObu>>,
+    /// Which resident pictures came off a BROKEN reference chain — the fact behind
+    /// [`PicturePlan::references_clean`]. Empty on a healthy stream; see
+    /// [`crate::clean::CleanLedger`] for the propagation rules.
+    clean: crate::clean::CleanLedger,
 }
 
 impl Default for Av1Planner {
@@ -381,6 +427,7 @@ impl Av1Planner {
             slots: [None; NUM_REF_SLOTS],
             next_id: 1,
             sequence: None,
+            clean: Default::default(),
         }
     }
 
@@ -549,7 +596,22 @@ impl Av1Planner {
             } else {
                 Vec::new()
             };
-            let picture = picture_plan(&header, &sequence);
+            // A `show_existing_frame` decodes nothing, so the only picture it puts on
+            // the screen is the one it displays: report THAT picture's cleanliness. A
+            // slot that held nothing already warned above and shows nothing at all,
+            // which is damage in its own right — reporting it unclean keeps the two
+            // statements consistent.
+            let references_clean = match shown {
+                Some(pic) => self.clean.references_clean([pic.id]),
+                None => false,
+            };
+            let picture = picture_plan(&header, &sequence, references_clean);
+            // A key-frame `show_existing_frame` rewrote every slot with the shown
+            // picture (7.20), so the ledger has to follow that aliasing: the refreshed
+            // slots all hold `pic.id`, whose mark already stands. Nothing new is
+            // stored, so there is no verdict to fold — only residency to re-bound.
+            self.clean
+                .retain_live(self.slots.iter().flatten().map(|p| p.id));
             return Ok(AuPlan {
                 picture,
                 tiles,
@@ -597,12 +659,34 @@ impl Av1Planner {
         }
         let removed = self.refresh_slots(header.refresh_frame_flags, id, RefState::of(&header));
 
-        let picture = picture_plan(&header, &sequence);
+        // Was every picture this frame predicts from decoded off an intact chain?
+        // Over the resolved names only: a `None` hole is a lost reference, which has
+        // already pushed `MissingReference` and therefore condemns this frame through
+        // `concealed` below. A key or intra-only frame names nothing, so this is
+        // vacuously true for it (`CleanLedger::references_clean`).
+        let references_clean = self
+            .clean
+            .references_clean(refs.iter().flatten().map(|r| r.id));
+
+        let picture = picture_plan(&header, &sequence, references_clean);
         let outputs = if header.show_frame {
             vec![id]
         } else {
             Vec::new()
         };
+        // Fold this frame's verdict, then bound the ledger to slot residency. After
+        // `refresh_slots`, so the live set reflects the writes this frame performed.
+        // `concealed` mirrors what a consumer conceals on, via the ONE classification
+        // (`PlanWarning::is_integrity`), so the ledger and the consumer can never
+        // disagree about whether this frame was damaged.
+        self.clean.note_stored(
+            id,
+            references_clean,
+            warnings.iter().any(PlanWarning::is_integrity),
+        );
+        self.clean
+            .retain_live(self.slots.iter().flatten().map(|p| p.id));
+
         Ok(AuPlan {
             picture,
             tiles,
@@ -655,7 +739,11 @@ impl Av1Planner {
     }
 }
 
-fn picture_plan(header: &FrameHeaderObu, sequence: &SequenceHeaderObu) -> PicturePlan {
+fn picture_plan(
+    header: &FrameHeaderObu,
+    sequence: &SequenceHeaderObu,
+    references_clean: bool,
+) -> PicturePlan {
     let color = &sequence.color_config;
     let bit_depth = if color.high_bitdepth {
         if color.twelve_bit {
@@ -698,6 +786,7 @@ fn picture_plan(header: &FrameHeaderObu, sequence: &SequenceHeaderObu) -> Pictur
             matrix_coefficients: color.matrix_coefficients as u8,
             video_full_range: color.color_range,
         },
+        references_clean,
     }
 }
 #[cfg(test)]

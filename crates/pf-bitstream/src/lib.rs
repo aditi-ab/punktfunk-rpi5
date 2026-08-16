@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod av1;
+pub mod clean;
 pub mod h264;
 pub mod h265;
 pub mod sei;

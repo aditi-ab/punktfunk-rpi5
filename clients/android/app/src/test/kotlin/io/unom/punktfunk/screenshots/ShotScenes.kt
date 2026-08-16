@@ -26,10 +26,13 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.BatteryFull
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SignalCellular4Bar
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -67,6 +70,7 @@ import io.unom.punktfunk.ConsoleLegendInset
 import io.unom.punktfunk.ConsoleLicensesScreen
 import io.unom.punktfunk.ControllersScreen
 import io.unom.punktfunk.Coverflow
+import io.unom.punktfunk.TouchGrid
 import io.unom.punktfunk.GamepadAuroraBackground
 import io.unom.punktfunk.GamepadHintBar
 import io.unom.punktfunk.PadGlyph
@@ -701,6 +705,39 @@ internal fun LibraryScene(paletteId: String = "violet") = ConsolePalette(palette
                 listOf(PadGlyph.hint('A', "Launch"), PadGlyph.hint('B', "Close")),
                 hazeState = hazeState,
             )
+        }
+    }
+}
+
+/**
+ * The TOUCH library — the poster grid a finger reaches through a host card's "Browse library…",
+ * with the same mock shelf the coverflow scene uses. Same construction as [LibraryScene]: the real
+ * [TouchGrid] under a rebuilt header, because the screen around it takes its state off the network.
+ */
+@Composable
+internal fun TouchLibraryScene() {
+    val context = LocalContext.current
+    val loader = remember { shotLibraryLoader(context) }
+    val games = remember { shotGames() }
+    Surface(color = MaterialTheme.colorScheme.background) {
+        Column(Modifier.fillMaxSize()) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 8.dp),
+            ) {
+                IconButton(onClick = {}) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                }
+                Text(
+                    "Living Room PC — Library",
+                    style = MaterialTheme.typography.titleLarge,
+                    modifier = Modifier.weight(1f),
+                )
+                IconButton(onClick = {}) {
+                    Icon(Icons.Filled.Refresh, contentDescription = "Reload")
+                }
+            }
+            TouchGrid(games, loader, onLaunch = {}, onCopyLink = {}, modifier = Modifier.weight(1f))
         }
     }
 }

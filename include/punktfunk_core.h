@@ -4163,6 +4163,15 @@ void punktfunk_reanchor_gate_arm_expecting_drops(ReanchorGate *g, uint64_t expec
 // `USER_FLAG_RECOVERY_POINT`. Pass `decoder_keyframe = false` where the platform decoder doesn't flag
 // IDRs (VideoToolbox/MediaCodec) — the wire `FLAG_SOF` covers it.
 //
+// This is the uncorroborated entry point and deliberately stays that way. Rust embedders whose
+// decoder parses the bitstream call [`ReanchorGate::on_decoded_corroborated`] to let their own
+// parser refute a `USER_FLAG_RECOVERY_ANCHOR` that names a picture they had to conceal; every
+// client reachable through THIS surface (Apple VideoToolbox, Android MediaCodec) uses a platform
+// decoder that surfaces no such fact, so it would have nothing to pass but
+// `AnchorEvidence::Unavailable` — which is exactly what this wrapper already means. Growing a
+// second export for a corroboration no C caller can supply would spend an ABI version bump on
+// dead surface.
+//
 // # Safety
 // `g` is a valid gate handle; `out_present` is writable or NULL.
 PunktfunkStatus punktfunk_reanchor_gate_on_decoded(ReanchorGate *g,

@@ -274,6 +274,14 @@ impl Encoder for TrackedEncoder {
     fn invalidate_ref_frames(&mut self, first_frame: i64, last_frame: i64) -> bool {
         self.inner.invalidate_ref_frames(first_frame, last_frame)
     }
+    // Same trap class as `set_wire_chunking`, and the one where it would hurt most: unforwarded,
+    // the default no-op would leave every session serving RFI anchors over damage the client
+    // reported and the host never repaired — the failure this method exists to close, silently
+    // reintroduced by the wrapper. (The `every_encoder_method_is_forwarded` guard below catches
+    // it, which is exactly why that guard is there.)
+    fn distrust_references(&mut self) {
+        self.inner.distrust_references()
+    }
     // Forwarded for the same reason as `set_wire_chunking` below — the unforwarded default
     // (`false` = "backend can't pipeline, stop asking") silently killed the §7 LN3 contention
     // escalation for every session, since the host loop only ever holds the wrapped box.

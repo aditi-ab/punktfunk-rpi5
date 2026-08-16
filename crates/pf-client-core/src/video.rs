@@ -493,6 +493,17 @@ pub struct NativeVkFrame {
     /// the host, and it cannot be lost separately from the picture. Fed to
     /// [`ReanchorGate::on_local_recovery`](punktfunk_core::reanchor::ReanchorGate::on_local_recovery).
     pub recovery: punktfunk_core::reanchor::LocalRecovery,
+    /// Every picture this AU predicts from was itself decoded from a fully-available
+    /// reference chain (pf-vkdecode's `DecodedVkFrame::references_clean`).
+    ///
+    /// The corroboration for the host's `USER_FLAG_RECOVERY_ANCHOR`, which is a claim
+    /// about THIS decoder that only this decoder can check. The host derives its
+    /// anchor from slot bookkeeping that tracks what the client RECEIVED; this tracks
+    /// what the client managed to DECODE. When they disagree the anchor lifts the
+    /// post-loss freeze onto a concealed picture and leaves it lifted, which is the
+    /// grey-with-motion field report. `true` on every ordinary frame of a healthy
+    /// stream, so the flag is only ever load-bearing on the AU that carries an anchor.
+    pub references_clean: bool,
     /// This picture's position in DECODE order (pf-vkdecode's strictly increasing
     /// per-session ordinal). Delivery order is not decode order: after a failed AU
     /// the H.265 decoder flushes its DPB, handing back every buffered picture at
@@ -556,6 +567,40 @@ impl DecodedImage {
             DecodedImage::NativeVk(f) => f.recovery,
             DecodedImage::Cpu(f) => f.recovery,
             _ => punktfunk_core::reanchor::LocalRecovery::NONE,
+        }
+    }
+
+    /// What this lane can say about the host's re-anchor claim on this frame — the
+    /// corroboration for `USER_FLAG_RECOVERY_ANCHOR`, fed to
+    /// [`ReanchorGate::on_decoded_corroborated`](punktfunk_core::reanchor::ReanchorGate::on_decoded_corroborated).
+    ///
+    /// An anchor is the host asserting a fact about THIS decoder — *the picture I
+    /// coded this P-frame against is one you still hold, intact* — and the gate lifts
+    /// its post-loss freeze on the first one, no two-mark wait. Only a rung that
+    /// planned the AU itself knows which pictures it predicts from and whether each of
+    /// those decoded cleanly, so only such a rung can catch the host being wrong.
+    ///
+    /// The native Vulkan rung answers; everyone else reports
+    /// [`AnchorEvidence::Unavailable`](punktfunk_core::reanchor::AnchorEvidence::Unavailable)
+    /// and the gate treats them exactly as it did before this existed — silence is not
+    /// refutation, so no lane becomes stricter by accident.
+    ///
+    /// ⚠ The CPU rung's H.264 leg plans every AU with the same `H264Planner` and so
+    /// COULD answer; it does not yet, because its frame type carries no equivalent of
+    /// [`NativeVkFrame::references_clean`]. Reporting `Unavailable` there is the
+    /// conservative reading (today's behaviour), not a claim that its references are
+    /// fine.
+    pub fn anchor_evidence(&self) -> punktfunk_core::reanchor::AnchorEvidence {
+        use punktfunk_core::reanchor::AnchorEvidence;
+        match self {
+            DecodedImage::NativeVk(f) => {
+                if f.references_clean {
+                    AnchorEvidence::ReferencesClean
+                } else {
+                    AnchorEvidence::ReferencesDamaged
+                }
+            }
+            _ => AnchorEvidence::Unavailable,
         }
     }
 

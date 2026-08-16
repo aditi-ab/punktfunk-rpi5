@@ -368,6 +368,32 @@ pub trait Encoder: Send {
     fn invalidate_ref_frames(&mut self, _first_frame: i64, _last_frame: i64) -> bool {
         false
     }
+    /// Mark every resident reference UNTRUSTED FOR RFI ANCHORING — the answer to "the client told
+    /// us it has damage and we did NOT repair it".
+    ///
+    /// Why this exists at all. The slot-family RFI trust domain is the WIRE index each reference
+    /// holds, which answers *did the client receive this frame*; what an anchor pick actually needs
+    /// is *did the client DECODE it intact*. [`super::rfi`]'s taint sweep bridges that gap, but it
+    /// only runs inside [`invalidate_ref_frames`] — reachable from exactly ONE of the client's five
+    /// damage signals (the frame-index gap, which carries a loss RANGE). The other four report
+    /// through [`request_keyframe`](Self::request_keyframe), which carries no range and so cannot
+    /// sweep anything. That is self-healing while the IDR is actually emitted — an IDR flushes the
+    /// DPB and rebuilds trust from scratch — but the host coalesces those requests (a keyframe
+    /// storm is a 20-40× spike that deepens the very loss it recovers), and a coalesced request
+    /// leaves the client's damage unrepaired AND unrecorded. Those references stay anchor
+    /// candidates, and the next loss is answered with one of them tagged `recovery_anchor` — the
+    /// client's *definitive* clean re-anchor signal, which lifts its post-loss freeze on the first
+    /// occurrence. Grey frames, presented, with the freeze lifted.
+    ///
+    /// Distrust is deliberately NOT "unusable": ordinary prediction runs off the backend's own slot
+    /// INDEX, never the wire domain, so this costs nothing but the next anchor pick — which
+    /// declines and falls through to the (still coalesced, so still non-storming) keyframe path.
+    /// It is also self-correcting on all three backends: a slot re-marked with a fresh frame, or an
+    /// IDR flushing the DPB, restores trust within a few frames. So this can suppress RFI briefly,
+    /// never permanently.
+    ///
+    /// Default: no-op — the backends with no reference bookkeeping have no trust to withdraw.
+    fn distrust_references(&mut self) {}
     /// Escalate into a pipelined (two-thread) retrieve mode under sustained GPU contention — the
     /// encoder analog of the capturer depth escalation: AUs ride ~one loop tick behind (`poll`
     /// may return `None` while an encode is in flight) in exchange for capture/submit no longer

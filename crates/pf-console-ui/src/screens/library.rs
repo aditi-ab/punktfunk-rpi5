@@ -75,6 +75,18 @@ impl LibraryScreen {
         }
     }
 
+    /// One title's self-emitted link: this shelf's host, this shelf's pinned profile (so a
+    /// link taken off a pinned card's shelf streams the way that card does), and the game.
+    fn game_link(&self, id: &str) -> Option<String> {
+        crate::screens::saved_host_link(
+            &self.fp_hex,
+            &self.addr,
+            self.port,
+            self.pin.as_ref().map(|p| p.id.as_str()),
+            Some(id),
+        )
+    }
+
     fn fetch_cmd(&self) -> ConsoleCmd {
         ConsoleCmd::FetchLibrary {
             addr: self.addr.clone(),
@@ -149,11 +161,29 @@ impl LibraryScreen {
                     });
                     Some(MenuPulse::Confirm)
                 }
+                // X copies the focused title's own `punktfunk://` link — the same
+                // self-emitted URL a host tile's "Copy link" hands out, plus this game's
+                // `launch=` id, so pasting it into Playnite or a Stream Deck macro boots
+                // straight into the title. Direct rather than behind an options screen:
+                // it is the only per-game action there is, and a menu holding one row is
+                // a press the user pays for nothing.
+                MenuEvent::Tertiary => {
+                    let g = self.games.get(self.cursor as usize)?;
+                    match self.game_link(&g.id) {
+                        Some(url) => {
+                            fx.copy = Some(url);
+                            fx.toast = Some("Link copied".into());
+                        }
+                        // Only if the host left the store while the shelf was open.
+                        None => fx.toast = Some("This host isn't saved any more".into()),
+                    }
+                    Some(MenuPulse::Confirm)
+                }
                 MenuEvent::Back => {
                     fx.pop();
                     None
                 }
-                MenuEvent::Move(_) | MenuEvent::Secondary | MenuEvent::Tertiary => None,
+                MenuEvent::Move(_) | MenuEvent::Secondary => None,
             },
             LibraryPhase::Error { can_retry, .. } => match ev {
                 MenuEvent::Confirm if *can_retry => {
@@ -254,6 +284,7 @@ impl LibraryScreen {
                         "Play"
                     },
                 ),
+                Hint::new(HintKey::Tertiary, "Copy link"),
                 Hint::new(HintKey::Shoulders, "Jump"),
                 Hint::new(HintKey::Back, "Back"),
             ],
