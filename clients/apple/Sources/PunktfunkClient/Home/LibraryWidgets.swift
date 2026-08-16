@@ -63,9 +63,10 @@ private extension Image {
 /// Sequentially tries cover-art URLs over `loader` (so a paired client can reach the host's own
 /// art proxy, not just public CDNs — see `LibraryArtLoader`), advancing past any that fail to
 /// load, then a placeholder. The loaded image is hard-clipped to fill the card's actual frame
-/// regardless of its own aspect ratio: a portrait capsule fills it as intended, but a fallback
-/// banner (wide hero/header art, used when a title has no portrait capsule) would otherwise report
-/// a much wider intrinsic size than the card and overflow into neighboring cards. Not `private` —
+/// regardless of its own aspect ratio: a portrait capsule fills it as intended, and a fallback
+/// banner (wide hero/header art, used when a title has no portrait capsule) is cropped to the same
+/// tile rather than allowed to size it — see the `Color.clear` in `body` for why that takes more
+/// than a `.frame(maxWidth:)` and a `.clipped()`. Not `private` —
 /// the gamepad coverflow (`LibraryCoverflowView`) reuses it directly rather than re-fetching art.
 struct PosterImage: View {
     let candidates: [URL]
@@ -84,9 +85,20 @@ struct PosterImage: View {
     var body: some View {
         Group {
             if let image {
-                Image(platformImage: image)
-                    .resizable()
-                    .scaledToFill()
+                // `Color.clear` is what takes the proposed size; the art rides along as its
+                // overlay, where it can be DRAWN but never MEASURED. Handing the image the sizing
+                // role instead is what let a fallback banner escape the tile: `scaledToFill`
+                // reports a size that covers the proposal, and the flexible frame below clamps it
+                // to `.infinity` — i.e. not at all. Measured offscreen, a 460×215 `header.jpg` in a
+                // 170pt grid column resolved the tile to 545×255 and overran its neighbours, while
+                // a 300×450 cover in the same chain came out correct — which is why this only ever
+                // showed on the titles whose cover was missing.
+                Color.clear
+                    .overlay {
+                        Image(platformImage: image)
+                            .resizable()
+                            .scaledToFill()
+                    }
                     .transition(.opacity)
             } else if index < candidates.count {
                 ZStack { placeholder; ProgressView() }
