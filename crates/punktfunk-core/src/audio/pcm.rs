@@ -389,8 +389,8 @@ mod tests {
     /// the encoder sees it, and that is the entire reason this second plane exists. So the plane
     /// has to be shown to carry one.
     ///
-    /// This is the SOFTWARE half of `design/hi-res-audio.md` §13.2. The full check is "play a
-    /// >24 kHz tone on the host and confirm it arrives", and its other half — that the host's
+    /// This is the SOFTWARE half of `design/hi-res-audio.md` §13.2. The full check is "play an
+    /// ultrasonic tone on the host and confirm it arrives", and its other half — that the host's
     /// CAPTURE did not silently resample on the way in — cannot be tested here, because that is
     /// WASAPI autoconvert and PipeWire's resampler, which need a host and an interface. What this
     /// proves is the part that is ours: once a 30 kHz tone is in the pipeline, the `0xD3` payload
