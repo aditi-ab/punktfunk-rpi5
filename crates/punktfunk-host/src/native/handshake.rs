@@ -834,6 +834,23 @@ pub(super) async fn negotiate(
     // wire/sequencing changes well beyond this pass; neither is needed for 48 kHz, where the
     // conservative answer already lands on the longest rung.
     let hires_asked = hello.client_caps & punktfunk_core::quic::CLIENT_CAP_AUDIO_HIRES != 0;
+    // A `Hello` that names a format but does not set the capability is CONTRADICTORY, and the two
+    // halves come from different places in a client — the capability from a settings toggle, the
+    // rate and depth from whatever that toggle resolved to. Condition 1 below is deliberately not
+    // logged, because "no capability" is every ordinary session with every shipping client and
+    // would drown the log. This case is not ordinary: something asked, and is being ignored.
+    //
+    // Worth the line because it is the exact shape that cost an on-glass session its first run —
+    // the host resolved Opus while every visible condition looked satisfiable, and the reason was
+    // unlogged by design. An embedder hitting this sees nothing at all otherwise.
+    if !hires_asked && (hello.audio_rate_hz != 0 || hello.audio_bits != 0) {
+        tracing::warn!(
+            requested_rate_hz = hello.audio_rate_hz,
+            requested_bits = hello.audio_bits,
+            "client sent an audio format but not CLIENT_CAP_AUDIO_HIRES — ignoring it and \
+             staying on Opus; the capability and the format must be set together"
+        );
+    }
     let hires_allowed = pf_host_config::config().audio_hires.unwrap_or(false);
     // §8.4 condition 4 — what the capture path can HONESTLY deliver, asked of the device rather
     // than inferred from a successful open (§4.3/§4.4: both backends resample a rate they cannot
