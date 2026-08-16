@@ -590,24 +590,34 @@ async fn session(args: Args) -> Result<()> {
             // it would just strip the pointer from the dumped bitstream. `--cursor-capture`
             // advertises it deliberately and then flips the channel to the capture model, so the
             // HOST composites and the dump is where the pointer must appear.
-            client_caps: if args.cursor_capture {
-                punktfunk_core::quic::CLIENT_CAP_CURSOR
-            } else {
-                0
+            client_caps: {
+                let mut c = if args.cursor_capture {
+                    punktfunk_core::quic::CLIENT_CAP_CURSOR
+                } else {
+                    0
+                };
+                // ⚠ This `Hello` is built BY HAND, so it never passes through
+                // `client::advertised_client_caps` — the helper that derives this bit from the
+                // requested format for the shipping clients. The rate and depth below are
+                // therefore inert on their own: the host's gate checks the CAPABILITY first, so a
+                // format without this bit is a request the host is right to ignore. Set both, or
+                // neither.
+                if args.audio_format.is_some() {
+                    c |= punktfunk_core::quic::CLIENT_CAP_AUDIO_HIRES;
+                }
+                c
             },
             // Like STREAMED_AU above: the shared-core reassembler pins geometry per-frame, so
             // the probe accepts a mid-session shard change (and jumbo growth) up to the
             // receive ceiling — and it's exactly the tool to measure both.
             max_shard_payload: punktfunk_core::config::max_shard_payload() as u16,
-            // `0`/`0` is UNSPECIFIED, and that distinction is load-bearing rather than cosmetic:
-            // `advertised_client_caps` sets CLIENT_CAP_AUDIO_HIRES when EITHER field is non-zero,
-            // because it keys on "the caller specified a format" — otherwise 48 kHz/16-bit, the
-            // cheapest lossless rung, would be the one format nobody could request. So the
-            // explicit `SAMPLE_RATE_HZ`/`BITS_16` this used to send was a genuine hi-res request:
-            // against a host with the operator policy on, the probe advertised the capability,
-            // was given the `0xD3` plane, and then silently counted nothing — its decode arm only
-            // handled `0xC9`. The comment here even claimed it "never sets
-            // CLIENT_CAP_AUDIO_HIRES", which made the bug invisible to a reader.
+            // `0`/`0` is UNSPECIFIED. For the shipping clients that distinction decides the
+            // capability bit — `advertised_client_caps` sets it when either field is non-zero,
+            // because it keys on "the caller specified a format", so that 48 kHz/16-bit (the
+            // cheapest lossless rung) is not the one format nobody can request. This `Hello` is
+            // hand-built and does not use that helper, so here the two are set together above and
+            // the sentinel is about honesty rather than mechanism: an inert format on the wire
+            // invites exactly the misreading that a rate alone asks for something.
             audio_rate_hz: args.audio_format.map(|(r, _)| r).unwrap_or(0),
             audio_bits: args.audio_format.map(|(_, b)| b).unwrap_or(0),
         }
