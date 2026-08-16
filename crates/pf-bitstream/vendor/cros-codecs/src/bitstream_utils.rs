@@ -96,13 +96,34 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    /// Read up to 31 bits from the stream. Note that we don't want to read 32
-    /// bits even though we're returning a u32 because that would break the
-    /// read_bits_signed() function. 31 bits should be overkill for compressed
-    /// header parsing anyway.
+    /// Read up to 32 bits from the stream.
+    ///
+    /// Upstream capped this at 31 "because that would break the read_bits_signed()
+    /// function". The reasoning was sound and the placement was not: the i32 accumulator
+    /// that cannot hold 32 bits belongs to [`Self::read_bits_signed`], which now carries
+    /// that limit itself, while the unsigned path gets the width the AV1 spec actually
+    /// asks for. AV1 requests 32 bits in five places — `timing_info`'s
+    /// `num_units_in_display_tick` and `time_scale`, `decoder_model_info`'s
+    /// `num_units_in_decoding_tick`, and the variable-width buffer-delay and
+    /// `buffer_removal_time` fields, whose lengths are read from the stream and reach 32.
+    /// A sequence header with `timing_info_present_flag` set was therefore unparseable,
+    /// which is a legal stream every AMF encoder emits.
     pub fn read_bits<U: TryFrom<u32>>(&mut self, num_bits: usize) -> Result<U, String> {
-        if num_bits > 31 {
+        if num_bits > 32 {
             return Err(ReadBitsError::TooManyBitsRequested(num_bits).to_string());
+        }
+
+        // Normalise the cursor before accumulating. A read that consumed a byte exactly
+        // leaves `num_remaining_bits_in_curr_byte` at 0 with `curr_byte` still holding the
+        // spent byte, and the loop below would then shift by the whole of `bits_left` and
+        // OR that spent byte in. At <= 31 bits the trailing mask discarded the result (the
+        // stale bits all land at or above bit `num_bits`), so it was invisible; at 32 the
+        // mask is all-ones and cannot discard anything, and the shift itself overflows.
+        // Advancing first keeps `bits_left - num_remaining_bits_in_curr_byte` <= 31 for
+        // every width this function accepts. Zero-width reads are left alone: they consume
+        // nothing today and must keep consuming nothing.
+        if num_bits > 0 && self.num_remaining_bits_in_curr_byte == 0 {
+            self.move_to_next_byte().map_err(|err| err.to_string())?;
         }
 
         let mut bits_left = num_bits;
@@ -115,7 +136,13 @@ impl<'a> BitReader<'a> {
         }
 
         out |= (self.curr_byte >> (self.num_remaining_bits_in_curr_byte - bits_left)) as u32;
-        out &= (1 << num_bits) - 1;
+        // `1u32 << 32` overflows — and at 32 bits every bit read is wanted, so the mask is
+        // the identity. Left as a shift for every narrower width, unchanged.
+        out &= if num_bits == 32 {
+            u32::MAX
+        } else {
+            (1 << num_bits) - 1
+        };
         self.num_remaining_bits_in_curr_byte -= bits_left;
         self.position += num_bits as u64;
 
@@ -124,12 +151,28 @@ impl<'a> BitReader<'a> {
 
     /// Reads a two's complement signed integer of length |num_bits|.
     pub fn read_bits_signed<U: TryFrom<i32>>(&mut self, num_bits: usize) -> Result<U, String> {
+        // The 31-bit limit lives here, where its reason is: the accumulator below is an
+        // i32, so a 32-bit read cannot round-trip through it — the `u32 -> i32` conversion
+        // fails for any value with the top bit set, and `1 << num_bits` in the
+        // sign-extension overflows. This used to be enforced indirectly by
+        // [`Self::read_bits`], which meant widening that function silently widened this
+        // one too.
+        if num_bits > 31 {
+            return Err(ReadBitsError::TooManyBitsRequested(num_bits).to_string());
+        }
         let mut out: i32 = self
             .read_bits::<u32>(num_bits)?
             .try_into()
             .map_err(|_| ReadBitsError::ConversionFailed.to_string())?;
         if out >> (num_bits - 1) != 0 {
-            out |= -1i32 ^ ((1 << num_bits) - 1);
+            // Sign-extend by setting every bit at or above `num_bits`. Written as a shift
+            // of -1 rather than upstream's `-1 ^ ((1 << num_bits) - 1)`: the two are equal
+            // for every width this function accepts, but the original overflows at
+            // `num_bits == 31`, where `1i32 << 31` is `i32::MIN` and subtracting one from
+            // it panics in a debug build. 31 is a width the guard above admits and the
+            // upstream comment explicitly considered safe, so this was a latent panic on
+            // legal input rather than an unreachable edge.
+            out |= -1i32 << num_bits;
         }
 
         U::try_from(out).map_err(|_| ReadBitsError::ConversionFailed.to_string())
@@ -784,5 +827,84 @@ mod tests {
     fn read_signed_bits() {
         let mut reader = BitReader::new(&[0b1111_0000], false);
         assert_eq!(reader.read_bits_signed::<i32>(4).unwrap(), -1);
+    }
+
+    /// AV1's `timing_info` reads `f(32)`, and the top bit is routinely set (`time_scale`
+    /// carries values like 1_000_000_000). Byte-aligned from a fresh reader.
+    #[test]
+    fn read_thirty_two_bits_aligned() {
+        let mut reader = BitReader::new(&[0xDE, 0xAD, 0xBE, 0xEF], false);
+        assert_eq!(reader.read_bits::<u32>(32).unwrap(), 0xDEAD_BEEF);
+    }
+
+    /// The same width entered mid-byte: the accumulation loop's first shift is then
+    /// `32 - num_remaining_bits_in_curr_byte`, which is the widest shift this function
+    /// ever performs and must stay under 32.
+    #[test]
+    fn read_thirty_two_bits_unaligned() {
+        // 1 bit, then 32 bits, out of a 5-byte run: 0b1 then 0xBD5B7DDE.
+        let mut reader = BitReader::new(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00], false);
+        assert_eq!(reader.read_bits::<u32>(1).unwrap(), 1);
+        assert_eq!(reader.read_bits::<u32>(32).unwrap(), 0xBD5B_7DDE);
+    }
+
+    /// The regression the mask fix exists for: entering a 32-bit read with the byte
+    /// cursor exactly spent (`num_remaining_bits_in_curr_byte == 0`) used to shift by 32
+    /// and OR the already-consumed byte into a result the mask could no longer clean.
+    #[test]
+    fn read_thirty_two_bits_on_a_spent_byte() {
+        let mut reader = BitReader::new(&[0xFF, 0xDE, 0xAD, 0xBE, 0xEF], false);
+        // Consume the first byte exactly, leaving the cursor at zero remaining bits.
+        assert_eq!(reader.read_bits::<u32>(8).unwrap(), 0xFF);
+        assert_eq!(reader.read_bits::<u32>(32).unwrap(), 0xDEAD_BEEF);
+    }
+
+    /// 33 bits is still refused — the widening is to exactly the width AV1 needs.
+    #[test]
+    fn more_than_thirty_two_bits_is_still_refused() {
+        let mut reader = BitReader::new(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00], false);
+        assert!(reader.read_bits::<u32>(33).is_err());
+    }
+
+    /// The signed path keeps the 31-bit limit on its own account: its accumulator is an
+    /// i32. Before this it was enforced by `read_bits`, so widening that function would
+    /// have widened this one into an overflow.
+    #[test]
+    fn signed_reads_stop_at_thirty_one_bits() {
+        let mut reader = BitReader::new(&[0xFF, 0xFF, 0xFF, 0xFF, 0x00], false);
+        assert!(reader.read_bits_signed::<i32>(32).is_err());
+        // 31 still works, and still sign-extends.
+        let mut reader = BitReader::new(&[0xFF, 0xFF, 0xFF, 0xFF, 0x00], false);
+        assert_eq!(reader.read_bits_signed::<i32>(31).unwrap(), -1);
+    }
+
+    /// The cursor normalisation must not change any narrower read. Walk every width from
+    /// 1 to 31 across a byte-spent boundary and check the value against an independent
+    /// big-endian bit extraction of the same stream.
+    #[test]
+    fn widths_below_thirty_two_are_unchanged_across_a_spent_byte() {
+        const DATA: [u8; 8] = [0xA5, 0x3C, 0x91, 0x7E, 0xDB, 0x42, 0x68, 0xF1];
+        // Independent reference: bit `i` of the stream, MSB-first.
+        let bit = |i: usize| (DATA[i / 8] >> (7 - (i % 8))) & 1;
+        for width in 1..=31usize {
+            let mut reader = BitReader::new(&DATA, false);
+            // Land the cursor exactly on a byte boundary with zero remaining bits.
+            assert_eq!(reader.read_bits::<u32>(8).unwrap(), DATA[0] as u32);
+            let got = reader.read_bits::<u32>(width).unwrap();
+            let want = (8..8 + width).fold(0u32, |acc, i| (acc << 1) | bit(i) as u32);
+            assert_eq!(got, want, "width {width}");
+        }
+    }
+
+    /// A zero-width read consumes nothing and returns zero, on a spent cursor as well as
+    /// a fresh one — `read_ue` reaches this whenever its first bit is set.
+    #[test]
+    fn zero_width_reads_consume_nothing() {
+        let mut reader = BitReader::new(&[0xAB, 0xCD], false);
+        assert_eq!(reader.read_bits::<u32>(0).unwrap(), 0);
+        assert_eq!(reader.read_bits::<u32>(8).unwrap(), 0xAB);
+        // Cursor now spent; a zero-width read must not pull the next byte in.
+        assert_eq!(reader.read_bits::<u32>(0).unwrap(), 0);
+        assert_eq!(reader.read_bits::<u32>(8).unwrap(), 0xCD);
     }
 }
