@@ -364,7 +364,12 @@ pub(crate) fn pick_pad_sink(sinks: &[SinkNode], cards: &[CardDevice]) -> Option<
 
 /// Read a sink node's facts out of a proplist. Split out because it has to run against the
 /// node's INFO props, not the registry's — see [`walk_graph`].
-#[cfg(any(target_os = "linux", test))]
+///
+/// Linux-only, unlike its pure-logic neighbours: `DictRef` comes from `pipewire`, which is a
+/// `cfg(target_os = "linux")` dependency. Widening this to `any(…, test)` the way the testable
+/// helpers around it do puts the item into the Windows `lib test` target, where the crate does
+/// not exist — E0433, visible only under `--all-targets`, and so only on the Windows CI leg.
+#[cfg(target_os = "linux")]
 pub(crate) fn sink_from_props(props: &pipewire::spa::utils::dict::DictRef) -> Option<SinkNode> {
     // Both spellings: PipeWire's own objects use the `device.`-prefixed keys, the pulse-facing
     // proplist GE reads uses the bare ones. Cheap to accept both.
