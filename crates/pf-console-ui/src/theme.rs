@@ -83,6 +83,13 @@ thread_local! {
     /// one thread — threading an `Ink` through ~90 call sites would be all cost and no safety.
     /// [`crate::shell::Shell::render`] sets it once per frame, before anything draws.
     static INK: std::cell::Cell<Ink> = const { std::cell::Cell::new(DARK_INK) };
+
+    /// Whether this frame draws in reduced-motion mode (`trust::Settings::reduce_motion`).
+    /// Published here for the same reason the ink is: motion is decided in ~15 places
+    /// scattered across widgets, screens and the shell, and every one of them already reads
+    /// a thread-local to know how to paint. Also set once per frame by
+    /// [`crate::shell::Shell::render`].
+    static REDUCE_MOTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn set_ink(ink: Ink) {
@@ -91,6 +98,18 @@ pub(crate) fn set_ink(ink: Ink) {
 
 pub(crate) fn ink() -> Ink {
     INK.with(std::cell::Cell::get)
+}
+
+pub(crate) fn set_reduce_motion(on: bool) {
+    REDUCE_MOTION.with(|r| r.set(on));
+}
+
+/// Is travel suppressed this frame? Callers keep the STATE change and drop the journey:
+/// a focused row is still focused, a stepped value still stepped — they simply arrive
+/// instead of gliding. Never used to skip a haptic; the pulse is the feedback that
+/// replaces the motion, not another thing to take away.
+pub(crate) fn reduce_motion() -> bool {
+    REDUCE_MOTION.with(std::cell::Cell::get)
 }
 
 /// The foreground at `alpha` — white on a dark palette, near-black on a pale one.

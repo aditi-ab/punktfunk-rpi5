@@ -68,6 +68,10 @@ enum RowId {
     /// backdrop behind this very row re-colours as it steps, which is the whole reason the
     /// picker lives on a screen rather than in a dialog.
     Palette,
+    /// Freeze the console's decorative motion — see `trust::Settings::reduce_motion`. Sits
+    /// beside the palette row for the same reason it does: both are presentation, and the
+    /// effect of stepping this one is visible on the backdrop behind it.
+    ReduceMotion,
 }
 
 // The couch-relevant subset grew 2026-07-31: this screen is the ONLY settings editor in
@@ -136,6 +140,7 @@ const TABS: [(&str, &[RowId]); 7] = [
         "Interface",
         &[
             RowId::Palette,
+            RowId::ReduceMotion,
             RowId::Stats,
             RowId::Fullscreen,
             RowId::AutoWake,
@@ -722,6 +727,9 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             "Background",
             crate::library::palette(&s.ui_palette).name.into(),
         ),
+        // Phrased as the thing that is ON, not as the suppression, so "On" means the
+        // reduction is in effect — the same way every other toggle on this screen reads.
+        RowId::ReduceMotion => (None, "Reduce motion", on_off(s.reduce_motion).into()),
         RowId::Stats => (
             None,
             "Statistics overlay",
@@ -838,6 +846,11 @@ fn detail(id: RowId) -> &'static str {
         RowId::Palette => {
             "The colour family this backdrop drifts through — it changes as you step, so \
              pick by looking. Appearance only; nothing about a stream depends on it."
+        }
+        RowId::ReduceMotion => {
+            "Freezes the backdrop and replaces the console's slides and pops with plain \
+             fades. Also the gentler choice on an OLED, where a still field can sit for \
+             hours."
         }
         RowId::Stats => {
             "How much the overlay shows: Compact (one line) → Normal → Detailed. \
@@ -1041,6 +1054,7 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             let cur = all.iter().position(|p| p.id == s.ui_palette);
             step_option(cur, all.len(), delta, wrap).map(|i| s.ui_palette = all[i].id.to_string())
         }
+        RowId::ReduceMotion => toggle(&mut s.reduce_motion, delta, wrap),
         RowId::Fullscreen => toggle(&mut s.fullscreen_on_stream, delta, wrap),
         RowId::AutoWake => toggle(&mut s.auto_wake, delta, wrap),
         RowId::Library => toggle(&mut s.library_enabled, delta, wrap),
@@ -1669,9 +1683,11 @@ mod tests {
                 seen.push(*id);
             }
         }
-        // The pre-tab flat list, plus the palette row and the lossless-audio row later passes added.
-        assert_eq!(seen.len(), 31, "{seen:?}");
+        // The pre-tab flat list, plus the palette row, the lossless-audio row and the
+        // reduce-motion row later passes added.
+        assert_eq!(seen.len(), 32, "{seen:?}");
         assert!(seen.contains(&RowId::Palette));
+        assert!(seen.contains(&RowId::ReduceMotion));
         assert!(seen.contains(&RowId::AudioFormat));
         // The catalog rows belong to the trailing tab, which builds them at render time.
         assert!(TABS[PROFILES_TAB].1.is_empty());

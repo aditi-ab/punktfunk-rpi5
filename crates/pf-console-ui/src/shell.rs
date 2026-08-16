@@ -9,7 +9,7 @@
 //! `save_layer_alpha` so a screen fades as a unit, never element by element. The
 //! backdrop crossfades in parallel when the screens disagree (aurora ↔ form).
 
-use crate::anim::Progress;
+use crate::anim::{Progress, Spring};
 use crate::glyphs::GlyphStyle;
 use crate::library::{mesh_sksl, palette, LibraryShared};
 use crate::model::{ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, WakeStatus};
@@ -27,6 +27,11 @@ mod overlays;
 mod render;
 
 const TRANSITION_S: f64 = 0.26;
+/// The reduced-motion transition: shorter, and drawn as a pure crossfade (no slide, no
+/// scale — see `render.rs`). Still a transition and not a cut, because the screen stack
+/// needs to stay legible: an instant swap loses the "you went somewhere" reading that is
+/// the only spatial cue a console shell has.
+const REDUCED_TRANSITION_S: f64 = 0.2;
 /// Chrome bands (design units): the pinned title above, hints below.
 const TOP_BAND: f64 = 64.0;
 const BOTTOM_BAND: f64 = 86.0;
@@ -37,9 +42,51 @@ enum Motion {
     Pop { leaving: Box<Screen>, t: Progress },
 }
 
+/// What a toast is REPORTING, which is the thing the old single style couldn't say: a
+/// pairing that worked and a connect that failed were the same grey pill, so the only way
+/// to tell them apart was to read. Each kind carries a mark and a hairline colour.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToastKind {
+    /// Something happened (a session ended, a scan started). The default.
+    Info,
+    /// Something the user asked for succeeded.
+    Success,
+    /// Something failed. The one kind that does NOT take its colour from the palette — a
+    /// pale field's accent can be a cheerful mint, and a failure must not read as one.
+    Error,
+}
+
+/// The shape drawn ahead of a toast's text. Three marks, deliberately geometric: the
+/// crate's glyph art is hand-built Skia paths, and a mark that has to survive from 0.75×
+/// to 3× `k` on a TV across the room can't rely on fine detail.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ToastMark {
+    Dot,
+    Check,
+    Bang,
+}
+
+impl ToastKind {
+    /// The tint and mark this kind draws with.
+    pub(crate) fn look(self) -> (Color4f, ToastMark) {
+        match self {
+            ToastKind::Info => (crate::theme::fg(0.55), ToastMark::Dot),
+            ToastKind::Success => (crate::theme::accent(1.0), ToastMark::Check),
+            // Fixed, not palette-derived, and that is the point: `moss`'s accent is a green
+            // and `ember`'s is an orange — either would report a failure in the colour the
+            // UI uses for "this is fine".
+            ToastKind::Error => (Color4f::new(0.93, 0.31, 0.28, 1.0), ToastMark::Bang),
+        }
+    }
+}
+
 struct Toast {
     text: String,
     at: f64,
+    kind: ToastKind,
+    /// Slide-in seat, 0 → 1 on the tray spring. The same gesture as the keyboard tray
+    /// (something arriving from off-screen and settling), so it takes the same spec.
+    seat: Spring,
 }
 
 struct Connecting {
@@ -197,7 +244,7 @@ impl Shell {
     pub(crate) fn session_failed(&mut self, msg: &str) {
         self.connecting = None;
         self.in_stream = false;
-        self.show_toast(format!("Couldn't connect — {msg}"));
+        self.show_toast_kind(format!("Couldn't connect — {msg}"), ToastKind::Error);
     }
 
     pub(crate) fn session_streaming(&mut self) {
@@ -246,7 +293,16 @@ impl Shell {
     }
 
     fn show_toast(&mut self, text: String) {
-        self.toast = Some(Toast { text, at: self.t() });
+        self.show_toast_kind(text, ToastKind::Info);
+    }
+
+    fn show_toast_kind(&mut self, text: String, kind: ToastKind) {
+        self.toast = Some(Toast {
+            text,
+            at: self.t(),
+            kind,
+            seat: Spring::rest(0.0),
+        });
     }
 
     // --- Model sync (hosts, pairing, wake) — before input and before render --------------
@@ -292,7 +348,7 @@ impl Shell {
                     .iter()
                     .find(|h| &h.key == key)
                     .map_or_else(|| "the host".to_string(), |h| h.name.clone());
-                self.show_toast(format!("Paired with {name}"));
+                self.show_toast_kind(format!("Paired with {name}"), ToastKind::Success);
                 self.console.set_pair(PairPhase::Idle);
                 if matches!(self.stack.last(), Some(Screen::Pair(_))) {
                     self.apply_nav(Nav::Pop);
@@ -582,11 +638,21 @@ impl Shell {
         }
     }
 
+    /// How long the next push/pop runs for. Read at NAV time rather than per frame so a
+    /// transition can't change duration under itself if the setting is stepped mid-flight.
+    fn transition_s(&self) -> f64 {
+        if self.settings.reduce_motion {
+            REDUCED_TRANSITION_S
+        } else {
+            TRANSITION_S
+        }
+    }
+
     fn apply_nav(&mut self, nav: Nav) {
         match nav {
             Nav::Push(screen) => {
                 self.stack.push(*screen);
-                self.motion = Motion::Push(Progress::new(TRANSITION_S));
+                self.motion = Motion::Push(Progress::new(self.transition_s()));
             }
             Nav::Replace(screen) => {
                 // Swap under the SAME push choreography: the outgoing screen is dropped
@@ -594,14 +660,14 @@ impl Shell {
                 // replaced screen was reached from.
                 self.stack.pop();
                 self.stack.push(*screen);
-                self.motion = Motion::Push(Progress::new(TRANSITION_S));
+                self.motion = Motion::Push(Progress::new(self.transition_s()));
             }
             Nav::Pop => {
                 if self.stack.len() > 1 {
                     let leaving = self.stack.pop().expect("len > 1");
                     self.motion = Motion::Pop {
                         leaving: Box::new(leaving),
-                        t: Progress::new(TRANSITION_S),
+                        t: Progress::new(self.transition_s()),
                     };
                 } else {
                     // Popping the root quits the console (B at home).
@@ -614,7 +680,24 @@ impl Shell {
     /// The living backdrop. `calm` 0 = the launcher's aurora, 1 = the quiet field the form
     /// screens sit on; the shell chases it, so there is only ever ONE backdrop pass — the
     /// former aurora-over-static-form crossfade is now a single uniform.
+    /// The clock the backdrop shader runs on. Reduced motion freezes the field at a fixed
+    /// phase rather than removing it: the colour IS the palette the user picked, and a
+    /// still gradient is also the OLED-friendly thing to leave on a screen for an hour.
+    ///
+    /// The CALM mix is deliberately not frozen with it — that tracks which screen is up,
+    /// a state change rather than decoration.
+    fn field_clock(&self, t: f64) -> f64 {
+        if self.settings.reduce_motion {
+            0.0
+        } else {
+            t
+        }
+    }
+
     fn draw_aurora(&self, canvas: &Canvas, w: f64, h: f64, t: f64, calm: f64) {
+        // Gated at the one place the shader's clock is read, so the takeover's own
+        // `draw_aurora` call inherits it and a third caller can't forget.
+        let t = self.field_clock(t);
         // Laid out to match the SkSL block: u_res (float2), u_tc (float2), u_lift (float4),
         // u_scrim (float4).
         let uniforms: [f32; 12] = [

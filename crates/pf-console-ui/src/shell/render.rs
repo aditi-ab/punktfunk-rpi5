@@ -35,6 +35,12 @@ impl Shell {
         // the crate reads it (see `theme::set_ink`), so a frame that skipped this would paint
         // the previous palette's text over the new palette's field.
         crate::theme::set_ink(self.ink);
+        // Same contract as the ink: published once, before anything draws, so every widget
+        // that has a choice to make about travel this frame reads one answer. Also kept as
+        // a local — `LayerEnv` borrows `self.settings` mutably below, so the transition
+        // arms can no longer reach the field itself.
+        let reduce = self.settings.reduce_motion;
+        crate::theme::set_reduce_motion(reduce);
         self.pads = pads.to_vec();
         self.glyphs = GlyphStyle::from_pref(pad_pref);
         self.chip = Some(pad.map_or_else(
@@ -117,6 +123,11 @@ impl Shell {
         // aren't where the pixels are — and the shell drops pointer input during a
         // transition anyway, exactly as it drops menu events.
         self.hint_rects.clear();
+        // Reduced motion keeps the CROSSFADE — the stack has to stay legible, and an
+        // instant swap loses the only spatial cue a console shell has — and drops the
+        // travel: no slide, no scale.
+        let slide = |dy: f64| if reduce { 0.0 } else { dy };
+        let zoom = |s: f64| if reduce { 1.0 } else { s };
         match (&mut self.motion, motion_p) {
             (Motion::Push(_), Some(raw)) => {
                 let p = ease_out_cubic(raw);
@@ -124,15 +135,20 @@ impl Shell {
                 // Outgoing recedes underneath…
                 if n >= 2 {
                     let (below, top) = self.stack.split_at_mut(n - 1);
-                    env.paint(&mut below[n - 2], 1.0 - p, 0.0, 1.0 - 0.04 * p);
+                    env.paint(&mut below[n - 2], 1.0 - p, 0.0, zoom(1.0 - 0.04 * p));
                     // …while the incoming slides up out of a fade.
-                    env.paint(&mut top[0], p, 36.0 * k * (1.0 - p), 0.985 + 0.015 * p);
+                    env.paint(
+                        &mut top[0],
+                        p,
+                        slide(36.0 * k * (1.0 - p)),
+                        zoom(0.985 + 0.015 * p),
+                    );
                 } else {
                     env.paint(
                         &mut self.stack[0],
                         p,
-                        36.0 * k * (1.0 - p),
-                        0.985 + 0.015 * p,
+                        slide(36.0 * k * (1.0 - p)),
+                        zoom(0.985 + 0.015 * p),
                     );
                 }
             }
@@ -140,9 +156,14 @@ impl Shell {
                 let p = ease_out_cubic(raw);
                 // The revealed screen grows back in…
                 let n = self.stack.len();
-                env.paint(&mut self.stack[n - 1], 0.4 + 0.6 * p, 0.0, 0.96 + 0.04 * p);
+                env.paint(
+                    &mut self.stack[n - 1],
+                    0.4 + 0.6 * p,
+                    0.0,
+                    zoom(0.96 + 0.04 * p),
+                );
                 // …while the leaving one slides down into a fade.
-                env.paint(leaving.as_mut(), 1.0 - p, 36.0 * k * p, 1.0);
+                env.paint(leaving.as_mut(), 1.0 - p, slide(36.0 * k * p), 1.0);
             }
             _ => {
                 let n = self.stack.len();

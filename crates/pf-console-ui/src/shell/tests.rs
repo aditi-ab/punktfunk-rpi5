@@ -397,6 +397,74 @@ fn every_settings_tab_rasters() {
     s.render(surface.canvas(), 640, 400, &fonts, None, None, &pads);
 }
 
+/// The three toast kinds must be tellable apart WITHOUT reading the words — that is the
+/// whole reason the kind exists. In particular the error tint is fixed rather than
+/// palette-derived: `moss`'s accent is a green and `ember`'s is an orange, and reporting a
+/// failure in the colour the rest of the UI uses for "this is fine" is exactly the bug.
+#[test]
+fn toast_kinds_are_visually_distinct() {
+    use crate::shell::{ToastKind, ToastMark};
+    let (info_c, info_m) = ToastKind::Info.look();
+    let (ok_c, ok_m) = ToastKind::Success.look();
+    let (err_c, err_m) = ToastKind::Error.look();
+    assert_eq!(info_m, ToastMark::Dot);
+    assert_eq!(ok_m, ToastMark::Check);
+    assert_eq!(err_m, ToastMark::Bang);
+    let rgb = |c: skia_safe::Color4f| (c.r, c.g, c.b);
+    assert_ne!(rgb(info_c), rgb(ok_c));
+    assert_ne!(rgb(ok_c), rgb(err_c));
+
+    // Swap in a green-accented palette: Success follows it, Error must not.
+    crate::theme::set_ink(crate::theme::Ink::of(crate::library::palette("moss")));
+    let (ok_moss, _) = ToastKind::Success.look();
+    let (err_moss, _) = ToastKind::Error.look();
+    assert_ne!(
+        rgb(ok_moss),
+        rgb(ok_c),
+        "Success takes the palette's accent, so it moved"
+    );
+    assert_eq!(
+        rgb(err_moss),
+        rgb(err_c),
+        "Error is fixed and must NOT follow the palette"
+    );
+}
+
+/// Reduced motion: the setting round-trips through the store, the backdrop shader's clock
+/// freezes, and the transition shortens. The clock is asserted through `field_clock`
+/// rather than by diffing pixels because that IS the decision — `draw_aurora` has exactly
+/// one place it reads time, and both callers (the screens and the connect takeover) go
+/// through it.
+#[test]
+fn reduce_motion_freezes_the_field_and_shortens_the_transition() {
+    let fonts = crate::theme::build_fonts().unwrap();
+    let pads: Vec<PadInfo> = Vec::new();
+    let (w, h) = (1280u32, 800u32);
+    let mut surface = skia_safe::surfaces::raster_n32_premul((w as i32, h as i32)).unwrap();
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+
+    assert!(!s.settings.reduce_motion, "off by default");
+    assert_eq!(s.field_clock(12.5), 12.5);
+    assert_eq!(s.transition_s(), TRANSITION_S);
+
+    s.settings.reduce_motion = true;
+    assert_eq!(s.field_clock(12.5), 0.0, "the field stops drifting");
+    assert_eq!(s.transition_s(), REDUCED_TRANSITION_S);
+    // …and a frame still draws (the shader runs at t = 0 like any other phase).
+    s.render(surface.canvas(), w, h, &fonts, None, None, &pads);
+
+    // Round-trip through the settings file, which is what makes it survive a restart.
+    s.settings.save();
+    let back = pf_client_core::trust::Settings::load();
+    assert!(back.reduce_motion, "persisted");
+    s.settings.reduce_motion = false;
+    s.settings.save();
+    assert!(
+        !pf_client_core::trust::Settings::load().reduce_motion,
+        "and back off again"
+    );
+}
+
 /// Render every console scene to PNGs for the eyeball pass (ignored; run with
 /// `PF_CONSOLE_DUMP=<dir> cargo test -p pf-console-ui --release -- --ignored dump`).
 /// CPU raster — the SkSL aurora, layers and text all run without a GPU.

@@ -320,6 +320,10 @@ impl LibraryScreen {
                 self.anim.settle(f64::from(self.cursor), 0.001, 0.01);
                 self.bump.step(0.0, BUMP_K, BUMP_C, dt);
                 self.bump.settle(0.0, 0.3, 4.0);
+                // See the twin in `home.rs`: the recoil's haptic survives, its travel does not.
+                if crate::theme::reduce_motion() {
+                    self.bump = Spring::rest(0.0);
+                }
                 self.draw_carousel(canvas, rect, k, fonts);
             }
             LibraryPhase::Loading => {

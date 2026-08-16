@@ -246,6 +246,13 @@ impl HomeScreen {
         self.anim.settle(f64::from(self.cursor), 0.001, 0.01);
         self.bump.step(0.0, BUMP_K, BUMP_C, dt);
         self.bump.settle(0.0, 0.3, 4.0);
+        // Reduced motion drops the recoil TRAVEL but not its meaning: the refusal is
+        // already reported as a `MenuPulse::Boundary` haptic, which is the half that says
+        // "there is nothing that way". The cursor chase itself stays sprung — that is
+        // navigation, not decoration, and freezing it would make the strip jump.
+        if crate::theme::reduce_motion() {
+            self.bump = Spring::rest(0.0);
+        }
 
         let w = f64::from(rect.width());
         let tile_w = (TILE_W * k).min(w * 0.84);
