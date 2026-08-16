@@ -617,6 +617,21 @@ fn journal_path() -> std::path::PathBuf {
     pf_paths::config_dir().join("edid-lock-active.json")
 }
 
+/// A non-`ADL_OK` rc that is this call's documented no-op rather than a failure.
+///
+/// The unlock is deliberately idempotent and runs over EVERY connector — including the ones that
+/// were never pinned, and every connector at all on a host recovering from an unclean exit. Some
+/// drivers answer `ADL_ERR_NOT_SUPPORTED` to "turn emulation off" where there is no emulation to
+/// turn off, so a clean host start emitted one WARN per connector, every time, saying nothing.
+/// Four standing warnings are how a log stops being read.
+///
+/// Scoped to the mode-off call on purpose: `adl-unlock-remove` is the call that actually clears a
+/// pin, so its rc is the one that means something, and it keeps its warning.
+fn is_expected_noop(r: &OpRecord) -> bool {
+    const ADL_ERR_NOT_SUPPORTED: i32 = -8;
+    r.op == "adl-unlock-mode-off" && r.rc == ADL_ERR_NOT_SUPPORTED
+}
+
 fn tracing_log(prefix: &str, outcome: &RunOutcome) {
     match outcome {
         RunOutcome::NoAdl => tracing::info!(
@@ -625,7 +640,7 @@ fn tracing_log(prefix: &str, outcome: &RunOutcome) {
         ),
         RunOutcome::InitFailed(recs) | RunOutcome::Done(recs) => {
             for r in recs {
-                if r.ok() {
+                if r.ok() || is_expected_noop(r) {
                     tracing::info!("{prefix}: {r}");
                 } else {
                     tracing::warn!("{prefix}: {r}");
