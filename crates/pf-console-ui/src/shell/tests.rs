@@ -573,6 +573,132 @@ fn a_completed_pop_frees_its_screen_and_republishes_hints() {
     );
 }
 
+/// Draw one frame at a small size. A freshly pushed screen has not seen the shared model
+/// yet — it adopts it on its first sync — so a test that asserts on a screen's CONTENT
+/// straight after pushing it is asking before the answer exists. The app always renders;
+/// so does this.
+fn frame(s: &mut Shell) {
+    let fonts = crate::theme::build_fonts().unwrap();
+    let pads: Vec<PadInfo> = Vec::new();
+    let mut surface = skia_safe::surfaces::raster_n32_premul((480, 300)).unwrap();
+    s.render(surface.canvas(), 480, 300, &fonts, None, None, &pads);
+}
+
+/// A library with more than one group, for the collections flow.
+fn mixed_library(library: &LibraryShared) {
+    let g = |id: &str, title: &str, store: &str, platform: Option<&str>, launcher: bool| {
+        crate::library::LibraryGame {
+            id: id.into(),
+            title: title.into(),
+            store: store.into(),
+            launcher,
+            icon: String::new(),
+            platform: platform.map(str::to_string),
+        }
+    };
+    library.set_games(vec![
+        g("l1", "Steam Big Picture", "steam", None, true),
+        g("s1", "Dota 2", "steam", None, false),
+        g("s2", "Half-Life", "steam", None, false),
+        g("p1", "Demon's Souls", "custom", Some("PS3"), false),
+        g("p2", "The Last of Us", "custom", Some("PS3"), false),
+        g("n1", "Super Metroid", "custom", Some("SNES"), false),
+    ]);
+}
+
+/// The user's flow, verbatim: group by platform, walk the platforms, pick PS3, see its
+/// games — and get back out again. This is the whole point of Part C, so it is asserted
+/// end to end rather than in pieces.
+#[test]
+fn collections_drill_in_reaches_one_platform_and_backs_out() {
+    let (mut s, _console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    mixed_library(&library);
+    s.handle_menu(MenuEvent::Secondary); // Y at home → this host's library
+    finish_motion(&mut s);
+    assert!(matches!(s.stack.last(), Some(Screen::Library(_))));
+
+    // Y again → Collections.
+    s.handle_menu(MenuEvent::Secondary);
+    finish_motion(&mut s);
+    assert!(
+        matches!(s.stack.last(), Some(Screen::Collections(_))),
+        "Y on a multi-group library opens the collections"
+    );
+
+    // Walk to the PS3 tile. Groups sort A–Z with launchers pinned first, so the strip
+    // reads: Launchers, PS3, SNES, Steam.
+    s.handle_menu(MenuEvent::Move(MenuDir::Right));
+
+    // A opens that collection as a filtered shelf.
+    s.handle_menu(MenuEvent::Confirm);
+    finish_motion(&mut s);
+    frame(&mut s); // the new shelf adopts the shared model on its first sync
+    let Some(Screen::Library(shelf)) = s.stack.last() else {
+        panic!("A on a collection tile opens a shelf");
+    };
+    assert_eq!(shelf.len_for_test(), 2, "PS3 has exactly its two titles");
+    assert!(
+        shelf.title().ends_with("PS3"),
+        "the breadcrumb names the collection: {}",
+        shelf.title()
+    );
+
+    // B B walks back out to the unfiltered shelf.
+    s.handle_menu(MenuEvent::Back);
+    finish_motion(&mut s);
+    assert!(matches!(s.stack.last(), Some(Screen::Collections(_))));
+    s.handle_menu(MenuEvent::Back);
+    finish_motion(&mut s);
+    frame(&mut s);
+    let Some(Screen::Library(shelf)) = s.stack.last() else {
+        panic!("back to the library");
+    };
+    assert_eq!(shelf.len_for_test(), 6, "the whole library again");
+}
+
+/// The gate: a library with nothing to collect must not offer the button, and must not
+/// answer it either — a hint and its press have to agree.
+#[test]
+fn collections_is_offered_only_when_there_is_something_to_browse() {
+    let (mut s, _console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    // One store, no platforms: a single group.
+    library.set_games(vec![
+        crate::library::LibraryGame {
+            id: "a".into(),
+            title: "Dota 2".into(),
+            store: "steam".into(),
+            launcher: false,
+            icon: String::new(),
+            platform: None,
+        },
+        crate::library::LibraryGame {
+            id: "b".into(),
+            title: "Half-Life".into(),
+            store: "steam".into(),
+            launcher: false,
+            icon: String::new(),
+            platform: None,
+        },
+    ]);
+    s.handle_menu(MenuEvent::Secondary);
+    finish_motion(&mut s);
+    assert!(matches!(s.stack.last(), Some(Screen::Library(_))));
+    let depth = s.stack.len();
+    assert!(matches!(
+        s.handle_menu(MenuEvent::Secondary),
+        Some(MenuPulse::Boundary)
+    ));
+    assert_eq!(s.stack.len(), depth, "and pushed nothing");
+
+    // Now give it a second group and the same press works.
+    mixed_library(&library);
+    s.handle_menu(MenuEvent::Secondary);
+    finish_motion(&mut s);
+    assert!(matches!(s.stack.last(), Some(Screen::Collections(_))));
+}
+
 /// The trailing Rescan tile asks discovery to look again — and nothing else. It sits one
 /// step past Add Host, where a mis-timed press used to land on nothing at all, so the test
 /// that matters is that it CANNOT connect: an accidental A on the end of the strip must

@@ -11,9 +11,9 @@ use crate::library::{
     ENTER_TURN_DEG, FOCUS_GAP, GRID_GAP, GRID_H, GRID_W, JUMP, PERSPECTIVE, POSTER_H, POSTER_W,
     RECEDE_DIM, RECEDE_SCALE, ROTATE_DEG, SIDE_SPACING, SPRING_C, SPRING_K, VISIBLE_RANGE,
 };
-use crate::model::{ConsoleCmd, HostRow, ProfileChip};
+use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::{Pointer, PointerKind};
-use crate::screens::{ConnectIntent, Ctx, Outbox};
+use crate::screens::{ConnectIntent, Ctx, Outbox, Screen};
 use crate::theme::{accent, fg, Fonts, W};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Color4f, Data, Image, Paint, Point, RRect, Rect, M44};
@@ -217,16 +217,15 @@ fn draw_poster_placeholder(
 }
 
 pub(crate) struct LibraryScreen {
-    host_name: String,
-    addr: String,
-    port: u16,
-    fp_hex: String,
-    mgmt: u16,
-    /// `Some` when this library was opened from a PINNED host+profile card (§5.2a) rather
-    /// than the host's primary tile: every launch off this shelf is that card's connect
-    /// with a title attached, so it carries the same one-off profile the card's plain
-    /// A-press would. `None` = the primary tile, where the host's binding decides.
-    pin: Option<ProfileChip>,
+    /// The host this shelf belongs to, kept WHOLE rather than unpacked into scalars: the
+    /// Collections drill-in builds a second `LibraryScreen` from it, and two partial copies
+    /// of the same host is the state that goes stale first.
+    ///
+    /// Its `pin` is load-bearing. `Some` = this library was opened from a PINNED
+    /// host+profile card (§5.2a) rather than the host's primary tile, so every launch off
+    /// this shelf is that card's connect with a title attached and carries the same one-off
+    /// profile. `None` = the primary tile, where the host's binding decides.
+    host: HostRow,
     shared: Option<LibraryShared>,
     // Synced snapshot of the shared model (re-pulled when the generation bumps).
     generation: u64,
@@ -242,6 +241,10 @@ pub(crate) struct LibraryScreen {
     /// model is untouched by it: filtering is index-level, so the art pump and the fetch
     /// flow never learn that a filter exists.
     filter: Option<crate::collate::GroupKey>,
+    /// The filter's display name, for the title breadcrumb. Held beside the key rather than
+    /// re-derived, because `GroupKey::Store("Steam")` and `GroupKey::Platform("Steam")` both
+    /// read "Steam" and the collation that produced the label is gone by then.
+    filter_label: Option<String>,
     // Navigation: the integer cursor is the authority; the eased position chases it.
     cursor: i32,
     /// Each card's rect as last drawn (axis-aligned, scale applied — the perspective tilt
@@ -282,12 +285,7 @@ pub(crate) struct LibraryScreen {
 impl LibraryScreen {
     pub(crate) fn new(host: &HostRow) -> LibraryScreen {
         LibraryScreen {
-            host_name: host.name.clone(),
-            addr: host.addr.clone(),
-            port: host.port,
-            fp_hex: host.fp_hex.clone(),
-            mgmt: host.mgmt_port,
-            pin: host.pin.clone(),
+            host: host.clone(),
             shared: None, // adopted from Ctx on the first render (the shell owns it)
             generation: u64::MAX,
             phase: LibraryPhase::Loading,
@@ -295,6 +293,7 @@ impl LibraryScreen {
             view: Vec::new(),
             sort: crate::collate::SortKey::default(),
             filter: None,
+            filter_label: None,
             cursor: 0,
             geom: Vec::new(),
             anim: Spring::rest(0.0),
@@ -392,32 +391,55 @@ impl LibraryScreen {
         self.view.len()
     }
 
+    /// How many tiles this shelf is showing, for the shell's collection-flow test — which
+    /// lives in another module and so cannot reach [`Self::len`].
+    #[cfg(test)]
+    pub(crate) fn len_for_test(&self) -> usize {
+        self.len()
+    }
+
     /// The screen's title: the host, and — when this shelf belongs to a pinned card — the
     /// profile every launch off it will use, in the card's own `host · profile` shape.
     pub(crate) fn title(&self) -> String {
-        match &self.pin {
-            Some(p) => format!("{} \u{b7} {}", self.host_name, p.name),
-            None => self.host_name.clone(),
+        // host · profile · collection, each part only when it applies — the same
+        // breadcrumb shape a pinned card's shelf already used, extended by one.
+        let mut t = match &self.host.pin {
+            Some(p) => format!("{} \u{b7} {}", self.host.name, p.name),
+            None => self.host.name.clone(),
+        };
+        if let Some(label) = &self.filter_label {
+            t.push_str(" \u{b7} ");
+            t.push_str(label);
         }
+        t
+    }
+
+    /// Show ONE collated group. Set before the screen is first rendered (the Collections
+    /// drill-in builds the shelf and pushes it in the same breath), so the shelf never
+    /// flashes the whole library on its way to a collection.
+    pub(crate) fn set_filter(&mut self, key: crate::collate::GroupKey, label: String) {
+        self.filter = Some(key);
+        self.filter_label = Some(label);
+        self.recollate();
     }
 
     /// One title's self-emitted link: this shelf's host, this shelf's pinned profile (so a
     /// link taken off a pinned card's shelf streams the way that card does), and the game.
     fn game_link(&self, id: &str) -> Option<String> {
         crate::screens::saved_host_link(
-            &self.fp_hex,
-            &self.addr,
-            self.port,
-            self.pin.as_ref().map(|p| p.id.as_str()),
+            &self.host.fp_hex,
+            &self.host.addr,
+            self.host.port,
+            self.host.pin.as_ref().map(|p| p.id.as_str()),
             Some(id),
         )
     }
 
     fn fetch_cmd(&self) -> ConsoleCmd {
         ConsoleCmd::FetchLibrary {
-            addr: self.addr.clone(),
-            mgmt: self.mgmt,
-            fp_hex: self.fp_hex.clone(),
+            addr: self.host.addr.clone(),
+            mgmt: self.host.mgmt_port,
+            fp_hex: self.host.fp_hex.clone(),
         }
     }
 
@@ -540,13 +562,13 @@ impl LibraryScreen {
             MenuEvent::Confirm => {
                 let g = self.focused()?;
                 fx.connect = Some(ConnectIntent {
-                    addr: self.addr.clone(),
-                    port: self.port,
-                    fp_hex: self.fp_hex.clone(),
+                    addr: self.host.addr.clone(),
+                    port: self.host.port,
+                    fp_hex: self.host.fp_hex.clone(),
                     launch: Some(g.id.clone()),
                     // A pinned card's shelf says which profile it is launching with,
                     // the same way its tile and this screen's title do.
-                    title: match &self.pin {
+                    title: match &self.host.pin {
                         Some(p) => format!("{} \u{b7} {}", g.title, p.name),
                         None => g.title.clone(),
                     },
@@ -555,7 +577,7 @@ impl LibraryScreen {
                     // with a title attached — it carries the card's profile as the
                     // one-off. Off the primary tile there is none, and the host's
                     // default binding decides.
-                    profile: self.pin.as_ref().map(|p| p.id.clone()),
+                    profile: self.host.pin.as_ref().map(|p| p.id.clone()),
                 });
                 Some(MenuPulse::Confirm)
             }
@@ -581,8 +603,24 @@ impl LibraryScreen {
                 fx.pop();
                 None
             }
+            // Y opens the collections. Refused — with a boundary pulse rather than
+            // silence — when there is nothing to collect, which is the same condition that
+            // keeps the hint off the legend, so the button and its label never disagree.
+            //
+            // Already inside a collection, Y is refused too: a drill-in from a drill-in
+            // would collate a set that is already one group and open onto a single tile.
+            MenuEvent::Secondary => {
+                if self.filter.is_some() || !crate::collate::worth_browsing(&self.games) {
+                    return Some(MenuPulse::Boundary);
+                }
+                let mut screen = super::collections::CollectionsScreen::new(&self.host, self.sort);
+                // Hand over the posters already decoded here, so the group tiles fan real
+                // covers instead of re-fetching art this screen is holding anyway.
+                screen.adopt_art(self.art.clone());
+                fx.push(Screen::Collections(screen));
+                Some(MenuPulse::Confirm)
+            }
             MenuEvent::Move(_) | MenuEvent::JumpBack | MenuEvent::JumpForward => None,
-            MenuEvent::Secondary => None,
         }
     }
 
@@ -665,19 +703,26 @@ impl LibraryScreen {
 
     pub(crate) fn hints(&self, _ctx: &Ctx) -> Vec<Hint> {
         match &self.phase {
-            LibraryPhase::Ready => vec![
-                Hint::new(
+            LibraryPhase::Ready => {
+                let mut hints = vec![Hint::new(
                     HintKey::Confirm,
                     if self.focused_is_launcher() {
                         "Open"
                     } else {
                         "Play"
                     },
-                ),
-                Hint::new(HintKey::Tertiary, "Copy link"),
-                Hint::new(HintKey::Shoulders, "Jump"),
-                Hint::new(HintKey::Back, "Back"),
-            ],
+                )];
+                // Only offered when there is something to browse, and never from inside a
+                // collection — the same two conditions the button itself checks, so the
+                // legend never advertises a press that would only thud.
+                if self.filter.is_none() && crate::collate::worth_browsing(&self.games) {
+                    hints.push(Hint::new(HintKey::Secondary, "Collections"));
+                }
+                hints.push(Hint::new(HintKey::Tertiary, "Copy link"));
+                hints.push(Hint::new(HintKey::Shoulders, "Jump"));
+                hints.push(Hint::new(HintKey::Back, "Back"));
+                hints
+            }
             LibraryPhase::Error {
                 can_retry: true, ..
             } => vec![

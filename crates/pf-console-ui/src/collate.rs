@@ -40,6 +40,34 @@ impl SortKey {
             _ => SortKey::HostOrder,
         }
     }
+
+    /// The persisted name. A FILE FORMAT — renaming one silently resets every user's
+    /// chosen sort to the default on their next launch.
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            SortKey::HostOrder => "host",
+            SortKey::Title => "title",
+            SortKey::Platform => "platform",
+            SortKey::Store => "store",
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SortKey::HostOrder => "Default",
+            SortKey::Title => "A–Z",
+            SortKey::Platform => "Platform",
+            SortKey::Store => "Store",
+        }
+    }
+
+    /// The pills, in the order they are offered.
+    pub(crate) const ALL: [SortKey; 4] = [
+        SortKey::HostOrder,
+        SortKey::Title,
+        SortKey::Platform,
+        SortKey::Store,
+    ];
 }
 
 /// What a group IS, kept as data rather than a formatted string so a filtered library can
@@ -244,19 +272,22 @@ pub(crate) fn filtered(
     }
 }
 
+/// Is there anything worth browsing? A library with one platform and one store has nothing
+/// to drill INTO, and a screen that opens onto a single tile is worse than no screen —
+/// so the button that reaches it is hidden rather than made to disappoint.
+pub(crate) fn worth_browsing(games: &[LibraryGame]) -> bool {
+    collate(games, SortKey::HostOrder, Some(GroupBy::Platform))
+        .iter()
+        .filter(|g| g.key != GroupKey::Launchers)
+        .count()
+        >= 2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Every sort the module offers. A local list rather than a shipped `ALL` const: the
-    /// pills that need one arrive with the Collections screen, and a table nothing but a
-    /// test reads is dead weight in a crate that lints dead code as an error.
-    const EVERY_SORT: [SortKey; 4] = [
-        SortKey::HostOrder,
-        SortKey::Title,
-        SortKey::Platform,
-        SortKey::Store,
-    ];
+    const EVERY_SORT: [SortKey; 4] = SortKey::ALL;
 
     fn game(
         id: &str,
@@ -366,6 +397,31 @@ mod tests {
         assert!(filtered(&games, SortKey::HostOrder, Some(&gone)).is_empty());
     }
 
+    #[test]
+    fn empty_and_single_group_libraries_are_not_worth_browsing() {
+        assert!(!worth_browsing(&[]));
+        assert!(!worth_browsing(&[game("l", "Steam", "steam", None, true)]));
+        // One store, no platforms: nothing to choose between, so the button stays hidden.
+        let one = [
+            game("a", "Dota", "steam", None, false),
+            game("b", "HL", "steam", None, false),
+        ];
+        assert!(!worth_browsing(&one));
+        // A second group earns the screen.
+        let two = [
+            game("a", "Dota", "steam", None, false),
+            game("b", "Ico", "custom", Some("PS2"), false),
+        ];
+        assert!(worth_browsing(&two));
+        // Launchers alone never count — every library has them, and a screen offering
+        // only "Launchers" is the single-tile screen this rule exists to prevent.
+        let launcher_plus_one = [
+            game("l", "Steam", "steam", None, true),
+            game("a", "Dota", "steam", None, false),
+        ];
+        assert!(!worth_browsing(&launcher_plus_one));
+    }
+
     /// The persisted strings, pinned literally. They are a FILE FORMAT: renaming one here
     /// silently resets every user's chosen sort to the default on their next launch.
     #[test]
@@ -373,6 +429,9 @@ mod tests {
         assert_eq!(SortKey::parse("title"), SortKey::Title);
         assert_eq!(SortKey::parse("platform"), SortKey::Platform);
         assert_eq!(SortKey::parse("store"), SortKey::Store);
+        for k in EVERY_SORT {
+            assert_eq!(SortKey::parse(k.id()), k, "{} round-trips", k.label());
+        }
         // Anything else is a newer client's key, and the right answer to one is today's
         // shelf rather than an error — the rule `ui_palette` already follows.
         assert_eq!(SortKey::parse("something-newer"), SortKey::HostOrder);
