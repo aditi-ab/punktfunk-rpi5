@@ -1,0 +1,44 @@
+[
+  {
+    "id": "launcher:steam",
+    "store": "steam",
+    "title": "Steam Big Picture",
+    "role": "launcher",
+    "icon": "steam"
+  },
+  {
+    "id": "launcher:heroic",
+    "store": "heroic",
+    "title": "Heroic",
+    "role": "launcher",
+    "icon": "heroic"
+  },
+
+  { "id": "steam:570", "store": "steam", "title": "Dota 2" },
+  { "id": "steam:220", "store": "steam", "title": "Half-Life 2" },
+  { "id": "steam:1091500", "store": "steam", "title": "Cyberpunk 2077" },
+  { "id": "steam:292030", "store": "steam", "title": "The Witcher 3: Wild Hunt" },
+  { "id": "steam:377160", "store": "steam", "title": "Fallout 4" },
+
+  { "id": "rom:ps3-1", "store": "custom", "title": "Demon's Souls", "platform": "PS3" },
+  { "id": "rom:ps3-2", "store": "custom", "title": "The Last of Us", "platform": "PS3" },
+  { "id": "rom:ps3-3", "store": "custom", "title": "Ni no Kuni", "platform": "PS3" },
+
+  { "id": "rom:ps2-1", "store": "custom", "title": "Shadow of the Colossus", "platform": "PS2" },
+  { "id": "rom:ps2-2", "store": "custom", "title": "Ico", "platform": "PS2" },
+  { "id": "rom:ps2-3", "store": "custom", "title": "Ōkami", "platform": "PS2" },
+
+  { "id": "rom:snes-1", "store": "custom", "title": "A Link to the Past", "platform": "SNES" },
+  { "id": "rom:snes-2", "store": "custom", "title": "Super Metroid", "platform": "SNES" },
+  { "id": "rom:snes-3", "store": "custom", "title": "Chrono Trigger", "platform": "SNES" },
+  { "id": "rom:snes-4", "store": "custom", "title": "EarthBound", "platform": "SNES" },
+
+  { "id": "rom:gc-1", "store": "custom", "title": "Metroid Prime", "platform": "GameCube" },
+  { "id": "rom:gc-2", "store": "custom", "title": "The Wind Waker", "platform": "GameCube" },
+
+  { "id": "epic:fn", "store": "epic", "title": "Alan Wake 2" },
+  { "id": "gog:1", "store": "gog", "title": "An Untitled Story" },
+
+  { "id": "custom:none-1", "store": "wat", "title": "Unlabelled Thing" },
+  { "id": "custom:none-2", "store": "wat", "title": "Émigré" }
+]

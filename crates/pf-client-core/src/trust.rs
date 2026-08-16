@@ -1307,6 +1307,16 @@ pub struct Settings {
     /// `default` so pre-existing stores load with the full motion they have today.
     #[serde(default)]
     pub reduce_motion: bool,
+    /// How the console's game library orders titles within a group: `""`/unknown (the
+    /// host's own order — today's shelf, byte for byte), `"title"`, `"platform"` or
+    /// `"store"`. See `pf-console-ui`'s `collate` module, which is the portable spec the
+    /// Apple and Android ports implement.
+    ///
+    /// Presentation only, like [`ui_palette`](Self::ui_palette), so it is a device
+    /// preference and never part of a settings profile. Parsed leniently — an unrecognized
+    /// value is a newer client's key, and the right answer to one is the default shelf.
+    #[serde(default)]
+    pub library_sort: String,
     /// Send Wake-on-LAN before connecting to a saved host and wait for it to boot (the
     /// Apple client's "Auto-wake on connect"). Default ON — that was the unconditional
     /// behavior before this became a setting. Off is for hosts reached over a VPN, where
@@ -1513,6 +1523,7 @@ impl Default for Settings {
             library_enabled: false,
             ui_palette: default_ui_palette(),
             reduce_motion: false,
+            library_sort: String::new(),
             auto_wake: true,
             invert_scroll: false,
             speaker_device: String::new(),

@@ -261,6 +261,7 @@ fn a_pinned_cards_library_launches_with_its_profile() {
         store: "steam".into(),
         launcher: false,
         icon: String::new(),
+        platform: None,
     }]);
     s.handle_menu(MenuEvent::Confirm);
     match s.take_action() {
@@ -292,6 +293,7 @@ fn a_primary_tiles_library_leaves_the_profile_to_the_binding() {
         store: "steam".into(),
         launcher: false,
         icon: String::new(),
+        platform: None,
     }]);
     s.handle_menu(MenuEvent::Confirm);
     assert!(matches!(
@@ -806,6 +808,7 @@ fn dump_console_screens() {
             store: "steam".into(),
             launcher: false,
             icon: String::new(),
+            platform: None,
         })
         .collect(),
     );

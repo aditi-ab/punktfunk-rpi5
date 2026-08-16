@@ -35,6 +35,16 @@ pub(crate) struct LibraryScreen {
     generation: u64,
     phase: LibraryPhase,
     games: Vec<LibraryGame>,
+    /// Display order: indices into `games`, as [`crate::collate`] arranged them. The cursor
+    /// indexes THIS, not `games` — which is what lets the plain shelf, a chosen sort and a
+    /// collection drill-in all be the same screen with the same cursor arithmetic, and what
+    /// keeps the art cache keyed on the model's own identities rather than on positions.
+    view: Vec<usize>,
+    sort: crate::collate::SortKey,
+    /// `Some` = this shelf shows ONE collated group (the Collections drill-in). The shared
+    /// model is untouched by it: filtering is index-level, so the art pump and the fetch
+    /// flow never learn that a filter exists.
+    filter: Option<crate::collate::GroupKey>,
     // Navigation: the integer cursor is the authority; the eased position chases it.
     cursor: i32,
     /// Each card's rect as last drawn (axis-aligned, scale applied — the perspective tilt
@@ -66,6 +76,9 @@ impl LibraryScreen {
             generation: u64::MAX,
             phase: LibraryPhase::Loading,
             games: Vec::new(),
+            view: Vec::new(),
+            sort: crate::collate::SortKey::default(),
+            filter: None,
             cursor: 0,
             geom: Vec::new(),
             anim: Spring::rest(0.0),
@@ -93,14 +106,48 @@ impl LibraryScreen {
         let cursor = self.cursor.max(0) as usize;
         // The cards actually on screen at rest — the ones the fan opens around.
         let lo = cursor.saturating_sub(2);
-        let hi = (cursor + 3).min(self.games.len());
-        let have_art = self.games[lo..hi]
-            .iter()
+        let hi = (cursor + 3).min(self.len());
+        let have_art = (lo..hi)
+            .filter_map(|i| self.game(i))
             .any(|g| self.art.contains_key(&g.id));
         if have_art || t - since >= 0.4 {
             self.entrance_armed = true;
             self.entrance = Some(Entrance::new(entrances::CARDS, cursor, t));
         }
+    }
+
+    /// Adopt the persisted presentation settings. Read every frame rather than at
+    /// construction because they can be changed while this screen is on the stack, and a
+    /// shelf that only picked them up on re-entry would look broken for one visit.
+    fn adopt_settings(&mut self, ctx: &Ctx) {
+        let sort = crate::collate::SortKey::parse(&ctx.settings.library_sort);
+        if sort != self.sort {
+            self.sort = sort;
+            self.recollate();
+        }
+    }
+
+    /// Rebuild the display order after anything that could change it: a new game list, a
+    /// new sort, a new filter. The cursor is clamped rather than followed by identity — a
+    /// re-sort moves everything, so "keep the same index" and "keep the same title" are
+    /// both arbitrary, and the cheap one at least never points off the end.
+    fn recollate(&mut self) {
+        self.view = crate::collate::filtered(&self.games, self.sort, self.filter.as_ref());
+        self.cursor = self.cursor.clamp(0, (self.view.len() as i32 - 1).max(0));
+    }
+
+    /// The game at a DISPLAY index (`None` past the end, or if the order went stale).
+    fn game(&self, i: usize) -> Option<&LibraryGame> {
+        self.games.get(*self.view.get(i)?)
+    }
+
+    fn focused(&self) -> Option<&LibraryGame> {
+        self.game(self.cursor.max(0) as usize)
+    }
+
+    /// Tiles on the shelf — the FILTERED count, not the library's.
+    fn len(&self) -> usize {
+        self.view.len()
     }
 
     /// The screen's title: the host, and — when this shelf belongs to a pinned card — the
@@ -137,7 +184,12 @@ impl LibraryScreen {
         if self.shared.is_none() {
             self.shared = Some(library.clone());
         }
-        let Some(shared) = &self.shared else { return };
+        // Cloned rather than borrowed: `LibraryShared` is an `Arc` handle, so this costs a
+        // refcount, and holding a borrow of `self.shared` across the body would forbid the
+        // `&mut self` work below (re-collating the display order) for no benefit.
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
         if shared.generation() != self.generation {
             let (phase, games, generation) = shared.snapshot();
             let fresh = self.games.len() != games.len()
@@ -157,7 +209,7 @@ impl LibraryScreen {
                 self.entrance_armed = false;
                 self.ready_at = None;
             }
-            self.cursor = self.cursor.clamp(0, (self.games.len() as i32 - 1).max(0));
+            self.recollate();
         }
         for (id, bytes) in shared.drain_art() {
             match Image::from_encoded(Data::new_copy(&bytes)) {
@@ -176,6 +228,7 @@ impl LibraryScreen {
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
         self.sync(ctx.library);
+        self.adopt_settings(ctx);
         match &self.phase {
             LibraryPhase::Ready => match ev {
                 MenuEvent::Move(MenuDir::Left) => self.step(-1, false),
@@ -183,7 +236,7 @@ impl LibraryScreen {
                 MenuEvent::JumpBack => self.step(-JUMP, true),
                 MenuEvent::JumpForward => self.step(JUMP, true),
                 MenuEvent::Confirm => {
-                    let g = self.games.get(self.cursor as usize)?;
+                    let g = self.focused()?;
                     fx.connect = Some(ConnectIntent {
                         addr: self.addr.clone(),
                         port: self.port,
@@ -211,7 +264,7 @@ impl LibraryScreen {
                 // it is the only per-game action there is, and a menu holding one row is
                 // a press the user pays for nothing.
                 MenuEvent::Tertiary => {
-                    let g = self.games.get(self.cursor as usize)?;
+                    let g = self.focused()?;
                     match self.game_link(&g.id) {
                         Some(url) => {
                             fx.copy = Some(url);
@@ -267,7 +320,7 @@ impl LibraryScreen {
                     .enumerate()
                     // The geometry is a frame old; a library refresh can shorten the shelf
                     // between the render that recorded it and this press.
-                    .filter(|(i, r)| *i < self.games.len() && p.hits(**r))
+                    .filter(|(i, r)| *i < self.len() && p.hits(**r))
                     .min_by_key(|(i, _)| (*i as i32 - self.cursor).abs())
                     .map(|(i, _)| i);
                 match hit {
@@ -287,7 +340,7 @@ impl LibraryScreen {
     }
 
     fn step(&mut self, delta: i32, clamp: bool) -> Option<MenuPulse> {
-        match step_cursor(self.cursor, self.games.len(), delta, clamp) {
+        match step_cursor(self.cursor, self.len(), delta, clamp) {
             StepResult::Moved(to) => {
                 self.cursor = to;
                 Some(MenuPulse::Move)
@@ -305,7 +358,11 @@ impl LibraryScreen {
     /// How many launcher entries lead the shelf — [`LibraryShared::set_games`] groups them at the
     /// front, so the launcher group is always the prefix `0..launcher_count()`.
     fn launcher_count(&self) -> usize {
-        self.games.iter().take_while(|g| g.launcher).count()
+        self.view
+            .iter()
+            .map_while(|&i| self.games.get(i))
+            .take_while(|g| g.launcher)
+            .count()
     }
 
     /// Is the focused entry a launcher? (Drives the confirm hint: you *open* Steam, you *play* a
@@ -351,6 +408,7 @@ impl LibraryScreen {
         ctx: &mut Ctx,
     ) {
         self.sync(ctx.library);
+        self.adopt_settings(ctx);
         let (w, cy_all) = (
             f64::from(rect.width()),
             f64::from(rect.top) + f64::from(rect.height()) / 2.0,
@@ -447,7 +505,7 @@ impl LibraryScreen {
         // cursor is in and changes as it crosses the boundary. Drawn only when the shelf
         // actually has both groups, so a library without launchers looks exactly as before.
         let launchers = self.launcher_count();
-        if launchers > 0 && launchers < self.games.len() {
+        if launchers > 0 && launchers < self.len() {
             let heading = if (self.cursor as usize) < launchers {
                 "LAUNCHERS"
             } else {
@@ -470,10 +528,10 @@ impl LibraryScreen {
 
         // Paint order = draw order: farthest from the (integer) cursor first, so the
         // dense side stacks overlap toward the focus.
-        let mut order: Vec<usize> = (0..self.games.len()).collect();
+        let mut order: Vec<usize> = (0..self.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse((i as i32 - self.cursor).abs()));
         self.geom.clear();
-        self.geom.resize(self.games.len(), Rect::new_empty());
+        self.geom.resize(self.len(), Rect::new_empty());
 
         for i in order {
             let d = i as f64 - pos;
@@ -508,7 +566,7 @@ impl LibraryScreen {
             );
             let m = card_matrix(ccx, cy, angle, scale, card_w, card_h, PERSPECTIVE * k);
 
-            let game = &self.games[i];
+            let Some(game) = self.game(i) else { continue };
             // The focused card's glow, drawn in SCREEN space before the card's own
             // transform: it is light spilling AROUND the card, so it cannot live inside the
             // rounded rect the card clips itself to. Fades with the sprung proximity rather
@@ -659,7 +717,7 @@ impl LibraryScreen {
         }
 
         // Detail block: focused title + store, in the band under the strip.
-        if let Some(g) = self.games.get(self.cursor as usize) {
+        if let Some(g) = self.focused() {
             let cx = f64::from(rect.left) + w / 2.0;
             fonts.centered(
                 canvas,

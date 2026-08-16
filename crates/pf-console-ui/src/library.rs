@@ -583,6 +583,11 @@ pub struct LibraryGame {
     /// [`pf_client_core::library::GameEntry::icon_token`]. Empty when the entry names no mark;
     /// a token we ship no art for simply draws nothing and the tile falls back to its name.
     pub icon: String,
+    /// The system this title runs on (`"PC"`, `"PS2"`, …) — the host's own free-form display
+    /// string, passed through untouched. `None` for a store-front game whose host said
+    /// nothing, which is the common case: the rom-manager plugin populates this, Steam does
+    /// not. [`crate::collate`] is where that `None` is given a meaning.
+    pub platform: Option<String>,
 }
 
 struct Shared {
@@ -782,6 +787,7 @@ mod tests {
             store: "steam".into(),
             launcher,
             icon: String::new(),
+            platform: None,
         };
         let shared = LibraryShared::default();
         shared.set_games(vec![
@@ -811,6 +817,7 @@ mod tests {
                     store: "steam".into(),
                     launcher: false,
                     icon: String::new(),
+                    platform: None,
                 })
                 .collect(),
         );
