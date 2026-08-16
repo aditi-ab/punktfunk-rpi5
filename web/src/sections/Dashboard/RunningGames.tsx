@@ -56,6 +56,11 @@ const GameRow: FC<{
 	isEnding: boolean;
 }> = ({ game, art, onEnd, isEnding }) => {
 	const waiting = game.state === "grace";
+	// A title the host cannot recognize the process of. Worth its own line rather than just a badge:
+	// the whole point is that the session settings do not apply to this row, and a user who has just
+	// quit the game and is watching the console wondering why nothing happened deserves the answer
+	// here rather than in the host log.
+	const untracked = game.state === "untracked";
 	return (
 		<div className="flex items-center gap-3">
 			{/* Fixed slot so rows line up whether or not a title has a cover. Plenty won't: an
@@ -86,7 +91,9 @@ const GameRow: FC<{
 						? m.games_closing_in({
 								time: formatCountdown(game.grace_remaining_s ?? 0),
 							})
-						: [game.client, planeLabel(game.plane)].filter(Boolean).join(" · ")}
+						: untracked
+							? m.games_untracked_note()
+							: [game.client, planeLabel(game.plane)].filter(Boolean).join(" · ")}
 				</p>
 			</div>
 			<Button
@@ -129,6 +136,8 @@ function stateLabel(state: string): string {
 			return m.games_state_exited();
 		case "grace":
 			return m.games_state_grace();
+		case "untracked":
+			return m.games_state_untracked();
 		default:
 			return state;
 	}
@@ -137,6 +146,9 @@ function stateLabel(state: string): string {
 function stateVariant(state: string): "success" | "secondary" | "outline" {
 	if (state === "running") return "success";
 	if (state === "launching") return "secondary";
+	// `untracked` falls through to `outline` with the rest: it is not an error — plenty of
+	// legitimate titles (a launcher tile, an AUMID activation) can never be tracked — so it must not
+	// wear the destructive styling that `grace` uses to mean "about to lose your progress".
 	return "outline";
 }
 

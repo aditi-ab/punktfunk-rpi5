@@ -26,6 +26,9 @@ struct LibraryCoverflowView: View {
     let games: [GameEntry]
     let artLoader: (any LibraryArtSource)?
     var onLaunch: ((String) -> Void)?
+    /// Which titles the host already has up, keyed by library id — so a card the player can return
+    /// to says `Resume` rather than looking like every other one. Empty on an older host.
+    var running: [String: RunningGame] = [:]
     /// Button B (back) — dismisses the library screen. No touch equivalent needed here (the toolbar
     /// Close button already covers that); this is what makes gamepad-only exit possible.
     var onDismiss: (() -> Void)?
@@ -154,6 +157,10 @@ struct LibraryCoverflowView: View {
                 // `solid`: a frosted chip can't sample a backdrop through this card's own
                 // composited transform, so it would only show up on the centred card.
                 StoreBadge(label: game.storeLabel, isLauncher: game.isLauncher, solid: true)
+            }
+            // Opposite corner from the store chip, and `solid` for the same compositing reason.
+            .overlay(alignment: .topTrailing) {
+                if running[game.id] != nil { RunningBadge(solid: true) }
             }
             .overlay {
                 RoundedRectangle(cornerRadius: 16, style: .continuous)

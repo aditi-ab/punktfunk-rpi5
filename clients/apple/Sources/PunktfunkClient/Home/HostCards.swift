@@ -126,7 +126,13 @@ struct HostCardView: View {
     let onSpeedTest: () -> Void
     let onForget: () -> Void
     let onRemove: () -> Void
-    /// Open the experimental library browser — nil (no menu item) unless the feature flag is on.
+    /// Open this host's game library. `nil` — no library affordance at all — when the setting is
+    /// off or the host is unpaired (the library plane needs the pinned identity).
+    ///
+    /// When present this is the card's **primary** action: tapping a machine you play games on
+    /// should offer the games, not drop you on its desktop. Streaming the desktop is still one tap
+    /// away, in the menu, and remains primary for a host with no library. Field note, 2026-08-16:
+    /// "clicking the PC opening the library directly".
     var onBrowseLibrary: (() -> Void)? = nil
     /// Send a Wake-on-LAN magic packet. Shown only when the host is offline and we have a stored
     /// MAC to target (a tap-to-connect already auto-wakes; this is the explicit "just wake it").
@@ -146,9 +152,13 @@ struct HostCardView: View {
         }
     }
 
+    /// What tapping the card does: open the library where the host has one, else connect. The
+    /// menu carries whichever of the two this isn't, so neither is ever more than one press away.
+    private var primaryAction: () -> Void { onBrowseLibrary ?? onConnect }
+
     var body: some View {
         let m = CardMetrics.current
-        return Button(action: onConnect) {
+        return Button(action: primaryAction) {
             HStack(spacing: m.spacing) {
                 monogramTile(monogram(host.displayName), osChain: host.osChain,
                              m: m, connecting: isConnecting, filled: true)
@@ -220,11 +230,12 @@ struct HostCardView: View {
             // the host's default binding.
             connectWithMenu(menu)
             // Browsing IS a connect-shaped action — it is this card's connect with a title picked
-            // first — so a pinned card offers it and opens its own shelf, whose launches carry the
-            // pinned profile. (Pair / speed test / wake / forget stay on the host's card: those
-            // are about the machine, and a shortcut has no business claiming them.)
-            if let onBrowseLibrary {
-                Button("Browse Library…", action: onBrowseLibrary)
+            // first — and it is now what TAPPING the card does, so the menu carries the other
+            // half instead: streaming the machine itself. (Pair / speed test / wake / forget stay
+            // on the host's card: those are about the machine, and a shortcut has no business
+            // claiming them.)
+            if onBrowseLibrary != nil {
+                Button("Stream the Desktop", systemImage: "display", action: onConnect)
             }
             if LinkClipboard.isAvailable {
                 Button("Copy Link") { menu.copyLink(pinned.id) }
@@ -245,8 +256,11 @@ struct HostCardView: View {
             }
             Button("Pair with PIN…", action: onPair)
             Button("Test Network Speed…", action: onSpeedTest)
-            if let onBrowseLibrary {
-                Button("Browse Library…", action: onBrowseLibrary)
+            // The inverse of the card's primary tap — see `onBrowseLibrary`. Absent for a host
+            // with no library, where connecting IS the primary tap and a menu row for it would
+            // just be the same action twice.
+            if onBrowseLibrary != nil {
+                Button("Stream the Desktop", systemImage: "display", action: onConnect)
             }
             if !isOnline, !host.wakeMacs.isEmpty, PunktfunkConnection.wakeOnLANAvailable, let onWake {
                 Button("Wake Host", systemImage: "power", action: onWake)

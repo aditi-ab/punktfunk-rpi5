@@ -44,6 +44,42 @@ struct StoreBadge: View {
     }
 }
 
+/// "This one is already running on the host" — the Resume affordance, overlaid on a poster.
+///
+/// A badge rather than a changed button title because the grid's tiles have no titles to change:
+/// the poster *is* the control. It says `Resume` rather than `Running` on purpose — the player
+/// does not need a status report, they need to know what tapping it will do.
+///
+/// Flat-filled for the same reason `StoreBadge(solid:)` exists: the coverflow composites its cards
+/// offscreen, where a material has no backdrop to sample.
+struct RunningBadge: View {
+    var solid: Bool = false
+    /// Glyph only, no word. The grid's tiles go down to ~130 pt wide and already carry the store
+    /// chip in the opposite corner; at that size "Resume" plus an icon leaves the two badges
+    /// touching in the middle. The coverflow's cards are several times wider and take the word.
+    var compact: Bool = false
+
+    var body: some View {
+        Group {
+            if compact {
+                Image(systemName: "play.fill")
+            } else {
+                Label("Resume", systemImage: "play.fill").labelStyle(.titleAndIcon)
+            }
+        }
+            .font(.geist(11, .semibold, relativeTo: .caption2))
+            .foregroundStyle(.white)
+            // Semantic green rather than the brand violet: this is a state the host reports, not a
+            // Punktfunk surface, and it has to stay distinguishable from the launcher badge — which
+            // already owns the brand fill one corner away.
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(Color.green.opacity(solid ? 0.92 : 0.85), in: Capsule())
+            .padding(6)
+            .accessibilityLabel("Running on the host — resume")
+    }
+}
+
 #if canImport(UIKit)
 private typealias PlatformImage = UIImage
 #elseif canImport(AppKit)

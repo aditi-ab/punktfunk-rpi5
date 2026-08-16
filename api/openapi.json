@@ -4242,7 +4242,7 @@
           },
           "state": {
             "type": "string",
-            "description": "`launching` (launched, not seen running yet), `running`, `exited`, or `grace` (its session is\ngone and it will be ended when the reconnect window closes).",
+            "description": "`launching` (launched, not seen running yet), `running`, `exited`, `untracked` (this title\nexposes nothing the host can recognize its process by, so its exit will never be noticed),\nor `grace` (its session is gone and it will be ended when the reconnect window closes).",
             "example": "running"
           },
           "store": {
@@ -6194,6 +6194,14 @@
           }
         }
       },
+      "GameOnNewLaunch": {
+        "type": "string",
+        "description": "What to do with a title this client already has running when it launches a **different** one.\n\nThe third axis rather than a fourth value on [`GameOnSessionEnd`], because it answers a different\nquestion at a different moment: that one is \"this session is over, what about its game\", this one\nis \"the player asked for something else, what about the last thing\". Folding them together would\ntie two unrelated choices to one switch — an operator who wants a game to survive a disconnect\nvery plausibly still wants it closed when they pick another title.\n\nScoped to the **same client's own launches**, and only ever to launches this host performed\nitself ([`crate::launchreg`]). A game the player started at the machine was never recorded there,\nso it can never be closed by this; nor can another client's game, which would otherwise let one\ndevice end someone else's session mid-play.",
+        "enum": [
+          "keep",
+          "end"
+        ]
+      },
       "GameOnSessionEnd": {
         "type": "string",
         "description": "What to do with the launched game when its session ends.",
@@ -8094,6 +8102,10 @@
             "format": "int32",
             "description": "How long a vanished client has to reconnect before `Always` ends its game. Ignored by the\nother two policies.",
             "minimum": 0
+          },
+          "game_on_new_launch": {
+            "$ref": "#/components/schemas/GameOnNewLaunch",
+            "description": "End this client's previous game when it launches a different one. See [`GameOnNewLaunch`]."
           },
           "game_on_session_end": {
             "$ref": "#/components/schemas/GameOnSessionEnd",

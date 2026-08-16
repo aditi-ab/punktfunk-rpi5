@@ -199,8 +199,9 @@ pub(crate) struct ActiveGame {
     store: Option<String>,
     /// `native` or `gamestream`.
     plane: crate::events::Plane,
-    /// `launching` (launched, not seen running yet), `running`, `exited`, or `grace` (its session is
-    /// gone and it will be ended when the reconnect window closes).
+    /// `launching` (launched, not seen running yet), `running`, `exited`, `untracked` (this title
+    /// exposes nothing the host can recognize its process by, so its exit will never be noticed),
+    /// or `grace` (its session is gone and it will be ended when the reconnect window closes).
     #[schema(example = "running")]
     state: String,
     /// Seconds until this game is ended — only present on a `grace` row.
@@ -592,9 +593,15 @@ pub(crate) async fn get_local_summary(State(st): State<Arc<MgmtState>>) -> Json<
         conflicts: crate::detect::summary_labels(crate::detect::snapshot()),
         games: crate::session_status::games()
             .into_iter()
-            .map(|g| match g.grace_remaining_s {
-                Some(left) => format!("{} (closing in {}:{:02})", g.title, left / 60, left % 60),
-                None => g.title,
+            .map(|g| match (g.grace_remaining_s, g.state) {
+                (Some(left), _) => {
+                    format!("{} (closing in {}:{:02})", g.title, left / 60, left % 60)
+                }
+                // Say so here too: the tray is the surface someone at the machine reads, and
+                // "Hades" beside a game the host cannot actually follow reads as a promise it
+                // never made.
+                (None, "untracked") => format!("{} (not tracked)", g.title),
+                (None, _) => g.title,
             })
             .collect(),
     })

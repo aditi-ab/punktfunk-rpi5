@@ -225,7 +225,8 @@ pub struct GameSnapshot {
     pub title: String,
     pub store: Option<String>,
     pub plane: crate::events::Plane,
-    /// `launching` / `running` / `exited`, or `grace` for a game on its reconnect window.
+    /// `launching` / `running` / `exited` / `untracked`, or `grace` for a game on its reconnect
+    /// window.
     pub state: &'static str,
     /// Seconds left before the game is ended, for a `grace` row.
     pub grace_remaining_s: Option<u64>,
@@ -437,6 +438,7 @@ mod tests {
                 nested: false,
                 launcher: false,
                 child: None,
+                spawned: None,
                 launch_stamp: None,
                 procs: None,
             },
