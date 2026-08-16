@@ -163,8 +163,13 @@ const DECODE_CAP_SIMILAR_DIV: u32 = 8;
 /// stream barely flowed (a host-side capture stall, an outage, a mid-window pause), so whatever
 /// distress the window carries — a flush, a keyframe-ask burst — is starvation-shaped, not
 /// rate-shaped, and the decoder decoded almost nothing at the nominal rate. Such a window may
-/// still back off (real damage deserves the safe response) but must never be a decode-knee
-/// sample: latching `current_kbps` off a starved window teaches a phantom decoder cap at
+/// still back off on what the CLIENT saw — loss, a flush, a dropped frame mean the same thing
+/// however little flowed, and real damage deserves the safe response — but two things it must
+/// never do. It must never be a decode-knee sample, and it must never carry the HOST-ENCODE
+/// signal: `encode_us` is averaged over the AUs of the window, so when almost none flowed the
+/// mean describes whatever interrupted them rather than the cost of encoding at this rate (see
+/// the withholding in [`BitrateController::on_window`]). Latching `current_kbps` off a starved
+/// window teaches a phantom decoder cap at
 /// whatever rate the stall interrupted (the periodic-capture-stall field case: every 5 s cycle
 /// offers another pair of "backoffs" at the same rate — a bogus latch that then fights the
 /// re-probe ladder for minutes). Deliberately far below the ×¾ utilization bar climbs require:
@@ -572,13 +577,35 @@ impl BitrateController {
             DECODE_RISE_US,
             DECODE_SEVERE_US,
         );
+        // STARVED (see [`STARVED_DELIVERY_DIV`]): the window carried under a quarter of the rate
+        // it was allowed. Hoisted above the signal scoring because the encode signal below is not
+        // merely inconvenient in such a window, it is not a measurement — see there. `current_kbps`
+        // does not move inside this function, so this is the same value the backoff block reads.
+        let starved =
+            (actual_kbps as u64) * (STARVED_DELIVERY_DIV as u64) < self.current_kbps as u64;
         // Host-encode latency: the same rolling-min-baseline treatment, measuring the HOST'S
         // encoder — the compute-knee down-driver (see [`ENCODE_RISE_US`]). This is the only
         // signal that can push an already-too-high rate back under the knee: the host refuses
         // further climbs while behind cadence, but nothing else ever DESCENDS on a clean LAN.
+        //
+        // Withheld entirely in a STARVED window. `encode_us` is a per-AU host measurement averaged
+        // over the window, so when almost no AUs flowed the mean is taken over the handful that
+        // straddled whatever interrupted them — and their encode time carries that interruption,
+        // not the cost of encoding at this rate. The field case: a 401 ms capture-ring and encoder
+        // rebuild (an exclusive-topology eviction, entirely host-local) produced one window with
+        // `encode_mean_us=15063` against a ~2800 baseline, `actual_kbps=390` against a 20 000
+        // target, and `loss_ppm=0`. That cleared [`ENCODE_SEVERE_US`], took the one-window path,
+        // and cost a ×0.7 plus slow start for the rest of the session — on a link that never
+        // dropped a packet. Passed as absent rather than ignored so it cannot teach the rolling
+        // baseline either: a sample that measures a stall is not evidence about anything.
+        //
+        // The other signals keep their full power here on purpose. Loss, a flush and a dropped
+        // frame describe what reached the CLIENT, and they mean the same thing however little
+        // flowed — the periodic-capture-stall case (see [`STARVED_DELIVERY_DIV`]) still backs off
+        // on one window, as its tests require.
         let (encode_bad, encode_severe) = score_baseline(
             &mut self.encode_means,
-            encode_mean_us,
+            encode_mean_us.filter(|_| !starved),
             ENCODE_RISE_US,
             ENCODE_SEVERE_US,
         );
@@ -708,10 +735,9 @@ impl BitrateController {
                 || self.streak_decode_windows >= BAD_WINDOWS_TO_DECREASE
                 || (recovery_kf >= RECOVERY_KF_BAD && loss_ppm < HEAVY_LOSS_PPM)
                 || (flushed && (decode_bad || decode_mean_us.is_none()));
-            // Starved deciding window (see [`STARVED_DELIVERY_DIV`]): the stream barely flowed,
-            // so the window says nothing about what the decoder can hold at this rate.
-            let starved =
-                (actual_kbps as u64) * (STARVED_DELIVERY_DIV as u64) < self.current_kbps as u64;
+            // `starved` (the deciding window barely flowed, so it says nothing about what the
+            // decoder can hold at this rate) is now computed once at the top of the window — the
+            // same predicate also governs the severe tier and slow start.
             if !self.climb_since_backoff {
                 // Still draining the previous backoff: the host acks a ×0.7 request in ~100 ms,
                 // so this window's rate is one the decoder never choked at while keeping up —
@@ -2201,6 +2227,88 @@ mod tests {
             c.decode_cap_kbps,
             Some(rate - rate / 16),
             "the genuine pair still latches around the starved interruption"
+        );
+    }
+
+    /// The host-rebuild field window, verbatim from the 0.29 log: an exclusive-topology eviction
+    /// rebuilt the capture ring and the encoder in place (401 ms, entirely host-local), and the
+    /// client's report window straddled it — 390 kbps delivered against a 20 000 target, zero
+    /// loss, no flush, and an encode mean of 15 063 µs against a ~2 800 baseline.
+    ///
+    /// That used to clear the severe encode tier and take the one-window path, costing a ×0.7 and
+    /// slow start for the rest of the session on a link that never dropped a packet. The encode
+    /// mean over a window in which almost nothing flowed is not a measurement of encode cost, so
+    /// the signal is withheld and the window decides nothing.
+    #[test]
+    fn a_starved_window_cannot_back_off_on_host_encode_time_alone() {
+        let mut c = BitrateController::new(20_000);
+        c.set_ceiling(657_000);
+        let start = Instant::now();
+        let mut t = 0;
+        // Seed the latency baselines. Half-utilized on purpose: above the starved bar (a quarter
+        // of target) so the encode samples count, below the climb bar (three quarters) so no step
+        // fires and `current_kbps` stays put.
+        for _ in 0..BASELINE_MIN_WINDOWS {
+            assert_eq!(
+                c.on_window(
+                    ticks(start, t),
+                    0,
+                    0,
+                    Some(3_500),
+                    Some(200),
+                    Some(2_800),
+                    10_000,
+                    false,
+                    0
+                ),
+                None
+            );
+            t += 1;
+        }
+        assert!(
+            c.probing,
+            "slow start is still armed going into the rebuild"
+        );
+
+        let verdict = c.on_window(
+            ticks(start, t),
+            0,
+            0,
+            Some(15_711),
+            Some(129),
+            Some(15_063),
+            390,
+            false,
+            0,
+        );
+        t += 1;
+        assert_eq!(
+            verdict, None,
+            "a host-local rebuild must not move the rate: nothing was lost and nothing was slow"
+        );
+        assert_eq!(c.current_kbps, 20_000, "and the rate is untouched");
+        assert!(
+            c.probing,
+            "nor may it retire slow start — recovery would crawl at +6 % per six windows"
+        );
+
+        // The signal itself must still work: the starved sample was withheld rather than folded
+        // into the rolling minimum, so the SAME encode excursion in a window that actually
+        // carried its rate is still severe, and still backs off on one window.
+        let verdict = c.on_window(
+            ticks(start, t),
+            0,
+            0,
+            Some(3_600),
+            Some(210),
+            Some(15_063),
+            20_000,
+            false,
+            0,
+        );
+        assert!(
+            verdict.is_some_and(|k| k < 20_000),
+            "a real encode excursion at full delivery still backs off, got {verdict:?}"
         );
     }
 
