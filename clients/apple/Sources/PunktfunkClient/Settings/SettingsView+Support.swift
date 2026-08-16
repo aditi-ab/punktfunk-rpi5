@@ -78,15 +78,14 @@ extension SettingsView {
     private static let maxSliderKbps = 3_000_000.0
 
     /// tvOS's cluster caption (the touch/desktop forms describe bitrate per-row instead).
-    static let bitrateFooter =
-        "Automatic uses the host's default bitrate (20 Mbps); the host clamps any choice "
-        + "to its supported range. Run a speed test from a host card's context menu to "
-        + "pick an informed value. Applies from the next session."
+    ///
+    /// Deliberately says nothing about the speed test: it is reached from a host card's context
+    /// menu, and tvOS has no context menus — the old wording sent Apple TV users after a control
+    /// that does not exist there.
+    static let bitrateFooter = "Automatic bitrate uses the host's default, 20 Mbps."
 
     static let gigabitWarning =
-        "Above 1 Gbps — test the network speed first (a host card's context menu → "
-        + "Test Network Speed…). A bitrate beyond what the link sustains causes loss "
-        + "and stutter."
+        "Above 1 Gbps — more than the link sustains causes loss and stutter. Speed-test first."
 
     /// `bitrateKbps == 0` is Automatic; switching to manual lands on the host default. Scoped, so
     /// flipping it in a profile records the override there rather than moving the global.
@@ -119,12 +118,12 @@ extension SettingsView {
     // MARK: - Statistics
 
     static var statisticsDescription: String {
-        let base = "Live session stats in a corner overlay — Compact is a one-line pill, "
-            + "Detailed adds the latency stage breakdown."
+        // No "Live session stats in a corner overlay" preamble: it restates the row's own label.
+        let base = "Compact is a one-line pill; Detailed adds the latency breakdown."
         #if os(macOS)
-        return base + " ⌃⌥⇧S cycles the tiers any time."
+        return base + " ⌃⌥⇧S cycles it."
         #elseif os(iOS)
-        return base + " ⌃⌥⇧S or a three-finger tap cycles the tiers any time."
+        return base + " ⌃⌥⇧S or a three-finger tap cycles it."
         #else
         return base
         #endif
@@ -134,9 +133,7 @@ extension SettingsView {
 
     /// tvOS's cluster caption (the touch/desktop form describes each row inline instead).
     static let controllersFooter =
-        "One controller is forwarded as player 1 — Automatic picks the most recently "
-        + "connected. Type is the virtual pad the host creates; Automatic matches your "
-        + "controller (a DualSense keeps adaptive triggers, lightbar, touchpad and motion). "
+        "Automatic uses the newest pad as player 1 and matches its type on the host. "
         + "Applies from the next session."
 
     /// "Use controller" choices for this view's manager (see `SettingsOptions.controllerOptions`).

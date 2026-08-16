@@ -470,8 +470,8 @@ struct SettingsView: View {
                     selection: $compositor)
                 tvCaption("The host drives a real output at exactly the chosen mode. "
                     + "\(Self.bitrateFooter) Lowest latency shows frames immediately; "
-                    + "Smoothness buffers a few to even out network hiccups. A specific "
-                    + "compositor is honored only if available on the host.")
+                    + "Smoothness buffers a few. A compositor is honored only if available. "
+                    + "Applies from the next session.")
                 TVSelectionRow(
                     title: "Audio channels",
                     options: SettingsOptions.audioChannels,
@@ -483,19 +483,12 @@ struct SettingsView: View {
                     title: "Audio quality",
                     options: SettingsOptions.audioFormats,
                     selection: $audioFormat)
-                tvCaption("Lossless sends bit-exact PCM instead of compressed audio — 2.1 to 8.5 "
-                    + "Mbps on top of the video for stereo, three times that for 5.1 and four for "
-                    + "7.1. It also has to be enabled on the host, the host's own interface has "
-                    + "to run the rate, and the Apple TV's output has to accept it. The top of "
-                    + "the ladder needs room the network may not have: 176.4 kHz sends a thousand "
-                    + "packets a second, and surround above 48 kHz does not fit at all. Anything "
-                    + "missing falls back to Standard — the stats overlay shows what the session "
-                    + "actually got.")
+                tvCaption("Lossless sends bit-exact PCM — 2.3 Mbps at 48 kHz, up to 8.5 at "
+                    + "176.4. Falls back to Standard if the host or this TV declines it.")
                 TVSelectionRow(
                     title: "Auto-wake on connect",
                     options: [("On", "on"), ("Off", "off")], selection: autoWakeEnabledTag)
-                tvCaption("Auto-wake sends Wake-on-LAN to a sleeping saved host and waits for "
-                    + "it before streaming.")
+                tvCaption("Sends Wake-on-LAN to a sleeping saved host and waits for it.")
                 TVSelectionRow(
                     title: "Statistics overlay",
                     options: SettingsOptions.statsVerbosities, selection: $statsVerbosityRaw)

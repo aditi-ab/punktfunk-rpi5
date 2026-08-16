@@ -41,9 +41,8 @@ extension SettingsView {
             // first of the two controls that drive it read as if the toggle alone were
             // overridden. It goes under the size control below, for the group.
             described(effective.matchWindow
-                ? "The host resizes its output to follow this window — the picture stays "
-                    + "pixel-exact (1:1) through every resize."
-                : "Stream at the fixed mode below; a window at a different size shows it scaled.") {
+                ? "The host follows this window's size — pixel-exact through every resize."
+                : "Streams the fixed mode below, scaled to the window.") {
                 Toggle("Match window", isOn: scoped(SettingsFields.matchWindow))
             }
             #endif
@@ -62,8 +61,8 @@ extension SettingsView {
                     .labelsHidden()
             }
             overrideMarker(OverlayField.resolution)
-            described("The host drives a real virtual output at exactly this size and refresh — "
-                + "true pixels, no scaling.", field: "refresh_hz") {
+            described("The host drives a real output at exactly this size — no scaling.",
+                field: "refresh_hz") {
                 TextField(
                     "Refresh rate (Hz)", value: scoped(SettingsFields.refreshHz),
                     format: .number.grouping(.never))
@@ -95,7 +94,7 @@ extension SettingsView {
             .labelsHidden()
             .pickerStyle(.wheel)
             .frame(maxHeight: 140)
-            Text("The host drives a real output at exactly this mode — true pixels, no scaling.")
+            Text("The host drives a real output at exactly this mode — no scaling.")
                 .font(.geist(13, relativeTo: .footnote))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -214,12 +213,12 @@ extension SettingsView {
                     }
                 }
             }
-            described("HDR10, when the host has HDR content and this display supports it. "
-                + "HEVC only; otherwise the stream stays SDR.", field: "hdr_enabled") {
+            described("HDR10 when the host sends it and this display supports it. HEVC only.",
+                field: "hdr_enabled") {
                 Toggle("10-bit HDR", isOn: scoped(SettingsFields.hdrEnabled))
             }
-            described("Sharper text and UI for desktop work, at more bandwidth. For games the "
-                + "bits are better spent at 4:2:0. HEVC only.", field: "enable_444") {
+            described("Sharper text and UI, at more bandwidth. For desktop work; HEVC only.",
+                field: "enable_444") {
                 Toggle("Full chroma (4:4:4)", isOn: scoped(SettingsFields.enable444))
             }
         }
@@ -243,24 +242,21 @@ extension SettingsView {
     /// legible. Only the explicit mode can show it (match-window derives the base from the live
     /// window, not these fields).
     private var renderScaleDescription: String {
-        var text = "Above native supersamples for sharpness; below renders lighter on the host "
-            + "and the link."
+        var text = "Above native is sharper, below is lighter on the host and link."
         let settings = effective
         if settings.renderScale != 1.0, !settings.matchWindow {
             let mode = RenderScale.apply(
                 baseWidth: settings.width, baseHeight: settings.height,
                 scale: settings.renderScale,
                 maxDimension: RenderScale.maxDimension(codec: settings.codec))
-            text += " Host renders \(Int(mode.width))×\(Int(mode.height)); this device scales "
-                + "it to your display."
+            text += " Host renders \(Int(mode.width))×\(Int(mode.height))."
         }
         return text
     }
 
     /// The automatic-bitrate toggle + manual slider (and the >1 Gbps warning) rows.
     @ViewBuilder private var bitrateRows: some View {
-        described("The host's default 20 Mbps, clamped to what it supports. Turn off to set a "
-            + "fixed rate — a host card's context menu has a network speed test.",
+        described("Uses the host's default, 20 Mbps. Off to set it yourself.",
             field: "bitrate_kbps") {
             Toggle("Automatic bitrate", isOn: automaticBitrate)
         }
@@ -291,10 +287,9 @@ extension SettingsView {
     @ViewBuilder var presentationSection: some View {
         Section("Presentation") {
             described(effective.presentPriority == "smooth"
-                ? "A small frame buffer evens out network hiccups, at the buffer's worth of "
-                    + "added display latency."
-                : "Every frame shows the moment the display can take it — a network hiccup is "
-                    + "an occasional repeated or skipped frame.", field: "present_priority") {
+                ? "A small buffer evens out network hiccups, at its worth of added latency."
+                : "Frames show as soon as they arrive; a hiccup repeats or skips one.",
+                field: "present_priority") {
                 Picker("Prioritize", selection: scoped(SettingsFields.presentPriority)) {
                     ForEach(SettingsOptions.presentPriorities, id: \.tag) { option in
                         Text(option.tag == SettingsOptions.presentPriorityDefault
@@ -304,8 +299,8 @@ extension SettingsView {
                 }
             }
             if effective.presentPriority == "smooth" {
-                described("Frames held back — each absorbs about one refresh of jitter and "
-                    + "adds one refresh of delay.", field: "smooth_buffer") {
+                described("Each frame costs one refresh of latency and absorbs one of jitter.",
+                    field: "smooth_buffer") {
                     Picker("Buffer", selection: scoped(SettingsFields.smoothBuffer)) {
                         ForEach(
                             SettingsOptions.smoothBuffers(refreshHz: effective.refreshHz),
@@ -319,27 +314,24 @@ extension SettingsView {
             // Non-tvOS: the Apple TV drives a fixed HDMI mode, so there's no adaptive refresh.
             #if !os(tvOS)
             described("A ProMotion or adaptive-sync display follows the stream's rate — "
-                + "smoother motion. No effect on fixed-refresh displays.", field: "allow_vrr") {
+                + "smoother motion.", field: "allow_vrr") {
                 Toggle("Allow VRR", isOn: scoped(SettingsFields.allowVRR))
             }
             #endif
             // macOS-only: iOS/tvOS layers always present on the display's vsync, so the choice
             // only exists on the Mac (the layer's own sync stays off — see MetalVideoPresenter).
             #if os(macOS)
-            described("Flips align to the display's refresh — even pacing, up to one refresh "
-                + "of added latency. Off shows frames as soon as they're ready.", field: "vsync") {
+            described("Even pacing, at up to one refresh of added latency.", field: "vsync") {
                 Toggle("V-Sync", isOn: scoped(SettingsFields.vsync))
             }
             // The DCP swapID-panic mitigation's user handle (see DefaultsKey.windowedSafePresent
             // for the saga). Default ON: turning it off re-arms a WHOLE-MACHINE kernel panic on
             // affected setups, so the caption says so in plain words.
             described(effective.windowedSafePresent
-                ? "Windowed streams present in step with the system compositor — avoids a macOS "
-                    + "display-driver crash seen on high-refresh displays, at a small latency "
-                    + "cost. Fullscreen always uses the fastest path."
-                : "Windowed streams use the fastest present path. On some high-refresh setups "
-                    + "this can crash macOS itself (kernel panic) — turn back on if your Mac "
-                    + "restarts during windowed streaming.", field: "windowed_safe_present") {
+                ? "Windowed streams present in step with the compositor — avoids a macOS "
+                    + "display-driver crash, at a small latency cost."
+                : "Windowed streams use the fastest path. On some high-refresh Macs this can "
+                    + "kernel-panic the machine.", field: "windowed_safe_present") {
                 Toggle("Safe windowed presentation", isOn: scoped(SettingsFields.windowedSafePresent))
             }
             #endif
@@ -350,8 +342,8 @@ extension SettingsView {
 
     @ViewBuilder var hostOutputSection: some View {
         Section {
-            described("The backend the host uses for its virtual output. A specific choice "
-                + "falls back to auto-detection when that backend isn't available.",
+            described("The backend the host drives its virtual output with — honored only if "
+                + "available.",
                 field: "compositor") {
                 Picker("Compositor", selection: scoped(SettingsFields.compositor)) {
                     ForEach(SettingsOptions.compositors, id: \.tag) { option in
@@ -394,17 +386,14 @@ extension SettingsView {
                 }
                 #endif
                 if !inProfileScope {
-                    described("Connecting to a saved host that's offline sends Wake-on-LAN and "
-                        + "waits for it to boot. Turn off if hosts behind a VPN look offline "
-                        + "when they aren't.") {
+                    described("Sends Wake-on-LAN to a sleeping saved host and waits for it.") {
                         Toggle("Auto-wake on connect", isOn: $autoWakeEnabled)
                     }
                 }
                 #if os(iOS)
                 if !inProfileScope {
-                    described("Audio and the connection stay live after you switch away; video "
-                        + "pauses to save power and resumes instantly when you return. Off, "
-                        + "backgrounding freezes the session.") {
+                    described("Audio and the connection stay live when you switch away; video "
+                        + "pauses.") {
                         Toggle("Keep streaming in background", isOn: $backgroundKeepAlive)
                     }
                     if backgroundKeepAlive {
@@ -455,8 +444,8 @@ extension SettingsView {
         // profile scope rather than rendering an empty group.
         if !inProfileScope {
             Section("Library") {
-                described("Adds “Browse Library…” to paired hosts — list their Steam and custom "
-                    + "games and launch one directly. No extra host setup.") {
+                described("Adds “Browse Library…” to paired hosts — launch their games "
+                    + "directly.") {
                     Toggle("Show game library", isOn: $libraryEnabled)
                 }
             }
@@ -480,8 +469,8 @@ extension SettingsView {
             // Whether a hardware mouse attached to THIS iPad gets locked is a fact about this
             // device's input hardware (tier G), not about how a host is streamed.
             if !inProfileScope, UIDevice.current.userInterfaceIdiom == .pad {
-                described("Locks a hardware mouse for relative mouse-look in games; off sends "
-                    + "absolute positions. Needs the stream fullscreen and frontmost.") {
+                described("Locks a hardware mouse for mouse-look. Needs the stream "
+                    + "fullscreen.") {
                     Toggle("Capture pointer for games", isOn: $pointerCapture)
                 }
             }
@@ -493,12 +482,14 @@ extension SettingsView {
     private var touchModeDescription: String {
         switch TouchInputMode(rawValue: effective.touchMode) ?? .trackpad {
         case .trackpad:
-            return "Your finger drives the host cursor like a laptop trackpad — tap to click, "
-                + "two-finger tap right-clicks, two-finger drag scrolls, tap-and-drag holds."
+            // The one caption where length is earned: this is a gesture reference, not an
+            // explanation. Only the two gestures a trackpad user would not guess are listed.
+            return "Drives the host cursor like a trackpad — two-finger tap right-clicks, "
+                + "two-finger drag scrolls."
         case .pointer:
-            return "The host cursor jumps to wherever you touch — tap is a click at that spot."
+            return "The host cursor jumps to wherever you touch."
         case .touch:
-            return "Real multi-touch reaches the host — for touch-native apps and games."
+            return "Real multi-touch reaches the host."
         }
     }
     #endif
@@ -542,11 +533,9 @@ extension SettingsView {
     /// silently does nothing should say so instead of leaving the user to find out.
     private var inhibitShortcutsDescription: String {
         if (MouseInputMode(rawValue: effective.mouseMode) ?? .capture) == .desktop {
-            return "⌘ shortcuts stay on this Mac under the desktop mouse model. Switch Mouse "
-                + "input to Capture to send them to the host."
+            return "No effect under the desktop mouse model — switch Mouse input to Capture."
         }
-        return "Sends ⌘ shortcuts to the host while input is captured, so ⌘Q and friends reach "
-            + "the remote desktop instead of this app. ⌘⎋ always stays local — it is what "
+        return "Sends ⌘ shortcuts to the host while captured. ⌘⎋ always stays local — it "
             + "releases capture."
     }
 
@@ -554,11 +543,11 @@ extension SettingsView {
     private var mouseModeDescription: String {
         switch MouseInputMode(rawValue: effective.mouseMode) ?? .capture {
         case .capture:
-            return "The pointer locks to the stream and sends relative motion — best for "
-                + "games. ⌃⌥⇧M switches live; applies from the next capture otherwise."
+            return "Locks the pointer and sends relative motion — best for games. ⌃⌥⇧M "
+                + "switches live."
         case .desktop:
-            return "The pointer moves freely in and out of the stream and sends absolute "
-                + "positions — best for remote desktop work. Unavailable on gamescope hosts."
+            return "The pointer moves freely and sends absolute positions — best for desktop "
+                + "work."
         }
     }
     #endif
@@ -590,8 +579,7 @@ extension SettingsView {
             #if os(macOS)
             // Which speaker THIS Mac plays through is this device's audio routing (tier G).
             if !inProfileScope {
-                described("Host audio plays through this device; System default follows your "
-                    + "Mac's output changes.") {
+                described("Where host audio plays on this Mac.") {
                     Picker("Speaker", selection: $speakerUID) {
                         Text("System default").tag("")
                         ForEach(outputDevices) { device in
@@ -645,99 +633,67 @@ extension SettingsView {
         } header: {
             Text("Audio")
         } footer: {
-            Text("Applies from the next session.")
+            // The lossless gates live HERE, once, rather than as a rider on each of the five
+            // lossless rows. This sentence is what keeps `audioFormatCaption` honest — see its
+            // doc comment: the picker must never read as a promise of the resolved format.
+            Text("Applies from the next session. Lossless falls back to Standard if the host or "
+                + "this device's output declines it.")
                 .font(.geist(12, relativeTo: .caption))
                 .foregroundStyle(.secondary)
         }
     }
 
-    /// The SELECTED audio format explained, and honest about the ways it can come to nothing: the
-    /// host has its own switch (off by default) and its own capture gate, this device's output has
-    /// to be able to open the rate, and the frame has to fit one QUIC datagram. Every failure
-    /// resolves back to Opus — a good outcome, but not the one the row's label promises, so the
-    /// caption says so before the user goes looking.
+    /// The SELECTED audio format: what it is, and what it costs on the wire. That is the whole
+    /// per-row caption. The ways a request can come to nothing — the host's own switch (off by
+    /// default), its capture gate, this device's output being unable to open the rate — are stated
+    /// ONCE in the section footer instead of riding all five lossless rows.
     ///
     /// ⚠ The rule this caption exists to keep is the design's: **the UI states the RESOLVED
     /// format, never the requested one.** Nothing here may read as a guarantee — the HUD's
     /// `audioFormatLabel` is built from the connection's `Welcome`, and that is the only place a
-    /// format is asserted as fact.
+    /// format is asserted as fact. The footer's "falls back to Standard" line is what carries that
+    /// now that the per-row gate riders are gone; do not drop it without replacing it.
     private var audioFormatCaption: String {
         let choice = AudioFormatChoice(setting: effective.audioFormat)
         guard choice != .opus else {
-            return "Compressed audio at 256 kbps — effectively transparent, and what every "
-                + "session used before lossless existed."
+            return "Compressed 256 kbps Opus — effectively transparent."
         }
         // Stereo cost at 24-bit, from `pcm::bitrate_kbps`. 5.1 is three times it and 7.1 four, so
         // the surround rider below states the multiplier rather than repeating the table.
-        let head: String
+        let mbps: String
         switch choice {
-        case .opus:
-            head = "" // unreachable — the guard above returns
-        case .lossless441:
-            head = "Bit-exact 44.1 kHz / 24-bit PCM — about 2.1 Mbps on top of the video. The "
-                + "rate to pick when the host's own endpoint runs at 44.1 kHz, since it is then "
-                + "the one that avoids a resample."
-        case .lossless48:
-            head = "Bit-exact 48 kHz / 24-bit PCM — no lossy stage at all. Costs about 2.3 Mbps "
-                + "on top of the video, and is the rate a game host's engine usually already runs "
-                + "at."
-        case .lossless882:
-            head = "Bit-exact 88.2 kHz / 24-bit PCM — about 4.2 Mbps on top of the video, and "
-                + "only real if the host's interface genuinely runs at 88.2 kHz."
-        case .lossless96:
-            head = "Bit-exact 96 kHz / 24-bit PCM — about 4.6 Mbps on top of the video, and only "
-                + "real if the host's interface genuinely runs at 96 kHz."
-        case .lossless1764:
-            // The one row that is honest about being mostly unreachable. Offering it is fine;
-            // presenting it as if it will be granted is not. Three vetoes, and the numbers behind
-            // them: the host gives audio at most a QUARTER of the video budget (8.5 Mbps of audio
-            // therefore needs ~34 Mbps of video), a stereo frame fits a datagram only on the
-            // ladder's shortest 1 ms rung at ~1 069 B, and a surround one fits no rung at all.
-            //
-            // Plain prose, no markdown: `described` hands this to `Text(String)`, which does NOT
-            // parse markup — asterisks would render as asterisks.
-            head = "Bit-exact 176.4 kHz / 24-bit PCM — 8.5 Mbps on top of the video, and far more "
-                + "likely to be declined than granted. The host caps audio at a quarter of the "
-                + "video bitrate, so it needs a session of about 34 Mbps or more; and each packet "
-                + "has to shrink to 1 ms of audio, a thousand a second, which only fits on a "
-                + "network with room to spare."
+        case .opus: mbps = "" // unreachable — the guard above returns
+        case .lossless441: mbps = "2.1"
+        case .lossless48: mbps = "2.3"
+        case .lossless882: mbps = "4.2"
+        case .lossless96: mbps = "4.6"
+        case .lossless1764: mbps = "8.5"
         }
-        // The host's switch is off by default and its capture gate is about the world, not policy;
-        // this device's output is the third way a granted rate still is not what reaches a speaker
-        // (a Bluetooth route has no 96 kHz mode to give, and the session log says so).
-        let gates = " Needs lossless enabled on the host as well, and an output here that accepts "
-            + "the rate; anything missing resolves the session back down and the log says which."
-        guard effective.audioChannels > 2 else { return head + gates }
-        // Surround is no longer hidden, so what it costs has to be said out loud. The plane sends
-        // one frame per datagram and never fragments, so more channels buy a SHORTER frame rather
-        // than a bigger packet — a packet rate, not an impossibility, right up until no rung on the
-        // ladder fits at all. Where that line falls, at 24-bit and the default datagram size
+        let head = "Bit-exact PCM — about \(mbps) Mbps on top of the video."
+        guard effective.audioChannels > 2 else { return head }
+        // Surround is offered at every rate, so what it costs has to be said out loud. The plane
+        // sends one frame per datagram and never fragments, so more channels buy a SHORTER frame
+        // rather than a bigger packet — a packet rate, not an impossibility, right up until no rung
+        // on the ladder fits at all. Where that line falls, at 24-bit and the default datagram size
         // (`pcm::frame_us_for` against ~1 387 B of payload): 44.1 kHz 5.1/7.1 and 48 kHz 7.1 land
         // on the 1 ms rung, 48 kHz 5.1 on 1.5 ms, and 88.2 kHz upward fit NOTHING. Two different
         // sentences, because "it will cost you" and "it will not happen" are two different things
         // to tell someone.
-        let layout = effective.audioChannels == 6 ? "5.1" : "7.1"
-        let multiple = effective.audioChannels == 6 ? "three" : "four"
-        let fitsSurround = choice == .lossless441 || choice == .lossless48
-        guard fitsSurround else {
-            return head + gates + " And on \(layout) this rate does not fit an ordinary network's "
-                + "packets at any length, so the session resolves back to Standard — 48 kHz or "
-                + "44.1 kHz is as far up as surround goes here."
+        guard choice == .lossless441 || choice == .lossless48 else {
+            return head + " Surround needs 48 kHz or lower."
         }
-        return head + gates + " On \(layout) it costs \(multiple) times that, and the host shortens "
-            + "each packet to about 1–1.5 ms of audio to keep it inside one datagram — roughly "
-            + "650 to 1 000 packets a second."
+        return head + (effective.audioChannels == 6
+            ? " Three times that on 5.1."
+            : " Four times that on 7.1.")
     }
 
     /// Honest about the macOS escape hatch: the voice processor only follows the system
     /// default devices, so hand-picked endpoints silently keep the raw path (see
     /// SessionAudio's topology note) — better said here than discovered mid-call.
     private var echoCancelCaption: String {
-        let base = "Voice processing cancels the audio this device plays out of the mic "
-            + "signal, so a speaker setup doesn't feed the game back to the host."
+        let base = "Filters the stream's own audio out of the mic pickup."
         #if os(macOS)
-        return base + " Follows the system default devices — a hand-picked speaker, "
-            + "microphone or input channel streams the raw mic instead."
+        return base + " Only on the system default devices."
         #else
         return base
         #endif
@@ -749,10 +705,8 @@ extension SettingsView {
         Section {
             // The master switch, above everything it governs. Profileable, so it renders in
             // both scopes: a "Work" profile can decline to forward what "Game" forwards.
-            described("Sends controllers connected to this device to the host. Turn it off when "
-                + "your controller already reaches the host another way — USB passthrough such "
-                + "as VirtualHere, or a pad plugged into the host itself — so games don't see "
-                + "two of them.",
+            described("Sends this device's controllers to the host. Off if they already reach it "
+                + "another way.",
                 field: "gamepad_forwarding") {
                 Toggle("Forward controllers", isOn: scoped(SettingsFields.gamepadForwarding))
             }
@@ -767,8 +721,7 @@ extension SettingsView {
                         controllerRow(controller)
                     }
                 }
-                described("One controller is forwarded as player 1 — Automatic picks the most "
-                    + "recently connected.") {
+                described("Which pad is player 1. Automatic picks the newest connection.") {
                     Picker("Use controller", selection: $gamepads.preferredID) {
                         ForEach(controllerOptions, id: \.tag) { option in
                             Text(option.label).tag(option.tag)
@@ -777,8 +730,7 @@ extension SettingsView {
                     .disabled(!effective.gamepadForwarding)
                 }
             }
-            described("The virtual pad created on the host. Automatic matches your controller "
-                + "— a DualSense keeps adaptive triggers, lightbar, touchpad and motion.",
+            described("The virtual pad the host creates — Automatic matches your controller.",
                 field: "gamepad") {
                 Picker("Controller type", selection: scoped(SettingsFields.gamepadType)) {
                     ForEach(SettingsOptions.padTypes, id: \.tag) { option in
@@ -787,9 +739,7 @@ extension SettingsView {
                 }
                 .disabled(!effective.gamepadForwarding)
             }
-            described("Where the guide (Xbox/PS) and share presses go while streaming. "
-                + "Automatic sends them to the host whenever this device delivers them "
-                + "— the hold-Select gesture below reaches the host regardless.",
+            described("Where guide and share presses go while streaming.",
                 field: "system_buttons") {
                 Picker("Guide button", selection: scoped(SettingsFields.systemButtons)) {
                     Text("Automatic").tag("auto")
@@ -798,10 +748,8 @@ extension SettingsView {
                 }
                 .disabled(!effective.gamepadForwarding)
             }
-            described("Hold Select on its own to press the host's guide button — keep "
-                + "holding for a Gaming-Mode host's quick-access menu. A Select tap still "
-                + "goes through, slightly delayed. Automatic arms it wherever the real "
-                + "button can't reach the host (this device reserves it).",
+            described("Hold Select for the host's guide button; keep holding for its "
+                + "quick-access menu.",
                 field: "guide_gesture") {
                 Picker("Hold Select for guide", selection: scoped(SettingsFields.guideGesture)) {
                     Text("Automatic").tag("auto")
@@ -813,8 +761,8 @@ extension SettingsView {
             #if os(iOS)
             // iPhone only in practice: hidden where the device itself can't play haptics (iPad).
             if !inProfileScope, CHHapticEngine.capabilitiesForHardware().supportsHaptics {
-                described("Plays player 1's rumble on the phone's own Taptic Engine — for "
-                    + "clip-on controllers without motors of their own.") {
+                described("Plays player 1's rumble on the phone itself — for pads without "
+                    + "motors.") {
                     Toggle("Rumble on this iPhone", isOn: $rumbleOnDevice)
                 }
             }
@@ -822,25 +770,23 @@ extension SettingsView {
             // device has no motion hardware, engages only while the player-1 controller
             // reports no rotation rate of its own.
             if !inProfileScope, DeviceGyro.isAvailable {
-                described("When the controller has no gyro of its own, sends this device's "
-                    + "motion sensors as player 1's — for clip-on pads without one.") {
+                described("Sends this device's motion as player 1's when the controller has no "
+                    + "gyro.") {
                     Toggle("Gyro from this device", isOn: $gyroFromDevice)
                 }
             }
             #endif
             #if !os(tvOS)
             if !inProfileScope {
-                described("The host list and library switch to a controller-friendly layout — "
-                    + "larger focus targets, a swipeable cover browser.") {
+                described("A controller-friendly layout for the host list and library.") {
                     Toggle("Gamepad-optimized browsing", isOn: $gamepadUIEnabled)
                 }
                 // Only meaningful while the switch above is on, so it is HIDDEN rather than
                 // disabled when it isn't: a picker whose every option decides nothing is worse
                 // than no picker, and this Section is short enough that nothing jumps far.
                 if gamepadUIEnabled {
-                    described("With a controller: the touch interface comes back when the last "
-                        + "one disconnects. Always keeps the controller-friendly layout either "
-                        + "way — for a device that lives on a TV.") {
+                    described("Always keeps it up — otherwise touch returns when the last "
+                        + "controller disconnects.") {
                         Picker("Show it", selection: $gamepadUIMode) {
                             ForEach(SettingsOptions.gamepadUIModes, id: \.tag) { option in
                                 Text(option.label).tag(option.tag)

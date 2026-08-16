@@ -794,7 +794,7 @@ struct GamepadSettingsView: View {
             choiceRow(
                 id: "resolution", tab: .stream, icon: "aspectratio",
                 label: "Resolution",
-                detail: "The host creates a virtual display at exactly this size — no scaling.",
+                detail: "The host creates a real display at exactly this size.",
                 options: resolution, current: "\(width)x\(height)"
             ) { tag in
                 let parts = tag.split(separator: "x").compactMap { Int($0) }
@@ -809,45 +809,36 @@ struct GamepadSettingsView: View {
             ) { hz = $0 },
             choiceRow(
                 id: "bitrate", tab: .stream, icon: "speedometer", label: "Bitrate",
-                detail: "Automatic uses the host's default (20 Mbps). "
-                    + "Run a speed test from the touch UI for an informed value.",
+                detail: "Automatic uses the host's default, 20 Mbps.",
                 options: bitrate, current: bitrateKbps
             ) { bitrateKbps = $0 },
             choiceRow(
                 id: "compositor", tab: .stream, icon: "macwindow", label: "Compositor",
-                detail: "Which compositor drives the virtual output — honored only if "
-                    + "available on the host.",
+                detail: "Which compositor drives the virtual output — honored only if available.",
                 options: SettingsOptions.compositors, current: compositor
             ) { compositor = $0 },
             choiceRow(
                 id: "codec", tab: .video, icon: "film", label: "Video codec",
-                detail: "A preference — the host falls back if it can't encode this one "
-                    + "(10-bit and 4:4:4 are HEVC-only).",
+                detail: "A preference — the host falls back if it can't encode it.",
                 options: SettingsOptions.codecs, current: codec
             ) { codec = $0 },
             toggleRow(
                 id: "hdr", tab: .video, icon: "sun.max", label: "10-bit HDR",
-                detail: "HDR10 — engages when the host sends HDR content and this display "
-                    + "supports it.",
+                detail: "HDR10 when the host sends it and this display supports it. HEVC only.",
                 value: $hdrEnabled),
             toggleRow(
                 id: "chroma", tab: .video, icon: "textformat", label: "Full chroma (4:4:4)",
-                detail: "Sharper text and UI at more bandwidth — needs host opt-in and "
-                    + "hardware decode.",
+                detail: "Sharper text and UI, at more bandwidth. For desktop work; HEVC only.",
                 value: $enable444),
             choiceRow(
                 id: "presentPriority", tab: .video, icon: "rectangle.stack", label: "Prioritize",
-                detail: "Lowest latency shows each frame the moment the display can take it; "
-                    + "Smoothness buffers a few frames to even out network hiccups. Applies "
-                    + "from the next session.",
+                detail: "Lowest latency shows each frame immediately; Smoothness buffers a few.",
                 options: SettingsOptions.presentPriorities, current: presentPriority
             ) { presentPriority = $0 },
             choiceRow(
                 id: "smoothBuffer", tab: .video, icon: "square.stack.3d.up",
                 label: "Smoothness buffer",
-                detail: "How many frames Smoothness holds — each adds about a refresh of "
-                    + "display latency and absorbs about a refresh of jitter. Only applies "
-                    + "when prioritizing smoothness.",
+                detail: "Each frame held costs one refresh of latency and absorbs one of jitter.",
                 options: SettingsOptions.smoothBuffers(refreshHz: hz), current: smoothBuffer
             ) { smoothBuffer = $0 },
 
@@ -863,13 +854,8 @@ struct GamepadSettingsView: View {
             choiceRow(
                 id: "audioFormat", tab: .audio, icon: "waveform.badge.magnifyingglass",
                 label: "Audio quality",
-                detail: "Lossless sends bit-exact PCM instead of compressed audio — 2.1 to 8.5 "
-                    + "Mbps on top of the video for stereo, three times that for 5.1 and four for "
-                    + "7.1. It must be enabled on the host too, the host's own interface has to "
-                    + "run the rate, and this device's output has to accept it. The top of the "
-                    + "ladder needs room the network may not have: 176.4 kHz sends a thousand "
-                    + "packets a second, and surround above 48 kHz does not fit at all. Anything "
-                    + "missing falls back to Standard.",
+                detail: "Bit-exact PCM — 2.3 Mbps at 48 kHz, up to 8.5 at 176.4. Falls back to "
+                    + "Standard if the host or this device declines it.",
                 options: SettingsOptions.audioFormats, current: audioFormat
             ) { audioFormat = $0 },
             toggleRow(
@@ -878,16 +864,14 @@ struct GamepadSettingsView: View {
                 value: $micEnabled),
             toggleRow(
                 id: "echoCancel", tab: .audio, icon: "waveform", label: "Echo cancellation",
-                detail: "Cancel the audio this device plays out of the mic signal — stops "
-                    + "speaker setups feeding the game back to the host.",
+                detail: "Filters the stream's own audio out of the mic pickup.",
                 value: $echoCancel),
 
             toggleRow(
                 id: "padForward", tab: .controller, icon: "gamecontroller",
                 label: "Forward controllers",
-                detail: "Send this device's controllers to the host. Turn it off when your "
-                    + "controller already reaches the host another way — USB passthrough such "
-                    + "as VirtualHere — so games don't see two of them.",
+                detail: "Sends this device's controllers to the host. Off if they already reach "
+                    + "it another way.",
                 value: $gamepadForwarding),
             // The four rows below only mean something while something is being forwarded, so
             // they follow the switch above — the same relationship the touch settings draw with
@@ -895,7 +879,7 @@ struct GamepadSettingsView: View {
             // `Row.enabled` existed, so it alone left them live and steppable.
             choiceRow(
                 id: "pad", tab: .controller, icon: "gamecontroller", label: "Use controller",
-                detail: "Which pad is forwarded to the host, as player 1.",
+                detail: "Which pad is player 1. Automatic picks the newest connection.",
                 options: controllers, current: gamepads.preferredID,
                 enabled: gamepadForwarding
             ) { gamepads.preferredID = $0 },
@@ -908,36 +892,32 @@ struct GamepadSettingsView: View {
             choiceRow(
                 id: "systemButtons", tab: .controller, icon: "house.circle",
                 label: "Guide button",
-                detail: "Where the guide (Xbox/PS) and share presses go while streaming — "
-                    + "Automatic sends them to the host whenever this device delivers them.",
+                detail: "Where guide and share presses go while streaming.",
                 options: SettingsOptions.systemButtons, current: systemButtons,
                 enabled: gamepadForwarding
             ) { systemButtons = $0 },
             choiceRow(
                 id: "guideGesture", tab: .controller, icon: "hand.point.up.left",
                 label: "Hold Select for guide",
-                detail: "Hold Select alone to press the host's guide button — keep holding "
-                    + "for a Gaming-Mode host's quick-access menu. A tap still goes through.",
+                detail: "Hold Select for the host's guide button; keep holding for its "
+                    + "quick-access menu.",
                 options: SettingsOptions.guideGestures, current: guideGesture,
                 enabled: gamepadForwarding
             ) { guideGesture = $0 },
 
             choiceRow(
                 id: "palette", tab: .interface, icon: "paintpalette", label: "Background",
-                detail: "The colour family this backdrop drifts through — it changes as you "
-                    + "step, so pick by looking. Appearance only.",
+                detail: "The colour family this backdrop drifts through.",
                 options: GamepadPalette.all.map { (label: $0.name, tag: $0.id) },
                 current: GamepadPalette.named(paletteID).id
             ) { paletteID = $0 },
             toggleRow(
                 id: "autoWake", tab: .interface, icon: "power", label: "Auto-wake on connect",
-                detail: "Send Wake-on-LAN to a sleeping saved host and wait for it before "
-                    + "streaming. Off connects straight through.",
+                detail: "Sends Wake-on-LAN to a sleeping saved host and waits for it.",
                 value: $autoWakeEnabled),
             choiceRow(
                 id: "hud", tab: .interface, icon: "chart.bar", label: "Statistics overlay",
-                detail: "How much to show while streaming — Compact is a one-line pill, "
-                    + "Detailed adds the latency stage breakdown.",
+                detail: "Compact is a one-line pill; Detailed adds the latency breakdown.",
                 options: SettingsOptions.statsVerbosities, current: statsVerbosityRaw
             ) { statsVerbosityRaw = $0 },
             choiceRow(
@@ -964,9 +944,8 @@ struct GamepadSettingsView: View {
                 choiceRow(
                     id: "gamepadUIMode", tab: .interface, icon: "gamecontroller.circle",
                     label: "Show it",
-                    detail: "With a controller: the touch interface comes back when the last one "
-                        + "disconnects. Always keeps this layout either way — for a device that "
-                        + "lives on a TV.",
+                    detail: "Always keeps it up — otherwise touch returns when the last "
+                        + "controller disconnects.",
                     options: SettingsOptions.gamepadUIModes, current: gamepadUIMode
                 ) { gamepadUIMode = $0 },
                 at: at + 1)
@@ -981,8 +960,7 @@ struct GamepadSettingsView: View {
                     id: "windowedSafePresent", tab: .video, icon: "macwindow.badge.plus",
                     label: "Safe windowed presentation",
                     detail: "Windowed streams present in step with the compositor — avoids a "
-                        + "macOS display-driver crash on high-refresh displays, at a small "
-                        + "latency cost. Fullscreen always uses the fastest path.",
+                        + "macOS display-driver crash, at a small latency cost.",
                     value: $windowedSafePresent),
                 at: at + 1)
         }
@@ -997,8 +975,8 @@ struct GamepadSettingsView: View {
                     id: "deviceRumble", tab: .controller,
                     icon: "iphone.radiowaves.left.and.right",
                     label: "Rumble on this iPhone",
-                    detail: "Also play player 1's rumble on the phone's own Taptic Engine — "
-                        + "for clip-on pads without rumble motors.",
+                    detail: "Also plays player 1's rumble on the phone itself — for pads "
+                        + "without motors.",
                     value: $rumbleOnDevice),
                 at: at + 1)
         }
@@ -1013,8 +991,8 @@ struct GamepadSettingsView: View {
                     id: "deviceGyro", tab: .controller,
                     icon: "gyroscope",
                     label: "Gyro from this device",
-                    detail: "When the controller has no gyro, send this device's motion "
-                        + "sensors as player 1's — for clip-on pads without one of their own.",
+                    detail: "Sends this device's motion as player 1's when the controller has "
+                        + "no gyro.",
                     value: $gyroFromDevice),
                 at: anchor + 1)
         }
@@ -1085,8 +1063,7 @@ struct GamepadSettingsView: View {
                 id: "pinHost-\(hostID.uuidString)", tab: .profiles, icon: "desktopcomputer",
                 label: host.displayName,
                 value: pinned ? "Pinned" : "Off",
-                detail: "A pinned profile appears as its own card on the host — one press "
-                    + "connects with it.",
+                detail: "A pinned profile gets its own card — one press connects with it.",
                 optionLabels: ["Off", "Pinned"],
                 selectedIndex: pinned ? 1 : 0,
                 adjust: { delta in
@@ -1104,11 +1081,10 @@ struct GamepadSettingsView: View {
     /// user at a "standard interface" would promise profiles that can never arrive there.
     private var profileDetail: String {
         #if os(tvOS)
-        return "Pin this profile to a host and it appears as its own card on the home screen — "
-            + "one press connects with it."
+        return "Pin a profile to a host and it gets its own card — one press connects."
         #else
-        return "Pin this profile to a host and it appears as its own card — one press connects "
-            + "with it. Profiles are created and edited in Punktfunk's standard interface."
+        return "Pin a profile to a host and it gets its own card — one press connects. Create "
+            + "profiles in the standard interface."
         #endif
     }
 
@@ -1116,11 +1092,10 @@ struct GamepadSettingsView: View {
     /// cannot be created (on the device or anywhere that would reach its per-device catalog).
     private var emptyCatalogDetail: String {
         #if os(tvOS)
-        return "Profiles bundle stream settings for different uses. Creating them isn't "
-            + "available on Apple TV yet."
+        return "Profiles bundle stream settings. Creating them isn't available on Apple TV yet."
         #else
-        return "Profiles bundle stream settings for different uses. Create them in Punktfunk's "
-            + "standard interface, then pin them here as one-press connect cards."
+        return "Profiles bundle stream settings. Create them in the standard interface, then "
+            + "pin them here."
         #endif
     }
 
