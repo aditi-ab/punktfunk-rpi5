@@ -105,14 +105,36 @@ class StatsOverlayAudioTest {
     /**
      * The RESOLVED audio format (35–37) — the surface `design/hi-res-audio.md` §10 requires, and
      * the only one that can answer "did lossless actually happen". The settings screen shows what
-     * this device REQUESTED; the host's five-condition gate (its own switch off by default) can
-     * decline every one of them and the session then looks, sounds and measures exactly like a
-     * granted one. Codec `2` is the `0xD3` lossless plane.
+     * this device REQUESTED; the host's gate (its own switch off by default) can decline every
+     * one of them and the session then looks, sounds and measures exactly like a granted one.
+     * Codec `2` is the `0xD3` lossless plane.
      */
     @Test
     fun aLosslessSessionNamesTheFormatItResolved() {
         show(stats(bufferMs = 42.0, avOffsetMs = 0.0, codec = 2.0, rateHz = 96_000.0, bits = 24.0))
         compose.onNodeWithText("audio lossless 96 kHz / 24-bit").assertExists()
+    }
+
+    /**
+     * The 44.1 kHz family renders as kHz with a tenth, not as raw Hz.
+     *
+     * The rest of the HUD can print whatever reads well; this line cannot, because its entire job
+     * is to be compared at a glance with the settings row that asked for the format. While the
+     * ladder was 48/96 only every rate divided by a thousand and the fallback arm was unreachable;
+     * admitting 44 100 / 88 200 / 176 400 made it the arm half the menu now takes, and "44100 Hz"
+     * next to a menu saying "44.1 kHz" is one more thing for a reader to have to work out.
+     */
+    @Test
+    fun aFractionalRateRendersInKilohertzRatherThanRawHertz() {
+        show(stats(bufferMs = 42.0, avOffsetMs = 0.0, codec = 2.0, rateHz = 44_100.0, bits = 24.0))
+        compose.onNodeWithText("audio lossless 44.1 kHz / 24-bit").assertExists()
+    }
+
+    /** …and the top of the ladder, which is the row most likely to have been declined outright. */
+    @Test
+    fun theTopOfTheLadderNamesItselfExactly() {
+        show(stats(bufferMs = 42.0, avOffsetMs = 0.0, codec = 2.0, rateHz = 176_400.0, bits = 24.0))
+        compose.onNodeWithText("audio lossless 176.4 kHz / 24-bit").assertExists()
     }
 
     /**

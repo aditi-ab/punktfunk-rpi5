@@ -2341,7 +2341,18 @@ pub unsafe extern "C" fn punktfunk_connect_ex10(
 /// and open the device from THOSE — opening at what you asked for is
 /// `design/hi-res-audio.md` §4.3's failure repeated at the client end.
 ///
-/// Passing `48000`/`16` is exactly [`punktfunk_connect_ex10`], byte-for-byte on the wire.
+/// ⚠ **Passing `48000`/`16` is NOT the same as [`punktfunk_connect_ex10`], and an earlier version
+/// of this comment claimed it was.** `ex10` passes `0`/`0` — *unspecified* — and the capability bit
+/// keys on "the caller specified a format", not on "the format differs from the default". So an
+/// explicit 48 kHz/16-bit is a genuine request for the cheapest lossless rung: the `Hello` carries
+/// [`quic::CLIENT_CAP_AUDIO_HIRES`](crate::quic::CLIENT_CAP_AUDIO_HIRES), the host's gate accepts
+/// 48/16 as a supported format, and a host with the operator policy on will resolve the session
+/// onto the lossless plane at 1.5 Mbps.
+///
+/// That is the intended behaviour — 48/16 would otherwise be the one rung on the ladder nobody
+/// could ask for — but it makes `0`/`0` load-bearing. **An embedder whose user chose "Opus" must
+/// pass `0`/`0` here, or call [`punktfunk_connect_ex10`].** Forwarding a hardcoded 48 000/16 as a
+/// stand-in for "default" silently opts every ordinary session into the lossless plane.
 ///
 /// The 44.1 kHz family is on the ladder, and was not always: core's de-jitter policy divided the
 /// rate by 1 000 before it multiplied, which made 44 100 Hz "44 samples per millisecond" and every

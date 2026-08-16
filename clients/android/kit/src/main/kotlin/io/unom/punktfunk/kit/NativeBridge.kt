@@ -56,18 +56,25 @@ object NativeBridge {
          *  decode loop then feeds slices with `BUFFER_FLAG_PARTIAL_FRAME` as they arrive). */
         framePartsOk: Boolean,
         audioChannels: Int,
-        /** Requested audio sample rate: `48000` (or `0`) for the legacy Opus plane, `96000` to ask
-         *  for lossless PCM at 96 kHz. Paired with [audioBits]; anything other than 48000/16 sets
-         *  `CLIENT_CAP_AUDIO_HIRES` in the Hello and asks the host for the `0xD3` plane.
+        /** Requested audio sample rate: **`0` (with [audioBits] `0`) for the legacy Opus plane**, or
+         *  any rung of the lossless ladder — `44100`, `48000`, `88200`, `96000`, `176400`, both rate
+         *  families.
          *
-         *  A request on BOTH counts. The host runs a five-condition gate (its own
-         *  `PUNKTFUNK_AUDIO_HIRES` switch among them) and may answer Opus; and the native side
-         *  first proves THIS device can open the rate — AAudio grants an explicit rate or fails
-         *  the open, and there is no recovery once the wire is negotiated — downgrading the
-         *  request if it cannot. */
+         *  ⚠⚠ **`48000`/`16` is NOT "the default" — it is the cheapest lossless rung.** Core sets
+         *  `CLIENT_CAP_AUDIO_HIRES` when either field is non-zero (it keys on "a format was
+         *  specified", so that 48/16 lossless is requestable at all), and the host's gate accepts
+         *  48 kHz/16-bit as a supported format. Passing it as a stand-in for "unset" opts every
+         *  session into the `0xD3` plane on any host with `PUNKTFUNK_AUDIO_HIRES=1`. Send `0`/`0`.
+         *
+         *  A request on BOTH counts. The host runs its gate (its own `PUNKTFUNK_AUDIO_HIRES` switch
+         *  among them, plus whether a frame of this format fits one datagram at all) and may answer
+         *  Opus; and the native side first proves THIS device can open the rate — AAudio grants an
+         *  explicit rate or fails the open, and there is no recovery once the wire is negotiated —
+         *  walking a fallback ladder and downgrading the request if it cannot. */
         audioRateHz: Int,
-        /** Requested audio sample depth: `16` (or `0`) legacy, `24` for the lossless plane. See
-         *  [audioRateHz]; 24-bit is where lossless earns its bandwidth. */
+        /** Requested audio sample depth: `0` alongside a `0` [audioRateHz] for the legacy Opus
+         *  plane, else `16` or `24`. See [audioRateHz] for why `16` is a request rather than a
+         *  default; 24-bit is where lossless earns its bandwidth. */
         audioBits: Int,
         /** `quic::CODEC_*` bitfield of codecs this device decodes ([VideoDecoders.decodableCodecBits]);
          *  `0` falls back to H.264|HEVC. The host resolves the emitted codec from this ∩ its GPU. */

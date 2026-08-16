@@ -917,18 +917,18 @@ internal fun buildSettingsRows(
             "The speaker layout requested from the host.",
             AUDIO_CHANNEL_OPTIONS, s.audioChannels,
         ) { update(s.copy(audioChannels = it)) },
-        // Follows the row above rather than disappearing, the same relationship the pad rows draw
-        // with the forwarding switch — this list is fixed-shape and a row that vanishes under the
-        // cursor is worse on a pad than one that dims. The lossless plane is stereo-only at the
-        // default MTU (a surround frame does not fit one datagram and this plane is never
-        // fragmented), so on 5.1/7.1 there is genuinely nothing here to choose.
+        // Live at every channel count now. It used to dim on 5.1/7.1 because a lossless surround
+        // frame did not fit one datagram at the default MTU; the frame ladder is channel-aware, so
+        // a surround session negotiates a shorter frame instead — only the top of the list fits
+        // nothing, and that is the host's call to make rather than this row's.
         choice(
             "audioFormat", GpTab.AUDIO, null, "Audio quality",
-            "Lossless sends bit-exact PCM instead of compressed audio — 2.3 Mbps at 48 kHz, " +
-                "4.6 at 96 — on top of the video. It must be enabled on the host too, and this " +
-                "device's output has to accept the rate; otherwise the session falls back to " +
-                "Standard.",
-            AUDIO_FORMAT_OPTIONS, s.audioFormat, enabled = s.audioChannels == 2,
+            "Lossless sends bit-exact PCM instead of compressed audio, on top of the video — " +
+                "2.3 Mbps at 48 kHz, 4.6 at 96, 8.5 at 176.4. It must be enabled on the host " +
+                "too, this device's output has to accept the rate, and the link has to fit the " +
+                "frames; otherwise the session falls back to Standard. The stats overlay says " +
+                "which.",
+            AUDIO_FORMAT_OPTIONS, s.audioFormat,
         ) { update(s.copy(audioFormat = it)) },
         toggle(
             "mic", GpTab.AUDIO, null, "Microphone",

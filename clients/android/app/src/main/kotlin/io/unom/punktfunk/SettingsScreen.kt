@@ -824,23 +824,23 @@ private fun AudioSettings(s: Settings, update: (Settings) -> Unit, onMicChange: 
             field = "audio_channels",
             caption = "Requested from the host; it downmixes if it has fewer.",
         ) { ch -> update(s.copy(audioChannels = ch)) }
-        // Stereo only, and the row is hidden rather than disabled on 5.1/7.1: a lossless surround
-        // frame does not fit one QUIC datagram at the default MTU and this plane is never
-        // fragmented, so the host declines the request outright. Offering a picker whose every
-        // non-default row would be refused is worse than not offering it — and the surround rows
-        // above are the setting a user in that state actually chose.
-        if (s.audioChannels == 2) {
-            SettingDropdown(
-                label = "Audio format",
-                options = AUDIO_FORMAT_OPTIONS,
-                selected = s.audioFormat,
-                field = "audio_format",
-                caption = "Lossless sends uncompressed audio — 2.3 Mbps at 48 kHz, 4.6 at " +
-                    "96 kHz, on top of the video. The host has its own switch for it and both " +
-                    "must be on; otherwise the session stays on Opus, which is already " +
-                    "effectively transparent.",
-            ) { f -> update(s.copy(audioFormat = f)) }
-        }
+        // Offered at every channel count. It used to be hidden on 5.1/7.1, because a lossless
+        // surround frame did not fit one QUIC datagram at the default MTU — but the frame ladder is
+        // channel-aware, so a surround session negotiates a shorter frame instead of being refused,
+        // and only the top of this list genuinely fits nothing. Which rows a given session can
+        // actually have depends on the host, this device's output and the path MTU, none of which
+        // this screen knows; the HUD's `audio lossless …` line is what reports the answer.
+        SettingDropdown(
+            label = "Audio format",
+            options = AUDIO_FORMAT_OPTIONS,
+            selected = s.audioFormat,
+            field = "audio_format",
+            caption = "Lossless sends uncompressed audio on top of the video — 2.3 Mbps at " +
+                "48 kHz, 4.6 at 96, 8.5 at 176.4 — and the top rates are often declined, " +
+                "surround especially. The host has its own switch and both must be on; " +
+                "otherwise the session stays on Opus, which is already effectively " +
+                "transparent. The overlay shows what a session actually got.",
+        ) { f -> update(s.copy(audioFormat = f)) }
         ToggleRow(
             title = "Microphone",
             subtitle = "Feeds this device's microphone to the host",

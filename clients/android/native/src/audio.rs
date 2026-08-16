@@ -26,19 +26,27 @@
 //!
 //! **The ladder's rate dimension.** Every rung used to ask for 48 kHz, so rejecting a stream whose
 //! GRANTED rate differed was free. With a negotiated rate it is not: a device that will not grant
-//! 96 kHz would fail every rung and the supervisor would disable audio for the whole session,
-//! which is the one outcome the design calls unacceptable. So the rung carries the rate it asked
-//! for, [`arm`] compares against THAT rather than a constant, and the ladder ends with a rung that
-//! asks for nothing at all (AAudio's own choice) for the HAL that refuses an explicit request but
-//! is natively at the rate we wanted. What the ladder deliberately does NOT contain is a 48 kHz
-//! rung on a 96 kHz session: opening one would mean either playing the wire at double speed or
+//! the session's rate would fail every rung and the supervisor would disable audio for the whole
+//! session, which is the one outcome the design calls unacceptable. So the rung carries the rate it
+//! asked for, [`arm`] compares against THAT rather than a constant, and the ladder ends with a rung
+//! that asks for nothing at all (AAudio's own choice) for the HAL that refuses an explicit request
+//! but is natively at the rate we wanted. What the ladder deliberately does NOT contain is a rung
+//! at any OTHER rate: opening one would mean either playing the wire at the wrong speed or
 //! resampling it behind the user's back, and §9's rule is "say so and fall back, not resample
 //! quietly". The fallback that keeps such a device in audio therefore happens BEFORE the `Hello`
-//! — see [`output_rate_is_openable`], which is why that function exists.
+//! — see [`output_rate_is_openable`], which is why that function exists. It matters more now than
+//! it did, not less: the plane carries both rate families
+//! ([`punktfunk_core::audio::pcm::rate_is_supported`]), 44 100 Hz is granted almost everywhere and
+//! 176 400 Hz almost nowhere, so which rungs a given device will open is genuinely unknown until
+//! one is opened.
 //!
 //! The layout is the host-RESOLVED channel count (`NativeClient::audio_channels`, negotiated at
 //! connect), so an older/clamping host that can only capture stereo is decoded + played as stereo.
-//! 2 = stereo / 6 = 5.1 / 8 = 7.1, in the canonical wire order FL FR FC LFE RL RR SL SR.
+//! 2 = stereo / 6 = 5.1 / 8 = 7.1, in the canonical wire order FL FR FC LFE RL RR SL SR. **That
+//! now applies to the lossless plane too**: `0xD3` was stereo-only while a surround frame did not
+//! fit a datagram, but the frame ladder is channel-aware and the restriction was one host-side
+//! condition — so every per-frame size here comes from the resolved count, and a 5.1 lossless
+//! session simply negotiates a shorter frame (and a higher packet rate) than a stereo one.
 //!
 //! The ring started as a port of `punktfunk-client-linux/src/audio.rs`, but AAudio — unlike
 //! PipeWire, which adaptively rate-matches the stream and absorbs a shallow buffer — hands us a raw
@@ -64,6 +72,7 @@
 //! the listener's stream. With no video reference (below API 33 there are no render callbacks, so
 //! nothing confirms a present) the target stays `None` and the ring behaves exactly as it did.
 
+use crate::audio_format::SessionAudio;
 use ndk::audio::{
     AudioCallbackResult, AudioContentType, AudioDirection, AudioFormat, AudioPerformanceMode,
     AudioSharingMode, AudioStream, AudioStreamBuilder, AudioUsage,
@@ -122,96 +131,6 @@ enum DecodeExit {
     Fatal,
 }
 
-/// The audio format this session RESOLVED, read once from the connector and threaded through the
-/// whole plane.
-///
-/// Gathered into one value rather than passed as five parameters because the fields are only
-/// meaningful together: a rate without the codec cannot tell a 48 kHz lossless session from a
-/// 48 kHz Opus one, and those two agree on every other resolved value.
-///
-/// ⚠ Everything here is what the HOST resolved, never what this client asked for. A client that
-/// requests 96 kHz, is answered 48 kHz and opens at 96 kHz anyway is `design/hi-res-audio.md`
-/// §4.3's failure one end further along — a session that audits clean at both ends and plays the
-/// wrong content.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SessionAudio {
-    /// [`punktfunk_core::quic::AUDIO_CODEC_OPUS`] (`0xC9`) or
-    /// [`punktfunk_core::quic::AUDIO_CODEC_PCM`] (`0xD3`) — what SELECTS the decoder, and the only
-    /// field that can.
-    codec: u8,
-    /// The resolved sample rate: 48 000 on every Opus session, 48 000 or 96 000 on `0xD3`.
-    rate_hz: u32,
-    /// The resolved sample depth (16 or 24) — the stride `0xD3` payloads are unpacked at.
-    /// Meaningless on the Opus plane, which decodes to f32 regardless.
-    bits: u8,
-    /// The resolved, normalized channel count (2 / 6 / 8).
-    channels: usize,
-    /// How much audio one datagram carries. Negotiated from the path MTU on `0xD3` (at 96 kHz /
-    /// 24-bit the default MTU ceiling only leaves room for 2 ms), and the Opus plane's fixed 5 ms
-    /// otherwise — folded to one field here so nothing downstream has to branch to size a buffer.
-    frame_us: u32,
-}
-
-impl SessionAudio {
-    fn of(client: &NativeClient) -> SessionAudio {
-        let codec = client.audio_codec;
-        let is_pcm = codec == punktfunk_core::quic::AUDIO_CODEC_PCM;
-        // A zero rate is inexpressible off the wire (`Welcome::decode` folds both absence and a
-        // literal 0 to the legacy 48 kHz), but every buffer figure below divides by `rate/1000`,
-        // so a 0 that ever DID reach here would be a division by zero on the decode thread. One
-        // clamp, at the one place the value enters this module.
-        let rate_hz = if client.audio_sample_rate_hz == 0 {
-            punktfunk_core::audio::SAMPLE_RATE_HZ
-        } else {
-            client.audio_sample_rate_hz
-        };
-        SessionAudio {
-            codec,
-            rate_hz,
-            bits: client.audio_bits,
-            channels: punktfunk_core::audio::normalize_channels(client.audio_channels) as usize,
-            // Same reasoning as the rate: an old host sends no `audio_frame_us` at all and a
-            // hostile one could send 0, and this number divides nothing but sizes everything.
-            //
-            // Capped at the longest rung of `FRAME_US_LADDER` (which is also the Opus plane's
-            // 5 ms) because the decode scratch is sized from that rung and clamps its copies to
-            // it: an unclamped `frame_us` would let a `Welcome` claim frames the scratch cannot
-            // hold, and the ring would then be reserved for a size the loop can never deliver.
-            // A conforming host only ever names a rung, so this bites nobody real.
-            frame_us: match (is_pcm, u32::from(client.audio_frame_us)) {
-                (true, us) if us > 0 => us.min(punktfunk_core::audio::pcm::FRAME_US_LADDER[0]),
-                // The Opus plane's frames are the protocol's fixed 5 ms (host `audio_thread`).
-                _ => OPUS_FRAME_US,
-            },
-        }
-    }
-
-    /// True when this session runs the lossless `0xD3` plane rather than Opus on `0xC9`.
-    fn is_pcm(&self) -> bool {
-        self.codec == punktfunk_core::quic::AUDIO_CODEC_PCM
-    }
-
-    /// Interleaved f32 samples per millisecond at this rate and layout — the unit every
-    /// ms-denominated jitter-ring depth is expressed in.
-    ///
-    /// Integer samples per millisecond is load-bearing, not a rounding convenience: 48 000 → 48
-    /// and 96 000 → 96 are exact, and it is why the ladder is 48/96 kHz only (44 100 → 44.1
-    /// truncates to 44, a silent 2.3 % error in every depth figure — §4.1).
-    /// [`punktfunk_core::audio::JitterPolicy::new_at_rate`] carries the matching tripwire.
-    fn per_ms(&self) -> usize {
-        (self.rate_hz as usize / 1000) * self.channels
-    }
-
-    /// Interleaved samples in ONE frame of this plane — what the ring reserves per queued chunk
-    /// and what the decode-scratch assertion is written against.
-    fn frame_samples(&self) -> usize {
-        (self.rate_hz as usize * self.frame_us as usize / 1_000_000) * self.channels
-    }
-}
-
-/// The `0xC9` plane's frame duration: fixed by the protocol at 5 ms (the host's `audio_thread`),
-/// not negotiated. Only `0xD3` carries `audio_frame_us`.
-const OPUS_FRAME_US: u32 = 5_000;
 /// Decoded-chunk hand-off depth: 64 frames of slack (matches the core's AUDIO_QUEUE).
 const RING_CHUNKS: usize = 64;
 /// How long [`arm`] waits for a freshly started stream's FIRST data callback before writing the
@@ -230,9 +149,10 @@ const REOPEN_SETTLE_MS: u64 = 250;
 /// instead of a forever loop of opens on the session's audio thread.
 const REOPEN_ATTEMPTS: u32 = 8;
 /// Packets decoded with AAudio never having taken a single sample before we call it — expressed
-/// as a DURATION, because the two planes do not agree on what a packet is worth: 5 ms on Opus, as
-/// little as 2 ms on a 96 kHz/24-bit `0xD3` session. A packet count would have meant ~0.4 s there
-/// and a warning that fires before a slow HAL has finished waking.
+/// as a DURATION, because the two planes do not agree on what a packet is worth: 5 ms on Opus, and
+/// down to the ladder's shortest 1 ms rung on a `0xD3` session that is 24-bit surround or at the
+/// top of the rate ladder. A packet count would have meant ~0.2 s there and a warning that fires
+/// before a slow HAL has finished waking.
 const DEAD_STREAM_WARN_MS: u64 = 1_000;
 
 // --- Jitter-ring depths now come from the SHARED policy (`punktfunk_core::audio::JitterTuning`). --
@@ -410,7 +330,8 @@ impl AudioDec {
 #[derive(Default)]
 struct Counters {
     // Wire frames decoded OK — Opus packets off `0xC9` (~200/s at 5 ms) or PCM frames off `0xD3`
-    // (up to 500/s at 2 ms). One counter for both planes because only one of them ever runs.
+    // (up to 1 000/s at the ladder's 1 ms rung, which 24-bit surround and the top of the rate
+    // ladder land on). One counter for both planes because only one of them ever runs.
     frames_decoded: AtomicU64,
     pcm_written: AtomicU64, // PCM frames copied out to AAudio (device clock is pulling)
     underruns: AtomicU64,   // callbacks that emitted silence (ring not primed / drained)
@@ -518,20 +439,32 @@ impl AudioPlayback {
 /// [`crate::session::connect`], and the reason it is asked there at all.
 ///
 /// AAudio's contract is that an explicitly-requested rate is honoured or the open FAILS — it never
-/// silently substitutes. Which means a device that will not grant 96 kHz cannot be rescued *after*
-/// negotiation: the wire would already be carrying 96 kHz frames, the plane is never renegotiated
-/// mid-session (§6), and the only ways to play them on a 48 kHz stream are double speed or a
-/// resampler nobody asked for. §7 states the rule directly — *"a client that cannot open a 96 kHz
-/// output must not set `CLIENT_CAP_AUDIO_HIRES`"* — and this is how this client knows.
+/// silently substitutes. Which means a device that will not grant the requested rate cannot be
+/// rescued *after* negotiation: the wire would already be carrying that rate's frames, the plane is
+/// never renegotiated mid-session (§6), and the only ways to play them on a stream of another rate
+/// are the wrong speed or a resampler nobody asked for. §7 states the rule directly — *"a client
+/// that cannot open a 96 kHz output must not set `CLIENT_CAP_AUDIO_HIRES`"* — and this is how this
+/// client knows.
+///
+/// **Android is the platform where this can genuinely fail, and the 44.1 kHz family widened the
+/// gap rather than narrowing it.** 44 100 Hz is granted by very nearly every output — it is what
+/// half the world's material is — while 176 400 Hz is granted by very nearly none, and neither
+/// answer is guessable from the rate alone. So the caller probes every rung it is willing to ask
+/// for (see `session::connect`'s fallback ladder) instead of assuming any of them opens.
 ///
 /// The probe is the most permissive rung the ladder would ever reach (Shared + no performance
 /// hint), so a `true` here means SOME rung can open it; it is not a promise that the Exclusive one
 /// will. It is also a measurement at one instant: a route change between here and playback can
 /// still invalidate it, which is why [`open_ladder`] carries the rate too.
 ///
+/// `channels` is the layout the session will REQUEST, not the one the host will resolve — the
+/// resolved count does not exist until the `Welcome`. It is the closest truth available here, and
+/// it errs the safe way: a device that cannot open 5.1 at all declines hi-res and gets Opus, which
+/// is the plane it would have been left on anyway.
+///
 /// Opened and immediately dropped — never started, no data callback, so nothing is routed and no
-/// audio focus is taken. Only called when the user actually asked for a non-default format
-/// (`rate_hz != 48 000`), so an ordinary session pays nothing for it.
+/// audio focus is taken. Never called for the 48 kHz rung (universally granted, and the ladder's
+/// floor), so an ordinary session opens nothing here and pays nothing for it.
 ///
 /// ⚠ Never `request_start` this stream. The ndk wrapper's `Drop` **unwraps** `AAudioStream_close`'s
 /// status, so closing a stream the HAL is unhappy about panics rather than logging — which is why
@@ -610,14 +543,14 @@ impl Drop for AudioPlayback {
 /// we wanted; [`arm`] still holds it to the session's rate, so it can only ever rescue, never
 /// mislabel.
 ///
-/// **What is deliberately NOT here: a 48 kHz rung on a 96 kHz session.** It would open on almost
-/// any device — and then the wire carries 96 kHz frames the stream would play at double speed, or
-/// we would resample them behind the user's back, which is exactly what §9 forbids ("say so and
-/// fall back, not resample quietly"). Mid-session the plane cannot be renegotiated either — the
-/// host never switches tags under a client whose device is already open (§6). So the fallback that
-/// keeps such a device in audio has to happen BEFORE the `Hello`, and it does:
-/// [`output_rate_is_openable`] downgrades the REQUEST so this session is never a 96 kHz one in the
-/// first place.
+/// **What is deliberately NOT here: a rung at any rate but the session's.** A 48 kHz rung would
+/// open on almost any device — and then the wire carries the resolved rate's frames, which that
+/// stream would play at the wrong speed, or we would resample them behind the user's back, which is
+/// exactly what §9 forbids ("say so and fall back, not resample quietly"). Mid-session the plane
+/// cannot be renegotiated either — the host never switches tags under a client whose device is
+/// already open (§6). So the fallback that keeps such a device in audio has to happen BEFORE the
+/// `Hello`, and it does: [`output_rate_is_openable`] downgrades the REQUEST so this session is
+/// never at an unplayable rate in the first place.
 ///
 /// **Overrides.** `debug.punktfunk.audio_sharing` (`exclusive`|`shared`) and
 /// `debug.punktfunk.audio_perf` (`lowlatency`|`none`) pin the ladder to one sharing/performance
@@ -869,10 +802,6 @@ fn supervise(
     // pump's first frame arrives, so it's captured when that session is created). No-op below API
     // 33. Done once for the thread, not once per generation — it is the same thread throughout.
     client.register_hot_thread();
-    // Interleaved f32 samples per millisecond at the RESOLVED rate and layout; every ms-denominated
-    // jitter-ring depth scales by it. 96 kHz doubles it, which is the whole reason it stopped being
-    // a constant.
-    let ms = fmt.per_ms();
     let tuning = punktfunk_core::audio::JitterTuning::AAUDIO;
     let counters = Arc::new(Counters::default());
     // The A/V sync hand-off: the realtime callback owns the ring (so it publishes the depth and
@@ -909,8 +838,11 @@ fn supervise(
         let ctx = OpenCtx {
             fmt,
             tuning,
-            // Worst transient the ring can hold before the policy trims it.
-            hard_cap_max: tuning.hard_cap_ms as usize * ms,
+            // Worst transient the ring can hold before the policy trims it. Through the format's
+            // own conversion rather than a samples-per-millisecond constant: the cap is a hard
+            // ceiling on latency, and one computed 2.3 % shallow on a 44.1-family session would
+            // trim a ring that was inside its budget.
+            hard_cap_max: fmt.ms_samples(tuning.hard_cap_ms),
             game_audio,
             counters: &counters,
             sync: &sync,
@@ -1043,20 +975,24 @@ fn try_open(rung: OpenRung, ctx: &OpenCtx) -> ndk::audio::Result<LiveStream> {
     // Pre-reserve the ring so `extend` never reallocates on the realtime thread. Worst
     // transient before the trim below = the hard cap plus one full channel of the plane's OWN
     // frame — 5 ms on Opus (the protocol's fixed size, host `audio_thread`), the negotiated
-    // `audio_frame_us` on `0xD3`, which at 96 kHz/24-bit is 2 ms. Sized from the resolved format
-    // rather than from a 5 ms constant: at 96 kHz a 5 ms reserve is DOUBLE what it should be,
-    // which is merely wasteful, but the same constant used the other way round (a plane whose
-    // frames were longer than the reserve) would force a one-time realloc on the RT thread —
-    // asserted, not silently corrupted, in `decode_loop`.
+    // `audio_frame_us` on `0xD3`, which at 96 kHz/24-bit stereo is 2 ms and on 24-bit surround
+    // 1 ms. Sized from the resolved format — rate, depth AND channel count — rather than from a
+    // 5 ms constant: at 96 kHz a 5 ms reserve is DOUBLE what it should be, which is merely
+    // wasteful, but the same constant used the other way round (a plane whose frames were longer
+    // than the reserve, which a surround session's are per frame even while being shorter in time)
+    // would force a one-time realloc on the RT thread — asserted, not silently corrupted, in
+    // `decode_loop`.
     let mut ring: VecDeque<f32> =
         VecDeque::with_capacity(hard_cap_max + RING_CHUNKS * fmt.frame_samples());
     // Shared de-jitter policy — prime depth, drift correction, de-prime hysteresis — told the
     // RESOLVED format on both axes, because it is denominated in both:
     //
     // - `new_at_rate`: every depth, target, shed threshold and the `buffer_ms`/`target_ms` this
-    //   client reports are `ms × per_ms` with `per_ms` an INTEGER count of samples per
-    //   millisecond, so a 96 kHz session's figures must be in 96-sample milliseconds or every one
-    //   of them is half what the tuning asked for.
+    //   client reports are milliseconds converted to interleaved samples at the session's own rate
+    //   and layout, so a 96 kHz session's figures must be in 96-sample milliseconds or every one of
+    //   them is half what the tuning asked for. Core converts by multiplying first and dividing
+    //   last (as `SessionAudio` does), which is why the 44.1 kHz family can be passed here at all —
+    //   pre-dividing turned 44 100 Hz into 44 samples/ms and put all of them 2.3 % out.
     // - `set_frame_us`: two of its decisions are denominated in FRAMES, not milliseconds — the
     //   floor under the effective target (a device quantum plus one frame) and the smooth shed
     //   (drop exactly one frame) — and both were written when 5 ms was the only frame this
@@ -1223,9 +1159,6 @@ fn decode_loop(
     let tx = &live.tx;
     let free_rx = &live.free_rx;
     let channels = fmt.channels;
-    // Interleaved f32 samples per millisecond at the RESOLVED rate — the unit `buffer_ms` and the
-    // ring-reserve assertion below are both expressed in.
-    let ms = fmt.per_ms();
     // Decode scratch, sized for the LARGEST frame the running plane can hand us — and only for
     // that plane, because they differ by more than an order of magnitude:
     //
@@ -1262,6 +1195,13 @@ fn decode_loop(
     let mut pcm = vec![0f32; scratch_samples];
     let mut window_peak = 0f32; // loudest |sample| since the last log — tells a tone from silence
     let mut gaps = punktfunk_core::audio::AudioGapTracker::new();
+    // The third thing in this loop denominated in FRAMES that had to be told what a frame is — the
+    // same shape as `JitterPolicy::set_frame_us` and `DroughtConceal::new_at_frame_us` below.
+    // `MAX_CONCEAL_MS` caps a single loss event at 50 ms of synthesized audio, and it derives the
+    // packet count from this: left at the protocol's 5 ms it would be ten packets, which on a 2 ms
+    // lossless frame is 20 ms — the cap tightening by two and a half times on precisely the
+    // sessions whose packet rate went UP. Identical on every Opus session, which passes 5 000.
+    gaps.set_frame_us(fmt.frame_us);
     let mut frame_samples = 0usize; // per-channel samples of the last decoded frame — the PLC unit
                                     // WP-C1 — the drought half of concealment. The loop below already conceals a SEQ GAP, but only
                                     // when a later packet arrives to reveal it; when the wire simply goes quiet — Wi-Fi power-save
@@ -1295,8 +1235,9 @@ fn decode_loop(
     }
     // One tick = one frame of THIS plane, which is what makes the drought arm below conceal at the
     // rate the callback drains at rather than racing it or falling behind. 5 ms on Opus (unchanged);
-    // as little as 2 ms on a 96 kHz/24-bit `0xD3` session, where a 5 ms tick would have synthesized
-    // 2 ms of cover per 5 ms of silence and lost ground for the whole drought. Also the poll period
+    // as little as 1 ms on a `0xD3` session at the short end of the ladder, where a 5 ms tick would
+    // have synthesized one frame of cover per five owed and lost ground for the whole drought. Also
+    // the poll period
     // for both exit flags, so a disconnect is still noticed within one packet time on a silent link.
     let tick = Duration::from_micros(fmt.frame_us.max(1) as u64);
     // The dead-stream warning is a DURATION, not a packet count — see `DEAD_STREAM_WARN_MS`.
@@ -1313,7 +1254,10 @@ fn decode_loop(
                 let depth = sync.depth();
                 // Published unconditionally — the ring's depth is worth seeing even with sync off,
                 // and it is what makes a "the audio delay is way too high" report triageable at all.
-                buffer_ms_out.store((depth / ms.max(1)) as u32, Ordering::Relaxed);
+                // Converted through the format, never by a samples-per-millisecond divisor: at
+                // 44 100 Hz that divisor is 44.1 and an integer one reported this 2.3 % DEEP, which
+                // is the one direction that makes a healthy ring look like the reported fault.
+                buffer_ms_out.store(fmt.samples_ms(depth), Ordering::Relaxed);
                 if av_sync_enabled {
                     let ve2e = video_e2e.load(Ordering::Relaxed);
                     av.observe(punktfunk_core::audio::AvSyncObservation {
@@ -1415,7 +1359,7 @@ fn decode_loop(
                                 plane_counter_key(fmt),
                                 counters.pcm_written.load(Ordering::Relaxed),
                                 counters.underruns.load(Ordering::Relaxed),
-                                (depth / ms.max(1)) as u64,
+                                fmt.samples_ms(depth),
                                 counters.target_ms.load(Ordering::Relaxed),
                                 av.offset_ms(),
                                 drought.total_ms(),
@@ -1435,7 +1379,7 @@ fn decode_loop(
                 // of racing ahead of a depth reading it has already invalidated. `frame_samples`
                 // is 0 until something has decoded — there is no state to extrapolate from
                 // before then.
-                let depth_ms = (sync.depth() / ms.max(1)) as u32;
+                let depth_ms = fmt.samples_ms(sync.depth());
                 if frame_samples > 0 && drought.conceal(last_packet.elapsed(), depth_ms) {
                     if let Ok(samples @ 1..) = dec.conceal(&mut pcm, frame_samples, channels) {
                         let mut buf = free_rx

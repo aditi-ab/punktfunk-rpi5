@@ -188,10 +188,12 @@ internal fun StatsOverlay(
         }
         // NOT gated to the detailed tier, unlike the audio latency above it, and deliberately: it
         // is the one thing a user who turned lossless on needs to see. The failure it guards
-        // against (design/hi-res-audio.md §4.3, §10) is a session that costs 2.3–4.6 Mbps and
+        // against (design/hi-res-audio.md §4.3, §10) is a session that costs 2.1–8.5 Mbps and
         // delivers ordinary Opus, which is indistinguishable from success without a surface naming
         // what the HOST resolved. `null` on the Opus plane every ordinary session runs, so the
-        // common case gains no line at all.
+        // common case gains no line at all — and the top of the format menu is declined often
+        // enough (176.4 kHz fits only the ladder's shortest 1 ms rung, and hi-res surround fits no
+        // rung at all) that "the setting says one thing" is not evidence of anything.
         audioFormatLine(s)?.let { statLine(it, Color(0xFFB0FFD0)) }
         counterLine(s, lost)?.let { statLine(it, Color(0xFFFFB0B0)) }
     }
@@ -234,13 +236,24 @@ private fun audioLine(s: DoubleArray): String? {
  * session has always been, so a line stating it would be noise on the HUD of every user who never
  * touched the setting. The line exists for the opposite case, and it is the only surface that can
  * answer it: the format the SETTINGS screen shows is what this device REQUESTED, and the host's
- * five-condition gate can decline every one of them (its own switch is off by default) — leaving a
- * session that looks, sounds and measures exactly like a granted one. The native side can also
- * have downgraded the request before the handshake, if this device's output would not open the
- * rate. Both land here as the truth.
+ * gate can decline every one of them (its own switch is off by default) — leaving a session that
+ * looks, sounds and measures exactly like a granted one. The native side can also have downgraded
+ * the request before the handshake, if this device's output would not open the rate. Both land
+ * here as the truth.
  *
  * `codec` is the wire byte: 0 = Opus on `0xC9`, 2 = lossless PCM on `0xD3` (1 is reserved for a
  * FLAC that was measured and not taken).
+ *
+ * The rate is rendered in kHz to one decimal when it needs one, because half the ladder does: the
+ * 44.1 kHz family (44 100 / 88 200 / 176 400) does not divide by a thousand, and printing raw Hz
+ * for it — as this did while the ladder was 48/96 only — put the settings menu's "44.1 kHz" next
+ * to a HUD saying "44100 Hz" and left the reader to decide whether those were the same session.
+ * The whole point of this line is that it is comparable at a glance with what was asked for.
+ *
+ * Built by integer division rather than `"%.1f".format(…)` deliberately: that formatter renders
+ * through the default locale and would say "44,1 kHz" on a device set to most of Europe — a
+ * decimal comma where the settings row it is meant to be compared against has a point. Every rate
+ * this plane carries is a whole number of hundreds of Hz, so the tenths digit is exact.
  */
 private fun audioFormatLine(s: DoubleArray): String? {
     if (s.size < 38) return null
@@ -248,7 +261,11 @@ private fun audioFormatLine(s: DoubleArray): String? {
     val rateHz = s[36].roundToInt()
     val bits = s[37].roundToInt()
     if (rateHz <= 0 || bits <= 0) return null
-    val khz = if (rateHz % 1000 == 0) "${rateHz / 1000} kHz" else "$rateHz Hz"
+    val khz = if (rateHz % 1000 == 0) {
+        "${rateHz / 1000} kHz"
+    } else {
+        "${rateHz / 1000}.${rateHz % 1000 / 100} kHz"
+    }
     return "audio lossless $khz / $bits-bit"
 }
 
