@@ -511,13 +511,10 @@ impl JitterTuning {
     }
 }
 
-/// A drought must outlast ordinary arrival jitter before anything is synthesized for it: two
-/// protocol frames, the same tolerance the host's capture-hole infill uses at the other end.
-const DROUGHT_AFTER: std::time::Duration = std::time::Duration::from_millis(2 * FRAME_MS as u64);
-/// …and the ring must actually be running out. A drought a deep ring can cover is not audible,
-/// and concealing it would synthesize audio the late packets are about to duplicate — pushing the
-/// whole stream later and handing the drift shed a mess to clean up audibly.
-const DROUGHT_FLOOR_MS: u32 = 2 * FRAME_MS;
+// The two drought thresholds — how long a quiet wire must stay quiet, and how empty the ring must
+// be — are both TWO PROTOCOL FRAMES, so they live on `DroughtConceal` as `after()`/`floor_ms()`
+// rather than as constants. They were `2 * FRAME_MS`, which on a 2 ms lossless frame waits five
+// frames instead of two before conceding there is a stall.
 
 /// Bounded concealment of a packet DROUGHT — the client-side twin of the host's capture-hole
 /// infill (design/host-source-stutter-fixes.md, WP-C1).
@@ -539,21 +536,53 @@ const DROUGHT_FLOOR_MS: u32 = 2 * FRAME_MS;
 /// Time is passed IN, so the policy stays as syscall-free and deterministic as the rest of this
 /// module.
 pub struct DroughtConceal {
-    /// Concealed since the last real packet.
-    concealed_ms: u32,
+    /// Frames concealed since the last real packet. Counted in FRAMES rather than milliseconds
+    /// because that is what [`packet`](Self::packet) owes its caller, and because the frame is no
+    /// longer a fixed 5 ms — see [`new_at_frame_us`](Self::new_at_frame_us).
+    concealed: u32,
     max_ms: u32,
+    /// One frame, in microseconds. Everything time-denominated here derives from it.
+    frame_us: u32,
     /// Concealed over the session — what the 10 s `plc_ms=` line reports. Concealment must be
     /// visible: a policy that quietly papers over a failing link is a policy that hides the bug.
-    total_ms: u64,
+    total: u64,
 }
 
 impl DroughtConceal {
+    /// At the protocol's default frame ([`FRAME_MS`]).
     pub fn new(max_ms: u32) -> DroughtConceal {
+        Self::new_at_frame_us(max_ms, FRAME_MS * 1000)
+    }
+
+    /// At an explicitly negotiated frame length.
+    ///
+    /// This type charges one frame per concealed frame and bounds itself in WALL-CLOCK
+    /// milliseconds, so the two have to agree about how long a frame is. They did not: the frame
+    /// was assumed to be 5 ms, and on a 2 ms lossless frame that made the `max_ms` budget run out
+    /// after two fifths of the time it is meant to buy, and the reported `plc_ms` two and a half
+    /// times too high. The frame COUNT was always right — it charged 5 and divided by 5 — which is
+    /// exactly why this went unnoticed: the load-bearing number was fine and only the two
+    /// human-facing ones were wrong.
+    pub fn new_at_frame_us(max_ms: u32, frame_us: u32) -> DroughtConceal {
         DroughtConceal {
-            concealed_ms: 0,
+            concealed: 0,
             max_ms,
-            total_ms: 0,
+            frame_us: frame_us.max(1),
+            total: 0,
         }
+    }
+
+    /// How long a drought must last before it is concealed at all — two frames, so an ordinary
+    /// inter-packet gap is never mistaken for a stall.
+    fn after(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(2 * self.frame_us as u64)
+    }
+
+    /// Ring depth below which a drought is worth concealing, in ms. A drought a deep ring can
+    /// cover is not audible, and concealing it would synthesize audio the late packets are about
+    /// to duplicate.
+    fn floor_ms(&self) -> u32 {
+        (2 * self.frame_us).div_ceil(1000)
     }
 
     /// A packet arrived, ending any drought. Returns how many FRAMES were concealed for it, so the
@@ -561,26 +590,31 @@ impl DroughtConceal {
     /// packets genuinely lost inside a drought we already covered must not be covered twice, which
     /// would insert audio the stream never had and push everything after it later.
     pub fn packet(&mut self) -> u32 {
-        std::mem::take(&mut self.concealed_ms) / FRAME_MS
+        std::mem::take(&mut self.concealed)
     }
 
     /// Should one more frame be concealed? `depth_ms` is the playout ring as the callback last
     /// saw it.
     pub fn conceal(&mut self, since_last_packet: std::time::Duration, depth_ms: u32) -> bool {
-        if since_last_packet < DROUGHT_AFTER
-            || depth_ms > DROUGHT_FLOOR_MS
-            || self.concealed_ms >= self.max_ms
+        if since_last_packet < self.after()
+            || depth_ms > self.floor_ms()
+            || self.concealed_ms() >= self.max_ms
         {
             return false;
         }
-        self.concealed_ms += FRAME_MS;
-        self.total_ms += FRAME_MS as u64;
+        self.concealed += 1;
+        self.total += 1;
         true
+    }
+
+    /// Concealed since the last real packet, in ms — the figure the `max_ms` budget bounds.
+    fn concealed_ms(&self) -> u32 {
+        (self.concealed as u64 * self.frame_us as u64 / 1000) as u32
     }
 
     /// Concealment over the session, ms.
     pub fn total_ms(&self) -> u64 {
-        self.total_ms
+        self.total * self.frame_us as u64 / 1000
     }
 }
 
@@ -1628,7 +1662,7 @@ mod tests {
     #[test]
     fn a_drought_is_concealed_only_while_the_ring_is_running_out() {
         let mut c = DroughtConceal::new(JitterTuning::PIPEWIRE.plc_max_ms());
-        let stalled = DROUGHT_AFTER + std::time::Duration::from_millis(FRAME_MS as u64);
+        let stalled = drought_after() + std::time::Duration::from_millis(FRAME_MS as u64);
         assert!(
             !c.conceal(stalled, 40),
             "a 40 ms ring covers this drought by itself"
@@ -1663,7 +1697,7 @@ mod tests {
             assert_eq!(t.plc_max_ms(), t.deprime_ms * 2);
             let mut c = DroughtConceal::new(t.plc_max_ms());
             let mut ms = 0u32;
-            while c.conceal(DROUGHT_AFTER, 0) {
+            while c.conceal(drought_after(), 0) {
                 ms += FRAME_MS;
                 assert!(ms <= t.plc_max_ms(), "ran past the budget for {t:?}");
             }
@@ -1678,7 +1712,7 @@ mod tests {
     fn concealment_already_paid_for_is_not_paid_for_twice() {
         let mut c = DroughtConceal::new(JitterTuning::WASAPI.plc_max_ms());
         for _ in 0..4 {
-            assert!(c.conceal(DROUGHT_AFTER, 0));
+            assert!(c.conceal(drought_after(), 0));
         }
         let mut gaps = AudioGapTracker::new();
         gaps.missing_before(10);
@@ -1687,7 +1721,7 @@ mod tests {
         assert_eq!(already, 4);
         assert_eq!(gaps.missing_before(17).saturating_sub(already), 2);
         // …and the next drought starts from a full budget.
-        assert!(c.conceal(DROUGHT_AFTER, 0));
+        assert!(c.conceal(drought_after(), 0));
     }
 
     // ---- bitrate tiers -------------------------------------------------------------------
@@ -2213,6 +2247,39 @@ mod tests {
         assert!(z.frame_samples() >= 1);
     }
 
+    /// The drought budget is wall-clock, and it is spent one frame at a time — so the two have to
+    /// agree about how long a frame is. They did not: a 2 ms lossless frame was charged 5 ms, so
+    /// the fuse blew after two fifths of the time it is meant to buy and `plc_ms` over-reported by
+    /// the same factor. The frame COUNT was always right, which is why it hid.
+    #[test]
+    fn the_drought_budget_is_spent_at_the_negotiated_frame_length() {
+        // Opus: 100 ms of budget is twenty 5 ms frames, and the reported total agrees.
+        let mut o = DroughtConceal::new(100);
+        let mut n = 0;
+        while o.conceal(drought_after(), 0) {
+            n += 1;
+        }
+        assert_eq!(n, 20, "100 ms of 5 ms frames");
+        assert_eq!(o.total_ms(), 100);
+        assert_eq!(o.packet(), 20, "the caller is owed a FRAME count");
+
+        // The same budget at a 2 ms frame must buy the same WALL CLOCK — fifty frames, not the
+        // twenty that a 5 ms charge would have allowed.
+        let mut p = DroughtConceal::new_at_frame_us(100, 2_000);
+        let mut m = 0;
+        while p.conceal(std::time::Duration::from_millis(10), 0) {
+            m += 1;
+        }
+        assert_eq!(m, 50, "100 ms of 2 ms frames");
+        assert_eq!(p.total_ms(), 100, "plc_ms must not over-report");
+        assert_eq!(p.packet(), 50);
+
+        // A short frame also stops waiting five frames before it concedes a stall.
+        let q = DroughtConceal::new_at_frame_us(100, 2_000);
+        assert_eq!(q.after(), std::time::Duration::from_millis(4));
+        assert_eq!(DroughtConceal::new(100).after(), drought_after());
+    }
+
     /// The near-miss margin is "less than one packet left in hand". Frozen at 5 ms it would mean
     /// two and a half packets on a 2 ms lossless frame — growing the target on a ring that was
     /// never close to starving, which inverts what the near-miss detects. Identical on Opus.
@@ -2244,6 +2311,11 @@ mod tests {
 
     fn per_ms_at(rate: u32, channels: u8) -> usize {
         (rate / 1000) as usize * channels as usize
+    }
+
+    /// Two default frames — what `DroughtConceal::after()` returns for an Opus session.
+    fn drought_after() -> std::time::Duration {
+        std::time::Duration::from_millis(2 * FRAME_MS as u64)
     }
 
     /// `new` is exactly `new_at_rate` at the protocol default — the property that let every

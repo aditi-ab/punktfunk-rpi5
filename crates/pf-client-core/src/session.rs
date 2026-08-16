@@ -1993,19 +1993,14 @@ fn spawn_audio(
             // but only when a later packet arrives to reveal it; when the wire simply goes quiet
             // nothing arrives to reveal anything, and the ring drains into an underrun and a
             // de-prime whose re-prime is a longer artifact than the audio that was missing.
-            let mut drought =
-                punktfunk_core::audio::DroughtConceal::new(audio::TUNING.plc_max_ms());
-            // ⚠ `DroughtConceal` is denominated in `FRAME_MS` INTERNALLY — it charges its fuse
-            // 5 ms per concealed frame and reports `packet()` in 5 ms units — which is exact on
-            // the Opus plane and wrong on a lossless one whose negotiated frame may be 2 ms. The
-            // reporting half only skews `plc_ms`, but the `packet()` half is load-bearing: it is
-            // subtracted from the loss concealment below, and under-reporting it makes frames the
-            // drought already covered get concealed a SECOND time, inserting audio the stream
-            // never carried and pushing everything after it later. So the frames are counted here
-            // instead, where the plane's real frame duration is known. (The fuse itself still trips
-            // early on a short-frame plane — conservative, i.e. less concealment than the tuning
-            // allows, never more.)
-            let mut drought_frames = 0u32;
+            // Told the plane's real frame, so its wall-clock fuse and its `plc_ms` are spent at
+            // the rate this session actually paces. It used to assume 5 ms, which on a 2 ms
+            // lossless frame blew the fuse after two fifths of the time the tuning intends and
+            // over-reported concealment by the same factor.
+            let mut drought = punktfunk_core::audio::DroughtConceal::new_at_frame_us(
+                audio::TUNING.plc_max_ms(),
+                frame_us,
+            );
             let mut last_packet = std::time::Instant::now();
             while !stop.load(Ordering::SeqCst) {
                 // Wait at most one frame WHILE there is a stream to protect: the drought decision
@@ -2040,11 +2035,8 @@ fn spawn_audio(
                         last_packet = std::time::Instant::now();
                         // Anything the drought path already covered is audio the stream now has;
                         // concealing it a second time here would insert samples it never carried
-                        // and push everything after them later. `packet()` is still called — it is
-                        // what ends the drought inside the concealer — but the COUNT comes from
-                        // the local tally (see its declaration).
-                        drought.packet();
-                        let already = std::mem::take(&mut drought_frames);
+                        // and push everything after them later.
+                        let already = drought.packet();
                         // Conceal lost packets (a seq gap) before decoding the one that arrived.
                         // Which concealment that is, is the plane's business: libopus PLC
                         // interpolates from its own decoder state on `0xC9`, and `PcmConceal`
@@ -2090,7 +2082,6 @@ fn spawn_audio(
                         // invalidated.
                         let depth_ms = (sync_cell.depth() / per_ms) as u32;
                         if frame_samples > 0 && drought.conceal(last_packet.elapsed(), depth_ms) {
-                            drought_frames = drought_frames.saturating_add(1);
                             if let Some(n) = dec.conceal(frame_samples, &mut pcm) {
                                 let mut buf = player.take_buffer();
                                 buf.extend_from_slice(&pcm[..n]);

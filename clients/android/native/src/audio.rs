@@ -1268,8 +1268,12 @@ fn decode_loop(
                                     // bunching, the shape this preset already runs deeper for — nothing arrives to reveal anything
                                     // and the ring drains into an underrun and a de-prime whose re-prime is a longer artifact than
                                     // the audio that was missing.
-    let mut drought = punktfunk_core::audio::DroughtConceal::new(
+                                    // Told the plane's real frame, so its wall-clock fuse and its `plc_ms` are spent at the rate
+                                    // this session actually paces. It used to assume 5 ms, which on a 2 ms lossless frame blew the
+                                    // fuse after two fifths of the time the tuning intends.
+    let mut drought = punktfunk_core::audio::DroughtConceal::new_at_frame_us(
         punktfunk_core::audio::JitterTuning::AAUDIO.plc_max_ms(),
+        fmt.frame_us,
     );
     let mut last_packet = std::time::Instant::now();
 
