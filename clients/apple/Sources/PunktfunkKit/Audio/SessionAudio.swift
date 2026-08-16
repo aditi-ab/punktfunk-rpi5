@@ -11,10 +11,13 @@
 //   virtual PipeWire source.
 //
 // The downlink's FORMAT is negotiated, not assumed. `connection.resolvedAudioRateHz` is 48 kHz
-// for every Opus session and every host older than the lossless plane, and 48 or 96 kHz on
-// `0xD3` — and it is what the ring, the A/V sync loop and the render graph's AVAudioFormat are
-// all built from (design/hi-res-audio.md §9). The UPLINK is deliberately untouched: Opus is
-// 48 kHz by construction and the mic carries voice, so §3 excludes it.
+// for every Opus session and every host older than the lossless plane, and any rate on the
+// lossless ladder (44 100 / 48 000 / 88 200 / 96 000 / 176 400) on `0xD3` — and it is what the
+// ring, the A/V sync loop and the render graph's AVAudioFormat are all built from
+// (design/hi-res-audio.md §9). Its CHANNEL count is negotiated the same way and is no longer
+// stereo on the lossless plane either: the frame ladder is sized per channel count, so a 5.1/7.1
+// lossless session simply arrives on a shorter frame. The UPLINK is deliberately untouched: Opus
+// is 48 kHz by construction and the mic carries voice, so §3 excludes it.
 //
 // Engine topology. With the mic enabled and echo cancellation on (both defaults), BOTH
 // directions run on ONE AVAudioEngine with the system voice processor engaged
@@ -224,15 +227,18 @@ public final class SessionAudio {
 
     /// The rate the samples on the wire are actually at — `Welcome`'s RESOLVED figure, not what
     /// this client asked for. 48 000 on every Opus session and every host older than the lossless
-    /// plane; 48 000 or 96 000 on `0xD3`. Everything that turns samples into time — the ring's
-    /// `perMS`, the A/V sync loop's, and the `AVAudioFormat` the render graph is built at — is
-    /// denominated in this, because it is what `nextAudioPcm` hands back.
+    /// plane; any rate on the ladder (44 100 / 48 000 / 88 200 / 96 000 / 176 400) on `0xD3`.
+    /// Everything that turns samples into time — the ring's ms ⇄ sample conversion, the A/V sync
+    /// loop's, and the `AVAudioFormat` the render graph is built at — is denominated in this,
+    /// because it is what `nextAudioPcm` hands back.
     private var wireRateHz: Int { Int(connection.resolvedAudioRateHz) }
 
     /// How much audio one datagram carries, in MICROSECONDS — `Welcome`'s resolved
-    /// `audio_frame_us`. 5 000 on every Opus session; 4 000 at 48 kHz/24-bit and 2 000 at
-    /// 96 kHz/24-bit on the lossless plane, which sizes its frame so the payload fits one datagram.
-    /// Microseconds because the ladder has sub-millisecond rungs (`AudioRing.setFrameUs`).
+    /// `audio_frame_us`. 5 000 on every Opus session; on the lossless plane the host sizes it so
+    /// the payload fits one datagram, which is 4 000 at 48 kHz/24-bit stereo, 2 000 at
+    /// 96 kHz/24-bit stereo, and shorter again for surround (a 5.1 frame carries three times the
+    /// samples, so it drops to roughly 1 000–1 500). Microseconds because the ladder has
+    /// sub-millisecond rungs (`AudioRing.setFrameUs`).
     private var wireFrameUs: Int { Int(connection.resolvedAudioFrameUs) }
 
     /// The same figure rounded UP to whole milliseconds, for the one consumer that can only express
@@ -1123,7 +1129,13 @@ public final class SessionAudio {
             // packet arrives to reveal it; when the wire simply goes quiet nothing arrives to
             // reveal anything, and the ring drains into an underrun and a de-prime whose re-prime
             // is a longer artifact than the audio that was missing.
-            var drought = DroughtConceal(maxMS: AudioRing.plcMaxMS)
+            //
+            // Given the SESSION's frame, like the ring: this type spends a wall-clock budget one
+            // frame at a time, and each `conceal()` that says yes costs exactly one `audioPlc()`
+            // frame below — so if it assumed 5 ms, a 2 ms lossless session would spend the budget
+            // in two fifths of the time it promises and report `plc_ms` two and a half times too
+            // high. A 5.1 session, whose frame drops to ~1 ms, would be five times out.
+            var drought = DroughtConceal(maxMS: AudioRing.plcMaxMS, frameUs: frameUs)
             var lastPacketNs = DispatchTime.now().uptimeNanoseconds
             // Something has decoded, so there is both state to conceal from and continuity to
             // hold. Until then a session whose host never sends audio keeps the long timeout below

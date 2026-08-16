@@ -476,17 +476,21 @@ struct SettingsView: View {
                     title: "Audio channels",
                     options: SettingsOptions.audioChannels,
                     selection: $audioChannels)
-                // Stereo only (the lossless plane is — see SettingsOptions.audioFormats).
-                if audioChannels == 2 {
-                    TVSelectionRow(
-                        title: "Audio quality",
-                        options: SettingsOptions.audioFormats,
-                        selection: $audioFormat)
-                    tvCaption("Lossless sends bit-exact PCM instead of compressed audio, at 2.3 "
-                        + "(48 kHz) or 4.6 (96 kHz) Mbps on top of the video. It also has to be "
-                        + "enabled on the host, and the Apple TV's output has to accept the "
-                        + "rate — otherwise the session falls back to Standard.")
-                }
+                // Offered at every channel count — the lossless plane is no longer stereo-only,
+                // because the frame ladder is sized per channel count and surround simply
+                // negotiates a shorter frame (see SettingsOptions.audioFormats).
+                TVSelectionRow(
+                    title: "Audio quality",
+                    options: SettingsOptions.audioFormats,
+                    selection: $audioFormat)
+                tvCaption("Lossless sends bit-exact PCM instead of compressed audio — 2.1 to 8.5 "
+                    + "Mbps on top of the video for stereo, three times that for 5.1 and four for "
+                    + "7.1. It also has to be enabled on the host, the host's own interface has "
+                    + "to run the rate, and the Apple TV's output has to accept it. The top of "
+                    + "the ladder needs room the network may not have: 176.4 kHz sends a thousand "
+                    + "packets a second, and surround above 48 kHz does not fit at all. Anything "
+                    + "missing falls back to Standard — the stats overlay shows what the session "
+                    + "actually got.")
                 TVSelectionRow(
                     title: "Auto-wake on connect",
                     options: [("On", "on"), ("Off", "off")], selection: autoWakeEnabledTag)

@@ -238,12 +238,22 @@ public struct EffectiveSettings: Equatable, Sendable {
 /// than a free rate/depth pair, so the states that cannot be asked for are unrepresentable rather
 /// than merely validated.
 ///
-/// **The ladder is 48/96 kHz only, and that is arithmetic, not bandwidth.** Every buffer figure in
-/// the jitter policy — at both ends and in all four clients — is `ms × perMS` with `perMS` an
-/// integer number of samples per millisecond. 48 000 → 48 and 96 000 → 96 are exact; 44 100 → 44.1
-/// truncates to 44, a silent 2.3 % error in every target, every de-prime fuse and every reported
-/// `buffer_ms`. 44.1 kHz and its multiples are therefore deferred behind denominating that policy
-/// in a rational `perMS`, not behind any difficulty in carrying them (design/hi-res-audio.md §4.1).
+/// **The ladder is both rate families**, matching `punktfunk_core::audio::pcm::rate_is_supported`:
+/// 44 100 / 48 000 / 88 200 / 96 000 / 176 400 Hz. The 44.1 kHz family used to be absent, and for
+/// exactly one reason: every buffer figure in the jitter policy — at both ends and in all four
+/// clients — was `ms × perMS` with `perMS` an INTEGER number of samples per millisecond, so
+/// 44 100 → 44.1 truncated to 44 and put every target, every de-prime fuse and every reported
+/// `buffer_ms` 2.3 % low. That arithmetic now multiplies before it divides (see the conversion
+/// helpers at the top of `AudioRing.swift`, and `JitterPolicy::new_at_rate`), which is the whole of
+/// what §4.1 deferred the family behind (design/hi-res-audio.md §4.1).
+///
+/// ⚠ **A rate being representable is not a promise that it will be granted**, and this surface must
+/// never read as one. The host runs a five-condition gate and any failure resolves the session back
+/// to Opus 48 kHz; on top of that the frame has to FIT one QUIC datagram, which the top of the
+/// ladder only barely does — 176 400/24-bit stereo is 8.5 Mbps and fits only the shortest rung
+/// (1 ms, ~1 069 B), and surround above 48 kHz fits no rung at all. What a session actually got is
+/// `PunktfunkConnection`'s `resolvedAudioRateHz`/`resolvedAudioBits`/`resolvedAudioChannels`/
+/// `isLosslessAudio`, which is what the HUD shows.
 ///
 /// Lossless at the DEFAULT 48 kHz/16-bit is deliberately not offered: it spends ~1.5 Mbps to sound
 /// like the transparent 256 kbps Opus it replaces, and it is the one lossless request whose wire
@@ -252,28 +262,63 @@ public struct EffectiveSettings: Equatable, Sendable {
 public enum AudioFormatChoice: String, CaseIterable, Sendable {
     /// Opus 48 kHz — the default, and byte-for-byte the session every earlier build ran.
     case opus
+    /// Bit-exact PCM at 44.1 kHz / 24-bit. ~2.1 Mbps. The CD family's base rate: what an ordinary
+    /// Windows endpoint or a 44.1 kHz interface reports as its OWN engine rate, and the request
+    /// that spares such a host a resample, exactly as `lossless48` does on a 48 kHz one.
+    case lossless441
     /// Bit-exact PCM at 48 kHz / 24-bit. ~2.3 Mbps. The honest win even without a hi-res
     /// interface: no lossy stage at all, and no double resample on a 48 kHz host.
     case lossless48
+    /// Bit-exact PCM at 88.2 kHz / 24-bit. ~4.2 Mbps — 96 kHz's counterpart in the 44.1 family, and
+    /// the one to prefer over it on 44.1-derived material, since doubling is exact.
+    case lossless882
     /// Bit-exact PCM at 96 kHz / 24-bit. ~4.6 Mbps, and only real if the host's capture endpoint
     /// genuinely runs at 96 kHz — the host declines rather than upsampling, and this client says so
     /// rather than claiming a rate its own output device refused.
     case lossless96
+    /// Bit-exact PCM at 176.4 kHz / 24-bit — 8.5 Mbps, and the one row far more likely to be
+    /// declined than granted. Three things have to go right: the host's bandwidth gate gives audio
+    /// at most a quarter of the video budget, so the session needs ~34 Mbps of video before it is
+    /// even considered; a stereo frame fits a QUIC datagram only on the ladder's shortest rung
+    /// (1 ms — a thousand datagrams a second — at ~1 069 B, so any connection with a smaller
+    /// datagram declines it) and a surround one fits no rung at all; and this device's output has
+    /// to open the rate. Offered because it is reachable, not because it is likely — the HUD's
+    /// `audio lossless …` line is what says which happened.
+    case lossless1764
 
     /// The stored raw value, falling back to `.opus` for anything a newer build wrote.
+    ///
+    /// ⚠ **The raw values are shared VERBATIM with `pf_client_core::session::AUDIO_FORMATS` and the
+    /// Android client's `AUDIO_FORMAT_*`, and must never be renamed.** One profile catalog
+    /// round-trips through all four clients, and a spelling that differs by a single character
+    /// fails in the worst possible way: the key is carried through untouched, so the profile keeps
+    /// "working" on the other client and silently inherits its global default instead. The naming
+    /// rule is the kHz figure with the decimal point dropped — `lossless48`, `lossless96`, and for
+    /// the 44.1 family `lossless441` / `lossless882` / `lossless1764`. Left implicit (case name ==
+    /// raw value) precisely so the two cannot drift apart here; `SharedFoundationTests` pins the
+    /// resulting strings against the other clients' tables.
     public init(setting: String) {
         self = AudioFormatChoice(rawValue: setting) ?? .opus
     }
 
-    /// The `Hello` fields this choice asks for. `48 000`/`16` is exactly a pre-lossless request and
-    /// keeps the legacy connect path; anything else asks core for the `0xD3` plane and lets it
-    /// derive `CLIENT_CAP_AUDIO_HIRES` from the format, so the bit and the format can never
-    /// disagree.
+    /// The `Hello` fields this choice asks for. Anything other than `48 000`/`16` asks core for the
+    /// `0xD3` plane and lets it derive `CLIENT_CAP_AUDIO_HIRES` from the format, so the bit and the
+    /// format can never disagree.
+    ///
+    /// ⚠ `.opus` reads `(48_000, 16)` here because that is what an Opus session runs at — **not**
+    /// because that pair is a way to ask for it. Core's hi-res entry point treats an explicit
+    /// 48 000/16 as a real request for the lossless plane's cheapest rung (the unspecified pair is
+    /// `0`/`0`, which is what the legacy entry point sends). `PunktfunkConnection.init` is where
+    /// that distinction is enforced — it compares against this pair and dials the legacy entry
+    /// point instead. Read that comment before changing either side.
     public var wire: (rateHz: UInt32, bits: UInt8) {
         switch self {
         case .opus: return (48_000, 16)
+        case .lossless441: return (44_100, 24)
         case .lossless48: return (48_000, 24)
+        case .lossless882: return (88_200, 24)
         case .lossless96: return (96_000, 24)
+        case .lossless1764: return (176_400, 24)
         }
     }
 

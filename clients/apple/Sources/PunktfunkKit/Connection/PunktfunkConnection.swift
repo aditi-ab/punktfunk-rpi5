@@ -473,12 +473,19 @@ public final class PunktfunkConnection {
     public private(set) var resolvedAudioBits: UInt8 = 16
 
     /// How much audio one datagram carries, in MICROSECONDS — `5000` on the Opus plane and every
-    /// host older than the lossless one, `4000` at 48 kHz/24-bit and `2000` at 96 kHz/24-bit under
-    /// the default MTU (the lossless plane sizes its frame so the payload fits one datagram).
+    /// host older than the lossless one; on `0xD3` the host picks the longest rung whose payload
+    /// fits one datagram, which is `4000` at 48 kHz/24-bit stereo and `2000` at 96 kHz/24-bit
+    /// stereo under the default MTU, and shorter again for surround, whose frame carries three
+    /// (5.1) or four (7.1) times the samples for the same duration.
     ///
     /// Microseconds, not milliseconds, because the ladder has sub-millisecond rungs and a frame
     /// that goes through integer ms truncates: 2 500 µs at 48 kHz stereo is 240 interleaved
     /// samples, and 2 ms would make it 192.
+    ///
+    /// ⚠ It is a LABEL, not a duration, on the 44.1 kHz family: a frame carries a whole number of
+    /// samples per channel and no rung divides 44 100 Hz, so a nominal 5 ms frame there is really
+    /// 4 988 662 ns. Size buffers from it (`AudioRing.setFrameUs`, which routes it through the same
+    /// floor-per-channel rule the host filled the frame with); never advance a clock by it.
     ///
     /// Needed only because this client ports the de-jitter policy into Swift rather than letting
     /// core run it. Two of the policy's decisions are denominated in FRAMES, not milliseconds — the
@@ -779,10 +786,14 @@ public final class PunktfunkConnection {
     ///
     /// `audioRateHz`/`audioBits`: the audio format to ASK for (48 000/16 = today's Opus plane, the
     /// default and the only pair that is byte-for-byte identical on the wire to every session
-    /// before the lossless plane existed). Anything else asks for the bit-exact `0xD3` plane and
-    /// takes 1.5–4.6 Mbps off the top of the link, outside ABR — so it is a deliberate user opt-in
-    /// on both ends, never a default. **The request is not the answer**: read `resolvedAudioRateHz`
-    /// / `resolvedAudioBits` afterwards and open the output device from those.
+    /// before the lossless plane existed). Anything else asks for the bit-exact `0xD3` plane, whose
+    /// rate ladder is 44 100 / 48 000 / 88 200 / 96 000 / 176 400 (`pcm::rate_is_supported`), and
+    /// takes 2.1–8.5 Mbps off the top of the link for stereo — three times that for 5.1, four for
+    /// 7.1 — outside ABR, so it is a deliberate user opt-in on both ends, never a default.
+    /// **The request is not the answer**: read `resolvedAudioRateHz`/`resolvedAudioBits`/
+    /// `resolvedAudioChannels` afterwards and open the output device from those. Asking for
+    /// something the connection cannot carry is not an error — a format whose frame does not fit
+    /// one datagram, 176 400/24-bit among them, resolves the session back to Opus 48 kHz.
     public init(
         host: String, port: UInt16 = 9777,
         width: UInt32, height: UInt32, refreshHz: UInt32,
@@ -818,12 +829,26 @@ public final class PunktfunkConnection {
         // device pending approval reads "This device".
         let override = deviceName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let label = override.isEmpty ? DeviceName.current : override
-        // `ex11` only when a NON-DEFAULT audio format is being asked for. 48 000/16 through `ex11`
-        // is documented as byte-for-byte identical to `ex10` on the wire, but staying on the older
-        // entry point for the default keeps that identity a property of this client rather than a
-        // promise it relies on — and it is the overwhelmingly common path. `ex11` also derives
-        // `CLIENT_CAP_AUDIO_HIRES` from the format itself and ORs it into `clientCaps`, so the bit
-        // and the format it advertises can never disagree; nothing here sets it by hand.
+        // `ex11` only when a NON-DEFAULT audio format is being asked for, and this branch is
+        // LOAD-BEARING rather than a tidiness preference.
+        //
+        // ⚠ It used to be commented as one — "48 000/16 through `ex11` is byte-for-byte identical
+        // to `ex10`, but staying on the older entry point keeps that identity a property of this
+        // client" — and the C header now says plainly that it is not identical. `ex10` passes
+        // `0`/`0`, meaning UNSPECIFIED, and core's capability bit keys on "the caller specified a
+        // format", not on "the format differs from the default". So an explicit 48 000/16 through
+        // `ex11` is a genuine request for the cheapest LOSSLESS rung: it sets
+        // `CLIENT_CAP_AUDIO_HIRES`, and a host with the operator policy on resolves the session
+        // onto the `0xD3` plane at 1.5 Mbps — for audio indistinguishable from the 256 kbps Opus it
+        // replaced. That is deliberate in core (48/16 would otherwise be the one rung nobody could
+        // ask for), which is exactly why deleting this test would opt every ordinary session in.
+        //
+        // `AudioFormatChoice.opus.wire` is `(48_000, 16)` for readability, so this comparison — not
+        // that pair — is what keeps a Standard session on the legacy path.
+        //
+        // `ex11` also derives `CLIENT_CAP_AUDIO_HIRES` from the format itself and ORs it into
+        // `clientCaps`, so the bit and the format it advertises can never disagree; nothing here
+        // sets it by hand.
         let wantsHiRes = audioRateHz != 48_000 || audioBits != 16
         handle = host.withCString { cs in
             withOptionalCString(identity?.certPEM) { cert in
@@ -1178,8 +1203,9 @@ public final class PunktfunkConnection {
         }
     }
 
-    /// One decoded audio frame from `nextAudioPcm`: interleaved 32-bit float at 48 kHz, in the
-    /// canonical wire channel order FL FR FC LFE RL RR SL SR (the first `channels`).
+    /// One decoded audio frame from `nextAudioPcm`: interleaved 32-bit float at
+    /// `resolvedAudioRateHz` — 48 kHz on the Opus plane, any rate on the lossless ladder on `0xD3`
+    /// — in the canonical wire channel order FL FR FC LFE RL RR SL SR (the first `channels`).
     public struct AudioPCM: Sendable {
         /// Interleaved f32 samples (`frameCount * channels` long), wire channel order.
         public let samples: [Float]

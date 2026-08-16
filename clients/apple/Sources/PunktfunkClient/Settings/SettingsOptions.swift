@@ -26,16 +26,29 @@ enum SettingsOptions {
     ]
 
     /// Audio format (`DefaultsKey.audioFormat`) — the `tag` is an `AudioFormatChoice` raw value.
-    /// Standard is the default; the two lossless rows are a per-session opt-in that spends real
+    /// Standard is the default; every lossless row is a per-session opt-in that spends real
     /// bandwidth outside the ABR loop, and the host has its own switch which is also off by
-    /// default. Offered only for STEREO — the lossless plane is stereo-only at the default MTU
-    /// (a 2.5 ms 5.1 frame is ~3 000 B and does not fit one datagram), so the surround rows and
-    /// these are mutually exclusive by construction; the surface hides this picker rather than
-    /// offering a request the host would decline.
+    /// default.
+    ///
+    /// Ordered by rate rather than by family, because that is the order a listener reads a rate
+    /// ladder in — the two families interleave (44.1, 48, 88.2, 96, 176.4) and grouping them would
+    /// put 88.2 above 48.
+    ///
+    /// **Offered at every channel count**, unlike before. This picker used to be hidden unless the
+    /// session was stereo, on the grounds that a surround frame does not fit one datagram — but the
+    /// frame ladder is sized per channel count (`pcm::frame_us_for`), so 5.1 and 7.1 simply
+    /// negotiate SHORTER frames: 48 kHz/16-bit 5.1 lands around 2 ms and 48/24 shorter still, which
+    /// is a higher packet rate rather than an impossibility. What genuinely fits no rung at the
+    /// default MTU is surround above 48 kHz, and the honest treatment of that is the caption plus
+    /// the host's own decline — not a hidden row, which silently discards a choice the user made
+    /// and explains nothing.
     static let audioFormats: [(label: String, tag: String)] = [
         ("Standard (Opus)", AudioFormatChoice.opus.rawValue),
+        ("Lossless 44.1 kHz / 24-bit", AudioFormatChoice.lossless441.rawValue),
         ("Lossless 48 kHz / 24-bit", AudioFormatChoice.lossless48.rawValue),
+        ("Lossless 88.2 kHz / 24-bit", AudioFormatChoice.lossless882.rawValue),
         ("Lossless 96 kHz / 24-bit", AudioFormatChoice.lossless96.rawValue),
+        ("Lossless 176.4 kHz / 24-bit", AudioFormatChoice.lossless1764.rawValue),
     ]
 
     /// Virtual-pad types — the `tag` is the wire value (`PunktfunkConnection.GamepadType` raw).
