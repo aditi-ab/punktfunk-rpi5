@@ -288,8 +288,12 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
     /// landing first and its neighbours fanning outward to either side.
     private func entrance(_ idx: Int) -> CardEntrance {
         // Capped so a several-hundred-title library never queues a card behind a visibly long
-        // wait — everything past the cap lands together, well off-screen anyway.
-        let delay = min(CardEntrance.maxDelay, Double(abs(idx - entranceAnchor)) * 0.07)
+        // wait — everything past the cap lands together, well off-screen anyway. The stagger and
+        // the cap move as a PAIR: their ratio is how many steps actually fan, so a wider offset
+        // under the same cap would land the outer half of the strip in one block.
+        // Mirrors `entrances::CARDS` in the desktop console's anim.rs — nothing pins the two
+        // together, so a change here is a change there.
+        let delay = min(CardEntrance.maxDelay, Double(abs(idx - entranceAnchor)) * 0.12)
         return CardEntrance(
             progress: entranceProgress,
             start: delay / CardEntrance.total,
@@ -499,9 +503,12 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
 /// focus engine are untouched either. Reduce Motion drops every bit of travel for a plain,
 /// unstaggered cross-fade.
 struct CardEntrance: ViewModifier, Animatable {
-    /// How long ONE card takes to travel, and the most any card waits before it starts.
+    /// How long ONE card takes to travel, and the most any card waits before it starts. The
+    /// pair matches `entrances::CARDS` in the desktop console's anim.rs; `maxDelay` divided by
+    /// the per-step stagger in `entrance(_:)` is the number of cards that visibly fan, which is
+    /// why it moves whenever that stagger does.
     static let perCard: Double = 0.6
-    static let maxDelay: Double = 0.42
+    static let maxDelay: Double = 0.6
     /// The master timeline the carousel animates 0 → 1.
     static var total: Double { perCard + maxDelay }
 

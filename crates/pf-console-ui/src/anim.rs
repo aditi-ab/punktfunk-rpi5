@@ -154,7 +154,10 @@ pub(crate) struct EntranceSpec {
     /// Delay added per step of distance from the anchor.
     pub stagger: f64,
     /// Ceiling on that delay. Without it a 400-title shelf would still be arriving a
-    /// minute later; with it, everything past ~6 items away starts together.
+    /// minute later; with it, everything past `cap / stagger` items away starts together —
+    /// five or six, for the specs below. Which is why the two move as a pair: that ratio IS
+    /// the number of steps anyone ever sees fan, so raising `stagger` alone buys a wider
+    /// offset across fewer steps and lands the far half of a shelf in one block.
     pub cap: f64,
 }
 
@@ -162,17 +165,28 @@ pub(crate) mod entrances {
     use super::EntranceSpec;
 
     /// Carousel and coverflow cards — the loud one, and the reason this exists.
+    ///
+    /// The stagger is measured against a card's VISIBLE life, not against `window`: the fade
+    /// is over at `FADE_SHARE` and [`super::ease_out_back`] is already at 0.89 by that same
+    /// point, so the last two thirds of the window is a crawl nobody can see. What is left is
+    /// ~0.2 s of readable action, and a neighbour starting a little past halfway through it is
+    /// what makes a strip arrive as a sequence rather than as one soft event. Judged against
+    /// the whole 0.6 s a stagger half this size looks generous; judged against the 0.2 s that
+    /// reads it is four frames, and since every surface here culls to a handful of items,
+    /// four frames is the whole event and not the gap between two of its steps.
     pub(crate) const CARDS: EntranceSpec = EntranceSpec {
         window: 0.6,
-        stagger: 0.07,
-        cap: 0.42,
+        stagger: 0.12,
+        cap: 0.6,
     };
     /// Menu rows. Same language, deliberately quieter: a settings list that fans open like
-    /// a shelf of box art is a settings list showing off.
+    /// a shelf of box art is a settings list showing off. Quieter still has to be countable,
+    /// though — under about three frames apart the rows read as one soft arrival rather than
+    /// as a ripple — so this is a shorter offset, not an absent one.
     pub(crate) const ROWS: EntranceSpec = EntranceSpec {
         window: 0.42,
-        stagger: 0.03,
-        cap: 0.24,
+        stagger: 0.055,
+        cap: 0.33,
     };
 }
 
@@ -318,9 +332,11 @@ mod tests {
             assert_eq!(e.at(3, t), e.at(7, t));
         }
 
-        // The cap holds: past cap/stagger = 6 steps out, everything starts at once. This is
-        // what keeps a 400-title shelf from still arriving a minute later.
-        assert_eq!(e.at(5 + 7, 0.3), e.at(5 + 250, 0.3));
+        // The cap holds: past `cap / stagger` steps out — five, for CARDS — everything starts
+        // at once. This is what keeps a 400-title shelf from still arriving a minute later.
+        // Derived rather than spelled out, so re-tuning the pair re-aims the probe with it.
+        let beyond = (entrances::CARDS.cap / entrances::CARDS.stagger).ceil() as usize + 1;
+        assert_eq!(e.at(5 + beyond, 0.3), e.at(5 + 250, 0.3));
 
         // Monotone once started, and never outside 0..=1.
         let mut last = 0.0;
@@ -338,6 +354,42 @@ mod tests {
         assert!(!e.done(over - 0.01));
         for i in [5, 9, 400] {
             assert_eq!(e.at(i, over), EntranceAt::SETTLED, "item {i} never landed");
+        }
+    }
+
+    /// Whether the strip reads as a SEQUENCE, which none of `entrance_envelope`'s shape
+    /// properties can see: a spec with `stagger` at zero satisfies every one of them and
+    /// arrives as a single soft event. Three numbers decide it, all derived from the specs
+    /// so that a re-tune which quietly undoes the fan fails here rather than on a couch.
+    #[test]
+    fn entrance_stagger_reads_as_a_sequence() {
+        // A neighbour must still be visibly behind while the anchor is halfway through its
+        // FADE — `window` flatters the stagger badly, because an item is perceptually done a
+        // third of the way through it, so this is measured against the part that reads.
+        let separation = |spec: EntranceSpec| {
+            let e = Entrance::new(spec, 5, 0.0);
+            let t_mid = 0.5 * FADE_SHARE * spec.window;
+            e.at(5, t_mid).fade - e.at(6, t_mid).fade
+        };
+        let cards = separation(entrances::CARDS);
+        assert!(cards > 0.7, "CARDS neighbours arrive together: {cards}");
+        let rows = separation(entrances::ROWS);
+        assert!(rows > 0.5, "ROWS is quieter, not staggerless: {rows}");
+
+        for (name, spec, budget) in [
+            ("CARDS", entrances::CARDS, 1.25),
+            ("ROWS", entrances::ROWS, 0.8),
+        ] {
+            // `cap / stagger` is how many steps ever fan, and every surface culls to a
+            // handful of items — the coverflow shows five. Let this drop and a wider
+            // `stagger` buys a bigger offset across fewer steps, which is worse, not better.
+            let steps = spec.cap / spec.stagger;
+            assert!(steps >= 4.0, "{name} fans only {steps} steps");
+            // The other end: "too long" should be a failing test rather than an opinion. The
+            // item under the cursor is untouched by both — its delay is 0 — so this budget
+            // buys peripheral polish and never makes anyone wait.
+            let total = spec.cap + spec.window;
+            assert!(total <= budget, "{name} takes {total} s to retire");
         }
     }
 

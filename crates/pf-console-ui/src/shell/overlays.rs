@@ -161,10 +161,14 @@ impl Shell {
             let size = 13.0 * k;
             let tw = f64::from(fonts.measure(&toast.text, W::Medium, size));
             let (pad_x, bh) = (16.0 * k, 34.0 * k);
-            // Leading run: hairline, air, mark, air — then the text.
-            let (hair_w, mark_w, gap) = (3.0 * k, 13.0 * k, 9.0 * k);
-            let lead = hair_w + gap + mark_w + gap;
-            let bw = lead + tw + 2.0 * pad_x;
+            // Leading run: the kind mark, air, then the text. The mark carries the kind by
+            // itself — a hairline in the same tint used to stand beside it, saying the same
+            // thing twice and reading as a rendering seam rather than as meaning. Its pad is
+            // shy of `pad_x` because nothing drawn in the 13 dp box fills it, and an equal pad
+            // leaves the pill visibly left-heavy in air.
+            let (mark_pad, mark_w, gap) = (13.0 * k, 13.0 * k, 9.0 * k);
+            let lead = mark_pad + mark_w + gap;
+            let bw = lead + tw + pad_x;
             let bx = (w - bw) / 2.0;
             let by = h - BOTTOM_BAND * k - bh - 8.0 * k + (1.0 - slide) * 12.0 * k;
             canvas.save_layer_alpha_f(None, alpha);
@@ -182,29 +186,12 @@ impl Shell {
                 k as f32,
             );
             let cy = by + bh / 2.0;
-            // The hairline: the kind, readable from a couch without reading the words.
-            let hair = Rect::from_xywh(
-                (bx + pad_x) as f32,
-                (cy - 8.0 * k) as f32,
-                hair_w as f32,
-                (16.0 * k) as f32,
-            );
-            canvas.draw_rrect(
-                skia_safe::RRect::new_rect_xy(hair, (hair_w / 2.0) as f32, (hair_w / 2.0) as f32),
-                &fill(tint),
-            );
-            draw_toast_mark(
-                canvas,
-                mark,
-                bx + pad_x + hair_w + gap + mark_w / 2.0,
-                cy,
-                k,
-                tint,
-            );
+            // Tinted by kind, so a toast is readable from a couch without reading the words.
+            draw_toast_mark(canvas, mark, bx + mark_pad + mark_w / 2.0, cy, k, tint);
             fonts.draw(
                 canvas,
                 &toast.text,
-                bx + pad_x + lead,
+                bx + lead,
                 cy + size * 0.36,
                 W::Medium,
                 size,
