@@ -36,11 +36,8 @@ const BAR_CORNER: f64 = 14.0;
 /// notice; the GRID starts its first row at the very top of what it is given, and a rank of
 /// covers flush against a band of chrome reads as one clipped object rather than two.
 const BAR_GAP: f64 = 12.0;
-/// Where the bar's arrangement column starts, in design units, when the band is too narrow
-/// to split down the middle: the sort's caption and its four pills, plus air. Measured from
-/// the widest they can be — the labels are compile-time constants — so this is a floor on
-/// the column, not a guess at it.
-const BAR_VIEW_COL: f64 = 430.0;
+/// Air between a caption and the pills it names, and between the two groups.
+const CAPTION_GAP: f64 = 10.0;
 /// How many decoded posters stay resident. Roughly nine grid rows' worth — enough that
 /// paging back and forth over the same stretch never re-decodes, small enough that a
 /// 400-title library cannot accumulate all of it. See `LibraryScreen::evict_art`.
@@ -303,6 +300,19 @@ fn store_view(view: LibraryView, ctx: &mut Ctx) {
 /// The caller adds the returned width to `x` and hands the REST of the band to
 /// [`TabStrip::render`], which insets itself from whatever rect it is given — so neither
 /// side has to be told how wide the other came out.
+/// How wide [`strip_caption`] will draw `label`.
+///
+/// Separate from the draw because a group anchored to the TRAILING edge has to know its own
+/// width before it can decide where to start — and measuring it a second way, by hand, is how
+/// the measured edge ends up somewhere the drawn edge is not.
+pub(super) fn caption_width(fonts: &Fonts, label: &str, k: f64) -> f64 {
+    let size = 11.0 * k;
+    // `draw_tracked` adds tracking after every character including the last, so the ink ends
+    // one gap short of the pen.
+    f64::from(fonts.measure(label, W::SemiBold, size))
+        + 1.4 * k * (label.chars().count().saturating_sub(1)) as f64
+}
+
 pub(super) fn strip_caption(
     canvas: &Canvas,
     fonts: &Fonts,
@@ -704,7 +714,6 @@ impl LibraryScreen {
     /// the top screen once a frame and swaps the returned screen in where the shelf stands —
     /// guarded on a settled transition, or a swap can land on a push the user has already
     /// reversed with B and put them on the collections instead of home.
-    #[allow(dead_code)]
     pub(crate) fn collections_upgrade(
         &mut self,
         library: &LibraryShared,
@@ -1397,42 +1406,31 @@ impl LibraryScreen {
     /// is named here anyway: one strip that answers both questions the same way is a control
     /// the user finds once.
     fn draw_bar(&mut self, canvas: &Canvas, bar: Rect, k: f64, fonts: &Fonts, dt: f64) {
-        // Focused, the WHOLE band lifts — the two rows are one control here (◀ ▶ step the
-        // sort, the shoulders pick the arrangement), so a ring around one pill row would
-        // name a focus the input model does not have. The glass and the brand hairline are
-        // the same pair the grid's focused cell uses, so this reads as focus rather than as
-        // a new kind of chrome.
+        // Focused, the WHOLE band takes an accent WASH — the two groups are one control here
+        // (◀ ▶ step the sort, the shoulders pick the arrangement), so a ring around one pill
+        // row would name a focus the input model does not have.
+        //
+        // A wash and nothing else: no border, no halo, no glass. This was a glass panel with
+        // a brand hairline and a halo behind it, which is the console's recipe for a floating
+        // SURFACE — and a strip of chrome sitting flat in the field is not one. It read as a
+        // dark slab with a line round it, worse on the pale palettes where the glass turns to
+        // frost over an already-light field. The accent is palette-derived, so at 14 % it is
+        // legible at both poles without ever becoming an object.
         if self.bar.focus {
-            crate::theme::focus_halo(canvas, bar, BAR_CORNER as f32, k as f32, 1.0);
-            crate::theme::panel(
-                canvas,
-                bar,
-                BAR_CORNER as f32,
-                None,
-                crate::theme::PanelStroke::Brand(0.9),
-                k as f32,
+            canvas.draw_rrect(
+                RRect::new_rect_xy(bar, (BAR_CORNER * k) as f32, (BAR_CORNER * k) as f32),
+                &fill(accent(0.14)),
             );
         }
-        // Two columns. The sort leads, at the same inset and in the same place the
-        // Collections screen puts the identical pills, so a user who has seen one has seen
-        // the other; the arrangement takes the trailing column, where the shoulders that
-        // change it are also the trailing pair.
+        // Two groups, each anchored to the edge it belongs to: the sort LEADS at the same
+        // inset as the heading above it, the arrangement TRAILS at the same inset as the
+        // controller chip above it — and the shoulders that change it are the trailing pair
+        // of buttons, so the hand and the eye agree.
         //
-        // Halfway, but never nearer than the sort's own column is wide. The console's scale
-        // follows the window's HEIGHT alone (`shell::render`), so on a tall narrow window a
-        // plain half would land the VIEW caption in the middle of the sort's pills. Pushed
-        // out instead, the arrangement's pills run off the trailing edge on a window that
-        // narrow — the shoulders still change it and the legend still says so, where two
-        // overlapping rows would leave neither readable.
-        let half = bar
-            .center_x()
-            .max(bar.left + (BAR_VIEW_COL * k) as f32)
-            .min(bar.right);
-        let sort_x = f64::from(bar.left) + EDGE_INSET * k;
-        let sort_left = sort_x + strip_caption(canvas, fonts, "SORT", bar, sort_x, k);
-        let view_x = f64::from(half);
-        let view_left = view_x + strip_caption(canvas, fonts, "VIEW", bar, view_x, k);
-
+        // The arrangement used to START at the band's midpoint, which is neither centred nor
+        // trailing: it read as a control that had been put down wherever there was room. An
+        // anchored pair is the same structure the top band already has, so the two rows line
+        // up as one piece of chrome rather than three.
         let sorts: Vec<&str> = crate::collate::SortKey::ALL
             .iter()
             .map(|s| s.label())
@@ -1441,9 +1439,41 @@ impl LibraryScreen {
             .iter()
             .position(|s| *s == self.sort)
             .unwrap_or(0);
+        let views: Vec<&str> = LibraryView::ALL.iter().map(|v| v.label()).collect();
+
+        // Each group is caption + gap + pills, measured whole. The gap is spelled out for
+        // BOTH rather than left to `TabStrip`'s own leading inset, which only appears when the
+        // rect it is handed has slack to spend: the trailing group's rect is exactly as wide
+        // as its pills, so it had no slack, no inset, and its caption ended up touching the
+        // first pill while the leading group — handed a wide rect — kept a gap by accident.
+        let gap = CAPTION_GAP * k;
+        let sort_cap = caption_width(fonts, "SORT", k);
+        let view_cap = caption_width(fonts, "VIEW", k);
+        let sort_pills = crate::widgets::TabStrip::width(&sorts, fonts, k);
+        let view_pills = crate::widgets::TabStrip::width(&views, fonts, k);
+
+        let sort_x = f64::from(bar.left) + EDGE_INSET * k;
+        // Clamped so a narrow window degrades by crowding the sort's own column rather than
+        // sliding off the leading edge: the console's scale follows the window's HEIGHT alone,
+        // so a tall narrow window can put these two groups closer than either likes.
+        let view_x = (f64::from(bar.right) - EDGE_INSET * k - view_cap - gap - view_pills)
+            .max(sort_x + sort_cap + gap + sort_pills + gap);
+
+        strip_caption(canvas, fonts, "SORT", bar, sort_x, k);
+        strip_caption(canvas, fonts, "VIEW", bar, view_x, k);
+        let sort_left = sort_x + sort_cap + gap;
+        let view_left = view_x + view_cap + gap;
+
+        // Both strips are handed a rect exactly as wide as their pills, so neither depends on
+        // that inset for its position — the caller places them.
         self.bar.sort_tabs.render(
             canvas,
-            Rect::from_ltrb(sort_left as f32, bar.top, half, bar.bottom),
+            Rect::from_ltrb(
+                sort_left as f32,
+                bar.top,
+                (sort_left + sort_pills) as f32,
+                bar.bottom,
+            ),
             &sorts,
             sort_at,
             fonts,
@@ -1451,14 +1481,18 @@ impl LibraryScreen {
             dt,
         );
 
-        let views: Vec<&str> = LibraryView::ALL.iter().map(|v| v.label()).collect();
         let view_at = LibraryView::ALL
             .iter()
             .position(|v| *v == self.view_mode)
             .unwrap_or(0);
         self.bar.view_tabs.render(
             canvas,
-            Rect::from_ltrb(view_left as f32, bar.top, bar.right, bar.bottom),
+            Rect::from_ltrb(
+                view_left as f32,
+                bar.top,
+                (view_left + view_pills) as f32,
+                bar.bottom,
+            ),
             &views,
             view_at,
             fonts,
@@ -1512,7 +1546,14 @@ impl LibraryScreen {
             row as f64 * pitch_y + heading_h + section_gap
         };
 
-        let content_h = row_top(shape.rows().saturating_sub(1)) + ch;
+        // …and the SAME inset again at the end, which is the other half of the same defect.
+        // The content used to stop at the last row's card bottom, so at maximum scroll that
+        // card sat exactly flush with the viewport's clip and lost its focus scale, its
+        // shadow and its label off the bottom edge — reported from a Deck as the grid being
+        // cut off at the bottom, once the top had air and the asymmetry became visible. The
+        // scroll range is what carries this: `content_h` is the only thing the clamp knows
+        // about, so the air has to be part of the content rather than part of the viewport.
+        let content_h = row_top(shape.rows().saturating_sub(1)) + ch + heading_h;
         // The detail band keeps its place at the bottom; the grid scrolls above it.
         let view_h = f64::from(rect.height()) - DETAIL_BAND * k;
         let (focus_row, _) = shape.cell_of(self.cursor.max(0) as usize);
