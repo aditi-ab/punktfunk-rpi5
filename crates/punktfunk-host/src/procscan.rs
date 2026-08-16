@@ -70,6 +70,23 @@ pub fn launch_stamp() -> Option<f64> {
     }
 }
 
+/// Pin a pid the host itself just spawned to *this* process, so it can be tracked and signalled
+/// under rule 2 — see [`Scanner::resolve`]. `None` on a platform with no matcher, and for a pid that
+/// has already gone or cannot be queried.
+///
+/// The platform-neutral wrapper, so [`crate::gamelease`] stays free of `cfg`s.
+pub fn resolve(pid: u32) -> Option<ProcRef> {
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        Scanner::system().resolve(pid)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// An out-of-band opinion on whether a spec's game is still running, independent of the process scan.
 ///
 /// Consulted **only to veto** declaring a game gone — never to declare it running, and never as the

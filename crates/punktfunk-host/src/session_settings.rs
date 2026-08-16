@@ -52,6 +52,40 @@ impl GameOnSessionEnd {
     }
 }
 
+/// What to do with a title this client already has running when it launches a **different** one.
+///
+/// The third axis rather than a fourth value on [`GameOnSessionEnd`], because it answers a different
+/// question at a different moment: that one is "this session is over, what about its game", this one
+/// is "the player asked for something else, what about the last thing". Folding them together would
+/// tie two unrelated choices to one switch — an operator who wants a game to survive a disconnect
+/// very plausibly still wants it closed when they pick another title.
+///
+/// Scoped to the **same client's own launches**, and only ever to launches this host performed
+/// itself ([`crate::launchreg`]). A game the player started at the machine was never recorded there,
+/// so it can never be closed by this; nor can another client's game, which would otherwise let one
+/// device end someone else's session mid-play.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GameOnNewLaunch {
+    /// Leave it running — the shipped default, and the same posture as [`GameOnSessionEnd::Keep`]:
+    /// ending a game can cost unsaved progress, so nothing is ended unless the operator asked.
+    #[default]
+    Keep,
+    /// Close it, politely first (`WM_CLOSE` / `SIGTERM`), before starting the new title. What a
+    /// player coming from Moonlight expects, and the top request from the 2026-08-16 field report:
+    /// "auto-closing the active game when launching a new one".
+    End,
+}
+
+impl GameOnNewLaunch {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::End => "end",
+        }
+    }
+}
+
 /// The default reconnect window before `Always` ends a game — long enough to cover a Wi-Fi
 /// roam, a client crash-and-restart, or a walk to another room, because the cost of being wrong is
 /// the player's unsaved progress.
@@ -84,6 +118,9 @@ pub struct SessionSettings {
     /// End the streaming session when the launched game exits.
     #[serde(default = "default_true")]
     pub session_on_game_exit: bool,
+    /// End this client's previous game when it launches a different one. See [`GameOnNewLaunch`].
+    #[serde(default)]
+    pub game_on_new_launch: GameOnNewLaunch,
     /// How long a vanished client has to reconnect before `Always` ends its game. Ignored by the
     /// other two policies.
     #[serde(default = "default_grace")]
@@ -96,6 +133,7 @@ impl Default for SessionSettings {
             version: 1,
             game_on_session_end: GameOnSessionEnd::default(),
             session_on_game_exit: true,
+            game_on_new_launch: GameOnNewLaunch::default(),
             disconnect_grace_seconds: DEFAULT_GRACE_SECS,
         }
     }
@@ -191,6 +229,7 @@ pub fn enforced() -> Vec<String> {
         vec![
             "session_on_game_exit".to_string(),
             "game_on_session_end".to_string(),
+            "game_on_new_launch".to_string(),
             "disconnect_grace_seconds".to_string(),
         ]
     }
@@ -207,9 +246,11 @@ mod tests {
     #[test]
     fn defaults_are_the_documented_ones() {
         let d = SessionSettings::default();
-        // End-session-on-game-exit ships ON; ending games ships OFF.
+        // End-session-on-game-exit ships ON; ending games ships OFF — on BOTH the axes that can
+        // end one, because both of them cost unsaved progress when they are wrong.
         assert!(d.session_on_game_exit);
         assert_eq!(d.game_on_session_end, GameOnSessionEnd::Keep);
+        assert_eq!(d.game_on_new_launch, GameOnNewLaunch::Keep);
         assert_eq!(d.disconnect_grace_seconds, 300);
     }
 
@@ -277,6 +318,7 @@ mod tests {
                 version: 99,
                 game_on_session_end: GameOnSessionEnd::Always,
                 session_on_game_exit: false,
+                game_on_new_launch: GameOnNewLaunch::End,
                 disconnect_grace_seconds: 5, // below the floor
             })
             .expect("write");
@@ -284,6 +326,7 @@ mod tests {
         let got = store.get();
         assert_eq!(got.game_on_session_end, GameOnSessionEnd::Always);
         assert!(!got.session_on_game_exit);
+        assert_eq!(got.game_on_new_launch, GameOnNewLaunch::End);
         assert_eq!(got.disconnect_grace_seconds, MIN_GRACE_SECS);
         assert_eq!(got.version, 1, "version is normalized, not echoed");
         // A fresh load sees the same thing, and no temp file is left behind.

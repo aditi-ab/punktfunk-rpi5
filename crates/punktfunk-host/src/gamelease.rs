@@ -17,6 +17,12 @@
 //! ([`crate::library::DetectSpec`]), not by a pid we happen to hold — and a lease we do hold a child
 //! for ([`LeaseKind::Child`]) falls back to recognition the moment that child turns out to be a shim.
 //!
+//! Where the host *did* start the process itself it keeps that too, as a second signal rather than
+//! the definition: a `Child` on Linux, and on Windows the bare pid `CreateProcessAsUserW` hands back
+//! ([`LeaseRequest::spawned`]). That pid used to be dropped, which left Windows strictly worse off
+//! than Linux — a title whose provider published no detect signals had *nothing* identifying it, so
+//! its exit was never noticed and it could not be ended (field report 2026-08-16, Windows 0.29.0).
+//!
 //! ### Safety posture
 //!
 //! Ending a game is destructive: it can cost unsaved progress. Three rules bound it.
@@ -135,6 +141,17 @@ pub enum GameState {
     Running = 1,
     /// Confirmed gone.
     Exited = 2,
+    /// The host launched this title but has no way to recognize its process
+    /// ([`LeaseKind::Untracked`]), so it will never observe the game starting *or* stopping.
+    ///
+    /// A terminal state, and the honest answer to "what is this game doing?" — which
+    /// [`Running`](Self::Running) was not. Reporting `Running` here (the shipped behavior until
+    /// 0.30) made three separate things indistinguishable in the console: a game being watched, a
+    /// game that quit and was never noticed, and a game the host cannot see at all. It is also
+    /// exactly what a 2026-08-16 field report hit — a Windows title quit mid-stream, the console
+    /// stayed on "running" forever, and no session setting made any difference, because
+    /// `session_on_game_exit` can never fire for a lease nothing is watching.
+    Untracked = 3,
 }
 
 impl GameState {
@@ -142,6 +159,7 @@ impl GameState {
         match v {
             1 => Self::Running,
             2 => Self::Exited,
+            3 => Self::Untracked,
             _ => Self::Launching,
         }
     }
@@ -151,6 +169,7 @@ impl GameState {
             Self::Launching => "launching",
             Self::Running => "running",
             Self::Exited => "exited",
+            Self::Untracked => "untracked",
         }
     }
 }
@@ -178,6 +197,13 @@ pub struct LeaseShared {
     /// The child the host spawned for this launch, when it spawned one ([`LeaseKind::Child`]).
     /// Cleared once that child is reaped.
     child: Mutex<Option<OwnedChild>>,
+    /// The process the host spawned for this launch on a platform with no `Child` to hold
+    /// ([`LeaseRequest::spawned`]), pinned to its start time.
+    ///
+    /// Never cleared: unlike a `Child` there is no handle to reap, and every read re-verifies the
+    /// pair through [`crate::procscan::Scanner::alive`] before counting it live or signalling it —
+    /// so a stale entry answers "gone", which is the correct answer, rather than a recycled pid.
+    spawned: Option<crate::procscan::ProcRef>,
     /// Whether this lease's game has been asked to end (so a second request is a no-op, and the
     /// watcher's exit doesn't look like the player quitting).
     terminating: AtomicBool,
@@ -283,6 +309,19 @@ pub struct LeaseRequest {
     /// The child the host spawned for this launch, when it spawned one directly, and whether it
     /// leads its own process group (see [`OwnedChild::group_leader`]).
     pub child: Option<(std::process::Child, bool)>,
+    /// The pid the host spawned for this launch on a platform where it gets a **pid instead of a
+    /// child** — Windows, where a launch goes through `CreateProcessAsUserW` into the interactive
+    /// session and there is no `std::process::Child` to hold.
+    ///
+    /// Tracked for exactly the same reason [`Self::child`] is, and it closes the gap that made
+    /// Windows strictly worse than Linux at this: a title whose provider supplied no detect hint
+    /// has an empty [`DetectSpec`], and with no child either the lease had *nothing* — so it went
+    /// [`LeaseKind::Untracked`], its exit was never noticed, and `POST /game/end` had no pid to
+    /// signal. The same title on Linux was fully tracked, because the host held its child there.
+    ///
+    /// Resolved to a (pid, start time) pair at [`open`] time so a recycled pid can never be
+    /// mistaken for it; see [`crate::procscan::Scanner::resolve`].
+    pub spawned: Option<u32>,
     /// Seconds-since-boot from **before** the launch ([`launch_clock`]): the floor for adopting a
     /// process, which is what keeps a copy of the game the player already had open from being
     /// mistaken for this session's. `None` disables the filter (no readable uptime clock).
@@ -323,9 +362,15 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         nested,
         launcher,
         child,
+        spawned,
         launch_stamp,
         procs,
     } = req;
+
+    // Pin the spawned pid to its start time before anything else can recycle it. A pid we cannot
+    // resolve (it already exited, or it is not queryable) is simply dropped: a bare number is never
+    // allowed further in, which is procscan's rule 2.
+    let spawned = spawned.and_then(crate::procscan::resolve);
 
     // A launcher tile is untracked FIRST, before anything else is considered — see
     // `LeaseRequest::launcher`. Checking it ahead of `child` is the whole point: a launcher the host
@@ -335,7 +380,10 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         LeaseKind::Untracked
     } else if nested {
         LeaseKind::Nested
-    } else if child.is_some() {
+    } else if child.is_some() || spawned.is_some() {
+        // A pid we spawned is our own child in every sense that matters here — the only difference
+        // is that this platform hands back a number instead of a handle — so it takes the same
+        // lifetime rules, shim reclassification included.
         LeaseKind::Child
     } else if !spec.is_empty() {
         LeaseKind::Matched
@@ -358,6 +406,7 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         spec,
         launch_stamp,
         child: Mutex::new(owned),
+        spawned,
         terminating: AtomicBool::new(false),
         created_ms: now_ms(),
         was_running: AtomicBool::new(false),
@@ -389,11 +438,27 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
 
     let watcher = spawn_watcher(shared.clone(), child, procs, on_exit);
     if watcher.is_none() {
-        // Nothing is polling this lease (no signals to poll, or a platform without a matcher yet), so
-        // its state will never advance on its own. Report it as running rather than leaving the
-        // console showing "launching" forever: the host did just launch it, and with no watcher it is
-        // making no claim about noticing the exit. The row disappears when the session ends.
-        shared.set_state(GameState::Running);
+        // Nothing is polling this lease, so its state will never advance on its own — and which
+        // state to leave it in depends on WHY, because the two cases make opposite promises.
+        //
+        // * An UNTRACKED lease has no signal at all: nothing will ever notice this game starting or
+        //   stopping. `Untracked` says so. It used to report `Running`, on the reasoning that the
+        //   host had just launched it and a row stuck at "launching" reads as broken — but that
+        //   made a console row assert liveness the host cannot back up, and it is what a
+        //   2026-08-16 field report ran into (see [`GameState::Untracked`]).
+        // * A NESTED lease with no store signals is genuinely being watched, just not from here:
+        //   a bare-spawn gamescope dies with its app, so the capture loop's node-death check is its
+        //   exit detection. Its game really is running, and its exit really will end the session,
+        //   so `Running` stays the truthful answer for it.
+        //
+        // Keyed on `Nested` rather than on `Untracked` so the two remaining ways to reach here —
+        // a platform with no process matcher, and a watcher thread that failed to spawn — land on
+        // the honest answer too: in both, nothing is watching, whatever the lease's kind says.
+        shared.set_state(if matches!(shared.kind, LeaseKind::Nested) {
+            GameState::Running
+        } else {
+            GameState::Untracked
+        });
     }
     GameLease { shared, watcher }
 }
@@ -475,11 +540,56 @@ fn watch(
     // assigns it, so an initial value would be dead.
     let mut known: Vec<crate::procscan::ProcRef>;
 
+    // The process the host spawned on a platform that hands back a pid rather than a `Child`
+    // (Windows). Cleared once it is seen gone, so `is_some()` reads "ours is still up" — the same
+    // one-way transition `child` makes when it is reaped, which is what lets both phases treat the
+    // two the same way.
+    let mut spawned = shared.spawned;
+    // Re-verified every time rather than remembered: `alive` checks the (pid, start) pair, so a
+    // recycled pid answers "gone" instead of impersonating our launch.
+    let spawned_up = |s: &Option<crate::procscan::ProcRef>| -> bool {
+        s.is_some_and(|p| !scanner.alive(&[p]).is_empty())
+    };
+
     // ---- Phase 1: wait for the game to show up. ----
     let start_deadline = spawned_at + START_GRACE;
     loop {
         if cancelled() {
             return;
+        }
+        // The pid-shaped twin of the `try_wait` arm below: our own process is gone, and the same
+        // two questions decide what that means. There is no exit status to read (no handle), so
+        // "quick" alone stands in for "a launcher handing off" — which is the right reading on the
+        // platform this applies to, where every launch goes through a launcher or the shell.
+        if matches!(kind, LeaseKind::Child)
+            && child.is_none()
+            && spawned.is_some()
+            && !spawned_up(&spawned)
+        {
+            spawned = None;
+            if spawned_at.elapsed() < SHIM_WINDOW {
+                if shared.spec.is_empty() {
+                    tracing::info!(
+                        title = %shared.game.title,
+                        "the launch command exited immediately (a launcher handing off) and this \
+                         title has no detect signals — stopping game tracking for it"
+                    );
+                    return;
+                }
+                tracing::debug!(
+                    title = %shared.game.title,
+                    "the launch command handed off and exited — recognizing the game by its store \
+                     signals instead"
+                );
+                kind = LeaseKind::Matched;
+            } else if shared.spec.is_empty() {
+                // It ran long enough to have BEEN the game, and nothing else identifies it.
+                shared.was_running.store(true, Ordering::Relaxed);
+                finish(&shared, &on_exit, "the launched process exited");
+                return;
+            }
+            // With signals available, let the scan below decide — it may have been a wrapper whose
+            // game is still up.
         }
         // A `Child` lease's own child is the primary signal; a shim exit re-resolves the lease.
         if matches!(kind, LeaseKind::Child) {
@@ -553,7 +663,7 @@ fn watch(
         // With no signals the child is all we have, so it still counts immediately: a custom command
         // is tracked exactly as before.
         let child_alive = matches!(kind, LeaseKind::Child)
-            && child.is_some()
+            && (child.is_some() || spawned.is_some())
             && (shared.spec.is_empty() || spawned_at.elapsed() >= SHIM_WINDOW);
         let live = scanner.find(&shared.spec, shared.launch_stamp);
         if !live.is_empty() || child_alive {
@@ -600,8 +710,19 @@ fn watch(
                     return;
                 }
             }
+            // Same conclusion for a pid-shaped launch: past the start phase there is no shim
+            // question left to ask, so our process going away IS the game going away when nothing
+            // else identifies it.
+            if spawned.is_some() && !spawned_up(&spawned) {
+                spawned = None;
+                if shared.spec.is_empty() {
+                    finish(&shared, &on_exit, "the launched process exited");
+                    return;
+                }
+            }
         }
-        let child_alive = matches!(kind, LeaseKind::Child) && child.is_some();
+        let child_alive =
+            matches!(kind, LeaseKind::Child) && (child.is_some() || spawned.is_some());
         // Cheap first: are the processes we already know about still there? Only when none of them is
         // do we pay for a full scan — which is also what notices a game that re-exec'd into a new pid
         // (a launcher stub becoming the real binary, an engine relaunching itself).
@@ -851,14 +972,28 @@ fn unix_term_ladder(shared: &LeaseShared) {
 
 /// Windows: ask the game's windows to close, wait, then terminate what's left.
 ///
-/// Same shape as the Unix ladder, different primitives — and one structural difference: the host never
-/// holds a child here. Every Windows launch goes through a launcher or the shell
-/// (`steam://`, `com.epicgames.launcher://`, `shell:AppsFolder\…`), so the game is always recognized
-/// rather than owned, and the pid set comes entirely from the matcher.
+/// Same shape as the Unix ladder, different primitives — and one structural difference: the host
+/// holds no `Child` here. Every Windows launch goes through a launcher or the shell (`steam://`,
+/// `com.epicgames.launcher://`, `shell:AppsFolder\…`), so the game is normally *recognized* rather
+/// than owned and the pid set comes from the matcher.
+///
+/// It does, however, know the pid it spawned ([`LeaseShared::spawned`]), and that is folded in here
+/// — otherwise a title with no detect signals could not be ended at all: the matcher returns
+/// nothing for an empty spec, so "End" found no pids and silently did nothing.
 #[cfg(windows)]
 fn windows_term_ladder(shared: &LeaseShared) {
     let scanner = crate::procscan::Scanner::system();
-    let live = || scanner.alive(&scanner.find(&shared.spec, shared.launch_stamp));
+    let live = || {
+        let mut procs = scanner.alive(&scanner.find(&shared.spec, shared.launch_stamp));
+        // Re-verified like everything else, so a dead or recycled pid contributes nothing, and
+        // de-duplicated: the matcher may well have found this same process by its image.
+        if let Some(p) = shared.spawned {
+            if !scanner.alive(&[p]).is_empty() && !procs.iter().any(|q| q.pid == p.pid) {
+                procs.push(p);
+            }
+        }
+        procs
+    };
 
     let pids: Vec<u32> = live().into_iter().map(|p| p.pid).collect();
     if pids.is_empty() {
@@ -893,6 +1028,121 @@ fn windows_term_ladder(shared: &LeaseShared) {
         grace_s = TERM_GRACE.as_secs(),
         "the game did not close when asked — killed it"
     );
+}
+
+/// End the processes an **earlier** launch adopted — the action behind
+/// [`crate::session_settings::GameOnNewLaunch::End`].
+///
+/// Its own ladder rather than a call into [`terminate`] because the input is different in kind. That
+/// one ends a game a *live lease* is tracking, and can therefore re-scan by [`DetectSpec`] and
+/// signal a child it owns. By the time a player picks a new title the previous game usually has no
+/// lease at all — its session ended, the lease was dropped, and all that survives is the pid set its
+/// watcher published to [`crate::launchreg`]. So this signals exactly that set, and nothing else.
+///
+/// Blocking: the caller is a launch about to spawn, and starting the new title *before* the old one
+/// has let go of the display, the audio device and the gamepad is precisely the mess this exists to
+/// avoid. Bounded by [`TERM_GRACE`].
+///
+/// Returns how many processes were still alive when asked.
+pub fn end_previous_launch(title: &str, procs: &[crate::procscan::ProcRef], why: &str) -> usize {
+    let scanner = crate::procscan::Scanner::system();
+    // Re-verified before every signal, so a pid recycled since the watcher last published it is
+    // never hit (procscan rule 2). This is the whole safety of signalling a remembered pid.
+    let live = || scanner.alive(procs);
+
+    let first = live();
+    if first.is_empty() {
+        return 0;
+    }
+    tracing::info!(
+        title,
+        procs = first.len(),
+        reason = why,
+        "ending the previous game before launching the new one"
+    );
+    ask_to_close(&first);
+    let deadline = Instant::now() + TERM_GRACE;
+    while Instant::now() < deadline {
+        std::thread::sleep(POLL);
+        if live().is_empty() {
+            tracing::info!(title, "the previous game closed when asked");
+            return first.len();
+        }
+    }
+    let remaining = live();
+    tracing::warn!(
+        title,
+        remaining = remaining.len(),
+        grace_s = TERM_GRACE.as_secs(),
+        "the previous game did not close when asked — killing it"
+    );
+    force_close(&remaining);
+    first.len()
+}
+
+/// Ask these processes to close the way a user would: `WM_CLOSE` on Windows, `SIGTERM` on Unix. The
+/// game runs its own shutdown and can save.
+fn ask_to_close(procs: &[crate::procscan::ProcRef]) {
+    #[cfg(windows)]
+    {
+        let pids: Vec<u32> = procs.iter().map(|p| p.pid).collect();
+        crate::game_term::request_close(&pids);
+    }
+    #[cfg(target_os = "linux")]
+    for p in procs {
+        // SAFETY: `kill` returns a status code and touches no memory of ours. Always a POSITIVE pid
+        // — these are processes the matcher adopted, not a group this host leads, so a negative
+        // target would signal an unrelated process group.
+        unsafe {
+            libc::kill(p.pid as i32, libc::SIGTERM);
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let _ = procs;
+}
+
+/// Insist, for whatever ignored [`ask_to_close`].
+fn force_close(procs: &[crate::procscan::ProcRef]) {
+    #[cfg(windows)]
+    {
+        let pids: Vec<u32> = procs.iter().map(|p| p.pid).collect();
+        crate::game_term::kill(&pids);
+    }
+    #[cfg(target_os = "linux")]
+    for p in procs {
+        // SAFETY: as above.
+        unsafe {
+            libc::kill(p.pid as i32, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let _ = procs;
+}
+
+/// Apply [`crate::session_settings::GameOnNewLaunch`] for a session about to launch `game_id`.
+///
+/// Called immediately **before** the spawn, so the old game is gone (or has had its grace) by the
+/// time the new one starts. A no-op on the shipped default, and for a client the host holds no
+/// launch records for.
+///
+/// ⚠ One path is ordered the other way round: a Linux **bare-spawn gamescope** launch is nested by
+/// the display layer when the source opens, which is well before this point — so there the previous
+/// game is closed just *after* the new one starts rather than just before. The policy still holds
+/// (the old game does not linger), and the contention this ordering exists to avoid is largely moot
+/// there anyway, since a nested launch brings up its own display rather than sharing one.
+pub fn end_others_for_new_launch(fingerprint: Option<&str>, game_id: Option<&str>) {
+    if crate::session_settings::get().game_on_new_launch
+        != crate::session_settings::GameOnNewLaunch::End
+    {
+        return;
+    }
+    for other in crate::launchreg::others_still_running(fingerprint, game_id) {
+        end_previous_launch(
+            &other.game_id,
+            &other.procs,
+            "the player launched a different title",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1191,6 +1441,7 @@ mod tests {
             nested,
             launcher: false,
             child: None,
+            spawned: None,
             // No start-time floor: these leases are never matched against real processes.
             launch_stamp: None,
             // Not a recorded launch — nothing here spawns anything (`crate::launchreg`).
@@ -1429,6 +1680,7 @@ mod tests {
                 nested: false,
                 launcher: false,
                 child: Some((child, false)),
+                spawned: None,
                 launch_stamp: None,
                 procs: None,
             },
@@ -1448,6 +1700,93 @@ mod tests {
             lease.shared().state(),
             GameState::Exited,
             "the game never ran, so it cannot have exited"
+        );
+    }
+
+    /// A launch the host knows only as a **pid** — no `Child`, no detect signals — is still its
+    /// own child, and must classify as one.
+    ///
+    /// This is the Windows shape (`CreateProcessAsUserW` returns a pid) reproduced on Linux, where
+    /// it can actually be driven. Before the pid was carried, this exact combination was
+    /// [`LeaseKind::Untracked`]: nothing watched the game, nothing could end it, and the console
+    /// reported it running forever.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pid_only_launch_is_tracked_like_a_child() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn the fake game");
+        let pid = child.id();
+        let lease = open(
+            LeaseRequest {
+                spawned: Some(pid),
+                // The field-report case: the provider gave nothing to recognize the game by.
+                spec: DetectSpec::default(),
+                launch_stamp: launch_clock(),
+                ..req("custom:pid-only", DetectSpec::default(), false)
+            },
+            Box::new(|| {}),
+        );
+        assert!(
+            matches!(lease.shared().kind(), LeaseKind::Child),
+            "a pid we spawned is our own child, whatever the spec says"
+        );
+        assert!(
+            lease.shared().is_trackable(),
+            "and therefore endable — `POST /game/end` had no pid to signal before this"
+        );
+        drop(lease);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The same launch, driven to its exit: the pid dying is the game exiting, and that fires the
+    /// action that ends the session — which is precisely what never happened in the field report.
+    ///
+    /// Ignored by default: it waits out [`EXIT_CONFIRM`] after a real process ends, ~10 s.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "drives a real process for ~10s (exit confirmation)"]
+    fn a_pid_only_launch_reports_its_exit() {
+        use std::sync::atomic::AtomicUsize;
+
+        // Reaped on its own thread: an unwaited child becomes a zombie, and a zombie keeps its
+        // `/proc/<pid>` entry with an unchanged start time — so the scan would call it alive
+        // forever and the exit under test could never be observed.
+        let mut child = std::process::Command::new("sleep")
+            .arg("4")
+            .spawn()
+            .expect("spawn the fake game");
+        let pid = child.id();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        static PID_EXITS: AtomicUsize = AtomicUsize::new(0);
+        PID_EXITS.store(0, Ordering::SeqCst);
+        let lease = open(
+            LeaseRequest {
+                spawned: Some(pid),
+                spec: DetectSpec::default(),
+                launch_stamp: launch_clock(),
+                ..req("custom:pid-only-exit", DetectSpec::default(), false)
+            },
+            Box::new(|| {
+                PID_EXITS.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let shared = lease.shared();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline && shared.state() != GameState::Exited {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert_eq!(shared.state(), GameState::Exited, "the game should be gone");
+        assert_eq!(
+            PID_EXITS.load(Ordering::SeqCst),
+            1,
+            "the player quitting must end the session exactly once"
         );
     }
 
@@ -1489,6 +1828,7 @@ mod tests {
                 nested: false,
                 launcher: false,
                 child: Some((child, true)),
+                spawned: None,
                 launch_stamp,
                 procs: None,
             },
@@ -1550,7 +1890,40 @@ mod tests {
         assert_eq!(GameState::Launching.as_str(), "launching");
         assert_eq!(GameState::Running.as_str(), "running");
         assert_eq!(GameState::Exited.as_str(), "exited");
+        assert_eq!(GameState::Untracked.as_str(), "untracked");
         assert_eq!(GameState::from_u8(1), GameState::Running);
+        assert_eq!(GameState::from_u8(3), GameState::Untracked);
         assert_eq!(GameState::from_u8(99), GameState::Launching);
+    }
+
+    /// The 2026-08-16 field report in one assertion: a title with nothing to recognize it by must
+    /// not report `running`. It used to, which made the console assert liveness the host had no way
+    /// to back up — and left a user who had just quit the game watching a row that would never
+    /// change, with no setting that could affect it.
+    #[test]
+    fn a_lease_with_nothing_to_watch_says_so_instead_of_claiming_to_run() {
+        let lease = open(
+            req("custom:no-signals", DetectSpec::default(), false),
+            Box::new(|| {}),
+        );
+        assert!(!lease.shared().is_trackable());
+        assert_eq!(
+            lease.shared().state(),
+            GameState::Untracked,
+            "an unwatchable lease must not report `running`"
+        );
+    }
+
+    /// The other half of that rule: a nested lease with no store signals IS watched, just from the
+    /// capture loop rather than from here (a bare-spawn gamescope dies with its app). Its game
+    /// really is running and its exit really does end the session, so it keeps saying `running` —
+    /// the fix must not flatten the two cases together.
+    #[test]
+    fn a_nested_lease_still_reports_running_because_something_else_watches_it() {
+        let lease = open(
+            req("steam:nested-no-signals", DetectSpec::default(), true),
+            Box::new(|| {}),
+        );
+        assert_eq!(lease.shared().state(), GameState::Running);
     }
 }

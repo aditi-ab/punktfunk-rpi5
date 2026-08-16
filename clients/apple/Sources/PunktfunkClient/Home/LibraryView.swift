@@ -1,7 +1,14 @@
-// Experimental game-library browser (plan step 3, gated behind DefaultsKey.libraryEnabled).
-// Renders a poster grid of the host's library fetched over the management API. Read-only:
-// launching a chosen title is a later step. Reached from a host card's "Browse Library…"
-// context-menu action, which only appears when the feature flag is on.
+// The host's game library: a poster grid fetched over the management API, from which titles are
+// launched. Reached by TAPPING a paired host's card — this is the primary destination for a host
+// that has a library, with streaming the desktop as the card's menu action.
+//
+// Three behaviours here exist to make the round trip (browse → play → quit → browse) hold together,
+// all from a 2026-08-16 field report: the catalog is cached so a sleeping host still shows its
+// titles, opening the screen wakes that host so it is warm by the time one is picked, and the
+// position in the grid survives the stream. Titles already running are marked and sorted first.
+//
+// Still gated behind `DefaultsKey.libraryEnabled` (default on) and, separately, on the host being
+// PAIRED — see `HomeView.hostCard` for why the pin is load-bearing rather than cosmetic.
 
 import PunktfunkKit
 import SwiftUI
@@ -72,6 +79,16 @@ struct LibraryView: View {
     @State private var games: [GameEntry] = []
     @State private var loading = false
     @State private var errorText: String?
+    /// What the host has launched right now, keyed by library id — the `Resume` affordance. Empty
+    /// on an older host, an unreachable one, or while the catalog is being served from cache.
+    @State private var running: [String: RunningGame] = [:]
+    /// When the catalog on screen was fetched, if it came from disk rather than from the host.
+    /// Non-nil ⇒ these titles are a memory, not an observation, and the view says so.
+    @State private var servedFromCacheAt: Date?
+    /// Guards the one-shot scroll restore. `onAppear` fires again on every re-layout (and once per
+    /// section), and re-scrolling after the player has started browsing would yank the grid out
+    /// from under them — which is a worse bug than the one being fixed.
+    @State private var restoredScroll = false
     /// Cover-art loader (the same paired identity + host pinning as the list fetch, reused across
     /// every poster in the grid). Built alongside `games` in `load()`; dropped on disappear.
     @State private var artLoader: (any LibraryArtSource)?
@@ -151,6 +168,23 @@ struct LibraryView: View {
             #endif
     }
 
+    /// Says the titles below are remembered rather than observed — shown only while that is true,
+    /// and never as an error: a cached library is a working library, and a host that is still
+    /// waking is the case this whole path exists to serve.
+    @ViewBuilder private var staleNote: some View {
+        if servedFromCacheAt != nil {
+            HStack(spacing: 6) {
+                Image(systemName: loading ? "arrow.clockwise" : "wifi.slash")
+                Text(loading ? "Waking the host…" : "Showing this host's last known library")
+            }
+            .font(.geist(12, relativeTo: .caption))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal)
+            .padding(.top, 8)
+        }
+    }
+
     @ViewBuilder private var content: some View {
         if loading && games.isEmpty {
             consoleField(
@@ -163,14 +197,20 @@ struct LibraryView: View {
         } else {
             if gamepadUIActive {
                 LibraryCoverflowView(
-                    games: games, artLoader: artLoader, onLaunch: onLaunch,
+                    games: ordered, artLoader: artLoader, onLaunch: launchAndRemember,
+                    running: running,
                     onDismiss: { (onClose ?? { dismiss() })() },
                     // Nil where there is nothing to copy into (tvOS), which is what drops the
                     // hint from the legend rather than leaving a button that does nothing.
                     onCopyLink: LinkClipboard.isAvailable ? { copyLink($0) } : nil,
                     controllerActive: controllerActive)
             } else {
-                grid
+                // Above the grid rather than over it: the coverflow owns its whole surface and has
+                // its own legend row, so the note rides the plain-grid presentation only.
+                VStack(spacing: 0) {
+                    staleNote
+                    grid
+                }
             }
         }
     }
@@ -197,8 +237,8 @@ struct LibraryView: View {
         // Design D4: launcher entries get their own section above the titles, never interleaved.
         // Both headers appear only when both groups exist, so a library without launcher entries
         // renders exactly as it did before.
-        let launchers = games.filter(\.isLauncher)
-        let titles = games.filter { !$0.isLauncher }
+        let launchers = ordered.filter(\.isLauncher)
+        let titles = ordered.filter { !$0.isLauncher }
         let both = !launchers.isEmpty && !titles.isEmpty
         return ScrollViewReader { proxy in
             ScrollView {
@@ -213,6 +253,18 @@ struct LibraryView: View {
                     }
                 }
                 .padding()
+                // Put the player back where they were. Leaving a stream re-presents this view from
+                // scratch, so a long library always came back at the top — meaning the round trip
+                // "browse → play → quit → browse" lost your place every single time. The last title
+                // opened from this shelf is remembered per host and scrolled back to once, without
+                // animation, so it is simply already there rather than visibly moving.
+                .onAppear {
+                    guard !restoredScroll, let last = LibraryScrollMemory.last(forHost: host.id.uuidString),
+                          ordered.contains(where: { $0.id == last })
+                    else { return }
+                    restoredScroll = true
+                    proxy.scrollTo(last, anchor: .center)
+                }
                 #if os(iOS) || os(macOS)
                 // The grid's own width, reported without affecting layout — a GeometryReader
                 // SIBLING inside a ScrollView would claim the whole viewport. It's what tells the
@@ -241,8 +293,8 @@ struct LibraryView: View {
                     withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(next, anchor: .center) }
                 },
                 onConfirm: {
-                    guard let onLaunch, let id = keyCursor else { return }
-                    onLaunch(id)
+                    guard let launch = launchAndRemember, let id = keyCursor else { return }
+                    launch(id)
                 })
             #endif
         }
@@ -274,13 +326,17 @@ struct LibraryView: View {
         LazyVGrid(columns: columns, spacing: 18) {
             ForEach(entries) { game in
                 Group {
-                    if let onLaunch {
-                        Button { onLaunch(game.id) } label: {
-                            GameCard(game: game, artLoader: artLoader, selected: isKeyCursor(game))
+                    if let launch = launchAndRemember {
+                        Button { launch(game.id) } label: {
+                            GameCard(
+                                game: game, artLoader: artLoader, selected: isKeyCursor(game),
+                                isRunning: running[game.id] != nil)
                         }
                         .buttonStyle(.plain)
                     } else {
-                        GameCard(game: game, artLoader: artLoader, selected: isKeyCursor(game))
+                        GameCard(
+                            game: game, artLoader: artLoader, selected: isKeyCursor(game),
+                            isRunning: running[game.id] != nil)
                     }
                 }
                 .id(game.id)
@@ -395,27 +451,117 @@ struct LibraryView: View {
             loading = false
             return
         }
-        do {
-            // `launchersFirst` groups launcher entries ahead of titles once, here, so the grid and
-            // the gamepad coverflow both inherit the D4 ordering.
-            games = try await LibraryClient.fetch(
-                address: current.address,
-                port: current.effectiveMgmtPort,
-                certPEM: identity.certPEM,
-                keyPEM: identity.keyPEM,
-                hostFingerprint: current.pinnedSHA256
-            ).launchersFirst
-            artLoader = try LibraryArtLoader(
-                address: current.address,
-                port: current.effectiveMgmtPort,
-                certPEM: identity.certPEM,
-                keyPEM: identity.keyPEM,
-                hostFingerprint: current.pinnedSHA256)
-        } catch {
-            games = []
-            errorText = (error as? LibraryError)?.errorDescription ?? error.localizedDescription
+        // Show the catalog we already have BEFORE talking to the host. A library is the screen a
+        // player uses to decide what to play, and an empty one while a sleeping box boots is the
+        // opposite of useful — so the last-known titles go up immediately, marked as remembered,
+        // and are replaced the moment the host answers.
+        if let cached = await LibraryCache.shared?.load(hostID: current.id.uuidString) {
+            games = cached.games.launchersFirst
+            servedFromCacheAt = cached.fetchedAt
         }
+        // ...and wake the box while the player is still choosing. Waking has always been bound to
+        // CONNECTING, which is too late to help: by then they have picked a title and are waiting
+        // out a cold boot. Opening the library is the earliest honest signal that someone intends
+        // to play.
+        //
+        // Sent up front and unconditionally rather than only when the host looks offline — the
+        // same shape as the client core's own `orchestrate` path, and for the same reason: a magic
+        // packet is a single fire-and-forget datagram that an already-awake machine ignores, so
+        // waiting to find out whether it is needed costs more than sending it.
+        let waking = !current.wakeMacs.isEmpty && PunktfunkConnection.wakeOnLANAvailable
+        if waking {
+            _ = PunktfunkConnection.wakeOnLAN(macs: current.wakeMacs, lastKnownIP: current.address)
+        }
+
+        // The art loader is built from the same identity whether or not the catalog fetch
+        // succeeds, so cached posters render behind a cached catalog with the host still down.
+        artLoader = try? LibraryArtLoader(
+            address: current.address,
+            port: current.effectiveMgmtPort,
+            certPEM: identity.certPEM,
+            keyPEM: identity.keyPEM,
+            hostFingerprint: current.pinnedSHA256)
+
+        // A woken box takes 20–60 s to answer, so one attempt would almost always land on a host
+        // that is still POSTing. Retry across that window when we sent a packet; without one, ask
+        // exactly once and report what happened, as before.
+        let attempts = waking ? 12 : 1
+        for attempt in 0..<attempts {
+            if Task.isCancelled { break }
+            do {
+                // `launchersFirst` groups launcher entries ahead of titles once, here, so the grid
+                // and the gamepad coverflow both inherit the D4 ordering.
+                let fetched = try await LibraryClient.fetch(
+                    address: current.address,
+                    port: current.effectiveMgmtPort,
+                    certPEM: identity.certPEM,
+                    keyPEM: identity.keyPEM,
+                    hostFingerprint: current.pinnedSHA256
+                ).launchersFirst
+                games = fetched
+                servedFromCacheAt = nil
+                errorText = nil
+                await LibraryCache.shared?.store(fetched, hostID: current.id.uuidString)
+                break
+            } catch {
+                // Anything other than "can't reach it" is settled — a rejected certificate does not
+                // become acceptable by waiting, and retrying an unpaired host twelve times just
+                // delays telling the user what is actually wrong.
+                let unreachable: Bool
+                if case .unreachable = error as? LibraryError { unreachable = true } else {
+                    unreachable = false
+                }
+                let more = unreachable && attempt + 1 < attempts
+                if !more {
+                    // A cached catalog outranks the error: the titles on screen are still the right
+                    // ones to choose from, and replacing them with a red message because the host
+                    // is asleep is precisely what this cache exists to prevent. The staleness note
+                    // carries the situation instead.
+                    if games.isEmpty {
+                        errorText = (error as? LibraryError)?.errorDescription
+                            ?? error.localizedDescription
+                    }
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 5 * NSEC_PER_SEC)
+            }
+        }
+
+        // What's up on the host right now — never fatal, and deliberately after the catalog so a
+        // slow `/status` can't hold the titles back.
+        let live = await LibraryClient.running(
+            address: current.address,
+            port: current.effectiveMgmtPort,
+            certPEM: identity.certPEM,
+            keyPEM: identity.keyPEM,
+            hostFingerprint: current.pinnedSHA256)
+        running = Dictionary(
+            live.filter(\.isUp).compactMap { g in g.appID.map { ($0, g) } },
+            // Two sessions can have the same title up (the host admits concurrent sessions); for a
+            // Resume badge either one is the same answer.
+            uniquingKeysWith: { first, _ in first })
         loading = false
+    }
+
+    /// Every launch from this shelf goes through here, so the player's position is recorded on
+    /// exactly one path however they picked the title — a tap, the keyboard, or the coverflow.
+    /// `nil` in browse-only mode, which is what keeps the tiles untappable there.
+    private var launchAndRemember: ((String) -> Void)? {
+        guard let onLaunch else { return nil }
+        return { id in
+            LibraryScrollMemory.remember(id, forHost: host.id.uuidString)
+            onLaunch(id)
+        }
+    }
+
+    /// The catalog in display order: anything already running first, so getting back into it is the
+    /// first thing on the screen rather than something to scroll for.
+    ///
+    /// Applied on top of `launchersFirst` rather than instead of it — a launcher that is up still
+    /// belongs with the launchers.
+    private var ordered: [GameEntry] {
+        guard !running.isEmpty else { return games }
+        return games.filter { running[$0.id] != nil } + games.filter { running[$0.id] == nil }
     }
 }
 
@@ -451,6 +597,11 @@ private struct GameCard: View {
     /// The hardware-keyboard cursor is on this tile — drawn as an accent ring, since the plain
     /// grid has no other way to say "Return launches THIS one".
     var selected = false
+    /// This title is already up on the host, so picking it resumes rather than starts. Worth
+    /// saying on the tile: the host has quietly adopted a running launch instead of starting a
+    /// second copy for a while now, but nothing ever told the player that — so choosing a game
+    /// they were already playing looked identical to starting one, and read as a relaunch.
+    var isRunning = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -468,6 +619,10 @@ private struct GameCard: View {
                 }
                 .overlay(alignment: .topLeading) {
                     StoreBadge(label: game.storeLabel, isLauncher: game.isLauncher)
+                }
+                // Opposite corner from the store badge so the two never collide on a narrow tile.
+                .overlay(alignment: .topTrailing) {
+                    if isRunning { RunningBadge(compact: true) }
                 }
             Text(game.title)
                 .font(.geist(12, relativeTo: .caption))

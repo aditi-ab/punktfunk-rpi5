@@ -105,6 +105,21 @@ impl Scanner {
         out
     }
 
+    /// Pin a pid the host itself just spawned to *this* process, by reading its creation time.
+    ///
+    /// This is what lets a Windows launch be tracked at all when the title carries no detect
+    /// signals. `CreateProcessAsUserW` into the interactive session hands back a bare pid rather
+    /// than a `std::process::Child`, and that pid used to be logged and dropped — so a title whose
+    /// provider gave no `install_dir`/`exe` had **nothing** identifying it, the lease degraded to
+    /// [`crate::gamelease::LeaseKind::Untracked`], and neither its exit nor a request to end it
+    /// could be acted on. Resolving the pid immediately after the spawn is the one safe entry into
+    /// rule 2 from a bare pid: the number cannot have been recycled in that window, and everything
+    /// downstream re-verifies the (pid, creation time) pair through [`Self::alive`].
+    pub fn resolve(&self, pid: u32) -> Option<ProcRef> {
+        let (start, _image) = process_start_and_image(pid)?;
+        Some(ProcRef { pid, start })
+    }
+
     /// Which of `procs` are still the same live processes — pid present **and** creation time
     /// unchanged, so a recycled pid is never reported alive (rule 2). Windows reuses pids briskly, so
     /// this check is what makes signalling a remembered pid safe at all.
