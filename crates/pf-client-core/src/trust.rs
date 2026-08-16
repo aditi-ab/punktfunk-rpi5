@@ -1283,9 +1283,6 @@ pub struct Settings {
     /// Enter fullscreen when a stream starts (F11 / the controller chord / the top-edge
     /// header reveal exit it). Gaming-Mode launches (`--fullscreen`) fullscreen regardless.
     pub fullscreen_on_stream: bool,
-    /// Experimental: the game-library browser ("Browse library…" on saved cards) —
-    /// mirrors the Apple client's "Show game library" toggle, default off.
-    pub library_enabled: bool,
     /// Which colour family the gamepad UI's living backdrop drifts through — the shared
     /// `ui_palette` key (`"violet"` = the brand default, then `oled`/`nebula`/`abyss`/
     /// `ember`/`moss`/`graphite`, then the six pale fields; see `pf-console-ui`'s palette
@@ -1525,7 +1522,6 @@ impl Default for Settings {
             show_stats: true,
             stats_verbosity: None,
             fullscreen_on_stream: true,
-            library_enabled: false,
             ui_palette: default_ui_palette(),
             reduce_motion: false,
             library_sort: String::new(),
@@ -1791,7 +1787,6 @@ mod tests {
         // Fields the old file doesn't carry take this struct's defaults.
         assert_eq!(s.forward_pad, "");
         assert!(s.fullscreen_on_stream);
-        assert!(!s.library_enabled);
         // Echo cancellation post-dates every stored file: it must load ON, or an upgrade
         // would silently turn a user's echo protection off.
         assert!(s.echo_cancel);
@@ -1817,6 +1812,25 @@ mod tests {
         let plain = serde_json::to_string(&Settings::default()).unwrap();
         assert!(!plain.contains("extra"), "{plain}");
         assert!(!plain.contains("frob"), "{plain}");
+    }
+
+    /// The same contract seen from the other side: a key this build RETIRED. `library_enabled`
+    /// gated "Browse library…" in the GTK and WinUI shells and defaulted off, so dropping the
+    /// field is what finally shows the library to everyone who never found the toggle. The
+    /// stored `false` must not fail the load — that would lock a user out of their whole
+    /// settings file over a setting that no longer exists — and it must survive the next
+    /// whole-file write, so a downgrade still reads the value it wrote.
+    #[test]
+    fn settings_retired_library_key_loads_and_survives() {
+        let stored = r#"{"width":1920,"height":1080,"library_enabled":false}"#;
+        let s: Settings = serde_json::from_str(stored).unwrap();
+        assert_eq!((s.width, s.height), (1920, 1080));
+        assert_eq!(
+            s.extra.get("library_enabled").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        let out = serde_json::to_string(&s).unwrap();
+        assert!(out.contains(r#""library_enabled":false"#), "{out}");
     }
 
     /// Stats-tier resolution: a pre-tier store falls back to `show_stats` (off → Off,

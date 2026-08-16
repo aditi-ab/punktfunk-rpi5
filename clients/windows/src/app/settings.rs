@@ -1127,9 +1127,6 @@ pub(crate) fn settings_page(
             let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
         }
     });
-    let library_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.library_enabled, |s, on| {
-        s.library_enabled = on
-    });
     // App identity + version at the top of the About card (the WinUI Settings convention; the About
     // screen previously showed no version at all). CARGO_PKG_VERSION is the workspace version, baked
     // in at compile time.
@@ -1656,21 +1653,6 @@ pub(crate) fn settings_page(
                      Detailed adds the latency stage breakdown. Ctrl+Alt+Shift+S cycles the \
                      tiers any time.",
                 )],
-                None,
-            ));
-            // The library browser is an app-level toggle for this device, not a per-profile one.
-            out.extend(group(
-                Some("Library"),
-                if profile_mode {
-                    Vec::new()
-                } else {
-                    vec![described_labeled(
-                    "Show game library (experimental)",
-                    library_toggle,
-                    "Adds \u{201C}Browse library\u{2026}\u{201D} to paired hosts \u{2014} list \
-                     their Steam and custom games and launch one directly. No extra host setup.",
-                )]
-                },
                 None,
             ));
             ("General", out)

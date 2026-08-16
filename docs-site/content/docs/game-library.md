@@ -133,11 +133,10 @@ confirmation open as usual, but the host refuses the change and the entry stays 
 Whatever the surface, the client sends only an **id**. The host looks that id up in its own library
 and runs what it already knows about the title, so a client can never hand the host a command to run.
 
-- **Native clients** — the browser is a per-device setting in **Settings → Library**, and it needs a
-  **paired** host. It is **off by default on the Linux and Windows clients** ("Show game library",
-  or "Show game library (experimental)" on Windows) and **on by default on macOS, iOS, iPadOS, tvOS
-  and Android**. Turn it on and a paired host's card offers **Browse library…** (**Browse Library…**
-  on Apple); pick a title and the stream starts with the host launching it. See
+- **Native clients** — the browser needs a **paired** host, and that is the only condition: a paired
+  host's card offers **Browse library…** (**Browse Library…** on Apple) with nothing to switch on
+  first. Pick a title and the stream starts with the host launching it. The Apple and Android apps
+  keep a **Show game library** switch, on by default, for turning it off. See
   [Client settings](/docs/client-settings).
 - **Android** — the library lives only in the controller-optimized home, which a TV always uses and a
   phone or tablet switches to when a controller is connected. Press **Y** on a saved host, or open its

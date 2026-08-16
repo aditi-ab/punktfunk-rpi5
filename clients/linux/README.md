@@ -27,10 +27,9 @@ Built in Rust end to end (no C ABI): the shell shares its plumbing with the sess
   First connect does a one-time **SPAKE2 PIN pairing** (or TOFU on trusted LANs), then reconnects on
   a pinned identity.
 - **Per-host speed test** to pick a bitrate, plus compositor and mode preferences in Settings.
-- **Game library browser** *(experimental, off by default)* — "Browse library…" on a saved host
-  shows its games (Steam + custom) as a poster grid; click one to launch it in the session.
-  Fetched from the host's management API over mTLS — paired devices are authorized by their
-  certificate, no extra host setup.
+- **Game library browser** — "Browse library…" on a paired host shows its games (Steam + custom)
+  as a poster grid; click one to launch it in the session. Fetched from the host's management API
+  over mTLS — paired devices are authorized by their certificate, no extra host setup.
 - **Gamepad library launcher** (`--browse host`) — a console-style, controller-driven library view
   of a paired host's games, rendered by the session binary's Skia console UI: A plays the focused
   title, B quits, L1/R1 jump. Built for the Steam Deck plugin's "Open library" launch; session end

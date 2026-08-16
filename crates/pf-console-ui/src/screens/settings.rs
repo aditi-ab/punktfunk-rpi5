@@ -63,7 +63,6 @@ enum RowId {
     Stats,
     Fullscreen,
     AutoWake,
-    Library,
     /// The gamepad UI's background colour family — see [`crate::library::PALETTES`]. The
     /// backdrop behind this very row re-colours as it steps, which is the whole reason the
     /// picker lives on a screen rather than in a dialog.
@@ -82,10 +81,10 @@ enum RowId {
 
 // The couch-relevant subset grew 2026-07-31: this screen is the ONLY settings editor in
 // Gaming Mode, so a field it omits is simply unreachable there (render scale, 4:4:4,
-// scroll/shortcut behavior, fullscreen-on-stream, auto-wake, the library toggle and echo
-// cancellation all were). Still deliberately smaller than the desktop dialogs — device
-// pickers (GPU/speaker/mic) stay desktop-only, and profiles are pinnable here (the
-// trailing Profiles tab) but created and edited only in the desktop app (design §5.4).
+// scroll/shortcut behavior, fullscreen-on-stream, auto-wake and echo cancellation all
+// were). Still deliberately smaller than the desktop dialogs — device pickers
+// (GPU/speaker/mic) stay desktop-only, and profiles are pinnable here (the trailing
+// Profiles tab) but created and edited only in the desktop app (design §5.4).
 //
 // The tab names are shared with the Apple and Android gamepad settings, so a setting is
 // found under the same word on every client. Profiles is the trailing tab and is built
@@ -151,7 +150,6 @@ const TABS: [(&str, &[RowId]); 7] = [
             RowId::Stats,
             RowId::Fullscreen,
             RowId::AutoWake,
-            RowId::Library,
         ],
     ),
     ("Profiles", &[]),
@@ -755,7 +753,6 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             on_off(s.fullscreen_on_stream).into(),
         ),
         RowId::AutoWake => (None, "Wake hosts automatically", on_off(s.auto_wake).into()),
-        RowId::Library => (None, "Game library", on_off(s.library_enabled).into()),
         RowId::Profile(_) | RowId::NoProfiles => unreachable!("returned above"),
     };
     RowSpec {
@@ -879,7 +876,6 @@ fn detail(id: RowId) -> &'static str {
             "Send Wake-on-LAN to a sleeping host before connecting. Turn off for hosts \
              reached over a VPN, where the wake wait only adds delay."
         }
-        RowId::Library => "Show paired hosts' game libraries (tap a title to stream it).",
         RowId::Profile(_) => {
             "Pin this profile to a host and it appears as its own card — one press \
              connects with these settings. Profiles are created and edited in the \
@@ -1081,7 +1077,6 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         }
         RowId::Fullscreen => toggle(&mut s.fullscreen_on_stream, delta, wrap),
         RowId::AutoWake => toggle(&mut s.auto_wake, delta, wrap),
-        RowId::Library => toggle(&mut s.library_enabled, delta, wrap),
         // Navigation rows, handled before the settings path in `menu` — never a value edit.
         RowId::Profile(_) | RowId::NoProfiles => None,
     }
@@ -1708,8 +1703,9 @@ mod tests {
             }
         }
         // The pre-tab flat list, plus the palette row, the lossless-audio row and the
-        // reduce-motion row later passes added.
-        assert_eq!(seen.len(), 33, "{seen:?}");
+        // reduce-motion row later passes added, minus the game-library toggle: this screen
+        // never read it, and the library is offered on any paired host now.
+        assert_eq!(seen.len(), 32, "{seen:?}");
         assert!(seen.contains(&RowId::Palette));
         assert!(seen.contains(&RowId::ReduceMotion));
         assert!(seen.contains(&RowId::AudioFormat));
