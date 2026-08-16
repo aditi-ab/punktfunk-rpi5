@@ -1295,6 +1295,33 @@ pub struct Settings {
     /// newer client may have shipped a palette this binary doesn't know.
     #[serde(default = "default_ui_palette")]
     pub ui_palette: String,
+    /// Suppress the gamepad UI's decorative motion: the living backdrop freezes, screen
+    /// transitions become a plain fade, entrances stop staggering, and refused moves keep
+    /// their haptic but drop the recoil travel. Presentation only, exactly like
+    /// [`ui_palette`](Self::ui_palette) — a device preference, never part of a settings
+    /// profile.
+    ///
+    /// A console setting rather than a mirror of an OS one, because there is no
+    /// system "reduce motion" SDL can read portably across Linux and Windows. It also
+    /// doubles as the OLED-friendly mode: a frozen backdrop is a static image.
+    /// `default` so pre-existing stores load with the full motion they have today.
+    #[serde(default)]
+    pub reduce_motion: bool,
+    /// How the console's game library orders titles within a group: `""`/unknown (the
+    /// host's own order — today's shelf, byte for byte), `"title"`, `"platform"` or
+    /// `"store"`. See `pf-console-ui`'s `collate` module, which is the portable spec the
+    /// Apple and Android ports implement.
+    ///
+    /// Presentation only, like [`ui_palette`](Self::ui_palette), so it is a device
+    /// preference and never part of a settings profile. Parsed leniently — an unrecognized
+    /// value is a newer client's key, and the right answer to one is the default shelf.
+    #[serde(default)]
+    pub library_sort: String,
+    /// How the console's game library is arranged: `"shelf"` (the coverflow — the default,
+    /// and unknown values read as it) or `"grid"`. Presentation only, same rules as
+    /// [`library_sort`](Self::library_sort).
+    #[serde(default)]
+    pub library_view: String,
     /// Send Wake-on-LAN before connecting to a saved host and wait for it to boot (the
     /// Apple client's "Auto-wake on connect"). Default ON — that was the unconditional
     /// behavior before this became a setting. Off is for hosts reached over a VPN, where
@@ -1500,6 +1527,9 @@ impl Default for Settings {
             fullscreen_on_stream: true,
             library_enabled: false,
             ui_palette: default_ui_palette(),
+            reduce_motion: false,
+            library_sort: String::new(),
+            library_view: String::new(),
             auto_wake: true,
             invert_scroll: false,
             speaker_device: String::new(),

@@ -83,6 +83,13 @@ thread_local! {
     /// one thread — threading an `Ink` through ~90 call sites would be all cost and no safety.
     /// [`crate::shell::Shell::render`] sets it once per frame, before anything draws.
     static INK: std::cell::Cell<Ink> = const { std::cell::Cell::new(DARK_INK) };
+
+    /// Whether this frame draws in reduced-motion mode (`trust::Settings::reduce_motion`).
+    /// Published here for the same reason the ink is: motion is decided in ~15 places
+    /// scattered across widgets, screens and the shell, and every one of them already reads
+    /// a thread-local to know how to paint. Also set once per frame by
+    /// [`crate::shell::Shell::render`].
+    static REDUCE_MOTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn set_ink(ink: Ink) {
@@ -91,6 +98,18 @@ pub(crate) fn set_ink(ink: Ink) {
 
 pub(crate) fn ink() -> Ink {
     INK.with(std::cell::Cell::get)
+}
+
+pub(crate) fn set_reduce_motion(on: bool) {
+    REDUCE_MOTION.with(|r| r.set(on));
+}
+
+/// Is travel suppressed this frame? Callers keep the STATE change and drop the journey:
+/// a focused row is still focused, a stepped value still stepped — they simply arrive
+/// instead of gliding. Never used to skip a haptic; the pulse is the feedback that
+/// replaces the motion, not another thing to take away.
+pub(crate) fn reduce_motion() -> bool {
+    REDUCE_MOTION.with(std::cell::Cell::get)
 }
 
 /// The foreground at `alpha` — white on a dark palette, near-black on a pale one.
@@ -187,6 +206,111 @@ pub(crate) fn panel(
 }
 
 /// The soft drop shadow under a focused tile — a blurred black round-rect behind it.
+/// The colour half of the focus recede: neighbours lose SATURATION and BRIGHTNESS with
+/// distance `d` (0 = focused, 1 = fully receded), as one 4×5 row-major matrix.
+///
+/// This is what the flat black veil could never do. A veil only darkens, so a receded card
+/// stays as colourful as the focused one and the eye keeps reading it as a competing
+/// subject; draining the colour is what makes it read as DEPTH. The veil survives at half
+/// its old strength, doing the job it is actually good at — separating overlapping cards.
+///
+/// Row-major `[r…, g…, b…, a…]`, each row `[R G B A offset]`. The RGB rows are a standard
+/// luminance-weighted saturation matrix (Rec. 709 weights) scaled by `sat`, with the
+/// brightness shift in the offset column — SwiftUI's `.brightness()` is additive, and
+/// matching it keeps the two codebases' recede comparable by eye.
+pub(crate) fn recede_matrix(d: f64) -> [f32; 20] {
+    let d = d.clamp(0.0, 1.0);
+    let sat = (1.0 - RECEDE_SATURATION * d) as f32;
+    // Toward the GROUND, not simply darker. Apple's `.brightness(-0.24·d)` is dark-mode
+    // arithmetic: on a dark field, down is away. On one of this crate's six PALE palettes
+    // it is exactly backwards — a darkened tile gains contrast against a light ground and
+    // the UNFOCUSED card becomes the heaviest thing on screen. The scrim already knows
+    // which way the field leans (it tends to black on a dark palette, white on a pale
+    // one), so the recede borrows its direction.
+    let toward_light = ink().scrim.r > 0.5;
+    let bright = (RECEDE_BRIGHTNESS * d) as f32 * if toward_light { 1.0 } else { -1.0 };
+    const LR: f32 = 0.2126;
+    const LG: f32 = 0.7152;
+    const LB: f32 = 0.0722;
+    let (ir, ig, ib) = (LR * (1.0 - sat), LG * (1.0 - sat), LB * (1.0 - sat));
+    [
+        ir + sat,
+        ig,
+        ib,
+        0.0,
+        bright,
+        ir,
+        ig + sat,
+        ib,
+        0.0,
+        bright,
+        ir,
+        ig,
+        ib + sat,
+        0.0,
+        bright,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+    ]
+}
+
+/// How much colour a fully receded neighbour loses…
+const RECEDE_SATURATION: f64 = 0.42;
+/// …and how much light. Both ported from the Apple gamepad UI's focus recede.
+const RECEDE_BRIGHTNESS: f64 = 0.24;
+
+/// The lit top edge that makes glass read as a material rather than as a tinted rectangle:
+/// a 1 px inner stroke fading from `fg(0.10)` to nothing over the top 40 % of the panel,
+/// so the highlight sits on the top arc and dies away down the sides.
+///
+/// Deliberately a separate call rather than a flag on [`panel`]: it is worth drawing on
+/// tiles and on the ONE focused row, and not worth it on the dozens of resting rows a
+/// settings screen paints every frame. Making the caller ask keeps that discipline visible
+/// instead of hiding it behind a default.
+pub(crate) fn panel_highlight(canvas: &Canvas, rect: Rect, corner: f32, k: f32) {
+    let inset = rect.with_inset((0.5 * k, 0.5 * k));
+    let mut p = Paint::default();
+    p.set_style(skia_safe::PaintStyle::Stroke);
+    p.set_stroke_width(k.max(1.0));
+    p.set_anti_alias(true);
+    let colors = [fg(0.10), fg(0.0)];
+    p.set_shader(gradient::shaders::linear_gradient(
+        (
+            Point::new(rect.left, rect.top),
+            Point::new(rect.left, rect.top + rect.height() * 0.4),
+        ),
+        &gradient::Gradient::new(
+            gradient::Colors::new_evenly_spaced(&colors, TileMode::Clamp, None),
+            gradient::Interpolation::default(),
+        ),
+        None,
+    ));
+    canvas.draw_rrect(RRect::new_rect_xy(inset, corner * k, corner * k), &p);
+}
+
+/// An accent-tinted glow under the focused card — the palette-aware mark that says "this
+/// one" from across a room, where a 2 % scale difference says nothing at all. Drawn behind
+/// [`drop_shadow`], and only ever for the ONE focused tile, so it costs a single extra
+/// blurred round-rect per frame.
+pub(crate) fn focus_halo(canvas: &Canvas, rect: Rect, corner: f32, k: f32, f: f32) {
+    if f <= 0.01 {
+        return;
+    }
+    let mut p = Paint::new(accent(0.28 * f), None);
+    p.set_mask_filter(MaskFilter::blur(
+        skia_safe::BlurStyle::Normal,
+        18.0 * k,
+        None,
+    ));
+    // Grown slightly rather than offset: a halo is light spilling out of the card on every
+    // side, where the shadow below it is the card's weight falling in one direction.
+    let spread = rect.with_outset((6.0 * k, 6.0 * k));
+    canvas.draw_rrect(RRect::new_rect_xy(spread, corner * k, corner * k), &p);
+}
+
 pub(crate) fn drop_shadow(canvas: &Canvas, rect: Rect, corner: f32, k: f32, alpha: f32) {
     let mut p = Paint::new(Color4f::new(0.0, 0.0, 0.0, alpha), None);
     p.set_mask_filter(MaskFilter::blur(
@@ -471,5 +595,82 @@ mod tests {
             fonts.measure("Punktfunk", W::Bold, 16.0)
                 > fonts.measure("Punktfunk", W::Regular, 16.0)
         );
+    }
+
+    /// Apply the 4×5 row-major matrix to one unpremultiplied RGBA colour, the way Skia
+    /// does — without the clamp, so the maths is testable at the edges.
+    fn apply(m: &[f32; 20], c: [f32; 4]) -> [f32; 4] {
+        core::array::from_fn(|row| {
+            let o = row * 5;
+            m[o] * c[0] + m[o + 1] * c[1] + m[o + 2] * c[2] + m[o + 3] * c[3] + m[o + 4]
+        })
+    }
+
+    /// The focused card must come out EXACTLY as it went in. This is the assertion that
+    /// makes it safe to hand every card the same code path — a matrix that tinted the focus
+    /// by half a percent would be invisible in review and wrong in every screenshot.
+    #[test]
+    fn recede_matrix_is_identity_at_the_focus() {
+        let m = recede_matrix(0.0);
+        for c in [
+            [1.0, 0.2, 0.4, 1.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.3, 0.9, 0.1, 0.5],
+        ] {
+            let out = apply(&m, c);
+            for i in 0..4 {
+                assert!((out[i] - c[i]).abs() < 1e-5, "{c:?} became {out:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn recede_matrix_drains_colour_and_light_but_never_alpha() {
+        let m = recede_matrix(1.0);
+        let c = [0.9f32, 0.2, 0.15, 1.0]; // a saturated red poster
+        let out = apply(&m, c);
+        let spread = |v: [f32; 4]| v[0].max(v[1]).max(v[2]) - v[0].min(v[1]).min(v[2]);
+        assert!(
+            spread(out) < spread(c) * 0.7,
+            "colour did not drain: {out:?}"
+        );
+        let lum = |v: [f32; 4]| 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+        assert!(lum(out) < lum(c), "it did not darken: {out:?}");
+        // ALPHA IS UNTOUCHED, and that is load-bearing: coverflow side cards overlap, so a
+        // recede that reached alpha would let them show through each other.
+        assert_eq!(out[3], 1.0);
+    }
+
+    /// The recede must move a card TOWARD ITS GROUND, which is the opposite direction on a
+    /// pale palette. Getting this wrong is not subtle and is not caught by any dark-palette
+    /// screenshot: on `mint` or `holo` a darkened neighbour gains contrast against the
+    /// light field, so the UNFOCUSED tile becomes the loudest thing on screen.
+    #[test]
+    fn recede_moves_toward_the_ground_on_a_pale_palette() {
+        let lum = |v: [f32; 4]| 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+        let card = [0.55f32, 0.55, 0.6, 1.0];
+
+        set_ink(Ink::of(crate::library::palette("violet")));
+        assert!(ink().scrim.r < 0.5, "violet is a dark field");
+        let dark_side = apply(&recede_matrix(1.0), card);
+
+        set_ink(Ink::of(crate::library::palette("mint")));
+        assert!(ink().scrim.r > 0.5, "mint is a pale field");
+        let pale_side = apply(&recede_matrix(1.0), card);
+
+        assert!(
+            lum(dark_side) < lum(card),
+            "on a dark field a receded card sinks"
+        );
+        assert!(
+            lum(pale_side) > lum(card),
+            "on a pale field it must LIFT, not sink: {pale_side:?}"
+        );
+        // Both drain colour, whichever way the light goes — saturation has no handedness.
+        let spread = |v: [f32; 4]| v[0].max(v[1]).max(v[2]) - v[0].min(v[1]).min(v[2]);
+        assert!(spread(dark_side) < spread(card));
+        assert!(spread(pale_side) < spread(card));
+
+        set_ink(DARK_INK);
     }
 }

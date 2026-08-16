@@ -22,6 +22,16 @@ session end returns to the library, B quits (Gaming Mode returns). Paired hosts 
 pairing is the desktop client / Decky plugin's job. `PUNKTFUNK_FAKE_LIBRARY=<file.json>`
 feeds canned entries with no host (portrait paths starting with `/` load from disk).
 
+`fixtures/mixed-platform-library.json` is the standing asset for the library's grouping and
+sorting work: launchers, five platforms, several stores, and entries with no platform at
+all — which is the case that matters, because a platform-less Steam library must not
+collapse into one "Unknown" heap. Two titles are deliberately awkward ("The Witcher 3"
+sorts under W, "Émigré" under E) so a broken article fold or diacritic relaxation shows up
+on screen rather than only in a unit test:
+
+    PUNKTFUNK_FAKE_LIBRARY=clients/session/fixtures/mixed-platform-library.json \
+        punktfunk-session --browse
+
 Reads the same identity / known-hosts / settings stores as the desktop client
 (`punktfunk-client`), so enrolling on either side makes the other work; this binary never
 connects to a host it has no pinned fingerprint for (`--fp HEX` overrides the store).

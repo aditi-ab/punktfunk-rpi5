@@ -9,7 +9,7 @@
 //! `save_layer_alpha` so a screen fades as a unit, never element by element. The
 //! backdrop crossfades in parallel when the screens disagree (aurora ↔ form).
 
-use crate::anim::Progress;
+use crate::anim::{springs, Spring};
 use crate::glyphs::GlyphStyle;
 use crate::library::{mesh_sksl, palette, LibraryShared};
 use crate::model::{ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, WakeStatus};
@@ -26,20 +26,110 @@ use std::time::Instant;
 mod overlays;
 mod render;
 
-const TRANSITION_S: f64 = 0.26;
+/// The reduced-motion transition: quick and critically damped, drawn as a pure crossfade
+/// (no slide, no scale — see `render.rs`). Still a transition and not a cut, because the
+/// screen stack needs to stay legible: an instant swap loses the "you went somewhere"
+/// reading that is the only spatial cue a console shell has.
+const REDUCED_NAV: crate::anim::SpringSpec = crate::anim::SpringSpec {
+    response: 0.22,
+    damping: 1.0,
+};
+/// The push/pop choreography, in design units. Named rather than inlined at the paint
+/// sites because `console-vectors.json` claims to pin them for all three clients, and a
+/// literal buried in a paint recipe is a literal no test can reach.
+const NAV_SLIDE_DP: f64 = 36.0;
+/// The incoming screen's starting scale on a push…
+const NAV_ENTER_SCALE: f64 = 0.985;
+/// …and the outgoing/revealed one's, which is the deeper of the two because the screen
+/// being left behind should read as further away than the one arriving.
+const NAV_EXIT_SCALE: f64 = 0.96;
+/// How visible the revealed screen is at the START of a pop — not 0, because it was
+/// already there behind the screen coming off.
+const NAV_REVEAL_ALPHA: f64 = 0.4;
+/// How far a transition must have travelled before it accepts anything other than Back.
+/// Not a time: with a sprung transition "how far along" and "how long ago" are different
+/// questions, and the one that matters for input is whether the screen under the cursor is
+/// the one the user is aiming at.
+const NAV_INPUT_OPENS: f64 = 0.85;
 /// Chrome bands (design units): the pinned title above, hints below.
 const TOP_BAND: f64 = 64.0;
 const BOTTOM_BAND: f64 = 86.0;
 
+/// Which way a transition is choreographed. The paint recipes differ (a push slides the
+/// incoming screen up out of a fade; a pop grows the revealed one back while the leaving
+/// one drops away), so the kind outlives the direction the spring happens to be heading.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NavKind {
+    Push,
+    Pop,
+}
+
+/// One transition, as a single sprung scalar rather than a timer.
+///
+/// The scalar is what makes it INTERRUPTIBLE. A Back pressed mid-push retargets this very
+/// spring from 1.0 to 0.0 — same recipe, same velocity, so the screen visibly turns around
+/// and goes back where it came from instead of finishing its arrival and then playing a
+/// separate dismissal. A tween could not do that: its progress is a function of elapsed
+/// time, and reversing it means either a snap or a second animation.
 enum Motion {
     None,
-    Push(Progress),
-    Pop { leaving: Box<Screen>, t: Progress },
+    Nav {
+        spring: Spring,
+        /// Where the spring is heading: 1.0 = the transition completing, 0.0 = it being
+        /// undone. Only a push is ever retargeted to 0.0 (see [`Shell::nav_back`]).
+        target: f64,
+        kind: NavKind,
+        /// The screen being dismissed. `Some` only for a pop — a push leaves its parent on
+        /// the stack, so there is nothing to carry.
+        leaving: Option<Box<Screen>>,
+    },
+}
+
+/// What a toast is REPORTING, which is the thing the old single style couldn't say: a
+/// pairing that worked and a connect that failed were the same grey pill, so the only way
+/// to tell them apart was to read. Each kind carries a mark and a hairline colour.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToastKind {
+    /// Something happened (a session ended, a scan started). The default.
+    Info,
+    /// Something the user asked for succeeded.
+    Success,
+    /// Something failed. The one kind that does NOT take its colour from the palette — a
+    /// pale field's accent can be a cheerful mint, and a failure must not read as one.
+    Error,
+}
+
+/// The shape drawn ahead of a toast's text. Three marks, deliberately geometric: the
+/// crate's glyph art is hand-built Skia paths, and a mark that has to survive from 0.75×
+/// to 3× `k` on a TV across the room can't rely on fine detail.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ToastMark {
+    Dot,
+    Check,
+    Bang,
+}
+
+impl ToastKind {
+    /// The tint and mark this kind draws with.
+    pub(crate) fn look(self) -> (Color4f, ToastMark) {
+        match self {
+            ToastKind::Info => (crate::theme::fg(0.55), ToastMark::Dot),
+            ToastKind::Success => (crate::theme::accent(1.0), ToastMark::Check),
+            // Fixed, not palette-derived, and that is the point: `moss`'s accent is a green
+            // and `ember`'s is an orange — either would report a failure in the colour the
+            // UI uses for "this is fine".
+            ToastKind::Error => (Color4f::new(0.93, 0.31, 0.28, 1.0), ToastMark::Bang),
+        }
+    }
 }
 
 struct Toast {
     text: String,
     at: f64,
+    kind: ToastKind,
+    /// Slide-in seat, 0 → 1 on the tray spring. The same gesture as the keyboard tray
+    /// (something arriving from off-screen and settling), so it takes the same spec.
+    seat: Spring,
 }
 
 struct Connecting {
@@ -197,7 +287,7 @@ impl Shell {
     pub(crate) fn session_failed(&mut self, msg: &str) {
         self.connecting = None;
         self.in_stream = false;
-        self.show_toast(format!("Couldn't connect — {msg}"));
+        self.show_toast_kind(format!("Couldn't connect — {msg}"), ToastKind::Error);
     }
 
     pub(crate) fn session_streaming(&mut self) {
@@ -246,7 +336,16 @@ impl Shell {
     }
 
     fn show_toast(&mut self, text: String) {
-        self.toast = Some(Toast { text, at: self.t() });
+        self.show_toast_kind(text, ToastKind::Info);
+    }
+
+    fn show_toast_kind(&mut self, text: String, kind: ToastKind) {
+        self.toast = Some(Toast {
+            text,
+            at: self.t(),
+            kind,
+            seat: Spring::rest(0.0),
+        });
     }
 
     // --- Model sync (hosts, pairing, wake) — before input and before render --------------
@@ -292,7 +391,7 @@ impl Shell {
                     .iter()
                     .find(|h| &h.key == key)
                     .map_or_else(|| "the host".to_string(), |h| h.name.clone());
-                self.show_toast(format!("Paired with {name}"));
+                self.show_toast_kind(format!("Paired with {name}"), ToastKind::Success);
                 self.console.set_pair(PairPhase::Idle);
                 if matches!(self.stack.last(), Some(Screen::Pair(_))) {
                     self.apply_nav(Nav::Pop);
@@ -401,10 +500,26 @@ impl Shell {
                 _ => return None,
             }
         }
-        // Mid-transition input is dropped — 0.26 s, and it keeps a double-tapped A
-        // from pushing two screens.
+        // A transition no longer walls input off, it only filters it.
+        //
+        // Back is always heard, and is answered by the TRANSITION rather than the screens
+        // (see `nav_back`): mid-push it reverses the push, mid-pop it starts the next one.
+        // That is the whole point of the work — holding B to back out of a deep stack used
+        // to stutter at every level, because each press landed inside the previous
+        // transition and was thrown away.
+        //
+        // Everything else is still dropped until the incoming screen is nearly seated,
+        // which is what keeps a double-tapped A from pushing two screens. The threshold is
+        // on the spring's POSITION, not on elapsed time, so it means "far enough along to
+        // be the thing you are aiming at" whatever the transition's velocity.
         if !matches!(self.motion, Motion::None) {
-            return None;
+            if ev == MenuEvent::Back {
+                if self.nav_back() {
+                    return Some(MenuPulse::Confirm);
+                }
+            } else if self.nav_pos() < NAV_INPUT_OPENS {
+                return None;
+            }
         }
 
         let mut fx = Outbox::default();
@@ -582,27 +697,49 @@ impl Shell {
         }
     }
 
+    /// The spring the next push/pop runs on. Read at NAV time rather than per frame so a
+    /// transition can't change feel under itself if the setting is stepped mid-flight.
+    ///
+    /// Reduced motion keeps a spring rather than switching integrators — one code path
+    /// stays one code path — and simply picks a critically damped, quicker one. Combined
+    /// with the flattened geometry in `render.rs` (no slide, no scale) that reads as the
+    /// plain crossfade the setting promises.
+    fn nav_spec(&self) -> crate::anim::SpringSpec {
+        if self.settings.reduce_motion {
+            REDUCED_NAV
+        } else {
+            springs::NAV
+        }
+    }
+
+    fn begin_nav(&mut self, kind: NavKind, leaving: Option<Box<Screen>>) {
+        self.motion = Motion::Nav {
+            spring: Spring::rest(0.0),
+            target: 1.0,
+            kind,
+            leaving,
+        };
+    }
+
     fn apply_nav(&mut self, nav: Nav) {
         match nav {
             Nav::Push(screen) => {
                 self.stack.push(*screen);
-                self.motion = Motion::Push(Progress::new(TRANSITION_S));
+                self.begin_nav(NavKind::Push, None);
             }
             Nav::Replace(screen) => {
                 // Swap under the SAME push choreography: the outgoing screen is dropped
                 // rather than parked, so Back from the incoming one lands where the
-                // replaced screen was reached from.
+                // replaced screen was reached from — and so does a Back that REVERSES this
+                // push, which pops to the same parent.
                 self.stack.pop();
                 self.stack.push(*screen);
-                self.motion = Motion::Push(Progress::new(TRANSITION_S));
+                self.begin_nav(NavKind::Push, None);
             }
             Nav::Pop => {
                 if self.stack.len() > 1 {
                     let leaving = self.stack.pop().expect("len > 1");
-                    self.motion = Motion::Pop {
-                        leaving: Box::new(leaving),
-                        t: Progress::new(TRANSITION_S),
-                    };
+                    self.begin_nav(NavKind::Pop, Some(Box::new(leaving)));
                 } else {
                     // Popping the root quits the console (B at home).
                     self.actions.push_back(OverlayAction::Quit);
@@ -611,10 +748,119 @@ impl Shell {
         }
     }
 
+    /// How far the transition in flight has travelled, 0 when there is none.
+    fn nav_pos(&self) -> f64 {
+        match &self.motion {
+            Motion::None => 1.0,
+            Motion::Nav { spring, .. } => spring.pos,
+        }
+    }
+
+    /// Back, pressed while a transition is still in flight. Returns `true` when the
+    /// transition itself answered it, so the event never reaches the screens.
+    ///
+    /// This is the method the whole work package exists for. Before it, every mid-flight
+    /// press was swallowed, so holding B to back out of a deep stack stuttered at each
+    /// level: press, wait 0.26 s, press again.
+    fn nav_back(&mut self) -> bool {
+        let Motion::Nav {
+            spring,
+            target,
+            kind,
+            ..
+        } = &mut self.motion
+        else {
+            return false;
+        };
+        match *kind {
+            // Reverse the push ON THE SAME SPRING. Velocity carries, so the entering screen
+            // decelerates, turns, and goes back down — one continuous motion rather than an
+            // arrival followed by a dismissal. `finish_nav` takes it off the stack when the
+            // spring lands on 0.
+            //
+            // Refused at the root, where there is no parent to fall back to and B means
+            // quit: that press belongs to the normal path.
+            NavKind::Push if *target == 1.0 && self.stack.len() > 1 => {
+                *target = 0.0;
+                true
+            }
+            // Already reversing — nothing further to say, and letting this through would
+            // pop the parent out from under a screen that is still on its way off.
+            NavKind::Push if *target == 0.0 => true,
+            NavKind::Push => false,
+            // A pop already going the right way: honour the press as "and the next one
+            // too". The current pop's bookkeeping is finished on the spot (the stack is
+            // already correct; only `leaving` is still being carried) and a fresh pop
+            // starts, which is exactly what makes a held B walk out of a stack smoothly.
+            NavKind::Pop => {
+                let _ = spring;
+                self.motion = Motion::None;
+                self.apply_nav(Nav::Pop);
+                true
+            }
+        }
+    }
+
+    /// Advance the transition by `dt`. Returns how far along it is, or `None` once it has
+    /// settled — by which point [`Self::finish_nav`] has already run.
+    ///
+    /// Separate from `render` so it can be driven at a chosen `dt`: the render path takes
+    /// its `dt` from the wall clock, and a test that called it in a tight loop would
+    /// advance the spring by microseconds per frame and never see it move.
+    fn advance_nav(&mut self, dt: f64) -> Option<f64> {
+        let spec = self.nav_spec();
+        let p = match &mut self.motion {
+            Motion::None => None,
+            Motion::Nav { spring, target, .. } => {
+                spring.step_spec(*target, spec, dt);
+                spring.settle(*target, 0.001, 0.01);
+                // `settle` snaps both to rest, so this is an exact test rather than an
+                // epsilon one — and it is the only way out of the state.
+                (spring.pos != *target || spring.vel != 0.0).then_some(spring.pos)
+            }
+        };
+        if p.is_none() {
+            self.finish_nav();
+        }
+        p
+    }
+
+    /// A settled transition's bookkeeping. Called once the spring has landed on its target.
+    fn finish_nav(&mut self) {
+        if let Motion::Nav { kind, target, .. } = &self.motion {
+            // A push that was reversed mid-flight never happened: take its screen back off.
+            // For a `Replace` this lands on the same parent a settled Back would have, so
+            // the two agree. Guarded on length because the root must never be popped here —
+            // `nav_back` refuses to reverse there, and this is the belt to that's braces.
+            if *kind == NavKind::Push && *target == 0.0 && self.stack.len() > 1 {
+                self.stack.pop();
+            }
+        }
+        // A completed pop drops the screen it was carrying, exactly as before.
+        self.motion = Motion::None;
+    }
+
     /// The living backdrop. `calm` 0 = the launcher's aurora, 1 = the quiet field the form
     /// screens sit on; the shell chases it, so there is only ever ONE backdrop pass — the
     /// former aurora-over-static-form crossfade is now a single uniform.
+    /// The clock the backdrop shader runs on. Reduced motion freezes the field at a fixed
+    /// phase rather than removing it: the colour IS the palette the user picked, and a
+    /// still gradient is also the OLED-friendly thing to leave on a screen for an hour.
+    ///
+    /// The CALM mix is deliberately not frozen with it — that tracks which screen is up,
+    /// a state change rather than decoration.
+    fn field_clock(&self, t: f64) -> f64 {
+        if self.settings.reduce_motion {
+            0.0
+        } else {
+            t
+        }
+    }
+
     fn draw_aurora(&self, canvas: &Canvas, w: f64, h: f64, t: f64, calm: f64) {
+        // Gated at the one place the shader's clock is read, so the takeover's own
+        // `draw_aurora` call inherits it and a third caller can't forget.
+        let t = self.field_clock(t);
         // Laid out to match the SkSL block: u_res (float2), u_tc (float2), u_lift (float4),
         // u_scrim (float4).
         let uniforms: [f32; 12] = [

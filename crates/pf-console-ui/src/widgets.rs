@@ -4,7 +4,7 @@
 //! springs and scroll, the SCREEN owns the domain (row content and what an activation
 //! means), and every frame the screen hands the widget fresh row specs.
 
-use crate::anim::{approach, Spring, TRAY_C, TRAY_K};
+use crate::anim::{approach, entrances, springs, Entrance, EntranceAt, Spring, TRAY_C, TRAY_K};
 use crate::library::{BUMP_C, BUMP_K};
 use crate::pointer::{Pointer, PointerKind};
 use crate::theme::{accent, fg, Fonts, PanelStroke, W};
@@ -78,13 +78,60 @@ const ROW_GAP: f64 = 6.0;
 const HEADER_H: f64 = 34.0;
 pub(crate) const ROW_MAX_W: f64 = 620.0;
 
+/// How far a stepped value slips before springing back, design units. The affordable 80 %
+/// of Apple's option-band drum: one sprung position plus a crossfade, rather than
+/// neighbours rendered in 3-D — our rows draw their value as a single text run, so a real
+/// drum would mean laying out values we never otherwise measure.
+const SLIP_DP: f64 = 14.0;
+/// Accumulated slip is capped here so a held repeat reads as one accelerating travel
+/// rather than throwing the value off the row.
+const SLIP_MAX: f64 = 22.0;
+/// The confirm dip's floor — the visual sibling of the haptic that already fires.
+const PRESS_DIP: f64 = 0.97;
+/// How far a row rises into place on mount. A twelfth of the carousel's travel: same
+/// language, but a settings list that fans open like a shelf of box art is a settings list
+/// showing off.
+const ROW_RISE: f64 = 12.0;
+
 /// The focus list: authoritative cursor, spring recoil at the ends, a scroll offset
 /// that chases the focused row, and a per-row focus amount for the scale/tint ease.
 pub(crate) struct MenuList {
     pub cursor: usize,
     bump: Spring,
     scroll: f64,
+    /// The COLOUR channel of focus (tint, alpha, chevrons), eased with `approach`.
+    /// Deliberately not sprung: an overshooting colour would overshoot past the palette's
+    /// accent into a tint that isn't in the palette at all.
     focus: Vec<f64>,
+    /// The SCALE channel, sprung — the whisker of overshoot is the pop that makes a
+    /// focused row read as picked up rather than merely tinted.
+    focus_pop: Vec<Spring>,
+    /// The activated row's dip, resting at 1.0. One spring, not one per row: only the
+    /// focused row can be activated, so only one can ever be dipping.
+    press: Spring,
+    /// A stepped value's displacement, chasing 0 from ±[`SLIP_DP`]. Never reset on a new
+    /// step — its velocity is what makes held repeats accumulate into one travel instead of
+    /// restarting the crossfade.
+    slip: Spring,
+    /// The value the slip is sliding OUT: `(row, text, offset)`. The offset is where that
+    /// text sits RELATIVE to the incoming one (∓[`SLIP_DP`], set from the step direction),
+    /// so the pair keeps travelling the right way round even after the spring reverses
+    /// through zero on an accumulated repeat.
+    slip_prev: Option<(usize, String, f64)>,
+    /// Direction of the step the list last emitted, consumed by the next render. The list
+    /// arms the slip ITSELF by noticing the value changed, so no screen has to report it —
+    /// and a refused adjust (the value didn't move) correctly produces no slip at all.
+    step_dir: i32,
+    /// Each row's value string as last drawn — the "before" half of the crossfade, and how
+    /// the list detects that an adjust actually landed.
+    shown: Vec<String>,
+    /// The mount entrance and the clock it runs on. Deliberately NOT replayed on a tab
+    /// switch: `jump_to` already seats everything instantly (chasing through rows that no
+    /// longer exist reads as a glitch), and re-fanning the rows on every L1/R1 would turn a
+    /// skim through the sections into a flicker.
+    entrance: Option<Entrance>,
+    entrance_armed: bool,
+    age: f64,
     /// Next render, seat the scroll and the focus ease instantly instead of chasing — see
     /// [`MenuList::jump_to`].
     snap: bool,
@@ -101,6 +148,15 @@ impl MenuList {
             bump: Spring::rest(0.0),
             scroll: 0.0,
             focus: Vec::new(),
+            focus_pop: Vec::new(),
+            press: Spring::rest(1.0),
+            slip: Spring::rest(0.0),
+            slip_prev: None,
+            step_dir: 0,
+            shown: Vec::new(),
+            entrance: None,
+            entrance_armed: false,
+            age: 0.0,
             snap: true,
             geom: Vec::new(),
         }
@@ -120,11 +176,31 @@ impl MenuList {
         match ev {
             MenuEvent::Move(MenuDir::Up) => (ListMsg::None, self.step(-1, len)),
             MenuEvent::Move(MenuDir::Down) => (ListMsg::None, self.step(1, len)),
-            MenuEvent::Move(MenuDir::Left) => (ListMsg::Adjust(-1), None),
-            MenuEvent::Move(MenuDir::Right) => (ListMsg::Adjust(1), None),
-            MenuEvent::Confirm => (ListMsg::Activate, Some(MenuPulse::Confirm)),
+            MenuEvent::Move(MenuDir::Left) => (ListMsg::Adjust(-1), self.armed(-1)),
+            MenuEvent::Move(MenuDir::Right) => (ListMsg::Adjust(1), self.armed(1)),
+            // A on a value row cycles it FORWARD, so the slip travels the same way a Right
+            // would; on an action row nothing steps and the render simply finds no change.
+            MenuEvent::Confirm => {
+                self.armed(1);
+                self.dip();
+                (ListMsg::Activate, Some(MenuPulse::Confirm))
+            }
             _ => (ListMsg::None, None),
         }
+    }
+
+    /// Note that a step went out in `dir`. Returns `None` so it drops into the pulse slot of
+    /// the arms above without changing what they report — the SCREEN decides whether the
+    /// step landed, and the next render finds out by looking at the value.
+    fn armed(&mut self, dir: i32) -> Option<MenuPulse> {
+        self.step_dir = dir;
+        None
+    }
+
+    /// Kick the confirm dip. Separate from [`Self::armed`] because a press is worth showing
+    /// even on an action row, where no value will change.
+    fn dip(&mut self) {
+        self.press.pos = PRESS_DIP;
     }
 
     /// A row's drawn rect, for tests that assert on what a press can actually reach.
@@ -146,6 +222,9 @@ impl MenuList {
             PointerKind::Press => match p.pick(&self.geom) {
                 Some(i) if i < len => {
                     self.cursor = i;
+                    // Same forward cycle A performs, so a click reads the same as a press.
+                    self.armed(1);
+                    self.dip();
                     (ListMsg::Activate, Some(MenuPulse::Confirm))
                 }
                 _ => (ListMsg::None, None),
@@ -181,12 +260,30 @@ impl MenuList {
         dt: f64,
         active: bool,
     ) {
+        let reduce = crate::theme::reduce_motion();
+        // The list keeps its own clock: `render` is handed `dt` but never the shell's `t`,
+        // and a per-MOUNT animation wants a per-mount clock anyway.
+        self.age += dt;
+        if !self.entrance_armed {
+            self.entrance_armed = true;
+            self.entrance = Some(Entrance::new(entrances::ROWS, self.cursor, self.age));
+        }
+        if self.entrance.is_some_and(|e| e.done(self.age)) {
+            self.entrance = None;
+        }
         if self.snap {
             // A replaced row set has no shared history with the old one — start every row's
-            // focus ease from scratch so the new cursor is simply THERE.
+            // focus ease from scratch so the new cursor is simply THERE. The slip goes with
+            // it: a value "changing" because the whole row set was swapped is not a step.
             self.focus.clear();
+            self.focus_pop.clear();
+            self.shown.clear();
+            self.slip = Spring::rest(0.0);
+            self.slip_prev = None;
+            self.step_dir = 0;
         }
         self.focus.resize(rows.len(), 0.0);
+        self.focus_pop.resize(rows.len(), Spring::rest(0.0));
         for (i, f) in self.focus.iter_mut().enumerate() {
             let target = if active && i == self.cursor { 1.0 } else { 0.0 };
             *f = if self.snap {
@@ -195,8 +292,57 @@ impl MenuList {
                 approach(*f, target, dt, 0.06)
             };
         }
+        for (i, s) in self.focus_pop.iter_mut().enumerate() {
+            let target = if active && i == self.cursor { 1.0 } else { 0.0 };
+            if self.snap || reduce {
+                *s = Spring::rest(target);
+            } else {
+                s.step_spec(target, springs::FOCUS, dt);
+                s.settle(target, 0.0005, 0.005);
+            }
+        }
         self.bump.step(0.0, BUMP_K, BUMP_C, dt);
         self.bump.settle(0.0, 0.3, 4.0);
+        if reduce {
+            // Reduced motion keeps the recoil's MEANING (the move was refused) in the
+            // haptic the screen already fired, and drops the travel.
+            self.bump = Spring::rest(0.0);
+            self.press = Spring::rest(1.0);
+        } else {
+            self.press.step_spec(1.0, springs::PRESS, dt);
+            self.press.settle(1.0, 0.0005, 0.005);
+        }
+
+        // Arm the value slip. A step went out (`step_dir`) AND the value under the cursor
+        // actually changed — comparing what we DREW last frame against what the screen just
+        // handed us is what makes a refused adjust produce no motion at all, without any
+        // screen having to report whether its edit landed.
+        let dir = std::mem::take(&mut self.step_dir);
+        if dir != 0 && !reduce {
+            let now = rows
+                .get(self.cursor)
+                .and_then(|r| r.value.as_deref())
+                .unwrap_or_default();
+            if self.shown.get(self.cursor).is_some_and(|p| p != now) {
+                let prev = self.shown[self.cursor].clone();
+                // ADD rather than set, and never touch `vel`: two fast presses accumulate
+                // into one accelerating travel instead of restarting the crossfade.
+                self.slip.pos =
+                    (self.slip.pos + SLIP_DP * f64::from(dir)).clamp(-SLIP_MAX, SLIP_MAX);
+                self.slip_prev = Some((self.cursor, prev, -SLIP_DP * f64::from(dir)));
+            }
+        }
+        self.slip.step_spec(0.0, springs::FOCUS, dt);
+        self.slip.settle(0.0, 0.02, 0.2);
+        if self.slip.pos == 0.0 {
+            self.slip_prev = None;
+        }
+        // This frame's values become the "before" the next step compares against. Recorded
+        // for EVERY row, not just the drawn ones: a row scrolled out of view still has a
+        // value, and reading a stale one back later would fake a change.
+        self.shown.clear();
+        self.shown
+            .extend(rows.iter().map(|r| r.value.clone().unwrap_or_default()));
 
         // Row tops (design units) incl. headers, so scroll math and drawing agree.
         let mut tops = Vec::with_capacity(rows.len());
@@ -235,6 +381,12 @@ impl MenuList {
             {
                 continue;
             }
+            // Culled first, then the entrance: an off-screen row costs nothing to not
+            // animate, and the rise is far smaller than the 8 dp cull margin either way.
+            let ent = self
+                .entrance
+                .map_or(EntranceAt::SETTLED, |e| e.at(i, self.age));
+            let top = top + (1.0 - ent.travel) * ROW_RISE * k;
             if let Some(header) = row.header {
                 fonts.draw_tracked(
                     canvas,
@@ -247,13 +399,30 @@ impl MenuList {
                     fg(0.45),
                 );
             }
-            // Focus scale eases 0.98 → 1.0 about the row center.
-            let scale = 0.98 + 0.02 * f;
+            // Focus scale springs 0.98 → 1.0 about the row center, times the confirm dip.
+            // Two channels rather than one because they answer different questions: the pop
+            // says "this is the row", the dip says "and you just pressed it".
+            let pop = self.focus_pop.get(i).map_or(f, |s| s.pos);
+            let dip = if i == self.cursor {
+                self.press.pos
+            } else {
+                1.0
+            };
+            let scale = (0.98 + 0.02 * pop) * dip;
             let (cx, cy) = (x0 + row_w / 2.0, top + ROW_H * k / 2.0);
             canvas.save();
             canvas.translate((cx as f32, cy as f32));
             canvas.scale((scale as f32, scale as f32));
             canvas.translate((-cx as f32, -cy as f32));
+            // One layer per row, only while it is still arriving — a row is a panel plus
+            // two text runs, so a whole-row fade genuinely needs one. Bounded to the row's
+            // own rect so it never becomes a full-screen pass.
+            let fading = ent.fade < 1.0;
+            if fading {
+                let bounds =
+                    Rect::from_xywh(x0 as f32, top as f32, row_w as f32, (ROW_H * k) as f32);
+                canvas.save_layer_alpha_f(bounds, ent.fade as f32);
+            }
             let r = Rect::from_xywh(x0 as f32, top as f32, row_w as f32, (ROW_H * k) as f32);
             // The untransformed rect: the focus scale is a 2 % breath about the centre, far
             // inside the slop a finger brings, and clicking must not depend on the ease.
@@ -271,6 +440,11 @@ impl MenuList {
                 None
             };
             crate::theme::panel(canvas, r, 14.0, tint, stroke, k as f32);
+            // The lit edge, for the focused row only — a settings screen paints dozens of
+            // resting rows every frame and none of them need a specular highlight.
+            if f > 0.5 {
+                crate::theme::panel_highlight(canvas, r, 14.0, k as f32);
+            }
 
             let baseline = cy + 16.0 * k * 0.36;
             if row.value.is_none() {
@@ -309,9 +483,42 @@ impl MenuList {
                 let vmax = row_w * 0.55;
                 let vw = (fonts.measure(value, W::Medium, 15.0 * k) as f64).min(vmax);
                 let vx = x0 + row_w - 16.0 * k - chevron_w - caret_w - vw;
+                // The sprung slip + crossfade. `slip_prev` names its ROW, so a value that
+                // changed somewhere else (a profile row appearing, a dependent row
+                // re-enabling) can't drag this one's text sideways.
+                let slipping = self.slip_prev.as_ref().filter(|(row, ..)| *row == i);
+                let dx = if slipping.is_some() {
+                    self.slip.pos * k
+                } else {
+                    0.0
+                };
+                let gone = (self.slip.pos.abs() / SLIP_DP).clamp(0.0, 1.0) as f32;
+                let alpha =
+                    |c: skia_safe::Color4f, a: f32| skia_safe::Color4f::new(c.r, c.g, c.b, c.a * a);
+                if let Some((_, prev, offset)) = slipping {
+                    // The value being left, sliding out the way the step came from.
+                    let prev_text = truncate_head(fonts, prev, W::Medium, 15.0 * k, vmax);
+                    fonts.draw(
+                        canvas,
+                        &prev_text,
+                        vx + dx + offset * k,
+                        baseline,
+                        W::Medium,
+                        15.0 * k,
+                        alpha(vcolor, gone),
+                    );
+                }
                 // Head-truncate: keep the END of a long address visible while typing.
                 let shown = truncate_head(fonts, value, W::Medium, 15.0 * k, vmax);
-                fonts.draw(canvas, &shown, vx, baseline, W::Medium, 15.0 * k, vcolor);
+                fonts.draw(
+                    canvas,
+                    &shown,
+                    vx + dx,
+                    baseline,
+                    W::Medium,
+                    15.0 * k,
+                    alpha(vcolor, 1.0 - gone),
+                );
                 if row.caret {
                     canvas.draw_rect(
                         Rect::from_xywh(
@@ -329,6 +536,9 @@ impl MenuList {
                     chevron(canvas, x0 + row_w - 16.0 * k, cy, 4.0 * k, false, alpha);
                 }
             }
+            if fading {
+                canvas.restore(); // the entrance layer
+            }
             canvas.restore();
         }
         canvas.restore();
@@ -344,9 +554,13 @@ pub(crate) const TAB_STRIP_H: f64 = 46.0;
 /// owns which tab is selected and what the shoulders do; this draws the pills and slides
 /// one highlight between them, so switching sections reads as travel rather than a swap.
 pub(crate) struct TabStrip {
-    /// Chased highlight geometry `(x, width)` in device px. `None` until the first render,
-    /// so a freshly opened screen doesn't animate its highlight in from x = 0.
-    indicator: Option<(f64, f64)>,
+    /// Chased highlight geometry `(x, width)` in device px, SPRUNG rather than eased so
+    /// velocity carries across rapid L1/R1: a fast skim through the sections reads as one
+    /// accelerating travel instead of a series of restarted eases that each begin at zero
+    /// speed. (The option-band lesson from the Apple gamepad UI, applied to the one widget
+    /// here that gets hammered.) `None` until the first render, so a freshly opened screen
+    /// doesn't animate its highlight in from x = 0.
+    indicator: Option<(Spring, Spring)>,
     /// Each pill's rect as last drawn, device px — the strip is the one part of a settings
     /// screen a pointer can reach directly, so it hit-tests against what it drew.
     pills: Vec<Rect>,
@@ -408,14 +622,24 @@ impl TabStrip {
             x + widths[..sel].iter().sum::<f64>() + gap * sel as f64,
             widths[sel],
         );
-        let (ix, iw) = match self.indicator {
-            None => target,
-            Some((cx, cw)) => (
-                approach(cx, target.0, dt, 0.07),
-                approach(cw, target.1, dt, 0.07),
-            ),
+        if self.indicator.is_none() {
+            self.indicator = Some((Spring::rest(target.0), Spring::rest(target.1)));
+        }
+        let (ix, iw) = {
+            let (sx, sw) = self.indicator.as_mut().expect("seeded just above");
+            if crate::theme::reduce_motion() {
+                *sx = Spring::rest(target.0);
+                *sw = Spring::rest(target.1);
+            } else {
+                sx.step_spec(target.0, springs::INDICATOR, dt);
+                sw.step_spec(target.1, springs::INDICATOR, dt);
+                // Epsilons in DEVICE PX (this geometry is already scaled by `k`), so the
+                // pill stops sub-pixel-jittering rather than at some design-unit fraction.
+                sx.settle(target.0, 0.05, 0.5);
+                sw.settle(target.1, 0.05, 0.5);
+            }
+            (sx.pos, sw.pos)
         };
-        self.indicator = Some((ix, iw));
         crate::theme::panel(
             canvas,
             Rect::from_xywh(ix as f32, top as f32, iw as f32, pill_h as f32),
@@ -906,6 +1130,196 @@ mod tests {
             ListMsg::Adjust(1)
         );
         assert_eq!(l.menu(MenuEvent::Confirm, 3).0, ListMsg::Activate);
+    }
+
+    const TABS: [&str; 7] = [
+        "Stream",
+        "Video",
+        "Audio",
+        "Controller",
+        "Input",
+        "Interface",
+        "Profiles",
+    ];
+
+    /// The sprung tab pill must accelerate through a burst without ever leaving the strip.
+    /// A spring that carries velocity CAN fly past its target, and the failure mode is a
+    /// highlight that shoots off the end of the section list — this pins that it doesn't,
+    /// and that it still lands exactly on the selected pill afterwards.
+    #[test]
+    fn tab_indicator_rides_a_burst_without_leaving_the_strip() {
+        let fonts = crate::theme::build_fonts().unwrap();
+        let mut surface = skia_safe::surfaces::raster_n32_premul((900, 120)).unwrap();
+        let rect = Rect::from_xywh(0.0, 0.0, 900.0, TAB_STRIP_H as f32);
+        let mut strip = TabStrip::new();
+        let dt = 1.0 / 60.0;
+        // Seat on the first tab, then a 5-step burst at one press per frame — far faster
+        // than the spring can settle, which is the whole point.
+        strip.render(surface.canvas(), rect, &TABS, 0, &fonts, 1.0, dt);
+        let mut worst_left = f64::MAX;
+        let mut worst_right = f64::MIN;
+        for sel in 1..=5 {
+            strip.render(surface.canvas(), rect, &TABS, sel, &fonts, 1.0, dt);
+            let (ix, iw) = strip.indicator.map(|(x, w)| (x.pos, w.pos)).unwrap();
+            worst_left = worst_left.min(ix);
+            worst_right = worst_right.max(ix + iw);
+        }
+        // Then let it land.
+        for _ in 0..240 {
+            strip.render(surface.canvas(), rect, &TABS, 5, &fonts, 1.0, dt);
+            let (ix, iw) = strip.indicator.map(|(x, w)| (x.pos, w.pos)).unwrap();
+            worst_left = worst_left.min(ix);
+            worst_right = worst_right.max(ix + iw);
+        }
+        assert!(
+            worst_left >= f64::from(rect.left) - 0.5,
+            "pill ran off the left: {worst_left}"
+        );
+        assert!(
+            worst_right <= f64::from(rect.right) + 0.5,
+            "pill ran off the right: {worst_right}"
+        );
+        let pill = strip.pill(5).expect("the selected pill was drawn");
+        let (ix, iw) = strip.indicator.map(|(x, w)| (x.pos, w.pos)).unwrap();
+        assert!(
+            (ix - f64::from(pill.left)).abs() < 0.5 && (iw - f64::from(pill.width())).abs() < 0.5,
+            "settled at ({ix}, {iw}), pill is at ({}, {})",
+            pill.left,
+            pill.width()
+        );
+    }
+
+    fn value_row(value: &str) -> Vec<RowSpec> {
+        vec![RowSpec {
+            header: None,
+            label: "Bitrate".into(),
+            value: Some(value.into()),
+            value_dim: false,
+            caret: false,
+            adjustable: true,
+            enabled: true,
+        }]
+    }
+
+    /// The value slip: armed only when a step actually CHANGED the value, and always
+    /// settling back onto the row's own position. A slip that never returns to identity
+    /// leaves the value permanently offset, which is the bug this shape can have.
+    #[test]
+    fn value_slip_arms_on_a_real_step_and_settles_to_identity() {
+        let fonts = crate::theme::build_fonts().unwrap();
+        let mut surface = skia_safe::surfaces::raster_n32_premul((900, 600)).unwrap();
+        let rect = Rect::from_xywh(0.0, 0.0, 900.0, 600.0);
+        let dt = 1.0 / 60.0;
+        let mut list = MenuList::new();
+        let mut frame = |list: &mut MenuList, rows: &[RowSpec]| {
+            list.render(surface.canvas(), rect, rows, &fonts, 1.0, dt, true);
+        };
+
+        frame(&mut list, &value_row("10 Mbps"));
+        assert_eq!(list.slip.pos, 0.0, "nothing has stepped yet");
+
+        // A step the screen HONOURED: the value it hands back next frame differs.
+        assert_eq!(
+            list.menu(MenuEvent::Move(MenuDir::Right), 1).0,
+            ListMsg::Adjust(1)
+        );
+        frame(&mut list, &value_row("20 Mbps"));
+        assert!(list.slip.pos.abs() > 1.0, "armed: {}", list.slip.pos);
+        assert!(
+            list.slip_prev.is_some(),
+            "the old value is held for the fade"
+        );
+
+        for _ in 0..240 {
+            frame(&mut list, &value_row("20 Mbps"));
+        }
+        assert_eq!(list.slip.pos, 0.0, "settled back onto the row");
+        assert!(list.slip_prev.is_none(), "and forgot the old value");
+
+        // A step the screen REFUSED (value unchanged) must not move anything — this is why
+        // the list detects the change itself instead of trusting the event.
+        list.menu(MenuEvent::Move(MenuDir::Right), 1);
+        frame(&mut list, &value_row("20 Mbps"));
+        assert_eq!(list.slip.pos, 0.0);
+        assert!(list.slip_prev.is_none());
+    }
+
+    /// Reduced motion keeps the STATE and drops the journey: the value is simply the new
+    /// one, the focus is simply on the row, and a refused move leaves no recoil behind.
+    #[test]
+    fn reduce_motion_drops_travel_but_not_state() {
+        let fonts = crate::theme::build_fonts().unwrap();
+        let mut surface = skia_safe::surfaces::raster_n32_premul((900, 600)).unwrap();
+        let rect = Rect::from_xywh(0.0, 0.0, 900.0, 600.0);
+        let dt = 1.0 / 60.0;
+        crate::theme::set_reduce_motion(true);
+        let mut list = MenuList::new();
+        list.render(
+            surface.canvas(),
+            rect,
+            &value_row("10 Mbps"),
+            &fonts,
+            1.0,
+            dt,
+            true,
+        );
+        list.menu(MenuEvent::Move(MenuDir::Right), 1);
+        list.render(
+            surface.canvas(),
+            rect,
+            &value_row("20 Mbps"),
+            &fonts,
+            1.0,
+            dt,
+            true,
+        );
+        assert_eq!(list.slip.pos, 0.0, "no slip under reduced motion");
+        assert!(list.slip_prev.is_none());
+        // A refused move still pulses (the screen's job) but leaves no recoil travel.
+        assert!(matches!(
+            list.menu(MenuEvent::Move(MenuDir::Up), 1).1,
+            Some(MenuPulse::Boundary)
+        ));
+        list.render(
+            surface.canvas(),
+            rect,
+            &value_row("20 Mbps"),
+            &fonts,
+            1.0,
+            dt,
+            true,
+        );
+        assert_eq!(list.bump.pos, 0.0, "recoil travel suppressed");
+        // The focus channel still ARRIVES — reduced motion is not "unfocused".
+        assert_eq!(list.focus_pop[0].pos, 1.0);
+        crate::theme::set_reduce_motion(false);
+    }
+
+    /// The mount entrance arms once, retires when it is over (so the steady state pays
+    /// nothing for it at all), and is NOT replayed by a tab switch — re-fanning the rows on
+    /// every L1/R1 would turn a skim through the sections into a flicker.
+    #[test]
+    fn menu_list_entrance_plays_once_and_retires() {
+        let fonts = crate::theme::build_fonts().unwrap();
+        let mut surface = skia_safe::surfaces::raster_n32_premul((900, 600)).unwrap();
+        let rect = Rect::from_xywh(0.0, 0.0, 900.0, 600.0);
+        let dt = 1.0 / 60.0;
+        let rows: Vec<RowSpec> = (0..6)
+            .map(|i| RowSpec::action(format!("Row {i}"), true))
+            .collect();
+        let mut list = MenuList::new();
+
+        list.render(surface.canvas(), rect, &rows, &fonts, 1.0, dt, true);
+        assert!(list.entrance.is_some(), "armed on the first frame");
+
+        for _ in 0..90 {
+            list.render(surface.canvas(), rect, &rows, &fonts, 1.0, dt, true);
+        }
+        assert!(list.entrance.is_none(), "retired once it played out");
+
+        list.jump_to(3);
+        list.render(surface.canvas(), rect, &rows, &fonts, 1.0, dt, true);
+        assert!(list.entrance.is_none(), "a tab switch must not replay it");
     }
 
     #[test]

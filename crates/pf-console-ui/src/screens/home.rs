@@ -5,9 +5,11 @@
 //! chases it, and the focus pop (scale/brightness/fade) reads off the LIVE sprung
 //! distance so the look always matches the strip mid-motion.
 
-use crate::anim::Spring;
+use crate::anim::{entrances, Entrance, EntranceAt, Spring};
 use crate::glyphs::{Hint, HintKey};
-use crate::library::{step_cursor, StepResult, BUMP_C, BUMP_K, BUMP_PX, SPRING_C, SPRING_K};
+use crate::library::{
+    step_cursor, StepResult, BUMP_C, BUMP_K, BUMP_PX, ENTER_RISE, ENTER_SCALE, SPRING_C, SPRING_K,
+};
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox, Screen};
@@ -23,6 +25,28 @@ const TILE_CORNER: f64 = 26.0;
 /// The Add Host tile's synthetic key (host keys are fingerprints or `addr:port`,
 /// neither starts with `\0`).
 const ADD_KEY: &str = "\0add";
+/// The Rescan tile's, the second sentinel after it.
+const SCAN_KEY: &str = "\0scan";
+
+/// What a carousel index actually is. The two trailing tiles are ACTIONS, not hosts, so
+/// every place that used to ask "is there a host at this index?" asks this instead — the
+/// old `hosts.get(i)` was already answering two questions with one `None`, and a second
+/// action tile makes that ambiguity a bug.
+enum Slot<'h> {
+    Host(&'h HostRow),
+    AddHost,
+    /// Ask the discovery sweep to look again. A controller surface has no pull-to-refresh,
+    /// so the affordance has to be a tile — the same reasoning the Apple client uses.
+    Rescan,
+}
+
+fn slot_at(i: usize, hosts: &[HostRow]) -> Slot<'_> {
+    match hosts.get(i) {
+        Some(h) => Slot::Host(h),
+        None if i == hosts.len() => Slot::AddHost,
+        None => Slot::Rescan,
+    }
+}
 
 pub(crate) struct HomeScreen {
     cursor: i32,
@@ -34,6 +58,11 @@ pub(crate) struct HomeScreen {
     /// carousel culled. Scaled to match: side tiles draw at 0.88, and a press near their
     /// edge would otherwise pick a neighbour.
     geom: Vec<Rect>,
+    /// The mount entrance, playing out. `None` before the first frame (the shell clock
+    /// isn't in scope until then) and again once it has finished, so the steady state pays
+    /// nothing at all for it; [`Self::entrance_armed`] is what stops it re-arming.
+    entrance: Option<Entrance>,
+    entrance_armed: bool,
 }
 
 impl HomeScreen {
@@ -44,6 +73,8 @@ impl HomeScreen {
             bump: Spring::rest(0.0),
             keys: Vec::new(),
             geom: Vec::new(),
+            entrance: None,
+            entrance_armed: false,
         }
     }
 
@@ -52,7 +83,7 @@ impl HomeScreen {
         let keys: Vec<String> = hosts
             .iter()
             .map(|h| h.key.clone())
-            .chain(std::iter::once(ADD_KEY.to_string()))
+            .chain([ADD_KEY.to_string(), SCAN_KEY.to_string()])
             .collect();
         if keys != self.keys {
             let followed = self
@@ -70,6 +101,15 @@ impl HomeScreen {
         hosts.get(self.cursor as usize)
     }
 
+    fn slot<'h>(&self, hosts: &'h [HostRow]) -> Slot<'h> {
+        slot_at(self.cursor.max(0) as usize, hosts)
+    }
+
+    /// Tiles in the strip: every host, then Add Host, then Rescan.
+    fn len(hosts: &[HostRow]) -> usize {
+        hosts.len() + 2
+    }
+
     pub(crate) fn menu(
         &mut self,
         ev: MenuEvent,
@@ -77,27 +117,32 @@ impl HomeScreen {
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
         self.reconcile(ctx.hosts);
-        let len = ctx.hosts.len() + 1;
+        let len = Self::len(ctx.hosts);
         match ev {
             MenuEvent::Move(MenuDir::Left) => self.step(-1, len, false),
             MenuEvent::Move(MenuDir::Right) => self.step(1, len, false),
             MenuEvent::JumpBack => self.step(-5, len, true),
             MenuEvent::JumpForward => self.step(5, len, true),
             MenuEvent::Confirm => {
-                match self.focused(ctx.hosts) {
-                    None => fx.push(Screen::AddHost(super::add_host::AddHostScreen::new())),
-                    Some(h) if !h.paired => fx.push(Screen::Pair(super::pair::PairScreen::new(
-                        h,
-                        ctx.device_name,
-                    ))),
-                    Some(h) if !h.online && h.can_wake => {
+                match self.slot(ctx.hosts) {
+                    Slot::AddHost => {
+                        fx.push(Screen::AddHost(super::add_host::AddHostScreen::new()))
+                    }
+                    Slot::Rescan => {
+                        fx.cmds.push(ConsoleCmd::Probe);
+                        fx.toast = Some("Scanning for hosts…".into());
+                    }
+                    Slot::Host(h) if !h.paired => fx.push(Screen::Pair(
+                        super::pair::PairScreen::new(h, ctx.device_name),
+                    )),
+                    Slot::Host(h) if !h.online && h.can_wake => {
                         // Wake first; the wake overlay connects once it answers.
                         fx.cmds.push(ConsoleCmd::Wake {
                             key: h.key.clone(),
                             then_connect: true,
                         });
                     }
-                    Some(h) => {
+                    Slot::Host(h) => {
                         // Dial-first even when the presence pips say offline — a
                         // routed/VPN host is mDNS-blind and probe-shy but dials fine.
                         // A pinned card connects with ITS profile (one-off, §5.2a);
@@ -167,7 +212,7 @@ impl HomeScreen {
     /// safer read and the one a coverflow trains you to expect.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
         self.reconcile(ctx.hosts);
-        let len = ctx.hosts.len() + 1;
+        let len = Self::len(ctx.hosts);
         match p.kind {
             PointerKind::Scroll { up } => {
                 self.step(if up { -1 } else { 1 }, len, false);
@@ -209,13 +254,14 @@ impl HomeScreen {
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
         let mut hints = Vec::new();
-        match self.focused(ctx.hosts) {
-            None => hints.push(Hint::new(HintKey::Confirm, "Add Host")),
-            Some(h) if !h.paired => hints.push(Hint::new(HintKey::Confirm, "Pair…")),
-            Some(h) if !h.online && h.can_wake => {
+        match self.slot(ctx.hosts) {
+            Slot::AddHost => hints.push(Hint::new(HintKey::Confirm, "Add Host")),
+            Slot::Rescan => hints.push(Hint::new(HintKey::Confirm, "Scan Again")),
+            Slot::Host(h) if !h.paired => hints.push(Hint::new(HintKey::Confirm, "Pair…")),
+            Slot::Host(h) if !h.online && h.can_wake => {
                 hints.push(Hint::new(HintKey::Confirm, "Wake & Connect"))
             }
-            Some(_) => hints.push(Hint::new(HintKey::Confirm, "Connect")),
+            Slot::Host(_) => hints.push(Hint::new(HintKey::Confirm, "Connect")),
         }
         if self.focused(ctx.hosts).is_some_and(|h| h.paired && h.saved) {
             hints.push(Hint::new(HintKey::Secondary, "Library"));
@@ -246,6 +292,27 @@ impl HomeScreen {
         self.anim.settle(f64::from(self.cursor), 0.001, 0.01);
         self.bump.step(0.0, BUMP_K, BUMP_C, dt);
         self.bump.settle(0.0, 0.3, 4.0);
+        // Reduced motion drops the recoil TRAVEL but not its meaning: the refusal is
+        // already reported as a `MenuPulse::Boundary` haptic, which is the half that says
+        // "there is nothing that way". The cursor chase itself stays sprung — that is
+        // navigation, not decoration, and freezing it would make the strip jump.
+        if crate::theme::reduce_motion() {
+            self.bump = Spring::rest(0.0);
+        }
+        // Arm the mount entrance on the first frame — the constructor has no clock, and
+        // "first frame after a push" is the same moment. Anchored on the CURSOR, so a
+        // restored selection assembles around the eye rather than sweeping in from an end.
+        if !self.entrance_armed {
+            self.entrance_armed = true;
+            self.entrance = Some(Entrance::new(
+                entrances::CARDS,
+                self.cursor.max(0) as usize,
+                ctx.t,
+            ));
+        }
+        if self.entrance.is_some_and(|e| e.done(ctx.t)) {
+            self.entrance = None;
+        }
 
         let w = f64::from(rect.width());
         let tile_w = (TILE_W * k).min(w * 0.84);
@@ -256,7 +323,7 @@ impl HomeScreen {
         let cx0 = f64::from(rect.left) + w / 2.0 + self.bump.pos * k;
         let cy = f64::from(rect.top) + f64::from(rect.height()) / 2.0;
 
-        let len = ctx.hosts.len() + 1;
+        let len = Self::len(ctx.hosts);
         self.geom.clear();
         self.geom.resize(len, Rect::new_empty());
         for i in 0..len {
@@ -265,15 +332,25 @@ impl HomeScreen {
                 continue;
             }
             let f = 1.0 - d.abs().min(1.0); // 1 at focus → 0 one slot out
-            let scale = 0.88 + 0.12 * f;
-            let alpha = 0.78 + 0.22 * f;
+                                            // The entrance folds into the transform and the layer alpha this tile already
+                                            // applies — no extra pass, and once it's over the arithmetic is `* 1.0`.
+            let ent = self
+                .entrance
+                .map_or(EntranceAt::SETTLED, |e| e.at(i, ctx.t));
+            let arrive = ENTER_SCALE + (1.0 - ENTER_SCALE) * ent.travel;
+            let scale = (0.88 + 0.12 * f) * arrive;
+            let alpha = (0.78 + 0.22 * f) * ent.fade;
             let cx = cx0 + d * pitch;
+            let cy = cy + (1.0 - ent.travel) * ENTER_RISE * k;
             let tile = Rect::from_xywh(
                 (cx - tile_w / 2.0) as f32,
                 (cy - tile_h / 2.0) as f32,
                 tile_w as f32,
                 tile_h as f32,
             );
+            // Hit boxes track the DRAWN geometry, entrance included: the tile is off its
+            // berth by up to 34 dp while arriving, and a press in that second must land on
+            // the card the eye sees, not on where it is about to be.
             self.geom[i] = Rect::from_xywh(
                 (cx - tile_w * scale / 2.0) as f32,
                 (cy - tile_h * scale / 2.0) as f32,
@@ -284,7 +361,21 @@ impl HomeScreen {
             canvas.translate((cx as f32, cy as f32));
             canvas.scale((scale as f32, scale as f32));
             canvas.translate((-cx as f32, -cy as f32));
-            canvas.save_layer_alpha_f(None, alpha as f32);
+            // The layer carries the fade AND the colour recede: one matrix per card, built
+            // and thrown away here, which is free next to the aurora behind it.
+            let recede = 1.0 - f;
+            let mut lp = Paint::default();
+            lp.set_alpha_f(alpha as f32);
+            if recede > 0.001 {
+                lp.set_color_filter(skia_safe::color_filters::matrix_row_major(
+                    &crate::theme::recede_matrix(recede),
+                    None,
+                ));
+            }
+            canvas.save_layer(&skia_safe::canvas::SaveLayerRec::default().paint(&lp));
+            // The focused tile gets a palette-tinted glow UNDER its shadow — the mark that
+            // reads from a sofa, where a 12 % scale difference does not.
+            crate::theme::focus_halo(canvas, tile, TILE_CORNER as f32, k as f32, f as f32);
             if f > 0.4 {
                 crate::theme::drop_shadow(
                     canvas,
@@ -294,13 +385,17 @@ impl HomeScreen {
                     0.45 * f as f32,
                 );
             }
-            match ctx.hosts.get(i) {
-                Some(h) => draw_host_tile(canvas, fonts, h, tile, k, ctx.t),
-                None => draw_add_tile(canvas, fonts, tile, k),
+            match slot_at(i, ctx.hosts) {
+                Slot::Host(h) => draw_host_tile(canvas, fonts, h, tile, k, ctx.t),
+                Slot::AddHost => draw_action_tile(canvas, fonts, tile, k, ActionTile::AddHost),
+                Slot::Rescan => draw_action_tile(canvas, fonts, tile, k, ActionTile::Rescan),
             }
-            // The brightness recede: an opaque veil, matching the coverflow's rule.
+            // The veil, at HALF its old strength. It used to do the whole recede on its own
+            // and had to be heavy for it; now the colour matrix above drains saturation and
+            // light, and this is left doing the one job a flat darkening is actually good
+            // at — separating cards that overlap.
             if f < 1.0 {
-                let veil = (1.0 - f) as f32 * 0.24;
+                let veil = (1.0 - f) as f32 * 0.12;
                 canvas.draw_rrect(
                     RRect::new_rect_xy(tile, (TILE_CORNER * k) as f32, (TILE_CORNER * k) as f32),
                     &Paint::new(Color4f::new(0.0, 0.0, 0.0, veil), None),
@@ -338,9 +433,10 @@ fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f6
         },
         k as f32,
     );
+    crate::theme::panel_highlight(canvas, rect, TILE_CORNER as f32, k as f32);
     let pad = 20.0 * k;
     let (l, t) = (f64::from(rect.left) + pad, f64::from(rect.top) + pad);
-    draw_monogram(canvas, fonts, &h.name, h.saved, l, t, k);
+    draw_badge(canvas, fonts, &h.name, &h.os, h.saved, l, t, k);
 
     // Top-right status cluster: a lock for a paired identity, a glowing pip when live.
     let mut sx = f64::from(rect.right) - pad;
@@ -454,7 +550,16 @@ fn accent_color(hex: Option<&str>) -> skia_safe::Color4f {
     )
 }
 
-fn draw_add_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
+/// The two action tiles trailing the strip. Same shape, same badge, different mark and
+/// words — they are the same KIND of thing (something the console does, rather than
+/// somewhere it goes), and drawing them alike is what says so.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActionTile {
+    AddHost,
+    Rescan,
+}
+
+fn draw_action_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64, kind: ActionTile) {
     crate::theme::panel(
         canvas,
         rect,
@@ -463,9 +568,10 @@ fn draw_add_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
         PanelStroke::GradientDashed,
         k as f32,
     );
+    crate::theme::panel_highlight(canvas, rect, TILE_CORNER as f32, k as f32);
     let pad = 20.0 * k;
     let (l, t) = (f64::from(rect.left) + pad, f64::from(rect.top) + pad);
-    // The badge with a + instead of a monogram.
+    // The badge with a mark instead of a monogram.
     let badge = Rect::from_xywh(l as f32, t as f32, (52.0 * k) as f32, (52.0 * k) as f32);
     canvas.draw_rrect(
         RRect::new_rect_xy(badge, (15.0 * k) as f32, (15.0 * k) as f32),
@@ -486,22 +592,55 @@ fn draw_add_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
     p.set_stroke_cap(skia_safe::PaintCap::Round);
     p.set_anti_alias(true);
     let r = 9.0 * k;
-    canvas.draw_line(
-        ((bcx - r) as f32, bcy as f32),
-        ((bcx + r) as f32, bcy as f32),
-        &p,
-    );
-    canvas.draw_line(
-        (bcx as f32, (bcy - r) as f32),
-        (bcx as f32, (bcy + r) as f32),
-        &p,
-    );
+    match kind {
+        ActionTile::AddHost => {
+            canvas.draw_line(
+                ((bcx - r) as f32, bcy as f32),
+                ((bcx + r) as f32, bcy as f32),
+                &p,
+            );
+            canvas.draw_line(
+                (bcx as f32, (bcy - r) as f32),
+                (bcx as f32, (bcy + r) as f32),
+                &p,
+            );
+        }
+        // A refresh arrow: three-quarters of a circle with a head on the open end. Drawn
+        // rather than spun — the sweep's progress is reported by the toast and by hosts
+        // appearing, and a permanently spinning tile would claim work that isn't running.
+        ActionTile::Rescan => {
+            let mut arc = PathBuilder::new();
+            arc.add_arc(
+                Rect::from_xywh(
+                    (bcx - r) as f32,
+                    (bcy - r) as f32,
+                    (2.0 * r) as f32,
+                    (2.0 * r) as f32,
+                ),
+                -45.0,
+                280.0,
+            );
+            canvas.draw_path(&arc.detach(), &p);
+            let head = 4.6 * k;
+            let (hx, hy) = (bcx + r * 0.72, bcy - r * 0.72);
+            let mut tip = PathBuilder::new();
+            tip.move_to(((hx - head) as f32, (hy - head * 0.2) as f32));
+            tip.line_to(((hx + head * 0.5) as f32, (hy - head * 1.1) as f32));
+            tip.line_to(((hx + head * 0.2) as f32, (hy + head * 0.7) as f32));
+            tip.close();
+            canvas.draw_path(&tip.detach(), &Paint::new(accent(1.0), None));
+        }
+    }
 
+    let (title, sub) = match kind {
+        ActionTile::AddHost => ("Add Host", "Register a host by address"),
+        ActionTile::Rescan => ("Rescan", "Look for hosts on this network again"),
+    };
     let max_w = f64::from(rect.width()) - 2.0 * pad;
     let sub_base = f64::from(rect.bottom) - pad;
     fonts.draw_clipped(
         canvas,
-        "Register a host by address",
+        sub,
         l,
         sub_base,
         W::Regular,
@@ -511,7 +650,7 @@ fn draw_add_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
     );
     fonts.draw_clipped(
         canvas,
-        "Add Host",
+        title,
         l,
         sub_base - 22.0 * k,
         W::Bold,
@@ -521,7 +660,28 @@ fn draw_add_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
     );
 }
 
-fn draw_monogram(canvas: &Canvas, fonts: &Fonts, name: &str, filled: bool, x: f64, y: f64, k: f64) {
+/// The tile's identity badge: the host's OS mark when its advertised chain resolves to one,
+/// and its initial when it doesn't.
+///
+/// The substitution, not an addition — a badge showing both a Tux and an "L" would say the
+/// same thing twice. An older host advertises no `os` at all and an unknown chain resolves
+/// to nothing, so both keep the monogram they have always drawn, pixel for pixel.
+///
+/// Accessibility note for the ports: the mark carries no information the card doesn't
+/// already state in words. The host's NAME is right beside it, and the OS is a property of
+/// that name, so a reader that skips the badge loses nothing — which is why this is a
+/// decorative substitution and not a labelled image.
+#[allow(clippy::too_many_arguments)]
+fn draw_badge(
+    canvas: &Canvas,
+    fonts: &Fonts,
+    name: &str,
+    os: &str,
+    filled: bool,
+    x: f64,
+    y: f64,
+    k: f64,
+) {
     let badge = Rect::from_xywh(x as f32, y as f32, (52.0 * k) as f32, (52.0 * k) as f32);
     let rr = RRect::new_rect_xy(badge, (15.0 * k) as f32, (15.0 * k) as f32);
     if filled {
@@ -551,6 +711,21 @@ fn draw_monogram(canvas: &Canvas, fonts: &Fonts, name: &str, filled: bool, x: f6
         ring.set_anti_alias(true);
         canvas.draw_rrect(rr, &ring);
     }
+    let ink = if filled { fg(1.0) } else { accent(1.0) };
+    // Inset to ~54 % of the badge so the mark reads as a mark ON a badge rather than a
+    // cropped one; `os_mark` letterboxes inside that box, so a non-square master (apple is
+    // 384x512, windows 24x24) keeps its proportions.
+    let side = 28.0 * k;
+    let inner = Rect::from_xywh(
+        (x + 26.0 * k - side / 2.0) as f32,
+        (y + 26.0 * k - side / 2.0) as f32,
+        side as f32,
+        side as f32,
+    );
+    if let Some(path) = crate::os_marks::os_mark(os, inner) {
+        canvas.draw_path(&path, &Paint::new(ink, None));
+        return;
+    }
     let letter: String = name
         .trim()
         .chars()
@@ -566,7 +741,7 @@ fn draw_monogram(canvas: &Canvas, fonts: &Fonts, name: &str, filled: bool, x: f6
         y + 26.0 * k + size * 0.36,
         W::Bold,
         size,
-        if filled { fg(1.0) } else { accent(1.0) },
+        ink,
     );
 }
 

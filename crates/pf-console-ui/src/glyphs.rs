@@ -31,6 +31,112 @@ impl GlyphStyle {
     }
 }
 
+/// A compact mark for WHAT is driving the console, drawn from `(x, cy)` across `w`: a
+/// controller silhouette, or a keycap when there is no pad and the keyboard is doing the
+/// work. Says at a glance which glyph set the legend below is speaking in.
+pub(crate) fn pad_mark(
+    canvas: &Canvas,
+    style: GlyphStyle,
+    x: f64,
+    cy: f64,
+    w: f64,
+    k: f64,
+    ink: skia_safe::Color4f,
+) {
+    let mut p = Paint::new(ink, None);
+    p.set_anti_alias(true);
+    if style == GlyphStyle::Keyboard {
+        // A keycap: the same shape the hint bar draws for a key, at chip size.
+        let h = w * 0.72;
+        let r = Rect::from_xywh(x as f32, (cy - h / 2.0) as f32, w as f32, h as f32);
+        p.set_style(skia_safe::PaintStyle::Stroke);
+        p.set_stroke_width((1.3 * k) as f32);
+        canvas.draw_rrect(
+            RRect::new_rect_xy(r, (3.0 * k) as f32, (3.0 * k) as f32),
+            &p,
+        );
+        return;
+    }
+    // A gamepad: a wide rounded body with a grip under each end. Detail beyond the
+    // silhouette is invisible at 15 dp, so there is none — the outline IS the glyph.
+    let h = w * 0.52;
+    let body = Rect::from_xywh(x as f32, (cy - h / 2.0) as f32, w as f32, h as f32);
+    canvas.draw_rrect(
+        RRect::new_rect_xy(body, (h / 2.2) as f32, (h / 2.2) as f32),
+        &p,
+    );
+    let grip = (w * 0.17) as f32;
+    canvas.draw_circle(((x + w * 0.2) as f32, (cy + h * 0.36) as f32), grip, &p);
+    canvas.draw_circle(((x + w * 0.8) as f32, (cy + h * 0.36) as f32), grip, &p);
+}
+
+/// A four-segment charge pip, drawn from `(x, cy)` across `w`. Filled segments are the
+/// charge; the outline is always the full cell, so "one bar" and "four bars" occupy the
+/// same width and the chip never reflows as the pad drains.
+///
+/// Three states, in priority order. CHARGING takes the palette's accent and outranks the
+/// low warning, because a pad at 4 % on the cable is not the problem a pad at 4 % off it
+/// is. Otherwise under 20 % goes red — a fixed red, not the accent, for the same reason the
+/// error toast uses one: on a `moss` or `mint` field the accent is a colour that means
+/// "fine". Everything else is plain foreground.
+pub(crate) fn battery_pip(
+    canvas: &Canvas,
+    x: f64,
+    cy: f64,
+    w: f64,
+    k: f64,
+    b: pf_client_core::gamepad::PadBattery,
+) {
+    let h = w * 0.5;
+    let cell = Rect::from_xywh(x as f32, (cy - h / 2.0) as f32, (w * 0.86) as f32, h as f32);
+    let ink = if b.charging {
+        crate::theme::accent(1.0)
+    } else if b.percent < 20 {
+        skia_safe::Color4f::new(0.93, 0.31, 0.28, 1.0)
+    } else {
+        crate::theme::fg(0.7)
+    };
+    let mut outline = Paint::new(ink, None);
+    outline.set_anti_alias(true);
+    outline.set_style(skia_safe::PaintStyle::Stroke);
+    outline.set_stroke_width((1.2 * k) as f32);
+    let r = (2.0 * k) as f32;
+    canvas.draw_rrect(RRect::new_rect_xy(cell, r, r), &outline);
+    // The terminal nub, so the cell reads as a battery and not as a text field.
+    canvas.draw_rrect(
+        RRect::new_rect_xy(
+            Rect::from_xywh(
+                cell.right + (1.5 * k) as f32,
+                (cy - h * 0.22) as f32,
+                (1.8 * k) as f32,
+                (h * 0.44) as f32,
+            ),
+            r,
+            r,
+        ),
+        &Paint::new(ink, None),
+    );
+    // Four segments, rounded UP so a pad with any charge left always shows at least one —
+    // an empty-looking cell on a pad that still works reads as broken.
+    let filled = ((f32::from(b.percent) / 100.0) * 4.0)
+        .ceil()
+        .clamp(0.0, 4.0) as i32;
+    let pad = (1.6 * k) as f32;
+    let seg_w = (cell.width() - 2.0 * pad) / 4.0;
+    for i in 0..filled {
+        let sx = cell.left + pad + i as f32 * seg_w;
+        canvas.draw_rect(
+            Rect::from_xywh(
+                sx + 0.4 * k as f32,
+                cell.top + pad,
+                seg_w - 0.8 * k as f32,
+                cell.height() - 2.0 * pad,
+            ),
+            &Paint::new(ink, None),
+        );
+    }
+}
+
 /// What a hint's glyph depicts. `Key` renders a literal keycap chip in any style (used
 /// for keyboard fallbacks and the Deck's "Steam + X" keyboard chord).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -107,22 +213,27 @@ pub(crate) fn hint_bar(
     let h = BADGE_D * k + 2.0 * pad;
     let w = content_w + 2.0 * pad;
     let rect = Rect::from_xywh((x) as f32, (bottom - h) as f32, w as f32, h as f32);
+    // A scrim under the glass, then the SHARED glass recipe — the legend used to mix its
+    // own (a flat `fg(0.06)` wash and a hand-rolled stroke), which meant it was the one
+    // floating surface in the console that didn't pick up the palette's glass. The scrim
+    // stays because this pill sits over the aurora at full contrast, where glass alone has
+    // little to separate it from the field. Same construction as the toast.
+    let corner = (h / 2.0 / k) as f32;
     canvas.draw_rrect(
         RRect::new_rect_xy(rect, (h / 2.0) as f32, (h / 2.0) as f32),
         &Paint::new(crate::theme::shade(0.30), None),
     );
-    canvas.draw_rrect(
-        RRect::new_rect_xy(rect, (h / 2.0) as f32, (h / 2.0) as f32),
-        &Paint::new(fg(0.06), None),
+    crate::theme::panel(
+        canvas,
+        rect,
+        corner,
+        None,
+        crate::theme::PanelStroke::Plain(0.12),
+        k as f32,
     );
-    let mut sp = Paint::new(fg(0.12), None);
-    sp.set_style(skia_safe::PaintStyle::Stroke);
-    sp.set_stroke_width(1.0);
-    sp.set_anti_alias(true);
-    canvas.draw_rrect(
-        RRect::new_rect_xy(rect, (h / 2.0) as f32, (h / 2.0) as f32),
-        &sp,
-    );
+    // One lit edge per frame for the whole legend — the cost discipline the highlight is
+    // rationed by counts ROWS, and this is chrome.
+    crate::theme::panel_highlight(canvas, rect, corner, k as f32);
 
     let cy = bottom - h / 2.0;
     let mut pen = x + pad;

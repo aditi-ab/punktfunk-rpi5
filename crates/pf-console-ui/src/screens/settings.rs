@@ -68,6 +68,16 @@ enum RowId {
     /// backdrop behind this very row re-colours as it steps, which is the whole reason the
     /// picker lives on a screen rather than in a dialog.
     Palette,
+    /// Freeze the console's decorative motion — see `trust::Settings::reduce_motion`. Sits
+    /// beside the palette row for the same reason it does: both are presentation, and the
+    /// effect of stepping this one is visible on the backdrop behind it.
+    ReduceMotion,
+    /// How the game library arranges its titles — see `library::LibraryView`. Lives beside
+    /// the other presentation rows rather than on a face button in the library itself: the
+    /// library's five hints are already spoken for (A play, X copy link, Y collections,
+    /// L1/R1 jump, B back), and this is a preference you set once, not a thing you toggle
+    /// while browsing.
+    LibraryView,
 }
 
 // The couch-relevant subset grew 2026-07-31: this screen is the ONLY settings editor in
@@ -136,6 +146,8 @@ const TABS: [(&str, &[RowId]); 7] = [
         "Interface",
         &[
             RowId::Palette,
+            RowId::ReduceMotion,
+            RowId::LibraryView,
             RowId::Stats,
             RowId::Fullscreen,
             RowId::AutoWake,
@@ -722,6 +734,16 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             "Background",
             crate::library::palette(&s.ui_palette).name.into(),
         ),
+        // Phrased as the thing that is ON, not as the suppression, so "On" means the
+        // reduction is in effect — the same way every other toggle on this screen reads.
+        RowId::ReduceMotion => (None, "Reduce motion", on_off(s.reduce_motion).into()),
+        RowId::LibraryView => (
+            None,
+            "Library view",
+            crate::library::LibraryView::parse(&s.library_view)
+                .label()
+                .into(),
+        ),
         RowId::Stats => (
             None,
             "Statistics overlay",
@@ -838,6 +860,15 @@ fn detail(id: RowId) -> &'static str {
         RowId::Palette => {
             "The colour family this backdrop drifts through — it changes as you step, so \
              pick by looking. Appearance only; nothing about a stream depends on it."
+        }
+        RowId::ReduceMotion => {
+            "Freezes the backdrop and replaces the console's slides and pops with plain \
+             fades. Also the gentler choice on an OLED, where a still field can sit for \
+             hours."
+        }
+        RowId::LibraryView => {
+            "Shelf shows one cover at a time, big. Grid shows about eighteen at once — \
+             for when you already know what you are looking for."
         }
         RowId::Stats => {
             "How much the overlay shows: Compact (one line) → Normal → Detailed. \
@@ -1040,6 +1071,13 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             let all = &crate::library::PALETTES;
             let cur = all.iter().position(|p| p.id == s.ui_palette);
             step_option(cur, all.len(), delta, wrap).map(|i| s.ui_palette = all[i].id.to_string())
+        }
+        RowId::ReduceMotion => toggle(&mut s.reduce_motion, delta, wrap),
+        RowId::LibraryView => {
+            let all = &crate::library::LibraryView::ALL;
+            let cur = crate::library::LibraryView::parse(&s.library_view);
+            let at = all.iter().position(|v| *v == cur);
+            step_option(at, all.len(), delta, wrap).map(|i| s.library_view = all[i].id().into())
         }
         RowId::Fullscreen => toggle(&mut s.fullscreen_on_stream, delta, wrap),
         RowId::AutoWake => toggle(&mut s.auto_wake, delta, wrap),
@@ -1669,9 +1707,11 @@ mod tests {
                 seen.push(*id);
             }
         }
-        // The pre-tab flat list, plus the palette row and the lossless-audio row later passes added.
-        assert_eq!(seen.len(), 31, "{seen:?}");
+        // The pre-tab flat list, plus the palette row, the lossless-audio row and the
+        // reduce-motion row later passes added.
+        assert_eq!(seen.len(), 33, "{seen:?}");
         assert!(seen.contains(&RowId::Palette));
+        assert!(seen.contains(&RowId::ReduceMotion));
         assert!(seen.contains(&RowId::AudioFormat));
         // The catalog rows belong to the trailing tab, which builds them at render time.
         assert!(TABS[PROFILES_TAB].1.is_empty());

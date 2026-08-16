@@ -4,6 +4,7 @@
 //! every screen animates and reads identically.
 
 pub(crate) mod add_host;
+pub(crate) mod collections;
 pub(crate) mod home;
 pub(crate) mod host_options;
 pub(crate) mod library;
@@ -137,6 +138,9 @@ pub(crate) fn host_link(row: &HostRow) -> Option<String> {
 pub(crate) enum Screen {
     Home(home::HomeScreen),
     Library(library::LibraryScreen),
+    /// The library's groups, one tile each — the drill-in that turns "group by console"
+    /// into somewhere you can actually go.
+    Collections(collections::CollectionsScreen),
     Settings(settings::SettingsScreen),
     AddHost(add_host::AddHostScreen),
     Pair(pair::PairScreen),
@@ -156,6 +160,7 @@ impl Screen {
         match self {
             Screen::Home(s) => s.menu(ev, ctx, fx),
             Screen::Library(s) => s.menu(ev, ctx, fx),
+            Screen::Collections(s) => s.menu(ev, ctx, fx),
             Screen::Settings(s) => s.menu(ev, ctx, fx),
             Screen::AddHost(s) => s.menu(ev, ctx, fx),
             Screen::Pair(s) => s.menu(ev, ctx, fx),
@@ -173,6 +178,7 @@ impl Screen {
         match self {
             Screen::Home(s) => s.pointer(p, ctx, fx),
             Screen::Library(s) => s.pointer(p, ctx, fx),
+            Screen::Collections(s) => s.pointer(p, ctx, fx),
             Screen::Settings(s) => s.pointer(p, ctx, fx),
             Screen::AddHost(s) => s.pointer(p, ctx, fx),
             Screen::Pair(s) => s.pointer(p, ctx, fx),
@@ -212,7 +218,7 @@ impl Screen {
 
     pub(crate) fn background(&self) -> Bg {
         match self {
-            Screen::Home(_) | Screen::Library(_) => Bg::Aurora,
+            Screen::Home(_) | Screen::Library(_) | Screen::Collections(_) => Bg::Aurora,
             _ => Bg::Form,
         }
     }
@@ -221,6 +227,7 @@ impl Screen {
         match self {
             Screen::Home(_) => "Select a Host".into(),
             Screen::Library(s) => s.title(),
+            Screen::Collections(s) => s.title(),
             Screen::Settings(_) => "Settings".into(),
             Screen::AddHost(s) => s.title(),
             Screen::Pair(s) => format!("Pair with {}", s.host_name()),
@@ -233,6 +240,7 @@ impl Screen {
         match self {
             Screen::Home(s) => s.hints(ctx),
             Screen::Library(s) => s.hints(ctx),
+            Screen::Collections(s) => s.hints(ctx),
             Screen::Settings(s) => s.hints(ctx),
             Screen::AddHost(s) => s.hints(ctx),
             Screen::Pair(s) => s.hints(ctx),
@@ -256,6 +264,7 @@ impl Screen {
         match self {
             Screen::Home(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::Library(s) => s.render(canvas, rect, k, dt, fonts, ctx),
+            Screen::Collections(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::Settings(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::AddHost(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::Pair(s) => s.render(canvas, rect, k, dt, fonts, ctx),

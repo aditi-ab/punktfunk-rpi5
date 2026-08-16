@@ -1,11 +1,54 @@
 //! The console shell's modal overlays (connecting / waking / toast / full-screen takeover).
 
-use crate::anim::{approach, ease_out_cubic};
+use crate::anim::{approach, springs};
 use crate::glyphs::{hint_bar, Hint, HintKey};
 use crate::theme::{fg, Fonts, PanelStroke, W};
-use skia_safe::{gradient, Canvas, Paint, Point, Rect, TileMode};
+use skia_safe::{gradient, Canvas, Color4f, Paint, PathBuilder, Point, Rect, TileMode};
 
-use super::{Shell, BOTTOM_BAND};
+use super::{Shell, ToastMark, BOTTOM_BAND};
+
+/// The toast's leading mark, centred on `(cx, cy)` in a ~13 dp box.
+fn draw_toast_mark(canvas: &Canvas, mark: ToastMark, cx: f64, cy: f64, k: f64, ink: Color4f) {
+    let mut p = Paint::new(ink, None);
+    p.set_anti_alias(true);
+    match mark {
+        ToastMark::Dot => {
+            canvas.draw_circle((cx as f32, cy as f32), (3.4 * k) as f32, &p);
+        }
+        ToastMark::Check => {
+            p.set_style(skia_safe::PaintStyle::Stroke);
+            p.set_stroke_width((1.9 * k) as f32);
+            p.set_stroke_cap(skia_safe::PaintCap::Round);
+            p.set_stroke_join(skia_safe::PaintJoin::Round);
+            let r = 5.0 * k;
+            let mut path = PathBuilder::new();
+            path.move_to(((cx - r) as f32, cy as f32));
+            path.line_to(((cx - r * 0.25) as f32, (cy + r * 0.7) as f32));
+            path.line_to(((cx + r) as f32, (cy - r * 0.7) as f32));
+            canvas.draw_path(&path.detach(), &p);
+        }
+        ToastMark::Bang => {
+            // A stem and a dot rather than a glyph: at 0.75× k an "!" from the text font
+            // would be two pixels of stem and disappear.
+            let r = 5.4 * k;
+            let w = 2.0 * k;
+            canvas.draw_rrect(
+                skia_safe::RRect::new_rect_xy(
+                    Rect::from_xywh(
+                        (cx - w / 2.0) as f32,
+                        (cy - r) as f32,
+                        w as f32,
+                        (r * 1.35) as f32,
+                    ),
+                    (w / 2.0) as f32,
+                    (w / 2.0) as f32,
+                ),
+                &p,
+            );
+            canvas.draw_circle((cx as f32, (cy + r * 0.72) as f32), (w * 0.62) as f32, &p);
+        }
+    }
+}
 
 impl Shell {
     #[allow(clippy::too_many_arguments)]
@@ -94,51 +137,81 @@ impl Shell {
             );
         }
 
-        // The toast: a transient pill above the hint bar; slides in, fades out.
+        // The toast: a transient pill above the hint bar; springs in, fades out.
         if self.toast.as_ref().is_some_and(|toast| t - toast.at > 4.0) {
             self.toast = None;
         }
-        if let Some(toast) = &self.toast {
+        if let Some(toast) = &mut self.toast {
             let age = t - toast.at;
-            {
-                let slide = ease_out_cubic((age / 0.25).min(1.0));
-                let fade = if age > 3.4 {
-                    (1.0 - (age - 3.4) / 0.6).max(0.0)
-                } else {
-                    1.0
-                };
-                let alpha = (slide * fade) as f32;
-                let size = 13.0 * k;
-                let tw = f64::from(fonts.measure(&toast.text, W::Medium, size));
-                let (pad_x, bh) = (16.0 * k, 34.0 * k);
-                let bw = tw + 2.0 * pad_x;
-                let bx = (w - bw) / 2.0;
-                let by = h - BOTTOM_BAND * k - bh - 8.0 * k + (1.0 - slide) * 12.0 * k;
-                canvas.save_layer_alpha_f(None, alpha);
-                let rect = Rect::from_xywh(bx as f32, by as f32, bw as f32, bh as f32);
-                canvas.draw_rrect(
-                    skia_safe::RRect::new_rect_xy(rect, (bh / 2.0) as f32, (bh / 2.0) as f32),
-                    &Paint::new(crate::theme::shade(0.6), None),
-                );
-                crate::theme::panel(
-                    canvas,
-                    rect,
-                    (bh / 2.0 / k) as f32,
-                    None,
-                    PanelStroke::Plain(0.14),
-                    k as f32,
-                );
-                fonts.draw(
-                    canvas,
-                    &toast.text,
-                    bx + pad_x,
-                    by + bh / 2.0 + size * 0.36,
-                    W::Medium,
-                    size,
-                    fg(0.92),
-                );
-                canvas.restore();
+            if crate::theme::reduce_motion() {
+                toast.seat = crate::anim::Spring::rest(1.0);
+            } else {
+                toast.seat.step_spec(1.0, springs::INDICATOR, dt);
+                toast.seat.settle(1.0, 0.001, 0.01);
             }
+            // The seat drives the SLIDE; the fade is deliberately still linear-in-time,
+            // because a dismissal is a deadline (4 s) and not a gesture.
+            let slide = toast.seat.pos.clamp(0.0, 1.0);
+            let fade = if age > 3.4 {
+                (1.0 - (age - 3.4) / 0.6).max(0.0)
+            } else {
+                1.0
+            };
+            let alpha = (slide * fade) as f32;
+            let (tint, mark) = toast.kind.look();
+            let size = 13.0 * k;
+            let tw = f64::from(fonts.measure(&toast.text, W::Medium, size));
+            let (pad_x, bh) = (16.0 * k, 34.0 * k);
+            // Leading run: hairline, air, mark, air — then the text.
+            let (hair_w, mark_w, gap) = (3.0 * k, 13.0 * k, 9.0 * k);
+            let lead = hair_w + gap + mark_w + gap;
+            let bw = lead + tw + 2.0 * pad_x;
+            let bx = (w - bw) / 2.0;
+            let by = h - BOTTOM_BAND * k - bh - 8.0 * k + (1.0 - slide) * 12.0 * k;
+            canvas.save_layer_alpha_f(None, alpha);
+            let rect = Rect::from_xywh(bx as f32, by as f32, bw as f32, bh as f32);
+            canvas.draw_rrect(
+                skia_safe::RRect::new_rect_xy(rect, (bh / 2.0) as f32, (bh / 2.0) as f32),
+                &Paint::new(crate::theme::shade(0.6), None),
+            );
+            crate::theme::panel(
+                canvas,
+                rect,
+                (bh / 2.0 / k) as f32,
+                None,
+                PanelStroke::Plain(0.14),
+                k as f32,
+            );
+            let cy = by + bh / 2.0;
+            // The hairline: the kind, readable from a couch without reading the words.
+            let hair = Rect::from_xywh(
+                (bx + pad_x) as f32,
+                (cy - 8.0 * k) as f32,
+                hair_w as f32,
+                (16.0 * k) as f32,
+            );
+            canvas.draw_rrect(
+                skia_safe::RRect::new_rect_xy(hair, (hair_w / 2.0) as f32, (hair_w / 2.0) as f32),
+                &Paint::new(tint, None),
+            );
+            draw_toast_mark(
+                canvas,
+                mark,
+                bx + pad_x + hair_w + gap + mark_w / 2.0,
+                cy,
+                k,
+                tint,
+            );
+            fonts.draw(
+                canvas,
+                &toast.text,
+                bx + pad_x + lead,
+                cy + size * 0.36,
+                W::Medium,
+                size,
+                fg(0.92),
+            );
+            canvas.restore();
         }
     }
     /// A full-screen connect/wake takeover: a fresh aurora over everything (so the carousel and

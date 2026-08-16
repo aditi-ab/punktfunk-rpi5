@@ -6,42 +6,58 @@ use punktfunk_core::config::GamepadPref;
 
 /// The screen-transition contract, against the shared vectors. Every client re-implements this
 /// motion in its own animation system, so the numbers exist in three places and drifted in two of
-/// them before this test.
+/// them before there was a test.
 ///
-/// The EASING is sampled rather than compared as control points, and that is the point of it:
-/// this side is the analytic `1 − (1−t)³`, Android reproduces it exactly, and SwiftUI can only
-/// approximate it with a Bézier. Worse, two different Béziers are published under the name
-/// "easeOutCubic" — `(0.215, 0.61, 0.355, 1)` and `(0.33, 1, 0.68, 1)` — and neither IS this
-/// curve; they differ from it by up to ~0.08 at the midpoint, which is visible on a 260 ms
-/// transition. Samples with a tolerance are the only form all three runtimes can meet.
+/// This side reads `motion_spring` (vectors version 2). The v1 `motion` block is still in the
+/// file and still correct — the Android client's `ConsoleVectorsTest` pins it, and the Apple
+/// client's `GamepadShell` mirrors its constants — but the desktop console's transition is a
+/// damped spring now rather than a 0.26 s ease-out-cubic, so it no longer implements that block
+/// and says so here rather than quietly passing a test about a curve it does not run.
+///
+/// Springs are INTEGRATOR-dependent, which is why v2 pins parameters where v1 pinned sampled
+/// positions: two runtimes that both honour `response`/`damping` agree to the eye and disagree
+/// in the third decimal, and sampling would pin the disagreement instead of the feel.
 #[test]
 fn motion_matches_the_shared_vectors() {
     let raw = include_str!("../../../../clients/shared/console-vectors.json");
     let file: serde_json::Value =
         serde_json::from_str(raw).expect("console-vectors.json must parse");
-    let motion = &file["motion"];
-    let want_s = motion["transition_s"].as_f64().expect("transition_s");
-    assert!(
-        (TRANSITION_S - want_s).abs() < 1e-9,
-        "TRANSITION_S is {TRANSITION_S}, vectors say {want_s}"
+    assert_eq!(
+        file["version"].as_u64(),
+        Some(2),
+        "the spring block arrived with version 2"
     );
 
-    let curve = &motion["ease_out_cubic"];
-    let tol = curve["tolerance"].as_f64().expect("tolerance");
-    let samples = curve["samples"].as_array().expect("samples");
-    assert!(
-        samples.len() >= 5,
-        "the curve needs enough samples to pin it"
-    );
-    for s in samples {
-        let t = s["t"].as_f64().expect("t");
-        let want = s["p"].as_f64().expect("p");
-        let got = crate::anim::ease_out_cubic(t);
+    let m = &file["motion_spring"];
+    let num = |key: &str| m[key].as_f64().unwrap_or_else(|| panic!("{key} missing"));
+    let close = |what: &str, got: f64, want: f64| {
         assert!(
-            (got - want).abs() <= tol,
-            "ease_out_cubic({t}) is {got}, vectors say {want} (±{tol})"
+            (got - want).abs() < 1e-9,
+            "{what} is {got}, vectors say {want}"
         );
-    }
+    };
+    close(
+        "response",
+        crate::anim::springs::NAV.response,
+        num("response"),
+    );
+    close("damping", crate::anim::springs::NAV.damping, num("damping"));
+    close("push slide", NAV_SLIDE_DP, num("push_slide_dp"));
+    close("enter scale", NAV_ENTER_SCALE, num("enter_scale"));
+    close("exit scale", NAV_EXIT_SCALE, num("exit_scale"));
+    close("reveal alpha", NAV_REVEAL_ALPHA, num("reveal_alpha"));
+    assert_eq!(
+        m["interruptible"].as_bool(),
+        Some(true),
+        "this client's transitions accept Back mid-flight; the block must say so"
+    );
+
+    // The v1 block stays put until the last client migrates, and stays MARKED so nobody
+    // reads it as live. Deleting it here would silently red Android's test instead.
+    assert!(
+        file["motion"]["$deprecated"].is_string(),
+        "the v1 motion block must carry its deprecation note while other clients read it"
+    );
 }
 
 /// Point the settings/known-hosts stores at a throwaway HOME — the settings screen
@@ -179,8 +195,28 @@ fn connect_flow_raises_launch_and_cancel() {
 }
 
 fn finish_motion(s: &mut Shell) {
-    // Transitions block input; tests fast-forward them.
-    s.motion = Motion::None;
+    // Tests fast-forward transitions. Seats the spring on its target and runs the REAL
+    // settle, rather than wishing the motion away — otherwise a reversed push would skip
+    // the bookkeeping that takes its screen back off the stack.
+    if let Motion::Nav { spring, target, .. } = &mut s.motion {
+        spring.pos = *target;
+        spring.vel = 0.0;
+    }
+    s.finish_nav();
+}
+
+/// Step the transition at a fixed `dt` until it settles, collecting every position it
+/// passed through. Bounded so a spring that never settles fails the test instead of
+/// hanging it.
+fn run_motion(s: &mut Shell) -> Vec<f64> {
+    let mut path = Vec::new();
+    for _ in 0..600 {
+        match s.advance_nav(1.0 / 120.0) {
+            Some(p) => path.push(p),
+            None => return path,
+        }
+    }
+    panic!("transition never settled");
 }
 
 /// A pinned host+profile card's library launches with THAT profile (design §5.2a).
@@ -225,6 +261,7 @@ fn a_pinned_cards_library_launches_with_its_profile() {
         store: "steam".into(),
         launcher: false,
         icon: String::new(),
+        platform: None,
     }]);
     s.handle_menu(MenuEvent::Confirm);
     match s.take_action() {
@@ -256,6 +293,7 @@ fn a_primary_tiles_library_leaves_the_profile_to_the_binding() {
         store: "steam".into(),
         launcher: false,
         icon: String::new(),
+        platform: None,
     }]);
     s.handle_menu(MenuEvent::Confirm);
     assert!(matches!(
@@ -335,7 +373,13 @@ fn a_secondary_press_goes_back() {
         kind: crate::pointer::PointerKind::Back,
     }));
     // The pop runs through the same transition a B press does.
-    assert!(matches!(s.motion, Motion::Pop { .. }));
+    assert!(matches!(
+        s.motion,
+        Motion::Nav {
+            kind: NavKind::Pop,
+            ..
+        }
+    ));
 }
 
 /// Up on a saved tile opens that host's menu; a discovered-but-unsaved one has none.
@@ -395,6 +439,377 @@ fn every_settings_tab_rasters() {
     // A narrow window is the case the strip has to shrink for (the pills are laid out from
     // measured text, so a too-small width must clamp rather than lay out off-screen).
     s.render(surface.canvas(), 640, 400, &fonts, None, None, &pads);
+}
+
+/// The work package's whole reason for existing: Back pressed mid-push is HEARD, and it
+/// turns the screen around rather than queuing a second animation behind the first.
+///
+/// The continuity assertion is the important half. A naive "cancel and play a pop" reads
+/// as a snap because the two recipes disagree about where things are; retargeting the same
+/// spring cannot snap, because position is carried and only the target moved. This asserts
+/// the position never jumps by more than a frame's worth of the travel it was already
+/// doing.
+#[test]
+fn back_mid_push_turns_the_screen_around() {
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    s.handle_menu(MenuEvent::Tertiary); // X → Settings
+    assert_eq!(s.stack.len(), 2);
+
+    // Let it get properly under way, then interrupt.
+    let mut before = 0.0;
+    for _ in 0..12 {
+        before = s.advance_nav(1.0 / 120.0).expect("still in flight");
+    }
+    assert!(before > 0.05 && before < 0.95, "mid-flight, got {before}");
+    assert!(s.nav_back(), "Back is answered by the transition itself");
+    assert_eq!(
+        s.stack.len(),
+        2,
+        "the screen is still on the stack while it flies back"
+    );
+
+    let path = run_motion(&mut s);
+    assert!(!path.is_empty(), "the reversal actually animated");
+    // No snap: the first sample after the retarget continues from where it was.
+    assert!(
+        (path[0] - before).abs() < 0.05,
+        "jumped from {before} to {}",
+        path[0]
+    );
+    // And it goes DOWN — the screen is leaving, having briefly been arriving.
+    assert!(*path.last().expect("non-empty") < before);
+    assert_eq!(
+        s.stack.len(),
+        1,
+        "the reversed push took its screen back off"
+    );
+    assert!(matches!(s.motion, Motion::None));
+}
+
+/// Back at the ROOT is not a reversal — there is no parent to fall back to, and B there
+/// means quit. The transition declines it so the normal path can answer.
+#[test]
+fn back_mid_push_at_the_root_is_left_to_the_normal_path() {
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    // A Replace at the root pushes without deepening the stack.
+    s.apply_nav(crate::screens::Nav::Replace(Box::new(Screen::Home(
+        HomeScreen::new(),
+    ))));
+    assert_eq!(s.stack.len(), 1);
+    s.advance_nav(1.0 / 120.0);
+    assert!(!s.nav_back(), "nothing to reverse into");
+    finish_motion(&mut s);
+    assert_eq!(s.stack.len(), 1, "and the root survived");
+}
+
+/// A mid-pop A is refused: activating a half-dismissed screen is a mis-tap, not intent.
+/// A mid-pop BACK, on the other hand, is exactly what a held B is — it starts the next pop
+/// at once, which is the stutter this work package removes.
+#[test]
+fn mid_pop_refuses_confirm_but_honours_another_back() {
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    s.handle_menu(MenuEvent::Tertiary); // → Settings
+    finish_motion(&mut s);
+    s.handle_menu(MenuEvent::Move(MenuDir::Down)); // a row that would push if activated
+    s.handle_menu(MenuEvent::Back); // start the pop
+    assert!(matches!(s.motion, Motion::Nav { .. }));
+    let mid = s.advance_nav(1.0 / 120.0).expect("in flight");
+    assert!(mid < NAV_INPUT_OPENS, "the test needs an early sample");
+
+    let depth = s.stack.len();
+    assert!(
+        s.handle_menu(MenuEvent::Confirm).is_none(),
+        "A mid-pop does nothing"
+    );
+    assert_eq!(s.stack.len(), depth, "and pushes nothing");
+
+    // Back again, though, walks out another level — here that is the root, so it quits.
+    s.handle_menu(MenuEvent::Back);
+    finish_motion(&mut s);
+    assert!(matches!(s.take_action(), Some(OverlayAction::Quit)));
+}
+
+/// A completed pop frees the screen it was carrying, and hint rects are published only
+/// once the shell is settled — the invariant that predates springs and survives them,
+/// because "settled" is still exactly `Motion::None`.
+#[test]
+fn a_completed_pop_frees_its_screen_and_republishes_hints() {
+    let fonts = crate::theme::build_fonts().unwrap();
+    let pads: Vec<PadInfo> = Vec::new();
+    let (w, h) = (640u32, 400u32);
+    let mut surface = skia_safe::surfaces::raster_n32_premul((w as i32, h as i32)).unwrap();
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    s.handle_menu(MenuEvent::Tertiary);
+    finish_motion(&mut s);
+    s.handle_menu(MenuEvent::Back);
+
+    // Mid-pop: a screen is being carried, and the legend is not clickable.
+    assert!(
+        matches!(
+            &s.motion,
+            Motion::Nav {
+                leaving: Some(_),
+                ..
+            }
+        ),
+        "the popped screen is parked on the motion"
+    );
+    s.render(surface.canvas(), w, h, &fonts, None, None, &pads);
+    assert!(
+        s.hint_rects.is_empty(),
+        "mid-transition the drawn rects are slid and scaled, so none are published"
+    );
+
+    run_motion(&mut s);
+    assert!(matches!(s.motion, Motion::None));
+    s.render(surface.canvas(), w, h, &fonts, None, None, &pads);
+    assert!(
+        !s.hint_rects.is_empty(),
+        "settled, the legend is clickable again"
+    );
+}
+
+/// Draw one frame at a small size. A freshly pushed screen has not seen the shared model
+/// yet — it adopts it on its first sync — so a test that asserts on a screen's CONTENT
+/// straight after pushing it is asking before the answer exists. The app always renders;
+/// so does this.
+fn frame(s: &mut Shell) {
+    let fonts = crate::theme::build_fonts().unwrap();
+    let pads: Vec<PadInfo> = Vec::new();
+    let mut surface = skia_safe::surfaces::raster_n32_premul((480, 300)).unwrap();
+    s.render(surface.canvas(), 480, 300, &fonts, None, None, &pads);
+}
+
+/// A library with more than one group, for the collections flow.
+fn mixed_library(library: &LibraryShared) {
+    let g = |id: &str, title: &str, store: &str, platform: Option<&str>, launcher: bool| {
+        crate::library::LibraryGame {
+            id: id.into(),
+            title: title.into(),
+            store: store.into(),
+            launcher,
+            icon: String::new(),
+            platform: platform.map(str::to_string),
+        }
+    };
+    library.set_games(vec![
+        g("l1", "Steam Big Picture", "steam", None, true),
+        g("s1", "Dota 2", "steam", None, false),
+        g("s2", "Half-Life", "steam", None, false),
+        g("p1", "Demon's Souls", "custom", Some("PS3"), false),
+        g("p2", "The Last of Us", "custom", Some("PS3"), false),
+        g("n1", "Super Metroid", "custom", Some("SNES"), false),
+    ]);
+}
+
+/// The user's flow, verbatim: group by platform, walk the platforms, pick PS3, see its
+/// games — and get back out again. This is the whole point of Part C, so it is asserted
+/// end to end rather than in pieces.
+#[test]
+fn collections_drill_in_reaches_one_platform_and_backs_out() {
+    let (mut s, _console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    mixed_library(&library);
+    s.handle_menu(MenuEvent::Secondary); // Y at home → this host's library
+    finish_motion(&mut s);
+    assert!(matches!(s.stack.last(), Some(Screen::Library(_))));
+
+    // Y again → Collections.
+    s.handle_menu(MenuEvent::Secondary);
+    finish_motion(&mut s);
+    assert!(
+        matches!(s.stack.last(), Some(Screen::Collections(_))),
+        "Y on a multi-group library opens the collections"
+    );
+
+    // Walk to the PS3 tile. Groups sort A–Z with launchers pinned first, so the strip
+    // reads: Launchers, PS3, SNES, Steam.
+    s.handle_menu(MenuEvent::Move(MenuDir::Right));
+
+    // A opens that collection as a filtered shelf.
+    s.handle_menu(MenuEvent::Confirm);
+    finish_motion(&mut s);
+    frame(&mut s); // the new shelf adopts the shared model on its first sync
+    let Some(Screen::Library(shelf)) = s.stack.last() else {
+        panic!("A on a collection tile opens a shelf");
+    };
+    assert_eq!(shelf.len_for_test(), 2, "PS3 has exactly its two titles");
+    assert!(
+        shelf.title().ends_with("PS3"),
+        "the breadcrumb names the collection: {}",
+        shelf.title()
+    );
+
+    // B B walks back out to the unfiltered shelf.
+    s.handle_menu(MenuEvent::Back);
+    finish_motion(&mut s);
+    assert!(matches!(s.stack.last(), Some(Screen::Collections(_))));
+    s.handle_menu(MenuEvent::Back);
+    finish_motion(&mut s);
+    frame(&mut s);
+    let Some(Screen::Library(shelf)) = s.stack.last() else {
+        panic!("back to the library");
+    };
+    assert_eq!(shelf.len_for_test(), 6, "the whole library again");
+}
+
+/// The gate: a library with nothing to collect must not offer the button, and must not
+/// answer it either — a hint and its press have to agree.
+#[test]
+fn collections_is_offered_only_when_there_is_something_to_browse() {
+    let (mut s, _console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    // One store, no platforms: a single group.
+    library.set_games(vec![
+        crate::library::LibraryGame {
+            id: "a".into(),
+            title: "Dota 2".into(),
+            store: "steam".into(),
+            launcher: false,
+            icon: String::new(),
+            platform: None,
+        },
+        crate::library::LibraryGame {
+            id: "b".into(),
+            title: "Half-Life".into(),
+            store: "steam".into(),
+            launcher: false,
+            icon: String::new(),
+            platform: None,
+        },
+    ]);
+    s.handle_menu(MenuEvent::Secondary);
+    finish_motion(&mut s);
+    assert!(matches!(s.stack.last(), Some(Screen::Library(_))));
+    let depth = s.stack.len();
+    assert!(matches!(
+        s.handle_menu(MenuEvent::Secondary),
+        Some(MenuPulse::Boundary)
+    ));
+    assert_eq!(s.stack.len(), depth, "and pushed nothing");
+
+    // Now give it a second group and the same press works.
+    mixed_library(&library);
+    s.handle_menu(MenuEvent::Secondary);
+    finish_motion(&mut s);
+    assert!(matches!(s.stack.last(), Some(Screen::Collections(_))));
+}
+
+/// The trailing Rescan tile asks discovery to look again — and nothing else. It sits one
+/// step past Add Host, where a mis-timed press used to land on nothing at all, so the test
+/// that matters is that it CANNOT connect: an accidental A on the end of the strip must
+/// never start a session.
+#[test]
+fn the_rescan_tile_probes_and_never_connects() {
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    // Walk to the very end of the strip: hosts, then Add Host, then Rescan.
+    for _ in 0..12 {
+        s.handle_menu(MenuEvent::Move(MenuDir::Right));
+    }
+    assert!(
+        s.stack
+            .last()
+            .is_some_and(|sc| matches!(sc, Screen::Home(_))),
+        "still on the home carousel"
+    );
+    s.handle_menu(MenuEvent::Confirm);
+
+    assert!(
+        s.take_action().is_none(),
+        "a scan must raise no Launch, and no Quit"
+    );
+    assert!(s.connecting.is_none(), "and must not open the connect card");
+    assert_eq!(s.stack.len(), 1, "and must push no screen");
+    assert!(s.toast.is_some(), "it says it is scanning");
+    // One step back is Add Host, which DOES push — proof the walk reached the end rather
+    // than stalling somewhere harmless.
+    s.handle_menu(MenuEvent::Move(MenuDir::Left));
+    s.handle_menu(MenuEvent::Confirm);
+    assert!(
+        matches!(s.stack.last(), Some(Screen::AddHost(_))),
+        "the tile before Rescan is Add Host"
+    );
+}
+
+/// The three toast kinds must be tellable apart WITHOUT reading the words — that is the
+/// whole reason the kind exists. In particular the error tint is fixed rather than
+/// palette-derived: `moss`'s accent is a green and `ember`'s is an orange, and reporting a
+/// failure in the colour the rest of the UI uses for "this is fine" is exactly the bug.
+#[test]
+fn toast_kinds_are_visually_distinct() {
+    use crate::shell::{ToastKind, ToastMark};
+    let (info_c, info_m) = ToastKind::Info.look();
+    let (ok_c, ok_m) = ToastKind::Success.look();
+    let (err_c, err_m) = ToastKind::Error.look();
+    assert_eq!(info_m, ToastMark::Dot);
+    assert_eq!(ok_m, ToastMark::Check);
+    assert_eq!(err_m, ToastMark::Bang);
+    let rgb = |c: skia_safe::Color4f| (c.r, c.g, c.b);
+    assert_ne!(rgb(info_c), rgb(ok_c));
+    assert_ne!(rgb(ok_c), rgb(err_c));
+
+    // Swap in a green-accented palette: Success follows it, Error must not.
+    crate::theme::set_ink(crate::theme::Ink::of(crate::library::palette("moss")));
+    let (ok_moss, _) = ToastKind::Success.look();
+    let (err_moss, _) = ToastKind::Error.look();
+    assert_ne!(
+        rgb(ok_moss),
+        rgb(ok_c),
+        "Success takes the palette's accent, so it moved"
+    );
+    assert_eq!(
+        rgb(err_moss),
+        rgb(err_c),
+        "Error is fixed and must NOT follow the palette"
+    );
+}
+
+/// Reduced motion: the setting round-trips through the store, the backdrop shader's clock
+/// freezes, and the transition shortens. The clock is asserted through `field_clock`
+/// rather than by diffing pixels because that IS the decision — `draw_aurora` has exactly
+/// one place it reads time, and both callers (the screens and the connect takeover) go
+/// through it.
+#[test]
+fn reduce_motion_freezes_the_field_and_shortens_the_transition() {
+    let fonts = crate::theme::build_fonts().unwrap();
+    let pads: Vec<PadInfo> = Vec::new();
+    let (w, h) = (1280u32, 800u32);
+    let mut surface = skia_safe::surfaces::raster_n32_premul((w as i32, h as i32)).unwrap();
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+
+    assert!(!s.settings.reduce_motion, "off by default");
+    assert_eq!(s.field_clock(12.5), 12.5);
+    assert_eq!(s.nav_spec().damping, crate::anim::springs::NAV.damping);
+
+    s.settings.reduce_motion = true;
+    assert_eq!(s.field_clock(12.5), 0.0, "the field stops drifting");
+    let spec = s.nav_spec();
+    assert_eq!(
+        spec.damping, 1.0,
+        "critically damped: it arrives, never bounces"
+    );
+    assert!(
+        spec.response < crate::anim::springs::NAV.response,
+        "and quicker"
+    );
+    // …and a frame still draws (the shader runs at t = 0 like any other phase).
+    s.render(surface.canvas(), w, h, &fonts, None, None, &pads);
+
+    // Round-trip through the settings file, which is what makes it survive a restart.
+    s.settings.save();
+    let back = pf_client_core::trust::Settings::load();
+    assert!(back.reduce_motion, "persisted");
+    s.settings.reduce_motion = false;
+    s.settings.save();
+    assert!(
+        !pf_client_core::trust::Settings::load().reduce_motion,
+        "and back off again"
+    );
 }
 
 /// Render every console scene to PNGs for the eyeball pass (ignored; run with
@@ -519,6 +934,7 @@ fn dump_console_screens() {
             store: "steam".into(),
             launcher: false,
             icon: String::new(),
+            platform: None,
         })
         .collect(),
     );

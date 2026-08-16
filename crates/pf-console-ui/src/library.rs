@@ -26,10 +26,20 @@ pub const RECEDE_SCALE: f64 = 0.24;
 pub const ROTATE_DEG: f64 = 38.0;
 /// Perspective depth for the tilt, px (CSS `perspective()` semantics).
 pub const PERSPECTIVE: f64 = 800.0;
-/// The darkening veil's max opacity (side cards stay opaque — they overlap).
-pub const RECEDE_DIM: f64 = 0.30;
+/// The darkening veil's max opacity (side cards stay opaque — they overlap). HALVED when
+/// the colour recede landed: this used to carry the whole "further away" reading on its
+/// own and had to be heavy for it, and is now left doing the one job a flat darkening is
+/// good at — separating cards that overlap. See `theme::recede_matrix`.
+pub const RECEDE_DIM: f64 = 0.15;
 /// Boundary recoil: a refused move deflects the strip this many px against the push.
 pub const BUMP_PX: f64 = 16.0;
+/// Mount entrance (see [`crate::anim::Entrance`]): a card arrives at this scale, this many
+/// design units below its berth, and — where the surface can turn a card at all — this many
+/// degrees away from the viewer. Shared by the home carousel and the library coverflow so
+/// the two read as one console arriving, not two widgets each with its own idea.
+pub const ENTER_SCALE: f64 = 0.74;
+pub const ENTER_RISE: f64 = 34.0;
+pub const ENTER_TURN_DEG: f64 = 62.0;
 /// L1/R1 jump distance.
 pub const JUMP: i32 = 5;
 
@@ -84,6 +94,97 @@ pub fn step_cursor(cursor: i32, len: usize, delta: i32, clamp: bool) -> StepResu
         (cursor + delta).clamp(0, max)
     } else {
         cursor + delta
+    };
+    if target == cursor || target < 0 || target > max {
+        StepResult::Boundary
+    } else {
+        StepResult::Moved(target)
+    }
+}
+
+/// Which arrangement the library draws in.
+///
+/// The shelf is a browsing surface — one title at a time, big, with its artwork doing the
+/// talking. The grid is a FINDING surface: ~18 covers at once instead of the coverflow's
+/// legible three, for the moment you know what you want and just need to see it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LibraryView {
+    #[default]
+    Shelf,
+    Grid,
+}
+
+impl LibraryView {
+    /// Parse the persisted `library_view` value, leniently — an unknown string is a newer
+    /// client's, and the right answer to one is the shelf everyone already has.
+    pub fn parse(s: &str) -> LibraryView {
+        match s {
+            "grid" => LibraryView::Grid,
+            _ => LibraryView::Shelf,
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            LibraryView::Shelf => "shelf",
+            LibraryView::Grid => "grid",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LibraryView::Shelf => "Shelf",
+            LibraryView::Grid => "Grid",
+        }
+    }
+
+    pub const ALL: [LibraryView; 2] = [LibraryView::Shelf, LibraryView::Grid];
+}
+
+/// Grid cell geometry: the same 2:3 as the coverflow poster at roughly two-thirds the size,
+/// which is what puts three rows on a Deck's 800-tall panel with the detail band still
+/// readable underneath.
+pub const GRID_W: f64 = 150.0;
+pub const GRID_H: f64 = 225.0;
+pub const GRID_GAP: f64 = 16.0;
+
+/// Which way a grid cursor is being pushed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridDir {
+    Left,
+    Right,
+    Up,
+    Down,
+    PageBack,
+    PageForward,
+}
+
+/// How many rows a shoulder press jumps.
+pub const GRID_PAGE_ROWS: i32 = 3;
+
+/// Cursor arithmetic for a 2-D grid, `cols` wide.
+///
+/// Left/right walk WITHIN a row and refuse at its ends, which is the shelf's rule and the
+/// one a thumb already knows — wrapping to the next row would make a held Right scan the
+/// whole library, and there are shoulders for that.
+///
+/// Up/down move by a whole row and CLAMP into the tail row rather than refusing. A short
+/// last row is a layout accident, not a boundary the user chose to hit: pressing Down from
+/// above the gap should land on the last title, not thud.
+pub fn grid_step(cursor: i32, len: usize, cols: usize, dir: GridDir) -> StepResult {
+    if len == 0 || cols == 0 {
+        return StepResult::Boundary;
+    }
+    let (max, cols_i) = (len as i32 - 1, cols as i32);
+    let col = cursor.rem_euclid(cols_i);
+    let target = match dir {
+        GridDir::Left if col > 0 => cursor - 1,
+        GridDir::Right if col < cols_i - 1 => cursor + 1,
+        GridDir::Left | GridDir::Right => return StepResult::Boundary,
+        GridDir::Up => cursor - cols_i,
+        GridDir::Down => (cursor + cols_i).min(max),
+        GridDir::PageBack => (cursor - cols_i * GRID_PAGE_ROWS).max(0),
+        GridDir::PageForward => (cursor + cols_i * GRID_PAGE_ROWS).min(max),
     };
     if target == cursor || target < 0 || target > max {
         StepResult::Boundary
@@ -573,6 +674,11 @@ pub struct LibraryGame {
     /// [`pf_client_core::library::GameEntry::icon_token`]. Empty when the entry names no mark;
     /// a token we ship no art for simply draws nothing and the tile falls back to its name.
     pub icon: String,
+    /// The system this title runs on (`"PC"`, `"PS2"`, …) — the host's own free-form display
+    /// string, passed through untouched. `None` for a store-front game whose host said
+    /// nothing, which is the common case: the rom-manager plugin populates this, Steam does
+    /// not. [`crate::collate`] is where that `None` is given a meaning.
+    pub platform: Option<String>,
 }
 
 struct Shared {
@@ -761,6 +867,91 @@ mod tests {
         assert_eq!(step_cursor(0, 0, 1, false), StepResult::Boundary);
     }
 
+    /// The grid's two different boundary rules, which is the whole subtlety of this
+    /// function: a row END refuses (like the shelf), a short TAIL row clamps.
+    #[test]
+    fn grid_rows_refuse_at_their_ends_but_the_tail_row_clamps() {
+        // 11 items, 4 columns: rows of 4, 4, 3.
+        let (len, cols) = (11, 4);
+        // Within a row.
+        assert_eq!(
+            grid_step(1, len, cols, GridDir::Right),
+            StepResult::Moved(2)
+        );
+        assert_eq!(grid_step(2, len, cols, GridDir::Left), StepResult::Moved(1));
+        // At a row's ends: refused, NOT wrapped onto the neighbouring row.
+        assert_eq!(
+            grid_step(3, len, cols, GridDir::Right),
+            StepResult::Boundary
+        );
+        assert_eq!(grid_step(4, len, cols, GridDir::Left), StepResult::Boundary);
+        // Down from the top row lands directly below.
+        assert_eq!(grid_step(1, len, cols, GridDir::Down), StepResult::Moved(5));
+        // Down into the SHORT tail row clamps to the last item rather than thudding —
+        // index 7 would map to 11, which does not exist.
+        assert_eq!(
+            grid_step(7, len, cols, GridDir::Down),
+            StepResult::Moved(10)
+        );
+        // …and once there, Down really is the end.
+        assert_eq!(
+            grid_step(10, len, cols, GridDir::Down),
+            StepResult::Boundary
+        );
+        assert_eq!(grid_step(2, len, cols, GridDir::Up), StepResult::Boundary);
+        assert_eq!(grid_step(6, len, cols, GridDir::Up), StepResult::Moved(2));
+    }
+
+    #[test]
+    fn grid_pages_by_rows_and_lands_on_the_ends() {
+        let (len, cols) = (40, 5);
+        assert_eq!(
+            grid_step(0, len, cols, GridDir::PageForward),
+            StepResult::Moved(15)
+        );
+        // A page past the end lands ON the end rather than refusing — a jump is a
+        // "take me there", the same reading `step_cursor`'s clamped mode has.
+        assert_eq!(
+            grid_step(35, len, cols, GridDir::PageForward),
+            StepResult::Moved(39)
+        );
+        assert_eq!(
+            grid_step(39, len, cols, GridDir::PageForward),
+            StepResult::Boundary
+        );
+        assert_eq!(
+            grid_step(3, len, cols, GridDir::PageBack),
+            StepResult::Moved(0)
+        );
+        assert_eq!(
+            grid_step(0, len, cols, GridDir::PageBack),
+            StepResult::Boundary
+        );
+    }
+
+    /// The persisted view name is a FILE FORMAT, and an unknown one must land on the shelf
+    /// — a newer client writing `"coverwall"` must not leave this one with no arrangement.
+    #[test]
+    fn library_view_parses_leniently() {
+        assert_eq!(LibraryView::parse("grid"), LibraryView::Grid);
+        assert_eq!(LibraryView::parse("shelf"), LibraryView::Shelf);
+        assert_eq!(LibraryView::parse("coverwall"), LibraryView::Shelf);
+        assert_eq!(LibraryView::parse(""), LibraryView::Shelf);
+        assert_eq!(LibraryView::default(), LibraryView::Shelf);
+        for v in LibraryView::ALL {
+            assert_eq!(LibraryView::parse(v.id()), v, "{} round-trips", v.label());
+        }
+    }
+
+    #[test]
+    fn grid_step_is_safe_on_a_degenerate_grid() {
+        assert_eq!(grid_step(0, 0, 4, GridDir::Right), StepResult::Boundary);
+        assert_eq!(grid_step(0, 5, 0, GridDir::Right), StepResult::Boundary);
+        // One column: left/right are always refused, up/down still walk.
+        assert_eq!(grid_step(1, 5, 1, GridDir::Right), StepResult::Boundary);
+        assert_eq!(grid_step(1, 5, 1, GridDir::Down), StepResult::Moved(2));
+    }
+
     /// Design D4: launcher entries lead the shelf, and the host's title order survives within
     /// each group. The renderer's `launcher_count()` reads the launcher group as the prefix
     /// `0..n`, so an interleaved list would silently mislabel the group heading.
@@ -772,6 +963,7 @@ mod tests {
             store: "steam".into(),
             launcher,
             icon: String::new(),
+            platform: None,
         };
         let shared = LibraryShared::default();
         shared.set_games(vec![
@@ -801,6 +993,7 @@ mod tests {
                     store: "steam".into(),
                     launcher: false,
                     icon: String::new(),
+                    platform: None,
                 })
                 .collect(),
         );

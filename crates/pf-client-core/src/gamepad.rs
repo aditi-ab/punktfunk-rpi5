@@ -96,6 +96,8 @@ const MENU_DEADZONE: u16 = 16384;
 const MENU_REPEAT_DELAY: Duration = Duration::from_millis(380);
 /// …and then repeats at this cadence until released or changed.
 const MENU_REPEAT_INTERVAL: Duration = Duration::from_millis(160);
+/// How often the open pad's battery is re-read. See [`GamepadWorker::battery_poll`].
+const BATTERY_POLL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuDir {
@@ -266,6 +268,47 @@ pub struct PadInfo {
     /// physical controller and has no sensors/touchpad, so auto-selection skips it while a real
     /// pad is connected — otherwise gyro silently dies on Bazzite/Deck game mode.
     pub steam_virtual: bool,
+    /// The pad's own power state, when it reports one. Purely LOCAL SDL state — nothing about
+    /// this crosses the wire, so it is additive with no ABI implication whatever.
+    ///
+    /// `None` is the common case, not an error: a wired pad has nothing to report, and Steam's
+    /// virtual gamepad reports nothing about the physical device behind it. Anything reading
+    /// this must degrade to "no battery shown" rather than to "0 %".
+    pub battery: Option<PadBattery>,
+}
+
+/// SDL's power report for an OPEN pad, reduced to the two facts a UI can act on.
+///
+/// `None` folds together every "nothing useful to say" case: a wired pad with no battery at
+/// all, an error, an unknown state, and the `-1` percentage SDL returns for "powered, level
+/// unknown". A caller must draw NO battery for `None` — never 0 %, which is the one reading
+/// that would send someone hunting for a charger.
+fn battery_of(pad: &sdl3::gamepad::Gamepad) -> Option<PadBattery> {
+    use sdl3::joystick::PowerLevel;
+    let info = pad.power_info();
+    let charging = match info.state {
+        PowerLevel::OnBattery => false,
+        PowerLevel::Charging | PowerLevel::Charged => true,
+        PowerLevel::NoBattery | PowerLevel::Error | PowerLevel::Unknown => return None,
+    };
+    if info.percentage < 0 {
+        return None;
+    }
+    Some(PadBattery {
+        percent: info.percentage.min(100) as u8,
+        charging,
+    })
+}
+
+/// A controller's power state, as SDL reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PadBattery {
+    /// 0–100. SDL gives −1 for "on power but level unknown", which callers map to `None`
+    /// rather than storing here.
+    pub percent: u8,
+    /// On the cable (or dock) right now. Worth showing separately: a pad at 4 % that is
+    /// charging is not the problem a pad at 4 % that is not.
+    pub charging: bool,
 }
 
 impl PadInfo {
@@ -1100,6 +1143,11 @@ struct Worker {
     /// The ONE device held open for menu navigation while menu mode is on and NO session is
     /// attached (`active_id`); mutually exclusive with `slots` (a session supersedes the menu).
     menu_open: Option<(u32, sdl3::gamepad::Gamepad)>,
+    /// The menu pad's last-read power state, `(id, level)`. Cached rather than read in
+    /// [`publish`](Self::publish) because publish runs on every hotplug and pin change,
+    /// while the battery only wants looking at every few seconds.
+    battery: Option<(u32, PadBattery)>,
+    battery_at: Option<Instant>,
     /// Connected pad ids in connection order (metadata only, no device open); the most
     /// recently connected is the auto selection.
     order: Vec<u32>,
@@ -1211,6 +1259,9 @@ impl Worker {
                 || name.starts_with("Steam Virtual Gamepad"),
             name,
             pref,
+            // Unknowable from an ID-based getter — SDL reports power only for an OPEN
+            // device. `publish` fills it in for the one pad this service holds open.
+            battery: None,
         })
     }
 
@@ -1897,14 +1948,63 @@ impl Worker {
 
     /// Publish the pad list, active pad, and pin to the UI-facing mutexes.
     fn publish(&self) {
+        // `pad_info` is deliberately open-free, and SDL only reports power for an OPEN
+        // device — so the battery is attached here, from the cache
+        // [`battery_poll`](Self::battery_poll) keeps for the one pad this service holds
+        // open. Every other pad publishes `None`, which is the honest answer: we cannot
+        // know without grabbing hardware that isn't ours to grab.
+        let with_battery = |id: u32| -> Option<PadInfo> {
+            let mut info = self.pad_info(id)?;
+            if let Some((bid, b)) = self.battery {
+                if bid == id {
+                    info.battery = Some(b);
+                }
+            }
+            Some(info)
+        };
         let mut list: Vec<PadInfo> = self
             .order
             .iter()
-            .filter_map(|&id| self.pad_info(id))
+            .copied()
+            .filter_map(with_battery)
             .collect();
         list.reverse(); // most recent first — the Settings list order
         *self.pads_out.lock().unwrap() = list;
-        *self.active_out.lock().unwrap() = self.active_id().and_then(|id| self.pad_info(id));
+        *self.active_out.lock().unwrap() = self.active_id().and_then(with_battery);
+    }
+
+    /// Re-read the open pad's battery on a slow cadence, republishing only when it moved.
+    ///
+    /// Polled rather than event-driven because nothing reports a battery CHANGING — it
+    /// drifts, so the only way to show it is to look now and then. 15 s is far finer than a
+    /// percent takes to move and far coarser than anything the service's 10 ms loop would
+    /// notice; the read itself is a cached HID report, not a device transaction.
+    ///
+    /// Only ever the menu pad, which is the only one open while a console is on screen —
+    /// and the only one any UI asks about.
+    fn battery_poll(&mut self) {
+        let Some((id, pad)) = &self.menu_open else {
+            // Nothing open: forget the level rather than publish a stale one for a pad that
+            // may since have been unplugged.
+            if self.battery.take().is_some() {
+                self.publish();
+            }
+            self.battery_at = None;
+            return;
+        };
+        let now = Instant::now();
+        if self
+            .battery_at
+            .is_some_and(|t| now.duration_since(t) < BATTERY_POLL)
+        {
+            return;
+        }
+        self.battery_at = Some(now);
+        let fresh = battery_of(pad).map(|b| (*id, b));
+        if fresh != self.battery {
+            self.battery = fresh;
+            self.publish();
+        }
     }
 
     /// Apply queued control-plane messages from the UI thread. Returns false when the
@@ -2533,6 +2633,8 @@ impl Worker {
             active_out,
             slots: Vec::new(),
             menu_open: None,
+            battery: None,
+            battery_at: None,
             order: Vec::new(),
             pinned: None,
             forwarding: true,
@@ -2617,6 +2719,7 @@ fn run(
         w.maybe_fire_disconnect();
 
         w.menu_poll();
+        w.battery_poll();
         w.render_feedback();
     }
 }

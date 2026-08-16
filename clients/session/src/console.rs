@@ -920,6 +920,7 @@ fn spawn_fetch(
                                 store: g.store.clone(),
                                 launcher: g.is_launcher(),
                                 icon: g.icon_token().unwrap_or_default().to_string(),
+                                platform: g.platform.clone(),
                             })
                             .collect(),
                     );
@@ -962,6 +963,7 @@ fn load_fake(shared: &LibraryShared, path: &str) {
                 store: g.store.clone(),
                 launcher: g.is_launcher(),
                 icon: g.icon_token().unwrap_or_default().to_string(),
+                platform: g.platform.clone(),
             })
             .collect(),
     );

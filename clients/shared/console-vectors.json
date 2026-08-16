@@ -1,6 +1,6 @@
 {
   "$comment": "Cross-client CONSOLE-UI parity vectors: the background palette table, the settings section tabs, and the screen-transition motion contract. Consumed by pf-console-ui's Rust tests, the Android app's ConsoleVectorsTest, and the Apple client's ConsoleVectorsTests -- so the three hand-copies of these tables can no longer drift in silence. Sibling of deeplink-vectors.json, same rules: this file is the contract, and a value absent here is a value no client may assume.",
-  "version": 1,
+  "version": 2,
   "cell_ramp": [
     0.1,
     -0.06,
@@ -1953,6 +1953,7 @@
     }
   ],
   "motion": {
+    "$deprecated": "SUPERSEDED by `motion_spring` (version 2). The desktop console's transition is a damped spring now, not a 0.26 s ease-out-cubic, so it no longer implements this block and its test reads `motion_spring` instead. Kept in place, and still correct, for the clients that have not migrated: the Android client's ConsoleVectorsTest pins it, and the Apple client's GamepadShell mirrors these constants (untested there - its ConsoleVectorsTests covers the palette table only). DELETE THIS BLOCK when the last client moves; until then the drift is visible rather than silent, because each client's test names which block it implements.",
     "$why": "The console screen transition, from pf-console-ui's shell: TRANSITION_S and the paint geometry in shell/render.rs. Every client re-implements this by hand in its own animation system, which is why it is pinned here.",
     "transition_s": 0.26,
     "push_slide_dp": 36.0,
@@ -2001,5 +2002,16 @@
         }
       ]
     }
+  },
+  "motion_spring": {
+    "$why": "The console screen transition, from pf-console-ui's shell. Springs are INTEGRATOR-dependent - semi-implicit Euler in <=8 ms substeps here, a different solver in every other runtime - so unlike the v1 curve this pins PARAMETERS, not sampled positions. Two implementations that both honour response/damping will agree to the eye and disagree in the third decimal, and sampling would pin the disagreement instead of the feel. The geometry below is unchanged from v1: the spring replaced the time-course, not the choreography.",
+    "response": 0.42,
+    "damping": 0.88,
+    "push_slide_dp": 36.0,
+    "enter_scale": 0.985,
+    "exit_scale": 0.96,
+    "reveal_alpha": 0.4,
+    "interruptible": true,
+    "$interruptible": "Back pressed mid-push retargets the SAME spring to 0 - the entering screen decelerates, turns, and goes back - and mid-pop starts the next pop immediately. Input other than Back stays queued-dropped until the spring passes 0.85, which keeps a double-tapped A from pushing two screens."
   }
 }

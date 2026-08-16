@@ -1,6 +1,6 @@
 //! The console shell's per-frame screen compose/transition render path.
 
-use crate::anim::{approach, ease_out_cubic};
+use crate::anim::approach;
 use crate::glyphs::{hint_bar, GlyphStyle};
 use crate::library::LibraryShared;
 use crate::model::HostRow;
@@ -11,7 +11,10 @@ use pf_client_core::trust;
 use skia_safe::{Canvas, Rect};
 use std::time::Instant;
 
-use super::{Motion, Shell, BOTTOM_BAND, TOP_BAND};
+use super::{
+    Motion, NavKind, Shell, BOTTOM_BAND, NAV_ENTER_SCALE, NAV_EXIT_SCALE, NAV_REVEAL_ALPHA,
+    NAV_SLIDE_DP, TOP_BAND,
+};
 
 impl Shell {
     #[allow(clippy::too_many_arguments)]
@@ -35,6 +38,12 @@ impl Shell {
         // the crate reads it (see `theme::set_ink`), so a frame that skipped this would paint
         // the previous palette's text over the new palette's field.
         crate::theme::set_ink(self.ink);
+        // Same contract as the ink: published once, before anything draws, so every widget
+        // that has a choice to make about travel this frame reads one answer. Also kept as
+        // a local — `LayerEnv` borrows `self.settings` mutably below, so the transition
+        // arms can no longer reach the field itself.
+        let reduce = self.settings.reduce_motion;
+        crate::theme::set_reduce_motion(reduce);
         self.pads = pads.to_vec();
         self.glyphs = GlyphStyle::from_pref(pad_pref);
         self.chip = Some(pad.map_or_else(
@@ -46,30 +55,11 @@ impl Shell {
         let k = (h / 800.0).clamp(0.75, 3.0);
         let t = self.t();
 
-        // Advance the transition; a finished pop finally drops its leaving screen.
-        let motion_p = match &mut self.motion {
-            Motion::None => None,
-            Motion::Push(p) => {
-                p.advance(dt);
-                let v = p.value();
-                if p.done() {
-                    self.motion = Motion::None;
-                    None
-                } else {
-                    Some(v)
-                }
-            }
-            Motion::Pop { t, .. } => {
-                t.advance(dt);
-                let v = t.value();
-                if t.done() {
-                    self.motion = Motion::None;
-                    None
-                } else {
-                    Some(v)
-                }
-            }
-        };
+        // Advance the transition. `None` means "settled" — which is also what makes the
+        // hint-rect invariant below still hold: with a spring, "settled" is
+        // `Motion::None`, exactly as it was with a timer. A reversed push takes its screen
+        // back off the stack here; a completed pop drops the one it was carrying.
+        let motion_p = self.advance_nav(dt);
 
         // The backdrop settles into (or out of) calm with the screen transition. It is the
         // SAME living field either way — a form screen quiets it, it doesn't replace it —
@@ -117,32 +107,58 @@ impl Shell {
         // aren't where the pixels are — and the shell drops pointer input during a
         // transition anyway, exactly as it drops menu events.
         self.hint_rects.clear();
+        // Reduced motion keeps the CROSSFADE — the stack has to stay legible, and an
+        // instant swap loses the only spatial cue a console shell has — and drops the
+        // travel: no slide, no scale.
+        let slide = |dy: f64| if reduce { 0.0 } else { dy };
+        let zoom = |s: f64| if reduce { 1.0 } else { s };
+        // The geometry below is UNCHANGED from the tween: same 36 dp slide, same
+        // 0.985/0.96 scales, same 0.4 reveal alpha. Only the time-course differs — `p` is
+        // now the spring's position where it used to be `ease_out_cubic(elapsed)`.
         match (&mut self.motion, motion_p) {
-            (Motion::Push(_), Some(raw)) => {
-                let p = ease_out_cubic(raw);
+            (
+                Motion::Nav {
+                    kind: NavKind::Push,
+                    ..
+                },
+                Some(p),
+            ) => {
                 let n = self.stack.len();
+                let enter_scale = zoom(NAV_ENTER_SCALE + (1.0 - NAV_ENTER_SCALE) * p);
+                let enter_slide = slide(NAV_SLIDE_DP * k * (1.0 - p));
                 // Outgoing recedes underneath…
                 if n >= 2 {
                     let (below, top) = self.stack.split_at_mut(n - 1);
-                    env.paint(&mut below[n - 2], 1.0 - p, 0.0, 1.0 - 0.04 * p);
-                    // …while the incoming slides up out of a fade.
-                    env.paint(&mut top[0], p, 36.0 * k * (1.0 - p), 0.985 + 0.015 * p);
-                } else {
                     env.paint(
-                        &mut self.stack[0],
-                        p,
-                        36.0 * k * (1.0 - p),
-                        0.985 + 0.015 * p,
+                        &mut below[n - 2],
+                        1.0 - p,
+                        0.0,
+                        zoom(1.0 - (1.0 - NAV_EXIT_SCALE) * p),
                     );
+                    // …while the incoming slides up out of a fade.
+                    env.paint(&mut top[0], p, enter_slide, enter_scale);
+                } else {
+                    env.paint(&mut self.stack[0], p, enter_slide, enter_scale);
                 }
             }
-            (Motion::Pop { leaving, .. }, Some(raw)) => {
-                let p = ease_out_cubic(raw);
+            (
+                Motion::Nav {
+                    kind: NavKind::Pop,
+                    leaving: Some(leaving),
+                    ..
+                },
+                Some(p),
+            ) => {
                 // The revealed screen grows back in…
                 let n = self.stack.len();
-                env.paint(&mut self.stack[n - 1], 0.4 + 0.6 * p, 0.0, 0.96 + 0.04 * p);
+                env.paint(
+                    &mut self.stack[n - 1],
+                    NAV_REVEAL_ALPHA + (1.0 - NAV_REVEAL_ALPHA) * p,
+                    0.0,
+                    zoom(NAV_EXIT_SCALE + (1.0 - NAV_EXIT_SCALE) * p),
+                );
                 // …while the leaving one slides down into a fade.
-                env.paint(leaving.as_mut(), 1.0 - p, 36.0 * k * p, 1.0);
+                env.paint(leaving.as_mut(), 1.0 - p, slide(NAV_SLIDE_DP * k * p), 1.0);
             }
             _ => {
                 let n = self.stack.len();
@@ -150,18 +166,27 @@ impl Shell {
             }
         }
 
-        // Persistent chrome: the controller chip (top-right, above every layer).
+        // Persistent chrome: the controller chip (top-right, above every layer). Reads
+        // left-to-right as kind · name · charge — a mark for what is connected, its name,
+        // and how long it has left.
         if let Some(chip) = &self.chip {
             let size = 12.0 * k;
             let tw = f64::from(fonts.measure(chip, W::Medium, size));
-            let (bh, pad_x) = (24.0 * k, 12.0 * k);
-            let bx = w - 24.0 * k - tw - 2.0 * pad_x;
-            let rect = Rect::from_xywh(
-                bx as f32,
-                (18.0 * k) as f32,
-                (tw + 2.0 * pad_x) as f32,
-                bh as f32,
-            );
+            let (bh, pad_x, gap) = (24.0 * k, 12.0 * k, 8.0 * k);
+            let mark_w = 15.0 * k;
+            // The battery only takes room when there IS one: a wired pad, a Steam virtual
+            // pad and "no controller" all report nothing, and the chip must not carry a
+            // gap where their charge would have been.
+            let battery = self.pads.first().and_then(|p| p.battery);
+            let pip_w = if battery.is_some() {
+                22.0 * k + gap
+            } else {
+                0.0
+            };
+            let bw = pad_x + mark_w + gap + tw + pip_w + pad_x;
+            let bx = w - 24.0 * k - bw;
+            let top = 18.0 * k;
+            let rect = Rect::from_xywh(bx as f32, top as f32, bw as f32, bh as f32);
             crate::theme::panel(
                 canvas,
                 rect,
@@ -170,15 +195,27 @@ impl Shell {
                 PanelStroke::Plain(0.12),
                 k as f32,
             );
+            let cy = top + bh / 2.0;
+            crate::glyphs::pad_mark(canvas, self.glyphs, bx + pad_x, cy, mark_w, k, fg(0.7));
             fonts.draw(
                 canvas,
                 chip,
-                bx + pad_x,
-                18.0 * k + 16.0 * k,
+                bx + pad_x + mark_w + gap,
+                cy + size * 0.36,
                 W::Medium,
                 size,
                 fg(0.7),
             );
+            if let Some(b) = battery {
+                crate::glyphs::battery_pip(
+                    canvas,
+                    bx + pad_x + mark_w + gap + tw + gap,
+                    cy,
+                    22.0 * k,
+                    k,
+                    b,
+                );
+            }
         }
 
         self.draw_overlays(canvas, w, h, k, dt, t, fonts);

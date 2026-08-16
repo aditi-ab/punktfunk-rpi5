@@ -15,6 +15,8 @@
 #[cfg(any(target_os = "linux", windows))]
 mod anim;
 #[cfg(any(target_os = "linux", windows))]
+mod collate;
+#[cfg(any(target_os = "linux", windows))]
 mod glyphs;
 #[cfg(any(target_os = "linux", windows))]
 mod launcher_icons;
@@ -22,6 +24,8 @@ mod launcher_icons;
 pub mod library;
 #[cfg(any(target_os = "linux", windows))]
 pub mod model;
+#[cfg(any(target_os = "linux", windows))]
+mod os_marks;
 #[cfg(any(target_os = "linux", windows))]
 mod pointer;
 #[cfg(any(target_os = "linux", windows))]
