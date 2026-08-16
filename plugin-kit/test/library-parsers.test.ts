@@ -280,6 +280,62 @@ describe("art locations", () => {
 		fs.rmSync(dir, { recursive: true, force: true });
 	});
 
+	test("finds a cover cached under Steam's newer `library_capsule` name", () => {
+		// The bug this pins: appid 2483190 (Forza Horizon 6) caches its 300×450 cover as
+		// `library_capsule.jpg`, the flat CDN URL for its `library_600x900.jpg` 404s, and the client
+		// therefore fell through to the header and drew a banner in a 2:3 poster slot.
+		const dir = tmp("art-capsule");
+		const hashDir = path.join(
+			dir,
+			"appcache",
+			"librarycache",
+			"2483190",
+			"711e",
+		);
+		fs.mkdirSync(hashDir, { recursive: true });
+		fs.writeFileSync(path.join(hashDir, "library_capsule.jpg"), "x");
+		expect(findLocalArtFile(dir, 2483190, "portrait")).toBe(
+			path.join(hashDir, "library_capsule.jpg"),
+		);
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	test("finds art stored straight in the appid dir, with no hash dir", () => {
+		// The majority layout — 623 of 779 appids on the reference cache. A hash-dir-only walk finds
+		// none of it and silently falls back to a CDN URL that 404s for anything re-hashed.
+		const dir = tmp("art-flat");
+		const appDir = path.join(dir, "appcache", "librarycache", "813230");
+		fs.mkdirSync(appDir, { recursive: true });
+		fs.writeFileSync(path.join(appDir, "library_600x900.jpg"), "x");
+		fs.writeFileSync(path.join(appDir, "header.jpg"), "x");
+		expect(findLocalArtFile(dir, 813230, "portrait")).toBe(
+			path.join(appDir, "library_600x900.jpg"),
+		);
+		// `header.jpg` is the CDN's name, but the local cache uses it too for newer entries — the
+		// two spellings are the same 460×215 asset and never appear together for one appid.
+		expect(findLocalArtFile(dir, 813230, "header")).toBe(
+			path.join(appDir, "header.jpg"),
+		);
+		expect(findLocalArtFile(dir, 813230, "hero")).toBeUndefined();
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	test("a hash dir wins over a loose file of the same kind", () => {
+		// No appid on the reference cache carries both, so this is only about which copy is the
+		// current one if Steam ever leaves the old layout behind: the hash dir is what it re-fetches
+		// into, so that is the copy it is itself displaying.
+		const dir = tmp("art-both");
+		const appDir = path.join(dir, "appcache", "librarycache", "570");
+		const hashDir = path.join(appDir, "abc123");
+		fs.mkdirSync(hashDir, { recursive: true });
+		fs.writeFileSync(path.join(appDir, "library_600x900.jpg"), "x");
+		fs.writeFileSync(path.join(hashDir, "library_600x900.jpg"), "x");
+		expect(findLocalArtFile(dir, 570, "portrait")).toBe(
+			path.join(hashDir, "library_600x900.jpg"),
+		);
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
 	test("fileUrl produces the host's local-art contract shape", () => {
 		const u = fileUrl(path.join(path.sep, "home", "u", "My Games", "c.jpg"));
 		expect(u.startsWith("file:///")).toBe(true);

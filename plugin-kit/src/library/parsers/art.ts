@@ -54,21 +54,44 @@ export const steamCdnUrl = (
 	return `https://cdn.cloudflare.steamstatic.com/steam/apps/${appid}/${file}`;
 };
 
-/** Filenames Steam's local `librarycache` uses per kind, in preference order (2x is sharper). */
+/**
+ * Filenames Steam's local `librarycache` uses per kind, in preference order (2x is sharper).
+ *
+ * Two spellings per kind, because Steam renamed these assets and one cache holds both eras side by
+ * side — on a 779-app cache, 594 appids carry `header.jpg` and 122 carry `library_header.jpg`, and
+ * NO appid carries both. Same story for the cover: 46 appids have only `library_capsule.jpg`. The
+ * renamed files are the same assets, byte-for-byte the same shapes (cover 300×450, header 460×215),
+ * so which name wins is cosmetic — but knowing only one name loses the art outright.
+ *
+ * Missing the cover is the one that shows: the fallback is then the flat CDN URL, which 404s for
+ * anything Valve has re-hashed, so the client walks on to the header and draws a BANNER in a 2:3
+ * poster slot (Forza Horizon 6 / appid 2483190 is the reference case).
+ */
 const localFilenames = (kind: ArtKind): string[] =>
 	kind === "portrait"
-		? ["library_600x900_2x.jpg", "library_600x900.jpg"]
+		? ["library_600x900_2x.jpg", "library_600x900.jpg", "library_capsule.jpg"]
 		: kind === "hero"
 			? ["library_hero.jpg"]
 			: kind === "logo"
 				? ["logo.png"]
 				: // Steam's local cache names the header asset differently from the store CDN's
-					// `header.jpg` — this trips everyone once.
-					["library_header.jpg"];
+					// `header.jpg` — this trips everyone once. Newer entries use the CDN's name, so
+					// both belong here.
+					["library_header.jpg", "header.jpg"];
 
 /**
- * This kind's file under one Steam root's `appcache/librarycache/<appid>/<hash>/`, or `undefined`.
- * Steam reuses one hash dir per asset version, so there is normally exactly one candidate.
+ * This kind's file under one Steam root's `appcache/librarycache/`, or `undefined`.
+ *
+ * Three layouts, all of them live in the same cache at the same time — a title's art is in exactly
+ * one of them, so all three have to be checked or its cover is simply not found:
+ *
+ *   1. `<appid>/<hash>/<name>` — per-asset-version hash dir. Steam reuses one hash dir per version,
+ *      so there is normally exactly one candidate. Checked first: where a title has been re-fetched
+ *      into this layout, this is the copy Steam itself is displaying.
+ *   2. `<appid>/<name>` — straight in the appid dir, and the MAJORITY case (623 of 779 appids on the
+ *      reference cache). A hash-dir-only walk misses every one of them, which stayed invisible only
+ *      because the flat CDN URL those titles fall back to still resolves for older appids.
+ *   3. `<appid>_<name>` flat in `librarycache/` — the oldest layout.
  */
 export const findLocalArtFile = (
 	root: string,
@@ -81,6 +104,11 @@ export const findLocalArtFile = (
 			const p = path.join(base, hash, name);
 			if (isFile(p)) return p;
 		}
+	}
+	// Layout 2: no hash dir, the asset sits directly in the appid dir.
+	for (const name of localFilenames(kind)) {
+		const p = path.join(base, name);
+		if (isFile(p)) return p;
 	}
 	// Older Steam wrote the files directly under `librarycache/` with the appid in the name.
 	for (const name of localFilenames(kind)) {
