@@ -149,6 +149,18 @@ pub struct PicturePlan {
     /// DPB size in frames per A.3.1 — backends size their slot pool from this.
     pub max_dpb_frames: usize,
     pub recovery_point: Option<RecoveryPoint>,
+    /// Every picture this AU predicts from was itself decoded from a fully-available
+    /// reference chain — so a host claim that this AU is a clean re-anchor
+    /// (`USER_FLAG_RECOVERY_ANCHOR`) can be corroborated rather than taken on trust.
+    /// `true` for an IDR (nothing to predict from) and for any picture whose whole
+    /// reference chain is clean; `false` from the moment this AU — or anything it
+    /// descends from — needed concealment.
+    ///
+    /// Purely additive observation: nothing in the plan, the warnings or the DPB
+    /// changes because of it, and on a stream that never loses a reference it is
+    /// `true` on every picture forever. See [`crate::clean`] for why it propagates and
+    /// why every rule errs toward `false`.
+    pub references_clean: bool,
 }
 
 /// The region of the coded picture that is actually displayed.
@@ -250,6 +262,41 @@ pub enum PlanWarning {
         max_dpb_frames: usize,
         level_idc: u8,
     },
+}
+
+impl PlanWarning {
+    /// Does this warning mean the PICTURE is damaged — the plan was completed with a
+    /// SUBSTITUTE in place of something that was lost — rather than reporting a
+    /// spec-legal fact about the stream's envelope?
+    ///
+    /// The distinction decides two things that must never disagree: whether a consumer
+    /// releases the AU's output unshown and asks for a re-anchor, and whether the
+    /// picture enters [`crate::clean::CleanLedger`] as unclean. It lives HERE, on the
+    /// enum, because those two consumers sit in different crates and a second copy of
+    /// the list would let one of them conceal damage the other reports — the exact
+    /// shape of the invisible-corruption failure the native-decode program exists to
+    /// end. `pf_vkdecode::is_integrity_warning` delegates to this.
+    ///
+    /// `Mmco5Rebase` is not damage: the AU carried an MMCO 5 and this planner planned
+    /// it in full (the plan holds the pre-rebase 8.2.1 values; later AUs reference the
+    /// rebased ones). `LevelDerivedDpb` is not either: the picture is intact and fully
+    /// planned — it reports that the SPS never declared its DPB depth, so the plan had
+    /// to size from A.3.1's level ceiling, a property of the STREAM's signalling which
+    /// a backend answers by failing to open a session, not by showing a damaged frame.
+    ///
+    /// Written as an EXHAUSTIVE match with no wildcard, deliberately. A `matches!` (or
+    /// a `_ => false`) makes "damage" the opt-in and silence the default, so a variant
+    /// added later — by definition one nobody here has classified — would be reported
+    /// as clean and its picture shown. The compiler is the only reviewer guaranteed to
+    /// be present when that variant is written, so it gets the decision.
+    pub fn is_integrity(&self) -> bool {
+        match self {
+            PlanWarning::FrameNumGap { .. }
+            | PlanWarning::MissingReference { .. }
+            | PlanWarning::TruncatedAu { .. } => true,
+            PlanWarning::Mmco5Rebase | PlanWarning::LevelDerivedDpb { .. } => false,
+        }
+    }
 }
 
 /// The AU cannot be planned at all.
@@ -482,6 +529,10 @@ pub struct H264Planner {
     reported_live: BTreeSet<PicId>,
     /// Set by [`Self::flush`]: planning resumes only at an IDR (upstream: `Reset`).
     awaiting_idr: bool,
+    /// Which resident pictures came off a BROKEN reference chain — the fact behind
+    /// [`PicturePlan::references_clean`]. Empty on a healthy stream; see
+    /// [`crate::clean::CleanLedger`] for the propagation rules.
+    clean: crate::clean::CleanLedger,
 }
 
 impl H264Planner {
@@ -600,9 +651,20 @@ impl H264Planner {
         let cur = current
             .ok_or_else(|| PlanError::Parse("access unit contains no coded picture".into()))?;
 
+        // Was every picture this AU predicts from decoded off an intact chain? Asked
+        // over the SLICE reference lists rather than the DPB snapshot, because those
+        // are what this picture actually predicts from — a resident-but-unreferenced
+        // damaged picture says nothing about this one. An IDR references nothing, so
+        // this is vacuously true for it (`CleanLedger::references_clean`).
+        let references_clean = self.clean.references_clean(
+            slices
+                .iter()
+                .flat_map(|s: &SlicePlan| s.ref_list0.iter().chain(&s.ref_list1))
+                .map(|r| r.id),
+        );
         // Captured before finish_picture: MMCO5 rewrites the stored POC afterwards, but
         // backends submit the picture with its 8.2.1 values.
-        let picture = Self::picture_plan(&cur, recovery_point);
+        let picture = Self::picture_plan(&cur, recovery_point, references_clean);
         // The activated parameter sets ride out with the plan (AuPlan field docs);
         // cloned before finish_picture consumes `cur`.
         let pps = Rc::clone(&cur.first_slice_pps);
@@ -618,6 +680,20 @@ impl H264Planner {
         previously_live.insert(stored);
         let removed = previously_live.difference(&live_after).copied().collect();
         self.reported_live = live_after;
+
+        // Fold this picture's verdict, then bound the ledger to DPB residency. Both
+        // AFTER `finish_picture`, so `stored` is the id the picture really got and
+        // `live_after` reflects the marking this AU performed — a mark written against
+        // a pre-marking view could survive an eviction it should have died with.
+        // `concealed` mirrors what a consumer conceals on, via the ONE classification
+        // (`PlanWarning::is_integrity`), so the ledger and the consumer can never
+        // disagree about whether this AU was damaged.
+        self.clean.note_stored(
+            stored,
+            references_clean,
+            warnings.iter().any(PlanWarning::is_integrity),
+        );
+        self.clean.retain_live(self.reported_live.iter().copied());
 
         Ok(AuPlan {
             picture,
@@ -650,6 +726,9 @@ impl H264Planner {
         self.max_long_term_frame_idx = Default::default();
         self.negotiation_info = Default::default();
         self.awaiting_idr = true;
+        // The DPB is drained, so no mark describes a resident picture any more — and
+        // planning resumes at an IDR, which is clean by construction.
+        self.clean.clear();
 
         DpbUpdate {
             stored: None,
@@ -1747,7 +1826,11 @@ impl H264Planner {
         Ok(id)
     }
 
-    fn picture_plan(cur: &CurrentPicState, recovery_point: Option<RecoveryPoint>) -> PicturePlan {
+    fn picture_plan(
+        cur: &CurrentPicState,
+        recovery_point: Option<RecoveryPoint>,
+        references_clean: bool,
+    ) -> PicturePlan {
         let pic = &cur.pic;
         // The first slice's PPS defines the picture's parameters (upstream's
         // start_picture semantics); `cur.pps` may have drifted to a later slice's.
@@ -1791,6 +1874,7 @@ impl H264Planner {
             chroma_format_idc: sps.chroma_format_idc,
             max_dpb_frames: dpb_limit(sps),
             recovery_point,
+            references_clean,
         }
     }
 }
@@ -2341,6 +2425,110 @@ mod tests {
         // The 8.2.5.2 placeholder is un-resolvable for backends, so planning around
         // it must also have flagged it.
         assert!(missing_seen);
+    }
+
+    /// The clean bit, end to end through the real planner: a `frame_num` gap
+    /// concealed one picture, and EVERY picture descending from it reports
+    /// `references_clean == false` even though their own plans are spotless. That
+    /// propagation is the whole point — the concealed picture is rarely the one a host
+    /// recovery anchor names; the ordinary P-frames after it are.
+    #[test]
+    fn a_concealed_picture_makes_every_descendant_report_unclean_references() {
+        let (sps, pps) = authored_sps_pps();
+        let mut au0 = param_set_au(&sps, &pps);
+        au0.extend(write_idr_slice());
+
+        let mut planner = H264Planner::new();
+        let p0 = planner.plan_au(&au0).unwrap();
+        assert!(
+            p0.picture.references_clean,
+            "an IDR references nothing, so it is clean by construction"
+        );
+
+        // A healthy P off the IDR: still clean.
+        let p1 = planner.plan_au(&write_p_slice(1, 2, 1, 1, None)).unwrap();
+        assert!(picture_warnings(&p1).is_empty());
+        assert!(p1.picture.references_clean);
+
+        // frame_num 2 never arrives — 8.2.5.2 fabricates a placeholder and the plan
+        // conceals. THIS picture's references were still intact; the damage is its own.
+        let p3 = planner.plan_au(&write_p_slice(3, 6, 1, 3, None)).unwrap();
+        assert!(p3
+            .warnings
+            .iter()
+            .any(|w| matches!(w, PlanWarning::FrameNumGap { .. })));
+
+        // …and every picture after it inherits the damage with a clean plan of its own.
+        let p4 = planner.plan_au(&write_p_slice(4, 8, 1, 1, None)).unwrap();
+        assert!(
+            picture_warnings(&p4).is_empty(),
+            "p4's own plan raises nothing — which is exactly why the bit is needed"
+        );
+        assert!(
+            !p4.picture.references_clean,
+            "p4 predicts from the concealed chain, so it must not read as clean"
+        );
+
+        let p5 = planner.plan_au(&write_p_slice(5, 10, 1, 1, None)).unwrap();
+        assert!(picture_warnings(&p5).is_empty());
+        assert!(!p5.picture.references_clean, "the rot keeps travelling");
+    }
+
+    /// An IDR ends a damaged run: it predicts from nothing, so it reads clean however
+    /// broken the stream was before it. Without this a session could never recover a
+    /// trustworthy anchor.
+    #[test]
+    fn an_idr_reports_clean_references_however_damaged_the_run_before_it() {
+        let (sps, pps) = authored_sps_pps();
+        let mut au0 = param_set_au(&sps, &pps);
+        au0.extend(write_idr_slice());
+
+        let mut planner = H264Planner::new();
+        planner.plan_au(&au0).unwrap();
+        planner.plan_au(&write_p_slice(1, 2, 1, 1, None)).unwrap();
+        // Gap: frame_num 2 lost.
+        let p3 = planner.plan_au(&write_p_slice(3, 6, 1, 3, None)).unwrap();
+        assert!(p3
+            .warnings
+            .iter()
+            .any(|w| matches!(w, PlanWarning::FrameNumGap { .. })));
+        let p4 = planner.plan_au(&write_p_slice(4, 8, 1, 1, None)).unwrap();
+        assert!(!p4.picture.references_clean);
+
+        // A fresh IDR re-anchors, and the pictures after it are clean again.
+        let mut idr = param_set_au(&sps, &pps);
+        idr.extend(write_idr_slice());
+        let p5 = planner.plan_au(&idr).unwrap();
+        assert!(p5.picture.references_clean, "an IDR is always clean");
+        let p6 = planner.plan_au(&write_p_slice(1, 2, 1, 1, None)).unwrap();
+        assert!(
+            p6.picture.references_clean,
+            "the damaged chain died with the IDR's DPB flush"
+        );
+    }
+
+    /// A stream that never loses a reference reports `references_clean` on every
+    /// picture, forever — the property that makes this free to carry in production.
+    #[test]
+    fn a_healthy_stream_reports_clean_references_on_every_picture() {
+        let (sps, pps) = authored_sps_pps();
+        let mut au0 = param_set_au(&sps, &pps);
+        au0.extend(write_idr_slice());
+
+        let mut planner = H264Planner::new();
+        assert!(planner.plan_au(&au0).unwrap().picture.references_clean);
+        // log2_max_frame_num_minus4 = 0 and pic_order_cnt_lsb is u(4): both wrap at 16.
+        for n in 1..16u32 {
+            let plan = planner
+                .plan_au(&write_p_slice(n, (n * 2) % 16, 1, 1, None))
+                .unwrap();
+            assert!(
+                picture_warnings(&plan).is_empty(),
+                "frame {n} should plan cleanly: {:?}",
+                picture_warnings(&plan)
+            );
+            assert!(plan.picture.references_clean, "frame {n} must read clean");
+        }
     }
 
     #[test]

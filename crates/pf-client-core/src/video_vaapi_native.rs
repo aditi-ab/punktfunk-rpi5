@@ -3060,6 +3060,11 @@ mod tests {
             picture: pf_vaadec::PicturePlanAv1 {
                 frame_type: pf_vaadec::FrameTypeAv1::KeyFrame,
                 is_key: true,
+                // Vacuously true for a key frame: it predicts from nothing. This fixture
+                // exists to exercise the SIZING path (sequence max vs coded vs render), so
+                // the clean bit is incidental here — but it must state the honest value,
+                // because `false` is the answer that withholds a re-anchor.
+                references_clean: true,
                 show_frame: true,
                 showable_frame: false,
                 order_hint: 0,

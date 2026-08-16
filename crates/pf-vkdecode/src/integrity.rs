@@ -38,19 +38,20 @@ use crate::{Av1PlanWarning, H265PlanWarning, PlanWarning};
 /// property of the STREAM's signalling, which the decoder answers by failing to open
 /// a session, not by showing a damaged frame.
 ///
-/// Written as an EXHAUSTIVE match with no wildcard, deliberately. A `matches!` (or
-/// a `_ => false`) makes "damage" the opt-in and silence the default, so a
-/// `PlanWarning` added later — by definition one nobody here has classified —
-/// would be reported as clean and its picture shown. Invisible damage is the bug
-/// this whole program exists to end; the compiler is the only reviewer guaranteed
-/// to be present when that variant is written, so it gets the decision.
+/// ⚠ The classification itself now lives on the warning enum, in pf-bitstream
+/// ([`PlanWarning::is_integrity`]), and this function delegates. It moved there when
+/// the planners gained the per-picture clean bit
+/// ([`pf_bitstream::h264::PicturePlan::references_clean`]): that ledger has to mark a
+/// picture damaged on exactly the warnings a consumer conceals on, and it lives one
+/// crate DOWN from here. A copy of the list in each crate would let the two disagree —
+/// the planner recording a picture as clean while the client concealed it, or the
+/// reverse — which is the same invisible-damage failure the single-list rule below was
+/// written to prevent, one layer lower. One list, in the crate that owns the enum.
+///
+/// This function stays as the crate's public spelling of the question (the fault
+/// harness, the client and the tests all name it) and keeps its exact semantics.
 pub fn is_integrity_warning(w: &PlanWarning) -> bool {
-    match w {
-        PlanWarning::FrameNumGap { .. }
-        | PlanWarning::MissingReference { .. }
-        | PlanWarning::TruncatedAu { .. } => true,
-        PlanWarning::Mmco5Rebase | PlanWarning::LevelDerivedDpb { .. } => false,
-    }
+    w.is_integrity()
 }
 
 /// The H.265 twin — the same set pf-bitstream's own `h265` conformance harness
@@ -59,10 +60,7 @@ pub fn is_integrity_warning(w: &PlanWarning) -> bool {
 /// Exhaustive for the same reason as [`is_integrity_warning`]: a new H.265 warning
 /// must not be able to mean "damaged" and read as clean.
 pub fn is_integrity_warning_h265(w: &H265PlanWarning) -> bool {
-    match w {
-        H265PlanWarning::MissingReference { .. } | H265PlanWarning::TruncatedAu { .. } => true,
-        H265PlanWarning::NonZeroReorder { .. } => false,
-    }
+    w.is_integrity()
 }
 
 /// The AV1 twin (M7). Every variant the AV1 planner has today IS damage, and that
@@ -93,11 +91,7 @@ pub fn is_integrity_warning_h265(w: &H265PlanWarning) -> bool {
 /// Exhaustive for the same reason as [`is_integrity_warning`]: a new AV1 warning
 /// must not be able to mean "damaged" and read as clean.
 pub fn is_integrity_warning_av1(w: &Av1PlanWarning) -> bool {
-    match w {
-        Av1PlanWarning::MissingReference { .. }
-        | Av1PlanWarning::MissingShowExisting { .. }
-        | Av1PlanWarning::TruncatedAu { .. } => true,
-    }
+    w.is_integrity()
 }
 
 #[cfg(test)]

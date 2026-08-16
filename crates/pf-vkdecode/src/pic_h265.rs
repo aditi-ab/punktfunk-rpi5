@@ -899,6 +899,9 @@ mod tests {
             max_dpb_frames,
             short_term_ref_pic_set_size_bits: 0,
             recovery_point: None,
+            // These fixtures model a healthy stream; the clean bit is the planner's
+            // observation and nothing in this conversion layer reads it.
+            references_clean: true,
         }
     }
 

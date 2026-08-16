@@ -166,6 +166,18 @@ pub struct PicturePlan {
     /// came from the SPS by index) — Vulkan's `NumBitsForSTRefPicSetInSlice`.
     pub short_term_ref_pic_set_size_bits: u32,
     pub recovery_point: Option<RecoveryPointHevc>,
+    /// Every picture this AU predicts from was itself decoded from a fully-available
+    /// reference chain — so a host claim that this AU is a clean re-anchor
+    /// (`USER_FLAG_RECOVERY_ANCHOR`) can be corroborated rather than taken on trust.
+    /// `true` for an IRAP (nothing to predict from) and for any picture whose whole
+    /// reference chain is clean; `false` from the moment this AU — or anything it
+    /// descends from — needed concealment.
+    ///
+    /// Purely additive observation: nothing in the plan, the warnings or the DPB
+    /// changes because of it, and on a stream that never loses a reference it is
+    /// `true` on every picture forever. See [`crate::clean`] for why it propagates and
+    /// why every rule errs toward `false`.
+    pub references_clean: bool,
 }
 
 /// A reference list / RPS entry: the minimum every backend picparams format needs.
@@ -230,6 +242,28 @@ pub enum PlanWarning {
     /// hosts emit zero-reorder low-delay streams only, so this warning is the field
     /// signal if that assumption ever breaks (the H.264 layer's `Mmco5Rebase` idiom).
     NonZeroReorder { max_num_reorder_pics: u8 },
+}
+
+impl PlanWarning {
+    /// Does this warning mean the PICTURE is damaged? The H.265 twin of
+    /// [`crate::h264::PlanWarning::is_integrity`] — the same one-list argument applies,
+    /// and `pf_vkdecode::is_integrity_warning_h265` delegates here.
+    ///
+    /// `NonZeroReorder` is NOT damage, and excluding it matters more here than the
+    /// H.264 exclusions do: it fires on the AU that ACTIVATES an SPS — the opening
+    /// IRAP, and the fresh IRAP at every ABR resolution change — so treating it as
+    /// concealment would cost a released-unshown frame plus a keyframe round trip at
+    /// every renegotiation, on a stream the planner says it planned correctly. It
+    /// would also poison the [`crate::clean::CleanLedger`] at exactly those IRAPs,
+    /// marking the one picture that is clean by construction as broken.
+    ///
+    /// Exhaustive with no wildcard, for the reason the H.264 twin spells out.
+    pub fn is_integrity(&self) -> bool {
+        match self {
+            PlanWarning::MissingReference { .. } | PlanWarning::TruncatedAu { .. } => true,
+            PlanWarning::NonZeroReorder { .. } => false,
+        }
+    }
 }
 
 /// The AU cannot be planned at all.
@@ -452,6 +486,10 @@ pub struct H265Planner {
     reported_live: BTreeSet<PicId>,
     /// Set by [`Self::flush`]: planning resumes only at an IRAP (upstream: `Reset`).
     awaiting_idr: bool,
+    /// Which resident pictures came off a BROKEN reference chain — the fact behind
+    /// [`PicturePlan::references_clean`]. Empty on a healthy stream; see
+    /// [`crate::clean::CleanLedger`] for the propagation rules.
+    clean: crate::clean::CleanLedger,
 }
 
 impl Default for H265Planner {
@@ -471,6 +509,7 @@ impl Default for H265Planner {
             pending_outputs: Vec::new(),
             reported_live: BTreeSet::new(),
             awaiting_idr: false,
+            clean: Default::default(),
         }
     }
 }
@@ -690,7 +729,20 @@ impl H265Planner {
         let cur = current
             .ok_or_else(|| PlanError::Parse("access unit contains no coded picture".into()))?;
 
-        let picture = Self::picture_plan(&cur, recovery_point);
+        // Was every picture this AU predicts from decoded off an intact chain? Asked
+        // over the SLICE reference lists rather than the RPS or the DPB snapshot,
+        // because those are what this picture actually predicts from: 8.3.2 RETAINS
+        // pictures in the RPS that the current picture does not use
+        // (`used_by_curr_pic` clear), and a damaged one among those says nothing about
+        // this picture. An IRAP's lists are empty, so this is vacuously true for it
+        // (`CleanLedger::references_clean`).
+        let references_clean = self.clean.references_clean(
+            slices
+                .iter()
+                .flat_map(|s: &SlicePlan| s.ref_list0.iter().chain(&s.ref_list1))
+                .map(|r| r.id),
+        );
+        let picture = Self::picture_plan(&cur, recovery_point, references_clean);
         let rps = cur.rps_plan.clone();
         let dpb_refs = cur.dpb_refs.clone();
         // The activated parameter sets ride out with the plan (AuPlan field docs);
@@ -707,6 +759,20 @@ impl H265Planner {
         previously_live.insert(stored);
         let removed = previously_live.difference(&live_after).copied().collect();
         self.reported_live = live_after;
+
+        // Fold this picture's verdict, then bound the ledger to DPB residency. Both
+        // AFTER `finish_picture`, so `stored` is the id the picture really got and
+        // `live_after` reflects the C.3.4/8.3.2 marking this AU performed — a mark
+        // written against a pre-marking view could survive an eviction it should have
+        // died with. `concealed` mirrors what a consumer conceals on, via the ONE
+        // classification (`PlanWarning::is_integrity`), so the ledger and the consumer
+        // can never disagree about whether this AU was damaged.
+        self.clean.note_stored(
+            stored,
+            references_clean,
+            warnings.iter().any(PlanWarning::is_integrity),
+        );
+        self.clean.retain_live(self.reported_live.iter().copied());
 
         Ok(AuPlan {
             picture,
@@ -745,6 +811,9 @@ impl H265Planner {
         // re-entry sound.
         self.first_picture_after_eos = true;
         self.awaiting_idr = true;
+        // The DPB is drained, so no mark describes a resident picture any more — and
+        // planning resumes at an IRAP, which is clean by construction.
+        self.clean.clear();
 
         DpbUpdate {
             stored: None,
@@ -1452,6 +1521,7 @@ impl H265Planner {
     fn picture_plan(
         cur: &CurrentPicState,
         recovery_point: Option<RecoveryPointHevc>,
+        references_clean: bool,
     ) -> PicturePlan {
         let pic = &cur.pic;
         // The first slice's PPS defines the picture's parameters; `cur.pps` may have
@@ -1498,6 +1568,7 @@ impl H265Planner {
             max_dpb_frames: dpb_limit(sps),
             short_term_ref_pic_set_size_bits: pic.short_term_ref_pic_set_size_bits,
             recovery_point,
+            references_clean,
         }
     }
 }
@@ -1550,11 +1621,15 @@ mod tests {
     /// `NonZeroReorder` is excluded: the vendored conformance clips are general
     /// (reordering) encodes, and the planner deliberately plans them while flagging
     /// the envelope fact.
+    ///
+    /// Delegates rather than restating the list. This harness exists to prove the
+    /// planner conceals exactly where production conceals, so a second copy here
+    /// could drift and quietly prove the wrong thing — and a `matches!` in
+    /// particular reads any FUTURE variant as clean, which is the one answer a
+    /// damage predicate must never default to. [`PlanWarning::is_integrity`] is an
+    /// exhaustive match, so a new variant stops the compiler there instead.
     fn is_integrity_warning(w: &PlanWarning) -> bool {
-        matches!(
-            w,
-            PlanWarning::MissingReference { .. } | PlanWarning::TruncatedAu { .. }
-        )
+        w.is_integrity()
     }
 
     /// Plan a whole vendored clip and assert the global invariants: every AU plans,
@@ -1656,6 +1731,30 @@ mod tests {
         assert!(!bear.is_empty());
         let (_, bbb) = plan_whole_clip(TEST_BBB);
         assert!(!bbb.is_empty());
+    }
+
+    /// The false-positive guard for [`PicturePlan::references_clean`], on REAL
+    /// bitstreams rather than authored ones: two conformance clips that lose nothing
+    /// must report every single picture clean. A regression that let the ledger mark a
+    /// healthy stream would refuse every host recovery anchor and force an IDR on
+    /// every loss — the cheap re-anchor path gone, silently.
+    ///
+    /// These clips carry B-slices and real reordering, so they also exercise the
+    /// "reference lists, not the RPS" reading: 8.3.2 retains pictures the current
+    /// picture does not use, and folding those in would condemn pictures at random.
+    #[test]
+    fn a_lossless_conformance_clip_reports_clean_references_on_every_picture() {
+        for (name, clip) in [("bear", TEST_BEAR), ("bbb", TEST_BBB)] {
+            let (_, plans) = plan_whole_clip(clip);
+            assert!(!plans.is_empty(), "{name} produced no plans");
+            for (i, plan) in plans.iter().enumerate() {
+                assert!(
+                    plan.picture.references_clean,
+                    "{name} picture {i} (poc {}) must read clean on a lossless clip",
+                    plan.picture.pic_order_cnt
+                );
+            }
+        }
     }
 
     #[test]

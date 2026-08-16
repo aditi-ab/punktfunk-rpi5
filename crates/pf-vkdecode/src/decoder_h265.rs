@@ -139,12 +139,19 @@ struct SessionStateH265 {
 ///
 /// This decoder FAILS CLOSED, and that stays: when an AU cannot be carried
 /// through to a submitted decode, it returns an error rather than substituting a
-/// reference or decoding against a slot whose image is gone. H.264's
-/// soft-degrade (trace the missing binding, drop that reference, decode anyway)
-/// is not available here because `StdVideoDecodeH265PictureInfo`'s
+/// reference or decoding against a slot whose image is gone. The structural argument
+/// is that `StdVideoDecodeH265PictureInfo`'s
 /// `RefPicSetStCurrBefore`/`StCurrAfter`/`LtCurr` arrays hold INDICES into the
 /// decode op's reference array — dropping one entry re-points every later index
 /// at the wrong picture, which is the corruption-hiding class this crate refuses.
+///
+/// ⚠ H.264 used to soft-degrade here (trace the missing binding, drop that reference,
+/// decode anyway) on the grounds that it carries no such index arrays. It now fails
+/// closed and carries this same latch: the arrays were never the point, the OUTPUT
+/// was. A P-picture decoded against a reference that was never bound is a gray plate
+/// with motion painted over it, and because the planner raises no warning for it, that
+/// frame reached the screen and cleared the consumer's demotion streak. Both codecs
+/// now fail closed, and both recover through this latch rather than wedging.
 ///
 /// But failing closed once must not wedge the stream FOREVER, and without this
 /// latch it did: by the time an AU reaches a failure exit, `plan_to_vk_h265` has
@@ -636,6 +643,7 @@ impl VkH265Decoder {
                 is_idr: plan.picture.is_idr,
                 recovery,
                 decode_order,
+                references_clean: plan.picture.references_clean,
             },
         );
 
@@ -1247,10 +1255,15 @@ fn profile_key_for(plan: &AuPlan) -> Result<H265ProfileKey, VkDecodeError> {
 /// let [`build_scope`] bind a slot the planner no longer knows about, which is the
 /// same "plausible-looking picture in the wrong place" the unbound-reference
 /// refusal exists to prevent.
-fn reset_slot_bindings(
+///
+/// Generic over the cached reference-info type so H.264's recovery uses this exact
+/// code rather than a twin: the three ledgers and the "empty them together" rule are
+/// codec-independent (`SlotMap` is already shared), and only the `StdVideo*` type in
+/// `slot_refs` differs.
+pub(crate) fn reset_slot_bindings<S>(
     slots: &mut SlotMap,
     slot_image: &mut [Option<usize>],
-    slot_refs: &mut [Option<hh::StdVideoDecodeH265ReferenceInfo>],
+    slot_refs: &mut [Option<S>],
 ) -> Vec<usize> {
     // `release` is the only way a slot is freed (SlotMap docs); the collect is
     // because `held` borrows the map the releases mutate.
@@ -1279,10 +1292,55 @@ fn slot_view(state: &SessionStateH265, slot: u8) -> Option<vk::ImageView> {
 /// (No derived equality: `StdVideoDecodeH265ReferenceInfo` is a plain-C bindgen
 /// struct without it. Assertions compare the fields that carry meaning.)
 #[derive(Debug, Clone, Copy)]
-struct ScopeEntry {
-    slot_index: i32,
-    view: vk::ImageView,
-    std: hh::StdVideoDecodeH265ReferenceInfo,
+pub(crate) struct ScopeEntry<S> {
+    pub(crate) slot_index: i32,
+    pub(crate) view: vk::ImageView,
+    pub(crate) std: S,
+}
+
+/// One of this AU's references, as [`build_scope`] needs to see it: a DPB slot and
+/// the codec reference info to bind with it.
+///
+/// It exists so H.264 and H.265 share ONE scope builder instead of two hand-copies of
+/// a function whose whole job is refusing to guess — the property most in need of a
+/// single implementation. Their `VkRef`/`VkRefH265` differ only in the `StdVideo*`
+/// type they carry, so the shape generalises exactly.
+///
+/// ⚠ AV1 deliberately keeps its own ([`crate::decoder_av1`]'s `build_scope_av1`): its
+/// reference array is indexed by reference NAME and may hold HOLES, so its walk is a
+/// different algorithm rather than the same one over a different Std type. Folding it
+/// in here would mean a builder with a mode flag, which is how the two would drift.
+pub(crate) trait ScopeRef {
+    /// The codec's `StdVideoDecode*ReferenceInfo`.
+    type Std: Copy;
+    /// The DPB slot this reference is bound in.
+    fn slot(&self) -> u8;
+    fn std(&self) -> Self::Std;
+}
+
+/// [`build_scope`]'s answer: the bound-slot list, and how many of its LEADING entries
+/// are this AU's own references (the prefix the decode op takes as its reference
+/// array — see the ordering note in `build_scope`'s docs).
+pub(crate) type Scope<R> = (Vec<ScopeEntry<<R as ScopeRef>::Std>>, usize);
+
+impl ScopeRef for crate::pic_h265::VkRefH265 {
+    type Std = hh::StdVideoDecodeH265ReferenceInfo;
+    fn slot(&self) -> u8 {
+        self.slot
+    }
+    fn std(&self) -> Self::Std {
+        self.std
+    }
+}
+
+impl ScopeRef for crate::pic::VkRef {
+    type Std = ash::vk::native::StdVideoDecodeH264ReferenceInfo;
+    fn slot(&self) -> u8 {
+        self.slot
+    }
+    fn std(&self) -> Self::Std {
+        self.std
+    }
 }
 
 /// Build the coding scope's bound-slot list and say how many leading entries are
@@ -1295,36 +1353,51 @@ struct ScopeEntry {
 ///    resources must stay bound even when this AU does not reference them);
 /// 3. the setup slot as the activation entry, slot index `-1`.
 ///
-/// A reference whose slot binds no image is a hard error, never a skip:
-/// `StdVideoDecodeH265PictureInfo`'s `RefPicSetStCurrBefore`/`StCurrAfter`/
-/// `LtCurr` arrays name DPB slots, and every slot they name is one of `refs`'
-/// ([`crate::pic_h265`]) — so dropping an entry leaves the hardware with a named
-/// slot this op never bound, which it can only answer by guessing or failing.
-/// Output that looks plausible and is wrong is the outcome this refusal exists to
-/// prevent.
-fn build_scope(
-    refs: &[crate::pic_h265::VkRefH265],
+/// A reference whose slot binds no image is a hard error, never a skip. For H.265 the
+/// argument is `StdVideoDecodeH265PictureInfo`'s `RefPicSetStCurrBefore`/`StCurrAfter`/
+/// `LtCurr` arrays: they name DPB slots, every slot they name is one of `refs`'
+/// ([`crate::pic_h265`]), so dropping an entry leaves the hardware with a named slot
+/// this op never bound — which it can only answer by guessing or failing.
+///
+/// H.264 has no such index arrays, and it used to skip the case with a `trace!` on
+/// exactly that reasoning. The reasoning was wrong about the OUTPUT: the hardware
+/// still decodes a P-picture against a reference that was never bound, which on the
+/// DPB-and-output-COINCIDE path is a gray plate with the new frame's motion painted
+/// over it — and because the planner raised no warning (its DPB genuinely holds the
+/// picture; the breakage is in this ledger), the frame was shipped, presented, and
+/// cleared the consumer's demotion streak on its way past. Both codecs fail closed
+/// here now; the recovery latch is what keeps failing closed from wedging the stream.
+///
+/// `reference_count` is captured the instant the `refs` loop ends, BEFORE the
+/// held-slot pass appends anything. That ordering is load-bearing: the decode op takes
+/// `scope[..reference_count]` as its reference list, so a count computed after the
+/// second pass could hand it a still-held slot that this AU does not reference, in
+/// place of one that failed to resolve. (Fail-closed above makes that unreachable —
+/// but the construction must be correct on its own, not by depending on a check
+/// somewhere else.)
+pub(crate) fn build_scope<R: ScopeRef>(
+    refs: &[R],
     held_slots: impl Iterator<Item = u8>,
     setup_slot: u8,
     setup_view: vk::ImageView,
-    setup_ref: hh::StdVideoDecodeH265ReferenceInfo,
-    slot_refs: &[Option<hh::StdVideoDecodeH265ReferenceInfo>],
+    setup_ref: R::Std,
+    slot_refs: &[Option<R::Std>],
     view_of: impl Fn(u8) -> Option<vk::ImageView>,
-) -> Result<(Vec<ScopeEntry>, usize), VkDecodeError> {
-    let mut scope: Vec<ScopeEntry> = Vec::with_capacity(refs.len() + slot_refs.len() + 1);
+) -> Result<Scope<R>, VkDecodeError> {
+    let mut scope: Vec<ScopeEntry<R::Std>> = Vec::with_capacity(refs.len() + slot_refs.len() + 1);
     for r in refs {
-        match view_of(r.slot) {
+        match view_of(r.slot()) {
             Some(view) => scope.push(ScopeEntry {
-                slot_index: i32::from(r.slot),
+                slot_index: i32::from(r.slot()),
                 view,
-                std: r.std,
+                std: r.std(),
             }),
-            None => return Err(VkDecodeError::UnboundReferenceSlot { slot: r.slot }),
+            None => return Err(VkDecodeError::UnboundReferenceSlot { slot: r.slot() }),
         }
     }
     let reference_count = scope.len();
     for slot in held_slots {
-        if slot == setup_slot || refs.iter().any(|r| r.slot == slot) {
+        if slot == setup_slot || refs.iter().any(|r| r.slot() == slot) {
             continue;
         }
         match (
@@ -1862,8 +1935,11 @@ mod tests {
         let setup_slot = slots.assign(400).unwrap();
         assert_eq!(setup_slot, 0, "the freed slots are assignable again");
         slot_image[usize::from(setup_slot)] = Some(9);
+        // The empty slice needs its element type named now that `build_scope` is
+        // generic over the two codecs' reference types.
+        let no_refs: [VkRefH265; 0] = [];
         let (scope, reference_count) = build_scope(
-            &[],
+            &no_refs,
             slots.held().map(|(slot, _id)| slot),
             setup_slot,
             fake_view(setup_slot),
