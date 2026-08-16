@@ -36,9 +36,9 @@ public enum ModifierLayout: String, CaseIterable, Sendable {
     public var detail: String {
         switch self {
         case .mac:
-            return "The ⌥ Option key sends Alt and the ⌘ Command key sends the Windows key — the Apple layout."
+            return "⌥ sends Alt, ⌘ sends the Windows key."
         case .windows:
-            return "The key nearest the space bar sends Alt and the next one sends the Windows key, matching a PC keyboard. Client shortcuts (⌘⎋ and friends) still use the physical ⌘ key."
+            return "The key beside the space bar sends Alt, the next sends Windows — like a PC keyboard."
         }
     }
 
