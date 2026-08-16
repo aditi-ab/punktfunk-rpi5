@@ -184,6 +184,7 @@ fun App(forceGamepadUi: Boolean = false) {
             // third permanent tab for something you reach from a card would be a nav item that is
             // meaningless until you pick one. So it takes the whole window (bar included, like the
             // console shell's does) and Back — the arrow or the system gesture — returns to the grid.
+            // Read once: `touchLibrary` is a `var`, so it does not smart-cast through the branch.
             val (host, pinId) = touchLibrary!!
             LibraryScreen(
                 host = host,

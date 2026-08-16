@@ -229,6 +229,10 @@ fun LibraryScreen(
         }
     }
 
+    // Lambdas, NOT `::launch` / `::copyLink`: two callable references to the same local function
+    // compare EQUAL however different the frame they captured, so a skipped recomposition would
+    // leave the child calling a closure over stale settings. SettingsScreen documents the same
+    // trap at `scopeProfile()`, having been bitten by it.
     if (console) {
         ConsoleLibrary(
             title = title,
@@ -236,8 +240,8 @@ fun LibraryScreen(
             launching = launching,
             navActive = navActive,
             onBack = onBack,
-            onLaunch = ::launch,
-            onCopyLink = ::copyLink,
+            onLaunch = { identity, game -> launch(identity, game) },
+            onCopyLink = { game -> copyLink(game) },
         )
     } else {
         TouchLibrary(
@@ -246,8 +250,8 @@ fun LibraryScreen(
             launching = launching,
             onBack = onBack,
             onReload = { reloadKey++ },
-            onLaunch = ::launch,
-            onCopyLink = ::copyLink,
+            onLaunch = { identity, game -> launch(identity, game) },
+            onCopyLink = { game -> copyLink(game) },
         )
     }
 }
@@ -428,9 +432,12 @@ private fun TouchLibrary(
  * The poster grid. Design D4: launcher entries get their own shelf above the titles, never
  * interleaved, and the headings only appear when both groups exist — so a library without
  * launchers looks exactly like a plain grid.
+ *
+ * Internal (not private) for the same reason as [Coverflow]: the screenshot harness composes the
+ * real grid with a mock shelf, because the screen around it takes its state off the network.
  */
 @Composable
-private fun TouchGrid(
+internal fun TouchGrid(
     games: List<GameEntry>,
     loader: ImageLoader,
     onLaunch: (GameEntry) -> Unit,

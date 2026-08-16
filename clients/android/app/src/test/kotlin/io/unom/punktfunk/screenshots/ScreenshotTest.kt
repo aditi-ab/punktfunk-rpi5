@@ -210,6 +210,14 @@ class ScreenshotTest {
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
     fun library() = shootRoot("library", statusBar = false) { LibraryScene() }
 
+    /**
+     * The same shelf as the TOUCH grid — the presentation a finger gets from a host card's
+     * "Browse library…". Portrait (the default qualifiers), because that is the orientation a
+     * phone browses a poster wall in, and the one whose column count the layout has to get right.
+     */
+    @Test
+    fun libraryTouch() = shootRoot("library-touch") { TouchLibraryScene() }
+
     @Test
     fun consoleControllersLight() =
         shootRoot("console-controllers-light", statusBar = false) { ConsoleControllersScene(paletteId = "holo") }
