@@ -497,6 +497,18 @@
 
 // The protocol's audio frame, in milliseconds — every host datagram carries exactly one
 // ([`crate::quic::encode_audio_datagram`]), so it is also the smallest useful shed unit.
+//
+// ⚠ **This is the OPUS plane's frame, and the default. It is not the only one.** The lossless
+// plane negotiates shorter frames sized to the path MTU ([`pcm::frame_us_for`]): 4 ms at
+// 48 kHz/24-bit and 2 ms at 96 kHz/24-bit under the default ceiling. The resolved value rides the
+// `Welcome` as `audio_frame_us` and is on [`crate::client::NativeClient::audio_frame_us`].
+//
+// It is exported to C as `PUNKTFUNK_AUDIO_FRAME_MS` and is **kept at 5 with its meaning
+// unchanged**, exactly like `PUNKTFUNK_AUDIO_SAMPLE_RATE_HZ`: embedders size rings from it and
+// removing it would be a silent C break. But sizing a ring as *frames × `PUNKTFUNK_AUDIO_FRAME_MS`*
+// is wrong by up to 2.5× on a lossless session. An embedder that drains
+// [`crate::abi::punktfunk_connection_next_audio_pcm`] is safe without doing anything — that call
+// reports each frame's real length in `frame_count`, which is the figure to size from.
 #define PUNKTFUNK_AUDIO_FRAME_MS 5
 
 // Sample rate of every audio plane in the protocol.
