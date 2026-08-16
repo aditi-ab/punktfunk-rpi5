@@ -140,12 +140,11 @@ pub trait AudioCapturer: Send {
 /// collapsing either into "unknown" would decline hi-res on the one configuration (§4.4) where
 /// it is honest by construction.
 ///
-/// Exactly ONE of the first two variants is ever constructed on a given target, so each carries
-/// the `dead_code` allow for the platforms that never build it — the same `cfg_attr` this module
-/// already puts on `wiring_plan` and `capture_policy`, and for the same reason: the crate root's
-/// blanket `#![allow(dead_code)]` covers it today, and a local marker is what keeps this honest
-/// if that scaffold-era allow is ever narrowed. Per-variant rather than on the enum, so a
-/// genuinely dead variant added later would still be caught.
+/// Each variant carries a `dead_code` allow for the platforms that never construct it — the same
+/// `cfg_attr` this module already puts on `wiring_plan` and `capture_policy`, and for the same
+/// reason: the crate root's blanket `#![allow(dead_code)]` covers it today, and a local marker is
+/// what keeps this honest if that scaffold-era allow is ever narrowed. Per-variant rather than on
+/// the enum, so a genuinely dead variant added later would still be caught.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureRate {
     /// The HOST declares the rate to the graph and applications render into it natively, so
@@ -153,17 +152,21 @@ pub enum CaptureRate {
     /// Linux stream-sink mode, the default (§4.4).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Declared,
-    /// The device's engine runs at exactly this rate, and asking it for anything else succeeds
-    /// anyway by resampling: WASAPI's `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` reconciles our
-    /// format with the engine's in whichever direction is needed, with no error (§4.3). Only a
-    /// request at or below this is honest; above it we would advertise a rate, spend the
-    /// bandwidth, and deliver interpolation.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    /// The device runs at exactly this rate, and asking it for anything else succeeds anyway by
+    /// resampling — so only a request at or below it is honest; above it we would advertise a
+    /// rate, spend the bandwidth, and deliver interpolation.
+    ///
+    /// Both hosts reach this, from different queries and against different resamplers. On
+    /// Windows it is the endpoint's engine mix format, which `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`
+    /// reconciles our request with in whichever direction is needed, with no error (§4.3). On
+    /// Linux it is the rate of the sink a `PUNKTFUNK_STREAM_SINK=0` monitor capture would follow,
+    /// read from the PipeWire registry, because the resampler between that node and our stream
+    /// is just as silent about what it hid (§4.4).
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     Engine(u32),
-    /// Not answerable without opening the capture — Linux `PUNKTFUNK_STREAM_SINK=0` monitor
-    /// mode (we capture someone else's sink THROUGH PipeWire's resampler, which reports a clean
-    /// rate whatever is upstream — §8.3), a Windows probe that could not reach the endpoint, or
-    /// a platform with no capture backend at all. Hi-res declines.
+    /// Nobody could be made to say, and so the answer is no: a Linux monitor capture whose
+    /// elected sink is gone, idle or unnameable (§8.3), a Windows probe that could not reach the
+    /// endpoint, or a platform with no capture backend at all. Hi-res declines.
     Unknown,
 }
 
@@ -186,9 +189,10 @@ impl CaptureRate {
 /// Ask the capture path what rate it can honestly deliver, WITHOUT opening a capture stream and
 /// without changing anything about the box — see [`CaptureRate`].
 ///
-/// Blocking (Windows enumerates endpoints and activates an `IAudioClient` per candidate), so
-/// callers on the async path run it off the reactor. Called only when hi-res is actually on the
-/// table: an ordinary session must not pay for a feature nobody asked for.
+/// Blocking — Windows enumerates endpoints and activates an `IAudioClient` per candidate, and a
+/// Linux monitor-mode host runs a bounded PipeWire registry round-trip — so callers on the async
+/// path run it off the reactor. Called only when hi-res is actually on the table: an ordinary
+/// session must not pay for a feature nobody asked for.
 #[cfg(target_os = "linux")]
 pub fn probe_capture_rate() -> CaptureRate {
     linux::probe_capture_rate()

@@ -247,6 +247,14 @@ pub struct HostConfig {
     /// tri-state is kept only so a future status/diagnostics reader can tell "the operator turned
     /// it off" from "the operator never said". Explicit-off grammar for symmetry with its
     /// neighbours.
+    ///
+    /// ⚠ **The desktop CLIENTS read a variable of this same name with a RICHER grammar** — see
+    /// `pf_client_core::session`, which takes `1`/`on`, a bare rate such as `96000`, or an explicit
+    /// `<rate>/<bits>`. A box that is both host and client therefore configures both halves from
+    /// one environment line, and they compose only because [`env_on`] reads everything that is not
+    /// `0`/`false`/`off`/`no` as *on*: a client-shaped `96000/24` happens to say *allow* here too.
+    /// That is an accident that works, not a shared grammar — `1` is the only spelling that means
+    /// the same thing at both ends, which is why it is the one the docs give.
     pub audio_hires: Option<bool>,
     /// `PUNKTFUNK_PERF` — per-stage timing instrumentation.
     pub perf: bool,

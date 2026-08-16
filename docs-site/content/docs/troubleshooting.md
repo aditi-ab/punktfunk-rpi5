@@ -565,7 +565,7 @@ PUNKTFUNK_AUDIO_HIRES=1         # allow the lossless PCM audio plane (default of
 ```
 
 That replaces Opus with uncompressed 48/96 kHz, 16/24-bit stereo PCM. It has to be turned on at
-**both** ends — the client has its own toggle, also off by default — because it costs 1.5–4.6 Mbps
+**both** ends — the client has its own switch, also off by default — because it costs 1.5–4.6 Mbps
 against Opus's 256 kbps, and like every other audio setting here that comes off the top of the
 link, where adaptive bitrate can neither see it nor reclaim it.
 
@@ -573,10 +573,18 @@ It is also unlikely to fix the problem *this* section is about: a lossless copy 
 mix is still a 24 kHz mono mix, so fix the endpoint first. What it buys is bit-exactness rather
 than audibly better sound — on game content, 256 kbps Opus is already effectively transparent. On
 Windows the host reads the endpoint's own engine rate (the `engine_hz` line above) and refuses to
-pad, so 96 kHz means setting that device to 96 kHz in Windows' own sound properties. Whenever any
-condition fails — the client didn't ask, the session isn't stereo, the capture path can't
-genuinely deliver the rate, or the link can't spare it — the session quietly stays on Opus and the
-log says which one lost.
+pad, so 96 kHz means setting that device to 96 kHz in Windows' own sound properties. A Linux host
+normally owns the sink applications play into and states its rate to the audio graph itself, so
+96 kHz there needs no device configuration at all. Whenever any condition fails — the client didn't
+ask, the session isn't stereo, the capture path can't genuinely deliver the rate, or the link can't
+spare it — the session quietly stays on Opus and the log says which one lost.
+
+One trap if the box you are editing is *also* a client: the Linux and Windows clients read a
+`PUNKTFUNK_AUDIO_HIRES` of their own, with a richer grammar — a bare rate such as `96000`, or an
+explicit `96000/24` — so one line in a shared environment sets both halves at once. **`1` is the
+value that means *on* to each of them**, which is why the line above is written that way. The
+client's spellings are in
+[Configuration → Client-side](/docs/configuration#client-side-native-clients).
 
 ## Audio lags behind the picture
 

@@ -248,8 +248,10 @@ pub(super) fn resolve_audio_plane(
             "hi-res audio was requested but this host's capture path cannot honestly deliver \
              that rate — the session uses Opus 48 kHz. On Windows the endpoint's own engine rate \
              is authoritative (autoconvert would silently hand us an upsampled copy), so set the \
-             rate in that device's Windows properties; on Linux the rate is only knowable in \
-             stream-sink mode, so PUNKTFUNK_STREAM_SINK=0 declines by construction"
+             rate in that device's Windows properties; on Linux the default stream-sink mode \
+             delivers any supported rate, while PUNKTFUNK_STREAM_SINK=0 can only offer the rate \
+             the monitored sink itself runs at — and declines outright when that sink is idle or \
+             cannot be read"
         );
         return AudioPlane::opus();
     }
@@ -1309,8 +1311,9 @@ mod tests {
             ),
             AudioPlane::opus()
         );
-        // Unknown — Linux `PUNKTFUNK_STREAM_SINK=0` monitor mode (§8.3), or a probe that could
-        // not reach the endpoint. Declines every rung: an unprovable claim is not a claim.
+        // Unknown — a Linux `PUNKTFUNK_STREAM_SINK=0` monitor capture whose elected sink could
+        // not be read (§8.3), or a Windows probe that could not reach the endpoint. Declines
+        // every rung: an unprovable claim is not a claim.
         for (rate, bits) in [
             (48_000u32, pcm::BITS_16),
             (48_000, pcm::BITS_24),

@@ -27,6 +27,7 @@
 //! surround session can replace a stereo capturer without leaking a PipeWire consumer (see
 //! CLAUDE.md: a wedged link head-blocks the daemon).
 
+mod monitor_rate;
 pub(crate) mod pad_sink;
 mod stream_sink;
 
@@ -52,30 +53,55 @@ fn stream_sink_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// §8.4 condition 4 on Linux (`design/hi-res-audio.md` §4.4 / §8.3) — answered from the CAPTURE
-/// TOPOLOGY alone, with no PipeWire connection at all.
-///
-/// The two modes give structurally different answers, and that is the whole content of §4.4:
+/// §8.4 condition 4 on Linux (`design/hi-res-audio.md` §4.4 / §8.3). The two capture modes give
+/// structurally different answers, and that difference is the whole content of §4.4:
 ///
 /// * **Stream-sink mode (the default).** We register the `Audio/Sink` node ourselves and
 ///   [`pw_thread`] declares its format, so applications render into it at that rate natively.
 ///   The rate we claim is the rate we get, by construction — there is no upstream resampler in
-///   the path to lie about it, so the answer is yes for every rate the plane supports and no
-///   probe is needed to say so.
+///   the path to lie about it, so the answer is yes for every rate the plane supports, and no
+///   probe of any kind is needed to say so.
 /// * **`PUNKTFUNK_STREAM_SINK=0` (monitor mode).** We capture somebody else's sink through
 ///   PipeWire's resampler, which reports a clean rate whatever the node upstream of it really
-///   runs at — the same blindness WASAPI's autoconvert has. The rate is therefore NOT knowable
-///   here, and §8.3 says to decline rather than trust it. (Reading the monitored node's own rate
-///   out of the registry would answer it; that lookup does not exist yet, and it is the
-///   prerequisite this configuration is waiting on.)
+///   runs at — the same blindness WASAPI's autoconvert has. So the answer cannot come from our
+///   own stream; it comes from the MONITORED NODE, read out of the registry by
+///   [`monitor_rate::monitored_sink_rate`]. A rate that can be read is an
+///   [`Engine`](super::CaptureRate::Engine) answer, exactly as a Windows endpoint's mix format
+///   is, and the gate compares the request against it.
 ///
-/// Note the asymmetry with Windows on purpose: there the honest answer needs a device query,
-/// here it needs none, because the host is the one declaring the format.
+/// ⚠ **The two failure directions are not symmetric, and the code leans on that.** An unreadable
+/// rate — a suspended sink, an unset metadata key, a node that vanished, a graph that did not
+/// answer inside the probe's timeout — is [`Unknown`](super::CaptureRate::Unknown), which
+/// declines and costs the session nothing but today's excellent Opus 48 kHz. A *guessed* rate
+/// that turns out wrong costs a session that advertises 96 kHz, spends 4.6 Mbps on it, and
+/// carries interpolated 48 kHz with both ends auditing clean. So this never guesses: there is no
+/// "assume the graph default", no reading `EnumFormat` (a capability, not a fact), and no
+/// falling back to the rate we asked for.
+///
+/// Note the asymmetry with Windows on purpose: there *every* answer needs a device query, here
+/// only the monitor mode does, because in the default mode the host is the one declaring the
+/// format.
 pub(super) fn probe_capture_rate() -> super::CaptureRate {
     if stream_sink_enabled() {
-        super::CaptureRate::Declared
-    } else {
-        super::CaptureRate::Unknown
+        return super::CaptureRate::Declared;
+    }
+    match monitor_rate::monitored_sink_rate() {
+        Ok(rate_hz) => {
+            tracing::debug!(
+                rate_hz,
+                "hi-res capture-rate probe: the sink this host would monitor runs at this rate"
+            );
+            super::CaptureRate::Engine(rate_hz)
+        }
+        Err(e) => {
+            tracing::debug!(
+                reason = %format!("{e:#}"),
+                "hi-res capture-rate probe: the monitored sink's own rate is not readable — \
+                 declining hi-res (PUNKTFUNK_STREAM_SINK=0 captures through PipeWire's resampler, \
+                 so the rate our own stream reports proves nothing)"
+            );
+            super::CaptureRate::Unknown
+        }
     }
 }
 
@@ -107,8 +133,8 @@ pub struct PwAudioCapturer {
     /// said otherwise — and in stream-sink mode it is nearly always the final one, since the
     /// host owns the sink and declares its format (`design/hi-res-audio.md` §4.4). In legacy
     /// monitor mode the value is a weaker claim: it is the rate of the resampled stream we are
-    /// handed, not of the node upstream of it, which is why the §8.3 gate declines hi-res
-    /// there rather than trusting this number.
+    /// handed, not of the node upstream of it, which is why the §8.3 gate reads the monitored
+    /// node's own rate out of the registry ([`monitor_rate`]) rather than trusting this number.
     negotiated_rate: Arc<AtomicU32>,
 }
 
@@ -999,9 +1025,10 @@ fn pw_thread(
                     // we saw it. In LEGACY monitor mode we are capturing someone else's sink
                     // through PipeWire's resampler: a 16 kHz Bluetooth headset upstream would
                     // still be reported here as a clean 48 kHz, exactly the way WASAPI's
-                    // autoconvert hid the same thing on Windows (the 2026-08-03 report). Reading
-                    // the monitored node's OWN rate needs a registry lookup this stream does not
-                    // do — recorded as an open gap rather than implied to be covered.
+                    // autoconvert hid the same thing on Windows (the 2026-08-03 report). So this
+                    // line is a fact about OUR stream and never about the content in legacy mode
+                    // — the monitored node's own rate is a registry lookup, and it lives in
+                    // `monitor_rate`, where the hi-res gate reads it before the `Welcome`.
                     tracing::info!(
                         format = ?info.format(),
                         rate = info.rate(),
@@ -1195,10 +1222,12 @@ fn pw_thread(
         // Request F32LE at the session's rate + channel count with explicit positions. In
         // legacy mode PipeWire's channel-mixer up/downmixes the sink monitor to this layout;
         // in stream-sink mode this IS the sink's advertised layout (apps mix/route to it) —
-        // which is exactly why hi-res is structurally honest there and declined in monitor mode
-        // (`design/hi-res-audio.md` §4.4): a sink we OWN renders at the rate we declare, while
-        // a monitor tap is handed a resampled copy that reports a clean rate whatever ran
-        // upstream. What was actually granted comes back through `param_changed` above.
+        // which is exactly why hi-res is structurally honest there and has to be PROVEN in
+        // monitor mode (`design/hi-res-audio.md` §4.4): a sink we OWN renders at the rate we
+        // declare, while a monitor tap is handed a resampled copy that reports a clean rate
+        // whatever ran upstream, so that configuration's rate comes from the registry
+        // (`monitor_rate`) and not from here. What was actually granted comes back through
+        // `param_changed` above.
         let mut info = AudioInfoRaw::new();
         info.set_format(AudioFormat::F32LE);
         info.set_rate(rate_hz);
