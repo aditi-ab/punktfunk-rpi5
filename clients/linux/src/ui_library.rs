@@ -10,7 +10,7 @@ use crate::library::{self, GameEntry};
 use crate::trust;
 use crate::ui_hosts::ConnectRequest;
 use adw::prelude::*;
-use gtk::{gdk, glib};
+use gtk::{gdk, gio, glib};
 use relm4::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -62,6 +62,32 @@ fn page_host_label(req: &ConnectRequest) -> String {
             || req.name.clone(),
             |p| format!("{} \u{b7} {}", req.name, p.name),
         )
+}
+
+/// One title's self-emitted `punktfunk://` link (design/client-deep-links.md §5): this
+/// page's host with the game's own `launch=` id attached, so the URL boots straight into
+/// that title instead of the desktop. Built from the STORE, like every other "Copy link"
+/// in this shell, because the stable id and the pin live there rather than on the request.
+///
+/// A shelf opened from a PINNED card carries that card's one-off profile into the link:
+/// what you copy off that shelf is what pressing the card and picking the title does.
+/// `None` only when the host has left the store while the page was open.
+fn game_link(req: &ConnectRequest, game_id: &str) -> Option<String> {
+    let known = pf_client_core::trust::KnownHosts::load();
+    let host = req
+        .fp_hex
+        .as_deref()
+        .filter(|fp| !fp.is_empty())
+        .and_then(|fp| known.find_by_fp(fp))
+        .or_else(|| known.find_by_addr(&req.addr, req.port))?;
+    Some(
+        pf_client_core::deeplink::DeepLink::for_host(
+            host,
+            Some(game_id),
+            req.profile.as_deref().filter(|p| !p.is_empty()),
+        )
+        .to_url(),
+    )
 }
 
 /// Open the library page for a saved host and start the fetch. `mgmt_port` comes from
@@ -379,10 +405,44 @@ fn game_card(state: &Rc<State>, game: &GameEntry) -> gtk::FlowBoxChild {
     badge.set_margin_start(6);
     badge.set_margin_top(6);
 
+    // The tile's own actions. Today that is one — "Copy link", the per-GAME half of the
+    // pairing the host cards already offer (design/client-deep-links.md §5 names the
+    // library game context menu as an attach point) — hung off a menu rather than a bare
+    // button so the next one lands next to it instead of growing a second affordance.
+    let actions = gio::SimpleActionGroup::new();
+    {
+        let (sender, req, id) = (state.sender.clone(), state.req.clone(), game.id.clone());
+        let a = gio::SimpleAction::new("copy-link", None);
+        a.connect_activate(move |_, _| match game_link(&req, &id) {
+            Some(url) => {
+                if let Some(display) = gdk::Display::default() {
+                    display.clipboard().set_text(&url);
+                }
+                sender.input(AppMsg::Toast("Link copied".into()));
+            }
+            // Only reachable if the host was forgotten while this page was open.
+            None => sender.input(AppMsg::Toast("This host isn't saved any more".into())),
+        });
+        actions.add_action(&a);
+    }
+    let menu = gio::Menu::new();
+    menu.append(Some("Copy link"), Some("game.copy-link"));
+    let menu_btn = gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .menu_model(&menu)
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Start)
+        .build();
+    menu_btn.add_css_class("flat");
+    menu_btn.add_css_class("pf-poster-menu");
+    menu_btn.set_tooltip_text(Some("More options"));
+
     let poster = gtk::Overlay::new();
     poster.set_child(Some(&placeholder));
     poster.add_overlay(&pic);
     poster.add_overlay(&badge);
+    poster.add_overlay(&menu_btn);
+    poster.insert_action_group("game", Some(&actions));
     poster.add_css_class("pf-poster");
     if launcher {
         poster.add_css_class("pf-launcher");
@@ -403,6 +463,14 @@ fn game_card(state: &Rc<State>, game: &GameEntry) -> gtk::FlowBoxChild {
 
     let child = gtk::FlowBoxChild::new();
     child.set_child(Some(&card));
+    // Right-click anywhere on the tile is the same menu — the desktop gesture for "this
+    // item's actions", and what the host cards already answer to.
+    let right_click = gtk::GestureClick::builder().button(3).build();
+    {
+        let menu_btn = menu_btn.clone();
+        right_click.connect_pressed(move |_, _, _, _| menu_btn.popup());
+    }
+    child.add_controller(right_click);
     let sender = state.sender.clone();
     let mut req = state.req.clone();
     req.launch = Some((game.id.clone(), game.title.clone()));

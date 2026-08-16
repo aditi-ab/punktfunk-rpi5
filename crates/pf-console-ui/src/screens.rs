@@ -103,23 +103,34 @@ impl Outbox {
     }
 }
 
-/// This row's `punktfunk://` link, built from the STORE so it carries the fingerprint and
-/// stable id a row doesn't hold — the same builder the desktop shells' "Copy link" uses,
-/// so a link is identical whichever surface hands it to you. `None` if the host has left
+/// A saved host's `punktfunk://` link, built from the STORE so it carries the fingerprint
+/// and stable id a screen doesn't hold — the same builder the desktop shells' "Copy link"
+/// uses, so a link is identical whichever surface hands it to you. `launch` attaches a
+/// library id, which is what makes a game's link a game's link. `None` if the host has left
 /// the store since the menu was opened.
-pub(crate) fn host_link(row: &HostRow) -> Option<String> {
+pub(crate) fn saved_host_link(
+    fp_hex: &str,
+    addr: &str,
+    port: u16,
+    profile: Option<&str>,
+    launch: Option<&str>,
+) -> Option<String> {
     let known = trust::KnownHosts::load();
-    let host = (!row.fp_hex.is_empty())
-        .then(|| known.find_by_fp(&row.fp_hex))
+    let host = (!fp_hex.is_empty())
+        .then(|| known.find_by_fp(fp_hex))
         .flatten()
-        .or_else(|| known.find_by_addr(&row.addr, row.port))?;
-    Some(
-        pf_client_core::deeplink::DeepLink::for_host(
-            host,
-            None,
-            row.pin.as_ref().map(|p| p.id.as_str()),
-        )
-        .to_url(),
+        .or_else(|| known.find_by_addr(addr, port))?;
+    Some(pf_client_core::deeplink::DeepLink::for_host(host, launch, profile).to_url())
+}
+
+/// This row's link — the host itself, with a pinned card's profile when the row is one.
+pub(crate) fn host_link(row: &HostRow) -> Option<String> {
+    saved_host_link(
+        &row.fp_hex,
+        &row.addr,
+        row.port,
+        row.pin.as_ref().map(|p| p.id.as_str()),
+        None,
     )
 }
 

@@ -2,25 +2,39 @@ package io.unom.punktfunk
 
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PageSize
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -59,6 +73,7 @@ import coil.ImageLoader
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import io.unom.punktfunk.components.launcherIcon
+import io.unom.punktfunk.kit.link.DeepLinks
 import io.unom.punktfunk.kit.library.GameEntry
 import io.unom.punktfunk.kit.library.LibraryClient
 import io.unom.punktfunk.kit.library.LibraryResult
@@ -75,9 +90,13 @@ import kotlin.math.sign
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-// The host game-library browser — the Android mirror of the Apple client's LibraryCoverflowView:
-// a gamepad-driven poster coverflow (centered cover flat + prominent, neighbours receding on a 3D
-// Y-tilt) fetched from the host's management API over mTLS. Reached with Y from a saved host.
+// The host game-library browser — the Android mirror of the Apple client's LibraryView: ONE screen
+// with two presentations of the same shelf, chosen the same way every other screen here chooses.
+// The console (gamepad) one is a poster coverflow (centered cover flat + prominent, neighbours
+// receding on a 3D Y-tilt), reached with Y from a saved host; the touch one is the poster GRID the
+// Apple, GTK and Windows shells draw, reached from a host card's "Browse library…". Both fetch from
+// the host's management API over mTLS, and everything data-shaped — the fetch, the states, the
+// launch — is shared: only the arrangement differs, because only the input device does.
 
 private sealed class LibState {
     object Loading : LibState()
@@ -100,13 +119,20 @@ fun LibraryScreen(
      * [ProfileStore.resolveFor] applies to every other connect.
      */
     pinnedProfileId: String? = null,
+    /**
+     * Which presentation to draw: the console coverflow (default — this screen's original and only
+     * form) or the touch poster grid. The CALLER decides rather than this screen reading the
+     * gamepad setting itself, because the two shells reach it by different routes and each already
+     * knows which one it is; a screen that guessed could disagree with the shell that pushed it.
+     */
+    console: Boolean = true,
 ) {
-    val ink = LocalGamepadInk.current
     BackHandler(onBack = onBack)
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val hazeState = remember { HazeState() }
-    val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    // Bumped by the touch header's Reload — re-keys the fetch effect below without the screen
+    // having to be popped and re-pushed to try a flaky host again.
+    var reloadKey by remember { mutableIntStateOf(0) }
     var state by remember { mutableStateOf<LibState>(LibState.Loading) }
     // A launch (connect) in flight: shows an overlay + gates the pad so a second press can't dial twice.
     var launching by remember { mutableStateOf(false) }
@@ -121,7 +147,7 @@ fun LibraryScreen(
 
     // Keyed on the mgmt port too: a discovery tick can learn it after this screen is composed, and
     // the fetch must redo itself against the real port rather than stay on a stale 47990 failure.
-    LaunchedEffect(host.address, host.port, host.fpHex, host.effectiveMgmtPort) {
+    LaunchedEffect(host.address, host.port, host.fpHex, host.effectiveMgmtPort, reloadKey) {
         state = LibState.Loading
         state = withContext(Dispatchers.IO) {
             val id = runCatching { obtainIdentity(IdentityStore(context)) }.getOrNull()
@@ -145,58 +171,122 @@ fun LibraryScreen(
         }
     }
 
+    // A pinned card's shelf says so, in the card's own `host · profile` shape: what a launch here
+    // will use is a property of the shelf, not something to remember from the tile two screens back.
+    val title = if (pinnedProfileId != null && profile != null) {
+        "${host.name} · ${profile.name} — Library"
+    } else {
+        "${host.name} — Library"
+    }
+
+    // Dial the host over the same pinned mTLS trust, booting straight into this title (the host
+    // resolves `launch` = its library id). Shared by both presentations: a tap on a grid tile and A
+    // on a centred cover are the same act, and a launch that behaved differently between them would
+    // be a bug nobody could see until they switched input device.
+    fun launch(identity: ClientIdentity, game: GameEntry) {
+        if (launching) return
+        launching = true
+        scope.launch {
+            val handle = connectToHost(
+                context, streamSettings, identity,
+                host.address, host.port, host.fpHex, launch = game.id,
+            )
+            launching = false
+            if (handle != 0L) {
+                onLaunched(
+                    ActiveSession(
+                        handle,
+                        streamSettings,
+                        host.clipboardSync,
+                        profileName = profile?.name,
+                        hostId = host.id,
+                        // Where to come back to when this game exits — this shelf, pin and all,
+                        // not the host's default one.
+                        launchedFromLibrary = true,
+                        libraryProfileId = pinnedProfileId,
+                    ),
+                )
+            } else {
+                Toast.makeText(
+                    context,
+                    "Launch failed — check the host and try again.",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+    }
+
+    // "Copy link" for one TITLE — the self-emitted form a host card already hands out (design/
+    // client-deep-links.md §4/§5), plus this game's `launch=` id, so pasting the URL into Playnite
+    // or a Stream Deck macro boots straight into it. A shelf opened from a PINNED card copies that
+    // card's profile with it, because that combination is the thing being copied.
+    fun copyLink(game: GameEntry) {
+        val url = DeepLinks.forHost(host, launch = game.id, profile = pinnedProfileId).toUrl()
+        // A toast either way here: this screen renders neither the touch home's notice banner nor
+        // the console's status line, and both of its presentations are full-bleed over artwork.
+        linkCopyMessage(putLinkOnClipboard(context, url))?.let {
+            Toast.makeText(context, it, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    if (console) {
+        ConsoleLibrary(
+            title = title,
+            state = state,
+            launching = launching,
+            navActive = navActive,
+            onBack = onBack,
+            onLaunch = ::launch,
+            onCopyLink = ::copyLink,
+        )
+    } else {
+        TouchLibrary(
+            title = title,
+            state = state,
+            launching = launching,
+            onBack = onBack,
+            onReload = { reloadKey++ },
+            onLaunch = ::launch,
+            onCopyLink = ::copyLink,
+        )
+    }
+}
+
+/** The console (gamepad) shelf: aurora, console header, coverflow, floating legend. */
+@Composable
+private fun ConsoleLibrary(
+    title: String,
+    state: LibState,
+    launching: Boolean,
+    navActive: Boolean,
+    onBack: () -> Unit,
+    onLaunch: (ClientIdentity, GameEntry) -> Unit,
+    onCopyLink: (GameEntry) -> Unit,
+) {
+    val ink = LocalGamepadInk.current
+    val hazeState = remember { HazeState() }
+    val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    // The cover the legend's X acts on — the coverflow reports it as the cursor settles, so the
+    // hint and the press agree about which title they mean.
+    var focused by remember { mutableStateOf<GameEntry?>(null) }
+
     Box(Modifier.fillMaxSize()) {
         Box(Modifier.fillMaxSize().hazeSource(hazeState)) {
             GamepadAuroraBackground(Modifier.fillMaxSize())
             Column(Modifier.fillMaxSize().consoleSafeArea()) {
-                // A pinned card's shelf says so, in the card's own `host · profile` shape: what a
-                // launch here will use is a property of the shelf, not something to remember from
-                // the tile two screens back.
-                ConsoleHeader(
-                    if (pinnedProfileId != null && profile != null) {
-                        "${host.name} · ${profile.name} — Library"
-                    } else {
-                        "${host.name} — Library"
-                    },
-                )
+                ConsoleHeader(title)
                 Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                    when (val s = state) {
+                    when (state) {
                         is LibState.Loading -> LoadingState()
-                        is LibState.Message -> MessageState(s.text)
-                        is LibState.Ready -> Coverflow(s.games, s.loader, navActive && !launching) { game ->
-                            if (!launching) {
-                                launching = true
-                                scope.launch {
-                                    // Dial the host over the same pinned mTLS trust, booting straight
-                                    // into this title (the host resolves `launch` = its library id).
-                                    val handle = connectToHost(
-                                        context, streamSettings, s.identity,
-                                        host.address, host.port, host.fpHex, launch = game.id,
-                                    )
-                                    launching = false
-                                    if (handle != 0L) {
-                                        onLaunched(
-                                            ActiveSession(
-                                                handle,
-                                                streamSettings,
-                                                host.clipboardSync,
-                                                profileName = profile?.name,
-                                                hostId = host.id,
-                                                // Where to come back to when this game exits —
-                                                // this shelf, pin and all, not the host's default one.
-                                                launchedFromLibrary = true,
-                                                libraryProfileId = pinnedProfileId,
-                                            ),
-                                        )
-                                    }
-                                    else Toast.makeText(
-                                        context,
-                                        "Launch failed — check the host and try again.",
-                                        Toast.LENGTH_LONG,
-                                    ).show()
-                                }
-                            }
-                        }
+                        is LibState.Message -> MessageState(state.text)
+                        is LibState.Ready -> Coverflow(
+                            games = state.games,
+                            loader = state.loader,
+                            navActive = navActive && !launching,
+                            onFocus = { focused = it },
+                            onCopyLink = onCopyLink,
+                            onLaunch = { game -> onLaunch(state.identity, game) },
+                        )
                     }
                 }
             }
@@ -225,12 +315,282 @@ fun LibraryScreen(
         ) {
             GamepadHintBar(
                 buildList {
-                    if (state is LibState.Ready) add(PadGlyph.hint('A', "Launch"))
+                    if (state is LibState.Ready) {
+                        add(PadGlyph.hint('A', "Launch"))
+                        // A controller has no right-click, so the grid's context menu becomes a
+                        // face button and a legend entry — the one per-game action there is.
+                        add(
+                            PadGlyph.hint('X', "Copy link") {
+                                focused?.let(onCopyLink)
+                            },
+                        )
+                    }
                     add(PadGlyph.hint('B', "Close", onClick = onBack))
                 },
                 hazeState = hazeState,
             )
         }
+    }
+}
+
+/**
+ * The touch shelf: a Material poster grid under a back/reload header — the same page the Apple,
+ * GTK and Windows shells draw, and the reason a finger-driven user can reach the library at all.
+ *
+ * Deliberately NOT the coverflow with the pad legend hidden: a coverflow is a one-at-a-time strip
+ * built for a D-pad, and on a phone it turns a 400-title library into 400 swipes. The grid is what
+ * every other touch surface in this app (and every other client's) already shows.
+ */
+@Composable
+private fun TouchLibrary(
+    title: String,
+    state: LibState,
+    launching: Boolean,
+    onBack: () -> Unit,
+    onReload: () -> Unit,
+    onLaunch: (ClientIdentity, GameEntry) -> Unit,
+    onCopyLink: (GameEntry) -> Unit,
+) {
+    Box(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize().consoleSafeArea()) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 8.dp),
+            ) {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                }
+                Text(
+                    title,
+                    style = MaterialTheme.typography.titleLarge,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                // A shelf that failed to load is otherwise a dead end you have to back out of and
+                // re-enter; every other client's library page has had this from the start.
+                IconButton(onClick = onReload, enabled = state !is LibState.Loading) {
+                    Icon(Icons.Filled.Refresh, contentDescription = "Reload")
+                }
+            }
+            when (state) {
+                is LibState.Loading -> Box(
+                    Modifier.weight(1f).fillMaxWidth(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        CircularProgressIndicator()
+                        Text("Loading library…", style = MaterialTheme.typography.bodyLarge)
+                    }
+                }
+                is LibState.Message -> Box(
+                    Modifier.weight(1f).fillMaxWidth(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        state.text,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 24.dp),
+                    )
+                }
+                is LibState.Ready -> TouchGrid(
+                    games = state.games,
+                    loader = state.loader,
+                    onLaunch = { game -> onLaunch(state.identity, game) },
+                    onCopyLink = onCopyLink,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+        if (launching) {
+            Box(
+                Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.55f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                ) {
+                    CircularProgressIndicator(color = Color.White)
+                    Text("Launching…", color = Color.White, style = MaterialTheme.typography.bodyLarge)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * The poster grid. Design D4: launcher entries get their own shelf above the titles, never
+ * interleaved, and the headings only appear when both groups exist — so a library without
+ * launchers looks exactly like a plain grid.
+ */
+@Composable
+private fun TouchGrid(
+    games: List<GameEntry>,
+    loader: ImageLoader,
+    onLaunch: (GameEntry) -> Unit,
+    onCopyLink: (GameEntry) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val launchers = games.filter { it.isLauncher }
+    val titles = games.filter { !it.isLauncher }
+    val both = launchers.isNotEmpty() && titles.isNotEmpty()
+    LazyVerticalGrid(
+        columns = GridCells.Adaptive(minSize = 130.dp),
+        modifier = modifier.fillMaxWidth(),
+        contentPadding = PaddingValues(16.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        if (launchers.isNotEmpty()) {
+            if (both) item(span = { GridItemSpan(maxLineSpan) }) { TouchGroupHeading("Launchers") }
+            items(launchers, key = { "launcher-${it.id}" }) {
+                TouchPoster(it, loader, onLaunch, onCopyLink)
+            }
+        }
+        if (titles.isNotEmpty()) {
+            if (both) item(span = { GridItemSpan(maxLineSpan) }) { TouchGroupHeading("Games") }
+            items(titles, key = { "game-${it.id}" }) {
+                TouchPoster(it, loader, onLaunch, onCopyLink)
+            }
+        }
+    }
+}
+
+@Composable
+private fun TouchGroupHeading(text: String) {
+    Text(
+        text.uppercase(),
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        letterSpacing = 1.4.sp,
+    )
+}
+
+/**
+ * One touch tile: 2:3 poster, store badge, title. Tap launches; a LONG PRESS opens this title's own
+ * actions — the finger's context menu, and the same gesture the host cards' overflow answers to.
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun TouchPoster(
+    game: GameEntry,
+    loader: ImageLoader,
+    onLaunch: (GameEntry) -> Unit,
+    onCopyLink: (GameEntry) -> Unit,
+) {
+    var menu by remember { mutableStateOf(false) }
+    val shape = MaterialTheme.shapes.medium
+    Box {
+        Column(
+            Modifier.combinedClickable(
+                onClickLabel = "Launch ${game.title}",
+                onLongClickLabel = "More options for ${game.title}",
+                onClick = { onLaunch(game) },
+                onLongClick = { menu = true },
+            ),
+        ) {
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(2f / 3f)
+                    .clip(shape)
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                contentAlignment = Alignment.Center,
+            ) {
+                TouchPosterArt(game, loader)
+                Box(Modifier.fillMaxSize().padding(6.dp), contentAlignment = Alignment.TopStart) {
+                    Text(
+                        game.storeLabel,
+                        style = MaterialTheme.typography.labelSmall,
+                        // A launcher's badge is brand-filled (design D4); a game's sits on a dark
+                        // wash over its own art, where the theme's own ink would be a coin toss.
+                        color = if (game.isLauncher) {
+                            MaterialTheme.colorScheme.onPrimary
+                        } else {
+                            Color.White
+                        },
+                        modifier = Modifier
+                            .semantics {
+                                contentDescription = if (game.isLauncher) {
+                                    "Opens ${game.storeLabel}"
+                                } else {
+                                    "From ${game.storeLabel}"
+                                }
+                            }
+                            .clip(ConsoleShape.Pill)
+                            .background(
+                                if (game.isLauncher) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    Color.Black.copy(alpha = 0.5f)
+                                },
+                            )
+                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                    )
+                }
+            }
+            Text(
+                game.title,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            DropdownMenuItem(
+                text = { Text("Copy link") },
+                onClick = {
+                    menu = false
+                    onCopyLink(game)
+                },
+            )
+        }
+    }
+}
+
+/** The tile's artwork: the candidates in order (portrait → header → hero), then a placeholder. */
+@Composable
+private fun TouchPosterArt(game: GameEntry, loader: ImageLoader) {
+    val candidates = game.art.posterCandidates
+    var idx by remember(game.id) { mutableIntStateOf(0) }
+    if (idx < candidates.size) {
+        AsyncImage(
+            model = ImageRequest.Builder(LocalContext.current).data(candidates[idx]).build(),
+            imageLoader = loader,
+            contentDescription = game.title,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxSize(),
+            onError = { idx++ }, // this candidate failed — try the next, or fall to the placeholder
+        )
+        return
+    }
+    // A launcher ships no poster by design, so its brand mark IS the poster; falling back to the
+    // launcher's NAME says "opens Steam", where a title would read as "a cover that failed to load".
+    val mark = launcherIcon(game.iconToken)
+    if (mark != null) {
+        Icon(
+            imageVector = mark,
+            contentDescription = game.title,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.fillMaxSize(0.45f),
+        )
+    } else {
+        Text(
+            if (game.isLauncher) game.storeLabel else game.title,
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(12.dp),
+        )
     }
 }
 
@@ -262,6 +622,10 @@ internal fun Coverflow(
     games: List<GameEntry>,
     loader: ImageLoader,
     navActive: Boolean,
+    /** Reports the CENTRED title as the cursor settles, so the screen's legend acts on it too. */
+    onFocus: (GameEntry?) -> Unit = {},
+    /** X — copy the centred title's link. Defaulted so the screenshot harness needs no wiring. */
+    onCopyLink: (GameEntry) -> Unit = {},
     onLaunch: (GameEntry) -> Unit,
 ) {
     val ink = LocalGamepadInk.current
@@ -275,9 +639,13 @@ internal fun Coverflow(
         var navTarget by remember { mutableIntStateOf(0) }
         LaunchedEffect(pagerState.settledPage) { navTarget = pagerState.settledPage }
         val current = games.getOrNull(navTarget)
+        // Publish the centred title outward. Keyed on the ENTRY, not the index, so a library
+        // refresh that shortens the strip can't leave the legend pointing at a title that moved.
+        LaunchedEffect(current) { onFocus(current) }
 
         // Controller nav: the pad drives the coverflow. Left/right steps a coalesced target the pager
-        // chases; A launches the centred title; B closes via the screen's BackHandler.
+        // chases; A launches the centred title; X copies its link; B closes via the screen's
+        // BackHandler.
         GamepadNavEffect(
             active = navActive && games.isNotEmpty(),
             onMove = { dir ->
@@ -285,6 +653,9 @@ internal fun Coverflow(
                 if (t != navTarget) { navTarget = t; scope.launch { pagerState.animateScrollToPage(t) } }
             },
             onActivate = { games.getOrNull(navTarget)?.let(onLaunch) },
+            // Read at press time rather than closed over: `navTarget` moves under this callback,
+            // and the link must be the one the cover under the cursor now points at.
+            onTertiary = { games.getOrNull(navTarget)?.let(onCopyLink) },
         )
 
         // Design D4: the launcher entries lead the strip (the client groups them at parse time).

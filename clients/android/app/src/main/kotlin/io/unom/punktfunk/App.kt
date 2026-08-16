@@ -54,6 +54,7 @@ import io.unom.punktfunk.kit.link.DeepLinkResult
 import io.unom.punktfunk.kit.link.DeepLinks
 import io.unom.punktfunk.kit.link.HostResolution
 import io.unom.punktfunk.kit.SessionEndReason
+import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.models.ActiveSession
 import io.unom.punktfunk.models.LibraryReturn
@@ -76,6 +77,11 @@ fun App(forceGamepadUi: Boolean = false) {
     // navigation state does not outlive the stream. Cleared once the shell has consumed it, so a
     // later manual Back out of the library is not undone by a stale value.
     var reopenLibrary by remember { mutableStateOf<LibraryReturn?>(null) }
+    // Which host's game library the TOUCH shell is showing, and which of its pinned cards opened it
+    // (null = the host's own card). Held here beside `tab` rather than inside the tab content: it is
+    // a PUSH over the whole shell, and a `remember` down in ConnectScreen would not survive the
+    // stream that a launch off the shelf starts — which is exactly what `reopenLibrary` restores.
+    var touchLibrary by remember { mutableStateOf<Pair<KnownHost, String?>?>(null) }
 
     // Console (gamepad) mode mirrors the Apple client: the setting AND (its mode says Always OR a
     // pad is attached OR this is a TV OR the dev force flag). Flips live as controllers
@@ -114,6 +120,21 @@ fun App(forceGamepadUi: Boolean = false) {
                 Toast.LENGTH_LONG,
             ).show()
         }
+    }
+
+    // The touch shell's half of "come back to the library this game was launched from" — the console
+    // shell consumes the same intent on its way in (see GamepadShell). Gated on which shell is up so
+    // exactly one of the two ever claims it, and cleared here so a later manual Back stays backed
+    // out. A host forgotten while the game ran simply leaves us on the host grid.
+    LaunchedEffect(reopenLibrary, gamepadUi) {
+        if (gamepadUi) return@LaunchedEffect
+        val (id, pinId) = reopenLibrary ?: return@LaunchedEffect
+        KnownHostStore(context).all().firstOrNull { it.id == id }?.let { kh ->
+            // A pin unpinned while the game was running is no longer a shelf: fall back to the
+            // host's own, rather than a card that no longer exists.
+            touchLibrary = kh to pinId?.takeIf { it in kh.pinnedProfileIds }
+        }
+        reopenLibrary = null
     }
 
     // The console backdrop's colour family, published once from the live settings rather than
@@ -158,6 +179,20 @@ fun App(forceGamepadUi: Boolean = false) {
                 reopenLibrary = reopenLibrary,
                 onReopenLibraryHandled = { reopenLibrary = null },
             )
+        } else if (touchLibrary != null) {
+            // The touch shell's library is a PUSHED screen, not a tab: it belongs to one host, and a
+            // third permanent tab for something you reach from a card would be a nav item that is
+            // meaningless until you pick one. So it takes the whole window (bar included, like the
+            // console shell's does) and Back — the arrow or the system gesture — returns to the grid.
+            val (host, pinId) = touchLibrary!!
+            LibraryScreen(
+                host = host,
+                settings = settings,
+                onLaunched = { session = it },
+                onBack = { touchLibrary = null },
+                pinnedProfileId = pinId,
+                console = false,
+            )
         } else {
             // Adaptive nav: a bottom bar on phones; on tablets / large windows a side NavigationRail
             // with its items centred vertically (the common Android tablet idiom, mirroring iPad's
@@ -193,6 +228,9 @@ fun App(forceGamepadUi: Boolean = false) {
                             onSettingsChange = { settings = it; settingsStore.save(it) },
                             deepLink = pendingLink,
                             onDeepLinkHandled = { activity?.pendingDeepLink = null },
+                            // "Browse library…" in a card's overflow — the touch route to the shelf
+                            // the console shell reaches with Y.
+                            onOpenLibrary = { kh, pinId -> touchLibrary = kh to pinId },
                         )
                         Tab.Settings -> SettingsScreen(
                             initial = settings,
