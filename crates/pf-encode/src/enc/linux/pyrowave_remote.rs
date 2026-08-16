@@ -380,7 +380,15 @@ fn handshake(mut link: Link, p: &Params, bitrate_bps: u64) -> Result<Handshake> 
         // the process boundary.
         priority_intent: std::env::var("PYROWAVE_QUEUE_PRIORITY").ok(),
     };
-    worker::send_eintr(link.sock.as_fd(), &hello, &[]).context("send Hello")?;
+    // Naming the handshake here is load-bearing, not decoration. A worker that dies during
+    // startup — no Vulkan 1.3 device, a missing feature, a half-installed binary that execs and
+    // exits — races this send: win the race and the death surfaces as the EOF the recv below
+    // reads, lose it and the socket is already closed, so the send takes EPIPE instead. One
+    // cause, so the operator must get one diagnosis; without this context the EPIPE side
+    // degrades the fallback warn to a bare "send Hello: Broken pipe (os error 32)", which names
+    // neither the worker nor the stage that failed.
+    worker::send_eintr(link.sock.as_fd(), &hello, &[])
+        .context("encode worker handshake: send Hello (died on startup?)")?;
     let (ready, fds) = worker::recv_eintr::<FromWorker>(
         link.sock.as_fd(),
         &mut link.rbuf,
@@ -1043,8 +1051,16 @@ mod tests {
             .expect("a `false` binary on PATH")
     }
 
-    /// Ladder rung: the binary exists and runs but is not a worker. It exits at once, so the
-    /// handshake reads EOF — the same rung a worker that dies during Vulkan bring-up takes.
+    /// Ladder rung: the binary exists and runs but is not a worker — the same rung a worker that
+    /// dies during Vulkan bring-up takes.
+    ///
+    /// Which HALF of the handshake reports the death is a race this test deliberately does not
+    /// try to win: the child exits while the parent is still writing, so the send either lands in
+    /// a socket whose peer is still open (and the death surfaces as the EOF the recv reads) or
+    /// finds it already closed (EPIPE). CI, being slower and more loaded than a dev box, lands on
+    /// the EPIPE side often enough that pinning the EOF wording alone flakes — so what is pinned
+    /// is the operator-visible contract that holds on BOTH sides. The EPIPE half also has a
+    /// deterministic test of its own below; this one keeps a real spawn+exec in the ladder.
     #[test]
     fn a_worker_that_exits_immediately_is_a_handshake_failure() {
         let err =
@@ -1053,6 +1069,22 @@ mod tests {
         assert!(
             text.contains("handshake"),
             "the rung must name the handshake: {text}"
+        );
+    }
+
+    /// The EPIPE half of the rung above, without the race: the peer is closed BEFORE the
+    /// handshake starts, so the Hello send cannot succeed. Deterministic, and it fails if anyone
+    /// trims the send's context back to a bare "send Hello" — which is exactly the drift that
+    /// made the spawn-driven test flake in CI.
+    #[test]
+    fn a_worker_that_died_before_hello_still_names_the_handshake() {
+        let (host, peer) = ipc::socketpair_seqpacket().unwrap();
+        drop(peer); // the worker is gone before the host writes a byte
+        let err = handshake_on(host).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("handshake"),
+            "the rung must name the handshake even when the death beats the Hello: {text}"
         );
     }
 
