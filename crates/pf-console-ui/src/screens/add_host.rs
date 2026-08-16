@@ -8,8 +8,8 @@ use crate::glyphs::{Hint, HintKey};
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox};
-use crate::theme::{fg, Fonts, W};
-use crate::widgets::{permits, Charset, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec};
+use crate::theme::{fg, Fonts, EDGE_INSET, W};
+use crate::widgets::{permits, Charset, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec, ROW_MAX_W};
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
 
@@ -306,16 +306,19 @@ impl AddHostScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
-        let cx = f64::from(rect.left) + f64::from(rect.width()) / 2.0;
-        fonts.centered(
+        // Half of the heading's block, so it sits on the heading's column — a centred
+        // sub-line under a leading title reads as belonging to the rows instead. Its width
+        // is capped against the ROW column, not the screen: measured off the full width it
+        // would run all the way under the controller chip.
+        fonts.leading(
             canvas,
             "Hosts on this network appear automatically — add one by address for everything else.",
             W::Regular,
             13.0 * k,
             fg(0.55),
-            cx,
+            f64::from(rect.left) + EDGE_INSET * k,
             f64::from(rect.top) + 2.0 * k,
-            f64::from(rect.width()) * 0.72,
+            ROW_MAX_W * 0.72 * k,
         );
 
         // While the keyboard tray is up (never on Deck) the rows squeeze above it.

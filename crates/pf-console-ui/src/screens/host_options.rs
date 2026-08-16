@@ -17,8 +17,8 @@ use crate::glyphs::{Hint, HintKey};
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox, Screen};
-use crate::theme::{fg, Fonts, W};
-use crate::widgets::{ListMsg, MenuList, RowSpec};
+use crate::theme::{fg, Fonts, EDGE_INSET, W};
+use crate::widgets::{ListMsg, MenuList, RowSpec, ROW_MAX_W};
 use pf_client_core::gamepad::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
 
@@ -247,16 +247,15 @@ impl HostOptionsScreen {
         } else {
             "Manage this saved host."
         };
-        let cx = f64::from(rect.left) + f64::from(rect.width()) / 2.0;
-        fonts.centered(
+        fonts.leading(
             canvas,
             blurb,
             W::Regular,
             13.0 * k,
             fg(0.55),
-            cx,
+            f64::from(rect.left) + EDGE_INSET * k,
             f64::from(rect.top) + 2.0 * k,
-            f64::from(rect.width()) * 0.72,
+            ROW_MAX_W * 0.72 * k,
         );
         let list_rect = Rect::from_ltrb(
             rect.left,

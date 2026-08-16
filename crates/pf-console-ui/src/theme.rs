@@ -491,6 +491,21 @@ pub(crate) fn spinner(canvas: &Canvas, cx: f64, cy: f64, r: f64, t: f64) {
     );
 }
 
+// --- Layout -------------------------------------------------------------------------------
+
+/// How far in from a screen's edge its CHROME sits, design units — the heading, the section
+/// strip under it and the controller chip on the right all share this one column.
+///
+/// The number is the other clients' verbatim: Apple pads every gamepad heading and its tab
+/// strip `.horizontal, 24`, Android names it `ConsoleEdgeInset = 24.dp`. It is deliberately
+/// NOT the legend's 18 — that is a PILL's edge, whose first glyph lands at 31, so matching it
+/// would misalign the very thing it was copied from.
+///
+/// It is a screen inset, not a content margin: the rows, the carousel and the coverflow are
+/// all CENTRED columns, so aligning a heading to one would mean tracking `(width − column)/2`,
+/// which is an artefact of the window size rather than a margin anyone chose.
+pub(crate) const EDGE_INSET: f64 = 24.0;
+
 // --- Typography ---------------------------------------------------------------------------
 
 /// Geist weights the console uses (matching the Apple client's `.geist(size, weight)`).
@@ -614,6 +629,10 @@ impl Fonts {
         }
     }
 
+    /// `clamp` caps the paragraph at that many lines and ellipsizes what doesn't fit; `None`
+    /// wraps freely. A heading has to clamp — an over-long one used to grow DOWNWARD into the
+    /// screen's content, which is why both other clients pin theirs to one line.
+    #[allow(clippy::too_many_arguments)]
     fn paragraph(
         &self,
         text: &str,
@@ -622,9 +641,14 @@ impl Fonts {
         color: Color4f,
         align: TextAlign,
         max_w: f64,
+        clamp: Option<usize>,
     ) -> skia_safe::textlayout::Paragraph {
         let mut style = ParagraphStyle::new();
         style.set_text_align(align);
+        if let Some(lines) = clamp {
+            style.set_max_lines(lines);
+            style.set_ellipsis("\u{2026}");
+        }
         let mut ts = TextStyle::new();
         ts.set_font_families(&["Geist"]);
         ts.set_font_size(size as f32);
@@ -664,8 +688,51 @@ impl Fonts {
         y: f64,
         max_w: f64,
     ) {
-        let p = self.paragraph(text, w, size, color, TextAlign::Center, max_w);
+        let p = self.paragraph(text, w, size, color, TextAlign::Center, max_w, None);
         p.paint(canvas, Point::new((cx - max_w / 2.0) as f32, y as f32));
+    }
+
+    /// [`centered`](Self::centered)'s LEFT-ALIGNED twin: `x` is the text's left edge, `y` its
+    /// top. Same paragraph path, so it shapes and falls back for CJK exactly as `centered`
+    /// does — which is why the screen chrome cannot use `draw`/`draw_clipped` instead.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn leading(
+        &self,
+        canvas: &Canvas,
+        text: &str,
+        w: W,
+        size: f64,
+        color: Color4f,
+        x: f64,
+        y: f64,
+        max_w: f64,
+    ) {
+        let p = self.paragraph(text, w, size, color, TextAlign::Left, max_w, None);
+        p.paint(canvas, Point::new(x as f32, y as f32));
+    }
+
+    /// A screen's heading: left-aligned at `x`, top edge at `y`, clamped to ONE ellipsized
+    /// line at `max_w`.
+    ///
+    /// Every punktfunk client anchors its console heading to the leading edge — Apple's
+    /// carries the note that a centred one "read as a floating label" rather than as a
+    /// section heading, Android's `ConsoleHeader` pins it to `ConsoleEdgeInset`. The single
+    /// line is not cosmetic either: left-aligned, a long host name would otherwise wrap under
+    /// the controller chip and push a second line into the content.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn heading(
+        &self,
+        canvas: &Canvas,
+        text: &str,
+        w: W,
+        size: f64,
+        color: Color4f,
+        x: f64,
+        y: f64,
+        max_w: f64,
+    ) {
+        let p = self.paragraph(text, w, size, color, TextAlign::Left, max_w, Some(1));
+        p.paint(canvas, Point::new(x as f32, y as f32));
     }
 
     /// A single shaped line, middle-ellipsized to `max_w`, drawn at a baseline. For

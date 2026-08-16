@@ -7,7 +7,7 @@
 use crate::anim::{approach, entrances, springs, Entrance, EntranceAt, Spring, TRAY_C, TRAY_K};
 use crate::library::{BUMP_C, BUMP_K};
 use crate::pointer::{Pointer, PointerKind};
-use crate::theme::{accent, fg, fill, stroke, Fonts, PanelStroke, W};
+use crate::theme::{accent, fg, fill, stroke, Fonts, PanelStroke, EDGE_INSET, W};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Paint, PathBuilder, RRect, Rect};
 
@@ -669,7 +669,8 @@ impl TabStrip {
         p.press().then(|| p.pick(&self.pills)).flatten()
     }
 
-    /// Draw the pills centered in `rect`'s top band. Returns nothing — the caller already
+    /// Draw the pills along the leading edge of `rect`'s top band, at the same
+    /// [`EDGE_INSET`] the heading above them uses. Returns nothing — the caller already
     /// knows the band is [`TAB_STRIP_H`] tall.
     #[allow(clippy::too_many_arguments)] // the crate's render signature, same as MenuList's
     pub(crate) fn render(
@@ -694,7 +695,20 @@ impl TabStrip {
             .map(|l| f64::from(fonts.measure(l, W::SemiBold, size)) + 2.0 * pad_x)
             .collect();
         let total: f64 = widths.iter().sum::<f64>() + gap * (labels.len() - 1) as f64;
-        let mut x = f64::from(rect.left) + (f64::from(rect.width()) - total) / 2.0;
+        // Leading, under the heading it belongs to — a strip centred beneath a left-aligned
+        // title reads as two unrelated pieces of chrome. Both callers hand this widget the
+        // full content width, so the inset is measured here rather than baked into the band.
+        //
+        // Written as a clamp rather than a branch so it degrades CONTINUOUSLY as the window
+        // narrows: full inset while both fit, then centred, then hard against the leading
+        // edge once the run is wider than the band. That last case spends its overflow on
+        // the right, which is the side the user has not looked at yet — losing the first
+        // section instead would cost them the one the strip is read from. Neither reference
+        // client can reach it (both scroll their strip) and the narrowest window the console
+        // is tested at still clears the first case.
+        let inset = EDGE_INSET * k;
+        let slack = f64::from(rect.width()) - total;
+        let mut x = f64::from(rect.left) + inset.min((slack / 2.0).max(0.0));
         let top = f64::from(rect.top) + 2.0 * k;
 
         // Where the highlight wants to be, then the eased position it actually draws at.
@@ -1263,6 +1277,66 @@ mod tests {
             "settled at ({ix}, {iw}), pill is at ({}, {})",
             pill.left,
             pill.width()
+        );
+    }
+
+    /// The strip stands on the same column as the heading above it — [`EDGE_INSET`], scaled
+    /// like every other design unit — and gives that column up only in the order a shrinking
+    /// window forces: inset, then centred, then flush. Asserted as that ordering rather than
+    /// against three measured x's, so it still means something when a tab is renamed.
+    #[test]
+    fn tab_strip_stands_on_the_edge_inset_and_gives_it_up_in_order() {
+        let fonts = crate::theme::build_fonts().unwrap();
+        let mut surface = skia_safe::surfaces::raster_n32_premul((1400, 160)).unwrap();
+        let dt = 1.0 / 60.0;
+        // What the seven sections actually measure, so nothing below is a hardcoded pixel.
+        let mut run = |w: f32, k: f64| {
+            let rect = Rect::from_xywh(0.0, 0.0, w, (TAB_STRIP_H * k) as f32);
+            let mut strip = TabStrip::new();
+            strip.render(surface.canvas(), rect, &TABS, 0, &fonts, k, dt);
+            let first = strip.pill(0).expect("the first section was drawn");
+            let last = strip
+                .pill(TABS.len() - 1)
+                .expect("the last section was drawn");
+            (rect, f64::from(first.left), f64::from(last.right))
+        };
+
+        // Room for both insets: the strip starts exactly on the heading's column, at every
+        // scale, and still ends inside the band.
+        for k in [0.75, 1.0, 2.0] {
+            let (rect, left, right) = run(1400.0, k);
+            assert!(
+                (left - (f64::from(rect.left) + EDGE_INSET * k)).abs() < 0.5,
+                "k={k}: strip starts at {left}, not on the {} column",
+                EDGE_INSET * k
+            );
+            assert!(
+                right <= f64::from(rect.right),
+                "k={k}: strip overran its band"
+            );
+        }
+
+        let (_, wide_left, wide_right) = run(1400.0, 1.0);
+        let total = wide_right - wide_left;
+
+        // Too narrow for both insets but still wider than the run: it centres, which is the
+        // only placement that does not spend the whole shortfall on one edge.
+        let (rect, left, right) = run((total + EDGE_INSET) as f32, 1.0);
+        assert!(
+            (left - f64::from(rect.left) - (f64::from(rect.right) - right)).abs() < 0.5,
+            "a squeezed strip should sit even: {left} in from the left, {} from the right",
+            f64::from(rect.right) - right
+        );
+
+        // Wider than the band: flush against the leading edge, overflowing right only.
+        let (rect, left, right) = run((total - 40.0) as f32, 1.0);
+        assert!(
+            (left - f64::from(rect.left)).abs() < 0.5,
+            "an overflowing strip should go flush left, not to {left}"
+        );
+        assert!(
+            right > f64::from(rect.right),
+            "the run was supposed to overflow"
         );
     }
 

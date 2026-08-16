@@ -1127,6 +1127,92 @@ fn collections_shell_no_art() -> (Shell, ConsoleShared, crate::library::LibraryS
     collections_shell_inner(false)
 }
 
+/// The bounding box of everything lit on a raster surface, in pixels: `(left, right, bottom)`.
+/// White ink on a cleared black field, so any channel answers.
+fn ink_bounds(surface: &mut skia_safe::Surface, w: i32, h: i32) -> (i32, i32, i32) {
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    let info = skia_safe::ImageInfo::new_n32_premul((w, h), None);
+    assert!(
+        surface.read_pixels(&info, &mut pixels, (w * 4) as usize, (0, 0)),
+        "raster surface read-back"
+    );
+    let (mut left, mut right, mut bottom) = (i32::MAX, i32::MIN, i32::MIN);
+    for (i, px) in pixels.chunks_exact(4).enumerate() {
+        if px[0] > 60 {
+            let (x, y) = (i as i32 % w, i as i32 / w);
+            left = left.min(x);
+            right = right.max(x);
+            bottom = bottom.max(y);
+        }
+    }
+    assert!(left <= right, "nothing was drawn");
+    (left, right, bottom)
+}
+
+/// A screen heading starts on its column and stays on ONE line.
+///
+/// Both halves are the defect this replaced. The heading used to be centred, which read as a
+/// floating label rather than as a section heading — every other punktfunk client anchors it
+/// to the leading edge — and, being a wrapping paragraph, a long host name grew a SECOND line
+/// downward into the screen's content. Asserted against a control render of the same string
+/// with room to spare rather than against a pixel row, so the line box is Geist's to define:
+/// the clamped heading must occupy the same one line the unclamped one does.
+#[test]
+fn a_heading_starts_on_its_column_and_never_takes_a_second_line() {
+    let fonts = crate::theme::build_fonts().unwrap();
+    let (w, h) = (1200, 200);
+    let (x, y, size) = (crate::theme::EDGE_INSET, 18.0, 30.0);
+    let title = "Living Room PC · Performance · PlayStation 3";
+    let render = |max_w: f64| {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
+        surface
+            .canvas()
+            .clear(skia_safe::Color4f::new(0.0, 0.0, 0.0, 1.0));
+        fonts.heading(
+            surface.canvas(),
+            title,
+            crate::theme::W::Bold,
+            size,
+            skia_safe::Color4f::new(1.0, 1.0, 1.0, 1.0),
+            x,
+            y,
+            max_w,
+        );
+        ink_bounds(&mut surface, w, h)
+    };
+
+    // Room to spare: one line, and the ink begins at the column (a cap's left sidebearing
+    // puts it a pixel or two right of the paragraph's origin, never left of it).
+    let (loose_left, loose_right, loose_bottom) = render(1100.0);
+    assert!(
+        (loose_left as f64) >= x - 1.0 && (loose_left as f64) < x + 0.1 * 1100.0,
+        "heading ink starts at {loose_left}, which is not the {x} column"
+    );
+    assert!(
+        loose_right < w,
+        "the control render was clipped by the surface"
+    );
+
+    // Squeezed: it ellipsizes inside the budget instead of wrapping, so its ink ends where
+    // the budget does and its bottom stays on the control's single line.
+    let budget = 300.0;
+    let (tight_left, tight_right, tight_bottom) = render(budget);
+    assert_eq!(
+        tight_left, loose_left,
+        "clamping the width must not move the heading's left edge"
+    );
+    assert!(
+        (tight_right as f64) <= x + budget + 1.0,
+        "heading ran to {tight_right}, past its {} budget",
+        x + budget
+    );
+    assert!(
+        tight_bottom <= loose_bottom + 1,
+        "heading wrapped to a second line: it reaches {tight_bottom} where one line ends at \
+         {loose_bottom}"
+    );
+}
+
 /// The console's geometry is ANTI-ALIASED — the defect this pins shipped in the overhaul and
 /// was only caught by looking at a Deck.
 ///

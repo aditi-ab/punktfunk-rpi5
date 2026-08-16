@@ -5,7 +5,7 @@ use crate::glyphs::{hint_bar, GlyphStyle};
 use crate::library::LibraryShared;
 use crate::model::HostRow;
 use crate::screens::{Bg, Ctx, Screen};
-use crate::theme::{fg, Fonts, PanelStroke, W};
+use crate::theme::{fg, Fonts, PanelStroke, EDGE_INSET, W};
 use pf_client_core::gamepad::PadInfo;
 use pf_client_core::trust;
 use skia_safe::{Canvas, Rect};
@@ -81,6 +81,23 @@ impl Shell {
             w as f32,
             (h - BOTTOM_BAND * k) as f32,
         );
+        // How much room the heading has before it reaches the controller chip. The chip is
+        // painted last so it sits above every layer, but its geometry is known now — `chip`
+        // and `pads` are both set above — and the heading needs it: centred, the title had
+        // the whole width to spread symmetrically into, where left-aligned it runs AT the
+        // chip. The 12 is the gap Apple keeps between the two; the floor keeps a
+        // pathologically long chip string from squeezing the title to nothing.
+        let title_max_w = {
+            let chip_w = self.chip.as_ref().map_or(0.0, |c| {
+                chip_width(
+                    fonts,
+                    c,
+                    self.pads.first().is_some_and(|p| p.battery.is_some()),
+                    k,
+                )
+            });
+            (w - 2.0 * EDGE_INSET * k - chip_w - 12.0 * k).max(w * 0.35)
+        };
         // One paint recipe per layer: (alpha, slide, scale). Everything below borrows
         // disjoint fields of `self` per call, so the borrow checker stays happy.
         let mut env = LayerEnv {
@@ -89,6 +106,7 @@ impl Shell {
             h,
             content,
             k,
+            title_max_w,
             dt,
             fonts,
             hosts: &self.hosts,
@@ -174,17 +192,9 @@ impl Shell {
             let tw = f64::from(fonts.measure(chip, W::Medium, size));
             let (bh, pad_x, gap) = (24.0 * k, 12.0 * k, 8.0 * k);
             let mark_w = 15.0 * k;
-            // The battery only takes room when there IS one: a wired pad, a Steam virtual
-            // pad and "no controller" all report nothing, and the chip must not carry a
-            // gap where their charge would have been.
             let battery = self.pads.first().and_then(|p| p.battery);
-            let pip_w = if battery.is_some() {
-                22.0 * k + gap
-            } else {
-                0.0
-            };
-            let bw = pad_x + mark_w + gap + tw + pip_w + pad_x;
-            let bx = w - 24.0 * k - bw;
+            let bw = chip_width(fonts, chip, battery.is_some(), k);
+            let bx = w - EDGE_INSET * k - bw;
             let top = 18.0 * k;
             let rect = Rect::from_xywh(bx as f32, top as f32, bw as f32, bh as f32);
             crate::theme::panel(
@@ -222,6 +232,21 @@ impl Shell {
     }
 }
 
+/// The controller chip's drawn width, device px. Its own function because two things need
+/// it — the chip itself, and the heading, which is left-aligned now and so has to stop short
+/// of it. A second copy of this arithmetic is a title that slides under the chip the day
+/// someone adds a field to it.
+///
+/// The battery only takes room when there IS one: a wired pad, a Steam virtual pad and "no
+/// controller" all report nothing, and the chip must not carry a gap where their charge
+/// would have been.
+fn chip_width(fonts: &Fonts, chip: &str, has_battery: bool, k: f64) -> f64 {
+    let tw = f64::from(fonts.measure(chip, W::Medium, 12.0 * k));
+    let (pad_x, gap, mark_w) = (12.0 * k, 8.0 * k, 15.0 * k);
+    let pip_w = if has_battery { 22.0 * k + gap } else { 0.0 };
+    pad_x + mark_w + gap + tw + pip_w + pad_x
+}
+
 /// Everything one screen layer needs to paint — bundled so the transition arms stay
 /// readable and each `paint` call borrows `Shell` fields disjointly.
 struct LayerEnv<'a> {
@@ -230,6 +255,8 @@ struct LayerEnv<'a> {
     h: f64,
     content: Rect,
     k: f64,
+    /// The heading's width budget — everything left of the controller chip. See `Shell::render`.
+    title_max_w: f64,
     dt: f64,
     fonts: &'a Fonts,
     hosts: &'a [HostRow],
@@ -272,15 +299,15 @@ impl LayerEnv<'_> {
             device_name: self.device_name,
             t: self.t,
         };
-        self.fonts.centered(
+        self.fonts.heading(
             canvas,
             &screen.title(&ctx),
             W::Bold,
             30.0 * self.k,
             fg(1.0),
-            self.w / 2.0,
+            EDGE_INSET * self.k,
             18.0 * self.k,
-            self.w * 0.7,
+            self.title_max_w,
         );
         screen.render(canvas, self.content, self.k, self.dt, self.fonts, &mut ctx);
         let rects = if self.show_hints {
