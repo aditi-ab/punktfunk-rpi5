@@ -282,7 +282,6 @@ pub(crate) fn panel(
     canvas.draw_rrect(rr, &sp);
 }
 
-/// The soft drop shadow under a focused tile — a blurred black round-rect behind it.
 /// The colour half of the focus recede: neighbours lose SATURATION and BRIGHTNESS with
 /// distance `d` (0 = focused, 1 = fully receded), as one 4×5 row-major matrix.
 ///
@@ -292,9 +291,8 @@ pub(crate) fn panel(
 /// its old strength, doing the job it is actually good at — separating overlapping cards.
 ///
 /// Row-major `[r…, g…, b…, a…]`, each row `[R G B A offset]`. The RGB rows are a standard
-/// luminance-weighted saturation matrix (Rec. 709 weights) scaled by `sat`, with the
-/// brightness shift in the offset column — SwiftUI's `.brightness()` is additive, and
-/// matching it keeps the two codebases' recede comparable by eye.
+/// luminance-weighted saturation matrix (Rec. 709 weights) scaled by `sat`, the whole of it
+/// then LERPED toward the ground: `out = (1 − b)·sat_mix(c) + ground·b`.
 pub(crate) fn recede_matrix(d: f64) -> [f32; 20] {
     let d = d.clamp(0.0, 1.0);
     let sat = (1.0 - RECEDE_SATURATION * d) as f32;
@@ -305,27 +303,37 @@ pub(crate) fn recede_matrix(d: f64) -> [f32; 20] {
     // which way the field leans (it tends to black on a dark palette, white on a pale
     // one), so the recede borrows its direction.
     let toward_light = ink().scrim.r > 0.5;
-    let bright = (RECEDE_BRIGHTNESS * d) as f32 * if toward_light { 1.0 } else { -1.0 };
+    // A FRACTION of the way to the ground, not a level offset. SwiftUI's `.brightness()` is
+    // additive and this matched it, which meant −0.24 was −61/255 on every channel and
+    // Skia's colour matrix clamps: the coverflow's own #1E1E25 placeholder came out at
+    // literal #000000, the whole side stack a single black slab with no depth in it and no
+    // cover-art detail left to see. A lerp cannot clip at either pole, and it is also the
+    // arithmetic "receding into the field" actually means — a fixed subtraction is a
+    // different amount of recede for every card and total annihilation for a dark one.
+    let b = (RECEDE_BRIGHTNESS * d) as f32;
+    let ground = if toward_light { 1.0f32 } else { 0.0 };
+    let keep = 1.0 - b;
+    let offset = ground * b;
     const LR: f32 = 0.2126;
     const LG: f32 = 0.7152;
     const LB: f32 = 0.0722;
     let (ir, ig, ib) = (LR * (1.0 - sat), LG * (1.0 - sat), LB * (1.0 - sat));
     [
-        ir + sat,
-        ig,
-        ib,
+        keep * (ir + sat),
+        keep * ig,
+        keep * ib,
         0.0,
-        bright,
-        ir,
-        ig + sat,
-        ib,
+        offset,
+        keep * ir,
+        keep * (ig + sat),
+        keep * ib,
         0.0,
-        bright,
-        ir,
-        ig,
-        ib + sat,
+        offset,
+        keep * ir,
+        keep * ig,
+        keep * (ib + sat),
         0.0,
-        bright,
+        offset,
         0.0,
         0.0,
         0.0,
@@ -334,10 +342,16 @@ pub(crate) fn recede_matrix(d: f64) -> [f32; 20] {
     ]
 }
 
-/// How much colour a fully receded neighbour loses…
-const RECEDE_SATURATION: f64 = 0.42;
-/// …and how much light. Both ported from the Apple gamepad UI's focus recede.
-const RECEDE_BRIGHTNESS: f64 = 0.24;
+/// How much colour a fully receded neighbour loses. Gentle enough that a side card still
+/// reads as the artwork it is — drain more and the shelf looks like a filter was applied to
+/// it rather than like the cards are standing further away. Cannot go below 0.125 while the
+/// brightness term is 0.20: `recede_matrix_drains_colour_and_light_but_never_alpha` wants
+/// the channel spread cut by 30 %, and spread scales exactly as `(1 − b)·sat`.
+const RECEDE_SATURATION: f64 = 0.34;
+/// …and how far it travels toward the ground, as a FRACTION of the distance — never as a
+/// level offset, whatever the Apple gamepad UI's `.brightness()` does. See
+/// [`recede_matrix`]: an additive term clips, and a card dark enough clips to nothing.
+const RECEDE_BRIGHTNESS: f64 = 0.20;
 
 /// The lit top edge that makes glass read as a material rather than as a tinted rectangle:
 /// a 1 px inner stroke fading from `fg(0.10)` to nothing over the top 40 % of the panel,
@@ -373,19 +387,53 @@ pub(crate) fn focus_halo(canvas: &Canvas, rect: Rect, corner: f32, k: f32, f: f3
     if f <= 0.01 {
         return;
     }
-    let mut p = fill(accent(0.28 * f));
+    // Every pale palette's accent is DARK — mint 0.34 luma, sunset 0.26, opal 0.33 — so a
+    // blurred accent on a pale field is a smudge, and the focused tile came out the dirtiest
+    // thing in the row while its unfocused neighbours stayed clean and light: the focus mark
+    // inverted. Mixing halfway to the scrim (white there) keeps the palette's own hue while
+    // making the mark read as light. It needs a little more body to register once lightened.
+    let (a, s) = (ink().accent, ink().scrim);
+    let (c, alpha) = if s.r > 0.5 {
+        let mix = |x: f32, y: f32| x + (y - x) * 0.5;
+        (
+            Color4f::new(mix(a.r, s.r), mix(a.g, s.g), mix(a.b, s.b), 1.0),
+            0.24 * f,
+        )
+    } else {
+        (a, 0.20 * f)
+    };
+    let mut p = fill(Color4f::new(c.r, c.g, c.b, alpha));
+    // Outer, not Normal: Normal keeps the blurred shape's INTERIOR, so the halo also filled
+    // the card's own footprint at full accent. On the home and collections tiles the panel
+    // glass over it is translucent (α 0.62 dark, 0.66 pale), so a third of that came through
+    // the face and the focused card read as a lit blob rather than as a card with light
+    // spilling around it.
     p.set_mask_filter(MaskFilter::blur(
-        skia_safe::BlurStyle::Normal,
-        18.0 * k,
+        skia_safe::BlurStyle::Outer,
+        10.0 * k,
         None,
     ));
     // Grown slightly rather than offset: a halo is light spilling out of the card on every
-    // side, where the shadow below it is the card's weight falling in one direction.
-    let spread = rect.with_outset((6.0 * k, 6.0 * k));
+    // side, where the shadow below it is the card's weight falling in one direction. The
+    // reach is outset + 3σ and it has to stay INSIDE the gap to the next card: at 6 + 3·18
+    // it overran the coverflow's 58 dp focused-to-neighbour gap, and since the strip paints
+    // farthest-first the focused card's corona landed on top of its neighbours — which is
+    // what made every card look like it was glowing.
+    let spread = rect.with_outset((4.0 * k, 4.0 * k));
     canvas.draw_rrect(RRect::new_rect_xy(spread, corner * k, corner * k), &p);
 }
 
 pub(crate) fn drop_shadow(canvas: &Canvas, rect: Rect, corner: f32, k: f32, alpha: f32) {
+    // Black under a tile is WEIGHT on a dark field and DIRT on a pale one, where it is the
+    // heaviest mark on the screen: on `holo` and `sunset` the focused tile sat in a muddy
+    // grey-brown ring while every unfocused tile stayed clean. Scaled back at the pale pole
+    // the same way the scrim already scales itself, so the caller's alpha keeps meaning
+    // "dark-field strength" and no call site has to know which palette is up.
+    let alpha = if ink().scrim.r > 0.5 {
+        alpha * 0.40
+    } else {
+        alpha
+    };
     let mut p = fill(Color4f::new(0.0, 0.0, 0.0, alpha));
     p.set_mask_filter(MaskFilter::blur(
         skia_safe::BlurStyle::Normal,
@@ -742,6 +790,26 @@ mod tests {
         assert!(spread(dark_side) < spread(card));
         assert!(spread(pale_side) < spread(card));
 
+        set_ink(DARK_INK);
+    }
+
+    /// The recede must never CLAMP. The other three assertions here are all relative and
+    /// none of them feeds the matrix a dark input, which is exactly how a brightness term
+    /// that subtracted 61/255 in the offset column shipped: the coverflow's own placeholder
+    /// face came out at literal #000000 on every card a slot or more from the focus, so the
+    /// side stack was one black slab with no depth and no cover-art detail in it. `apply`
+    /// omits Skia's clamp deliberately, so a channel below zero here IS the shipped bug.
+    #[test]
+    fn a_dark_card_face_survives_a_full_recede() {
+        set_ink(Ink::of(crate::library::palette("violet")));
+        // The coverflow's placeholder face, `screens::library::draw_poster_placeholder`.
+        let out = apply(&recede_matrix(1.0), [0.118, 0.118, 0.145, 1.0]);
+        for c in &out[..3] {
+            assert!(
+                *c > 0.05,
+                "the recede crushed a dark card to black: {out:?}"
+            );
+        }
         set_ink(DARK_INK);
     }
 }

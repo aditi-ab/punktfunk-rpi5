@@ -1102,7 +1102,7 @@ impl LibraryScreen {
             // transform: it is light spilling AROUND the card, so it cannot live inside the
             // rounded rect the card clips itself to. Fades with the sprung proximity rather
             // than snapping on the integer cursor, so it travels with the strip. The few
-            // degrees of perspective it misses are invisible on an 18 dp blur.
+            // degrees of perspective it misses are invisible on a 10 dp blur.
             crate::theme::focus_halo(canvas, self.geom[i], 16.0, k as f32, (1.0 - prox) as f32);
             canvas.save();
             canvas.concat_44(&M44::row_major(&m));
@@ -1183,11 +1183,15 @@ impl LibraryScreen {
                     fg(1.0),
                 );
             }
-            // The brightness recede: an opaque-black veil, never whole-card alpha.
+            // The separating veil: an opaque wash toward the GROUND, never whole-card alpha.
+            // Hardcoded black cancelled itself out on the six pale palettes — it greyed back
+            // the lift `recede_matrix` had just applied and left a receded card muddier than
+            // the focused one — so it goes through the scrim, which is black on a dark field
+            // and white on a pale one and so pushes the same direction the matrix does.
             if prox > 0.0 {
                 canvas.draw_rect(
                     crect,
-                    &fill(Color4f::new(0.0, 0.0, 0.0, (prox * RECEDE_DIM) as f32)),
+                    &fill(crate::theme::shade((prox * RECEDE_DIM) as f32)),
                 );
             }
             if layered {

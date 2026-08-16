@@ -390,15 +390,17 @@ impl HomeScreen {
                 Slot::AddHost => draw_action_tile(canvas, fonts, tile, k, ActionTile::AddHost),
                 Slot::Rescan => draw_action_tile(canvas, fonts, tile, k, ActionTile::Rescan),
             }
-            // The veil, at HALF its old strength. It used to do the whole recede on its own
-            // and had to be heavy for it; now the colour matrix above drains saturation and
-            // light, and this is left doing the one job a flat darkening is actually good
-            // at — separating cards that overlap.
+            // The veil, the fourth and lightest of the recede's mechanisms — the transform,
+            // the layer alpha and the colour matrix above already carry it, and stacking a
+            // heavy darkening on top of all three is what took an unfocused tile 55 % down
+            // against the aurora behind it. It goes through the scrim rather than straight
+            // black so that on a pale palette it pushes the same way the matrix does instead
+            // of greying back the lift.
             if f < 1.0 {
-                let veil = (1.0 - f) as f32 * 0.12;
+                let veil = (1.0 - f) as f32 * 0.07;
                 canvas.draw_rrect(
                     RRect::new_rect_xy(tile, (TILE_CORNER * k) as f32, (TILE_CORNER * k) as f32),
-                    &fill(Color4f::new(0.0, 0.0, 0.0, veil)),
+                    &fill(crate::theme::shade(veil)),
                 );
             }
             canvas.restore(); // layer
