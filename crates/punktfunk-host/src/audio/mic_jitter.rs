@@ -19,10 +19,23 @@ pub(super) enum Deliver {
     Conceal,
 }
 
-/// Most concealment frames one gap may synthesize (~100 ms at the common 20 ms frames) — the
-/// client downlink's `AudioGapTracker` cap, scaled to the uplink's bigger frames. libopus PLC
-/// fades to silence after a few frames anyway; past the cap the ring's underrun/re-prime path
-/// takes over, as before.
+/// Most concealment frames one gap may synthesize. libopus PLC fades to silence after a few
+/// frames anyway; past the cap the ring's underrun/re-prime path takes over, as before.
+///
+/// ⚠ **A COUNT, and the downlink this was copied from no longer has one to be scaled against.**
+/// The old wording — "the client downlink's `AudioGapTracker` cap, scaled to the uplink's bigger
+/// frames" — described a core that capped at a flat ten packets; core now states that bound in
+/// TIME (`MAX_CONCEAL_MS` = 50 ms) and derives the packet count from the frame length each session
+/// actually resolved, precisely because a fixed count silently retunes when the frame does. Same
+/// defect family as the drought fuse and the near-miss margin.
+///
+/// This constant is not the same number by another name, and never was: five frames is ~100 ms at
+/// the uplink's common 20 ms Opus frame — twice the downlink's bound, not a scaling of it. It is
+/// left as a count because the uplink cannot be told its frame length: the client encodes it and
+/// nothing announces it, so [`MicDejitter`] can only *measure* it, from consecutive frames' pts
+/// deltas (`frame_ms`). That measurement is the material a time-stated cap would be derived from
+/// if this is ever retuned — and the reason to retune it is a client that drops to 10 ms frames,
+/// where the same five frames become 50 ms of cover instead of 100.
 const MAX_CONCEAL_FRAMES: u32 = 5;
 
 /// How long one out-of-order frame may wait for its missing predecessor before the gap is

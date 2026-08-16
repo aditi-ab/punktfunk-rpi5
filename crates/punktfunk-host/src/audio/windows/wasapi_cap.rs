@@ -574,12 +574,27 @@ fn capture_once(
     // downsample — the legacy 48 kHz behaviour on a 96 kHz endpoint, which is what this host has
     // always done and is lossy only in the way every previous release already was.
     //
-    // ⚠ …and the floor is the LEGACY rate, never the engine's. An endpoint configured at
-    // 44 100 Hz is an ordinary Windows configuration, and this host has always asked it for
-    // 48 kHz and let autoconvert upsample — it has to, since libopus accepts nothing else and
-    // the `0xC9` plane is 48 kHz by definition. Declining down to 44 100 there would break the
-    // plane that works today in order to protect a plane that is not even running. So only a
-    // HI-RES request can lose here; 48 kHz is the baseline claim every session already makes.
+    // ⚠⚠ …and the floor is the LEGACY rate, never the engine's — `hz.max(SAMPLE_RATE)`. That
+    // `max` serves the **OPUS** path and nothing else, and getting it backwards regresses every
+    // ordinary Windows box. An endpoint configured at 44 100 Hz is an unremarkable Windows
+    // configuration; libopus accepts 8/12/16/24/48 kHz only (RFC 6716), so the `0xC9` plane is
+    // 48 kHz by definition, and this host has always asked such an endpoint for 48 kHz and let
+    // autoconvert upsample. Settling down to 44 100 for an Opus session would hand libopus a rate
+    // it refuses — breaking the plane that works today to protect one that is not even running.
+    //
+    // What the 44.1 kHz family being admitted to the **PCM** plane changes is only which requests
+    // can reach here: a hi-res session may now legitimately ask for 44 100, and it settles at
+    // 44 100 rather than being floored to 48 000 — because the `max` is inside the `rate_hz >`
+    // test, so a request AT or BELOW the floor never trips this arm at all. The two rules read as
+    // one line and are genuinely two:
+    //
+    // - `rate_hz > hz` — the honesty rule, for either plane: never advertise a rate the engine
+    //   cannot produce. This is what declines 96 kHz on a 48 kHz engine.
+    // - `.max(SAMPLE_RATE)` — the Opus floor, for the `0xC9` plane: a 48 kHz open on a slower
+    //   engine is the legacy upsample every release has already shipped, and stays.
+    //
+    // So a HI-RES request loses here only when it is above the engine; the 48 kHz baseline claim
+    // every session makes is untouched, and a 44.1 kHz hi-res request is not a loss at all.
     //
     // The operator's lever is Windows' own device properties: set the endpoint to 96 kHz there
     // and the host sees it here and honours it. Driving the engine format FROM the host would

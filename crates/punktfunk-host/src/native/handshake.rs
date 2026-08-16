@@ -148,36 +148,52 @@ impl AudioPlane {
 /// it when the link tightens. So this is not "audio gets 25 % and video adapts around it" — it is
 /// "video permanently loses 25 % of a number it was already told to fit inside".
 ///
-/// What 25 % buys, against `pcm::bitrate_kbps`: 48/16 (1 536 kbps) needs ≥ 6.1 Mbps of video,
-/// 48/24 (2 304) needs ≥ 9.2, 96/16 (3 072) needs ≥ 12.3, 96/24 (4 608) needs ≥ 18.4. A 20 Mbps
-/// session affords the whole ladder; a 5 Mbps one affords none of it, which is the §4.6 case
-/// ("more than half of a 5 Mbps session") landing where it should.
+/// What 25 % buys, against `pcm::bitrate_kbps` **in stereo**: 48/16 (1 536 kbps) needs ≥ 6.1 Mbps
+/// of video, 48/24 (2 304) needs ≥ 9.2, 96/16 (3 072) needs ≥ 12.3, 96/24 (4 608) needs ≥ 18.4.
+/// A 5 Mbps session affords none of it, which is the §4.6 case ("more than half of a 5 Mbps
+/// session") landing where it should.
+///
+/// ⚠ A 20 Mbps session no longer affords the whole stereo ladder, and this line used to say it
+/// did. The 44.1 kHz family being admitted brought 176 400 Hz with it: 176.4/24 is 8 467 kbps and
+/// wants ≥ 33.9 Mbps, 176.4/16 (5 644) wants ≥ 22.6. The cheap end moved too — 44.1/16 is
+/// 1 411 kbps and needs only ≥ 5.6 Mbps, the first rung a modest link can actually reach.
+///
+/// Surround multiplies all of that by the channel count, and it is this gate rather than the frame
+/// ladder that keeps it honest: 48/24 5.1 is 6 912 kbps and needs ≥ 27.6 Mbps of video, 7.1 is
+/// 9 216 and needs ≥ 36.9. Both FIT a datagram comfortably — what they do not fit is an ordinary
+/// link, and saying so in bits is the statement that survives a change of MTU.
 const HIRES_MAX_VIDEO_SHARE_PCT: u32 = 25;
 
 /// The §8.4 gate: resolve the session's audio plane. Returns [`AudioPlane::opus`] — today's
-/// wire, byte for byte — unless **all five** conditions hold, and says out loud which one lost.
+/// wire, byte for byte — unless **all four** policy conditions hold, and says out loud which one
+/// lost.
 ///
 /// 1. `client_asked` — the client set `CLIENT_CAP_AUDIO_HIRES`. Capable **and** the user turned
 ///    it on, the `VIDEO_CAP_444` precedent: a client that cannot open a 96 kHz output, or whose
 ///    user never asked, must not set the bit.
 /// 2. `operator_allows` — `PUNKTFUNK_AUDIO_HIRES`, default OFF. This spends bandwidth the host's
 ///    owner did not previously agree to, so it is asked for at both ends.
-/// 3. Stereo only. A hi-res 5.1 frame does not fit one datagram at the default MTU, and this
-///    plane is never fragmented — see §4.2. (On an opted-in jumbo path it would fit, so this is a
-///    restriction to relax later, not a wire limitation.)
-/// 4. `capture_rate` — the capture path can GENUINELY deliver the requested rate (§8.2 / §8.3).
+/// 3. `capture_rate` — the capture path can GENUINELY deliver the requested rate (§8.2 / §8.3).
 ///    Not "did the open succeed": both backends accept a rate their endpoint does not run at and
 ///    resample to it without an error, so the question has to be put to the DEVICE before the
 ///    `Welcome` is built. See [`CaptureRate`](crate::audio::CaptureRate) for what each OS can
 ///    honestly answer and why an unknown answer declines.
-/// 5. The link can afford it — see [`HIRES_MAX_VIDEO_SHARE_PCT`].
+/// 4. The link can afford it — see [`HIRES_MAX_VIDEO_SHARE_PCT`].
 ///
-/// …plus two that are not policies at all. The requested format must be one the plane can carry
-/// at all: a supported depth, and 48 or 96 kHz — 44.1 kHz and its multiples are absent on
-/// purpose, because they break `JitterPolicy`'s integer samples-per-millisecond arithmetic
-/// (§4.1), which is a rework, not a table entry. And a frame duration must EXIST for the
-/// negotiated format at this connection's datagram size; `max_datagram` is `None` when the peer
-/// does not do datagrams (in which case there is no audio plane of any kind to argue about).
+/// …plus two that are not policies at all. The requested format must be one the plane can carry:
+/// a supported depth, and a rate in [`pcm::rate_is_supported`]'s set — **both** families now,
+/// 44 100 / 48 000 / 88 200 / 96 000 / 176 400. The 44.1 kHz family was deferred rather than
+/// refused (§4.1: `JitterPolicy` divided by 1 000 before it multiplied, so 44 100 Hz became 44
+/// samples/ms and everything derived from it came out 2.3 % low); core fixed that arithmetic, so
+/// this gate asks core for the set instead of restating it — a second expression of a rate set is
+/// a second thing to forget to update, and a host and a client disagreeing about it is a session
+/// that negotiates a format one end cannot open.
+///
+/// And a frame duration must EXIST for the negotiated format at this connection's datagram size;
+/// `max_datagram` is `None` when the peer does not do datagrams (in which case there is no audio
+/// plane of any kind to argue about). That test is also **where the channel count is decided** —
+/// there is no separate stereo-only rule, and there deliberately never was a correct one; see the
+/// note at the `frame_us_for` call.
 ///
 /// **Not a downgrade ladder, on purpose.** A client asking for 96/24 on a link that only affords
 /// 48/24 is declined rather than quietly handed the cheaper rung. The wire would carry it
@@ -207,31 +223,30 @@ pub(super) fn resolve_audio_plane(
     }
     if !operator_allows {
         tracing::info!(
+            // ⚠ The range is the OPERATOR's decision criterion, so it has to keep up with what
+            // the plane can now negotiate: 1.4 Mbps at 44.1/16 stereo up to 8.5 at 176.4/24, and
+            // up to 33.9 for 176.4/24 7.1. It read "1.5–4.6" while the plane was 48/96 stereo.
             "hi-res audio requested by the client but PUNKTFUNK_AUDIO_HIRES is not enabled on \
-             this host — the session uses Opus 48 kHz (the lossless plane costs 1.5–4.6 Mbps off \
-             the top of the link, so it is opt-in on both ends)"
+             this host — the session uses Opus 48 kHz (the lossless plane costs 1.4–8.5 Mbps in \
+             stereo, and up to 33.9 in 7.1, off the top of the link — so it is opt-in on both \
+             ends)"
         );
         return AudioPlane::opus();
     }
-    if channels != 2 {
-        tracing::info!(
-            channels,
-            "hi-res audio is stereo-only — a surround frame does not fit one QUIC datagram at \
-             the default MTU and this plane is never fragmented; the session uses Opus 48 kHz"
-        );
-        return AudioPlane::opus();
-    }
-    if !pcm::depth_is_supported(requested_bits)
-        || !matches!(
-            requested_rate_hz,
-            punktfunk_core::audio::SAMPLE_RATE_HZ | 96_000
-        )
-    {
+    // ⚠ No channel-count test here, deliberately. This used to hard-decline `channels != 2`
+    // BEFORE the frame ladder was consulted, on the strength of §4.2's blanket "surround is out at
+    // the default MTU" — which is simply not true below 96 kHz: 48/16 5.1 fits a 2 ms frame and
+    // 48/24 7.1 fits a 1 ms one, well inside an ordinary datagram. An early `!= 2` did not
+    // *implement* that claim, it OVERRODE the one piece of code that knows the answer.
+    // `pcm::frame_us_for` is channel-aware and returns `None` when nothing fits, which is both the
+    // honest decline and the one that stays right when the MTU, the ladder or the depth set moves.
+    // See the frame-duration gate at the bottom of this function for what surround actually costs.
+    if !pcm::depth_is_supported(requested_bits) || !pcm::rate_is_supported(requested_rate_hz) {
         tracing::info!(
             requested_rate_hz,
             requested_bits,
-            "hi-res audio was requested at a format this host does not carry (48 or 96 kHz, 16 \
-             or 24-bit) — the session uses Opus 48 kHz"
+            "hi-res audio was requested at a format this host does not carry (44 100 / 48 000 / \
+             88 200 / 96 000 / 176 400 Hz, 16 or 24-bit) — the session uses Opus 48 kHz"
         );
         return AudioPlane::opus();
     }
@@ -278,15 +293,40 @@ pub(super) fn resolve_audio_plane(
         );
         return AudioPlane::opus();
     };
+    // THE channel-count decision, and the only one: the ladder is asked whether a frame of this
+    // format FITS, and `None` is the decline. Channel count enters exactly here, as the multiplier
+    // it is — a 7.1 frame is four times a stereo one, so it needs a rung four times shorter and
+    // runs out of ladder four times sooner.
+    //
+    // At a 1 400-byte datagram that lands as: 5.1 at 48/16 on 2 ms and 48/24 on 1.5 ms
+    // (~667 packets/s), 7.1 at 48/16 on 1.5 ms and 48/24 on 1 ms; 16-bit 5.1 still fitting a 1 ms
+    // frame at 88.2 and 96 kHz; and **nothing surround above 48 kHz in 24-bit, and no 7.1 above
+    // 48 kHz at all** — 96/24 5.1 is 1 728 B of payload per millisecond, over the datagram before
+    // the shortest rung is reached. §4.2's blanket "surround is out at the default MTU" is
+    // therefore wrong for the whole 48 kHz-and-below half of the table.
+    //
+    // ⚠ The 44.1 kHz family fits the same rung or a LONGER one than 48 kHz, never a shorter one —
+    // 5.1/16 takes 2.5 ms where 48 kHz takes 2 — which is counter-intuitive only until you
+    // remember that a rung is a sample count here: 44 100 Hz simply puts fewer samples in the same
+    // milliseconds. It is the same floor that makes the rung a label rather than a duration for
+    // the pts (`audio.rs`), rounding in the safe direction for a payload and the unsafe one for a
+    // clock. The arithmetic is the authority rather than the prose; the gate tests pin the matrix.
+    //
+    // ⚠ What this does NOT police is packet rate. A 1 ms rung is 1 000 datagrams a second on a
+    // plane that rides outside the ABR loop; the affordability gate above is what keeps that from
+    // being reached on a link that cannot carry it, and it is stated in bits, not packets.
     let Some(frame_us) =
         pcm::frame_us_for(requested_rate_hz, requested_bits, channels, max_datagram)
     else {
         tracing::info!(
             requested_rate_hz,
             requested_bits,
+            channels,
             max_datagram,
             "no hi-res frame duration fits this connection's datagram size — the session uses \
-             Opus 48 kHz"
+             Opus 48 kHz. This plane is never fragmented, so a frame that would not fit one \
+             datagram is not sent at all; surround and the rates above 96 kHz are what reach \
+             this, and a jumbo path (PUNKTFUNK_WIRE_MTU) is what would carry them"
         );
         return AudioPlane::opus();
     };
@@ -932,7 +972,7 @@ pub(super) async fn negotiate(
             // bit — a client that did not ask keeps the plain 0xC9 wire byte-for-byte.
             //
             // Never alongside the lossless plane: `0xD2` is not defined for `0xD3` and is never
-            // sent with it (§4.5). Doubling a 1.5–4.6 Mbps plane is absurd on its face, and the
+            // sent with it (§4.5). Doubling a 1.4–33.9 Mbps plane is absurd on its face, and the
             // client has no `0xD2` decoder on the PCM side to receive it — so the two bits are
             // mutually exclusive on the wire, stated here rather than left to the audio thread
             // to discover.
@@ -1107,8 +1147,13 @@ mod tests {
     /// A usable datagram at the default 1472-byte discovery ceiling, less QUIC header + AEAD
     /// tag. The same number `pcm`'s own ladder test argues from.
     const DGRAM: usize = 1400;
-    /// Comfortably above the 25 % allowance for every rung on the ladder (96/24 needs 18.4).
+    /// Comfortably above the 25 % allowance for every STEREO rung on the ladder (96/24 needs
+    /// 18.4).
     const FAT_LINK_KBPS: u32 = 40_000;
+    /// …and enough for every SURROUND rung too — 176.4/24 7.1 is 33 869 kbps and wants ≥ 135 Mbps.
+    /// Used only where the frame ladder is the thing under test, so a row that should fail on
+    /// arithmetic cannot fail on bandwidth first and look like a pass for the wrong reason.
+    const HUGE_LINK_KBPS: u32 = 200_000;
     /// A capture path that can carry anything the plane asks for — Linux stream-sink mode, where
     /// the host declares the format itself (§4.4). The condition-4 tests vary this; every other
     /// test holds it here so it is never the thing that made them pass or fail.
@@ -1187,32 +1232,174 @@ mod tests {
         assert!(!pf_host_config::config().audio_hires.unwrap_or(false));
     }
 
-    /// §8.4 condition 3 — stereo only. A hi-res surround frame does not fit one datagram at the
-    /// default MTU and this plane is never fragmented (§4.2).
+    /// Surround, decided by the FRAME LADDER rather than by a stereo-only rule — the whole point
+    /// of removing the `channels != 2` decline that used to sit above it.
+    ///
+    /// ⚠ This runs on [`HUGE_LINK_KBPS`] on purpose: on an ordinary link every declining row here
+    /// would decline on BANDWIDTH first (96/24 5.1 is 13.8 Mbps and wants a 55 Mbps session), and
+    /// the test would prove the affordability gate while claiming to prove the ladder. The link is
+    /// taken out of the argument so the only thing that can move a row is the arithmetic.
+    ///
+    /// The matrix contradicts the design in both directions, which is why it is written out rather
+    /// than summarised: §4.2's blanket "surround is out at the default MTU" is false for the whole
+    /// 48 kHz-and-below half, and "above 48 kHz surround fits nothing" is false for 16-bit 5.1,
+    /// which still fits a 1 ms frame at 88.2 and 96 kHz.
     #[test]
-    fn surround_gets_opus() {
-        for ch in [6u8, 8] {
+    fn surround_is_decided_by_the_frame_ladder() {
+        // (channels, rate, bits, the rung it must land on — `None` = the honest decline)
+        let matrix: [(u8, u32, u8, Option<u16>); 20] = [
+            // 5.1 — and note 44.1 kHz fits a LONGER rung than 48 kHz, not a shorter one: a rung
+            // is a sample count, and 44 100 Hz puts fewer samples in the same milliseconds.
+            (6, 44_100, pcm::BITS_16, Some(2500)),
+            (6, 44_100, pcm::BITS_24, Some(1500)),
+            (6, 48_000, pcm::BITS_16, Some(2000)),
+            (6, 48_000, pcm::BITS_24, Some(1500)), // ~667 packets/s
+            (6, 88_200, pcm::BITS_16, Some(1000)),
+            (6, 88_200, pcm::BITS_24, None),
+            (6, 96_000, pcm::BITS_16, Some(1000)),
+            (6, 96_000, pcm::BITS_24, None), // 1 728 B per ms — over before the shortest rung
+            (6, 176_400, pcm::BITS_16, None),
+            (6, 176_400, pcm::BITS_24, None),
+            // 7.1 — four times a stereo frame, so it runs out of ladder four times sooner, and
+            // nothing above 48 kHz fits at either depth.
+            (8, 44_100, pcm::BITS_16, Some(1500)),
+            (8, 44_100, pcm::BITS_24, Some(1000)),
+            (8, 48_000, pcm::BITS_16, Some(1500)),
+            (8, 48_000, pcm::BITS_24, Some(1000)),
+            (8, 88_200, pcm::BITS_16, None),
+            (8, 88_200, pcm::BITS_24, None),
+            (8, 96_000, pcm::BITS_16, None),
+            (8, 96_000, pcm::BITS_24, None),
+            (8, 176_400, pcm::BITS_16, None),
+            (8, 176_400, pcm::BITS_24, None),
+        ];
+        for (ch, rate, bits, want_us) in matrix {
             let p = resolve_audio_plane(
+                true,
+                true,
+                rate,
+                bits,
+                ch,
+                HONEST_CAPTURE,
+                HUGE_LINK_KBPS,
+                Some(DGRAM),
+            );
+            match want_us {
+                Some(us) => {
+                    assert!(
+                        p.is_pcm(),
+                        "{ch}ch {rate}/{bits} should have resolved to PCM"
+                    );
+                    assert_eq!(p.frame_us, us, "{ch}ch {rate}/{bits} rung");
+                    assert_eq!(p.rate_hz, rate);
+                    assert_eq!(p.bits, bits);
+                    // Whatever the ladder chose, it has to FIT — a datagram over the path MTU is
+                    // not sent at all, and this plane is never fragmented.
+                    assert!(
+                        pcm::frame_payload_bytes(rate, bits, ch, us as u32) + pcm::PCM_HEADER_LEN
+                            <= DGRAM,
+                        "{ch}ch {rate}/{bits} chose a {us} µs frame that does not fit"
+                    );
+                }
+                None => assert_eq!(
+                    p,
+                    AudioPlane::opus(),
+                    "{ch}ch {rate}/{bits} must decline via the ladder, not be carried"
+                ),
+            }
+        }
+    }
+
+    /// …and on an ORDINARY link surround declines on bandwidth long before the ladder is reached,
+    /// which is the outcome a real session sees. Stated separately so the two gates can never be
+    /// confused for one another: 48/24 5.1 is 6 912 kbps and wants ≥ 27.6 Mbps of video.
+    #[test]
+    fn surround_still_needs_a_link_that_can_afford_it() {
+        assert_eq!(
+            resolve_audio_plane(
                 true,
                 true,
                 48_000,
                 pcm::BITS_24,
-                ch,
+                6,
+                HONEST_CAPTURE,
+                20_000,
+                Some(DGRAM)
+            ),
+            AudioPlane::opus(),
+            "5.1 at 48/24 costs 6 912 kbps — more than a 20 Mbps session's 25 % allowance"
+        );
+        assert!(resolve_audio_plane(
+            true,
+            true,
+            48_000,
+            pcm::BITS_24,
+            6,
+            HONEST_CAPTURE,
+            28_000,
+            Some(DGRAM)
+        )
+        .is_pcm());
+    }
+
+    /// The 44.1 kHz family, which core has just made reachable — the deferral in §4.1 was
+    /// `JitterPolicy` dividing by 1 000 before it multiplied, not anything about the plane. These
+    /// used to land in `an_unsupported_format_gets_opus`; a host that still refuses them now
+    /// disagrees with `pcm::rate_is_supported` and with every client that has already shipped the
+    /// request.
+    #[test]
+    fn the_44_1_khz_family_resolves_to_the_lossless_plane() {
+        for (rate, bits, want_us) in [
+            (44_100u32, pcm::BITS_16, 5000u16),
+            (44_100, pcm::BITS_24, 5000),
+            (88_200, pcm::BITS_16, 3000),
+            (88_200, pcm::BITS_24, 2500),
+            (176_400, pcm::BITS_16, 1500),
+            (176_400, pcm::BITS_24, 1000),
+        ] {
+            let p = resolve_audio_plane(
+                true,
+                true,
+                rate,
+                bits,
+                2,
                 HONEST_CAPTURE,
                 FAT_LINK_KBPS,
                 Some(DGRAM),
             );
-            assert_eq!(p, AudioPlane::opus(), "{ch} channels");
+            assert!(p.is_pcm(), "{rate}/{bits} should have resolved to PCM");
+            assert_eq!(p.rate_hz, rate, "the Welcome must state what was ASKED for");
+            assert_eq!(p.bits, bits);
+            assert_eq!(p.frame_us, want_us, "{rate}/{bits} rung");
+            assert!(
+                pcm::frame_payload_bytes(rate, bits, 2, p.frame_us as u32) + pcm::PCM_HEADER_LEN
+                    <= DGRAM,
+                "{rate}/{bits} chose a {} µs frame that does not fit",
+                p.frame_us
+            );
         }
+        // ⚠ The gate must never round 44 100 to 48 000 to make it fit something. That would be the
+        // exact "label right, content wrong" lie the feature is built to avoid — and it is now the
+        // reachable mistake, where before the whole family was simply refused.
+        let p = resolve_audio_plane(
+            true,
+            true,
+            44_100,
+            pcm::BITS_24,
+            2,
+            HONEST_CAPTURE,
+            FAT_LINK_KBPS,
+            Some(DGRAM),
+        );
+        assert_eq!(p.rate_hz, 44_100);
     }
 
-    /// A format the plane cannot carry at all. 44.1 kHz is the one worth pinning: it is absent
-    /// because it breaks `JitterPolicy`'s integer samples-per-ms arithmetic (§4.1), not because
-    /// it is hard to encode, and quietly rounding it to 48 000 would be the exact "label right,
-    /// content wrong" lie this feature is built to avoid.
+    /// A format the plane cannot carry at all — and after the 44.1 kHz family was admitted, that
+    /// set is only the rates outside BOTH families. 192 kHz is out by the §3 scope decision rather
+    /// than by any arithmetic; 16 kHz is a narrow voice rate this plane never offers.
     #[test]
     fn an_unsupported_format_gets_opus() {
-        for rate in [44_100u32, 88_200, 176_400, 192_000, 16_000] {
+        for rate in [192_000u32, 16_000] {
             let p = resolve_audio_plane(
                 true,
                 true,
@@ -1224,6 +1411,13 @@ mod tests {
                 Some(DGRAM),
             );
             assert_eq!(p, AudioPlane::opus(), "{rate} Hz");
+        }
+        // The gate must read the set off core rather than restate it, so the two cannot drift.
+        for rate in [44_100u32, 48_000, 88_200, 96_000, 176_400] {
+            assert!(pcm::rate_is_supported(rate), "{rate} Hz");
+        }
+        for rate in [0u32, 22_050, 32_000, 192_000] {
+            assert!(!pcm::rate_is_supported(rate), "{rate} Hz");
         }
         for bits in [8u8, 20, 32] {
             let p = resolve_audio_plane(

@@ -230,13 +230,17 @@ pub struct HostConfig {
     /// (the default) = automatic: sent only to a client that asked for it, and only while the link
     /// is actually losing packets.
     pub audio_redundancy: Option<bool>,
-    /// `PUNKTFUNK_AUDIO_HIRES` — host policy gate for the lossless `0xD3` audio plane (48/96 kHz,
-    /// 16/24-bit PCM; `design/hi-res-audio.md` §10).
+    /// `PUNKTFUNK_AUDIO_HIRES` — host policy gate for the lossless `0xD3` audio plane
+    /// (44.1/48/88.2/96/176.4 kHz, 16/24-bit PCM, stereo through 7.1;
+    /// `design/hi-res-audio.md` §10). The rate set lives in
+    /// [`punktfunk_core::audio::pcm::rate_is_supported`] and the channel count is decided by
+    /// whether a frame fits a datagram, not by a list — so neither is restated here.
     ///
     /// **Default OFF, and deliberately unlike every other `Option<bool>` knob here** — the use
     /// site is `unwrap_or(false)`, not `unwrap_or(true)`. `audio_redundancy` above defaults ON
     /// because it costs a few hundred kbps and buys loss resilience on a plane the user already
-    /// agreed to; hi-res costs **1.5–4.6 Mbps** and rides QUIC datagrams OUTSIDE the ABR loop,
+    /// agreed to; hi-res costs **1.4–8.5 Mbps in stereo, up to 33.9 in 7.1** and rides QUIC
+    /// datagrams OUTSIDE the ABR loop,
     /// so it is taken off the top of the link and adaptive bitrate can neither see nor reclaim
     /// it (§4.6). That is bandwidth nobody consented to, on a link the host cannot re-negotiate
     /// afterwards — so it must be asked for at BOTH ends: the client sets

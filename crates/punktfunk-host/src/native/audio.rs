@@ -4,9 +4,9 @@
 //! - **Opus** (48 kHz, 5 ms, constrained VBR at the configured
 //!   [`AudioTier`](punktfunk_core::audio::AudioTier)) → `AUDIO_MAGIC` QUIC datagrams, or
 //!   `AUDIO_RED_MAGIC` when the session negotiated redundancy — the default and the fallback; or
-//! - **lossless PCM** (48/96 kHz, 16/24-bit, a negotiated frame duration) → `AUDIO_PCM_MAGIC`
-//!   datagrams, when the handshake's §8.4 gate resolved the hi-res plane
-//!   (`design/hi-res-audio.md`).
+//! - **lossless PCM** (both rate families — 44.1/48/88.2/96/176.4 kHz — 16/24-bit, any negotiated
+//!   channel count, a negotiated frame duration) → `AUDIO_PCM_MAGIC` datagrams, when the
+//!   handshake's §8.4 gate resolved the hi-res plane (`design/hi-res-audio.md`).
 //!
 //! …at the negotiated channel count. Which plane a session runs is decided ONCE, at handshake,
 //! and never switches underneath the client: its output device is open at a fixed rate, so a
@@ -20,6 +20,90 @@
 //! pure quality tax) and the fixed 128 kbps stereo bitrate. See [`NativeAudioEnc::new`].
 
 use super::*;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use punktfunk_core::audio::pcm;
+
+/// The audio plane's wire clock — the `pts_ns` every datagram is stamped with.
+///
+/// An **anchor plus a running total of interleaved samples**, not an accumulator advanced once per
+/// frame. That shape is the whole point:
+///
+/// ⚠⚠ **The negotiated `frame_us` is a LABEL, not a duration.** A frame carries a whole number of
+/// samples PER CHANNEL, and `pcm::samples_per_frame` floors — so a rung is a real duration only
+/// when the rate divides it. Every rung divides the 48 kHz family; **none of the seven divides
+/// 44 100 Hz**, 88 200 divides only 5 000 µs and 176 400 only 5 000 and 2 500. A "5 ms" frame at
+/// 44 100 Hz is 220 samples per channel — `frame_duration_ns` of it is 4 988 662 ns, not
+/// 5 000 000. Stamping `pts += frame_us * 1000` therefore runs the clock **2 268 ppm fast**: 2.3
+/// ms of invented time every second, for the life of the session.
+///
+/// ⚠ And it is not self-correcting. [`reanchor`](Self::reanchor) only ever moves the clock
+/// FORWARD (a capture arrival must not un-send frames already on the wire), so a clock running
+/// slow is pulled up by the next chunk while a clock running fast is never pulled back by
+/// anything. The client's A/V sync loop then chases a drift manufactured at the source, and every
+/// stat agrees with it, because the timestamps are self-consistent and simply wrong.
+///
+/// Counting samples cannot drift: the sample count IS the frame. A running total beats even a sum
+/// of per-frame `frame_duration_ns` values — that sum accumulates just under 1 ns per frame
+/// (~0.2 µs/s, irrelevant next to 2.3 ms/s, but not nothing), while this accumulates zero.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct PtsClock {
+    /// Wall-clock nanoseconds the current run of samples is measured from.
+    base_ns: u64,
+    /// Interleaved samples charged to the clock since [`base_ns`](Self::base_ns).
+    samples: usize,
+    rate_hz: u32,
+    channels: u8,
+    /// Interleaved samples in one second — the fold factor [`advance`](Self::advance) uses to keep
+    /// `samples` bounded. Precomputed: it is a property of the plane, not of a frame.
+    samples_per_sec: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl PtsClock {
+    fn new(rate_hz: u32, channels: u8) -> PtsClock {
+        PtsClock {
+            base_ns: 0,
+            samples: 0,
+            rate_hz,
+            channels,
+            samples_per_sec: rate_hz as usize * channels as usize,
+        }
+    }
+
+    /// The pts of the NEXT frame to leave, real or synthesized.
+    fn pts_ns(&self) -> u64 {
+        self.base_ns + pcm::frame_duration_ns(self.samples, self.rate_hz, self.channels)
+    }
+
+    /// Charge one frame of `samples` interleaved samples: it has left the host.
+    fn advance(&mut self, samples: usize) {
+        self.samples += samples;
+        // Fold whole seconds into the base so a long session cannot grow the total without bound
+        // (`frame_duration_ns` takes a `usize`, which is 32 bits on some targets, and 176 400 Hz
+        // 7.1 is 1.4 M samples a second). EXACT, so the fold is invisible to `pts_ns`:
+        // `rate_hz × channels` interleaved samples are 1 000 000 000 ns at every rate this plane
+        // carries, with no remainder to round away.
+        if self.samples_per_sec > 0 && self.samples >= self.samples_per_sec {
+            let secs = self.samples / self.samples_per_sec;
+            self.base_ns += secs as u64 * 1_000_000_000;
+            self.samples -= secs * self.samples_per_sec;
+        }
+    }
+
+    /// Re-anchor on a capture arrival — **forward only**.
+    ///
+    /// Infilled frames advanced the wire clock while capture was away, and an anchor re-derived
+    /// from a chunk's arrival can land at or before the last frame already sent; moving back would
+    /// re-issue a pts the client has already played. Re-anchoring restarts the running total,
+    /// because the new base already describes everything the old base plus its samples did.
+    fn reanchor(&mut self, anchor_ns: u64) {
+        if anchor_ns > self.pts_ns() {
+            self.base_ns = anchor_ns;
+            self.samples = 0;
+        }
+    }
+}
 
 /// Opus encoder for the native audio plane: a plain stereo encoder (the live-validated,
 /// byte-identical path) or a libopus *multistream* encoder for 5.1/7.1, both behind one
@@ -102,7 +186,6 @@ pub(super) fn audio_thread(
     plane: super::handshake::AudioPlane,
 ) {
     use crate::audio::SAMPLE_RATE;
-    use punktfunk_core::audio::pcm;
     const FRAME_MS: usize = 5;
     /// Ceiling on a single pacing sleep. The capture channel is finite and `next_chunk` has to be
     /// serviced; sleeping past a couple of frames would trade a burst on the wire for a drop at
@@ -133,10 +216,35 @@ pub(super) fn audio_thread(
     } else {
         FRAME_MS as u32 * 1000
     };
+    // Interleaved samples in one protocol frame, derived from the negotiated rate and frame
+    // duration rather than from a constant. THE single source of truth for how long a frame is —
+    // the client's ring drains exactly this many, so both ends agree by construction rather than
+    // by re-deriving `rate × µs` and hoping they round the same way (`pcm::samples_per_frame`).
+    //
+    // ⚠ Exact only on the 48 kHz family. Every ladder rung divides 48 000 and 96 000 into whole
+    // samples per channel; **none of them divides 44 100**, and 88 200/176 400 divide only the
+    // longest one or two. On those rates this FLOORS, so a frame is up to one sample per channel
+    // shorter than the rung it is labelled with — safe for sizing (the payload can only shrink
+    // inside its datagram) and wrong for timing, which is why the pts below is stamped from
+    // `frame_duration_ns` and not from `frame_us`.
+    let frame_len = pcm::samples_per_frame(rate_hz, frame_us, want);
     // One protocol frame of wall time — the cadence paced sends aim for. A `let`, not a const:
     // the PCM plane's frames are shorter than 5 ms whenever the format does not fit a datagram
     // at that length (§4.2), and a 96/24 session paces 500 of them a second.
-    let frame_interval = std::time::Duration::from_micros(frame_us as u64);
+    //
+    // Measured from the frame's REAL sample count for the same reason the pts is, even though the
+    // consequence here is far smaller: this only decides when the loop next looks for work, and
+    // every release is additionally gated on `acc` actually holding a frame, so a rung-length
+    // interval would produce a slot the pacer waits out rather than time it invents. Cosmetic or
+    // not, two clocks describing the same frame must not disagree — a 0.23 % gap between them is
+    // exactly the kind of thing a later reader reconciles in the wrong direction. On the 48 kHz
+    // family this is bit-identical to `from_micros(frame_us)`.
+    //
+    // The `max(1)` guards the same malformed-plane case `frame_us` does above: a sub-microsecond
+    // rung would floor `frame_len` to zero samples and leave the pacer with a zero interval to
+    // spin on. The §8.4 gate never produces one (the shortest ladder rung is 1 000 µs).
+    let frame_interval =
+        std::time::Duration::from_nanos(pcm::frame_duration_ns(frame_len, rate_hz, want).max(1));
     // Same boost the video capture/encode loop takes, and this thread needs it MORE: it paces
     // 5 ms datagrams, so a scheduling stall here is directly audible where a late video frame
     // is one presentation slip. The 2026-08-14 field log's stutter was exactly this thread
@@ -147,7 +255,7 @@ pub(super) fn audio_thread(
     // and fell back to the default, so nothing here can silently downgrade someone's audio.
     //
     // Redundancy is FORCED off on the lossless plane (§4.5): `0xD2` is not defined for `0xD3`,
-    // there is no PCM-side decoder that would receive it, and doubling a 1.5–4.6 Mbps plane is
+    // there is no PCM-side decoder that would receive it, and doubling a 1.4–33.9 Mbps plane is
     // absurd on its face. The handshake already refuses to grant both bits together, so this is
     // a second lock on the same door — cheap, and it means no future change to the budget ladder
     // can switch redundancy on behind this branch.
@@ -198,11 +306,6 @@ pub(super) fn audio_thread(
         }
     };
 
-    // Interleaved samples in one protocol frame, derived from the negotiated rate and frame
-    // duration rather than from a constant. Every rung of the frame ladder divides both shipping
-    // rates into a whole number of samples, so this is exact and the pacer never carries a
-    // fractional frame (`pcm::FRAME_US_LADDER`).
-    let frame_len = pcm::samples_per_frame(rate_hz, frame_us, want);
     // Operator capture gain, soft-limited (`PUNKTFUNK_AUDIO_GAIN`, default 1.0 = untouched). This
     // plane had NO gain at all until now, so `PUNKTFUNK_AUDIO_GAIN` silently did nothing on
     // punktfunk/1 while working on GameStream — and since WASAPI loopback taps upstream of the
@@ -286,8 +389,9 @@ pub(super) fn audio_thread(
     //
     // Seeded rather than left uninitialised now that infilled frames advance it too: it is the
     // pts of the NEXT frame to leave, real or synthesized, and every send advances it by one
-    // frame. `sent_any` is what keeps the seed from ever reaching the wire.
-    let mut next_pts_ns: u64 = 0;
+    // frame. `sent_any` is what keeps the seed from ever reaching the wire. See [`PtsClock`] for
+    // why it counts SAMPLES rather than accumulating the negotiated frame length.
+    let mut clock = PtsClock::new(rate_hz, want);
     let mut pace_due: Option<std::time::Instant> = None;
     // WP-C — what the wire actually did, as opposed to what the tap handed us. See [`SendStats`]:
     // until this existed the send path was the one stage of the audio pipeline that could not be
@@ -472,10 +576,9 @@ pub(super) fn audio_thread(
             // the anchor twice as far into the past as the queued audio really is, so every pts
             // would be early by the whole buffer occupancy and A/V sync would chase it.
             let anchor = arrival_ns.saturating_sub(queued_frames * 1_000_000_000 / rate_hz as u64);
-            // Never step backwards. Infilled frames advanced the wire clock while capture was
-            // away, and an anchor re-derived from this chunk's arrival can land at or before the
-            // last frame we already sent.
-            next_pts_ns = anchor.max(next_pts_ns);
+            // Never step backwards — and see [`PtsClock::reanchor`] for why that asymmetry is
+            // exactly what makes a fast clock unrecoverable and the sample-exact stamp mandatory.
+            clock.reanchor(anchor);
         }
         // Everything the wire owes for the slots that have come due — real or synthesized, one
         // schedule, one encoder, one `seq`. A schedule that has fallen more than one frame behind
@@ -520,8 +623,13 @@ pub(super) fn audio_thread(
             if gain != 1.0 {
                 punktfunk_core::audio::apply_gain(&mut frame_buf, gain);
             }
-            let pts_ns = next_pts_ns;
-            next_pts_ns += frame_us as u64 * 1_000;
+            // W1.1 — the wire clock. ⚠ Charged the frame's REAL sample count, never the negotiated
+            // `frame_us`, which is a label on the 44.1 kHz family and would run this 2.3 ms/s fast
+            // forever; see [`PtsClock`]. `frame_buf.len()` rather than `frame_len` because both
+            // fill paths above produce exactly `frame_len` today and taking the count off the
+            // buffer we are about to send keeps that an observation rather than an assumption.
+            let pts_ns = clock.pts_ns();
+            clock.advance(frame_buf.len());
             // Build this frame's datagram. Two planes, ONE send path below: the pacing, the
             // telemetry and the send-error handling are properties of the wire, not of the codec,
             // and duplicating them per plane is how the two would drift.
@@ -598,8 +706,8 @@ pub(super) fn audio_thread(
                         infilled,
                     );
                     last_departure = Some(now);
-                    // From here there is a continuity worth protecting, and `next_pts_ns` has a
-                    // real anchor to continue from — both preconditions for synthesizing anything.
+                    // From here there is a continuity worth protecting, and `clock` has a real
+                    // anchor to continue from — both preconditions for synthesizing anything.
                     sent_any = true;
                 }
                 // The only outcome that really is "the session is over".
@@ -694,4 +802,144 @@ pub(super) fn audio_thread(
     _plane: super::handshake::AudioPlane,
 ) {
     tracing::warn!("punktfunk/1 audio requires Linux or Windows — session continues without it");
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod tests {
+    use super::*;
+
+    /// The number this whole clock exists for, pinned exactly rather than approximately.
+    ///
+    /// One second of "5 ms" frames at 44 100 Hz stereo: 200 frames of 440 interleaved samples =
+    /// 88 000 samples, which is 997 732 426 ns — the second is 0.23 % SHORT of the 200 × 5 ms the
+    /// rung is labelled with, because 44 100 divides none of the seven ladder rungs and
+    /// `samples_per_frame` floors 220.5 to 220 per channel.
+    ///
+    /// The old stamp added `frame_us * 1000` per frame and would land on exactly 1 000 000 000 —
+    /// 2 267 574 ns of time this host never captured, every second, forever. Planting that error
+    /// (`base += frame_us * 1000` in place of `advance`) makes the equality below fail by
+    /// 2 267 574 ns and the ppm assertion report 2 268.
+    #[test]
+    fn the_clock_counts_samples_and_not_nominal_frames() {
+        let (rate, us, ch) = (44_100u32, 5_000u32, 2u8);
+        let n = pcm::samples_per_frame(rate, us, ch);
+        assert_eq!(n, 440, "220 samples per channel, not 220.5");
+
+        let mut c = PtsClock::new(rate, ch);
+        let frames = 1_000_000 / us as u64; // 200
+        for _ in 0..frames {
+            c.advance(n);
+        }
+        let real_ns = c.pts_ns();
+        assert_eq!(real_ns, 997_732_426, "88 000 samples at 44 100 Hz stereo");
+
+        // What the nominal advance would have claimed, and the gap between the two.
+        let nominal_ns = frames * us as u64 * 1_000;
+        assert_eq!(nominal_ns - real_ns, 2_267_574, "invented ns per second");
+        let fast_ppm = (nominal_ns - real_ns) * 1_000_000 / real_ns;
+        assert_eq!(fast_ppm, 2_272, "the nominal clock runs this many ppm fast");
+
+        // ⚠ And the drift is CUMULATIVE, which is what makes it a defect rather than an offset:
+        // an hour of session is 8.2 seconds of invented time. The re-anchor cannot take any of it
+        // back (it only moves forward), so the client's A/V sync loop chases it to the end.
+        let hour = 3_600 * (nominal_ns - real_ns) / 1_000_000;
+        assert_eq!(hour, 8_163, "ms of drift over an hour");
+    }
+
+    /// Summing floored per-frame durations — the alternative core's doc offers — is *also* fine,
+    /// and this pins the size of the difference so the choice is on the record rather than
+    /// re-litigated. Under 1 ns per frame against the running total, four orders of magnitude
+    /// below what the nominal advance invents.
+    #[test]
+    fn a_running_total_beats_summing_floored_frames_by_a_hair() {
+        let (rate, us, ch) = (44_100u32, 5_000u32, 2u8);
+        let n = pcm::samples_per_frame(rate, us, ch);
+        let frames = 200u64;
+        let mut c = PtsClock::new(rate, ch);
+        for _ in 0..frames {
+            c.advance(n);
+        }
+        let summed = frames * pcm::frame_duration_ns(n, rate, ch);
+        let total = c.pts_ns();
+        assert!(
+            total >= summed && total - summed < frames,
+            "{total} vs {summed}"
+        );
+    }
+
+    /// On the 48 kHz family a rung IS a duration, so the new clock and the old nominal advance are
+    /// the same clock. This is why the defect went unnoticed while the ladder was 48/96 only — and
+    /// it is the compatibility claim that matters most: an Opus session's timestamps must not move
+    /// by a nanosecond.
+    #[test]
+    fn the_48k_family_is_bit_identical_to_the_nominal_advance() {
+        for (rate, ch) in [(48_000u32, 2u8), (48_000, 6), (48_000, 8), (96_000, 2)] {
+            for us in pcm::FRAME_US_LADDER {
+                let n = pcm::samples_per_frame(rate, us, ch);
+                let mut c = PtsClock::new(rate, ch);
+                for i in 1..=400u64 {
+                    c.advance(n);
+                    assert_eq!(
+                        c.pts_ns(),
+                        i * us as u64 * 1_000,
+                        "{rate} Hz/{ch}ch at {us} µs, frame {i}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fold that keeps the running total bounded must be invisible: it moves whole seconds
+    /// from the sample count into the base, and `rate × channels` samples are exactly 1e9 ns at
+    /// every rate the plane carries. Run long enough to fold many times, on a rate that divides
+    /// nothing.
+    #[test]
+    fn folding_whole_seconds_does_not_move_the_clock() {
+        for (rate, ch) in [(44_100u32, 2u8), (176_400, 8), (88_200, 6), (96_000, 2)] {
+            let n = pcm::samples_per_frame(rate, 1_000, ch);
+            let mut c = PtsClock::new(rate, ch);
+            let mut unfolded: u128 = 0;
+            for _ in 0..5_000 {
+                c.advance(n);
+                unfolded += n as u128;
+                // The clock must always equal the duration of every sample ever charged to it,
+                // computed in one shot from zero — the property the fold could silently break.
+                assert!(
+                    c.samples < c.samples_per_sec,
+                    "{rate}/{ch}ch: the total was not folded"
+                );
+                assert_eq!(
+                    c.pts_ns(),
+                    (unfolded * 1_000_000_000 / (rate as u128 * ch as u128)) as u64,
+                    "{rate} Hz/{ch}ch after {unfolded} samples"
+                );
+            }
+        }
+    }
+
+    /// The re-anchor is forward-only, and it restarts the running total rather than adding to it.
+    /// Both halves matter: moving back would re-issue a pts the client has already played, and
+    /// keeping the count across a re-anchor would charge the same span twice.
+    #[test]
+    fn the_reanchor_only_ever_moves_the_clock_forward() {
+        let (rate, ch) = (44_100u32, 2u8);
+        let n = pcm::samples_per_frame(rate, 5_000, ch);
+        let mut c = PtsClock::new(rate, ch);
+        c.reanchor(1_000_000_000);
+        assert_eq!(c.pts_ns(), 1_000_000_000);
+        c.advance(n);
+        let after = c.pts_ns();
+        assert_eq!(after, 1_000_000_000 + 4_988_662);
+        // An anchor behind the wire clock — capture returning after infilled frames advanced it —
+        // is ignored outright.
+        c.reanchor(1_000_000_000);
+        assert_eq!(c.pts_ns(), after, "a late anchor must not rewind the wire");
+        c.reanchor(after);
+        assert_eq!(c.pts_ns(), after, "an equal anchor is not a step either");
+        // Forward is taken, and the total restarts from it rather than compounding.
+        c.reanchor(after + 1_000_000);
+        assert_eq!(c.pts_ns(), after + 1_000_000);
+        c.advance(n);
+        assert_eq!(c.pts_ns(), after + 1_000_000 + 4_988_662);
+    }
 }
