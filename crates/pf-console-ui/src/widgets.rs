@@ -440,6 +440,11 @@ impl MenuList {
                 None
             };
             crate::theme::panel(canvas, r, 14.0, tint, stroke, k as f32);
+            // The lit edge, for the focused row only — a settings screen paints dozens of
+            // resting rows every frame and none of them need a specular highlight.
+            if f > 0.5 {
+                crate::theme::panel_highlight(canvas, r, 14.0, k as f32);
+            }
 
             let baseline = cy + 16.0 * k * 0.36;
             if row.value.is_none() {

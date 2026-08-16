@@ -458,7 +458,10 @@ impl LibraryScreen {
                 heading,
                 W::SemiBold,
                 12.0 * k,
-                fg(0.5),
+                // 0.45 is the SECTION-HEADER weight, the same one `MenuList` gives its own
+                // group headers. This sat at 0.5 and read a shade louder than the identical
+                // role two screens over.
+                fg(0.45),
                 f64::from(rect.left) + w / 2.0,
                 cy - card_h / 2.0 - 22.0 * k,
                 w * 0.5,
@@ -506,20 +509,35 @@ impl LibraryScreen {
             let m = card_matrix(ccx, cy, angle, scale, card_w, card_h, PERSPECTIVE * k);
 
             let game = &self.games[i];
+            // The focused card's glow, drawn in SCREEN space before the card's own
+            // transform: it is light spilling AROUND the card, so it cannot live inside the
+            // rounded rect the card clips itself to. Fades with the sprung proximity rather
+            // than snapping on the integer cursor, so it travels with the strip. The few
+            // degrees of perspective it misses are invisible on an 18 dp blur.
+            crate::theme::focus_halo(canvas, self.geom[i], 16.0, k as f32, (1.0 - prox) as f32);
             canvas.save();
             canvas.concat_44(&M44::row_major(&m));
             let crect = Rect::from_wh(card_w as f32, card_h as f32);
             let rr = RRect::new_rect_xy(crect, 16.0 * k as f32, 16.0 * k as f32);
             canvas.clip_rrect(rr, None, true);
-            // A layer ONLY while this card is still fading in. The coverflow's steady state
-            // deliberately has none — side cards OVERLAP, so it dims them with an opaque
-            // veil rather than whole-card alpha — and gating on `fade` keeps the resting
-            // frame exactly as cheap as it was. Raised after the clip so `None` bounds mean
-            // the CARD, not the screen: a full-screen layer per arriving card is the one
-            // way this could have cost real time on a Deck.
+            // ONE layer carrying both the entrance fade and the colour recede, raised only
+            // when a card needs either — the focused, settled card still pays nothing.
+            // Raised after the clip so `None` bounds mean the CARD and not the screen: a
+            // full-screen layer per card is the one way this could cost real time on a
+            // Deck. This is the plan's named O(visible cards) cost, and the thing to watch
+            // on a Deck frame graph if the shelf ever feels heavy.
             let fading = ent.fade < 1.0;
-            if fading {
-                canvas.save_layer_alpha_f(None, ent.fade as f32);
+            let layered = fading || prox > 0.001;
+            if layered {
+                let mut lp = Paint::default();
+                lp.set_alpha_f(ent.fade as f32);
+                if prox > 0.001 {
+                    lp.set_color_filter(skia_safe::color_filters::matrix_row_major(
+                        &crate::theme::recede_matrix(prox),
+                        None,
+                    ));
+                }
+                canvas.save_layer(&skia_safe::canvas::SaveLayerRec::default().paint(&lp));
             }
             match self.art.get(&game.id) {
                 Some(img) => {
@@ -634,8 +652,8 @@ impl LibraryScreen {
                     ),
                 );
             }
-            if fading {
-                canvas.restore(); // the entrance layer
+            if layered {
+                canvas.restore(); // the entrance/recede layer
             }
             canvas.restore();
         }
@@ -663,7 +681,9 @@ impl LibraryScreen {
                 &sub,
                 W::Regular,
                 12.0 * k,
-                fg(0.5),
+                // The subtitle rung of the 0.55 / 0.7 / 0.85 ladder every other detail line
+                // in the crate already sits on.
+                fg(0.55),
                 cx,
                 f64::from(rect.bottom) - 30.0 * k,
                 w * 0.5,

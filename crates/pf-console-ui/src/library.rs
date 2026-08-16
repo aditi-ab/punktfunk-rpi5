@@ -26,8 +26,11 @@ pub const RECEDE_SCALE: f64 = 0.24;
 pub const ROTATE_DEG: f64 = 38.0;
 /// Perspective depth for the tilt, px (CSS `perspective()` semantics).
 pub const PERSPECTIVE: f64 = 800.0;
-/// The darkening veil's max opacity (side cards stay opaque — they overlap).
-pub const RECEDE_DIM: f64 = 0.30;
+/// The darkening veil's max opacity (side cards stay opaque — they overlap). HALVED when
+/// the colour recede landed: this used to carry the whole "further away" reading on its
+/// own and had to be heavy for it, and is now left doing the one job a flat darkening is
+/// good at — separating cards that overlap. See `theme::recede_matrix`.
+pub const RECEDE_DIM: f64 = 0.15;
 /// Boundary recoil: a refused move deflects the strip this many px against the push.
 pub const BUMP_PX: f64 = 16.0;
 /// Mount entrance (see [`crate::anim::Entrance`]): a card arrives at this scale, this many

@@ -324,7 +324,21 @@ impl HomeScreen {
             canvas.translate((cx as f32, cy as f32));
             canvas.scale((scale as f32, scale as f32));
             canvas.translate((-cx as f32, -cy as f32));
-            canvas.save_layer_alpha_f(None, alpha as f32);
+            // The layer carries the fade AND the colour recede: one matrix per card, built
+            // and thrown away here, which is free next to the aurora behind it.
+            let recede = 1.0 - f;
+            let mut lp = Paint::default();
+            lp.set_alpha_f(alpha as f32);
+            if recede > 0.001 {
+                lp.set_color_filter(skia_safe::color_filters::matrix_row_major(
+                    &crate::theme::recede_matrix(recede),
+                    None,
+                ));
+            }
+            canvas.save_layer(&skia_safe::canvas::SaveLayerRec::default().paint(&lp));
+            // The focused tile gets a palette-tinted glow UNDER its shadow — the mark that
+            // reads from a sofa, where a 12 % scale difference does not.
+            crate::theme::focus_halo(canvas, tile, TILE_CORNER as f32, k as f32, f as f32);
             if f > 0.4 {
                 crate::theme::drop_shadow(
                     canvas,
@@ -338,9 +352,12 @@ impl HomeScreen {
                 Some(h) => draw_host_tile(canvas, fonts, h, tile, k, ctx.t),
                 None => draw_add_tile(canvas, fonts, tile, k),
             }
-            // The brightness recede: an opaque veil, matching the coverflow's rule.
+            // The veil, at HALF its old strength. It used to do the whole recede on its own
+            // and had to be heavy for it; now the colour matrix above drains saturation and
+            // light, and this is left doing the one job a flat darkening is actually good
+            // at — separating cards that overlap.
             if f < 1.0 {
-                let veil = (1.0 - f) as f32 * 0.24;
+                let veil = (1.0 - f) as f32 * 0.12;
                 canvas.draw_rrect(
                     RRect::new_rect_xy(tile, (TILE_CORNER * k) as f32, (TILE_CORNER * k) as f32),
                     &Paint::new(Color4f::new(0.0, 0.0, 0.0, veil), None),
@@ -378,6 +395,7 @@ fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f6
         },
         k as f32,
     );
+    crate::theme::panel_highlight(canvas, rect, TILE_CORNER as f32, k as f32);
     let pad = 20.0 * k;
     let (l, t) = (f64::from(rect.left) + pad, f64::from(rect.top) + pad);
     draw_monogram(canvas, fonts, &h.name, h.saved, l, t, k);
@@ -503,6 +521,7 @@ fn draw_add_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
         PanelStroke::GradientDashed,
         k as f32,
     );
+    crate::theme::panel_highlight(canvas, rect, TILE_CORNER as f32, k as f32);
     let pad = 20.0 * k;
     let (l, t) = (f64::from(rect.left) + pad, f64::from(rect.top) + pad);
     // The badge with a + instead of a monogram.
