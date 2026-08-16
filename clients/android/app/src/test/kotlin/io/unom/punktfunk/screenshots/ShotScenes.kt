@@ -446,12 +446,12 @@ internal fun StreamScene(verbosity: StatsVerbosity = StatsVerbosity.DETAILED) {
                 Brush.linearGradient(listOf(Color(0xFF2A1E5C), Color(0xFF0E1B3D), Color(0xFF06122B))),
             ),
     ) {
-        // The full 35-double unified layout — NativeBridge.nativeVideoStats' KDoc is the
+        // The full 38-double unified layout — NativeBridge.nativeVideoStats' KDoc is the
         // authoritative index list: [fps, mbps, e2eP50, e2eP95, latValid, skew, w, h, hz,
         // lostTotal, bitDepth, colorPrimaries, colorTransfer, chromaFormatIdc, hostNetP50,
         // decodeP50, hostP50, netP50, lost, skipped, fec, frames, dispValid, displayP50,
         // e2eDispP50, e2eDispP95, paceP50, latchP50, presents, presenterActive, feedP50, codecP50,
-        // skippedOverflow, audioBufferMs, audioAvOffsetMs].
+        // skippedOverflow, audioBufferMs, audioAvOffsetMs, audioCodec, audioRateHz, audioBits].
         // 10/9/16/1 = a 10-bit BT.2020 PQ (HDR) 4:2:0 feed so the DETAILED HUD renders its
         // video-feed line; the display stage is valid (dispValid 1) so the headline is the
         // directly-measured capture→displayed pair, less the excluded OS present floor (the 0.3
@@ -475,6 +475,11 @@ internal fun StreamScene(verbosity: StatsVerbosity = StatsVerbosity.DETAILED) {
                 // The audio plane: a 28 ms ring placed 4 ms behind the picture — a converged sync
                 // loop, i.e. inside the deadband it deliberately leaves alone.
                 28.0, 4.0,
+                // The resolved audio format: codec 0 = Opus at 48 kHz/16-bit, which is what an
+                // ordinary session runs and what these shots are of. The HUD's format line only
+                // renders for the lossless plane (codec 2), so this triple deliberately adds
+                // nothing to the capture — the scene shows the shape almost every user sees.
+                0.0, 48_000.0, 16.0,
             ),
             verbosity = verbosity,
             decoderLabel = "c2.qti.hevc.decoder · low-latency",

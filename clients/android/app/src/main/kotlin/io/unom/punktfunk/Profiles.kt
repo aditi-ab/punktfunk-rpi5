@@ -37,6 +37,12 @@ data class SettingsOverlay(
     val hdrEnabled: Boolean? = null,
     val compositor: Int? = null,
     val audioChannels: Int? = null,
+    /**
+     * The requested audio format ([AUDIO_FORMAT_OPTIONS]'s stored value). Profileable because it
+     * is about how a HOST is streamed — a wired desktop can afford lossless, a phone on a hotspot
+     * cannot — rather than about this device's hardware.
+     */
+    val audioFormat: String? = null,
     val micEnabled: Boolean? = null,
     val echoCancel: Boolean? = null,
     val touchMode: TouchMode? = null,
@@ -73,6 +79,7 @@ data class SettingsOverlay(
         hdrEnabled = hdrEnabled ?: base.hdrEnabled,
         compositor = compositor ?: base.compositor,
         audioChannels = audioChannels ?: base.audioChannels,
+        audioFormat = audioFormat ?: base.audioFormat,
         micEnabled = micEnabled ?: base.micEnabled,
         echoCancel = echoCancel ?: base.echoCancel,
         touchMode = touchMode ?: base.touchMode,
@@ -110,6 +117,7 @@ data class SettingsOverlay(
         hdrEnabled = if (after.hdrEnabled != before.hdrEnabled) after.hdrEnabled else hdrEnabled,
         compositor = if (after.compositor != before.compositor) after.compositor else compositor,
         audioChannels = if (after.audioChannels != before.audioChannels) after.audioChannels else audioChannels,
+        audioFormat = if (after.audioFormat != before.audioFormat) after.audioFormat else audioFormat,
         micEnabled = if (after.micEnabled != before.micEnabled) after.micEnabled else micEnabled,
         echoCancel = if (after.echoCancel != before.echoCancel) after.echoCancel else echoCancel,
         touchMode = if (after.touchMode != before.touchMode) after.touchMode else touchMode,
@@ -141,6 +149,7 @@ data class SettingsOverlay(
         "hdr_enabled" -> copy(hdrEnabled = null)
         "compositor" -> copy(compositor = null)
         "audio_channels" -> copy(audioChannels = null)
+        "audio_format" -> copy(audioFormat = null)
         "mic_enabled" -> copy(micEnabled = null)
         "echo_cancel" -> copy(echoCancel = null)
         "touch_mode" -> copy(touchMode = null)
@@ -167,6 +176,7 @@ data class SettingsOverlay(
         if (hdrEnabled != null) add("hdr_enabled")
         if (compositor != null) add("compositor")
         if (audioChannels != null) add("audio_channels")
+        if (audioFormat != null) add("audio_format")
         if (micEnabled != null) add("mic_enabled")
         if (echoCancel != null) add("echo_cancel")
         if (touchMode != null) add("touch_mode")
@@ -201,6 +211,7 @@ data class SettingsOverlay(
         hdrEnabled?.let { j.put("hdr_enabled", it) }
         compositor?.let { j.put("compositor", it) }
         audioChannels?.let { j.put("audio_channels", it) }
+        audioFormat?.let { j.put("audio_format", it) }
         micEnabled?.let { j.put("mic_enabled", it) }
         echoCancel?.let { j.put("echo_cancel", it) }
         touchMode?.let { j.put("touch_mode", it.name) }
@@ -224,7 +235,7 @@ data class SettingsOverlay(
         /** Keys this build models; everything else in a stored overlay is carried through. */
         private val KNOWN = setOf(
             "width", "height", "refresh_hz", "bitrate_kbps", "render_scale", "codec",
-            "hdr_enabled", "compositor", "audio_channels", "mic_enabled", "echo_cancel",
+            "hdr_enabled", "compositor", "audio_channels", "audio_format", "mic_enabled", "echo_cancel",
             "touch_mode", "mouse_mode", "invert_scroll", "gamepad", "gamepad_forwarding",
             "system_buttons", "guide_gesture",
             "stats_verbosity",
@@ -241,6 +252,7 @@ data class SettingsOverlay(
             hdrEnabled = j.optBooleanOrNull("hdr_enabled"),
             compositor = j.optIntOrNull("compositor"),
             audioChannels = j.optIntOrNull("audio_channels"),
+            audioFormat = j.optStringOrNull("audio_format"),
             micEnabled = j.optBooleanOrNull("mic_enabled"),
             echoCancel = j.optBooleanOrNull("echo_cancel"),
             touchMode = j.optStringOrNull("touch_mode")

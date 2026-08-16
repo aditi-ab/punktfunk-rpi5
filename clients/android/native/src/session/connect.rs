@@ -102,9 +102,64 @@ fn force_parts_sysprop() -> bool {
     false
 }
 
+/// Resolve the audio format this `Hello` should ASK for, from what Kotlin's setting requested —
+/// after proving this device can actually open it.
+///
+/// This is `design/hi-res-audio.md` §7's rule made mechanical: *"a client that cannot open a
+/// 96 kHz output must not set `CLIENT_CAP_AUDIO_HIRES`"*. It has to happen here, before the
+/// handshake, because after it there is no recovery: AAudio grants an explicitly-requested rate or
+/// fails the open (it never substitutes), the host does not renegotiate the plane mid-session
+/// (§6), and the only ways to play a 96 kHz wire through a 48 kHz stream are double speed or a
+/// resampler nobody asked for — which §9 forbids in as many words ("say so and fall back, not
+/// resample quietly"). So the fall back happens where falling back is still free: in the request.
+///
+/// The ladder is 96 kHz → 48 kHz → the legacy pair. Dropping the RATE keeps the depth, so a device
+/// that refuses 96 kHz still gets 48 kHz/24-bit lossless rather than being pushed all the way back
+/// to Opus — the depth is where the plane earns its bandwidth anyway.
+///
+/// Only the 96 kHz request is probed. 48 kHz is universally supported, and the DEPTH never reaches
+/// AAudio at all (the device is opened as f32 on both planes — see `crate::audio`), so there is
+/// nothing about 16-vs-24-bit for a probe to discover. An ordinary session therefore opens no
+/// stream here and pays nothing.
+fn resolve_requested_audio_format(rate_hz: u32, bits: u8, channels: u8) -> (u32, u8) {
+    let default = (
+        punktfunk_core::audio::SAMPLE_RATE_HZ,
+        punktfunk_core::audio::pcm::BITS_16,
+    );
+    // A format core would not carry (or Kotlin's `0` for "unset") is the legacy pair, not an
+    // error: the request is a preference, and an unrecognized one must not block a connect.
+    if !punktfunk_core::audio::pcm::depth_is_supported(bits)
+        || !matches!(rate_hz, punktfunk_core::audio::SAMPLE_RATE_HZ | 96_000)
+    {
+        return default;
+    }
+    if rate_hz == punktfunk_core::audio::SAMPLE_RATE_HZ || audio_rate_is_openable(rate_hz, channels)
+    {
+        return (rate_hz, bits);
+    }
+    log::warn!(
+        "audio: this device will not open a {rate_hz} Hz output, so the session asks for {} Hz / {bits}-bit instead — the wire is only ever offered a format this client has proved it can play",
+        punktfunk_core::audio::SAMPLE_RATE_HZ,
+    );
+    (punktfunk_core::audio::SAMPLE_RATE_HZ, bits)
+}
+
+#[cfg(target_os = "android")]
+fn audio_rate_is_openable(rate_hz: u32, channels: u8) -> bool {
+    crate::audio::output_rate_is_openable(rate_hz, channels)
+}
+
+/// Off-device (the host `cargo build --workspace` leg, where there is no AAudio at all): nothing
+/// can be proved, so nothing is claimed. The caller falls back to the legacy rate, which is the
+/// safe answer for a build that never runs on a phone anyway.
+#[cfg(not(target_os = "android"))]
+fn audio_rate_is_openable(_rate_hz: u32, _channels: u8) -> bool {
+    false
+}
+
 /// `NativeBridge.nativeConnect(host, port, w, h, hz, certPem, keyPem, pinHex, bitrateKbps,
-/// compositorPref, gamepadPref, hdrEnabled, audioChannels, preferredCodec, timeoutMs, launch,
-/// deviceName): Long`.
+/// compositorPref, gamepadPref, hdrEnabled, audioChannels, audioRateHz, audioBits, preferredCodec,
+/// timeoutMs, launch, deviceName): Long`.
 /// `launch` (empty ⇒ none) is a store-qualified library id to boot straight into a game.
 /// `deviceName` (empty ⇒ none) rides the Hello as `name` — what the host's pending-approval list
 /// and trust store show for this device (Kotlin passes `Build.MODEL`, its `nativePair` convention).
@@ -113,6 +168,12 @@ fn force_parts_sysprop() -> bool {
 /// `bitrateKbps` 0 = host default. `compositorPref`/`gamepadPref` are `CompositorPref`/`GamepadPref`
 /// wire bytes (0 = Auto; unknown → Auto). `audioChannels` is the requested surround layout (2/6/8;
 /// normalized, anything else → stereo) — the host clamps it and the resolved count drives playback.
+/// `audioRateHz`/`audioBits` are the audio FORMAT asked for: `48000`/`16` — or `0`/`0`, or anything
+/// unrecognized — is the legacy Opus request every build has made, and any other supported pair asks
+/// the host for the lossless `0xD3` plane. Only a request; the host's five-condition gate may answer
+/// Opus regardless, and this device may not be able to open the rate at all, which is what
+/// [`resolve_requested_audio_format`] settles HERE rather than letting the session negotiate a wire
+/// it cannot play.
 /// `preferredCodec` is the soft codec preference wire byte (0 = Auto). `timeoutMs` is the handshake
 /// budget: the normal path passes a short value, the no-PIN "request access" path a long one (≥ the
 /// host's approval-park window) so a slow operator approval lands on this same parked connection
@@ -137,6 +198,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     multi_slice_ok: jboolean,
     frame_parts_ok: jboolean,
     audio_channels: jint,
+    audio_rate_hz: jint,
+    audio_bits: jint,
     video_codecs: jint,
     preferred_codec: jint,
     timeout_ms: jint,
@@ -222,7 +285,21 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         height: height as u32,
         refresh_hz: refresh_hz as u32,
     };
-    match NativeClient::connect(
+    // Requested surround layout (2 = stereo / 6 = 5.1 / 8 = 7.1); anything else is stereo. The
+    // host clamps it and echoes the resolved count in `connector.audio_channels`, which drives the
+    // decoder + AAudio layout (read in `crate::audio::AudioPlayback::start`).
+    let audio_channels =
+        punktfunk_core::audio::normalize_channels(audio_channels.clamp(0, u8::MAX as jint) as u8);
+    // The audio format, downgraded to something this device has PROVED it can open before the
+    // `Hello` carries it — see `resolve_requested_audio_format` for why it cannot wait until
+    // playback. `clamp` first: a negative jint from a corrupted setting must not wrap into a
+    // plausible rate.
+    let (audio_rate_hz, audio_bits) = resolve_requested_audio_format(
+        audio_rate_hz.max(0) as u32,
+        audio_bits.clamp(0, u8::MAX as jint) as u8,
+        audio_channels,
+    );
+    match NativeClient::connect_with_audio_format(
         &host,
         port as u16,
         mode,
@@ -248,11 +325,15 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         } else {
             0
         }),
-        // Requested surround layout (2 = stereo / 6 = 5.1 / 8 = 7.1). The host clamps to what it can
-        // capture and echoes the resolved count in `connector.audio_channels`, which drives the
-        // decoder + AAudio layout (read in `crate::audio::AudioPlayback::start`). Anything else
-        // normalizes to stereo here.
-        punktfunk_core::audio::normalize_channels(audio_channels.clamp(0, u8::MAX as jint) as u8),
+        audio_channels,
+        // The audio format this session ASKS for (resolved above). A non-default pair is what
+        // makes core set `CLIENT_CAP_AUDIO_HIRES` in the `Hello` — capable AND the user turned it
+        // on, the `VIDEO_CAP_444` precedent — and it is answered by the host re-formatting the
+        // wire, so it must never be advertised on a device that cannot open the output. The host
+        // may still decline; `connector.audio_codec`/`audio_sample_rate_hz`/`audio_bits` are what
+        // actually happened, and `crate::audio` opens the device from those, never from these.
+        audio_rate_hz,
+        audio_bits,
         // Codecs this device can decode, ranked on the Kotlin side (`VideoDecoders.decodableCodecBits`:
         // H.264 + HEVC always, AV1 when a real `video/av01` decoder exists — AMediaCodec is
         // mime-driven, see `codec_mime`). Mask to the known bits and fall back to the pre-AV1
@@ -489,4 +570,60 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePair<'local
         env.new_string(out)
     })
     .resolve::<LogErrorAndDefault>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use punktfunk_core::audio::pcm::{BITS_16, BITS_24};
+    use punktfunk_core::audio::SAMPLE_RATE_HZ;
+
+    /// The rule this leg exists to enforce: the `Hello` never asks for an audio format this device
+    /// has not proved it can open, because after the handshake there is no way back — AAudio grants
+    /// an explicit rate or fails the open, the host does not renegotiate the plane mid-session, and
+    /// playing a 96 kHz wire through a 48 kHz stream is not a fallback, it is the wrong audio.
+    ///
+    /// Off-device (this test's target) `audio_rate_is_openable` answers `false` for everything, so
+    /// what is pinned here is the DOWNGRADE, which is the half that has to be right: a device that
+    /// cannot do 96 kHz still gets a lossless session at 48 kHz rather than being pushed all the
+    /// way back to Opus, and the depth — the thing lossless is actually for — survives.
+    #[test]
+    fn an_unopenable_rate_is_downgraded_before_the_hello_and_keeps_its_depth() {
+        // The legacy pair passes through and probes nothing — a default session's `Hello` must
+        // stay byte-identical to every build before the lossless plane existed.
+        assert_eq!(
+            resolve_requested_audio_format(SAMPLE_RATE_HZ, BITS_16, 2),
+            (SAMPLE_RATE_HZ, BITS_16)
+        );
+        // 48 kHz is never probed, so 48/24 lossless survives even where nothing can be opened.
+        assert_eq!(
+            resolve_requested_audio_format(SAMPLE_RATE_HZ, BITS_24, 2),
+            (SAMPLE_RATE_HZ, BITS_24)
+        );
+        // 96 kHz IS probed, is refused here, and drops to 48 kHz with the depth intact.
+        assert_eq!(
+            resolve_requested_audio_format(96_000, BITS_24, 2),
+            (SAMPLE_RATE_HZ, BITS_24)
+        );
+    }
+
+    /// A settings string, a profile written by a newer build, or a corrupted preference must never
+    /// reach the wire as a format the plane cannot carry — and must never block a connect either.
+    /// Both halves resolve to the legacy pair, which every host can answer.
+    #[test]
+    fn an_unrepresentable_request_falls_back_instead_of_failing() {
+        for (rate, bits) in [
+            (0, 0),               // Kotlin's "unset"
+            (44_100, BITS_24),    // §4.1 — breaks the integer samples-per-ms arithmetic
+            (192_000, BITS_24),   // above the ladder
+            (SAMPLE_RATE_HZ, 32), // 32-bit float is deliberately not on the wire
+            (SAMPLE_RATE_HZ, 8),  // not a depth this plane carries
+        ] {
+            assert_eq!(
+                resolve_requested_audio_format(rate, bits, 2),
+                (SAMPLE_RATE_HZ, BITS_16),
+                "{rate} Hz / {bits}-bit should have fallen back to the legacy pair"
+            );
+        }
+    }
 }

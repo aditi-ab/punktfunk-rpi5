@@ -50,6 +50,7 @@ class ProfilesTest {
             hdrEnabled = false,
             compositor = 4,
             audioChannels = 6,
+            audioFormat = AUDIO_FORMAT_LOSSLESS_96,
             micEnabled = true,
             touchMode = TouchMode.POINTER,
             mouseMode = MouseMode.CAPTURE,
@@ -67,6 +68,7 @@ class ProfilesTest {
         assertFalse(out.hdrEnabled)
         assertEquals(4, out.compositor)
         assertEquals(6, out.audioChannels)
+        assertEquals(AUDIO_FORMAT_LOSSLESS_96, out.audioFormat)
         assertTrue(out.micEnabled)
         assertEquals(TouchMode.POINTER, out.touchMode)
         assertEquals(MouseMode.CAPTURE, out.mouseMode)
@@ -234,6 +236,31 @@ class ProfilesTest {
         assertEquals(PROFILE_ACCENTS[2], nextAccent(made.filter { it.accent != PROFILE_ACCENTS[2] }))
         // The colour is presentation, so it never reaches the resolved settings.
         assertEquals(base, made.first().overrides.apply(base))
+    }
+
+    /**
+     * The audio-format setting is a STRING, and the two numbers it turns into are what the `Hello`
+     * carries — get the mapping wrong and the session either spends 4.6 Mbps it was not asked for
+     * or silently declines to ask for what it was. The `48000/16` row is the load-bearing one: it
+     * is byte-for-byte a pre-lossless request, which is what keeps `CLIENT_CAP_AUDIO_HIRES` off
+     * (core derives the bit from the pair) and the default session unchanged.
+     */
+    @Test
+    fun theAudioFormatSettingMapsToTheWireFieldsItClaims() {
+        assertEquals(48_000 to 16, base.copy(audioFormat = AUDIO_FORMAT_OPUS).audioFormatWire())
+        assertEquals(
+            48_000 to 24,
+            base.copy(audioFormat = AUDIO_FORMAT_LOSSLESS_48).audioFormatWire(),
+        )
+        assertEquals(
+            96_000 to 24,
+            base.copy(audioFormat = AUDIO_FORMAT_LOSSLESS_96).audioFormatWire(),
+        )
+        // The default is the legacy request — a fresh install asks for exactly what it always did.
+        assertEquals(48_000 to 16, Settings().audioFormatWire())
+        // A newer build's value (or a corrupted pref) falls back to Opus rather than reaching the
+        // host as an unrepresentable rate: a settings string must never be able to block a connect.
+        assertEquals(48_000 to 16, base.copy(audioFormat = "lossless192").audioFormatWire())
     }
 
     @Test

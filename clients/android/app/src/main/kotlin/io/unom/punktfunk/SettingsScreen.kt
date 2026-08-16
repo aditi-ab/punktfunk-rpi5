@@ -824,6 +824,23 @@ private fun AudioSettings(s: Settings, update: (Settings) -> Unit, onMicChange: 
             field = "audio_channels",
             caption = "Requested from the host; it downmixes if it has fewer.",
         ) { ch -> update(s.copy(audioChannels = ch)) }
+        // Stereo only, and the row is hidden rather than disabled on 5.1/7.1: a lossless surround
+        // frame does not fit one QUIC datagram at the default MTU and this plane is never
+        // fragmented, so the host declines the request outright. Offering a picker whose every
+        // non-default row would be refused is worse than not offering it — and the surround rows
+        // above are the setting a user in that state actually chose.
+        if (s.audioChannels == 2) {
+            SettingDropdown(
+                label = "Audio format",
+                options = AUDIO_FORMAT_OPTIONS,
+                selected = s.audioFormat,
+                field = "audio_format",
+                caption = "Lossless sends uncompressed audio — 2.3 Mbps at 48 kHz, 4.6 at " +
+                    "96 kHz, on top of the video. The host has its own switch for it and both " +
+                    "must be on; otherwise the session stays on Opus, which is already " +
+                    "effectively transparent.",
+            ) { f -> update(s.copy(audioFormat = f)) }
+        }
         ToggleRow(
             title = "Microphone",
             subtitle = "Feeds this device's microphone to the host",

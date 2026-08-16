@@ -630,12 +630,8 @@ const SHRINK_QUIET_MS: u32 = 30_000;
 /// The same, while the A/V sync loop is actively asking for a shallower ring — see the branch in
 /// [`JitterPolicy::note_read`] that selects between them.
 const SHRINK_QUIET_SYNC_MS: u32 = 5_000;
-/// Post-read depth below which a served callback counts as a NEAR-MISS: the device got its
-/// samples, but less than one protocol frame was left in hand, so the next callback starves
-/// unless a packet lands inside one frame time. On a healthy link the post-read depth hovers a
-/// whole target above this, which is what makes a near-miss evidence of real delivery jitter —
-/// the same evidence as an underrun, except nobody heard it yet.
-const NEAR_MISS_MARGIN_MS: u32 = FRAME_MS;
+// The NEAR-MISS margin is ONE PROTOCOL FRAME, so it is [`JitterPolicy::frame_samples`] rather
+// than a constant — see the use site in `step`.
 /// How long a shrink remains a PROBE, in consumed audio: an underrun or near-miss inside this
 /// window means the shrink was wrong, and the previous target is restored at once instead of
 /// being re-learned three audible underruns at a time.
@@ -720,7 +716,7 @@ pub struct JitterPolicy {
     /// without diverging in the meantime.
     sync_target: Option<usize>,
     /// Set by [`step`](Self::step) when the read it authorised leaves less than
-    /// [`NEAR_MISS_MARGIN_MS`] buffered; consumed by [`note_read`](Self::note_read).
+    /// one protocol frame buffered; consumed by [`note_read`](Self::note_read).
     near_miss: bool,
     /// A near-miss already grew the target this window — one step per window, so a single
     /// bunching episode (which lands as a RUN of consecutive near-misses while the ring refills)
@@ -950,7 +946,17 @@ impl JitterPolicy {
         let after = depth.saturating_sub(out.drop_front);
         self.near_miss = self.primed
             && after >= want
-            && after - want < NEAR_MISS_MARGIN_MS as usize * self.per_ms;
+            // Post-read depth below which a served callback counts as a NEAR-MISS: the device got
+            // its samples, but less than ONE PROTOCOL FRAME was left in hand, so the next callback
+            // starves unless a packet lands inside one frame time. On a healthy link the post-read
+            // depth hovers a whole target above this, which is what makes a near-miss evidence of
+            // real delivery jitter — the same evidence as an underrun, except nobody heard it yet.
+            //
+            // Denominated in the RESOLVED frame, not a fixed 5 ms. Against a 2 ms lossless frame a
+            // frozen 5 ms margin stops meaning "one packet in hand" and starts meaning two and a
+            // half, so it would grow the target on a ring that was never close to starving —
+            // inverting the thing it exists to detect. Identical on every Opus session.
+            && after - want < self.frame_samples();
         // Hollow: the depth AVERAGE runs a debt against the target — the promise has been raised
         // but the depth was never re-banked (see `DEPRIME_DEBT_MS`). Judged on the average, not
         // this instant: a single late packet empties the ring for a callback without making it
@@ -2207,6 +2213,35 @@ mod tests {
         assert!(z.frame_samples() >= 1);
     }
 
+    /// The near-miss margin is "less than one packet left in hand". Frozen at 5 ms it would mean
+    /// two and a half packets on a 2 ms lossless frame — growing the target on a ring that was
+    /// never close to starving, which inverts what the near-miss detects. Identical on Opus.
+    #[test]
+    fn the_near_miss_margin_is_one_negotiated_frame() {
+        let pm = per_ms(2);
+        let want = 5 * pm;
+
+        // A depth one sample short of a full frame in hand is a near miss…
+        let mut p = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
+        p.set_frame_us(2_000);
+        p.step(60 * pm, want); // prime
+        p.note_read(false);
+        p.step(want + 2 * pm - 1, want);
+        assert!(p.near_miss, "under one 2 ms frame in hand is a near miss");
+
+        // …and a full frame in hand is not. Under the old fixed 5 ms margin this depth would
+        // have counted, and the target would have grown for nothing.
+        let mut q = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
+        q.set_frame_us(2_000);
+        q.step(60 * pm, want);
+        q.note_read(false);
+        q.step(want + 2 * pm, want);
+        assert!(
+            !q.near_miss,
+            "a whole 2 ms frame in hand is not a near miss"
+        );
+    }
+
     fn per_ms_at(rate: u32, channels: u8) -> usize {
         (rate / 1000) as usize * channels as usize
     }
@@ -2654,7 +2689,7 @@ mod tests {
         assert!(p.is_primed());
         let base = p.target_ms();
         // Serve the callback with less than one frame left over: depth = want + (margin − 1).
-        p.step(want + NEAR_MISS_MARGIN_MS as usize * pm - 1, want);
+        p.step(want + FRAME_MS as usize * pm - 1, want);
         p.note_read(false); // NOT short — the device got its samples
         assert_eq!(
             p.target_ms(),

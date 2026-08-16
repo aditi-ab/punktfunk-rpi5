@@ -917,6 +917,19 @@ internal fun buildSettingsRows(
             "The speaker layout requested from the host.",
             AUDIO_CHANNEL_OPTIONS, s.audioChannels,
         ) { update(s.copy(audioChannels = it)) },
+        // Follows the row above rather than disappearing, the same relationship the pad rows draw
+        // with the forwarding switch — this list is fixed-shape and a row that vanishes under the
+        // cursor is worse on a pad than one that dims. The lossless plane is stereo-only at the
+        // default MTU (a surround frame does not fit one datagram and this plane is never
+        // fragmented), so on 5.1/7.1 there is genuinely nothing here to choose.
+        choice(
+            "audioFormat", GpTab.AUDIO, null, "Audio quality",
+            "Lossless sends bit-exact PCM instead of compressed audio — 2.3 Mbps at 48 kHz, " +
+                "4.6 at 96 — on top of the video. It must be enabled on the host too, and this " +
+                "device's output has to accept the rate; otherwise the session falls back to " +
+                "Standard.",
+            AUDIO_FORMAT_OPTIONS, s.audioFormat, enabled = s.audioChannels == 2,
+        ) { update(s.copy(audioFormat = it)) },
         toggle(
             "mic", GpTab.AUDIO, null, "Microphone",
             "Send this device's microphone to the host's virtual mic.",
