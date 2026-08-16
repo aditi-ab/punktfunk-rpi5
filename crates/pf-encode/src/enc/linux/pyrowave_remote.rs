@@ -677,6 +677,18 @@ impl Encoder for RemotePyroWave {
         false
     }
 
+    fn distrust_references(&mut self) {
+        // Nothing to distrust, for the same reason `invalidate_ref_frames` has nothing to
+        // invalidate and `request_keyframe` has nothing to request: PyroWave is intra-only, so
+        // every AU is already a keyframe and no RFI anchor trust exists to withdraw. The
+        // in-process encoder reaches the same answer by inheriting the trait's default.
+        //
+        // Written out rather than inherited BECAUSE this is the proxy. An unforwarded default here
+        // would mean the worker never hears the call — which for a method that does something is a
+        // feature silently dead on every worker-backed session, and is exactly what the
+        // trait-coverage test below exists to catch. The no-op has to be a visible decision.
+    }
+
     fn set_pipelined(&mut self, _on: bool) -> bool {
         // No pipelined-retrieve mode; the encode is synchronous by design.
         false
