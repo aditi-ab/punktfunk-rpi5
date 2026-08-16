@@ -856,7 +856,11 @@ mod tests {
         let mask = plane(&[0, 0, 1, 1]);
         let out = masked_color_to_rgba(&color, &mask, 4, 1);
         assert_eq!(px(&out, 0), OPAQUE_BLACK, "AND=0 colour=0 ⇒ black");
-        assert_eq!(px(&out, 1), [0xCC, 0, 0, 0xFF], "AND=0 colour ⇒ opaque colour");
+        assert_eq!(
+            px(&out, 1),
+            [0xCC, 0, 0, 0xFF],
+            "AND=0 colour ⇒ opaque colour"
+        );
         // Pixel 2 is transparent by the table, but it is an 8-neighbour of the invert pixel at 3,
         // so the outline claims it — same as the monochrome table.
         assert_eq!(
@@ -864,7 +868,11 @@ mod tests {
             OPAQUE_WHITE,
             "outline grows into adjacent transparency"
         );
-        assert_eq!(px(&out, 3), OPAQUE_BLACK, "AND=1 colour≠0 ⇒ invert, not drop");
+        assert_eq!(
+            px(&out, 3),
+            OPAQUE_BLACK,
+            "AND=1 colour≠0 ⇒ invert, not drop"
+        );
     }
 
     /// AND=1 and a zero colour pixel stays transparent when nothing invert-neighbours it.

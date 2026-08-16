@@ -1,18 +1,16 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
-import { Download, Trash2 } from "lucide-react";
-import type { FC } from "react";
-import type { ClientLogMeta } from "@/api/gen/model/clientLogMeta";
+import { ChevronDown, ChevronRight, Download, Trash2 } from "lucide-react";
+import { type FC, useState } from "react";
 import {
 	clientLogsGet,
 	getClientLogsListQueryKey,
 	useClientLogsDelete,
-	useClientLogsList,
 } from "@/api/gen/logs/logs";
+import type { ClientLogMeta } from "@/api/gen/model/clientLogMeta";
 import { useDialogs } from "@/components/dialogs";
 import { QueryState } from "@/components/query-state";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import {
 	Table,
 	TableBody,
@@ -33,14 +31,20 @@ const fmtSize = (bytes: number): string =>
 		: `${(bytes / 1024).toFixed(1)} KB`;
 
 /**
- * Container: log bundles paired clients uploaded via "Send logs to host" — the log-escape hatch
- * for platforms whose own files the user can't reach (a Deck in Gaming Mode, tvOS). Owns the
- * list query, the text download, and delete.
+ * Container for bundle housekeeping: fetch the raw file, delete one.
+ *
+ * Reading a bundle is no longer this component's job — the device chips merge it into the viewer
+ * above. What is left is the file-cabinet half (keep the raw bytes, throw one away), which is
+ * occasional and belongs behind a disclosure rather than in a card of its own competing with the
+ * log for the top of the page.
  */
-export const ClientLogsSection: FC = () => {
+export const ClientLogsSection: FC<{
+	list: Loadable<ClientLogMeta[]>;
+	/** Drop a deleted bundle's rows from the viewer — the list alone cannot do that. */
+	onDeleted: (id: string) => void;
+}> = ({ list, onDeleted }) => {
 	const qc = useQueryClient();
 	const { confirm } = useDialogs();
-	const bundles = useClientLogsList();
 	const del = useClientLogsDelete();
 
 	const onDelete = async (id: string) => {
@@ -54,8 +58,10 @@ export const ClientLogsSection: FC = () => {
 		del.mutate(
 			{ id },
 			{
-				onSuccess: () =>
-					qc.invalidateQueries({ queryKey: getClientLogsListQueryKey() }),
+				onSuccess: () => {
+					onDeleted(id);
+					qc.invalidateQueries({ queryKey: getClientLogsListQueryKey() });
+				},
 				onError: (e) =>
 					toast.error(apiErrorMessage(e) ?? m.client_logs_delete_failed()),
 			},
@@ -82,7 +88,7 @@ export const ClientLogsSection: FC = () => {
 
 	return (
 		<ClientLogsCard
-			bundles={bundles}
+			bundles={list}
 			onDownload={onDownload}
 			onDelete={onDelete}
 			isDeleting={del.isPending}
@@ -90,89 +96,103 @@ export const ClientLogsSection: FC = () => {
 	);
 };
 
-/** Uploaded client log bundles, newest first, with Download / Delete row actions. */
+/**
+ * Uploaded bundles as a collapsed disclosure: Download (raw) / Delete per row.
+ *
+ * Collapsed by default because it answers a question nobody arrives with. It renders nothing at all
+ * when there is nothing stored — the "no device has sent logs yet" hint now lives beside the source
+ * chips, where someone who has never used the feature will actually meet it.
+ */
 export const ClientLogsCard: FC<{
 	bundles: Loadable<ClientLogMeta[]>;
 	onDownload: (id: string) => void;
 	onDelete: (id: string) => void;
 	isDeleting: boolean;
 }> = ({ bundles, onDownload, onDelete, isDeleting }) => {
+	const [open, setOpen] = useState(false);
 	const rows = bundles.data ?? [];
-	// No bundles is the ordinary state (nothing was ever sent) — an empty card would just be
-	// noise on every visit, so the whole card only appears once something arrived. Errors and
-	// loading still render: a broken list must not look like "nothing was sent".
+	// Errors and loading still render: a broken list must not look like "nothing was sent".
 	if (!bundles.isLoading && !bundles.error && rows.length === 0) return null;
+
 	return (
-		<Card>
-			<CardHeader>
-				<div className="space-y-1">
-					<h2 className="text-lg font-medium">{m.client_logs_title()}</h2>
-					<p className="text-sm text-muted-foreground">
-						{m.client_logs_subtitle()}
-					</p>
-				</div>
-			</CardHeader>
-			<QueryState
-				isLoading={bundles.isLoading}
-				error={bundles.error}
-				refetch={bundles.refetch}
+		<div className="flex flex-col gap-2">
+			<button
+				type="button"
+				className="flex items-center gap-1 self-start text-xs text-muted-foreground hover:text-foreground"
+				aria-expanded={open}
+				onClick={() => setOpen((v) => !v)}
 			>
-				<CardContent flush>
-					<Table>
-						<TableHeader>
-							<TableRow>
-								<TableHead>{m.client_logs_col_received()}</TableHead>
-								<TableHead>{m.client_logs_col_device()}</TableHead>
-								<TableHead className="text-right">
-									{m.client_logs_col_size()}
-								</TableHead>
-								<TableHead className="w-24" />
-							</TableRow>
-						</TableHeader>
-						<TableBody>
-							{rows.map((r) => (
-								<TableRow key={r.id}>
-									<TableCell className="whitespace-nowrap font-medium">
-										{fmtTimestamp(r.received_ms)}
-									</TableCell>
-									<TableCell>
-										<span>{r.device_name}</span>
-										<span className="ml-2 font-mono text-xs text-muted-foreground">
-											{r.fingerprint_prefix}
-										</span>
-									</TableCell>
-									<TableCell className="text-right tabular-nums">
-										{fmtSize(r.size_bytes)}
-									</TableCell>
-									<TableCell>
-										<div className="flex justify-end gap-1">
-											<Button
-												variant="ghost"
-												size="icon"
-												aria-label={m.client_logs_download()}
-												title={m.client_logs_download()}
-												onClick={() => onDownload(r.id)}
-											>
-												<Download className="size-4" />
-											</Button>
-											<Button
-												variant="ghost"
-												size="icon"
-												aria-label={m.client_logs_delete()}
-												title={m.client_logs_delete()}
-												disabled={isDeleting}
-												onClick={() => onDelete(r.id)}
-											>
-												<Trash2 className="size-4 text-destructive" />
-											</Button>
-										</div>
-									</TableCell>
+				{open ? (
+					<ChevronDown className="size-3" />
+				) : (
+					<ChevronRight className="size-3" />
+				)}
+				{m.client_logs_manage({ count: rows.length })}
+			</button>
+
+			{open && (
+				<QueryState
+					isLoading={bundles.isLoading}
+					error={bundles.error}
+					refetch={bundles.refetch}
+				>
+					<div className="rounded-md border">
+						<Table>
+							<TableHeader>
+								<TableRow>
+									<TableHead>{m.client_logs_col_received()}</TableHead>
+									<TableHead>{m.client_logs_col_device()}</TableHead>
+									<TableHead className="text-right">
+										{m.client_logs_col_size()}
+									</TableHead>
+									<TableHead className="w-24" />
 								</TableRow>
-							))}
-						</TableBody>
-					</Table>
-				</CardContent>
-			</QueryState>
-		</Card>
+							</TableHeader>
+							<TableBody>
+								{rows.map((r) => (
+									<TableRow key={r.id}>
+										<TableCell className="whitespace-nowrap font-medium">
+											{fmtTimestamp(r.received_ms)}
+										</TableCell>
+										<TableCell>
+											<span>{r.device_name}</span>
+											<span className="ml-2 font-mono text-xs text-muted-foreground">
+												{r.fingerprint_prefix}
+											</span>
+										</TableCell>
+										<TableCell className="text-right tabular-nums">
+											{fmtSize(r.size_bytes)}
+										</TableCell>
+										<TableCell>
+											<div className="flex justify-end gap-1">
+												<Button
+													variant="ghost"
+													size="icon"
+													aria-label={m.client_logs_download()}
+													title={m.client_logs_download()}
+													onClick={() => onDownload(r.id)}
+												>
+													<Download className="size-4" />
+												</Button>
+												<Button
+													variant="ghost"
+													size="icon"
+													aria-label={m.client_logs_delete()}
+													title={m.client_logs_delete()}
+													disabled={isDeleting}
+													onClick={() => onDelete(r.id)}
+												>
+													<Trash2 className="size-4 text-destructive" />
+												</Button>
+											</div>
+										</TableCell>
+									</TableRow>
+								))}
+							</TableBody>
+						</Table>
+					</div>
+				</QueryState>
+			)}
+		</div>
 	);
 };

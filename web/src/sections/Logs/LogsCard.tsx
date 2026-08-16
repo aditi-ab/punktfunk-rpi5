@@ -1,22 +1,29 @@
-import { toast } from "@unom/ui/toast";
-import { Copy, Download, Pause, Play, Share2, Trash2 } from "lucide-react";
-import { type FC, useEffect, useMemo, useRef, useState } from "react";
-import { useLogsGet } from "@/api/gen/logs/logs";
-import type { LogEntry } from "@/api/gen/model/logEntry";
+import {
+	AlertCircle,
+	Copy,
+	Download,
+	Pause,
+	Play,
+	Share2,
+	Trash2,
+} from "lucide-react";
+import {
+	type FC,
+	type ReactNode,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages";
-import {
-	detectShareMode,
-	downloadText,
-	logFilename,
-	logsToText,
-	type ShareMode,
-	shareLogs,
-} from "./export";
+import type { ShareMode } from "./export";
+import { PLUGINS_SOURCE, type Row } from "./rows";
 
 const LEVELS = ["DEBUG", "INFO", "WARN", "ERROR"] as const;
 type MinLevel = (typeof LEVELS)[number];
@@ -35,151 +42,48 @@ const LEVEL_CLASS: Record<string, string> = {
 	TRACE: "text-muted-foreground",
 };
 
-const KEEP = 5_000; // accumulated entries (client memory bound)
 const SHOW = 1_000; // rendered rows (DOM bound)
 
 /**
- * Producer filter. The ring carries the host's own `tracing` events AND whatever the plugin runner
- * ships up (`POST /api/v1/plugins/logs`), the latter targeted `plugin:<name>`. Without this the two
- * are interleaved with nothing but the target column to tell them apart, and "show me what my
- * plugin said" — the question that sends people to `journalctl` — means knowing to type `plugin:`
- * into the search box.
+ * One selectable producer. Host and plugins are always offered; devices appear as their bundles
+ * arrive.
  */
-const SOURCES = ["all", "host", "plugins"] as const;
-type Source = (typeof SOURCES)[number];
-
-/** The target prefix the host stamps on every runner-shipped line. */
-const PLUGIN_TARGET_PREFIX = "plugin:";
-
-const matchesSource = (target: string, source: Source): boolean =>
-	source === "all" ||
-	(source === "plugins") === target.startsWith(PLUGIN_TARGET_PREFIX);
-
-const SOURCE_LABEL: Record<Source, () => string> = {
-	all: () => m.logs_source_all(),
-	host: () => m.logs_source_host(),
-	plugins: () => m.logs_source_plugins(),
-};
+export interface SourceChoice {
+	id: string;
+	label: string;
+	/** A device chip's second line — when that bundle landed. */
+	hint?: string;
+	selected: boolean;
+	/** Fetching the bundle, or failed to. Host and plugins are never either. */
+	state?: "loading" | "error";
+}
 
 /**
- * Container: cursor-paged log polling. A non-empty page advances the cursor — a new query key,
- * so the next page fetches immediately and a backlog drains fast; an empty page leaves the key
- * unchanged and `refetchInterval` paces the idle poll. Pausing (follow off) stops the interval.
- */
-export const LogsSection: FC = () => {
-	const [cursor, setCursor] = useState(0);
-	const [entries, setEntries] = useState<LogEntry[]>([]);
-	const [follow, setFollow] = useState(true);
-	const [dropped, setDropped] = useState(false);
-	const [shareMode, setShareMode] = useState<ShareMode | null>(null);
-	// Set while a poll has failed and we have not yet re-read the ring from the start.
-	const [resync, setResync] = useState(false);
-
-	// Probed after mount: the server render has no `navigator`, and guessing there would mismatch
-	// on hydration. Until then the share button is simply absent.
-	useEffect(() => {
-		setShareMode(detectShareMode());
-	}, []);
-
-	const query = useLogsGet(
-		{ after: cursor > 0 ? cursor : undefined },
-		{
-			query: {
-				refetchInterval: follow ? 2_000 : false,
-				// Pausing must actually pause. Stopping only the interval left React Query's default
-				// focus/reconnect refetches landing, and the append effect consumed them
-				// unconditionally — so tabbing away and back evicted the lines the operator had
-				// paused on, from behind the pause button.
-				refetchOnWindowFocus: follow,
-				refetchOnReconnect: follow,
-			},
-		},
-	);
-
-	// Resync after the host goes away and comes back.
-	//
-	// The host's log ring restarts at seq 1 on every restart, while our cursor stays wherever it
-	// got to. `GET /logs?after=8000` against a fresh ring is not an error — it is a permanently
-	// EMPTY page (`next` echoes `after`), so the page would poll forever showing stale lines with
-	// no error, no dropped badge and no way back short of a full reload. The console's own update
-	// flow restarts the host, so this was reachable from two clicks away.
-	//
-	// A restart always breaks the poll first, so a failed query is the trigger: on the next success
-	// we re-read from the start of the ring once and let the effect below decide whether the
-	// sequence actually regressed.
-	const failed = query.isError;
-	useEffect(() => {
-		if (failed) setResync(true);
-	}, [failed]);
-	useEffect(() => {
-		if (resync && cursor !== 0) setCursor(0);
-	}, [resync, cursor]);
-
-	const data = query.data;
-	useEffect(() => {
-		if (!data || data.entries.length === 0) return;
-		setEntries((prev) => {
-			const lastSeq = prev.at(-1)?.seq ?? -1;
-			// A page whose newest entry is OLDER than what we already hold can only mean the host's
-			// sequence restarted underneath us — the buffer describes a host that no longer exists,
-			// so replace it wholesale rather than filtering every new line away as "already seen".
-			const newest = data.entries.at(-1)?.seq ?? -1;
-			if (newest < lastSeq) return data.entries.slice(-KEEP);
-			// Otherwise append only what's newer — dedup by the monotonic `seq`. Guards a
-			// double-invoked mount effect (React StrictMode, or `data` warm in cache) from appending
-			// the same page twice (duplicate rows + duplicate React keys), and makes the post-resync
-			// re-read from 0 a no-op when the host did NOT restart.
-			const fresh = data.entries.filter((e) => e.seq > lastSeq);
-			return fresh.length ? [...prev, ...fresh].slice(-KEEP) : prev;
-		});
-		setDropped((d) => d || data.dropped);
-		setCursor(data.next);
-		setResync(false);
-	}, [data]);
-
-	// The card hands back the entries its filters currently match, so an export carries exactly what
-	// the viewer shows — never the DOM-bounded tail of it.
-	return (
-		<LogsCard
-			entries={entries}
-			follow={follow}
-			onFollow={setFollow}
-			onClear={() => {
-				setEntries([]);
-				setDropped(false);
-			}}
-			onDownload={(shown) =>
-				downloadText(logsToText(shown), logFilename(new Date()))
-			}
-			onShare={async (shown) => {
-				const outcome = await shareLogs(
-					logsToText(shown),
-					logFilename(new Date()),
-				);
-				if (outcome === "copied") toast.success(m.logs_copied());
-				else if (outcome === "failed") toast.error(m.logs_share_failed());
-			}}
-			shareMode={shareMode}
-			dropped={dropped}
-			error={query.error}
-			isLoading={query.isLoading}
-			onRetry={() => query.refetch()}
-		/>
-	);
-};
-
-/**
- * Pure log viewer: level/min filter + text search (local UI state), follow, clear, and export.
- * Export is the filters' full result, not the rendered tail — the `SHOW` cap is a DOM budget and
- * has no business truncating a file destined for a bug report.
+ * The log viewer: one pane, one timeline, every producer on it.
+ *
+ * The source control is **multi-select**, which is the whole point rather than a detail. The old
+ * `All | Host | Plugins` strip could only ever isolate one producer, so the question that actually
+ * brings someone here — "the client stalled at 12:03:47; what was the host doing?" — had no view
+ * at all. Any combination is now expressible, and Host + one device is the interesting one.
+ *
+ * A line that does not parse still renders (see `rows.ts`), and the level/search filters treat an
+ * unparsed row as level-less rather than hiding it: a filter must never be the reason a log looks
+ * empty when it isn't.
  */
 export const LogsCard: FC<{
-	entries: LogEntry[];
+	/** Every loaded row, merged and sorted. The card filters; the caller does not pre-filter. */
+	rows: Row[];
+	sources: SourceChoice[];
+	onToggleSource: (id: string) => void;
+	/** No device has ever uploaded — the hint that teaches the feature exists. */
+	devicesEmpty?: boolean;
+	/** Bundle housekeeping (download raw / delete), tucked under the viewer. */
+	manage?: ReactNode;
 	follow: boolean;
 	onFollow: (follow: boolean) => void;
 	onClear: () => void;
-	onDownload: (shown: LogEntry[]) => void;
-	onShare: (shown: LogEntry[]) => void;
+	onDownload: (shown: Row[]) => void;
+	onShare: (shown: Row[]) => void;
 	shareMode: ShareMode | null;
 	dropped: boolean;
 	/** The poll's failure, if any — without it a broken /logs is indistinguishable from a quiet host. */
@@ -187,7 +91,11 @@ export const LogsCard: FC<{
 	isLoading?: boolean;
 	onRetry?: () => void;
 }> = ({
-	entries,
+	rows,
+	sources,
+	onToggleSource,
+	devicesEmpty,
+	manage,
 	follow,
 	onFollow,
 	onClear,
@@ -200,32 +108,47 @@ export const LogsCard: FC<{
 	onRetry,
 }) => {
 	const [minLevel, setMinLevel] = useState<MinLevel>("DEBUG");
-	const [source, setSource] = useState<Source>("all");
 	const [search, setSearch] = useState("");
 	const listRef = useRef<HTMLDivElement>(null);
+
+	const selected = useMemo(
+		() => new Set(sources.filter((s) => s.selected).map((s) => s.id)),
+		[sources],
+	);
 
 	const matched = useMemo(() => {
 		const min = RANK[minLevel] ?? 0;
 		const q = search.trim().toLowerCase();
-		return entries.filter(
-			(e) =>
-				(RANK[e.level] ?? 0) >= min &&
-				matchesSource(e.target, source) &&
+		return rows.filter(
+			(r) =>
+				selected.has(r.source) &&
+				// An unparsed row has no level to rank. Ranking it as 0 would hide it behind any
+				// filter above DEBUG, which is the one outcome a fail-soft parser must not produce —
+				// so it is always in range and only the text search can exclude it.
+				(r.level === "" || (RANK[r.level] ?? 0) >= min) &&
 				(q === "" ||
-					e.msg.toLowerCase().includes(q) ||
-					e.target.toLowerCase().includes(q)),
+					r.msg.toLowerCase().includes(q) ||
+					r.target.toLowerCase().includes(q) ||
+					(r.device?.toLowerCase().includes(q) ?? false)),
 		);
-	}, [entries, minLevel, source, search]);
+	}, [rows, selected, minLevel, search]);
+
 	const visible = useMemo(() => matched.slice(-SHOW), [matched]);
 	const shareLabel = shareMode === "share" ? m.logs_share() : m.logs_copy();
+	const nothingSelected = selected.size === 0;
+	// "No plugin output" has a specific, actionable cause that the generic "adjust the filter" line
+	// actively misdirects from: the runner is a separate service and is opt-in on Linux, so the
+	// usual reason for an empty Plugins view is that it simply isn't running. Only worth saying
+	// when plugins are the ONLY thing being looked at — otherwise the emptiness is not about them.
+	const onlyPlugins = selected.size === 1 && selected.has(PLUGINS_SOURCE);
 
 	// Keep the tail in view while following.
 	//
-	// Keyed on the newest RENDERED seq, not on `visible.length`: `visible` is `matched.slice(-SHOW)`,
+	// Keyed on the newest RENDERED key, not on `visible.length`: `visible` is `matched.slice(-SHOW)`,
 	// so once the filter matches SHOW rows its length is pinned at SHOW forever. The effect then
 	// stopped re-running and follow-mode quietly stopped following — exactly when the log is busy
-	// enough to need it. The newest seq keeps changing for as long as lines arrive.
-	const newestVisible = visible.at(-1)?.seq ?? -1;
+	// enough to need it. The newest key keeps changing for as long as lines arrive.
+	const newestVisible = visible.at(-1)?.key ?? "";
 	// NOTE: biome flags `newestVisible` as an unnecessary dependency (it is not read in the body) and
 	// offers to remove it. Do NOT take that fix — it is a TRIGGER, the signal that new lines arrived.
 	// Removing it reinstates the bug this replaced: the effect stops re-running and follow-mode
@@ -245,6 +168,43 @@ export const LogsCard: FC<{
 				{/* The page heading says "Troubleshooting" now, so this card names itself — otherwise
 				    the log stream is the only section on the page with no label. */}
 				<h2 className="text-lg font-medium">{m.logs_title()}</h2>
+
+				<div className="flex flex-wrap items-center gap-2">
+					<span className="text-xs text-muted-foreground">
+						{m.logs_sources_label()}
+					</span>
+					{sources.map((s) => (
+						<Button
+							key={s.id}
+							size="sm"
+							variant={s.selected ? "secondary" : "outline"}
+							aria-pressed={s.selected}
+							disabled={s.state === "loading"}
+							onClick={() => onToggleSource(s.id)}
+						>
+							{s.state === "loading" && <Spinner className="mr-1 size-3.5" />}
+							{s.state === "error" && (
+								<AlertCircle className="mr-1 size-3.5 text-destructive" />
+							)}
+							{s.label}
+							{s.hint && (
+								<span className="ml-1.5 text-xs text-muted-foreground">
+									{s.hint}
+								</span>
+							)}
+						</Button>
+					))}
+					{/* The bundle list used to vanish entirely when empty, which meant the one place
+					    that could teach "your devices can send their logs here" showed nothing to
+					    anyone who had never already used it. One line is not the noise a whole empty
+					    card was. */}
+					{devicesEmpty && (
+						<span className="text-xs text-muted-foreground">
+							{m.logs_devices_empty()}
+						</span>
+					)}
+				</div>
+
 				<div className="flex flex-wrap items-center gap-2">
 					<div className="flex items-center gap-1">
 						{LEVELS.map((l) => (
@@ -255,18 +215,6 @@ export const LogsCard: FC<{
 								onClick={() => setMinLevel(l)}
 							>
 								{l}
-							</Button>
-						))}
-					</div>
-					<div className="flex items-center gap-1 border-l pl-2">
-						{SOURCES.map((s) => (
-							<Button
-								key={s}
-								size="sm"
-								variant={source === s ? "secondary" : "ghost"}
-								onClick={() => setSource(s)}
-							>
-								{SOURCE_LABEL[s]()}
 							</Button>
 						))}
 					</div>
@@ -326,7 +274,7 @@ export const LogsCard: FC<{
 				{/* A failing poll while lines are already on screen keeps them there — during a host
 				    restart the last lines before it went away are the interesting ones — but says so,
 				    instead of letting a frozen view read as a quiet host. */}
-				{error != null && entries.length > 0 && (
+				{error != null && rows.length > 0 && (
 					<p
 						role="status"
 						className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
@@ -340,8 +288,9 @@ export const LogsCard: FC<{
 					className="max-h-[65vh] overflow-auto rounded-md border bg-card/40 p-2 font-mono text-xs leading-5"
 				>
 					{visible.length === 0 ? (
-						// An empty list has three quite different causes and used to render one sentence
-						// for all of them: the host is quiet, the request failed, or it hasn't answered yet.
+						// An empty list has four quite different causes and used to render one sentence
+						// for all of them: the host is quiet, the request failed, it hasn't answered yet,
+						// or every source is switched off.
 						<div className="p-2">
 							{error ? (
 								<div className="space-y-2 font-sans">
@@ -356,36 +305,46 @@ export const LogsCard: FC<{
 								<p className="text-muted-foreground">
 									{isLoading
 										? m.common_loading()
-										: // "No plugin output" has a specific, actionable cause that the generic
-											// "adjust the filter" line actively misdirects from: the runner is a
-											// separate service and is opt-in on Linux, so the usual reason for an
-											// empty Plugins view is that it simply isn't running.
-											source === "plugins"
-											? m.logs_empty_plugins()
-											: m.logs_empty()}
+										: nothingSelected
+											? m.logs_sources_none()
+											: onlyPlugins
+												? m.logs_empty_plugins()
+												: m.logs_empty()}
 								</p>
 							)}
 						</div>
 					) : (
-						visible.map((e) => (
-							<div key={e.seq} className="whitespace-pre-wrap break-words">
-								<span className="text-muted-foreground">
-									{fmtTime(e.ts_ms)}{" "}
-								</span>
+						visible.map((r) => (
+							<div key={r.key} className="whitespace-pre-wrap break-words">
+								<span className="text-muted-foreground">{fmtTime(r.ts)} </span>
 								<span
 									className={cn(
 										"font-medium",
-										LEVEL_CLASS[e.level] ?? "text-muted-foreground",
+										LEVEL_CLASS[r.level] ?? "text-muted-foreground",
 									)}
 								>
-									{e.level.padEnd(5)}{" "}
+									{r.level.padEnd(5)}{" "}
 								</span>
-								<span className="text-muted-foreground">{e.target} </span>
-								<span>{e.msg}</span>
+								{/* Only device rows are tagged. Absence of a tag reads as "this host",
+								    and stamping every host line would double the noise in the common
+								    case where no bundle is loaded at all. */}
+								{/* Theme-aware, unlike LEVEL_CLASS above: one fixed mid shade is legible on
+								    exactly one of the two palettes, and this tag is the thing that has
+								    to stay readable for a merged view to be worth having. Checked in
+								    both themes, not inferred. */}
+								{r.device && (
+									<span className="text-violet-600 dark:text-violet-400">
+										[{r.device}]{" "}
+									</span>
+								)}
+								<span className="text-muted-foreground">{r.target} </span>
+								<span>{r.msg}</span>
 							</div>
 						))
 					)}
 				</div>
+
+				{manage}
 			</CardContent>
 		</Card>
 	);
