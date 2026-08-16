@@ -571,6 +571,43 @@ fn a_completed_pop_frees_its_screen_and_republishes_hints() {
     );
 }
 
+/// The trailing Rescan tile asks discovery to look again — and nothing else. It sits one
+/// step past Add Host, where a mis-timed press used to land on nothing at all, so the test
+/// that matters is that it CANNOT connect: an accidental A on the end of the strip must
+/// never start a session.
+#[test]
+fn the_rescan_tile_probes_and_never_connects() {
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    // Walk to the very end of the strip: hosts, then Add Host, then Rescan.
+    for _ in 0..12 {
+        s.handle_menu(MenuEvent::Move(MenuDir::Right));
+    }
+    assert!(
+        s.stack
+            .last()
+            .is_some_and(|sc| matches!(sc, Screen::Home(_))),
+        "still on the home carousel"
+    );
+    s.handle_menu(MenuEvent::Confirm);
+
+    assert!(
+        s.take_action().is_none(),
+        "a scan must raise no Launch, and no Quit"
+    );
+    assert!(s.connecting.is_none(), "and must not open the connect card");
+    assert_eq!(s.stack.len(), 1, "and must push no screen");
+    assert!(s.toast.is_some(), "it says it is scanning");
+    // One step back is Add Host, which DOES push — proof the walk reached the end rather
+    // than stalling somewhere harmless.
+    s.handle_menu(MenuEvent::Move(MenuDir::Left));
+    s.handle_menu(MenuEvent::Confirm);
+    assert!(
+        matches!(s.stack.last(), Some(Screen::AddHost(_))),
+        "the tile before Rescan is Add Host"
+    );
+}
+
 /// The three toast kinds must be tellable apart WITHOUT reading the words — that is the
 /// whole reason the kind exists. In particular the error tint is fixed rather than
 /// palette-derived: `moss`'s accent is a green and `ember`'s is an orange, and reporting a

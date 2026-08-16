@@ -166,18 +166,27 @@ impl Shell {
             }
         }
 
-        // Persistent chrome: the controller chip (top-right, above every layer).
+        // Persistent chrome: the controller chip (top-right, above every layer). Reads
+        // left-to-right as kind · name · charge — a mark for what is connected, its name,
+        // and how long it has left.
         if let Some(chip) = &self.chip {
             let size = 12.0 * k;
             let tw = f64::from(fonts.measure(chip, W::Medium, size));
-            let (bh, pad_x) = (24.0 * k, 12.0 * k);
-            let bx = w - 24.0 * k - tw - 2.0 * pad_x;
-            let rect = Rect::from_xywh(
-                bx as f32,
-                (18.0 * k) as f32,
-                (tw + 2.0 * pad_x) as f32,
-                bh as f32,
-            );
+            let (bh, pad_x, gap) = (24.0 * k, 12.0 * k, 8.0 * k);
+            let mark_w = 15.0 * k;
+            // The battery only takes room when there IS one: a wired pad, a Steam virtual
+            // pad and "no controller" all report nothing, and the chip must not carry a
+            // gap where their charge would have been.
+            let battery = self.pads.first().and_then(|p| p.battery);
+            let pip_w = if battery.is_some() {
+                22.0 * k + gap
+            } else {
+                0.0
+            };
+            let bw = pad_x + mark_w + gap + tw + pip_w + pad_x;
+            let bx = w - 24.0 * k - bw;
+            let top = 18.0 * k;
+            let rect = Rect::from_xywh(bx as f32, top as f32, bw as f32, bh as f32);
             crate::theme::panel(
                 canvas,
                 rect,
@@ -186,15 +195,27 @@ impl Shell {
                 PanelStroke::Plain(0.12),
                 k as f32,
             );
+            let cy = top + bh / 2.0;
+            crate::glyphs::pad_mark(canvas, self.glyphs, bx + pad_x, cy, mark_w, k, fg(0.7));
             fonts.draw(
                 canvas,
                 chip,
-                bx + pad_x,
-                18.0 * k + 16.0 * k,
+                bx + pad_x + mark_w + gap,
+                cy + size * 0.36,
                 W::Medium,
                 size,
                 fg(0.7),
             );
+            if let Some(b) = battery {
+                crate::glyphs::battery_pip(
+                    canvas,
+                    bx + pad_x + mark_w + gap + tw + gap,
+                    cy,
+                    22.0 * k,
+                    k,
+                    b,
+                );
+            }
         }
 
         self.draw_overlays(canvas, w, h, k, dt, t, fonts);

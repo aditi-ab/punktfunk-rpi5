@@ -25,6 +25,28 @@ const TILE_CORNER: f64 = 26.0;
 /// The Add Host tile's synthetic key (host keys are fingerprints or `addr:port`,
 /// neither starts with `\0`).
 const ADD_KEY: &str = "\0add";
+/// The Rescan tile's, the second sentinel after it.
+const SCAN_KEY: &str = "\0scan";
+
+/// What a carousel index actually is. The two trailing tiles are ACTIONS, not hosts, so
+/// every place that used to ask "is there a host at this index?" asks this instead — the
+/// old `hosts.get(i)` was already answering two questions with one `None`, and a second
+/// action tile makes that ambiguity a bug.
+enum Slot<'h> {
+    Host(&'h HostRow),
+    AddHost,
+    /// Ask the discovery sweep to look again. A controller surface has no pull-to-refresh,
+    /// so the affordance has to be a tile — the same reasoning the Apple client uses.
+    Rescan,
+}
+
+fn slot_at(i: usize, hosts: &[HostRow]) -> Slot<'_> {
+    match hosts.get(i) {
+        Some(h) => Slot::Host(h),
+        None if i == hosts.len() => Slot::AddHost,
+        None => Slot::Rescan,
+    }
+}
 
 pub(crate) struct HomeScreen {
     cursor: i32,
@@ -61,7 +83,7 @@ impl HomeScreen {
         let keys: Vec<String> = hosts
             .iter()
             .map(|h| h.key.clone())
-            .chain(std::iter::once(ADD_KEY.to_string()))
+            .chain([ADD_KEY.to_string(), SCAN_KEY.to_string()])
             .collect();
         if keys != self.keys {
             let followed = self
@@ -79,6 +101,15 @@ impl HomeScreen {
         hosts.get(self.cursor as usize)
     }
 
+    fn slot<'h>(&self, hosts: &'h [HostRow]) -> Slot<'h> {
+        slot_at(self.cursor.max(0) as usize, hosts)
+    }
+
+    /// Tiles in the strip: every host, then Add Host, then Rescan.
+    fn len(hosts: &[HostRow]) -> usize {
+        hosts.len() + 2
+    }
+
     pub(crate) fn menu(
         &mut self,
         ev: MenuEvent,
@@ -86,27 +117,32 @@ impl HomeScreen {
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
         self.reconcile(ctx.hosts);
-        let len = ctx.hosts.len() + 1;
+        let len = Self::len(ctx.hosts);
         match ev {
             MenuEvent::Move(MenuDir::Left) => self.step(-1, len, false),
             MenuEvent::Move(MenuDir::Right) => self.step(1, len, false),
             MenuEvent::JumpBack => self.step(-5, len, true),
             MenuEvent::JumpForward => self.step(5, len, true),
             MenuEvent::Confirm => {
-                match self.focused(ctx.hosts) {
-                    None => fx.push(Screen::AddHost(super::add_host::AddHostScreen::new())),
-                    Some(h) if !h.paired => fx.push(Screen::Pair(super::pair::PairScreen::new(
-                        h,
-                        ctx.device_name,
-                    ))),
-                    Some(h) if !h.online && h.can_wake => {
+                match self.slot(ctx.hosts) {
+                    Slot::AddHost => {
+                        fx.push(Screen::AddHost(super::add_host::AddHostScreen::new()))
+                    }
+                    Slot::Rescan => {
+                        fx.cmds.push(ConsoleCmd::Probe);
+                        fx.toast = Some("Scanning for hosts…".into());
+                    }
+                    Slot::Host(h) if !h.paired => fx.push(Screen::Pair(
+                        super::pair::PairScreen::new(h, ctx.device_name),
+                    )),
+                    Slot::Host(h) if !h.online && h.can_wake => {
                         // Wake first; the wake overlay connects once it answers.
                         fx.cmds.push(ConsoleCmd::Wake {
                             key: h.key.clone(),
                             then_connect: true,
                         });
                     }
-                    Some(h) => {
+                    Slot::Host(h) => {
                         // Dial-first even when the presence pips say offline — a
                         // routed/VPN host is mDNS-blind and probe-shy but dials fine.
                         // A pinned card connects with ITS profile (one-off, §5.2a);
@@ -176,7 +212,7 @@ impl HomeScreen {
     /// safer read and the one a coverflow trains you to expect.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
         self.reconcile(ctx.hosts);
-        let len = ctx.hosts.len() + 1;
+        let len = Self::len(ctx.hosts);
         match p.kind {
             PointerKind::Scroll { up } => {
                 self.step(if up { -1 } else { 1 }, len, false);
@@ -218,13 +254,14 @@ impl HomeScreen {
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
         let mut hints = Vec::new();
-        match self.focused(ctx.hosts) {
-            None => hints.push(Hint::new(HintKey::Confirm, "Add Host")),
-            Some(h) if !h.paired => hints.push(Hint::new(HintKey::Confirm, "Pair…")),
-            Some(h) if !h.online && h.can_wake => {
+        match self.slot(ctx.hosts) {
+            Slot::AddHost => hints.push(Hint::new(HintKey::Confirm, "Add Host")),
+            Slot::Rescan => hints.push(Hint::new(HintKey::Confirm, "Scan Again")),
+            Slot::Host(h) if !h.paired => hints.push(Hint::new(HintKey::Confirm, "Pair…")),
+            Slot::Host(h) if !h.online && h.can_wake => {
                 hints.push(Hint::new(HintKey::Confirm, "Wake & Connect"))
             }
-            Some(_) => hints.push(Hint::new(HintKey::Confirm, "Connect")),
+            Slot::Host(_) => hints.push(Hint::new(HintKey::Confirm, "Connect")),
         }
         if self.focused(ctx.hosts).is_some_and(|h| h.paired && h.saved) {
             hints.push(Hint::new(HintKey::Secondary, "Library"));
@@ -286,7 +323,7 @@ impl HomeScreen {
         let cx0 = f64::from(rect.left) + w / 2.0 + self.bump.pos * k;
         let cy = f64::from(rect.top) + f64::from(rect.height()) / 2.0;
 
-        let len = ctx.hosts.len() + 1;
+        let len = Self::len(ctx.hosts);
         self.geom.clear();
         self.geom.resize(len, Rect::new_empty());
         for i in 0..len {
@@ -348,9 +385,10 @@ impl HomeScreen {
                     0.45 * f as f32,
                 );
             }
-            match ctx.hosts.get(i) {
-                Some(h) => draw_host_tile(canvas, fonts, h, tile, k, ctx.t),
-                None => draw_add_tile(canvas, fonts, tile, k),
+            match slot_at(i, ctx.hosts) {
+                Slot::Host(h) => draw_host_tile(canvas, fonts, h, tile, k, ctx.t),
+                Slot::AddHost => draw_action_tile(canvas, fonts, tile, k, ActionTile::AddHost),
+                Slot::Rescan => draw_action_tile(canvas, fonts, tile, k, ActionTile::Rescan),
             }
             // The veil, at HALF its old strength. It used to do the whole recede on its own
             // and had to be heavy for it; now the colour matrix above drains saturation and
@@ -398,7 +436,7 @@ fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f6
     crate::theme::panel_highlight(canvas, rect, TILE_CORNER as f32, k as f32);
     let pad = 20.0 * k;
     let (l, t) = (f64::from(rect.left) + pad, f64::from(rect.top) + pad);
-    draw_monogram(canvas, fonts, &h.name, h.saved, l, t, k);
+    draw_badge(canvas, fonts, &h.name, &h.os, h.saved, l, t, k);
 
     // Top-right status cluster: a lock for a paired identity, a glowing pip when live.
     let mut sx = f64::from(rect.right) - pad;
@@ -512,7 +550,16 @@ fn accent_color(hex: Option<&str>) -> skia_safe::Color4f {
     )
 }
 
-fn draw_add_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
+/// The two action tiles trailing the strip. Same shape, same badge, different mark and
+/// words — they are the same KIND of thing (something the console does, rather than
+/// somewhere it goes), and drawing them alike is what says so.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActionTile {
+    AddHost,
+    Rescan,
+}
+
+fn draw_action_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64, kind: ActionTile) {
     crate::theme::panel(
         canvas,
         rect,
@@ -524,7 +571,7 @@ fn draw_add_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
     crate::theme::panel_highlight(canvas, rect, TILE_CORNER as f32, k as f32);
     let pad = 20.0 * k;
     let (l, t) = (f64::from(rect.left) + pad, f64::from(rect.top) + pad);
-    // The badge with a + instead of a monogram.
+    // The badge with a mark instead of a monogram.
     let badge = Rect::from_xywh(l as f32, t as f32, (52.0 * k) as f32, (52.0 * k) as f32);
     canvas.draw_rrect(
         RRect::new_rect_xy(badge, (15.0 * k) as f32, (15.0 * k) as f32),
@@ -545,22 +592,55 @@ fn draw_add_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
     p.set_stroke_cap(skia_safe::PaintCap::Round);
     p.set_anti_alias(true);
     let r = 9.0 * k;
-    canvas.draw_line(
-        ((bcx - r) as f32, bcy as f32),
-        ((bcx + r) as f32, bcy as f32),
-        &p,
-    );
-    canvas.draw_line(
-        (bcx as f32, (bcy - r) as f32),
-        (bcx as f32, (bcy + r) as f32),
-        &p,
-    );
+    match kind {
+        ActionTile::AddHost => {
+            canvas.draw_line(
+                ((bcx - r) as f32, bcy as f32),
+                ((bcx + r) as f32, bcy as f32),
+                &p,
+            );
+            canvas.draw_line(
+                (bcx as f32, (bcy - r) as f32),
+                (bcx as f32, (bcy + r) as f32),
+                &p,
+            );
+        }
+        // A refresh arrow: three-quarters of a circle with a head on the open end. Drawn
+        // rather than spun — the sweep's progress is reported by the toast and by hosts
+        // appearing, and a permanently spinning tile would claim work that isn't running.
+        ActionTile::Rescan => {
+            let mut arc = PathBuilder::new();
+            arc.add_arc(
+                Rect::from_xywh(
+                    (bcx - r) as f32,
+                    (bcy - r) as f32,
+                    (2.0 * r) as f32,
+                    (2.0 * r) as f32,
+                ),
+                -45.0,
+                280.0,
+            );
+            canvas.draw_path(&arc.detach(), &p);
+            let head = 4.6 * k;
+            let (hx, hy) = (bcx + r * 0.72, bcy - r * 0.72);
+            let mut tip = PathBuilder::new();
+            tip.move_to(((hx - head) as f32, (hy - head * 0.2) as f32));
+            tip.line_to(((hx + head * 0.5) as f32, (hy - head * 1.1) as f32));
+            tip.line_to(((hx + head * 0.2) as f32, (hy + head * 0.7) as f32));
+            tip.close();
+            canvas.draw_path(&tip.detach(), &Paint::new(accent(1.0), None));
+        }
+    }
 
+    let (title, sub) = match kind {
+        ActionTile::AddHost => ("Add Host", "Register a host by address"),
+        ActionTile::Rescan => ("Rescan", "Look for hosts on this network again"),
+    };
     let max_w = f64::from(rect.width()) - 2.0 * pad;
     let sub_base = f64::from(rect.bottom) - pad;
     fonts.draw_clipped(
         canvas,
-        "Register a host by address",
+        sub,
         l,
         sub_base,
         W::Regular,
@@ -570,7 +650,7 @@ fn draw_add_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
     );
     fonts.draw_clipped(
         canvas,
-        "Add Host",
+        title,
         l,
         sub_base - 22.0 * k,
         W::Bold,
@@ -580,7 +660,28 @@ fn draw_add_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
     );
 }
 
-fn draw_monogram(canvas: &Canvas, fonts: &Fonts, name: &str, filled: bool, x: f64, y: f64, k: f64) {
+/// The tile's identity badge: the host's OS mark when its advertised chain resolves to one,
+/// and its initial when it doesn't.
+///
+/// The substitution, not an addition — a badge showing both a Tux and an "L" would say the
+/// same thing twice. An older host advertises no `os` at all and an unknown chain resolves
+/// to nothing, so both keep the monogram they have always drawn, pixel for pixel.
+///
+/// Accessibility note for the ports: the mark carries no information the card doesn't
+/// already state in words. The host's NAME is right beside it, and the OS is a property of
+/// that name, so a reader that skips the badge loses nothing — which is why this is a
+/// decorative substitution and not a labelled image.
+#[allow(clippy::too_many_arguments)]
+fn draw_badge(
+    canvas: &Canvas,
+    fonts: &Fonts,
+    name: &str,
+    os: &str,
+    filled: bool,
+    x: f64,
+    y: f64,
+    k: f64,
+) {
     let badge = Rect::from_xywh(x as f32, y as f32, (52.0 * k) as f32, (52.0 * k) as f32);
     let rr = RRect::new_rect_xy(badge, (15.0 * k) as f32, (15.0 * k) as f32);
     if filled {
@@ -610,6 +711,21 @@ fn draw_monogram(canvas: &Canvas, fonts: &Fonts, name: &str, filled: bool, x: f6
         ring.set_anti_alias(true);
         canvas.draw_rrect(rr, &ring);
     }
+    let ink = if filled { fg(1.0) } else { accent(1.0) };
+    // Inset to ~54 % of the badge so the mark reads as a mark ON a badge rather than a
+    // cropped one; `os_mark` letterboxes inside that box, so a non-square master (apple is
+    // 384x512, windows 24x24) keeps its proportions.
+    let side = 28.0 * k;
+    let inner = Rect::from_xywh(
+        (x + 26.0 * k - side / 2.0) as f32,
+        (y + 26.0 * k - side / 2.0) as f32,
+        side as f32,
+        side as f32,
+    );
+    if let Some(path) = crate::os_marks::os_mark(os, inner) {
+        canvas.draw_path(&path, &Paint::new(ink, None));
+        return;
+    }
     let letter: String = name
         .trim()
         .chars()
@@ -625,7 +741,7 @@ fn draw_monogram(canvas: &Canvas, fonts: &Fonts, name: &str, filled: bool, x: f6
         y + 26.0 * k + size * 0.36,
         W::Bold,
         size,
-        if filled { fg(1.0) } else { accent(1.0) },
+        ink,
     );
 }
 
