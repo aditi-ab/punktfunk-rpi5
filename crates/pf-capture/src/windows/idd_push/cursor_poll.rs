@@ -481,7 +481,11 @@ fn bitmap_extent(hbm: HBITMAP) -> Option<(u32, u32)> {
 
 /// Convert the ICONINFO bitmaps to straight RGBA. Two families:
 /// - color (`hbmColor` set): 32bpp BGRA; if the alpha channel is entirely empty (old-style
-///   cursors) the AND mask supplies it (mask bit 1 = transparent).
+///   masked-color cursors, including Windows 11's coloured I-beam) the AND mask is NOT just
+///   transparency — it is the same four-state table as monochrome, with the colour bitmap
+///   standing in for the XOR plane. Treating AND=1 as "always transparent" drops invert
+///   pixels, and the text I-beam is almost entirely invert, so the client would install a
+///   fully-transparent pointer over every text field.
 /// - monochrome (`hbmColor` null): `hbmMask` is DOUBLE height — AND plane over XOR plane, the
 ///   WebRTC truth table: (0,0) black, (0,1) white, (1,0) transparent, (1,1) invert. Invert
 ///   pixels — unrepresentable in straight alpha — become opaque black with a white outline
@@ -497,12 +501,12 @@ fn convert(ii: &ICONINFO) -> Option<(Vec<u8>, u32, u32)> {
             let (w, h) = (color.w as u32, color.h as u32);
             let mut rgba = bgra_to_rgba(&color.bgra);
             if alpha_is_empty(&rgba) {
-                // Alpha-less color cursor: transparency lives in the AND mask.
+                // Alpha-less color cursor: AND + colour-as-XOR, including invert.
                 let mask = read_bitmap_32(dc, ii.hbmMask)?;
                 if mask.w != color.w || mask.h < color.h {
                     return None;
                 }
-                apply_and_mask_alpha(&mut rgba, &mask.bgra);
+                rgba = masked_color_to_rgba(&rgba, &mask.bgra, w as usize, h as usize);
             }
             Some((rgba, w, h))
         } else {
@@ -596,7 +600,8 @@ fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
 }
 
 /// Whether a 32bpp RGBA buffer's alpha channel is entirely zero — the "old-style cursor with no
-/// alpha" test, whose transparency lives in the AND mask instead ([`apply_and_mask_alpha`]).
+/// alpha" test, whose transparency (and invert) live in the AND mask instead
+/// ([`masked_color_to_rgba`]).
 fn alpha_is_empty(rgba: &[u8]) -> bool {
     rgba.chunks_exact(4).all(|p| p[3] == 0)
 }
@@ -604,10 +609,43 @@ fn alpha_is_empty(rgba: &[u8]) -> bool {
 /// Take alpha from an expanded AND mask: mask WHITE (AND bit 1) means transparent, black opaque.
 /// `mask_bgra` is the 32bpp expansion `GetDIBits` produces from the 1bpp mask, so any non-zero
 /// channel byte is "set".
+///
+/// Test-only: the simple AND-as-alpha helper (no invert). [`convert`] uses
+/// [`masked_color_to_rgba`] instead — AND=1 plus a non-zero colour pixel is invert, not
+/// transparent, and that is the I-beam.
+#[cfg(test)]
 fn apply_and_mask_alpha(rgba: &mut [u8], mask_bgra: &[u8]) {
     for (px, m) in rgba.chunks_exact_mut(4).zip(mask_bgra.chunks_exact(4)) {
         px[3] = if m[0] != 0 { 0 } else { 0xFF };
     }
+}
+
+/// Alpha-less colour cursor: the AND mask plus the colour bitmap as XOR, same four states as
+/// [`mono_planes_to_rgba`]. A non-zero RGB with AND=1 is invert — which treating AND=1 as
+/// "always transparent" would have dropped, vanishing the I-beam.
+///
+/// `(false, true)` keeps the colour (a painted glyph), unlike the monochrome table which can
+/// only emit white.
+fn masked_color_to_rgba(color_rgba: &[u8], mask_bgra: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut rgba = vec![0u8; w * h * 4];
+    let mut invert = vec![false; w * h];
+    for i in 0..w * h {
+        let and = mask_bgra.get(i * 4).is_some_and(|&b| b != 0);
+        let c = color_rgba.get(i * 4..i * 4 + 3).unwrap_or(&[0, 0, 0]);
+        let xor = c[0] != 0 || c[1] != 0 || c[2] != 0;
+        let px = &mut rgba[i * 4..i * 4 + 4];
+        match (and, xor) {
+            (false, false) => px.copy_from_slice(&[0, 0, 0, 0xFF]),
+            (false, true) => px.copy_from_slice(&[c[0], c[1], c[2], 0xFF]),
+            (true, false) => {} // transparent (already zeroed)
+            (true, true) => {
+                px.copy_from_slice(&[0, 0, 0, 0xFF]);
+                invert[i] = true;
+            }
+        }
+    }
+    grow_invert_outline(&mut rgba, &invert, w, h);
+    rgba
 }
 
 /// The monochrome-cursor truth table, plus the white outline that makes an INVERT region legible.
@@ -645,6 +683,13 @@ fn mono_planes_to_rgba(and_plane: &[u8], xor_plane: &[u8], w: usize, h: usize) -
             }
         }
     }
+    grow_invert_outline(&mut rgba, &invert, w, h);
+    rgba
+}
+
+/// Turn every TRANSPARENT 8-neighbour of an invert pixel opaque white. Invert itself stays
+/// opaque black. Shared by the monochrome and masked-color converters.
+fn grow_invert_outline(rgba: &mut [u8], invert: &[bool], w: usize, h: usize) {
     for y in 0..h as i32 {
         for x in 0..w as i32 {
             if !invert[(y * w as i32 + x) as usize] {
@@ -662,7 +707,6 @@ fn mono_planes_to_rgba(and_plane: &[u8], xor_plane: &[u8], w: usize, h: usize) -
             }
         }
     }
-    rgba
 }
 
 #[cfg(test)]
@@ -793,5 +837,44 @@ mod tests {
         apply_and_mask_alpha(&mut rgba, &plane(&[0]));
         assert_eq!(px(&rgba, 0), [1, 2, 3, 0xFF]);
         assert_eq!(px(&rgba, 1), [4, 5, 6, 0]);
+    }
+
+    // ---- masked-color (colour bitmap as XOR) ------------------------------------------------
+
+    /// The four-state table, with colour standing in for XOR. Pixel 3 is the I-beam case:
+    /// AND=1 and a non-zero colour pixel is invert, not transparent — `apply_and_mask_alpha`
+    /// would have dropped it, which is how the text cursor vanished on a Windows host.
+    #[test]
+    fn a_masked_color_invert_pixel_is_not_transparent() {
+        //          (0,0) black  (0,1) red    (1,0) transparent  (1,1) invert
+        let color = vec![
+            0, 0, 0, 0, //
+            0xCC, 0, 0, 0, //
+            0, 0, 0, 0, //
+            0xFF, 0xFF, 0xFF, 0, //
+        ];
+        let mask = plane(&[0, 0, 1, 1]);
+        let out = masked_color_to_rgba(&color, &mask, 4, 1);
+        assert_eq!(px(&out, 0), OPAQUE_BLACK, "AND=0 colour=0 ⇒ black");
+        assert_eq!(px(&out, 1), [0xCC, 0, 0, 0xFF], "AND=0 colour ⇒ opaque colour");
+        // Pixel 2 is transparent by the table, but it is an 8-neighbour of the invert pixel at 3,
+        // so the outline claims it — same as the monochrome table.
+        assert_eq!(
+            px(&out, 2),
+            OPAQUE_WHITE,
+            "outline grows into adjacent transparency"
+        );
+        assert_eq!(px(&out, 3), OPAQUE_BLACK, "AND=1 colour≠0 ⇒ invert, not drop");
+    }
+
+    /// AND=1 and a zero colour pixel stays transparent when nothing invert-neighbours it.
+    #[test]
+    fn a_masked_color_transparent_pixel_stays_transparent() {
+        let color = vec![0u8; 16];
+        let mask = plane(&[1, 1, 1, 1]);
+        let out = masked_color_to_rgba(&color, &mask, 4, 1);
+        for i in 0..4 {
+            assert_eq!(px(&out, i), TRANSPARENT, "pixel {i}");
+        }
     }
 }
