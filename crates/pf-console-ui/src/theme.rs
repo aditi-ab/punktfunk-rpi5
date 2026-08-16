@@ -221,7 +221,14 @@ pub(crate) fn panel(
 pub(crate) fn recede_matrix(d: f64) -> [f32; 20] {
     let d = d.clamp(0.0, 1.0);
     let sat = (1.0 - RECEDE_SATURATION * d) as f32;
-    let bright = -(RECEDE_BRIGHTNESS * d) as f32;
+    // Toward the GROUND, not simply darker. Apple's `.brightness(-0.24·d)` is dark-mode
+    // arithmetic: on a dark field, down is away. On one of this crate's six PALE palettes
+    // it is exactly backwards — a darkened tile gains contrast against a light ground and
+    // the UNFOCUSED card becomes the heaviest thing on screen. The scrim already knows
+    // which way the field leans (it tends to black on a dark palette, white on a pale
+    // one), so the recede borrows its direction.
+    let toward_light = ink().scrim.r > 0.5;
+    let bright = (RECEDE_BRIGHTNESS * d) as f32 * if toward_light { 1.0 } else { -1.0 };
     const LR: f32 = 0.2126;
     const LG: f32 = 0.7152;
     const LB: f32 = 0.0722;
@@ -632,5 +639,38 @@ mod tests {
         // ALPHA IS UNTOUCHED, and that is load-bearing: coverflow side cards overlap, so a
         // recede that reached alpha would let them show through each other.
         assert_eq!(out[3], 1.0);
+    }
+
+    /// The recede must move a card TOWARD ITS GROUND, which is the opposite direction on a
+    /// pale palette. Getting this wrong is not subtle and is not caught by any dark-palette
+    /// screenshot: on `mint` or `holo` a darkened neighbour gains contrast against the
+    /// light field, so the UNFOCUSED tile becomes the loudest thing on screen.
+    #[test]
+    fn recede_moves_toward_the_ground_on_a_pale_palette() {
+        let lum = |v: [f32; 4]| 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+        let card = [0.55f32, 0.55, 0.6, 1.0];
+
+        set_ink(Ink::of(crate::library::palette("violet")));
+        assert!(ink().scrim.r < 0.5, "violet is a dark field");
+        let dark_side = apply(&recede_matrix(1.0), card);
+
+        set_ink(Ink::of(crate::library::palette("mint")));
+        assert!(ink().scrim.r > 0.5, "mint is a pale field");
+        let pale_side = apply(&recede_matrix(1.0), card);
+
+        assert!(
+            lum(dark_side) < lum(card),
+            "on a dark field a receded card sinks"
+        );
+        assert!(
+            lum(pale_side) > lum(card),
+            "on a pale field it must LIFT, not sink: {pale_side:?}"
+        );
+        // Both drain colour, whichever way the light goes — saturation has no handedness.
+        let spread = |v: [f32; 4]| v[0].max(v[1]).max(v[2]) - v[0].min(v[1]).min(v[2]);
+        assert!(spread(dark_side) < spread(card));
+        assert!(spread(pale_side) < spread(card));
+
+        set_ink(DARK_INK);
     }
 }
