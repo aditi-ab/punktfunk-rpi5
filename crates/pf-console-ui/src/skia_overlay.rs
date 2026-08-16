@@ -25,9 +25,23 @@ use skia_safe::gpu::{self, DirectContext, SurfaceOrigin};
 use skia_safe::{Canvas, Color4f, Font, FontMgr, Point, RRect, Rect, Surface};
 use std::time::Instant;
 
-/// Skia's GPU resource budget — poster art plus a few screen layers; 64 MB fits
-/// Deck-class shared memory.
-const RESOURCE_CACHE_BYTES: usize = 64 << 20;
+/// Skia's GPU resource budget — poster art plus a few screen layers.
+///
+/// A CEILING, not an allocation: Skia grows into it only under demand, and the console's
+/// demand is now small — with the library's posters cached at the size they are drawn
+/// (`screens::library::art_cache_size`) a full grid at Deck scale asks for ~30 MB. What
+/// matters is the HEADROOM. At 64 MB the budget sat under a full grid's working set: a
+/// screenful of full-resolution covers is ~100 MB, so `GrResourceCache` evicted a third of
+/// them on every submit and the next frame re-decoded them from JPEG on the render thread.
+/// That was the grid's slideshow, and a cliff rather than a slope — which is exactly how it
+/// was reported, smooth until the screen filled.
+///
+/// 160 MB clears the working set several times over at every scale a panel up to 1440p
+/// produces, with room for the two render targets and the glyph atlases. The one arrangement
+/// that can still crowd it is a 4K panel (`k` 2.7, 33 MB a render target) fed 1000×1500
+/// SteamGridDB portraits, where full resolution is genuinely what gets drawn — and that is a
+/// desktop GPU by the time it happens.
+pub(crate) const RESOURCE_CACHE_BYTES: usize = 160 << 20;
 
 /// How long the start-of-stream banner lingers (fading through the tail).
 const BANNER_S: f64 = 6.0;

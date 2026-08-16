@@ -6,17 +6,18 @@
 use crate::anim::{entrances, Entrance, EntranceAt, Spring};
 use crate::glyphs::{Hint, HintKey};
 use crate::library::{
-    card_matrix, initials, step_cursor, store_label, GridDir, LibraryGame, LibraryPhase,
-    LibraryShared, LibraryView, StepResult, BUMP_C, BUMP_K, BUMP_PX, ENTER_RISE, ENTER_SCALE,
-    ENTER_TURN_DEG, FOCUS_GAP, GRID_GAP, GRID_H, GRID_W, JUMP, PERSPECTIVE, POSTER_H, POSTER_W,
-    RECEDE_DIM, RECEDE_SCALE, ROTATE_DEG, SIDE_SPACING, SPRING_C, SPRING_K, VISIBLE_RANGE,
+    card_matrix, grid_col_hint, grid_step, initials, step_cursor, store_label, GridDir, GridShape,
+    LibraryGame, LibraryPhase, LibraryShared, LibraryView, StepResult, BUMP_C, BUMP_K, BUMP_PX,
+    ENTER_RISE, ENTER_SCALE, ENTER_TURN_DEG, FOCUS_GAP, GRID_GAP, GRID_H, GRID_W, JUMP,
+    PERSPECTIVE, POSTER_H, POSTER_W, RECEDE_DIM, RECEDE_SCALE, ROTATE_DEG, SIDE_SPACING, SPRING_C,
+    SPRING_K, VISIBLE_RANGE,
 };
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox, Screen};
 use crate::theme::{accent, art_sampling, fg, fill, Fonts, W};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
-use skia_safe::{Canvas, Color4f, Data, Image, Point, RRect, Rect, M44};
+use skia_safe::{Canvas, Color4f, Data, Image, Matrix, Point, RRect, Rect, TileMode, M44};
 use std::collections::HashMap;
 
 /// How wide a margin the grid keeps at each side of the field.
@@ -31,7 +32,53 @@ const DETAIL_BAND: f64 = 84.0;
 /// How many decoded posters stay resident. Roughly nine grid rows' worth — enough that
 /// paging back and forth over the same stretch never re-decodes, small enough that a
 /// 400-title library cannot accumulate all of it. See `LibraryScreen::evict_art`.
+///
+/// These are RASTER images now, not encoded bytes with a promise to decode: at the cached
+/// size (see [`ART_CACHE_W`]) that is ~0.7 MB each at Deck scale, so this number is also the
+/// screen's memory ceiling and not only its re-decode policy.
 const ART_BUDGET: usize = 160;
+/// The box a poster is KEPT in, in design units — twice the grid cell, scaled by the live
+/// `k` at `LibraryScreen::cache_art`.
+///
+/// The host sends Steam's 600×900 capsule (SteamGridDB portraits run to 1000×1500) and
+/// nothing here ever draws one at that size: the largest destination in the crate is the
+/// shelf's focused card, `POSTER_W · k`. What the draw actually samples is the mip chain
+/// [`crate::theme::art_sampling`] asks for — at a 150 dp grid cell the 150-wide level, at a
+/// 220 dp shelf card the levels either side of it — so a cache base of twice the grid cell
+/// carries exactly the levels both arrangements read today, out of a quarter of the pixels.
+/// Larger would only feed a level 0 no draw reaches; smaller would put the shelf on a
+/// MAGNIFIED level, which is the softness this must not trade the stutter for.
+const ART_CACHE_W: f64 = GRID_W * 2.0;
+const ART_CACHE_H: f64 = GRID_H * 2.0;
+/// How many arrived posters are decoded per frame.
+///
+/// The decode is real work — a 600×900 JPEG is ~10 ms on a Deck core — and it has to happen
+/// somewhere; this is the bound on how much of it lands in one frame. Two per frame is 120
+/// posters a second, comfortably ahead of what the fetch pool's three workers deliver over a
+/// LAN, so the art still streams in as fast as it arrives while no single frame pays more
+/// than one dropped frame's worth of it.
+const ART_DECODES_PER_FRAME: usize = 2;
+
+/// The size a fetched poster is cached at: fitted into the [`ART_CACHE_W`]×[`ART_CACHE_H`]
+/// box at scale `k`, aspect preserved, never enlarged.
+///
+/// The aspect is the SOURCE's, not the card's. A title with no portrait capsule falls back
+/// to its 460×215 header ([`pf_client_core::library::Artwork::poster_candidates`]), and
+/// squeezing that into the cards' 2:3 would stretch an image the draw's own centre-crop is
+/// already there to handle.
+fn art_cache_size(src: (i32, i32), k: f64) -> (i32, i32) {
+    let (iw, ih) = (f64::from(src.0), f64::from(src.1));
+    if iw <= 0.0 || ih <= 0.0 {
+        return src;
+    }
+    // Never UP: the source is the ceiling on how sharp any of this can be, and storing a
+    // small poster large only spends memory to magnify it sooner.
+    let s = (ART_CACHE_W * k / iw).min(ART_CACHE_H * k / ih).min(1.0);
+    (
+        (iw * s).round().max(1.0) as i32,
+        (ih * s).round().max(1.0) as i32,
+    )
+}
 
 /// Which decoded posters to drop, coldest first, once more than [`ART_BUDGET`] are live.
 ///
@@ -45,7 +92,9 @@ fn art_to_evict(live: &[String], seen: &HashMap<String, u64>) -> Vec<String> {
     let mut by_age: Vec<(u64, &String)> = live
         .iter()
         // A poster decoded but never yet DRAWN stamps 0 and goes first. That is right: it
-        // is off-screen by definition, and re-decoding costs one frame of grey.
+        // is off-screen by definition, and dropping it costs nothing that was on show. It
+        // does not come back, though — the encoded bytes were consumed by the decode — so
+        // this is a trim of the coldest, never a cache that refills itself.
         .map(|id| (seen.get(id).copied().unwrap_or(0), id))
         .collect();
     by_age.sort_unstable();
@@ -56,101 +105,67 @@ fn art_to_evict(live: &[String], seen: &HashMap<String, u64>) -> Vec<String> {
         .collect()
 }
 
-/// The loading state: placeholder cards in the arrangement the real ones will arrive in,
-/// with a sheen travelling across them.
+/// The library's ONE waiting state: the shell's spinner with a line of text under it,
+/// centred in the field.
 ///
-/// One animated linear gradient over the whole run rather than a shader or a per-card
-/// animation — the sweep is the only thing that says "still working", and it costs one
-/// paint. Frozen under reduced motion, where a still skeleton says the same thing.
-fn draw_skeleton(canvas: &Canvas, rect: Rect, k: f64, t: f64, view: LibraryView, cols: usize) {
+/// There are two waits here and the user is meant to read them as one. The list is in flight
+/// (`LibraryPhase::Loading`), and then the shelf holds — for up to 400 ms — for the first
+/// posters, because the entrance exists to show artwork off and fanning open a rank of grey
+/// faces is worse than not animating at all (see [`LibraryScreen::arm_entrance`]). The second
+/// wait used to draw the FINISHED shelf, which is what made the cards appear, blink out and
+/// animate in again. One continuous spinner covers both, so nothing appears until it is the
+/// entrance's first frame.
+///
+/// This replaced a skeleton shelf — placeholder cells in the arrangement the real cards would
+/// arrive in, under a travelling sheen. The shape argument for it only ever answered the FIRST
+/// wait, and a rank of grey rectangles that then has to be swept away is a second thing to
+/// dismiss rather than a preview of the first.
+fn draw_loading(canvas: &Canvas, rect: Rect, k: f64, fonts: &Fonts, t: f64) {
     let w = f64::from(rect.width());
-    let cy = f64::from(rect.top) + (f64::from(rect.height()) - DETAIL_BAND * k) / 2.0;
-    let mut cells: Vec<Rect> = Vec::new();
-    match view {
-        LibraryView::Shelf => {
-            // The coverflow's arrangement, without its perspective: a big centre card and
-            // two receded neighbours each side.
-            let (cw, ch) = (POSTER_W * k, POSTER_H * k);
-            for d in -2i32..=2 {
-                let s = 1.0 - f64::from(d.abs()).min(1.0) * RECEDE_SCALE;
-                let off = if d.abs() <= 1 {
-                    f64::from(d) * FOCUS_GAP * k
-                } else {
-                    f64::from(d.signum()) * (FOCUS_GAP + SIDE_SPACING) * k
-                };
-                let cx = f64::from(rect.left) + w / 2.0 + off;
-                cells.push(Rect::from_xywh(
-                    (cx - cw * s / 2.0) as f32,
-                    (cy - ch * s / 2.0) as f32,
-                    (cw * s) as f32,
-                    (ch * s) as f32,
-                ));
-            }
-        }
-        LibraryView::Grid => {
-            let (cw, ch) = (GRID_W * k, GRID_H * k);
-            let pitch_x = cw + GRID_GAP * k;
-            let grid_w = cols as f64 * pitch_x - GRID_GAP * k;
-            let x0 = f64::from(rect.left) + (w - grid_w) / 2.0;
-            let rows = 2;
-            let y0 = cy - (rows as f64 * (ch + GRID_GAP * k) - GRID_GAP * k) / 2.0;
-            for r in 0..rows {
-                for c in 0..cols {
-                    cells.push(Rect::from_xywh(
-                        (x0 + c as f64 * pitch_x) as f32,
-                        (y0 + r as f64 * (ch + GRID_GAP * k)) as f32,
-                        cw as f32,
-                        ch as f32,
-                    ));
-                }
-            }
-        }
-    }
-    for cell in &cells {
-        canvas.draw_rrect(
-            RRect::new_rect_xy(*cell, (14.0 * k) as f32, (14.0 * k) as f32),
-            &fill(fg(0.06)),
-        );
-    }
-    // The sheen: a narrow bright band travelling left to right on a 1.6 s cycle.
-    let phase = if crate::theme::reduce_motion() {
-        0.35
+    let cx = f64::from(rect.left) + w / 2.0;
+    let cy = f64::from(rect.top) + f64::from(rect.height()) / 2.0;
+    // The connect takeover's arc, at its size, over its own gap to the line beneath
+    // (`shell::overlays::draw_takeover`): the console waits in one shape everywhere. It turns
+    // under reduced motion like the other three spinners in the crate do — a frozen arc reads
+    // as a hung screen, which is the one thing this must not say.
+    fonts.centered(
+        canvas,
+        "Loading library…",
+        W::Regular,
+        14.0 * k,
+        fg(0.55),
+        cx,
+        cy + 26.0 * k,
+        w * 0.8,
+    );
+    crate::theme::spinner(canvas, cx, cy - 26.0 * k, 22.0 * k, t);
+}
+
+/// How much accent a coverless card's face carries — see [`crate::theme::card_face`], which
+/// mixes it into the ground side of the field so the face stays OPAQUE.
+///
+/// A launcher gets the louder one. Its face is the cue that survives being three cards deep
+/// in the coverflow's recede, and it is the whole reason the two faces differ: a launcher
+/// without a poster is not a game whose cover failed to load.
+const FACE_TINT: f32 = 0.20;
+const LAUNCHER_FACE_TINT: f32 = 0.38;
+
+/// The face a coverless card sits on. Its own function because the palette contrast test is
+/// an assertion about THIS colour, and a test that re-derived it would only prove itself.
+fn placeholder_face(launcher: bool) -> Color4f {
+    crate::theme::card_face(if launcher {
+        LAUNCHER_FACE_TINT
     } else {
-        (t / 1.6).fract()
-    };
-    let span = w * 0.45;
-    let head = f64::from(rect.left) - span + (w + 2.0 * span) * phase;
-    let mut sheen = crate::theme::shaded();
-    let stops = [fg(0.0), fg(0.09), fg(0.0)];
-    sheen.set_shader(skia_safe::gradient::shaders::linear_gradient(
-        (
-            Point::new(head as f32, rect.top),
-            Point::new((head + span) as f32, rect.bottom),
-        ),
-        &skia_safe::gradient::Gradient::new(
-            skia_safe::gradient::Colors::new_evenly_spaced(
-                &stops,
-                skia_safe::TileMode::Clamp,
-                None,
-            ),
-            skia_safe::gradient::Interpolation::default(),
-        ),
-        None,
-    ));
-    for cell in &cells {
-        canvas.draw_rrect(
-            RRect::new_rect_xy(*cell, (14.0 * k) as f32, (14.0 * k) as f32),
-            &sheen,
-        );
-    }
+        FACE_TINT
+    })
 }
 
 /// A cover we have no art for, drawn into `rect`.
 ///
 /// A LAUNCHER without a poster is not a game whose cover failed to load, and must not read
 /// like one: it gets the brand-tinted face and its launcher's mark (or name), where a game
-/// gets the darker face and a title monogram. `None` is the skeleton case — a cell that is
-/// still waiting for the library itself.
+/// gets the quieter face and a title monogram. `None` is the stale-order case — a cell whose
+/// index no longer names a title.
 fn draw_poster_placeholder(
     canvas: &Canvas,
     fonts: &Fonts,
@@ -159,12 +174,10 @@ fn draw_poster_placeholder(
     k: f64,
 ) {
     // Solid, never glass: coverflow side cards OVERLAP, so a translucent face would show
-    // its neighbour through it.
-    let face = match game {
-        Some(g) if g.launcher => Color4f::new(0.153, 0.137, 0.267, 1.0),
-        _ => Color4f::new(0.118, 0.118, 0.145, 1.0),
-    };
-    canvas.draw_rect(rect, &fill(face));
+    // its neighbour through it. `card_face` gets the accent tint without spending alpha on
+    // it, which a plain `accent(0.20)` could not.
+    let launcher = matches!(game, Some(g) if g.launcher);
+    canvas.draw_rect(rect, &fill(placeholder_face(launcher)));
     let Some(game) = game else { return };
     // The launcher's brand mark IS the poster when we ship one for it. Inset to ~44 % of
     // the card so it reads as a mark on a face rather than a cropped cover; `launcher_mark`
@@ -190,18 +203,20 @@ fn draw_poster_placeholder(
     }
     // Sized off the CARD rather than off `k`: the grid's cells are two-thirds the shelf's,
     // and a monogram scaled for a poster would not fit one.
-    let (glyph, size, ink) = if game.launcher {
+    //
+    // ONE rung for both, the same `fg(0.85)` on the same accent-tinted face the collections
+    // deck's monogram now uses — a game's fallback and a group's fallback sit a screen apart
+    // and must not read as two different ideas. A game's monogram used to sit at 0.45, which
+    // measured 2.5:1 against this face on the pale palettes: what separates a game from a
+    // launcher here is the face and the glyph's SIZE, neither of which the palette can take
+    // away.
+    let (glyph, size) = if game.launcher {
         (
             store_label(&game.store).to_string(),
             f64::from(rect.height()) * 0.067,
-            fg(0.85),
         )
     } else {
-        (
-            initials(&game.title),
-            f64::from(rect.height()) * 0.115,
-            fg(0.45),
-        )
+        (initials(&game.title), f64::from(rect.height()) * 0.115)
     };
     let font = fonts.font(W::Bold, size.max(9.0 * k));
     let tw = font.measure_str(&glyph, None).0;
@@ -212,7 +227,7 @@ fn draw_poster_placeholder(
             rect.center_y() + (size * 0.36) as f32,
         ),
         &font,
-        &fill(ink),
+        &fill(fg(0.85)),
     );
 }
 
@@ -259,11 +274,42 @@ pub(crate) struct LibraryScreen {
     /// Seat the scroll instead of chasing it on the next frame — used when the arrangement
     /// changes, where "gliding from the old position" is meaningless.
     snap_scroll: bool,
-    /// Columns the last frame actually drew. Navigation reads THIS rather than recomputing,
-    /// so the cursor arithmetic and the layout can never disagree about the grid's shape.
-    grid_cols_last: usize,
-    /// Decoded posters by game id (decode once; Skia uploads lazily on first draw).
+    /// Columns the last frame actually drew, `None` until the grid has drawn a frame.
+    /// Navigation reads THIS rather than recomputing, so the cursor arithmetic and the
+    /// layout can never disagree about the grid's shape.
+    ///
+    /// Honest about not knowing, because the alternative is worse than a swallowed press:
+    /// this used to be seeded at four while a Deck draws seven, so the first press after
+    /// entering the grid — before its first frame — moved by a column count nothing had
+    /// drawn.
+    grid_cols_last: Option<usize>,
+    /// The column the user last CHOSE, carried across vertical moves (see
+    /// [`crate::library::grid_col_hint`]). Without it, one pass through the two-wide
+    /// launcher row would pin the cursor to column 1 for the rest of the library.
+    grid_col: usize,
+    /// Which axis the boundary recoil deflects along — the grid refuses in two dimensions,
+    /// and a vertical thud that nudged the field sideways would read as a mis-move rather
+    /// than as an edge.
+    bump_vertical: bool,
+    /// Posters by game id: RASTER images, decoded once on arrival and reduced to the size
+    /// they are drawn at, with their mip chain already built (`Self::cache_art`).
+    ///
+    /// Every part of that sentence is load-bearing, and the shelf shipped with none of it.
+    /// `Image::from_encoded` does not decode — skia-safe's own doc says it defers "until the
+    /// image is actually used", and that a purge makes "the next draw of the image have to
+    /// re-decode". A grid full of full-resolution posters overruns Skia's GPU resource
+    /// budget, so that purge came round every frame and most of the covers on screen were
+    /// re-decoded from JPEG, on the render thread, per frame. That was the grid's slideshow,
+    /// and it is why it only appeared once the screen was FULL: a half-filled grid fits.
     art: HashMap<String, Image>,
+    /// The scale the posters in `art` were decoded for — the last frame's `k`, published by
+    /// `render` before it syncs. Kept because the cache is sized against what will be DRAWN,
+    /// and `sync` (which also runs from `menu`) has no window of its own to ask.
+    ///
+    /// A window that GROWS leaves the posters already cached at the smaller size: the
+    /// encoded bytes are gone by then, and there is nothing to decode again from. That costs
+    /// a re-entry to the shelf to put right, and only after a resolution change.
+    art_k: f64,
     /// Frame stamp of each decoded poster's last DRAW, and the frame counter behind it.
     ///
     /// The grid is what forces this. A 400-title library paged through in the shelf touched
@@ -279,6 +325,10 @@ pub(crate) struct LibraryScreen {
     /// [`Self::arm_entrance`].
     entrance: Option<Entrance>,
     entrance_armed: bool,
+    /// The index the live entrance fans out from. [`Entrance`] keeps its own copy and asks
+    /// for a distance in ITEMS; the grid measures that distance in CELLS instead (see
+    /// [`Self::entrance_at`]), so it needs the anchor back.
+    entrance_anchor: usize,
     ready_at: Option<f64>,
 }
 
@@ -301,12 +351,18 @@ impl LibraryScreen {
             view_mode: LibraryView::default(),
             scroll: Spring::rest(0.0),
             snap_scroll: true,
-            grid_cols_last: 4,
+            grid_cols_last: None,
+            grid_col: 0,
+            bump_vertical: false,
             art: HashMap::new(),
+            // Seated at the design scale; the first frame publishes the real one, and it
+            // does so before the first `sync` can decode anything against it.
+            art_k: 1.0,
             art_seen: HashMap::new(),
             frame: 0,
             entrance: None,
             entrance_armed: false,
+            entrance_anchor: 0,
             ready_at: None,
         }
     }
@@ -331,9 +387,38 @@ impl LibraryScreen {
         let have_art = (lo..hi)
             .filter_map(|i| self.game(i))
             .any(|g| self.art.contains_key(&g.id));
-        if have_art || t - since >= 0.4 {
+        // An EMPTY shelf — a collection whose filter matches nothing — has no art coming and
+        // nothing to fan, so it must not spend the deadline waiting for either. Without this
+        // it holds the spinner for 400 ms over a shelf that was never going to have a card.
+        if have_art || self.len() == 0 || t - since >= 0.4 {
             self.entrance_armed = true;
+            self.entrance_anchor = cursor;
             self.entrance = Some(Entrance::new(entrances::CARDS, cursor, t));
+        }
+    }
+
+    /// One item's place in the entrance, `steps` of fan away from the anchor.
+    ///
+    /// [`Entrance`] measures the fan as the distance between two INDICES, which is the right
+    /// unit for a strip and the wrong one for a field: the stagger caps five steps out, so a
+    /// seven-wide grid indexed linearly exhausts the whole fan inside its first row and every
+    /// cell after that starts at once. The grid passes a distance in CELLS instead and the
+    /// entrance opens diagonally out from the focused cover.
+    ///
+    /// THREE states in two variables, and reading two of them as one is what made the shelf
+    /// flash: `entrance == None` means "already over" only once the entrance has been ARMED.
+    /// Before that it means "not begun", and answering `SETTLED` there drew the finished shelf
+    /// for as long as the arming waited on art — then the entrance armed and every card blinked
+    /// out to play it. Nothing draws while un-armed today ([`Self::render`] shows the spinner
+    /// instead), and this is the same answer stated where the state actually lives.
+    fn entrance_at(&self, steps: usize, t: f64) -> EntranceAt {
+        match self.entrance {
+            Some(e) => e.at(self.entrance_anchor + steps, t),
+            None if self.entrance_armed => EntranceAt::SETTLED,
+            None => EntranceAt {
+                travel: 0.0,
+                fade: 0.0,
+            },
         }
     }
 
@@ -368,6 +453,27 @@ impl LibraryScreen {
         (((avail + GRID_GAP * k) / pitch).floor() as i64).clamp(2, 8) as usize
     }
 
+    /// The grid as the last frame drew it — the shape navigation and the renderer share, and
+    /// the reason they can no longer disagree about which cover the cursor is on. `None`
+    /// until the grid has drawn once: the column count is a fact about the window, and
+    /// inventing one is exactly the divergence this exists to prevent.
+    fn grid_shape(&self) -> Option<GridShape> {
+        Some(GridShape::new(
+            self.len(),
+            self.grid_cols_last?,
+            self.launcher_count(),
+        ))
+    }
+
+    /// Re-seat the remembered column on wherever the cursor now is. For everything that
+    /// moves the cursor without CHOOSING a column — a re-sort, a press, a resize — where it
+    /// landed is the only honest answer to "which column would Up and Down return to".
+    fn seat_grid_col(&mut self) {
+        if let Some(shape) = self.grid_shape() {
+            self.grid_col = shape.cell_of(self.cursor.max(0) as usize).1;
+        }
+    }
+
     /// Rebuild the display order after anything that could change it: a new game list, a
     /// new sort, a new filter. The cursor is clamped rather than followed by identity — a
     /// re-sort moves everything, so "keep the same index" and "keep the same title" are
@@ -375,6 +481,7 @@ impl LibraryScreen {
     fn recollate(&mut self) {
         self.view = crate::collate::filtered(&self.games, self.sort, self.filter.as_ref());
         self.cursor = self.cursor.clamp(0, (self.view.len() as i32 - 1).max(0));
+        self.seat_grid_col();
     }
 
     /// The game at a DISPLAY index (`None` past the end, or if the order went stale).
@@ -421,6 +528,17 @@ impl LibraryScreen {
         self.filter = Some(key);
         self.filter_label = Some(label);
         self.recollate();
+    }
+
+    /// Inherit posters that are already decoded, from the screen that pushed this one.
+    ///
+    /// The counterpart to `CollectionsScreen::adopt_art`, and the same reasoning running the
+    /// other way. The shared model's art queue is DRAINED by whoever reads it first, so by the
+    /// time a collection drill-in builds its shelf the bytes are long gone — the drill-in would
+    /// sit out the entrance's whole art deadline and then show monogram cards permanently, for
+    /// covers the console had decoded two screens ago and is still holding.
+    pub(crate) fn adopt_art(&mut self, art: HashMap<String, Image>) {
+        self.art = art;
     }
 
     /// One title's self-emitted link: this shelf's host, this shelf's pinned profile (so a
@@ -476,14 +594,44 @@ impl LibraryScreen {
             }
             self.recollate();
         }
-        for (id, bytes) in shared.drain_art() {
-            match Image::from_encoded(Data::new_copy(&bytes)) {
+        // A bounded handful per frame: this is where the decode happens now, and a burst of
+        // arrivals must not become one long frame (see `ART_DECODES_PER_FRAME`).
+        let k = self.art_k;
+        for (id, bytes) in shared.drain_art(ART_DECODES_PER_FRAME) {
+            let poster = Image::from_encoded(Data::new_copy(&bytes))
+                .and_then(|img| Self::cache_art(&img, k));
+            match poster {
                 Some(img) => {
                     self.art.insert(id, img);
                 }
                 None => tracing::debug!(%id, "undecodable poster"),
             }
         }
+    }
+
+    /// One arrived poster, reduced to what the console will actually sample.
+    ///
+    /// Forces the decode HERE — the whole point (see the `art` field) — and does it at
+    /// `art_cache_size`, which is a quarter of the pixels a Steam capsule arrives with and
+    /// the difference between a screenful of posters fitting Skia's GPU budget and thrashing
+    /// it. The mip chain is baked at the same time, so even a purge under some other screen's
+    /// pressure costs an upload rather than a decode or a regeneration pass.
+    fn cache_art(img: &Image, k: f64) -> Option<Image> {
+        let want = art_cache_size((img.width(), img.height()), k);
+        let scaled = if want == (img.width(), img.height()) {
+            None
+        } else {
+            // The destination's own info: the console's render targets are `new_n32_premul`
+            // with no colour space (`skia_overlay::ensure_slot`), so this is the format the
+            // poster is headed for and no conversion happens at draw time either way.
+            let info = skia_safe::ImageInfo::new_n32_premul(want, None);
+            img.make_scaled(&info, art_sampling())
+        };
+        // A scale Skia refused leaves the poster at full size — the old behaviour for one
+        // cover, rather than no cover.
+        let out = scaled.unwrap_or_else(|| img.clone());
+        let mipped = out.with_default_mipmaps();
+        Some(mipped.unwrap_or(out))
     }
 
     pub(crate) fn menu(
@@ -537,19 +685,28 @@ impl LibraryScreen {
 
     /// Move the grid cursor, seating the boundary recoil the same way the shelf does.
     fn grid_move(&mut self, dir: GridDir) -> Option<MenuPulse> {
-        // The column count is a RENDER fact (it depends on the window), so navigation reads
+        // The grid's shape is a RENDER fact (it depends on the window), so navigation reads
         // the last frame's. One frame of staleness after a resize is invisible; deriving it
-        // twice from different widths would not be.
-        match crate::library::grid_step(self.cursor, self.len(), self.grid_cols_last, dir) {
+        // twice from two widths would not be — and before the first grid frame there is no
+        // grid to move in, so the press is dropped rather than answered by a guess.
+        let shape = self.grid_shape()?;
+        match grid_step(self.cursor, shape, self.grid_col, dir) {
             StepResult::Moved(c) => {
+                self.grid_col = grid_col_hint(shape, self.grid_col, dir, c);
                 self.cursor = c;
                 Some(MenuPulse::Move)
             }
             StepResult::Boundary => {
+                // Against the push, along the axis it was pushed on. The old sign expression
+                // deflected only Right and Down and left every other refusal with a recoil of
+                // exactly zero — a refused press that moves nothing on screen is what makes an
+                // edge read as a dropped input.
+                let forward = matches!(dir, GridDir::Right | GridDir::Down | GridDir::PageForward);
                 self.bump = Spring {
-                    pos: -BUMP_PX * f64::from(matches!(dir, GridDir::Right | GridDir::Down) as i8),
+                    pos: -BUMP_PX * if forward { 1.0 } else { -1.0 },
                     vel: 0.0,
                 };
+                self.bump_vertical = !matches!(dir, GridDir::Left | GridDir::Right);
                 Some(MenuPulse::Boundary)
             }
         }
@@ -658,6 +815,10 @@ impl LibraryScreen {
                     }
                     Some(i) => {
                         self.cursor = i as i32;
+                        // A press CHOOSES a cell, and with it the column Up and Down will
+                        // return to — the alternative is a grid that walks back to wherever
+                        // the stick last was.
+                        self.seat_grid_col();
                         true
                     }
                     None => false,
@@ -678,6 +839,7 @@ impl LibraryScreen {
                     pos: -BUMP_PX * f64::from(delta.signum()),
                     vel: 0.0,
                 };
+                self.bump_vertical = false; // the shelf is a line, and it runs across
                 Some(MenuPulse::Boundary)
             }
         }
@@ -695,10 +857,12 @@ impl LibraryScreen {
 
     /// Is the focused entry a launcher? (Drives the confirm hint: you *open* Steam, you *play* a
     /// game.)
+    ///
+    /// Through [`Self::focused`], because the cursor indexes the DISPLAY order: reading
+    /// `games` with it agrees only under the default sort, and told you "Open" over a game
+    /// under any other one.
     fn focused_is_launcher(&self) -> bool {
-        self.games
-            .get(self.cursor as usize)
-            .is_some_and(|g| g.launcher)
+        self.focused().is_some_and(|g| g.launcher)
     }
 
     pub(crate) fn hints(&self, _ctx: &Ctx) -> Vec<Hint> {
@@ -742,6 +906,9 @@ impl LibraryScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        // Published before the sync that reads it: the poster cache is sized against the
+        // scale its covers will be drawn at, and a decode is not something this can redo.
+        self.art_k = k;
         self.sync(ctx.library);
         self.adopt_settings(ctx);
         self.frame = self.frame.wrapping_add(1);
@@ -762,6 +929,21 @@ impl LibraryScreen {
                     self.bump = Spring::rest(0.0);
                 }
                 self.arm_entrance(ctx.t);
+                if !self.entrance_armed {
+                    // Still holding for the first posters, so the shelf has NOT appeared yet.
+                    // Drawing it settled here is what made the cards flash: the finished
+                    // coverflow sat on glass for up to 400 ms, blinked out the frame the
+                    // entrance armed, and only then animated in. Same spinner as the list
+                    // wait, so the two waits have no seam between them.
+                    //
+                    // The geometry has to go with them — `pointer` reads `geom` a frame late,
+                    // and a press must not land on a card nothing drew. `grid_cols_last` is
+                    // deliberately left alone: it is what the last frame DREW, no frame has
+                    // drawn a grid yet, and `grid_move` already declines rather than guessing.
+                    self.geom.clear();
+                    draw_loading(canvas, rect, k, fonts, ctx.t);
+                    return;
+                }
                 if self.entrance.is_some_and(|e| e.done(ctx.t)) {
                     self.entrance = None;
                 }
@@ -772,30 +954,9 @@ impl LibraryScreen {
                 self.draw_detail_band(canvas, rect, k, fonts);
                 self.evict_art();
             }
-            // A skeleton shelf rather than a spinner and a line of text. The wait is for a
-            // LIST, and its shape is known before its contents are — so showing that shape
-            // is both more honest and less startling than a blank field that suddenly
-            // becomes a coverflow.
-            LibraryPhase::Loading => {
-                draw_skeleton(
-                    canvas,
-                    rect,
-                    k,
-                    ctx.t,
-                    self.view_mode,
-                    self.grid_cols(rect, k),
-                );
-                fonts.centered(
-                    canvas,
-                    "Loading library…",
-                    W::Regular,
-                    14.0 * k,
-                    fg(0.55),
-                    cx,
-                    f64::from(rect.bottom) - 40.0 * k,
-                    w * 0.8,
-                );
-            }
+            // The same spinner the Ready arm shows while it holds for art — one wait, drawn
+            // one way, so the list landing does not change what the screen is saying.
+            LibraryPhase::Loading => draw_loading(canvas, rect, k, fonts, ctx.t),
             LibraryPhase::Empty => {
                 fonts.centered(
                     canvas,
@@ -863,19 +1024,24 @@ impl LibraryScreen {
     /// forked any of those would be a second screen pretending to be a view.
     fn draw_grid(&mut self, canvas: &Canvas, rect: Rect, k: f64, fonts: &Fonts, t: f64) {
         let cols = self.grid_cols(rect, k);
-        self.grid_cols_last = cols;
+        // Publishing the shape is what navigation waits for. A resize is a DIFFERENT grid, so
+        // the column the cursor remembers belonged to the old one and is re-seated on where
+        // the cursor actually is — which is also how the very first grid frame seats it.
+        if self.grid_cols_last != Some(cols) {
+            self.grid_cols_last = Some(cols);
+            self.seat_grid_col();
+        }
+        // The same shape `grid_move` reads. Two copies of this arithmetic — one here, one in
+        // the cursor — is what put the focus ring in a different column from the cover the
+        // scroll had just brought up.
+        let shape = GridShape::new(self.len(), cols, self.launcher_count());
         let (cw, ch) = (GRID_W * k, GRID_H * k);
         let pitch_x = cw + GRID_GAP * k;
         let pitch_y = ch + GRID_GAP * k + GRID_LABEL * k;
-        let launchers = self.launcher_count();
         // The launcher prefix keeps its own band, which is how design D4 reads in two
         // dimensions: the shelf says it with a heading that changes as the cursor crosses,
         // a grid says it with a gap and a heading over each half.
-        let split_row = if launchers > 0 && launchers < self.len() {
-            Some(launchers.div_ceil(cols))
-        } else {
-            None
-        };
+        let split_row = (shape.split > 0).then(|| shape.split_row());
         let heading_h = GRID_HEADING * k;
         let row_top = |row: usize| -> f64 {
             let extra = match split_row {
@@ -884,25 +1050,11 @@ impl LibraryScreen {
             };
             row as f64 * pitch_y + extra + if split_row.is_some() { heading_h } else { 0.0 }
         };
-        // Launchers occupy whole rows of their own, so a game never shares a row with one.
-        let cell_of = |i: usize| -> (usize, usize) {
-            match split_row {
-                Some(s) if i >= launchers => {
-                    let j = i - launchers;
-                    (s + j / cols, j % cols)
-                }
-                _ => (i / cols, i % cols),
-            }
-        };
 
-        let rows_total = match split_row {
-            Some(s) => s + (self.len() - launchers).div_ceil(cols),
-            None => self.len().div_ceil(cols),
-        };
-        let content_h = row_top(rows_total.saturating_sub(1)) + ch;
+        let content_h = row_top(shape.rows().saturating_sub(1)) + ch;
         // The detail band keeps its place at the bottom; the grid scrolls above it.
         let view_h = f64::from(rect.height()) - DETAIL_BAND * k;
-        let (focus_row, _) = cell_of(self.cursor.max(0) as usize);
+        let (focus_row, _) = shape.cell_of(self.cursor.max(0) as usize);
         // The focused row rides the upper-middle band rather than an edge, so there is
         // always a row of context above and below it.
         let want = (row_top(focus_row) - view_h * 0.34).clamp(0.0, (content_h - view_h).max(0.0));
@@ -914,8 +1066,19 @@ impl LibraryScreen {
             self.scroll.settle(want, 0.05, 0.5);
         }
 
+        // The boundary recoil, deflected along the axis the refused press pushed on.
+        // `draw_carousel` has always drawn this; the grid computed it, integrated it and then
+        // drew nothing with it — which is what makes an edge in the field read as a swallowed
+        // press rather than as an edge.
+        let bump = self.bump.pos * k;
+        let (bump_x, scroll) = if self.bump_vertical {
+            (0.0, self.scroll.pos - bump)
+        } else {
+            (bump, self.scroll.pos)
+        };
+
         let grid_w = cols as f64 * pitch_x - GRID_GAP * k;
-        let x0 = f64::from(rect.left) + (f64::from(rect.width()) - grid_w) / 2.0;
+        let x0 = f64::from(rect.left) + (f64::from(rect.width()) - grid_w) / 2.0 + bump_x;
         let y0 = f64::from(rect.top);
         let viewport = Rect::from_xywh(rect.left, rect.top, rect.width(), (view_h.max(0.0)) as f32);
 
@@ -936,21 +1099,38 @@ impl LibraryScreen {
                     fg(0.45),
                 );
             };
-            head(canvas, "LAUNCHERS", y0 + heading_h * 0.62 - self.scroll.pos);
+            head(canvas, "LAUNCHERS", y0 + heading_h * 0.62 - scroll);
             head(
                 canvas,
                 "GAMES",
-                y0 + row_top(split_row.expect("checked")) - heading_h * 0.38 - self.scroll.pos,
+                y0 + row_top(split_row.expect("checked")) - heading_h * 0.38 - scroll,
             );
         }
 
+        // What a cell can reach BEYOND its berth, and so how far outside the viewport one
+        // still has to be drawn: the entrance carries a card up from below its berth, and
+        // the focused cell swells 6 %. Only while the entrance is running — once it is over
+        // a card sits exactly on its berth, and the cull can be as tight as the clip.
+        //
+        // It used to keep a whole extra card height at BOTH edges unconditionally, which is
+        // a third more posters resident than the screen ever shows. That is a third more of
+        // the one resource this screen is short of.
+        let reach = if self.entrance.is_some() {
+            ENTER_RISE * k + 0.06 * ch
+        } else {
+            0.0
+        };
+        // Where the entrance fans FROM, as a cell — the anchor is an index, and a field's
+        // idea of "next" is not its list's. See `entrance_at`.
+        let (anchor_row, anchor_col) =
+            shape.cell_of(self.entrance_anchor.min(self.len().saturating_sub(1)));
         for i in 0..self.len() {
-            let (row, col) = cell_of(i);
-            let top = y0 + row_top(row) - self.scroll.pos;
-            if top + ch < f64::from(rect.top) - ch || top > y0 + view_h + ch {
+            let (row, col) = shape.cell_of(i);
+            let top = y0 + row_top(row) - scroll;
+            if top + ch + reach < f64::from(rect.top) || top > y0 + view_h {
                 continue; // off-screen: not drawn, and deliberately not art-stamped either
             }
-            let ent = self.entrance.map_or(EntranceAt::SETTLED, |e| e.at(i, t));
+            let ent = self.entrance_at(anchor_row.abs_diff(row) + anchor_col.abs_diff(col), t);
             let f = if i == self.cursor.max(0) as usize {
                 1.0
             } else {
@@ -973,15 +1153,21 @@ impl LibraryScreen {
             let id = game.id.clone();
 
             crate::theme::focus_halo(canvas, cell, 12.0, k as f32, f as f32);
-            let fading = ent.fade < 1.0;
-            if fading {
+            let art = self.art.get(&id);
+            let rr = RRect::new_rect_xy(cell, (12.0 * k) as f32, (12.0 * k) as f32);
+            // The entrance fade goes through the PAINT wherever a cell is a single draw, and
+            // raises a layer only where it has several overlapping pieces to fade as one: a
+            // placeholder's face and monogram, or the focused cell's ring and glass (which
+            // `theme::panel` mixes itself and has no alpha for). A layer per visible card was
+            // thirty-odd offscreen allocations a frame, paid for exactly the second the
+            // screen is arriving in.
+            let layered = ent.fade < 1.0 && (art.is_none() || f > 0.0);
+            if layered {
                 canvas.save_layer_alpha_f(cell, ent.fade as f32);
             }
-            let rr = RRect::new_rect_xy(cell, (12.0 * k) as f32, (12.0 * k) as f32);
-            canvas.save();
-            canvas.clip_rrect(rr, None, true);
-            match self.art.get(&id) {
+            match art {
                 Some(img) => {
+                    // Cover-fit: center-crop the source to the cell's 2:3.
                     let (iw, ih) = (img.width() as f32, img.height() as f32);
                     let aspect = cell.width() / cell.height();
                     let src = if iw / ih > aspect {
@@ -991,19 +1177,41 @@ impl LibraryScreen {
                         let sh = iw / aspect;
                         Rect::from_xywh(0.0, (ih - sh) / 2.0, iw, sh)
                     };
-                    canvas.draw_image_rect_with_sampling_options(
-                        img,
-                        Some((&src, skia_safe::canvas::SrcRectConstraint::Fast)),
-                        cell,
+                    // One shader-filled round-rect, not a clip plus an image draw — the same
+                    // picture out of one draw, with the corner getting real coverage AA
+                    // instead of an AA clip, and no clip-stack element per card across a
+                    // screenful of them. `collections::draw_cover` is the same move.
+                    let (sx, sy) = (cell.width() / src.width(), cell.height() / src.height());
+                    let mut local = Matrix::scale((sx, sy));
+                    local.post_translate((cell.left - src.left * sx, cell.top - src.top * sy));
+                    if let Some(shader) = img.to_shader(
+                        (TileMode::Clamp, TileMode::Clamp),
                         art_sampling(),
-                        &fill(fg(1.0)),
-                    );
+                        Some(&local),
+                    ) {
+                        // OPAQUE by construction — Skia modulates a shader by the paint's
+                        // alpha, so a transparent placeholder here would draw literally
+                        // nothing (theme.rs:52-64). Which is also what makes the fade below
+                        // work: the cover is exactly what the paint's alpha scales.
+                        let mut p = crate::theme::shaded();
+                        p.set_shader(shader);
+                        if !layered {
+                            p.set_alpha_f(ent.fade as f32);
+                        }
+                        canvas.draw_rrect(rr, &p);
+                    }
                 }
-                None => draw_poster_placeholder(canvas, fonts, self.game(i), cell, k),
+                // The placeholder paints a square face and a monogram over it, so it still
+                // needs the rounded clip to come out a card.
+                None => {
+                    canvas.save();
+                    canvas.clip_rrect(rr, None, true);
+                    draw_poster_placeholder(canvas, fonts, self.game(i), cell, k);
+                    canvas.restore();
+                }
             }
-            canvas.restore();
-            // The focus ring goes OUTSIDE the clip, so it reads as a ring around the cover
-            // rather than a border painted onto it.
+            // The focus ring goes OUTSIDE the cover, so it reads as a ring around it rather
+            // than a border painted onto it.
             if f > 0.0 {
                 crate::theme::panel(
                     canvas,
@@ -1014,7 +1222,7 @@ impl LibraryScreen {
                     k as f32,
                 );
             }
-            if fading {
+            if layered {
                 canvas.restore();
             }
             self.art_seen.insert(id, self.frame);
@@ -1075,7 +1283,11 @@ impl LibraryScreen {
             // fake its turn with a cos-squeeze is that SwiftUI can't snapshot a rotated
             // layer to glass, and Skia has no such constraint here. Cards turn away in the
             // direction they sit from the anchor, so the strip fans open like a book.
-            let ent = self.entrance.map_or(EntranceAt::SETTLED, |e| e.at(i, t));
+            // A strip's fan IS its index distance, so the steps are the distance to the
+            // anchor — the same number `e.at(i, t)` used to work out for itself. Through
+            // `entrance_at` all the same, so there is one place that knows what an absent
+            // entrance means and the coverflow cannot drift from the grid on it.
+            let ent = self.entrance_at(i.abs_diff(self.entrance_anchor), t);
             let arrive = ENTER_SCALE + (1.0 - ENTER_SCALE) * ent.travel;
             let turn = (1.0 - ent.travel)
                 * ENTER_TURN_DEG
@@ -1250,6 +1462,133 @@ impl LibraryScreen {
 mod tests {
     use super::*;
 
+    fn host() -> HostRow {
+        HostRow {
+            key: "aa".into(),
+            name: "Desk".into(),
+            addr: "10.0.0.5".into(),
+            port: 9777,
+            fp_hex: "aa".into(),
+            paired: true,
+            saved: true,
+            online: true,
+            mgmt_port: 9778,
+            can_wake: false,
+            last_used: None,
+            os: String::new(),
+            pin: None,
+            bound_profile: None,
+        }
+    }
+
+    /// A shelf whose list has landed but whose art has not — the state the fix is about.
+    fn waiting_shelf() -> LibraryScreen {
+        let mut s = LibraryScreen::new(&host());
+        s.phase = LibraryPhase::Ready;
+        s.games = (0..6)
+            .map(|i| LibraryGame {
+                id: format!("g{i}"),
+                title: format!("Game {i}"),
+                store: "steam".into(),
+                launcher: false,
+                icon: String::new(),
+                platform: None,
+            })
+            .collect();
+        s.recollate();
+        s
+    }
+
+    /// The shelf must never be drawn ARRIVED before it has arrived.
+    ///
+    /// `entrance == None` is two states, not one — "not begun" and "already over" — and the
+    /// draw code read both as settled. Since the arming deliberately waits for art or 400 ms,
+    /// that put the finished coverflow on screen, blinked it out and then played its entrance.
+    /// The property is that the first thing a card is ever drawn at is frame one of its own
+    /// entrance: invisible, and never full opacity before it.
+    #[test]
+    fn a_shelf_is_hidden_until_its_entrance_begins_not_settled() {
+        let mut s = waiting_shelf();
+        // No art, no deadline yet: it declines to arm, and every card reads as absent.
+        s.arm_entrance(10.0);
+        assert!(!s.entrance_armed, "armed with nothing to show");
+        for steps in 0..s.len() {
+            let at = s.entrance_at(steps, 10.0);
+            assert_eq!(
+                (at.travel, at.fade),
+                (0.0, 0.0),
+                "card {steps} was drawn before the entrance began"
+            );
+        }
+        s.arm_entrance(10.39);
+        assert!(!s.entrance_armed, "the deadline is 400 ms");
+
+        // The deadline: it arms, and the very frame it arms on is still invisible.
+        s.arm_entrance(10.4);
+        assert!(s.entrance_armed);
+        assert_eq!(s.entrance_at(0, 10.4).fade, 0.0, "the shelf flashed");
+
+        // …and once it is over, `None` means settled again.
+        s.entrance = None;
+        assert_eq!(s.entrance_at(3, 99.0), EntranceAt::SETTLED);
+    }
+
+    /// Art on any card in the neighbourhood arms it immediately — the deadline is the
+    /// fallback, not the path.
+    #[test]
+    fn decoded_art_arms_the_entrance_without_waiting_out_the_deadline() {
+        let mut s = waiting_shelf();
+        s.arm_entrance(4.0);
+        assert!(!s.entrance_armed);
+        let mut surface = skia_safe::surfaces::raster_n32_premul((2, 2)).expect("2×2 raster");
+        s.art.insert("g1".into(), surface.image_snapshot());
+        s.arm_entrance(4.05);
+        assert!(s.entrance_armed, "a decoded poster is the whole point");
+    }
+
+    fn over(src: Color4f, dst: Color4f) -> Color4f {
+        let m = |s: f32, d: f32| s * src.a + d * (1.0 - src.a);
+        Color4f::new(m(src.r, dst.r), m(src.g, dst.g), m(src.b, dst.b), 1.0)
+    }
+
+    /// WCAG's own arithmetic: sRGB to linear, then Rec. 709 relative luminance.
+    fn contrast(a: Color4f, b: Color4f) -> f32 {
+        let lin = |c: f32| {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let lum = |c: Color4f| 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// A title with no cover shows its initials, and that has to hold on ALL THIRTEEN
+    /// palettes rather than on the one anybody screenshots.
+    ///
+    /// The face was a hardcoded near-black under `fg()` ink. On the six PALE palettes `fg()`
+    /// is itself a near-black tinted toward the ground, so the two landed on top of each
+    /// other — `mint` measured 1.03:1, which is an absent monogram, not a dim one — and it hit
+    /// every coverless card in both the grid and the coverflow. Only an assertion that fails
+    /// before and passes after is worth writing, and this is that assertion.
+    #[test]
+    fn a_coverless_card_reads_on_every_palette() {
+        for p in &crate::library::PALETTES {
+            crate::theme::set_ink(crate::theme::Ink::of(p));
+            for launcher in [false, true] {
+                let face = placeholder_face(launcher);
+                // OPAQUE, and load-bearing: the coverflow's side cards overlap, so any alpha
+                // here would show the neighbour through the card in front of it.
+                assert_eq!(face.a, 1.0, "{} face is translucent", p.id);
+                let c = contrast(over(fg(0.85), face), face);
+                assert!(c > 3.0, "the monogram is unreadable on {}: {c:.2}:1", p.id);
+            }
+        }
+        crate::theme::set_ink(crate::theme::Ink::of(crate::library::palette("violet")));
+    }
+
     /// Eviction must never take a cover that is ON SCREEN. That is the whole point of
     /// stamping after the draw rather than on arrival: a 400-title library paged end to end
     /// touches every decode, and an LRU keyed on arrival would happily drop the six the
@@ -1278,6 +1617,77 @@ mod tests {
     fn eviction_does_nothing_under_the_budget() {
         let live: Vec<String> = (0..ART_BUDGET).map(|i| format!("g{i}")).collect();
         assert!(art_to_evict(&live, &HashMap::new()).is_empty());
+    }
+
+    /// The cache is sized against what is DRAWN, in both directions.
+    ///
+    /// Too small and a cached poster is being MAGNIFIED onto the shelf's focused card — the
+    /// soft, "low-resolution" look the sampling work exists to have removed, and the one way
+    /// a memory fix could quietly trade one artefact for another. Too large and it is feeding
+    /// a mip level no draw reaches, which is what put a screenful of covers over Skia's GPU
+    /// budget in the first place. The source is the ceiling over both: nothing is ever
+    /// enlarged, and the aspect is the source's, so a title whose only art is a 460×215
+    /// header is not stretched into the cards' 2:3 on its way in.
+    #[test]
+    fn a_cached_poster_is_bounded_by_the_size_it_is_drawn_at() {
+        for k in [0.75, 1.0, 1.25, 1.5, 1.8, 2.7, 3.0] {
+            for src in [(600, 900), (1000, 1500), (460, 215), (300, 450), (64, 64)] {
+                let (w, h) = art_cache_size(src, k);
+                assert!(
+                    w <= src.0 && h <= src.1,
+                    "{src:?} at k={k} was enlarged to {w}×{h}"
+                );
+                // The shelf's focused card is the largest a poster is ever drawn.
+                let drawn = (POSTER_W * k).min(f64::from(src.0));
+                assert!(
+                    f64::from(w) >= drawn - 1.0,
+                    "{src:?} at k={k} cached {w} px wide, under the {drawn:.0} px drawn"
+                );
+                assert!(
+                    f64::from(w) <= ART_CACHE_W * k + 1.0 && f64::from(h) <= ART_CACHE_H * k + 1.0,
+                    "{src:?} at k={k} cached {w}×{h}, outside the cache box"
+                );
+                let (want, got) = (
+                    f64::from(src.0) / f64::from(src.1),
+                    f64::from(w) / f64::from(h),
+                );
+                assert!(
+                    (want - got).abs() < 0.02,
+                    "{src:?} at k={k} came back {w}×{h} — aspect {got:.3} for a {want:.3} source"
+                );
+            }
+        }
+    }
+
+    /// A screenful of covers has to FIT Skia's GPU resource budget. When it doesn't, the
+    /// cache evicts a third of them on every submit and the next frame re-decodes them from
+    /// JPEG on the render thread — which is not a slow frame, it is a slideshow, and it
+    /// arrives as a cliff the moment the grid fills rather than as a gradual sag.
+    #[test]
+    fn a_screenful_of_covers_fits_the_gpu_budget() {
+        // The most cells the grid can put on screen: `grid_cols` clamps at eight columns, and
+        // the cull keeps a little over three rows at any scale — `k` is the panel's height
+        // over 800, so the row COUNT barely moves with resolution. Six rows is generous.
+        const SCREENFUL: usize = 8 * 6;
+        // Four bytes a pixel, and a third again for the mip chain `cache_art` bakes in.
+        let bytes = |(w, h): (i32, i32)| (w as usize) * (h as usize) * 4 * 4 / 3;
+        // Up to a 1440p panel; `skia_overlay::RESOURCE_CACHE_BYTES` names the one case past
+        // it (4K fed 1000×1500 art) that the budget does not claim to cover.
+        for k in [0.75, 1.0, 1.35, 1.8] {
+            for src in [(600, 900), (1000, 1500)] {
+                let covers = bytes(art_cache_size(src, k)) * SCREENFUL;
+                // The console holds two render targets of the panel's own size as well.
+                let targets = 2 * (1280.0 * k) as usize * (800.0 * k) as usize * 4;
+                let budget = crate::skia_overlay::RESOURCE_CACHE_BYTES;
+                assert!(
+                    covers + targets < budget,
+                    "{src:?} art at k={k}: {} MB of covers + {} MB of targets over a {} MB budget",
+                    covers >> 20,
+                    targets >> 20,
+                    budget >> 20
+                );
+            }
+        }
     }
 
     /// A poster decoded but never drawn is the FIRST to go — it is off-screen by

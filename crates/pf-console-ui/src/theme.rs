@@ -209,6 +209,26 @@ pub(crate) fn shade(alpha: f32) -> Color4f {
     Color4f::new(s.r, s.g, s.b, alpha * s.a)
 }
 
+/// An OPAQUE card face, `tint` of the way from the ground side of the field toward the
+/// palette's accent — the backdrop for a cover we have no art for.
+///
+/// Opaque is the constraint that rules the alternatives out: coverflow side cards OVERLAP, so
+/// a glass face would show its neighbour through it, and `accent(0.20)` over nothing is
+/// exactly that. Mixing the same tint into a base the field's own lean chooses (black under a
+/// dark palette, white under a pale one, which is what [`Ink::scrim`] already knows) gets the
+/// accent tint with no alpha spent.
+///
+/// The pairing with [`fg`] is the point of it. A fixed near-black face carrying `fg()` ink was
+/// legible on the seven dark palettes and ABSENT on the six pale ones, where `fg()` is itself a
+/// near-black tinted toward the ground — the two composited to 1.03:1. Face and ink now move in
+/// opposite directions with the palette, so they separate at both poles by construction.
+pub(crate) fn card_face(tint: f32) -> Color4f {
+    let a = ink().accent;
+    let base = if ink().scrim.r > 0.5 { 1.0 } else { 0.0 };
+    let mix = |c: f32| c * tint + base * (1.0 - tint);
+    Color4f::new(mix(a.r), mix(a.g), mix(a.b), 1.0)
+}
+
 /// Ink that reads ON the accent (a filled key, a selected pill): whichever of black or white
 /// the accent has more room for. Chosen by luminance rather than by `light`, because an accent
 /// is picked for contrast against the GLASS, not against the field.
@@ -801,14 +821,19 @@ mod tests {
     /// omits Skia's clamp deliberately, so a channel below zero here IS the shipped bug.
     #[test]
     fn a_dark_card_face_survives_a_full_recede() {
-        set_ink(Ink::of(crate::library::palette("violet")));
-        // The coverflow's placeholder face, `screens::library::draw_poster_placeholder`.
-        let out = apply(&recede_matrix(1.0), [0.118, 0.118, 0.145, 1.0]);
-        for c in &out[..3] {
-            assert!(
-                *c > 0.05,
-                "the recede crushed a dark card to black: {out:?}"
-            );
+        // Every dark palette's coverless card, at the quieter of the two tints
+        // `screens::library::draw_poster_placeholder` draws — the darkest face the shelf has.
+        for p in crate::library::PALETTES.iter().filter(|p| !p.light) {
+            set_ink(Ink::of(p));
+            let f = card_face(0.20);
+            let out = apply(&recede_matrix(1.0), [f.r, f.g, f.b, 1.0]);
+            for c in &out[..3] {
+                assert!(
+                    *c > 0.05,
+                    "the recede crushed {}'s card face to black: {out:?}",
+                    p.id
+                );
+            }
         }
         set_ink(DARK_INK);
     }
