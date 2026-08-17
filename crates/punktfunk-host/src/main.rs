@@ -633,6 +633,10 @@ fn real_main() -> Result<()> {
         // Mint one pad-audio PipeWire sink and capture from it — the Linux 0xD1 source gate.
         #[cfg(target_os = "linux")]
         Some("pad-sink-test") => devtest::pad_sink_test(&args),
+        // Attach the usbip DualSense (real USB device + its own UAC sound card) and capture off its
+        // isochronous endpoint — the gate for the ContainerId / real-ALSA-card path.
+        #[cfg(target_os = "linux")]
+        Some("pad-usbip-test") => devtest::pad_usbip_test(&args),
         // Create a virtual Switch Pro Controller via UHID and exercise it (validation, no session).
         #[cfg(target_os = "linux")]
         Some("switchpro-test") => devtest::switchpro_test(&args),
