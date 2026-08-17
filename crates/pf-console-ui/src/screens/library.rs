@@ -16,7 +16,7 @@ use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox, Screen};
 use crate::theme::{accent, art_sampling, fg, fill, Fonts, EDGE_INSET, W};
-use crate::widgets::{TabStrip, TAB_STRIP_H};
+use crate::widgets::{TabStrip, TAB_PILL_H, TAB_PILL_TOP, TAB_STRIP_H};
 use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Color4f, Data, Image, Matrix, Point, RRect, Rect, TileMode, M44};
 use std::collections::HashMap;
@@ -454,12 +454,22 @@ pub(crate) struct LibraryScreen {
     /// goes, because a rescan that later grows the library to two collections must not yank
     /// the user off a shelf they are already browsing.
     pending_collections: bool,
-    /// This shelf has seen the fetch it was pushed with go out. Between the push and the
-    /// fetch reaching the service thread the shared model still holds the PREVIOUS host's
-    /// titles, ready and all — and deciding the entry on those would open one host's library
-    /// on another's collections. Every entry raises a fetch and every fetch begins by
-    /// setting the model loading, so this is the honest "the list I am looking at is mine".
-    fetch_seen: bool,
+    /// The model's fetch epoch when this shelf was PUSHED.
+    ///
+    /// Between the push and the fetch reaching the service thread, the shared model still holds
+    /// the PREVIOUS host's titles — ready and all — and deciding the collections entry on those
+    /// would open one host's library on another's collections. Comparing the epoch against this
+    /// answers "the list I am looking at is mine" exactly.
+    ///
+    /// 🛑 This used to be a `fetch_seen: bool`, flipped from the render loop on the first frame
+    /// that saw a non-`Ready` phase. That only ever worked because a fetch's first act was to
+    /// block on the network, so `Loading` stood for hundreds of milliseconds. Once the catalog
+    /// cache landed, a warm cache published `Ready` about a millisecond later — inside a single
+    /// frame — so the shelf went from the previous host's `Ready` to its own without ever
+    /// observing `Loading`, the flag stayed false, and "Start in collections" silently stopped
+    /// working for exactly the hosts you had visited before. Do not go back to inferring this
+    /// from a phase: a counter cannot be missed the way a passing state can.
+    entry_epoch: u64,
     // Navigation: the integer cursor is the authority; the eased position chases it.
     cursor: i32,
     /// Each card's rect as last drawn (axis-aligned, scale applied — the perspective tilt
@@ -538,7 +548,9 @@ pub(crate) struct LibraryScreen {
 }
 
 impl LibraryScreen {
-    pub(crate) fn new(host: &HostRow) -> LibraryScreen {
+    /// `entry_epoch` is [`LibraryShared::fetch_epoch`] read at the moment of the push — BEFORE
+    /// the `FetchLibrary` command is queued, which is what makes the comparison exact.
+    pub(crate) fn new(host: &HostRow, entry_epoch: u64) -> LibraryScreen {
         LibraryScreen {
             host: host.clone(),
             shared: None, // adopted from Ctx on the first render (the shell owns it)
@@ -552,7 +564,7 @@ impl LibraryScreen {
             filter_label: None,
             drilled: false,
             pending_collections: true,
-            fetch_seen: false,
+            entry_epoch,
             cursor: 0,
             geom: Vec::new(),
             anim: Spring::rest(0.0),
@@ -803,14 +815,13 @@ impl LibraryScreen {
         self.sync(library);
         // Loading, Empty and Error decide nothing. A fetch that failed keeps this screen and
         // its Retry — and a retry that lands still upgrades, because the pending bit is only
-        // spent on a ready library. Any of them also proves the fetch is this shelf's own.
+        // spent on a ready library.
         if !matches!(self.phase, LibraryPhase::Ready) {
-            self.fetch_seen = true;
             return None;
         }
-        // Ready before the fetch even went out is the PREVIOUS host's library, still in the
-        // model — wait for one that belongs to this shelf.
-        if !self.fetch_seen {
+        // Ready on a fetch epoch this shelf was pushed at is the PREVIOUS host's library, still
+        // sitting in the model — wait for one that belongs to this shelf.
+        if library.fetch_epoch() == self.entry_epoch {
             return None;
         }
         self.pending_collections = false;
@@ -1522,8 +1533,17 @@ impl LibraryScreen {
         // frost over an already-light field. The accent is palette-derived, so at 14 % it is
         // legible at both poles without ever becoming an object.
         if self.bar.focus {
+            // Over the PILL ROW's extent, not the band's. `TabStrip` seats its pills
+            // `TAB_PILL_TOP` into the band and draws them `TAB_PILL_H` tall, so the content
+            // occupies 34 of the band's 46 and the remaining 12 is air below it — air that
+            // belongs to the gap before the field, not to this control. Washing the whole band
+            // put 2 dp above the pills and 14 below them: a backdrop its own content visibly
+            // sat high inside. Padded symmetrically instead, so the wash is centred on the
+            // thing it is highlighting at any scale.
+            let wash_h = (TAB_PILL_TOP * 2.0 + TAB_PILL_H) * k;
+            let wash = Rect::from_ltrb(bar.left, bar.top, bar.right, bar.top + wash_h as f32);
             canvas.draw_rrect(
-                RRect::new_rect_xy(bar, (BAR_CORNER * k) as f32, (BAR_CORNER * k) as f32),
+                RRect::new_rect_xy(wash, (BAR_CORNER * k) as f32, (BAR_CORNER * k) as f32),
                 &fill(accent(0.14)),
             );
         }
@@ -2148,7 +2168,7 @@ mod tests {
                 })
                 .collect(),
         );
-        let mut s = LibraryScreen::new(&host());
+        let mut s = LibraryScreen::new(&host(), 0);
         s.sync(&library);
         s.entrance_armed = true;
         (s, library)
@@ -2453,7 +2473,7 @@ mod tests {
 
     /// A shelf whose list has landed but whose art has not — the state the fix is about.
     fn waiting_shelf() -> LibraryScreen {
-        let mut s = LibraryScreen::new(&host());
+        let mut s = LibraryScreen::new(&host(), 0);
         s.phase = LibraryPhase::Ready;
         s.games = (0..6)
             .map(|i| LibraryGame {
@@ -2706,7 +2726,8 @@ mod tests {
         library: &LibraryShared,
         settings: &pf_client_core::trust::Settings,
     ) -> LibraryScreen {
-        let mut s = LibraryScreen::new(&host());
+        let mut s = LibraryScreen::new(&host(), library.fetch_epoch());
+        library.begin_fetch(); // the queued fetch reaches the service thread
         s.collections_upgrade(library, settings);
         s
     }
@@ -2726,7 +2747,7 @@ mod tests {
         let off = pf_client_core::trust::Settings::default();
         let library = LibraryShared::default();
         library.set_games(mixed.clone());
-        let mut s = LibraryScreen::new(&host());
+        let mut s = LibraryScreen::new(&host(), library.fetch_epoch());
         assert!(
             s.collections_upgrade(&library, &off).is_none(),
             "setting off"
@@ -2763,17 +2784,62 @@ mod tests {
         let mixed = games(&[("Ico", Some("PS2")), ("Journey", None)]);
         let library = LibraryShared::default();
         library.set_games(mixed.clone()); // the host the user was just on
-        let mut s = LibraryScreen::new(&host());
+        let mut s = LibraryScreen::new(&host(), library.fetch_epoch());
         assert!(s.collections_upgrade(&library, &setting_on()).is_none());
         assert!(
             s.pending_collections,
             "the decision was deferred, not spent"
         );
 
-        library.set_phase(LibraryPhase::Loading); // …and now this shelf's own fetch goes out
+        library.begin_fetch(); // …and now this shelf's own fetch goes out
         assert!(s.collections_upgrade(&library, &setting_on()).is_none());
         library.set_games(mixed);
         assert!(s.collections_upgrade(&library, &setting_on()).is_some());
+    }
+
+    /// 🛑 REGRESSION (C7): a WARM CATALOG CACHE hands the shelf a ready library without any
+    /// frame ever seeing `Loading`, and the hand-over must still happen.
+    ///
+    /// This is the exact sequence a second visit to a host produces once the catalog is cached
+    /// on disk: the model holds the previous host's `Ready` list, `begin_fetch` flips it to
+    /// `Loading`, and the fetch thread's very first act — a file read, about a millisecond —
+    /// publishes the cached catalog as `Ready` again. All of that lands between two 60 Hz
+    /// frames, so the render loop observes `Ready` before and `Ready` after and nothing in
+    /// between. The old `fetch_seen` flag was set only by *catching* a non-`Ready` phase, so it
+    /// stayed false and "Start in collections" silently stopped working — for precisely the
+    /// hosts you had opened before, which is everyone's own host.
+    ///
+    /// Note there is no `collections_upgrade` call between `begin_fetch` and the cached list:
+    /// that absence IS the test. Adding one would let a phase-observing implementation pass.
+    #[test]
+    fn a_warm_cache_still_hands_over_though_no_frame_ever_saw_loading() {
+        let mixed = games(&[("Ico", Some("PS2")), ("Journey", None)]);
+        let library = LibraryShared::default();
+        library.set_games(mixed.clone()); // the previous host, still on screen
+        let mut s = LibraryScreen::new(&host(), library.fetch_epoch());
+
+        library.begin_fetch();
+        library.set_games_cached(mixed); // the disk cache, before the next frame
+        assert!(
+            s.collections_upgrade(&library, &setting_on()).is_some(),
+            "a cached catalog is this shelf's own list and must upgrade"
+        );
+    }
+
+    /// The other half of that guarantee: an epoch the shelf was pushed at is NOT its own fetch,
+    /// however ready the model looks. Without this the fix would just be "always upgrade".
+    #[test]
+    fn a_cached_list_from_before_the_push_is_still_refused() {
+        let mixed = games(&[("Ico", Some("PS2")), ("Journey", None)]);
+        let library = LibraryShared::default();
+        library.begin_fetch();
+        library.set_games_cached(mixed); // the PREVIOUS host, served from ITS cache
+        let mut s = LibraryScreen::new(&host(), library.fetch_epoch());
+        assert!(
+            s.collections_upgrade(&library, &setting_on()).is_none(),
+            "same epoch as the push — this list belongs to the host we came from"
+        );
+        assert!(s.pending_collections, "and the decision is still pending");
     }
 
     /// A fetch that failed keeps the shelf — the error card and its Retry live here and
@@ -2782,12 +2848,15 @@ mod tests {
     #[test]
     fn a_failed_fetch_keeps_the_shelf_and_still_hands_over_on_retry() {
         let library = LibraryShared::default();
+        let mut s = LibraryScreen::new(&host(), library.fetch_epoch());
+
+        // The shelf's own fetch goes out and fails.
+        library.begin_fetch();
         library.set_phase(LibraryPhase::Error {
             title: "Couldn't load the library".into(),
             body: "refused".into(),
             can_retry: true,
         });
-        let mut s = LibraryScreen::new(&host());
         assert!(s.collections_upgrade(&library, &setting_on()).is_none());
         assert!(
             s.pending_collections,
@@ -2798,6 +2867,8 @@ mod tests {
             "the retry is still here"
         );
 
+        // Retry — a second fetch, so a second epoch — and this one lands.
+        library.begin_fetch();
         library.set_games(games(&[("Ico", Some("PS2")), ("Journey", None)]));
         assert!(s.collections_upgrade(&library, &setting_on()).is_some());
     }
@@ -2811,7 +2882,7 @@ mod tests {
         library.set_games(games(&[("Ico", Some("PS2")), ("Journey", None)]));
         let mut settings = setting_on();
         for drill in [0, 1] {
-            let mut s = LibraryScreen::new(&host());
+            let mut s = LibraryScreen::new(&host(), 0);
             if drill == 0 {
                 s.set_filter(
                     crate::collate::GroupKey::Platform("PS2".into()),
@@ -2846,7 +2917,7 @@ mod tests {
         };
         let library = LibraryShared::default();
         library.set_games(games(&[("Ico", Some("PS2")), ("Journey", None)]));
-        let mut s = LibraryScreen::new(&host());
+        let mut s = LibraryScreen::new(&host(), 0);
         s.adopt_art(HashMap::from([("g0".to_string(), poster())]));
         s.sync(&library);
         assert_eq!(s.art.len(), 1, "the hand-over was wiped by the first list");

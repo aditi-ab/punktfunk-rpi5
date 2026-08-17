@@ -631,6 +631,15 @@ impl MenuList {
 /// The strip's design height, including the air under it before the first row.
 pub(crate) const TAB_STRIP_H: f64 = 46.0;
 
+/// Where the pill row sits inside that band, and how tall it is.
+///
+/// The band is 46 but the pills only occupy 2..32 of it — the remaining 14 is air between the
+/// strip and whatever it sits above. Published because a caller that draws anything BEHIND the
+/// row (the library bar's focus wash) needs the row's true extent, not the band's, or the
+/// backdrop comes out with 2 dp above the content and 14 below.
+pub(crate) const TAB_PILL_TOP: f64 = 2.0;
+pub(crate) const TAB_PILL_H: f64 = 30.0;
+
 /// The horizontal section switcher above a menu list. Purely presentational — the SCREEN
 /// owns which tab is selected and what the shoulders do; this draws the pills and slides
 /// one highlight between them, so switching sections reads as travel rather than a swap.
@@ -713,7 +722,7 @@ impl TabStrip {
         if labels.is_empty() {
             return;
         }
-        let pill_h = 30.0 * k;
+        let pill_h = TAB_PILL_H * k;
         let size = PILL_TEXT * k;
         let (widths, total) = pill_widths(labels, fonts, k);
         let gap = PILL_GAP * k;
@@ -731,7 +740,7 @@ impl TabStrip {
         let inset = EDGE_INSET * k;
         let slack = f64::from(rect.width()) - total;
         let mut x = f64::from(rect.left) + inset.min((slack / 2.0).max(0.0));
-        let top = f64::from(rect.top) + 2.0 * k;
+        let top = f64::from(rect.top) + TAB_PILL_TOP * k;
 
         // Where the highlight wants to be, then the eased position it actually draws at.
         let sel = selected.min(labels.len() - 1);

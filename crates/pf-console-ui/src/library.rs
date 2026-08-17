@@ -871,6 +871,17 @@ struct Shared {
     art_in: VecDeque<(String, Vec<u8>)>,
     /// Bumped on phase/games changes so the renderer re-syncs its snapshot.
     generation: u64,
+    /// Bumped once per FETCH, by [`LibraryShared::begin_fetch`].
+    ///
+    /// Exists so a shelf can tell "the list in this model is the one MY fetch produced" from
+    /// "it is the previous host's, still sitting here" — WITHOUT having to catch a transient
+    /// phase in the act. That used to be inferred by observing a non-`Ready` phase from the
+    /// render loop, which held only because the first thing a fetch did was block on the network
+    /// for hundreds of milliseconds. The catalog cache broke it: a warm cache publishes `Ready`
+    /// a millisecond after `Loading`, well inside one 60 Hz frame, so a shelf could go from the
+    /// previous host's `Ready` straight to its own and never see the `Loading` between them.
+    /// A counter cannot be missed the way a passing state can.
+    fetch_epoch: u64,
 }
 
 /// One consistent read of the shared model.
@@ -898,11 +909,36 @@ impl Default for LibraryShared {
             stale: Stale::No,
             art_in: VecDeque::new(),
             generation: 0,
+            fetch_epoch: 0,
         })))
     }
 }
 
 impl LibraryShared {
+    /// A fetch for a host is starting: the model goes to `Loading` and the epoch advances.
+    ///
+    /// Every fetch must come through here rather than through `set_phase(Loading)`, because the
+    /// epoch is what tells a freshly-pushed shelf that the titles it is looking at are its own —
+    /// see `Shared::fetch_epoch`. A fetch that only set the phase would be invisible to a shelf
+    /// whose disk cache answered before the next frame.
+    pub fn begin_fetch(&self) {
+        let mut s = self.0.lock().unwrap();
+        s.phase = LibraryPhase::Loading;
+        // The previous host's staleness is not this fetch's: a cached render re-declares it a
+        // moment from now, and until then the shelf must not carry a note about a library it is
+        // no longer showing.
+        s.stale = Stale::No;
+        s.fetch_epoch += 1;
+        s.generation += 1;
+    }
+
+    /// Which fetch the model is on. A shelf records this when it is pushed and compares later;
+    /// any difference means a fetch has begun since, so what is in the model now belongs to it
+    /// rather than to the host it replaced.
+    pub(crate) fn fetch_epoch(&self) -> u64 {
+        self.0.lock().unwrap().fetch_epoch
+    }
+
     pub fn set_phase(&self, phase: LibraryPhase) {
         let mut s = self.0.lock().unwrap();
         s.phase = phase;

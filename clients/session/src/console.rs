@@ -951,7 +951,11 @@ fn spawn_fetch(
     pin: Option<[u8; 32]>,
     macs: Vec<String>,
 ) {
-    shared.set_phase(LibraryPhase::Loading);
+    // `begin_fetch`, not `set_phase(Loading)`: it also advances the model's fetch epoch, which
+    // is how a shelf pushed a moment ago knows the titles it is about to see are its own rather
+    // than the previous host's. A cached catalog can land within a millisecond of this, so there
+    // is no phase transition for anyone to observe.
+    shared.begin_fetch();
     std::thread::Builder::new()
         .name("punktfunk-library".into())
         .spawn(move || {
