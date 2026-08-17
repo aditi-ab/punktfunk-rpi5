@@ -263,24 +263,52 @@ jobs:
           #      the .flatpak-builder state dir. Both are resumable/idempotent, so re-running
           #      after a partial failure is safe and cheap.
           # --disable-rofiles-fuse is the container-safe path (no FUSE).
+          # --disable-updates ("only download missing sources, never update to latest vcs
+          # version") is what makes a restored .flatpak-builder cache actually save network:
+          # every `type: git` source in the manifest is pinned to a COMMIT SHA (gamescope, glm,
+          # stb — plus gamescope's submodules, pinned by their gitlinks), so there is nothing to
+          # update to and re-fetching them only buys upstream flakiness. See the build step below
+          # for the mechanism.
           # 10 attempts (~9min budget), matching the remote-add bootstrap above — same shared,
           # load-sensitive runner, same flathub.org resolution path.
           bash scripts/ci/retry.sh 10 flatpak-builder --user --force-clean --disable-rofiles-fuse \
             --install-deps-from=flathub --install-deps-only \
             "$PWD/build-dir" "$MANIFEST"
           bash scripts/ci/retry.sh 10 flatpak-builder --user --force-clean --disable-rofiles-fuse \
-            --download-only \
+            --download-only --disable-updates \
             "$PWD/build-dir" "$MANIFEST"
 
       - name: Build the flatpak (offline — deps + sources prefetched above)
         run: |
           # Everything is already local (state dir warmed by the prefetch step), so this long
           # step needs no network; --install-deps-from stays as a no-op safety net.
+          #
+          # --disable-updates is LOAD-BEARING, not tidiness: without it this step was never
+          # actually offline. flatpak-builder runs the DOWNLOAD PHASE again as part of every
+          # build (builder-main.c calls builder_manifest_download() unconditionally — only
+          # --disable-download skips it), and it passes `update_vcs = !--disable-updates`. With
+          # updates on (the default) builder_git_mirror_repo() ALWAYS does a live `git ls-remote`
+          # + `git fetch` for every git source and every submodule, even ones pinned to an
+          # immutable commit sha. So this step re-fetched five repos on each run — gamescope plus
+          # its wlroots / libliftoff / vkroots / libdisplay-info submodules — outside retry.sh,
+          # and one HTTP 503 from gitlab.freedesktop.org killed the job minutes in:
+          #     Fetching git repo https://gitlab.freedesktop.org/emersion/libdisplay-info, ref refs/tags/0.3.0
+          #     error: RPC failed; HTTP 503 … fatal: expected 'acknowledgments'
+          #     Failed to download sources: module gamescope-wsi-layer: … exited with code 128
+          # (Those three submodules are not even built — the module sets enable_gamescope=false;
+          # they get mirrored only because flatpak-builder clones submodules by default.)
+          # With the flag, builder_git_mirror_repo() short-circuits on `git cat-file -e <commit>`
+          # against the warm mirror and returns BEFORE any network call, so an upstream blip can
+          # no longer reach this step. It can never change what is built either: every git source
+          # here is commit-pinned (see the manifest), so "don't update" is a semantic no-op.
+          # Anything genuinely missing still downloads, so a cold state dir self-heals.
+          #
           # --default-branch=$FLATPAK_BRANCH pins the ref to app/io.unom.Punktfunk/x86_64/<branch>
           # (canary or stable) so the matching hosted .flatpakref resolves deterministically
           # (manifest sets no branch).
           flatpak-builder --user --force-clean --disable-rofiles-fuse \
             --default-branch="$FLATPAK_BRANCH" \
+            --disable-updates \
             --install-deps-from=flathub \
             --repo="$PWD/repo" \
             "$PWD/build-dir" "$MANIFEST"
