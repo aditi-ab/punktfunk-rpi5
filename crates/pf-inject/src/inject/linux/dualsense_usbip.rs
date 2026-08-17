@@ -624,7 +624,20 @@ impl DualSenseUsbip {
             &format!("virtual DualSense {index}"),
         )?;
 
-        // Publish only once the device is actually attached, so a failed attach leaves no stale
+        // **A successful attach is not a working pad.** `vhci_hcd` accepts the socket immediately
+        // and enumerates asynchronously, so any protocol fault downstream of the attach — a reply
+        // the kernel rejects, a descriptor it will not parse — surfaces a few hundred milliseconds
+        // later as a device that appears and then vanishes. Returning `Ok` on the attach alone
+        // reported those as success, and because this transport *replaces* uhid the user was left
+        // with no pad at all rather than a degraded one. That has now happened twice, so the
+        // contract is: `open` returns `Ok` only once the kernel has actually bound a driver, and
+        // the caller's existing uhid fallback covers everything else.
+        if let Err(e) = wait_until_bound(index) {
+            drop(attach); // detach the port before the caller retries or degrades
+            return Err(e);
+        }
+
+        // Publish only once the device is attached *and* bound, so a failed bringup leaves no stale
         // receiver for the streamer to drain forever.
         publish_audio_rx(index, rx);
         tracing::info!(
@@ -666,6 +679,94 @@ impl Drop for DualSenseUsbip {
     fn drop(&mut self) {
         clear_audio_rx(self.pad);
     }
+}
+
+/// How long to give the kernel to enumerate the pad and bind a HID driver to it.
+///
+/// Enumeration + `hid-playstation` bind measured ~330 ms on an idle box; the failure this guards
+/// against tore the device down ~400 ms after attach. Three seconds is comfortably clear of both,
+/// and the cost of waiting is paid once per pad arrival. `PUNKTFUNK_DUALSENSE_USBIP_GRACE_MS`
+/// overrides it; `0` skips the check entirely (useful when bisecting the transport itself).
+const BIND_GRACE: std::time::Duration = std::time::Duration::from_millis(3000);
+
+/// Block until the kernel has enumerated the virtual pad *and* bound a HID driver to its HID
+/// interface, or the grace period expires.
+///
+/// Checking for the `usb_device` node alone is not enough: in the 2026-08-17 failure the node was
+/// created and then removed ~400 ms later when the calibration reply tore the connection down, so a
+/// single early poll saw a healthy device. Requiring a bound HID driver with an `input` child means
+/// the thing the pad exists to provide actually came up.
+fn wait_until_bound(index: u8) -> Result<()> {
+    let grace = std::env::var("PUNKTFUNK_DUALSENSE_USBIP_GRACE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(BIND_GRACE);
+    if grace.is_zero() {
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + grace;
+    let mut saw_device = false;
+    loop {
+        if let Some(t) = find_usb_topology() {
+            saw_device = true;
+            if hid_input_bound(&t.sysfs_path) {
+                tracing::debug!(
+                    index,
+                    sysfs = %t.sysfs_path.display(),
+                    "usbip DualSense bound a HID driver"
+                );
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Which of the two it is tells the operator where to look, so say it rather than "failed".
+    if saw_device {
+        anyhow::bail!(
+            "the virtual DualSense enumerated but no HID driver bound within {:?} — it is present \
+             in sysfs without an input device. Check `dmesg` for a `playstation`/`hid-generic` \
+             probe failure",
+            grace
+        )
+    }
+    anyhow::bail!(
+        "the virtual DualSense never enumerated within {grace:?} — `vhci_hcd` accepted the attach \
+         but no 054c:0ce6 device appeared (or it appeared and was torn down again). Check `dmesg`; \
+         a transport fault here reads as `recv xbuf` / `sendmsg failed` from vhci_hcd"
+    )
+}
+
+/// Whether the pad's HID interface under `sysfs` has a bound HID driver that produced an input
+/// device. Either `hid-playstation` or `hid-generic` counts — both give a usable pad.
+fn hid_input_bound(sysfs: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(sysfs) else {
+        return false;
+    };
+    for e in entries.flatten() {
+        // The HID function is interface 3; its sysfs node is `<busid>:1.3`.
+        if !e.file_name().to_string_lossy().ends_with(":1.3") {
+            continue;
+        }
+        let Ok(children) = std::fs::read_dir(e.path()) else {
+            continue;
+        };
+        for c in children.flatten() {
+            // `0003:054C:0CE6.000N` — the bound HID device. `input/` appears only once a driver
+            // has claimed it and registered; a probe that fails leaves the directory absent.
+            if c.file_name().to_string_lossy().starts_with("0003:")
+                && c.path().join("input").is_dir()
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The sysfs path of an attached virtual DualSense's `usb_device` node, plus the udev properties

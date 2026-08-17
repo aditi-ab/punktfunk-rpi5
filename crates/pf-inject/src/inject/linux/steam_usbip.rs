@@ -225,10 +225,12 @@ struct ServerThread {
 }
 
 impl ServerThread {
-    /// Spawn the server on `listener`, serving exactly the one simulated `dev`.
-    fn spawn(listener: std::net::TcpListener, dev: UsbDevice) -> Result<ServerThread> {
+    /// Spawn the server on `listener`, serving exactly the one simulated `dev`. `label` names the
+    /// device in log lines and in the `PUNKTFUNK_USBIP_TRACE` file names.
+    fn spawn(listener: std::net::TcpListener, dev: UsbDevice, label: &str) -> Result<ServerThread> {
         let stop = Arc::new(tokio::sync::Notify::new());
         let stop_t = stop.clone();
+        let label = label.to_string();
         let join = std::thread::Builder::new()
             .name("pf-deck-usbip".into())
             .spawn(move || {
@@ -246,6 +248,7 @@ impl ServerThread {
                     listener,
                     Arc::new(UsbIpServer::new_simulated(vec![dev])),
                     stop_t,
+                    label,
                 ));
             })
             .context("spawn usbip server thread")?;
@@ -270,6 +273,7 @@ async fn run_server(
     listener: std::net::TcpListener,
     server: Arc<UsbIpServer>,
     stop: Arc<tokio::sync::Notify>,
+    label: String,
 ) {
     let listener = match tokio::net::TcpListener::from_std(listener) {
         Ok(l) => l,
@@ -289,8 +293,41 @@ async fn run_server(
                     // active hidraw against a 266 Hz source).
                     sock.set_nodelay(true).ok();
                     let server = server.clone();
+                    let trace = super::usbip_trace::trace_prefix(&label);
+                    let label = label.clone();
                     tokio::spawn(async move {
-                        let _ = usbip_sim::handler(&mut sock, server).await;
+                        // The handler's Err arm used to be discarded. It is the *only* signal that
+                        // we tore the connection down rather than the kernel — and the kernel's
+                        // side of that (`recv xbuf`, `sendmsg failed`) reads identically either
+                        // way, so throwing it away cost days of mis-attributed diagnosis.
+                        let sink = trace.and_then(|prefix| {
+                            match super::usbip_trace::open_trace(&prefix) {
+                                Ok(s) => {
+                                    tracing::info!(prefix, "usbip byte trace armed");
+                                    Some(s)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "usbip trace files unopenable — running untraced");
+                                    None
+                                }
+                            }
+                        });
+                        let res = match sink {
+                            Some(s) => {
+                                let mut traced = super::usbip_trace::TracedIo::wrap(sock, s);
+                                usbip_sim::handler(&mut traced, server).await
+                            }
+                            None => usbip_sim::handler(&mut sock, server).await,
+                        };
+                        match res {
+                            Ok(()) => tracing::debug!(label, "usbip connection closed by the kernel"),
+                            Err(e) => tracing::warn!(
+                                label,
+                                error = %e,
+                                "usbip server dropped the connection — the kernel will report this as a \
+                                 transfer error on whatever URB was in flight"
+                            ),
+                        }
                     });
                 }
                 Err(e) => {
@@ -361,7 +398,7 @@ fn attach_in_process(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
     listener
         .set_nonblocking(true)
         .context("usbip listener set_nonblocking")?;
-    let server = ServerThread::spawn(listener, dev)?;
+    let server = ServerThread::spawn(listener, dev, label)?;
 
     // Connect to our own server and run the OP_REQ_IMPORT handshake.
     let mut sock = connect_loopback(port).context("connect to usbip server")?;
@@ -395,7 +432,7 @@ fn attach_via_cli(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
     listener
         .set_nonblocking(true)
         .context("usbip listener set_nonblocking")?;
-    let server = ServerThread::spawn(listener, dev)?;
+    let server = ServerThread::spawn(listener, dev, label)?;
 
     let before = vhci_used_ports();
     usbip_attach_cli().context("usbip CLI attach")?;
