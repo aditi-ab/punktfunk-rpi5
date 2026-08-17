@@ -159,7 +159,8 @@ impl CollectionsScreen {
     /// the tiles hold labels and ids, not games.
     fn sync(&mut self, library: &LibraryShared) {
         if library.generation() != self.generation {
-            let (_, games, generation) = library.snapshot();
+            let snap = library.snapshot();
+            let (games, generation) = (snap.games, snap.generation);
             self.generation = generation;
             self.groups = collate(&games, self.sort, Some(GroupBy::Platform))
                 .into_iter()
@@ -835,6 +836,7 @@ mod tests {
                     launcher: false,
                     icon: String::new(),
                     platform: Some(if i < 4 { "PS2".into() } else { "PS3".into() }),
+                    running: false,
                 })
                 .collect(),
         );
@@ -1034,6 +1036,7 @@ mod tests {
                 launcher: true,
                 icon: "steam".into(),
                 platform: Some("Launchers".into()),
+                running: false,
             },
             LibraryGame {
                 id: "g0".into(),
@@ -1042,6 +1045,7 @@ mod tests {
                 launcher: false,
                 icon: String::new(),
                 platform: Some("PS3".into()),
+                running: false,
             },
         ]);
         let mut s = CollectionsScreen::new(&host(), SortKey::HostOrder);

@@ -105,6 +105,49 @@ sealed class LibraryResult {
     data class Ok(val games: List<GameEntry>) : LibraryResult()
     data class Unauthorized(val message: String) : LibraryResult()
     data class Error(val message: String) : LibraryResult()
+
+    /**
+     * Is this the "can't reach it" failure — the only one worth waiting out?
+     *
+     * A rejected certificate does not become acceptable by retrying, and asking an unpaired host
+     * twelve times only delays telling the user what is actually wrong. Lives here rather than at
+     * the call site so the retry loop and the error copy can never disagree about which failures
+     * are transient.
+     */
+    val isTransient: Boolean get() = this is Error
+}
+
+/**
+ * One game the host currently has launched, from `GET /api/v1/status`.
+ *
+ * A deliberately partial mirror of the host's `ActiveGame`: only the fields a client can act on.
+ * The web console's view of this payload carries more (which session, which plane, the grace
+ * countdown), and none of that is a player's business from the library shelf.
+ */
+data class RunningGame(
+    /**
+     * Store-qualified library id (`steam:570`) — the key that lines this up with a [GameEntry].
+     * Null for an operator-typed GameStream command, which has no catalog entry behind it.
+     */
+    val appId: String?,
+    val title: String,
+    /**
+     * `launching` | `running` | `exited` | `untracked` | `grace`. A plain String on purpose: the
+     * host owns the vocabulary and adds to it (`untracked` arrived in 0.30), so an unknown value
+     * must never fail the decode of the whole list.
+     */
+    val state: String,
+) {
+    /**
+     * Is this title *up on the host right now* — i.e. would picking it take the player back into
+     * it rather than start it?
+     *
+     * `untracked` counts: the host cannot follow that process, but it did launch it and has no
+     * evidence it stopped. `grace` counts too — its session is gone but the game is still running,
+     * which is precisely the case where getting back in promptly matters most. Only a confirmed
+     * `exited` does not.
+     */
+    val isUp: Boolean get() = state != "exited"
 }
 
 object LibraryClient {
@@ -148,6 +191,55 @@ object LibraryClient {
                 "Couldn't reach the host's management API: ${e.message}. It binds the LAN by default, so check the host is updated and reachable.",
             )
         }
+    }
+
+    /**
+     * What the host currently has running, from `GET /api/v1/status`.
+     *
+     * Same lane, same identity, no new host work: `/status` is already on the paired-certificate
+     * allowlist (the host's `mgmt::auth::cert_may_access`) alongside `/library`, and has carried a
+     * `games[]` array since the session⇄game lifetime work. This client simply never read it — so
+     * a player had no way to see, from the device they browse on, that something was already up.
+     *
+     * **Best-effort by contract**: an older host, an unreachable one, or a shape we don't recognize
+     * yields an empty list rather than an error. Nothing here is worth failing a library screen
+     * over — the worst case is a Resume badge that doesn't appear. BLOCKING; call from IO.
+     */
+    fun fetchRunning(
+        address: String,
+        mgmtPort: Int = DEFAULT_MGMT_PORT,
+        certPem: String,
+        keyPem: String,
+        fpHex: String,
+    ): List<RunningGame> {
+        if (fpHex.isBlank()) return emptyList()
+        return try {
+            val client = mtlsHttpClient(certPem, keyPem, address, fpHex)
+            val req = Request.Builder().url("https://$address:$mgmtPort/api/v1/status").build()
+            client.newCall(req).execute().use { resp ->
+                if (resp.code != 200) return emptyList()
+                parseRunning(resp.body?.string().orEmpty())
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /** Just the `games[]` slice of `/status`; everything else on that payload is the console's. */
+    private fun parseRunning(json: String): List<RunningGame> {
+        val arr = JSONObject(json).optJSONArray("games") ?: return emptyList()
+        val out = ArrayList<RunningGame>(arr.length())
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            out.add(
+                RunningGame(
+                    appId = str(o, "app_id"),
+                    title = o.optString("title"),
+                    state = o.optString("state"),
+                ),
+            )
+        }
+        return out
     }
 
     private fun parse(json: String, base: String): List<GameEntry> {

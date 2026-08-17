@@ -303,6 +303,7 @@ mod tests {
             launcher,
             icon: String::new(),
             platform: platform.map(str::to_string),
+            running: false,
         }
     }
 

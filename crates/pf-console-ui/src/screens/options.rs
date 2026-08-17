@@ -402,6 +402,7 @@ mod tests {
             launcher: false,
             icon: "steam".into(),
             platform: None,
+            running: false,
         }
     }
 

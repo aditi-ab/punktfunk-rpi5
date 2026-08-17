@@ -754,6 +754,11 @@ fun ConnectScreen(
 
     fun forgetHost(kh: KnownHost) {
         knownHostStore.remove(kh)
+        // A forgotten host leaves no list of what somebody plays, and no record of what they were
+        // playing, behind on the device. Its record id is the key both are filed under, so this is
+        // the last moment either can be found.
+        io.unom.punktfunk.kit.library.LibraryCache.standard(context.cacheDir).forget(kh.id)
+        LibraryPosition.forget(context, kh.id)
         savedHosts = knownHostStore.all()
     }
 

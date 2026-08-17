@@ -157,6 +157,17 @@ pub enum ConsoleCmd {
         mgmt: u16,
         fp_hex: String,
     },
+    /// Re-read only WHICH titles the host has up (`GET /api/v1/status`), leaving the catalog
+    /// on screen untouched — raised when a stream ends onto a shelf, the one moment the
+    /// running set is most likely to have changed under it.
+    ///
+    /// Its own command rather than a `FetchLibrary`: that one sets the phase to `Loading`,
+    /// which would replace the shelf the player just came back to with a spinner.
+    RefreshRunning {
+        addr: String,
+        mgmt: u16,
+        fp_hex: String,
+    },
     /// Run the SPAKE2 PIN ceremony; on success persist the pin and refresh hosts.
     Pair {
         addr: String,

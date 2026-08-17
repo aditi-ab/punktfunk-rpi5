@@ -1,7 +1,8 @@
 //! The console home: a center-snapping carousel of host tiles (saved, discovered, and
 //! the trailing Add Host action) — the Swift `GamepadHomeView` re-homed onto Skia. A
-//! connects (or wakes, or routes to pairing), Y opens a paired host's library, X opens
-//! settings, B quits to Gaming Mode. The cursor is the authority; the sprung position
+//! opens a paired host's LIBRARY (or routes to pairing, or connects where there is no
+//! library to open), Y streams the machine's desktop instead, X opens settings, B quits to
+//! Gaming Mode. The cursor is the authority; the sprung position
 //! chases it, and the focus pop (scale/brightness/fade) reads off the LIVE sprung
 //! distance so the look always matches the strip mid-motion.
 
@@ -135,6 +136,17 @@ impl HomeScreen {
                     Slot::Host(h) if !h.paired => fx.push(Screen::Pair(
                         super::pair::PairScreen::new(h, ctx.device_name),
                     )),
+                    // A machine you play games on should offer the GAMES when you press A on
+                    // it, rather than dropping you on its desktop. Streaming the desktop moves
+                    // to Y — one press away and named in the legend, so neither is buried.
+                    //
+                    // Deliberately ABOVE the wake arm, and with no wake of its own: opening
+                    // the library IS the wake now. The library fires the packet on entry and
+                    // retries across the boot window, so the box warms while the player is
+                    // still choosing — strictly earlier than a wake bound to a connect, and
+                    // with a cached shelf to look at meanwhile. A wake-then-connect here would
+                    // instead park them on an overlay before they had picked anything.
+                    Slot::Host(h) if h.paired && h.saved => Self::open_library(h, fx),
                     Slot::Host(h) if !h.online && h.can_wake => {
                         // Wake first; the wake overlay connects once it answers.
                         fx.cmds.push(ConsoleCmd::Wake {
@@ -142,42 +154,32 @@ impl HomeScreen {
                             then_connect: true,
                         });
                     }
-                    Slot::Host(h) => {
-                        // Dial-first even when the presence pips say offline — a
-                        // routed/VPN host is mDNS-blind and probe-shy but dials fine.
-                        // A pinned card connects with ITS profile (one-off, §5.2a);
-                        // the primary tile keeps the host's default binding.
-                        fx.connect = Some(ConnectIntent {
-                            addr: h.addr.clone(),
-                            port: h.port,
-                            fp_hex: h.fp_hex.clone(),
-                            launch: None,
-                            title: match &h.pin {
-                                Some(p) => format!("{} · {}", h.name, p.name),
-                                None => h.name.clone(),
-                            },
-                            request_access: false,
-                            profile: h.pin.as_ref().map(|p| p.id.clone()),
-                        });
-                    }
+                    // No library to open (paired but unsaved — a discovered host, or one
+                    // reached by `--browse`): connecting is the primary press, as it always was.
+                    Slot::Host(h) => Self::stream_desktop(h, fx),
                 }
                 Some(MenuPulse::Confirm)
             }
+            // The other half of A — see the `Confirm` arm. Offered only on the tiles where A
+            // took the library: everywhere else A already connects, and a second button doing
+            // the identical thing is a legend entry that teaches nothing.
             MenuEvent::Secondary => match self.focused(ctx.hosts) {
                 Some(h) if h.paired && h.saved => {
-                    fx.cmds.push(ConsoleCmd::FetchLibrary {
-                        addr: h.addr.clone(),
-                        mgmt: h.mgmt_port,
-                        fp_hex: h.fp_hex.clone(),
-                    });
-                    fx.push(Screen::Library(super::library::LibraryScreen::new(h)));
+                    if !h.online && h.can_wake {
+                        // The desktop is what was asked for, so this keeps the wake-then-connect
+                        // flow A used to run. There is nothing to look at while a box boots into
+                        // a desktop — which is precisely what makes the library path different,
+                        // and why only that one wakes quietly in the background.
+                        fx.cmds.push(ConsoleCmd::Wake {
+                            key: h.key.clone(),
+                            then_connect: true,
+                        });
+                    } else {
+                        Self::stream_desktop(h, fx);
+                    }
                     Some(MenuPulse::Confirm)
                 }
-                Some(_) => {
-                    fx.toast = Some("Pair with this host to browse its library".into());
-                    Some(MenuPulse::Boundary)
-                }
-                None => None,
+                Some(_) | None => None,
             },
             MenuEvent::Tertiary => {
                 fx.push(Screen::Settings(super::settings::SettingsScreen::new()));
@@ -252,19 +254,60 @@ impl HomeScreen {
         }
     }
 
+    /// Open this host's library: raise the fetch (which also wakes the box and retries across
+    /// its boot window) and push the shelf.
+    ///
+    /// A function rather than two inlined statements because the pair is load-bearing — a push
+    /// without the command shows the PREVIOUS host's titles until something happens to refetch,
+    /// which is one host's library under another host's name.
+    fn open_library(h: &HostRow, fx: &mut Outbox) {
+        fx.cmds.push(ConsoleCmd::FetchLibrary {
+            addr: h.addr.clone(),
+            mgmt: h.mgmt_port,
+            fp_hex: h.fp_hex.clone(),
+        });
+        fx.push(Screen::Library(super::library::LibraryScreen::new(h)));
+    }
+
+    /// Stream the machine itself, no title attached.
+    ///
+    /// Dial-first even when the presence pips say offline — a routed/VPN host is mDNS-blind and
+    /// probe-shy but dials fine. A pinned card connects with ITS profile (one-off, §5.2a); the
+    /// primary tile keeps the host's default binding.
+    fn stream_desktop(h: &HostRow, fx: &mut Outbox) {
+        fx.connect = Some(ConnectIntent {
+            addr: h.addr.clone(),
+            port: h.port,
+            fp_hex: h.fp_hex.clone(),
+            launch: None,
+            title: match &h.pin {
+                Some(p) => format!("{} · {}", h.name, p.name),
+                None => h.name.clone(),
+            },
+            request_access: false,
+            profile: h.pin.as_ref().map(|p| p.id.clone()),
+        });
+    }
+
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
         let mut hints = Vec::new();
+        // Mirrors `menu`'s arms in the same order, so the legend can never advertise a press
+        // the handler does something else with — the library arm sits above the wake arm in
+        // both.
         match self.slot(ctx.hosts) {
             Slot::AddHost => hints.push(Hint::new(HintKey::Confirm, "Add Host")),
             Slot::Rescan => hints.push(Hint::new(HintKey::Confirm, "Scan Again")),
             Slot::Host(h) if !h.paired => hints.push(Hint::new(HintKey::Confirm, "Pair…")),
+            Slot::Host(h) if h.paired && h.saved => {
+                hints.push(Hint::new(HintKey::Confirm, "Library"));
+                // Named for what it does, not for the machine's state: "Wake & Stream" on an
+                // offline box would be the only hint on this screen that describes plumbing.
+                hints.push(Hint::new(HintKey::Secondary, "Stream Desktop"));
+            }
             Slot::Host(h) if !h.online && h.can_wake => {
                 hints.push(Hint::new(HintKey::Confirm, "Wake & Connect"))
             }
             Slot::Host(_) => hints.push(Hint::new(HintKey::Confirm, "Connect")),
-        }
-        if self.focused(ctx.hosts).is_some_and(|h| h.paired && h.saved) {
-            hints.push(Hint::new(HintKey::Secondary, "Library"));
         }
         if self
             .focused(ctx.hosts)
@@ -829,8 +872,12 @@ mod tests {
         assert_eq!(s.cursor, 2);
     }
 
+    /// A on a host you have paired opens its LIBRARY; Y streams the machine itself. The two
+    /// swapped when the library became the point of a host card, and the pair has to stay
+    /// exhaustive — every arm of `menu`'s `Confirm` match is exercised here, because a tile
+    /// that quietly did nothing is the failure this screen cannot afford.
     #[test]
-    fn confirm_routes_by_host_state() {
+    fn confirm_opens_the_library_and_secondary_streams_the_desktop() {
         let mut settings = ctx_settings();
         let hosts = [
             host("paired-online", true, true, false),
@@ -839,7 +886,9 @@ mod tests {
         ];
         let pads: Vec<pf_client_core::gamepad::PadInfo> = Vec::new();
 
-        // Paired+online → connect intent.
+        // Paired + saved → the library, with the fetch that fills it. The command is as
+        // load-bearing as the push: a shelf pushed without one shows the PREVIOUS host's
+        // titles under this host's name.
         let mut s = HomeScreen::new();
         let mut fx = Outbox::default();
         let library = crate::library::LibraryShared::default();
@@ -853,19 +902,49 @@ mod tests {
             t: 0.0,
         };
         s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
-        assert!(fx.connect.is_some());
+        assert!(matches!(
+            fx.cmds.first(),
+            Some(ConsoleCmd::FetchLibrary { .. })
+        ));
+        assert!(matches!(fx.nav, Some(crate::screens::Nav::Push(_))));
+        assert!(fx.connect.is_none(), "A no longer starts a desktop stream");
 
-        // Unpaired → the pair screen.
+        // …and Y on that same tile is the other half.
+        let mut fx = Outbox::default();
+        s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
+        assert!(fx.connect.is_some(), "Y streams the desktop");
+
+        // Unpaired → the pair screen, and Y offers nothing (there is no library to be the
+        // other half of).
         let mut fx = Outbox::default();
         s.cursor = 1;
         s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
         assert!(matches!(fx.nav, Some(crate::screens::Nav::Push(_))));
         assert!(fx.connect.is_none());
+        let mut fx = Outbox::default();
+        s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
+        assert!(fx.connect.is_none() && fx.cmds.is_empty());
 
-        // Asleep + MAC on file → wake-then-connect.
+        // Asleep + MAC on file, but PAIRED: A still opens the library, which wakes the box
+        // itself and retries across its boot window — that is the whole reason waking moved
+        // off the connect. It must NOT raise a wake-then-connect and park the player on an
+        // overlay before they have picked anything.
         let mut fx = Outbox::default();
         s.cursor = 2;
         s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
+        assert!(matches!(
+            fx.cmds.first(),
+            Some(ConsoleCmd::FetchLibrary { .. })
+        ));
+        assert!(
+            !fx.cmds.iter().any(|c| matches!(c, ConsoleCmd::Wake { .. })),
+            "the library wakes the host itself"
+        );
+
+        // Y on the sleeping box DOES wake-then-connect: there is nothing to look at while a
+        // machine boots into a desktop, which is exactly what makes the library path different.
+        let mut fx = Outbox::default();
+        s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
         assert!(matches!(
             fx.cmds.first(),
             Some(ConsoleCmd::Wake {
@@ -875,8 +954,39 @@ mod tests {
         ));
     }
 
-    /// A pinned card's A-press is a connect WITH its profile (one-off), titled so the
-    /// connecting takeover says which settings are coming (§5.2a).
+    /// A host that is paired but NOT saved — a discovered tile, or one reached by `--browse`
+    /// — has no library to open, so connecting stays its primary press. Without this arm the
+    /// swap above would leave those tiles doing nothing at all.
+    #[test]
+    fn an_unsaved_host_still_connects_on_confirm() {
+        let mut settings = ctx_settings();
+        let mut h = host("discovered", true, true, false);
+        h.saved = false;
+        let hosts = [h];
+        let pads: Vec<pf_client_core::gamepad::PadInfo> = Vec::new();
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &hosts,
+            library: &library,
+            settings: &mut settings,
+            pads: &pads,
+            deck: false,
+            device_name: "test",
+            t: 0.0,
+        };
+        let mut s = HomeScreen::new();
+        let mut fx = Outbox::default();
+        s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
+        assert!(fx.connect.is_some());
+        assert!(
+            s.hints(&ctx).iter().all(|h| h.key != HintKey::Secondary),
+            "no Y hint where Y does nothing"
+        );
+    }
+
+    /// A pinned card's desktop stream is a connect WITH its profile (one-off), titled so the
+    /// connecting takeover says which settings are coming (§5.2a). On Y now rather than A —
+    /// the profile has to survive the move, since it is the whole point of a pinned card.
     #[test]
     fn pinned_card_connects_with_its_profile() {
         let mut settings = ctx_settings();
@@ -901,7 +1011,7 @@ mod tests {
         };
         let mut s = HomeScreen::new();
         let mut fx = Outbox::default();
-        s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
+        s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
         let intent = fx.connect.expect("a pinned card connects");
         assert_eq!(intent.profile.as_deref(), Some("p1"));
         assert_eq!(intent.title, "Tower · Work");

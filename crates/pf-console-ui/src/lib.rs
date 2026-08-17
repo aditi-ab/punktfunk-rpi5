@@ -40,7 +40,7 @@ mod theme;
 mod widgets;
 
 #[cfg(any(target_os = "linux", windows))]
-pub use library::{LibraryGame, LibraryPhase, LibraryShared};
+pub use library::{LibraryGame, LibraryPhase, LibraryShared, Stale};
 #[cfg(any(target_os = "linux", windows))]
 pub use model::{
     ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, ProfileChip, WakeStatus,

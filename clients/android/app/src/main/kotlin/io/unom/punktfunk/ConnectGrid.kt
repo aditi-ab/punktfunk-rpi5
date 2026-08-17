@@ -97,13 +97,24 @@ internal fun ConnectGrid(
     // user who never wants this feature sees no new clutter anywhere but the settings scope chips.
     // "Connect with" is a ONE-OFF on every card: it never rebinds the host, which is why rebinding
     // lives in the Edit sheet instead.
+    /**
+     * Does tapping this card open its library?
+     *
+     * Browsing IS a connect-shaped action — this card's connect with a title picked first — and it
+     * is now what TAPPING a host does: a machine you play games on should offer the games, not drop
+     * you on its desktop. The pin is load-bearing rather than cosmetic: the library plane
+     * authenticates by the paired identity, so an unpinned host has nothing to browse with and
+     * keeps connecting as its primary tap.
+     */
+    fun opensLibrary(kh: KnownHost): Boolean = libraryEnabled && kh.fpHex.isNotBlank()
+
     fun hostMenu(kh: KnownHost, pin: StreamProfile?): List<HostMenuItem> = buildList {
-        // Browsing IS a connect-shaped action — this card's connect with a title picked first — so
-        // a PINNED card offers it too, and its shelf launches with that card's profile. Without it
-        // the touch home had no route to the library at all: the console shell reaches it with Y
-        // from a tile, and a finger has no Y.
-        if (libraryEnabled) {
-            add(HostMenuItem("Browse library…") { onBrowseLibrary(kh, pin) })
+        // The inverse of the card's primary tap — see [opensLibrary]. Absent on a host with no
+        // library, where connecting IS the primary tap and a menu row for it would just be the
+        // same action twice. A PINNED card carries it too, so streaming that card's machine still
+        // uses that card's profile.
+        if (opensLibrary(kh)) {
+            add(HostMenuItem("Stream the desktop") { onConnect(kh, pin?.id) })
         }
         if (pin == null) {
             add(HostMenuItem("Network speed test") { onSpeedTest(kh) })
@@ -259,9 +270,15 @@ internal fun ConnectGrid(
                         os = discovered.firstOrNull { kh.matches(it) && it.os.isNotEmpty() }?.os
                             ?: kh.os,
                         enabled = !connecting,
-                        // A pinned card connects with ITS profile; the host's own card follows the
-                        // binding, which is exactly what its chip says it will do.
-                        onConnect = { onConnect(kh, pin?.id) },
+                        // The card's PRIMARY tap: this host's library where it has one, else the
+                        // connect it always was. A pinned card's shelf launches with ITS profile,
+                        // exactly as its connect would; the host's own card follows the binding,
+                        // which is what its chip says it will do.
+                        onConnect = if (opensLibrary(kh)) {
+                            ({ onBrowseLibrary(kh, pin) })
+                        } else {
+                            ({ onConnect(kh, pin?.id) })
+                        },
                         // Edit / Forget / Wake live on the host's own card only: a pinned card is a
                         // shortcut, not a second host, and offering destructive host actions on it
                         // would blur exactly that.

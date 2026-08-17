@@ -34,6 +34,9 @@ pub mod gamepad;
 pub mod keymap;
 #[cfg(any(target_os = "linux", windows))]
 pub mod library;
+// Per-host catalog cache, so a library screen has titles to show while a sleeping host boots.
+#[cfg(any(target_os = "linux", windows))]
+pub mod library_cache;
 #[cfg(any(target_os = "linux", windows))]
 pub mod logring;
 // The `punktfunk://` grammar (design/client-deep-links.md §2): one parser/emitter for the

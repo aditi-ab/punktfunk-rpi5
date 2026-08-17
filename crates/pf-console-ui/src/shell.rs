@@ -300,6 +300,21 @@ impl Shell {
     pub(crate) fn session_ended(&mut self, reason: Option<&str>) {
         self.connecting = None;
         self.in_stream = false;
+        // Coming back to a shelf means the player just left a game, which is the single moment
+        // the running set is most likely to have changed — and the moment they are standing in
+        // front of the badge that claims to know. Nothing else refreshes it: this screen stack
+        // SURVIVES a stream (which is why the shelf needs no scroll restoration at all), so
+        // without this the Resume badge would still be advertising the title they just quit.
+        //
+        // Only the running set, never the catalog: a re-fetch would reset the phase to Loading
+        // and replace the shelf they are looking at with a spinner over a stream that just ended.
+        if let Some(Screen::Library(lib)) = self.stack.last() {
+            self.bus.send(ConsoleCmd::RefreshRunning {
+                addr: lib.host_addr().to_string(),
+                mgmt: lib.host_mgmt_port(),
+                fp_hex: lib.host_fp_hex().to_string(),
+            });
+        }
         if let Some(reason) = reason {
             self.show_toast(format!("Session ended — {reason}"));
         }

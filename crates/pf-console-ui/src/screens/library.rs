@@ -7,8 +7,8 @@ use crate::anim::{entrances, Entrance, EntranceAt, Spring};
 use crate::glyphs::{Hint, HintKey};
 use crate::library::{
     card_matrix, grid_col_hint, grid_step, initials, step_cursor, store_label, GridDir, GridShape,
-    LibraryGame, LibraryPhase, LibraryShared, LibraryView, StepResult, BUMP_C, BUMP_K, BUMP_PX,
-    ENTER_RISE, ENTER_SCALE, ENTER_TURN_DEG, FOCUS_GAP, GRID_GAP, GRID_H, GRID_W, JUMP,
+    LibraryGame, LibraryPhase, LibraryShared, LibraryView, Stale, StepResult, BUMP_C, BUMP_K,
+    BUMP_PX, ENTER_RISE, ENTER_SCALE, ENTER_TURN_DEG, FOCUS_GAP, GRID_GAP, GRID_H, GRID_W, JUMP,
     PERSPECTIVE, POSTER_H, POSTER_W, RECEDE_DIM, RECEDE_SCALE, ROTATE_DEG, SIDE_SPACING, SPRING_C,
     SPRING_K, VISIBLE_RANGE,
 };
@@ -270,6 +270,50 @@ fn draw_poster_placeholder(
     );
 }
 
+/// "This one is already up on the host" — the Resume affordance, in `rect`'s top-RIGHT corner.
+///
+/// A badge rather than a changed action label because these tiles have no labels to change: the
+/// poster *is* the control. It says `RESUME` rather than `RUNNING` on purpose — the player does not
+/// need a status report, they need to know what pressing A will do.
+///
+/// Top-right because the coverflow's store chip owns top-left; the grid draws no store chip at all,
+/// so this is the only mark on its cells and the corner is free either way. `ONLINE_GREEN` is the
+/// same semantic green the host presence pip uses — this is a state the host reports, not a
+/// Punktfunk surface, and it has to stay distinguishable from the launcher chip, which already owns
+/// the brand fill one corner away.
+///
+/// Opaque fill, like [`StoreBadge(solid:)`] on Apple and for the same reason: the coverflow
+/// composites its cards into an offscreen layer, where a translucent pill has no backdrop to sample
+/// and would simply reveal the neighbour behind it.
+fn draw_running_badge(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
+    const LABEL: &str = "RESUME";
+    let size = 11.0 * k;
+    let tw = fonts.measure(LABEL, W::SemiBold, size) as f64;
+    let (bw, bh) = (tw + 16.0 * k, 20.0 * k);
+    let pad = 8.0 * k;
+    let x = f64::from(rect.right) - pad - bw;
+    let y = f64::from(rect.top) + pad;
+    canvas.draw_rrect(
+        RRect::new_rect_xy(
+            Rect::from_xywh(x as f32, y as f32, bw as f32, bh as f32),
+            (bh / 2.0) as f32,
+            (bh / 2.0) as f32,
+        ),
+        &fill(crate::theme::ONLINE_GREEN),
+    );
+    // Near-black on the green rather than the palette's ink: this pill is a fixed colour on
+    // every palette, so taking `fg()` would put white text on it under the six pale ones.
+    fonts.draw(
+        canvas,
+        LABEL,
+        x + 8.0 * k,
+        y + 14.0 * k,
+        W::SemiBold,
+        size,
+        Color4f::new(0.04, 0.10, 0.05, 1.0),
+    );
+}
+
 /// Persist the library's sort, from wherever it was chosen.
 ///
 /// Deliberately writes the SETTING and nothing else. Every screen that shows the library
@@ -379,6 +423,10 @@ pub(crate) struct LibraryScreen {
     generation: u64,
     phase: LibraryPhase,
     games: Vec<LibraryGame>,
+    /// Whether these titles came off the disk cache rather than off the host, and what to say
+    /// about it. Never an error state: a cached library is a working library, and this is
+    /// precisely the screen a player wants while a sleeping box boots.
+    stale: Stale,
     /// Display order: indices into `games`, as [`crate::collate`] arranged them. The cursor
     /// indexes THIS, not `games` — which is what lets the plain shelf, a chosen sort and a
     /// collection drill-in all be the same screen with the same cursor arithmetic, and what
@@ -497,6 +545,7 @@ impl LibraryScreen {
             generation: u64::MAX,
             phase: LibraryPhase::Loading,
             games: Vec::new(),
+            stale: Stale::No,
             view: Vec::new(),
             sort: crate::collate::SortKey::default(),
             filter: None,
@@ -636,9 +685,13 @@ impl LibraryScreen {
     }
 
     /// Rebuild the display order after anything that could change it: a new game list, a
-    /// new sort, a new filter. The cursor is clamped rather than followed by identity — a
-    /// re-sort moves everything, so "keep the same index" and "keep the same title" are
-    /// both arbitrary, and the cheap one at least never points off the end.
+    /// new sort, a new filter. The cursor is only CLAMPED here, never followed by identity: on
+    /// a user-chosen re-sort "keep the same index" and "keep the same title" are both arbitrary,
+    /// and the cheap one at least never points off the end.
+    ///
+    /// [`Self::sync`] is the exception, and it re-anchors after calling this: a list that moved
+    /// on its own (the running-first order arriving with a `/status` read) is not something the
+    /// player asked for, so the cursor has to stay on the title it was standing on.
     fn recollate(&mut self) {
         self.view = crate::collate::filtered(&self.games, self.sort, self.filter.as_ref());
         self.cursor = self.cursor.clamp(0, (self.view.len() as i32 - 1).max(0));
@@ -657,6 +710,22 @@ impl LibraryScreen {
     /// Tiles on the shelf — the FILTERED count, not the library's.
     fn len(&self) -> usize {
         self.view.len()
+    }
+
+    // Which host this shelf belongs to, for the shell's `RefreshRunning` on a stream ending.
+    // Three narrow readers rather than exposing `host`: the shell needs to address the host's
+    // management API and nothing else, and a `&HostRow` would hand it the pin, the profile and
+    // the presence state as well.
+    pub(crate) fn host_addr(&self) -> &str {
+        &self.host.addr
+    }
+
+    pub(crate) fn host_mgmt_port(&self) -> u16 {
+        self.host.mgmt_port
+    }
+
+    pub(crate) fn host_fp_hex(&self) -> &str {
+        &self.host.fp_hex
     }
 
     /// How many tiles this shelf is showing, for the shell's collection-flow test — which
@@ -796,9 +865,29 @@ impl LibraryScreen {
             return;
         };
         if shared.generation() != self.generation {
-            let (phase, games, generation) = shared.snapshot();
-            let fresh = self.games.len() != games.len()
-                || self.games.iter().zip(&games).any(|(a, b)| a.id != b.id);
+            let snap = shared.snapshot();
+            let (phase, games, generation) = (snap.phase, snap.games, snap.generation);
+            // A different SET of titles — a different library. Deliberately not "a different
+            // sequence": the shelf re-sorts in place now (a `/status` read moving the running
+            // titles to the front), and reading that as a new library would clear every decoded
+            // poster and throw the cursor back to the start while the player was standing on a
+            // tile. Compared as a multiset of ids, so an ORDER change alone is not freshness.
+            let fresh = self.games.len() != games.len() || {
+                let mut before: Vec<&str> = self.games.iter().map(|g| g.id.as_str()).collect();
+                let mut after: Vec<&str> = games.iter().map(|g| g.id.as_str()).collect();
+                before.sort_unstable();
+                after.sort_unstable();
+                before != after
+            };
+            // The title under the cursor, so a re-sort can put the cursor back on it rather
+            // than on whatever slid into that index. The same "position is a title, not an
+            // offset" rule the Apple client remembers a scroll position by, applied where this
+            // shell actually needs it: its screen stack survives a stream, so the cursor is
+            // never lost to a re-mount — only to the list moving under it.
+            let anchor = (!fresh)
+                .then(|| self.focused().map(|g| g.id.clone()))
+                .flatten();
+            self.stale = snap.stale;
             // Whether this is the shelf's FIRST list or a later one — the difference between
             // "the screen just mounted" and "the library moved under it", which `fresh`
             // alone cannot tell apart because a screen that holds no games is different from
@@ -833,6 +922,16 @@ impl LibraryScreen {
                 self.bar.focus = false;
             }
             self.recollate();
+            // Put the cursor back on the title it was on. After `recollate`, because the
+            // display order is what the cursor indexes — and only when the anchor is still in
+            // the (possibly filtered) view, so a collection drill-in that no longer contains it
+            // keeps the clamped index `recollate` already chose.
+            if let Some(id) = anchor {
+                if let Some(i) = self.view.iter().position(|&i| self.games[i].id == id) {
+                    self.cursor = i as i32;
+                    self.seat_grid_col();
+                }
+            }
         }
         // A bounded handful per frame: this is where the decode happens now, and a burst of
         // arrivals must not become one long frame (see `ART_DECODES_PER_FRAME`).
@@ -1223,12 +1322,18 @@ impl LibraryScreen {
         }
         match &self.phase {
             LibraryPhase::Ready => {
+                // "Resume" outranks both: what A does to a title that is already up is get you
+                // back into it, and that is worth saying before whether it is a launcher —
+                // resuming Steam Big Picture is still resuming.
                 let mut hints = vec![Hint::new(
                     HintKey::Confirm,
-                    if self.focused_is_launcher() {
-                        "Open"
-                    } else {
-                        "Play"
+                    match (
+                        self.focused().is_some_and(|g| g.running),
+                        self.focused_is_launcher(),
+                    ) {
+                        (true, _) => "Resume",
+                        (false, true) => "Open",
+                        (false, false) => "Play",
                     },
                 )];
                 // Only offered when there is something to browse, and never on a shelf the
@@ -1653,6 +1758,9 @@ impl LibraryScreen {
             self.geom[i] = cell;
             let Some(game) = self.game(i) else { continue };
             let id = game.id.clone();
+            // Read out now rather than re-borrowing below: the art stamp at the end of this
+            // body needs `&mut self`, so nothing may still be holding a `&LibraryGame` by then.
+            let running = game.running;
 
             crate::theme::focus_halo(canvas, cell, 12.0, k as f32, f as f32);
             let art = self.art.get(&id);
@@ -1723,6 +1831,12 @@ impl LibraryScreen {
                     crate::theme::PanelStroke::Brand(0.9),
                     k as f32,
                 );
+            }
+            // The grid draws no store chip, so this is the only mark on a cell — it still goes
+            // top-right, because the same badge in two different corners on two arrangements of
+            // the same shelf would read as two different badges.
+            if running {
+                draw_running_badge(canvas, fonts, cell, k);
             }
             if layered {
                 canvas.restore();
@@ -1897,6 +2011,12 @@ impl LibraryScreen {
                     fg(1.0),
                 );
             }
+            // Opposite corner from the store chip, so the two never meet in the middle of a
+            // card. Inside the recede layer with everything else: a receded neighbour's badge
+            // should fade with the card it belongs to, not float over the shelf.
+            if game.running {
+                draw_running_badge(canvas, fonts, crect, k);
+            }
             // The separating veil: an opaque wash toward the GROUND, never whole-card alpha.
             // Hardcoded black cancelled itself out on the six pale palettes — it greyed back
             // the lift `recede_matrix` had just applied and left a receded card muddier than
@@ -1923,6 +2043,21 @@ impl LibraryScreen {
     /// LIBRARY, not in how they describe one title, and a second copy of this would be a
     /// second place for the platform line to go stale.
     fn draw_detail_band(&self, canvas: &Canvas, rect: Rect, k: f64, fonts: &Fonts) {
+        // Says the titles above are remembered rather than observed — shown only while that is
+        // true, and never as an error. Leading-aligned on the subtitle's own baseline rather
+        // than centred over the title: it describes the SHELF, and a line stacked above the
+        // focused title would read as part of it.
+        if let Some(note) = self.stale.note() {
+            fonts.draw(
+                canvas,
+                note,
+                f64::from(rect.left) + EDGE_INSET * k,
+                f64::from(rect.bottom) - 30.0 * k,
+                W::Regular,
+                12.0 * k,
+                fg(0.55),
+            );
+        }
         let Some(g) = self.focused() else { return };
         let w = f64::from(rect.width());
         let cx = f64::from(rect.left) + w / 2.0;
@@ -2009,6 +2144,7 @@ mod tests {
                     launcher: false,
                     icon: String::new(),
                     platform: None,
+                    running: false,
                 })
                 .collect(),
         );
@@ -2327,6 +2463,7 @@ mod tests {
                 launcher: false,
                 icon: String::new(),
                 platform: None,
+                running: false,
             })
             .collect();
         s.recollate();
@@ -2550,6 +2687,7 @@ mod tests {
                 launcher: false,
                 icon: String::new(),
                 platform: platform.map(str::to_string),
+                running: false,
             })
             .collect()
     }
