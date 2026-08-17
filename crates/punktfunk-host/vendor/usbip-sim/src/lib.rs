@@ -134,6 +134,34 @@ async fn handle_iso_submit(
     }
 }
 
+/// Force a non-isochronous reply into the shape `vhci_hcd` will accept (punktfunk addition).
+///
+/// **A reply may be shorter than the host asked for, never longer.** A short IN transfer is
+/// ordinary USB — the device had less to say — but an over-long one is a babble condition and the
+/// kernel does not forgive it: `usbip_recv_xbuff()` compares the reply's `actual_length` against
+/// the URB's `transfer_buffer_length` and, on `>`, treats it as a malicious packet, logs
+/// `recv xbuf, 0` (that `0` is the untouched initialiser, not a byte count) and raises
+/// `VDEV_EVENT_ERROR_TCP` — which tears down the **whole connection**, so the device disappears
+/// rather than one URB failing. Real hardware truncates here, so we do too: a handler bug then
+/// costs one wrong reply instead of the pad.
+///
+/// An OUT transfer returns nothing at all. `usbip_recv_xbuff()` returns early for `usb_pipeout`,
+/// so any payload appended to an OUT reply is bytes the kernel never reads — and every byte after
+/// it in the stream is then misframed.
+///
+/// Field-diagnosed 2026-08-17: a 42-byte DualSense calibration report answering a 41-byte request
+/// killed `hid-playstation`'s probe with `-EPROTO` and took the controller with it. Every backend
+/// that is not USB (uhid, Windows `hidclass`) truncates silently, which is why the same constant
+/// had looked correct for months.
+pub(crate) fn clamp_reply(mut resp: Vec<u8>, requested: u32, out: bool) -> Vec<u8> {
+    if out {
+        resp.clear();
+    } else if resp.len() > requested as usize {
+        resp.truncate(requested as usize);
+    }
+    resp
+}
+
 pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
     mut socket: &mut T,
     server: Arc<UsbIpServer>,
@@ -264,6 +292,15 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
 
                         match resp {
                             Ok(resp) => {
+                                let over = resp.len() > transfer_buffer_length as usize;
+                                let resp = clamp_reply(resp, transfer_buffer_length, out);
+                                if over {
+                                    warn!(
+                                        "handler returned more than the {transfer_buffer_length}-byte \
+                                         request on ep {real_ep:02x?} — truncated; an over-long reply \
+                                         tears down the whole usbip connection"
+                                    );
+                                }
                                 if out {
                                     trace!("<-Wrote {}", data.len());
                                 } else {
@@ -323,3 +360,34 @@ pub async fn server(addr: SocketAddr, server: Arc<UsbIpServer>) {
 }
 
 // (Host-mode constructors and in-crate tests removed in the vendored copy — see NOTICE.)
+
+/// Covers only the punktfunk reply-shaping addition; see [`clamp_reply`] for why the kernel treats
+/// an over-long reply as fatal to the connection rather than to the URB.
+#[cfg(test)]
+mod clamp_tests {
+    use super::clamp_reply;
+
+    /// The exact 2026-08-17 field failure: a 42-byte calibration blob against `wLength` 41.
+    /// Un-truncated this is `actual_length = 42 > transfer_buffer_length = 41`, which makes
+    /// `usbip_recv_xbuff()` raise `VDEV_EVENT_ERROR_TCP` and disconnect the pad entirely.
+    #[test]
+    fn an_over_long_in_reply_is_truncated_to_the_request() {
+        let reply = vec![0xAB; 42];
+        assert_eq!(clamp_reply(reply, 41, false).len(), 41);
+    }
+
+    /// A device returning less than asked is a short packet — ordinary USB, and the host is told
+    /// the true count. Padding it out would fabricate data the device never sent.
+    #[test]
+    fn a_short_in_reply_is_left_alone() {
+        assert_eq!(clamp_reply(vec![1, 2, 3], 64, false), vec![1, 2, 3]);
+    }
+
+    /// An OUT reply carries no payload back whatever the handler returns: the kernel does not read
+    /// one, so those bytes would stay in the stream and misframe every PDU after them.
+    #[test]
+    fn an_out_reply_never_carries_a_payload() {
+        assert!(clamp_reply(vec![1, 2, 3, 4], 4, true).is_empty());
+        assert!(clamp_reply(vec![], 0, true).is_empty());
+    }
+}

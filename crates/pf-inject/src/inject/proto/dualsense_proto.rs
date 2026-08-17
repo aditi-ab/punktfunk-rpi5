@@ -20,15 +20,19 @@ use punktfunk_core::quic::{HidOutput, RichInput};
 // inputtino (each array's first byte is the report id). The pairing report carries a fixed
 // virtual MAC.
 #[rustfmt::skip]
-// FIXME(cal-len): the descriptor declares report 0x05 as a 40-byte feature (id + 40 = 41 total),
-// but this blob is 42 bytes (one trailing pad byte too many). Linux `hid-playstation` tolerates it
-// (the backend is live-validated), and `hidclass` truncates to the declared length, so it is not
-// currently blocking; trim the trailing 0x00 to 41 once a physical DualSense is available to
-// re-verify motion calibration on both backends.
+// **41 bytes, and that is load-bearing** — the descriptor declares report 0x05 as a 40-byte feature
+// and `hid-playstation` asks for id + 40 = 41 (`DS_FEATURE_REPORT_CALIBRATION_SIZE`). This blob
+// carried one trailing pad byte too many until 2026-08-17. On uhid and on Windows that was
+// invisible, because hidraw and `hidclass` both truncate a feature reply to the declared length —
+// but a *USB* backend does not: `usbip_recv_xbuff()` compares the reply's `actual_length` against
+// the URB's `transfer_buffer_length` and, on 42 > 41, treats it as a malicious packet, logs
+// `recv xbuf, 0` and raises `VDEV_EVENT_ERROR_TCP` — which tears down the whole connection, not the
+// one URB. That killed the usbip pad's `hid-playstation` probe with -EPROTO and took the controller
+// with it. Keep this exactly 41 bytes. See [`crate::dualsense_usbip`].
 pub const DS_FEATURE_CALIBRATION: &[u8] = &[ // report 0x05 (motion calibration)
     0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x27, 0xF0, 0xD8, 0x10, 0x27, 0xF0, 0xD8, 0x10,
     0x27, 0xF0, 0xD8, 0xF4, 0x01, 0xF4, 0x01, 0x10, 0x27, 0xF0, 0xD8, 0x10, 0x27, 0xF0, 0xD8, 0x10,
-    0x27, 0xF0, 0xD8, 0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x27, 0xF0, 0xD8, 0x0B, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 #[rustfmt::skip]
 pub const DS_FEATURE_PAIRING: &[u8] = &[ // report 0x09 (pairing info: MAC at bytes 1..7)
@@ -642,6 +646,33 @@ pub fn parse_ds_output(pad: u8, data: &[u8], fb: &mut DsFeedback) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every feature report must be exactly the size the driver asks for.**
+    ///
+    /// `hid-playstation` requests these by fixed size (`DS_FEATURE_REPORT_*_SIZE`), and on a *USB*
+    /// backend a reply longer than the request is fatal to the whole transport, not to the URB:
+    /// `usbip_recv_xbuff()` sees `actual_length > transfer_buffer_length`, calls it a malicious
+    /// packet, and raises `VDEV_EVENT_ERROR_TCP`, which disconnects the device. Calibration was
+    /// 42 bytes against a 41-byte request until 2026-08-17 and killed the usbip pad outright —
+    /// invisibly on uhid and on Windows, because hidraw and `hidclass` both truncate.
+    ///
+    /// Sizes are `hid-playstation`'s own constants: calibration 41, pairing 20, firmware 64.
+    #[test]
+    fn feature_reports_are_exactly_the_size_the_driver_requests() {
+        assert_eq!(
+            DS_FEATURE_CALIBRATION.len(),
+            41,
+            "calibration (report 0x05)"
+        );
+        assert_eq!(DS_FEATURE_PAIRING.len(), 20, "pairing (report 0x09)");
+        assert_eq!(DS_FEATURE_FIRMWARE.len(), 64, "firmware (report 0x20)");
+        assert_eq!(ds_pairing_reply(0).len(), 20, "pairing reply");
+
+        // The first byte of a feature report is its id; a wrong one is answered to the wrong query.
+        assert_eq!(DS_FEATURE_CALIBRATION[0], 0x05);
+        assert_eq!(DS_FEATURE_PAIRING[0], 0x09);
+        assert_eq!(DS_FEATURE_FIRMWARE[0], 0x20);
+    }
 
     /// The Steam dual-pad → DualSense touchpad SPLIT: left pad (surface 1) lands contact 0
     /// on the left half, right pad (surface 2) contact 1 on the right half; y follows the

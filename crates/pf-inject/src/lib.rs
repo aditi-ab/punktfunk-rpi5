@@ -623,6 +623,12 @@ pub mod uhid_abi;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/uhid_manager.rs"]
 pub mod uhid_manager;
+/// Linux: byte-level tracing of the USB/IP socket (`PUNKTFUNK_USBIP_TRACE`). A framing bug in that
+/// stream is only ever visible as damage the kernel notices somewhere later, so the wire itself has
+/// to be recoverable.
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/usbip_trace.rs"]
+pub mod usbip_trace;
 /// Transport-independent Xbox HID codec — the report the `pf-gamepad` UMDF driver serves under
 /// device-types 4, 5 and 6 (Xbox Wireless / One S / Elite Series 2, which share one descriptor and
 /// differ only in VID/PID), giving an Xbox pad the HID footing `pf-xusb` never had
