@@ -816,15 +816,84 @@ pub struct LibraryGame {
     /// nothing, which is the common case: the rom-manager plugin populates this, Steam does
     /// not. [`crate::collate`] is where that `None` is given a meaning.
     pub platform: Option<String>,
+    /// This title is already up on the host, so picking it RESUMES rather than starts — read
+    /// from `/api/v1/status` and applied by [`LibraryShared::set_running`].
+    ///
+    /// Host state, never catalog state. It is deliberately not part of what the catalog cache
+    /// persists (that stores `pf_client_core::library::GameEntry`, which has no such field), so
+    /// a shelf served from disk can never claim a game is running because it was running the
+    /// last time anyone looked.
+    ///
+    /// `false` for every older host and while the `/status` read is still in flight — the
+    /// degradation is a Resume badge that appears a moment late, which is why the read is
+    /// allowed to lag the catalog rather than hold it back.
+    pub running: bool,
+}
+
+/// Whether the shelf on screen is an observation or a memory — and, if a memory, whether
+/// anything is still being done about it.
+///
+/// Three states rather than a flag because the two cached ones want different words. "Waking the
+/// host…" says a shelf is about to become current; "Last known library" says it isn't going to.
+/// Telling a player the first thing while nothing is happening is the kind of lie a progress
+/// indicator tells, and it is worth one extra variant to never tell it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stale {
+    /// These titles came from the host just now.
+    No,
+    /// Served from the disk cache while the host is being woken and re-asked.
+    Waking,
+    /// Served from the disk cache, and the host never answered. Not an error phase: the titles
+    /// are still the right ones to choose from, and replacing them with a red message because a
+    /// box is asleep is precisely what the cache exists to prevent.
+    Offline,
+}
+
+impl Stale {
+    /// The line the shelf shows, or `None` when there is nothing to say.
+    pub(crate) fn note(self) -> Option<&'static str> {
+        match self {
+            Stale::No => None,
+            Stale::Waking => Some("Last known library \u{2014} waking the host\u{2026}"),
+            Stale::Offline => Some("Last known library \u{2014} the host didn't answer"),
+        }
+    }
 }
 
 struct Shared {
     phase: LibraryPhase,
     games: Vec<LibraryGame>,
+    /// Whether these titles came off the disk cache rather than off the host, and what the shelf
+    /// should say about it. Reset to [`Stale::No`] by the live [`LibraryShared::set_games`] that
+    /// reconciles a cached render.
+    stale: Stale,
     /// Fetched poster bytes the renderer hasn't decoded yet (id, encoded image).
     art_in: VecDeque<(String, Vec<u8>)>,
     /// Bumped on phase/games changes so the renderer re-syncs its snapshot.
     generation: u64,
+    /// Bumped once per FETCH, by [`LibraryShared::begin_fetch`].
+    ///
+    /// Exists so a shelf can tell "the list in this model is the one MY fetch produced" from
+    /// "it is the previous host's, still sitting here" — WITHOUT having to catch a transient
+    /// phase in the act. That used to be inferred by observing a non-`Ready` phase from the
+    /// render loop, which held only because the first thing a fetch did was block on the network
+    /// for hundreds of milliseconds. The catalog cache broke it: a warm cache publishes `Ready`
+    /// a millisecond after `Loading`, well inside one 60 Hz frame, so a shelf could go from the
+    /// previous host's `Ready` straight to its own and never see the `Loading` between them.
+    /// A counter cannot be missed the way a passing state can.
+    fetch_epoch: u64,
+}
+
+/// One consistent read of the shared model.
+///
+/// A struct rather than the tuple this used to be: `stale` made it a four-tuple, and by then
+/// every call site was destructuring positionally into names it chose itself, which is how a
+/// caller ends up reading the generation as the phase.
+pub(crate) struct LibrarySnapshot {
+    pub phase: LibraryPhase,
+    pub games: Vec<LibraryGame>,
+    pub stale: Stale,
+    pub generation: u64,
 }
 
 /// The binary's write handle / the overlay's read handle — fetch threads push into it,
@@ -837,35 +906,117 @@ impl Default for LibraryShared {
         LibraryShared(Arc::new(Mutex::new(Shared {
             phase: LibraryPhase::Loading,
             games: Vec::new(),
+            stale: Stale::No,
             art_in: VecDeque::new(),
             generation: 0,
+            fetch_epoch: 0,
         })))
     }
 }
 
 impl LibraryShared {
+    /// A fetch for a host is starting: the model goes to `Loading` and the epoch advances.
+    ///
+    /// Every fetch must come through here rather than through `set_phase(Loading)`, because the
+    /// epoch is what tells a freshly-pushed shelf that the titles it is looking at are its own —
+    /// see `Shared::fetch_epoch`. A fetch that only set the phase would be invisible to a shelf
+    /// whose disk cache answered before the next frame.
+    pub fn begin_fetch(&self) {
+        let mut s = self.0.lock().unwrap();
+        s.phase = LibraryPhase::Loading;
+        // The previous host's staleness is not this fetch's: a cached render re-declares it a
+        // moment from now, and until then the shelf must not carry a note about a library it is
+        // no longer showing.
+        s.stale = Stale::No;
+        s.fetch_epoch += 1;
+        s.generation += 1;
+    }
+
+    /// Which fetch the model is on. A shelf records this when it is pushed and compares later;
+    /// any difference means a fetch has begun since, so what is in the model now belongs to it
+    /// rather than to the host it replaced.
+    pub(crate) fn fetch_epoch(&self) -> u64 {
+        self.0.lock().unwrap().fetch_epoch
+    }
+
     pub fn set_phase(&self, phase: LibraryPhase) {
         let mut s = self.0.lock().unwrap();
         s.phase = phase;
         s.generation += 1;
     }
 
-    /// Loaded games → the carousel (empty = the empty scene).
+    /// Loaded games → the carousel (empty = the empty scene). The titles came from the HOST, so
+    /// whatever staleness a cached render declared is over.
     ///
     /// **Launcher entries are moved to the front, keeping the host's title order within each
     /// group.** Grouping here rather than in the renderer means the carousel's cursor arithmetic,
     /// the art pump and every future consumer of this model all inherit the invariant for free —
     /// a launcher tile is never buried in the middle of a 400-title shelf.
     pub fn set_games(&self, games: Vec<LibraryGame>) {
-        let mut games = games;
-        // `sort_by_key` is stable, so this is a partition that preserves the incoming order.
-        games.sort_by_key(|g| !g.launcher);
+        self.put_games(games, Stale::No);
+    }
+
+    /// The same, for a catalog served from the on-disk cache while the host is still being
+    /// asked. Identical in every way except that the shelf knows to say these titles are
+    /// remembered rather than observed.
+    ///
+    /// Not an error state and not a lesser one: a cached library is a working library, and a host
+    /// that is still waking is the case the cache exists to serve. The live fetch is always in
+    /// flight behind it.
+    pub fn set_games_cached(&self, games: Vec<LibraryGame>) {
+        self.put_games(games, Stale::Waking);
+    }
+
+    /// Update what the shelf says about a cached catalog without disturbing the catalog itself —
+    /// the retry window closing on a host that never answered. A no-op on a live shelf, so a late
+    /// give-up from an abandoned fetch can never mark a freshly-fetched library stale.
+    pub fn set_stale(&self, stale: Stale) {
+        let mut s = self.0.lock().unwrap();
+        if s.stale == stale || s.stale == Stale::No {
+            return;
+        }
+        s.stale = stale;
+        s.generation += 1;
+    }
+
+    fn put_games(&self, mut games: Vec<LibraryGame>, stale: Stale) {
+        order(&mut games);
         let mut s = self.0.lock().unwrap();
         s.phase = if games.is_empty() {
             LibraryPhase::Empty
         } else {
             LibraryPhase::Ready
         };
+        s.games = games;
+        s.stale = stale;
+        s.generation += 1;
+    }
+
+    /// Mark which titles the host currently has up, by library id, and re-order accordingly.
+    ///
+    /// Separate from [`set_games`] because it arrives separately: `/status` is read AFTER the
+    /// catalog so a slow answer can't hold the titles back, and it is re-read when a stream ends
+    /// (the player has just quit something, which is exactly when this changes). Called with an
+    /// empty set on an older host or an unreachable one, which correctly clears every badge.
+    ///
+    /// A no-op — no generation bump, so no re-sync and no cursor disturbance — when nothing
+    /// actually changed. That matters: this is polled, and a shelf that re-sorted every few
+    /// seconds on identical data would be a shelf that flickers.
+    pub fn set_running(&self, up: &std::collections::HashSet<String>) {
+        let mut s = self.0.lock().unwrap();
+        let mut changed = false;
+        for g in &mut s.games {
+            let now = up.contains(&g.id);
+            if g.running != now {
+                g.running = now;
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        let mut games = std::mem::take(&mut s.games);
+        order(&mut games);
         s.games = games;
         s.generation += 1;
     }
@@ -879,9 +1030,14 @@ impl LibraryShared {
         self.0.lock().unwrap().generation
     }
 
-    pub(crate) fn snapshot(&self) -> (LibraryPhase, Vec<LibraryGame>, u64) {
+    pub(crate) fn snapshot(&self) -> LibrarySnapshot {
         let s = self.0.lock().unwrap();
-        (s.phase.clone(), s.games.clone(), s.generation)
+        LibrarySnapshot {
+            phase: s.phase.clone(),
+            games: s.games.clone(),
+            stale: s.stale,
+            generation: s.generation,
+        }
     }
 
     /// Take at most `max` newly fetched posters, leaving the rest queued.
@@ -922,6 +1078,24 @@ impl LibraryShared {
         }
         out
     }
+}
+
+/// The shelf's display order, in the one place every writer of the model goes through.
+///
+/// Two rules, in this order:
+/// 1. **Launcher entries lead** (design D4). Non-negotiable and applied FIRST, because the grid's
+///    layout is built on it: [`GridShape`] is told a launcher COUNT and treats those entries as a
+///    prefix, giving them rows of their own. Let a running game jump ahead of a launcher and the
+///    cursor arithmetic and the renderer would be laying out two different fields.
+/// 2. **Running titles lead within their group.** Getting back into what is already up should be
+///    the first thing on the shelf rather than something to scroll for — and a launcher that is
+///    up still belongs with the launchers, which is what makes the two rules compose instead of
+///    fighting.
+///
+/// `sort_by_key` is stable, so this is a pair of partitions that preserves the host's own title
+/// order inside each of the four resulting bands.
+fn order(games: &mut [LibraryGame]) {
+    games.sort_by_key(|g| (!g.launcher, !g.running));
 }
 
 /// Store id → display label (the GTK `ui_library` table).
@@ -1382,6 +1556,7 @@ mod tests {
             launcher,
             icon: String::new(),
             platform: None,
+            running: false,
         };
         let shared = LibraryShared::default();
         shared.set_games(vec![
@@ -1390,11 +1565,103 @@ mod tests {
             g("Portal 2", false),
             g("Heroic", true),
         ]);
-        let (phase, games, _) = shared.snapshot();
-        assert!(matches!(phase, LibraryPhase::Ready));
-        let titles: Vec<&str> = games.iter().map(|g| g.title.as_str()).collect();
+        let snap = shared.snapshot();
+        assert!(matches!(snap.phase, LibraryPhase::Ready));
+        assert_eq!(snap.stale, Stale::No, "a live fetch is not a memory");
+        let titles: Vec<&str> = snap.games.iter().map(|g| g.title.as_str()).collect();
         assert_eq!(titles, ["Big Picture", "Heroic", "Celeste", "Portal 2"]);
-        assert_eq!(games.iter().take_while(|g| g.launcher).count(), 2);
+        assert_eq!(snap.games.iter().take_while(|g| g.launcher).count(), 2);
+    }
+
+    /// Running titles lead — but WITHIN their group, so the launcher prefix the grid's
+    /// [`GridShape`] is built on survives. A running game jumping ahead of a launcher would put
+    /// the cursor arithmetic and the renderer on two different fields.
+    #[test]
+    fn running_titles_lead_without_breaking_the_launcher_prefix() {
+        let g = |title: &str, launcher: bool| LibraryGame {
+            id: format!("steam:{title}"),
+            title: title.to_string(),
+            store: "steam".into(),
+            launcher,
+            icon: String::new(),
+            platform: None,
+            running: false,
+        };
+        let shared = LibraryShared::default();
+        shared.set_games(vec![
+            g("Celeste", false),
+            g("Big Picture", true),
+            g("Portal 2", false),
+            g("Heroic", true),
+            g("Tunic", false),
+        ]);
+        // Portal 2 and Heroic are up — one of each group.
+        let up: std::collections::HashSet<String> = ["steam:Portal 2", "steam:Heroic"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        shared.set_running(&up);
+        let snap = shared.snapshot();
+        let titles: Vec<&str> = snap.games.iter().map(|g| g.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["Heroic", "Big Picture", "Portal 2", "Celeste", "Tunic"],
+            "running first inside each group; launchers still the prefix"
+        );
+        assert_eq!(
+            snap.games.iter().take_while(|g| g.launcher).count(),
+            2,
+            "the launcher prefix GridShape depends on is intact"
+        );
+        assert!(snap.games[0].running && snap.games[2].running);
+
+        // Re-applying the SAME set changes nothing and must not bump the generation — this is
+        // polled, and a shelf that re-synced on identical data would be a shelf that flickers.
+        let gen_before = snap.generation;
+        shared.set_running(&up);
+        assert_eq!(shared.snapshot().generation, gen_before);
+
+        // The game quit: the badge clears and the shelf re-sorts back.
+        shared.set_running(&std::collections::HashSet::new());
+        let after = shared.snapshot();
+        assert!(after.games.iter().all(|g| !g.running));
+        assert!(after.generation > gen_before, "a real change does re-sync");
+    }
+
+    /// A cached catalog is a normal `Ready` shelf that merely knows it is a memory — never an
+    /// error, and never a lesser phase. The live fetch reconciling it clears the flag.
+    #[test]
+    fn a_cached_catalog_is_ready_and_stale_until_the_host_answers() {
+        let g = |t: &str| LibraryGame {
+            id: format!("steam:{t}"),
+            title: t.to_string(),
+            store: "steam".into(),
+            launcher: false,
+            icon: String::new(),
+            platform: None,
+            running: false,
+        };
+        let shared = LibraryShared::default();
+        shared.set_games_cached(vec![g("Celeste"), g("Tunic")]);
+        let cached = shared.snapshot();
+        assert!(matches!(cached.phase, LibraryPhase::Ready));
+        assert_eq!(cached.stale, Stale::Waking);
+        assert!(cached.stale.note().is_some());
+        // The retry window closed with no answer: same titles, different words.
+        shared.set_stale(Stale::Offline);
+        assert_eq!(shared.snapshot().stale, Stale::Offline);
+        shared.set_games(vec![g("Celeste"), g("Tunic"), g("Hades")]);
+        let live = shared.snapshot();
+        assert_eq!(
+            live.stale,
+            Stale::No,
+            "the host answered — these are observed now"
+        );
+        assert!(live.stale.note().is_none());
+        assert_eq!(live.games.len(), 3);
+        // A late give-up from an abandoned fetch must not mark a fresh library stale.
+        shared.set_stale(Stale::Offline);
+        assert_eq!(shared.snapshot().stale, Stale::No);
     }
 
     /// A library with no launcher entries is untouched — the whole point of the grouping being
@@ -1412,11 +1679,16 @@ mod tests {
                     launcher: false,
                     icon: String::new(),
                     platform: None,
+                    running: false,
                 })
                 .collect(),
         );
-        let (_, games, _) = shared.snapshot();
-        let titles: Vec<&str> = games.iter().map(|g| g.title.as_str()).collect();
+        let titles: Vec<String> = shared
+            .snapshot()
+            .games
+            .iter()
+            .map(|g| g.title.clone())
+            .collect();
         assert_eq!(titles, ["Celeste", "Portal 2", "Tunic"]);
     }
 

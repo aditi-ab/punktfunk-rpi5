@@ -262,6 +262,7 @@ fn a_pinned_cards_library_launches_with_its_profile() {
         launcher: false,
         icon: String::new(),
         platform: None,
+        running: false,
     }]);
     s.handle_menu(MenuEvent::Confirm);
     match s.take_action() {
@@ -294,6 +295,7 @@ fn a_primary_tiles_library_leaves_the_profile_to_the_binding() {
         launcher: false,
         icon: String::new(),
         platform: None,
+        running: false,
     }]);
     s.handle_menu(MenuEvent::Confirm);
     assert!(matches!(
@@ -647,6 +649,7 @@ fn mixed_library(library: &LibraryShared) {
             launcher,
             icon: String::new(),
             platform: platform.map(str::to_string),
+            running: false,
         }
     };
     library.set_games(vec![
@@ -676,19 +679,21 @@ fn the_setting_hands_a_multi_platform_library_over_to_collections() {
     for (want_collections, enabled) in [(true, true), (false, false)] {
         let (mut s, _console, library) = shell(vec![
             Screen::Home(HomeScreen::new()),
-            Screen::Library(LibraryScreen::new(&hosts()[0])),
+            Screen::Library(LibraryScreen::new(&hosts()[0], 0)),
         ]);
         s.settings.library_collections = enabled;
 
-        // The shelf must see its OWN fetch go out before it will read the model: a library
-        // that is Ready before the fetch is the PREVIOUS host's, still sitting in the shared
-        // model. A default library is Loading, so this frame is that proof.
+        // The shelf reads the model only once its OWN fetch has begun: a library that is Ready
+        // before that is the PREVIOUS host's, still sitting in the shared model. `begin_fetch`
+        // is what the service thread does when it drains the queued `FetchLibrary`, and the
+        // epoch it raises is what the shelf compares against the one it was pushed at.
         s.sync();
         assert!(
             matches!(s.stack.last(), Some(Screen::Library(_))),
             "nothing to hand over to while the fetch is still out"
         );
 
+        library.begin_fetch();
         library.set_games(games.clone());
         s.sync();
 
@@ -717,10 +722,11 @@ fn the_setting_hands_a_multi_platform_library_over_to_collections() {
 fn one_collection_is_not_worth_a_screen() {
     let (mut s, _console, library) = shell(vec![
         Screen::Home(HomeScreen::new()),
-        Screen::Library(LibraryScreen::new(&hosts()[0])),
+        Screen::Library(LibraryScreen::new(&hosts()[0], 0)),
     ]);
     s.settings.library_collections = true;
     s.sync();
+    library.begin_fetch();
     library.set_games(
         platform_games()
             .into_iter()
@@ -803,6 +809,7 @@ fn collections_is_offered_only_when_there_is_something_to_browse() {
             launcher: false,
             icon: String::new(),
             platform: None,
+            running: false,
         },
         crate::library::LibraryGame {
             id: "b".into(),
@@ -811,6 +818,7 @@ fn collections_is_offered_only_when_there_is_something_to_browse() {
             launcher: false,
             icon: String::new(),
             platform: None,
+            running: false,
         },
     ]);
     s.handle_menu(MenuEvent::Secondary);
@@ -1066,29 +1074,33 @@ fn dump_console_screens() {
             launcher: false,
             icon: String::new(),
             platform: None,
+            running: false,
         })
         .collect(),
     );
-    let (mut s2, _c2, _l2) = {
+    // A shell parked on this host's shelf. A closure rather than one inline block because
+    // there are three scenes over it now — the coverflow, and the sort/view bar at both
+    // palette poles — and each needs its own shell, since the entrance and the bar's focus
+    // are per-shell state that cannot be rewound.
+    let shelf_shell = || {
         let console2 = ConsoleShared::default();
         console2.set_hosts(hosts());
-        let bus = ConsoleBus::default();
-        let sh = Shell::new(
-            console2.clone(),
+        Shell::new(
+            console2,
             library.clone(),
-            bus,
+            ConsoleBus::default(),
             ConsoleOptions {
                 device_name: "deck".into(),
                 deck: false,
             },
             vec![
                 Screen::Home(HomeScreen::new()),
-                Screen::Library(LibraryScreen::new(&hosts()[0])),
+                Screen::Library(LibraryScreen::new(&hosts()[0], 0)),
             ],
         )
-        .unwrap();
-        (sh, console2, library.clone())
+        .unwrap()
     };
+    let mut s2 = shelf_shell();
     s2.handle_menu(MenuEvent::Move(MenuDir::Right));
     s2.handle_menu(MenuEvent::Move(MenuDir::Right));
     // 80 frames, not 40: this shelf carries no art, so it takes the entrance's 400 ms
@@ -1096,6 +1108,25 @@ fn dump_console_screens() {
     // spinner. At 40×8 ms the dump could finish inside the wait and shoot the SPINNER while
     // claiming to be the coverflow — a screenshot that lies is worse than a missing one.
     dump(&mut s2, 80, 8, "07-library", true);
+
+    // …and the same shelf with the SORT/VIEW bar focused, which is the only state that draws
+    // the bar's accent wash. There was no shot of it, which is how the wash shipped covering
+    // the whole 46 dp band while its content occupies the top 34 — 2 dp of padding above the
+    // pills and 14 below, a backdrop its own content visibly sat high inside. Shot at BOTH
+    // palette poles because the wash is `accent(0.14)`: a translucent accent reads differently
+    // over a dark field than over a pale one, and this crate has been bitten by exactly that.
+    for (name, palette) in [
+        ("07c-library-bar", "violet"),
+        ("07c-library-bar-mint", "mint"),
+    ] {
+        let mut s4 = shelf_shell();
+        s4.settings.ui_palette = palette.to_string();
+        // Settle the shelf first (same 400 ms art-wait as above), THEN Up to the bar: pressing
+        // before the field exists would be swallowed and the bar would never take focus.
+        dump(&mut s4, 80, 8, "_07c-settle", true);
+        s4.handle_menu(MenuEvent::Move(MenuDir::Up));
+        dump(&mut s4, 20, 8, name, true);
+    }
 
     // Collections, the drill-in, on a library that actually has PLATFORMS — the scene above
     // has none, so collating it would yield one group and witness nothing.
@@ -1215,6 +1246,7 @@ fn platform_games() -> Vec<crate::library::LibraryGame> {
         launcher: false,
         icon: String::new(),
         platform: Some((*platform).to_string()),
+        running: false,
     })
     .collect()
 }
@@ -1243,7 +1275,7 @@ fn collections_shell_inner(
         },
         vec![
             Screen::Home(HomeScreen::new()),
-            Screen::Library(LibraryScreen::new(&hosts()[0])),
+            Screen::Library(LibraryScreen::new(&hosts()[0], 0)),
         ],
     )
     .unwrap();

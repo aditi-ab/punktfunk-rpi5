@@ -451,13 +451,40 @@ impl ServiceState {
     fn handle(&mut self, cmd: ConsoleCmd) {
         match cmd {
             ConsoleCmd::FetchLibrary { addr, mgmt, fp_hex } => {
+                // Opening a library is the earliest honest signal that somebody intends to
+                // play, so the box gets woken HERE rather than at connect time — by which
+                // point they have chosen a title and are sitting through a cold boot. Resolved
+                // the same way `Wake` does, and empty for a host with no MAC on record, which
+                // simply means the fetch asks once instead of retrying across a boot window.
+                let macs = trust::KnownHosts::load()
+                    .hosts
+                    .iter()
+                    .find(|h| (!fp_hex.is_empty() && h.fp_hex == fp_hex) || h.addr == addr)
+                    .map(|h| h.mac.clone())
+                    .unwrap_or_default();
                 spawn_fetch(
                     self.library.clone(),
                     addr,
                     mgmt,
                     self.identity.clone(),
+                    fp_hex.clone(),
                     trust::parse_hex32(&fp_hex),
+                    macs,
                 );
+            }
+            ConsoleCmd::RefreshRunning { addr, mgmt, fp_hex } => {
+                // Blocking network on a worker, like every other command here: the service
+                // loop's own host refresh must keep running while a just-ended stream's host
+                // is asked what it still has up.
+                let shared = self.library.clone();
+                let identity = self.identity.clone();
+                let pin = trust::parse_hex32(&fp_hex);
+                std::thread::Builder::new()
+                    .name("punktfunk-running".into())
+                    .spawn(move || {
+                        shared.set_running(&running_ids(&addr, mgmt, &identity, pin));
+                    })
+                    .ok();
             }
             ConsoleCmd::SendLogs {
                 addr,
@@ -592,6 +619,10 @@ impl ServiceState {
                 if let Err(e) = known.save() {
                     tracing::warn!(error = %format!("{e:#}"), "saving known hosts");
                 }
+                // A forgotten host leaves no list of what somebody plays behind on disk. The
+                // catalog cache is keyed on the fingerprint, so this is the only moment that
+                // key is still known.
+                pf_client_core::library_cache::forget(&gone.fp_hex);
                 tracing::info!(name = %gone.name, addr = %gone.addr, "host forgotten");
                 // It may still be advertising, in which case it comes straight back as a
                 // DISCOVERED row — unsaved and unpaired, which is the honest state.
@@ -888,16 +919,43 @@ fn spawn_wake(
         .ok();
 }
 
+/// How long to keep asking a host we have just sent a magic packet to. A cold box takes
+/// 20–60 s to POST and start serving, so one attempt would almost always land on a machine
+/// that is still booting — the same 90-second budget `spawn_wake` allows.
+const WAKE_ATTEMPTS: u32 = 12;
+const WAKE_RETRY_EVERY: Duration = Duration::from_secs(5);
+/// Re-send the magic packet this often while retrying. A single packet can be missed, and some
+/// NICs only wake on a fresh one after dropping into a deeper sleep state — `spawn_wake`'s rule,
+/// expressed in this loop's units (every other attempt ≈ every 10 s).
+const WAKE_RESEND_EVERY: u32 = 2;
+
 /// Fetch the library off the service thread, then stream poster art into the shared
 /// model as results land (the renderer drains `push_art` per frame).
+///
+/// Three things happen before the host is ever asked, and the order is the point:
+/// 1. the CACHED catalog goes up immediately, marked stale — a library is the screen a player
+///    uses to decide what to play, and an empty one while a sleeping box boots is the opposite
+///    of useful;
+/// 2. a magic packet goes out, so the box warms while they are still choosing;
+/// 3. only then does the live fetch start, retrying across the boot window.
+///
+/// A cached catalog also outranks a failure: if the host never answers, the titles on screen are
+/// still the right ones to choose from, and replacing them with a red error because a box is
+/// asleep is precisely what the cache exists to prevent.
 fn spawn_fetch(
     shared: LibraryShared,
     addr: String,
     mgmt: u16,
     identity: (String, String),
+    fp_hex: String,
     pin: Option<[u8; 32]>,
+    macs: Vec<String>,
 ) {
-    shared.set_phase(LibraryPhase::Loading);
+    // `begin_fetch`, not `set_phase(Loading)`: it also advances the model's fetch epoch, which
+    // is how a shelf pushed a moment ago knows the titles it is about to see are its own rather
+    // than the previous host's. A cached catalog can land within a millisecond of this, so there
+    // is no phase transition for anyone to observe.
+    shared.begin_fetch();
     std::thread::Builder::new()
         .name("punktfunk-library".into())
         .spawn(move || {
@@ -905,42 +963,134 @@ fn spawn_fetch(
                 load_fake(&shared, &path);
                 return;
             }
-            match library::fetch_games(&addr, mgmt, &identity, pin) {
-                Ok(games) => {
-                    let base = library::base_url(&addr, mgmt);
-                    let jobs: VecDeque<(String, Vec<String>)> = games
-                        .iter()
-                        .map(|g| (g.id.clone(), g.art.poster_candidates(&base)))
-                        .filter(|(_, candidates)| !candidates.is_empty())
-                        .collect();
-                    shared.set_games(
-                        games
-                            .iter()
-                            .map(|g| LibraryGame {
-                                id: g.id.clone(),
-                                title: g.title.clone(),
-                                store: g.store.clone(),
-                                launcher: g.is_launcher(),
-                                icon: g.icon_token().unwrap_or_default().to_string(),
-                                platform: g.platform.clone(),
-                            })
-                            .collect(),
-                    );
-                    if !jobs.is_empty() {
-                        let rx = library::spawn_art_fetch(base, identity, pin, jobs);
-                        while let Ok((id, bytes)) = rx.recv_blocking() {
-                            shared.push_art(id, bytes);
+            // Whatever we already know about this host, on screen before a single packet goes
+            // out. Keyed on the pinned fingerprint, so a box that came back on a new DHCP lease
+            // is still recognised as the same host with the same library.
+            let mut have_cached = false;
+            if let Some(cached) = pf_client_core::library_cache::load(&fp_hex) {
+                if !cached.games.is_empty() {
+                    have_cached = true;
+                    shared.set_games_cached(to_model(&cached.games));
+                }
+            }
+            // Fire-and-forget, and deliberately unconditional rather than only when the host
+            // looks offline: a magic packet is one datagram that an already-awake machine
+            // ignores, so finding out whether it is needed costs more than sending it.
+            let waking = !macs.is_empty();
+            let last_ip = addr.parse::<Ipv4Addr>().ok();
+            if waking {
+                wol::wake(&macs, last_ip);
+            }
+
+            let attempts = if waking { WAKE_ATTEMPTS } else { 1 };
+            let mut last_err = None;
+            let mut fetched = None;
+            for attempt in 0..attempts {
+                match library::fetch_games(&addr, mgmt, &identity, pin) {
+                    Ok(games) => {
+                        fetched = Some(games);
+                        break;
+                    }
+                    Err(e) => {
+                        // Anything other than "can't reach it" is settled — a rejected
+                        // certificate does not become acceptable by waiting, and retrying an
+                        // unpaired host twelve times only delays telling the user what is
+                        // actually wrong.
+                        let retryable = matches!(e, library::LibraryError::Unreachable(_));
+                        last_err = Some(e);
+                        if !retryable || attempt + 1 >= attempts {
+                            break;
                         }
+                        if attempt % WAKE_RESEND_EVERY == WAKE_RESEND_EVERY - 1 {
+                            wol::wake(&macs, last_ip);
+                        }
+                        std::thread::sleep(WAKE_RETRY_EVERY);
                     }
                 }
-                Err(e) => shared.set_phase(LibraryPhase::Error {
-                    title: "Couldn't load the library".into(),
-                    body: e.to_string(),
-                    can_retry: true,
-                }),
+            }
+
+            let Some(games) = fetched else {
+                let e = last_err.expect("the loop runs at least once and every miss records why");
+                if have_cached {
+                    // The shelf stays; only the words change. The player can still pick a title
+                    // — the launch will wake and dial the host on its own.
+                    tracing::info!(%addr, error = %e, "library fetch failed; keeping the cached shelf");
+                    shared.set_stale(pf_console_ui::Stale::Offline);
+                } else {
+                    shared.set_phase(LibraryPhase::Error {
+                        title: "Couldn't load the library".into(),
+                        body: e.to_string(),
+                        can_retry: true,
+                    });
+                }
+                return;
+            };
+
+            let base = library::base_url(&addr, mgmt);
+            let jobs: VecDeque<(String, Vec<String>)> = games
+                .iter()
+                .map(|g| (g.id.clone(), g.art.poster_candidates(&base)))
+                .filter(|(_, candidates)| !candidates.is_empty())
+                .collect();
+            shared.set_games(to_model(&games));
+            // Remembered AFTER it is on screen: the disk write is not on the path to a shelf.
+            pf_client_core::library_cache::store(&fp_hex, &games);
+            // What the host has up right now, so a title the player can return to says so.
+            // Deliberately after the catalog — a slow `/status` must not hold the titles back —
+            // and never fatal: an older host answers nothing and every badge simply stays off.
+            shared.set_running(&running_ids(&addr, mgmt, &identity, pin));
+            if !jobs.is_empty() {
+                let rx = library::spawn_art_fetch(base, identity, pin, jobs);
+                while let Ok((id, bytes)) = rx.recv_blocking() {
+                    shared.push_art(id, bytes);
+                }
             }
         })
         .ok();
+}
+
+/// The wire catalog in the shell's own terms.
+///
+/// One conversion, because there are now three callers (a live fetch, a cached one and the dev
+/// hook) and a fourth that quietly dropped a field would be a shelf missing its launcher grouping
+/// or its platform line on one path only.
+///
+/// `running` is deliberately NOT derived here: it is host state that arrives from `/status`,
+/// separately and later, and the catalog this reads from is the same shape that gets written to
+/// the disk cache. Seeding it from a catalog would be how a cached shelf comes back claiming a
+/// game is up because it was up the last time anybody looked.
+fn to_model(games: &[library::GameEntry]) -> Vec<LibraryGame> {
+    games
+        .iter()
+        .map(|g| LibraryGame {
+            id: g.id.clone(),
+            title: g.title.clone(),
+            store: g.store.clone(),
+            launcher: g.is_launcher(),
+            icon: g.icon_token().unwrap_or_default().to_string(),
+            platform: g.platform.clone(),
+            running: false,
+        })
+        .collect()
+}
+
+/// Which library ids the host has up right now — the Resume set.
+///
+/// Best-effort by contract (see [`library::fetch_running`]): an older host, an unreachable one or
+/// a shape we don't recognise yields an empty set, which correctly clears every badge rather than
+/// failing anything. Entries with no `app_id` — an operator-typed GameStream command — are dropped:
+/// there is no catalog entry to badge.
+fn running_ids(
+    addr: &str,
+    mgmt: u16,
+    identity: &(String, String),
+    pin: Option<[u8; 32]>,
+) -> std::collections::HashSet<String> {
+    library::fetch_running(addr, mgmt, identity, pin)
+        .into_iter()
+        .filter(|g| g.is_up())
+        .filter_map(|g| g.app_id)
+        .collect()
 }
 
 /// Dev hook: entries from a JSON file; portrait paths starting with `/` load from disk.
@@ -956,17 +1106,5 @@ fn load_fake(shared: &LibraryShared, path: &str) {
             }
         }
     }
-    shared.set_games(
-        games
-            .iter()
-            .map(|g| LibraryGame {
-                id: g.id.clone(),
-                title: g.title.clone(),
-                store: g.store.clone(),
-                launcher: g.is_launcher(),
-                icon: g.icon_token().unwrap_or_default().to_string(),
-                platform: g.platform.clone(),
-            })
-            .collect(),
-    );
+    shared.set_games(to_model(&games));
 }

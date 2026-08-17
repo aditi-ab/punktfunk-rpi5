@@ -159,7 +159,8 @@ impl CollectionsScreen {
     /// the tiles hold labels and ids, not games.
     fn sync(&mut self, library: &LibraryShared) {
         if library.generation() != self.generation {
-            let (_, games, generation) = library.snapshot();
+            let snap = library.snapshot();
+            let (games, generation) = (snap.games, snap.generation);
             self.generation = generation;
             self.groups = collate(&games, self.sort, Some(GroupBy::Platform))
                 .into_iter()
@@ -274,7 +275,13 @@ impl CollectionsScreen {
             MenuEvent::JumpForward => self.step_sort(1, ctx),
             MenuEvent::Confirm => {
                 let g = self.groups.get(self.cursor.max(0) as usize)?;
-                let mut shelf = super::library::LibraryScreen::new(&self.host);
+                // The CURRENT epoch: a drill-in raises no fetch of its own — it filters the
+                // list already in the model — so the titles it shows are this epoch's by
+                // definition. (`set_filter` marks it drilled, which refuses a second
+                // collections hand-over regardless; this just keeps the epoch honest rather
+                // than leaning on that.)
+                let mut shelf =
+                    super::library::LibraryScreen::new(&self.host, ctx.library.fetch_epoch());
                 shelf.set_filter(g.key.clone(), g.label.clone());
                 // Hand the decoded posters DOWN as well. These are the very covers this
                 // screen just fanned on the tile the user pressed; without this the drill-in
@@ -290,7 +297,8 @@ impl CollectionsScreen {
             // Opened from a shelf's own Y, that shelf is one B away and this would be a
             // second, deeper copy of it.
             MenuEvent::Secondary if self.root => {
-                let mut shelf = super::library::LibraryScreen::new(&self.host);
+                let mut shelf =
+                    super::library::LibraryScreen::new(&self.host, ctx.library.fetch_epoch());
                 shelf.all_titles();
                 shelf.adopt_art(self.art.clone());
                 fx.push(Screen::Library(shelf));
@@ -835,6 +843,7 @@ mod tests {
                     launcher: false,
                     icon: String::new(),
                     platform: Some(if i < 4 { "PS2".into() } else { "PS3".into() }),
+                    running: false,
                 })
                 .collect(),
         );
@@ -1034,6 +1043,7 @@ mod tests {
                 launcher: true,
                 icon: "steam".into(),
                 platform: Some("Launchers".into()),
+                running: false,
             },
             LibraryGame {
                 id: "g0".into(),
@@ -1042,6 +1052,7 @@ mod tests {
                 launcher: false,
                 icon: String::new(),
                 platform: Some("PS3".into()),
+                running: false,
             },
         ]);
         let mut s = CollectionsScreen::new(&host(), SortKey::HostOrder);

@@ -188,7 +188,12 @@ impl SkiaOverlay {
             ConsoleEntry::Home => vec![Screen::Home(crate::screens::home::HomeScreen::new())],
             ConsoleEntry::Library(host) => vec![
                 Screen::Home(crate::screens::home::HomeScreen::new()),
-                Screen::Library(crate::screens::library::LibraryScreen::new(&host)),
+                // A freshly-built model, so the epoch is 0 and the `--browse` entry's own
+                // `FetchLibrary` (queued by the binary right after this) is the first to raise it.
+                Screen::Library(crate::screens::library::LibraryScreen::new(
+                    &host,
+                    library.fetch_epoch(),
+                )),
             ],
         };
         let shell = Shell::new(console.clone(), library.clone(), bus.clone(), opts, stack)?;

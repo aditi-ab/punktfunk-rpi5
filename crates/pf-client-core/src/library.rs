@@ -5,7 +5,7 @@
 //! read-only library routes, no bearer token. The host's self-signed certificate is
 //! verified by its pinned SHA-256 fingerprint (`KnownHost::fp_hex`), not a CA chain.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,13 +19,17 @@ pub const DEFAULT_MGMT_PORT: u16 = 47990;
 /// entries, host-relative proxy paths (`/api/v1/library/art/...`) for Steam titles. The
 /// wire shape also carries a `logo` (a transparent title logo) — not a poster kind, so
 /// serde just skips it here.
-#[derive(Clone, Debug, Default, Deserialize)]
+///
+/// `Serialize` as well as `Deserialize` so a catalog can be written back out verbatim by
+/// [`crate::library_cache`]; `skip_serializing_if` keeps a cached file the same shape the host
+/// sent, rather than a wall of `null`s.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Artwork {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub portrait: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hero: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header: Option<String>,
 }
 
@@ -59,7 +63,10 @@ impl Artwork {
 /// `custom:<id>`) and is also the launch handle the Hello carries when a session is
 /// started from the library. The host's `launch` spec field is deliberately not
 /// deserialized — launching goes by id, the host resolves the spec itself.
-#[derive(Clone, Debug, Deserialize)]
+///
+/// `Serialize` for [`crate::library_cache`]'s benefit — see [`Artwork`]. The `launch` spec the
+/// host also sends stays undecoded, so a cached catalog loses nothing a client was using.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GameEntry {
     pub id: String,
     /// Which store surfaced it (`"steam"`, `"custom"`, future `"heroic"`/`"gog"`/…) —
@@ -70,14 +77,14 @@ pub struct GameEntry {
     pub art: Artwork,
     /// The system the title runs on (`"PC"`, `"PS2"`, …) — free-form display string from the
     /// host's flattened `GameMeta`; the rest of the metadata is not decoded until a UI needs it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
     /// `"game"` (the default, and what an older host omits) or `"launcher"` — an entry that opens
     /// the launcher itself (Steam Big Picture, Heroic) rather than a title. A UI may group these
     /// separately; one that doesn't renders them as ordinary tiles, which is the intended
     /// degradation (design D4). Kept a plain string: the host owns the vocabulary, and an unknown
     /// future value must never fail the whole library decode.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     /// Which brand mark to draw for this entry — `"steam"`, `"heroic"`, `"playnite"` — or `None`
     /// when the host sent none (every older host, and every ordinary title).
@@ -88,7 +95,7 @@ pub struct GameEntry {
     /// guarantees the slug shape (`[a-z][a-z0-9-]{0,31}`), which is what makes it safe to
     /// interpolate into a resource name or an asset lookup — but see [`GameEntry::icon_token`],
     /// which re-checks rather than trusting it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
 }
 
@@ -214,6 +221,80 @@ pub fn fetch_games(
         Err(e) => return Err(classify(e)),
     };
     serde_json::from_str(&body).map_err(|e| LibraryError::Unreachable(format!("bad JSON: {e}")))
+}
+
+/// One game the host currently has launched, from `GET /api/v1/status`.
+///
+/// A deliberately partial mirror of the host's `ActiveGame`: only the fields a client can act on.
+/// The web console's view of this payload carries more (which session, which plane, the grace
+/// countdown), and none of that is a player's business from a library shelf.
+#[derive(Clone, Debug, Deserialize)]
+pub struct RunningGame {
+    /// Store-qualified library id (`steam:570`) — the key that lines this up with a
+    /// [`GameEntry`]. Absent for an operator-typed GameStream command, which has no catalog
+    /// entry behind it.
+    #[serde(default)]
+    pub app_id: Option<String>,
+    #[serde(default)]
+    pub title: String,
+    /// `launching` | `running` | `exited` | `untracked` | `grace`. A plain String on purpose:
+    /// the host owns the vocabulary and adds to it (`untracked` arrived in 0.30), so an unknown
+    /// value must never fail the decode of the whole list.
+    #[serde(default)]
+    pub state: String,
+}
+
+impl RunningGame {
+    /// Is this title *up on the host right now* — i.e. would picking it take the player back
+    /// into it rather than start it?
+    ///
+    /// `untracked` counts: the host cannot follow that process, but it did launch it and has no
+    /// evidence it stopped. `grace` counts too — its session is gone but the game is still
+    /// running, which is precisely the case where getting back in promptly matters most. Only a
+    /// confirmed `exited` does not.
+    pub fn is_up(&self) -> bool {
+        self.state != "exited"
+    }
+}
+
+/// Just the slice of `/status` a client reads. Everything else on that payload is the operator
+/// console's business, and decoding only what we use keeps an unrelated schema change on the
+/// host from breaking a library screen.
+#[derive(Deserialize)]
+struct HostStatus {
+    #[serde(default)]
+    games: Vec<RunningGame>,
+}
+
+/// What the host currently has running, from `GET /api/v1/status`.
+///
+/// Same lane, same identity, no new host work: `/status` is already on the paired-certificate
+/// allowlist (the host's `mgmt::auth::cert_may_access`) alongside `/library`, and has carried a
+/// `games[]` array since the session⇄game lifetime work. Clients simply never read it — so a
+/// player had no way to see, from the device they browse on, that something was already up.
+///
+/// **Best-effort by contract**: an older host, an unreachable one, or a shape we don't recognize
+/// yields an empty list rather than an error. Nothing here is worth failing a library screen
+/// over — the worst case is a Resume badge that doesn't appear.
+pub fn fetch_running(
+    addr: &str,
+    mgmt_port: u16,
+    identity: &(String, String),
+    pin: Option<[u8; 32]>,
+) -> Vec<RunningGame> {
+    let Ok(agent) = agent(identity, pin) else {
+        return Vec::new();
+    };
+    let url = format!("{}/api/v1/status", base_url(addr, mgmt_port));
+    let Ok(mut resp) = agent.get(&url).call() else {
+        return Vec::new();
+    };
+    let Ok(body) = resp.body_mut().read_to_string() else {
+        return Vec::new();
+    };
+    serde_json::from_str::<HostStatus>(&body)
+        .map(|s| s.games)
+        .unwrap_or_default()
 }
 
 /// Poster-art byte fetch cap — largest Steam hero assets run a few MB; anything bigger is
@@ -355,6 +436,70 @@ mod tests {
             games[1].platform.is_none(),
             "pre-metadata hosts still parse"
         );
+    }
+
+    #[test]
+    fn running_games_decode_and_untracked_counts_as_up() {
+        // The `/status` slice a client reads, in the shape `mgmt::host` serializes: `app_id` and
+        // `store` omitted on an operator-typed GameStream command, extra fields present.
+        let json = r#"{"games":[
+            {"app_id":"steam:570","title":"Dota 2","state":"running","plane":"native",
+             "client":"iPad","session_id":7},
+            {"app_id":"steam:1091500","title":"Cyberpunk","state":"untracked","plane":"native",
+             "client":"Deck"},
+            {"app_id":"custom:x","title":"Waiting","state":"grace","plane":"native",
+             "client":"TV","grace_remaining_s":252},
+            {"app_id":"steam:4","title":"Gone","state":"exited","plane":"native","client":"TV"},
+            {"title":"A typed command","state":"running","plane":"gamestream","client":"TV"}
+        ],"video_streaming":false}"#;
+        let status: HostStatus = serde_json::from_str(json).expect("the /status slice decodes");
+        assert_eq!(status.games.len(), 5);
+        // `untracked` means the host cannot FOLLOW the process, not that the game is gone — the
+        // whole point of the state, and the one a Resume badge must not misread.
+        assert!(status.games[1].is_up(), "untracked is up");
+        assert!(
+            status.games[2].is_up(),
+            "grace is up — resuming matters most here"
+        );
+        assert!(!status.games[3].is_up(), "only a confirmed exit is down");
+        assert!(
+            status.games[4].app_id.is_none(),
+            "a typed command has no catalog id"
+        );
+    }
+
+    #[test]
+    fn an_unknown_state_from_a_newer_host_still_decodes_and_reads_as_up() {
+        // The host owns this vocabulary and adds to it. A value we've never seen must degrade to
+        // "something is up" rather than failing the decode of the whole list — the badge being
+        // slightly optimistic is nothing next to losing every other game's state.
+        let one: RunningGame =
+            serde_json::from_str(r#"{"app_id":"steam:1","title":"T","state":"hibernating"}"#)
+                .expect("an unknown state is not a decode failure");
+        assert!(one.is_up());
+    }
+
+    #[test]
+    fn a_catalog_round_trips_through_the_cache_encoding() {
+        // `library_cache` writes `GameEntry` back out verbatim, so the Serialize half has to
+        // preserve everything the Deserialize half read — including the fields an older host
+        // omits, which must stay omitted rather than becoming nulls a re-read misparses.
+        let json = r#"[{"id":"steam:570","store":"steam","title":"Dota 2","platform":"PC",
+             "art":{"portrait":"/api/v1/library/art/steam:570/portrait"},"role":"launcher",
+             "icon":"steam"},
+            {"id":"custom:abc","store":"custom","title":"My Emu","art":{}}]"#;
+        let games: Vec<GameEntry> = serde_json::from_str(json).unwrap();
+        let back: Vec<GameEntry> =
+            serde_json::from_str(&serde_json::to_string(&games).unwrap()).unwrap();
+        assert_eq!(back.len(), 2);
+        assert!(back[0].is_launcher());
+        assert_eq!(back[0].icon_token(), Some("steam"));
+        assert_eq!(back[0].platform.as_deref(), Some("PC"));
+        assert_eq!(
+            back[0].art.poster_candidates("https://h:47990"),
+            vec!["https://h:47990/api/v1/library/art/steam:570/portrait"]
+        );
+        assert!(back[1].platform.is_none() && back[1].role.is_none());
     }
 
     #[test]

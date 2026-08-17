@@ -170,7 +170,12 @@ impl HomeScreen {
                         mgmt: h.mgmt_port,
                         fp_hex: h.fp_hex.clone(),
                     });
-                    fx.push(Screen::Library(super::library::LibraryScreen::new(h)));
+                    // The epoch is read HERE, before the command above is drained, so the shelf
+                    // can tell its own fetch's titles from the ones already in the model.
+                    fx.push(Screen::Library(super::library::LibraryScreen::new(
+                        h,
+                        ctx.library.fetch_epoch(),
+                    )));
                     Some(MenuPulse::Confirm)
                 }
                 Some(_) => {

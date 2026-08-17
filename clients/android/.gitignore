@@ -1,6 +1,8 @@
 # Gradle / Android build artifacts
 .gradle/
 build/
+# Kotlin compiler daemon session files, written by any Gradle invocation.
+.kotlin/
 local.properties
 *.iml
 .idea/
