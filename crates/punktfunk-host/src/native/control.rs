@@ -44,6 +44,10 @@ pub(super) async fn run(
     // Host-initiated bitrate re-target (a rebuild re-resolved an Automatic rate): forwarded to
     // the client as a `BitrateChanged` so its controller's climb base tracks the real encoder.
     mut retarget_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
+    // Pipeline-gap announcements (see `gap_tx`): a rebuild that kept the session up stopped the
+    // stream for this many ms, forwarded to the client as a `PipelineGap` so its bitrate
+    // controller discards the report window that straddled our own stall.
+    mut gap_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
     // Mid-session shard renegotiation (design/shard-payload-reneg.md): the wire-MTU watcher
     // asks for a `ShardPayloadChanged` here (this task is the control stream's sole writer),
     // and the client's `ShardPayloadAck`s flow back on `shard_ack_tx` — the grow gate.
@@ -422,6 +426,25 @@ pub(super) async fn run(
                     "encoder re-targeted by a pipeline rebuild — telling the client"
                 );
                 if io::write_msg(&mut ctrl_send, &BitrateChanged { bitrate_kbps: kbps }.encode())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            gap = gap_rx.recv() => {
+                // A rebuild that kept the session up (a mode switch, or the Windows
+                // exclusive-topology eviction recovery) just finished. Tell the client how long
+                // its stream was stopped so its bitrate controller can throw the straddling
+                // report window away instead of reading our own stall as congestion — see
+                // `PipelineGap`. Sent here because this task is the control stream's sole writer,
+                // and sent AFTER the fact so `gap_ms` is a measurement rather than a promise.
+                let Some(gap_ms) = gap else { break }; // data plane gone
+                tracing::info!(
+                    gap_ms,
+                    "pipeline rebuilt in place — telling the client the stream had a gap"
+                );
+                if io::write_msg(&mut ctrl_send, &PipelineGap { gap_ms }.encode())
                     .await
                     .is_err()
                 {

@@ -28,8 +28,8 @@ use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::{FLAG_PIC, FLAG_PROBE, FLAG_SOF};
 use punktfunk_core::quic::{
     classify, endpoint, io, AccessUpdate, BitrateChanged, ClockEcho, ClockProbe, ColorInfo,
-    GrantClass, Hello, LossReport, PairRequest, ProbeRequest, ProbeResult, Reconfigure,
-    Reconfigured, RequestKeyframe, RfiRequest, SetBitrate, Start, Welcome, GRANT_ALL,
+    GrantClass, Hello, LossReport, PairRequest, PipelineGap, ProbeRequest, ProbeResult,
+    Reconfigure, Reconfigured, RequestKeyframe, RfiRequest, SetBitrate, Start, Welcome, GRANT_ALL,
     GRANT_CLIPBOARD, GRANT_GAMEPAD, GRANT_LAUNCH, GRANT_MIC, GRANT_POINTER,
 };
 use punktfunk_core::transport::UdpTransport;
@@ -1422,6 +1422,14 @@ async fn serve_session(
     // downward, with the rebuild it costs. Tell the client instead; `BitrateChanged` already
     // means exactly this and old clients already handle one arriving unprompted.
     let (retarget_tx, retarget_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+    // Pipeline-gap announcements, data plane → control task (the same bridge pattern, for the same
+    // reason: the control task is the control stream's sole writer). A rebuild that keeps the
+    // session up — a mode switch, or the Windows exclusive-topology eviction recovery — still
+    // stops the stream dead for a few hundred milliseconds, and the client's adaptive-bitrate
+    // controller reads the report window that straddles it as congestion. We are the only party
+    // that knows it was us, so we say so: the channel carries the rebuild's length in ms, and the
+    // control task turns it into a `PipelineGap` the client answers by discarding that window.
+    let (gap_tx, gap_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
     // Cursor-forward bridge (M2): the encode loop diffs each frame's cursor serial and hands
     // changed SHAPES here; the control task (the control stream's sole writer) sends them.
     // Same shape as `probe_result_tx`. Wired even when the channel wasn't negotiated — it
@@ -1535,6 +1543,7 @@ async fn serve_session(
         probe_result_rx,
         reconfig_result_rx,
         retarget_rx,
+        gap_rx,
         shard_change_rx,
         shard_ack_tx,
         cursor_shape_rx,
@@ -2124,6 +2133,7 @@ async fn serve_session(
                         probe_result_tx,
                         reconfig_result_tx,
                         retarget_tx,
+                        gap_tx,
                         fec_target: fec_target_dp,
                         phase: phase_ctl,
                         conn: conn_stream,

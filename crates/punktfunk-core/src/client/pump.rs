@@ -86,6 +86,17 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     let clock_rtt_ns = negotiated.clock_rtt_ns;
     let resolved_bitrate_kbps = negotiated.bitrate_kbps;
     let negotiated_codec = negotiated.codec;
+    // What this session's mode + codec could plausibly use — the bound the ABR holds its
+    // probe-measured link ceiling to. Computed here because this is where the Welcome-resolved
+    // geometry lives; the data pump stays codec-agnostic.
+    let stream_cap_kbps = crate::abr::stream_ceiling_kbps(
+        negotiated.mode.width,
+        negotiated.mode.height,
+        negotiated.mode.refresh_hz,
+        negotiated.codec,
+        negotiated.bit_depth,
+        negotiated.chroma_format,
+    );
     // Seed the live offset with the connect-time estimate BEFORE the embedder can observe the
     // client (ready_tx): clock_offset_now_ns() never reads a pre-handshake 0 on a skewed pair.
     clock_offset.store(negotiated.clock_offset_ns, Ordering::Relaxed);
@@ -154,6 +165,11 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     // outbound `CtrlRequest::Keyframe` — the one choke point all emitters funnel through — and
     // the pump drains the count per report window.
     let recovery_kf = Arc::new(AtomicU32::new(0));
+    // Host-announced capture/encode pipeline rebuilds (`PipelineGap`): the control task parks the
+    // gap's length here and the pump drains it every iteration, discarding the report window in
+    // flight. A host-local rebuild starves a window of stream without the link doing anything
+    // wrong, and the controller cannot tell that apart from congestion on its own.
+    let pipeline_gap = Arc::new(AtomicU32::new(0));
     // Host-encode-latency accumulator (the ABR encode signal, see [`EncodeLatAcc`]): the
     // datagram task adds one sample per 0xCF; the pump drains a window mean per report tick.
     let encode_lat = Arc::new(Mutex::new(super::frame_channel::EncodeLatAcc::default()));
@@ -174,6 +190,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             bitrate_ack: bitrate_ack.clone(),
             live_bitrate,
             recovery_kf: recovery_kf.clone(),
+            pipeline_gap: pipeline_gap.clone(),
             clock_offset: clock_offset.clone(),
             clock_gen: clock_gen.clone(),
             clip_event_tx: clip_event_tx.clone(),
@@ -249,9 +266,11 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         fec_recovered,
         bitrate_ack,
         recovery_kf,
+        pipeline_gap,
         bitrate_kbps,
         resolved_bitrate_kbps,
         negotiated_codec,
+        stream_cap_kbps,
     };
     let _ = tokio::task::spawn_blocking(move || pump.run()).await;
 

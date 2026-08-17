@@ -1628,6 +1628,111 @@ mod tests {
         assert_eq!(buf, SEQ_HDR_RAW);
     }
 
+    /// A sequence header carrying `timing_info` must survive a write/read round trip.
+    ///
+    /// This is the field failure: AMF emits `timing_info_present_flag = 1`, whose
+    /// `num_units_in_display_tick` and `time_scale` are `f(32)`, and the reader refused
+    /// any width above 31 — so every AMD AV1 session died with "AV1 parse: more than 31
+    /// (32) bits were requested" on its first access unit and then "No sequence header
+    /// parsed yet" forever after. The writer had always accepted 32 bits, so this crate
+    /// could emit a header it could not read back.
+    ///
+    /// Both values deliberately have their top bit set: a mask computed as
+    /// `(1 << 32) - 1` truncates to zero rather than to all-ones, so a wrong mask shows up
+    /// here as a zero, not as a near-miss.
+    #[test]
+    fn sequence_header_obu_round_trips_timing_info() {
+        use crate::codec::av1::parser::ObuAction;
+        use crate::codec::av1::parser::ParsedObu;
+        use crate::codec::av1::parser::Parser;
+        use crate::codec::av1::parser::TimingInfo;
+
+        const TICK: u32 = 0xDEAD_BEEF;
+        const SCALE: u32 = 0xFFFF_FFFF;
+
+        let seq_hdr = SequenceHeaderObu {
+            obu_header: ObuHeader {
+                obu_type: ObuType::SequenceHeader,
+                extension_flag: false,
+                has_size_field: true,
+                temporal_id: 0,
+                spatial_id: 0,
+            },
+
+            seq_profile: Profile::Profile0,
+            num_planes: 3,
+            still_picture: false,
+            reduced_still_picture_header: false,
+            timing_info_present_flag: true,
+            timing_info: TimingInfo {
+                num_units_in_display_tick: TICK,
+                time_scale: SCALE,
+                equal_picture_interval: false,
+                num_ticks_per_picture_minus_1: 0,
+            },
+            decoder_model_info_present_flag: false,
+            initial_display_delay_present_flag: false,
+            operating_points_cnt_minus_1: 0,
+            frame_width_bits_minus_1: 8,
+            frame_height_bits_minus_1: 7,
+            max_frame_width_minus_1: 319,
+            max_frame_height_minus_1: 239,
+            frame_id_numbers_present_flag: false,
+            use_128x128_superblock: true,
+            enable_filter_intra: true,
+            enable_intra_edge_filter: true,
+            enable_interintra_compound: true,
+            enable_masked_compound: true,
+            enable_warped_motion: true,
+            enable_dual_filter: true,
+            enable_order_hint: true,
+            enable_jnt_comp: true,
+            enable_ref_frame_mvs: true,
+            seq_choose_screen_content_tools: true,
+            seq_force_screen_content_tools: SELECT_SCREEN_CONTENT_TOOLS as u32,
+            seq_choose_integer_mv: true,
+            seq_force_integer_mv: SELECT_INTEGER_MV as u32,
+            order_hint_bits_minus_1: 6,
+            order_hint_bits: 7,
+            enable_superres: false,
+            enable_cdef: true,
+            enable_restoration: true,
+            color_config: ColorConfig {
+                high_bitdepth: false,
+                mono_chrome: false,
+                color_description_present_flag: false,
+                color_range: false,
+                subsampling_x: true,
+                subsampling_y: true,
+                chroma_sample_position: ChromaSamplePosition::Unknown,
+                separate_uv_delta_q: false,
+                ..Default::default()
+            },
+            film_grain_params_present: false,
+
+            ..Default::default()
+        };
+
+        let mut buf = Vec::<u8>::new();
+        Synthesizer::<'_, SequenceHeaderObu, _>::synthesize(&seq_hdr, &mut buf).unwrap();
+
+        let mut parser = Parser::default();
+        let obu = match parser.read_obu(&buf).expect("the OBU header must read") {
+            ObuAction::Process(obu) => obu,
+            ObuAction::Drop(_) => panic!("a sequence header must not be dropped"),
+        };
+        let parsed = parser
+            .parse_obu(obu)
+            .expect("the sequence header must parse");
+        let ParsedObu::SequenceHeader(seq) = parsed else {
+            panic!("expected a sequence header back");
+        };
+
+        assert!(seq.timing_info_present_flag);
+        assert_eq!(seq.timing_info.num_units_in_display_tick, TICK);
+        assert_eq!(seq.timing_info.time_scale, SCALE);
+    }
+
     #[test]
     fn sequence_header_obu_av1_annexb() {
         // Extraced from: ./src/codec/av1/test_data/av1-annexb.ivf.av1

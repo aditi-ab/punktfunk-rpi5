@@ -163,8 +163,13 @@ const DECODE_CAP_SIMILAR_DIV: u32 = 8;
 /// stream barely flowed (a host-side capture stall, an outage, a mid-window pause), so whatever
 /// distress the window carries — a flush, a keyframe-ask burst — is starvation-shaped, not
 /// rate-shaped, and the decoder decoded almost nothing at the nominal rate. Such a window may
-/// still back off (real damage deserves the safe response) but must never be a decode-knee
-/// sample: latching `current_kbps` off a starved window teaches a phantom decoder cap at
+/// still back off on what the CLIENT saw — loss, a flush, a dropped frame mean the same thing
+/// however little flowed, and real damage deserves the safe response — but two things it must
+/// never do. It must never be a decode-knee sample, and it must never carry the HOST-ENCODE
+/// signal: `encode_us` is averaged over the AUs of the window, so when almost none flowed the
+/// mean describes whatever interrupted them rather than the cost of encoding at this rate (see
+/// the withholding in [`BitrateController::on_window`]). Latching `current_kbps` off a starved
+/// window teaches a phantom decoder cap at
 /// whatever rate the stall interrupted (the periodic-capture-stall field case: every 5 s cycle
 /// offers another pair of "backoffs" at the same rate — a bogus latch that then fights the
 /// re-probe ladder for minutes). Deliberately far below the ×¾ utilization bar climbs require:
@@ -203,6 +208,61 @@ fn ceiling_cap_from_env() -> Option<u32> {
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|&m| m > 0)
         .map(|m| m.saturating_mul(1_000))
+}
+
+/// The most bitrate this stream's SHAPE could plausibly use, in kbps — the backstop the
+/// probe-measured link ceiling has never had.
+///
+/// The measured ceiling is pure link capacity (`delivered × 0.7`) with no term for what is being
+/// carried, and the utilization gate cannot supply one: a hardware encoder in CBR mode genuinely
+/// fills whatever target it is handed, so "the encoder could not use the rate" never fires. The
+/// field session climbed to 657 Mbps for 1440p120 — 1.49 bits per pixel, some 3× beyond any rate
+/// an inter-coded stream benefits from — and reaching for it drove the client's decode latency
+/// from 0.8 ms to 10 ms.
+///
+/// Deliberately generous. This is a bound on the absurd, not a quality opinion: it is set well
+/// above what anyone actually runs, so it should never bind on a real session, and where it does
+/// bind [`BitrateController::set_ceiling`] says so in the log. A session with an explicit bitrate,
+/// and every PyroWave session, is outside the controller entirely and never reaches here.
+///
+/// It is NOT the answer to "how much is enough" — that is content-dependent and only the encoder
+/// knows it (at minimum QP more bits buy nothing). This is the part that works without new
+/// telemetry.
+pub(crate) fn stream_ceiling_kbps(
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    codec: u8,
+    bit_depth: u8,
+    chroma_format: u8,
+) -> u32 {
+    let pixel_rate = (width as u64)
+        .saturating_mul(height as u64)
+        .saturating_mul(refresh_hz.max(1) as u64);
+    if pixel_rate == 0 {
+        return u32::MAX;
+    }
+    // Milli-bits per pixel, so the whole computation stays in integers. H.264 is the least
+    // efficient of the three and is allowed correspondingly more.
+    let milli_bpp: u64 = match codec {
+        crate::quic::CODEC_H264 => 1_000,
+        _ => 750,
+    };
+    // 10-bit carries 25 % more sample depth; 4:4:4 carries twice the chroma of 4:2:0, which is
+    // half again as many samples overall.
+    let milli_bpp = if bit_depth >= 10 {
+        milli_bpp * 5 / 4
+    } else {
+        milli_bpp
+    };
+    let milli_bpp = if chroma_format == crate::quic::CHROMA_IDC_444 {
+        milli_bpp * 3 / 2
+    } else {
+        milli_bpp
+    };
+    // bits/s = pixel_rate × bpp; kbps = that / 1000. The milli- factor and the kbps divisor
+    // cancel, so this is just pixel_rate × milli_bpp / 1_000_000.
+    u32::try_from(pixel_rate.saturating_mul(milli_bpp) / 1_000_000).unwrap_or(u32::MAX)
 }
 
 /// Score one window's latency sample against its rolling-min baseline, then record it.
@@ -250,6 +310,11 @@ pub(crate) struct BitrateController {
     /// construction so tests exercise the clamp without touching the process environment.
     /// `None` = no cap.
     ceiling_cap_kbps: Option<u32>,
+    /// What this stream's SHAPE could plausibly use (see [`stream_ceiling_kbps`]), set once the
+    /// session's mode and codec are known. `None` = never set, i.e. exactly the old behavior.
+    /// Bounds only what [`set_ceiling`](Self::set_ceiling) LEARNS: the negotiated start rate is a
+    /// number the host resolved on purpose and is left alone.
+    stream_cap_kbps: Option<u32>,
     floor_kbps: u32,
     /// Slow start: true until the first congestion signal — clean windows DOUBLE the rate
     /// (cooldown-paced) instead of the +6 % additive step.
@@ -356,6 +421,7 @@ impl BitrateController {
             // [`on_window`](Self::on_window).
             ceiling_kbps: start_kbps.min(ceiling_cap_kbps.unwrap_or(u32::MAX)),
             ceiling_cap_kbps,
+            stream_cap_kbps: None,
             floor_kbps: FLOOR_KBPS.min(start_kbps.max(1)),
             probing: true,
             owd_means: VecDeque::with_capacity(BASELINE_WINDOWS),
@@ -393,10 +459,30 @@ impl BitrateController {
     /// ceiling was learned; monotonicity is precisely why the user needs it (one inflated
     /// measurement is otherwise permanent for the session).
     pub(crate) fn set_ceiling(&mut self, kbps: u32) {
-        let kbps = kbps.min(self.ceiling_cap_kbps.unwrap_or(u32::MAX));
+        let measured = kbps;
+        let kbps = kbps
+            .min(self.ceiling_cap_kbps.unwrap_or(u32::MAX))
+            .min(self.stream_cap_kbps.unwrap_or(u32::MAX));
+        if self.enabled && kbps < measured {
+            // Say so when it binds. A cap that silently trims what the link offered is exactly
+            // the kind of thing nobody reports and everybody wonders about, so a field log should
+            // carry both numbers.
+            tracing::info!(
+                measured_kbps = measured,
+                bounded_kbps = kbps,
+                "adaptive bitrate: link ceiling bounded by what this stream can use"
+            );
+        }
         if self.enabled && kbps > self.ceiling_kbps {
             self.ceiling_kbps = kbps;
         }
+    }
+
+    /// Teach the controller what this session's mode and codec could plausibly use (see
+    /// [`stream_ceiling_kbps`]). Applied to LEARNED ceilings only, at the same funnel as the
+    /// operator's env cap.
+    pub(crate) fn set_stream_cap(&mut self, kbps: u32) {
+        self.stream_cap_kbps = Some(kbps);
     }
 
     /// The host's [`crate::quic::BitrateChanged`] ack: its clamp is authoritative for what the
@@ -572,13 +658,35 @@ impl BitrateController {
             DECODE_RISE_US,
             DECODE_SEVERE_US,
         );
+        // STARVED (see [`STARVED_DELIVERY_DIV`]): the window carried under a quarter of the rate
+        // it was allowed. Hoisted above the signal scoring because the encode signal below is not
+        // merely inconvenient in such a window, it is not a measurement — see there. `current_kbps`
+        // does not move inside this function, so this is the same value the backoff block reads.
+        let starved =
+            (actual_kbps as u64) * (STARVED_DELIVERY_DIV as u64) < self.current_kbps as u64;
         // Host-encode latency: the same rolling-min-baseline treatment, measuring the HOST'S
         // encoder — the compute-knee down-driver (see [`ENCODE_RISE_US`]). This is the only
         // signal that can push an already-too-high rate back under the knee: the host refuses
         // further climbs while behind cadence, but nothing else ever DESCENDS on a clean LAN.
+        //
+        // Withheld entirely in a STARVED window. `encode_us` is a per-AU host measurement averaged
+        // over the window, so when almost no AUs flowed the mean is taken over the handful that
+        // straddled whatever interrupted them — and their encode time carries that interruption,
+        // not the cost of encoding at this rate. The field case: a 401 ms capture-ring and encoder
+        // rebuild (an exclusive-topology eviction, entirely host-local) produced one window with
+        // `encode_mean_us=15063` against a ~2800 baseline, `actual_kbps=390` against a 20 000
+        // target, and `loss_ppm=0`. That cleared [`ENCODE_SEVERE_US`], took the one-window path,
+        // and cost a ×0.7 plus slow start for the rest of the session — on a link that never
+        // dropped a packet. Passed as absent rather than ignored so it cannot teach the rolling
+        // baseline either: a sample that measures a stall is not evidence about anything.
+        //
+        // The other signals keep their full power here on purpose. Loss, a flush and a dropped
+        // frame describe what reached the CLIENT, and they mean the same thing however little
+        // flowed — the periodic-capture-stall case (see [`STARVED_DELIVERY_DIV`]) still backs off
+        // on one window, as its tests require.
         let (encode_bad, encode_severe) = score_baseline(
             &mut self.encode_means,
-            encode_mean_us,
+            encode_mean_us.filter(|_| !starved),
             ENCODE_RISE_US,
             ENCODE_SEVERE_US,
         );
@@ -708,10 +816,9 @@ impl BitrateController {
                 || self.streak_decode_windows >= BAD_WINDOWS_TO_DECREASE
                 || (recovery_kf >= RECOVERY_KF_BAD && loss_ppm < HEAVY_LOSS_PPM)
                 || (flushed && (decode_bad || decode_mean_us.is_none()));
-            // Starved deciding window (see [`STARVED_DELIVERY_DIV`]): the stream barely flowed,
-            // so the window says nothing about what the decoder can hold at this rate.
-            let starved =
-                (actual_kbps as u64) * (STARVED_DELIVERY_DIV as u64) < self.current_kbps as u64;
+            // `starved` (the deciding window barely flowed, so it says nothing about what the
+            // decoder can hold at this rate) is now computed once at the top of the window — the
+            // same predicate also governs the severe tier and slow start.
             if !self.climb_since_backoff {
                 // Still draining the previous backoff: the host acks a ×0.7 request in ~100 ms,
                 // so this window's rate is one the decoder never choked at while keeping up —
@@ -1158,6 +1265,88 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         c.set_ceiling(10_000); // below the negotiated start → ignored
         assert_eq!(c.ceiling_kbps, 20_000);
+    }
+
+    /// The stream bound must cut the field runaway and must NOT touch a session anyone
+    /// actually runs. Both halves matter: a cap that silently trims a happy user is a
+    /// regression nobody reports.
+    #[test]
+    fn the_stream_bound_cuts_the_absurd_and_spares_the_ordinary() {
+        use crate::quic::{CHROMA_IDC_420, CHROMA_IDC_444, CODEC_H264, CODEC_HEVC};
+
+        // The field session: 1440p120 HEVC Main10 4:2:0. The probe measured 939 Mbps and the
+        // ceiling became 657 Mbps — 1.49 bits/pixel. The client's decode latency was still flat
+        // (0.78 ms) at ~396 Mbps delivered and blew up to 10 ms by ~461 Mbps, so the bound has to
+        // land below that knee to have helped.
+        let field = stream_ceiling_kbps(2560, 1440, 120, CODEC_HEVC, 10, CHROMA_IDC_420);
+        assert!(
+            field < 657_000,
+            "the bound must actually bind on the field case, got {field}"
+        );
+        assert!(
+            field < 460_000,
+            "and land under the decode knee this session found, got {field}"
+        );
+
+        // 1080p60 HEVC 8-bit: people do run 80-100 Mbps here and must not be trimmed.
+        let ordinary = stream_ceiling_kbps(1920, 1080, 60, CODEC_HEVC, 8, CHROMA_IDC_420);
+        assert!(
+            ordinary >= 90_000,
+            "an ordinary 1080p60 session must keep its headroom, got {ordinary}"
+        );
+
+        // H.264 needs more bits for the same picture, and 4:4:4 / 10-bit carry more samples.
+        assert!(
+            stream_ceiling_kbps(1920, 1080, 60, CODEC_H264, 8, CHROMA_IDC_420) > ordinary,
+            "H.264 is allowed more than HEVC"
+        );
+        assert!(
+            stream_ceiling_kbps(1920, 1080, 60, CODEC_HEVC, 10, CHROMA_IDC_420) > ordinary,
+            "10-bit is allowed more than 8-bit"
+        );
+        assert!(
+            stream_ceiling_kbps(1920, 1080, 60, CODEC_HEVC, 8, CHROMA_IDC_444) > ordinary,
+            "4:4:4 is allowed more than 4:2:0"
+        );
+        // A degenerate mode must not produce a bound of zero and strangle the session.
+        assert_eq!(
+            stream_ceiling_kbps(0, 0, 0, CODEC_HEVC, 8, CHROMA_IDC_420),
+            u32::MAX
+        );
+    }
+
+    /// The bound rides the same funnel as the operator's env cap, and binds only what the probe
+    /// LEARNS — a rate the host resolved on purpose is left alone.
+    #[test]
+    fn the_stream_bound_clamps_a_learned_ceiling_only() {
+        let mut c = BitrateController::new(20_000);
+        c.set_stream_cap(100_000);
+        c.set_ceiling(657_000);
+        assert_eq!(c.ceiling_kbps, 100_000, "a learned ceiling is bounded");
+
+        // Never set → exactly the old behaviour.
+        let mut c = BitrateController::new(20_000);
+        c.set_ceiling(657_000);
+        assert_eq!(c.ceiling_kbps, 657_000);
+
+        // A negotiated start rate above the bound stands: the host resolved that number.
+        let mut c = BitrateController::new(300_000);
+        c.set_stream_cap(100_000);
+        assert_eq!(c.ceiling_kbps, 300_000);
+        c.set_ceiling(657_000);
+        assert_eq!(
+            c.ceiling_kbps, 300_000,
+            "and a learned ceiling under it never lowers what was negotiated"
+        );
+
+        // The tighter of the two caps wins.
+        let mut c = BitrateController::with_ceiling_cap(20_000, Some(50_000));
+        c.set_stream_cap(100_000);
+        c.set_ceiling(657_000);
+        assert_eq!(
+            c.ceiling_kbps, 50_000,
+            "the env cap still binds when it is tighter"
+        );
     }
 
     #[test]
@@ -2201,6 +2390,88 @@ mod tests {
             c.decode_cap_kbps,
             Some(rate - rate / 16),
             "the genuine pair still latches around the starved interruption"
+        );
+    }
+
+    /// The host-rebuild field window, verbatim from the 0.29 log: an exclusive-topology eviction
+    /// rebuilt the capture ring and the encoder in place (401 ms, entirely host-local), and the
+    /// client's report window straddled it — 390 kbps delivered against a 20 000 target, zero
+    /// loss, no flush, and an encode mean of 15 063 µs against a ~2 800 baseline.
+    ///
+    /// That used to clear the severe encode tier and take the one-window path, costing a ×0.7 and
+    /// slow start for the rest of the session on a link that never dropped a packet. The encode
+    /// mean over a window in which almost nothing flowed is not a measurement of encode cost, so
+    /// the signal is withheld and the window decides nothing.
+    #[test]
+    fn a_starved_window_cannot_back_off_on_host_encode_time_alone() {
+        let mut c = BitrateController::new(20_000);
+        c.set_ceiling(657_000);
+        let start = Instant::now();
+        let mut t = 0;
+        // Seed the latency baselines. Half-utilized on purpose: above the starved bar (a quarter
+        // of target) so the encode samples count, below the climb bar (three quarters) so no step
+        // fires and `current_kbps` stays put.
+        for _ in 0..BASELINE_MIN_WINDOWS {
+            assert_eq!(
+                c.on_window(
+                    ticks(start, t),
+                    0,
+                    0,
+                    Some(3_500),
+                    Some(200),
+                    Some(2_800),
+                    10_000,
+                    false,
+                    0
+                ),
+                None
+            );
+            t += 1;
+        }
+        assert!(
+            c.probing,
+            "slow start is still armed going into the rebuild"
+        );
+
+        let verdict = c.on_window(
+            ticks(start, t),
+            0,
+            0,
+            Some(15_711),
+            Some(129),
+            Some(15_063),
+            390,
+            false,
+            0,
+        );
+        t += 1;
+        assert_eq!(
+            verdict, None,
+            "a host-local rebuild must not move the rate: nothing was lost and nothing was slow"
+        );
+        assert_eq!(c.current_kbps, 20_000, "and the rate is untouched");
+        assert!(
+            c.probing,
+            "nor may it retire slow start — recovery would crawl at +6 % per six windows"
+        );
+
+        // The signal itself must still work: the starved sample was withheld rather than folded
+        // into the rolling minimum, so the SAME encode excursion in a window that actually
+        // carried its rate is still severe, and still backs off on one window.
+        let verdict = c.on_window(
+            ticks(start, t),
+            0,
+            0,
+            Some(3_600),
+            Some(210),
+            Some(15_063),
+            20_000,
+            false,
+            0,
+        );
+        assert!(
+            verdict.is_some_and(|k| k < 20_000),
+            "a real encode excursion at full delivery still backs off, got {verdict:?}"
         );
     }
 

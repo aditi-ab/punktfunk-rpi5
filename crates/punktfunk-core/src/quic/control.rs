@@ -124,6 +124,37 @@ pub struct BitrateChanged {
     pub bitrate_kbps: u32,
 }
 
+/// `host → client`, unsolicited: the host tore its own capture ring and encoder down and rebuilt
+/// them in place, and nothing flowed for `gap_ms`. Entirely host-local — no packet was lost, the
+/// link never changed — but the client's adaptive-bitrate controller decides on 750 ms report
+/// windows, and a window straddling the rebuild sees almost no stream.
+///
+/// The 0.29 field log is the case this exists for: an exclusive-topology eviction on a Windows
+/// host rebuilt the pipeline for 401 ms, and the straddling window reported `actual_kbps=390`
+/// against a 20 000 target with `loss_ppm=0` and a host encode mean of 15 063 µs against a ~2 800
+/// baseline. The controller read that as congestion, backed off ×0.7 and retired slow start, and
+/// the session spent the next three minutes at ~15 Mbps on a link that never dropped a packet.
+/// The client already knows how to throw a window away — it does exactly that for the tail of its
+/// own speed-test probe — so the host announcing the rebuild is all that was missing.
+///
+/// A DURATION, never an instant, on purpose: host and client clocks are not in the same domain
+/// (14.7 s apart in that same log), so an instant stamped in the host's clock would need
+/// skew-correcting before it meant anything on the client. The control stream is reliable and
+/// sub-millisecond on a LAN, so the client anchors the gap to its OWN receive time — "the rebuild
+/// just ended" — and `gap_ms` is evidence for the log rather than an input to the arithmetic.
+///
+/// Fire-and-forget, and sent only after a rebuild that SUCCEEDED. The eviction recovery's failure
+/// arm ends the session outright, and the reconnect re-baselines everything the controller had
+/// learned; a mode-switch rebuild that fails keeps streaming the old mode, and that one does leave
+/// its stall unannounced today — a known gap, not a claim that no such gap exists.
+///
+/// A client that predates this hits its "unknown control message" arm and keeps the old behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PipelineGap {
+    /// How long the host's pipeline was down, in milliseconds (the rebuild's measured span).
+    pub gap_ms: u32,
+}
+
 /// `client → host`, any time after [`Start`]: run a bandwidth speed test. The host bursts
 /// filler access units (flagged [`crate::packet::FLAG_PROBE`]) over the data plane at
 /// `target_kbps` of application goodput for `duration_ms`, *pausing video for the duration*, then
@@ -234,6 +265,11 @@ pub const MSG_RFI_REQUEST: u8 = 0x07;
 pub const MSG_SHARD_PAYLOAD_CHANGED: u8 = 0x08;
 /// Type byte of [`ShardPayloadAck`].
 pub const MSG_SHARD_PAYLOAD_ACK: u8 = 0x09;
+/// Type byte of [`PipelineGap`]. 0x0A extends the video/rate-control block (0x01-0x09) it belongs
+/// to: its only consumer is the same adaptive-bitrate controller [`LossReport`], [`SetBitrate`]
+/// and [`BitrateChanged`] already feed. Deliberately NOT in the 0x30 clock block — it carries a
+/// duration precisely so that no clock domain is involved.
+pub const MSG_PIPELINE_GAP: u8 = 0x0A;
 /// Type byte of [`ProbeRequest`].
 pub const MSG_PROBE_REQUEST: u8 = 0x20;
 /// Type byte of [`ProbeResult`].
@@ -436,6 +472,26 @@ impl BitrateChanged {
         }
         Ok(BitrateChanged {
             bitrate_kbps: u32::from_le_bytes(b[5..9].try_into().unwrap()),
+        })
+    }
+}
+
+impl PipelineGap {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] gap_ms[5..9]
+        let mut b = Vec::with_capacity(9);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_PIPELINE_GAP);
+        b.extend_from_slice(&self.gap_ms.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PipelineGap> {
+        if b.len() != 9 || &b[0..4] != CTL_MAGIC || b[4] != MSG_PIPELINE_GAP {
+            return Err(PunktfunkError::InvalidArg("bad PipelineGap"));
+        }
+        Ok(PipelineGap {
+            gap_ms: u32::from_le_bytes(b[5..9].try_into().unwrap()),
         })
     }
 }
@@ -1271,6 +1327,32 @@ mod tests {
         assert!(SetBitrate::decode(&ack.encode()).is_err());
         assert!(BitrateChanged::decode(&req.encode()).is_err());
         assert!(SetBitrate::decode(&LossReport { loss_ppm: 7 }.encode()).is_err());
+    }
+
+    #[test]
+    fn pipeline_gap_roundtrips() {
+        // 401 ms is the 0.29 field rebuild verbatim; the rest are the boundaries a duration can
+        // legitimately take (an instant rebuild, a whole minute of it).
+        for gap_ms in [1u32, 401, 60_000, u32::MAX] {
+            let m = PipelineGap { gap_ms };
+            assert_eq!(PipelineGap::decode(&m.encode()).unwrap(), m);
+        }
+        // 0x0A shares its 9-byte shape with the three rate-control messages either side of it, so
+        // the type byte is the ONLY thing keeping them apart — a gap that re-decoded as a
+        // `SetBitrate` would retarget the encoder to 401 kbps.
+        let gap = PipelineGap { gap_ms: 401 }.encode();
+        assert_eq!(gap[4], MSG_PIPELINE_GAP);
+        assert!(LossReport::decode(&gap).is_err());
+        assert!(SetBitrate::decode(&gap).is_err());
+        assert!(BitrateChanged::decode(&gap).is_err());
+        assert!(PipelineGap::decode(&LossReport { loss_ppm: 401 }.encode()).is_err());
+        assert!(PipelineGap::decode(&SetBitrate { bitrate_kbps: 401 }.encode()).is_err());
+        assert!(PipelineGap::decode(&BitrateChanged { bitrate_kbps: 401 }.encode()).is_err());
+        // …and the neighbouring id (0x09) an old peer would have to fall past to reach its
+        // "unknown control message" arm. Length is exact — no trailing bytes, no truncation.
+        assert!(ShardPayloadAck::decode(&gap).is_err());
+        assert!(PipelineGap::decode(&[gap.as_slice(), &[0]].concat()).is_err());
+        assert!(PipelineGap::decode(&gap[..gap.len() - 1]).is_err());
     }
 
     #[test]

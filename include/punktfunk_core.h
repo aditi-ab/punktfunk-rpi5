@@ -1207,6 +1207,14 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`PipelineGap`]. 0x0A extends the video/rate-control block (0x01-0x09) it belongs
+// to: its only consumer is the same adaptive-bitrate controller [`LossReport`], [`SetBitrate`]
+// and [`BitrateChanged`] already feed. Deliberately NOT in the 0x30 clock block — it carries a
+// duration precisely so that no clock domain is involved.
+#define PUNKTFUNK_MSG_PIPELINE_GAP 10
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ProbeRequest`].
 #define PUNKTFUNK_MSG_PROBE_REQUEST 32
 #endif
