@@ -17,6 +17,19 @@ Modifications by the punktfunk project:
     `handle_urb` (so a simulated interrupt-IN mimics a real device's
     NAK-until-bInterval behaviour rather than free-running over the loopback
     link); added the tokio `time` feature for it.
+  - Added **alternate settings** (`UsbAltSetting`, `UsbDevice::with_alt_settings`).
+    Upstream emits one interface descriptor per interface with
+    `bAlternateSetting` hardcoded to 0, which cannot express a USB Audio Class
+    streaming interface (alt 0 zero-bandwidth, alt 1 carrying the endpoint).
+    Endpoint descriptors gained an in-descriptor `extra` tail so a UAC
+    isochronous endpoint can be the 9-byte form (`bRefresh`/`bSynchAddress`).
+  - Added **isochronous transfer** support (`UsbInterfaceHandler::handle_iso_urb`,
+    `IsoPacket`, `UsbIpResponse::usbip_ret_submit_iso`, the ISO branch in
+    `handler`). Upstream parsed `number_of_packets`/`iso_packet_descriptor` off
+    the wire and then discarded them, always replying with an empty packet
+    table, which stalls any ISO endpoint. ISO completion is paced by
+    bInterval × packet count, because for an audio endpoint the completion rate
+    *is* the device's sample clock.
 
 Only the USB/IP server *simulation* path is retained: the device model, the
 USB/IP wire protocol, and the `UsbInterfaceHandler` trait. The original MIT

@@ -960,6 +960,7 @@ mod tests {
             endpoints: vec![],
             string_interface: 0,
             class_specific_descriptor: vec![],
+            alt_settings: vec![],
             handler: boxed(IdleDummy),
         };
         let ep_out = UsbEndpoint {
