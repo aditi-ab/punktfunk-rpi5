@@ -85,8 +85,13 @@ fi
 echo "==> flatpak-builder ($APP_ID, version $VERSION, arch $ARCH)"
 # --default-branch=stable matches CI / the hosted repo ref, so a locally-built install can also
 # track flatpak.unom.io. build-bundle must then be told the branch (else it defaults to `master`).
+# --disable-updates matches CI (see .gitea/workflows/flatpak.yml for the full why): every git
+# source in the manifest is commit-pinned, so re-running this script reuses the mirrors already in
+# the .flatpak-builder state dir instead of re-fetching gamescope and its submodules (~2.5 min of
+# wlroots/libliftoff/vkroots/libdisplay-info that this manifest never even builds).
 "${FPB[@]}" --user --force-clean --disable-rofiles-fuse \
   --default-branch=stable \
+  --disable-updates \
   --arch="$ARCH" \
   --install-deps-from=flathub \
   "${EXTRA_ARGS[@]}" \
