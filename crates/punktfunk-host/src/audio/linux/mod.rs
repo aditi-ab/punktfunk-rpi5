@@ -29,6 +29,7 @@
 
 mod monitor_rate;
 pub(crate) mod pad_sink;
+pub(crate) mod pad_usb;
 mod stream_sink;
 
 use super::{AudioCapturer, MicBackendStats, VirtualMic, SAMPLE_RATE};

@@ -216,9 +216,45 @@ impl Drop for DualSensePad {
     }
 }
 
-/// The DualSense-specific half of the shared stateful manager (see [`PadProto`]): UHID transport
-/// open, the [`DsState`] mappers, and the kernel-handshake service pass. Everything lifecycle-
-/// shaped (slot table, unplug sweep, heartbeat, feedback dedup) lives in [`UhidManager`].
+/// How a virtual DualSense is presented to the kernel.
+///
+/// [`Usbip`](DsTransport::Usbip) is a *real* USB device (see [`crate::dualsense_usbip`]) and is the
+/// only rung that can satisfy wine's ContainerId derivation or GE-Proton's raw-ALSA leg, because
+/// both walk sysfs for a `usb_device` parent that a UHID pad simply does not have.
+/// [`Uhid`](DsTransport::Uhid) is the long-validated universal fallback: the pad works, games see
+/// it, but its speaker cannot be paired to it by a libScePad-style title.
+pub enum DsTransport {
+    Usbip(crate::dualsense_usbip::DualSenseUsbip),
+    Uhid(DualSensePad),
+}
+
+/// Open the best DualSense transport available: **usbip/`vhci_hcd` → UHID**, degrading on failure
+/// so a host without `vhci_hcd` (or without the `punktfunk` group's write on its sysfs `attach`)
+/// still gets a working pad.
+///
+/// The usbip rung is opt-in while it awaits on-glass verification — see
+/// [`crate::dualsense_usbip::usbip_preferred`].
+fn open_transport(idx: u8) -> Result<DsTransport> {
+    if crate::dualsense_usbip::usbip_preferred() {
+        match crate::dualsense_usbip::DualSenseUsbip::open(idx) {
+            Ok(u) => return Ok(DsTransport::Usbip(u)),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "usbip DualSense unavailable — falling back to UHID")
+            }
+        }
+    }
+    let p = DualSensePad::open(idx, &DsUhidIdentity::dualsense())?;
+    tracing::info!(
+        index = idx,
+        "virtual DualSense created (UHID hid-playstation)"
+    );
+    Ok(DsTransport::Uhid(p))
+}
+
+/// The DualSense-specific half of the shared stateful manager (see [`PadProto`]): transport
+/// open ([`open_transport`]), the [`DsState`] mappers, and the kernel-handshake service pass.
+/// Everything lifecycle-shaped (slot table, unplug sweep, heartbeat, feedback dedup) lives in
+/// [`UhidManager`].
 pub struct DsLinuxProto {
     /// Fallback policy for the Steam back grips a client may send (the DualSense has no back-button
     /// HID slot). `PUNKTFUNK_STEAM_REMAP=paddles=…`; default drop.
@@ -234,19 +270,14 @@ impl Default for DsLinuxProto {
 }
 
 impl PadProto for DsLinuxProto {
-    type Pad = DualSensePad;
+    type Pad = DsTransport;
     type State = DsState;
     const LABEL: &'static str = "DualSense";
     const DEVICE: &'static str = "DualSense";
     const CREATE_HINT: &'static str = "";
 
-    fn open(&mut self, idx: u8) -> Result<DualSensePad> {
-        let p = DualSensePad::open(idx, &DsUhidIdentity::dualsense())?;
-        tracing::info!(
-            index = idx,
-            "virtual DualSense created (UHID hid-playstation)"
-        );
-        Ok(p)
+    fn open(&mut self, idx: u8) -> Result<DsTransport> {
+        open_transport(idx)
     }
 
     fn neutral(&self) -> DsState {
@@ -289,15 +320,25 @@ impl PadProto for DsLinuxProto {
         st.clear_rich();
     }
 
-    fn write_state(&self, pad: &mut DualSensePad, st: &DsState) {
-        let _ = pad.write_state(st);
+    fn write_state(&self, pad: &mut DsTransport, st: &DsState) {
+        match pad {
+            DsTransport::Usbip(u) => u.write_state(st),
+            DsTransport::Uhid(p) => {
+                let _ = p.write_state(st);
+            }
+        }
     }
 
     /// Answer the kernel's init handshake (it blocks `hid-playstation` init until its GET_REPORTs
     /// are answered — call frequently) and parse a game's feedback: motor rumble on the universal
     /// 0xCA plane, the rich lightbar/player-LED/trigger events on the 0xCD plane.
-    fn service(&self, pad: &mut DualSensePad, idx: u8) -> PadFeedback {
-        let fb = pad.service(idx);
+    fn service(&self, pad: &mut DsTransport, idx: u8) -> PadFeedback {
+        let fb = match pad {
+            // The usbip pad answers EP0 on the server thread, so `service` only drains what the
+            // handlers already collected — `idx` is baked into the handler at build time.
+            DsTransport::Usbip(u) => u.service(),
+            DsTransport::Uhid(p) => p.service(idx),
+        };
         PadFeedback {
             // No trigger motors on this protocol — see `PadFeedback::rumble`.
             rumble: fb.rumble.map(|(low, high)| (low, high, 0, 0)),

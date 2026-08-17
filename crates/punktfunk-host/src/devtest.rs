@@ -310,6 +310,118 @@ pub fn pad_sink_test(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Attach the **usbip** virtual DualSense — a real USB device carrying its own USB Audio Class
+/// sound card — and capture the pad's audio off its isochronous endpoint. The on-glass gate for
+/// everything a UHID pad cannot do, with no client and no game involved.
+///
+/// What it proves, in the order the failures happen:
+///
+/// 1. **The device enumerates.** `vhci_hcd` accepted the emulated descriptors and `hid-playstation`
+///    bound the HID interface.
+/// 2. **`snd-usb-audio` bound the audio function**, producing a *real* ALSA card — the thing
+///    GE-Proton's `snd_card_next` scan looks for and a minted PipeWire node can never be.
+/// 3. **The USB topology exists**, so wine can walk a HID device up to a `usb_device` parent and
+///    derive a non-null Windows ContainerId instead of `GUID_NULL`.
+/// 4. **Samples flow**, split per pair exactly as `pad-sink-test` reports them.
+///
+/// This ignores `PUNKTFUNK_DUALSENSE_USBIP` — asking for the devtest *is* the opt-in.
+/// `--pad N` (default 0), `--seconds N` (default 30).
+#[cfg(target_os = "linux")]
+pub fn pad_usbip_test(args: &[String]) -> Result<()> {
+    use crate::audio::AudioCapturer as _;
+    use std::time::{Duration, Instant};
+    let arg = |name: &str, default: u64| -> u64 {
+        args.iter()
+            .skip_while(|a| *a != name)
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    };
+    let secs = arg("--seconds", 30);
+    let pad = arg("--pad", 0) as u8;
+
+    let _pad = pf_inject::dualsense_usbip::DualSenseUsbip::open(pad).context(
+        "attach the usbip DualSense (is vhci_hcd loaded, and is \
+         /sys/devices/platform/vhci_hcd.0/attach writable by the `punktfunk` group?)",
+    )?;
+    // Enumeration, driver bind and the ALSA/PipeWire cascade are all asynchronous; give the kernel
+    // and PipeWire a moment before reporting what appeared, or the report reads as a failure.
+    std::thread::sleep(Duration::from_millis(1500));
+
+    match pf_inject::dualsense_usbip::find_usb_topology() {
+        Some(t) => println!(
+            "usb device attached:\n  \
+             sysfs         = {}\n  \
+             busnum/devnum = {}/{}   (with the vendor/product pair, these are exactly the fields \
+             wine packs into the ContainerId — the pad's HID device and its audio sink must both \
+             resolve to THIS node)\n  \
+             check the sink agrees:\n    \
+             pactl list sinks | grep -E 'Name:|sysfs'\n  \
+             (`sysfs.path` on the sink is what winepulse prefixes with /sys and walks up; with a \
+             real card PipeWire fills it in itself)",
+            t.sysfs_path.display(),
+            t.busnum,
+            t.devnum,
+        ),
+        None => println!(
+            "⚠ no 054c:0ce6 usb device found under vhci_hcd — the attach reported success but the \
+             kernel did not enumerate it. Check `dmesg | tail -40`."
+        ),
+    }
+    match std::fs::read_to_string("/proc/asound/cards") {
+        Ok(cards) if cards.contains("DualSense") => println!(
+            "alsa card present (GE-Proton's snd_card_next scan can see this):\n{}",
+            cards.trim_end()
+        ),
+        Ok(cards) => println!(
+            "⚠ no DualSense ALSA card — snd-usb-audio did NOT bind the audio function, so \
+             GE-Proton's raw-ALSA haptic leg stays blind. /proc/asound/cards:\n{}\n  \
+             check `dmesg | grep -i 'usb\\|snd' | tail -30`",
+            cards.trim_end()
+        ),
+        Err(e) => println!("⚠ could not read /proc/asound/cards: {e}"),
+    }
+    println!(
+        "drive it (either route converges on the pad's isochronous endpoint):\n  \
+         via PipeWire:  pw-play --target <the pad's SpeakerHaptic sink> \
+         --channel-map 'front-left,front-right,rear-left,rear-right' <48k-file>\n  \
+         raw ALSA:      aplay -D plughw:CARD=Controller -f S16_LE -r 48000 -c 4 <48k-file>\n\
+         Capturing for {secs}s…"
+    );
+
+    let mut cap = crate::audio::pad_usb::PadUsbCapturer::open(pad)
+        .context("claim the usbip pad's audio stream")?;
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let (mut chunks, mut samples) = (0u64, 0u64);
+    // Per-pair peaks, the same split_quad contract pad-sink-test checks: ch0/1 = speaker/headphone,
+    // ch2/3 = the voice coils. Proving the pairs separately is the point — a channel-order slip in
+    // the UAC descriptors would smear or zero one pair while a global peak still looked healthy.
+    let (mut peak_spk, mut peak_coil) = (0f32, 0f32);
+    let mut last_report = Instant::now();
+    while Instant::now() < deadline {
+        let c = cap.next_chunk().context("usb pad capture")?;
+        if !c.is_empty() {
+            chunks += 1;
+            samples += c.len() as u64;
+            for f in c.chunks_exact(4) {
+                peak_spk = peak_spk.max(f[0].abs()).max(f[1].abs());
+                peak_coil = peak_coil.max(f[2].abs()).max(f[3].abs());
+            }
+        }
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            last_report = Instant::now();
+            println!(
+                "  chunks={chunks} samples={samples} (~{:.1}ms of 4ch audio) \
+                 peak_speaker={peak_spk:.4} peak_coils={peak_coil:.4}",
+                samples as f64 / (4.0 * 48.0)
+            );
+            (chunks, samples, peak_spk, peak_coil) = (0, 0, 0.0, 0.0);
+        }
+    }
+    println!("pad-usbip-test: done");
+    Ok(())
+}
+
 /// Create a virtual Switch Pro Controller via UHID and exercise it (validation, no
 /// streaming session): answers the full hid-nintendo probe conversation, then cycles the
 /// A/B buttons (positionally swapped) + sweeps the left stick, printing rumble / player-

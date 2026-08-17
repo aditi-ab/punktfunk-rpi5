@@ -357,6 +357,10 @@ mod linux;
 // layer mints per-pad sinks and the CLI exposes the `pad-sink-test` devtest.
 #[cfg(target_os = "linux")]
 pub(crate) use linux::pad_sink;
+// The same pad audio taken one layer lower, when the pad is a real USB device and therefore has a
+// real sound card: capture straight off its isochronous endpoint instead of minting a node graph.
+#[cfg(target_os = "linux")]
+pub(crate) use linux::pad_usb;
 // DualSense pad-audio endpoint provisioning + loopback capture (design: pad haptics/audio).
 // pub(crate): the session layer queries endpoints by pad index and the CLI exposes the
 // `pad-endpoint` devtest.

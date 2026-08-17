@@ -187,8 +187,28 @@ impl UsbDevice {
             endpoints,
             string_interface,
             class_specific_descriptor,
+            alt_settings: Vec::new(),
             handler,
         });
+        self
+    }
+
+    /// Attach alternate settings to the interface added most recently by [`with_interface`]
+    /// (punktfunk addition — see [`UsbAltSetting`]). Chained directly after the `with_interface`
+    /// that created the alt-0 setting.
+    ///
+    /// # Panics
+    /// If no interface has been added yet, or if any setting uses `alternate_setting == 0` (that
+    /// number belongs to the interface's own descriptor).
+    pub fn with_alt_settings(mut self, alts: Vec<UsbAltSetting>) -> Self {
+        assert!(
+            alts.iter().all(|a| a.alternate_setting != 0),
+            "alternate_setting 0 is the interface's own descriptor"
+        );
+        self.interfaces
+            .last_mut()
+            .expect("with_alt_settings called before with_interface")
+            .alt_settings = alts;
         self
     }
 
@@ -217,7 +237,11 @@ impl UsbDevice {
             Some((self.ep0_out, None))
         } else {
             for intf in &self.interfaces {
-                for endpoint in &intf.endpoints {
+                // Alt-setting endpoints route to the same handler as alt 0 (punktfunk addition):
+                // one handler implements the whole interface across its settings, and the kernel
+                // only ever drives the endpoints of the setting it selected.
+                let alt_eps = intf.alt_settings.iter().flat_map(|a| a.endpoints.iter());
+                for endpoint in intf.endpoints.iter().chain(alt_eps) {
                     if endpoint.address == ep {
                         return Some((*endpoint, Some(intf)));
                     }
@@ -271,6 +295,47 @@ impl UsbDevice {
         result
     }
 
+    /// The service interval of `ep` — one packet's worth of time. High/Super speed express
+    /// `bInterval` as `2^(n-1)` 125 µs microframes; full/low speed as whole milliseconds.
+    fn service_interval(&self, ep: UsbEndpoint) -> std::time::Duration {
+        if self.speed == UsbSpeed::High as u32
+            || self.speed == UsbSpeed::Super as u32
+            || self.speed == UsbSpeed::SuperPlus as u32
+        {
+            let n = ep.interval.clamp(1, 16) as u32;
+            std::time::Duration::from_micros((1u64 << (n - 1)) * 125)
+        } else {
+            std::time::Duration::from_millis(ep.interval.max(1) as u64)
+        }
+    }
+
+    /// Dispatch an **isochronous** URB to the owning interface's handler (punktfunk addition).
+    ///
+    /// Returns one payload per packet: empty vectors for an OUT endpoint (the host wants only the
+    /// per-packet `actual_length` back), the sampled data for an IN endpoint.
+    ///
+    /// **Paced by `bInterval` × the packet count, and that pacing is the device's audio clock.**
+    /// Isochronous endpoints move exactly one packet per service interval on real hardware, and
+    /// `snd-usb-audio` advances its PCM pointer from URB *completions* — it has no other time
+    /// reference. `vhci_hcd` does not throttle the server side (the same reason the interrupt path
+    /// above is paced), so completing instantly would both spin the loopback link and tell the
+    /// kernel the device consumed a whole URB's worth of samples in no time, running the stream's
+    /// clock away and xrunning it continuously.
+    pub(crate) async fn handle_iso_urb(
+        &self,
+        ep: UsbEndpoint,
+        intf: Option<&UsbInterface>,
+        packets: &[IsoPacket<'_>],
+    ) -> Result<Vec<Vec<u8>>> {
+        let Some(intf) = intf else {
+            // ISO on ep0 is not a thing; treat it as an unsupported transfer rather than panicking.
+            return Err(std::io::Error::other("isochronous transfer to ep0"));
+        };
+        tokio::time::sleep(self.service_interval(ep) * packets.len() as u32).await;
+        let mut handler = intf.handler.lock().unwrap();
+        handler.handle_iso_urb(intf, ep, packets)
+    }
+
     pub(crate) async fn handle_urb(
         &self,
         ep: UsbEndpoint,
@@ -284,7 +349,8 @@ impl UsbDevice {
         use EndpointAttributes::*;
         use StandardRequest::*;
 
-        match (FromPrimitive::from_u8(ep.attributes), ep.direction()) {
+        // Only bits 1..0 of bmAttributes are the transfer type — see `UsbEndpoint::transfer_type`.
+        match (ep.transfer_type(), ep.direction()) {
             (Some(Control), In) => {
                 // control in
                 debug!("Control IN setup={setup_packet:x?}");
@@ -374,18 +440,39 @@ impl UsbDevice {
                                     intf_desc.append(&mut specific);
                                     // endpoint descriptors
                                     for endpoint in &intf.endpoints {
-                                        let mut ep_desc = vec![
-                                            0x07,                // bLength
-                                            Endpoint as u8,      // bDescriptorType: Endpoint
-                                            endpoint.address,    // bEndpointAddress
-                                            endpoint.attributes, // bmAttributes
-                                            endpoint.max_packet_size as u8,
-                                            (endpoint.max_packet_size >> 8) as u8, // wMaxPacketSize
-                                            endpoint.interval,                     // bInterval
-                                        ];
-                                        intf_desc.append(&mut ep_desc);
+                                        intf_desc.append(&mut endpoint_descriptor(endpoint, &[]));
                                     }
                                     desc.append(&mut intf_desc);
+
+                                    // Alternate settings 1.. (punktfunk addition): another full
+                                    // interface descriptor per setting, same bInterfaceNumber.
+                                    for alt in &intf.alt_settings {
+                                        let mut alt_desc = vec![
+                                            0x09,                      // bLength
+                                            Interface as u8,           // bDescriptorType
+                                            i as u8,                   // bInterfaceNumber
+                                            alt.alternate_setting,     // bAlternateSetting
+                                            alt.endpoints.len() as u8, // bNumEndpoints
+                                            alt.interface_class,
+                                            alt.interface_subclass,
+                                            alt.interface_protocol,
+                                            intf.string_interface, // iInterface
+                                        ];
+                                        alt_desc.extend_from_slice(&alt.class_specific_descriptor);
+                                        for (n, endpoint) in alt.endpoints.iter().enumerate() {
+                                            let extra = alt
+                                                .endpoint_extra
+                                                .get(n)
+                                                .map(Vec::as_slice)
+                                                .unwrap_or(&[]);
+                                            alt_desc
+                                                .append(&mut endpoint_descriptor(endpoint, extra));
+                                            if let Some(t) = alt.endpoint_trailers.get(n) {
+                                                alt_desc.extend_from_slice(t);
+                                            }
+                                        }
+                                        desc.append(&mut alt_desc);
+                                    }
                                 }
                                 // length
                                 let len = desc.len() as u16;
@@ -549,6 +636,23 @@ impl UsbDevice {
     }
 }
 
+/// Serialize one standard endpoint descriptor. `extra` is appended inside the descriptor and grows
+/// `bLength` past 7 — UAC 1.0 isochronous endpoints carry `bRefresh` + `bSynchAddress` that way
+/// (punktfunk addition; upstream only ever emitted the 7-byte form).
+fn endpoint_descriptor(endpoint: &UsbEndpoint, extra: &[u8]) -> Vec<u8> {
+    let mut d = vec![
+        (7 + extra.len()) as u8,               // bLength
+        DescriptorType::Endpoint as u8,        // bDescriptorType
+        endpoint.address,                      // bEndpointAddress
+        endpoint.attributes,                   // bmAttributes
+        endpoint.max_packet_size as u8,        // wMaxPacketSize (lo)
+        (endpoint.max_packet_size >> 8) as u8, // wMaxPacketSize (hi)
+        endpoint.interval,                     // bInterval
+    ];
+    d.extend_from_slice(extra);
+    d
+}
+
 /// A handler for URB targeting the device
 pub trait UsbDeviceHandler: std::fmt::Debug {
     /// Handle a URB(USB Request Block) targeting at this device
@@ -574,3 +678,81 @@ pub trait UsbDeviceHandler: std::fmt::Debug {
 }
 
 // (In-crate test module removed in the vendored copy — see NOTICE.)
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+
+    fn dev(speed: UsbSpeed) -> UsbDevice {
+        let mut d = UsbDevice::new(0);
+        d.speed = speed as u32;
+        d
+    }
+
+    fn iso_ep(interval: u8) -> UsbEndpoint {
+        UsbEndpoint {
+            address: 0x01,
+            attributes: EndpointAttributes::Isochronous as u8,
+            max_packet_size: 392,
+            interval,
+        }
+    }
+
+    /// At high speed `bInterval` counts 125 µs microframes as `2^(n-1)`, so the audio endpoints'
+    /// `bInterval 4` must come out as exactly one millisecond — the rate that makes a 48 kHz
+    /// stream advance 48 frames per packet. Getting this wrong retunes the device's sample clock.
+    #[test]
+    fn high_speed_interval_4_is_one_millisecond() {
+        assert_eq!(
+            dev(UsbSpeed::High).service_interval(iso_ep(4)),
+            std::time::Duration::from_millis(1)
+        );
+        assert_eq!(
+            dev(UsbSpeed::High).service_interval(iso_ep(1)),
+            std::time::Duration::from_micros(125)
+        );
+        assert_eq!(
+            dev(UsbSpeed::High).service_interval(iso_ep(6)),
+            std::time::Duration::from_millis(4)
+        );
+    }
+
+    /// `bmAttributes` carries the synchronisation and usage type above the transfer type, so a real
+    /// UAC endpoint is `0x05`/`0x09` rather than a bare `0x01`. Decoding the whole byte returns
+    /// `None` for those and used to reach `unimplemented!()`; only bits 1..0 may be decoded.
+    #[test]
+    fn transfer_type_ignores_the_sync_and_usage_bits() {
+        let iso = |attrs| {
+            UsbEndpoint {
+                address: 0x01,
+                attributes: attrs,
+                max_packet_size: 392,
+                interval: 4,
+            }
+            .transfer_type()
+        };
+        // 0x09 = isochronous + adaptive data (the DualSense's speaker/haptic endpoint),
+        // 0x05 = isochronous + asynchronous data (its microphone endpoint).
+        assert!(matches!(iso(0x09), Some(EndpointAttributes::Isochronous)));
+        assert!(matches!(iso(0x05), Some(EndpointAttributes::Isochronous)));
+        assert!(matches!(iso(0x01), Some(EndpointAttributes::Isochronous)));
+        // The plain forms every pre-existing device used must keep decoding as before.
+        assert!(matches!(iso(0x03), Some(EndpointAttributes::Interrupt)));
+        assert!(matches!(iso(0x02), Some(EndpointAttributes::Bulk)));
+        assert!(matches!(iso(0x00), Some(EndpointAttributes::Control)));
+    }
+
+    /// Full speed states `bInterval` in whole milliseconds instead, and 0 must not mean "no wait"
+    /// (that would free-run the link).
+    #[test]
+    fn full_speed_interval_is_milliseconds_and_never_zero() {
+        assert_eq!(
+            dev(UsbSpeed::Full).service_interval(iso_ep(1)),
+            std::time::Duration::from_millis(1)
+        );
+        assert_eq!(
+            dev(UsbSpeed::Full).service_interval(iso_ep(0)),
+            std::time::Duration::from_millis(1)
+        );
+    }
+}

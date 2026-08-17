@@ -486,6 +486,12 @@ pub mod dualsense_edge_windows;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[path = "inject/proto/dualsense_proto.rs"]
 pub mod dualsense_proto;
+/// Linux: virtual DualSense over **USB/IP** (`vhci_hcd`) carrying its own USB Audio Class sound
+/// card — the pad with *real* USB topology, so wine can derive a ContainerId for it and GE-Proton
+/// finds a real ALSA card. The uhid pad ([`dualsense`]) can satisfy neither.
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/dualsense_usbip.rs"]
+pub mod dualsense_usbip;
 /// Windows: virtual DualSense via the UMDF minidriver + a shared-memory host channel.
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/dualsense_windows.rs"]

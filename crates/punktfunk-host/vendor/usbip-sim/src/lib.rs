@@ -82,6 +82,58 @@ impl UsbIpServer {
     }
 }
 
+/// Answer one isochronous `USBIP_CMD_SUBMIT` (punktfunk addition).
+///
+/// The wire's `iso_packet_descriptor` is `number_of_packets` × 16 bytes of big-endian
+/// `offset / length / actual_length / status`. On an OUT transfer the payload for each packet lives
+/// at `offset` in the URB's transfer buffer — packets are **not** necessarily contiguous, which is
+/// why the offsets must be honoured rather than assuming a flat stride.
+async fn handle_iso_submit(
+    device: &UsbDevice,
+    header: &usbip_protocol::UsbIpHeaderBasic,
+    real_ep: u8,
+    start_frame: u32,
+    number_of_packets: u32,
+    data: &[u8],
+    iso_packet_descriptor: &[u8],
+) -> UsbIpResponse {
+    let n = number_of_packets as usize;
+    let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+
+    let mut requested = Vec::with_capacity(n);
+    let mut packets = Vec::with_capacity(n);
+    for i in 0..n {
+        let d = &iso_packet_descriptor[i * 16..i * 16 + 16];
+        let offset = be(&d[0..4]) as usize;
+        let length = be(&d[4..8]);
+        requested.push(length);
+        // Slice the packet out of the transfer buffer, tolerating a short/absent buffer (an IN
+        // transfer carries none) rather than panicking on a malformed table.
+        let end = offset.saturating_add(length as usize).min(data.len());
+        let payload = data.get(offset..end).unwrap_or(&[]);
+        packets.push(IsoPacket {
+            data: payload,
+            requested_len: length as usize,
+        });
+    }
+
+    match device.find_ep(real_ep) {
+        None => {
+            warn!("Endpoint {real_ep:02x?} not found (iso)");
+            UsbIpResponse::usbip_ret_submit_fail(header)
+        }
+        Some((ep, intf)) => match device.handle_iso_urb(ep, intf, &packets).await {
+            Ok(replies) => {
+                UsbIpResponse::usbip_ret_submit_iso(header, start_frame, &requested, &replies)
+            }
+            Err(err) => {
+                warn!("Error handling iso URB: {err}");
+                UsbIpResponse::usbip_ret_submit_fail(header)
+            }
+        },
+    }
+}
+
 pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
     mut socket: &mut T,
     server: Arc<UsbIpServer>,
@@ -156,8 +208,11 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
             UsbIpCommand::UsbIpCmdSubmit {
                 mut header,
                 transfer_buffer_length,
+                start_frame,
+                number_of_packets,
                 setup,
                 data,
+                iso_packet_descriptor,
                 ..
             } => {
                 trace!("Got USBIP_CMD_SUBMIT");
@@ -167,6 +222,26 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                 let real_ep = if out { header.ep } else { header.ep | 0x80 };
 
                 header.command = USBIP_RET_SUBMIT.into();
+
+                // Isochronous URBs carry a packet table and must be answered packet-by-packet
+                // (punktfunk addition — upstream dropped the table, which stalls USB audio).
+                // `0xFFFFFFFF` is the kernel's documented "not ISO" sentinel; the real
+                // implementation sends 0, and `read_from_socket` treats both as no table.
+                if !iso_packet_descriptor.is_empty() {
+                    let res = handle_iso_submit(
+                        device,
+                        &header,
+                        real_ep as u8,
+                        start_frame,
+                        number_of_packets,
+                        &data,
+                        &iso_packet_descriptor,
+                    )
+                    .await;
+                    res.write_to_socket(socket).await?;
+                    trace!("Sent USBIP_RET_SUBMIT (iso)");
+                    continue;
+                }
 
                 let res = match device.find_ep(real_ep as u8) {
                     None => {

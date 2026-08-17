@@ -353,11 +353,52 @@ pub(super) fn spawn(
     }
 }
 
-/// Linux: mint the pad's PipeWire sink lazily inside the streamer thread (the same
-/// open-with-backoff loop the Windows capture rides — a PipeWire hiccup at arrival time starts
-/// pad audio late, not never). `edge` picks the DualSense Edge identity for the sink. `None`
-/// only for empty kinds, a slot past `PUNKTFUNK_PAD_AUDIO_SLOTS`, or a failed thread spawn;
-/// the pad itself keeps working either way, just without audio.
+/// Where a Linux pad's audio is captured from. The two are mutually exclusive by construction:
+/// a usbip pad brings a **real** ALSA card, so PipeWire builds the pad's sinks itself and minting
+/// impersonated ones alongside would produce a duplicate, competing node graph.
+#[cfg(target_os = "linux")]
+enum LinuxPadCapture {
+    /// The pad is a real USB device — take the samples off its isochronous endpoint.
+    Usb(crate::audio::pad_usb::PadUsbCapturer),
+    /// The pad is UHID — mint the sinks it would have had and capture what lands in them.
+    Sink(crate::audio::pad_sink::PadSinkCapturer),
+}
+
+#[cfg(target_os = "linux")]
+impl crate::audio::AudioCapturer for LinuxPadCapture {
+    fn next_chunk(&mut self) -> anyhow::Result<Vec<f32>> {
+        match self {
+            LinuxPadCapture::Usb(c) => c.next_chunk(),
+            LinuxPadCapture::Sink(c) => c.next_chunk(),
+        }
+    }
+
+    fn next_chunk_within(&mut self, budget: std::time::Duration) -> anyhow::Result<Vec<f32>> {
+        match self {
+            LinuxPadCapture::Usb(c) => c.next_chunk_within(budget),
+            LinuxPadCapture::Sink(c) => c.next_chunk_within(budget),
+        }
+    }
+
+    fn channels(&self) -> u32 {
+        match self {
+            LinuxPadCapture::Usb(c) => c.channels(),
+            LinuxPadCapture::Sink(c) => c.channels(),
+        }
+    }
+}
+
+/// Linux: open the pad's capture lazily inside the streamer thread (the same open-with-backoff
+/// loop the Windows capture rides — a hiccup at arrival time starts pad audio late, not never).
+/// `edge` picks the DualSense Edge identity for the minted sink. `None` only for empty kinds, a
+/// slot past `PUNKTFUNK_PAD_AUDIO_SLOTS`, or a failed thread spawn; the pad itself keeps working
+/// either way, just without audio.
+///
+/// The transport decides the capture: with the usbip pad selected we wait for *its* endpoint and
+/// never mint sinks, because that pad already owns a real sound card. The choice is read from the
+/// same flag the pad transport uses rather than from whether a stream happens to have been
+/// published yet — otherwise the race between pad arrival and this thread starting would decide
+/// it, and losing the race would mint a duplicate node graph over a real card.
 #[cfg(target_os = "linux")]
 pub(super) fn spawn(
     conn: quinn::Connection,
@@ -377,6 +418,7 @@ pub(super) fn spawn(
         return None;
     }
     let stop_t = stop.clone();
+    let usb = pf_inject::dualsense_usbip::usbip_preferred();
     match std::thread::Builder::new()
         .name(format!("punktfunk1-pad{pad}"))
         .spawn(move || {
@@ -384,7 +426,14 @@ pub(super) fn spawn(
                 conn,
                 pad,
                 kinds,
-                move || crate::audio::pad_sink::PadSinkCapturer::open(pad, edge),
+                move || {
+                    if usb {
+                        crate::audio::pad_usb::PadUsbCapturer::open(pad).map(LinuxPadCapture::Usb)
+                    } else {
+                        crate::audio::pad_sink::PadSinkCapturer::open(pad, edge)
+                            .map(LinuxPadCapture::Sink)
+                    }
+                },
                 stop_t,
             )
         }) {
