@@ -118,6 +118,13 @@ jobs:
           # arch.yml runs in it; ~1 GB of per-run pacman traffic became image layers.
           - image: punktfunk-arch-ci
             dockerfile: ci/arch-ci.Dockerfile
+          # Flatpak builder (flatpak + flatpak-builder + ostree + the GNOME 50 runtime/SDK
+          # and the rust-stable/llvm20 extensions) — flatpak.yml runs in it. ~5 min of
+          # per-run dnf plus a 168 s restore of a 1.5 GB runtime cache became image layers;
+          # the ci/ tree is also where the runtime pins now live, so a GNOME bump in the
+          # manifest means bumping this Dockerfile's ARGs in the same commit.
+          - image: punktfunk-flatpak-ci
+            dockerfile: ci/flatpak-ci.Dockerfile
     steps:
       - uses: actions/checkout@v4
 
