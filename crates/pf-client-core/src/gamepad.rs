@@ -920,10 +920,35 @@ impl Ds5Feedback {
     /// audio haptics", and asserting either would mute the coils this plane drives.
     ///
     /// ⚠ `path` is empirical. Measured on a DualSense (`054c:0ce6`) using the pad's OWN
-    /// microphone as the detector: `0x20` was loudest (~5× the noise floor at the test tone),
-    /// `0x30` also sounded, `0x10` was silent. Overridable per-run with
-    /// `PUNKTFUNK_PAD_SPEAKER_PATH` / `PUNKTFUNK_PAD_SPEAKER_VOLUME` so a field report can
-    /// bisect it without a rebuild.
+    /// microphone as the detector, with a tone driven into the speaker pair. The first sweep
+    /// only cleared the noise floor by ~5× and left the value unsettled; a second sweep
+    /// (2026-08-17, DS5 wired to a Steam Deck client, 330 Hz) swept the whole byte and is the
+    /// one to trust — it separates the two sounding values by ~300×:
+    ///
+    /// | `ucAudioEnableBits` | 330 Hz energy | |
+    /// |---|---|---|
+    /// | `0x00` (power-on) | 0.000001 | silent — the headphone jack |
+    /// | `0x10` | 0.000002 | silent |
+    /// | `0x20` | 0.000283 | **speaker sounds** |
+    /// | `0x30` | 0.000336 | speaker sounds, marginally louder |
+    /// | `0x40` | 0.000001 | silent |
+    /// | `0x50` | 0.000002 | silent |
+    ///
+    /// So **bit 5 is the speaker-path enable** and bit 4 alone does nothing. We ship `0x20`
+    /// rather than the marginally louder `0x30` because `0x30` asserts a second path bit whose
+    /// effect on the HEADPHONE leg was NOT measured, and `0x20` already sounds — a pad with
+    /// headphones in its jack must not lose them to a default. Two further properties were
+    /// measured the same day, both of which this one-shot relies on: the setting **persists**
+    /// (unchanged 40 s after a single write, with SDL live on the pad), and it **survives the
+    /// pad's USB audio stream stopping and restarting** — so it does not need re-asserting when
+    /// the renderer opens its output.
+    ///
+    /// Verified end-to-end on glass 2026-08-17 by forcing the pad back to `0x00` (pad-mic floor
+    /// 0.000000, inaudible), then reconnecting: this packet alone restored the speaker
+    /// (pad-mic 0.000349, and audible to the user).
+    ///
+    /// Overridable per-run with `PUNKTFUNK_PAD_SPEAKER_PATH` / `PUNKTFUNK_PAD_SPEAKER_VOLUME`
+    /// so a field report can bisect it without a rebuild.
     fn speaker_enable_packet(volume: u8, path: u8) -> [u8; 47] {
         let mut p = [0u8; 47];
         // bit5 = ucSpeakerVolume is valid, bit7 = the audio-control byte is valid.
