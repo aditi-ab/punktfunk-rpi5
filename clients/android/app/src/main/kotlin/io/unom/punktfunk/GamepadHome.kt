@@ -110,12 +110,9 @@ class HomeTile(
 }
 
 /**
- * The console home. [tiles] is rebuilt by the caller from the live host stores.
- *
- * A opens the focused host's LIBRARY where it has one ([onOpenLibrary]) and falls back to the
- * tile's own action ([onActivate] — connect, or Add Host) where it does not; Y is then the other
- * half, streaming the machine's desktop. X is [onOpenSettings]. Fully driven by D-pad / stick /
- * face buttons (MainActivity already maps a pad's A→center, B→back, sticks→D-pad) and by touch.
+ * The console home. [tiles] is rebuilt by the caller from the live host stores; [onActivate] runs a
+ * tile's action, [onOpenLibrary]/[onOpenSettings] are the Y/X actions. Fully driven by D-pad / stick
+ * / face buttons (MainActivity already maps a pad's A→center, B→back, sticks→D-pad) and by touch.
  */
 @Composable
 fun GamepadHome(
@@ -146,13 +143,6 @@ fun GamepadHome(
 
     // Bumped on every confirm — the centred card dips under the press and springs back, so A reads
     // as a button being pushed rather than as a screen simply changing.
-    // What A does to a tile: open its library where it has one (and the setting allows), else the
-    // tile's own action — connect for a host, "add" for the Add tile. Derived here so the nav
-    // effect, the legend's label and the legend's tap target can never disagree about it.
-    val primaryAction: (HomeTile) -> Unit = { tile ->
-        if (libraryEnabled && tile.hasLibrary) onOpenLibrary(tile) else onActivate(tile)
-    }
-
     var pressToken by remember { mutableIntStateOf(0) }
     val press = remember { Animatable(1f) }
     LaunchedEffect(pressToken) {
@@ -170,12 +160,10 @@ fun GamepadHome(
                 scope.launch { pagerState.animateScrollToPage(target) }
             }
         },
-        // A / D-pad-center → the tile's PRIMARY action: its library where it has one, else
-        // connect. A machine you play games on should offer the games, not drop you on its
-        // desktop; streaming the desktop is Y, one press away and named in the legend.
-        onActivate = { pressToken++; tiles.getOrNull(navTarget)?.let(primaryAction) },
-        onSecondary = { // Y (gamepad) → Stream the desktop, the other half of A
-            tiles.getOrNull(navTarget)?.takeIf { libraryEnabled && it.hasLibrary }?.let(onActivate)
+        // A / D-pad-center → Connect
+        onActivate = { pressToken++; tiles.getOrNull(navTarget)?.let(onActivate) },
+        onSecondary = { // Y (gamepad) → Library
+            tiles.getOrNull(navTarget)?.takeIf { libraryEnabled && it.hasLibrary }?.let(onOpenLibrary)
         },
         onTertiary = onOpenSettings, // X (gamepad) → Settings
         // A TV remote has no A/B/X/Y: Up → Settings, Down → a saved host's Options (Wake / Library /
@@ -190,22 +178,15 @@ fun GamepadHome(
     // (Settings) / Down (Options) arrows, with Library folded into Options. Input is universal either
     // way. Each hint is also TAPPABLE (touch hatch).
     val padIsGamepad = (LocalContext.current as? MainActivity)?.lastPadIsGamepad ?: false
-    val opensLibrary = libraryEnabled && current?.hasLibrary == true
-    val connectLabel = when {
-        current?.isAdd == true -> "Add Host"
-        opensLibrary -> "Library"
-        else -> "Connect"
-    }
-    val connectAction: () -> Unit = { pressToken++; tiles.getOrNull(navTarget)?.let(primaryAction) }
+    val connectLabel = if (current?.isAdd == true) "Add Host" else "Connect"
+    val connectAction: () -> Unit = { pressToken++; tiles.getOrNull(navTarget)?.let(onActivate) }
     val optionsAction: () -> Unit = { current?.let(onOptions) }
     val arrowTint = PadGlyph.Arrow
     val hints = buildList {
         if (padIsGamepad) {
             add(PadGlyph.hint('A', connectLabel, onClick = connectAction))
-            // Offered only where A took the library: on every other tile A already connects, and
-            // a second button doing the identical thing is a legend entry that teaches nothing.
-            if (opensLibrary) add(PadGlyph.hint('Y', "Stream Desktop") {
-                tiles.getOrNull(navTarget)?.takeIf { it.hasLibrary }?.let(onActivate)
+            if (libraryEnabled && current?.hasLibrary == true) add(PadGlyph.hint('Y', "Library") {
+                tiles.getOrNull(navTarget)?.takeIf { it.hasLibrary }?.let(onOpenLibrary)
             })
             add(PadGlyph.hint('X', "Settings", onClick = onOpenSettings))
             // The pad's Select/View button (drawn as its capsule glyph) opens host options.
@@ -286,11 +267,7 @@ fun GamepadHome(
                             ) {
                                 if (page == navTarget) {
                                     pressToken++
-                                    // The same primary action A runs — a tap on the centred card
-                                    // and an A press are the same act, and a tap that connected
-                                    // where A opened the library would be a difference nobody
-                                    // could see until they put the pad down.
-                                    primaryAction(tile)
+                                    onActivate(tile)
                                 } else {
                                     navTarget = page
                                     scope.launch { pagerState.animateScrollToPage(page) }

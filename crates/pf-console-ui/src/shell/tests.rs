@@ -159,8 +159,8 @@ fn navigation_lap() {
     s.handle_menu(MenuEvent::Back);
     finish_motion(&mut s);
     assert_eq!(s.stack.len(), 1);
-    // Home → Library on the paired host (A — the card's primary press), then back.
-    s.handle_menu(MenuEvent::Confirm);
+    // Home → Library on the paired host (Y), then back.
+    s.handle_menu(MenuEvent::Secondary);
     assert_eq!(s.stack.len(), 2);
     finish_motion(&mut s);
     s.handle_menu(MenuEvent::Back);
@@ -175,9 +175,7 @@ fn navigation_lap() {
 fn connect_flow_raises_launch_and_cancel() {
     let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
     s.sync();
-    // Y, not A: on a paired+saved host A opens the LIBRARY now, and streaming the machine
-    // itself — a launch with no title attached — is the card's other half.
-    s.handle_menu(MenuEvent::Secondary); // paired+online host focused first
+    s.handle_menu(MenuEvent::Confirm); // paired+online host focused first
     assert!(matches!(
         s.take_action(),
         Some(OverlayAction::Launch { launch: None, .. })
@@ -244,9 +242,9 @@ fn a_pinned_cards_library_launches_with_its_profile() {
     console.set_hosts(rows);
     s.sync();
 
-    // Focus the pinned card (it sits right after its host's primary tile), then A.
+    // Focus the pinned card (it sits right after its host's primary tile), then Y.
     s.handle_menu(MenuEvent::Move(MenuDir::Right));
-    s.handle_menu(MenuEvent::Confirm);
+    s.handle_menu(MenuEvent::Secondary);
     finish_motion(&mut s);
     match s.stack.last() {
         Some(Screen::Library(l)) => assert_eq!(
@@ -254,7 +252,7 @@ fn a_pinned_cards_library_launches_with_its_profile() {
             "Living Room PC \u{b7} HDR",
             "the shelf names the profile it will launch with"
         ),
-        _ => panic!("A on a pinned card opens its library"),
+        _ => panic!("Y on a pinned card opens its library"),
     }
 
     library.set_games(vec![crate::library::LibraryGame {
@@ -288,7 +286,7 @@ fn a_pinned_cards_library_launches_with_its_profile() {
 fn a_primary_tiles_library_leaves_the_profile_to_the_binding() {
     let (mut s, _console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
     s.sync();
-    s.handle_menu(MenuEvent::Confirm); // paired+online host focused first
+    s.handle_menu(MenuEvent::Secondary); // paired+online host focused first
     finish_motion(&mut s);
     library.set_games(vec![crate::library::LibraryGame {
         id: "steam:570".into(),
@@ -310,16 +308,13 @@ fn a_primary_tiles_library_leaves_the_profile_to_the_binding() {
 fn wake_gates_input_in_the_same_press() {
     let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
     s.sync();
-    // Focus "Office Tower" (offline + wakeable), then Y: the wake starts. Y rather than A
-    // because A opens that host's library, which does its own quieter waking in the
-    // background — there is nothing to look at while a box boots into a DESKTOP, which is
-    // what still makes this flow worth its modal.
+    // Focus "Office Tower" (offline + wakeable), then A: the wake starts.
     s.handle_menu(MenuEvent::Move(MenuDir::Right));
-    s.handle_menu(MenuEvent::Secondary);
+    s.handle_menu(MenuEvent::Confirm);
     let w = s
         .wake
         .as_ref()
-        .expect("Waking card raised in the SAME call as the Y press");
+        .expect("Waking card raised in the SAME call as the A press");
     assert_eq!(w.name, "Office Tower");
     assert!(!w.online);
     // The very next input is modal-gated — the cursor can't drift onto Add Host —
@@ -753,7 +748,7 @@ fn collections_drill_in_reaches_one_platform_and_backs_out() {
     let (mut s, _console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
     s.sync();
     mixed_library(&library);
-    s.handle_menu(MenuEvent::Confirm); // A at home → this host's library
+    s.handle_menu(MenuEvent::Secondary); // Y at home → this host's library
     finish_motion(&mut s);
     assert!(matches!(s.stack.last(), Some(Screen::Library(_))));
 
@@ -823,7 +818,7 @@ fn collections_is_offered_only_when_there_is_something_to_browse() {
             running: false,
         },
     ]);
-    s.handle_menu(MenuEvent::Confirm);
+    s.handle_menu(MenuEvent::Secondary);
     finish_motion(&mut s);
     assert!(matches!(s.stack.last(), Some(Screen::Library(_))));
     let depth = s.stack.len();
