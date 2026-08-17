@@ -155,6 +155,10 @@ impl VirtualDisplay for WlrootsDisplay {
         swaymsg(&["output", &name, "enable"])
             .with_context(|| format!("swaymsg output {name} enable"))?;
 
+        // Put the compositor's focus on the head we are about to stream, so the windows this
+        // session opens land where the client can see them.
+        focus_output(&name);
+
         // Steer xdpw's headless output chooser at our new output, then run the portal handshake on
         // its own thread (it parks to keep the cast alive, like the other backends). Serialized:
         // the chooser is one per-user file, so a concurrent session's write between ours and xdpw's
@@ -270,6 +274,16 @@ impl Drop for StopGuard {
 /// it lets us NAME the output (D6).
 static CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Could `name` be a headless output a punktfunk host created? sway names these itself, so unlike
+/// Hyprland's `PF-<pid>-<n>` there is nothing in the name to attribute — the prefix is the whole
+/// answer, and a headless output the operator made by hand is indistinguishable. That is why the two
+/// callers are both narrow: [`unplug_strays`] additionally requires the output to have appeared
+/// during our own `create_output`, and [`super::super::focus_streamed_output`] only ever passes the
+/// name of the head this session is streaming.
+pub(crate) fn is_managed_output(name: &str) -> bool {
+    name.starts_with("HEADLESS-")
+}
+
 /// Unplug any headless output that appeared since `before` and that nothing owns — the cleanup for a
 /// `create_output` whose output we could not identify in time. Only `HEADLESS-*` is touched: a
 /// physical hotplug in the same window is the operator's, not ours, and `unplug` on a real connector
@@ -279,7 +293,7 @@ fn unplug_strays(before: &[String]) {
     let Ok(now) = output_names() else { return };
     for name in now
         .into_iter()
-        .filter(|n| n.starts_with("HEADLESS-") && !before.iter().any(|b| b == n))
+        .filter(|n| is_managed_output(n) && !before.iter().any(|b| b == n))
     {
         match swaymsg(&["output", &name, "unplug"]) {
             Ok(_) => tracing::warn!(output = %name, "unplugged a headless output we created but \
@@ -290,10 +304,48 @@ fn unplug_strays(before: &[String]) {
     }
 }
 
+/// Point sway's focus at the head we are about to stream, so the windows this session opens land
+/// where the client can see them.
+///
+/// sway opens a new window on the focused workspace, and `create_output` does not focus what it
+/// creates — focus stays on whatever head already had it, which on a box with a physical monitor is
+/// that monitor. Nothing else in the session moves it (the client's pointer is confined to the
+/// streamed output), so without this every app the host launches for the session opens where the
+/// client cannot see it. The Hyprland twin of this is `hyprland::focus_output`; both are the
+/// EXTEND-topology answer to window placement, and neither touches the operator's heads.
+///
+/// Best-effort: a failure costs window placement, not the session.
+pub(crate) fn focus_output(name: &str) {
+    match swaymsg(&focus_argv(name)) {
+        Ok(_) => tracing::info!(output = %name, "focused the streamed headless output"),
+        Err(e) => tracing::warn!(
+            output = %name, error = %format!("{e:#}"),
+            "could not focus the streamed headless output — apps this session launches may open on \
+             a physical monitor instead of on the stream"
+        ),
+    }
+}
+
+/// The `swaymsg` argv that focuses `name`, split out so a test pins its SHAPE.
+///
+/// sway's command is `focus output <name>` — the noun comes SECOND, unlike every other call in this
+/// file (`output <name> mode|enable|unplug`), where it comes first. Transposing it yields
+/// `output focus <name>`, which sway rejects, and the field symptom is the very bug this fixes.
+///
+/// ⚠ Unlike the Hyprland twin, this shape is **from sway's documented command surface, not yet
+/// exercised on a live sway** (no box in the fleet runs one — the 2026-08-17 probe had Hyprland
+/// only). It is the safer of the two to get wrong: [`swaymsg`] passes these through `--` as a sway
+/// *command* and rejects a non-zero exit, and sway exits non-zero on an invalid command (the
+/// `Unknown/invalid command` path [`swaymsg_query`] documents), so a bad shape surfaces as the
+/// logged warning rather than as a silent success the way `hyprctl`'s exit-0 rejection would.
+fn focus_argv(name: &str) -> [&str; 3] {
+    ["focus", "output", name]
+}
+
 /// The configured [`crate::policy::Topology`] is not implemented on this backend — say so once per
 /// create instead of leaving the management API's echo as the only signal that the pin was dropped
-/// (sweep 13.18). sway's virtual output is always an EXTENSION: nothing here promotes it to primary
-/// or disables the operator's heads.
+/// (sweep 13.18). sway's virtual output is always an EXTENSION: [`focus_output`] steers new windows
+/// onto it, but nothing here promotes it to primary or disables the operator's heads.
 fn warn_topology_is_extend_only() {
     let topology = crate::effective_topology();
     if !matches!(
@@ -739,4 +791,18 @@ fn portal_thread(
             let _ = err_tx.send(Err(format!("{e:#}")));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// sway spells this one `focus output <name>` — noun second, unlike the `output <name> …` shape
+    /// every other call in this file uses. A transposed `output focus <name>` is rejected, and the
+    /// only symptom would be the bug the call exists to fix: apps opening on the operator's monitor
+    /// while the stream shows a bare desktop.
+    #[test]
+    fn focus_names_the_output_after_the_verb() {
+        assert_eq!(focus_argv("HEADLESS-2"), ["focus", "output", "HEADLESS-2"]);
+    }
 }

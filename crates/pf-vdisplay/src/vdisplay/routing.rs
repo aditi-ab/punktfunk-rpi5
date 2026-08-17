@@ -277,6 +277,49 @@ pub fn launch_into_gamescope_session(cmd: &str) -> Result<std::process::Child> {
     gamescope::launch_into_session(cmd)
 }
 
+/// Put the compositor's focus on the streamed head `name`, so a window mapping **now** lands where
+/// the client is looking. Split out for `library.rs` like [`launch_into_gamescope_session`].
+///
+/// Only the two EXTEND backends need (or can act on) this. The streamed head sits *beside* the
+/// operator's there, and a new window goes to whatever monitor holds focus — so a session that never
+/// claims focus launches every app onto a screen the client cannot see. The other backends are
+/// no-ops by construction, not by omission:
+///
+/// * **KWin / Mutter** — the virtual output is promoted *primary* (`apply_virtual_primary` /
+///   `make_virtual_primary`), which is already the compositor-level answer to "where do new windows
+///   go".
+/// * **gamescope** — the app is a child of the nested compositor, so placement is structural.
+/// * **mirror pins** — the streamed head IS a physical head the operator is using; stealing its
+///   focus mid-session would be a change they did not ask for.
+///
+/// `name` is checked against the backend's own minting scheme first, which is what keeps the
+/// mirror-pin case out: there `name` is a physical connector, and only a head we created ourselves is
+/// ours to focus.
+///
+/// Returns whether focus was actually asserted, so the caller can log the distinction rather than
+/// guess. Best-effort throughout: failing to focus costs window placement, never the session.
+#[cfg(target_os = "linux")]
+pub fn focus_streamed_output(compositor: Compositor, name: &str) -> bool {
+    match compositor {
+        Compositor::Hyprland if hyprland::is_managed_output(name) => {
+            hyprland::focus_output(name);
+            true
+        }
+        Compositor::Wlroots if wlroots::is_managed_output(name) => {
+            wlroots::focus_output(name);
+            true
+        }
+        // Exhaustive on purpose (no `_` arm): a backend added later must come here and decide,
+        // rather than inheriting "no focus" silently — the failure mode is invisible in a log and
+        // only shows up as a game on the wrong screen.
+        Compositor::Hyprland
+        | Compositor::Wlroots
+        | Compositor::Kwin
+        | Compositor::Mutter
+        | Compositor::Gamescope => false,
+    }
+}
+
 /// Every nested Xwayland `(DISPLAY, XAUTHORITY)` of the running gamescope session for the XFixes
 /// cursor source (remote-desktop-sweep Phase C) — gamescope can run several, and the pointer is on
 /// whichever is focused. Empty when no gamescope session is running / it exposes no Xwayland (the

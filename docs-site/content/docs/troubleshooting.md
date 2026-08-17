@@ -216,6 +216,33 @@ See [GNOME](/docs/gnome) for the GL/EGL userspace details.
   auto-detects the live compositor, and the pin points it at one backend even when a different
   session is live (it also disables Gaming ↔ Desktop following).
 
+## Games from my library open on a physical monitor, not on the stream (Hyprland / sway)
+
+The stream shows your bare desktop while the game is running on a screen at the machine. On
+**Hyprland** and **sway** the virtual display is an *extend* output — it's added beside your real
+monitors, and neither compositor moves anything onto a new output by itself. Both open a new window on
+whatever monitor holds **focus**, so a session that never claims focus launches everything onto the
+monitor you were last using in person.
+
+The host now claims focus for the streamed display at session start and again just before each library
+launch, which is the fix — if you're seeing this, [update](/docs/updating) first, since hosts up to and
+including **0.29.0** never claimed it at all. The host log says which head it took
+(`focused the streamed headless output`), and warns when it couldn't.
+
+If it still happens on a host that has the fix:
+
+- **Are you also using the machine in person?** Focus is per-monitor and live: clicking on a physical
+  monitor while the game is still starting pulls the new window over to it. Launch, then leave the
+  host's own keyboard and mouse alone until the game is up.
+- **A launcher that opens a second window later** (Steam Big Picture, Heroic, some emulator
+  front-ends) places that window wherever focus is at *that* moment, not where the first one went. If
+  this is your normal way to play, set **Virtual displays → Dedicated game sessions** to **Dedicated**
+  — every launch then gets its own headless gamescope with only the game inside, and placement stops
+  being a question of focus at all (needs `gamescope` installed).
+- **Setting the topology to Primary or Exclusive won't do it.** Neither is implemented on these two
+  backends — the console accepts the setting and the host logs that it dropped it. See
+  [Virtual displays → Topology](/docs/virtual-displays#topology).
+
 ## The screen stays black after switching to Game Mode (Nobara)
 
 On distros whose Game Mode is display-manager autologin under **plasmalogin** (Nobara), a managed

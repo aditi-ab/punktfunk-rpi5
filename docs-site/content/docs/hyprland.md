@@ -47,6 +47,11 @@ See [Configuration](/docs/configuration) for the full reference.
   portal. To pick the output without a GUI on a headless host, the host writes a managed
   `~/.config/hypr/xdph.conf` pointing xdph's `custom_picker_binary` at a small shim that selects the
   new output automatically — no interactive picker dialog to answer.
+- **Window placement** — the headless output is an *extension*: it sits beside your real monitors and
+  nothing promotes it or turns them off. Hyprland opens a new window on the **focused** monitor, so
+  the host runs `hyprctl dispatch focusmonitor PF-…` — once when the output is ready, and again right
+  before it launches anything from your library. Without that, games open on whichever physical
+  monitor had focus and the stream shows a bare desktop.
 - **Input** — mouse and keyboard are injected via the wlroots **virtual pointer** and **virtual
   keyboard** protocols (Hyprland kept them). Gamepads and audio are compositor-independent.
 

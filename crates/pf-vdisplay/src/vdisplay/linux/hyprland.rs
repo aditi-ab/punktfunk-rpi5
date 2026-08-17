@@ -28,6 +28,13 @@
 //! `$XDG_RUNTIME_DIR/hypr/` and [`super::super::apply_session_env`] exports it for `hyprctl` — with
 //! the ScreenCast interface routed to xdph (`scripts/headless/portals.conf`).
 //!
+//! The focus contract [`focus_output`] rests on is verified on **Hyprland 0.56.2** (2026-08-17,
+//! headless probe against a real instance): `output create headless` leaves the new head
+//! `focused: false` — which is the whole reason [`focus_output`] exists — `dispatch focusmonitor
+//! <name>` replies `ok` and moves `focused` onto it, and a client spawned afterwards maps onto that
+//! head. The bare `hyprctl focusmonitor <name>` (no `dispatch`) answers `unknown request` at
+//! **exit 0**, which is what [`hyprctl_dispatch`]'s `unknown` marker turns into an error.
+//!
 //! Contracts verified on **Hyprland 0.55.4 + xdph 1.3.x** (`design/hyprland-support.md` Phase 0):
 //! `hyprctl` subcommands / JSON shapes, the `[SELECTION]/screen:<name>` picker format (re-derived
 //! from xdph 1.3.12's own parser on 2026-08-14, which is when the missing `/` turned up), the
@@ -93,7 +100,7 @@ fn next_output_name() -> String {
 /// Is `name` an output some punktfunk host created (`PF-<pid>-<n>`, or a legacy `PF-<n>`)? Pure —
 /// this is what [`list_monitors`] reports as `managed`, so a user's own monitor called `PF-office`
 /// must not qualify.
-fn is_managed_output(name: &str) -> bool {
+pub(crate) fn is_managed_output(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("PF-") else {
         return false;
     };
@@ -231,6 +238,10 @@ impl VirtualDisplay for HyprlandDisplay {
 
         // The client's exact mode (also the frame clock — a headless output is timer-paced from it).
         set_monitor_rule(&name, mode).with_context(|| format!("set monitor rule for {name}"))?;
+
+        // Put the compositor's focus on the head we are about to stream, so the windows this
+        // session opens land where the client can see them.
+        focus_output(&name);
 
         // Steer xdph's custom picker at our new output, then run the portal handshake on its own
         // thread (it parks to keep the cast alive, like the other backends). Serialized: the
@@ -402,10 +413,47 @@ fn reclaim_leftovers_once() {
     });
 }
 
+/// Point Hyprland's focus at the head we are about to stream, so the windows this session opens
+/// land where the client can see them.
+///
+/// Hyprland opens a new window on the **active workspace of the focused monitor**, and
+/// `output create headless` does not focus what it creates — focus stays wherever it already was,
+/// which on any box with a physical head is that head. Nothing else in the session ever moves it:
+/// the client's pointer is confined to the streamed output (the #240 cursor fix), so no amount of
+/// remote mouse motion can focus-follows-mouse its way over, and no window rule names our output.
+/// So without this, every app the host launches for the session — the whole game library — opens on
+/// a monitor the client cannot see, and the stream shows a bare desktop. This is the EXTEND-topology
+/// answer to that: it steers window placement without touching the operator's heads (which is what
+/// [`warn_topology_is_extend_only`] is still telling the truth about).
+///
+/// Best-effort by construction: a failure costs window placement, not the session, and a box with no
+/// physical head was already placing windows correctly.
+pub(crate) fn focus_output(name: &str) {
+    match hyprctl_dispatch(&focus_argv(name)) {
+        Ok(()) => tracing::info!(output = %name, "focused the streamed headless output"),
+        Err(e) => tracing::warn!(
+            output = %name, error = %format!("{e:#}"),
+            "could not focus the streamed headless output — apps this session launches may open on \
+             a physical monitor instead of on the stream"
+        ),
+    }
+}
+
+/// The `hyprctl` argv that focuses `name`, split out so a test pins its SHAPE.
+///
+/// `focusmonitor` is a **dispatcher**, so it lives behind the `dispatch` subcommand. Getting that
+/// wrong is the one mistake here that no type can catch and that reads as success from the outside:
+/// `hyprctl` answers an unknown subcommand with an exit-0 error string (see [`hyprctl_dispatch`],
+/// which exists for exactly that), and the field symptom would be identical to the bug this fixes —
+/// a bare streamed desktop with every launched app on the operator's monitor.
+fn focus_argv(name: &str) -> [&str; 3] {
+    ["dispatch", "focusmonitor", name]
+}
+
 /// The configured [`crate::policy::Topology`] is not implemented on this backend — say so once per
 /// create instead of leaving the management API's echo as the only signal that the pin was dropped
-/// (sweep 13.18). The Hyprland headless output is always an EXTENSION: nothing here promotes it to
-/// primary or disables the operator's heads.
+/// (sweep 13.18). The Hyprland headless output is always an EXTENSION: [`focus_output`] steers new
+/// windows onto it, but nothing here promotes it to primary or disables the operator's heads.
 fn warn_topology_is_extend_only() {
     let topology = crate::effective_topology();
     if !matches!(
@@ -1074,6 +1122,18 @@ mod tests {
         // Missing patch defaults to 0; garbage is rejected.
         assert_eq!(parse_version_tag("v1.0"), Some((1, 0, 0)));
         assert_eq!(parse_version_tag("wat"), None);
+    }
+
+    /// `focusmonitor` is a dispatcher, so it must go through `hyprctl dispatch`. A bare
+    /// `hyprctl focusmonitor NAME` is not a subcommand and hyprctl reports it with exit 0, so the
+    /// only signal would be the field symptom this whole call exists to remove: apps opening on the
+    /// operator's monitor while the stream shows a bare desktop.
+    #[test]
+    fn focus_goes_through_the_dispatch_subcommand() {
+        assert_eq!(
+            focus_argv("PF-1234-1"),
+            ["dispatch", "focusmonitor", "PF-1234-1"]
+        );
     }
 
     #[test]

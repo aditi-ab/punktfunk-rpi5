@@ -54,6 +54,11 @@ See [Configuration](/docs/configuration) for the full reference.
 - **Capture** — it captures that output through the **xdg-desktop-portal-wlr (xdpw)** ScreenCast
   portal. The host writes a managed chooser config so the output pick is automatic — no interactive
   picker dialog to answer.
+- **Window placement** — the headless output is an *extension*: it sits beside your real monitors and
+  nothing promotes it or turns them off. sway opens a new window on the focused workspace, so the host
+  runs `swaymsg focus output HEADLESS-…` — once when the output is ready, and again right before it
+  launches anything from your library. Without that, games open on whichever physical monitor had
+  focus and the stream shows a bare desktop.
 - **Input** — mouse and keyboard are injected via the wlroots **virtual pointer** and **virtual
   keyboard** protocols.
 
