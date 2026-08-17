@@ -236,30 +236,37 @@ pub struct HostConfig {
     /// [`punktfunk_core::audio::pcm::rate_is_supported`] and the channel count is decided by
     /// whether a frame fits a datagram, not by a list — so neither is restated here.
     ///
-    /// **Default OFF, and deliberately unlike every other `Option<bool>` knob here** — the use
-    /// site is `unwrap_or(false)`, not `unwrap_or(true)`. `audio_redundancy` above defaults ON
-    /// because it costs a few hundred kbps and buys loss resilience on a plane the user already
-    /// agreed to; hi-res costs **1.4–8.5 Mbps in stereo, up to 33.9 in 7.1** and rides QUIC
-    /// datagrams OUTSIDE the ABR loop,
-    /// so it is taken off the top of the link and adaptive bitrate can neither see nor reclaim
-    /// it (§4.6). That is bandwidth nobody consented to, on a link the host cannot re-negotiate
-    /// afterwards — so it must be asked for at BOTH ends: the client sets
-    /// `CLIENT_CAP_AUDIO_HIRES` (its own user-facing toggle, also default off) and the operator
-    /// sets this.
+    /// **Default ON** (2026-08-17), explicit-off grammar — the same shape as `four_four_four`,
+    /// `chacha20` and `ten_bit` above, and for the same reason: the host merely *allows* the plane,
+    /// and the switch that decides any actual session is the CLIENT's, which is still default OFF.
+    /// `PUNKTFUNK_AUDIO_HIRES=0`/`false`/`off`/`no` disables.
     ///
-    /// `None` (unset) and an explicit off are therefore the same answer at the use site; the
-    /// tri-state is kept only so a future status/diagnostics reader can tell "the operator turned
-    /// it off" from "the operator never said". Explicit-off grammar for symmetry with its
-    /// neighbours.
+    /// It used to be default OFF, on the argument that the plane costs **1.4–8.5 Mbps in stereo,
+    /// up to 33.9 in 7.1**, rides QUIC datagrams OUTSIDE the ABR loop (§4.6) and is therefore
+    /// bandwidth nobody consented to. Every clause of that is still true — what was wrong was
+    /// asking the OPERATOR to pre-consent to it, because the operator is not who spends it and, on
+    /// a host with no settings UI, is a person who has to be told an environment variable exists
+    /// before a user's own explicit menu choice can work at all. The field report that moved this:
+    /// a user picked "Lossless 96 kHz / 24-bit" in the macOS client, got Opus, and nothing in any
+    /// UI said why — the reason was one `INFO` line in the host's journal.
+    ///
+    /// What actually protects the link is the rest of the §8.4 gate, and it is mechanical rather
+    /// than consent-based: the client must have asked, the capture path must HONESTLY deliver the
+    /// rate (not merely open at it), the cost must fit `HIRES_MAX_VIDEO_SHARE_PCT` (25 %) of the
+    /// session's video bitrate, and a frame must fit a datagram. A 5 Mbps session still cannot buy
+    /// 96/24 no matter what this says. So the operator gate was never the thing keeping a modest
+    /// link safe — it was only keeping the feature unreachable.
     ///
     /// ⚠ **The desktop CLIENTS read a variable of this same name with a RICHER grammar** — see
     /// `pf_client_core::session`, which takes `1`/`on`, a bare rate such as `96000`, or an explicit
     /// `<rate>/<bits>`. A box that is both host and client therefore configures both halves from
-    /// one environment line, and they compose only because [`env_on`] reads everything that is not
-    /// `0`/`false`/`off`/`no` as *on*: a client-shaped `96000/24` happens to say *allow* here too.
-    /// That is an accident that works, not a shared grammar — `1` is the only spelling that means
-    /// the same thing at both ends, which is why it is the one the docs give.
-    pub audio_hires: Option<bool>,
+    /// one environment line, and they still compose after the flip: [`env_on`] reads everything
+    /// that is not `0`/`false`/`off`/`no` as *on*, so a client-shaped `96000/24` says *allow* here
+    /// too — and the one spelling that has to mean the same thing at both ends is now `0`, which
+    /// does: it forces Opus on the host and forces Opus at the client. The interesting direction
+    /// reversed with the default. It used to be "did anyone remember to turn this on"; it is now
+    /// "did anyone turn it off".
+    pub audio_hires: bool,
     /// `PUNKTFUNK_PERF` — per-stage timing instrumentation.
     pub perf: bool,
     /// `PUNKTFUNK_VIDEO_SOURCE` — GameStream video source select. `virtual` (the default — a
@@ -465,9 +472,11 @@ impl HostConfig {
             audio_output_mode: AudioOutputMode::from_env(),
             audio_quality: val("PUNKTFUNK_AUDIO_QUALITY").map(|s| s.trim().to_lowercase()),
             audio_redundancy: env_on("PUNKTFUNK_AUDIO_REDUNDANCY"),
-            // Tri-state like its neighbour, but read as `unwrap_or(FALSE)` at the use site —
-            // see the field doc for why this one knob inverts the house default.
-            audio_hires: env_on("PUNKTFUNK_AUDIO_HIRES"),
+            // Default ON, explicit-off grammar (the client's CLIENT_CAP_AUDIO_HIRES bit — and the
+            // audio-format row its user picked — is the real per-session switch; the §8.4 gate's
+            // capture, bandwidth and datagram conditions are what keep a modest link safe, not
+            // this. See the field doc for why it stopped being opt-in).
+            audio_hires: env_on("PUNKTFUNK_AUDIO_HIRES").unwrap_or(true),
             perf: flag("PUNKTFUNK_PERF"),
             // Default ON while the interval-stutter field program runs (see the field doc).
             stall_probes: env_on("PUNKTFUNK_STALL_PROBES").unwrap_or(true),

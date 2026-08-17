@@ -168,10 +168,14 @@ fn rate_fallback_ladder(rate_hz: u32) -> &'static [u32] {
 ///
 /// So returning the legacy-looking `(48 000, 16)` for a user who chose **Standard (Opus)** does not
 /// mean "no request" — it advertises the capability, the host's gate accepts 48 kHz/16-bit as a
-/// perfectly supported format, and any host running `PUNKTFUNK_AUDIO_HIRES=1` silently gives that
-/// user the lossless `0xD3` plane at 1.5 Mbps in place of 256 kbps of Opus. This returned exactly
-/// that pair until it was caught by comparing all four clients; the desktop client and every
-/// pre-v24 `punktfunk_connect_ex*` send `(0, 0)`, and so does this now.
+/// perfectly supported format, and the host then silently gives that user the lossless `0xD3` plane
+/// at 1.5 Mbps in place of 256 kbps of Opus. This returned exactly that pair until it was caught by
+/// comparing all four clients; the desktop client and every pre-v24 `punktfunk_connect_ex*` send
+/// `(0, 0)`, and so does this now.
+///
+/// ⚠⚠ The reach of that slip grew on 2026-08-17: `PUNKTFUNK_AUDIO_HIRES` went default-ON, so where
+/// this used to need a host whose operator had opted in, it now lands on every host that has not
+/// deliberately opted out.
 ///
 /// `(0, 0)` is also what keeps the `Hello` byte-identical to a legacy one, because the wire encodes
 /// an explicit 48 000/16 the same as absent — the difference lives entirely in the capability bit.
@@ -723,9 +727,10 @@ mod tests {
     /// lossless rung, so the other rule would make that rung the one nobody could request.
     ///
     /// The consequence is that `(48 000, 16)` is not a way of saying "default" — it is a request,
-    /// the host's gate accepts it as a supported format, and on any host with
-    /// `PUNKTFUNK_AUDIO_HIRES=1` the user who chose Standard gets the lossless `0xD3` plane instead
-    /// of Opus. Nothing surfaces it: the settings screen shows what was asked for, and a granted
+    /// the host's gate accepts it as a supported format, and the user who chose Standard gets the
+    /// lossless `0xD3` plane instead of Opus on every host that has not opted out of it (which,
+    /// since the host gate went default-ON on 2026-08-17, is all of them). Nothing surfaces it: the
+    /// settings screen shows what was asked for, and a granted
     /// session and a declined one look identical from there. This function returned that pair until
     /// all four clients were compared against each other.
     ///

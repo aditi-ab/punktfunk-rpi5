@@ -171,8 +171,13 @@ const HIRES_MAX_VIDEO_SHARE_PCT: u32 = 25;
 /// 1. `client_asked` — the client set `CLIENT_CAP_AUDIO_HIRES`. Capable **and** the user turned
 ///    it on, the `VIDEO_CAP_444` precedent: a client that cannot open a 96 kHz output, or whose
 ///    user never asked, must not set the bit.
-/// 2. `operator_allows` — `PUNKTFUNK_AUDIO_HIRES`, default OFF. This spends bandwidth the host's
-///    owner did not previously agree to, so it is asked for at both ends.
+/// 2. `operator_allows` — `PUNKTFUNK_AUDIO_HIRES`, **default ON since 2026-08-17**; the operator
+///    opts OUT with `=0`. It was default off, on the argument that this spends bandwidth the
+///    host's owner never agreed to — but the operator is not who spends it, the client's user is,
+///    and condition 1 is already that user's explicit choice. What a default-off operator gate
+///    actually produced was a user picking "Lossless 96 kHz / 24-bit" in the client, silently
+///    getting Opus, and the reason living in one `INFO` line of the host's journal. Conditions
+///    3 and 4 are what keep a link safe, and they are mechanical rather than consent-based.
 /// 3. `capture_rate` — the capture path can GENUINELY deliver the requested rate (§8.2 / §8.3).
 ///    Not "did the open succeed": both backends accept a rate their endpoint does not run at and
 ///    resample to it without an error, so the question has to be put to the DEVICE before the
@@ -226,10 +231,16 @@ pub(super) fn resolve_audio_plane(
             // ⚠ The range is the OPERATOR's decision criterion, so it has to keep up with what
             // the plane can now negotiate: 1.4 Mbps at 44.1/16 stereo up to 8.5 at 176.4/24, and
             // up to 33.9 for 176.4/24 7.1. It read "1.5–4.6" while the plane was 48/96 stereo.
-            "hi-res audio requested by the client but PUNKTFUNK_AUDIO_HIRES is not enabled on \
-             this host — the session uses Opus 48 kHz (the lossless plane costs 1.4–8.5 Mbps in \
-             stereo, and up to 33.9 in 7.1, off the top of the link — so it is opt-in on both \
-             ends)"
+            //
+            // ⚠ This is now the DELIBERATE-OPT-OUT message, not the forgot-to-opt-in one: the gate
+            // defaults ON, so reaching this line means someone set the variable to `0` on this
+            // host. Naming the variable AND the value it must have is the difference between an
+            // operator finding their own `host.env` line and re-reading the docs for a switch they
+            // never set. The old wording sent people looking for something to enable.
+            "hi-res audio requested by the client but it is disabled on this host by \
+             PUNKTFUNK_AUDIO_HIRES=0 — the session uses Opus 48 kHz (remove that line, or set it \
+             to 1, to allow the lossless plane; it costs 1.4–8.5 Mbps in stereo and up to 33.9 in \
+             7.1, off the top of the link and outside the ABR loop)"
         );
         return AudioPlane::opus();
     }
@@ -851,7 +862,7 @@ pub(super) async fn negotiate(
              staying on Opus; the capability and the format must be set together"
         );
     }
-    let hires_allowed = pf_host_config::config().audio_hires.unwrap_or(false);
+    let hires_allowed = pf_host_config::config().audio_hires;
     // §8.4 condition 4 — what the capture path can HONESTLY deliver, asked of the device rather
     // than inferred from a successful open (§4.3/§4.4: both backends resample a rate they cannot
     // run at, without an error). Blocking on Windows (an endpoint enumeration plus an
@@ -860,7 +871,10 @@ pub(super) async fn negotiate(
     //
     // Short-circuited behind the two cheap policy conditions, which is the same discipline those
     // probes use: an ordinary session — every session with every shipping client today — must not
-    // pay COM work for a feature nobody asked for. The value is not merely unused in that case
+    // pay COM work for a feature nobody asked for. ⚠ Since the operator gate went default-ON that
+    // guarantee rests on `hires_asked` ALONE, so keep it first: a client that does not set
+    // CLIENT_CAP_AUDIO_HIRES is now the only thing standing between an ordinary Windows session
+    // and an endpoint enumeration it has no use for. The value is not merely unused in that case
     // but unreachable, since the gate returns on condition 1 or 2 before it looks at this one;
     // `Unknown` is nonetheless the correct thing to pass, because "we did not ask" and "we asked
     // and could not tell" both mean the same thing to the gate: decline.
@@ -1225,8 +1239,10 @@ mod tests {
         assert_eq!(p, AudioPlane::opus());
     }
 
-    /// §8.4 condition 2 — the operator's `PUNKTFUNK_AUDIO_HIRES` gate, default OFF. A client
-    /// asking is not enough on its own: this costs bandwidth the host's owner never agreed to.
+    /// §8.4 condition 2 — the operator's `PUNKTFUNK_AUDIO_HIRES` gate. Default ON since
+    /// 2026-08-17, so this is now the OPT-OUT path (`=0`) rather than the un-opted-in one: an
+    /// operator who has deliberately turned the plane off outranks a client that asks for it, and
+    /// still gets today's wire.
     #[test]
     fn the_operator_gate_alone_can_decline() {
         let p = resolve_audio_plane(
@@ -1242,11 +1258,16 @@ mod tests {
         assert_eq!(p, AudioPlane::opus());
     }
 
-    /// …and the default really is off, so an operator who has set nothing gets today's wire.
+    /// …and the default really is ON, so an operator who has set nothing no longer has to discover
+    /// an environment variable before a client's own explicit audio-format choice can be honoured.
     /// (`config()` reads the process environment once; no test in this crate sets the knob.)
+    ///
+    /// ⚠ This asserts the DEFAULT, not that any session goes lossless: condition 1 still gates
+    /// every one of them on the client's `CLIENT_CAP_AUDIO_HIRES`, which ships off. The two
+    /// neighbouring tests above are what prove an ordinary session is untouched by this flip.
     #[test]
-    fn the_operator_default_is_off() {
-        assert!(!pf_host_config::config().audio_hires.unwrap_or(false));
+    fn the_operator_default_is_on() {
+        assert!(pf_host_config::config().audio_hires);
     }
 
     /// Surround, decided by the FRAME LADDER rather than by a stereo-only rule — the whole point

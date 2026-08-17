@@ -557,17 +557,21 @@ INFO  punktfunk/1 audio streaming … tier=high kbps=512 redundancy=true
 
 `standard` reproduces the pre-0.25 encoder exactly if you want to A/B it.
 
-If what you want is **no lossy stage at all**, there is a third knob — but read what it costs
-first:
+If what you want is **no lossy stage at all**, ask for it in the client: its audio-format setting
+has a **Lossless** row per rate, and picking one is the whole opt-in. There is nothing to set on the
+host — the host allows the lossless plane by default. If you want to forbid it on this host
+regardless of what clients ask for, that is the same variable, inverted:
 
 ```ini
-PUNKTFUNK_AUDIO_HIRES=1         # allow the lossless PCM audio plane (default off)
+PUNKTFUNK_AUDIO_HIRES=0         # refuse the lossless PCM audio plane (default: allowed)
 ```
 
-That replaces Opus with uncompressed 48/96 kHz, 16/24-bit stereo PCM. It has to be turned on at
-**both** ends — the client has its own switch, also off by default — because it costs 1.5–4.6 Mbps
-against Opus's 256 kbps, and like every other audio setting here that comes off the top of the
-link, where adaptive bitrate can neither see it nor reclaim it.
+The plane replaces Opus with uncompressed PCM — 44.1 through 176.4 kHz, 16 or 24-bit, stereo
+through 7.1 — and it costs 1.4–8.5 Mbps in stereo (up to 33.9 for 176.4 kHz/24-bit 7.1) against
+Opus's 256 kbps. Like every other audio setting here, that comes off the top of the link, where
+adaptive bitrate can neither see it nor reclaim it. Which is why the client's setting ships off and
+the host's affordability check is unconditional: a session only goes lossless when it can pay for
+it out of a quarter of its video bitrate.
 
 It is also unlikely to fix the problem *this* section is about: a lossless copy of a 24 kHz mono
 mix is still a 24 kHz mono mix, so fix the endpoint first. What it buys is bit-exactness rather
@@ -576,14 +580,18 @@ Windows the host reads the endpoint's own engine rate (the `engine_hz` line abov
 pad, so 96 kHz means setting that device to 96 kHz in Windows' own sound properties. A Linux host
 normally owns the sink applications play into and states its rate to the audio graph itself, so
 96 kHz there needs no device configuration at all. Whenever any condition fails — the client didn't
-ask, the session isn't stereo, the capture path can't genuinely deliver the rate, or the link can't
-spare it — the session quietly stays on Opus and the log says which one lost.
+ask, this host has `PUNKTFUNK_AUDIO_HIRES=0`, the capture path can't genuinely deliver the rate, the
+link can't spare it, or one frame of that format won't fit a datagram at that channel count — the
+session quietly stays on Opus and the log says which one lost. That log line is worth knowing about
+before you go looking in the UI: a declined session and a granted one look the same from the
+settings screen, and the host's journal is where the reason lives.
 
 One trap if the box you are editing is *also* a client: the Linux and Windows clients read a
 `PUNKTFUNK_AUDIO_HIRES` of their own, with a richer grammar — a bare rate such as `96000`, or an
-explicit `96000/24` — so one line in a shared environment sets both halves at once. **`1` is the
-value that means *on* to each of them**, which is why the line above is written that way. The
-client's spellings are in
+explicit `96000/24` — so one line in a shared environment sets both halves at once. **`0` is the
+value that means *off* to each of them**, which is why the opt-out line above is written that way;
+anything that isn't `0`/`false`/`off`/`no` reads as *allow* on the host side, so a client-shaped
+`96000/24` also leaves the host's half permissive. The client's spellings are in
 [Configuration → Client-side](/docs/configuration#client-side-native-clients).
 
 ## Audio lags behind the picture

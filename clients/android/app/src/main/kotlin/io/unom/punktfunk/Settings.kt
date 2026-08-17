@@ -69,8 +69,10 @@ data class Settings(
      *
      * Off by default and deliberately: lossless takes 2.1–8.5 Mbps off the top of the link,
      * OUTSIDE the ABR loop that manages the video budget, against the ~256 kbps Opus it replaces —
-     * so it has to be asked for at both ends (`PUNKTFUNK_AUDIO_HIRES` is the host's half, also off
-     * by default). A REQUEST, never a fact: the host runs its gate and may answer Opus anyway, and
+     * so a user has to pick it. Since 2026-08-17 this setting is the ONLY opt-in: the host's half
+     * (`PUNKTFUNK_AUDIO_HIRES`) defaults ON and is an opt-OUT (`=0`), so this choice is enough on
+     * any host that has not deliberately turned the plane off.
+     * A REQUEST, never a fact: the host runs its gate and may answer Opus anyway, and
      * the native side downgrades the rate first if THIS device will not open it. What actually
      * happened is on the stats HUD, and in logcat's `audio: plane codec=… rate=…` line.
      */
@@ -789,8 +791,13 @@ val AUDIO_FORMAT_OPTIONS = listOf(
  * specified* rather than *the format differs from the default*: 48 kHz/16-bit is the cheapest
  * lossless rung as well as the legacy pair, so the other rule would make it the one rung nobody
  * could ask for. Sending `48000`/`16` for a user who chose Standard therefore advertises the
- * capability, and any host with `PUNKTFUNK_AUDIO_HIRES=1` hands that user 1.5 Mbps of lossless PCM
- * instead of 256 kbps of Opus. This returned that pair until all four clients were compared.
+ * capability, and the host then hands that user 1.5 Mbps of lossless PCM instead of 256 kbps of
+ * Opus. This returned that pair until all four clients were compared.
+ *
+ * ⚠⚠ **That bug got worse on 2026-08-17, when the host's `PUNKTFUNK_AUDIO_HIRES` gate went
+ * default-ON.** It used to need a host whose operator had opted in — rare, so a slip here would
+ * have been survivable and probably unnoticed. The blast radius is now every host that has not
+ * deliberately opted out, i.e. all of them. The zeroes below are load-bearing.
  *
  * The zeroes are also what keeps a default `Hello` byte-identical to a pre-lossless one — the wire
  * encodes an explicit 48 000/16 the same as absent, and the whole difference is the capability bit.

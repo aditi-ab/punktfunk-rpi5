@@ -68,8 +68,10 @@ public enum DefaultsKey {
     ///
     /// Off by default and deliberately: lossless takes 2.1–8.5 Mbps off the top of the link for
     /// stereo (three times that for 5.1, four for 7.1), OUTSIDE the ABR loop that manages the video
-    /// budget, against the ~256 kbps Opus it replaces — so it must be asked for on both ends
-    /// (`PUNKTFUNK_AUDIO_HIRES` is the host's half, also off by default). A REQUEST: the host's
+    /// budget, against the ~256 kbps Opus it replaces — so a user has to pick it. Since 2026-08-17
+    /// this row is the ONLY opt-in: the host's half (`PUNKTFUNK_AUDIO_HIRES`) defaults ON and is an
+    /// opt-OUT (`=0`), so picking a lossless row here is enough on any host that has not
+    /// deliberately turned the plane off. A REQUEST: the host's
     /// five-condition gate may resolve the session back to Opus, and
     /// `PunktfunkConnection.resolvedAudioRateHz`/`resolvedAudioBits`/`resolvedAudioChannels` are
     /// what actually happened.
