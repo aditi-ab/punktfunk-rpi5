@@ -386,14 +386,21 @@ impl UsbIpResponse {
 
                 debug_assert!(header.command == USBIP_RET_SUBMIT.into());
                 // For an isochronous URB `actual_length` totals the per-packet actual lengths in
-                // both directions, so the OUT-is-zero rule only applies to non-ISO transfers.
-                debug_assert!(
-                    if number_of_packets != 0 || header.direction == Direction::In as u32 {
-                        actual_length == transfer_buffer.len() as u32
-                    } else {
-                        actual_length == 0
-                    }
-                );
+                // BOTH directions — on OUT that is nonzero while the transfer buffer is empty, so
+                // it cannot be checked against the buffer. This mirrors the kernel's
+                // `usbip_recv_iso()`, which sums the table and tears the whole connection down on
+                // a mismatch. Non-ISO keeps the plain rule: IN returns its payload, OUT nothing.
+                debug_assert!(if number_of_packets != 0 {
+                    actual_length
+                        == iso_packet_descriptor
+                            .chunks_exact(16)
+                            .map(|d| u32::from_be_bytes([d[8], d[9], d[10], d[11]]))
+                            .sum::<u32>()
+                } else if header.direction == Direction::In as u32 {
+                    actual_length == transfer_buffer.len() as u32
+                } else {
+                    actual_length == 0
+                });
 
                 result.extend_from_slice(&header.to_bytes());
                 result.extend_from_slice(&status.to_be_bytes());
@@ -494,6 +501,15 @@ impl UsbIpResponse {
         let mut transfer_buffer = Vec::new();
         let mut iso_packet_descriptor = Vec::with_capacity(16 * requested.len());
         let mut offset = 0u32;
+        // The kernel's own invariant, and the reason this is a running total rather than the
+        // buffer's length: `usbip_recv_iso()` sums every packet's `actual_length` and compares
+        // the total against the URB's `actual_length`, and on a mismatch raises `ERROR_TCP` and
+        // returns `-EPIPE` — which tears the whole connection down (stop threads, release socket,
+        // disconnect device), not just the one URB. On an OUT endpoint the transfer buffer is
+        // EMPTY while the per-packet actuals are the bytes we accepted, so sizing this from the
+        // buffer reported "device swallowed nothing" against nonzero packets and killed the pad
+        // ~56 ms after `snd-usb-audio` started the stream.
+        let mut total_actual = 0u32;
         for (i, &req_len) in requested.iter().enumerate() {
             let actual = if inbound {
                 let payload = replies.get(i).map(Vec::as_slice).unwrap_or(&[]);
@@ -508,11 +524,12 @@ impl UsbIpResponse {
             iso_packet_descriptor.extend_from_slice(&actual.to_be_bytes());
             iso_packet_descriptor.extend_from_slice(&0u32.to_be_bytes()); // status: success
             offset += actual;
+            total_actual += actual;
         }
         Self::UsbIpRetSubmit {
             header: header.clone(),
             status: 0,
-            actual_length: transfer_buffer.len() as u32,
+            actual_length: total_actual,
             start_frame,
             number_of_packets: requested.len() as u32,
             error_count: 0,
@@ -586,19 +603,39 @@ mod iso_tests {
         // 48-byte fixed header: ... status@20, actual_length@24, start_frame@28,
         // number_of_packets@32, error_count@36.
         assert_eq!(be(&bytes[20..24]), 0, "status");
-        assert_eq!(be(&bytes[24..28]), 0, "OUT carries no payload back");
+        // NOT zero, even though OUT sends no payload BACK: this field is the bytes the device
+        // consumed. `usbip_recv_iso()` sums the table below and compares it against exactly this
+        // value, raising ERROR_TCP / -EPIPE on a mismatch — which drops the whole connection, so
+        // the pad disappears entirely rather than glitching. Field-observed 2026-08-17.
+        assert_eq!(
+            be(&bytes[24..28]),
+            3 * 192,
+            "bytes consumed, not bytes returned"
+        );
         assert_eq!(be(&bytes[28..32]), 7, "start_frame echoed");
         assert_eq!(be(&bytes[32..36]), 3, "number_of_packets");
         assert_eq!(be(&bytes[36..40]), 0, "error_count");
 
         let table = &bytes[48..];
-        assert_eq!(table.len(), 3 * 16, "one 16-byte descriptor per packet");
+        assert_eq!(
+            table.len(),
+            3 * 16,
+            "one 16-byte descriptor per packet, and no payload buffer on OUT"
+        );
         for i in 0..3 {
             let d = &table[i * 16..i * 16 + 16];
             assert_eq!(be(&d[4..8]), 192, "packet {i} length echoed");
             assert_eq!(be(&d[8..12]), 192, "packet {i} fully consumed");
             assert_eq!(be(&d[12..16]), 0, "packet {i} status");
         }
+
+        // The kernel's invariant itself, stated once: sum(table actual_length) == actual_length.
+        let summed: u32 = table.chunks_exact(16).map(|d| be(&d[8..12])).sum();
+        assert_eq!(
+            summed,
+            be(&bytes[24..28]),
+            "usbip_recv_iso() sums the table against actual_length"
+        );
     }
 
     /// An isochronous IN reply packs the per-packet payloads contiguously and states the offset
