@@ -1188,8 +1188,10 @@ pub struct Settings {
     ///
     /// Off by default and deliberately: lossless takes 2.3–4.6 Mbps off the top of the link,
     /// OUTSIDE the ABR loop that manages the video budget, against the ~256 kbps Opus it replaces —
-    /// so it has to be asked for at BOTH ends (`PUNKTFUNK_AUDIO_HIRES` is the host's half, also off
-    /// by default). A REQUEST, never a fact: the host runs a five-condition gate and may answer
+    /// so a user has to pick it. Since 2026-08-17 this setting is the ONLY opt-in: the host's half
+    /// (`PUNKTFUNK_AUDIO_HIRES`) defaults ON and is an opt-OUT (`=0`), so this choice is enough on
+    /// any host that has not deliberately turned the plane off. A REQUEST, never a fact: the host
+    /// runs a five-condition gate and may answer
     /// Opus anyway, and this client downgrades it further if the output device will not open the
     /// rate. What actually happened is the OSD's `audio lossless …` line, and the log's
     /// "negotiated audio format".

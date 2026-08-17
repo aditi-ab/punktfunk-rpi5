@@ -64,10 +64,12 @@ object NativeBridge {
          *  `CLIENT_CAP_AUDIO_HIRES` when either field is non-zero (it keys on "a format was
          *  specified", so that 48/16 lossless is requestable at all), and the host's gate accepts
          *  48 kHz/16-bit as a supported format. Passing it as a stand-in for "unset" opts every
-         *  session into the `0xD3` plane on any host with `PUNKTFUNK_AUDIO_HIRES=1`. Send `0`/`0`.
+         *  session into the `0xD3` plane on every host that has not deliberately opted out — which
+         *  since 2026-08-17 is all of them, the host gate having gone default-ON. Send `0`/`0`.
          *
          *  A request on BOTH counts. The host runs its gate (its own `PUNKTFUNK_AUDIO_HIRES` switch
-         *  among them, plus whether a frame of this format fits one datagram at all) and may answer
+         *  among them — now an opt-OUT, so it declines only at `=0` — plus whether a frame of this
+         *  format fits one datagram at all) and may answer
          *  Opus; and the native side first proves THIS device can open the rate — AAudio grants an
          *  explicit rate or fails the open, and there is no recovery once the wire is negotiated —
          *  walking a fallback ladder and downgrading the request if it cannot. */

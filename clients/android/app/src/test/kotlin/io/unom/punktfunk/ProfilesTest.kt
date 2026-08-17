@@ -294,8 +294,9 @@ class ProfilesTest {
      * both the legacy pair AND the cheapest lossless rung and the other rule would make that rung
      * unrequestable. The host's gate then accepts 48 kHz/16-bit as a perfectly supported format. So
      * a client that sends the legacy-looking numbers as its stand-in for "default" opts every one of
-     * its users in, on every host running `PUNKTFUNK_AUDIO_HIRES=1`, with no surface anywhere saying
-     * so — a declined session and a silently granted one look identical from the settings screen.
+     * its users in, on every host that has not deliberately opted out — which since 2026-08-17 is
+     * every host, `PUNKTFUNK_AUDIO_HIRES` having gone default-ON — with no surface anywhere saying
+     * so: a declined session and a silently granted one look identical from the settings screen.
      *
      * This client did exactly that until the four clients were compared. The rule is restated here
      * rather than reached through core because Kotlin cannot call it; core's own tests pin the other
