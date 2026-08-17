@@ -214,6 +214,19 @@ Per-backend support:
 | Primary | ✅ | ✅ | ⚠️ treated as Extend | ✅ |
 | Exclusive | ✅ | ✅ | ⏳ following release | ✅ |
 
+On **Sway/wlroots and Hyprland** the virtual display is always an *extend* output — it is added
+beside your physical monitors and neither promoted nor allowed to disable them, whatever the topology
+says. So that "treated as Extend" doesn't leave your games on the wrong screen, the host **claims the
+compositor's focus for the streamed display**: once at session start, and again immediately before it
+launches anything from your library. Both compositors open a new window on the focused monitor, so
+that is what puts the game on the display you're streaming.
+
+Two things follow from it being focus rather than promotion. Your physical monitors stay lit and
+usable — this is Extend, not Exclusive. And a window that opens *later* (a launcher that spawns a
+second window, a game that re-parents itself) follows whatever has focus at that moment, so if you're
+also sitting at the machine, clicking on a physical monitor mid-launch can still pull a window over
+to it.
+
 ### Conflict handling · identity · layout
 
 - **Conflict handling** — what happens when a *different* client connects while one is already

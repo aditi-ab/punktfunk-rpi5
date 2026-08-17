@@ -789,9 +789,18 @@ pub struct SpawnedLaunch {
 /// client-sent string. Best-effort by contract: a failure leaves the user on the (streamed)
 /// desktop/session rather than tearing the stream down.
 ///
-/// * **KWin / Mutter / wlroots** — the host runs inside the user's graphical session (the process
-///   env was retargeted at it by `apply_session_env`, and the per-session virtual output is
-///   promoted primary), so a plain spawn lands the app on the streamed output.
+/// * **KWin / Mutter** — the host runs inside the user's graphical session (the process env was
+///   retargeted at it by `apply_session_env`) and the per-session virtual output is promoted
+///   *primary*, so a plain spawn lands the app on the streamed output.
+/// * **Hyprland / wlroots (sway)** — those two are EXTEND-only: the streamed head is added *beside*
+///   the operator's and nothing promotes it, so a plain spawn lands the app on whichever monitor
+///   holds focus — the operator's physical one. This is the case that was reported from the field as
+///   "anything from the library opens on my main display instead of the virtual screen". The spawn is
+///   therefore preceded by [`crate::vdisplay::focus_streamed_output`], which claims focus for the
+///   streamed head so the window Hyprland/sway is about to map goes there. (The backends also focus
+///   it at capture bring-up; re-asserting here is what covers the gap between the two — portal
+///   handshake, encoder build and first frame all sit in between, and anything that touches focus in
+///   that window would otherwise silently put the launch back on a physical head.)
 /// * **gamescope (managed / SteamOS / attach)** — the app must open *inside* the running gamescope
 ///   session: spawned with the session's own `DISPLAY`/Wayland env
 ///   ([`crate::vdisplay::launch_into_gamescope_session`]). A `steam steam://…` command additionally
@@ -807,6 +816,15 @@ pub fn launch_session_command(
     use std::os::unix::process::CommandExt;
     let cmd = cmd.trim();
     anyhow::ensure!(!cmd.is_empty(), "empty command");
+    // Claim focus for the streamed head before spawning, so the window the compositor is about to map
+    // opens where the client is looking (see the EXTEND note above; a no-op on every other backend).
+    // The name comes from the same slot the absolute-input pointer is bound to, so focus and cursor
+    // land on one head by construction rather than by two independent guesses.
+    if let Some(out) = crate::inject::stream_output() {
+        if crate::vdisplay::focus_streamed_output(compositor, &out) {
+            tracing::debug!(output = %out, "claimed focus for the streamed head before launching");
+        }
+    }
     let (child, group_leader) = match compositor {
         crate::vdisplay::Compositor::Gamescope => {
             (crate::vdisplay::launch_into_gamescope_session(cmd)?, false)
