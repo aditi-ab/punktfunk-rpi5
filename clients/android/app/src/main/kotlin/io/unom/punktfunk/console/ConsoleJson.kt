@@ -11,6 +11,7 @@ import io.unom.punktfunk.kit.discovery.DiscoveredHost
 import io.unom.punktfunk.kit.library.DEFAULT_MGMT_PORT
 import io.unom.punktfunk.kit.library.GameEntry
 import io.unom.punktfunk.kit.security.KnownHost
+import io.unom.punktfunk.padInfoOf
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -229,16 +230,25 @@ internal object ConsoleJson {
 
     /**
      * `{"label", "pref", "pads": [...]}` — the controller chip's text (the driving pad's name),
-     * the glyph style's pref byte, and one entry per connected pad for the settings rows.
+     * the glyph style's pref byte, and one entry per connected pad for the settings rows and the
+     * console's Connected-controllers screen.
+     *
+     * `detail`/`forwarded`/`rumble` come straight from [padInfoOf], the same reader the touch
+     * Controllers screen renders from: the support answer a user gets must not depend on which
+     * interface asked, and two readers of `InputDevice` would be two answers waiting to drift.
      */
     fun pads(pads: List<InputDevice>, driving: InputDevice?): String {
         val arr = JSONArray()
         for (d in pads) {
+            val info = padInfoOf(d)
             val entry = JSONObject()
                 .put("name", d.name)
                 .put("key", "${d.vendorId}:${d.productId}:${d.name}")
                 .put("pref", Gamepad.prefFor(d))
                 .put("steam_virtual", false)
+                .put("detail", info.detail)
+                .put("forwarded", info.forwarded)
+                .put("rumble", info.canRumble)
             val battery = if (android.os.Build.VERSION.SDK_INT >= 31) {
                 val b = d.batteryState
                 if (b.isPresent && b.capacity >= 0f) {

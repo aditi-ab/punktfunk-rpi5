@@ -1075,6 +1075,14 @@ impl Worker {
             // Unknowable from an ID-based getter — SDL reports power only for an OPEN
             // device. `publish` fills it in for the one pad this service holds open.
             battery: None,
+            // The three below feed the console's controllers screen, which is Android-only
+            // (design android-skia-console-port.md D3) — nothing on the desktop reads them.
+            // SDL enumerates only gamepad-classified devices, so the joystick-only case
+            // `forwarded` exists to name cannot arise here; rumble, like battery, needs the
+            // device OPEN and so is not knowable from this getter.
+            detail: format!("{vid:04X}:{pid:04X}"),
+            forwarded: true,
+            rumble: false,
         })
     }
 

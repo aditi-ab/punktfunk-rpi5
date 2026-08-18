@@ -226,6 +226,17 @@ pub enum ConsoleCmd {
     /// while it is up, and the console never learns what it looked like. The desktop raises
     /// none — its settings list has no such rows.
     OpenPlatformScreen { id: String },
+    /// Something only the PLATFORM can do to a controller, raised by the controllers screen:
+    /// Android's USB / Bluetooth grant dialogs, a rumble pulse on the real `InputDevice`, the
+    /// DualSense pad-audio self test. `action` is a
+    /// [`crate::screens::controllers::PadAction::id`]; `pad_key` addresses one of
+    /// [`crate::screens::Ctx::pads`] and is empty for the actions that are about a device the
+    /// pad list cannot name (an SC2 in lizard mode is no input device at all).
+    ///
+    /// ONE parameterised command rather than one per button: the host's answer to every one
+    /// of them is the same shape — do the platform thing, report back as a notice — and a
+    /// command per grant would make adding the next pad a change in three crates.
+    PadAction { action: String, pad_key: String },
 }
 
 /// The overlay→binary command queue. A plain deque under the same locking discipline as

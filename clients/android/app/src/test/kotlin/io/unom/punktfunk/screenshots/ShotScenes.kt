@@ -62,7 +62,6 @@ import coil.test.FakeImageLoaderEngine
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
 import io.unom.punktfunk.AddHostSheet
-import io.unom.punktfunk.ConsoleControllersScreen
 import io.unom.punktfunk.ConsoleHeader
 import io.unom.punktfunk.ConsoleLegendInset
 import io.unom.punktfunk.ConsoleLicensesScreen
@@ -559,36 +558,24 @@ private fun ConsolePalette(paletteId: String, content: @Composable () -> Unit) {
 }
 
 /**
- * The two screens the console could not reach at all until WP8.3 — the open-source notices and the
- * connected-controllers view — in their console presentation.
+ * The one Compose screen the console still opens over itself — the open-source notices — in its
+ * console presentation. (Connected controllers used to be its sibling here; it is the console's
+ * own Skia screen now, covered by pf-console-ui's tests.)
  *
- * Worth a shot each, and worth a PALE one: both are ordinary Material screens underneath, and the
- * console shows them through a `ColorScheme` derived from the palette's ink. That derivation is the
- * whole risk. Their touch presentation is inked by the app theme, which is always dark, so nothing
+ * Worth a shot, and worth a PALE one: it is an ordinary Material screen underneath, and the
+ * console shows it through a `ColorScheme` derived from the palette's ink. That derivation is the
+ * whole risk. Its touch presentation is inked by the app theme, which is always dark, so nothing
  * before this could catch light-grey body text stranded on a pastel field.
- *
- * Robolectric enumerates no input devices, so the controllers scenes inject [shotPads] — the
- * deterministic connected-pads state the store listing needs.
  */
 @Composable
 internal fun ConsoleLicensesScene(paletteId: String = "violet") =
     ConsolePalette(paletteId) { ConsoleLicensesScreen(onBack = {}, navActive = false) }
 
-@Composable
-internal fun ConsoleControllersScene(paletteId: String = "violet") =
-    ConsolePalette(paletteId) {
-        // Robolectric enumerates no input devices, so the shot injects the two pads the store
-        // listing talks about — the empty "no controller detected" state proves the palette but
-        // sells nothing.
-        ConsoleControllersScreen(
-            gamepadSetting = 0, onBack = {}, navActive = false, padsOverride = shotPads(),
-        )
-    }
-
 /**
- * The touch presentation of the same screen, with the same injected pads. Wrapped in a background
- * [Surface]: the activity provides the dark ground in the app, and without one here the content
- * color falls back to black-on-white while the cards stay dark.
+ * The controllers screen with [shotPads] injected — Robolectric enumerates no input devices, and
+ * the connected-pad card is the point of the shot. Wrapped in a background [Surface]: the
+ * activity provides the dark ground in the app, and without one here the content color falls
+ * back to black-on-white while the cards stay dark.
  */
 @Composable
 internal fun ControllersScene() =

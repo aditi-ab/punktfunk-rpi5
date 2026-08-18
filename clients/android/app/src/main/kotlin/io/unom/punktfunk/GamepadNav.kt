@@ -82,8 +82,9 @@ fun GamepadNavEffect(
     val currentOnOptions by rememberUpdatedState(onOptions)
 
     DisposableEffect(active) {
-        // Stable probe refs (see GamepadNavEffect2D) so onDispose only releases the slot if we still
-        // own it — a cross-fading-out screen mustn't null the incoming screen's probes.
+        // One entry on the MainActivity probe stack (see GamepadNavEffect2D), removed by identity on
+        // dispose — a cross-fading-out screen must take only its OWN claim, never the incoming
+        // screen's, and never the console shell's underneath.
         val motionProbe: (MotionEvent) -> Boolean = probe@{ ev ->
             if (ev.isFromSource(InputDevice.SOURCE_JOYSTICK) && ev.actionMasked == MotionEvent.ACTION_MOVE) {
                 state.stickX = ev.getAxisValue(MotionEvent.AXIS_X)
@@ -113,13 +114,10 @@ fun GamepadNavEffect(
                 else -> false // B / shoulders / etc. → MainActivity handles (B remaps to BACK)
             }
         }
-        if (active) {
-            activity.padMotionProbe = motionProbe
-            activity.padKeyProbe = keyProbe
-        }
+        val probes = if (active) MainActivity.PadProbes(keyProbe, motionProbe) else null
+        probes?.let { activity.pushPadProbes(it) }
         onDispose {
-            if (activity.padMotionProbe === motionProbe) activity.padMotionProbe = null
-            if (activity.padKeyProbe === keyProbe) activity.padKeyProbe = null
+            probes?.let { activity.removePadProbes(it) }
             state.reset()
         }
     }
@@ -186,9 +184,11 @@ fun GamepadNavEffect2D(
     val currentOnShoulder by rememberUpdatedState(onShoulder)
 
     DisposableEffect(active) {
-        // Stable probe refs so onDispose only releases the slot if WE still own it — during a
+        // One entry on the MainActivity probe stack, removed by identity on dispose — during a
         // cross-fade both the outgoing and incoming screen are briefly composed, and the outgoing's
-        // teardown must not null out the incoming screen's just-installed probes.
+        // teardown must take only its own claim. On the console this effect sits OVER the Skia
+        // shell's probes: pushing (not overwriting) is what lets the shell's pad input resurface
+        // the moment this screen pops, instead of dying with a nulled slot.
         val motionProbe: (MotionEvent) -> Boolean = probe@{ ev ->
             if (ev.isFromSource(InputDevice.SOURCE_JOYSTICK) && ev.actionMasked == MotionEvent.ACTION_MOVE) {
                 state.stickX = ev.getAxisValue(MotionEvent.AXIS_X)
@@ -220,13 +220,10 @@ fun GamepadNavEffect2D(
                 else -> false // B → MainActivity (remapped to BACK → BackHandler)
             }
         }
-        if (active) {
-            activity.padMotionProbe = motionProbe
-            activity.padKeyProbe = keyProbe
-        }
+        val probes = if (active) MainActivity.PadProbes(keyProbe, motionProbe) else null
+        probes?.let { activity.pushPadProbes(it) }
         onDispose {
-            if (activity.padMotionProbe === motionProbe) activity.padMotionProbe = null
-            if (activity.padKeyProbe === keyProbe) activity.padKeyProbe = null
+            probes?.let { activity.removePadProbes(it) }
             state.reset()
         }
     }

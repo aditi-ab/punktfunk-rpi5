@@ -8,6 +8,9 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.InputDevice
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import io.unom.punktfunk.CONNECT_TIMEOUT_MS
 import io.unom.punktfunk.ConnectErrors
 import io.unom.punktfunk.ProfileStore
@@ -67,6 +70,17 @@ object SkiaConsole {
     private const val PREFS = "punktfunk_console_settings"
 
     private var handle = 0L
+
+    /**
+     * False once the console has proven it cannot draw — the native create failed, or the render
+     * thread died (a GL context that never came up, or one Android reclaimed and that would not
+     * come back). Compose observes it: `App` folds it into the gamepad-UI gate, so the answer to a
+     * dead console is the touch UI — not the gray, never-painted `SurfaceView` the shell would
+     * otherwise sit on for the rest of the process.
+     */
+    var healthy by mutableStateOf(true)
+        private set
+
     private var appContext: Context? = null
     private val main = Handler(Looper.getMainLooper())
     private val ioPool = Executors.newCachedThreadPool { r -> Thread(r, "pf-console-io").apply { isDaemon = true } }
@@ -90,6 +104,7 @@ object SkiaConsole {
     private var onSettingsChange: ((Settings) -> Unit)? = null
     private var onQuit: (() -> Unit)? = null
     private var onPlatformScreen: ((String) -> Unit)? = null
+    private var onPadAction: ((String, String) -> Unit)? = null
     private var onPulse: ((String) -> Unit)? = null
 
     /** The connect in flight, if any — cancelable through `OverlayAction::CancelConnect`. */
@@ -149,6 +164,7 @@ object SkiaConsole {
         handle = runCatching { NativeBridge.nativeConsoleCreate(opts.toString()) }.getOrDefault(0L)
         if (handle == 0L) {
             Log.e(TAG, "console: native create failed")
+            healthy = false // see [healthy] — the touch UI fronts everything from here
             return 0L
         }
         Log.i(TAG, "console: created (gpu cache ${gpuCacheBytes(app) shr 20} MB)")
@@ -236,12 +252,14 @@ object SkiaConsole {
         onSettingsChange: (Settings) -> Unit,
         onQuit: () -> Unit,
         onPlatformScreen: (String) -> Unit,
+        onPadAction: (String, String) -> Unit,
         onPulse: (String) -> Unit,
     ) {
         this.onConnected = onConnected
         this.onSettingsChange = onSettingsChange
         this.onQuit = onQuit
         this.onPlatformScreen = onPlatformScreen
+        this.onPadAction = onPadAction
         this.onPulse = onPulse
         discovery?.restart()
         // The touch UI may have paired/forgotten/edited hosts or profiles while we were away.
@@ -255,6 +273,7 @@ object SkiaConsole {
         onSettingsChange = null
         onQuit = null
         onPlatformScreen = null
+        onPadAction = null
         onPulse = null
     }
 
@@ -373,7 +392,7 @@ object SkiaConsole {
         NativeBridge.nativeConsoleSetKnownHosts(handle, ConsoleJson.knownHosts(knownHostStore.all()))
     }
 
-    private fun notice(text: String) {
+    internal fun notice(text: String) {
         if (handle != 0L) NativeBridge.nativeConsoleNotice(handle, text)
     }
 
@@ -386,7 +405,10 @@ object SkiaConsole {
             ev.has("editing") -> {} // the shell draws its own keyboard; nothing to raise here
             ev.has("settings") -> onSettingsSaved(ev.getJSONObject("settings"))
             ev.has("gles") -> Log.i(TAG, "console: GLES ${ev.optInt("gles")}")
-            ev.has("dead") -> Log.e(TAG, "console: render thread died: ${ev.optString("dead")}")
+            ev.has("dead") -> {
+                Log.e(TAG, "console: render thread died: ${ev.optString("dead")}")
+                healthy = false // the touch UI takes over; only a process restart tries again
+            }
         }
     }
 
@@ -521,6 +543,7 @@ object SkiaConsole {
                     c.optJSONObject("Wake")?.let(::wake)
                     c.optJSONObject("SetPin")?.let(::setPin)
                     c.optJSONObject("OpenPlatformScreen")?.let { onPlatformScreen?.invoke(it.optString("id")) }
+                    c.optJSONObject("PadAction")?.let { onPadAction?.invoke(it.optString("action"), it.optString("pad_key")) }
                     c.optString("OpenPlatformScreen").takeIf { c.has("OpenPlatformScreen") && c.opt("OpenPlatformScreen") is String }
                         ?.let { onPlatformScreen?.invoke(it) }
                 }

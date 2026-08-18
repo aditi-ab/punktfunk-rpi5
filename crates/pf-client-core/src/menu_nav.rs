@@ -235,6 +235,20 @@ pub struct PadInfo {
     /// virtual gamepad reports nothing about the physical device behind it. Anything reading
     /// this must degrade to "no battery shown" rather than to "0 %".
     pub battery: Option<PadBattery>,
+    /// The identity line the console's controllers screen shows under the name —
+    /// `VID:PID · gamepad · dpad`. Support's first question when a pad "doesn't work" is
+    /// whether the OS enumerated the pad or the adapter in front of it, and the name alone
+    /// never answers that. Written by whoever enumerated the device; empty is "nothing more
+    /// to say", never an error.
+    pub detail: String,
+    /// Actually forwarded to the host: a real, non-virtual controller the OS classifies as a
+    /// GAMEPAD. A joystick-only node — an adapter that enumerates as a bare joystick, a
+    /// DualSense's motion-sensor sibling — is listed and NOT forwarded, which is the single
+    /// most common cause of "my pad is connected and nothing happens".
+    pub forwarded: bool,
+    /// The device reports a rumble motor. `false` is what turns the controllers screen's
+    /// rumble test into the sentence explaining why host rumble will be silent on this pad.
+    pub rumble: bool,
 }
 
 /// A controller's power state, as SDL reports it.

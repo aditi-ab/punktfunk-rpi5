@@ -127,18 +127,15 @@ class ScreenshotTest {
         WakeTimedOutScene()
     }
 
-    // The two screens the console reached for the first time in WP8.3. Each is shot on a dark AND a
-    // pale palette, because the console draws them through a ColorScheme derived from the palette's
-    // ink — and the pale one is the only place a grey-on-pastel slip can show up.
+    // The licences view — the one screen the console still opens as a Compose takeover. Shot on a
+    // dark AND a pale palette, because the console draws it through a ColorScheme derived from the
+    // palette's ink — and the pale one is the only place a grey-on-pastel slip can show up.
     @Test
     fun consoleLicenses() = shootRoot("console-licenses", statusBar = false) { ConsoleLicensesScene() }
 
     @Test
     fun consoleLicensesLight() =
         shootRoot("console-licenses-light", statusBar = false) { ConsoleLicensesScene(paletteId = "holo") }
-
-    @Test
-    fun consoleControllers() = shootRoot("console-controllers", statusBar = false) { ConsoleControllersScene() }
 
     /**
      * The touch presentation, pads connected — landscape, like every store frame: the app is
@@ -148,12 +145,6 @@ class ScreenshotTest {
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
     fun controllers() = shootRoot("controllers") { ControllersScene() }
 
-    /** The console presentation at the same landscape geometry — the store's FEEL THE GAME frame. */
-    @Test
-    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
-    fun consoleControllersLandscape() =
-        shootRoot("console-controllers-landscape", statusBar = false) { ConsoleControllersScene() }
-
     /**
      * The same shelf as the TOUCH grid — the presentation a finger gets from a host card's
      * "Browse library…". Portrait (the default qualifiers), because that is the orientation a
@@ -161,10 +152,6 @@ class ScreenshotTest {
      */
     @Test
     fun libraryTouch() = shootRoot("library-touch") { TouchLibraryScene() }
-
-    @Test
-    fun consoleControllersLight() =
-        shootRoot("console-controllers-light", statusBar = false) { ConsoleControllersScene(paletteId = "holo") }
 
     @Test
     fun trust() = shootScreen("trust") {

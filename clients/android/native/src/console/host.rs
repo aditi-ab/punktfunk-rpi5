@@ -11,7 +11,7 @@
 
 use super::egl::{EglContext, EglSurface, GlesVersion};
 use super::gpu::Gpu;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use ndk::native_window::NativeWindow;
 use pf_client_core::console::{OverlayAction, PointerInput, SessionPhase};
 use pf_client_core::menu_nav::{MenuEvent, MenuNav, MenuPulse, MenuSample, PadInfo};
@@ -267,6 +267,13 @@ fn render_loop(mut console: Console, shared: Arc<Shared>, store: Arc<SnapshotSto
     let mut was_editing = console.editing();
     let mut saved_gen = store.saved_gen();
     let mut menu_out: Vec<MenuEvent> = Vec::new();
+    // Consecutive GL setup failures (window surface / Skia wrap). One is a transient (a window
+    // torn down mid-create); a run of them is a context that is not coming back — most likely
+    // reclaimed by Android while the app was backgrounded. Only exiting reports that: each
+    // failure alone is logged, the loop retries, and the screen stays a gray never-painted
+    // SurfaceView forever. Dying raises `Dead`, and Kotlin answers with the touch UI.
+    let mut gl_failures = 0u32;
+    const GL_FAILURE_LIMIT: u32 = 3;
 
     loop {
         // Take everything queued. With no surface up, block until something arrives.
@@ -347,11 +354,15 @@ fn render_loop(mut console: Console, shared: Arc<Shared>, store: Arc<SnapshotSto
                             }
                             surface = Some(s);
                             window = Some(w);
+                            gl_failures = 0;
                             // A fresh surface is a fresh entry: snapshot the pad so a button
                             // still held from before does not fire into the first frame.
                             nav.reset();
                         }
-                        Err(e) => log::error!("console: window surface: {e:#}"),
+                        Err(e) => {
+                            log::error!("console: window surface: {e:#}");
+                            gl_failures += 1;
+                        }
                     }
                 }
                 Cmd::SurfaceChanged => {
@@ -411,8 +422,14 @@ fn render_loop(mut console: Console, shared: Arc<Shared>, store: Arc<SnapshotSto
             if need_wrap {
                 skia = None;
                 match g.wrap_window(&egl, w, h) {
-                    Ok(surf) => skia = Some((surf, w, h)),
-                    Err(e) => log::error!("console: {e:#}"),
+                    Ok(surf) => {
+                        skia = Some((surf, w, h));
+                        gl_failures = 0;
+                    }
+                    Err(e) => {
+                        log::error!("console: {e:#}");
+                        gl_failures += 1;
+                    }
                 }
             }
             if let Some((surf, _, _)) = skia.as_mut() {
@@ -439,6 +456,16 @@ fn render_loop(mut console: Console, shared: Arc<Shared>, store: Arc<SnapshotSto
                     window = None;
                 }
             }
+        }
+
+        if gl_failures >= GL_FAILURE_LIMIT {
+            // Same release order as `Cmd::Quit`: the Skia surface, the current binding, then (on
+            // return) the EGL surface + window + context drop.
+            drop(skia.take());
+            if surface.is_some() {
+                egl.release_current();
+            }
+            bail!("GL surface failed {gl_failures} times in a row — giving the screen back");
         }
 
         // Publish what the console raised.
