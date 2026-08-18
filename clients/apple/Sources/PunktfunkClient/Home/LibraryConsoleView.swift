@@ -132,7 +132,10 @@ struct LibraryConsoleView: View {
             // A push/pop is a state change inside `placeMotion` (see the mutations below), so the
             // outgoing place leaves and the incoming one arrives with the shell's own transition.
             .id(top)
-            .transition(.gamepadScreen(slide: GamepadShellMotion.slide(compact: compact)))
+            .transition(
+                reduceMotion
+                    ? .opacity
+                    : .gamepadScreen(slide: GamepadShellMotion.slide(compact: compact)))
         }
         .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
             GamepadHintBar(hints: barFocused ? barHints : (top.isCollections ? collectionHints : hints))
@@ -416,7 +419,7 @@ struct LibraryConsoleView: View {
     /// The push/pop choreography between places — the shell's own (`GamepadShellMotion`), a plain
     /// crossfade under Reduce Motion.
     private var placeMotion: Animation {
-        reduceMotion ? .easeOut(duration: 0.2) : GamepadShellMotion.screen
+        reduceMotion ? GamepadShellMotion.reducedScreen : GamepadShellMotion.screen
     }
 
     /// The "start in collections" hand-over — decided once per shelf. This view is mounted only

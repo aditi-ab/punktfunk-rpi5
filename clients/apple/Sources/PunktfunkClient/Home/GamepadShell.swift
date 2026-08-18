@@ -51,21 +51,31 @@ enum GamepadScreen: Identifiable {
     }
 }
 
-/// The console shell's motion constants, mapped to SwiftUI. Source of truth:
-/// `crates/pf-console-ui/src/shell/render.rs` (push/pop) and `shell.rs` (`TRANSITION_S`).
+/// The console shell's motion, mapped to SwiftUI from the numbers `ConsoleMotion` pins against
+/// the shared vectors' `motion_spring` block (version 2). Source of truth:
+/// `crates/pf-console-ui/src/shell.rs` (the NAV spring) and `shell/render.rs` (the geometry).
 enum GamepadShellMotion {
-    /// One transition, both layers — the console's `TRANSITION_S`.
-    static let duration: TimeInterval = 0.26
-    /// `1-(1-t)³` as a bezier: the standard ease-out-cubic control points.
-    static let screen = Animation.timingCurve(0.33, 1, 0.68, 1, duration: duration)
+    /// One transition, both layers — the console's `springs::NAV`. A spring rather than the old
+    /// 0.26 s ease-out-cubic, so a Back pressed mid-push turns the entering screen around instead
+    /// of waiting for a tween to finish (`ConsoleMotion.interruptible`).
+    static let screen = Animation.spring(
+        response: ConsoleMotion.response, dampingFraction: ConsoleMotion.damping)
+    /// Reduce Motion: a plain crossfade on the desktop's `REDUCED_NAV` — no slide, no scale.
+    static let reducedScreen = Animation.spring(
+        response: ConsoleMotion.reducedResponse, dampingFraction: ConsoleMotion.reducedDamping)
     /// The backdrop's calm chase. The console runs an exponential approach (τ 0.12 s); the same
     /// ease-out at 0.30 s lands within a few percent of it and settles together with the screen.
     static let calm = Animation.timingCurve(0.33, 1, 0.68, 1, duration: 0.30)
     /// The push/pop travel — the console's `36 * k`, k-floored for a landscape phone.
-    static func slide(compact: Bool) -> CGFloat { compact ? 27 : 36 }
+    static func slide(compact: Bool) -> CGFloat {
+        compact ? 27 : CGFloat(ConsoleMotion.pushSlideDp)
+    }
     /// The incoming screen grows from this; the revealed launcher grows back from `underScale`.
-    static let inScale: CGFloat = 0.985
-    static let underScale: CGFloat = 0.96
+    static let inScale = CGFloat(ConsoleMotion.enterScale)
+    static let underScale = CGFloat(ConsoleMotion.exitScale)
+    /// When a fresh push starts accepting input other than Back (the desktop's
+    /// `NAV_INPUT_OPENS` 0.85 of the spring's travel, as a time).
+    static let inputOpensAfter: TimeInterval = ConsoleMotion.inputOpensAfter
 }
 
 extension AnyTransition {

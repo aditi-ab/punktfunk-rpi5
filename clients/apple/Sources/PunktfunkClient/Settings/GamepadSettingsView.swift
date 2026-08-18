@@ -35,17 +35,8 @@ import CoreHaptics
 
 /// The settings screen's sections. Order IS the strip order and the L1/R1 cycle order; the names
 /// match `pf-console-ui`'s `TABS` and the Android client's `GpTab`.
-enum GpSettingsTab: String, CaseIterable, Hashable {
-    case stream = "Stream"
-    case video = "Video"
-    case audio = "Audio"
-    case controller = "Controller"
-    case interface = "Interface"
-    case profiles = "Profiles"
-    /// Trailing, like Profiles: both are built from something other than the settings store, and
-    /// About is where the strip ends because it is the one section that changes nothing.
-    case about = "About"
-}
+// `GpSettingsTab` — the strip's sections — lives in PunktfunkShared (`ConsoleContract.swift`), where
+// `ConsoleVectorsTests` can pin its names against the shared vectors.
 
 struct GamepadSettingsView: View {
     /// Resolved from `paletteID` below, NOT from `\.gamepadInk` — this screen publishes that value
