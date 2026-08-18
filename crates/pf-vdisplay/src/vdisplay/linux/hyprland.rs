@@ -143,6 +143,23 @@ pub struct HyprlandDisplay {
     /// [`VirtualDisplay::last_portal_cursor_mode`], which is how the host learns that a cursor
     /// overlay is never coming instead of inferring it from an absence.
     last_cursor_mode: Option<crate::portal_cursor::Mode>,
+    /// The topology-restore action the last `create` prepared (re-enable the heads an `exclusive`
+    /// topology disabled), pending pickup by the registry via [`take_topology_restore`] — so the
+    /// operator's screens come back when the display GROUP's last member drops (design §6.1), not
+    /// when this one session ends. A backstop [`Drop`] runs it if the registry never took it, so a
+    /// physical head is never left dark. Mirrors `kwin.rs`'s field of the same name.
+    pending_restore: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Drop for HyprlandDisplay {
+    fn drop(&mut self) {
+        // Backstop only: the registry takes the restore right after `create` (moving it into the
+        // group), so this is normally `None`. If some path skipped the take, re-enable here rather
+        // than strand the operator's heads dark.
+        if let Some(restore) = self.pending_restore.take() {
+            restore();
+        }
+    }
 }
 
 impl HyprlandDisplay {
@@ -150,7 +167,31 @@ impl HyprlandDisplay {
         Ok(HyprlandDisplay {
             hw_cursor: false,
             last_cursor_mode: None,
+            pending_restore: None,
         })
+    }
+
+    /// Apply the effective [`crate::policy::Topology`] for the just-created output `ours`, and stash
+    /// the restore for the registry (see [`Self::pending_restore`]).
+    ///
+    /// Called at the very END of [`create`](VirtualDisplay::create), on purpose: nothing can fail
+    /// after it, so there is no path that disables the operator's heads and then unwinds past the
+    /// point where the restore is handed over. The cost is that the physical heads stay lit for the
+    /// duration of the portal handshake, which is the pre-existing `extend` behaviour anyway.
+    fn apply_topology(&mut self, ours: &str) {
+        use crate::policy::Topology;
+        match crate::effective_topology() {
+            // Nothing to do — the headless output joins the desk as one more head, which is what
+            // `create` has already built.
+            Topology::Extend | Topology::Auto => {}
+            Topology::Primary => warn_primary_is_not_expressible(),
+            Topology::Exclusive => {
+                let disabled = disable_other_heads(ours);
+                self.pending_restore = (!disabled.is_empty()).then(|| {
+                    Box::new(move || restore_heads(&disabled)) as Box<dyn FnOnce() + Send>
+                });
+            }
+        }
     }
 }
 
@@ -220,12 +261,15 @@ impl VirtualDisplay for HyprlandDisplay {
         self.last_cursor_mode
     }
 
+    fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        self.pending_restore.take()
+    }
+
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
         // Log the permission-system caveat once per process (silent black frames otherwise).
         preflight_once();
         // Remove any output a PREVIOUS host left in this compositor, before we mint our first.
         reclaim_leftovers_once();
-        warn_topology_is_extend_only();
 
         let name = next_output_name();
         hyprctl_dispatch(&["output", "create", "headless", &name]).with_context(|| {
@@ -264,6 +308,9 @@ impl VirtualDisplay for HyprlandDisplay {
             cursor = cursor_mode.name(),
             "hyprland headless output ready"
         );
+        // Display-management topology (design §5.2). Last, so no failure path unwinds past the
+        // hand-off of the restore — see [`HyprlandDisplay::apply_topology`].
+        self.apply_topology(&name);
         Ok(VirtualOutput {
             node_id,
             remote_fd: Some(fd),
@@ -423,11 +470,20 @@ fn reclaim_leftovers_once() {
 /// remote mouse motion can focus-follows-mouse its way over, and no window rule names our output.
 /// So without this, every app the host launches for the session — the whole game library — opens on
 /// a monitor the client cannot see, and the stream shows a bare desktop. This is the EXTEND-topology
-/// answer to that: it steers window placement without touching the operator's heads (which is what
-/// [`warn_topology_is_extend_only`] is still telling the truth about).
+/// answer to that: it steers window placement without touching the operator's heads — which is also
+/// the whole of what `topology: primary` can mean here (see [`warn_primary_is_not_expressible`]).
+/// Under `exclusive` it is called a second time, after the heads are disabled, because that moves
+/// focus (see [`disable_other_heads`]).
 ///
 /// Best-effort by construction: a failure costs window placement, not the session, and a box with no
 /// physical head was already placing windows correctly.
+///
+/// ⚠️ **This is a no-op under the Lua config manager.** Measured on .138 (0.55.4, Lua) 2026-08-18:
+/// `hyprctl dispatch focusmonitor <name>` is parsed as Lua (`hl.dispatch(focusmonitor <name>)`) and
+/// rejected, and `hl.dsp.focusmonitor` does not exist either — so the #283 window-placement fix
+/// does not reach a Lua-configured box. Both rejections carry "error", so [`hyprctl_dispatch`]
+/// reports them and this warns rather than failing silently; the gap itself is unfixed and belongs
+/// to the #283 follow-up, not to the topology work here.
 pub(crate) fn focus_output(name: &str) {
     match hyprctl_dispatch(&focus_argv(name)) {
         Ok(()) => tracing::info!(output = %name, "focused the streamed headless output"),
@@ -450,21 +506,233 @@ fn focus_argv(name: &str) -> [&str; 3] {
     ["dispatch", "focusmonitor", name]
 }
 
-/// The configured [`crate::policy::Topology`] is not implemented on this backend — say so once per
-/// create instead of leaving the management API's echo as the only signal that the pin was dropped
-/// (sweep 13.18). The Hyprland headless output is always an EXTENSION: [`focus_output`] steers new
-/// windows onto it, but nothing here promotes it to primary or disables the operator's heads.
-fn warn_topology_is_extend_only() {
-    let topology = crate::effective_topology();
-    if !matches!(
-        topology,
-        crate::policy::Topology::Extend | crate::policy::Topology::Auto
-    ) {
+/// `topology: primary` has no expression on this compositor, and saying so once per create is the
+/// honest implementation (design §5.2 gives the whole wlr family "**unsupported** (no primary
+/// concept) → log + treat as extend").
+///
+/// Wayland has no primary-output concept at all, and Hyprland's nearest equivalent is the *focused*
+/// monitor — which [`focus_output`] already points at the streamed head for every session, whatever
+/// the topology says. So `primary` is not silently dropped so much as already granted, as far as
+/// this compositor can express it; what an operator does NOT get is a persistent designation other
+/// clients can read. Distinct from the `exclusive` path, which really does change the desk.
+fn warn_primary_is_not_expressible() {
+    tracing::info!(
+        "hyprland: `topology: primary` has no equivalent here — Wayland has no primary output and \
+         Hyprland has only a FOCUSED monitor, which the streamed head already holds. Treating it \
+         as `extend`; use `exclusive` to actually disable the operator's heads."
+    );
+}
+
+/// Which heads an `exclusive` topology should disable: enabled, not ours, and **not managed**.
+///
+/// Pure so the group-awareness rule (design §6.1 — "exclusive means the *managed virtual displays*
+/// are the only enabled outputs; never disable a sibling slot") is unit-testable without a
+/// compositor. `managed` comes from [`list_monitors`], i.e. [`is_managed_output`]: `PF-<pid>-<n>`,
+/// which covers a SECOND host's outputs as well as our own, so a concurrent session's screen can
+/// never be blacked out by ours. `ours` is excluded by name too — belt and braces, since our own
+/// output is managed by construction and the one head that must survive.
+fn heads_to_disable(heads: &[crate::monitors::PhysicalMonitor], ours: &str) -> Vec<String> {
+    heads
+        .iter()
+        .filter(|h| h.enabled && !h.managed && h.connector != ours)
+        .map(|h| h.connector.clone())
+        .collect()
+}
+
+/// Disable every non-managed head for an `exclusive` session, returning the ones actually disabled
+/// (the input to [`restore_heads`]). Best-effort per head: one that refuses costs exclusivity on
+/// that screen, not the session.
+fn disable_other_heads(ours: &str) -> Vec<String> {
+    let heads = match list_monitors() {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "hyprland: could not enumerate monitors for `topology: exclusive` — leaving the \
+                 operator's heads enabled (the session still streams, as `extend`)"
+            );
+            return Vec::new();
+        }
+    };
+    let targets = heads_to_disable(&heads, ours);
+    if targets.is_empty() {
+        tracing::info!(
+            "hyprland: `topology: exclusive` had nothing to disable — no enabled head besides the \
+             managed ones (a headless box, or a sibling session already took the desk)"
+        );
+        return Vec::new();
+    }
+    let mut disabled = Vec::new();
+    for name in targets {
+        match disable_head(&name) {
+            Ok(()) => disabled.push(name),
+            Err(e) => tracing::warn!(
+                output = %name, error = %format!("{e:#}"),
+                "hyprland: could not disable this head for `topology: exclusive` — it stays lit"
+            ),
+        }
+    }
+    if !disabled.is_empty() {
+        tracing::info!(
+            ?disabled,
+            "hyprland: `topology: exclusive` — the streamed output is now the desk"
+        );
+        // Disabling heads re-homes their workspaces, and the compositor picks the replacement
+        // focus itself. Re-assert ours so window placement still lands on the stream (the #283
+        // contract) rather than on whichever head Hyprland happened to choose.
+        focus_output(ours);
+    }
+    disabled
+}
+
+/// Disable one head, supporting **both config eras** and confirming by read-back.
+///
+/// Same two-era shape as [`set_monitor_rule`], and for the same reason: `hyprctl keyword` is the
+/// hyprlang form and is *rejected outright* under the Lua config manager ("keyword can't work with
+/// non-legacy parsers. Use eval."), while `hyprctl eval` is rejected under hyprlang ("eval is only
+/// supported with the lua config manager"). Both rejections come back at **exit 0**, so the read-back
+/// — not the exit status, and not the `ok` — is what decides. Measured 2026-08-18 on Hyprland
+/// 0.56.2 (hyprlang, `.21`) and 0.55.4 (Lua, `.138`); both spellings disable, both verified by
+/// `disabled: true` in `hyprctl -j monitors all`.
+fn disable_head(name: &str) -> Result<()> {
+    let spec = disable_rule_spec(name);
+    let lua = disable_lua_expr(name);
+    let keyword: Vec<&str> = vec!["keyword", "monitor", &spec];
+    let eval: Vec<&str> = vec!["eval", &lua];
+    let mut attempts: Vec<String> = Vec::new();
+    for a in [&keyword, &eval] {
+        if let Err(e) = hyprctl_dispatch(a) {
+            let said = format!("{e:#}");
+            tracing::debug!(output = %name, cmd = ?a, error = %said, "hyprctl rejected this disable form — trying the other config era");
+            attempts.push(said);
+            continue;
+        }
+        if wait_head_disabled(name, DISABLE_BUDGET) {
+            return Ok(());
+        }
+        attempts.push(format!(
+            "hyprctl {a:?} was accepted but the head never went disabled"
+        ));
+    }
+    bail!("no hyprctl form disabled {name}: {}", attempts.join("; "))
+}
+
+/// The **hyprlang** disable rule for `name` (`hyprctl keyword monitor <this>`), split out so a test
+/// pins its shape. `disable` is a whole-rule verb and replaces the resolution field — there is no
+/// `<name>,<mode>,disable`, and (measured) no `<name>,enable` to undo it.
+fn disable_rule_spec(name: &str) -> String {
+    format!("{name},disable")
+}
+
+/// The **Lua** disable rule for `name` (`hyprctl eval <this>`), split out so a test pins its shape.
+///
+/// The field is `disabled` (past tense) and takes a boolean. Measured on .138: `disable = true` is
+/// rejected with "unknown field 'disable'", and `mode = "disable"` with "error applying field
+/// 'mode'" — the hyprlang spelling does not carry over, so this is not a place to guess.
+fn disable_lua_expr(name: &str) -> String {
+    format!("hl.monitor{{ output = \"{name}\", disabled = true }}")
+}
+
+/// Poll until `name` reports `disabled: true` (the rule applies asynchronously), up to `timeout`.
+fn wait_head_disabled(name: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if matches!(head_is_enabled(name), Ok(Some(false))) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Is head `name` currently enabled? `None` if it is not present at all. Reads `-j monitors all`,
+/// which is the only listing that includes a DISABLED head (the plain `-j monitors` drops it, so
+/// asking that one "is it disabled?" cannot distinguish disabled from unplugged).
+fn head_is_enabled(name: &str) -> Result<Option<bool>> {
+    let out = hyprctl(&["-j", "monitors", "all"])?;
+    let monitors: serde_json::Value =
+        serde_json::from_str(&out).context("parse hyprctl -j monitors all")?;
+    let Some(arr) = monitors.as_array() else {
+        return Ok(None);
+    };
+    for m in arr {
+        if m.get("name").and_then(|n| n.as_str()) == Some(name) {
+            return Ok(Some(
+                !m.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+/// How long a `disable` (or the `reload` that undoes it) has to show up in `hyprctl -j monitors
+/// all`. Generous next to the measured near-instant apply; a miss is reported, never assumed.
+const DISABLE_BUDGET: Duration = Duration::from_secs(3);
+
+/// Re-enable the heads an `exclusive` session disabled. Run by the REGISTRY when the display
+/// group's last member is torn down (design §6.1) and, critically, **before** that member's output
+/// is removed — so Hyprland never sees zero enabled outputs.
+///
+/// 🛑🛑 **`hyprctl reload` is the only thing that re-enables a disabled head, and that is measured,
+/// not chosen.** The obvious restore — re-apply the head's own mode/position/scale, which is what
+/// `design/display-management.md` §5.2 assumes and what the issue (#284) proposed — **does not
+/// work**: it answers `ok` and leaves `disabled: true`. Probed 2026-08-18 against Hyprland 0.56.2
+/// (hyprlang) and 0.55.4 (Lua); every one of these was accepted and changed nothing:
+///
+/// * `keyword monitor <name>,<W>x<H>@<Hz>,<x>x<y>,<scale>` (the exact pre-disable rule)
+/// * `keyword monitor <name>,preferred,auto,1`
+/// * `keyword monitor <name>,enable` — not a verb: answers `invalid resolution`
+/// * `keyword monitorv2 output=<name>,…,disabled=false`
+/// * `keyword unset monitor`
+/// * `eval 'hl.monitor{ output = "<name>", disabled = false, … }'` (the Lua twin)
+/// * `dispatch dpms on <name>` — DPMS is a different axis; the head stays disabled
+/// * `dispatch forcerendererreload`
+///
+/// A runtime `monitor` rule is additive, and the `disable` in it keeps winning; only re-reading the
+/// config clears the runtime rules. So the restore is the operator's own config, re-applied — which
+/// for a config-driven compositor is exactly what "put it back how it was" means.
+///
+/// ⚠️ The side effects are real and worth knowing: a reload drops **every** runtime `hyprctl
+/// keyword`/`eval` override, including our own monitor rule for the streamed output (harmless — the
+/// output is removed moments later by the same teardown) and any the operator set by hand; and on a
+/// hyprlang config it re-runs `exec =` lines (`exec-once` is not re-run, and a Lua config's
+/// `hl.on("hyprland.start", …)` autostart does not re-fire either). This runs ONLY when we actually
+/// disabled something, so a box that never used `exclusive` never pays it.
+fn restore_heads(disabled: &[String]) {
+    if let Err(e) = hyprctl_dispatch(&["reload"]) {
+        tracing::error!(
+            ?disabled, error = %format!("{e:#}"),
+            "hyprland: `hyprctl reload` failed — the heads this session disabled are still dark. \
+             Re-run `hyprctl reload` by hand to get them back."
+        );
+        return;
+    }
+    // Report the OUTCOME, not the request: `reload` answers `ok` for "config parsed", which is not
+    // the same as "the head came back" (a head the operator's own config disables stays disabled,
+    // correctly). Read it back so a field report says which screens actually returned.
+    let deadline = Instant::now() + DISABLE_BUDGET;
+    let still_dark = loop {
+        let dark: Vec<&String> = disabled
+            .iter()
+            .filter(|n| matches!(head_is_enabled(n), Ok(Some(false))))
+            .collect();
+        if dark.is_empty() || Instant::now() >= deadline {
+            break dark;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    if still_dark.is_empty() {
+        tracing::info!(
+            ?disabled,
+            "hyprland: re-enabled the heads `topology: exclusive` disabled"
+        );
+    } else {
         tracing::warn!(
-            ?topology,
-            "hyprland: this backend implements EXTEND only — the headless output is added beside \
-             the operator's heads and nothing is promoted or disabled. Configure `topology: extend` \
-             to stop the console promising otherwise."
+            ?disabled, ?still_dark,
+            "hyprland: `hyprctl reload` ran but these heads are still disabled — the operator's own \
+             config may disable them, otherwise they need a manual `hyprctl reload`"
         );
     }
 }
@@ -686,6 +954,13 @@ fn hyprctl_dispatch(args: &[&str]) -> Result<()> {
         // config manager" — a rejection hyprctl reports with exit 0 and no other marker.
         || lc.contains("only supported")
         || lc.contains("not supported")
+        // The MIRROR rejection, and it matched none of the markers above: `hyprctl keyword` on a
+        // Lua config answers "keyword can't work with non-legacy parsers. Use eval." — note
+        // "can't", not the "couldn't" that was already covered. Measured on .138 (0.55.4, Lua).
+        // Without this the wrong-era `keyword` read as SUCCESS, and every caller then had to
+        // notice the miss for itself by reading the state back.
+        || lc.contains("can't")
+        || lc.contains("cannot")
     {
         bail!("hyprctl {:?} rejected: {t}", args);
     }
@@ -1171,5 +1446,86 @@ mod tests {
     #[test]
     fn picker_line_is_the_shared_selection_format() {
         assert_eq!(picker_selection_line("PF-1"), "[SELECTION]/screen:PF-1\n");
+    }
+
+    fn head(connector: &str, enabled: bool) -> crate::monitors::PhysicalMonitor {
+        crate::monitors::PhysicalMonitor {
+            connector: connector.to_string(),
+            description: connector.to_string(),
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 60_000,
+            x: 0,
+            y: 0,
+            scale: 1.0,
+            primary: false,
+            enabled,
+            // The real `list_monitors` derives this with `is_managed_output`; mirror it here so the
+            // fixture can't drift into asserting a rule the backend doesn't actually apply.
+            managed: is_managed_output(connector),
+        }
+    }
+
+    /// The group-awareness rule (design §6.1): `exclusive` disables the operator's heads and
+    /// **only** those. A sibling session's output — ours or another host's, both `PF-<pid>-<n>` —
+    /// must survive, or the second exclusive session blacks out the first one's screen, which is
+    /// the exact bug KWin's Stage 3 shipped and Stage 5 fixed.
+    #[test]
+    fn exclusive_disables_the_operators_heads_and_never_a_managed_sibling() {
+        let ours = "PF-4242-1";
+        let heads = [
+            head("DP-1", true),
+            head("HDMI-A-1", true),
+            head(ours, true),
+            // A concurrent session's output, and one from a second host — both managed.
+            head("PF-4242-2", true),
+            head("PF-99-1", true),
+            // Already off: nothing to disable, and it must NOT end up in the restore list, or
+            // teardown would switch on a head the operator had deliberately left dark.
+            head("DP-3", false),
+        ];
+        assert_eq!(heads_to_disable(&heads, ours), vec!["DP-1", "HDMI-A-1"]);
+    }
+
+    /// A box with no physical head (the CI/headless posture) has nothing to disable, so no restore
+    /// is prepared and teardown never runs a `hyprctl reload` — the reload's side effects are paid
+    /// only by a session that actually took a screen.
+    #[test]
+    fn exclusive_on_a_headless_box_disables_nothing() {
+        let ours = "PF-4242-1";
+        assert!(heads_to_disable(&[head(ours, true)], ours).is_empty());
+    }
+
+    /// Both config eras, pinned. These two strings are the whole contract with the compositor and
+    /// neither is guessable: `hyprctl` answers a wrong-era or malformed rule at **exit 0**, so a
+    /// typo here reads as success and the operator's screen simply stays lit under `exclusive`.
+    #[test]
+    fn disable_rules_are_pinned_for_both_config_eras() {
+        assert_eq!(disable_rule_spec("DP-1"), "DP-1,disable");
+        assert_eq!(
+            disable_lua_expr("DP-1"),
+            r#"hl.monitor{ output = "DP-1", disabled = true }"#
+        );
+    }
+
+    /// `hyprctl keyword` under the Lua config manager answers "keyword can't work with non-legacy
+    /// parsers. Use eval." at exit 0 — the one rejection shape the marker list used to miss, so the
+    /// wrong-era form reported success. (Its mirror, `eval` under hyprlang, was already covered.)
+    #[test]
+    fn a_wrong_era_rejection_is_an_error_not_a_success() {
+        for said in [
+            "keyword can't work with non-legacy parsers. Use eval.",
+            "eval is only supported with the lua config manager",
+            "invalid resolution ",
+        ] {
+            let lc = said.to_ascii_lowercase();
+            assert!(
+                lc.contains("can't")
+                    || lc.contains("cannot")
+                    || lc.contains("only supported")
+                    || lc.contains("invalid"),
+                "{said:?} must match a marker in hyprctl_dispatch"
+            );
+        }
     }
 }

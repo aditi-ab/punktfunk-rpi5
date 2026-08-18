@@ -26,15 +26,24 @@ struct GamepadLibraryScreen: View {
     @ObservedObject private var profiles = ProfileStore.shared
 
     private var compact: Bool { vSizeClass == .compact }
+    /// The collection the shelf is drilled into, for the title — `host · profile · collection`.
+    @State private var collection: String?
+
+    private var title: String {
+        let base = target.title(in: profiles)
+        guard let collection else { return "\(base) — Library" }
+        return "\(base) \u{b7} \(collection) — Library"
+    }
 
     var body: some View {
         LibraryView(
             store: store, target: target, onLaunch: onLaunch,
-            onClose: close, controllerActive: controllerActive)
+            onClose: close, controllerActive: controllerActive,
+            onCollectionChanged: { collection = $0 })
             .safeAreaInset(edge: .top, spacing: 0) {
                 // Leading, like every gamepad heading — no close chrome, B is the exit (the
                 // coverflow's, or LibraryView's own back-catcher before the coverflow exists).
-                Text("\(target.title(in: profiles)) — Library")
+                Text(title)
                     .font(.geist(gamepadTitleSize(compact: compact), .bold, relativeTo: .title))
                     .foregroundStyle(ink.fg)
                     .lineLimit(1)

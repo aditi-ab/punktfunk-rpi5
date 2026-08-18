@@ -1953,7 +1953,7 @@
     }
   ],
   "motion": {
-    "$deprecated": "SUPERSEDED by `motion_spring` (version 2). The desktop console's transition is a damped spring now, not a 0.26 s ease-out-cubic, so it no longer implements this block and its test reads `motion_spring` instead. Kept in place, and still correct, for the clients that have not migrated: the Android client's ConsoleVectorsTest pins it, and the Apple client's GamepadShell mirrors these constants (untested there - its ConsoleVectorsTests covers the palette table only). DELETE THIS BLOCK when the last client moves; until then the drift is visible rather than silent, because each client's test names which block it implements.",
+    "$deprecated": "SUPERSEDED by `motion_spring` (version 2). The desktop console's transition is a damped spring now, not a 0.26 s ease-out-cubic, so it no longer implements this block and its test reads `motion_spring` instead. Kept in place, and still correct, for the client that has not migrated: the Android client's ConsoleVectorsTest pins it. (The Apple client moved to `motion_spring` on 2026-08-18 - `ConsoleMotion` in PunktfunkShared, pinned by its ConsoleVectorsTests.) DELETE THIS BLOCK when Android moves; until then the drift is visible rather than silent, because each client's test names which block it implements.",
     "$why": "The console screen transition, from pf-console-ui's shell: TRANSITION_S and the paint geometry in shell/render.rs. Every client re-implements this by hand in its own animation system, which is why it is pinned here.",
     "transition_s": 0.26,
     "push_slide_dp": 36.0,

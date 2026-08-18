@@ -127,54 +127,6 @@ class ScreenshotTest {
         WakeTimedOutScene()
     }
 
-    // The console flow is the full-screen aurora takeover (a root capture).
-    @Test
-    fun connectingConsole() = shootRoot("connecting-console", statusBar = false) { ConnectConsoleScene() }
-
-    @Test
-    fun consoleSettings() = shootRoot("console-settings", statusBar = false) { ConsoleSettingsScene() }
-
-    /** A PALE palette: the whole UI flips to dark ink on white frost, which only a shot proves. */
-    @Test
-    fun consoleSettingsLight() =
-        shootRoot("console-settings-light", statusBar = false) { ConsoleSettingsScene(paletteId = "holo") }
-
-    /**
-     * Landscape — the orientation the console actually runs in, and a DIFFERENT layout since the
-     * on-glass review: rows capped and left-aligned, the focused row's description in a side pane
-     * on the right instead of the floating band.
-     */
-    @Test
-    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
-    fun consoleSettingsLandscape() =
-        shootRoot("console-settings-landscape", statusBar = false) { ConsoleSettingsScene() }
-
-    // The console home, the screen the living backdrop is most of. The default sdk (36) draws the
-    // real AGSL MESH field; the paired API-31 shot below draws the blob fallback, so the two
-    // renderings of the same palette can be compared rather than assumed equivalent.
-    @Test
-    fun consoleHome() = shootRoot("console-home", statusBar = false) { ConsoleHomeScene() }
-
-    @Test
-    fun consoleHomeLight() = shootRoot("console-home-light", statusBar = false) { ConsoleHomeScene(paletteId = "holo") }
-
-    /**
-     * Landscape — the orientation the console UI actually runs in, and the only one wide enough to
-     * show the carousel's NEIGHBOURS, which is where the projected turn (`CARD_TURN_RAD`) lives.
-     */
-    @Test
-    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
-    fun consoleHomeLandscape() = shootRoot("console-home-landscape", statusBar = false) { ConsoleHomeScene() }
-
-    /**
-     * The API 31/32 field. `RuntimeShader` is API 33+, so everything below it keeps the four
-     * drifting blobs — an honest approximation rather than an emulation, and the thing this shot
-     * exists to keep honest.
-     */
-    @Test
-    @Config(sdk = [31], qualifiers = "w360dp-h800dp-xxhdpi")
-    fun consoleHomeBlobFallback() = shootRoot("console-home-blobs", statusBar = false) { ConsoleHomeScene() }
-
     // The two screens the console reached for the first time in WP8.3. Each is shot on a dark AND a
     // pale palette, because the console draws them through a ColorScheme derived from the palette's
     // ink — and the pale one is the only place a grey-on-pastel slip can show up.
@@ -201,14 +153,6 @@ class ScreenshotTest {
     @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
     fun consoleControllersLandscape() =
         shootRoot("console-controllers-landscape", statusBar = false) { ConsoleControllersScene() }
-
-    /**
-     * The library coverflow with a mock shelf — the store's PICK & PLAY frame. Landscape: the
-     * orientation the coverflow actually runs in, and the only one wide enough for neighbours.
-     */
-    @Test
-    @Config(sdk = [36], qualifiers = "w800dp-h360dp-xxhdpi")
-    fun library() = shootRoot("library", statusBar = false) { LibraryScene() }
 
     /**
      * The same shelf as the TOUCH grid — the presentation a finger gets from a host card's

@@ -195,6 +195,10 @@ pub(super) fn audio_thread(
     /// re-anchors. Chasing an old schedule after a stall would send a burst — the exact thing
     /// pacing exists to prevent — so past this point the debt is forgiven, not repaid.
     const PACE_REANCHOR: std::time::Duration = std::time::Duration::from_millis(100);
+    /// How much audio is faded at each edge of a capture hole — out into the hole, in out of
+    /// it — in µs. One millisecond: long enough to be a slope rather than an edge, far too short
+    /// to read as a swell. See `last_real` / `resume_fade` below.
+    const EDGE_FADE_US: u64 = 1_000;
     let want = punktfunk_core::audio::normalize_channels(channels);
     // The three session values that used to be compile-time constants. Every one of them is now
     // a property of the negotiated plane, and everything downstream — the pacer, the sample
@@ -352,6 +356,26 @@ pub(super) fn audio_thread(
     // Nothing may be synthesized before the first real frame: there is no continuity to protect
     // yet, and the wire clock has no anchor to continue from.
     let mut sent_any = false;
+    // The two EDGES of a hole. The infill used to be digital zero from its first sample, and
+    // zero is not the absence of sound — it is a step from whatever level the last real sample
+    // sat at down to nothing, which the listener hears as a click at the front of every hole
+    // (and which the codec faithfully encodes); the audio then resumes mid-waveform, a second
+    // step. The Skynet field host opens ~2 such holes a second. So the first synthesized frame
+    // fades the audio OUT over `EDGE_FADE_US` and the first real frame after the hole fades it
+    // back IN over the same span, both on the same raised cosine — a crossfade through silence
+    // rather than a step at each end. `last_real` is what the fade-out is built from when a hole
+    // opens on an empty partial (nothing of the pre-hole audio left in hand to fade).
+    let mut last_real: Vec<f32> = Vec::with_capacity(frame_len);
+    let mut resume_fade = false;
+    // In interleaved samples: `frames × channels`, so the curve spans whole frames. (Adjacent
+    // channels of one frame land one step apart on the curve — a 1/n gain difference, nothing at
+    // any fade longer than a few frames.)
+    let edge_fade_samples = (rate_hz as u64 * EDGE_FADE_US / 1_000_000) as usize * want as usize;
+    // Backlog above which a slot sends TWO frames — see the bonus arm in the loop below. Sized
+    // from the largest capture chunk this session has actually seen (the graph's quantum, or a
+    // VM's clamped 1024 frames), plus one full protocol frame: anything up to that is a chunk
+    // being paced out, anything past it is audio that arrived faster than the schedule sends.
+    let mut max_chunk_len: usize = 0;
     // Reopen-with-backoff: hold the capturer in an Option so a mid-session capture-thread death
     // (device unplug, daemon restart) — or a first open lost to session-start churn above —
     // reopens instead of muting the rest of a multi-hour session. A quiet sink is NOT a death —
@@ -571,6 +595,15 @@ pub(super) fn audio_thread(
             // long session.
             let arrival_ns = now_ns();
             acc.extend_from_slice(&chunk);
+            max_chunk_len = max_chunk_len.max(chunk.len());
+            // How big the graph's buffers really are, so the infill threshold is one chunk plus
+            // one frame and never the middle of a legitimately long cycle — see
+            // `InfillPolicy::after`.
+            infill.note_quantum(std::time::Duration::from_nanos(pcm::frame_duration_ns(
+                chunk.len(),
+                rate_hz,
+                want,
+            )));
             let queued_frames = (acc.len() / want as usize) as u64;
             // The session's rate, not the module constant: at 96 kHz a 48 000 divisor would put
             // the anchor twice as far into the past as the queued audio really is, so every pts
@@ -581,9 +614,42 @@ pub(super) fn audio_thread(
             clock.reanchor(anchor);
         }
         // Everything the wire owes for the slots that have come due — real or synthesized, one
-        // schedule, one encoder, one `seq`. A schedule that has fallen more than one frame behind
-        // is re-anchored rather than chased, so a scheduling hiccup cannot turn into a permanent
-        // send-time debt.
+        // schedule, one encoder, one `seq`. A schedule that has fallen more than
+        // `PACE_REANCHOR` behind is re-anchored rather than chased, so a scheduling hiccup cannot
+        // turn into a permanent send-time debt.
+        //
+        // **The schedule is wall clock; the source is not, and the two disagree in both
+        // directions.** What this loop owes the client is a wire that carries one frame per
+        // frame-time of WALL clock — the client's ring is drained on its own device clock, so
+        // any frame this schedule fails to send is a frame the ring goes without, and any frame
+        // it sends over is one the ring holds forever:
+        //
+        // - **Source behind** (capture lost audio, or the graph clock is slow): a slot comes due
+        //   with no complete frame in `acc`. That is a hole. The ≥ 10 ms kind was already covered
+        //   by the infill policy, measured from the last chunk; the SHORT kind — a missed
+        //   2.7 ms graph cycle or two, invisible to the capture gap counter — was not, and it
+        //   left the schedule permanently behind by the loss. The 2026-08-17 field log shows the
+        //   shape: 33–72 % of departures "late", `max_late_ms` climbing to 99, `reanchors` ≈ 0 —
+        //   a lag that only ever accumulated, and was only ever repaid when the next long hole's
+        //   infill burst out (lag + 10 ms) / 5 ms silence frames back to back. On the client
+        //   that is a ring drained a frame at a time and then refilled with a burst it has to
+        //   trim. So the infill decision now looks at the LAG as well as the time since the
+        //   last chunk: a schedule `after()` behind with no audio to send is owed a frame of
+        //   cover exactly as a hole that long is, and the lag stays bounded at that (a couple
+        //   of frames at a frame-sized quantum, one chunk plus a frame on a clamped one).
+        // - **Source ahead** (the graph clock is fast, or a chunk landed after a stall): `acc`
+        //   holds more than a chunk's worth beyond the frame being sent. Left alone the surplus
+        //   is never sent — one frame per slot, forever — so a source a hundred ppm fast grows
+        //   the backlog, and the latency, by five milliseconds every fifty seconds for the life
+        //   of the session, and only a hole ever takes it back. So a slot whose remaining
+        //   backlog exceeds one chunk plus one frame sends a second frame in the same slot
+        //   (`bonus`): at most two per slot, so a burst never exceeds what a 10 ms quantum
+        //   sends every cycle anyway, and the surplus drains at twice real time until it is gone.
+        //
+        // Both together bound what `late` can accumulate: a lag can no longer grow past
+        // `after()` without being covered, so a `max_late_ms` beyond that band is this thread's
+        // own scheduling — the reading WP-C built the counter for — and not the source's.
+        let mut bonus_taken = false;
         loop {
             let now = std::time::Instant::now();
             // How far past its slot this frame is leaving. Measured before the re-anchor arm can
@@ -605,23 +671,64 @@ pub(super) fn audio_thread(
             } else if !sent_any {
                 break;
             } else {
-                match infill.decide(last_chunk_at.elapsed()) {
+                // The hole is the LATER of "since the last chunk" and "how far the schedule is
+                // behind": the first is a graph that stopped feeding us, the second is a graph
+                // that fed us less than wall clock — see the loop comment.
+                match infill.decide(last_chunk_at.elapsed().max(late)) {
                     crate::audio::capture_policy::Infill::Silence => {
                         infilled = true;
                         // Pad the partial frame out with silence and send THAT, rather than
                         // leaving it for post-gap samples to complete: one frame carrying audio
                         // from both sides of a hole is a click, and its pts is a lie about when
-                        // half of it was captured.
+                        // half of it was captured. (And it is not dropped either: those samples
+                        // are audio the wire owes, and every sample dropped here would come
+                        // straight back as schedule lag — see the loop comment.)
+                        let partial = acc.len();
                         frame_buf.append(&mut acc);
+                        if infill.covered() == infill.frame() {
+                            // First frame of the hole: the audio does not stop at a step. Fade
+                            // the tail of what we have over up to `EDGE_FADE_US` — the partial
+                            // frame if there is one, else the same slice of the last real frame
+                            // again, so the fade is a slope from the level the listener was at
+                            // down to nothing rather than an edge there.
+                            if partial == 0 && !last_real.is_empty() {
+                                let n = edge_fade_samples.min(last_real.len());
+                                frame_buf.extend_from_slice(&last_real[..n]);
+                            }
+                            let n = frame_buf.len().min(edge_fade_samples);
+                            pcm::raised_cosine_tail(&mut frame_buf, n);
+                        }
                         frame_buf.resize(frame_len, 0.0);
+                        // Whatever follows this hole starts mid-waveform.
+                        resume_fade = true;
                     }
                     crate::audio::capture_policy::Infill::Wait
                     | crate::audio::capture_policy::Infill::Quiet => break,
                 }
             }
-            pace_due = Some(pace_due.unwrap_or_else(std::time::Instant::now) + frame_interval);
-            if gain != 1.0 {
-                punktfunk_core::audio::apply_gain(&mut frame_buf, gain);
+            // A slot whose remaining backlog exceeds one chunk plus one whole frame sends a
+            // second frame in the same slot — see the loop comment. Decided on what is left
+            // AFTER this frame, so the frame that merely completes a chunk never triggers it,
+            // and never twice in a row, so a big surplus drains at 2× and not in one burst.
+            let bonus = !infilled && !bonus_taken && acc.len() >= max_chunk_len + frame_len;
+            pace_due = match pace_due {
+                Some(due) if bonus => Some(due), // same slot again for the next frame
+                other => Some(other.unwrap_or_else(std::time::Instant::now) + frame_interval),
+            };
+            bonus_taken = bonus;
+            if !infilled {
+                if gain != 1.0 {
+                    punktfunk_core::audio::apply_gain(&mut frame_buf, gain);
+                }
+                if std::mem::take(&mut resume_fade) {
+                    // First real frame after a hole: fade it in from silence, the mirror of the
+                    // fade the hole started with.
+                    pcm::raised_cosine_head(&mut frame_buf, edge_fade_samples);
+                }
+                // What the next hole's fade is built from when it opens on an empty partial —
+                // recorded post-gain, so the fade sits at the level the listener was hearing.
+                last_real.clear();
+                last_real.extend_from_slice(&frame_buf);
             }
             // W1.1 — the wire clock. ⚠ Charged the frame's REAL sample count, never the negotiated
             // `frame_us`, which is a label on the 44.1 kHz family and would run this 2.3 ms/s fast

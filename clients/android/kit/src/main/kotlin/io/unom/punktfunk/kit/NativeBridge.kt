@@ -283,6 +283,11 @@ object NativeBridge {
         /** The display mode's own refresh rate (0 = unknown) — the latch grid the presenter
          *  subdivides onto when the platform down-rates the app's choreographer stream. */
         panelFps: Int,
+        /** The video SurfaceView's on-screen pixel size (0 = not laid out yet). The ASurfaceControl
+         *  present backend composites its layer in this coordinate space — the aspect-fitted display
+         *  footprint — rather than the window's rotated/scaled buffer geometry. */
+        surfaceW: Int,
+        surfaceH: Int,
     )
 
     /** Stop + join the decode thread without closing the session. No-op on `0`. */
@@ -640,4 +645,143 @@ object NativeBridge {
      * Returns the byte count, or -1 on timeout / session closed.
      */
     external fun nativeNextHidout(handle: Long, buf: java.nio.ByteBuffer): Int
+
+    // ---- The Skia console UI (crates/pf-console-ui over EGL/GLES — clients/android/native/src/console) ----
+    //
+    // The same console shell the Linux/Windows session binary shows, drawn by native onto a
+    // SurfaceView. Kotlin keeps the services and feeds the console's models as JSON in the model
+    // types' own serde shape (HostRow, LibraryGame, ConsoleCmd, OverlayAction, Settings — see
+    // `crates/pf-console-ui/src/model.rs` and `pf-client-core/src/trust.rs`); what the console
+    // raises comes back through [nativeConsoleNextEvent]. Every call is main-thread-safe and cheap
+    // except the two polls, which block ~100 ms and belong on their own threads.
+
+    /**
+     * Whether this `.so` carries the console host at all. Present on EVERY ABI — armeabi-v7a has no
+     * prebuilt Skia archive yet, so there the rest of these symbols DO NOT EXIST and calling one is
+     * an UnsatisfiedLinkError. Ask this first.
+     */
+    external fun nativeConsoleAvailable(): Boolean
+
+    /**
+     * Build the console: [optionsJson] = `{device_name, gpu_cache_bytes, settings: <trust::Settings>,
+     * profiles: [[id, name]], known_hosts: <KnownHosts>, entry: {} | {"library": <HostRow>}}`.
+     * Returns a handle (its render thread parked until a surface arrives), or `0` on a bad options
+     * document. EGL/Skia failures arrive later as a `{"dead": …}` event.
+     */
+    external fun nativeConsoleCreate(optionsJson: String): Long
+
+    /** Stop the render thread (joined) and free. Stop + join the event poll thread FIRST. */
+    external fun nativeConsoleDestroy(handle: Long)
+
+    /** The SurfaceView's surface is up. */
+    external fun nativeConsoleSurfaceCreated(handle: Long, surface: android.view.Surface)
+
+    /** The surface's size changed. */
+    external fun nativeConsoleSurfaceChanged(handle: Long)
+
+    /** BLOCKS until the render thread has let go of the surface — call from `surfaceDestroyed`. */
+    external fun nativeConsoleSurfaceDestroyed(handle: Long)
+
+    /** Safe-area insets in surface pixels + the design-unit scale (`0` = the shell's own formula). */
+    external fun nativeConsoleSetViewport(
+        handle: Long,
+        left: Float,
+        top: Float,
+        right: Float,
+        bottom: Float,
+        scale: Float,
+    )
+
+    /**
+     * The raw pad, whenever it changes: [buttons] bit i = a, b, x, y, l1, r1 held; [lx]/[ly] the left
+     * stick in wire units (±32767, +y down); [dpad] bit i = up, down, left, right held. Native runs
+     * the shared menu synthesizer over it (dead zone, repeat, hysteresis).
+     */
+    external fun nativeConsolePadSample(handle: Long, buttons: Int, lx: Int, ly: Int, dpad: Int)
+
+    /**
+     * A discrete menu event: 0..3 move up/down/left/right, 4 confirm, 5 back, 6 secondary (Y),
+     * 7 tertiary (X), 8 jump back (L1), 9 jump forward (R1). For input that is already an event on
+     * this side (a TV remote's D-pad keys, the touch legend).
+     */
+    external fun nativeConsoleMenu(handle: Long, event: Int)
+
+    /**
+     * Pointer input in surface pixels: [kind] 0 move, 1 primary down, 2 primary up, 3 secondary
+     * down (= Back), 4 wheel ([dy] steps, + = up), 5 cancel.
+     */
+    external fun nativeConsolePointer(handle: Long, kind: Int, x: Float, y: Float, dy: Float)
+
+    /**
+     * A hardware key the console understands: 0..3 left/right/up/down, 4 return, 5 space,
+     * 6 escape, 7 backspace, 8 page up, 9 page down, 10 tab, 11 Y, 12 X.
+     */
+    external fun nativeConsoleKey(handle: Long, key: Int, shift: Boolean, repeat: Boolean)
+
+    /** Typed characters while the console reports `{"editing": true}`. */
+    external fun nativeConsoleText(handle: Long, text: String)
+
+    /**
+     * Where the session the console asked for stands: 0 connecting, 1 streaming, 2 failed([message]),
+     * 3 ended ([message] = the abnormal reason, or "" for a clean end), 4 reconnecting([message]).
+     */
+    external fun nativeConsoleSessionPhase(handle: Long, phase: Int, message: String)
+
+    /** Re-root the console: `{}` = Home, `{"library": <HostRow>}` = that host's shelf over Home. */
+    external fun nativeConsoleNavigate(handle: Long, entryJson: String)
+
+    /**
+     * The connected controllers: `{"label": "DualSense", "pref": 2, "pads": [{name, key, pref,
+     * steam_virtual, battery: {percent, charging} | null}]}` — the chip and the settings rows.
+     */
+    external fun nativeConsoleSetPads(handle: Long, padsJson: String)
+
+    /**
+     * Block up to ~100 ms for the next event: `{"action": <OverlayAction>}`, `{"pulse": "move" |
+     * "confirm" | "boundary"}`, `{"editing": bool}`, `{"settings": <Settings>}` (persist it),
+     * `{"gles": 2 | 3}`, `{"dead": "<why>"}`. `""` on timeout. Call from a dedicated poll thread.
+     */
+    external fun nativeConsoleNextEvent(handle: Long): String
+
+    /** Every `ConsoleCmd` queued since the last call, as a JSON array (`[]` when none). */
+    external fun nativeConsoleDrainCmds(handle: Long): String
+
+    /** The home carousel's rows: `[HostRow]`. */
+    external fun nativeConsoleSetHosts(handle: Long, json: String)
+
+    /** The pairing ceremony's phase: `"Idle"`, `"Busy"`, `{"Failed": "why"}`, `{"Paired": {"key": …}}`. */
+    external fun nativeConsoleSetPair(handle: Long, json: String)
+
+    /** The wake card's status (`WakeStatus` JSON) or `null` to clear it. */
+    external fun nativeConsoleSetWake(handle: Long, json: String)
+
+    /** A one-shot toast from a service worker. */
+    external fun nativeConsoleNotice(handle: Long, text: String)
+
+    /** A library fetch is starting for the shelf on screen (bumps the epoch, sets Loading). */
+    external fun nativeConsoleLibraryBegin(handle: Long)
+
+    /** `"Loading"`, `"Empty"`, `"Ready"`, or `{"Error": {"title", "body", "can_retry"}}`. */
+    external fun nativeConsoleLibraryPhase(handle: Long, json: String)
+
+    /** The catalog `[LibraryGame]`; [cached] = the last-known list shown while the fetch runs. */
+    external fun nativeConsoleLibraryGames(handle: Long, json: String, cached: Boolean)
+
+    /** One title's poster, encoded (JPEG/PNG bytes). */
+    external fun nativeConsoleLibraryArt(handle: Long, id: String, bytes: ByteArray)
+
+    /** The ids the host has up: `["steam:570", …]`. */
+    external fun nativeConsoleLibraryRunning(handle: Long, json: String)
+
+    /** 0 fresh, 1 waking, 2 offline — the cached shelf's staleness note. */
+    external fun nativeConsoleLibraryStale(handle: Long, stale: Int)
+
+    /** A settings change made elsewhere (touch UI, deep link): the shell reads it next. Not a save. */
+    external fun nativeConsoleSetSettings(handle: Long, json: String)
+
+    /** The profile catalog `[[id, name]]`. */
+    external fun nativeConsoleSetProfiles(handle: Long, json: String)
+
+    /** The known-hosts records (`KnownHosts` JSON) the console builds `punktfunk://` links from. */
+    external fun nativeConsoleSetKnownHosts(handle: Long, json: String)
 }

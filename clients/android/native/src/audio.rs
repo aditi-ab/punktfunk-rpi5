@@ -336,6 +336,10 @@ struct Counters {
     pcm_written: AtomicU64, // PCM frames copied out to AAudio (device clock is pulling)
     underruns: AtomicU64,   // callbacks that emitted silence (ring not primed / drained)
     target_ms: AtomicU64,   // the policy's LIVE target depth (it grows on this device's underruns)
+    /// Sync-driven inserts: one duplicated, crossfaded frame each (`JitterStep::insert_front`).
+    /// Concealment must be visible next to the underruns it prevents — a ring that is quietly
+    /// being deepened is a link whose picture keeps moving away from its audio.
+    inserts: AtomicU64,
     /// Data callbacks since the process started, primed or not. Distinct from `pcm_written`
     /// (which only counts SERVED reads) because that is exactly the distinction the start
     /// watchdog needs: a device that is pulling but un-primed still ticks this, a stream that
@@ -1046,6 +1050,14 @@ fn try_open(rung: OpenRung, ctx: &OpenCtx) -> ndk::audio::Result<LiveStream> {
         if step.drop_front > 0 {
             punktfunk_core::audio::crossfade_drop(&mut ring, step.drop_front, step.crossfade);
         }
+        // The mirror: the sync loop asked for a DEEPER ring, answered with one duplicated,
+        // crossfaded frame instead of a de-prime (see `JitterStep::insert_front`). Stays inside
+        // the ring's reserve on this RT thread — `with_capacity` above leaves `RING_CHUNKS`
+        // frames past the hard cap, and the policy only inserts BELOW its target.
+        if step.insert_front > 0 {
+            punktfunk_core::audio::crossfade_insert(&mut ring, step.insert_front, step.crossfade);
+            cb_counters.inserts.fetch_add(1, Ordering::Relaxed);
+        }
         let mut ran_short = false;
         if !step.silence {
             for slot in out.iter_mut() {
@@ -1355,7 +1367,7 @@ fn decode_loop(
                             // `underruns` bought with a climbing `plc_ms` is a link in trouble,
                             // not a link that is fine.
                             log::info!(
-                                "audio: {}={count} pcm_frames={} underruns={} buffer_ms={} target_ms={} av_ms={} plc_ms={} peak={window_peak:.3}",
+                                "audio: {}={count} pcm_frames={} underruns={} buffer_ms={} target_ms={} av_ms={} plc_ms={} drift_inserts={} peak={window_peak:.3}",
                                 plane_counter_key(fmt),
                                 counters.pcm_written.load(Ordering::Relaxed),
                                 counters.underruns.load(Ordering::Relaxed),
@@ -1363,6 +1375,7 @@ fn decode_loop(
                                 counters.target_ms.load(Ordering::Relaxed),
                                 av.offset_ms(),
                                 drought.total_ms(),
+                                counters.inserts.load(Ordering::Relaxed),
                             );
                             window_peak = 0.0;
                         }

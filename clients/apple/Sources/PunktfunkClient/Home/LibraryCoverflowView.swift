@@ -1,17 +1,16 @@
-// The gamepad-driven presentation of the game library (iOS/iPadOS/macOS/tvOS — see LibraryView's
-// `gamepadUIActive` branch): a classic coverflow instead of the touch grid. All the
-// scrolling/snapping/navigation/haptics live in GamepadCarousel; this file is the coverflow card
-// (poster + the 3D recede treatment via `.scrollTransition`), the "now focused" detail panel, and
-// the controller-glyph hints. A steps through covers, A launches the centered title, B closes, and
-// the shoulders (L1/R1) jump a handful at a time through a long library.
+// The gamepad library's SHELF arrangement (iOS/iPadOS/macOS/tvOS — see LibraryView's
+// `gamepadUIActive` branch): a classic coverflow. All the scrolling/snapping/navigation/haptics
+// live in GamepadCarousel; this file is the coverflow card (poster + the 3D recede treatment via
+// `.scrollTransition`) and the LAUNCHERS/GAMES heading. The detail band, the legend, the backdrop
+// and the view/sort bar belong to `LibraryConsoleView`, which hosts this arrangement and the grid
+// alike — one shelf, two arrangements, one set of chrome, exactly the desktop console's split.
 //
-// Layout discipline (so nothing is EVER clipped, portrait or landscape): the gradient is a
-// `.background` modifier — NOT a ZStack sibling — because an `.ignoresSafeArea()` sibling expands the
-// stack to full-screen and hands the GeometryReader the full height, laying content out under the
-// status bar / home indicator. As a background it draws behind without affecting layout, so the
-// GeometryReader is sized to the safe area, and the controller-glyph hints are pinned inside it with
-// `.safeAreaInset(.bottom, alignment: .leading)`. Cover size is then derived from the height that
-// remains, so a tall 2:3 poster + the detail line always fit.
+// A steps through covers, A launches the centered title, B closes, the shoulders (L1/R1) jump a
+// handful at a time through a long library, and ▲ hands the controller to the bar above.
+//
+// Layout discipline (so nothing is EVER clipped, portrait or landscape): the container hands this
+// view the height that remains after its own chrome; cover size is derived from that, so a tall
+// 2:3 poster always fits.
 
 import PunktfunkKit
 import SwiftUI
@@ -19,44 +18,45 @@ import SwiftUI
 import GameController
 
 struct LibraryCoverflowView: View {
-    /// Resolved from the stored palette, NOT from `\.gamepadInk` — this screen publishes that
-    /// value itself and so sits above its own copy (see `GamepadInk.stored`).
+    /// Resolved from the stored palette, NOT from `\.gamepadInk` — the container publishes that
+    /// value and this view sits above its own copy (see `GamepadInk.stored`).
     @AppStorage(DefaultsKey.uiPalette) private var paletteID = "violet"
     private var ink: GamepadInk { .stored(paletteID) }
+    /// The shelf in DISPLAY order — collated by the container (launchers lead, then the sort).
     let games: [GameEntry]
     let artLoader: (any LibraryArtSource)?
+    /// The centred title, published for the container's detail band and legend. Output only —
+    /// the carousel's cursor is the authority (see GamepadCarousel's header).
+    @Binding var focusID: String?
     var onLaunch: ((String) -> Void)?
     /// Which titles the host already has up, keyed by library id — so a card the player can return
     /// to says `Resume` rather than looking like every other one. Empty on an older host.
     var running: [String: RunningGame] = [:]
-    /// Button B (back) — dismisses the library screen. No touch equivalent needed here (the toolbar
-    /// Close button already covers that); this is what makes gamepad-only exit possible.
-    var onDismiss: (() -> Void)?
-    /// Button X — copy the centered title's `punktfunk://` link. The coverflow's answer to the
-    /// touch grid's context menu: a controller has no right-click, so the one per-game action
-    /// there is gets a face button and a legend entry rather than a menu holding a single row.
-    /// nil where the platform has no clipboard (tvOS), which also drops the hint.
-    var onCopyLink: ((GameEntry) -> Void)?
-    /// Whether the carousel owns the controller — the in-place shell gates it (mid-transition,
-    /// and under the connect takeover after A launches a title, where this coverflow used to
-    /// keep polling underneath). Cover/sheet presentations keep the default.
+    /// The title to assemble the strip around on mount — the one last opened from this shelf
+    /// (`LibraryScrollMemory`), so coming back from a stream lands where the player left rather
+    /// than on the first cover. Ignored when it is no longer in the list.
+    var initialSelection: String?
+    /// Button B (back) — the container decides what that means (pop a place, or dismiss).
+    var onBack: (() -> Void)?
+    /// Button Y — the container's secondary action (Collections); nil disables it.
+    var onSecondary: (() -> Void)?
+    /// Button X — copy the centred title's link; nil where the platform has no clipboard.
+    var onTertiary: (() -> Void)?
+    /// ▲ — hand the controller to the view/sort bar above the field. Wiring it makes vertical
+    /// the bar's axis (down goes inert), the reading the desktop shelf has.
+    var onUp: (() -> Void)?
+    /// Whether the carousel owns the controller — the container gates it while the bar has
+    /// focus, and the shell gates it mid-transition and under the connect takeover.
     var controllerActive = true
-    @Environment(\.gamepadHostedInShell) private var hostedInShell
 
     #if os(iOS)
-    /// `.compact` in a landscape phone window — drives a tighter poster so everything still fits.
+    /// `.compact` in a landscape phone window — a tighter poster so the title band gets air.
     @Environment(\.verticalSizeClass) private var vSizeClass
-
     private var compact: Bool { vSizeClass == .compact }
     #else
     private let compact = false // no size classes on macOS
     #endif
-    @State private var selection: String?
-    /// The copy hint's acknowledgement. There is no toast on this surface, so the legend entry
-    /// says it itself — the same answer `GamepadHostOptionsView` gives, in the place the user is
-    /// already looking. Transient here (the screen stays up, unlike that menu), and cleared the
-    /// moment the strip moves, since "Copied" was about the cover that WAS centred.
-    @State private var copied = false
+
     /// How many covers have settled (art loaded, or every candidate exhausted).
     @State private var artSettled = 0
     /// The backstop below has fired: play the entrance regardless of what the art is doing.
@@ -74,39 +74,20 @@ struct LibraryCoverflowView: View {
         GeometryReader { geo in
             content(for: geo.size)
         }
-        .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
-            GamepadHintBar(hints: hints)
-                .padding(.leading, 22)
-                .padding(.vertical, compact ? 6 : 10)
-        }
-        // Hosted in the shell, the field is the shell's own persistent aurora (the library is
-        // an aurora screen — the calm mix simply stays 0, so nothing even chases).
-        .background {
-            if !hostedInShell { GamepadScreenBackground() }
-        }
-        // Publish the palette's ink to this screen (text, glass, accent, scrims) — a
-        // pale palette flips all of them, and no leaf should have to read the setting.
-        .gamepadPaletteInk()
         // The entrance's backstop (see `contentReady`).
         .task {
             try? await Task.sleep(for: .milliseconds(700))
             artWaitOver = true
         }
-        // "Copied" is an acknowledgement, not a state — it goes away on its own, and at once if
-        // the strip moves off the cover it was about.
-        .task(id: copied) {
-            guard copied else { return }
-            try? await Task.sleep(for: .milliseconds(1600))
-            withAnimation(.smooth(duration: 0.2)) { copied = false }
-        }
-        .onChange(of: selection) { _, _ in copied = false }
     }
 
     @ViewBuilder private func content(for size: CGSize) -> some View {
-        // Fit the tallest poster into the height the detail line + paddings leave (the hints are a
-        // safe-area inset, already out of this budget) — capped so it never dwarfs a large iPad and
+        // Fit the tallest poster into the height the container left us (the detail band and the
+        // legend are already out of this budget) — capped so it never dwarfs a large iPad and
         // clamped by width on a narrow screen.
-        let reserved: CGFloat = (compact ? 72 : 96) + (showsGroupHeading ? 26 : 0)
+        // In a landscape phone's height the title band sits right under the strip; hold a
+        // little of the cover's height back so the two don't touch.
+        let reserved: CGFloat = (compact ? 26 : 8) + (showsGroupHeading ? 26 : 0)
         let coverHeight = min(360, min(max(140, size.height - reserved), size.width * 0.9))
         let coverWidth = coverHeight * 2 / 3
 
@@ -116,8 +97,6 @@ struct LibraryCoverflowView: View {
                 groupHeading.padding(.bottom, 6)
             }
             carousel(coverWidth: coverWidth, coverHeight: coverHeight)
-            detailPanel
-                .padding(.top, 12)
             Spacer(minLength: 4)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -126,12 +105,15 @@ struct LibraryCoverflowView: View {
     private func carousel(coverWidth: CGFloat, coverHeight: CGFloat) -> some View {
         GamepadCarousel(
             items: games,
-            selection: $selection,
+            selection: $focusID,
             itemWidth: coverWidth,
             spacing: 34,
+            initialItemID: initialSelection,
             onActivate: { onLaunch?($0.id) },
-            onTertiary: onCopyLink.map { copy in { copyCentered(copy) } },
-            onBack: { onDismiss?() },
+            onSecondary: onSecondary,
+            onTertiary: onTertiary,
+            onBack: onBack,
+            onUp: onUp,
             shoulderJump: 5,
             isActive: controllerActive,
             contentReady: contentReady
@@ -150,7 +132,10 @@ struct LibraryCoverflowView: View {
     ) -> some View {
         PosterImage(
             candidates: game.art.posterCandidates, title: game.title, loader: artLoader,
-            icon: game.iconToken, onLoaded: { artSettled += 1 })
+            icon: game.iconToken,
+            // Decode at the size drawn (the container's poster box), never at the CDN's.
+            drawnSize: CGSize(width: width, height: height),
+            onLoaded: { artSettled += 1 })
             .frame(width: width, height: height)
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             .overlay(alignment: .topLeading) {
@@ -186,14 +171,6 @@ struct LibraryCoverflowView: View {
             }
     }
 
-    /// Hand the CENTERED title to the copy action. Read at press time, not when the legend or
-    /// the carousel was built (the same rule A's hint follows), and inert with nothing centred.
-    private func copyCentered(_ copy: (GameEntry) -> Void) {
-        guard let game = games.first(where: { $0.id == selection }) else { return }
-        copy(game)
-        withAnimation(.smooth(duration: 0.2)) { copied = true }
-    }
-
     /// Does this library have both groups? Only then does the heading earn its row — a
     /// launcher-less library gets exactly the layout it had before design D4.
     private var showsGroupHeading: Bool {
@@ -204,63 +181,11 @@ struct LibraryCoverflowView: View {
     /// rail (a whole new up/down nav model for two or three tiles) the heading names the group and
     /// changes as the selection crosses the boundary — the launcher entries lead the strip.
     private var groupHeading: some View {
-        let selected = games.first { $0.id == selection }
+        let selected = games.first { $0.id == focusID }
         return Text(selected?.isLauncher == true ? "LAUNCHERS" : "GAMES")
             .font(.geist(11, .semibold, relativeTo: .caption2))
             .tracking(1.4)
             .foregroundStyle(ink.fg(0.45))
-    }
-
-    /// The centered title + store tag — empty (not hidden) so the layout doesn't jump.
-    @ViewBuilder private var detailPanel: some View {
-        let game = games.first { $0.id == selection }
-        VStack(spacing: 6) {
-            Text(game?.title ?? " ")
-                .font(.geist(compact ? 22 : 25, .bold, relativeTo: .title))
-                .foregroundStyle(ink.fg)
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
-                .multilineTextAlignment(.center)
-            if let game {
-                // main's richer store label, in the palette's ink.
-                Text(
-                    game.isLauncher
-                        ? "\(game.storeLabel.uppercased()) · LAUNCHER" : game.storeLabel.uppercased()
-                )
-                .font(.geist(11, .semibold, relativeTo: .caption2))
-                .tracking(1.2)
-                .foregroundStyle(ink.fg(0.5))
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.horizontal, 24)
-        .animation(.smooth(duration: 0.25), value: selection)
-    }
-
-    // MARK: - Hint bar (pinned bottom-leading via safeAreaInset)
-
-    private var hints: [GamepadHint] {
-        var hints: [GamepadHint] = []
-        if let onLaunch {
-            // You *open* a launcher and *launch* a game — the hint follows the focused entry.
-            let opens = games.first { $0.id == selection }?.isLauncher == true
-            hints.append(.init(
-                glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: opens ? "Open" : "Launch",
-                // Reads `selection` when it fires, not when the legend was built (see the
-                // launcher's twin) — and does nothing with no title centred, which is exactly
-                // what A does.
-                action: { if let id = selection { onLaunch(id) } }))
-        }
-        if let onCopyLink {
-            hints.append(.init(
-                glyph: buttonGlyph(\.buttonX, fallback: "x.circle"),
-                text: copied ? "Copied" : "Copy link",
-                action: { copyCentered(onCopyLink) }))
-        }
-        hints.append(.init(
-            glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Close",
-            action: { onDismiss?() }))
-        return hints
     }
 }
 #endif

@@ -92,5 +92,29 @@ opus = "0.3"
 uac-host = { git = "https://github.com/unom-io/usbfs-iso", rev = "f3de1fd62cec271d07f45664dc464f23e423e721" }
 usbfs-iso = { git = "https://github.com/unom-io/usbfs-iso", rev = "f3de1fd62cec271d07f45664dc464f23e423e721" }
 
+# The Skia console UI (design/android-skia-console-port.md): the SAME `pf-console-ui` shell the
+# Linux/Windows session binary shows, drawn here through Skia's GL backend on an EGL surface
+# (`src/console/`). `default-features = false` turns its Vulkan overlay off — this host owns the
+# surface. `pf-client-core` for the portable types the shell speaks (settings, menu events,
+# overlay actions); `default-features = false` like every other consumer (its default is the
+# PyroWave decoder, C++ nobody here wants).
+#
+# All three shipping ABIs. rust-skia publishes prebuilt Skia archives for aarch64/x86_64/
+# i686-linux-android but NOT armv7-linux-androideabi (the 32-bit TV boxes) — that one comes from
+# OUR mirror through `SKIA_BINARIES_URL` (kit/build.gradle.kts forwards it; the CI variable of
+# the same name; sha256 table beside it), built once with skia-bindings itself (design
+# android-skia-console-port.md WP6). 🛑 skia-bindings does not fail when no archive matches — it
+# silently builds Skia from source — so an armeabi-v7a build WITHOUT the mirror url is a
+# multi-minute source build, and every ABI's log must show `DOWNLOAD AND INSTALL SUCCEEDED`.
+# (Continues the `cfg(target_os = "android")` table above — TOML allows a table header once.)
+pf-console-ui = { path = "../../../crates/pf-console-ui", default-features = false }
+pf-client-core = { path = "../../../crates/pf-client-core", default-features = false }
+# `gl` + `textlayout` = the prebuilt key `gl-jpegd-jpege-pdf-textlayout` (verify
+# `DOWNLOAD AND INSTALL SUCCEEDED` in the build log on every bump — see pf-console-ui/Cargo.toml).
+skia-safe = { version = "0.99", features = ["gl", "textlayout"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
 [lints]
 workspace = true

@@ -29,7 +29,7 @@ use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{Ctx, Outbox, Screen};
 use crate::theme::{accent, art_sampling, fg, fill, stroke, Fonts, PanelStroke, EDGE_INSET, W};
 use crate::widgets::{TabStrip, TAB_STRIP_H};
-use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
+use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Color4f, Image, Matrix, Point, RRect, Rect, TileMode};
 use std::collections::HashMap;
 
@@ -936,6 +936,8 @@ mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &[],
             deck: false,
             device_name: "test",

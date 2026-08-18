@@ -148,14 +148,28 @@ mod imp {
     /// place used to be the design ("reverts at process exit") — but the host is a 24/7 service,
     /// so after one stream it competed at HIGH class with a 1 ms global timer against whatever
     /// the user played locally, forever.
+    ///
+    /// 🛑 **Nothing in here may log, or touch anything that logs.** This runs from
+    /// [`HotThreadGuard`]'s `Drop`, which is a **TLS destructor** — and by then this thread's
+    /// *other* thread-locals may already be gone, including the ones `tracing_subscriber`'s
+    /// registry keeps (it is `sharded-slab`-backed, and the slab's per-thread registration is a
+    /// `thread_local!` read with `LocalKey::with`). Emitting an event here panicked with "cannot
+    /// access a Thread Local Storage value during or after destruction", and **a panic that
+    /// escapes a TLS destructor is fatal in Rust** — `fatal runtime error: thread local panicked
+    /// on drop, aborting`. So one `info!` line killed the whole host on session teardown and the
+    /// SCM restarted it ~6 s later, which read in the field as a mystery reconnect (on glass,
+    /// .173: four aborts, every one of them a session teardown).
+    ///
+    /// The revert itself is only FFI and stays here, inside the refcount lock, so it remains
+    /// atomic against a session starting concurrently. The counterpart "applied" line in
+    /// [`tune_process`] runs on a live thread and is kept — that one is safe.
     fn untune_process() {
         // SAFETY: same FFI surface as `tune_process` — plain-integer arguments, constant
-        // pseudo-handle, no pointers or buffers.
+        // pseudo-handle, no pointers or buffers. Sound in a TLS destructor: no Rust TLS is read.
         unsafe {
             timeEndPeriod(1); // pairs the timeBeginPeriod(1)
             DwmEnableMMCSS(0);
             SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
-            tracing::info!("windows session tuning reverted (timer, DWM MMCSS, NORMAL priority)");
         }
     }
 
@@ -165,8 +179,9 @@ mod imp {
 
     impl Drop for HotThreadGuard {
         fn drop(&mut self) {
-            // A poisoned lock skips the revert (best-effort, like every call here) instead of
-            // panicking inside a TLS destructor.
+            // ⚠ TLS DESTRUCTOR. Everything reached from here must be panic-free and must not log —
+            // see [`untune_process`] for what a single `info!` here cost. A poisoned lock skips the
+            // revert (best-effort, like every call here) rather than panicking.
             if let Ok(mut n) = HOT_THREADS.lock() {
                 *n -= 1;
                 if *n == 0 {

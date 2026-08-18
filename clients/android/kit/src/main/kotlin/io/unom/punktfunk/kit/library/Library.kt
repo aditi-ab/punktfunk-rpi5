@@ -55,6 +55,11 @@ data class GameEntry(
     val art: Artwork,
     val role: String? = null,
     val icon: String? = null,
+    /**
+     * The host's platform tag (`platform` in the catalog — a ROM manager's console name; Steam
+     * sets none). What the console's Collections group by; carried through verbatim.
+     */
+    val platform: String? = null,
 ) {
     val isCustom: Boolean get() = store == "custom"
 
@@ -260,6 +265,7 @@ object LibraryClient {
                     ),
                     role = str(o, "role"),
                     icon = str(o, "icon"),
+                    platform = str(o, "platform"),
                 ),
             )
         }

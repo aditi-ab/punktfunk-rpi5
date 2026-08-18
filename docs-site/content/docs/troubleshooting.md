@@ -239,8 +239,10 @@ If it still happens on a host that has the fix:
   this is your normal way to play, set **Virtual displays → Dedicated game sessions** to **Dedicated**
   — every launch then gets its own headless gamescope with only the game inside, and placement stops
   being a question of focus at all (needs `gamescope` installed).
-- **Setting the topology to Primary or Exclusive won't do it.** Neither is implemented on these two
-  backends — the console accepts the setting and the host logs that it dropped it. See
+- **Setting the topology to Primary won't do it.** Wayland has no primary output for these two
+  backends to set, so Primary behaves as Extend and the host says so in the log. **Exclusive** *is*
+  implemented here — it switches your physical monitors off for the session and back on afterwards,
+  which does put every window on the stream. See
   [Virtual displays → Topology](/docs/virtual-displays#topology).
 
 ## The screen stays black after switching to Game Mode (Nobara)
@@ -534,6 +536,30 @@ If the stream is *wrong* rather than late — a codec you didn't pick, 8-bit whe
 told your client so. [When the client and the host
 disagree](/docs/client-settings#when-the-client-and-the-host-disagree) lists what it does with each
 one.
+
+## Audio stutters, and only the audio (Linux)
+
+Video steady, sound broken up: on a Linux host, look for this line in the host log.
+
+```
+WARN  our audio capture group is being clocked by another node — every hole in this stream is
+      that node's scheduling, not ours … driver="alsa_input.usb-…" expected="punktfunk-speaker-…"
+```
+
+PipeWire schedules audio in groups, and each group runs on one node's clock. The host brings its
+own — the virtual output it records — so this warning means something has linked that output to
+another device and handed it the clock instead. Whatever the named device does with its timing,
+your stream now does too: if it stalls for 30 ms, so does the audio, and the host fills the hole
+with silence.
+
+The usual cause is a loopback from the host's virtual output to a real one (some "listen to this
+device" setups create exactly that). The pathological case is a **sound card reached over the
+network** — a controller forwarded with VirtualHere or USB/IP presents one, and its clock cannot be
+recovered across the link at all; a host in that state synthesized 15 % of everything the user
+heard. Remove the loopback, or turn off that card's audio profile (KDE → Audio → the device →
+Profile → *Off*), and the group goes back to the host's own clock.
+
+Without the warning, audio stutter is the same problem as any other stutter — see above.
 
 ## Streamed audio sounds worse than the host does
 

@@ -192,8 +192,30 @@ public enum DefaultsKey {
     /// "pointer" (the cursor jumps to the finger), or "touch" (real multi-touch passthrough).
     /// Read live per gesture by `StreamLayerUIView`.
     public static let touchMode = "punktfunk.touchMode"
-    /// Experimental: show the host's game library (browsed over the management API). Off by default.
+    /// Show the host's game library (browsed over the management API). On by default — every
+    /// reader defaults it to `true`.
     public static let libraryEnabled = "punktfunk.libraryEnabled"
+    /// How the library's titles are ordered within a group — a `LibrarySortKey` stored value
+    /// (`"host"` = the host's own order, the default; `"title"` A–Z; `"platform"`; `"store"`).
+    /// The cross-client `library_sort` key: the desktop console persists the same ids, and an
+    /// unknown value reads as host order. Presentation only — a device preference, never part of
+    /// a stream profile. Written by the library's sort/view bar and by the Collections screen.
+    public static let librarySort = "punktfunk.librarySort"
+    /// Which arrangement the gamepad library opens in — a `LibraryArrangement` stored value
+    /// (`"shelf"` = the coverflow, the default; `"grid"`). The cross-client `library_view` key;
+    /// unknown reads as shelf. Presentation only. One key, two surfaces: the library's bar and the
+    /// Interface settings row both write it.
+    public static let libraryView = "punktfunk.libraryView"
+    /// Open a browsable library straight onto its Collections (group-by-platform tiles) instead of
+    /// the shelf — the cross-client `library_collections` key. Off by default; a library that is
+    /// not worth browsing (one platform, one store) opens on the shelf regardless. Presentation
+    /// only.
+    public static let libraryCollections = "punktfunk.libraryCollections"
+    /// The TOUCH library grid's grouping — `""` (none, the default), `"platform"` or `"store"`:
+    /// one section per collated group. Touch-only: on the console the grouping is a PLACE
+    /// (Collections), not a mode of the shelf, so there is no cross-client key for it. The sort it
+    /// composes with is the shared `librarySort`. Presentation only.
+    public static let libraryGroupBy = "punktfunk.libraryGroupBy"
     /// macOS: take the window fullscreen while streaming and restore it on the host list. On by default.
     public static let fullscreenWhileStreaming = "punktfunk.fullscreenWhileStreaming"
     /// LEGACY (pre-tiered overlay): the old boolean stats-overlay toggle. Kept ONLY as the

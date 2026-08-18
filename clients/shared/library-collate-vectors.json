@@ -1,0 +1,137 @@
+{
+  "$comment": "Cross-client parity vectors for LIBRARY COLLATION — the sort/group rules every console shell must implement identically (desktop pf-console-ui `collate.rs` is the source of truth; Apple `LibraryCollation.swift` and Android port it). One mixed library, then the exact groups each (sort, group_by) must produce, the flat lists a group filter yields, which libraries are 'worth browsing', the title fold, the store labels, and the persisted sort ids. `library` entries use the host's /api/v1/library wire shape so a client can decode them with its real model. Read by: crates/pf-console-ui/src/collate.rs (`vectors_match_the_shared_file`), clients/apple/Tests/PunktfunkKitTests/LibraryCollationTests.swift. Group labels sort BYTEWISE (so 'GOG' < 'Game' < 'Steam'); an ungrouped collation is one group keyed platform/'All' (never drawn); `filtered` with no filter flattens EVERY group, launchers included.",
+  "version": 1,
+  "library": [
+    {"id": "steam:launcher", "store": "steam", "title": "Steam", "role": "launcher", "icon": "steam", "art": {}},
+    {"id": "steam:292030", "store": "steam", "title": "The Witcher 3: Wild Hunt", "art": {}},
+    {"id": "steam:1222700", "store": "steam", "title": "A Way Out", "art": {}},
+    {"id": "custom:zelda-oot", "store": "custom", "title": "Zelda: Ocarina of Time", "platform": "N64", "art": {}},
+    {"id": "custom:sm64", "store": "custom", "title": "Super Mario 64", "platform": "N64", "art": {}},
+    {"id": "heroic:launcher", "store": "heroic", "title": "Heroic", "role": "launcher", "icon": "heroic", "art": {}},
+    {"id": "custom:gow3", "store": "custom", "title": "God of War", "platform": "PS3", "art": {}},
+    {"id": "custom:eclair", "store": "custom", "title": "Éclair", "platform": "PS3", "art": {}},
+    {"id": "gog:witcher", "store": "gog", "title": "The Witcher", "art": {}},
+    {"id": "weird:odyssey", "store": "weird", "title": "An Odyssey", "art": {}},
+    {"id": "custom:the", "store": "custom", "title": "The", "platform": "PS3", "art": {}},
+    {"id": "steam:620", "store": "steam", "title": "Portal 2", "platform": "PC", "art": {}},
+    {"id": "steam:lower", "store": "steam", "title": "a lowercase start", "platform": "", "art": {}},
+    {"id": "custom:gow-dup", "store": "custom", "title": "God of War", "platform": "PS3", "art": {}}
+  ],
+  "sort_title": [
+    {"in": "The Witcher 3: Wild Hunt", "out": "witcher 3 wild hunt"},
+    {"in": "A Way Out", "out": "way out"},
+    {"in": "An Untitled Story", "out": "untitled story"},
+    {"in": "Theme Hospital", "out": "theme hospital"},
+    {"in": "Anno 1800", "out": "anno 1800"},
+    {"in": "Pokémon: Red!", "out": "pokemon red"},
+    {"in": "Éclair", "out": "eclair"},
+    {"in": "Spider-Man 2", "out": "spiderman 2"},
+    {"in": "The", "out": "the"},
+    {"in": "  A  ", "out": "a"},
+    {"in": "Ōkami", "out": "ōkami"},
+    {"in": "Zelda: Ocarina of Time", "out": "zelda ocarina of time"}
+  ],
+  "store_labels": {
+    "steam": "Steam", "custom": "Custom", "heroic": "Heroic", "lutris": "Lutris",
+    "epic": "Epic", "gog": "GOG", "xbox": "Xbox", "weird": "Game", "": "Game"
+  },
+  "sort_keys": [
+    {"stored": "host", "key": "host"},
+    {"stored": "title", "key": "title"},
+    {"stored": "platform", "key": "platform"},
+    {"stored": "store", "key": "store"},
+    {"stored": "", "key": "host"},
+    {"stored": "bogus", "key": "host"},
+    {"stored": "Title", "key": "host"}
+  ],
+  "cases": [
+    {
+      "name": "host order, ungrouped, is byte-identical to the shelf",
+      "sort": "host", "group_by": null,
+      "expect": [
+        {"kind": "launchers", "label": "Launchers", "ids": ["steam:launcher", "heroic:launcher"]},
+        {"kind": "platform", "name": "All", "label": "All", "ids": ["steam:292030", "steam:1222700", "custom:zelda-oot", "custom:sm64", "custom:gow3", "custom:eclair", "gog:witcher", "weird:odyssey", "custom:the", "steam:620", "steam:lower", "custom:gow-dup"]}
+      ]
+    },
+    {
+      "name": "A–Z folds articles and diacritics; equal keys keep host order; launchers keep host order",
+      "sort": "title", "group_by": null,
+      "expect": [
+        {"kind": "launchers", "label": "Launchers", "ids": ["steam:launcher", "heroic:launcher"]},
+        {"kind": "platform", "name": "All", "label": "All", "ids": ["custom:eclair", "custom:gow3", "custom:gow-dup", "steam:lower", "weird:odyssey", "steam:620", "custom:sm64", "custom:the", "steam:1222700", "gog:witcher", "steam:292030", "custom:zelda-oot"]}
+      ]
+    },
+    {
+      "name": "group by platform: platform-less store games bucket under their STORE, a generic-store title under Other, groups A–Z by label",
+      "sort": "host", "group_by": "platform",
+      "expect": [
+        {"kind": "launchers", "label": "Launchers", "ids": ["steam:launcher", "heroic:launcher"]},
+        {"kind": "store", "name": "GOG", "label": "GOG", "ids": ["gog:witcher"]},
+        {"kind": "platform", "name": "N64", "label": "N64", "ids": ["custom:zelda-oot", "custom:sm64"]},
+        {"kind": "platform", "name": "Other", "label": "Other", "ids": ["weird:odyssey"]},
+        {"kind": "platform", "name": "PC", "label": "PC", "ids": ["steam:620"]},
+        {"kind": "platform", "name": "PS3", "label": "PS3", "ids": ["custom:gow3", "custom:eclair", "custom:the", "custom:gow-dup"]},
+        {"kind": "store", "name": "Steam", "label": "Steam", "ids": ["steam:292030", "steam:1222700", "steam:lower"]}
+      ]
+    },
+    {
+      "name": "group by platform, sorted A–Z within each group",
+      "sort": "title", "group_by": "platform",
+      "expect": [
+        {"kind": "launchers", "label": "Launchers", "ids": ["steam:launcher", "heroic:launcher"]},
+        {"kind": "store", "name": "GOG", "label": "GOG", "ids": ["gog:witcher"]},
+        {"kind": "platform", "name": "N64", "label": "N64", "ids": ["custom:sm64", "custom:zelda-oot"]},
+        {"kind": "platform", "name": "Other", "label": "Other", "ids": ["weird:odyssey"]},
+        {"kind": "platform", "name": "PC", "label": "PC", "ids": ["steam:620"]},
+        {"kind": "platform", "name": "PS3", "label": "PS3", "ids": ["custom:eclair", "custom:gow3", "custom:gow-dup", "custom:the"]},
+        {"kind": "store", "name": "Steam", "label": "Steam", "ids": ["steam:lower", "steam:1222700", "steam:292030"]}
+      ]
+    },
+    {
+      "name": "sort by store, ungrouped: store label bytewise (GOG before Game), then title, then host order",
+      "sort": "store", "group_by": null,
+      "expect": [
+        {"kind": "launchers", "label": "Launchers", "ids": ["steam:launcher", "heroic:launcher"]},
+        {"kind": "platform", "name": "All", "label": "All", "ids": ["custom:eclair", "custom:gow3", "custom:gow-dup", "custom:sm64", "custom:the", "custom:zelda-oot", "gog:witcher", "weird:odyssey", "steam:lower", "steam:620", "steam:1222700", "steam:292030"]}
+      ]
+    },
+    {
+      "name": "group by store, sorted by platform within: raw platform string first (empty leads), then title",
+      "sort": "platform", "group_by": "store",
+      "expect": [
+        {"kind": "launchers", "label": "Launchers", "ids": ["steam:launcher", "heroic:launcher"]},
+        {"kind": "store", "name": "Custom", "label": "Custom", "ids": ["custom:sm64", "custom:zelda-oot", "custom:eclair", "custom:gow3", "custom:gow-dup", "custom:the"]},
+        {"kind": "store", "name": "GOG", "label": "GOG", "ids": ["gog:witcher"]},
+        {"kind": "store", "name": "Game", "label": "Game", "ids": ["weird:odyssey"]},
+        {"kind": "store", "name": "Steam", "label": "Steam", "ids": ["steam:lower", "steam:1222700", "steam:292030", "steam:620"]}
+      ]
+    },
+    {
+      "name": "sort by platform, ungrouped",
+      "sort": "platform", "group_by": null,
+      "expect": [
+        {"kind": "launchers", "label": "Launchers", "ids": ["steam:launcher", "heroic:launcher"]},
+        {"kind": "platform", "name": "All", "label": "All", "ids": ["steam:lower", "weird:odyssey", "steam:1222700", "gog:witcher", "steam:292030", "custom:sm64", "custom:zelda-oot", "steam:620", "custom:eclair", "custom:gow3", "custom:gow-dup", "custom:the"]}
+      ]
+    }
+  ],
+  "filtered": [
+    {"name": "a platform filter yields that group's games only", "sort": "host", "filter": {"kind": "platform", "name": "PS3"}, "expect": ["custom:gow3", "custom:eclair", "custom:the", "custom:gow-dup"]},
+    {"name": "a store filter groups by store and sorts within", "sort": "title", "filter": {"kind": "store", "name": "Steam"}, "expect": ["steam:lower", "steam:620", "steam:1222700", "steam:292030"]},
+    {"name": "a filter naming a group that does not exist yields nothing, never everything", "sort": "host", "filter": {"kind": "platform", "name": "SNES"}, "expect": []},
+    {"name": "a filter of the wrong KIND for the group is not the group", "sort": "host", "filter": {"kind": "platform", "name": "Steam"}, "expect": []},
+    {"name": "the launchers filter is the launcher group", "sort": "title", "filter": {"kind": "launchers"}, "expect": ["steam:launcher", "heroic:launcher"]},
+    {"name": "no filter flattens every group, launchers first", "sort": "host", "filter": null, "expect": ["steam:launcher", "heroic:launcher", "steam:292030", "steam:1222700", "custom:zelda-oot", "custom:sm64", "custom:gow3", "custom:eclair", "gog:witcher", "weird:odyssey", "custom:the", "steam:620", "steam:lower", "custom:gow-dup"]},
+    {"name": "no filter, A–Z", "sort": "title", "filter": null, "expect": ["steam:launcher", "heroic:launcher", "custom:eclair", "custom:gow3", "custom:gow-dup", "steam:lower", "weird:odyssey", "steam:620", "custom:sm64", "custom:the", "steam:1222700", "gog:witcher", "steam:292030", "custom:zelda-oot"]}
+  ],
+  "worth_browsing": [
+    {"name": "the whole library", "ids": null, "expect": true},
+    {"name": "a Steam-only library with no platform metadata is ONE group", "ids": ["steam:launcher", "steam:292030", "steam:1222700"], "expect": false},
+    {"name": "two stores are two groups", "ids": ["steam:292030", "gog:witcher"], "expect": true},
+    {"name": "empty", "ids": [], "expect": false},
+    {"name": "launchers alone", "ids": ["steam:launcher", "heroic:launcher"], "expect": false},
+    {"name": "one platform", "ids": ["custom:zelda-oot", "custom:sm64"], "expect": false},
+    {"name": "one platform plus its launcher", "ids": ["heroic:launcher", "custom:gow3", "custom:eclair"], "expect": false},
+    {"name": "a platform and a platform-less store title", "ids": ["custom:gow3", "steam:292030"], "expect": true}
+  ]
+}

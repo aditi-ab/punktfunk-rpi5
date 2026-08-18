@@ -14,7 +14,7 @@ use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox, Screen};
 use crate::theme::{accent, fg, fill, stroke, Fonts, PanelStroke, ONLINE_GREEN, W};
-use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
+use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Color4f, MaskFilter, PathBuilder, Point, RRect, Rect};
 
 const TILE_W: f64 = 340.0;
@@ -185,7 +185,9 @@ impl HomeScreen {
                 None => None,
             },
             MenuEvent::Tertiary => {
-                fx.push(Screen::Settings(super::settings::SettingsScreen::new()));
+                fx.push(Screen::Settings(super::settings::SettingsScreen::new(
+                    ctx.store,
+                )));
                 Some(MenuPulse::Confirm)
             }
             MenuEvent::Back => {
@@ -842,7 +844,7 @@ mod tests {
             host("unpaired", false, true, false),
             host("asleep", true, false, true),
         ];
-        let pads: Vec<pf_client_core::gamepad::PadInfo> = Vec::new();
+        let pads: Vec<pf_client_core::menu_nav::PadInfo> = Vec::new();
 
         // Paired+online → connect intent.
         let mut s = HomeScreen::new();
@@ -852,6 +854,8 @@ mod tests {
             hosts: &hosts,
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "test",
@@ -893,12 +897,14 @@ mod tests {
             accent: None,
         });
         let hosts = [pinned];
-        let pads: Vec<pf_client_core::gamepad::PadInfo> = Vec::new();
+        let pads: Vec<pf_client_core::menu_nav::PadInfo> = Vec::new();
         let library = crate::library::LibraryShared::default();
         let mut ctx = Ctx {
             hosts: &hosts,
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "test",
@@ -915,12 +921,14 @@ mod tests {
     #[test]
     fn add_tile_is_always_last() {
         let mut settings = ctx_settings();
-        let pads: Vec<pf_client_core::gamepad::PadInfo> = Vec::new();
+        let pads: Vec<pf_client_core::menu_nav::PadInfo> = Vec::new();
         let library = crate::library::LibraryShared::default();
         let mut ctx = Ctx {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "test",

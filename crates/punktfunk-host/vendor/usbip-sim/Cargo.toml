@@ -28,9 +28,15 @@ num-derive = "0.4"
 num-traits = "0.2"
 # `time` is for the interrupt-IN pacing added in device.rs (punktfunk modification — see NOTICE).
 tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time"] }
+
 # Upstream gated its struct derives behind a `serde` feature; kept (off by default) so the
 # `#[cfg(feature = "serde")]` attributes stay valid and the vendored diff stays minimal.
 serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+# `#[tokio::test(start_paused = true)]` for the ISO pacing tests — paused virtual time is the
+# only way to pin an absolute-deadline pacer exactly.
+tokio = { version = "1", features = ["rt", "macros", "test-util", "time"] }
 
 [features]
 default = []

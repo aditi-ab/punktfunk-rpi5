@@ -1229,7 +1229,7 @@ public final class SessionAudio {
                 if drained % 2_000 == 0 {
                     let s = ring.stats
                     log.info(
-                        "audio: rate_hz=\(rateHz) frame_us=\(frameUs) buffer_ms=\(s.bufferedMS) target_ms=\(s.targetMS) underruns=\(s.underruns) drift_sheds=\(s.sheds) av_offset_ms=\(s.avOffsetMS) plc_ms=\(s.plcMS)"
+                        "audio: rate_hz=\(rateHz) frame_us=\(frameUs) buffer_ms=\(s.bufferedMS) target_ms=\(s.targetMS) underruns=\(s.underruns) drift_sheds=\(s.sheds) drift_inserts=\(s.inserts) av_offset_ms=\(s.avOffsetMS) plc_ms=\(s.plcMS)"
                     )
                 }
                 return true

@@ -283,6 +283,10 @@ pub struct AudioPlayer {
     /// A/V sync hand-off with the render thread: it publishes the ring depth, the decode thread
     /// posts the depth the sync loop wants. See [`punktfunk_core::audio::AudioSyncCell`].
     sync: Arc<punktfunk_core::audio::AudioSyncCell>,
+    /// The render loop's vitals, logged by the decode thread — the same surface the PipeWire
+    /// twin exposes, so `session.rs` prints one line shape on both platforms
+    /// (see [`crate::audio_vitals`]).
+    vitals: Arc<crate::audio_vitals::PlaybackVitals>,
 }
 
 impl AudioPlayer {
@@ -306,10 +310,14 @@ impl AudioPlayer {
         let stop_t = stop.clone();
         let sync: Arc<punktfunk_core::audio::AudioSyncCell> = Arc::default();
         let sync_t = sync.clone();
+        let vitals: Arc<crate::audio_vitals::PlaybackVitals> = Arc::default();
+        let vitals_t = vitals.clone();
         let thread = std::thread::Builder::new()
             .name("punktfunk-audio".into())
             .spawn(move || {
-                if let Err(e) = render_thread(pcm_rx, recycle_tx, stop_t, ready_tx, fmt, sync_t) {
+                if let Err(e) =
+                    render_thread(pcm_rx, recycle_tx, stop_t, ready_tx, fmt, sync_t, vitals_t)
+                {
                     tracing::warn!(error = %format!("{e:#}"), "audio playback thread ended");
                 }
             })
@@ -333,6 +341,7 @@ impl AudioPlayer {
                     stop,
                     thread: Some(thread),
                     sync,
+                    vitals,
                 })
             }
             Ok(Err(e)) => Err(e),
@@ -353,6 +362,11 @@ impl AudioPlayer {
     /// depth the sync loop wants back through it.
     pub fn sync_cell(&self) -> Arc<punktfunk_core::audio::AudioSyncCell> {
         self.sync.clone()
+    }
+
+    /// The render loop's vitals — the decode thread logs them (see [`crate::audio_vitals`]).
+    pub fn vitals(&self) -> Arc<crate::audio_vitals::PlaybackVitals> {
+        self.vitals.clone()
     }
 
     /// Queue one interleaved f32 chunk (in the session's channel layout). Drops the chunk if the
@@ -380,6 +394,7 @@ fn render_thread(
     ready: SyncSender<Result<Option<u32>>>,
     fmt: PlaybackFormat,
     sync: Arc<punktfunk_core::audio::AudioSyncCell>,
+    vitals: Arc<crate::audio_vitals::PlaybackVitals>,
 ) -> Result<()> {
     if let Err(e) = wasapi::initialize_mta()
         .ok()
@@ -388,6 +403,10 @@ fn render_thread(
         let _ = ready.send(Err(e));
         return Ok(());
     }
+    // Event-driven at the endpoint's period on a plain thread until now: MMCSS "Pro Audio" +
+    // THREAD_PRIORITY_HIGHEST, what every audio engine on the platform gives its render loop.
+    // A missed period here is a click the ring cannot help with. Best-effort (`audio_rt`).
+    crate::audio_rt::boost_and_log("wasapi-render");
     let res = (|| -> Result<Option<u32>> {
         let channels = fmt.channels.clamp(1, 8) as u8;
         // 32-bit float interleaved: channels × 4 bytes/sample, at EVERY rate and depth this client
@@ -484,7 +503,6 @@ fn render_thread(
             punktfunk_core::audio::JitterPolicy::new_at_rate(TUNING, channels, fmt.rate_hz);
         policy.set_frame_us(fmt.frame_us);
         let mut out = Vec::new(); // per-quantum scratch, reused across iterations
-        let (mut underruns, mut sheds, mut callbacks) = (0u64, 0u64, 0u64);
 
         while !stop.load(Ordering::Relaxed) {
             if h_event.wait_for_event(100).is_err() {
@@ -504,6 +522,15 @@ fn render_thread(
                 continue;
             }
             let want = avail_frames * channels as usize;
+            // Once per stream: the engine's period as we first see it — same field meanings as
+            // the PipeWire twin's line, printed by the decode thread.
+            if !vitals.quantum_known() {
+                vitals.note_quantum(
+                    avail_frames as u32,
+                    avail_frames as u32,
+                    avail_frames as u32,
+                );
+            }
 
             // A/V sync: same contract as the PipeWire ring — take the decode thread's request,
             // publish where the ring actually is. The policy clamps the request against its own
@@ -513,8 +540,16 @@ fn render_thread(
 
             let step = policy.step(ring.len(), want);
             if step.drop_front > 0 {
-                sheds += 1;
                 punktfunk_core::audio::crossfade_drop(&mut ring, step.drop_front, step.crossfade);
+            }
+            // The mirror: the sync loop asked for a DEEPER ring, answered with one duplicated,
+            // crossfaded frame instead of a de-prime (see `JitterStep::insert_front`).
+            if step.insert_front > 0 {
+                punktfunk_core::audio::crossfade_insert(
+                    &mut ring,
+                    step.insert_front,
+                    step.crossfade,
+                );
             }
 
             out.clear();
@@ -533,21 +568,14 @@ fn render_thread(
             // No-op while un-primed (the policy ignores it), so a deliberate priming silence is
             // never miscounted as an underrun.
             policy.note_read(ran_short);
-            underruns += u64::from(ran_short);
-            callbacks += 1;
-            if callbacks % 1_000 == 0 {
-                tracing::debug!(
-                    buffer_ms = policy.avg_depth_ms(),
-                    target_ms = policy.target_ms(),
-                    underruns,
-                    drift_sheds = sheds,
-                    // Concealment must be visible next to the underruns it prevented: a healthy
-                    // `underruns` bought with a climbing `plc_ms` is a link in trouble, not a
-                    // link that is fine.
-                    plc_ms = sync.plc_ms(),
-                    "audio playback"
-                );
-            }
+            // The 10 s `audio playback` line is printed by the decode thread from these.
+            vitals.note_callback(
+                ran_short,
+                step.drop_front > 0,
+                step.insert_front > 0,
+                policy.avg_depth_ms(),
+                policy.target_ms(),
+            );
             render_client
                 .write_to_device(avail_frames, &out, None)
                 .context("write_to_device")?;
@@ -624,6 +652,8 @@ fn mic_thread(
     wasapi::initialize_mta()
         .ok()
         .context("CoInitializeEx (MTA)")?;
+    // Same treatment for the capture loop: capture, encode and send all run here.
+    crate::audio_rt::boost_and_log("wasapi-mic");
 
     let mut encoder = opus::Encoder::new(
         SAMPLE_RATE as u32,

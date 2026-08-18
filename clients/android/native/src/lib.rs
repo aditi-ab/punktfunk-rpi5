@@ -30,6 +30,10 @@ use jni::EnvUnowned;
 mod adpf;
 #[cfg(target_os = "android")]
 mod audio;
+// The Skia console UI host (design/android-skia-console-port.md): the shared `pf-console-ui`
+// shell over EGL/GLES, on every ABI (the armv7 Skia archive is self-hosted — see Cargo.toml).
+#[cfg(target_os = "android")]
+mod console;
 // The RESOLVED audio format + its ms ⇄ sample arithmetic, split out of `audio` and — unlike it —
 // ungated, because that arithmetic is what a rate the ladder does not divide gets wrong (44 100 Hz
 // used to come out 2.3 % off in every direction at once) and it must be provable without a phone.
@@ -98,4 +102,16 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_coreVersion<'loca
 ) -> JString<'local> {
     env.with_env(|env| env.new_string(env!("CARGO_PKG_VERSION")))
         .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeConsoleAvailable(): Boolean` — whether this `.so` carries the Skia
+/// console host ([`console`]). Kotlin asks before it calls any `nativeConsole*` symbol, so a
+/// build that ever drops the host on some ABI again degrades to the touch UI rather than an
+/// `UnsatisfiedLinkError`. Today: every Android ABI.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleAvailable(
+    _env: EnvUnowned,
+    _this: JObject,
+) -> jni::sys::jboolean {
+    cfg!(target_os = "android")
 }

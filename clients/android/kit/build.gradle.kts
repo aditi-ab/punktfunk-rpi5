@@ -90,6 +90,32 @@ fun Exec.cargoNdkEnvironment() {
     // (pure C) so the android .so links it instead of looking for the host's libopus.so.
     environment("LIBOPUS_STATIC", "1")
     environment("LIBOPUS_NO_PKG", "1")
+    // The Skia console (pf-console-ui over skia-bindings): prebuilt Skia archives are keyed by
+    // target + features. rust-skia's GitHub releases carry no armv7-linux-androideabi archive, so
+    // ALL three Android keys are served from our own release — public, R2-backed, unauthenticated:
+    //   https://git.unom.io/unom/skia-binaries/releases/download/{tag}/skia-binaries-{key}.tar.gz
+    // (the armv7 archive built by us, the two 64-bit ones byte-for-byte mirrors of rust-skia's —
+    // design/android-skia-console-port.md WP6; re-derive + re-upload on every skia-safe bump).
+    // Override with `-PskiaBinariesUrl=<template>` or the `SKIA_BINARIES_URL` env (`{tag}`/`{key}`
+    // placeholders, `file://` allowed) — e.g. a local mirror while cutting the next bump's archives.
+    // 🛑 skia-bindings never fails when no archive matches — it silently builds Skia from source
+    // for hours; every log must show `DOWNLOAD AND INSTALL SUCCEEDED` per target.
+    //
+    // The archives at rust-skia tag 0.99.0 (skia hash a25a0fdb7d90429aa2d1), key
+    // `<target>-gl-jpegd-jpege-pdf-textlayout`, sha256 — re-derive on every skia-safe bump:
+    //   aarch64-linux-android  fdbb25dd2e4ff22ce663b38d368ea696c88a522c73f54010662046b26bcf362c (GitHub)
+    //   x86_64-linux-android   93c1eaf379f539565343e99fdac4414fa22e45daa04de689bb0db2ef9290523b (GitHub)
+    //   armv7-linux-androideabi 4867856bcd1f01c197f796346ba555cffddb5e151f6cd072663ec1a56983d685 (ours:
+    //     FORCE_SKIA_BUILD=1 cargo ndk -t armeabi-v7a build -p pf-console-ui --no-default-features,
+    //     then OUT_DIR/skia/{libskia,libskshaper,libskparagraph,libskunicode_core,libskunicode_icu,
+    //     libskia-bindings}.a + bindings.rs + tag.txt + key.txt packed as skia-binaries/ in
+    //     skia-binaries-<key>.tar.gz)
+    environment(
+        "SKIA_BINARIES_URL",
+        (project.findProperty("skiaBinariesUrl") as String? ?: System.getenv("SKIA_BINARIES_URL"))
+            ?.takeIf { it.isNotBlank() }
+            ?: "https://git.unom.io/unom/skia-binaries/releases/download/{tag}/skia-binaries-{key}.tar.gz",
+    )
 }
 
 fun registerCargoNdk(taskName: String, release: Boolean) =

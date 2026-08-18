@@ -140,6 +140,22 @@ public final class GamepadMenuInput {
         let stick = gamepad.leftThumbstick
         let x = stick.xAxis.value
         let y = stick.yAxis.value
+        let dpad = gamepad.dpad
+        // HYSTERESIS: an engaged direction stays engaged until ITS OWN input releases, even if the
+        // other axis is momentarily larger. Without this a single flick to the right passed through
+        // samples where |y| > |x| on the way out of the dead zone and read as UP, then RIGHT — two
+        // moves for one gesture. Invisible on the carousels (their vertical axis is inert or a
+        // menu), a "random jump" on any 2-D field such as the library grid.
+        if let current = currentDirection {
+            let held: Bool
+            switch current {
+            case .left: held = (x < -deadzone && abs(x) >= abs(y) * 0.5) || dpad.left.isPressed
+            case .right: held = (x > deadzone && abs(x) >= abs(y) * 0.5) || dpad.right.isPressed
+            case .up: held = (y > deadzone && abs(y) >= abs(x) * 0.5) || dpad.up.isPressed
+            case .down: held = (y < -deadzone && abs(y) >= abs(x) * 0.5) || dpad.down.isPressed
+            }
+            if held { return current }
+        }
         // Horizontal wins an exact |x| == |y| diagonal tie (>=), matching the SDL core and Android
         // nav so a perfect 45° push resolves to the same direction on every client.
         if abs(x) >= abs(y), abs(x) > deadzone {
@@ -147,7 +163,6 @@ public final class GamepadMenuInput {
         } else if abs(y) > deadzone {
             return y > 0 ? .up : .down
         }
-        let dpad = gamepad.dpad
         if dpad.left.isPressed { return .left }
         if dpad.right.isPressed { return .right }
         if dpad.up.isPressed { return .up }

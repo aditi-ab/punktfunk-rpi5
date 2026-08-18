@@ -124,3 +124,64 @@ describe("SyncEngine", () => {
 		expect(statuses[1]?.lastSync?.count).toBe(2);
 	});
 });
+
+// The fs-change RATE cap (`SyncSettings.minInterval`). A debounce collapses a burst but extends
+// on every event, so a launcher that keeps writing (Steam, while a game runs) drove one field log
+// to 102 fs-change syncs in 27 minutes. With the cap, sustained churn costs one sync per interval
+// and still lands one trailing sync for whatever changed inside it.
+describe("SyncEngine fs-change min-interval", () => {
+	test("sustained churn is capped to one fs-change sync per interval, plus one trailing", async () => {
+		const fs = await import("node:fs");
+		const os = await import("node:os");
+		const path = await import("node:path");
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-sync-cap-"));
+		try {
+			const computes = await run(
+				Effect.gen(function* () {
+					const computed = yield* Ref.make(0);
+					const last = yield* Ref.make<LastSync | undefined>(undefined);
+					const engine = yield* makeSyncEngine<
+						Report,
+						ReadonlyArray<string>,
+						never
+					>({
+						compute: () =>
+							Ref.updateAndGet(computed, (n) => n + 1).pipe(
+								// Distinct content every time, so nothing is fingerprint-skipped
+								// and every sync is a real re-walk — the cost being capped.
+								Effect.map((n) => ({
+									entries: [`e${n}`],
+									report: { included: 1 },
+								})),
+							),
+						apply: () => Effect.void,
+						lastSync: { get: Ref.get(last), set: (l) => Ref.set(last, l) },
+						settings: Effect.succeed({
+							pollInterval: Duration.minutes(60),
+							watch: true,
+							debounce: Duration.millis(20),
+							minInterval: Duration.millis(400),
+							watchDirs: [dir],
+						}),
+					});
+					yield* engine.start; // startup sync (1) + the watch loops
+					// Churn: a write every 25 ms for 700 ms — each one clears the 20 ms debounce,
+					// so without the cap this is ~28 syncs.
+					for (let i = 0; i < 28; i++) {
+						fs.writeFileSync(path.join(dir, `f${i % 3}.txt`), String(i));
+						yield* Effect.sleep("25 millis");
+					}
+					// Past the last hold, so the trailing sync has happened.
+					yield* Effect.sleep("600 millis");
+					return yield* Ref.get(computed);
+				}),
+			);
+			// startup + first fs-change + one per 400 ms hold (+ trailing): well under the ~29 an
+			// uncapped engine would run, and more than the startup alone (the watch works).
+			expect(computes).toBeGreaterThanOrEqual(2);
+			expect(computes).toBeLessThanOrEqual(6);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});

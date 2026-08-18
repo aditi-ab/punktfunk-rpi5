@@ -84,7 +84,7 @@ pub(crate) fn battery_pip(
     cy: f64,
     w: f64,
     k: f64,
-    b: pf_client_core::gamepad::PadBattery,
+    b: pf_client_core::menu_nav::PadBattery,
 ) {
     let h = w * 0.5;
     let cell = Rect::from_xywh(x as f32, (cy - h / 2.0) as f32, (w * 0.86) as f32, h as f32);

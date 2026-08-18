@@ -774,6 +774,7 @@ impl Fonts {
 /// Resolve the first available family. Generic aliases ("sans-serif", "monospace")
 /// resolve through fontconfig on Linux; Windows' DirectWrite-backed FontMgr has no
 /// generic aliases, so the list falls through to concrete family names there.
+#[cfg(feature = "vulkan-overlay")]
 pub(crate) fn match_first_family(
     mgr: &FontMgr,
     families: &[&str],

@@ -29,8 +29,8 @@ different setting and it turns most of this page off — see
 > exclusive), **conflict handling**, **per-client identity + persistent scaling** (Windows, KDE/KWin
 > *and* GNOME/Mutter), and **multi-monitor layout** (several clients as monitors of one desktop) are
 > all enforced. A reconnect always resumes the kept display — even a fast one — instead of spawning a
-> second. The remaining gaps are noted inline: the Linux `primary` physical-keep *effect*, Sway
-> `exclusive`, and multi-display for a *single* client (that last is the next stage).
+> second. The remaining gaps are noted inline: the Linux `primary` physical-keep *effect*, and
+> multi-display for a *single* client (that last is the next stage).
 
 ## Stream a real monitor instead
 
@@ -212,20 +212,30 @@ Per-backend support:
 |---|---|---|---|---|
 | Extend | ✅ | ✅ | ✅ | ✅ |
 | Primary | ✅ | ✅ | ⚠️ treated as Extend | ✅ |
-| Exclusive | ✅ | ✅ | ⏳ following release | ✅ |
+| Exclusive | ✅ | ✅ | ✅ | ✅ |
 
-On **Sway/wlroots and Hyprland** the virtual display is always an *extend* output — it is added
-beside your physical monitors and neither promoted nor allowed to disable them, whatever the topology
-says. So that "treated as Extend" doesn't leave your games on the wrong screen, the host **claims the
-compositor's focus for the streamed display**: once at session start, and again immediately before it
-launches anything from your library. Both compositors open a new window on the focused monitor, so
-that is what puts the game on the display you're streaming.
+**Primary** has no equivalent on **Sway/wlroots and Hyprland**, and that is a Wayland fact rather
+than a missing feature: there is no primary-output concept to set. What these compositors do have is
+a *focused* output, and the host already points that at the streamed display — once at session start,
+and again immediately before it launches anything from your library. Both open a new window on the
+focused monitor, so that is what puts the game on the display you're streaming. Choosing Primary
+therefore behaves as Extend, and the host says so in the log.
 
-Two things follow from it being focus rather than promotion. Your physical monitors stay lit and
-usable — this is Extend, not Exclusive. And a window that opens *later* (a launcher that spawns a
-second window, a game that re-parents itself) follows whatever has focus at that moment, so if you're
-also sitting at the machine, clicking on a physical monitor mid-launch can still pull a window over
-to it.
+One thing follows from it being focus rather than promotion: a window that opens *later* (a launcher
+that spawns a second window, a game that re-parents itself) follows whatever has focus at that
+moment, so if you're also sitting at the machine, clicking on a physical monitor mid-launch can still
+pull a window over to it.
+
+**Exclusive** does disable your physical monitors on both, and switches them back on when the last
+streaming display is torn down. Two details are specific to these compositors:
+
+- Punktfunk only ever disables monitors it did not create, so a second client streaming at the same
+  time never goes dark.
+- On Hyprland the restore is a `hyprctl reload`, because nothing else re-enables a monitor that a
+  rule disabled — a re-applied monitor rule is accepted and ignored. That re-reads your Hyprland
+  config, which is what puts your monitors back; the side effect is that any settings you changed at
+  runtime with `hyprctl keyword` are dropped too, and a non-Lua config re-runs its `exec =` lines
+  (`exec-once` is not re-run). This only happens if a session actually disabled something.
 
 ### Conflict handling · identity · layout
 

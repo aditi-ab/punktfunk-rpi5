@@ -385,11 +385,12 @@ impl UsbIpResponse {
                     Vec::with_capacity(48 + transfer_buffer.len() + iso_packet_descriptor.len());
 
                 debug_assert!(header.command == USBIP_RET_SUBMIT.into());
-                // For an isochronous URB `actual_length` totals the per-packet actual lengths in
-                // BOTH directions — on OUT that is nonzero while the transfer buffer is empty, so
-                // it cannot be checked against the buffer. This mirrors the kernel's
-                // `usbip_recv_iso()`, which sums the table and tears the whole connection down on
-                // a mismatch. Non-ISO keeps the plain rule: IN returns its payload, OUT nothing.
+                // `actual_length` is "bytes the device transferred", in BOTH directions and for
+                // every transfer type. Only an IN reply carries a buffer to check it against: an
+                // OUT reply reports the bytes it *accepted* and sends nothing back, so on OUT the
+                // one invariant is an empty buffer. For an isochronous URB the value is the sum
+                // of the per-packet actuals, which is what the kernel's `usbip_recv_iso()`
+                // recomputes and tears the whole connection down over on a mismatch.
                 debug_assert!(if number_of_packets != 0 {
                     actual_length
                         == iso_packet_descriptor
@@ -399,7 +400,7 @@ impl UsbIpResponse {
                 } else if header.direction == Direction::In as u32 {
                     actual_length == transfer_buffer.len() as u32
                 } else {
-                    actual_length == 0
+                    transfer_buffer.is_empty()
                 });
 
                 result.extend_from_slice(&header.to_bytes());
@@ -455,7 +456,9 @@ impl UsbIpResponse {
         }
     }
 
-    /// Constructs a successful OP_REP_IMPORT response
+    /// Constructs a successful `USBIP_RET_SUBMIT` for an **IN** URB: the payload the device
+    /// produced, with `actual_length` counting it. Not for OUT — see
+    /// [`usbip_ret_submit_out_success`](Self::usbip_ret_submit_out_success).
     pub fn usbip_ret_submit_success(
         header: &UsbIpHeaderBasic,
         start_frame: u32,
@@ -472,6 +475,36 @@ impl UsbIpResponse {
             error_count: 0,
             transfer_buffer,
             iso_packet_descriptor,
+        }
+    }
+
+    /// Constructs a successful `USBIP_RET_SUBMIT` for a non-isochronous **OUT** URB (punktfunk
+    /// addition): no payload back, `actual_length` = the bytes the device `accepted`.
+    ///
+    /// Upstream answered OUT with [`usbip_ret_submit_success`](Self::usbip_ret_submit_success) and
+    /// an empty buffer, i.e. `actual_length = 0`. `vhci_hcd` copies that field straight into
+    /// `urb->actual_length` (`usbip_pack_pdu(pdu, urb, USBIP_RET_SUBMIT, 0)` in
+    /// `vhci_recv_ret_submit()`), and for an OUT URB the kernel has no other source for the count.
+    /// So every synchronous writer up the stack was told "0 bytes transferred" on success:
+    /// `usbhid_output_report()` returns `actual_length` as the byte count, so a `write()` on the
+    /// pad's hidraw returned **0**, and `usb_control_msg()` returns the data-stage length, so
+    /// `HIDIOCSFEATURE` returned **0** too. Anything checking `> 0` — winebus's
+    /// `hidraw_device_set_output_report`, whose failure branch prints the thread's *stale* errno,
+    /// hence "write failed error: 2 No such file or directory" — took the write as failed, and
+    /// GE-Proton's `hidraw_enable_dualsense_usb_haptics` never enabled the DualSense's USB haptics
+    /// mode. Adaptive triggers, voice-coil haptics and the speaker are all gated behind that one
+    /// enable. A real usbip stub reports the real URB's `actual_length`, which on OUT is the
+    /// number of bytes sent. Field-diagnosed 2026-08-18.
+    pub fn usbip_ret_submit_out_success(header: &UsbIpHeaderBasic, accepted: u32) -> Self {
+        Self::UsbIpRetSubmit {
+            header: header.clone(),
+            status: 0,
+            actual_length: accepted,
+            start_frame: 0,
+            number_of_packets: 0,
+            error_count: 0,
+            transfer_buffer: Vec::new(),
+            iso_packet_descriptor: Vec::new(),
         }
     }
 
@@ -669,5 +702,33 @@ mod iso_tests {
         assert_eq!(be(&bytes[24..28]), 2);
         assert_eq!(&bytes[48..50], &[1, 2]);
         assert_eq!(be(&bytes[50 + 8..50 + 12]), 2, "actual_length clamped");
+    }
+
+    /// The exact 2026-08-18 field failure: an interrupt-OUT HID output report (a 48-byte
+    /// DualSense report `0x02`) must be acknowledged as 48 bytes *accepted*, with no payload
+    /// after the 48-byte header. `vhci_hcd` copies `actual_length` into the URB verbatim and
+    /// `usbhid_output_report()` hands it back as `write()`'s return value — the old reply said 0,
+    /// so every hidraw write on the pad "succeeded" with 0 bytes and winebus took it as failed.
+    #[test]
+    fn non_iso_out_reply_acknowledges_the_bytes_accepted_and_carries_no_payload() {
+        let bytes = UsbIpResponse::usbip_ret_submit_out_success(&header(0), 48).to_bytes();
+        assert_eq!(
+            bytes.len(),
+            48,
+            "header only: the kernel reads no payload back on OUT"
+        );
+        assert_eq!(be(&bytes[20..24]), 0, "status");
+        assert_eq!(be(&bytes[24..28]), 48, "bytes accepted, NOT bytes returned");
+        assert_eq!(be(&bytes[32..36]), 0, "not isochronous");
+    }
+
+    /// The IN constructor keeps counting the payload it returns.
+    #[test]
+    fn non_iso_in_reply_counts_its_payload() {
+        let bytes =
+            UsbIpResponse::usbip_ret_submit_success(&header(1), 0, 0, vec![7u8; 41], vec![])
+                .to_bytes();
+        assert_eq!(bytes.len(), 48 + 41);
+        assert_eq!(be(&bytes[24..28]), 41);
     }
 }

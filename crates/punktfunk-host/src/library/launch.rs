@@ -176,6 +176,70 @@ fn command_for(spec: &LaunchSpec) -> Option<String> {
     }
 }
 
+/// A resolved Windows launch: the command line to spawn, the directory to spawn it in, and whether
+/// the process that line starts **is** the game.
+///
+/// [`Self::owns_game`] is the whole reason this is a struct and not a pair. Almost every Windows
+/// recipe is a protocol hand-off — `explorer.exe "playnite://…"`, `Steam.exe "steam://…"` — that
+/// forwards the request to whichever launcher owns the title and then exits. Its pid is a
+/// forwarder's, so that pid's lifetime says nothing about the game's, in either direction:
+///
+/// * the launcher was already running, so the forwarder quits a second later — read as a `Child`
+///   lease, that is the game "exiting" while it is still loading;
+/// * the launcher was *not* running, so the process the host started becomes the launcher itself
+///   and outlives every game the player then quits — a lease that can never report an exit.
+///
+/// Only a line that starts the game (or the operator's own command) directly earns its pid a place
+/// in [`crate::gamelease::LeaseRequest::spawned`]; a hand-off pid is dropped, and the lease falls
+/// back to the title's detect signals, exactly as it did before the pid was carried at all.
+#[cfg(windows)]
+pub struct WinRecipe {
+    /// The full command line to hand to `CreateProcessAsUserW`.
+    pub cmdline: String,
+    /// The working directory to start it in, when the recipe needs a specific one.
+    pub workdir: Option<std::path::PathBuf>,
+    /// See the type docs: `false` for a protocol/launcher hand-off.
+    pub owns_game: bool,
+}
+
+#[cfg(windows)]
+impl WinRecipe {
+    /// A line that forwards the launch to whoever owns the title and then exits.
+    fn handoff(cmdline: String) -> Self {
+        Self {
+            cmdline,
+            workdir: None,
+            owns_game: false,
+        }
+    }
+
+    /// A line that starts the game — or the operator's own command — as its own process.
+    fn game(cmdline: String, workdir: Option<std::path::PathBuf>) -> Self {
+        Self {
+            cmdline,
+            workdir,
+            owns_game: true,
+        }
+    }
+}
+
+/// What a Windows launch started, as the lease needs to hear it — see [`WinRecipe::owns_game`].
+#[cfg(windows)]
+pub struct WindowsLaunch {
+    /// The pid `CreateProcessAsUserW` handed back.
+    pub pid: u32,
+    /// Whether that pid is the game's rather than a forwarder's.
+    pub owns_game: bool,
+}
+
+#[cfg(windows)]
+impl WindowsLaunch {
+    /// The pid to carry on the lease: `None` when all the host started was a hand-off.
+    pub fn tracked_pid(&self) -> Option<u32> {
+        self.owns_game.then_some(self.pid)
+    }
+}
+
 /// Windows: launch a store-qualified library id into the **interactive user session** — the Windows
 /// analogue of the Linux gamescope-nested [`resolve_launch`]. The id is resolved against the host's
 /// OWN library (the client never sends a command), mapped to a concrete process by
@@ -184,12 +248,13 @@ fn command_for(spec: &LaunchSpec) -> Option<String> {
 /// Wired into the data plane *after* capture is live, so the title renders onto the already-captured
 /// desktop and grabs foreground.
 ///
-/// Returns the **pid of the process it started**, which is what the caller hands to
-/// [`crate::gamelease::LeaseRequest::spawned`]. It used to be logged and discarded, and that was the
-/// whole of Windows' disadvantage against Linux here: with no `Child` to hold and no pid kept, a
-/// title whose provider supplied no detect hint left the lease nothing to watch or signal.
+/// Returns the process it started and whether that process is the game ([`WindowsLaunch`]) — the
+/// pid is what the caller hands to [`crate::gamelease::LeaseRequest::spawned`], but only when it
+/// belongs to the game. It used to be logged and discarded, and that was the whole of Windows'
+/// disadvantage against Linux here: with no `Child` to hold and no pid kept, a title whose provider
+/// supplied no detect hint left the lease nothing to watch or signal.
 #[cfg(windows)]
-pub fn launch_title(id: &str) -> Result<u32> {
+pub fn launch_title(id: &str) -> Result<WindowsLaunch> {
     let entry = all_games()
         .into_iter()
         .find(|g| g.id == id)
@@ -199,8 +264,10 @@ pub fn launch_title(id: &str) -> Result<u32> {
     // A `plugin` entry's recipe comes from the plugin that owns it, and arrives in the same
     // (command line, working dir) shape this path already spawns. `windows_launch_for` has no arm
     // for the kind, so a failed ask falls through to the "no recipe" error below.
-    let (cmdline, workdir) = plugin_recipe(&entry)
-        .map(|l| (l.command, l.cwd))
+    // A plugin publishes a concrete `(command line, working dir)` for its own title, the same shape
+    // the operator-typed `command` kind produces — so it is spawned, and tracked, on the same terms.
+    let recipe = plugin_recipe(&entry)
+        .map(|l| WinRecipe::game(l.command, l.cwd))
         .or_else(|| windows_launch_for(&spec))
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -208,10 +275,21 @@ pub fn launch_title(id: &str) -> Result<u32> {
                 spec.kind
             )
         })?;
+    let WinRecipe {
+        cmdline,
+        workdir,
+        owns_game,
+    } = recipe;
     let pid = crate::interactive::spawn_in_active_session(&cmdline, workdir.as_deref())
         .with_context(|| format!("launch '{id}' in the interactive session"))?;
-    tracing::info!(launch_id = id, %cmdline, pid, "launched library title in the interactive session");
-    Ok(pid)
+    tracing::info!(
+        launch_id = id,
+        %cmdline,
+        pid,
+        owns_game,
+        "launched library title in the interactive session"
+    );
+    Ok(WindowsLaunch { pid, owns_game })
 }
 
 /// Windows: map a resolved [`LaunchSpec`] to a `(command line, working dir)` to spawn into the
@@ -223,7 +301,7 @@ pub fn launch_title(id: &str) -> Result<u32> {
 /// The `plugin` kind is deliberately absent: its answer comes from another process, so it is
 /// resolved by [`plugin_recipe`] before this is reached.
 #[cfg(windows)]
-fn windows_launch_for(spec: &LaunchSpec) -> Option<(String, Option<std::path::PathBuf>)> {
+fn windows_launch_for(spec: &LaunchSpec) -> Option<WinRecipe> {
     match spec.kind.as_str() {
         "steam_appid" => {
             if !valid_steam_appid(&spec.value) {
@@ -237,7 +315,9 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<(String, Option<std::path::Pa
                 Some(exe) => format!("\"{}\" \"{uri}\"", exe.display()),
                 None => format!("explorer.exe \"{uri}\""),
             };
-            Some((cmdline, None))
+            // Either line is a forwarder: `Steam.exe <uri>` against a running client posts the URI
+            // and exits, and against a cold one it *becomes* the client. Neither is the game.
+            Some(WinRecipe::handoff(cmdline))
         }
         // A launcher entry (D4): open the Steam client's own UI. Same Steam.exe-then-explorer ladder
         // as `steam_appid`, and the URI is one of exactly two host-owned literals — nothing from the
@@ -252,23 +332,22 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<(String, Option<std::path::Pa
                 Some(exe) => format!("\"{}\" \"{uri}\"", exe.display()),
                 None => format!("explorer.exe \"{uri}\""),
             };
-            Some((cmdline, None))
+            Some(WinRecipe::handoff(cmdline))
         }
         // Epic: open the (host-built, validated) com.epicgames.launcher:// URI via explorer.exe — a
         // concrete EXE that resolves the registered protocol handler as the user; the URI is a single
         // argv element (no shell, no cmd /c). Same pattern as the steam explorer fallback.
-        "epic" => epic_launch_uri(&spec.value).map(|uri| (format!("explorer.exe \"{uri}\""), None)),
+        "epic" => epic_launch_uri(&spec.value)
+            .map(|uri| WinRecipe::handoff(format!("explorer.exe \"{uri}\""))),
         // GOG: spawn the resolved game exe directly (host-derived from goggame-<id>.info), no Galaxy.
-        "gog" => gog_spawn(&spec.value),
+        // ...and the one store recipe that is NOT a hand-off: the resolved exe is the game itself.
+        "gog" => gog_spawn(&spec.value).map(|(cmdline, workdir)| WinRecipe::game(cmdline, workdir)),
         // Xbox/Game Pass: activate the UWP/GDK package by its AUMID (<PFN>!<AppId>) via explorer's
         // shell:AppsFolder — which runs in the interactive user session (UWP activation fails as
         // SYSTEM/session-0; spawn_in_active_session uses the user token). Guard the charset (the value
         // is host-derived from MicrosoftGame.config + AppRepository, but belt-and-suspenders).
         "aumid" => valid_aumid(&spec.value).then(|| {
-            (
-                format!("explorer.exe \"shell:AppsFolder\\{}\"", spec.value),
-                None,
-            )
+            WinRecipe::handoff(format!("explorer.exe \"shell:AppsFolder\\{}\"", spec.value))
         }),
         // Xbox / Game Pass from a library PLUGIN: `<Identity>!<AppId>`, both read straight out of
         // `MicrosoftGame.config`. The host completes it into the AUMID.
@@ -287,10 +366,9 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<(String, Option<std::path::Pa
                 return None;
             }
             let pfn = xbox_pfn(identity)?;
-            Some((
-                format!("explorer.exe \"shell:AppsFolder\\{pfn}!{app_id}\""),
-                None,
-            ))
+            Some(WinRecipe::handoff(format!(
+                "explorer.exe \"shell:AppsFolder\\{pfn}!{app_id}\""
+            )))
         }
         // Playnite: open the game through Playnite's own URI handler, which is what actually knows
         // how to start it (Playnite maps the id to whichever store owns the title). explorer.exe
@@ -301,10 +379,10 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<(String, Option<std::path::Pa
         // line). The 2026-08-05 review made `command` operator-only, which refuses a plugin's whole
         // reconcile — so without a typed kind the Playnite plugin cannot publish anything at all.
         "playnite" => valid_playnite_id(&spec.value).then(|| {
-            (
-                format!("explorer.exe \"playnite://playnite/start/{}\"", spec.value),
-                None,
-            )
+            WinRecipe::handoff(format!(
+                "explorer.exe \"playnite://playnite/start/{}\"",
+                spec.value
+            ))
         }),
         // A launcher entry (D4) on Windows: today that is Playnite's Fullscreen app, spawned
         // directly (its `playnite://` handler opens the DESKTOP app, so no URI can do this). The
@@ -313,16 +391,18 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<(String, Option<std::path::Pa
         "launcher_ui" => match spec.value.as_str() {
             "playnite" => playnite_fullscreen_exe().map(|exe| {
                 let dir = exe.parent().map(std::path::Path::to_path_buf);
-                (format!("\"{}\"", exe.display()), dir)
+                WinRecipe::game(format!("\"{}\"", exe.display()), dir)
             }),
             _ => None,
         },
         // Operator-typed custom command (host-owned, never client-set): run it through the shell in the
         // interactive session. `cmd.exe /c` is acceptable here precisely because the value is operator
         // input — the same trust as the operator typing it — not a client-influenced string.
+        // `cmd.exe /c <v>` blocks until the operator's command returns, so its pid tracks that
+        // command's life — the Windows twin of the Linux child the host holds.
         "command" => {
             let v = spec.value.trim();
-            (!v.is_empty()).then(|| (format!("cmd.exe /c {v}"), None))
+            (!v.is_empty()).then(|| WinRecipe::game(format!("cmd.exe /c {v}"), None))
         }
         _ => None,
     }
@@ -744,7 +824,7 @@ pub(crate) fn gog_spawn(value: &str) -> Option<(String, Option<PathBuf>)> {
 /// interactive Windows user session, AFTER capture is up (the host is SYSTEM). The Linux paths go
 /// through the compositor-aware [`launch_session_command`] instead.
 #[cfg(windows)]
-pub fn launch_gamestream_command(cmd: &str) -> Result<u32> {
+pub fn launch_gamestream_command(cmd: &str) -> Result<WindowsLaunch> {
     let cmd = cmd.trim();
     anyhow::ensure!(!cmd.is_empty(), "empty command");
     // cmd.exe /c is fine here: the value is the host operator's own apps.json command, not a
@@ -752,9 +832,13 @@ pub fn launch_gamestream_command(cmd: &str) -> Result<u32> {
     let pid = crate::interactive::spawn_in_active_session(&format!("cmd.exe /c {cmd}"), None)
         .context("spawn gamestream command in the interactive session")?;
     tracing::info!(command = %cmd, pid, "gamestream: launched app in the interactive session");
-    // The `cmd.exe` shim's own pid: it exits the moment it has started the real program, which the
-    // lease reads as a hand-off (inside its shim window) rather than as the game exiting.
-    Ok(pid)
+    // `cmd.exe /c` waits for the operator's command, so this pid is the command's own life. Should
+    // the command itself be a forwarder that returns at once, the lease's shim window is what reads
+    // that as a hand-off rather than as the game exiting.
+    Ok(WindowsLaunch {
+        pid,
+        owns_game: true,
+    })
 }
 
 /// Launch a library title chosen from the **GameStream `/applist`** (the store-qualified id is carried
@@ -763,7 +847,7 @@ pub fn launch_gamestream_command(cmd: &str) -> Result<u32> {
 /// only ever pick an existing title — never inject a command. Linux resolves the id via
 /// [`resolve_launch`] and goes through [`launch_session_command`] instead.
 #[cfg(windows)]
-pub fn launch_gamestream_library(id: &str) -> Result<u32> {
+pub fn launch_gamestream_library(id: &str) -> Result<WindowsLaunch> {
     launch_title(id)
 }
 
@@ -1023,11 +1107,13 @@ mod tests {
         let Some(exe) = playnite_fullscreen_exe() else {
             return;
         };
-        let (cmd, dir) = ui("playnite").expect("resolvable when the exe was found");
+        let r = ui("playnite").expect("resolvable when the exe was found");
+        let cmd = &r.cmdline;
         assert!(cmd.contains("Playnite.FullscreenApp.exe"), "{cmd}");
         assert!(!cmd.contains("DesktopApp"), "{cmd}");
         assert!(!cmd.contains("playnite://"), "{cmd}");
-        assert_eq!(dir.as_deref(), exe.parent());
+        assert_eq!(r.workdir.as_deref(), exe.parent());
+        assert!(r.owns_game, "the exe is spawned directly, not forwarded");
     }
 
     #[cfg(target_os = "linux")]
@@ -1078,11 +1164,20 @@ mod tests {
                 value: v.into(),
             })
         };
-        let (bp, wd) = ui("bigpicture").expect("bigpicture recipe");
-        assert!(bp.contains("steam://open/bigpicture"), "line was {bp:?}");
-        assert!(wd.is_none());
-        let (desk, _) = ui("desktop").expect("desktop recipe");
-        assert!(desk.contains("steam://open/main"), "line was {desk:?}");
+        let bp = ui("bigpicture").expect("bigpicture recipe");
+        assert!(
+            bp.cmdline.contains("steam://open/bigpicture"),
+            "line was {:?}",
+            bp.cmdline
+        );
+        assert!(bp.workdir.is_none());
+        assert!(!bp.owns_game, "a steam:// URI is forwarded to the client");
+        let desk = ui("desktop").expect("desktop recipe");
+        assert!(
+            desk.cmdline.contains("steam://open/main"),
+            "line was {:?}",
+            desk.cmdline
+        );
         assert!(ui("nonsense").is_none());
         assert!(ui("").is_none());
     }
@@ -1162,9 +1257,10 @@ mod tests {
             kind: "steam_appid".into(),
             value: "570".into(),
         };
-        let (line, wd) = windows_launch_for(&steam).expect("steam recipe");
+        let steam_r = windows_launch_for(&steam).expect("steam recipe");
+        let line = &steam_r.cmdline;
         assert!(line.contains("steam://rungameid/570"), "line was {line:?}");
-        assert!(wd.is_none());
+        assert!(steam_r.workdir.is_none());
         // A non-numeric "appid" (a client trying to inject) is rejected, never interpolated.
         let evil = LaunchSpec {
             kind: "steam_appid".into(),
@@ -1176,9 +1272,11 @@ mod tests {
             kind: "command".into(),
             value: "notepad.exe".into(),
         };
-        assert_eq!(
-            windows_launch_for(&cmd).unwrap().0,
-            "cmd.exe /c notepad.exe"
+        let cmd_r = windows_launch_for(&cmd).unwrap();
+        assert_eq!(cmd_r.cmdline, "cmd.exe /c notepad.exe");
+        assert!(
+            cmd_r.owns_game,
+            "`cmd /c` blocks on the operator's command, so its pid is that command's"
         );
         // Xbox AUMID → explorer shell:AppsFolder activation; a value without '!' is rejected.
         let aumid = LaunchSpec {
@@ -1186,7 +1284,7 @@ mod tests {
             value: "Microsoft.X_8wekyb3d8bbwe!Game".into(),
         };
         assert_eq!(
-            windows_launch_for(&aumid).unwrap().0,
+            windows_launch_for(&aumid).unwrap().cmdline,
             "explorer.exe \"shell:AppsFolder\\Microsoft.X_8wekyb3d8bbwe!Game\""
         );
         assert!(windows_launch_for(&LaunchSpec {

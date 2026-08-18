@@ -30,6 +30,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
     present_priority: jni::sys::jint,
     smooth_buffer: jni::sys::jint,
     panel_fps: jni::sys::jint,
+    surface_w: jni::sys::jint,
+    surface_h: jni::sys::jint,
 ) {
     use super::VideoThread;
     use std::sync::atomic::AtomicBool;
@@ -78,6 +80,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
             present_priority,
             smooth_buffer,
             panel_hz: panel_fps,
+            surface_w,
+            surface_h,
         };
         let join = std::thread::Builder::new()
             .name("pf-decode".into())

@@ -10,7 +10,7 @@ use crate::pointer::Pointer;
 use crate::screens::{ConnectIntent, Ctx, Outbox};
 use crate::theme::{fg, Fonts, EDGE_INSET, ERROR, W};
 use crate::widgets::{permits, Charset, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec, ROW_MAX_W};
-use pf_client_core::gamepad::{MenuEvent, MenuPulse};
+use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -140,18 +140,18 @@ impl PairScreen {
         }
     }
 
-    pub(crate) fn edit_key(&mut self, sc: sdl3::keyboard::Scancode) -> bool {
-        use sdl3::keyboard::Scancode as S;
+    pub(crate) fn edit_key(&mut self, key: crate::input::Key) -> bool {
+        use crate::input::Key as K;
         if self.editing.is_none() {
             return false;
         }
-        match sc {
-            S::Backspace => {
+        match key {
+            K::Backspace => {
                 let f = self.editing.unwrap();
                 self.field_mut(f).pop();
                 true
             }
-            S::Return | S::KpEnter | S::Escape => {
+            K::Return | K::Escape => {
                 self.editing = None;
                 true
             }
@@ -492,6 +492,8 @@ mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "living-room-deck",
@@ -501,7 +503,7 @@ mod tests {
         s.device.clear(); // the user deleted the prefill
         s.editing = Some(Field::Pin);
         s.text_input("1234");
-        s.edit_key(sdl3::keyboard::Scancode::Return);
+        s.edit_key(crate::input::Key::Return);
         s.list.cursor = 2;
         let mut fx = Outbox::default();
         s.menu(MenuEvent::Confirm, &mut ctx, &mut fx);
@@ -530,6 +532,8 @@ mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "deck",

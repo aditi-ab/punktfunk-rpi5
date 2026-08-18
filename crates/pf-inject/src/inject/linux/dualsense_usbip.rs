@@ -522,6 +522,17 @@ fn build_device(
     dev.configuration_max_power = 250; // 500 mA in 2 mA units
     dev.set_manufacturer_name("Sony Interactive Entertainment");
     dev.set_product_name("DualSense Wireless Controller");
+    // A real DualSense reports **no iSerialNumber**, but the vendored server's `UsbDevice::default`
+    // fills in the placeholder string "Serial" — which ALSA bakes into the card id and PipeWire into
+    // the node names: `…DualSense_Wireless_Controller_Serial-00` where the hardware gives
+    // `…DualSense_Wireless_Controller-00`. Clear it so every name a matcher can key on is
+    // byte-identical to a physical pad's.
+    //
+    // ⚠ This is fidelity, NOT a fix for UCM selection — measured on .41 2026-08-18, `alsa-ucm-conf`
+    // keys on `${CardComponents}` (`USB054c:0ce6`), so the DualSense UCM matched with the
+    // placeholder still present. Do not re-derive that: the profile a card lands on is chosen by
+    // verb priority, not by its name.
+    dev.unset_serial_number();
 
     dev
         // Interface 0 — Audio Control (no endpoints).

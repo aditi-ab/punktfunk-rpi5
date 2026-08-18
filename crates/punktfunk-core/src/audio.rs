@@ -675,8 +675,22 @@ impl DroughtConceal {
 pub struct JitterStep {
     /// Interleaved samples to discard from the FRONT of the ring before reading.
     pub drop_front: usize,
-    /// Interleaved samples of linear crossfade to apply across the seam left by `drop_front`
-    /// ([`crossfade_drop`] does it for a `VecDeque<f32>` ring). Zero only when nothing is dropped.
+    /// Interleaved samples to DUPLICATE at the front of the ring before reading — the mirror of
+    /// `drop_front` ([`crossfade_insert`] does it for a `VecDeque<f32>` ring). Never set in the
+    /// same step as `drop_front`. Zero when nothing is inserted.
+    ///
+    /// This is how the ring gets DEEPER without a re-prime. Before it existed the policy could
+    /// lower depth gently (one crossfaded frame per sustain window) but could only raise it by
+    /// de-priming — a whole `target − depth` of inserted silence plus the priming wait — and the
+    /// A/V sync loop asking for a deeper ring made that happen on the very next late packet: a
+    /// 15–60 ms gap, repeated every time a wandering video reference asked again. Now a sync
+    /// request for more depth is answered the way a request for less is: one crossfaded frame at
+    /// a time, and the de-prime is reserved for genuine starvation and for growth that was never
+    /// banked (see `hollow`).
+    pub insert_front: usize,
+    /// Interleaved samples of linear crossfade to apply across the seam left by `drop_front` or
+    /// `insert_front` ([`crossfade_drop`] / [`crossfade_insert`] do it for a `VecDeque<f32>`
+    /// ring). Zero only when nothing is dropped or inserted.
     ///
     /// BOTH kinds of drop are faded. The hard-cap trim used to splice raw, on the reasoning that a
     /// ring which blew its ceiling "is already a discontinuity" — but that is a statement about the
@@ -700,6 +714,27 @@ const EWMA_TAU_MS: u32 = 1_000;
 /// The depth EWMA must stay above the shed threshold for this much CONSUMED AUDIO. Deliberately long: a shed is the only
 /// thing here a listener could ever notice, so it must never fire on a transient.
 const SHED_SUSTAIN_MS: u32 = 2_000;
+/// The mirror for the sync-driven INSERT: the depth EWMA must sit below the target for this much
+/// consumed audio before one frame is duplicated. Starts equal to the shed's — the two corrections
+/// are then the same instrument in both directions (2.5 ms of correction per second at a 5 ms
+/// frame; ~8 s to answer a 20 ms request), and equal time constants are the safest thing against
+/// the pair ever fighting. Kept as its own constant so the insert can be sped up (a crossfaded
+/// 5 ms repeat every 500 ms is a 1 % time-stretch, which is what RFC 3550 playout adaptation
+/// does) without touching the shed, IF a listen test proves it inaudible. Not `pub` — cbindgen.
+const INSERT_SUSTAIN_MS: u32 = SHED_SUSTAIN_MS;
+/// How far below the sync-requested target the depth AVERAGE must sit before the insert arms.
+///
+/// NOT the shed's `shed_excess_ms` (12–20 ms across the presets), though the branch is otherwise
+/// its mirror: the sync loop only ever asks for more depth once the offset has left its
+/// ±[`AV_DEADBAND_MS`] deadband, so a margin at or above the deadband would leave every request
+/// the loop is allowed to make — "audio is 10–20 ms early, deepen by that" — permanently
+/// unanswered, and the insert would be dead code for exactly the field shape it exists to fix.
+/// Half the deadband: small enough that every request is acted on, and — with the shed's
+/// threshold on the other side — a settling zone at least `shed_excess + this` wide, so a ring
+/// parked anywhere inside it is touched by neither. The insert never chases itself, either: the
+/// loop asks for `depth − offset`, and one inserted frame moves both by the same amount.
+const INSERT_MARGIN_MS: u32 = AV_DEADBAND_MS / 2;
+const _: () = assert!(INSERT_MARGIN_MS < AV_DEADBAND_MS);
 /// Linear crossfade applied across a drift shed's seam.
 ///
 /// Sized against the protocol's 5 ms Opus frame, where 2 ms is a comfortable fraction of what a
@@ -817,6 +852,14 @@ fn samples_to_ms(rate_hz: u32, channels: u8, samples: usize) -> u32 {
 /// [`SHED_SUSTAIN_MS`] of consumed audio sheds ONE 5 ms frame with a crossfade, so latency returns
 /// to target instead of ratcheting.
 ///
+/// **And the mirror.** When the A/V sync loop asks for a DEEPER ring than the adaptive target,
+/// the depth is raised the same way — a depth EWMA that sits [`INSERT_MARGIN_MS`] below the
+/// request for [`INSERT_SUSTAIN_MS`] duplicates ONE frame with a crossfade
+/// ([`JitterStep::insert_front`]). Until that existed the only way UP was a de-prime, and a
+/// sync request for more depth made the ring `hollow` at once, so the next single late packet
+/// bought a full `target − depth` of silence: the "audio gaps track the A/V offset" field
+/// shape, on every client, since sync steering shipped.
+///
 /// **Driven by the audio clock, not the wall clock**: every duration is measured in samples
 /// consumed. That makes it allocation-free, syscall-free (safe in a realtime callback) and
 /// deterministic under test.
@@ -845,6 +888,9 @@ pub struct JitterPolicy {
     depth_avg: f32,
     /// Consumed samples for which the EWMA has stayed above the shed threshold.
     over_run: usize,
+    /// The mirror: consumed samples for which the EWMA has stayed below the sync-requested
+    /// target by more than [`INSERT_MARGIN_MS`] — see the insert branch in [`step`](Self::step).
+    under_run: usize,
     /// Underruns seen in the current growth window, and the window's consumed-sample count.
     underruns: u32,
     window_run: usize,
@@ -866,7 +912,8 @@ pub struct JitterPolicy {
     /// buys one measured step, not a sprint to the ceiling.
     near_miss_grown: bool,
     /// Set by [`step`](Self::step): the depth average sits more than [`DEPRIME_DEBT_MS`] below
-    /// the target, so an underrun should re-prime at once instead of waiting out the hysteresis.
+    /// the ADAPTIVE target (the one underrun pressure grew — never the sync-inflated one), so an
+    /// underrun should re-prime at once instead of waiting out the hysteresis.
     hollow: bool,
     /// Consumed samples left in the current shrink-probe window (0 = no probe outstanding).
     probe_run: usize,
@@ -918,6 +965,7 @@ impl JitterPolicy {
             empties_run: 0,
             depth_avg: 0.0,
             over_run: 0,
+            under_run: 0,
             underruns: 0,
             window_run: 0,
             quiet_run: 0,
@@ -999,6 +1047,14 @@ impl JitterPolicy {
         self.sync_target.is_some_and(|s| s < self.target)
     }
 
+    /// The sync loop is asking to run DEEPER than the adaptive target — audio is playing early
+    /// against the picture. This is what arms the insert branch in [`step`](Self::step); without
+    /// a sync request the policy never adds depth on its own, so an un-wired ring (`sync_target
+    /// == None`) behaves exactly as it did before the insert existed.
+    fn sync_wants_more(&self) -> bool {
+        self.sync_target.is_some_and(|s| s > self.target)
+    }
+
     /// The live target depth in ms (grows under underrun pressure; never below the base).
     pub fn target_ms(&self) -> u32 {
         self.samples_ms(self.target)
@@ -1019,12 +1075,21 @@ impl JitterPolicy {
         self.primed
     }
 
-    /// The effective target for a device asking for `want` samples per callback. A ring can never
-    /// sustain a target below one device quantum, so a large-buffer device (a 20 ms PipeWire graph
-    /// quantum, a legacy AAudio path) lifts it to `want` plus one protocol frame rather than
-    /// oscillating prime → dropout → re-prime forever.
+    /// The ADAPTIVE target for a device asking for `want` samples per callback: the live target
+    /// underrun pressure has grown, lifted so it can always serve one quantum plus a packet. A
+    /// ring can never sustain a target below one device quantum, so a large-buffer device (a
+    /// 20 ms PipeWire graph quantum, a legacy AAudio path) is lifted to `want` plus one protocol
+    /// frame rather than oscillating prime → dropout → re-prime forever. This is the floor the
+    /// sync loop's request is clamped against, and — because it is what underrun evidence has
+    /// PROVEN this link needs — the depth `hollow` is judged against.
+    fn adaptive_target(&self, want: usize) -> usize {
+        self.target.max(want + self.frame_samples())
+    }
+
+    /// The effective target: [`adaptive_target`](Self::adaptive_target), or the sync loop's
+    /// request clamped into `[adaptive, hard_cap]`. Never below the adaptive one.
     fn effective_target(&self, want: usize) -> usize {
-        let floor = self.target.max(want + self.frame_samples());
+        let floor = self.adaptive_target(want);
         match self.sync_target {
             // Continuity outranks sync — see `set_sync_target`. The loop may pull the ring
             // shallower to catch the picture up, or push it deeper when audio runs early, but
@@ -1074,8 +1139,10 @@ impl JitterPolicy {
                 .crossfade_samples()
                 .min(depth.saturating_sub(out.drop_front));
             self.over_run = 0;
+            self.under_run = 0;
         } else if self.depth_avg > (target + self.ms_samples(self.tuning.shed_excess_ms())) as f32 {
             self.over_run += want;
+            self.under_run = 0;
             if self.over_run >= self.ms_samples(SHED_SUSTAIN_MS) {
                 out.drop_front = self.frame_samples().min(depth);
                 out.crossfade = self
@@ -1083,12 +1150,36 @@ impl JitterPolicy {
                     .min(depth.saturating_sub(out.drop_front));
                 self.over_run = 0;
             }
+        } else if self.primed
+            && self.sync_wants_more()
+            && (self.depth_avg as usize + self.ms_samples(INSERT_MARGIN_MS)) < target
+        {
+            // The mirror of the shed. The sync loop has asked for a DEEPER ring than the adaptive
+            // target (audio is early against the picture), and the depth AVERAGE has sat more
+            // than the margin below what it asked for, for the sustain window of consumed audio:
+            // duplicate ONE frame at the front, crossfaded. Below-target-only, so it can never
+            // fight the trim; sync-only, so an un-wired ring never adds depth by itself and the
+            // hollow re-prime keeps its job for growth that was never banked; primed-only, so a
+            // ring filling from silence is not padded with copies of what little it holds.
+            //
+            // The ring must hold a whole frame to duplicate. If it does not, it is not "a little
+            // shallow", it is running dry — and the drought/PLC path is the tool for that.
+            self.over_run = 0;
+            self.under_run += want;
+            if self.under_run >= self.ms_samples(INSERT_SUSTAIN_MS) && depth >= self.frame_samples()
+            {
+                out.insert_front = self.frame_samples();
+                out.crossfade = self.crossfade_samples();
+                self.under_run = 0;
+            }
         } else {
             self.over_run = 0;
+            self.under_run = 0;
         }
-        // Whatever we shed is no longer buffered — reflect it immediately so the next callbacks
-        // don't re-fire on a stale average.
-        self.depth_avg = (self.depth_avg - out.drop_front as f32).max(0.0);
+        // Whatever we shed is no longer buffered, and whatever we duplicated now is — reflect
+        // both immediately so the next callbacks don't re-fire on a stale average.
+        self.depth_avg =
+            (self.depth_avg - out.drop_front as f32 + out.insert_front as f32).max(0.0);
 
         if !self.primed && depth.saturating_sub(out.drop_front) >= target {
             self.primed = true;
@@ -1104,7 +1195,7 @@ impl JitterPolicy {
         // Near-miss: this read will be served, but with less than one frame left over — the
         // next callback starves unless a packet lands within one frame time. Unconditional
         // assignment, so a stale flag can never survive a de-prime into the next primed read.
-        let after = depth.saturating_sub(out.drop_front);
+        let after = depth.saturating_sub(out.drop_front) + out.insert_front;
         self.near_miss = self.primed
             && after >= want
             // Post-read depth below which a served callback counts as a NEAR-MISS: the device got
@@ -1122,8 +1213,18 @@ impl JitterPolicy {
         // but the depth was never re-banked (see `DEPRIME_DEBT_MS`). Judged on the average, not
         // this instant: a single late packet empties the ring for a callback without making it
         // hollow, and must keep the consecutive-empties hysteresis.
+        //
+        // Judged against the ADAPTIVE target, never the sync-inflated one. The debt this exists
+        // to call in is GROWTH that was never banked — underrun evidence raised the promise —
+        // and only a re-prime cashes that. A sync request is not evidence of starvation; it is a
+        // request for alignment, and it now has its own gentle instrument (the insert above).
+        // Measured against the effective target, a request for ≥ `DEPRIME_DEBT_MS` more depth
+        // made the ring hollow on the very next callback and turned the next single late packet
+        // into a full re-prime: the field's "audio gaps track the A/V offset" shape. The
+        // effective target is never below the adaptive one, so this can only be LESS hollow.
+        let adaptive = self.adaptive_target(want);
         self.hollow =
-            self.primed && (self.depth_avg as usize + self.ms_samples(DEPRIME_DEBT_MS)) < target;
+            self.primed && (self.depth_avg as usize + self.ms_samples(DEPRIME_DEBT_MS)) < adaptive;
         out
     }
 
@@ -1272,21 +1373,71 @@ pub fn crossfade_drop(ring: &mut std::collections::VecDeque<f32>, drop: usize, f
         ring.drain(..drop);
         return;
     }
-    // The last `fade` samples of what we are about to discard are the fade-OUT source; they blend
-    // into the first `fade` samples of what survives.
+    // The FIRST `fade` samples of what we are about to discard are the fade-OUT source — they are
+    // the continuation of the sample the device just played — and they blend into the first
+    // `fade` samples of what survives, whose own continuation the stream then follows. Both ends
+    // of the seam are continuous: the splice smears `drop` samples of waveform advance over the
+    // fade instead of stepping.
     //
-    // Blended in place and BEFORE the drain, with no scratch buffer: a value written at `drop + i`
-    // can never be read again as a fade-OUT source, because those sources are `drop - fade + j` for
-    // `j < fade`, i.e. strictly below `drop`. One ascending pass is therefore safe — and this runs
-    // inside realtime audio callbacks, where the `Vec` this used to allocate had no business being.
-    // It now runs on every hard-cap trim too, which is the common case on a bunching link.
+    // (It used to fade out from the LAST `fade` discarded samples, `drop - fade + i`. That end is
+    // adjacent to the survivors, so the fade-in side was smooth — but the sample the device had
+    // just played was adjacent to `ring[0]`, not to `ring[drop - fade]`, so the seam still opened
+    // with a step of `drop - fade` samples of waveform: 3 ms of a 5 ms shed. The old test only
+    // bounded steps INSIDE the faded region and never looked at the one before it.)
+    //
+    // Blended in place and BEFORE the drain, with no scratch buffer: the fade-OUT sources are
+    // `i < fade <= drop`, strictly below every write at `drop + i`, so a written value is never
+    // read again. One ascending pass is therefore safe — and this runs inside realtime audio
+    // callbacks, where the `Vec` this used to allocate had no business being. It runs on every
+    // hard-cap trim too, which is the common case on a bunching link.
     for i in 0..fade {
-        let old = ring[drop - fade + i];
+        let old = ring[i];
         let new = ring[drop + i];
         let t = (i + 1) as f32 / (fade + 1) as f32;
         ring[drop + i] = old * (1.0 - t) + new * t;
     }
     ring.drain(..drop);
+}
+
+/// The mirror of [`crossfade_drop`]: DUPLICATE the first `insert` interleaved samples of `ring`
+/// at its front — the ring plays them, then plays them again — linearly crossfading the seam over
+/// `fade` samples so the sync-driven deepening ([`JitterStep::insert_front`]) is a continuous
+/// waveform rather than a click. Net length change is exactly `+insert`.
+///
+/// Allocation-free when the ring has `insert` samples of spare capacity, which the three
+/// `VecDeque<f32>` rings that call this reserve up front (they are sized for the hard cap plus
+/// slack, and the policy only inserts BELOW its target): the copy is built with `push_front`,
+/// which never reallocates inside capacity, and the seam is blended in place. It runs inside
+/// realtime audio callbacks, like its twin. The Apple ring is index-based and mirrors this in
+/// Swift (`AudioRing.insertOneFrame`).
+///
+/// A no-op on `insert == 0` or a ring shorter than `insert` (nothing to duplicate); `fade` is
+/// clamped to `insert` and to what the ring holds beyond the copy, and `fade == 0` splices hard.
+pub fn crossfade_insert(ring: &mut std::collections::VecDeque<f32>, insert: usize, fade: usize) {
+    if insert == 0 || ring.len() < insert {
+        return;
+    }
+    let fade = fade.min(insert).min(ring.len() - insert);
+    // Build the copy at the front, last sample first. Before iteration `k` the front `k`
+    // samples of the ring are `orig[insert-k .. insert]`, so `orig[insert-1-k]` — the sample
+    // to push next — always sits at index `insert - 1`. After `insert` pushes the ring reads
+    // `orig[0..insert] ++ orig`, and `orig[j]` sits at `insert + j`.
+    for _ in 0..insert {
+        let s = ring[insert - 1];
+        ring.push_front(s);
+    }
+    // Seam: the device plays the copy — `orig[0..insert]` — and then `orig[0..]` again. What
+    // would have followed the copy's last sample is `orig[insert..]`, so THAT is the fade-out
+    // source (at `2·insert + i`), blending into the original's head `orig[i]` (at
+    // `insert + i`), in place. Both ends of the seam are continuous, exactly as in the drop.
+    // The fade-out reads sit at or above `2·insert`, above every write, and the fade-in read is
+    // the very cell about to be written — one ascending pass is safe.
+    for i in 0..fade {
+        let old = ring[2 * insert + i];
+        let new = ring[insert + i];
+        let t = (i + 1) as f32 / (fade + 1) as f32;
+        ring[insert + i] = old * (1.0 - t) + new * t;
+    }
 }
 
 /// Where [`apply_gain`]'s soft knee begins, in linear amplitude (≈ −3.1 dBFS). Below this the
@@ -2084,6 +2235,9 @@ mod tests {
                 );
                 depth -= s.drop_front.min(depth);
             }
+            // No sync target here, so the insert must never fire: an un-wired ring adds no
+            // depth by itself. Pinned on every drift run rather than in one test.
+            assert_eq!(s.insert_front, 0, "an unsynced ring inserted");
             if s.silence {
                 p.note_read(false);
                 continue;
@@ -3164,6 +3318,13 @@ mod tests {
         /// Audible reads in the second half of the run: non-zero means the policy never
         /// converged and the user hears it forever.
         audible_tail: u32,
+        /// Sync-driven inserts (one crossfaded frame each) — the gentle deepening.
+        inserts: u32,
+        /// Times the ring de-primed AFTER its first prime: each is a `target` worth of silence.
+        reprimes: u32,
+        /// Simulated ms at which the depth AVERAGE first came within `INSERT_MARGIN_MS` of the
+        /// sync target — how long the deepening took. `None` = never (or no sync target).
+        settle_ms: Option<u32>,
     }
 
     /// Drive a policy over a link that BUNCHES: delivery pauses for `gap_ms` every `period_ms`,
@@ -3183,11 +3344,17 @@ mod tests {
         let pm = per_ms(2);
         let want = 5 * pm;
         let mut p = JitterPolicy::new(tuning, 2);
-        p.set_sync_target(sync_target);
         let mut depth = 0usize;
         let mut withheld = 0usize;
         let mut carry: i64 = 0;
         let mut out = BunchSim::default();
+        let mut was_primed = false;
+        // The sync loop speaks only once it has evidence (`AV_MIN_OBSERVATIONS`), which is
+        // always after the ring has primed at its own base — so the request lands on a PRIMED
+        // ring, never on one still filling. Modelled the same way here: a request for less is
+        // clamped at the base anyway, and a request for more must be answered by the insert,
+        // not by the ring happening to prime straight to it.
+        let mut sync_pending = sync_target;
         for cb in 0..(ms / 5) {
             // The host keeps producing (want ± drift per callback); the link decides delivery.
             carry += want as i64 * drift_ppm;
@@ -3201,7 +3368,30 @@ mod tests {
                 depth += produced + std::mem::take(&mut withheld);
             }
             let s = p.step(depth, want);
+            if p.is_primed() {
+                if let Some(t) = sync_pending.take() {
+                    p.set_sync_target(Some(t));
+                }
+            }
             depth -= s.drop_front.min(depth);
+            if s.insert_front > 0 {
+                assert!(s.crossfade > 0, "every insert must be faded");
+                assert_eq!(s.drop_front, 0, "a step never drops AND inserts");
+                assert!(s.insert_front <= depth, "inserted more than the ring holds");
+                depth += s.insert_front;
+                out.inserts += 1;
+            }
+            if let Some(t) = sync_target {
+                if out.settle_ms.is_none()
+                    && p.depth_avg as usize + p.ms_samples(INSERT_MARGIN_MS) >= t
+                {
+                    out.settle_ms = Some(cb * 5);
+                }
+            }
+            if was_primed && !p.is_primed() {
+                out.reprimes += 1;
+            }
+            was_primed = p.is_primed();
             if s.silence {
                 p.note_read(false);
                 continue;
@@ -3259,6 +3449,398 @@ mod tests {
         let s = simulate_bunching(JitterTuning::COREAUDIO, None, 600_000, 25, 300, -50);
         assert!(s.audible_tail <= 4, "{s:?}");
         assert!(s.audible <= 12, "{s:?}");
+        assert_eq!(s.inserts, 0, "an unsynced ring must never insert: {s:?}");
+    }
+
+    // ---- sync-driven DEEPENING: the insert, the mirror of the shed -----------------------
+
+    /// THE field shape this exists for ("started at 0.24/0.25", every client). The sync loop
+    /// asks for a DEEPER ring — audio is early against a picture whose latency wandered (a
+    /// 53–74 fps KWin source, an ABR retarget, a keyframe burst). Before the insert existed the
+    /// policy could only raise depth by de-priming: the sync-inflated target made the ring
+    /// `hollow` on the very next callback, and the next single late packet bought a full
+    /// `target − depth` of silence plus the priming wait — 15–60 ms of gap, repeated every time
+    /// the reference asked again. Now the request is answered the way a request for LESS is:
+    /// one crossfaded frame per sustain window, and no de-prime at all on a clean link.
+    #[test]
+    fn a_sync_request_for_more_depth_deepens_without_a_de_prime_on_a_clean_link() {
+        // Ring primes at PIPEWIRE's 15 ms base; sync asks for 35 ms — 20 ms deeper. No gaps.
+        let s = simulate_bunching(
+            JitterTuning::PIPEWIRE,
+            Some(per_ms(2) * 35),
+            60_000,
+            0,
+            300,
+            0,
+        );
+        assert_eq!(s.audible, 0, "a clean link must stay silent-free: {s:?}");
+        assert_eq!(s.reprimes, 0, "sync must never cause a de-prime: {s:?}");
+        assert!(
+            s.inserts > 0,
+            "the deepening has to come from somewhere: {s:?}"
+        );
+        // 20 ms at one 5 ms frame per INSERT_SUSTAIN_MS, plus the EWMA's settling — well
+        // inside the bound the handoff set.
+        let settle = s.settle_ms.expect("the ring never reached the sync target");
+        assert!(
+            settle <= 20_000,
+            "deepening by 20 ms took {settle} ms — too slow to track a wandering reference: {s:?}"
+        );
+        // …and, having settled, it STOPS: the insert is below-target-only and must not keep
+        // duplicating once the average sits inside the margin. Four frames cover 20 ms; allow
+        // the EWMA a couple more, not a stream of them.
+        assert!(
+            s.inserts <= 8,
+            "the insert kept firing after the ring was deep enough: {s:?}"
+        );
+    }
+
+    /// The same request on the bunching link the two convergence tests above use — sync asking
+    /// for MORE where they ask for less. The insert must not make a bunching link worse than
+    /// the unsynced case (same "handful over ten minutes" bound), and the deepening must not be
+    /// paid for in re-primes.
+    #[test]
+    fn a_sync_request_for_more_depth_stays_clean_on_a_bunching_link() {
+        let s = simulate_bunching(
+            JitterTuning::COREAUDIO,
+            Some(per_ms(2) * 45),
+            600_000,
+            25,
+            300,
+            -50,
+        );
+        assert!(s.audible_tail <= 4, "{s:?}");
+        assert!(s.audible <= 12, "{s:?}");
+        assert!(
+            s.settle_ms.is_some(),
+            "the ring must reach the requested depth on a link that delivers: {s:?}"
+        );
+    }
+
+    /// Unit pin of the two mechanisms in isolation: a primed ring asked for +30 ms is NOT hollow
+    /// (`hollow` is judged against the adaptive target), so one short read leaves it primed; and
+    /// once the average has sat below the request for `INSERT_SUSTAIN_MS` of consumed audio the
+    /// step carries `insert_front` of exactly one frame, faded, and the average reflects it.
+    #[test]
+    fn a_sync_request_for_more_depth_never_de_primes() {
+        let pm = per_ms(2);
+        let want = 5 * pm;
+        let mut p = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
+        let mut depth = 15 * pm;
+        assert!(
+            !p.step(depth, want).silence,
+            "15 ms primes the PIPEWIRE base"
+        );
+        depth -= want;
+        p.note_read(false);
+        p.set_sync_target(Some(45 * pm));
+        // Hold the depth flat at ~15 ms while the sync target sits 30 ms above it, and count
+        // consumed audio until the insert arms. 100 ms in, ONE late packet: the read runs short.
+        // Before the fix that de-primed at once (the sync-inflated target made the ring hollow).
+        let mut consumed = 0usize;
+        let mut short_read_done = false;
+        let mut first = None;
+        for _ in 0..2_000 {
+            if !short_read_done && consumed >= 100 * pm {
+                short_read_done = true;
+                assert!(
+                    !p.hollow,
+                    "a sync request is not growth debt — the ring must not read as hollow"
+                );
+                let s = p.step(want / 2, want);
+                assert!(!s.silence);
+                p.note_read(true);
+                assert!(
+                    p.is_primed(),
+                    "a single short read on a sync-deepened ring must keep the hysteresis, not de-prime"
+                );
+                consumed += want;
+                continue;
+            }
+            depth += want;
+            let before = p.depth_avg;
+            let s = p.step(depth, want);
+            if s.insert_front > 0 {
+                assert_eq!(s.insert_front, p.frame_samples(), "one frame, no more");
+                assert_eq!(s.crossfade, p.crossfade_samples(), "faded");
+                assert_eq!(s.drop_front, 0);
+                assert!(
+                    p.depth_avg >= before + s.insert_front as f32 - 1.0,
+                    "the average must reflect the inserted frame at once: {before} -> {}",
+                    p.depth_avg
+                );
+                // The arming step's own `want` is part of the sustain (the policy counts it
+                // when it decides, before the read).
+                first = Some(consumed + want);
+                break;
+            }
+            depth -= want;
+            consumed += want;
+            p.note_read(false);
+        }
+        assert!(short_read_done, "the short read never happened");
+        let first = first.expect("the insert never armed");
+        // At least the sustain window; the EWMA is already settled at 15 ms so not much more.
+        assert!(
+            first >= p.ms_samples(INSERT_SUSTAIN_MS),
+            "armed after {} ms — before the sustain window",
+            first / pm
+        );
+        assert!(
+            first <= p.ms_samples(INSERT_SUSTAIN_MS + 500),
+            "armed after {} ms — long after the sustain window",
+            first / pm
+        );
+    }
+
+    /// The surviving `hollow` path: growth that was never banked STILL re-primes on the click it
+    /// already paid — that is what the hollow re-prime is for, and it must not be lost in
+    /// moving its yardstick from the effective target to the adaptive one. No sync target here.
+    #[test]
+    fn growth_not_banked_still_re_primes() {
+        let pm = per_ms(2);
+        let want = 5 * pm;
+        let mut p = JitterPolicy::new(JitterTuning::PIPEWIRE, 2);
+        // Prime at the 15 ms base and settle the average there.
+        let mut depth = 15 * pm;
+        assert!(!p.step(depth, want).silence);
+        depth -= want;
+        p.note_read(false);
+        for _ in 0..400 {
+            depth += want;
+            let s = p.step(depth, want);
+            depth -= s.drop_front + want;
+            p.note_read(false);
+        }
+        // Grow the target twice (two windows of three underruns) WITHOUT letting the depth
+        // follow: the average stays ~15 ms while the promise climbs to 35.
+        for _round in 0..2 {
+            for _ in 0..GROW_UNDERRUNS {
+                // A short read: the device asked for `want`, the ring had less.
+                let s = p.step(want / 2, want);
+                assert!(
+                    !s.silence,
+                    "the hysteresis must hold through a single short read"
+                );
+                p.note_read(true);
+                // Refill to the base depth so the average is not dragged down by the run.
+                for _ in 0..8 {
+                    let s = p.step(15 * pm + want, want);
+                    p.note_read(s.silence);
+                }
+            }
+            // Roll the growth window over so the next three count as a fresh window.
+            let mut consumed = 0;
+            while consumed < p.ms_samples(GROW_WINDOW_MS) {
+                let s = p.step(15 * pm + want, want);
+                p.note_read(s.silence);
+                consumed += want;
+            }
+        }
+        // Growth may already have de-primed the ring in the loop above via exactly the path
+        // under test; either way, by now the target is grown and the ring, if primed, is
+        // hollow against it.
+        assert!(
+            p.target_ms() >= 25,
+            "the target must have grown, got {} ms",
+            p.target_ms()
+        );
+        // Re-prime at the grown target if the loop above already spent the click, and drain
+        // the average back down to the base without an underrun — the ring stays PRIMED (no
+        // short read) while its promise runs 20 ms above what it holds.
+        let target = p.effective_target(want);
+        let s = p.step(target + want, want);
+        assert!(!s.silence);
+        p.note_read(false);
+        for _ in 0..600 {
+            let s = p.step(15 * pm + want, want);
+            assert!(!s.silence, "no starvation here — the depth is only shallow");
+            p.note_read(false);
+        }
+        assert!(p.is_primed());
+        assert!(p.hollow, "a grown promise the depth never banked is hollow");
+        // ONE short read: the click has been paid; the hollow ring cashes the refill at once.
+        let s = p.step(want / 2, want);
+        assert!(!s.silence);
+        p.note_read(true);
+        assert!(
+            !p.is_primed(),
+            "growth that was never banked must still re-prime on its first click"
+        );
+    }
+
+    /// A ring at the hard cap being asked deeper: `effective_target` clamps the request at the
+    /// cap, the insert is below-target-only, and so it can never fight the trim. Pinned, since
+    /// the trim and the insert both move the depth and a fight between them would be a
+    /// continuous stream of faded corrections.
+    #[test]
+    fn the_insert_never_fights_the_trim() {
+        let pm = per_ms(2);
+        let want = 5 * pm;
+        let t = JitterTuning::PIPEWIRE;
+        let mut p = JitterPolicy::new(t, 2);
+        // Ask for far more than the cap; sit the ring right at the cap.
+        p.set_sync_target(Some(usize::MAX / 2));
+        let cap = t.hard_cap_ms as usize * pm;
+        let mut depth = cap;
+        assert!(!p.step(depth, want).silence);
+        depth -= want;
+        p.note_read(false);
+        let (mut trims, mut inserts) = (0, 0);
+        for _ in 0..4_000 {
+            depth += want; // producer keeps pace exactly
+            let s = p.step(depth, want);
+            if s.hard_trim {
+                trims += 1;
+            }
+            if s.insert_front > 0 {
+                inserts += 1;
+            }
+            depth = depth + s.insert_front - s.drop_front.min(depth) - want;
+            p.note_read(false);
+        }
+        assert_eq!(
+            trims, 0,
+            "a ring holding exactly the cap must not be trimmed"
+        );
+        assert_eq!(
+            inserts, 0,
+            "a ring at the cap is at its (clamped) target — nothing to insert"
+        );
+    }
+
+    /// The insert on the lossless plane: 2 ms frames at 96 kHz/24-bit. `frame_samples` follows
+    /// `set_frame_us`, and the seam fade is capped at half a frame (1 ms) — a fade as long as
+    /// the material it fades is not a crossfade.
+    #[test]
+    fn the_insert_follows_the_negotiated_frame_length() {
+        let rate = 96_000;
+        let mut p = JitterPolicy::new_at_rate(JitterTuning::PIPEWIRE, 2, rate);
+        p.set_frame_us(2_000);
+        let frame = p.frame_samples();
+        assert_eq!(frame, 96 * 2 * 2, "2 ms at 96 kHz stereo is 384 samples");
+        let want = frame; // a 2 ms device quantum
+        let base = ms_to_samples(rate, 2, JitterTuning::PIPEWIRE.base_target_ms);
+        let mut depth = base;
+        assert!(!p.step(depth, want).silence);
+        depth -= want;
+        p.note_read(false);
+        p.set_sync_target(Some(base * 3));
+        let mut got = None;
+        for _ in 0..20_000 {
+            depth += want;
+            let s = p.step(depth, want);
+            if s.insert_front > 0 {
+                got = Some(s);
+                break;
+            }
+            depth -= want;
+            p.note_read(false);
+        }
+        let s = got.expect("the insert never armed at 96 kHz");
+        assert_eq!(s.insert_front, frame, "insert exactly one 2 ms frame");
+        assert_eq!(s.crossfade, frame / 2, "the fade is capped at half a frame");
+    }
+
+    /// Mirror of `crossfade_drop_splices_without_a_step`, and stricter: BOTH ends of the seam are
+    /// checked, including against the sample the device played just before the ring's head —
+    /// which is where the old drop stepped (see `crossfade_drop`).
+    #[test]
+    fn crossfade_insert_adds_exactly_one_frame_and_the_seam_is_continuous() {
+        use std::collections::VecDeque;
+        // A slow ramp starting at 1000 — "the device just played 999".
+        let mut ring: VecDeque<f32> = (1000..2000).map(|i| i as f32).collect();
+        let (insert, fade) = (240, 96);
+        crossfade_insert(&mut ring, insert, fade);
+        assert_eq!(
+            ring.len(),
+            1000 + insert,
+            "net length change is exactly +insert"
+        );
+        // The copy is verbatim: the device plays the head once…
+        for (i, &s) in ring.iter().take(insert).enumerate() {
+            assert_eq!(s, (1000 + i) as f32, "copy sample {i}");
+        }
+        // …and the whole played sequence — including the step from the previously played
+        // sample (999) into the ring — never jumps by more than the fade's slope. The seam sits
+        // at `insert`: what the copy's last sample (1239) leads into is blended from 1240… down
+        // toward the replayed 1000… over the fade, so the local slope is at most
+        // (insert / fade + 1) per sample and no sample steps by anything like `insert`.
+        let max_slope = (insert as f32 / fade as f32) + 2.0;
+        let mut prev = 999.0f32;
+        for (i, &s) in ring.iter().enumerate() {
+            let step = (s - prev).abs();
+            assert!(
+                step <= max_slope,
+                "sample {i}: step {step} from {prev} to {s} is a splice, not a fade"
+            );
+            prev = s;
+        }
+        // Past the fade the original is untouched, and the tail is intact.
+        for (i, &s) in ring.iter().enumerate().skip(insert + fade) {
+            assert_eq!(s, (1000 + i - insert) as f32, "original sample {i}");
+        }
+        assert_eq!(ring[ring.len() - 1], 1999.0);
+    }
+
+    #[test]
+    fn crossfade_insert_handles_degenerate_inputs() {
+        use std::collections::VecDeque;
+        let mut ring: VecDeque<f32> = (0..10).map(|i| i as f32).collect();
+        crossfade_insert(&mut ring, 0, 4); // nothing to insert
+        assert_eq!(ring.len(), 10);
+        crossfade_insert(&mut ring, 99, 4); // more than we hold — refuse
+        assert_eq!(ring.len(), 10);
+        crossfade_insert(&mut ring, 10, 4); // exactly all of it: no room to fade, hard splice
+        assert_eq!(ring.len(), 20);
+        let v: Vec<f32> = ring.iter().copied().collect();
+        let mut want: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        want.extend((0..10).map(|i| i as f32));
+        assert_eq!(v, want, "a hard splice is a verbatim repeat");
+        // A fade longer than the insert is clamped to it, not read out of bounds.
+        let mut ring: VecDeque<f32> = (0..100).map(|i| i as f32).collect();
+        crossfade_insert(&mut ring, 8, 50);
+        assert_eq!(ring.len(), 108);
+    }
+
+    /// The RT-safety claim: with the spare capacity the client rings reserve, an insert must not
+    /// reallocate. `VecDeque::push_front` never grows inside capacity; pin that the helper does
+    /// nothing else that would.
+    #[test]
+    fn crossfade_insert_does_not_reallocate_inside_capacity() {
+        use std::collections::VecDeque;
+        let mut ring: VecDeque<f32> = VecDeque::with_capacity(4096);
+        ring.extend((0..1000).map(|i| i as f32));
+        let cap = ring.capacity();
+        crossfade_insert(&mut ring, 240, 96);
+        assert_eq!(ring.capacity(), cap, "the insert reallocated the ring");
+        assert_eq!(ring.len(), 1240);
+    }
+
+    /// The drop's seam, checked the way the insert's is: against the sample played just BEFORE
+    /// the ring's head. This is the check the original test lacked, and the one the old
+    /// `drop - fade + i` fade-out source failed by a step of `drop - fade` samples.
+    #[test]
+    fn crossfade_drop_is_continuous_with_what_was_just_played() {
+        use std::collections::VecDeque;
+        let mut ring: VecDeque<f32> = (1000..2000).map(|i| i as f32).collect();
+        let (drop, fade) = (240, 96);
+        crossfade_drop(&mut ring, drop, fade);
+        assert_eq!(ring.len(), 1000 - drop);
+        let max_slope = (drop as f32 / fade as f32) + 2.0;
+        let mut prev = 999.0f32; // the device just played 999; the ring's head was 1000
+        for (i, &s) in ring.iter().enumerate() {
+            let step = (s - prev).abs();
+            assert!(
+                step <= max_slope,
+                "sample {i}: step {step} from {prev} to {s} is a splice, not a fade"
+            );
+            prev = s;
+        }
+        // Past the fade the survivors are untouched.
+        for (i, &s) in ring.iter().enumerate().skip(fade) {
+            assert_eq!(s, (1000 + drop + i) as f32, "survivor {i}");
+        }
     }
 
     /// Unity must be bit-exact. The callers gate on `gain != 1.0` anyway, but if this ever stopped

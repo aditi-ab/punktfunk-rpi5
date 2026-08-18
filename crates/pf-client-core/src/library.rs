@@ -4,10 +4,17 @@
 //! cert the host paired over QUIC) and the host authorizes paired certificates for the
 //! read-only library routes, no bearer token. The host's self-signed certificate is
 //! verified by its pinned SHA-256 fingerprint (`KnownHost::fp_hex`), not a CA chain.
+//!
+//! The MODEL half (`GameEntry`, `Artwork`, `RunningGame`, `LibraryError`, `base_url`) is
+//! portable — the Skia console renders it on Android too, where the Kotlin client does the
+//! fetching; the ureq/rustls half below is desktop-gated item by item.
 
 use serde::{Deserialize, Serialize};
+#[cfg(any(target_os = "linux", windows))]
 use std::collections::VecDeque;
+#[cfg(any(target_os = "linux", windows))]
 use std::sync::{Arc, Mutex};
+#[cfg(any(target_os = "linux", windows))]
 use std::time::Duration;
 
 /// The management API's default port — matches `mgmt::DEFAULT_PORT` on the host. A
@@ -170,6 +177,7 @@ pub fn base_url(addr: &str, mgmt_port: u16) -> String {
 /// An HTTPS agent presenting `identity` via TLS client auth and verifying the server by
 /// `pin` (`None` = accept any cert, the TOFU special case — same semantics as the QUIC
 /// connect). Reused across a whole grid's worth of poster loads.
+#[cfg(any(target_os = "linux", windows))]
 pub fn agent(
     identity: &(String, String),
     pin: Option<[u8; 32]>,
@@ -205,6 +213,7 @@ pub fn agent(
 
 /// Fetch the host's unified library. Errors are pre-classified for the UI (401/403 →
 /// [`LibraryError::NotPaired`], a pin-verifier rejection → [`LibraryError::PinMismatch`]).
+#[cfg(any(target_os = "linux", windows))]
 pub fn fetch_games(
     addr: &str,
     mgmt_port: u16,
@@ -260,6 +269,7 @@ impl RunningGame {
 /// Just the slice of `/status` a client reads. Everything else on that payload is the operator
 /// console's business, and decoding only what we use keeps an unrelated schema change on the
 /// host from breaking a library screen.
+#[cfg(any(target_os = "linux", windows))]
 #[derive(Deserialize)]
 struct HostStatus {
     #[serde(default)]
@@ -276,6 +286,7 @@ struct HostStatus {
 /// **Best-effort by contract**: an older host, an unreachable one, or a shape we don't recognize
 /// yields an empty list rather than an error. Nothing here is worth failing a library screen
 /// over — the worst case is a Resume badge that doesn't appear.
+#[cfg(any(target_os = "linux", windows))]
 pub fn fetch_running(
     addr: &str,
     mgmt_port: u16,
@@ -299,12 +310,14 @@ pub fn fetch_running(
 
 /// Poster-art byte fetch cap — largest Steam hero assets run a few MB; anything bigger is
 /// not an image we want to hand to the texture decoder.
+#[cfg(any(target_os = "linux", windows))]
 const ART_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Fetch one cover-art image. URLs on the host itself (under `base`) go through the
 /// pinned mTLS agent (the host's art proxy requires the paired cert); any other origin —
 /// a public CDN URL on a custom entry — uses ureq's default agent with normal webpki
 /// trust and no client cert (Apple's `LibraryTLSDelegate` does the same split).
+#[cfg(any(target_os = "linux", windows))]
 pub fn fetch_art(pinned: &ureq::Agent, base: &str, url: &str) -> Result<Vec<u8>, LibraryError> {
     let mut resp = if url.starts_with(base) {
         pinned.get(url).call()
@@ -330,6 +343,7 @@ pub fn fetch_art(pinned: &ureq::Agent, base: &str, url: &str) -> Result<Vec<u8>,
 
 /// Concurrent poster fetches — a handful is plenty for a LAN art proxy without turning a
 /// big library into a connection burst.
+#[cfg(any(target_os = "linux", windows))]
 const ART_WORKERS: usize = 3;
 
 /// Fetch poster bytes for `jobs` (entry id → candidate URLs, walked in order until one
@@ -337,6 +351,7 @@ const ART_WORKERS: usize = 3;
 /// Dropping the receiver (the consuming page popped) winds the workers down. Shared by
 /// the touch grid and the gamepad launcher — the consumer does its own texture decode on
 /// the main loop.
+#[cfg(any(target_os = "linux", windows))]
 pub fn spawn_art_fetch(
     base: String,
     identity: (String, String),
@@ -379,6 +394,7 @@ pub fn spawn_art_fetch(
     rx
 }
 
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn classify(e: ureq::Error) -> LibraryError {
     match e {
         ureq::Error::StatusCode(401 | 403) => LibraryError::NotPaired,

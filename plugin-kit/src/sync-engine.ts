@@ -13,7 +13,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import {
-	type Duration,
+	Duration,
 	Effect,
 	Exit,
 	PubSub,
@@ -58,7 +58,20 @@ export interface SyncSettings {
 	readonly watch: boolean;
 	readonly debounce: Duration.Duration;
 	readonly watchDirs: ReadonlyArray<string>;
+	/**
+	 * Floor between two `fs-change` syncs. The debounce collapses a BURST of events into one
+	 * sync, but it extends on every event and so cannot bound how often a busy launcher makes
+	 * us re-walk the library — Steam writes to its dirs the whole time a game runs, and one
+	 * field log carried 102 `fs-change` syncs in 27 minutes. This caps the RATE: at most one
+	 * fs-change sync per interval, and every change that lands inside it coalesces into exactly
+	 * one trailing sync. Default `30 s` (see `DEFAULT_FS_CHANGE_MIN_INTERVAL`).
+	 */
+	readonly minInterval?: Duration.Duration;
 }
+
+/** `SyncSettings.minInterval` when a plugin does not set one. */
+export const DEFAULT_FS_CHANGE_MIN_INTERVAL: Duration.Duration =
+	Duration.seconds(30);
 
 export interface SyncEngineOptions<
 	Report,
@@ -265,11 +278,26 @@ export const makeSyncEngine = <
 							}),
 					),
 				);
-				const watchLoop = watchStream.pipe(
+				// Debounce collapses a burst; the sliding queue of ONE plus the hold below caps the
+				// rate (see `SyncSettings.minInterval`). Debounced events land in the queue and
+				// coalesce there while a sync runs or the hold sleeps, so a launcher that never
+				// stops writing costs one sync per interval — and the change it made is never
+				// lost, because the queue is drained by exactly one trailing sync.
+				const minInterval =
+					settings.minInterval ?? DEFAULT_FS_CHANGE_MIN_INTERVAL;
+				const kick = yield* Queue.sliding<void>(1);
+				const feed = watchStream.pipe(
 					Stream.debounce(settings.debounce),
-					Stream.runForEach(() => safeSync("fs-change")),
+					Stream.runForEach(() => Queue.offer(kick, undefined)),
 				);
-				yield* Effect.forkIn(watchLoop, scope);
+				yield* Effect.forkIn(feed, scope);
+				const drain = Effect.forever(
+					Queue.take(kick).pipe(
+						Effect.andThen(safeSync("fs-change")),
+						Effect.andThen(Effect.sleep(minInterval)),
+					),
+				);
+				yield* Effect.forkIn(drain, scope);
 			}
 		});
 

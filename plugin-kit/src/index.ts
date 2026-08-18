@@ -37,6 +37,7 @@ export {
 } from "./runtime.js";
 export { type SseRouteOptions, sseRoute } from "./sse.js";
 export {
+	DEFAULT_FS_CHANGE_MIN_INTERVAL,
 	type LastSync,
 	makeSyncEngine,
 	type SyncEngine,

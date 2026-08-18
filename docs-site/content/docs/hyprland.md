@@ -47,11 +47,18 @@ See [Configuration](/docs/configuration) for the full reference.
   portal. To pick the output without a GUI on a headless host, the host writes a managed
   `~/.config/hypr/xdph.conf` pointing xdph's `custom_picker_binary` at a small shim that selects the
   new output automatically — no interactive picker dialog to answer.
-- **Window placement** — the headless output is an *extension*: it sits beside your real monitors and
-  nothing promotes it or turns them off. Hyprland opens a new window on the **focused** monitor, so
+- **Window placement** — under the default *extend* topology the headless output sits beside your
+  real monitors and nothing promotes it. Hyprland opens a new window on the **focused** monitor, so
   the host runs `hyprctl dispatch focusmonitor PF-…` — once when the output is ready, and again right
   before it launches anything from your library. Without that, games open on whichever physical
   monitor had focus and the stream shows a bare desktop.
+- **Exclusive topology** — if you set it, the host disables your physical monitors for the session
+  (`monitor <name>,disable`, or the Lua `hl.monitor{ …, disabled = true }` if you use a Lua config)
+  and brings them back with a **`hyprctl reload`** at teardown. The reload is not a shortcut: a
+  disabled Hyprland monitor cannot be re-enabled by re-applying its rule — every targeted form is
+  accepted and does nothing — so re-reading your config is the only way back. It also drops other
+  runtime `hyprctl keyword` changes and re-runs `exec =` lines in a non-Lua config, and it runs only
+  when a session actually disabled a monitor.
 - **Input** — mouse and keyboard are injected via the wlroots **virtual pointer** and **virtual
   keyboard** protocols (Hyprland kept them). Gamepads and audio are compositor-independent.
 

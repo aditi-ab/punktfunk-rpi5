@@ -34,6 +34,29 @@ pub(crate) struct PadUsbCapturer {
     pad: u8,
 }
 
+/// Map the pad's **hardware** quad onto the wire's **logical** layout.
+///
+/// The isochronous endpoint carries the DualSense's own channel map — `ch0` = headphone LEFT,
+/// `ch1` = headphone RIGHT *and* the built-in mono speaker, `ch2`/`ch3` = the voice coils
+/// (confirmed twice independently: the UCM split positions `[AUX1,AUX1,AUX2,AUX3]` and the
+/// on-glass channel sweep). The 0xD1 wire contract instead puts the *speaker pair* on ch0/1.
+/// Forwarding the hardware quad verbatim therefore ships headphone-left (silence, or content no
+/// remote pad can render — the jack is on the other end of the stream) as wire speaker-left, and
+/// the actual speaker channel as wire speaker-right — which the client then plays into the ONE
+/// split-sink channel that a current PipeWire never wires to the physical speaker.
+/// Field-diagnosed 2026-08-18: haptics felt, speaker dead, the tone measured on exactly one
+/// channel at each hop.
+///
+/// So: duplicate the hardware speaker channel (`ch1`) across the wire's speaker pair, pass the
+/// coils through. Headphone-left is dropped deliberately — the remote pad's jack is not a wire
+/// surface, and a game that routes to the jack has the pad's audio *off* the speaker anyway.
+fn normalize_hw_quad(mut chunk: Vec<f32>) -> Vec<f32> {
+    for frame in chunk.chunks_exact_mut(4) {
+        frame[0] = frame[1];
+    }
+    chunk
+}
+
 impl PadUsbCapturer {
     /// Claim wire pad `pad`'s USB audio stream.
     ///
@@ -60,7 +83,7 @@ impl AudioCapturer for PadUsbCapturer {
 
     fn next_chunk_within(&mut self, budget: Duration) -> Result<Vec<f32>> {
         match self.rx.recv_timeout(budget.min(IDLE_TIMEOUT)) {
-            Ok(chunk) => Ok(chunk),
+            Ok(chunk) => Ok(normalize_hw_quad(chunk)),
             // Nothing arrived in the budget. The game isn't writing (or the stream is stopped) —
             // a quiet pad, not a dead one, exactly as the sink capturer reports it.
             Err(RecvTimeoutError::Timeout) => Ok(Vec::new()),
@@ -115,15 +138,29 @@ mod tests {
         assert!(c.next_chunk_within(Duration::from_millis(10)).is_err());
     }
 
-    /// Samples pass through untouched — the handler already produced interleaved `f32`.
+    /// The hardware quad is normalized to the wire layout: hw ch1 (the pad's one real speaker
+    /// channel) is duplicated across the wire speaker pair, the coils pass through, and hw ch0
+    /// (headphone-left — not a wire surface) is dropped. Forwarding the quad verbatim shipped
+    /// the speaker on wire ch1 only, which the client's split-sink render never got to the
+    /// physical speaker (field, 2026-08-18: haptics felt, speaker dead).
     #[test]
-    fn delivers_the_published_chunk_verbatim() {
+    fn normalizes_the_hardware_quad_to_the_wire_layout() {
         let (tx, mut c) = capturer();
-        tx.send(vec![0.5, -0.5, 0.25, -0.25]).expect("send");
+        tx.send(vec![0.9, 0.5, 0.25, -0.25, 0.8, 0.4, 0.2, -0.2])
+            .expect("send");
         assert_eq!(
             c.next_chunk_within(Duration::from_millis(50))
                 .expect("chunk"),
-            vec![0.5, -0.5, 0.25, -0.25]
+            vec![0.5, 0.5, 0.25, -0.25, 0.4, 0.4, 0.2, -0.2]
+        );
+    }
+
+    /// The normalizer itself, on one frame: `[hpL, spk, coilA, coilB]` → `[spk, spk, coilA, coilB]`.
+    #[test]
+    fn normalize_duplicates_the_speaker_channel() {
+        assert_eq!(
+            normalize_hw_quad(vec![0.9, 0.5, 0.25, -0.25]),
+            vec![0.5, 0.5, 0.25, -0.25]
         );
     }
 }

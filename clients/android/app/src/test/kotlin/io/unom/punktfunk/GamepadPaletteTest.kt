@@ -136,46 +136,9 @@ class GamepadPaletteTest {
         assertTrue(light.shadeScale < 0.5f)
     }
 
-    /**
-     * Every settings row lands in exactly one tab — a row missing from the tab map is a setting
-     * that became unreachable on a TV, which is precisely what this screen exists to prevent.
-     */
-    @Test
-    fun everySettingsRowHasATab() {
-        val rows = buildSettingsRows(
-            Settings(), hasBodyVibrator = true, hasGyroscope = true, av1Capable = true,
-        ) {}
-        assertTrue(rows.isNotEmpty())
-        assertEquals(rows.size, rows.map { it.id }.toSet().size)
-        // Profiles is built separately (from the catalog), so no settings row claims it.
-        assertTrue(rows.none { it.tab == GpTab.PROFILES })
-        for (t in listOf(GpTab.STREAM, GpTab.VIDEO, GpTab.AUDIO, GpTab.CONTROLLER, GpTab.INTERFACE)) {
-            assertTrue("$t is empty", rows.any { it.tab == t })
-        }
-    }
+    
 
-    /** The Background row steps the shared `ui_palette` key and wraps on A, like every choice row. */
-    @Test
-    fun backgroundRowStepsTheSharedKey() {
-        var s = Settings()
-        fun rows() = buildSettingsRows(
-            s, hasBodyVibrator = false, hasGyroscope = false, av1Capable = false,
-        ) { s = it }
-        fun palette() = rows().first { it.id == "palette" }
-
-        assertEquals("violet", s.uiPalette)
-        assertEquals("Violet", palette().value)
-        assertTrue("already the first = thud", !palette().adjust(-1))
-        assertTrue(palette().adjust(1))
-        assertEquals(GamepadPalette.ALL[1].id, s.uiPalette)
-
-        // A from the last entry wraps home.
-        s = s.copy(uiPalette = GamepadPalette.ALL.last().id)
-        palette().activate()
-        assertEquals("violet", s.uiPalette)
-
-        // A store written by a newer client shows the palette that is actually drawing.
-        s = s.copy(uiPalette = "chartreuse")
-        assertEquals("Violet", palette().value)
-    }
+    // The settings-rows tests that lived here pinned the Compose console's row
+    // catalog (`buildSettingsRows`). That console is gone — the shared Skia shell owns the rows
+    // now, pinned in Rust (`pf-console-ui/src/screens/settings.rs`).
 }

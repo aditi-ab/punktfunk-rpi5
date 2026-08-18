@@ -332,7 +332,8 @@ fn run(
         #[allow(unused_mut)]
         let mut spawned_now = false;
         // Windows hands back a pid rather than a child; kept for the lease (see the native plane
-        // and `gamelease::LeaseRequest::spawned`). `None` elsewhere and when nothing was spawned.
+        // and `gamelease::LeaseRequest::spawned`). `None` elsewhere, when nothing was spawned, and
+        // when what was spawned only forwards the launch (`library::WinRecipe::owns_game`).
         #[allow(unused_mut)]
         let mut spawned_pid: Option<u32> = None;
         // Close this client's previous game first, when the operator asked for that — the compat
@@ -365,8 +366,8 @@ fn run(
                     (None, None) => Ok(None),
                 };
                 match launched {
-                    Ok(pid) => {
-                        spawned_pid = pid;
+                    Ok(l) => {
+                        spawned_pid = l.and_then(|l| l.tracked_pid());
                         spawned_now = true;
                     }
                     Err(e) => {

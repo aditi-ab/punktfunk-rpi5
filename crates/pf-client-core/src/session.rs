@@ -635,61 +635,14 @@ impl AudioDec {
     }
 }
 
-/// The `audio_format` setting's stored value for the Opus plane — the default, and byte for byte
-/// the session every build before the lossless plane ran.
-pub const AUDIO_FORMAT_OPUS: &str = "opus";
-
-/// Bit-exact PCM at 48 kHz / 24-bit (~2.3 Mbps). The honest win even without a hi-res interface:
-/// no lossy stage at all, and no double resample on a host whose engine already runs at 48 kHz.
-pub const AUDIO_FORMAT_LOSSLESS_48: &str = "lossless48";
-
-/// Bit-exact PCM at 96 kHz / 24-bit (~4.6 Mbps), and only real if the host's capture endpoint
-/// genuinely runs at 96 kHz — the host declines rather than upsampling to meet the request.
-pub const AUDIO_FORMAT_LOSSLESS_96: &str = "lossless96";
-
-/// `(stored value, label)` for the requested audio format — the cross-client table both desktop
-/// settings UIs render, so the two shells can never drift from each other or from the wire.
-///
-/// ⚠ **The stored values are shared VERBATIM with the Apple client's `AudioFormatChoice` raw
-/// values and the Android client's `AUDIO_FORMAT_*`.** One profile catalog round-trips through all
-/// four clients (`profiles.rs`), and a spelling that differs by a single character fails in the
-/// worst possible way: the key is carried through untouched, so a profile written on a phone would
-/// keep working on a TV and silently inherit the global default here. Change these only in lockstep
-/// with `clients/apple/Sources/PunktfunkShared/EffectiveSettings.swift` and
-/// `clients/android/app/src/main/kotlin/io/unom/punktfunk/Settings.kt`.
-///
-/// **The ladder is 48/96 kHz only, and that is arithmetic rather than bandwidth.** Core's jitter
-/// policy sizes every buffer as `ms × samples-per-ms` with an INTEGER per-ms: 48 000 → 48 and
-/// 96 000 → 96 are exact, 44 100 → 44.1 truncates to 44 — a silent 2.3 % error in every target and
-/// every reported depth. 44.1 kHz and its multiples are deferred behind reworking that arithmetic
-/// (`design/hi-res-audio.md` §4.1), and the host would decline them regardless.
-///
-/// Lossless at 48 kHz / **16**-bit is deliberately absent from the menu even though the env
-/// override below can still ask for it: it spends ~1.5 Mbps to sound like the transparent 256 kbps
-/// Opus it replaces. 24-bit is where the plane earns its bandwidth.
-pub const AUDIO_FORMATS: &[(&str, &str)] = &[
-    (AUDIO_FORMAT_OPUS, "Standard (Opus)"),
-    (AUDIO_FORMAT_LOSSLESS_48, "Lossless 48 kHz / 24-bit"),
-    (AUDIO_FORMAT_LOSSLESS_96, "Lossless 96 kHz / 24-bit"),
-];
-
-/// The `(rate_hz, bits)` a stored [`AUDIO_FORMATS`] value asks the host for; `None` = the Opus
-/// plane, which the caller must turn into the unspecified `0`/`0` pair on the wire rather than an
-/// explicit 48 000/16 — core reads any non-zero pair as "this client is asking for the lossless
-/// plane", so a literal legacy pair would advertise hi-res on every ordinary session.
-///
-/// An unrecognized value — a newer client's row, or a corrupted settings file — resolves to Opus
-/// rather than blocking the connect, matching what the Apple and Android ports do with the same
-/// string. Deriving the pair FROM the stored value is what stops the menu row and the format ever
-/// disagreeing.
-pub fn audio_format_wire(setting: &str) -> Option<(u32, u8)> {
-    use punktfunk_core::audio::pcm::BITS_24;
-    match setting {
-        AUDIO_FORMAT_LOSSLESS_48 => Some((48_000, BITS_24)),
-        AUDIO_FORMAT_LOSSLESS_96 => Some((96_000, BITS_24)),
-        _ => None,
-    }
-}
+// The audio-format vocabulary (`AUDIO_FORMAT_*`, the `AUDIO_FORMATS` table, `audio_format_wire`)
+// lives in the portable `audio_format` module now — the Skia console's settings screen reads it
+// on Android too, where nothing else in this file compiles. Re-exported here so every desktop
+// caller's `session::AUDIO_FORMATS` spelling stays valid.
+pub use crate::audio_format::{
+    audio_format_wire, AUDIO_FORMATS, AUDIO_FORMAT_LOSSLESS_48, AUDIO_FORMAT_LOSSLESS_96,
+    AUDIO_FORMAT_OPUS,
+};
 
 /// The lossless format this client ASKS the host for — `Some((rate_hz, bits))` when it is on,
 /// `None` for the legacy Opus plane.
@@ -2099,6 +2052,9 @@ fn spawn_audio(
         Ok("1") | Ok("true")
     );
     let sync_cell = player.sync_cell();
+    // The device callback's counters. Logged from THIS thread, on wall clock — the PipeWire
+    // callback runs on the graph's realtime loop and formats nothing (`crate::audio_vitals`).
+    let vitals = player.vitals();
     let video_e2e = connector.video_e2e_shared();
     let av_offset_out = connector.audio_av_offset_shared();
     let buffer_ms_out = connector.audio_buffer_ms_shared();
@@ -2131,6 +2087,14 @@ fn spawn_audio(
     std::thread::Builder::new()
         .name("punktfunk-audio-rx".into())
         .spawn(move || {
+            // Best-effort priority for the decode leg. This thread's lateness is absorbed by
+            // the ring (target 15 ms and up), so it is not the callback's problem in kind — but
+            // on a Steam Deck the same four cores decode 1440p120 and present it, and a decode
+            // thread descheduled past the ring depth is a drought the callback then has to
+            // conceal. `setpriority` where RLIMIT_NICE allows, else the Realtime portal (in a
+            // flatpak) or rtkit — the sanctioned unprivileged paths; a refusal leaves the thread
+            // exactly as it was. See `audio_rt`.
+            crate::audio_rt::boost_and_log("punktfunk-audio-rx");
             let mut pcm = vec![0f32; scratch];
             let mut gaps = punktfunk_core::audio::AudioGapTracker::new();
             // Interleaved samples in the last decoded frame — the unit concealment is produced in.
@@ -2152,7 +2116,47 @@ fn spawn_audio(
                 frame_us,
             );
             let mut last_packet = std::time::Instant::now();
+            // The playback vitals line, ~every 10 s on wall clock (it used to be every 2 000
+            // device callbacks from inside the callback — same fields, same name, so a field-log
+            // grep keeps working), plus the one-shot quantum line the first time the callback
+            // has published one.
+            let mut last_vitals = std::time::Instant::now();
+            let mut quantum_logged = false;
             while !stop.load(Ordering::SeqCst) {
+                if !quantum_logged && vitals.quantum_known() {
+                    quantum_logged = true;
+                    let v = vitals.snapshot();
+                    tracing::info!(
+                        requested_frames = v.requested_frames,
+                        capacity_frames = v.capacity_frames,
+                        write_frames = v.write_frames,
+                        // From the session's rate, not from 48: a 96 kHz quantum divided by 48
+                        // reads as twice the latency it is, in the one line an on-glass latency
+                        // report is triaged from.
+                        write_ms = v.write_frames / (rate_hz / 1000).max(1),
+                        rate_hz,
+                        "audio playback quantum"
+                    );
+                }
+                if last_vitals.elapsed() >= Duration::from_secs(10) {
+                    last_vitals = std::time::Instant::now();
+                    let v = vitals.snapshot();
+                    tracing::debug!(
+                        buffer_ms = v.buffer_ms,
+                        target_ms = v.target_ms,
+                        underruns = v.underruns,
+                        drift_sheds = v.sheds,
+                        // The other direction of the same correction: sync-driven deepening,
+                        // one duplicated crossfaded frame each. Concealment must stay visible.
+                        drift_inserts = v.inserts,
+                        callbacks = v.callbacks,
+                        // Concealment must be visible next to the underruns it prevented: a
+                        // healthy `underruns` bought with a climbing `plc_ms` is a link in
+                        // trouble, not a link that is fine.
+                        plc_ms = sync_cell.plc_ms(),
+                        "audio playback"
+                    );
+                }
                 // Wait at most one frame WHILE there is a stream to protect: the drought decision
                 // has to be made on the wire's schedule, not whenever the next packet happens to
                 // turn up. Before anything has decoded there is no state to conceal from and

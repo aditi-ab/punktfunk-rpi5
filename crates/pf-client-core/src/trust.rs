@@ -1182,8 +1182,8 @@ pub struct Settings {
     /// can capture; the resolved count drives the decoder + playback layout.
     pub audio_channels: u8,
     /// Requested audio format — the cross-client `audio_format` key, whose stored values are shared
-    /// verbatim with the Apple and Android clients (`crate::session::AUDIO_FORMATS`):
-    /// [`crate::session::AUDIO_FORMAT_OPUS`] (the default, and byte for byte the session every
+    /// verbatim with the Apple and Android clients (`crate::audio_format::AUDIO_FORMATS`):
+    /// [`crate::audio_format::AUDIO_FORMAT_OPUS`] (the default, and byte for byte the session every
     /// build before the lossless plane ran), `..._LOSSLESS_48` or `..._LOSSLESS_96`.
     ///
     /// Off by default and deliberately: lossless takes 2.3–4.6 Mbps off the top of the link,
@@ -1399,7 +1399,7 @@ fn default_codec() -> String {
 /// an older client must load as. Named from `session` so the default and the menu's first row can
 /// never be two different strings.
 fn default_audio_format() -> String {
-    crate::session::AUDIO_FORMAT_OPUS.into()
+    crate::audio_format::AUDIO_FORMAT_OPUS.into()
 }
 
 fn default_auto() -> String {

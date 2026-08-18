@@ -124,10 +124,21 @@ def main(prefix):
         if p["cmd"] != RET_SUBMIT:
             continue
         req = submits.get(p["seq"])
-        # The two rules vhci_hcd kills the whole connection over, checked against its own logic.
-        if p["dir"] == 0 and not p["npkts"] and p["actual"]:
-            bad.append((p, f"OUT reply declares actual_length={p['actual']}, but the kernel reads "
-                           f"NO payload back on OUT — those bytes desync every frame after it"))
+        # The rule vhci_hcd kills the whole connection over, checked against its own logic — plus
+        # the quieter one that kills nothing and breaks everything: an OUT reply's `actual_length`
+        # is copied into the URB verbatim and is what `write()` on the device node returns, so an
+        # OUT reply claiming 0 against a non-empty request tells every writer it sent nothing.
+        # (An earlier version of this check flagged ANY nonzero OUT actual_length as a desync;
+        # that was wrong — the kernel reads no payload back on OUT whatever the field says, so the
+        # framing above never depends on it. Field-diagnosed 2026-08-18: winebus's DualSense
+        # haptics enable "failed" for months on exactly this.)
+        if req and p["dir"] == 0 and not p["npkts"] and p["actual"] > req["xfer_len"]:
+            bad.append((p, f"OUT reply claims actual_length={p['actual']} > the {req['xfer_len']} "
+                           f"bytes the kernel sent — a device cannot accept more than it was given"))
+        elif req and p["dir"] == 0 and not p["npkts"] and req["xfer_len"] and not p["actual"]:
+            bad.append((p, f"OUT reply claims actual_length=0 against a {req['xfer_len']}-byte "
+                           f"write — write()/HIDIOCSFEATURE on the device node return 0 and every "
+                           f"caller checking '> 0' (winebus does) takes the write as failed"))
         elif req and p["dir"] == 1 and p["actual"] > req["xfer_len"]:
             bad.append((p, f"actual_length {p['actual']} > the {req['xfer_len']} requested "
                            f"(setup {req['setup']}) — usbip_recv_xbuff() calls this a malicious "

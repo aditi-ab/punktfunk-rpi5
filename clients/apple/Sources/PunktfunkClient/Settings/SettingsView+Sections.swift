@@ -448,6 +448,20 @@ extension SettingsView {
                     + "directly.") {
                     Toggle("Show game library", isOn: $libraryEnabled)
                 }
+                if libraryEnabled {
+                    described("How the controller-optimized library arranges titles: Shelf is the "
+                        + "coverflow, Grid shows more at once.") {
+                        Picker("Library view", selection: $libraryViewRaw) {
+                            ForEach(LibraryArrangement.all, id: \.stored) { arrangement in
+                                Text(arrangement.label).tag(arrangement.stored)
+                            }
+                        }
+                    }
+                    described("Opens a library on its platform groups first; a library with one "
+                        + "platform still opens on the shelf.") {
+                        Toggle("Start in collections", isOn: $libraryCollections)
+                    }
+                }
             }
         }
     }
