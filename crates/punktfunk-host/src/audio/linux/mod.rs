@@ -1199,6 +1199,11 @@ fn pw_thread(
                             // percentage and mean entirely different things.
                             gaps = ud.stats.gaps,
                             max_gap_ms = ud.stats.max_gap_ms(),
+                            // …and their SHAPE: bucket counts under 20/50/100 ms and ≥ 100 ms,
+                            // plus the audio they cost. Sixty 30 ms stalls and fifty-nine
+                            // hiccups plus one outage share `gaps=60`; they do not share this.
+                            gap_hist = %ud.stats.gap_hist(),
+                            missing_ms = ud.stats.missing_ms(),
                             // The OTHER thing a shortfall can be (see `CaptureStats::pauses`):
                             // time our node was not in the graph at all. `gaps` deliberately
                             // cannot see it, so without these two a paused span and a starved

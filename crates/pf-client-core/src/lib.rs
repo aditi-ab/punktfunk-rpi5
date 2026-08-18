@@ -26,6 +26,10 @@ pub mod audio;
 #[cfg(windows)]
 #[path = "audio_wasapi.rs"]
 pub mod audio;
+// The playback vitals both twins publish from their device callback and the decode thread logs
+// — atomics only, because the PipeWire callback runs on the graph's realtime loop.
+#[cfg(any(target_os = "linux", windows))]
+pub mod audio_vitals;
 #[cfg(any(target_os = "linux", windows))]
 pub mod discovery;
 #[cfg(any(target_os = "linux", windows))]

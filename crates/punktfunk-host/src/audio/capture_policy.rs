@@ -103,6 +103,13 @@ pub(crate) const STATS_EVERY: Duration = Duration::from_secs(30);
 /// 2.7 ms) from scoring ordinary scheduling noise as a hole.
 const GAP_FLOOR: Duration = Duration::from_millis(10);
 
+/// Upper edges (exclusive, ms) of the gap-size histogram's first buckets; the last bucket is
+/// everything at or above the final edge. Chosen around what the client can hide: libopus PLC
+/// covers ~50 ms of a seq gap, the drought fuse twice a de-prime window (80–120 ms by preset), so
+/// `<20` is a hiccup nobody hears, `<50` is concealable, `<100` is on the edge, and `≥100` is a
+/// dropout however good the concealment.
+pub(crate) const GAP_HIST_EDGES_MS: [u64; 3] = [20, 50, 100];
+
 /// One reporting window's worth of capture vitals.
 ///
 /// The point is to make three states that used to look identical in a log tell themselves apart: a
@@ -134,6 +141,16 @@ pub(crate) struct CaptureStats {
     pub(crate) gaps: u64,
     /// The largest of those, µs. Reported in ms; kept in µs so a sub-ms threshold is expressible.
     pub(crate) max_gap_us: u64,
+    /// The SHAPE of those gaps: how many fell in each of [`GAP_HIST_EDGES_MS`]'s buckets, and
+    /// the audio they cost in total. `gaps` + `max_gap_ms` say "sixty holes, the worst 146 ms"
+    /// and leave a reader unable to tell sixty 30 ms stalls (a periodic scheduler on the box)
+    /// from fifty-nine 12 ms hiccups and one outage — a different fault with a different fix.
+    /// The 2026-08-17 field log had exactly that ambiguity across 53 windows. `missing_us` also
+    /// closes the arithmetic between `gaps` and `delivered_pct`: when the sum of the gaps
+    /// accounts for the shortfall the loss is all in counted holes, and when it does not, the
+    /// remainder is sub-threshold losses the counter cannot see (see [`GAP_FLOOR`]).
+    pub(crate) gap_hist: [u64; GAP_HIST_EDGES_MS.len() + 1],
+    pub(crate) missing_us: u64,
     /// Callbacks that ran but carried nothing — no buffer to dequeue, no `datas`, no mapped
     /// memory. Every one of these used to `return` silently, so a stream that fired its callback
     /// on time and handed us nothing looked identical to a stream nobody was feeding.
@@ -187,20 +204,49 @@ impl CaptureStats {
     pub(crate) fn observe_callback(&mut self, since_last: Option<Duration>, quantum: Duration) {
         let Some(delta) = since_last else { return };
         if delta > (quantum * 2).max(GAP_FLOOR) {
-            self.gaps += 1;
             // The MISSING audio, not the callback delta: one quantum of that delta is the buffer
             // we were legitimately handed. Reporting the delta would inflate every gap by the
             // quantum and — worse — mean something different from the Windows feed, which sizes
             // its holes from the device position and so reports missing audio by construction.
-            self.max_gap_us = self
-                .max_gap_us
-                .max(delta.saturating_sub(quantum).as_micros() as u64);
+            self.observe_gap(delta.saturating_sub(quantum));
         }
+    }
+
+    /// Score one hole of `missing` audio — the shared accounting behind both feeds: the Linux
+    /// callback cadence above, and the Windows discontinuity flag, which measures the hole from
+    /// the device position and calls this directly.
+    pub(crate) fn observe_gap(&mut self, missing: Duration) {
+        self.gaps += 1;
+        let us = missing.as_micros() as u64;
+        self.max_gap_us = self.max_gap_us.max(us);
+        self.missing_us = self.missing_us.saturating_add(us);
+        let ms = us / 1_000;
+        let bucket = GAP_HIST_EDGES_MS
+            .iter()
+            .position(|&edge| ms < edge)
+            .unwrap_or(GAP_HIST_EDGES_MS.len());
+        self.gap_hist[bucket] += 1;
     }
 
     /// The window's worst gap in whole ms — the unit the log line and the field reports speak.
     pub(crate) fn max_gap_ms(&self) -> u64 {
         self.max_gap_us / 1_000
+    }
+
+    /// Audio the window's counted gaps cost in total, whole ms.
+    pub(crate) fn missing_ms(&self) -> u64 {
+        self.missing_us / 1_000
+    }
+
+    /// The gap-size histogram as one log field, `a/b/c/d` = counts under 20 / 50 / 100 ms and
+    /// at-or-above 100 ms ([`GAP_HIST_EDGES_MS`]). One field rather than four so the line stays
+    /// greppable and the buckets read as a shape.
+    pub(crate) fn gap_hist(&self) -> String {
+        self.gap_hist
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join("/")
     }
 
     /// Record one span the stream spent away from `Streaming`.
@@ -400,6 +446,9 @@ pub(crate) struct InfillPolicy {
     filled: Duration,
     /// Latched once a hole outlives the budget and the wire falls silent.
     broke: bool,
+    /// The largest capture chunk seen, as a duration — see [`Self::after`]. Zero until the
+    /// caller reports one, which leaves every figure here at its frame-denominated default.
+    quantum: Duration,
 }
 
 impl InfillPolicy {
@@ -419,15 +468,31 @@ impl InfillPolicy {
             frame: Duration::from_micros(frame_us.max(1) as u64),
             filled: Duration::ZERO,
             broke: false,
+            quantum: Duration::ZERO,
         }
+    }
+
+    /// Tell the policy how big the capture chunks actually are. Called with each chunk's
+    /// duration; only the largest is kept, so a graph that hands us 21 ms buffers lifts
+    /// [`after`](Self::after) once and a single short buffer never lowers it.
+    pub(crate) fn note_quantum(&mut self, chunk: Duration) {
+        self.quantum = self.quantum.max(chunk);
     }
 
     /// How long a capture hole may run before the wire starts covering it. Two protocol frames:
     /// long enough that ordinary quantum jitter never trips it, short enough that the client's
     /// ring never notices the hole. Two frames of THIS session — the client's ring is sized in
     /// its own frames, so that is what "before it notices" is measured in.
+    ///
+    /// …at a quantum of a frame or two. A graph that clamps us to a 21 ms buffer (a VM's
+    /// `min-quantum = 1024`, see `audio::linux`) legitimately goes 21 ms between chunks, and
+    /// two frames after the last one is the MIDDLE of a normal cycle: a chunk merely a couple
+    /// of milliseconds late would read as a hole, be covered, and leave one frame of surplus
+    /// behind for good. So the threshold is never less than one chunk plus one frame — the
+    /// jitter budget a chunk is allowed before it counts as missing. Identical to two frames
+    /// wherever the quantum is a frame, which is every host that asked for one and got it.
     pub(crate) fn after(&self) -> Duration {
-        self.frame * 2
+        (self.frame * 2).max(self.quantum + self.frame)
     }
 
     /// Decide the slot that is due now. Call EXACTLY once per due frame — it consumes budget.
@@ -449,6 +514,19 @@ impl InfillPolicy {
     /// instead of waking every few milliseconds to decide to stay quiet.
     pub(crate) fn exhausted(&self) -> bool {
         self.filled >= INFILL_MAX
+    }
+
+    /// Silence sent for the hole currently open. Read after [`decide`](Self::decide) says
+    /// `Silence`: equal to one frame means that frame is the FIRST of the hole — the one that
+    /// carries the fade out of the last real audio (see the caller) — and anything larger is
+    /// deep enough into the hole to be plain silence.
+    pub(crate) fn covered(&self) -> Duration {
+        self.filled
+    }
+
+    /// One frame of this session, the unit [`covered`](Self::covered) counts in.
+    pub(crate) fn frame(&self) -> Duration {
+        self.frame
     }
 
     /// A real chunk arrived. Returns whether the hole it closed BROKE continuity — the wire went
@@ -598,6 +676,44 @@ mod tests {
         );
     }
 
+    /// The histogram is what tells sixty 30 ms stalls from fifty-nine 12 ms hiccups and one
+    /// outage — `gaps=60` either way, and the 2026-08-17 field log had exactly that ambiguity.
+    /// Buckets sit on the client-concealment edges, the total is the audio the holes cost, and
+    /// both feeds (Linux cadence, Windows discontinuity) land in the same accounting.
+    #[test]
+    fn gap_histogram_gives_the_shape_and_the_cost() {
+        let mut stalls = CaptureStats::default();
+        for _ in 0..60 {
+            // A 30 ms hole arrives as a 35 ms callback delta at the 5 ms quantum.
+            stalls.observe_callback(Some(Q + Duration::from_millis(30)), Q);
+        }
+        assert_eq!(stalls.gaps, 60);
+        assert_eq!(stalls.gap_hist(), "0/60/0/0", "all in the <50 ms bucket");
+        assert_eq!(stalls.missing_ms(), 60 * 30);
+
+        let mut mixed = CaptureStats::default();
+        for _ in 0..59 {
+            mixed.observe_callback(Some(Q + Duration::from_millis(12)), Q);
+        }
+        // The Windows feed measures the hole from the device position and calls this directly.
+        mixed.observe_gap(Duration::from_millis(1_092));
+        assert_eq!(mixed.gaps, 60, "same count as the stalls above…");
+        assert_eq!(
+            mixed.gap_hist(),
+            "59/0/0/1",
+            "…and nothing like the same shape"
+        );
+        assert_eq!(mixed.missing_ms(), 59 * 12 + 1_092);
+        assert_eq!(mixed.max_gap_ms(), 1_092);
+
+        // Edges are exclusive on the upper side: exactly 20 ms is the second bucket.
+        let mut edge = CaptureStats::default();
+        edge.observe_gap(Duration::from_millis(20));
+        edge.observe_gap(Duration::from_micros(19_999));
+        edge.observe_gap(Duration::from_millis(100));
+        assert_eq!(edge.gap_hist(), "1/1/0/1");
+    }
+
     /// A stream delivering exactly what it negotiated is never a gap — including the clamped
     /// 21.3 ms quantum a VM's `default.clock.min-quantum` forces, which would otherwise score a
     /// gap on every single callback and bury the real ones.
@@ -667,6 +783,43 @@ mod tests {
             "the wire must cover exactly the budget, in frames of {FRAME_MS} ms"
         );
         assert!(p.exhausted(), "…and then stop asking");
+    }
+
+    /// A clamped quantum lifts the hole threshold to one chunk plus one frame, so a 21 ms VM
+    /// buffer arriving a couple of milliseconds late is jitter, not a hole to be covered — and
+    /// at a frame-sized quantum nothing moves. `covered()`/`frame()` let the caller pick out the
+    /// first frame of a hole, which is the one that carries the fade.
+    #[test]
+    fn infill_threshold_follows_a_clamped_quantum() {
+        let frame = Duration::from_millis(FRAME_MS as u64);
+        let mut tight = InfillPolicy::new(OPUS_FRAME_US);
+        tight.note_quantum(Duration::from_micros(2_667)); // 128 frames at 48 kHz
+        tight.note_quantum(frame); // 240 frames — what we ask for
+        assert_eq!(
+            tight.after(),
+            frame * 2,
+            "a frame-sized quantum changes nothing"
+        );
+
+        let mut vm = InfillPolicy::new(OPUS_FRAME_US);
+        vm.note_quantum(Duration::from_micros(21_333)); // 1024 frames at 48 kHz
+        vm.note_quantum(Duration::from_micros(2_667)); // one short buffer never lowers it
+        assert_eq!(
+            vm.after(),
+            Duration::from_micros(26_333),
+            "one chunk plus one frame"
+        );
+        assert_eq!(
+            vm.decide(Duration::from_millis(23)),
+            Infill::Wait,
+            "a chunk 2 ms late on a 21 ms quantum is not a hole"
+        );
+        assert_eq!(vm.decide(Duration::from_millis(27)), Infill::Silence);
+        assert_eq!(vm.covered(), vm.frame(), "the first frame of the hole");
+        assert_eq!(vm.decide(Duration::from_millis(32)), Infill::Silence);
+        assert_eq!(vm.covered(), vm.frame() * 2, "…and no longer the first");
+        vm.chunk_arrived();
+        assert_eq!(vm.covered(), Duration::ZERO, "a chunk closes the hole");
     }
 
     /// **The gate on re-deriving these policies from `audio_frame_us`.** A 5 ms Opus session must

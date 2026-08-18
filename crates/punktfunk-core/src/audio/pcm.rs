@@ -350,7 +350,13 @@ impl PcmConceal {
 
 /// Apply a raised-cosine fade to the final `n` samples in place, so a spliced or repeated frame
 /// meets what follows it without a step.
-fn raised_cosine_tail(buf: &mut [f32], n: usize) {
+///
+/// `pub` for the host's capture-hole infill (`punktfunk-host::native::audio`), which fades the
+/// audio into a hole rather than stepping to digital zero — same curve, same reason. `n` counts
+/// interleaved samples: a fade meant to span whole frames of a multi-channel signal passes
+/// `frames × channels`, and adjacent channels of one frame then sit one step apart on the curve
+/// (a 1/n gain difference — nothing, at any fade longer than a few frames).
+pub fn raised_cosine_tail(buf: &mut [f32], n: usize) {
     let n = n.min(buf.len());
     if n == 0 {
         return;
@@ -359,6 +365,20 @@ fn raised_cosine_tail(buf: &mut [f32], n: usize) {
     for (i, s) in buf[start..].iter_mut().enumerate() {
         let t = (i as f32 + 0.5) / n as f32;
         *s *= 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
+    }
+}
+
+/// The mirror of [`raised_cosine_tail`]: fade the FIRST `n` samples in from zero, so audio that
+/// resumes mid-waveform after a hole (or after silence) starts without a step. `n` counts
+/// interleaved samples, like the tail.
+pub fn raised_cosine_head(buf: &mut [f32], n: usize) {
+    let n = n.min(buf.len());
+    if n == 0 {
+        return;
+    }
+    for (i, s) in buf[..n].iter_mut().enumerate() {
+        let t = (i as f32 + 0.5) / n as f32;
+        *s *= 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
     }
 }
 
@@ -775,5 +795,28 @@ mod tests {
             "ends at silence: {}",
             out.last().unwrap()
         );
+    }
+
+    /// The head fade is the tail fade run backwards: it starts at silence, lands at full level,
+    /// touches nothing past `n`, and the two together are unity — so a tail-faded frame followed
+    /// by a head-faded one is a crossfade, not a dip.
+    #[test]
+    fn the_head_fade_mirrors_the_tail_fade() {
+        let mut head = vec![1.0f32; 64];
+        raised_cosine_head(&mut head, 32);
+        assert!(head[0] < 0.01, "starts at silence: {}", head[0]);
+        assert!(head[31] > 0.99, "lands at full level: {}", head[31]);
+        assert_eq!(head[32], 1.0, "untouched past n");
+        let mut tail = vec![1.0f32; 32];
+        raised_cosine_tail(&mut tail, 32);
+        for i in 0..32 {
+            let sum = head[i] + tail[i];
+            assert!((sum - 1.0).abs() < 1e-5, "unity at {i}: {sum}");
+        }
+        // Degenerate lengths must not panic or touch anything.
+        let mut short = vec![1.0f32; 4];
+        raised_cosine_head(&mut short, 0);
+        raised_cosine_head(&mut short, 100);
+        assert!(short[3] > 0.9);
     }
 }

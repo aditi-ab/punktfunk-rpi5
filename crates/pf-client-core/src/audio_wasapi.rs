@@ -283,6 +283,10 @@ pub struct AudioPlayer {
     /// A/V sync hand-off with the render thread: it publishes the ring depth, the decode thread
     /// posts the depth the sync loop wants. See [`punktfunk_core::audio::AudioSyncCell`].
     sync: Arc<punktfunk_core::audio::AudioSyncCell>,
+    /// The render loop's vitals, logged by the decode thread — the same surface the PipeWire
+    /// twin exposes, so `session.rs` prints one line shape on both platforms
+    /// (see [`crate::audio_vitals`]).
+    vitals: Arc<crate::audio_vitals::PlaybackVitals>,
 }
 
 impl AudioPlayer {
@@ -306,10 +310,14 @@ impl AudioPlayer {
         let stop_t = stop.clone();
         let sync: Arc<punktfunk_core::audio::AudioSyncCell> = Arc::default();
         let sync_t = sync.clone();
+        let vitals: Arc<crate::audio_vitals::PlaybackVitals> = Arc::default();
+        let vitals_t = vitals.clone();
         let thread = std::thread::Builder::new()
             .name("punktfunk-audio".into())
             .spawn(move || {
-                if let Err(e) = render_thread(pcm_rx, recycle_tx, stop_t, ready_tx, fmt, sync_t) {
+                if let Err(e) =
+                    render_thread(pcm_rx, recycle_tx, stop_t, ready_tx, fmt, sync_t, vitals_t)
+                {
                     tracing::warn!(error = %format!("{e:#}"), "audio playback thread ended");
                 }
             })
@@ -333,6 +341,7 @@ impl AudioPlayer {
                     stop,
                     thread: Some(thread),
                     sync,
+                    vitals,
                 })
             }
             Ok(Err(e)) => Err(e),
@@ -353,6 +362,11 @@ impl AudioPlayer {
     /// depth the sync loop wants back through it.
     pub fn sync_cell(&self) -> Arc<punktfunk_core::audio::AudioSyncCell> {
         self.sync.clone()
+    }
+
+    /// The render loop's vitals — the decode thread logs them (see [`crate::audio_vitals`]).
+    pub fn vitals(&self) -> Arc<crate::audio_vitals::PlaybackVitals> {
+        self.vitals.clone()
     }
 
     /// Queue one interleaved f32 chunk (in the session's channel layout). Drops the chunk if the
@@ -380,6 +394,7 @@ fn render_thread(
     ready: SyncSender<Result<Option<u32>>>,
     fmt: PlaybackFormat,
     sync: Arc<punktfunk_core::audio::AudioSyncCell>,
+    vitals: Arc<crate::audio_vitals::PlaybackVitals>,
 ) -> Result<()> {
     if let Err(e) = wasapi::initialize_mta()
         .ok()
@@ -484,7 +499,6 @@ fn render_thread(
             punktfunk_core::audio::JitterPolicy::new_at_rate(TUNING, channels, fmt.rate_hz);
         policy.set_frame_us(fmt.frame_us);
         let mut out = Vec::new(); // per-quantum scratch, reused across iterations
-        let (mut underruns, mut sheds, mut callbacks) = (0u64, 0u64, 0u64);
 
         while !stop.load(Ordering::Relaxed) {
             if h_event.wait_for_event(100).is_err() {
@@ -504,6 +518,15 @@ fn render_thread(
                 continue;
             }
             let want = avail_frames * channels as usize;
+            // Once per stream: the engine's period as we first see it — same field meanings as
+            // the PipeWire twin's line, printed by the decode thread.
+            if !vitals.quantum_known() {
+                vitals.note_quantum(
+                    avail_frames as u32,
+                    avail_frames as u32,
+                    avail_frames as u32,
+                );
+            }
 
             // A/V sync: same contract as the PipeWire ring — take the decode thread's request,
             // publish where the ring actually is. The policy clamps the request against its own
@@ -513,7 +536,6 @@ fn render_thread(
 
             let step = policy.step(ring.len(), want);
             if step.drop_front > 0 {
-                sheds += 1;
                 punktfunk_core::audio::crossfade_drop(&mut ring, step.drop_front, step.crossfade);
             }
 
@@ -533,21 +555,13 @@ fn render_thread(
             // No-op while un-primed (the policy ignores it), so a deliberate priming silence is
             // never miscounted as an underrun.
             policy.note_read(ran_short);
-            underruns += u64::from(ran_short);
-            callbacks += 1;
-            if callbacks % 1_000 == 0 {
-                tracing::debug!(
-                    buffer_ms = policy.avg_depth_ms(),
-                    target_ms = policy.target_ms(),
-                    underruns,
-                    drift_sheds = sheds,
-                    // Concealment must be visible next to the underruns it prevented: a healthy
-                    // `underruns` bought with a climbing `plc_ms` is a link in trouble, not a
-                    // link that is fine.
-                    plc_ms = sync.plc_ms(),
-                    "audio playback"
-                );
-            }
+            // The 10 s `audio playback` line is printed by the decode thread from these.
+            vitals.note_callback(
+                ran_short,
+                step.drop_front > 0,
+                policy.avg_depth_ms(),
+                policy.target_ms(),
+            );
             render_client
                 .write_to_device(avail_frames, &out, None)
                 .context("write_to_device")?;

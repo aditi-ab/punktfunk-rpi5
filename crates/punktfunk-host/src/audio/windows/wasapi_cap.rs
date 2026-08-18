@@ -249,6 +249,14 @@ fn capture_thread(
         let _ = ready.send(Err(e));
         return Ok(());
     }
+    // This is the thread that produces the chunks the paced sender consumes — the one that
+    // has to wake on the engine's event every 10 ms and read the loopback packets before the
+    // engine's buffer wraps. The SENDER has carried `THREAD_PRIORITY_HIGHEST` + MMCSS since the
+    // data-plane QoS work; this reader ran at normal priority beside it, so a CPU-saturating
+    // game could hold it off long enough for `DATA_DISCONTINUITY` to fire — a hole the sender
+    // then dutifully covered. Same boost, same helper: it registers the MMCSS task and raises
+    // the class, and is a no-op where either is refused.
+    pf_frame::thread_qos::boost_thread_priority(true);
     // Self-heal for the capturer's whole life: each `capture_once` is one endpoint open + inner
     // capture loop; it returns to reopen (default-device change) or errors (device invalidated,
     // engine restart). The FIRST open gets [`FIRST_OPEN_ATTEMPTS`] tries (session-start endpoint
@@ -777,11 +785,10 @@ fn capture_once(
                         stats.missed_dequeues += 1;
                     } else {
                         if info.flags.data_discontinuity && flowing {
-                            stats.gaps += 1;
                             let lost = info.index.saturating_sub(next_index);
-                            stats.max_gap_us = stats
-                                .max_gap_us
-                                .max(lost.saturating_mul(1_000_000) / open_hz.max(1) as u64);
+                            stats.observe_gap(Duration::from_micros(
+                                lost.saturating_mul(1_000_000) / open_hz.max(1) as u64,
+                            ));
                         }
                         next_index = info.index.saturating_add(frames);
                         last_packet = Some(now);
@@ -846,6 +853,10 @@ fn capture_once(
                 // resumes is not among them — see [`LOOPBACK_IDLE_AFTER`].
                 gaps = stats.gaps,
                 max_gap_ms = stats.max_gap_ms(),
+                // Their shape (bucket counts under 20/50/100 ms and ≥ 100 ms) and their total
+                // cost — same fields, same meaning as the Linux line.
+                gap_hist = %stats.gap_hist(),
+                missing_ms = stats.missing_ms(),
                 missed_dequeues = stats.missed_dequeues,
                 dropped_chunks = stats.dropped_chunks,
                 "desktop audio capture"
