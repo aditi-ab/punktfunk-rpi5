@@ -538,6 +538,15 @@ fn render_thread(
             if step.drop_front > 0 {
                 punktfunk_core::audio::crossfade_drop(&mut ring, step.drop_front, step.crossfade);
             }
+            // The mirror: the sync loop asked for a DEEPER ring, answered with one duplicated,
+            // crossfaded frame instead of a de-prime (see `JitterStep::insert_front`).
+            if step.insert_front > 0 {
+                punktfunk_core::audio::crossfade_insert(
+                    &mut ring,
+                    step.insert_front,
+                    step.crossfade,
+                );
+            }
 
             out.clear();
             out.resize(avail_frames * block_align, 0);
@@ -559,6 +568,7 @@ fn render_thread(
             vitals.note_callback(
                 ran_short,
                 step.drop_front > 0,
+                step.insert_front > 0,
                 policy.avg_depth_ms(),
                 policy.target_ms(),
             );

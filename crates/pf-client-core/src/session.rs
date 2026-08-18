@@ -2199,6 +2199,9 @@ fn spawn_audio(
                         target_ms = v.target_ms,
                         underruns = v.underruns,
                         drift_sheds = v.sheds,
+                        // The other direction of the same correction: sync-driven deepening,
+                        // one duplicated crossfaded frame each. Concealment must stay visible.
+                        drift_inserts = v.inserts,
                         callbacks = v.callbacks,
                         // Concealment must be visible next to the underruns it prevented: a
                         // healthy `underruns` bought with a climbing `plc_ms` is a link in
