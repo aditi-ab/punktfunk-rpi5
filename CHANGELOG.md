@@ -12,6 +12,431 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ---
 
+## v0.31.0
+
+88 commits since v0.30.0 (64 non-merge).
+
+Nothing versioned moves. `WIRE_VERSION` stays **2**, the C ABI stays **24** — `include/punktfunk_core.h`
+is byte-identical to the v0.30.0 tag — the driver protocol, gamepad channel and plugin index schema
+are all unchanged, and no `trust::Settings` field, capability bit or control-message type byte was
+added. Every 0.30.x host, client, driver and plugin keeps interoperating in both directions, with no
+re-pairing.
+
+What did move is beneath the versioned surfaces, and three parts of it are worth a packager's or
+embedder's attention: the Linux host package installs **three new system files** (a udev rule, a
+WirePlumber policy and an ALSA UCM drop-in) that the DualSense audio path depends on; the Linux
+desktop-audio capture **flipped topology by default** (`PUNKTFUNK_STREAM_SINK` unset now means a
+host-owned `null-audio-sink`, with `=stream` a one-release escape hatch to the 0.30 shape); and the
+Android app's Compose console is **deleted** — `pf-console-ui` over Skia/GL is now the console on all
+three ABIs, which removes the Compose screenshot scenes.
+
+### Versions
+
+| | v0.30.0 | v0.31.0 | Notes |
+|---|---|---|---|
+| Wire protocol | 2 | **2** | unchanged |
+| C ABI | 24 | **24** | unchanged — `include/punktfunk_core.h` is byte-identical to the v0.30.0 tag; the only new `pub` items in `punktfunk-core` are three RT-safe DSP helpers (`crossfade_insert`, `pcm::raised_cosine_tail`, `pcm::raised_cosine_head`), Rust-only, no `pub const` for cbindgen to pick up |
+| Rust edition | 2024 | **2024** | unchanged |
+| MSRV (`rust-version`) | 1.85 | **1.85** | unchanged |
+| Workspace crate dirs | 27 | **27** | unchanged (39 `[workspace] members`, also unchanged) |
+| Virtual-display driver protocol | 6 | **6** | unchanged (minimum accepted still 3); `pf-driver-proto` shows no diff against the v0.30.0 tag |
+| Windows virtual-gamepad channel | 3 | **3** | unchanged |
+| Plugin index schema | 1 | **1** | unchanged |
+| Host event schema | 1 | **1** | unchanged (`punktfunk-host/src/events.rs`) |
+| `api/openapi.json` | 0.29.0 | **0.29.0** | unchanged — no management-API surface moved this cycle; both copies (`api/` and `docs-site/public/`) are byte-identical to each other and to the tag |
+| gamescope patch level (`+pfhdrN`) | 8 | **8** | unchanged; no new patch files. ⚠ `packaging/gamescope/PKGBUILD` still says `pfhdr7` — pre-existing at v0.30.0, not a regression this cycle, but the Arch package builds a binary the host's `>= 8` probe rejects for the keymap path |
+| `@punktfunk/host` (SDK) | 0.1.4 | **0.1.4** | unchanged in `package.json` — but `sdk/src/config.ts` and `runner-cli.ts` changed (the `mgmt-endpoint` fix below), so a `sdk-v0.1.5` cut is **owed**; plugins resolve the SDK from the registry and cannot pick the fix up until it ships |
+| `@punktfunk/plugin-kit` | 0.4.2 | **0.4.2** | unchanged in `package.json` — but `sync-engine.ts` gained `minInterval` (below), so a `plugin-kit-v0.4.3` cut is **owed** for the same reason |
+
+⚠ The SDK and plugin-kit version independently of the app (`sdk-v*` / `plugin-kit-v*` tags,
+`sdk-publish.yml` / `plugin-kit-publish.yml`); this release commit does not bump them. Both have
+unpublished code changes, called out in the table so they are cut deliberately rather than
+discovered.
+
+### ⚠ Breaking changes
+
+**None on any versioned surface.** No wire change, no C ABI change, no driver-protocol change, no
+plugin-contract change. Four things are worth attention anyway; none breaks a build:
+
+- **`refactor(android)!` — the Compose console is deleted.** `pf-console-ui` (the Skia shell the
+  desktop session binary draws) is now Android's console on arm64-v8a, x86_64 **and** armeabi-v7a;
+  the gate is simply "does the native host exist", and where it does not a controller drives the
+  touch UI through focus. ~6.5 kLOC of `GamepadHome`, `GamepadSettingsScreen`,
+  `GamepadAddHostScreen`, `GamepadDialogs`, `HomeTiles`, the console halves of `LibraryScreen`,
+  `ConnectOverlay`/`ConnectTakeover`, the `gamepadUi` branches of `ConnectScreen`/`ConnectPrompts`/
+  `AdaptiveDialogs`, `App.kt`'s `GamepadShell`/`GamepadScreen` and their tests are gone. The `!` is
+  for the **store-screenshot surface**: the Compose console's marketing scenes cannot be rendered by
+  Roborazzi any more (the shell draws over native GL); its shots come from the desktop screenshot dump
+  or a device capture. Sysprop `debug.punktfunk.console_backend=compose` is meaningless; `=none`
+  still forces the touch UI on glass.
+- **Linux desktop-audio capture topology flipped by default** — see the audio section. `=stream`
+  restores 0.30 for **one release only**.
+- **Hyprland / sway: `topology: exclusive` now does what it says.** Both backends accepted it,
+  echoed it as the session's effective topology, and dropped it with a warning; because `auto`
+  resolves to Exclusive on any unpinned host, the *default* policy on every auto-detected Hyprland
+  or sway box was an Exclusive that behaved as Extend. Operators who relied on that get their
+  monitors disabled for the session now (closes #284).
+- **Three new system files in the Linux host package** — the DualSense audio path does not work
+  without them. Downstream repackagers: see the packaging section.
+
+### DualSense audio and haptics on Linux: five faults, and the files they needed
+
+The whole in-game path — GE-Proton's haptic router → the pad's ALSA card → the voice coils — had
+never once worked against our virtual pad. In wire order:
+
+- **`usbip`: the calibration feature report was 42 bytes; `hid-playstation` asks for 41.** On a USB
+  backend an over-long reply is not truncated: the kernel treats it as hostile and tears down the
+  connection, not the transfer — the pad vanished ~400 ms after enumerating, and the dmesg order made
+  the teardown look like the cause. Three changes so the trap is not left set: the constant is 41 and
+  all three feature-report sizes are pinned by test; `clamp_reply` clamps every reply to the requested
+  length in the transport and drops any payload a handler returns on an OUT (the kernel never reads
+  one; those bytes would misframe every following PDU); `DualSenseUsbip::open` waits for the kernel
+  to actually bind a HID driver before reporting success (vhci attach succeeds immediately and
+  enumerates asynchronously), so bring-up faults return `Err` and the uhid fallback catches them.
+  New `PUNKTFUNK_USBIP_TRACE` (both socket directions to disk) and `scripts/usbip-trace-analyse.py`.
+- **`usbip`: every non-ISO OUT was answered with an empty buffer, i.e. `actual_length = 0`.** vhci
+  copies that field verbatim into the URB's actual length; the driver returned 0 as the write's byte
+  count; Wine's bus driver reads 0 as failure and prints the thread's *stale* errno — so the ENOENT /
+  EINVAL / EAGAIN in the GE logs were never kernel verdicts. New
+  `UsbIpResponse::usbip_ret_submit_out_success(header, accepted)`; the debug assertion now pins
+  "OUT carries no buffer", not "OUT claims 0"; two wire-byte tests pin both directions. **The Steam
+  Controller 2 shares this handler.** `usbip-trace-analyse.py` had flagged *any* nonzero OUT
+  actual_length as a desync — the rule that would have hidden this bug — and now flags an OUT reply
+  claiming more than it was sent, or 0 against a non-empty write.
+- **`usbip`: ISO completions were paced by relative sleeps**, so timer slop, socket I/O and lock waits
+  accumulated per transfer: the pad's clock ran ~26 % slow (~35,700 frames/s against 48 kHz), its PCM
+  backed up into dropouts, and because completion *is* the pad's audio clock, on the test box the pad
+  sink became the graph driver and pulled desktop capture to 50 % delivery. Now a per-endpoint
+  absolute deadline ledger (a stall > 20 ms re-anchors instead of fast-forwarding a burst); measured
+  after: 48,005 frames/s. Two paused-clock tests pin the rate and the re-anchor.
+- **`usbip`: the capture forwarded the pad's hardware quad as the wire's speaker pair.** Hardware
+  is HP-L, HP-R+mono-speaker, coil-L, coil-R; the wire puts the speaker pair first. Now: the speaker
+  channel duplicated across the wire's speaker pair, coils passed through, HP-L dropped. The
+  stream-sink (uhid) capture path already emitted the logical layout and is unchanged.
+- **`usbip`: `iSerialNumber` was the literal `"Serial"`.** A real DualSense reports none, ALSA bakes it
+  into the card id (`…Wireless_Controller_Serial-00` vs `…Wireless_Controller-00`) and PipeWire
+  carried it into every node name and `device.serial`. Cleared. Explicitly *not* a fix for anything
+  observed broken — GE's winepulse leg matched the placeholder — and *not* a UCM-selection fix
+  (alsa-ucm-conf keys on `${CardComponents}`, `USB054c:0ce6`).
+- **The pad's ALSA card was root-only.** It is created mid-session-bringup with no seat session
+  active, so logind's ACL never materialises; WirePlumber's probe got EACCES and the card never
+  appeared in PipeWire at all. `scripts/60-punktfunk.rules` gains two `SUBSYSTEM=="sound"` rules for
+  `054c:0ce6` / `054c:0df2` (`GROUP="input" MODE="0660" TAG+="uaccess"`), matching physical pads too.
+  Verified live on Bazzite f44.
+- **The DualSense's only playback route was a 1-channel `Default__Speaker__sink`**, from which
+  GE-Proton mints its synthetic endpoint, and *Marvel's Spider-Man Remastered* overruns it ~74 s in
+  (`EXCEPTION_ACCESS_VIOLATION`, write; the copy loop past the frame count, 5206/5207 vs 5034 — a
+  game/GE bug on a code path that only exists when the mono sink does). Fix: delete the sink. New
+  ALSA UCM drop-in `scripts/alsa-ucm2/USB-Audio/conf.d/{054c-0ce6,054c-0df2}.conf` +
+  `scripts/alsa-ucm2/USB-Audio/Punktfunk/DualSense-PS5-Haptic{,-HiFi}.conf` raises a `SpeakerHaptic`
+  device at playback priority 200 against `Speaker`'s 100, so the card takes the 4-channel HiFi
+  profile and the mono sink never exists. Shipped **without** replacing a file `alsa-ucm-conf` owns:
+  `USB-Audio.conf` ends with an unconditional optional include of `conf.d/{vid}-{pid}.conf`
+  (verified against alsa-lib source; hook and DualSense profile both since 1.2.15). New CI guard
+  `scripts/ci/check-dualsense-ucm.sh` runs the chain on a real distro tree via UCM's card-less
+  `conf.virt.d`, negative-tested both ways. **NixOS is not covered** (no `/usr/share/alsa/ucm2` to
+  drop into).
+- **WirePlumber met every new pad card at `default-sink-volume` 0.4 — cubed, i.e. −23.88 dB — and
+  both ends minted one**, so haptics reached the coils at 0.064² = −47.8 dB (field-measured −48).
+  Client: `pin_sink_volume` from `correlate_pad_sink` at every pick (skipped for the `split_parent`
+  pick). Host: new `audio/linux/pad_card_volume.rs`, started when `PadUsbCapturer::open` succeeds
+  (the host half matters because `pad_usb` captures at the ISO OUT endpoint, downstream of this
+  sink), retrying 15 s because the USB device is live before its ALSA card is; only sinks of a
+  DualSense **card** are touched (`device.id` keeps it off the host's own minted pad sink). Neither
+  end restores on exit, deliberately. New `PUNKTFUNK_PAD_SINK_VOLUME=0` disables both ends for
+  bisecting. Both pins unit-tested for one unity float per channel — PipeWire silently ignores a
+  `channelVolumes` whose length mismatches the port count.
+- **`scripts/60-punktfunk-dualsense.conf`** — a new WirePlumber policy installed to
+  `/usr/share/wireplumber/wireplumber.conf.d/` by rpm/deb/arch/nix: `node.always-process` + no
+  suspend on the pad's `alsa_output` (GE opens the backing device raw when it is free, then hits
+  "busy" against its own handle and spins a 100 Hz refresh loop — SteamOS never shows this because
+  PipeWire always holds the device there), and `priority.driver = 0`. **Zero, not one**: the field is
+  unsigned and a driver is skipped only when `<= 0`; at 1 the pad was merely *last*, and last is still
+  elected whenever nothing above it qualifies — the ordinary in-session state on a host that has
+  claimed its own sink as default and idled the real card. A second rule sets `priority.driver = 0`
+  on the same cards' `alsa_input` (in the Pro Audio profile that node carries 2600 and clocked a
+  reporter's whole desktop session with nothing linked to it). The rule's first landing duplicated
+  its `%files` line into `%install`, which killed every RPM build on main for a few hours (fixed same
+  day, no release affected).
+- **`0xD1` lane split:** speaker = Opus `Application::Audio` @ 96 kbps (~120 B / 10 ms frame),
+  haptics = `Application::LowDelay` @ 64 kbps CBR, unchanged.
+- **`punktfunk-session --pad-audio-test`** now prints the effective `pad_speaker` / `pad_haptics`
+  before the tone (the capability is never advertised when the toggle is off, so no later log line can
+  catch it); the Android settings row states its default. Android is the one client defaulting pad
+  speaker **off**; `pf_client_core`'s `default_pad_speaker` is `"pad"` and always was.
+
+### The Linux desktop-audio capture drives its own graph group
+
+The stream sink was a `pw_stream` wearing `media.class = Audio/Sink`. A stream is structurally a
+follower, so its group had no clock and PipeWire assigned it to the highest-priority *running*
+driver on the box. On a reporter's host that was a DualSense forwarded over VirtualHere in the Pro
+Audio profile — never suspended, nothing linked, its frame counter a kernel stub logging "not yet
+implemented" and returning 0 ~1900×/s. Not xruns: 11 errors in 15 min, wait never past 111 µs; the
+loss was *between* cycles — 3.9 delivery holes/s, worst 142 ms, **15.4 % synthesized silence** over
+a 15-minute session.
+
+Now a `support.null-audio-sink` adapter created on our own connection, captured through its monitor
+(the same object `pactl load-module module-null-sink` creates). Three load-bearing properties:
+`node.passive` on the monitor tap (idle between sessions, so the null sink's timer parks — the
+objection that kept `node.always-process` off the old stream sink); `node.force-quantum`, not
+`node.latency` (a driver's quantum is the smallest follower latency rounded **down** to a power of
+two under the default `default.clock.power-of-two-quantum`, which is why the 240-frame ask has been
+served as **128** — 2.67 ms callbacks, not the 5 ms it is designed around — on every stock Linux host
+since the capture was written; force-quantum skips the rounding and forces nothing on anyone else,
+since this sink drives only its own group); and `node.dont-fallback` **with** `node.linger`, never
+one alone (WirePlumber 0.5 reads dont-fallback alone as licence to destroy the stream when its target
+is not visible). Routing claim, capture callback, stats line and everything downstream untouched.
+`PUNKTFUNK_STREAM_SINK`: unset = new topology, `stream` = 0.30's (one release), `0` = the legacy
+default-sink-monitor follower. Documented at last in `configuration.md`, with a new troubleshooting
+section on the `punktfunk-audio-…` recording stream and on another device clocking your capture.
+
+Around it, from the same 2026-08-14/17 field logs:
+
+- The host binds its own node and reads `node.driver-id` from its `info` event (a node-id→name map
+  from the registry): on change, `audio capture graph driver` names the clocking node — WARN in the
+  null-sink mode (exactly one right answer), INFO in the legacy topologies (they borrow a clock by
+  design).
+- `CaptureStats::observe_gap` is now the one accounting behind both feeds (Linux callback cadence and
+  the Windows discontinuity flag) and buckets holes at <20 / <50 / <100 / ≥100 ms — the client
+  concealment edges. Both capture lines print `gap_hist=a/b/c/d missing_ms=`; the sum closes the
+  arithmetic against `delivered_pct`. The Windows loopback **reader** thread now takes
+  `boost_thread_priority(true)` like the paced sender it feeds.
+- **The pacer's schedule was wall clock; the source was not.** A missed 2.7 ms cycle is below the gap
+  counter's floor and the infill threshold, so the schedule kept the debt and repaid the next ≥ 10 ms
+  hole as a burst of (lag + 10)/5 silence frames (field: 33–72 % departures late, worst 99 ms,
+  re-anchors 0). The infill decision now sees schedule lag; `after()` follows the real quantum
+  (`InfillPolicy::note_quantum`) — one chunk plus one frame, never under two frames; a slot whose
+  backlog exceeds one chunk plus one frame sends a second frame in the same slot (at most two), since
+  a fast source clock could otherwise only grow the backlog — 5 ms of host latency per 50 s at
+  100 ppm. Holes fade out over 1 ms (`pcm::raised_cosine_tail`) and the first real frame after fades
+  in (`raised_cosine_head`).
+
+### The client jitter ring can now grow without de-priming
+
+`JitterStep::insert_front` mirrors `drop_front`: when the sync loop wants more than the adaptive
+target and the depth EWMA has sat > `INSERT_MARGIN_MS` below the request for `INSERT_SUSTAIN_MS` of
+consumed audio, duplicate one frame at the front, crossfaded (`crossfade_insert`, the RT-safe twin
+of `crossfade_drop`). Sync-only, primed-only, below-target-only. `hollow` is judged against the
+**adaptive** target, never the sync request — the bug was that a ≥ 10 ms sync request read as hollow
+on the next callback and the next late packet cost 15–60 ms of silence, since ~0.24/0.25. Margin is
+half the sync loop's ±10 ms deadband (a margin at or above it would leave every request it is allowed
+to make unanswered). Also fixes `crossfade_drop`'s seam: the fade-out source is now the continuation
+of the sample the device just played, not the tail of the discarded region — a hard-cap trim stepped
+2,688 samples where it now stays under 17. Wired into the PipeWire, WASAPI and AAudio rings
+(`PlaybackVitals.inserts`, `drift_inserts=` on the 10 s lines) and ported line for line to the Swift
+ring (`insertOneFrame()`, `AudioRingDriftTests` carrying the same vectors). No new `pub const`; the
+C header is unchanged.
+
+Beside it: the Linux desktop client's playback stream now connects with `RT_PROCESS` (it ran on the
+main-loop thread at nice 0, and when late PipeWire rendered silence for our node and moved on — an
+underrun no counter saw); the ring is pre-reserved so `extend` never reallocates on the RT loop; new
+`audio_vitals::PlaybackVitals` printed from the decode thread on wall clock. New `audio_rt` module
+raises the decode, pad-audio, PipeWire-loop and Linux mic threads: `setpriority` where `RLIMIT_NICE`
+allows → inside a Flatpak the `org.freedesktop.portal.Realtime` portal → else rtkit
+`MakeThreadHighPriorityWithPID`. The split is `module-rt`'s and not optional: rtkit-daemon has no
+PID-namespace translation (verified on the Deck, rtkit 0.14), so a direct call from a sandbox is
+ENOENT; the portal maps pid/tid. Never setcap / `SCHED_RR`. Windows: MMCSS "Pro Audio" +
+`THREAD_PRIORITY_HIGHEST` on the render and mic loops. Acceptance on the Deck: `ps -eLo
+cls,rtprio,ni,comm` shows the decode thread at nice −10 after connect.
+
+The client log ring drops DEBUG/TRACE from `cros_codecs` (its WARN+ still lands) and normalizes
+`log`-bridge events to their real target: a dozen DPB lines per frame at 120 fps last three seconds
+in a 4,096-line ring — a 2026-08-17 Deck bundle read "2,037,456 older lines evicted". `Cargo.lock`
+gains two direct deps already in the graph.
+
+### Android: `pf-console-ui` is the console, presented through `ASurfaceControl`
+
+- **`pf-client-core` un-gated for Android** (trust::Settings, known-hosts store, profiles model,
+  deep links, the library *model*; the ureq fetches stay desktop), with `audio_format`,
+  `decoder_pref`, `menu_nav` (`MenuEvent`/`MenuNav`/`PadInfo`) and `console` (`OverlayAction`,
+  `PointerInput`, `SessionPhase`) split out and re-exported. `pf-console-ui`: Vulkan overlay + SDL
+  event path behind the default `vulkan-overlay` feature (clients/session unchanged); a `Key` enum
+  replaces SDL scancodes; a `SettingsStore` seam (desktop = the file, `SnapshotStore` across a
+  language boundary); `Viewport{width,height,insets,scale}`; `Platform` filters the settings rows;
+  `ConsoleOptions`; a portable `Console` driver. skia-safe features are target-specific: desktop
+  `jpegd-jpege-pdf-textlayout-vulkan` (the flatpak pin), Android `gl-jpegd-jpege-pdf-textlayout`.
+  Model types derive serde — the wire IS the model. `MenuNav` gains the stick hysteresis
+  (`MENU_RELEASE = 0.3`) both the Apple and Android shells had grown on glass.
+- **`clients/android/native/src/console/`**: hand-declared EGL binding, Skia GL `DirectContext` over
+  FBO 0, one render thread paced by `eglSwapBuffers`, ~28 `nativeConsole*` JNI seams; a run of GL
+  setup failures ends the render thread through the normal release path, which raises the
+  `SkiaConsole.healthy` handover to the touch UI. `SkiaConsoleShell` (SurfaceView + lifecycle,
+  insets = systemBars ∪ displayCutout in surface px, system bars hidden transiently while the console
+  is up, phone density floor **0.6 → 0.75**, pad probes into the shared `MenuNav`, remote D-pad,
+  hardware keys, Back as B, touch as pointer). Pad-listener slot is a **stack** with removal by
+  identity (a leaving Controllers/Licences page used to null the console's claim). Android-only
+  settings rows ride `Settings::extra` `android.*` keys; `row_on()` keeps them off the desktop list.
+  New `ConsoleCmd::PadAction { action, pad_key }` (`sc2_bluetooth`, `sc2_usb`, `ds_usb`, rumble,
+  pad-audio self test); `PlatformScreen::Controllers` removed (the mechanism stays for Licences);
+  `PadInfo` gains detail line / forwarded / rumble. Detail band 84 → 64 units; the grid's two-column
+  minimum shrinks covers instead of clipping.
+- **Skia prebuilts** for all three ABIs come from `unom/skia-binaries` release **0.99.0** on
+  git.unom.io (R2-backed), mirroring rust-skia's `{tag}/{key}` layout; the armv7 archive
+  (`a25a0fdb7d90429aa2d1-armv7-linux-androideabi-gl-jpegd-jpege-pdf-textlayout`, sha256
+  `4867856b…`) is built by us since rust-skia publishes none. GitHub is out of the Android build path;
+  `-PskiaBinariesUrl` / `SKIA_BINARIES_URL` remain as overrides.
+- **Present path:** the codec renders into an `AImageReader`; frames are composited onto an
+  `ASurfaceControl` layer via a transaction carrying a desired present time, and completion reports
+  the real latch time and the previous buffer's release fence — so the panel period is learned from
+  real latches (Android down-rates a game process's vsync callbacks; the old presenter could learn 60
+  on a 120 Hz panel) and the frame budget is bounded by real completions. `ASurfaceControl` /
+  `ASurfaceTransaction` are not in ndk-sys 0.6, so `surface_control.rs` hand-declares them and
+  resolves via `dlsym` from `libandroid.so` (all API 29, above minSdk 28), same pattern as `adpf.rs` /
+  `vsync.rs`. Memory safety does not rest on the fences (an `AImage` keeps its buffer alive through
+  SurfaceFlinger's own reference; a mishandled fence is at worst a tear). **Default**; auto-fallback
+  to the SurfaceView presenter, byte-for-byte unchanged, on API < 29 or any init failure; escape hatch
+  `debug.punktfunk.present_backend=surfaceview`. The layer is sized to the view's on-screen pixels,
+  not the window buffer (which is reported in a rotated/scaled space — 1260×567 for a 2800×1260
+  stream, drawing into the top-left 45 %). The present-time grid uses the mode table's seed period
+  for spacing and the last real latch only for phase (learning the period from latches was
+  self-fulfilling and locked the panel at 60). On glass at 2800×1260@120: e2e p50 30 → ~18 ms,
+  skipped 40–50/s → 0. Whether the panel *holds* 120 is the OEM's LTPO governor — measured: no
+  app-side API (`preferredDisplayModeId`, `preferredRefreshRate`, the layer rate vote,
+  `frameRatePowerSavingsBalanced`) raises the render-range floor — so the ineffective pins were
+  removed again and `pf.present` gained the cadence loop's late-permille / jitter / cushion /
+  re-anchors / qDepth.
+
+### Hyprland / sway: `topology: exclusive` (closes #284)
+
+`exclusive` disables the operator's outputs for the session and restores them when the display
+group's last member is torn down, through the same registry hand-off KWin uses (the compositor never
+sees zero enabled outputs; a sibling session's desk is never re-enabled under it). The disable filter
+is group-aware — enabled, not ours (`PF-<pid>-<n>` on Hyprland, the `HEADLESS-` prefix on sway), not
+managed. **The Hyprland restore is `hyprctl reload`, and that is measured, not chosen**: re-applying
+the head's own mode/position/scale does not undo a disable (probed 2026-08-18 against 0.56.2
+hyprlang and 0.55.4 Lua — every targeted form was accepted at exit 0 and changed nothing, including
+`,enable`, `preferred,auto,1`, `monitorv2 disabled=false`, `keyword unset monitor`, the Lua
+`disabled = false`, `dispatch dpms on`, `forcerendererreload`); a runtime rule is additive and the
+disable keeps winning. Disable is spelled per config era (`keyword monitor <n>,disable` under
+hyprlang; `hl.monitor{ output = "<n>", disabled = true }` under Lua) and confirmed by **read-back**,
+not exit status. `hyprctl_dispatch` now also matches "can't" (the Lua manager's "keyword can't work
+with non-legacy parsers"). `primary` stays extend and warns distinctly. ⚠ **The sway half is not
+exercised on a live sway** — no box in the fleet runs one; both argv shapes are pinned by tests and
+the read-back turns a wrong guess into a warning naming the outputs. Six new unit tests.
+
+### Gaming Mode takeover: the mask was the relogin storm
+
+On an SDDM-autologin box the runtime mask the takeover laid sat in SDDM's relogin path, so every
+autologin failed in milliseconds and `Relogin=true` has no backoff: 962 logind sessions in 3.7 min,
+system buttons re-scanned 5,688×, udev `change` at ~20/s, iio-sensor-proxy crash-looping ~16
+starts/s, load 26 on 12 cores — and Wine's bus driver, re-enumerating udev per event, read the pad at
+~1.4 Hz. `dm_plan` loses its `mask` input and `dm_survives_masked_unit`; the mask is laid **only after
+the stop has landed** and every restore path unmasks before restarting; a planned DM stop that does
+not land now **fails the takeover** and the caller degrades to ATTACH. `skip` is `!any_live` on every
+flavor; `any_live` now counts `deactivating` and `reloading`. New `DmHelperError::shape()`;
+`watch_for_relogin_storm()` (two `read_dir`s of `/run/systemd/sessions` 5 s apart, ERROR above 1/s,
+detect-only); `systemctl_system` captures stderr at DEBUG (the "requires interactive authentication"
+line was going to the journal on the *successful* path). `cargo test -p pf-vdisplay --lib gamescope`
+52 passed, 1 ignored.
+
+### Windows host: two session-killers
+
+- **`untune_process` logged from a TLS destructor.** By then `tracing`'s own thread-local state can be
+  gone; the log call panicked, and a panic escaping a TLS destructor aborts. The panic hook then hid
+  the evidence — it logged through the same framework and panicked the same way, and a panic inside
+  the hook is a case where std deliberately does not format the message (the field log: a location, a
+  blank line, "thread panicked while processing panic. aborting."). The service manager restarted the
+  host ~6 s later, so it read as a reconnect. `untune_process` no longer logs (still atomic under the
+  refcount lock); the panic hook writes straight to the `LogRing` (`OnceLock` + `Mutex`, TLS-free;
+  `thread::current()` and `Backtrace::force_capture()` verified safe during TLS destruction).
+  Reproduced standalone on 1.96.0, byte-identical to the field log.
+- **A Windows launch is a hand-off, and 0.30 read its exit as the game's.** `explorer.exe
+  "playnite://…"`, `Steam.exe "steam://…"` and shell app-folder links spawn a forwarder that quits a
+  second later (launcher already running) or *becomes* the launcher (it was not); the shim window that
+  guards this was skipped for hint-less titles — the one shape that needs it — so the lease reported
+  running, then the forwarder's exit closed the connection. The forwarder was also a termination
+  target. `WinRecipe::owns_game` records which recipe lines start the game (only `gog`, `command` and
+  a plugin's own recipe) and which forward; a forwarder's pid is dropped; the shim window applies to a
+  bare child or pid whatever the spec holds; giving up on tracking lands on `GameState::Untracked`
+  instead of `launching` forever. Fixture in `a_pid_only_launch_reports_its_exit` widened 4 → 8 s
+  (it passed only because of the bug); new ignored test drives the field report.
+
+### Everything else an integrator might notice
+
+- **`mgmt-endpoint` is followed everywhere.** `PUNKTFUNK_MGMT_BIND` moved off 47990 left every plugin,
+  the runner's log shipper and the tray dialing a dead port (task Running, plugins never registering,
+  empty library, "no logs at all"). `sdk/src/config.ts::publishedMgmtUrl` reads
+  `<config_dir>/mgmt-endpoint`; `resolveConfig` uses it after `PUNKTFUNK_MGMT_URL` and before the
+  default; `runner-cli.ts` exports it into `PUNKTFUNK_MGMT_URL` before any plugin loads (older
+  vendored SDK copies follow too). New `pf_paths::published_mgmt_port`; `punktfunk-tray` depends on
+  `pf-paths` and its `mgmt_port` is `Option<u16>` — `None` re-reads the file every poll. SDK 83 tests
+  (4 new). **Unpublished — `sdk-v0.1.5` owed.**
+- **`scripts/windows/scripting-run.cmd`** redirects the runner's stdout+stderr to
+  `%ProgramData%\punktfunk\plugin-state\runner.log` (previous run rotated to `.1`; writability probed
+  with `copy /y nul`; no `goto`, the file is LF). Verified by reading only.
+- **`@punktfunk/plugin-kit`: `SyncSettings.minInterval`** (optional; `LibraryPluginDef.minInterval`
+  overrides), default `DEFAULT_FS_CHANGE_MIN_INTERVAL` = 30 s — a floor on top of the 3 s debounce,
+  which cannot bound the *rate* under sustained churn (`plugin:steam sync (fs-change)` 102× in
+  27 min). Changes inside the hold coalesce into one trailing sync. **Unpublished — `plugin-kit-v0.4.3`
+  owed.** Narrowing the Steam plugin's watch set lives in the steam plugin repo.
+- **Nix binary cache at `https://nix.unom.io`** (`nix.yml` third tier: build Rust packages +
+  gamescope, sign, publish on every main push; a release needs no new trigger since `Cargo.toml` is
+  in the path filter). Only punktfunk's own store paths (~300 MB per publish); the step asserts every
+  output matches the name filter; NARs before narinfos, rsync without `--delete`. New
+  `packaging/nix/server/{Caddyfile,compose.production.yml,prune.sh}` (a `caddy:2-alpine` static tree
+  on unom-1 beside the flatpak repo) and `scripts/setup-nix-cache.sh` (five stages; the secret key is
+  shown once and never written to disk). `inputs.punktfunk.inputs.nixpkgs.follows` defeats the cache
+  entirely. Rejected: Gitea's package registry (no Nix type), storage.unom.io (home uplink, and S3
+  answers 403 not 404 for a missing key, which nix treats as fatal). PR #318 (signing key installed,
+  DNS notes) is **not** in this cut.
+- **Apple console-UI parity** (Swift, PunktfunkKit/PunktfunkShared): `LibraryCollation` ports
+  `pf-console-ui`'s `collate.rs` (the desktop's eight tests by name; both read
+  `clients/shared/library-collate-vectors.json`, new — desktop is the source of truth and regenerates
+  it); `GameEntry.platform` (sent in `GameMeta` all along, dropped by `Codable`); `LibraryPlaceStack`,
+  `CollectionsHandover.decide`, `LibraryGridCursor` (port of `GridShape`/`grid_step`/`grid_col_hint`,
+  nine grid tests by name), `GridGeometry` (the grid owns its scroll offset — no trackpad wheel on the
+  grid, a named trade); `ConsoleContract.swift` pins `ConsoleMotion` to the shared vectors'
+  `motion_spring` (response 0.42, damping 0.88, slide 36, scales 0.985/0.96, reveal 0.4,
+  interruptible; the v1 `$deprecated` note now names Android as the last v1 reader — and Android
+  moved to the shared shell in this same release). Device keys `librarySort` / `libraryView` /
+  `libraryCollections` / `libraryGroupBy` — presentation only, never in a profile. `PosterImage`
+  decodes at the drawn size (`CGImageSourceCreateThumbnailAtIndex`). `HostCardView`'s primary action
+  reverted to connect (`22fdea66` reverted; `swift test` 375/0). New dev hooks
+  `PUNKTFUNK_FAKE_LIBRARY=<file.json>`, `PUNKTFUNK_SHOT_EDITING=<field>`, `PUNKTFUNK_SHOT_INTERACTIVE=1`
+  (screenshot harness only).
+- **New environment variables:** `PUNKTFUNK_PAD_SINK_VOLUME` (`=0` skips both pad-sink pins),
+  `PUNKTFUNK_DUALSENSE_USBIP_GRACE_MS` (pad-arrival grace), `PUNKTFUNK_USBIP_TRACE` (byte-level
+  USB/IP trace prefix, off by default), and the three Apple screenshot-harness hooks above.
+  `PUNKTFUNK_STREAM_SINK` gained the `stream` value and is documented for the first time.
+- **New packaging payload (Linux host, rpm/deb/arch; nix where noted):** `scripts/60-punktfunk.rules`
+  (+2 sound rules), `scripts/60-punktfunk-dualsense.conf` (WirePlumber, also nix),
+  `scripts/alsa-ucm2/…` (UCM drop-in, **not** nix). Bazzite sysext inherits all three from the RPMs.
+- **Docs:** `AGENTS.md` + `docs/agents/` (issue tracker is Gitea via the `gitea` MCP server; the
+  five triage labels; single-context domain docs). A host audio-source comment corrected
+  (`pw_impl_node_set_driver` marks props changed but leaves the flush to the next info emission).
+- **CI:** Nix publish job records `df` after the build as well as before.
+
+### Verification status
+
+Gates run on the release tree (this MacBook, rustc/rustfmt 1.96.0 per `rust-toolchain.toml`):
+`cargo fmt --all --check` clean — **after** a whitespace-only commit on the release branch: two files
+(`pf-console-ui/src/screens/controllers.rs`, `punktfunk-host/src/audio/linux/pad_card_volume.rs`)
+had landed on main formatted differently from rustfmt 1.96.0, so `ci.yml`'s Format step was red on
+the tip this is cut from; `cargo metadata --offline` ok with the `Cargo.lock` diff versions-only
+(36/36 lines); `cargo test -p punktfunk-core` **272 passed** in the unit suite; the android.yml Play
+notes gate run verbatim — 498/500 characters and not byte-identical to any prior release's; both
+openapi copies `cmp` identical and unchanged since the tag; `include/punktfunk_core.h` regenerated
+by the build and `git diff` clean against the tag.
+
+⚠ **The C ABI harness (`tests/c_abi.rs`) did not run on this cut**: it links the staticlib with
+`-lopus` and this machine has no libopus (`ld: library 'opus' not found`), which is an environment
+gap, not a code fault. The header it exercises is byte-identical to v0.30.0's, where the harness
+passed (261 + 1 + 8), and nothing in `punktfunk-core`'s C surface changed. The CI runner is its
+first execution for this tag.
+
+⚠ **Verified by reading only** — compiled nowhere available to the cutting host: the Windows runner
+log redirect (`scripting-run.cmd`), the tray's `Option<u16>` port on Windows, and the sway half of
+`topology: exclusive` (no live sway in the fleet, as with #283).
+
+⚠ **Not verified on hardware by this cut**, named rather than left to be discovered: the null-sink
+capture topology's on-glass validation (pw-top showing our sink at the top of its own group, 5 min
+of loud audio at `delivered_pct=100 gaps=0` on a box where a hardware sink also runs) was still owed
+when it landed; the 96 kbps speaker lane was judged on glass by ear only; and the Android
+`ASurfaceControl` path was verified on one device (Nothing Phone 3) — the fallback presenter is
+byte-for-byte the 0.30 one.
+
+---
+
 ## v0.30.0
 
 175 commits since v0.29.0 (131 non-merge).
