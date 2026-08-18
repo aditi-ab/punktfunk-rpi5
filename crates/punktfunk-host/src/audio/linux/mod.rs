@@ -49,7 +49,7 @@ mod stream_sink;
 
 use super::{AudioCapturer, MicBackendStats, VirtualMic, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::sync::Arc;
@@ -943,6 +943,8 @@ fn pw_thread(
     use pw::{properties::properties, spa};
     use spa::param::audio::{AudioFormat, AudioInfoRaw};
     use spa::pod::Pod;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     let CaptureNodes {
         mode,
         sink: sink_name,
@@ -1049,6 +1051,125 @@ fn pw_thread(
         // together so the ask stays 5 ms at 48 kHz and at 96 kHz alike. Formatted once here
         // rather than at each use so the two property arms cannot drift apart.
         let node_latency = format!("{}/{}", capture_quantum_frames(rate_hz), rate_hz);
+        // ── Which node is clocking us ────────────────────────────────────────────────────
+        // `node.driver-id` on our own node names the driver of the group we are scheduled in.
+        // It is deliberately NOT in the registry's announce set (`pw_impl_node_register`'s key
+        // list), so it takes a bind and the node's `info` event; the daemon republishes the
+        // props whenever the graph is recalculated.
+        //
+        // This line exists because on 2026-08-14 the question "what is clocking desktop audio?"
+        // cost four field logs, a bespoke probe script and a `pw-top` DRIVER column to answer —
+        // and the answer was a sound card attached over the network that nothing was linked to.
+        // Whatever the next such box is, it now says so itself, in the log the reporter already
+        // sends. Reported on CHANGE, not per window: it moves a handful of times a session, and
+        // the capture summary is written from the RT callback while this arrives on the main
+        // loop.
+        struct GraphDriver {
+            /// `node.name` of every Node global, so the driver can be NAMED and not just
+            /// numbered. Pruned on removal — a host runs for days and streams come and go.
+            names: HashMap<u32, String>,
+            /// Our own node, bound so that its `info` — and with it `node.driver-id` — arrives.
+            ours: Option<(pw::node::Node, pw::node::NodeListener)>,
+            /// The last driver reported, so only changes are logged.
+            driver: Option<u32>,
+        }
+        // In null-sink mode there is exactly one right answer and it is ours; the legacy
+        // topologies borrow a driver by design, so there the line names it without judging it.
+        let expected_driver = match mode {
+            CaptureMode::NullSink => sink_name.clone(),
+            _ => None,
+        };
+        let watch = Rc::new(RefCell::new(GraphDriver {
+            names: HashMap::new(),
+            ours: None,
+            driver: None,
+        }));
+        let registry = core.get_registry_rc().context("pw audio registry")?;
+        let _registry_listener = registry
+            .add_listener_local()
+            .global({
+                let watch = watch.clone();
+                let registry = registry.clone();
+                let capture_name = capture_name.clone();
+                move |global| {
+                    if global.type_ != pw::types::ObjectType::Node {
+                        return;
+                    }
+                    let Some(props) = global.props else { return };
+                    let Some(name) = props.get("node.name") else {
+                        return;
+                    };
+                    watch.borrow_mut().names.insert(global.id, name.to_string());
+                    if name != capture_name.as_str() || watch.borrow().ours.is_some() {
+                        return;
+                    }
+                    let Ok(node) = registry.bind::<pw::node::Node, _>(global) else {
+                        return;
+                    };
+                    let listener = node
+                        .add_listener_local()
+                        .info({
+                            let watch = watch.clone();
+                            let expected = expected_driver.clone();
+                            move |info| {
+                                let Some(props) = info.props() else { return };
+                                // Absent = we are between drivers (the daemon drops the key from
+                                // a node that has none), which is not worth a line: the next
+                                // assignment reports itself.
+                                let Some(id) = props
+                                    .get("node.driver-id")
+                                    .and_then(|v| v.parse::<u32>().ok())
+                                else {
+                                    return;
+                                };
+                                let mut w = watch.borrow_mut();
+                                if w.driver == Some(id) {
+                                    return;
+                                }
+                                w.driver = Some(id);
+                                let named = w.names.get(&id).cloned();
+                                let driver = named.as_deref().unwrap_or("<unnamed>");
+                                match expected.as_deref() {
+                                    Some(sink) if driver == sink => tracing::info!(
+                                        driver,
+                                        driver_id = id,
+                                        "audio capture graph driver"
+                                    ),
+                                    Some(sink) => tracing::warn!(
+                                        driver,
+                                        driver_id = id,
+                                        expected = sink,
+                                        "our audio capture group is being clocked by another \
+                                         node — every hole in this stream is that node's \
+                                         scheduling, not ours. Something has linked our sink to \
+                                         it (a loopback from its monitor is the usual cause); a \
+                                         USB or USB-over-IP sound card here is the 2026-08-18 \
+                                         defect"
+                                    ),
+                                    // Both legacy topologies have no driver of their own, so
+                                    // borrowing one is the design and not a fault — but WHICH one
+                                    // is still the first thing anybody investigating wants.
+                                    None => tracing::info!(
+                                        driver,
+                                        driver_id = id,
+                                        "audio capture graph driver (borrowed — this topology \
+                                         has none of its own)"
+                                    ),
+                                }
+                            }
+                        })
+                        .register();
+                    watch.borrow_mut().ours = Some((node, listener));
+                }
+            })
+            .global_remove({
+                let watch = watch.clone();
+                move |id| {
+                    watch.borrow_mut().names.remove(&id);
+                }
+            })
+            .register();
+
         let props = match mode {
             // Null-sink mode: the sink is the adapter created above and this stream is a MONITOR
             // TAP of it — the same `stream.capture.sink=true` recipe as the legacy arm below,
