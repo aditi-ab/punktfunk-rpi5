@@ -14,7 +14,7 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ## v0.31.0
 
-88 commits since v0.30.0 (64 non-merge).
+90 commits since v0.30.0 (65 non-merge).
 
 Nothing versioned moves. `WIRE_VERSION` stays **2**, the C ABI stays **24** — `include/punktfunk_core.h`
 is byte-identical to the v0.30.0 tag — the driver protocol, gamepad channel and plugin index schema
@@ -375,10 +375,16 @@ line was going to the journal on the *successful* path). `cargo test -p pf-vdisp
   output matches the name filter; NARs before narinfos, rsync without `--delete`. New
   `packaging/nix/server/{Caddyfile,compose.production.yml,prune.sh}` (a `caddy:2-alpine` static tree
   on unom-1 beside the flatpak repo) and `scripts/setup-nix-cache.sh` (five stages; the secret key is
-  shown once and never written to disk). `inputs.punktfunk.inputs.nixpkgs.follows` defeats the cache
-  entirely. Rejected: Gitea's package registry (no Nix type), storage.unom.io (home uplink, and S3
-  answers 403 not 404 for a missing key, which nix treats as fatal). PR #318 (signing key installed,
-  DNS notes) is **not** in this cut.
+  shown once and never written to disk; four stages after #318, which also made it detect an
+  installed key and refuse to casually regenerate one). The signing key is generated and installed as
+  the `NIX_CACHE_SIGNING_KEY` Actions secret; its public half,
+  `punktfunk-cache-1:yhOJmHxzg6tzXpxSFzlYn6Pc6r0jHprsWqt8MZC654o=`, is pinned in `install.md` and
+  `packaging/nix/README.md` and served by the cache at `/punktfunk-cache.pub` (the wizard compares the
+  two and warns on mismatch). DNS for `nix.unom.io` is provisioned through `unom/infra`'s OpenTofu
+  (`terraform/cloudflare/records.tf`, applied by `dns-cutover.yml`) — not a dashboard click.
+  `inputs.punktfunk.inputs.nixpkgs.follows` defeats the cache entirely. Rejected: Gitea's package
+  registry (no Nix type), storage.unom.io (home uplink, and S3 answers 403 not 404 for a missing key,
+  which nix treats as fatal).
 - **Apple console-UI parity** (Swift, PunktfunkKit/PunktfunkShared): `LibraryCollation` ports
   `pf-console-ui`'s `collate.rs` (the desktop's eight tests by name; both read
   `clients/shared/library-collate-vectors.json`, new — desktop is the source of truth and regenerates
