@@ -82,8 +82,18 @@ struct GamepadAddHostView: View {
                 .padding(.horizontal, 24)
                 // While the tray edits this row, the row IS the one seated above the keyboard
                 // (see `bottomTray`); its slot here stays empty and keeps the list's layout.
-                .matchedGeometryEffect(id: row.id, in: fieldFlight, isSource: editing != row.id)
                 .opacity(editing == row.id ? 0 : 1)
+                // The flight's origin/destination: an invisible frame-provider that exists only
+                // while the row is HERE. When editing starts it unmounts and the seated row is
+                // inserted with the same id, so SwiftUI animates the seated row in FROM this
+                // frame; when editing ends it returns and the seated row's removal flies back to
+                // it. Exactly one matched view per id at any time — two live ones with the
+                // source flag swapped sent the invisible list row flying instead.
+                .overlay {
+                    if editing != row.id {
+                        Color.clear.matchedGeometryEffect(id: row.id, in: fieldFlight)
+                    }
+                }
         }
         .frame(maxWidth: .infinity)
         .safeAreaInset(edge: .top, spacing: 0) {
@@ -148,12 +158,16 @@ struct GamepadAddHostView: View {
         // The visible close ✕ is gone (a gamepad UI exits with B) — this keeps a hardware
         // keyboard's Esc and the macOS sheet's cancel working without chrome.
         .background {
-            Button("Cancel") { performClose() }
-                .keyboardShortcut(.cancelAction)
-                .buttonStyle(.plain)
-                .frame(width: 0, height: 0)
-                .opacity(0)
-                .accessibilityHidden(true)
+            // Not while the keyboard tray is up: Esc is the tray's Done then (see
+            // GamepadKeyboard), and a shortcut here would fire first and close the whole screen.
+            if editing == nil {
+                Button("Cancel") { performClose() }
+                    .keyboardShortcut(.cancelAction)
+                    .buttonStyle(.plain)
+                    .frame(width: 0, height: 0)
+                    .opacity(0)
+                    .accessibilityHidden(true)
+            }
         }
         #endif
         #if os(tvOS)
@@ -198,8 +212,8 @@ struct GamepadAddHostView: View {
                     rowView(row, focused: true)
                         .frame(maxWidth: metrics.rowMaxWidth)
                         .padding(.horizontal, 24)
+                        .matchedGeometryEffect(id: row.id, in: fieldFlight)
                         .frame(maxWidth: .infinity)
-                        .matchedGeometryEffect(id: row.id, in: fieldFlight, isSource: true)
                         .transition(.opacity)
                 }
                 VStack(spacing: 10) {

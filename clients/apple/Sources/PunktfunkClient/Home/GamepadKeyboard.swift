@@ -7,7 +7,10 @@
 //
 // Edits are applied to the binding live (the caller's field row shows every keystroke), so
 // closing the keyboard is always "done" — there is no separate cancel/commit step to get wrong.
-// Touch stays a fallback: every keycap is tappable.
+// Touch stays a fallback: every keycap is tappable. A HARDWARE keyboard (an iPad on a Magic
+// Keyboard, a Mac) types straight into the field while the tray is up — characters insert,
+// ⌫ deletes, arrows move the key cursor, Return and Esc are Done — with no system keyboard ever
+// raised, because there is no text field to raise it.
 
 import PunktfunkKit
 import SwiftUI
@@ -26,6 +29,9 @@ struct GamepadKeyboard: View {
     @State private var cursor = GridPos(row: 1, col: 0) // opens on "q"
     @State private var pressTick = 0
     @State private var boundaryTick = 0
+    /// Hardware-keyboard focus: the tray takes it on appear so key presses land here (the row
+    /// list behind it hands its own key navigation off while editing).
+    @FocusState private var hardwareFocus: Bool
     #if os(iOS)
     /// `.compact` (landscape phone): shorter keycaps so the tray leaves room for the field rows.
     @Environment(\.verticalSizeClass) private var vSizeClass
@@ -85,9 +91,15 @@ struct GamepadKeyboard: View {
         .sensoryFeedback(.selection, trigger: cursor)
         .sensoryFeedback(.impact(weight: .light), trigger: pressTick)
         .sensoryFeedback(.impact(flexibility: .rigid, intensity: 0.7), trigger: boundaryTick)
+        // Hardware keys. No focus ring — the tray draws its own cursor.
+        .focusable()
+        .focusEffectDisabled()
+        .focused($hardwareFocus)
+        .onKeyPress(phases: .down) { hardwareKey($0) }
         .onAppear {
             wire()
             input.start()
+            hardwareFocus = true
         }
         .onDisappear {
             input.stop()
@@ -180,6 +192,56 @@ struct GamepadKeyboard: View {
     private func refuse() {
         boundaryTick &+= 1
         haptics.boundary()
+    }
+
+    /// A hardware key while the tray is up. Return and Esc are both Done — the binding already
+    /// holds the text, so there is nothing to cancel; ⌫ deletes; arrows drive the key cursor
+    /// (Return does NOT type the highlighted key — a keyboard user types letters, not caps);
+    /// anything with ⌘ (⌘Q, ⌘W…) is left to the system.
+    private func hardwareKey(_ key: KeyPress) -> KeyPress.Result {
+        if key.modifiers.contains(.command) { return .ignored }
+        switch key.key {
+        case .escape, .return:
+            haptics.confirm()
+            onDone()
+            return .handled
+        case .delete, .deleteForward:
+            DispatchQueue.main.async { press(.backspace) }
+            return .handled
+        case .leftArrow: move(.left); return .handled
+        case .rightArrow: move(.right); return .handled
+        case .upArrow: move(.up); return .handled
+        case .downArrow: move(.down); return .handled
+        case .space:
+            DispatchQueue.main.async { press(.space) }
+            return .handled
+        default:
+            break
+        }
+        // ⌫ can also arrive as a bare control character rather than a named key.
+        if key.characters == "\u{7F}" || key.characters == "\u{08}" {
+            DispatchQueue.main.async { press(.backspace) }
+            return .handled
+        }
+        // Printable characters — including ones the on-screen grid doesn't offer (a capital,
+        // an umlaut): the on-screen set is deliberately small, the field's own `allowed` set is
+        // the real rule.
+        let typed = key.characters
+        guard !typed.isEmpty,
+              typed.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
+        else { return .ignored }
+        if let allowed, !typed.unicodeScalars.allSatisfy(allowed.contains) {
+            refuse()
+            return .handled
+        }
+        // Off the key-event dispatch: writing the binding synchronously here re-rendered the
+        // screen mid-delivery and a fast burst of keystrokes lost every other one.
+        DispatchQueue.main.async {
+            text.append(typed)
+            pressTick &+= 1
+            haptics.move()
+        }
+        return .handled
     }
 }
 #endif
