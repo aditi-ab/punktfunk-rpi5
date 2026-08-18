@@ -3057,6 +3057,7 @@ dependencies = [
  "pf-presenter",
  "punktfunk-core",
  "sdl3",
+ "serde",
  "serde_json",
  "skia-safe",
  "tracing",
@@ -3498,6 +3499,7 @@ name = "punktfunk-client-android"
 version = "0.30.0"
 dependencies = [
  "android_logger",
+ "anyhow",
  "jni",
  "libc",
  "log",
@@ -3505,7 +3507,12 @@ dependencies = [
  "ndk",
  "ndk-sys",
  "opus",
+ "pf-client-core",
+ "pf-console-ui",
  "punktfunk-core",
+ "serde",
+ "serde_json",
+ "skia-safe",
  "tracing",
  "uac-host",
  "usbfs-iso",

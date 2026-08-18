@@ -11,7 +11,7 @@ use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox};
 use crate::theme::{fg, Fonts, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec};
-use pf_client_core::gamepad::{MenuEvent, MenuPulse};
+use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
 
 pub(crate) struct PinHostsScreen {
@@ -228,6 +228,8 @@ mod tests {
             hosts: &hosts,
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -248,7 +250,7 @@ mod tests {
         // Left on an unpinned host = already off = boundary, no command.
         let mut fx = Outbox::default();
         let pulse = s.menu(
-            MenuEvent::Move(pf_client_core::gamepad::MenuDir::Left),
+            MenuEvent::Move(pf_client_core::menu_nav::MenuDir::Left),
             &mut ctx,
             &mut fx,
         );
@@ -267,6 +269,8 @@ mod tests {
             hosts: &hosts,
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",

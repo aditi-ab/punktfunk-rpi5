@@ -30,6 +30,14 @@ use jni::EnvUnowned;
 mod adpf;
 #[cfg(target_os = "android")]
 mod audio;
+// The Skia console UI host (design/android-skia-console-port.md): the shared `pf-console-ui`
+// shell over EGL/GLES. 64-bit ABIs only until the armv7 Skia archive is self-hosted (WP6) —
+// see the matching gate in Cargo.toml; `nativeConsoleAvailable` below tells Kotlin which.
+#[cfg(all(
+    target_os = "android",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+mod console;
 // The RESOLVED audio format + its ms ⇄ sample arithmetic, split out of `audio` and — unlike it —
 // ungated, because that arithmetic is what a rate the ladder does not divide gets wrong (44 100 Hz
 // used to come out 2.3 % off in every direction at once) and it must be provable without a phone.
@@ -98,4 +106,20 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_coreVersion<'loca
 ) -> JString<'local> {
     env.with_env(|env| env.new_string(env!("CARGO_PKG_VERSION")))
         .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeConsoleAvailable(): Boolean` — whether this `.so` carries the Skia
+/// console host ([`console`]). Present on EVERY ABI so Kotlin can ask before it calls any
+/// `nativeConsole*` symbol: on armeabi-v7a those symbols do not exist yet (no prebuilt Skia
+/// archive — see Cargo.toml) and a call would be an `UnsatisfiedLinkError`, not a graceful
+/// fallback.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleAvailable(
+    _env: EnvUnowned,
+    _this: JObject,
+) -> jni::sys::jboolean {
+    cfg!(all(
+        target_os = "android",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))
 }

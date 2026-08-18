@@ -17,8 +17,8 @@ use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox, Screen};
 use crate::theme::{fg, Fonts, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec, TabStrip, TAB_STRIP_H};
-use pf_client_core::gamepad::{MenuEvent, MenuPulse};
-use pf_client_core::session::{AUDIO_FORMATS, AUDIO_FORMAT_OPUS};
+use pf_client_core::audio_format::{AUDIO_FORMATS, AUDIO_FORMAT_OPUS};
+use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use pf_client_core::trust::{MouseMode, StatsVerbosity, TouchMode};
 use skia_safe::{Canvas, Rect};
 
@@ -267,14 +267,11 @@ pub(crate) struct SettingsScreen {
 }
 
 impl SettingsScreen {
-    pub(crate) fn new() -> SettingsScreen {
-        Self::with_profiles(
-            pf_client_core::profiles::ProfilesFile::load()
-                .profiles
-                .into_iter()
-                .map(|p| (p.id, p.name))
-                .collect(),
-        )
+    /// The settings screen over the host's profile catalog (`store.profiles()`), read once
+    /// here — the console can't create profiles, so the list is stable for the screen's
+    /// lifetime.
+    pub(crate) fn new(store: &dyn crate::store::SettingsStore) -> SettingsScreen {
+        Self::with_profiles(store.profiles())
     }
 
     fn with_profiles(profiles: Vec<(String, String)>) -> SettingsScreen {
@@ -296,7 +293,7 @@ impl SettingsScreen {
                 .1
                 .iter()
                 .copied()
-                .filter(|id| row_applies(*id, ctx.settings))
+                .filter(|id| row_on(*id, ctx.platform) && row_applies(*id, ctx.settings))
                 .collect();
         }
         if self.profiles.is_empty() {
@@ -428,13 +425,13 @@ impl SettingsScreen {
         // stored while the console was open. Only on the mutating events — a cursor move
         // shouldn't touch the disk.
         if matches!(msg, ListMsg::Adjust(_) | ListMsg::Activate) {
-            *ctx.settings = pf_client_core::trust::Settings::load();
+            *ctx.settings = ctx.store.load();
         }
         match msg {
             ListMsg::Adjust(delta) => {
                 let changed = adjust(focused, delta, false, ctx);
                 if changed {
-                    ctx.settings.save();
+                    ctx.store.save(ctx.settings);
                     Some(MenuPulse::Move)
                 } else {
                     Some(MenuPulse::Boundary)
@@ -443,7 +440,7 @@ impl SettingsScreen {
             ListMsg::Activate => {
                 // A cycles forward WRAPPING, so every option is reachable one-handed.
                 if adjust(focused, 1, true, ctx) {
-                    ctx.settings.save();
+                    ctx.store.save(ctx.settings);
                 }
                 pulse
             }
@@ -532,6 +529,27 @@ impl SettingsScreen {
 /// there. This screen was the lone exception because its row list was fixed; it is rebuilt from
 /// this filter each frame now, and the row it drops sits directly BELOW the row that drops it,
 /// so the cursor is never under anything that moves.
+/// Which platform HAS a row (design android-skia-console-port.md D3). The tables above are
+/// one union so a setting is found under the same word on every client; a row that names a
+/// concept the platform does not have — a decoder picker, vsync, fullscreen-on-stream, the
+/// keyboard-shortcut grab — is simply absent there, never a control that changes nothing.
+/// The desktop shows everything, exactly as before there was a second platform.
+fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
+    use crate::platform::Platform;
+    match platform {
+        Platform::Desktop => true,
+        Platform::Android => !matches!(
+            id,
+            RowId::Decoder
+                | RowId::Chroma444
+                | RowId::Vsync
+                | RowId::AllowVrr
+                | RowId::Fullscreen
+                | RowId::Shortcuts
+        ),
+    }
+}
+
 fn row_applies(id: RowId, s: &pf_client_core::trust::Settings) -> bool {
     match id {
         RowId::SmoothBuffer => s.present_priority == "smooth",
@@ -655,7 +673,7 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             "Decoder",
             label_for(
                 &DECODERS,
-                &pf_client_core::video::migrate_decoder_pref(&s.decoder),
+                &pf_client_core::decoder_pref::migrate_decoder_pref(&s.decoder),
             )
             .into(),
         ),
@@ -926,7 +944,7 @@ fn label_for<'a>(options: &'a [(&str, &'a str)], value: &str) -> &'a str {
 /// An unrecognized value is not a corrupt one here: the key travels verbatim through a profile
 /// catalog shared with the Apple and Android clients, so a rung a NEWER client offers can land in
 /// this file. The session resolves anything it doesn't know to Opus
-/// (`pf_client_core::session::audio_format_wire`), so the row says Opus too. `label_for`'s "—"
+/// (`pf_client_core::audio_format::audio_format_wire`), so the row says Opus too. `label_for`'s "—"
 /// would name a format no session on this box will ever run.
 fn audio_format_label(value: &str) -> &'static str {
     AUDIO_FORMATS
@@ -979,7 +997,7 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             // …and on the way in here too, or stepping from a legacy value would start
             // from "not found" and jump to the first/last entry instead of the neighbour
             // of what the user actually has.
-            s.decoder = pf_client_core::video::migrate_decoder_pref(&s.decoder);
+            s.decoder = pf_client_core::decoder_pref::migrate_decoder_pref(&s.decoder);
             step_str(&DECODERS, &mut s.decoder, delta, wrap)
         }
         RowId::Hdr => toggle(&mut s.hdr_enabled, delta, wrap),
@@ -1171,7 +1189,7 @@ pub(super) mod tests {
         assert_eq!(got, want, "the desktop console's tab names and order");
     }
 
-    fn ctx_parts() -> (Settings, Vec<pf_client_core::gamepad::PadInfo>) {
+    fn ctx_parts() -> (Settings, Vec<pf_client_core::menu_nav::PadInfo>) {
         (Settings::default(), Vec::new())
     }
 
@@ -1211,6 +1229,8 @@ pub(super) mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -1243,6 +1263,8 @@ pub(super) mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -1306,6 +1328,8 @@ pub(super) mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -1349,6 +1373,8 @@ pub(super) mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -1388,6 +1414,8 @@ pub(super) mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -1416,6 +1444,8 @@ pub(super) mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -1450,6 +1480,8 @@ pub(super) mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -1522,6 +1554,8 @@ pub(super) mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -1553,6 +1587,8 @@ pub(super) mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -1582,6 +1618,8 @@ pub(super) mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -1609,6 +1647,8 @@ pub(super) mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -1655,6 +1695,8 @@ pub(super) mod tests {
             hosts: &hosts,
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -1686,7 +1728,7 @@ pub(super) mod tests {
 
         let mut fx = Outbox::default();
         let pulse = s.menu(
-            MenuEvent::Move(pf_client_core::gamepad::MenuDir::Right),
+            MenuEvent::Move(pf_client_core::menu_nav::MenuDir::Right),
             &mut ctx,
             &mut fx,
         );
@@ -1704,6 +1746,8 @@ pub(super) mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -1726,6 +1770,34 @@ pub(super) mod tests {
     /// Every row the screen knows about must live in exactly one tab — a row missing from
     /// [`TABS`] is a setting that became unreachable in Gaming Mode, which is precisely
     /// what this screen exists to prevent.
+    /// The desktop row set is untouched by the platform split (the non-regression contract),
+    /// and Android drops exactly the desktop-only concepts — nothing else.
+    #[test]
+    fn platform_row_split_hides_only_desktop_concepts_on_android() {
+        use crate::platform::Platform;
+        let all: Vec<RowId> = TABS
+            .iter()
+            .flat_map(|(_, rows)| rows.iter().copied())
+            .collect();
+        assert!(all.iter().all(|id| row_on(*id, Platform::Desktop)));
+        let hidden: Vec<RowId> = all
+            .iter()
+            .copied()
+            .filter(|id| !row_on(*id, Platform::Android))
+            .collect();
+        assert_eq!(
+            hidden,
+            vec![
+                RowId::Decoder,
+                RowId::Chroma444,
+                RowId::Vsync,
+                RowId::AllowVrr,
+                RowId::Shortcuts,
+                RowId::Fullscreen,
+            ]
+        );
+    }
+
     #[test]
     fn every_row_has_exactly_one_tab() {
         let mut seen: Vec<RowId> = Vec::new();
@@ -1773,6 +1845,8 @@ pub(super) mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -1812,6 +1886,8 @@ pub(super) mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -1842,11 +1918,11 @@ pub(super) mod tests {
     /// under the channel count, and follows it — dim and inert under 5.1/7.1, because this
     /// client's session refuses to ASK for lossless surround (see the `enabled` note in
     /// [`row_spec`]; the host's own decline is gone). Every value is asserted against
-    /// `pf_client_core::session`'s constants rather than restated, so a spelling change there
+    /// `pf_client_core::audio_format`'s constants rather than restated, so a spelling change there
     /// reds this test instead of quietly making the console write a key nobody reads.
     #[test]
     fn audio_format_ships_off_and_follows_the_channel_count() {
-        use pf_client_core::session::{AUDIO_FORMAT_LOSSLESS_48, AUDIO_FORMAT_LOSSLESS_96};
+        use pf_client_core::audio_format::{AUDIO_FORMAT_LOSSLESS_48, AUDIO_FORMAT_LOSSLESS_96};
         let (mut settings, pads) = ctx_parts();
         assert_eq!(settings.audio_format, AUDIO_FORMAT_OPUS, "off by default");
         assert_eq!(settings.audio_channels, 2, "…and the gate starts open");
@@ -1855,6 +1931,8 @@ pub(super) mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",
@@ -1931,6 +2009,8 @@ pub(super) mod tests {
             hosts: &[],
             library: &library,
             settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
             device_name: "t",

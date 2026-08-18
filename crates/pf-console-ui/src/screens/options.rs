@@ -27,7 +27,7 @@ use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox, Screen};
 use crate::theme::{fg, Fonts, EDGE_INSET, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec, ROW_MAX_W};
-use pf_client_core::gamepad::{MenuEvent, MenuPulse};
+use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -194,7 +194,7 @@ impl OptionsScreen {
         msg: ListMsg,
         pulse: Option<MenuPulse>,
         actions: &[Action],
-        _ctx: &mut Ctx,
+        ctx: &mut Ctx,
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
         let Some(action) = actions.get(self.list.cursor).copied() else {
@@ -209,7 +209,7 @@ impl OptionsScreen {
             ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
             ListMsg::None => pulse,
             ListMsg::Activate => {
-                self.run(action, fx);
+                self.run(action, ctx.store, fx);
                 pulse
             }
         }
@@ -218,10 +218,11 @@ impl OptionsScreen {
     /// This subject's `punktfunk://` link, built from the store at ACTIVATION — never at open.
     /// The store is what holds the fingerprint and stable id, and the row the menu was raised
     /// on may have left it since; a link built early would be a link built from a lie.
-    fn link(&self) -> Option<String> {
+    fn link(&self, store: &dyn crate::store::SettingsStore) -> Option<String> {
         match &self.subject {
-            Subject::Host(h) => crate::screens::host_link(h),
+            Subject::Host(h) => crate::screens::host_link(store, h),
             Subject::Game { host, id, .. } => crate::screens::saved_host_link(
+                store,
                 &host.fp_hex,
                 &host.addr,
                 host.port,
@@ -231,7 +232,7 @@ impl OptionsScreen {
         }
     }
 
-    fn run(&mut self, action: Action, fx: &mut Outbox) {
+    fn run(&mut self, action: Action, store: &dyn crate::store::SettingsStore, fx: &mut Outbox) {
         let key = self.host_key().to_string();
         match action {
             Action::Wake => {
@@ -253,7 +254,7 @@ impl OptionsScreen {
                 fx.pop();
             }
             Action::CopyLink => {
-                match self.link() {
+                match self.link(store) {
                     Some(url) => {
                         fx.copy = Some(url);
                         fx.toast = Some("Link copied".into());
@@ -450,12 +451,12 @@ mod tests {
         s.list.cursor = i;
         let mut fx = Outbox::default();
 
-        s.run(Action::Forget, &mut fx);
+        s.run(Action::Forget, crate::store::file_store(), &mut fx);
         assert!(fx.cmds.is_empty(), "the first press only arms");
         assert!(s.armed);
         assert!(s.label(Action::Forget).contains("press again"));
 
-        s.run(Action::Forget, &mut fx);
+        s.run(Action::Forget, crate::store::file_store(), &mut fx);
         assert_eq!(
             fx.cmds,
             vec![ConsoleCmd::ForgetHost { key: "aa".into() }],
@@ -474,6 +475,8 @@ mod tests {
             hosts: &[],
             library: &crate::library::LibraryShared::default(),
             settings: &mut ctx_settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &[],
             deck: false,
             device_name: "test",
@@ -532,7 +535,7 @@ mod tests {
             OptionsScreen::for_game(&host(), &game()),
         ] {
             let mut fx = Outbox::default();
-            s.run(Action::CopyLink, &mut fx);
+            s.run(Action::CopyLink, crate::store::file_store(), &mut fx);
             assert!(matches!(fx.nav, Some(Nav::Pop)));
             assert!(fx.toast.is_some());
         }

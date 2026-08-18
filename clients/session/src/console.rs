@@ -112,10 +112,7 @@ pub fn run(target: Option<&str>) -> u8 {
         ConsoleEntry::Home => None,
     };
 
-    let opts = ConsoleOptions {
-        device_name: trust::device_name(),
-        deck: is_steam_deck(),
-    };
+    let opts = ConsoleOptions::desktop(trust::device_name(), is_steam_deck());
     let (overlay, handles) = match SkiaOverlay::console(opts, entry) {
         Ok(v) => v,
         Err(e) => {

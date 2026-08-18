@@ -134,10 +134,7 @@ fn shell(stack: Vec<Screen>) -> (Shell, ConsoleShared, LibraryShared) {
         console.clone(),
         library.clone(),
         bus,
-        ConsoleOptions {
-            device_name: "deck".into(),
-            deck: false,
-        },
+        ConsoleOptions::desktop("deck".into(), false),
         stack,
     )
     .unwrap();
@@ -340,7 +337,7 @@ fn wake_gates_input_in_the_same_press() {
 /// a controller plugged in a keyboard user had no way in, and no way to find one.
 #[test]
 fn tab_and_shift_tab_change_section() {
-    use sdl3::keyboard::Scancode;
+    use crate::input::Key as Scancode;
     let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
     s.handle_menu(MenuEvent::Tertiary); // X → Settings
     s.motion = Motion::None; // skip the push transition, which drops input
@@ -1089,10 +1086,7 @@ fn dump_console_screens() {
             console2,
             library.clone(),
             ConsoleBus::default(),
-            ConsoleOptions {
-                device_name: "deck".into(),
-                deck: false,
-            },
+            ConsoleOptions::desktop("deck".into(), false),
             vec![
                 Screen::Home(HomeScreen::new()),
                 Screen::Library(LibraryScreen::new(&hosts()[0], 0)),
@@ -1269,10 +1263,7 @@ fn collections_shell_inner(
         console.clone(),
         library.clone(),
         ConsoleBus::default(),
-        ConsoleOptions {
-            device_name: "deck".into(),
-            deck: false,
-        },
+        ConsoleOptions::desktop("deck".into(), false),
         vec![
             Screen::Home(HomeScreen::new()),
             Screen::Library(LibraryScreen::new(&hosts()[0], 0)),

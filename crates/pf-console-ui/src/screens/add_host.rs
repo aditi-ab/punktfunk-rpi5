@@ -10,7 +10,7 @@ use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox};
 use crate::theme::{fg, Fonts, EDGE_INSET, W};
 use crate::widgets::{permits, Charset, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec, ROW_MAX_W};
-use pf_client_core::gamepad::{MenuEvent, MenuPulse};
+use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -158,17 +158,17 @@ impl AddHostScreen {
         }
     }
 
-    pub(crate) fn edit_key(&mut self, sc: sdl3::keyboard::Scancode) -> bool {
-        use sdl3::keyboard::Scancode as S;
+    pub(crate) fn edit_key(&mut self, key: crate::input::Key) -> bool {
+        use crate::input::Key as K;
         if self.editing.is_none() {
             return false;
         }
-        match sc {
-            S::Backspace => {
+        match key {
+            K::Backspace => {
                 self.backspace();
                 true
             }
-            S::Return | S::KpEnter | S::Escape => {
+            K::Return | K::Escape => {
                 self.editing = None;
                 true
             }
@@ -384,7 +384,7 @@ mod tests {
 
     fn ctx<'a>(
         settings: &'a mut Settings,
-        pads: &'a [pf_client_core::gamepad::PadInfo],
+        pads: &'a [pf_client_core::menu_nav::PadInfo],
         library: &'a crate::library::LibraryShared,
         deck: bool,
     ) -> Ctx<'a> {
@@ -392,6 +392,8 @@ mod tests {
             hosts: &[],
             library,
             settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads,
             deck,
             device_name: "t",
@@ -416,10 +418,10 @@ mod tests {
         // Hardware keys / Steam keyboard commit text; spaces are refused for addresses.
         s.text_input("deck tower.local");
         assert_eq!(s.address, "decktower.local");
-        s.edit_key(sdl3::keyboard::Scancode::Backspace);
+        s.edit_key(crate::input::Key::Backspace);
         assert_eq!(s.address, "decktower.loca");
         s.text_input("l");
-        s.edit_key(sdl3::keyboard::Scancode::Return);
+        s.edit_key(crate::input::Key::Return);
         assert!(s.editing.is_none());
 
         // Now Add saves, toasts, and pops.
@@ -456,7 +458,7 @@ mod tests {
         // Moves don't drive a key grid on Deck; B closes the field.
         assert!(s
             .menu(
-                MenuEvent::Move(pf_client_core::gamepad::MenuDir::Right),
+                MenuEvent::Move(pf_client_core::menu_nav::MenuDir::Right),
                 &mut c,
                 &mut fx
             )

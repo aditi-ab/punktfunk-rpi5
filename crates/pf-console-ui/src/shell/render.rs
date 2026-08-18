@@ -6,7 +6,7 @@ use crate::library::LibraryShared;
 use crate::model::HostRow;
 use crate::screens::{Bg, Ctx, Screen};
 use crate::theme::{fg, Fonts, PanelStroke, EDGE_INSET, W};
-use pf_client_core::gamepad::PadInfo;
+use pf_client_core::menu_nav::PadInfo;
 use pf_client_core::trust;
 use skia_safe::{Canvas, Rect};
 use std::time::Instant;
@@ -18,11 +18,37 @@ use super::{
 
 impl Shell {
     #[allow(clippy::too_many_arguments)]
+    /// Render at `width`×`height` with no insets and the default scale — what a test means
+    /// by "render at w×h". See [`Self::render_in`], which the hosts call.
+    #[cfg(test)]
     pub(crate) fn render(
         &mut self,
         canvas: &Canvas,
         width: u32,
         height: u32,
+        fonts: &Fonts,
+        pad: Option<&str>,
+        pad_pref: Option<punktfunk_core::config::GamepadPref>,
+        pads: &[PadInfo],
+    ) {
+        self.render_in(
+            canvas,
+            &crate::console::Viewport::plain(width, height),
+            fonts,
+            pad,
+            pad_pref,
+            pads,
+        );
+    }
+
+    /// Render one frame into `viewport`. The backdrop paints the whole surface; every
+    /// piece of chrome and content lays out inside the viewport's insets, by translating
+    /// the canvas once — the screens never learn insets exist. `k` (device px per design
+    /// unit) is the viewport's `scale` when it has one, else the couch formula.
+    pub(crate) fn render_in(
+        &mut self,
+        canvas: &Canvas,
+        viewport: &crate::console::Viewport,
         fonts: &Fonts,
         pad: Option<&str>,
         pad_pref: Option<punktfunk_core::config::GamepadPref>,
@@ -51,8 +77,22 @@ impl Shell {
             str::to_owned,
         ));
 
-        let (w, h) = (f64::from(width), f64::from(height));
-        let k = (h / 800.0).clamp(0.75, 3.0);
+        let (full_w, full_h) = (f64::from(viewport.width), f64::from(viewport.height));
+        let ins = viewport.insets;
+        // The design-unit scale reads the FULL height even under insets: a phone's landscape
+        // cutout is a side inset and must not shrink the type, and on the desktop (no insets)
+        // this is byte for byte the formula it always was.
+        let k = viewport
+            .scale
+            .unwrap_or_else(|| (full_h / 800.0).clamp(0.75, 3.0));
+        // Everything below the backdrop lays out in the safe area: (0,0) is its top-left
+        // corner and (w,h) its size. Pointer input is brought into the same space by
+        // `Shell::pointer` via `last_insets`.
+        let (w, h) = (
+            full_w - f64::from(ins.left) - f64::from(ins.right),
+            full_h - f64::from(ins.top) - f64::from(ins.bottom),
+        );
+        self.last_insets = (ins.left, ins.top);
         let t = self.t();
 
         // Advance the transition. `None` means "settled" — which is also what makes the
@@ -72,7 +112,9 @@ impl Shell {
         if (self.bg_mix - bg_target).abs() < 0.005 {
             self.bg_mix = bg_target;
         }
-        self.draw_aurora(canvas, w, h, t, self.bg_mix);
+        self.draw_aurora(canvas, full_w, full_h, t, self.bg_mix);
+        canvas.save();
+        canvas.translate((ins.left, ins.top));
 
         // The screens, through the transition choreography.
         let content = Rect::from_ltrb(
@@ -112,6 +154,8 @@ impl Shell {
             hosts: &self.hosts,
             library: &self.library,
             settings: &mut self.settings,
+            store: &*self.store,
+            platform: self.platform,
             pads: &self.pads,
             deck: self.deck,
             device_name: &self.device_name,
@@ -233,6 +277,7 @@ impl Shell {
         }
 
         self.draw_overlays(canvas, w, h, k, dt, t, fonts);
+        canvas.restore();
     }
 }
 
@@ -266,6 +311,8 @@ struct LayerEnv<'a> {
     hosts: &'a [HostRow],
     library: &'a LibraryShared,
     settings: &'a mut trust::Settings,
+    store: &'a dyn crate::store::SettingsStore,
+    platform: crate::platform::Platform,
     pads: &'a [PadInfo],
     deck: bool,
     device_name: &'a str,
@@ -298,6 +345,8 @@ impl LayerEnv<'_> {
             hosts: self.hosts,
             library: self.library,
             settings: self.settings,
+            store: self.store,
+            platform: self.platform,
             pads: self.pads,
             deck: self.deck,
             device_name: self.device_name,

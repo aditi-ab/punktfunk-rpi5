@@ -7,41 +7,20 @@
 //! settings, pairing — always dirty, the aurora animates) and the stream chrome (stats
 //! OSD, capture hint, the auto-fading start banner).
 
-use crate::model::{ConsoleBus, ConsoleShared, HostRow};
-use crate::pointer::{Pointer, PointerKind};
-use crate::screens::Screen;
+use crate::console::{Console, ConsoleEntry, ConsoleHandles};
 use crate::shell::{ConsoleOptions, Shell};
 use crate::theme::{fill, match_first_family, Fonts};
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk as avk;
 use ash::vk::Handle as _;
-use pf_client_core::gamepad::{MenuEvent, MenuPulse};
+use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use pf_presenter::overlay::{
-    FrameCtx, Overlay, OverlayAction, OverlayFrame, PointerButton, PointerInput, SessionPhase,
-    SharedDevice,
+    FrameCtx, Overlay, OverlayAction, OverlayFrame, PointerInput, SessionPhase, SharedDevice,
 };
 use skia_safe::gpu::vk as skvk;
 use skia_safe::gpu::{self, DirectContext, SurfaceOrigin};
 use skia_safe::{Canvas, Color4f, Font, FontMgr, Point, RRect, Rect, Surface};
 use std::time::Instant;
-
-/// Skia's GPU resource budget — poster art plus a few screen layers.
-///
-/// A CEILING, not an allocation: Skia grows into it only under demand, and the console's
-/// demand is now small — with the library's posters cached at the size they are drawn
-/// (`screens::library::art_cache_size`) a full grid at Deck scale asks for ~30 MB. What
-/// matters is the HEADROOM. At 64 MB the budget sat under a full grid's working set: a
-/// screenful of full-resolution covers is ~100 MB, so `GrResourceCache` evicted a third of
-/// them on every submit and the next frame re-decoded them from JPEG on the render thread.
-/// That was the grid's slideshow, and a cliff rather than a slope — which is exactly how it
-/// was reported, smooth until the screen filled.
-///
-/// 160 MB clears the working set several times over at every scale a panel up to 1440p
-/// produces, with room for the two render targets and the glyph atlases. The one arrangement
-/// that can still crowd it is a 4K panel (`k` 2.7, 33 MB a render target) fed 1000×1500
-/// SteamGridDB portraits, where full resolution is genuinely what gets drawn — and that is a
-/// desktop GPU by the time it happens.
-pub(crate) const RESOURCE_CACHE_BYTES: usize = 160 << 20;
 
 /// How long the start-of-stream banner lingers (fading through the tail).
 const BANNER_S: f64 = 6.0;
@@ -105,23 +84,6 @@ mod base {
     pub const PILL_BOTTOM: f32 = 24.0;
 }
 
-/// Where the console starts (the session binary's `--browse` forms).
-pub enum ConsoleEntry {
-    /// The host list (bare `--browse`).
-    Home,
-    /// Home with this host's library already pushed (`--browse host` — the Decky
-    /// per-host launch; B backs out to Home). Boxed: `HostRow` outgrew the dataless
-    /// `Home` variant when it learned its profile chips.
-    Library(Box<HostRow>),
-}
-
-/// The binary's ends of the console: models to write, commands to serve.
-pub struct ConsoleHandles {
-    pub console: ConsoleShared,
-    pub library: crate::library::LibraryShared,
-    pub bus: ConsoleBus,
-}
-
 pub struct SkiaOverlay {
     /// Set by `init`; `None` until then (and after an init failure the run loop drops
     /// the whole overlay, so mid-session these are always `Some`).
@@ -181,32 +143,13 @@ impl SkiaOverlay {
         opts: ConsoleOptions,
         entry: ConsoleEntry,
     ) -> Result<(SkiaOverlay, ConsoleHandles)> {
-        let console = ConsoleShared::default();
-        let library = crate::library::LibraryShared::default();
-        let bus = ConsoleBus::default();
-        let stack = match entry {
-            ConsoleEntry::Home => vec![Screen::Home(crate::screens::home::HomeScreen::new())],
-            ConsoleEntry::Library(host) => vec![
-                Screen::Home(crate::screens::home::HomeScreen::new()),
-                // A freshly-built model, so the epoch is 0 and the `--browse` entry's own
-                // `FetchLibrary` (queued by the binary right after this) is the first to raise it.
-                Screen::Library(crate::screens::library::LibraryScreen::new(
-                    &host,
-                    library.fetch_epoch(),
-                )),
-            ],
-        };
-        let shell = Shell::new(console.clone(), library.clone(), bus.clone(), opts, stack)?;
+        let handles = ConsoleHandles::new();
+        let console = Console::new(opts, entry, &handles)?;
         let mut o = SkiaOverlay::new();
+        let (shell, fonts) = console.into_parts();
         o.shell = Some(shell);
-        Ok((
-            o,
-            ConsoleHandles {
-                console,
-                library,
-                bus,
-            },
-        ))
+        o.fonts = Some(fonts);
+        Ok((o, handles))
     }
 
     fn console_visible(&self) -> bool {
@@ -293,7 +236,11 @@ impl Overlay for SkiaOverlay {
         let backend = unsafe { backend_builder.build() };
         let mut context = gpu::direct_contexts::make_vulkan(&backend, None)
             .ok_or_else(|| anyhow!("Skia DirectContext over the shared device"))?;
-        context.set_resource_cache_limit(RESOURCE_CACHE_BYTES);
+        context.set_resource_cache_limit(
+            self.shell
+                .as_ref()
+                .map_or(crate::shell::DEFAULT_GPU_CACHE_BYTES, |s| s.gpu_cache_bytes),
+        );
 
         let typeface = match_first_family(
             &FontMgr::new(),
@@ -302,7 +249,9 @@ impl Overlay for SkiaOverlay {
         )
         .context("no monospace typeface (fontconfig alias or system family)")?;
         self.font = Some(Font::new(typeface, base::FONT_PX));
-        self.fonts = Some(crate::theme::build_fonts()?);
+        if self.fonts.is_none() {
+            self.fonts = Some(crate::theme::build_fonts()?);
+        }
 
         self.gpu = Some(Gpu {
             device: shared.device.clone(),
@@ -337,7 +286,10 @@ impl Overlay for SkiaOverlay {
                     return false;
                 }
                 let shift = keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
-                shell.key(*sc, shift, *repeat)
+                let Some(key) = key_of(*sc) else {
+                    return false;
+                };
+                shell.key(key, shift, *repeat)
             }
             sdl3::event::Event::TextInput { text, .. } => {
                 shell.text_input(text);
@@ -359,42 +311,10 @@ impl Overlay for SkiaOverlay {
         if !self.console_visible() {
             return false;
         }
-        let Some(shell) = &mut self.shell else {
-            return false;
-        };
-        // `Up` of the secondary button is dropped rather than mapped: `Down` already sent
-        // Back, and a second event would pop two screens per right-click.
-        let (x, y, kind) = match input {
-            PointerInput::Move { x, y } => (x, y, PointerKind::Move),
-            PointerInput::Down {
-                x,
-                y,
-                button: PointerButton::Primary,
-            } => (x, y, PointerKind::Press),
-            PointerInput::Down {
-                x,
-                y,
-                button: PointerButton::Secondary,
-            } => (x, y, PointerKind::Back),
-            PointerInput::Up {
-                x,
-                y,
-                button: PointerButton::Primary,
-            } => (x, y, PointerKind::Release),
-            PointerInput::Up { .. } => return true,
-            PointerInput::Wheel { x, y, dy } => {
-                if dy == 0.0 {
-                    return true;
-                }
-                (x, y, PointerKind::Scroll { up: dy > 0.0 })
-            }
-            PointerInput::Cancel => (0.0, 0.0, PointerKind::Cancel),
-        };
-        shell.pointer(Pointer {
-            x: f64::from(x),
-            y: f64::from(y),
-            kind,
-        })
+        match &mut self.shell {
+            Some(shell) => shell.pointer_input(input),
+            None => false,
+        }
     }
 
     fn take_action(&mut self) -> Option<OverlayAction> {
@@ -407,27 +327,13 @@ impl Overlay for SkiaOverlay {
 
     fn session_phase(&mut self, phase: SessionPhase) {
         let Some(shell) = &mut self.shell else { return };
-        match phase {
-            SessionPhase::Connecting => {} // the shell raised the Launch; already showing
-            SessionPhase::Streaming => {
-                shell.session_streaming();
-                self.streaming_since = Some(Instant::now());
-            }
-            SessionPhase::Failed(msg) => shell.session_failed(msg),
-            SessionPhase::Ended(reason) => {
-                shell.session_ended(reason);
-                self.streaming_since = None;
-            }
-            // The stream stopped but a new dial is already in flight: toast WHY (the
-            // codec changed under the user) AND raise the connecting takeover, because
-            // nothing else will — the run loop starts the retry's pump directly rather
-            // than through a `Launch`, so the shell would otherwise sit in a state where
-            // a menu press could start a second session over the running one.
-            SessionPhase::Reconnecting(msg) => {
-                shell.session_reconnecting(msg);
-                self.streaming_since = None;
-            }
+        // The start banner's clock is the overlay's own; everything else is the shell's.
+        match &phase {
+            SessionPhase::Streaming => self.streaming_since = Some(Instant::now()),
+            SessionPhase::Ended(_) | SessionPhase::Reconnecting(_) => self.streaming_since = None,
+            SessionPhase::Connecting | SessionPhase::Failed(_) => {}
         }
+        shell.session_phase(phase);
     }
 
     fn frame(&mut self, ctx: &FrameCtx) -> Result<Option<OverlayFrame>> {
@@ -447,10 +353,9 @@ impl Overlay for SkiaOverlay {
             let slot = slots[next].as_mut().expect("just ensured");
             let shell = shell.as_mut().expect("console_visible");
             let fonts = fonts.as_ref().expect("init ran");
-            shell.render(
+            shell.render_in(
                 slot.surface.canvas(),
-                ctx.width,
-                ctx.height,
+                &crate::console::Viewport::plain(ctx.width, ctx.height),
                 fonts,
                 ctx.pad,
                 ctx.pad_pref,
@@ -717,6 +622,29 @@ impl SkiaOverlay {
 
 /// The chrome face at `scale`. `with_size` only fails on a nonsensical size (the caller clamps),
 /// in which case the unscaled face is still better than no text.
+/// SDL scancode → the console's own [`Key`](crate::input::Key). `None` = a key the console
+/// has no use for, which the run loop keeps for itself.
+fn key_of(sc: sdl3::keyboard::Scancode) -> Option<crate::input::Key> {
+    use crate::input::Key as K;
+    use sdl3::keyboard::Scancode as S;
+    Some(match sc {
+        S::Left => K::Left,
+        S::Right => K::Right,
+        S::Up => K::Up,
+        S::Down => K::Down,
+        S::Return | S::KpEnter => K::Return,
+        S::Space => K::Space,
+        S::Escape => K::Escape,
+        S::Backspace => K::Backspace,
+        S::PageUp => K::PageUp,
+        S::PageDown => K::PageDown,
+        S::Tab => K::Tab,
+        S::Y => K::Y,
+        S::X => K::X,
+        _ => return None,
+    })
+}
+
 fn chrome_font(font: &Font, scale: f32) -> Font {
     font.with_size(base::FONT_PX * scale)
         .unwrap_or_else(|| font.clone())

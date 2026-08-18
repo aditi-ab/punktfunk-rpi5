@@ -59,7 +59,7 @@ pub struct SettingsOverlay {
     pub compositor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_channels: Option<u8>,
-    /// The requested audio format (`crate::session::AUDIO_FORMATS`' stored value). Profileable
+    /// The requested audio format (`crate::audio_format::AUDIO_FORMATS`' stored value). Profileable
     /// because it is about how a HOST is streamed — a wired desktop on the LAN can afford the
     /// 2.3–4.6 Mbps lossless takes off the top of the link, the same laptop on a hotel Wi-Fi
     /// cannot — rather than about this device's hardware. Apple and Android carry it under the
@@ -683,14 +683,14 @@ mod tests {
         let base = Settings::default();
         assert_eq!(
             base.audio_format,
-            crate::session::AUDIO_FORMAT_OPUS,
+            crate::audio_format::AUDIO_FORMAT_OPUS,
             "the setting ships off"
         );
 
         let mut o = SettingsOverlay::default();
         let before = o.apply(&base);
         let mut after = before.clone();
-        after.audio_format = crate::session::AUDIO_FORMAT_LOSSLESS_96.into();
+        after.audio_format = crate::audio_format::AUDIO_FORMAT_LOSSLESS_96.into();
         o.absorb(&before, &after);
         assert_eq!(o.audio_format.as_deref(), Some("lossless96"));
         assert_eq!(o.apply(&base).audio_format, "lossless96");
@@ -715,7 +715,7 @@ mod tests {
         // Back to inheriting the global — not a remembered "lossless96".
         assert_eq!(
             o.apply(&base).audio_format,
-            crate::session::AUDIO_FORMAT_OPUS
+            crate::audio_format::AUDIO_FORMAT_OPUS
         );
     }
 

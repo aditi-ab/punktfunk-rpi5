@@ -4,13 +4,14 @@
 //! frame by generation stamp. The overlay never blocks: anything that touches the
 //! network or disk rides a [`ConsoleCmd`] to the binary instead.
 
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 /// A settings profile as the console shows it (design client-settings-profiles.md §5.2a):
 /// the resolved name and accent of a catalog entry, keyed by its stable id. The service
 /// thread resolves these against the catalog; the shell never opens the profiles file.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProfileChip {
     pub id: String,
     pub name: String,
@@ -21,7 +22,7 @@ pub struct ProfileChip {
 /// One row on the console home carousel — a saved host, a discovered-but-unsaved one,
 /// a pinned profile card, or (client-side) the trailing Add Host tile. Fully resolved by
 /// the service thread; the shell renders it verbatim.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HostRow {
     /// Stable identity across refreshes: the pinned fingerprint when known, else
     /// `addr:port` — keeps the cursor on "the same host" as snapshots churn.
@@ -57,7 +58,7 @@ pub struct HostRow {
 }
 
 /// The pairing ceremony's observable state (one at a time — the ceremony is modal).
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub enum PairPhase {
     #[default]
     Idle,
@@ -72,7 +73,7 @@ pub enum PairPhase {
 
 /// A wake-and-wait in progress (one at a time). The service thread re-sends magic
 /// packets and probes; the shell renders the card and acts on `online`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WakeStatus {
     pub key: String,
     pub name: String,
@@ -149,7 +150,7 @@ impl ConsoleShared {
 
 /// Work the shell asks the binary to do. Everything here blocks (network/disk), so it
 /// runs on the binary's service thread, never on the render path.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConsoleCmd {
     /// (Re)fetch a host's game library into the shared library model.
     FetchLibrary {
