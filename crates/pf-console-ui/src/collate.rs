@@ -7,6 +7,10 @@
 //! library collapsing into one "Unknown" heap, a fold that files "The Witcher" under T).
 //! Both are cheap to test here and expensive to notice on a TV.
 //!
+//! The spec is also MACHINE-READABLE: `clients/shared/library-collate-vectors.json` pins the
+//! groups these rules produce over one mixed library (`vectors_match_the_shared_file`), and the
+//! ports read the same file — change a rule here, regenerate the file in the same commit.
+//!
 //! Everything returns INDICES into the caller's slice. The screens' art cache, fetch pump
 //! and cursor arithmetic all key off the shared model's ordering, so a collation that
 //! handed back cloned games would fork the identity of every title in the shelf.
@@ -438,5 +442,143 @@ mod tests {
         assert_eq!(SortKey::parse("something-newer"), SortKey::HostOrder);
         assert_eq!(SortKey::parse(""), SortKey::HostOrder);
         assert_eq!(SortKey::default(), SortKey::HostOrder);
+    }
+
+    /// The cross-client parity file. `clients/shared/library-collate-vectors.json` pins, from
+    /// this module's rules, the exact groups every (sort, group_by) must produce over one
+    /// mixed library, the flat lists a filter yields, which libraries are worth browsing,
+    /// the title fold, the store labels and the persisted sort ids — so the Apple and Android
+    /// ports have a machine contract to read instead of prose to transcribe. This crate is
+    /// the source of truth: a rule change here regenerates the file, never the other way.
+    #[test]
+    fn vectors_match_the_shared_file() {
+        let raw = include_str!("../../../clients/shared/library-collate-vectors.json");
+        let file: serde_json::Value =
+            serde_json::from_str(raw).expect("library-collate-vectors.json must parse");
+        assert_eq!(
+            file["version"], 1,
+            "bump the reader when the file's version moves"
+        );
+
+        let games: Vec<LibraryGame> = file["library"]
+            .as_array()
+            .expect("library")
+            .iter()
+            .map(|e| LibraryGame {
+                id: e["id"].as_str().expect("id").to_string(),
+                title: e["title"].as_str().expect("title").to_string(),
+                store: e["store"].as_str().expect("store").to_string(),
+                launcher: e["role"].as_str() == Some("launcher"),
+                icon: e["icon"].as_str().unwrap_or("").to_string(),
+                platform: e["platform"].as_str().map(str::to_string),
+                running: false,
+            })
+            .collect();
+        let ids =
+            |idx: &[usize]| -> Vec<&str> { idx.iter().map(|&i| games[i].id.as_str()).collect() };
+        let str_list = |v: &serde_json::Value| -> Vec<String> {
+            v.as_array()
+                .expect("array")
+                .iter()
+                .map(|s| s.as_str().expect("string").to_string())
+                .collect()
+        };
+        let key_of = |v: &serde_json::Value| -> GroupKey {
+            let name = || v["name"].as_str().expect("name").to_string();
+            match v["kind"].as_str().expect("kind") {
+                "launchers" => GroupKey::Launchers,
+                "platform" => GroupKey::Platform(name()),
+                "store" => GroupKey::Store(name()),
+                other => panic!("unknown group kind {other}"),
+            }
+        };
+        let group_by = |v: &serde_json::Value| -> Option<GroupBy> {
+            match v.as_str() {
+                None => None,
+                Some("platform") => Some(GroupBy::Platform),
+                Some("store") => Some(GroupBy::Store),
+                Some(other) => panic!("unknown group_by {other}"),
+            }
+        };
+
+        for case in file["sort_title"].as_array().expect("sort_title") {
+            let input = case["in"].as_str().expect("in");
+            assert_eq!(
+                sort_title(input),
+                case["out"].as_str().expect("out"),
+                "sort_title({input:?})"
+            );
+        }
+        for (store, label) in file["store_labels"].as_object().expect("store_labels") {
+            assert_eq!(
+                store_label(store),
+                label.as_str().expect("label"),
+                "store_label({store:?})"
+            );
+        }
+        for case in file["sort_keys"].as_array().expect("sort_keys") {
+            let stored = case["stored"].as_str().expect("stored");
+            assert_eq!(
+                SortKey::parse(stored).id(),
+                case["key"].as_str().expect("key"),
+                "SortKey::parse({stored:?})"
+            );
+        }
+
+        for case in file["cases"].as_array().expect("cases") {
+            let name = case["name"].as_str().expect("name");
+            let sort = SortKey::parse(case["sort"].as_str().expect("sort"));
+            let got = collate(&games, sort, group_by(&case["group_by"]));
+            let want = case["expect"].as_array().expect("expect");
+            assert_eq!(got.len(), want.len(), "{name}: group count");
+            for (g, w) in got.iter().zip(want) {
+                assert_eq!(g.key, key_of(w), "{name}: group key");
+                assert_eq!(
+                    g.label,
+                    w["label"].as_str().expect("label"),
+                    "{name}: label"
+                );
+                assert_eq!(
+                    ids(&g.games),
+                    str_list(&w["ids"]),
+                    "{name}: {} ids",
+                    g.label
+                );
+            }
+        }
+
+        for case in file["filtered"].as_array().expect("filtered") {
+            let name = case["name"].as_str().expect("name");
+            let sort = SortKey::parse(case["sort"].as_str().expect("sort"));
+            let filter = (!case["filter"].is_null()).then(|| key_of(&case["filter"]));
+            assert_eq!(
+                ids(&filtered(&games, sort, filter.as_ref())),
+                str_list(&case["expect"]),
+                "{name}"
+            );
+        }
+
+        for case in file["worth_browsing"].as_array().expect("worth_browsing") {
+            let name = case["name"].as_str().expect("name");
+            let subset: Vec<LibraryGame> = match case["ids"].as_array() {
+                None => games.clone(),
+                Some(want) => want
+                    .iter()
+                    .map(|id| {
+                        let id = id.as_str().expect("id");
+                        games
+                            .iter()
+                            .find(|g| g.id == id)
+                            .unwrap_or_else(|| panic!("{name}: unknown id {id}"))
+                            .clone()
+                    })
+                    .collect(),
+            };
+            assert_eq!(
+                worth_browsing(&subset),
+                case["expect"].as_bool().expect("expect"),
+                "{name}"
+            );
+        }
     }
 }

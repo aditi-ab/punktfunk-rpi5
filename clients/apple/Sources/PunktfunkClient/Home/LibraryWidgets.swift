@@ -1,6 +1,7 @@
 // Reusable library widgets, shared by the touch grid (LibraryView's `GameCard`) and the gamepad
 // coverflow (LibraryCoverflowView's cover cell).
 
+import ImageIO
 import PunktfunkKit
 import SwiftUI
 #if canImport(UIKit)
@@ -96,6 +97,36 @@ private extension Image {
     }
 }
 
+/// Decode cover art at the size it will be DRAWN, not the size the CDN shipped.
+///
+/// A Steam capsule is 600×900 (some custom art 1000×1500); decoded, that is 2–6 MB per poster
+/// and stays resident for as long as its tile does. A coverflow holds a dozen; a grid on an iPad
+/// Pro or an Apple TV holds forty, and Apple TV's memory ceiling is the lowest of the three.
+/// This is the desktop console's own lesson (its grid was a slideshow until posters were decoded
+/// at twice their cell size): `CGImageSourceCreateThumbnailAtIndex` decodes straight to a
+/// bounded bitmap and never materialises the full-size one. `maxPixels` is the longer edge, in
+/// PIXELS (the caller multiplies its point size by the screen scale, ×2 for headroom under the
+/// focus pop). nil ⇒ decode as-is (the touch grid's tiles are small and few enough).
+private func decodePoster(_ data: Data, maxPixels: Int?) -> PlatformImage? {
+    guard let maxPixels, maxPixels > 0 else { return PlatformImage(data: data) }
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+    let options: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixels,
+    ]
+    guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+        // A format ImageIO can't thumbnail (rare) still gets the full decode rather than a hole.
+        return PlatformImage(data: data)
+    }
+    #if canImport(UIKit)
+    return UIImage(cgImage: cg)
+    #elseif canImport(AppKit)
+    return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+    #endif
+}
+
 /// Sequentially tries cover-art URLs over `loader` (so a paired client can reach the host's own
 /// art proxy, not just public CDNs — see `LibraryArtLoader`), advancing past any that fail to
 /// load, then a placeholder. The loaded image is hard-clipped to fill the card's actual frame
@@ -111,12 +142,16 @@ struct PosterImage: View {
     /// The entry's brand-mark token (`GameEntry.iconToken`), when it has one. A launcher tile ships
     /// no cover art by design, so for those the mark IS the poster — see `placeholder`.
     var icon: String?
+    /// The size this poster is drawn at, in POINTS — the decode is bounded to twice its longer
+    /// edge in pixels (see `decodePoster`). nil decodes the art as shipped.
+    var drawnSize: CGSize?
     /// Fires once this poster has settled — art loaded, or every candidate exhausted and the
     /// placeholder is what it will be. The gamepad coverflow waits on a few of these before
     /// playing its entrance, so the cards swing in carrying artwork rather than grey rectangles.
     var onLoaded: (() -> Void)?
     @State private var index = 0
     @State private var image: PlatformImage?
+    @Environment(\.displayScale) private var displayScale
 
     var body: some View {
         Group {
@@ -159,8 +194,11 @@ struct PosterImage: View {
             onLoaded?()
             return
         }
+        // Twice the drawn edge: headroom for the focus pop and a Retina-crisp cover, without
+        // ever holding the CDN's 600×900 (or larger) bitmap for the life of the tile.
+        let maxPixels = drawnSize.map { Int(max($0.width, $0.height) * displayScale * 2) }
         guard let loader, let data = try? await loader.data(for: candidates[index]),
-              let loaded = PlatformImage(data: data)
+              let loaded = decodePoster(data, maxPixels: maxPixels)
         else {
             index += 1 // advance to the next candidate (or past the end → placeholder)
             return

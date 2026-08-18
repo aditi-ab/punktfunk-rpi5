@@ -27,6 +27,7 @@ final class LibraryClientTests: XCTestCase {
             "id": "custom:abc123",
             "store": "custom",
             "title": "Dolphin",
+            "platform": "GameCube",
             "art": { "header": "https://example.com/dolphin.jpg" }
           }
         ]
@@ -45,6 +46,10 @@ final class LibraryClientTests: XCTestCase {
         XCTAssertTrue(custom.isCustom)
         XCTAssertNil(custom.launch)
         XCTAssertNil(custom.art.portrait)
+        // `platform` is the host's flattened `GameMeta.platform`: present on a rom-manager entry,
+        // absent (nil) on a store-front title — the field the library's collections group by.
+        XCTAssertEqual(custom.platform, "GameCube")
+        XCTAssertNil(steam.platform)
     }
 
     func testPosterCandidatesPreferPortraitThenHeader() {

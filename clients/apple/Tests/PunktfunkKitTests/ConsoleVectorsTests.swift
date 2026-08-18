@@ -16,11 +16,10 @@ import simd
 /// produces, which is what actually reaches the gradient. `GamepadPaletteTests` already asserts
 /// the invariants (hue spread, gamut, lightness honesty); this asserts the values.
 ///
-/// ⚠️ The tab names and the shell motion constants are in the vectors file too, but this client
-/// cannot yet check them: `GpSettingsTab` and `GamepadShellMotion` live in `PunktfunkClient`,
-/// an executable target with no test target of its own. Moving them into `PunktfunkShared` — where
-/// `GamepadPalette` already sits, and for exactly this reason (see its header) — is what would
-/// close that gap.
+/// The tab names and the shell motion are pinned here too, since `GpSettingsTab` and
+/// `ConsoleMotion` moved into `PunktfunkShared` (`ConsoleContract.swift`) — where `GamepadPalette`
+/// already sat, and for exactly this reason. This client implements the version-2 `motion_spring`
+/// block; the deprecated v1 `motion` block is Android's until it migrates.
 final class ConsoleVectorsTests: XCTestCase {
     /// Read from the repo, not from a bundle resource: a copy would be a second file, and a
     /// second file drifts. Four `deletingLastPathComponent()` calls walk
@@ -38,6 +37,36 @@ final class ConsoleVectorsTests: XCTestCase {
         let cellRamp: [Double]
         let meshInterior: [[Double]]
         let palettes: [Palette]
+        let tabs: [Tab]
+        let motionSpring: MotionSpring
+
+        // swiftlint:disable:next nesting
+        struct Tab: Decodable {
+            let name: String
+            let desktopOnly: Bool?
+            enum CodingKeys: String, CodingKey {
+                case name
+                case desktopOnly = "desktop_only"
+            }
+        }
+
+        // swiftlint:disable:next nesting
+        struct MotionSpring: Decodable {
+            let response: Double
+            let damping: Double
+            let pushSlideDp: Double
+            let enterScale: Double
+            let exitScale: Double
+            let revealAlpha: Double
+            let interruptible: Bool
+            enum CodingKeys: String, CodingKey {
+                case response, damping, interruptible
+                case pushSlideDp = "push_slide_dp"
+                case enterScale = "enter_scale"
+                case exitScale = "exit_scale"
+                case revealAlpha = "reveal_alpha"
+            }
+        }
 
         // swiftlint:disable:next nesting
         struct Palette: Decodable {
@@ -55,8 +84,35 @@ final class ConsoleVectorsTests: XCTestCase {
         enum CodingKeys: String, CodingKey {
             case cellRamp = "cell_ramp"
             case meshInterior = "mesh_interior"
-            case palettes
+            case palettes, tabs
+            case motionSpring = "motion_spring"
         }
+    }
+
+    /// The section names, against the shared vectors — a setting is found under the same word on
+    /// every client. The desktop's `Input` tab is `desktop_only` (touch mode, mouse, invert-scroll
+    /// and shortcuts have nothing to set on a phone or a TV); this client's trailing `About` is its
+    /// own and not in the shared list (`GpSettingsTab.shared` drops it).
+    func testTabNamesMatchTheSharedVectors() throws {
+        let file = try JSONDecoder().decode(VectorFile.self, from: Data(contentsOf: Self.vectorFileURL))
+        let want = file.tabs.filter { $0.desktopOnly != true }.map(\.name)
+        XCTAssertEqual(GpSettingsTab.shared.map(\.rawValue), want, "console settings tabs")
+        XCTAssertEqual(GpSettingsTab.allCases.last, .about, "About ends the strip")
+    }
+
+    /// The screen transition — the version-2 `motion_spring` block. Parameters, not samples:
+    /// springs are integrator-dependent, and two implementations honouring response/damping agree
+    /// to the eye. The geometry (slide, scales, reveal alpha) is unchanged from v1.
+    func testMotionMatchesTheSharedVectors() throws {
+        let file = try JSONDecoder().decode(VectorFile.self, from: Data(contentsOf: Self.vectorFileURL))
+        let m = file.motionSpring
+        assertClose(ConsoleMotion.response, m.response, "response")
+        assertClose(ConsoleMotion.damping, m.damping, "damping")
+        assertClose(ConsoleMotion.pushSlideDp, m.pushSlideDp, "push_slide_dp")
+        assertClose(ConsoleMotion.enterScale, m.enterScale, "enter_scale")
+        assertClose(ConsoleMotion.exitScale, m.exitScale, "exit_scale")
+        assertClose(ConsoleMotion.revealAlpha, m.revealAlpha, "reveal_alpha")
+        XCTAssertEqual(ConsoleMotion.interruptible, m.interruptible, "interruptible")
     }
 
     private func assertClose(

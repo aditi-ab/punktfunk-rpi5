@@ -162,14 +162,28 @@ struct GamepadHomeView: View {
                     .geometryGroup()
                     .zIndex(1)
                     .id(screen.id)
-                    .transition(.gamepadScreen(slide: GamepadShellMotion.slide(compact: compact)))
+                    // Reduce Motion: a crossfade — no slide, no scale (the desktop's rule).
+                    .transition(
+                        reduceMotion
+                            ? .opacity
+                            : .gamepadScreen(slide: GamepadShellMotion.slide(compact: compact)))
+            }
+            // Back mid-push (the desktop's interruptible transition): while a push is in flight
+            // no layer owns the controller, so this zero-size listener takes B alone and turns
+            // the entering screen around. A and the rest stay dropped until the spring has
+            // passed 0.85 of its travel (`transitioning`), which keeps a double-tapped A from
+            // pushing two screens.
+            if transitioning, topScreen != nil {
+                MidPushBackCatcher { backOutOfPush() }
             }
             #endif
         }
         // Value-keyed rather than `withAnimation` at the triggers: pushes originate outside
         // this view too (`model.returnToLibrary` writes `libraryTarget`), and keying on the
-        // derived id catches every writer. Reduce Motion snaps.
-        .animation(reduceMotion ? nil : GamepadShellMotion.screen, value: topScreenID)
+        // derived id catches every writer. Reduce Motion crossfades on the reduced spring.
+        .animation(
+            reduceMotion ? GamepadShellMotion.reducedScreen : GamepadShellMotion.screen,
+            value: topScreenID)
         // ONE living field for every layer, still a `.background` (the layout rule in this
         // file's header). Its calm is CHASED between the launcher's aurora and the form
         // screens' quiet, never crossfaded per screen — the console's `bg_mix`.
@@ -195,7 +209,9 @@ struct GamepadHomeView: View {
             transitionEpoch += 1
             let epoch = transitionEpoch
             transitioning = true
-            let hold = reduceMotion ? 0.05 : GamepadShellMotion.duration + 0.02
+            // The gate opens when the spring has passed 0.85 of its travel, not when it has
+            // settled — the wall is gone, the double-tap protection stays.
+            let hold = reduceMotion ? 0.05 : GamepadShellMotion.inputOpensAfter
             DispatchQueue.main.asyncAfter(deadline: .now() + hold) {
                 if epoch == transitionEpoch { transitioning = false }
             }
@@ -347,6 +363,24 @@ struct GamepadHomeView: View {
         false
         #endif
     }
+
+    #if os(iOS)
+    /// Back pressed while a push is still in flight: clear the trigger that raised the top
+    /// screen, so the same spring carries it back down — the desktop retargets its NAV spring
+    /// to 0 mid-push; SwiftUI does the equivalent when the identity flips back before the
+    /// insertion has settled.
+    private func backOutOfPush() {
+        guard transitioning, let screen = topScreen else { return }
+        switch screen {
+        case .pair: pairingTarget = nil
+        case .editHost: editTarget = nil
+        case .hostOptions: hostOptionsTarget = nil
+        case .settings: showSettings = false
+        case .addHost: showAddHost = false
+        case .library: libraryTarget = nil
+        }
+    }
+    #endif
 
     private var topScreenID: String? {
         #if os(iOS)
@@ -805,6 +839,26 @@ private struct GamepadHostTile: View {
     private func monogram(_ name: String) -> String {
         guard let first = name.trimmingCharacters(in: .whitespacesAndNewlines).first else { return "•" }
         return String(first).uppercased()
+    }
+}
+#endif
+
+#if os(iOS)
+/// Zero-size controller listener for a push in flight — B alone. The same shape as LibraryView's
+/// `LibraryBackCatcher`; `GamepadMenuInput.needsSnapshot` swallows the still-held A that pushed
+/// the screen, so only a FRESH B mid-push counts. Unmounts the moment the gate opens.
+private struct MidPushBackCatcher: View {
+    let onBack: () -> Void
+    @State private var input = GamepadMenuInput(manager: .shared)
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onAppear {
+                input.onBack = onBack
+                input.start()
+            }
+            .onDisappear { input.stop() }
     }
 }
 #endif

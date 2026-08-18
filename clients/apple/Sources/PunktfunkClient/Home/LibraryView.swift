@@ -68,6 +68,16 @@ struct LibraryView: View {
     /// and while the connect takeover is up. Presentations that cover the launcher keep the
     /// default (their being up IS the launcher's gate).
     var controllerActive = true
+    /// The collection the gamepad shelf is drilled into (its label), or nil — reported so a host
+    /// screen (GamepadLibraryScreen's pinned title) can read `host · profile · collection`.
+    var onCollectionChanged: ((String?) -> Void)?
+    /// The same, for this view's own navigation title (the sheet/cover presentations).
+    @State private var collectionLabel: String?
+    /// The touch grid's sort (the shared `library_sort` key, the same one the console's bar
+    /// writes) and its grouping (touch-only — sections are the touch analogue of the console's
+    /// Collections place).
+    @AppStorage(DefaultsKey.librarySort) private var sortRaw = ""
+    @AppStorage(DefaultsKey.libraryGroupBy) private var groupByRaw = ""
     @Environment(\.dismiss) private var dismiss
     /// Resolves a pinned shelf's profile NAME for the title (the target carries only its id).
     @ObservedObject private var profiles = ProfileStore.shared
@@ -118,15 +128,23 @@ struct LibraryView: View {
 
     var body: some View {
         content
-            .navigationTitle("\(target.title(in: profiles)) — Library")
+            .navigationTitle("\(shelfTitle) — Library")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
             .toolbar {
                 #if os(macOS)
-                ToolbarItemGroup { reloadButton }
+                ToolbarItemGroup {
+                    if !gamepadUIActive { sortMenu }
+                    reloadButton
+                }
                 #else
                 ToolbarItem(placement: .primaryAction) { reloadButton }
+                // The console presentation carries its own sort/view bar; the plain grid gets a
+                // menu in the bar it already has.
+                if !gamepadUIActive {
+                    ToolbarItem(placement: .primaryAction) { sortMenu }
+                }
                 #endif
                 // A gamepad-only user can't swipe-to-dismiss the sheet this view is presented in
                 // (ContentView's `.sheet(item: $libraryTarget)`) — give it a focusable, dpad-reachable
@@ -152,7 +170,12 @@ struct LibraryView: View {
             // (the gamepad screens carry no close chrome).
             .background {
                 if gamepadUIActive && games.isEmpty {
-                    LibraryBackCatcher(active: controllerActive) { (onClose ?? { dismiss() })() }
+                    LibraryBackCatcher(
+                        active: controllerActive,
+                        // A = the on-screen Retry button, only while there is an error to retry
+                        // (a press during the load itself would start a second fetch).
+                        onConfirm: errorText != nil && !loading ? { Task { await load() } } : nil,
+                        onBack: { (onClose ?? { dismiss() })() })
                 }
             }
             #endif
@@ -172,10 +195,10 @@ struct LibraryView: View {
     /// and never as an error: a cached library is a working library, and a host that is still
     /// waking is the case this whole path exists to serve.
     @ViewBuilder private var staleNote: some View {
-        if servedFromCacheAt != nil {
+        if let text = staleness.text {
             HStack(spacing: 6) {
-                Image(systemName: loading ? "arrow.clockwise" : "wifi.slash")
-                Text(loading ? "Waking the host…" : "Showing this host's last known library")
+                Image(systemName: staleness.symbol)
+                Text(text)
             }
             .font(.geist(12, relativeTo: .caption))
             .foregroundStyle(.secondary)
@@ -196,14 +219,24 @@ struct LibraryView: View {
             consoleField(emptyState)
         } else {
             if gamepadUIActive {
-                LibraryCoverflowView(
+                LibraryConsoleView(
                     games: ordered, artLoader: artLoader, onLaunch: launchAndRemember,
                     running: running,
+                    staleness: staleness,
+                    // The title last opened from this shelf — the coverflow assembles around it,
+                    // the way the plain grid scrolls back to it, so the round trip browse → play →
+                    // quit → browse lands where the player left rather than at the first cover.
+                    initialSelection: LibraryScrollMemory.last(forHost: host.id.uuidString),
                     onDismiss: { (onClose ?? { dismiss() })() },
                     // Nil where there is nothing to copy into (tvOS), which is what drops the
-                    // hint from the legend rather than leaving a button that does nothing.
+                    // Options row and its hint rather than leaving a menu with nothing in it.
                     onCopyLink: LinkClipboard.isAvailable ? { copyLink($0) } : nil,
-                    controllerActive: controllerActive)
+                    hostName: host.displayName,
+                    controllerActive: controllerActive,
+                    onCollectionChanged: { label in
+                        collectionLabel = label
+                        onCollectionChanged?(label)
+                    })
             } else {
                 // Above the grid rather than over it: the coverflow owns its whole surface and has
                 // its own legend row, so the note rides the plain-grid presentation only.
@@ -223,33 +256,73 @@ struct LibraryView: View {
     /// the titles land and the coverflow takes over.
     ///
     /// Only in gamepad mode: the plain grid's states belong on the system background, as before.
+    ///
+    /// In gamepad mode these states also carry the legend the coverflow carries — `A Retry` on an
+    /// error, `B Back` always — because a controller-only user on an error screen otherwise had
+    /// no visible way out (the desktop console shows the same two hints there).
     @ViewBuilder private func consoleField(_ view: some View) -> some View {
         #if os(iOS) || os(macOS) || os(tvOS)
-        view.background {
-            if gamepadUIActive, !hostedInShell { GamepadScreenBackground() }
-        }
+        view
+            .background {
+                if gamepadUIActive, !hostedInShell { GamepadScreenBackground() }
+            }
+            .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
+                if gamepadUIActive {
+                    GamepadHintBar(hints: stateHints)
+                        .padding(.leading, 22)
+                        .padding(.vertical, 10)
+                }
+            }
         #else
         view
         #endif
     }
 
+    #if os(iOS) || os(macOS) || os(tvOS)
+    /// The legend under the loading / error / empty states: A retries a failed fetch (the same
+    /// action as the on-screen Retry button), B backs out. Read at press time, like every hint.
+    private var stateHints: [GamepadHint] {
+        var hints: [GamepadHint] = []
+        if errorText != nil, !loading {
+            hints.append(.init(
+                glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Retry",
+                action: { Task { await load() } }))
+        }
+        hints.append(.init(
+            glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back",
+            action: { (onClose ?? { dismiss() })() }))
+        return hints
+    }
+    #endif
+
+    /// The grid's sections: the catalog collated by the shared rules — launchers lead (design
+    /// D4), then one section per group under the chosen grouping (none = one section of games),
+    /// each in the chosen sort. Headers only when there is more than one section, so an
+    /// ungrouped, launcher-less library renders exactly as it always did.
+    private var sections: [(label: String, games: [GameEntry])] {
+        let groupBy: LibraryGroupBy?
+        switch groupByRaw {
+        case "platform": groupBy = .platform
+        case "store": groupBy = .store
+        default: groupBy = nil
+        }
+        return LibraryCollation.collate(ordered, sort: LibrarySortKey(stored: sortRaw), groupBy: groupBy)
+            .map { group in
+                // The ungrouped bucket names itself "All"; on this grid it has always been "Games".
+                let label = (groupBy == nil && group.key != .launchers) ? "Games" : group.label
+                return (label, group.indices.map { ordered[$0] })
+            }
+    }
+
     private var grid: some View {
-        // Design D4: launcher entries get their own section above the titles, never interleaved.
-        // Both headers appear only when both groups exist, so a library without launcher entries
-        // renders exactly as it did before.
-        let launchers = ordered.filter(\.isLauncher)
-        let titles = ordered.filter { !$0.isLauncher }
-        let both = !launchers.isEmpty && !titles.isEmpty
+        let sections = self.sections
+        let showsHeaders = sections.count > 1
         return ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    if !launchers.isEmpty {
-                        if both { sectionHeader("Launchers") }
-                        tiles(launchers)
-                    }
-                    if !titles.isEmpty {
-                        if both { sectionHeader("Games") }
-                        tiles(titles)
+                    ForEach(Array(sections.enumerated()), id: \.offset) { _, section in
+                        if showsHeaders { sectionHeader(section.label) }
+                        tiles(section.games)
                     }
                 }
                 .padding()
@@ -287,7 +360,7 @@ struct LibraryView: View {
             .gamepadKeyNavigation(
                 active: onLaunch != nil,
                 onMove: { direction in
-                    guard let next = gridNav(launchers: launchers, titles: titles)
+                    guard let next = gridNav(sections: sections.map(\.games))
                         .move(from: keyCursor, direction) else { return }
                     keyCursor = next
                     withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(next, anchor: .center) }
@@ -303,9 +376,9 @@ struct LibraryView: View {
     #if os(iOS) || os(macOS)
     /// The keyboard cursor's model over the two grid sections. Rebuilt per press from the live
     /// sections so it can never point into a stale list.
-    private func gridNav(launchers: [GameEntry], titles: [GameEntry]) -> LibraryGridNav {
+    private func gridNav(sections: [[GameEntry]]) -> LibraryGridNav {
         LibraryGridNav(
-            sections: [launchers, titles].filter { !$0.isEmpty }.map { $0.map(\.id) },
+            sections: sections.filter { !$0.isEmpty }.map { $0.map(\.id) },
             columns: columnCount)
     }
 
@@ -427,9 +500,38 @@ struct LibraryView: View {
         .disabled(loading)
     }
 
+    /// Sort and group for the plain grid — the console's bar, as a menu. The sort is the shared
+    /// key (Default · A–Z · Platform · Store); the grouping is this grid's own (sections stand in
+    /// for the console's Collections place).
+    private var sortMenu: some View {
+        Menu {
+            Picker("Sort", selection: $sortRaw) {
+                ForEach(LibrarySortKey.all, id: \.stored) { key in
+                    Text(key.label).tag(key.stored)
+                }
+            }
+            Picker("Group by", selection: $groupByRaw) {
+                Text("None").tag("")
+                Text("Platform").tag("platform")
+                Text("Store").tag("store")
+            }
+        } label: {
+            Label("Sort & group", systemImage: "line.3.horizontal.decrease.circle")
+        }
+    }
+
     private func load() async {
         loading = true
         errorText = nil
+        // Dev hook, the twin of the desktop console's `PUNKTFUNK_FAKE_LIBRARY`: a file holding
+        // the host's `/api/v1/library` JSON (or the shared collate vectors file, whose `library`
+        // array is the same shape) stands in for the host, so the grid, the sort bar and the
+        // collections can be exercised on a Mac with no host at all. No wake, no cache, no
+        // `/status`, and no art — the posters are placeholders.
+        if let fake = ProcessInfo.processInfo.environment["PUNKTFUNK_FAKE_LIBRARY"], !fake.isEmpty {
+            loadFake(path: fake)
+            return
+        }
         let current = store.hosts.first { $0.id == host.id } ?? host
         // mTLS uses this client's persistent identity (the host paired it over QUIC). No identity
         // yet → the user hasn't connected/paired, which is also when there's nothing to browse.
@@ -543,6 +645,29 @@ struct LibraryView: View {
         loading = false
     }
 
+    /// The `PUNKTFUNK_FAKE_LIBRARY` path: a plain `[GameEntry]` array, or a `{ "library": [...] }`
+    /// wrapper (the shared vectors file). A bad file reads as an error state, not a crash.
+    private func loadFake(path: String) {
+        defer { loading = false }
+        struct Wrapped: Decodable { let library: [GameEntry] }
+        servedFromCacheAt = nil
+        running = [:]
+        guard let data = FileManager.default.contents(atPath: path) else {
+            games = []
+            errorText = "PUNKTFUNK_FAKE_LIBRARY: can't read \(path)"
+            return
+        }
+        let decoder = JSONDecoder()
+        if let list = try? decoder.decode([GameEntry].self, from: data) {
+            games = list.launchersFirst
+        } else if let wrapped = try? decoder.decode(Wrapped.self, from: data) {
+            games = wrapped.library.launchersFirst
+        } else {
+            games = []
+            errorText = "PUNKTFUNK_FAKE_LIBRARY: \(path) is not a library JSON"
+        }
+    }
+
     /// Every launch from this shelf goes through here, so the player's position is recorded on
     /// exactly one path however they picked the title — a tap, the keyboard, or the coverflow.
     /// `nil` in browse-only mode, which is what keeps the tiles untappable there.
@@ -554,23 +679,67 @@ struct LibraryView: View {
         }
     }
 
-    /// The catalog in display order: anything already running first, so getting back into it is the
-    /// first thing on the screen rather than something to scroll for.
-    ///
-    /// Applied on top of `launchersFirst` rather than instead of it — a launcher that is up still
-    /// belongs with the launchers.
+    /// `host` → `host · profile` (a pinned card's shelf) → `host · profile · collection` (drilled
+    /// into one group), joined with `·` — the desktop's title shape.
+    private var shelfTitle: String {
+        let base = target.title(in: profiles)
+        guard let collectionLabel else { return base }
+        return "\(base) \u{b7} \(collectionLabel)"
+    }
+
+    /// The catalog in display order — `LibraryOrder.display`, the desktop's `order()`: launcher
+    /// entries lead, and anything already running leads WITHIN its band, so getting back into it
+    /// is the first thing on the screen rather than something to scroll for. (Its predecessor put
+    /// every running entry first, over `launchersFirst`, so a running game jumped ahead of the
+    /// launcher prefix and the coverflow's heading read GAMES · LAUNCHERS · GAMES along the strip.)
     private var ordered: [GameEntry] {
         guard !running.isEmpty else { return games }
-        return games.filter { running[$0.id] != nil } + games.filter { running[$0.id] == nil }
+        return LibraryOrder.display(games, running: Set(running.keys))
+    }
+
+    /// Whether the titles on screen are remembered rather than observed, and what the host is
+    /// doing about it — the three-state staleness both presentations show. Never an error: a
+    /// cached library is a working library.
+    private var staleness: LibraryStaleness {
+        guard servedFromCacheAt != nil else { return .none }
+        return loading ? .waking : .offline
+    }
+}
+
+/// The catalog's provenance, as the shelf states it. Three states rather than a flag so "waking
+/// the host…" can never be shown while nothing is happening — the same enum the desktop console
+/// keeps (`Stale::{No, Waking, Offline}`), with its exact wording.
+enum LibraryStaleness: Equatable {
+    case none
+    /// Served from disk; a fetch (and a wake) is in flight.
+    case waking
+    /// Served from disk; the host did not answer.
+    case offline
+
+    /// The note the shelf shows, or nil when the titles are live.
+    var text: String? {
+        switch self {
+        case .none: return nil
+        case .waking: return "Last known library — waking the host…"
+        case .offline: return "Last known library — the host didn't answer"
+        }
+    }
+
+    var symbol: String {
+        self == .waking ? "arrow.clockwise" : "wifi.slash"
     }
 }
 
 #if os(iOS) || os(macOS)
-/// Zero-size controller listener for the library's pre-coverflow states — B backs out. The same
-/// shape as ConnectOverlay's `ConnectControllerInput`; `GamepadMenuInput.needsSnapshot` swallows
-/// the held press that opened the screen. Unmounts the moment the coverflow (and its own B) is up.
+/// Zero-size controller listener for the library's pre-coverflow states — B backs out, A retries
+/// a failed fetch. The same shape as ConnectOverlay's `ConnectControllerInput`;
+/// `GamepadMenuInput.needsSnapshot` swallows the held press that opened the screen. Unmounts the
+/// moment the coverflow (and its own A/B) is up.
 private struct LibraryBackCatcher: View {
     let active: Bool
+    /// nil while there is nothing to retry — the press then does nothing, exactly like the
+    /// legend, which shows no A cell in that state.
+    var onConfirm: (() -> Void)?
     let onBack: () -> Void
     @State private var input = GamepadMenuInput(manager: .shared)
 
@@ -579,8 +748,11 @@ private struct LibraryBackCatcher: View {
             .frame(width: 0, height: 0)
             .onAppear {
                 input.onBack = onBack
+                input.onConfirm = onConfirm
                 if active { input.start() }
             }
+            // The retry closure comes and goes with the error; keep the poller's copy current.
+            .onChange(of: onConfirm != nil) { _, _ in input.onConfirm = onConfirm }
             .onChange(of: active) { _, nowActive in
                 if nowActive { input.start() } else { input.stop() }
             }

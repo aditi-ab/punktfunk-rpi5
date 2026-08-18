@@ -40,6 +40,10 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
     /// insets center exactly one at a time.
     let itemWidth: CGFloat
     let spacing: CGFloat
+    /// The item to open ON when the strip mounts — a remembered position (the library's last
+    /// opened title). Consulted once, before the first `reconcile()`; ignored when it isn't in
+    /// `items`, in which case the strip opens on the first item as it always has.
+    var initialItemID: Item.ID?
     /// A → activate the centered item.
     let onActivate: (Item) -> Void
     /// Y → the screen's secondary action (e.g. open a host's library); nil disables it.
@@ -57,6 +61,9 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
     var onUp: (() -> Void)?
     /// L1/R1 → jump this many items at once (clamped to the ends); 0 disables the shoulders.
     var shoulderJump: Int = 0
+    /// L1 (`false`) / R1 (`true`) → the screen's own shoulder action (the Collections screen steps
+    /// its sort with them). Set, it takes the shoulders away from `shoulderJump`.
+    var onShoulder: ((Bool) -> Void)?
     /// Whether this carousel currently owns controller input. A presenting screen (e.g. the host
     /// launcher) stays mounted behind a presented one (e.g. the library), and both carousels would
     /// otherwise poll the SAME controller at once — driving both. The parent sets this false while
@@ -172,9 +179,12 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
                 .safeAreaPadding(.horizontal, inset)
                 .offset(x: bumpOffset)
                 #if os(tvOS)
-                // Land initial focus on the first card (the launcher's first host / the coverflow's
-                // first title) instead of wherever the engine guesses.
-                .defaultFocus($focusedID, items.first?.id)
+                // Land initial focus on the remembered card when there is one, else the first
+                // (the launcher's first host / the coverflow's first title) instead of wherever
+                // the engine guesses.
+                .defaultFocus(
+                    $focusedID,
+                    initialItemID.flatMap { index(of: $0) != nil ? $0 : nil } ?? items.first?.id)
                 // Focus moved (remote swipe / pad dpad) — chase it: cursor, detail selection,
                 // controller detent, and an imperative center scroll.
                 .onChange(of: focusedID) { _, newValue in
@@ -209,6 +219,12 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
             onBack: onBack)
         #endif
         .onAppear {
+            // Seat the cursor on the remembered item before the first reconcile publishes it as
+            // the scroll target — only while nothing has been aligned yet (a re-appear keeps
+            // wherever the strip already is).
+            if scrolledID == nil, let id = initialItemID, let idx = index(of: id) {
+                cursor = idx
+            }
             reconcile()
             wire()
             if isActive { input.start() }
@@ -329,7 +345,7 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
         input.onSecondary = onSecondary
         input.onTertiary = onTertiary
         input.onBack = onBack
-        input.onShoulder = shoulderJump > 0 ? { shoulder(right: $0) } : nil
+        input.onShoulder = onShoulder ?? (shoulderJump > 0 ? { shoulder(right: $0) } : nil)
         #endif
     }
 
