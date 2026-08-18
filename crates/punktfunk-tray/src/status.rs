@@ -158,7 +158,7 @@ impl Poller {
     /// had one.
     pub fn spawn(
         mgmt_addr: String,
-        mgmt_port: u16,
+        mgmt_port: Option<u16>,
         web_port: u16,
         on_change: Box<dyn Fn(TrayStatus, bool) + Send>,
     ) -> Poller {
@@ -184,15 +184,23 @@ impl Poller {
 fn poll_loop(
     shared: &Shared,
     mgmt_addr: &str,
-    mgmt_port: u16,
+    mgmt_port: Option<u16>,
     web_port: u16,
     on_change: Box<dyn Fn(TrayStatus, bool) + Send>,
 ) {
-    // IPv6 literals bracketed, like the Linux client's `base_url`.
-    let url = if mgmt_addr.contains(':') {
-        format!("https://[{mgmt_addr}]:{mgmt_port}/api/v1/local/summary")
-    } else {
-        format!("https://{mgmt_addr}:{mgmt_port}/api/v1/local/summary")
+    // Resolved PER TICK, not once: with no `--mgmt-port` the port is whatever the host last
+    // published, and a host restarted on a moved `PUNKTFUNK_MGMT_BIND` must not leave the tray
+    // polling the old one until the next login. One tiny file read every 3 s is nothing.
+    let summary_url = || {
+        let port = mgmt_port
+            .or_else(pf_paths::published_mgmt_port)
+            .unwrap_or(47990);
+        // IPv6 literals bracketed, like the Linux client's `base_url`.
+        if mgmt_addr.contains(':') {
+            format!("https://[{mgmt_addr}]:{port}/api/v1/local/summary")
+        } else {
+            format!("https://{mgmt_addr}:{port}/api/v1/local/summary")
+        }
     };
     // `/login`, not `/`: `/` is auth-gated and 302s to `/login`, and ureq follows redirects by
     // default — so probing `/` spent TLS + `/` + a full cold `/login` SSR render inside one 2 s
@@ -212,7 +220,7 @@ fn poll_loop(
     loop {
         let svc = probe_service();
         let summary = if svc == ServiceState::Running {
-            let s = fetch_summary(&agent, &url);
+            let s = fetch_summary(&agent, &summary_url());
             match s {
                 Some(_) => unreachable_since = None,
                 None if unreachable_since.is_none() => unreachable_since = Some(Instant::now()),

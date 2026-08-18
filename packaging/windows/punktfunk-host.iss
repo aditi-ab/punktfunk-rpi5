@@ -241,7 +241,8 @@ Type: files; Name: "{app}\web\web-run.cmd"
 
 [Registry]
 ; Auto-start the status tray at sign-in (all users of this host box; uninsdeletevalue removes it
-; with the app). Operators who moved --mgmt-bind can append --mgmt-addr/--mgmt-port here.
+; with the app). No --mgmt-port needed for a moved --mgmt-bind: the tray follows the port the host
+; publishes in %ProgramData%\punktfunk\mgmt-endpoint (pf_paths::published_mgmt_port); the flag pins it.
 Root: HKLM64; Subkey: "SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; \
   ValueName: "PunktfunkTray"; ValueData: """{app}\punktfunk-tray.exe"""; Flags: uninsdeletevalue; Tasks: trayicon
 ; Toast identity for the tray's notifications ("client connected"). The tray process tags itself

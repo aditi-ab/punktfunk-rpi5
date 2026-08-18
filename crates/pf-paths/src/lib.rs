@@ -47,6 +47,30 @@ pub fn config_dir() -> PathBuf {
     base.join("punktfunk")
 }
 
+/// The mgmt port the host actually bound, from `<config_dir>/mgmt-endpoint` — the one
+/// `PUNKTFUNK_MGMT_URL=https://127.0.0.1:<port>` line `punktfunk-host serve` publishes on every
+/// start (`mgmt::publish_endpoint`). This is how a `PUNKTFUNK_MGMT_BIND` move reaches a loopback
+/// consumer that inherits nothing from `host.env` — the tray, which on Windows cannot even read
+/// `host.env` (DACL-locked to SYSTEM/Administrators) while this file is deliberately Users-readable.
+/// `None` when the file is absent (an older host, or no host on this box) or unparsable; callers
+/// fall back to 47990, which is strictly what they did before.
+pub fn published_mgmt_port() -> Option<u16> {
+    published_mgmt_port_in(&config_dir())
+}
+
+/// The IO half of [`published_mgmt_port`], taking the directory so it is testable without touching
+/// `PUNKTFUNK_CONFIG_DIR` (this crate forbids the `unsafe` that `set_var` now needs).
+pub fn published_mgmt_port_in(dir: &std::path::Path) -> Option<u16> {
+    let raw = std::fs::read_to_string(dir.join("mgmt-endpoint")).ok()?;
+    let line = raw.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let value = line.split_once('=').map_or(line, |(_, v)| v).trim();
+    // `https://127.0.0.1:47995` → the last `:`-separated field, tolerating a trailing `/`.
+    value
+        .trim_end_matches('/')
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+}
+
 /// Create `dir` (and parents) owner-private — **0700** on Unix (so the host's secrets aren't readable
 /// by other local users via a traversable config path). On Windows, applies a restrictive DACL
 /// ([`restrict_dir_to_system_admins`]) so a local unprivileged user can't pre-create / plant files in
@@ -258,5 +282,43 @@ fn restrict_to_system_admins(path: &std::path::Path) {
             path = %path.display(),
             "icacls hardening did not succeed — this secret may be readable by other local users"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn published_mgmt_port_follows_the_endpoint_file_and_is_absent_without_it() {
+        let dir = std::env::temp_dir().join(format!("pf-paths-endpoint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            published_mgmt_port_in(&dir),
+            None,
+            "no file → fall back to the default"
+        );
+
+        // exactly what `mgmt::endpoint_line` writes
+        std::fs::write(
+            dir.join("mgmt-endpoint"),
+            "PUNKTFUNK_MGMT_URL=https://127.0.0.1:47995\n",
+        )
+        .unwrap();
+        assert_eq!(published_mgmt_port_in(&dir), Some(47995));
+
+        std::fs::write(dir.join("mgmt-endpoint"), "\n").unwrap();
+        assert_eq!(
+            published_mgmt_port_in(&dir),
+            None,
+            "blank reads as unset, not port 0"
+        );
+
+        std::fs::write(dir.join("mgmt-endpoint"), "PUNKTFUNK_MGMT_URL=\n").unwrap();
+        assert_eq!(published_mgmt_port_in(&dir), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
