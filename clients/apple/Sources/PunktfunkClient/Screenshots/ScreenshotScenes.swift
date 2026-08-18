@@ -40,6 +40,14 @@ enum ShotScenes {
             ShotScene(name: "11-library", orientation: .landscape, colorScheme: .dark) {
                 AnyView(ShotLibrary())
             },
+            // The grid arrangement, and the view/sort bar FOCUSED — the desktop shipped a
+            // mis-sized bar wash precisely because no shot ever showed the bar with focus.
+            ShotScene(name: "11b-library-grid", orientation: .landscape, colorScheme: .dark) {
+                AnyView(ShotLibrary(arrangement: .grid))
+            },
+            ShotScene(name: "11c-library-bar", orientation: .landscape, colorScheme: .dark) {
+                AnyView(ShotLibrary(arrangement: .shelf, barFocused: true))
+            },
         ]
         #if os(iOS) || os(macOS)
         // The gamepad-mode console screens (no tvOS — native focus engine there). Dev-only shots
@@ -267,14 +275,18 @@ private struct ShotHome: View {
 
 // MARK: - Library
 
-/// The library coverflow with the mock shelf — the store listing's PICK & PLAY frame. The real
-/// `LibraryCoverflowView`, no network: `ShotPosterArt` answers the mock entries' art immediately,
+/// The library with the mock shelf — the store listing's PICK & PLAY frame. The real
+/// `LibraryConsoleView` (coverflow or grid), no network: `ShotPosterArt` answers the mock entries' art immediately,
 /// so the cards swing in already carrying posters (the entrance waits on art settling).
 private struct ShotLibrary: View {
+    var arrangement: LibraryArrangement?
+    var barFocused = false
+
     var body: some View {
-        LibraryCoverflowView(
+        LibraryConsoleView(
             games: ShotMock.games, artLoader: ShotPosterArt.source,
-            onLaunch: { _ in }, onDismiss: {}, controllerActive: false)
+            onLaunch: { _ in }, onDismiss: {}, controllerActive: false,
+            arrangementOverride: arrangement, barFocusedInitially: barFocused)
     }
 }
 

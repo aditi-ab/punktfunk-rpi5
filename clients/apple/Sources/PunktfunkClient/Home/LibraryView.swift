@@ -201,7 +201,7 @@ struct LibraryView: View {
             consoleField(emptyState)
         } else {
             if gamepadUIActive {
-                LibraryCoverflowView(
+                LibraryConsoleView(
                     games: ordered, artLoader: artLoader, onLaunch: launchAndRemember,
                     running: running,
                     staleness: staleness,
