@@ -22,10 +22,13 @@ mod win;
 #[cfg(windows)]
 mod win_theme;
 
-/// CLI configuration (hand-rolled parse, house style). The mgmt address/port default to the
-/// host's defaults; they are flags because the tray cannot read `host.env` on Windows (it is
-/// DACL-locked to SYSTEM/Administrators), so an operator who moved `--mgmt-bind` adjusts the
-/// autostart command line instead.
+/// CLI configuration (hand-rolled parse, house style). The mgmt address defaults to loopback; the
+/// port, when not given, follows what the host PUBLISHED (`<config_dir>/mgmt-endpoint`, rewritten
+/// on every host start — see `pf_paths::published_mgmt_port`), falling back to 47990. That file is
+/// how a moved `PUNKTFUNK_MGMT_BIND` reaches the tray: it cannot read `host.env` on Windows (DACL-
+/// locked to SYSTEM/Administrators), and before this an operator who moved the port had to know to
+/// edit the autostart command line — nobody did, and the tray reported a running host as
+/// unreachable (field report 2026-08-18). `--mgmt-port` still pins it explicitly.
 pub struct Args {
     /// Ask an already-running tray instance to exit (Windows; used by the uninstaller).
     pub quit: bool,
@@ -34,7 +37,9 @@ pub struct Args {
     pub autostart: bool,
     /// Management API address to poll (loopback only; the summary route rejects anything else).
     pub mgmt_addr: String,
-    pub mgmt_port: u16,
+    /// `None` = follow the published endpoint (re-read on every poll, so a host restarted on a new
+    /// port is picked up without relaunching the tray).
+    pub mgmt_port: Option<u16>,
     /// Web console port for the "Open web console" action.
     pub web_port: u16,
 }
@@ -45,7 +50,7 @@ impl Default for Args {
             quit: false,
             autostart: false,
             mgmt_addr: "127.0.0.1".into(),
-            mgmt_port: 47990,
+            mgmt_port: None,
             web_port: 47992,
         }
     }
@@ -63,7 +68,7 @@ fn parse_args() -> anyhow::Result<Args> {
             "--quit" => args.quit = true,
             "--autostart" => args.autostart = true,
             "--mgmt-addr" => args.mgmt_addr = value("--mgmt-addr")?,
-            "--mgmt-port" => args.mgmt_port = value("--mgmt-port")?.parse()?,
+            "--mgmt-port" => args.mgmt_port = Some(value("--mgmt-port")?.parse()?),
             "--web-port" => args.web_port = value("--web-port")?.parse()?,
             "--version" | "-V" => {
                 println!("punktfunk-tray {}", env!("CARGO_PKG_VERSION"));

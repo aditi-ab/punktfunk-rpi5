@@ -94,7 +94,10 @@ pub fn effective_port() -> u16 {
 /// console's own default. Moving the listener therefore silently broke the console, because nothing
 /// downstream had any way to learn the new port. Now the host is the single source of truth and
 /// publishes what it actually bound; consumers keep a 47990 fallback purely so an OLD host with a
-/// NEW console still works.
+/// NEW console still works. The plugin runner / SDK (`sdk/src/config.ts::publishedMgmtUrl`) and
+/// the tray (`pf_paths::published_mgmt_port`) read the same file — both used to be a sixth and
+/// seventh literal 47990, and a moved port left every plugin dialing the old one in silence
+/// (field report 2026-08-18).
 ///
 /// Always loopback, never `bind`'s own address: the console proxies over loopback by design (see
 /// the module docs — the bearer-token admin surface is confined to loopback peers), so a wide

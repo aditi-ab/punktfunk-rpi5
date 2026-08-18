@@ -108,7 +108,7 @@ Plus a real-world recipe:
 
 | What | Source |
 |---|---|
-| URL | `{ url }` → `PUNKTFUNK_MGMT_URL` → `https://127.0.0.1:47990` |
+| URL | `{ url }` → `PUNKTFUNK_MGMT_URL` → `<config_dir>/mgmt-endpoint` (the URL the host actually bound, rewritten on every start — a moved `PUNKTFUNK_MGMT_BIND` is followed here) → `https://127.0.0.1:47990` |
 | Token | `{ token }` → `PUNKTFUNK_MGMT_TOKEN` → `PUNKTFUNK_PLUGIN_TOKEN` → `<config_dir>/plugin-token` → `<config_dir>/mgmt-token` |
 | TLS pin | `{ ca }` → `PUNKTFUNK_MGMT_CA` (path) → `<config_dir>/cert.pem` |
 

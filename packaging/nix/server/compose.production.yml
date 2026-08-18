@@ -1,0 +1,17 @@
+# Static file server for the punktfunk Nix binary cache, on unom-1 (the DMZ services VM) —
+# the same shape as packaging/flatpak/server, because a Nix cache and an OSTree repo are both
+# just immutable files behind a web server. Caddy on home-reverse-proxy-1 terminates TLS for
+# nix.unom.io and reverse_proxies to 192.168.50.50:3250 (the port must be in unom/infra
+# caddy_target_ports). This inner Caddy serves the bind-mounted ./site tree over plain HTTP.
+# nix.yml rsyncs into ./site and runs `docker compose up -d` (idempotent).
+#
+# Port 3250: docs is 3220, flatpak 3230, winget 3240 — keep the run going.
+services:
+  nix-cache:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "3250:3250"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./site:/srv:ro

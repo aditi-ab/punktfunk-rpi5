@@ -22,6 +22,7 @@
 // plugin store (crates/punktfunk-host/src/store), which installs one reviewed version of a
 // package that may live on somebody else's registry — but they are ordinary CLI flags too.
 import { Effect, Fiber } from "effect";
+import { publishedMgmtUrl } from "./config.js";
 import { installLogShipper } from "./log-ship.js";
 import {
 	addPlugins,
@@ -163,6 +164,16 @@ if (process.argv.includes("--list")) {
 // nothing at all: field report 2026-07-25 had it pinning a full core indefinitely, `strace`
 // showing a bare `clock_gettime` loop and nothing else. One idle handle is the whole fix.
 const keepAlive = setInterval(() => {}, 2 ** 31 - 1);
+
+// Follow the host's REAL mgmt port before anything dials it. Plugins run in this process and
+// resolve their connection from `process.env` first, so setting it here reaches every plugin —
+// including one whose vendored `@punktfunk/host` predates `publishedMgmtUrl` (on Windows
+// `reconcileSharedSdk` cannot refresh a read-only tree, so an old copy can outlive several host
+// upgrades). An explicit PUNKTFUNK_MGMT_URL from the operator still wins.
+if (!process.env.PUNKTFUNK_MGMT_URL) {
+	const published = publishedMgmtUrl();
+	if (published) process.env.PUNKTFUNK_MGMT_URL = published;
+}
 
 // Tee this process's output to the host so the console's Logs page can show it. Installed HERE and
 // not in `runner.ts`, so it covers the supervised run only: a plugin's own CLI builds the same

@@ -2,7 +2,8 @@
 // identity cert, from the environment with file fallbacks — so `connect()` on the host machine
 // needs zero configuration.
 //
-//   PUNKTFUNK_MGMT_URL     (default https://127.0.0.1:47990)
+//   PUNKTFUNK_MGMT_URL     else <config_dir>/mgmt-endpoint (the URL the host actually bound,
+//                          rewritten on every start), else https://127.0.0.1:47990
 //   PUNKTFUNK_MGMT_TOKEN   (admin override), else PUNKTFUNK_PLUGIN_TOKEN,
 //                          else <config_dir>/plugin-token, else <config_dir>/mgmt-token
 //   PUNKTFUNK_MGMT_CA      (path; else <config_dir>/native-cert.pem, else cert.pem when present)
@@ -111,12 +112,26 @@ const parseTokenFile = (raw: string): string | undefined => {
 	return undefined;
 };
 
+/**
+ * The mgmt URL the host published: `<config_dir>/mgmt-endpoint`, one
+ * `PUNKTFUNK_MGMT_URL=https://127.0.0.1:<port>` line the host rewrites on every start with the port
+ * it REALLY bound. This is how a `PUNKTFUNK_MGMT_BIND` move (the supported way to share a box with
+ * Sunshine/Apollo, whose web UI owns 47990) reaches a plugin: the runner is a scheduled task /
+ * systemd unit that inherits nothing from `host.env` (which on Windows it can't even read), so
+ * before this a moved port left every plugin — and the runner's own log shipper — dialing
+ * `127.0.0.1:47990` forever, silently. Field report 2026-08-18. `undefined` when the file is absent
+ * (an old host, or a plugin CLI run on another machine); the caller falls back to the default.
+ */
+export const publishedMgmtUrl = (): string | undefined =>
+	parseTokenFile(readIfExists(path.join(configDir(), "mgmt-endpoint")) ?? "");
+
 export const resolveConfig = async (
 	options?: ConnectOptions,
 ): Promise<ResolvedConfig> => {
 	const url = (
 		options?.url ??
 		process.env.PUNKTFUNK_MGMT_URL ??
+		publishedMgmtUrl() ??
 		"https://127.0.0.1:47990"
 	).replace(/\/+$/, "");
 	const token =

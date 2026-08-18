@@ -45,6 +45,69 @@ GPU drivers are resolved at runtime from `/run/opengl-driver/lib`. On non-NixOS 
 [nixGL](https://github.com/nix-community/nixGL) so that path is populated (`nixGL nix run …`); on
 NixOS the module (below) sets `hardware.graphics.enable = true` for you.
 
+> **Do this first, or the commands above compile the world:** without the binary cache, `nix build`
+> here means the whole Rust workspace *and* a gamescope build from source — roughly an hour on a
+> fast machine. See below.
+
+---
+
+## Binary cache (do this before your first build)
+
+CI publishes every punktfunk package to **`https://nix.unom.io`** on each push to `main` that moves
+the flake, so you get prebuilt binaries instead of an hour of `rustc`. It covers
+`punktfunk-host`, `-client`, `-tray`, `-web`, `-scripting` and `-gamescope` — everything the flake
+builds from source. Everything else in the closure is stock nixpkgs and comes from `cache.nixos.org`
+as usual, so the cache is deliberately small and adding it costs you nothing on unrelated builds.
+
+**NixOS** — in your system configuration:
+
+```nix
+nix.settings = {
+  substituters = [ "https://nix.unom.io" ];
+  trusted-public-keys = [ "punktfunk-cache-1:<PUBLIC KEY — see below>" ];
+};
+```
+
+**Anywhere else** — in `/etc/nix/nix.conf` (or `~/.config/nix/nix.conf` if you are a trusted user):
+
+```conf
+extra-substituters = https://nix.unom.io
+extra-trusted-public-keys = punktfunk-cache-1:<PUBLIC KEY — see below>
+```
+
+The current public key is served by the cache itself, so you can always check it against the source
+of truth:
+
+```sh
+curl https://nix.unom.io/punktfunk-cache.pub
+```
+
+Verify the cache is being used — this should print the store paths without compiling anything:
+
+```sh
+nix build --dry-run git+https://git.unom.io/unom/punktfunk#punktfunk-host
+```
+
+### ⚠ `nixpkgs.follows` turns the cache off
+
+Every store path is keyed by the exact inputs it was built from. Pointing punktfunk's nixpkgs at
+yours changes those inputs, so **every** path misses and you compile the workspace anyway:
+
+```nix
+# Convenient, but it costs you the entire binary cache:
+inputs.punktfunk.inputs.nixpkgs.follows = "nixpkgs";
+```
+
+That is a real trade, not a bug — `follows` buys you one shared nixpkgs in the closure instead of
+two. Take it if closure size matters more to you than build time; leave it out to get binaries.
+
+### Why not `cachix`?
+
+Nothing against it — punktfunk simply self-hosts every other channel (flatpak, deb, rpm, Arch,
+docker, winget), and a Nix cache is static files behind a web server, so it rides the same unom-1
+box and the same deploy key as the rest. Nothing about the cache is punktfunk-specific: it speaks
+plain HTTP binary-cache protocol, so any nix client works with it.
+
 ---
 
 ## NixOS module
@@ -55,6 +118,8 @@ Add the flake and enable the host and/or client:
 {
   inputs.punktfunk.url = "git+https://git.unom.io/unom/punktfunk";
   # (optional) share your nixpkgs: inputs.punktfunk.inputs.nixpkgs.follows = "nixpkgs";
+  #   ⚠ this DISABLES the binary cache — different inputs, different store paths, so every
+  #     package is rebuilt from source (~1h). See "Binary cache" above.
 
   outputs = { self, nixpkgs, punktfunk, ... }: {
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
@@ -369,8 +434,66 @@ RUNPATH (`/run/opengl-driver/lib`) and the GTK GApps wrapper (GSettings schemas 
 are present. Fixes discovered during that bring-up: `CMAKE_POLICY_VERSION_MINIMUM=3.5` (CMake ≥ 4),
 system `libopus` (audiopus_sys), and the session Skia note above.
 
-In CI (`.gitea/workflows/nix.yml`): `nix flake check --no-build` evaluates every output *including*
-the module check above, and `punktfunk-web` + `punktfunk-scripting` are built for real. The Rust
-packages and `punktfunk-gamescope` are `workflow_dispatch` opt-ins (`build-rust`,
-`build-gamescope`) — run the latter after a `flake.lock` bump, since it patches whatever gamescope
-the pinned nixpkgs carries.
+In CI (`.gitea/workflows/nix.yml`), three tiers: `nix flake check --no-build` evaluates every output
+*including* the module check above; `punktfunk-web` + `punktfunk-scripting` are built for real on
+every PR; and on a push to `main` the Rust packages and `punktfunk-gamescope` are built and
+published to the binary cache. A `flake.lock` bump that breaks the gamescope patches therefore goes
+red on main rather than in an operator's rebuild. The `build-rust` / `build-gamescope`
+`workflow_dispatch` inputs remain, for checking those on a branch before merging.
+
+---
+
+## Cache infrastructure (maintainers)
+
+`https://nix.unom.io` is a `caddy:2-alpine` container on unom-1 serving a static directory —
+`packaging/nix/server/` — exactly like the flatpak repo (3230) and the winget source (3240). A Nix
+binary cache *is* just `nix-cache-info` + `<hash>.narinfo` + `nar/<hash>.nar.xz` behind a web
+server; there is no cache daemon to run.
+
+**Why not Gitea, and why not `storage.unom.io`:**
+
+- Gitea has 23 package registry types and none is Nix. It is not a missing label — the protocol
+  needs fixed anonymous paths at a URL *root* (`/nix-cache-info`, `/<hash>.narinfo`,
+  `/nar/…`), and `/api/packages/{owner}/generic/{name}/{version}/{file}` cannot express them.
+- The RustFS S3 at `storage.unom.io` *would* work mechanically (nix speaks `s3://…?endpoint=`, and
+  the sccache credentials already exist), but it is a local box on the home uplink with no CDN, so
+  every user download competes with CI. It also answers **403** for a missing key unless the bucket
+  policy grants anonymous `ListBucket` — and nix treats anything other than **404** as a hard error
+  rather than a cache miss, which would break users' builds for packages the cache never held.
+
+**One-time setup — in this order.** The publish step ends by fetching `nix.unom.io` to prove the
+cache really answers (and answers **404**, not 403, for a path it does not hold), so stand the
+service up *before* you set the secret that switches publishing on. The secret is the last step for
+exactly that reason: until it exists the publish no-ops with a warning and `main` stays green,
+the same way flatpak.yml's repo deploy does.
+
+1. **Edge proxy:** `nix.unom.io { reverse_proxy 192.168.50.50:3250 }` on home-reverse-proxy-1.
+2. **Port allowlist:** add `3250` to `caddy_target_ports` in `unom/infra` (proxmox/unom-1) +
+   terraform apply.
+3. **DNS:** ensure `nix.unom.io` resolves to the edge proxy.
+4. Dispatch `deploy-services.yml` (or `unom/infra`'s `deploy-all`) to bring the container up. It
+   serves an empty cache — every path 404s, which is exactly what a healthy empty cache does.
+5. Generate the signing key on a Nix box and store the secret half as the repo Actions secret
+   `NIX_CACHE_SIGNING_KEY` (the whole `name:base64` line):
+   ```sh
+   nix key generate-secret --key-name punktfunk-cache-1
+   ```
+6. Push to `main` touching the flake. The publish step prints the **public** key — paste it into the
+   "Binary cache" section above (and `docs-site/content/docs/install.md`) and commit.
+
+**Operational notes:**
+
+- Only punktfunk's own store paths are published (`nix path-info -r … | grep -- '-punktfunk'`).
+  Everything else in a closure is stock nixpkgs, already on `cache.nixos.org` behind a real CDN;
+  mirroring it would cost disk and home-to-cloud bandwidth to serve a worse copy. The publish step
+  asserts every built output is matched by that filter, so a future `pname` change fails the build
+  instead of silently dropping a package from the cache.
+- `rsync` runs **without** `--delete` (a client mid-download is never pulled out from under), and
+  NARs are uploaded *before* narinfos — a narinfo whose NAR has not landed is a hard download
+  failure for whoever fetches it in that window, while an unreferenced NAR is merely invisible.
+- Growth is bounded by `packaging/nix/server/prune.sh` (evicts narinfos untouched for 180 days,
+  then sweeps NARs nothing references). The flatpak repo next door reached 3.84 GB publishing the
+  same way with no sweep, on a box that has run out of disk before — hence the sweep from the first
+  publish. Run its self-check with `sh packaging/nix/server/prune.sh --self-test`.
+- A user on a pinned rev older than the eviction window falls back to building from source, which
+  is the pre-cache status quo.
