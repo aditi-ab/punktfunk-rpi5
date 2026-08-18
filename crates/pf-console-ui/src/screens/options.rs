@@ -27,7 +27,7 @@ use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox, Screen};
 use crate::theme::{fg, Fonts, EDGE_INSET, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec, ROW_MAX_W};
-use pf_client_core::gamepad::{MenuEvent, MenuPulse};
+use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -115,7 +115,7 @@ impl OptionsScreen {
         key.split('\0').next().unwrap_or(key)
     }
 
-    fn actions(&self) -> Vec<Action> {
+    fn actions(&self, platform: crate::platform::Platform) -> Vec<Action> {
         let host = match &self.subject {
             Subject::Host(h) => h,
             // Deliberately not [Play, …]: the host menu does not repeat its tile's own A
@@ -137,7 +137,9 @@ impl OptionsScreen {
         // error. This is the log-escape hatch for platforms whose own filesystem the user
         // can't reach (Deck Gaming Mode, tvOS): the bundle lands on the host, listed in
         // its web console next to the host's own logs.
-        if host.paired && host.online {
+        // Only where a service exists to upload them: the Android client has no log-ring
+        // uploader yet, and a row that can only toast "not available" is a promise broken.
+        if host.paired && host.online && platform == crate::platform::Platform::Desktop {
             a.push(Action::SendLogs);
         }
         a.extend([
@@ -174,13 +176,13 @@ impl OptionsScreen {
             fx.pop();
             return None;
         }
-        let actions = self.actions();
+        let actions = self.actions(ctx.platform);
         let (msg, pulse) = self.list.menu(ev, actions.len());
         self.dispatch(msg, pulse, &actions, ctx, fx)
     }
 
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
-        let actions = self.actions();
+        let actions = self.actions(ctx.platform);
         let (msg, pulse) = self.list.pointer(p, actions.len());
         if matches!(msg, ListMsg::None) && pulse.is_none() {
             return false;
@@ -194,7 +196,7 @@ impl OptionsScreen {
         msg: ListMsg,
         pulse: Option<MenuPulse>,
         actions: &[Action],
-        _ctx: &mut Ctx,
+        ctx: &mut Ctx,
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
         let Some(action) = actions.get(self.list.cursor).copied() else {
@@ -209,7 +211,7 @@ impl OptionsScreen {
             ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
             ListMsg::None => pulse,
             ListMsg::Activate => {
-                self.run(action, fx);
+                self.run(action, ctx.store, fx);
                 pulse
             }
         }
@@ -218,10 +220,11 @@ impl OptionsScreen {
     /// This subject's `punktfunk://` link, built from the store at ACTIVATION — never at open.
     /// The store is what holds the fingerprint and stable id, and the row the menu was raised
     /// on may have left it since; a link built early would be a link built from a lie.
-    fn link(&self) -> Option<String> {
+    fn link(&self, store: &dyn crate::store::SettingsStore) -> Option<String> {
         match &self.subject {
-            Subject::Host(h) => crate::screens::host_link(h),
+            Subject::Host(h) => crate::screens::host_link(store, h),
             Subject::Game { host, id, .. } => crate::screens::saved_host_link(
+                store,
                 &host.fp_hex,
                 &host.addr,
                 host.port,
@@ -231,7 +234,7 @@ impl OptionsScreen {
         }
     }
 
-    fn run(&mut self, action: Action, fx: &mut Outbox) {
+    fn run(&mut self, action: Action, store: &dyn crate::store::SettingsStore, fx: &mut Outbox) {
         let key = self.host_key().to_string();
         match action {
             Action::Wake => {
@@ -253,7 +256,7 @@ impl OptionsScreen {
                 fx.pop();
             }
             Action::CopyLink => {
-                match self.link() {
+                match self.link(store) {
                     Some(url) => {
                         fx.copy = Some(url);
                         fx.toast = Some("Link copied".into());
@@ -315,7 +318,7 @@ impl OptionsScreen {
         k: f64,
         dt: f64,
         fonts: &Fonts,
-        _ctx: &mut Ctx,
+        ctx: &mut Ctx,
     ) {
         // The explainer line, as on Add Host — it says what this menu is FOR, and the air it
         // takes is what keeps the first row off the title.
@@ -336,7 +339,7 @@ impl OptionsScreen {
             rect.bottom,
         );
         let rows: Vec<RowSpec> = self
-            .actions()
+            .actions(ctx.platform)
             .into_iter()
             .map(|a| RowSpec::action(self.label(a), true))
             .collect();
@@ -422,20 +425,24 @@ mod tests {
             online: true,
             ..host()
         });
-        assert!(!awake.actions().contains(&Action::Wake));
+        assert!(!awake
+            .actions(crate::platform::Platform::Desktop)
+            .contains(&Action::Wake));
         let asleep = OptionsScreen::for_host(&HostRow {
             can_wake: true,
             online: false,
             ..host()
         });
-        assert!(asleep.actions().contains(&Action::Wake));
+        assert!(asleep
+            .actions(crate::platform::Platform::Desktop)
+            .contains(&Action::Wake));
     }
 
     #[test]
     fn a_pinned_card_cannot_forget_or_edit_the_host() {
         let s = OptionsScreen::for_host(&pinned());
         assert_eq!(
-            s.actions(),
+            s.actions(crate::platform::Platform::Desktop),
             vec![Action::Unpin, Action::CopyLink, Action::Cancel]
         );
         // …and its commands still address the HOST, not the pin's composite key.
@@ -445,17 +452,17 @@ mod tests {
     #[test]
     fn forget_needs_two_presses() {
         let mut s = OptionsScreen::for_host(&host());
-        let actions = s.actions();
+        let actions = s.actions(crate::platform::Platform::Desktop);
         let i = actions.iter().position(|a| *a == Action::Forget).unwrap();
         s.list.cursor = i;
         let mut fx = Outbox::default();
 
-        s.run(Action::Forget, &mut fx);
+        s.run(Action::Forget, crate::store::file_store(), &mut fx);
         assert!(fx.cmds.is_empty(), "the first press only arms");
         assert!(s.armed);
         assert!(s.label(Action::Forget).contains("press again"));
 
-        s.run(Action::Forget, &mut fx);
+        s.run(Action::Forget, crate::store::file_store(), &mut fx);
         assert_eq!(
             fx.cmds,
             vec![ConsoleCmd::ForgetHost { key: "aa".into() }],
@@ -466,7 +473,7 @@ mod tests {
     #[test]
     fn leaving_the_forget_row_disarms_it() {
         let mut s = OptionsScreen::for_host(&host());
-        let actions = s.actions();
+        let actions = s.actions(crate::platform::Platform::Desktop);
         s.armed = true;
         s.list.cursor = actions.iter().position(|a| *a == Action::Cancel).unwrap();
         let mut ctx_settings = pf_client_core::trust::Settings::default();
@@ -474,6 +481,8 @@ mod tests {
             hosts: &[],
             library: &crate::library::LibraryShared::default(),
             settings: &mut ctx_settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &[],
             deck: false,
             device_name: "test",
@@ -487,7 +496,10 @@ mod tests {
     #[test]
     fn a_title_offers_the_link_and_nothing_its_cover_already_does() {
         let s = OptionsScreen::for_game(&host(), &game());
-        assert_eq!(s.actions(), vec![Action::CopyLink, Action::Cancel]);
+        assert_eq!(
+            s.actions(crate::platform::Platform::Desktop),
+            vec![Action::CopyLink, Action::Cancel]
+        );
         // The cursor starts on row 0, so the row nearly everyone opened this for is the row
         // the confirm press is already on.
         assert_eq!(s.list.cursor, 0);
@@ -502,7 +514,10 @@ mod tests {
             OptionsScreen::for_game(&host(), &game()),
             OptionsScreen::for_game(&pinned(), &game()),
         ] {
-            assert_eq!(s.actions().last(), Some(&Action::Cancel));
+            assert_eq!(
+                s.actions(crate::platform::Platform::Desktop).last(),
+                Some(&Action::Cancel)
+            );
         }
     }
 
@@ -532,7 +547,7 @@ mod tests {
             OptionsScreen::for_game(&host(), &game()),
         ] {
             let mut fx = Outbox::default();
-            s.run(Action::CopyLink, &mut fx);
+            s.run(Action::CopyLink, crate::store::file_store(), &mut fx);
             assert!(matches!(fx.nav, Some(Nav::Pop)));
             assert!(fx.toast.is_some());
         }

@@ -8,7 +8,7 @@ use crate::anim::{approach, entrances, springs, Entrance, EntranceAt, Spring, TR
 use crate::library::{BUMP_C, BUMP_K};
 use crate::pointer::{Pointer, PointerKind};
 use crate::theme::{accent, fg, fill, stroke, Fonts, PanelStroke, EDGE_INSET, W};
-use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
+use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Paint, PathBuilder, RRect, Rect};
 
 // --- Menu list -----------------------------------------------------------------------------

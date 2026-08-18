@@ -93,16 +93,10 @@ fun ConnectScreen(
     // Writes the global defaults back. Only the speed test uses it — that is the one action on this
     // screen that can land in the defaults layer (design/client-settings-profiles.md §5.3).
     onSettingsChange: (Settings) -> Unit = {},
-    // Console (gamepad) mode: render the host carousel instead of the touch grid, sharing all of this
-    // screen's connect/trust/discovery logic. [onOpenSettings] is the console's X action (the touch
-    // UI reaches Settings via the bottom bar).
-    gamepadUi: Boolean = false,
-    onOpenSettings: () -> Unit = {},
     // (host, pinned profile id) — a pinned host+profile card opens ITS shelf, and the id is the
     // one-off every launch off that shelf runs with (design §5.2a). Null = the host's own tile.
-    // BOTH homes raise it: Y on a console tile, and "Browse library…" in a touch card's overflow.
+    // Raised by "Browse library…" in a card's overflow.
     onOpenLibrary: (KnownHost, String?) -> Unit = { _, _ -> },
-    navGate: Boolean = true, // false while the console home is cross-fading out
     // A `punktfunk://` URL to route (design/client-deep-links.md §3). This screen owns it because
     // it owns the connect path — trust decisions, the local-network grant, wake-and-retry — and a
     // link must go through all of them, not around them.
@@ -294,9 +288,6 @@ fun ConnectScreen(
     var awaiting by remember { mutableStateOf<RequestAccessState?>(null) }
     // A saved host being edited (name / address / port / MAC).
     var editTarget by remember { mutableStateOf<KnownHost?>(null) }
-    // A saved host whose console options menu (Wake / Edit / Forget) is open — reached with Up on the
-    // carousel (the console counterpart of the touch host card's overflow menu).
-    var optionsTarget by remember { mutableStateOf<HostCardEntry?>(null) }
 
     // Discovered hosts not already saved — a saved host (paired or TOFU) belongs in "Saved hosts",
     // not also in "Discovered", so we hide the overlap (matched by fingerprint when both carry it, so
@@ -636,13 +627,9 @@ fun ConnectScreen(
         val url = DeepLinks.forHost(kh, profile = pin?.id).toUrl()
         val copied = putLinkOnClipboard(context, url)
         val message = linkCopyMessage(copied) ?: return
-        // The console home renders neither the notice nor the status banner, so there it has to be a
-        // toast; the touch grid has both, and a success dressed as an error banner is a small lie.
-        when {
-            gamepadUi -> Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
-            copied -> notice = message
-            else -> status = message
-        }
+        // A success dressed as an error banner is a small lie: the notice line for a copy, the
+        // status line for a failure.
+        if (copied) notice = message else status = message
     }
 
     // ---- punktfunk:// routing (design/client-deep-links.md §3) --------------------------------
@@ -762,100 +749,49 @@ fun ConnectScreen(
         savedHosts = knownHostStore.all()
     }
 
-    if (gamepadUi) {
-        // Console mode: the host carousel (saved → discovered → Add Host), driven by the pad. Shares
-        // every action above; the trailing Add Host tile opens the same manual-entry sheet.
-        GamepadHome(
-            tiles = buildHomeTiles(
-                savedHosts = savedHosts,
-                profiles = profiles,
-                pinsFor = profileStore::pinsFor,
-                discoveredUnsaved = discoveredUnsaved,
-                isOnline = { it.isOnline(discovered, reachable) },
-                onConnect = { kh, oneOff -> connect(kh.address, kh.port, oneOffProfile = oneOff) },
-                onConnectDiscovered = { dh -> connect(dh.host, dh.port, dh) },
-                onAddHost = { showManualSheet = true },
-            ),
-            libraryEnabled = settings.libraryEnabled,
-            controllerName = io.unom.punktfunk.kit.Gamepad.firstPad()?.name,
-            // Stop the carousel from consuming the pad while a sheet/dialog/overlay owns the screen,
-            // while a connect is in flight (else a second A launches a concurrent connect that leaks a
-            // handle — the touch grid guards the same way with enabled=!connecting), or while the whole
-            // console home is cross-fading out.
-            // ⚠ `speedTest` belongs in this list and was missing. It LOOKED covered by `!connecting`,
-            // and is — right up until the measurement finishes: `startSpeedTest` clears `connecting`
-            // before its Done/Failed card is dismissed, so from that moment the card AND the
-            // carousel underneath both consumed the pad. One A then dismissed the card and started
-            // a connect. Every other modal on this screen is named here for exactly this reason.
-            navActive = navGate && !connecting && !showManualSheet && pendingTrust == null &&
-                awaiting == null && editTarget == null && optionsTarget == null &&
-                speedTest == null && waker.waking == null && !lnpPrompt,
-            onActivate = { it.activate() },
-            onOpenLibrary = { tile -> tile.knownHost?.let { onOpenLibrary(it, tile.pinnedProfileId) } },
-            onOpenSettings = onOpenSettings,
-            onOptions = { tile ->
-                tile.knownHost?.let { kh ->
-                    optionsTarget = HostCardEntry(kh, tile.pinnedProfileId?.let(profileStore::byId))
-                }
-            },
-        )
-    } else {
-        ConnectGrid(
-            savedHosts = savedHosts,
-            discovered = discovered,
-            discoveredUnsaved = discoveredUnsaved,
-            reachable = reachable,
-            profiles = profiles,
-            pinsFor = profileStore::pinsFor,
-            connecting = connecting,
-            notice = notice,
-            status = status,
-            lnpGranted = lnpGranted,
-            onAskLocalNetwork = { lnpPrompt = true },
-            onConnect = { kh, oneOff -> connect(kh.address, kh.port, oneOffProfile = oneOff) },
-            onConnectDiscovered = { dh -> connect(dh.host, dh.port, dh) },
-            onForget = { kh -> forgetHost(kh) },
-            onEdit = { kh -> editTarget = kh },
-            onWake = { kh -> wakeHost(kh) },
-            onSpeedTest = { kh -> startSpeedTest(HostCardEntry(kh, null)) },
-            onCopyLink = { kh, pin -> copyLink(kh, pin) },
-            onTogglePin = { kh, p -> togglePin(kh, p) },
-            libraryEnabled = settings.libraryEnabled,
-            onBrowseLibrary = { kh, pin -> onOpenLibrary(kh, pin?.id) },
-            onRescan = { discovery.restart() },
-            onAddHost = { showManualSheet = true },
-        )
-    }
+    ConnectGrid(
+        savedHosts = savedHosts,
+        discovered = discovered,
+        discoveredUnsaved = discoveredUnsaved,
+        reachable = reachable,
+        profiles = profiles,
+        pinsFor = profileStore::pinsFor,
+        connecting = connecting,
+        notice = notice,
+        status = status,
+        lnpGranted = lnpGranted,
+        onAskLocalNetwork = { lnpPrompt = true },
+        onConnect = { kh, oneOff -> connect(kh.address, kh.port, oneOffProfile = oneOff) },
+        onConnectDiscovered = { dh -> connect(dh.host, dh.port, dh) },
+        onForget = { kh -> forgetHost(kh) },
+        onEdit = { kh -> editTarget = kh },
+        onWake = { kh -> wakeHost(kh) },
+        onSpeedTest = { kh -> startSpeedTest(HostCardEntry(kh, null)) },
+        onCopyLink = { kh, pin -> copyLink(kh, pin) },
+        onTogglePin = { kh, p -> togglePin(kh, p) },
+        libraryEnabled = settings.libraryEnabled,
+        onBrowseLibrary = { kh, pin -> onOpenLibrary(kh, pin?.id) },
+        onRescan = { discovery.restart() },
+        onAddHost = { showManualSheet = true },
+    )
 
     // Add Host stayed behind while the other modals moved into ConnectPrompts: its form fields are
     // remembered HERE, on purpose, so a half-typed address survives the sheet being dismissed and
     // reopened. Moving the block without moving that state would quietly change what a dismiss
     // costs; moving both is a separate decision from this one.
     if (showManualSheet) {
-        if (gamepadUi) {
-            // Console add-host: field list + on-screen controller keyboard. "Add" connects (which
-            // saves the host on TOFU/pair), exactly like the touch sheet's Connect.
-            GamepadAddHostScreen(
-                onAdd = { n, addr, p ->
-                    showManualSheet = false
-                    connect(addr, p, manualName = n)
-                },
-                onDismiss = { showManualSheet = false },
-            )
-        } else {
-            AddHostSheet(
-                hostName = hostName,
-                onHostNameChange = { hostName = it },
-                host = host,
-                onHostChange = { host = it },
-                port = port,
-                onPortChange = { port = it },
-                connecting = connecting,
-                modeLabel = "$w×$h@$hz",
-                onDismiss = { showManualSheet = false },
-                onConnect = { h2, p, n -> connect(h2, p, manualName = n) },
-            )
-        }
+        AddHostSheet(
+            hostName = hostName,
+            onHostNameChange = { hostName = it },
+            host = host,
+            onHostChange = { host = it },
+            port = port,
+            onPortChange = { port = it },
+            connecting = connecting,
+            modeLabel = "$w×$h@$hz",
+            onDismiss = { showManualSheet = false },
+            onConnect = { h2, p, n -> connect(h2, p, manualName = n) },
+        )
     }
 
     // Which layer a measurement would land in. Resolved here, not in the prompt: it is a question
@@ -869,7 +805,6 @@ fun ConnectScreen(
     // Everything that floats above whichever home was drawn, in one place and in one order — see
     // ConnectPrompts.kt. It decides nothing: each action below lands right back in the engine above.
     ConnectPrompts(
-        gamepadUi = gamepadUi,
         identity = identity,
         profiles = profiles,
         isOnline = { it.isOnline(discovered, reachable) },
@@ -893,16 +828,6 @@ fun ConnectScreen(
             connecting = false
             discovery.start() // the request may still be pending on the host; keep scanning
         },
-        optionsTarget = optionsTarget,
-        onDismissOptions = { optionsTarget = null },
-        libraryEnabled = settings.libraryEnabled,
-        onOpenLibrary = onOpenLibrary,
-        onWake = { kh -> wakeHost(kh) },
-        onSpeedTest = { kh -> startSpeedTest(HostCardEntry(kh, null)) },
-        onCopyLink = { kh, pin -> copyLink(kh, pin) },
-        onEditHost = { kh -> editTarget = kh },
-        onForgetHost = { kh -> forgetHost(kh) },
-        onTogglePin = { kh, p -> togglePin(kh, p) },
         speedTest = speedTest,
         speedTestTarget = speedTestTarget,
         speedTestPhase = speedTestPhase,
@@ -952,9 +877,6 @@ fun ConnectScreen(
  * One entry in the saved-hosts grid: a host's own card ([pin] null), or one of its pinned
  * host+profile cards. Pins are additive presentation state on the host record — never duplicated
  * host entries, which would fork pairing, trust and renames (design §5.2a).
- *
- * The console reuses it deliberately: its options dialog acts on a host-or-pin exactly as the touch
- * card's overflow menu does, and one currency for "which card is this" keeps the two from drifting.
  */
 internal data class HostCardEntry(val host: KnownHost, val pin: StreamProfile?) {
     val key: String get() = "card-${host.id}-${pin?.id ?: "primary"}"

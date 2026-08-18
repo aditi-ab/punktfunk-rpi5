@@ -34,9 +34,27 @@ pub mod audio_vitals;
 pub mod discovery;
 #[cfg(any(target_os = "linux", windows))]
 pub mod gamepad;
+// The menu-event vocabulary + synthesizer and the pad descriptors, portable: `gamepad`
+// (the SDL3 service) re-exports them on the desktop; the Android client feeds the same
+// synthesizer from Kotlin-captured pad samples (design/android-skia-console-port.md D4).
+#[cfg(any(target_os = "linux", windows, target_os = "android"))]
+pub mod menu_nav;
+// The audio-format vocabulary (`session` re-exports it) and the decoder-preference
+// migration (`video` re-exports it): two settings-screen inputs the console needs on
+// every platform, split out so the platform-bound modules can stay platform-bound.
+#[cfg(any(target_os = "linux", windows, target_os = "android"))]
+pub mod audio_format;
+#[cfg(any(target_os = "linux", windows, target_os = "android"))]
+pub mod decoder_pref;
+// The console shell's platform-facing data types (actions it raises, pointer input,
+// session phases) — shared by the Vulkan session's overlay and the Android GL host.
+#[cfg(any(target_os = "linux", windows, target_os = "android"))]
+pub mod console;
 #[cfg(target_os = "linux")]
 pub mod keymap;
-#[cfg(any(target_os = "linux", windows))]
+// The library MODEL (`GameEntry`, `Artwork`, the running set) is portable — the Skia console
+// renders it on Android too; the ureq fetches inside the module stay desktop-gated.
+#[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod library;
 // Per-host catalog cache, so a library screen has titles to show while a sleeping host boots.
 #[cfg(any(target_os = "linux", windows))]
@@ -45,7 +63,7 @@ pub mod library_cache;
 pub mod logring;
 // The `punktfunk://` grammar (design/client-deep-links.md §2): one parser/emitter for the
 // shells, the session and the CLI, held to the Swift/Kotlin ports by a shared vector file.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod deeplink;
 // The brain layer (design/client-architecture-split.md §3): what a connect is, the wake
 // state machine every front-end drives, and the session spawn + stdout contract.
@@ -73,11 +91,11 @@ pub mod overlay_focus;
 // the tier-A pad registry the gamepad worker feeds it through.
 #[cfg(any(target_os = "linux", windows))]
 pub mod pad_audio;
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod profiles;
 #[cfg(any(target_os = "linux", windows))]
 pub mod session;
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod trust;
 // "Is a newer client available, and can this box install it?" — the client half of the
 // signed-manifest update check the host already runs (design: host-update-from-web-console.md).

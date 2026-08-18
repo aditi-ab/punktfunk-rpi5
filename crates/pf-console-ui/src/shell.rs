@@ -13,14 +13,17 @@ use crate::anim::{springs, Spring};
 use crate::glyphs::GlyphStyle;
 use crate::library::{mesh_sksl, palette, LibraryShared};
 use crate::model::{ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, WakeStatus};
+use crate::platform::Platform;
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{Bg, ConnectIntent, Ctx, Nav, Outbox, Screen};
+use crate::store::SettingsStore;
 use anyhow::{anyhow, Result};
-use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse, PadInfo};
+use pf_client_core::console::OverlayAction;
+use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse, PadInfo};
 use pf_client_core::trust;
-use pf_presenter::overlay::OverlayAction;
 use skia_safe::{Canvas, Color4f, Data, Rect, RuntimeEffect};
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Instant;
 
 mod overlays;
@@ -143,13 +146,59 @@ struct Connecting {
     request_access: bool,
 }
 
-/// What the session binary hands the shell at construction.
+/// What the host hands the shell at construction.
 pub struct ConsoleOptions {
     /// The machine's hostname — the default device name pairing registers.
     pub device_name: String,
     /// Steam Deck: Steam's keyboard types (SDL text input); ours never draws.
     pub deck: bool,
+    /// Where settings persist and the profile catalog comes from. `None` = the desktop
+    /// file store (`pf_client_core::trust`), which is what the Vulkan session wants and the
+    /// only store there is on Linux/Windows; every other host must supply one.
+    pub store: Option<Arc<dyn SettingsStore>>,
+    /// Which platform this shell fronts — decides which settings rows exist and which
+    /// platform-native screens the settings list may open.
+    pub platform: Platform,
+    /// Skia's GPU resource-cache budget, bytes — where decoded posters and glyph atlases
+    /// live. The desktop's 160 MB ([`DEFAULT_GPU_CACHE_BYTES`]) is sized for
+    /// a Deck; a 1 GB TV box wants a quarter of that (design/android-skia-console-port.md D11).
+    pub gpu_cache_bytes: usize,
 }
+
+impl ConsoleOptions {
+    /// The Vulkan session's options: file-backed settings, the desktop row set, the
+    /// desktop cache budget.
+    pub fn desktop(device_name: String, deck: bool) -> ConsoleOptions {
+        ConsoleOptions {
+            device_name,
+            deck,
+            store: None,
+            platform: Platform::Desktop,
+            gpu_cache_bytes: DEFAULT_GPU_CACHE_BYTES,
+        }
+    }
+}
+
+/// Skia's GPU resource budget — poster art plus a few screen layers.
+///
+/// A CEILING, not an allocation: Skia grows into it only under demand, and the console's
+/// demand is now small — with the library's posters cached at the size they are drawn
+/// (`screens::library::art_cache_size`) a full grid at Deck scale asks for ~30 MB. What
+/// matters is the HEADROOM. At 64 MB the budget sat under a full grid's working set: a
+/// screenful of full-resolution covers is ~100 MB, so `GrResourceCache` evicted a third of
+/// them on every submit and the next frame re-decoded them from JPEG on the render thread.
+/// That was the grid's slideshow, and a cliff rather than a slope — which is exactly how it
+/// was reported, smooth until the screen filled.
+///
+/// 160 MB clears the working set several times over at every scale a panel up to 1440p
+/// produces, with room for the two render targets and the glyph atlases. The one arrangement
+/// that can still crowd it is a 4K panel (`k` 2.7, 33 MB a render target) fed 1000×1500
+/// SteamGridDB portraits, where full resolution is genuinely what gets drawn — and that is a
+/// desktop GPU by the time it happens.
+///
+/// The desktop's number; a host with less memory (a TV box) passes its own through
+/// [`ConsoleOptions::gpu_cache_bytes`].
+pub const DEFAULT_GPU_CACHE_BYTES: usize = 160 << 20;
 
 pub(crate) struct Shell {
     stack: Vec<Screen>,
@@ -159,6 +208,10 @@ pub(crate) struct Shell {
     bus: ConsoleBus,
     actions: VecDeque<OverlayAction>,
     settings: trust::Settings,
+    /// Where `settings` persists (see [`ConsoleOptions::store`]).
+    store: Arc<dyn SettingsStore>,
+    /// The platform this shell fronts (see [`ConsoleOptions::platform`]).
+    pub(crate) platform: Platform,
     hosts: Vec<HostRow>,
     hosts_gen: u64,
     device_name: String,
@@ -203,8 +256,21 @@ pub(crate) struct Shell {
     /// [`Shell::render`]. The legend is the console's only on-screen statement of what the
     /// face buttons do; for a pointer, which has none, it IS the button bar.
     hint_rects: Vec<(crate::glyphs::HintKey, Rect)>,
+    /// The (left, top) inset the last frame laid out under — pointer coordinates arrive in
+    /// surface pixels and are brought into the same space `hint_rects` and every screen's
+    /// hit boxes were published in.
+    last_insets: (f32, f32),
+    /// Skia's resource-cache budget for the host that renders this shell (see
+    /// [`ConsoleOptions::gpu_cache_bytes`]).
+    pub(crate) gpu_cache_bytes: usize,
     t0: Instant,
     last_frame: Option<Instant>,
+    /// Test-only: `(t, step)` — when set, the shell clock reads `t` and every frame advances
+    /// it by `step` instead of wall time, so the screenshot dump renders the SAME pixels on
+    /// any machine at any load (the aurora's phase is the clock; two real-time runs never agree
+    /// past the first scene). Never set outside `shell/tests.rs`.
+    #[cfg(test)]
+    pub(crate) fake_clock: Option<(f64, f64)>,
 }
 
 impl Shell {
@@ -216,7 +282,20 @@ impl Shell {
         stack: Vec<Screen>,
     ) -> Result<Shell> {
         anyhow::ensure!(!stack.is_empty(), "the console needs a root screen");
-        let settings = trust::Settings::load();
+        let store: Arc<dyn SettingsStore> = match opts.store {
+            Some(store) => store,
+            None => {
+                #[cfg(any(target_os = "linux", windows))]
+                {
+                    Arc::new(crate::store::FileSettingsStore)
+                }
+                #[cfg(not(any(target_os = "linux", windows)))]
+                {
+                    anyhow::bail!("the console needs a settings store on this platform")
+                }
+            }
+        };
+        let settings = store.load();
         let (mesh, mesh_lift, mesh_scrim, ink) = build_mesh(&settings.ui_palette)?;
         let bg_mix = match stack.last().expect("non-empty").background() {
             Bg::Aurora => 0.0,
@@ -231,6 +310,8 @@ impl Shell {
             actions: VecDeque::new(),
             mesh_palette: settings.ui_palette.clone(),
             settings,
+            store,
+            platform: opts.platform,
             hosts: Vec::new(),
             hosts_gen: u64::MAX,
             device_name: opts.device_name,
@@ -250,12 +331,90 @@ impl Shell {
             chip: None,
             pads: Vec::new(),
             hint_rects: Vec::new(),
+            last_insets: (0.0, 0.0),
+            gpu_cache_bytes: opts.gpu_cache_bytes,
             t0: Instant::now(),
             last_frame: None,
+            #[cfg(test)]
+            fake_clock: None,
         })
     }
 
+    /// The live library model — for a host re-rooting the stack (see [`Self::replace_stack`]).
+    pub(crate) fn library(&self) -> &LibraryShared {
+        &self.library
+    }
+
+    /// Replace the whole screen stack (a deep link, a "back to that shelf" on return from a
+    /// game). Cuts, no transition: this is a re-entry, not navigation the user watched.
+    pub(crate) fn replace_stack(&mut self, stack: Vec<Screen>) {
+        if stack.is_empty() {
+            return;
+        }
+        self.stack = stack;
+        self.motion = Motion::None;
+        self.bg_mix = match self.stack.last().expect("non-empty").background() {
+            Bg::Aurora => 0.0,
+            Bg::Form => 1.0,
+        };
+    }
+
+    /// The host-facing pointer vocabulary onto the shell's own: primary press/release,
+    /// secondary-down = Back (its release is dropped, or a right-click would pop two
+    /// screens), wheel = discrete scroll steps, cancel.
+    pub(crate) fn pointer_input(&mut self, input: pf_client_core::console::PointerInput) -> bool {
+        use pf_client_core::console::{PointerButton, PointerInput};
+        let (x, y, kind) = match input {
+            PointerInput::Move { x, y } => (x, y, PointerKind::Move),
+            PointerInput::Down {
+                x,
+                y,
+                button: PointerButton::Primary,
+            } => (x, y, PointerKind::Press),
+            PointerInput::Down {
+                x,
+                y,
+                button: PointerButton::Secondary,
+            } => (x, y, PointerKind::Back),
+            PointerInput::Up {
+                x,
+                y,
+                button: PointerButton::Primary,
+            } => (x, y, PointerKind::Release),
+            PointerInput::Up { .. } => return true,
+            PointerInput::Wheel { x, y, dy } => {
+                if dy == 0.0 {
+                    return true;
+                }
+                (x, y, PointerKind::Scroll { up: dy > 0.0 })
+            }
+            PointerInput::Cancel => (0.0, 0.0, PointerKind::Cancel),
+        };
+        self.pointer(Pointer {
+            x: f64::from(x),
+            y: f64::from(y),
+            kind,
+        })
+    }
+
+    /// The host reports a session edge. `Connecting` is a no-op — the shell raised the
+    /// Launch itself and is already showing the takeover.
+    pub(crate) fn session_phase(&mut self, phase: pf_client_core::console::SessionPhase) {
+        use pf_client_core::console::SessionPhase;
+        match phase {
+            SessionPhase::Connecting => {}
+            SessionPhase::Streaming => self.session_streaming(),
+            SessionPhase::Failed(msg) => self.session_failed(msg),
+            SessionPhase::Ended(reason) => self.session_ended(reason),
+            SessionPhase::Reconnecting(msg) => self.session_reconnecting(msg),
+        }
+    }
+
     fn t(&self) -> f64 {
+        #[cfg(test)]
+        if let Some((t, _)) = self.fake_clock {
+            return t;
+        }
         self.t0.elapsed().as_secs_f64()
     }
 
@@ -578,6 +737,8 @@ impl Shell {
                 hosts: &self.hosts,
                 library: &self.library,
                 settings: &mut self.settings,
+                store: &*self.store,
+                platform: self.platform,
                 pads: &self.pads,
                 deck: self.deck,
                 device_name: &self.device_name,
@@ -600,6 +761,12 @@ impl Shell {
     /// face buttons and the legend is where those actions live.
     pub(crate) fn pointer(&mut self, p: Pointer) -> bool {
         self.sync();
+        // Surface pixels → the safe-area space the last frame laid out in.
+        let p = Pointer {
+            x: p.x - f64::from(self.last_insets.0),
+            y: p.y - f64::from(self.last_insets.1),
+            kind: p.kind,
+        };
         // The right button is the pointer's B, everywhere — including on the modal cards,
         // where Back is the only thing that answers at all.
         //
@@ -652,6 +819,8 @@ impl Shell {
                 hosts: &self.hosts,
                 library: &self.library,
                 settings: &mut self.settings,
+                store: &*self.store,
+                platform: self.platform,
                 pads: &self.pads,
                 deck: self.deck,
                 device_name: &self.device_name,
@@ -671,23 +840,23 @@ impl Shell {
     /// (suppressed while editing, where letters are text).
     ///
     /// `shift` only matters for Tab, whose two directions are one key.
-    pub(crate) fn key(&mut self, sc: sdl3::keyboard::Scancode, shift: bool, repeat: bool) -> bool {
-        use sdl3::keyboard::Scancode as S;
+    pub(crate) fn key(&mut self, key: crate::input::Key, shift: bool, repeat: bool) -> bool {
+        use crate::input::Key as S;
         if self.editing() {
             if let Some(top) = self.stack.last_mut() {
-                if top.edit_key(sc) {
+                if top.edit_key(key) {
                     return true;
                 }
             }
             // Arrows etc. still drive the OSK grid below.
         }
         let editing = self.stack.last().is_some_and(Screen::editing);
-        let ev = match sc {
+        let ev = match key {
             S::Left => MenuEvent::Move(MenuDir::Left),
             S::Right => MenuEvent::Move(MenuDir::Right),
             S::Up => MenuEvent::Move(MenuDir::Up),
             S::Down => MenuEvent::Move(MenuDir::Down),
-            S::Return | S::KpEnter | S::Space if !repeat => MenuEvent::Confirm,
+            S::Return | S::Space if !repeat => MenuEvent::Confirm,
             S::Escape | S::Backspace if !repeat => MenuEvent::Back,
             S::PageUp if !repeat => MenuEvent::JumpBack,
             S::PageDown if !repeat => MenuEvent::JumpForward,

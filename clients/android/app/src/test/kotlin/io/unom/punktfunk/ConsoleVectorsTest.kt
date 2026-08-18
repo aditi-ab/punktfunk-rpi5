@@ -118,21 +118,8 @@ class ConsoleVectorsTest {
         }
     }
 
-    /**
-     * The section names, in order. The desktop console carries one tab this client does not —
-     * Input, which holds touch mode, mouse, invert-scroll and shortcuts: desktop-host settings
-     * with nothing to set on a phone or a TV. The vectors flag it `desktop_only` rather than
-     * leaving it out, so neither side has to red the other to be right.
-     */
-    @Test
-    fun tabNamesMatchTheSharedVectors() {
-        val tabs = vectors.getJSONArray("tabs")
-        val want = (0 until tabs.length())
-            .map { tabs.getJSONObject(it) }
-            .filterNot { it.optBoolean("desktop_only", false) }
-            .map { it.getString("name") }
-        assertEquals("console settings tabs", want, GpTab.entries.map { it.title })
-    }
+    // The tab-names assertion moved with the tabs: the Skia shell renders them, and its Rust twin
+    // (`tab_names_match_the_shared_vectors` in pf-console-ui) pins them against the same file.
 
     /**
      * The screen-transition contract. The easing is sampled rather than compared as Bézier

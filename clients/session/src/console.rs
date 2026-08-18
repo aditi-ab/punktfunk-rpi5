@@ -112,10 +112,7 @@ pub fn run(target: Option<&str>) -> u8 {
         ConsoleEntry::Home => None,
     };
 
-    let opts = ConsoleOptions {
-        device_name: trust::device_name(),
-        deck: is_steam_deck(),
-    };
+    let opts = ConsoleOptions::desktop(trust::device_name(), is_steam_deck());
     let (overlay, handles) = match SkiaOverlay::console(opts, entry) {
         Ok(v) => v,
         Err(e) => {
@@ -670,6 +667,9 @@ impl ServiceState {
                     r.request();
                 }
             }
+            // A platform-native screen (Android's Controllers/Licences views) — the desktop
+            // shell has no such rows, so this never arrives here.
+            ConsoleCmd::OpenPlatformScreen { .. } => {}
             ConsoleCmd::SetPin {
                 key,
                 profile_id,

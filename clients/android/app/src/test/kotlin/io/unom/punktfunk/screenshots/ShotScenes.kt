@@ -54,9 +54,7 @@ import androidx.compose.ui.unit.dp
 import io.unom.punktfunk.BrandDark
 import io.unom.punktfunk.ConnectModal
 import io.unom.punktfunk.ConnectPhase
-import io.unom.punktfunk.ConnectTakeover
 import androidx.compose.runtime.CompositionLocalProvider
-import io.unom.punktfunk.GamepadHome
 import io.unom.punktfunk.GamepadInk
 import io.unom.punktfunk.GamepadPalette
 import coil.ImageLoader
@@ -69,9 +67,7 @@ import io.unom.punktfunk.ConsoleHeader
 import io.unom.punktfunk.ConsoleLegendInset
 import io.unom.punktfunk.ConsoleLicensesScreen
 import io.unom.punktfunk.ControllersScreen
-import io.unom.punktfunk.Coverflow
 import io.unom.punktfunk.TouchGrid
-import io.unom.punktfunk.GamepadAuroraBackground
 import io.unom.punktfunk.GamepadHintBar
 import io.unom.punktfunk.PadGlyph
 import io.unom.punktfunk.PadInfo
@@ -81,8 +77,6 @@ import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.library.Artwork
 import io.unom.punktfunk.kit.library.GameEntry
 import androidx.compose.ui.platform.LocalConfiguration
-import io.unom.punktfunk.GamepadSettingsScreen
-import io.unom.punktfunk.HomeTile
 import io.unom.punktfunk.LocalGamepadInk
 import io.unom.punktfunk.LocalGamepadPalette
 import io.unom.punktfunk.Settings
@@ -337,7 +331,6 @@ internal fun SettingsProfileScene() {
 @Composable
 internal fun SpeedTestScene() {
     SpeedTestPrompt(
-        gamepadUi = false,
         hostName = "Living Room PC",
         target = SpeedTestTarget.Ask(newProfile("Game")),
         phase = SpeedTestPhase.Done(throughputKbps = 412_000, lossPct = 0.3, recommendedKbps = 288_400),
@@ -514,14 +507,6 @@ internal fun WakeTimedOutScene() =
     ConnectModal(ConnectPhase.WakeTimedOut("Living Room PC"), onCancel = {}, onRetry = {})
 
 /**
- * The console / gamepad connect flow (the real full-screen [ConnectTakeover]) — the aurora backdrop
- * with a bottom hint bar, the same signature look the console home uses.
- */
-@Composable
-internal fun ConnectConsoleScene() =
-    ConnectTakeover(ConnectPhase.Connecting("Living Room PC"), onCancel = {}, onRetry = {})
-
-/**
  * The real console settings screen — the section tab strip, the glass rows, the focused row's
  * unfolded detail, and the living (calmed) backdrop behind them. The touch [SettingsScene] can't
  * stand in for it: this is a different screen with different navigation, and the strip is the part
@@ -558,40 +543,18 @@ internal fun StreamBannerScene(pad: Boolean) {
 }
 
 /**
- * The console HOME — the host carousel over the living backdrop, which is the screen the aurora is
- * most of. Worth its own shot for exactly that reason: on API 33+ the field is the real bicubic
- * MESH (`GamepadAurora`'s AGSL port of the desktop console's shader) and below it the four-blob
- * fallback, and the two are only comparable side by side. The scene composes [GamepadHome]
- * directly with mock tiles — it needs no JNI core and no session, unlike the ConnectScreen that
- * normally feeds it.
+ * Publish the palette locals `App` would normally provide. A scene that calls a console screen
+ * directly gets the DEFAULT dark ink without this, and a pale-palette shot would then silently
+ * prove nothing at all.
  */
 @Composable
-internal fun ConsoleHomeScene(paletteId: String = "violet") {
+private fun ConsolePalette(paletteId: String, content: @Composable () -> Unit) {
     val palette = GamepadPalette.named(paletteId)
-    val tiles = listOf(
-        HomeTile(
-            id = "living", title = "Living Room PC", subtitle = "192.168.1.42 · Paired",
-            filled = true, online = true, paired = true, activate = {},
-        ),
-        HomeTile(
-            id = "studio", title = "studio-deck", subtitle = "192.168.1.61 · Discovered",
-            online = true, activate = {},
-        ),
-        HomeTile(id = "add", title = "Add Host", subtitle = "By address", isAdd = true, activate = {}),
-    )
     CompositionLocalProvider(
         LocalGamepadPalette provides palette,
         LocalGamepadInk provides GamepadInk.of(palette),
     ) {
-        GamepadHome(
-            tiles = tiles,
-            libraryEnabled = true,
-            controllerName = "Xbox Wireless Controller",
-            navActive = false,
-            onActivate = {},
-            onOpenLibrary = {},
-            onOpenSettings = {},
-        )
+        content()
     }
 }
 
@@ -650,6 +613,14 @@ internal fun AddHostScene() {
     )
 }
 
+
+// The Compose console's scenes (home carousel, settings, coverflow, connect takeover) are gone
+// with the screens themselves: the console is the Skia shell now
+// (design/android-skia-console-port.md), which renders over native GL and cannot compose under
+// Roborazzi. Its store shots come from the desktop screenshot dump (the same pixels) or from a
+// device capture. The scenes that remain are the touch UI and the two Compose platform screens
+// the console still opens (Controllers, Licences).
+
 /** The two pads the store listing names: DualSense (adaptive triggers, LEDs, rumble) and Xbox. */
 internal fun shotPads() = listOf(
     PadInfo(
@@ -671,44 +642,6 @@ internal fun shotPads() = listOf(
  * directly gets the DEFAULT dark ink without this, and a pale-palette shot would then silently
  * prove nothing at all.
  */
-/**
- * The game-library coverflow (the real [Coverflow] over the real console chrome) with a mock shelf.
- * The library screen itself can't be shot — its state comes off the network — so the scene rebuilds
- * the same shell [io.unom.punktfunk.LibraryScreen] draws around it: aurora, header, floating hint
- * bar. Cover art is answered synchronously by coil-test's [FakeImageLoaderEngine] with generated
- * posters, so the frozen animation clock never races an async load.
- */
-@Composable
-internal fun LibraryScene(paletteId: String = "violet") = ConsolePalette(paletteId) {
-    val context = LocalContext.current
-    val loader = remember { shotLibraryLoader(context) }
-    val games = remember { shotGames() }
-    val hazeState = remember { HazeState() }
-    val landscape =
-        LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
-    Box(Modifier.fillMaxSize()) {
-        Box(Modifier.fillMaxSize().hazeSource(hazeState)) {
-            GamepadAuroraBackground(Modifier.fillMaxSize())
-            Column(Modifier.fillMaxSize().consoleSafeArea()) {
-                ConsoleHeader("Living Room PC — Library")
-                Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                    Coverflow(games, loader, navActive = false, onLaunch = {})
-                }
-            }
-        }
-        Box(
-            Modifier.align(Alignment.BottomStart)
-                .consoleLegendInsets(landscape)
-                .padding(ConsoleLegendInset),
-        ) {
-            GamepadHintBar(
-                listOf(PadGlyph.hint('A', "Launch"), PadGlyph.hint('B', "Close")),
-                hazeState = hazeState,
-            )
-        }
-    }
-}
-
 /**
  * The TOUCH library — the poster grid a finger reaches through a host card's "Browse library…",
  * with the same mock shelf the coverflow scene uses. Same construction as [LibraryScene]: the real
@@ -996,31 +929,5 @@ private fun drawEmber(canvas: Canvas) {
         val y = rng.range(180f, 620f)
         val r = rng.range(2.5f, 6f)
         glowDot(canvas, x, y, r, shotAlpha(0xFFB067, rng.range(0.35f, 0.9f)))
-    }
-}
-
-@Composable
-private fun ConsolePalette(paletteId: String, content: @Composable () -> Unit) {
-    val palette = GamepadPalette.named(paletteId)
-    CompositionLocalProvider(
-        LocalGamepadPalette provides palette,
-        LocalGamepadInk provides GamepadInk.of(palette),
-        content = content,
-    )
-}
-
-@Composable
-internal fun ConsoleSettingsScene(paletteId: String = "violet") {
-    // The scene calls the screen directly, so it has to publish the palette locals `App` would
-    // normally provide — without them a light palette would render with the default DARK ink and
-    // the shot would silently prove nothing.
-    val palette = GamepadPalette.named(paletteId)
-    CompositionLocalProvider(
-        LocalGamepadPalette provides palette,
-        LocalGamepadInk provides GamepadInk.of(palette),
-    ) {
-        GamepadSettingsScreen(
-            initial = SHOT_SETTINGS.copy(uiPalette = paletteId), onChange = {}, onBack = {},
-        )
     }
 }

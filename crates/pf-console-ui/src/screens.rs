@@ -30,8 +30,8 @@ use crate::library::LibraryShared;
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::Pointer;
 use crate::theme::Fonts;
-use pf_client_core::gamepad::{MenuEvent, MenuPulse};
-use pf_client_core::{gamepad::PadInfo, trust};
+use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
+use pf_client_core::{menu_nav::PadInfo, trust};
 use skia_safe::{Canvas, Rect};
 
 /// What a screen draws over (the shell crossfades between them on push/pop).
@@ -51,6 +51,13 @@ pub(crate) struct Ctx<'a> {
     /// The one live library model slot (the screen on top of the stack owns it).
     pub library: &'a LibraryShared,
     pub settings: &'a mut trust::Settings,
+    /// Where `settings` persists to, and where the profile catalog comes from — the host's
+    /// store (desktop file, Android snapshot). Screens call `store.save(settings)` after a
+    /// mutation and `store.load()` right before one (rebase).
+    pub store: &'a dyn crate::store::SettingsStore,
+    /// The platform this shell fronts — which settings rows exist, which native screens the
+    /// list may open.
+    pub platform: crate::platform::Platform,
     pub pads: &'a [PadInfo],
     /// Steam Deck: never draw our keyboard — Steam's types via SDL text input.
     pub deck: bool,
@@ -135,13 +142,14 @@ impl Outbox {
 /// library id, which is what makes a game's link a game's link. `None` if the host has left
 /// the store since the menu was opened.
 pub(crate) fn saved_host_link(
+    store: &dyn crate::store::SettingsStore,
     fp_hex: &str,
     addr: &str,
     port: u16,
     profile: Option<&str>,
     launch: Option<&str>,
 ) -> Option<String> {
-    let known = trust::KnownHosts::load();
+    let known = store.known_hosts();
     let host = (!fp_hex.is_empty())
         .then(|| known.find_by_fp(fp_hex))
         .flatten()
@@ -150,8 +158,9 @@ pub(crate) fn saved_host_link(
 }
 
 /// This row's link — the host itself, with a pinned card's profile when the row is one.
-pub(crate) fn host_link(row: &HostRow) -> Option<String> {
+pub(crate) fn host_link(store: &dyn crate::store::SettingsStore, row: &HostRow) -> Option<String> {
     saved_host_link(
+        store,
         &row.fp_hex,
         &row.addr,
         row.port,
@@ -225,10 +234,10 @@ impl Screen {
 
     /// Raw key edits while a field is editing (Backspace repeats, Return = done).
     /// Returns true when consumed.
-    pub(crate) fn edit_key(&mut self, sc: sdl3::keyboard::Scancode) -> bool {
+    pub(crate) fn edit_key(&mut self, key: crate::input::Key) -> bool {
         match self {
-            Screen::AddHost(s) => s.edit_key(sc),
-            Screen::Pair(s) => s.edit_key(sc),
+            Screen::AddHost(s) => s.edit_key(key),
+            Screen::Pair(s) => s.edit_key(key),
             _ => false,
         }
     }

@@ -116,6 +116,7 @@ class LibraryCache(private val directory: File) {
         .apply {
             g.role?.let { put("role", it) }
             g.icon?.let { put("icon", it) }
+            g.platform?.let { put("platform", it) }
         }
 
     private fun decode(o: JSONObject): GameEntry {
@@ -131,6 +132,7 @@ class LibraryCache(private val directory: File) {
             ),
             role = nullable(o, "role"),
             icon = nullable(o, "icon"),
+            platform = nullable(o, "platform"),
         )
     }
 

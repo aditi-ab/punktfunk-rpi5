@@ -8,9 +8,21 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+# The Vulkan session's overlay (`SkiaOverlay` over pf-presenter's shared device + the SDL event
+# path). ON by default so `clients/session` is unchanged; the Android host turns it off
+# (`default-features = false`) and drives the portable `Console` over its own EGL surface.
+# ⚠ Also what puts `vulkan` on skia-safe: with it, the desktop's prebuilt key stays
+# `jpegd-jpege-pdf-textlayout-vulkan` (the flatpak pins that archive by hand — see below);
+# without it Android resolves `gl-jpegd-jpege-pdf-textlayout`, which rust-skia also prebuilds
+# for aarch64/x86_64/i686-linux-android. Neither key must drift or skia-bindings silently
+# builds Skia from source for hours.
+default = ["vulkan-overlay"]
+vulkan-overlay = ["dep:pf-presenter", "dep:ash", "dep:sdl3", "skia-safe/vulkan"]
+
 # Same Linux+Windows gating as the rest of the client stack.
 [target.'cfg(any(target_os = "linux", windows))'.dependencies]
-pf-presenter = { path = "../pf-presenter" }
+pf-presenter = { path = "../pf-presenter", optional = true }
 # MenuEvent/MenuPulse (the gamepad service's menu mode drives the library).
 # `default-features = false` like every other consumer (pf-presenter, cli, session, clients/windows):
 # pf-client-core's default is `pyrowave`, which compiles the vendored PyroWave C++ — fatal on
@@ -39,21 +51,42 @@ pf-client-core = { path = "../pf-client-core", default-features = false }
 # that pin from this file. Leave it stale and the flatpak leg unpacks the OLD archive's
 # pre-generated bindings.rs under the NEW crate, failing with `no variant, associated function,
 # or constant named 'Default' found for enum SkPathFillType`. That is exactly how #193 shipped.
-skia-safe = { version = "0.99", features = ["vulkan", "textlayout"] }
-ash = { version = "0.38", features = ["loaded"] }
+skia-safe = { version = "0.99", features = ["textlayout"] }
+ash = { version = "0.38", features = ["loaded"], optional = true }
 
+# Android (design/android-skia-console-port.md D1): the same crate over Skia's GL backend on
+# the client's own EGL surface. `gl` not `vulkan` — universal on every Android device this
+# client ships to (GLES 2 boxes included) and the emulator, and prebuilt:
+#   skia-binaries-a25a0fdb7d90429aa2d1-{aarch64,x86_64,i686}-linux-android-gl-jpegd-jpege-pdf-textlayout.tar.gz
+# ⚠ armv7-linux-androideabi has NO published archive (rust-skia's CI does not build it) — the
+# 32-bit TV ABI is served from a self-hosted archive via `SKIA_BINARIES_URL` (WP6); until that
+# is hosted the Android client only enables its console feature on the 64-bit ABIs.
+[target.'cfg(target_os = "android")'.dependencies]
+skia-safe = { version = "0.99", features = ["gl", "textlayout"] }
+pf-client-core = { path = "../pf-client-core", default-features = false }
+
+# Everything the shell itself needs, on every platform it runs on (macOS stays an empty crate:
+# the Mac client is clients/apple).
+[target.'cfg(any(target_os = "linux", windows, target_os = "android"))'.dependencies]
 anyhow = "1"
 tracing = "0.1"
+# The host-facing model types (`HostRow`, `ConsoleCmd`, `LibraryGame`, …) derive serde so a host
+# that lives across a language boundary (Android's Kotlin services, over JNI) can hand them over
+# as JSON — the wire IS the model, no second set of mirror types to drift.
+serde = { version = "1", features = ["derive"] }
+# The Android-only settings rows live in `trust::Settings::extra` (a JSON map), so the desktop
+# settings struct never grows a field only one platform reads.
+serde_json = "1"
 # `config::GamepadPref` keys the button-glyph style (PlayStation shapes vs ABXY).
 punktfunk-core = { path = "../punktfunk-core" }
 
 # Linux links the system SDL3; Windows builds it from source (same choice as the rest
 # of the workspace's Windows SDL consumers).
 [target.'cfg(target_os = "linux")'.dependencies]
-sdl3 = { version = "0.18", features = ["hidapi", "ash"] }
+sdl3 = { version = "0.18", features = ["hidapi", "ash"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
-sdl3 = { version = "0.18", features = ["hidapi", "ash", "build-from-source"] }
+sdl3 = { version = "0.18", features = ["hidapi", "ash", "build-from-source"], optional = true }
 
 # The shared console parity vectors (`clients/shared/console-vectors.json`) are read by three
 # tests here — the palette table, the tab names and the transition motion — and the library

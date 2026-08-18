@@ -17,7 +17,7 @@ use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox, Screen};
 use crate::theme::{accent, art_sampling, fg, fill, Fonts, EDGE_INSET, W};
 use crate::widgets::{TabStrip, TAB_PILL_H, TAB_PILL_TOP, TAB_STRIP_H};
-use pf_client_core::gamepad::{MenuDir, MenuEvent, MenuPulse};
+use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Color4f, Data, Image, Matrix, Point, RRect, Rect, TileMode, M44};
 use std::collections::HashMap;
 
@@ -323,14 +323,14 @@ fn draw_running_badge(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
 /// what stops the console from having two answers to "what is the sort".
 pub(super) fn store_sort(sort: crate::collate::SortKey, ctx: &mut Ctx) {
     ctx.settings.library_sort = sort.id().to_string();
-    ctx.settings.save();
+    ctx.store.save(ctx.settings);
 }
 
 /// Persist the library's arrangement. The Settings → Interface row writes this same key, so
 /// the row and the bar cannot drift: whichever moved last is what both read next frame.
 fn store_view(view: LibraryView, ctx: &mut Ctx) {
     ctx.settings.library_view = view.id().to_string();
-    ctx.settings.save();
+    ctx.store.save(ctx.settings);
 }
 
 /// The caption over a strip of pills, drawn at `x` on the pill row's own centre line, and
@@ -2182,6 +2182,8 @@ mod tests {
             hosts: &[],
             library,
             settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
             pads: &[],
             deck: false,
             device_name: "test",
@@ -2662,14 +2664,14 @@ mod tests {
         const SCREENFUL: usize = 8 * 6;
         // Four bytes a pixel, and a third again for the mip chain `decode_poster` bakes in.
         let bytes = |(w, h): (i32, i32)| (w as usize) * (h as usize) * 4 * 4 / 3;
-        // Up to a 1440p panel; `skia_overlay::RESOURCE_CACHE_BYTES` names the one case past
+        // Up to a 1440p panel; `shell::DEFAULT_GPU_CACHE_BYTES` names the one case past
         // it (4K fed 1000×1500 art) that the budget does not claim to cover.
         for k in [0.75, 1.0, 1.35, 1.8] {
             for src in [(600, 900), (1000, 1500)] {
                 let covers = bytes(art_cache_size(src, k)) * SCREENFUL;
                 // The console holds two render targets of the panel's own size as well.
                 let targets = 2 * (1280.0 * k) as usize * (800.0 * k) as usize * 4;
-                let budget = crate::skia_overlay::RESOURCE_CACHE_BYTES;
+                let budget = crate::shell::DEFAULT_GPU_CACHE_BYTES;
                 assert!(
                     covers + targets < budget,
                     "{src:?} art at k={k}: {} MB of covers + {} MB of targets over a {} MB budget",

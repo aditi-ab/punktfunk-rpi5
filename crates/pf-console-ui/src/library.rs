@@ -784,7 +784,7 @@ pub fn mesh_sksl(colors: &[(f64, f64, f64); 16]) -> String {
 
 // --- The shared binary↔overlay model ------------------------------------------------------
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LibraryPhase {
     Loading,
     Error {
@@ -797,7 +797,7 @@ pub enum LibraryPhase {
     Ready,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct LibraryGame {
     pub id: String,
     pub title: String,
@@ -837,7 +837,7 @@ pub struct LibraryGame {
 /// host…" says a shelf is about to become current; "Last known library" says it isn't going to.
 /// Telling a player the first thing while nothing is happening is the kind of lie a progress
 /// indicator tells, and it is worth one extra variant to never tell it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Stale {
     /// These titles came from the host just now.
     No,
