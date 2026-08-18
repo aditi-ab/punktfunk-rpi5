@@ -447,7 +447,7 @@
 	"logs_export_all": "Export all",
 	"logs_export_all_working": "Collecting…",
 	"logs_export_all_failed": "Couldn't assemble the export",
-	"logs_empty_plugins": "No plugin output yet. Plugins log here once the plugin runner is running — check `punktfunk-host plugins status`.",
+	"logs_empty_plugins": "No plugin output yet. Plugins log here once the plugin runner is running — check `punktfunk-host plugins status`. If it is running and still silent, it can't reach the host; the runner's own log says why: `journalctl --user -u punktfunk-scripting` on Linux, `%ProgramData%\\punktfunk\\plugin-state\\runner.log` on Windows.",
 	"logs_follow": "Follow",
 	"logs_pause": "Pause",
 	"logs_clear": "Clear",

@@ -344,8 +344,19 @@ journalctl --user -u punktfunk-scripting -f
 </Tab>
 <Tab value="Windows">
 
-The runner task doesn't write a log file, so run it in the foreground to watch it start your
-plugins (stop it with <kbd>Ctrl</kbd>+<kbd>C</kbd>):
+The runner task writes its output to `%ProgramData%\punktfunk\plugin-state\runner.log` (the
+previous run is kept as `runner.log.1`). This is the file to read — or send — when the console's
+Plugins view stays empty although the runner is running: everything the runner and its plugins
+printed lands here even when they can't reach the host.
+
+```powershell
+Get-Content "$env:ProgramData\punktfunk\plugin-state\runner.log" -Tail 100
+```
+
+If the file doesn't exist, the task started before `punktfunk-host plugins enable` ever ran (which
+is what makes `plugin-state` writable for the runner's `LocalService` account) — run it from an
+elevated prompt, then read the file. To watch a start live instead, run the runner in the
+foreground (stop it with <kbd>Ctrl</kbd>+<kbd>C</kbd>):
 
 ```powershell
 & "$env:ProgramFiles\punktfunk\bun\bun.exe" "$env:ProgramFiles\punktfunk\scripting\runner-cli.js"
