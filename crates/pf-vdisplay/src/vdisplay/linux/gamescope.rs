@@ -2094,20 +2094,37 @@ fn kill_unit(unit: &str) {
 /// 2026-07-07). `--runtime` keeps the mask in tmpfs so a reboot clears it even if the host dies
 /// without restoring (the same semantics as the persisted takeover file).
 ///
-/// ⚠ The mask stops the UNIT from starting — it does NOT stop the relogin loop that keeps trying.
-/// On images whose SDDM session helper execs the session script directly (`/etc/sddm/wayland-session
-/// gamescope-session-plus steam`, f43 bazzite-deck — live-diagnosed on the .41 VM 2026-07-31) SDDM
-/// relogins ~3×/s regardless, each a full `bash --login` session start — 328 forks/s, load 6+, 1481
-/// logind sessions in 8 minutes, the journal flooded past its own rotation. The stream itself
-/// survives, but the storm starves the game and the encoder ("atrocious, unplayable 240fps"). The
-/// real defense against the storm is stopping the DM ([`dm_plan`]); the mask stays as belt-and-braces
-/// for the window before the stop lands, and as the degraded takeover when the stop is impossible.
+/// ⚠⚠⚠ **A mask laid while the display manager is still RUNNING is the relogin storm, not a defense
+/// against it** — the single most expensive misreading in this file's history, and the reason
+/// [`dm_plan`] no longer has a `mask` input. Measured end to end on `.41` (Bazzite `.41`, host
+/// `0.31.0`, 2026-08-18): `/usr/share/wayland-sessions/gamescope-session-ogui-steam.desktop` runs
+/// `Exec=gamescope-session-plus ogui-steam`, and that script's last act is
+/// `systemctl --user --wait start gamescope-session-plus@ogui-steam.service`. So the mask sits
+/// **directly in SDDM's relogin path**: every autologin fails in milliseconds instead of taking the
+/// seconds a real gamescope + Steam start costs, and SDDM's `Relogin=true` has no backoff at all.
+/// That converts a slow, survivable relogin loop into a **4–5 logins/s fork storm**: 962 logind
+/// sessions in 3.7 min, `Watching system buttons` re-scanned 5,688 times, a box-wide udev `change`
+/// storm at ~20/s, `iio-sensor-proxy` crash-looping at ~16 starts/s, load 26 on 12 cores. What it
+/// breaks is not the display: `winebus` re-enumerates udev on every event instead of reading
+/// `hidraw`, so **the pad delivers input at ~1.4 Hz instead of 250 Hz** — "my DualSense is not
+/// detected in the game" (see `design/sddm-relogin-storm-starves-input-handoff.md`). The earlier
+/// reading of the same box (2026-07-31) recorded the storm but concluded the sddm helper "execs the
+/// session script directly, so the masked unit never enters the picture" — it does, one `systemctl`
+/// call further down, which is why masking looked inert and was left as the degraded takeover.
 ///
-/// ⚠⚠ The mask DOES bite on that image, which is easy to miss and was the 2026-08-10 field bug: the
-/// session script's last act is `systemctl --user --wait start gamescope-session-plus@$1.service`, so
-/// a masked unit makes every entry into game mode — including the user's own deliberate "Return to
-/// Gaming Mode" — fail instantly, with Steam left sitting on its "Switch to Desktop…" modal forever.
-/// The mask is therefore only sound while our managed session actually holds the box: the moment the
+/// The rule that follows, enforced by [`stop_autologin_sessions`]: **the mask is laid only once the
+/// DM stop has landed, and is never a substitute for it.** With the DM down there is no relogin
+/// loop for the mask to accelerate, and it is pure belt-and-braces against a supervisor-side
+/// restart. It is also what keeps a mask-fragile flavor safe — Nobara's `plasmalogin` (KDE's SDDM
+/// successor) start-limit-kills ITSELF against a masked unit within ~1 s, leaving a permanent black
+/// screen that only a root `reset-failed` + `restart` recovers (live-proven on the Nobara repro VM
+/// 2026-07-24) — because a stopped DM cannot trip its own start limit, and every restore path
+/// unmasks BEFORE restarting the DM ([`do_restore_tv_session`]).
+///
+/// ⚠⚠ The mask DOES bite the user's own way back, which is easy to miss and was the 2026-08-10 field
+/// bug: a masked unit makes every entry into game mode — including a deliberate "Return to Gaming
+/// Mode" — fail instantly, with Steam left sitting on its "Switch to Desktop…" modal forever. The
+/// mask is therefore only sound while our managed session actually holds the box: the moment the
 /// box leaves it (a mid-stream switch to a desktop session), [`lift_autologin_mask`] must lift it, or
 /// the way back is barred until reboot (`--runtime` lives in tmpfs — which is exactly why "it works
 /// again after a reboot").
@@ -2193,54 +2210,35 @@ fn display_manager_unit_under(base: &std::path::Path) -> Option<String> {
     target.file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
-/// Does this display manager's autologin loop SURVIVE the gamescope unit being masked? This does
-/// NOT decide whether the DM keeps running — any DM relogin-loops against a killed live gaming
-/// session, so [`dm_plan`] stops the DM on every flavor — it decides whether masking is safe at
-/// all, and with it the DEGRADED takeover when the DM can't be stopped (no lingering / no
-/// privilege):
-/// * **SDDM** survives (a failing autologin leaves sddm itself running — .181 2026-07-07), so the
-///   degraded takeover is mask-only: Steam stays protected, and the cost is SDDM's relogin churn
-///   for the stream's duration — anything from logind/ACL flapping (.181, the audio-flap
-///   pathology) to a full fork storm on images whose sddm helper bypasses the unit (.41
-///   2026-07-31, see [`mask_unit`]).
-/// * Nobara's `plasmalogin` (KDE's SDDM successor) is proven FATAL: against a masked unit
-///   its session Exec fails instantly, `Relogin=true` retries, and `plasmalogin.service` trips
-///   systemd's start limit within ~1 s — the DM dies and the box is a permanent black screen that
-///   only a root `reset-failed` + `restart` recovers (live-proven on the Nobara repro VM
-///   2026-07-24). Unknown DMs are treated as fragile: the fragile path degrades gracefully, a wrong
-///   "safe" kills the seat.
-fn dm_survives_masked_unit(dm: &str) -> bool {
-    dm == "sddm.service"
-}
-
-/// The takeover's display-manager decision, derived purely from the DM flavor and whether any
-/// autologin gaming instance is LIVE (unit-tested; the runtime guards — lingering, privilege —
-/// stay with [`stop_autologin_sessions`]).
+/// The takeover's display-manager decision, derived purely from whether a display manager exists
+/// and whether any autologin gaming instance is LIVE (unit-tested; the runtime guards — lingering,
+/// privilege — stay with [`stop_autologin_sessions`]).
 ///
 /// Killing a live autologin session starts its DM's `Relogin=true` loop, and no flavor tolerates
 /// that loop well: SDDM's churns logind sessions up to a fork storm ([`mask_unit`]), plasmalogin's
 /// start-limit-kills the DM. So whenever a DM drove a LIVE gaming session, the DM itself is
 /// stopped for the stream's duration; the restore ([`do_restore_tv_session`]) brings it back and
-/// its autologin restores gaming mode. The flavors differ only in masking and in the degraded
-/// mode ([`dm_survives_masked_unit`]).
+/// its autologin restores gaming mode.
+///
+/// There is no flavor-dependent degraded mode any more, and the DM flavor is no longer an input.
+/// It used to be: SDDM was classified as surviving a masked unit, so a failed DM stop degraded to
+/// **mask-only** there. That degrade is what starved the .41 box's input plane on 2026-08-18 —
+/// masking without the stop is not a weaker defense, it is the storm's engine ([`mask_unit`]). A
+/// planned DM stop that does not land now fails the takeover and the caller degrades to ATTACH.
 struct DmPlan {
-    /// Touch nothing at all: a mask-fragile DM with no live gaming instance — killing
-    /// loaded-but-inactive leftovers frees nothing, and stopping the DM would kill the user's
-    /// live desktop for it.
+    /// Touch nothing at all: no live gaming instance. Killing loaded-but-inactive leftovers frees
+    /// no Steam, masking them while a DM is up is the relogin storm ([`mask_unit`]), and stopping
+    /// the DM would kill the user's live desktop for it.
     skip: bool,
-    /// Mask the units before killing them (safe only where the DM survives a masked unit; also
-    /// the whole of the degraded takeover when the DM can't be stopped).
-    mask: bool,
-    /// Stop the DM for the stream's duration (only a live instance justifies it).
+    /// Stop the DM for the stream's duration (only a live instance justifies it). Masking is not
+    /// a plan input: it is laid only once this stop has LANDED, so it can never substitute for it.
     stop_dm: bool,
 }
 
 /// See [`DmPlan`].
 fn dm_plan(dm: Option<&str>, any_live: bool) -> DmPlan {
-    let mask = dm.is_none_or(dm_survives_masked_unit);
     DmPlan {
-        skip: !mask && !any_live,
-        mask,
+        skip: !any_live,
         stop_dm: dm.is_some() && any_live,
     }
 }
@@ -2309,6 +2307,23 @@ enum DmHelperError {
         code: Option<i32>,
         stderr: String,
     },
+}
+
+impl DmHelperError {
+    /// The variant as a stable one-word tag, for the `shape` log field. The [`Display`] text is
+    /// prose aimed at whoever reads the line; this is what makes the four cases greppable and
+    /// countable across boxes, since each needs a different fix (package it / install polkit /
+    /// fix the action / join the group).
+    ///
+    /// [`Display`]: std::fmt::Display
+    fn shape(&self) -> &'static str {
+        match self {
+            Self::NotInstalled => "not-installed",
+            Self::NotExecutable { .. } => "not-executable",
+            Self::Denied { .. } => "denied",
+            Self::Refused { .. } => "refused",
+        }
+    }
 }
 
 impl std::fmt::Display for DmHelperError {
@@ -2568,12 +2583,29 @@ fn user_in_group(user: &str, group: &str) -> bool {
 /// wait — a system manager mid-shutdown can still take the request and never answer. A timeout
 /// reads as `false`, which is the same answer an unauthorized call already gives, so every caller
 /// falls through to the pkexec helper exactly as it does today.
+///
+/// Its stderr is **captured and logged at DEBUG**, not inherited. On an unprivileged host this verb
+/// is EXPECTED to fail — it is the cheap probe that runs before the pkexec helper — so systemctl's
+/// own "Access denied … requires interactive authentication" went to the journal on the normal,
+/// successful path: two of them immediately before `INFO restored the display manager`. That shape
+/// cost two debugging sessions on its own (2026-08-18), each spent explaining a failure that had
+/// already succeeded one line later. A `--no-ask-password` refusal is not news; it is the design.
 fn systemctl_system(args: &[&str]) -> bool {
     let mut cmd = Command::new("systemctl");
     cmd.arg("--no-ask-password").args(args);
-    crate::proc::status_within(&mut cmd, DM_VERB_BUDGET)
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let Ok(out) = crate::proc::output_within(&mut cmd, DM_VERB_BUDGET) else {
+        return false; // timed out / could not spawn — the helper path is next either way
+    };
+    if !out.status.success() {
+        tracing::debug!(
+            ?args,
+            status = ?out.status.code(),
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "systemctl on the system bus was refused — falling through to the packaged pkexec \
+             helper (expected on an unprivileged host)"
+        );
+    }
+    out.status.success()
 }
 
 /// Would stopping the display manager also stop US? A packaged host runs as a `systemd --user`
@@ -2878,22 +2910,24 @@ fn honor_session_select_switch(dm: String) {
 ///
 /// When a display manager drove a LIVE gaming session, it is **stopped for the stream** on every
 /// flavor ([`dm_plan`]): killing the session otherwise starts the DM's `Relogin=true` loop, which
-/// at best churns logind sessions/ACLs and at worst is a full fork storm — f43 bazzite-deck's sddm
-/// helper execs the session script directly, so the masked unit never enters the picture (328
-/// forks/s, load 6+, live-diagnosed on the .41 VM 2026-07-31 — see [`mask_unit`]). The units
-/// themselves are torn down with **SIGKILL** ([`kill_unit`]) to avoid the F44 GPU-context leak
-/// that the autologin's SIGTERM stop triggers. The flavors differ in masking and in the degraded
-/// mode when the DM can't be stopped (no lingering / no privilege):
-/// * **SDDM / no DM**: each unit is **masked first** ([`mask_unit`] — belt-and-braces under a
-///   stopped DM, and the whole defense on images that DO route the relogin through the unit).
-///   Matches every loaded instance, not just `running` ones — under a relogin churn the unit
-///   flaps through `activating`/`failed` between cycles, and an unmasked flapping unit re-enters
-///   the fight the moment the supervisor restarts it. A failed DM stop **degrades to mask-only**
-///   with a warning, never to attach: the mask still protects Steam, at the storm-tax price.
-/// * **Mask-fragile DM** (Nobara's `plasmalogin`, unknown DMs): masking start-limit-kills the DM
-///   itself (permanent black screen), so the units are killed unmasked, and a failed DM stop
-///   **fails the takeover** — the error tells the caller to degrade to ATTACH (mirror the box's
-///   own session) rather than destabilize the seat.
+/// at best churns logind sessions/ACLs and at worst is a full fork storm. The units themselves are
+/// torn down with **SIGKILL** ([`kill_unit`]) to avoid the F44 GPU-context leak that the autologin's
+/// SIGTERM stop triggers, and each is **masked first** ([`mask_unit`]) so the supervisor cannot
+/// restart it underneath us. Masking matches every loaded instance, not just `running` ones — under
+/// a relogin churn the unit flaps through `activating`/`failed` between cycles, and an unmasked
+/// flapping unit re-enters the fight the moment the supervisor restarts it.
+///
+/// **A planned DM stop that does not land fails the takeover, on every flavor** — the `Err` tells
+/// the caller to degrade to ATTACH (mirror the box's own session) instead. There is deliberately no
+/// mask-only degrade any more. SDDM used to get one, on the reasoning that "the mask still protects
+/// Steam, at the storm-tax price"; the storm tax was then measured on `.41` (2026-08-18) and it is
+/// not a tax, it is a **4–5 logins/s fork storm that costs the user their input plane** — the pad
+/// reads at 1.4 Hz instead of 250 Hz, because the mask sits inside SDDM's relogin path and makes
+/// every retry fail instantly ([`mask_unit`] has the full chain). Fighting an autologin we cannot
+/// stop is strictly worse than not taking over at all, and attach is a fully working stream.
+///
+/// The ORDER is therefore load-bearing and not a style choice: stop the DM, bail if it did not
+/// land, and only then mask. A mask laid before a stop that never arrives is the storm.
 fn stop_autologin_sessions() -> Result<()> {
     let Ok(out) = crate::proc::output_within(
         Command::new("systemctl").args([
@@ -2927,9 +2961,15 @@ fn stop_autologin_sessions() -> Result<()> {
     // Only a LIVE instance holds Steam / justifies touching the DM. A loaded-but-inactive
     // leftover (the box switched back to the desktop earlier) must not stop the DM — that
     // would kill the user's live desktop to free nothing.
+    // Stated as the NEGATIVE — systemd has exactly two not-running ACTIVE states, and the other
+    // four all mean the unit still owns Steam and the GPU. Listing the live ones instead missed
+    // `deactivating` (and `reloading`): a unit caught mid-teardown read as a dead leftover, so a
+    // box that IS in gaming mode could be sampled as idle and skipped, leaving the autologin's
+    // Steam holding the single instance our own launch then collides with. The window is small on
+    // an idle box and wide open on a churning one — which is exactly when this is sampled.
     let any_live = listed
         .iter()
-        .any(|(_, active)| matches!(active.as_str(), "active" | "activating"));
+        .any(|(_, active)| !matches!(active.as_str(), "inactive" | "failed"));
     let plan = dm_plan(dm.as_deref(), any_live);
     if plan.skip {
         return Ok(());
@@ -2938,97 +2978,165 @@ fn stop_autologin_sessions() -> Result<()> {
         let dm = dm.expect("stop_dm ⇒ Some");
         // The DM stop ends this user's last login session. If our own lifetime hangs off the user
         // manager and lingering can't be turned on, that stop kills the host ~10s later — with the
-        // box's display manager down and nobody left to bring it back. On a mask-fragile flavor,
-        // degrading to attach is strictly better than a black screen that needs a VT to recover;
-        // where masking is safe, mask-only (the storm tax) is strictly better than attach.
+        // box's display manager down and nobody left to bring it back.
         //
-        // Both failure arms below quote the REASON they were handed rather than describing one.
+        // BOTH arms below now BAIL, on every DM flavor. They did not always: SDDM used to degrade
+        // to mask-only here, on the reasoning that the mask still protects Steam and the cost is
+        // just relogin churn. It is not just churn — the mask is IN sddm's relogin path, so a
+        // mask without the stop is a 4–5 logins/s fork storm that drops the pad from 250 Hz to
+        // 1.4 Hz ([`mask_unit`]). Degrading to attach costs the client's mode; degrading to
+        // mask-only costs the user their input plane. Attach wins.
+        //
+        // Both bails quote the REASON they were handed rather than describing one.
         // 0.26.0/0.27.0 described one — "the packaged pf-dm-helper polkit action is missing or was
         // denied (reinstall the punktfunk package, or install the display-manager polkit rule from
         // the docs)" — and on the box that produced it the action was installed, permissive,
         // correctly annotated, and pkexec had already RUN the helper; the helper's refusal ("user
         // 'x' is not in the 'punktfunk' group") was thrown away with its stderr. Both suggested
         // remedies were dead ends: neither a reinstall nor a polkit rule adds anyone to a group.
-        let dm_stopped = if let Err(why) = ensure_host_survives_dm_stop() {
-            if !plan.mask {
-                // The reason goes LAST in both bails: the helper's own refusal ends in a command
-                // to paste, and burying that mid-sentence is how it stops being read.
-                bail!(
-                    "stopping {dm} ends this user's last login session, and without lingering \
-                     logind would stop the user manager — and this host with it — about 10s \
-                     later, leaving the box with no display manager and nothing to restore it; \
-                     lingering could not be enabled, so the managed takeover is unavailable. \
-                     Either run `sudo loginctl enable-linger $USER` once, as the setup docs ask, \
-                     and reconnect — or fix the privileged path: {why}"
-                );
-            }
-            tracing::warn!(
-                %dm,
-                reason = %why,
-                "cannot stop the display manager for this stream (lingering could not be \
-                 enabled, and without it the DM stop would take this host down ~10s later) — \
-                 leaving it running: its autologin Relogin loop will churn logind sessions for \
-                 the whole stream, up to a fork storm that starves the game and encoder; run \
-                 `sudo loginctl enable-linger $USER` once, as the setup docs ask"
+        if let Err(why) = ensure_host_survives_dm_stop() {
+            // The reason goes LAST in both bails: the helper's own refusal ends in a command
+            // to paste, and burying that mid-sentence is how it stops being read.
+            bail!(
+                "stopping {dm} ends this user's last login session, and without lingering \
+                 logind would stop the user manager — and this host with it — about 10s \
+                 later, leaving the box with no display manager and nothing to restore it; \
+                 lingering could not be enabled, so the managed takeover is unavailable. \
+                 Either run `sudo loginctl enable-linger $USER` once, as the setup docs ask, \
+                 and reconnect — or fix the privileged path: {why}"
             );
-            false
-        } else if let Err(why) = try_stop_display_manager(&dm) {
-            if !plan.mask {
-                bail!(
-                    "the box's gaming session is driven by {dm}, which does not survive a masked \
-                     session unit, and stopping it needs privilege, so the managed takeover is \
-                     unavailable — {why}"
-                );
-            }
-            tracing::warn!(
-                %dm,
-                reason = %why,
-                "stopping the display manager for this stream needs privilege and the privileged \
-                 path failed — leaving it running: its autologin Relogin loop will churn logind \
-                 sessions for the whole stream, up to a fork storm that starves the game and \
-                 encoder"
-            );
-            false
-        } else {
-            true
-        };
-        if dm_stopped {
-            tracing::info!(
-                %dm,
-                "freed Steam: stopped the display manager for this stream (its autologin \
-                 Relogin loop would otherwise churn against the takeover)"
-            );
-            // Baseline the switch sentinel HERE, not just at a successful launch: setting
-            // STOPPED_DM is what arms the honor gate, so from this instant an unbaselined
-            // sentinel would read as an in-stream "Switch to Desktop" — including the write from
-            // the switch that just brought the box INTO game mode. A successful launch
-            // re-baselines (tighter still).
-            record_session_select_baseline();
-            *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()) = Some(dm);
         }
+        if let Err(why) = try_stop_display_manager(&dm) {
+            // ERROR, not WARN, and it names the SHAPE: this is the branch whose silence cost an
+            // evening on .41 — the takeover degraded, nothing failed loudly, and the storm that
+            // followed read as a pad bug. The `bail!` below reaches the caller's own warn line;
+            // this one exists so the shape survives into the journal even if the caller's does
+            // not, because the four shapes need four different fixes.
+            tracing::error!(
+                %dm,
+                shape = why.shape(),
+                reason = %why,
+                "the managed takeover planned to stop the display manager and could not — \
+                 degrading to ATTACH rather than fighting its autologin: a killed session under \
+                 a running DM relogin-loops at 4-5/s and starves the box's input plane"
+            );
+            bail!(
+                "the box's gaming session is driven by {dm}, and stopping it for the stream needs \
+                 privilege this host does not have; taking over without stopping it would leave \
+                 its autologin relogin-looping against us for the whole stream, so the managed \
+                 takeover is unavailable — {why}"
+            );
+        }
+        tracing::info!(
+            %dm,
+            "freed Steam: stopped the display manager for this stream (its autologin \
+             Relogin loop would otherwise churn against the takeover)"
+        );
+        // Baseline the switch sentinel HERE, not just at a successful launch: setting
+        // STOPPED_DM is what arms the honor gate, so from this instant an unbaselined
+        // sentinel would read as an in-stream "Switch to Desktop" — including the write from
+        // the switch that just brought the box INTO game mode. A successful launch
+        // re-baselines (tighter still).
+        record_session_select_baseline();
+        *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()) = Some(dm);
     }
+    // Reaching here means no display manager can relogin against us: either there is none
+    // (`!plan.stop_dm` with `dm == None`), or the stop above LANDED — both failure arms bail. That
+    // is the precondition the mask needs, and the only one under which it is a defense rather than
+    // the storm's accelerator ([`mask_unit`]).
     let units: Vec<String> = listed.into_iter().map(|(u, _)| u).collect();
     let mut stopped = Vec::new();
-    if plan.mask {
-        // Record that a mask is outstanding BEFORE laying it: every hand-back path lifts it off this
-        // flag, and one that ran between the mask and an unrecorded flag would leave it on forever.
-        *AUTOLOGIN_MASKED.lock().unwrap_or_else(|e| e.into_inner()) = true;
-    }
+    // Record that a mask is outstanding BEFORE laying it: every hand-back path lifts it off this
+    // flag, and one that ran between the mask and an unrecorded flag would leave it on forever.
+    *AUTOLOGIN_MASKED.lock().unwrap_or_else(|e| e.into_inner()) = true;
     for unit in units {
-        if plan.mask {
-            mask_unit(&unit); // belt-and-braces under a stopped DM; the whole defense otherwise
-        }
+        mask_unit(&unit); // belt-and-braces: no DM is up to relogin through it
         kill_unit(&unit); // SIGKILL teardown — avoid the F44 GPU-context leak
         tracing::info!(
             %unit,
-            masked = plan.mask,
-            "freed Steam: stopped the autologin gaming session for this stream"
+            dm_stopped = plan.stop_dm,
+            "freed Steam: masked and stopped the autologin gaming session for this stream"
         );
         stopped.push(unit);
     }
     *STOPPED_AUTOLOGIN.lock().unwrap_or_else(|e| e.into_inner()) = stopped;
     persist_takeover(); // A3: survive a host crash mid-stream
+    watch_for_relogin_storm(); // §5.4: no measurement taken during a storm is valid — say so
     Ok(())
+}
+
+/// How long the post-takeover storm probe samples logind's session counter for. Long enough that
+/// one legitimate login racing our teardown cannot reach the threshold, short enough that the line
+/// lands in the journal while the operator is still looking at the connect that produced it.
+const STORM_PROBE_WINDOW: Duration = Duration::from_secs(5);
+
+/// New logind sessions per second above which the box is relogin-storming rather than merely busy.
+/// A healthy takeover creates **zero** (the display manager is stopped for the stream); the
+/// measured storm ran at 4–5/s. An order of magnitude clear of both.
+const STORM_LOGINS_PER_SEC: f64 = 1.0;
+
+/// The highest logind session id on the box right now. logind names its per-session state files
+/// after the id in `/run/systemd/sessions/` and hands ids out monotonically, so the maximum is a
+/// free monotonic LOGIN COUNTER — no `journalctl` grep, no D-Bus, just a `read_dir`. `None` on a
+/// box with no logind at all.
+fn max_logind_session_id() -> Option<u64> {
+    std::fs::read_dir("/run/systemd/sessions")
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse::<u64>().ok()))
+        .max()
+}
+
+/// Watch for a display-manager relogin storm just after a takeover, and say so at ERROR if one is
+/// running.
+///
+/// This exists because of what a storm costs to DIAGNOSE, not what it costs to run. A box relogging
+/// at 4–5/s re-fires logind's seat scan on every cycle, which re-fires udev `uaccess` across every
+/// subsystem at ~20/s; `winebus` then re-enumerates udev instead of reading `hidraw` and the pad
+/// delivers **~1.4 Hz instead of 250 Hz**, WirePlumber re-enumerates at 72 % CPU, and
+/// `iio-sensor-proxy` crash-loops at ~16 starts/s as a udev-activated amplifier. None of that names
+/// the display manager. It presents as "my controller is not detected in the game", and an evening
+/// was spent on 2026-08-18 disproving the pad stack, the ALSA UCM, PipeWire and GE-Proton before
+/// the DM was suspected at all. **Every audio, input and PipeWire measurement taken during a storm
+/// is invalid**, and that is worth one loud line before anyone starts measuring.
+///
+/// ponytail: detect-and-report only, no self-mitigation. The mitigation would be tearing our own
+/// session down mid-stream and re-connecting in attach mode, which is a worse failure than the one
+/// it fixes if the detector is ever wrong. Now that the mask can no longer outlive the DM stop
+/// ([`stop_autologin_sessions`]) this host does not create storms, so what is left to catch is
+/// somebody else's — a hand-masked unit, a third-party session switcher, a distro change. If one of
+/// those turns up in the field with a reliable signature, self-mitigate then.
+fn watch_for_relogin_storm() {
+    let Some(before) = max_logind_session_id() else {
+        return; // no logind — nothing relogins here
+    };
+    // Detached: the takeover path is already the slowest part of a connect and the answer is worth
+    // nothing to it (it only ever logs). Dies with the process, which is fine — a storm outlives
+    // any single 5 s window and the next connect probes again.
+    std::thread::spawn(move || {
+        std::thread::sleep(STORM_PROBE_WINDOW);
+        let Some(after) = max_logind_session_id() else {
+            return;
+        };
+        let logins = after.saturating_sub(before);
+        let per_sec = logins as f64 / STORM_PROBE_WINDOW.as_secs_f64();
+        if per_sec < STORM_LOGINS_PER_SEC {
+            return;
+        }
+        tracing::error!(
+            logins,
+            window_s = STORM_PROBE_WINDOW.as_secs(),
+            rate = %format!("{per_sec:.1}/s"),
+            "this box is in a display-manager RELOGIN STORM — logind is opening sessions faster \
+             than once a second. Every udev consumer on the box is drowning in the fallout: \
+             expect the gamepad to read at a few Hz instead of 250, WirePlumber to burn CPU \
+             re-enumerating, and iio-sensor-proxy to crash-loop. NO audio, input or PipeWire \
+             measurement taken now is valid — find what is relogging first. Usual cause: a \
+             gamescope session unit left masked while the display manager is running, so every \
+             autologin fails instantly (`systemctl --user list-unit-files 'gamescope-session*'`); \
+             `systemctl --user unmask --runtime <unit>` clears it, a reboot clears it too"
+        );
+    });
 }
 
 /// How long a desktop Steam gets to honor `steam -shutdown` before the spawn fails. Steam tears
@@ -3515,6 +3623,7 @@ fn do_restore_tv_session() {
             }
             Err(why) if crate::try_recover_session() => tracing::warn!(
                 %dm,
+                shape = why.shape(),
                 reason = %why,
                 "display-manager restart lost its privilege — fired PUNKTFUNK_RECOVER_SESSION_CMD \
                  to bring the session back"
@@ -3524,6 +3633,7 @@ fn do_restore_tv_session() {
             // symptom once and the reason is what stops it happening again.
             Err(why) => tracing::error!(
                 %dm,
+                shape = why.shape(),
                 reason = %why,
                 "could not restart the display manager and no PUNKTFUNK_RECOVER_SESSION_CMD is \
                  configured — the box has no graphical session until someone runs \
@@ -5169,14 +5279,14 @@ mod tests {
     use super::{
         any_output_size_is, cancel_pending_restore, cgroup_is_punktfunk_owned,
         cgroup_under_user_manager, classify_output_size, connected_connector_under,
-        display_manager_unit_under, dm_plan, dm_survives_masked_unit, game_hz,
-        gamescope_output_size, hdr_args, is_steam_launch, mask_unit, missing_flags, mode_mismatch,
-        nested_wrapper_script, our_wsi_layer_dir, plan_bind, release_autologin_mask,
-        script_hardcodes_gamescope, sentinel_advanced, shape_dedicated_command,
-        switch_ends_mask_window, takeover_state_is_live, unmask_unit, xwayland_refusal_marker,
-        BindOff, BindPlan, BoxOutputSize, DmHelperError, SessionBind, TakeoverState, WsiPlan,
-        AUTOLOGIN_MASKED, DISTRO_GAMESCOPE_PATH, PENDING_RESTORE, RESTORE_FLIGHT,
-        STOPPED_AUTOLOGIN, WSI_OFF_ENV, X11_SOCKET_DIR,
+        display_manager_unit_under, dm_plan, game_hz, gamescope_output_size, hdr_args,
+        is_steam_launch, mask_unit, missing_flags, mode_mismatch, nested_wrapper_script,
+        our_wsi_layer_dir, plan_bind, release_autologin_mask, script_hardcodes_gamescope,
+        sentinel_advanced, shape_dedicated_command, switch_ends_mask_window,
+        takeover_state_is_live, unmask_unit, xwayland_refusal_marker, BindOff, BindPlan,
+        BoxOutputSize, DmHelperError, SessionBind, TakeoverState, WsiPlan, AUTOLOGIN_MASKED,
+        DISTRO_GAMESCOPE_PATH, PENDING_RESTORE, RESTORE_FLIGHT, STOPPED_AUTOLOGIN, WSI_OFF_ENV,
+        X11_SOCKET_DIR,
     };
     use std::time::{Duration, Instant};
 
@@ -5423,11 +5533,6 @@ mod tests {
             display_manager_unit_under(&base).as_deref(),
             Some("plasmalogin.service")
         );
-        // Only SDDM is proven to survive a masked session unit; plasmalogin start-limit-kills
-        // itself (live-proven), and unknown DMs default to fragile.
-        assert!(dm_survives_masked_unit("sddm.service"));
-        assert!(!dm_survives_masked_unit("plasmalogin.service"));
-        assert!(!dm_survives_masked_unit("gdm.service"));
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -5479,23 +5584,55 @@ mod tests {
 
     #[test]
     fn dm_plan_stops_any_dm_that_drove_a_live_session() {
-        // SDDM, live gaming session: mask (belt-and-braces) AND stop the DM — the mask alone
-        // does not stop the relogin loop on images whose sddm helper execs the session script
-        // directly, bypassing the unit (fork storm, .41 VM 2026-07-31).
+        // A live gaming session behind a DM: stop the DM, whatever the flavor. The mask alone does
+        // NOT stop the relogin loop — on .41 it is what makes the loop fast, because the session
+        // script's last act is `systemctl --user --wait start gamescope-session-plus@…` and a
+        // masked unit fails that in milliseconds (4-5 logins/s, pad at 1.4 Hz, 2026-08-18).
         let p = dm_plan(Some("sddm.service"), true);
-        assert!(!p.skip && p.mask && p.stop_dm);
-        // SDDM, only inactive leftovers: nothing live justifies touching the DM — mask+kill only.
-        let p = dm_plan(Some("sddm.service"), false);
-        assert!(!p.skip && p.mask && !p.stop_dm);
-        // Mask-fragile flavor, live: stop the DM, never mask (masking start-limit-kills the DM).
-        let p = dm_plan(Some("plasmalogin.service"), true);
-        assert!(!p.skip && !p.mask && p.stop_dm);
-        // Mask-fragile flavor, nothing live: hands off entirely — stopping the DM here would
-        // kill the user's live desktop to free nothing.
+        assert!(!p.skip && p.stop_dm);
+        // Flavor is no longer an input: plasmalogin gets the same plan as sddm. It used to differ
+        // only to pick a DEGRADED mode (mask-only for sddm), and that degrade is now gone —
+        // `stop_autologin_sessions` bails to ATTACH instead.
+        let q = dm_plan(Some("plasmalogin.service"), true);
+        assert!(q.skip == p.skip && q.stop_dm == p.stop_dm);
+        // Nothing live, DM present: hands off entirely, on EVERY flavor. Killing loaded-but-
+        // inactive leftovers frees no Steam; masking them while the DM is up is the storm; and
+        // stopping the DM would kill the user's live desktop for it.
+        assert!(dm_plan(Some("sddm.service"), false).skip);
         assert!(dm_plan(Some("plasmalogin.service"), false).skip);
-        // No DM at all (getty autologin): mask+kill, nothing to stop.
+        // No DM at all (getty autologin), live: mask+kill, nothing to stop — masking is sound
+        // here precisely because no relogin loop exists to run into it.
         let p = dm_plan(None, true);
-        assert!(!p.skip && p.mask && !p.stop_dm);
+        assert!(!p.skip && !p.stop_dm);
+        assert!(dm_plan(None, false).skip);
+    }
+
+    /// The four [`DmHelperError`] shapes need four different fixes, so the `shape` field must keep
+    /// them apart — a helper that could not be EXECUTED must never read as one that ran and refused.
+    #[test]
+    fn dm_helper_error_shapes_stay_distinct() {
+        let shapes = [
+            DmHelperError::NotInstalled.shape(),
+            DmHelperError::NotExecutable {
+                helper: "h",
+                io: String::new(),
+            }
+            .shape(),
+            DmHelperError::Denied {
+                helper: "h",
+                code: 127,
+                stderr: String::new(),
+            }
+            .shape(),
+            DmHelperError::Refused {
+                helper: "h",
+                code: Some(1),
+                stderr: String::new(),
+            }
+            .shape(),
+        ];
+        let unique: std::collections::HashSet<_> = shapes.iter().collect();
+        assert_eq!(unique.len(), shapes.len(), "shapes collided: {shapes:?}");
     }
 
     #[test]
