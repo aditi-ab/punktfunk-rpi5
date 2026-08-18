@@ -18,6 +18,9 @@ path = "src/main.rs"
 # stub main (same pattern as the platform-gated clients).
 [dependencies]
 anyhow = "1"
+# `config_dir()` + `published_mgmt_port()`: the tray follows the mgmt port the host actually bound
+# (`<config_dir>/mgmt-endpoint`) instead of assuming 47990. Std-only leaf, no I/O stack.
+pf-paths = { path = "../pf-paths" }
 
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 serde = { version = "1", features = ["derive"] }

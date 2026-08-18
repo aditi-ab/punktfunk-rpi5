@@ -447,7 +447,7 @@
 	"logs_export_all": "Alles exportieren",
 	"logs_export_all_working": "Wird gesammelt…",
 	"logs_export_all_failed": "Export konnte nicht erstellt werden",
-	"logs_empty_plugins": "Noch keine Plugin-Ausgabe. Plugins loggen hier, sobald der Plugin-Runner läuft — prüfe `punktfunk-host plugins status`.",
+	"logs_empty_plugins": "Noch keine Plugin-Ausgabe. Plugins loggen hier, sobald der Plugin-Runner läuft — prüfe `punktfunk-host plugins status`. Läuft er und bleibt trotzdem stumm, erreicht er den Host nicht; warum, steht im eigenen Log des Runners: `journalctl --user -u punktfunk-scripting` unter Linux, `%ProgramData%\\punktfunk\\plugin-state\\runner.log` unter Windows.",
 	"logs_follow": "Folgen",
 	"logs_pause": "Pause",
 	"logs_clear": "Leeren",

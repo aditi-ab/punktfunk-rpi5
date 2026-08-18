@@ -4,10 +4,11 @@
 // `import()`s each plugin in-process, so a plugin's output is THIS process's stdout and the host's
 // `tracing` ring — the thing `GET /api/v1/logs` and the console's Logs page serve — never sees a
 // byte of it. On Linux the fallback was `journalctl --user -u punktfunk-scripting`; on Windows the
-// runner scheduled task writes no log file AT ALL, so a failing plugin could only be diagnosed by
-// stopping the task and re-running the runner by hand. Both need shell access on the host box,
-// which is the exact thing the console exists to avoid. A user hitting a plugin misconfiguration
-// therefore had no way to see the error explaining it.
+// runner scheduled task wrote no log file at all (it does now — `scripting-run.cmd` tees to
+// `%ProgramData%\punktfunk\plugin-state\runner.log`, because THIS door needs the very connection
+// whose failure you'd be reading about; field report 2026-08-18). Both need shell access on the
+// host box, which is the exact thing the console exists to avoid. A user hitting a plugin
+// misconfiguration therefore had no way to see the error explaining it.
 //
 // So: tee every console line to `POST /api/v1/plugins/logs`, which lands it in the host's ring
 // alongside the host's own lines under the target `plugin:<source>`.

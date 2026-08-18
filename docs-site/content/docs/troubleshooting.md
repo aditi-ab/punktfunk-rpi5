@@ -46,8 +46,10 @@ GameStream compat **off** (the default), the overlap narrows to two things you c
    PUNKTFUNK_MGMT_BIND=0.0.0.0:47991
    ```
 
-   Nothing else needs changing: clients learn the port from discovery, and the web console reads it
-   from `~/.config/punktfunk/mgmt-endpoint`, which the host rewrites on every start. A host added
+   Nothing else needs changing: clients learn the port from discovery, and the web console, the
+   plugin runner (so every library plugin) and the status tray read it from
+   `~/.config/punktfunk/mgmt-endpoint` (`%ProgramData%\punktfunk\mgmt-endpoint` on Windows), which
+   the host rewrites on every start. A host added
    manually **by IP address** is the exception — it assumes 47990 and its library will stop loading,
    so re-add it from discovery. (You can move the other host instead: Sunshine and its forks derive
    every port from one base setting.)
