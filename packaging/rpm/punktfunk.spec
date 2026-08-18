@@ -323,6 +323,11 @@ install -Dm0755 target/release/punktfunk-encode-worker %{buildroot}%{_bindir}/pu
 
 # udev rule — /dev/uinput access for virtual gamepads (input group).
 install -Dm0644 scripts/60-punktfunk.rules %{buildroot}%{_udevrulesdir}/60-punktfunk.rules
+%{_datadir}/wireplumber/wireplumber.conf.d/60-punktfunk-dualsense.conf
+
+# WirePlumber policy — hold a DualSense's sound card open (GE-Proton's raw-open self-race) and
+# keep it from driving the graph clock. See the file's own comments.
+install -Dm0644 scripts/60-punktfunk-dualsense.conf %{buildroot}%{_datadir}/wireplumber/wireplumber.conf.d/60-punktfunk-dualsense.conf
 
 # Managed gamescope takeover on DM-autologin boxes (Nobara's plasmalogin): a root helper + polkit
 # action let the host stop/restore the display manager for the stream without a hand-installed
@@ -577,6 +582,7 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %{_unitdir}/user@.service.d/50-punktfunk-nice.conf
 %{_bindir}/punktfunk-tray
 %{_udevrulesdir}/60-punktfunk.rules
+%{_datadir}/wireplumber/wireplumber.conf.d/60-punktfunk-dualsense.conf
 %dir %{_libexecdir}/punktfunk
 %{_libexecdir}/punktfunk/pf-dm-helper
 %{_libexecdir}/punktfunk/pf-update

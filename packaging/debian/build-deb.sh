@@ -82,6 +82,7 @@ install -Dm0644 packaging/linux/punktfunk-update.service \
 install -Dm0644 packaging/linux/49-punktfunk-update.rules \
                                                    "$STAGE/usr/share/polkit-1/rules.d/49-punktfunk-update.rules"
 install -Dm0644 scripts/60-punktfunk.rules         "$STAGE/usr/lib/udev/rules.d/60-punktfunk.rules"
+install -Dm0644 scripts/60-punktfunk-dualsense.conf "$STAGE/usr/share/wireplumber/wireplumber.conf.d/60-punktfunk-dualsense.conf"
 # Managed gamescope takeover on DM-autologin boxes: root helper + polkit action so the host can
 # stop/restore the display manager for the stream (the helper derives the DM unit itself).
 install -Dm0755 scripts/pf-dm-helper               "$STAGE/usr/libexec/punktfunk/pf-dm-helper"

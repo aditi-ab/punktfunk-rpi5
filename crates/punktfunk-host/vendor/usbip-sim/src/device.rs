@@ -52,6 +52,13 @@ pub struct UsbDevice {
     #[cfg_attr(feature = "serde", serde(skip))]
     pub device_handler: Option<Arc<Mutex<Box<dyn UsbDeviceHandler + Send>>>>,
 
+    /// Per-endpoint isochronous completion deadlines (punktfunk addition) — the absolute-time
+    /// ledger [`handle_iso_urb`](Self::handle_iso_urb) paces against. Keyed by endpoint address.
+    /// Shared across clones because the clones all present the same device: whoever services the
+    /// endpoint advances the one clock.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) iso_deadlines: Arc<Mutex<HashMap<u8, tokio::time::Instant>>>,
+
     pub usb_version: Version,
 
     pub(crate) ep0_in: UsbEndpoint,
@@ -321,6 +328,17 @@ impl UsbDevice {
     /// above is paced), so completing instantly would both spin the loopback link and tell the
     /// kernel the device consumed a whole URB's worth of samples in no time, running the stream's
     /// clock away and xrunning it continuously.
+    ///
+    /// **Paced against an absolute per-endpoint deadline, not relative sleeps.** A plain
+    /// `sleep(interval × packets)` per URB adds every source of slop — tokio timer granularity,
+    /// socket I/O, handler lock waits — ON TOP of the nominal period, so the device's clock runs
+    /// systematically slow (measured ~26 % slow on a busy graph, 2026-08-18: `hw_ptr` advanced
+    /// ~35.7 k frames/s against a 48 kHz stream — the PCM backs up, latency grows into xruns,
+    /// and anything clocked off this device drags). The ledger makes late completions *catch up*:
+    /// each URB advances the endpoint's deadline by exactly its nominal duration and sleeps until
+    /// that absolute instant, so overhead eats into the next sleep instead of accumulating. If
+    /// the stream stalls long enough that the ledger is far behind (stop/start, unlink storm),
+    /// it re-anchors to now rather than fast-forwarding a burst of instant completions.
     pub(crate) async fn handle_iso_urb(
         &self,
         ep: UsbEndpoint,
@@ -331,7 +349,22 @@ impl UsbDevice {
             // ISO on ep0 is not a thing; treat it as an unsupported transfer rather than panicking.
             return Err(std::io::Error::other("isochronous transfer to ep0"));
         };
-        tokio::time::sleep(self.service_interval(ep) * packets.len() as u32).await;
+        // Allow this much catch-up before deciding the stream stalled and re-anchoring. Two USB
+        // frames of slack keeps ordinary scheduling jitter inside the ledger (where it averages
+        // out) without letting a restarted stream burn through a stale deadline backlog.
+        const RESYNC_SLACK: std::time::Duration = std::time::Duration::from_millis(20);
+        let step = self.service_interval(ep) * packets.len() as u32;
+        let deadline = {
+            let mut ledger = self.iso_deadlines.lock().unwrap();
+            let now = tokio::time::Instant::now();
+            let due = ledger.entry(ep.address).or_insert(now);
+            if *due + RESYNC_SLACK < now {
+                *due = now;
+            }
+            *due += step;
+            *due
+        };
+        tokio::time::sleep_until(deadline).await;
         let mut handler = intf.handler.lock().unwrap();
         handler.handle_iso_urb(intf, ep, packets)
     }
@@ -715,6 +748,106 @@ mod pacing_tests {
             dev(UsbSpeed::High).service_interval(iso_ep(6)),
             std::time::Duration::from_millis(4)
         );
+    }
+
+    /// A no-op ISO handler so the pacing tests can drive `handle_iso_urb` without a device model.
+    #[derive(Debug)]
+    struct NullIso;
+    impl crate::UsbInterfaceHandler for NullIso {
+        fn handle_urb(
+            &mut self,
+            _interface: &UsbInterface,
+            _ep: UsbEndpoint,
+            _transfer_buffer_length: u32,
+            _setup: crate::SetupPacket,
+            _req: &[u8],
+        ) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        fn handle_iso_urb(
+            &mut self,
+            _interface: &UsbInterface,
+            _ep: UsbEndpoint,
+            packets: &[IsoPacket<'_>],
+        ) -> Result<Vec<Vec<u8>>> {
+            Ok(vec![Vec::new(); packets.len()])
+        }
+        fn get_class_specific_descriptor(&self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn as_any(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    fn null_intf() -> UsbInterface {
+        UsbInterface {
+            interface_class: 1,
+            interface_subclass: 2,
+            interface_protocol: 0,
+            endpoints: vec![iso_ep(4)],
+            string_interface: 0,
+            class_specific_descriptor: Vec::new(),
+            alt_settings: Vec::new(),
+            handler: Arc::new(Mutex::new(
+                Box::new(NullIso) as Box<dyn crate::UsbInterfaceHandler + Send>
+            )),
+        }
+    }
+
+    /// The completion pace must hold the NOMINAL rate over many URBs — a relative
+    /// `sleep(interval × packets)` per URB adds scheduling overhead on top of every period and
+    /// the device's audio clock runs measurably slow (~26 % on a busy graph, field 2026-08-18).
+    /// Under tokio's paused clock the ledger's `sleep_until` deadlines auto-advance with zero
+    /// slop, so 50 URBs × 8 packets × 1 ms must take exactly 400 ms of virtual time — and the
+    /// deadline arithmetic (not per-call `now()`) is what guarantees the same under real slop.
+    #[tokio::test(start_paused = true)]
+    async fn iso_pacing_holds_the_nominal_rate_across_urbs() {
+        let d = dev(UsbSpeed::High);
+        let intf = null_intf();
+        let buf = [0u8; 392];
+        let start = tokio::time::Instant::now();
+        for _ in 0..50 {
+            let packets: Vec<IsoPacket<'_>> = (0..8)
+                .map(|_| IsoPacket {
+                    data: &buf,
+                    requested_len: 392,
+                })
+                .collect();
+            d.handle_iso_urb(iso_ep(4), Some(&intf), &packets)
+                .await
+                .expect("iso urb");
+        }
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::from_millis(400),
+            "50 URBs × 8 packets × 1 ms must complete in exactly their nominal duration"
+        );
+    }
+
+    /// After a stall longer than the resync slack, the ledger re-anchors to now instead of
+    /// fast-forwarding a burst of instant completions through the stale backlog.
+    #[tokio::test(start_paused = true)]
+    async fn iso_pacing_reanchors_after_a_stall() {
+        let d = dev(UsbSpeed::High);
+        let intf = null_intf();
+        let buf = [0u8; 392];
+        let one = |d: &UsbDevice, intf: &UsbInterface| {
+            let packets = vec![IsoPacket {
+                data: &buf,
+                requested_len: 392,
+            }];
+            let d = d.clone();
+            let intf = intf.clone();
+            async move { d.handle_iso_urb(iso_ep(4), Some(&intf), &packets).await }
+        };
+        one(&d, &intf).await.expect("prime the ledger");
+        // Stall well past the slack, then resume: the next URB must take ~its nominal 1 ms from
+        // NOW, not complete instantly against the stale deadline.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let start = tokio::time::Instant::now();
+        one(&d, &intf).await.expect("resumed urb");
+        assert_eq!(start.elapsed(), std::time::Duration::from_millis(1));
     }
 
     /// `bmAttributes` carries the synchronisation and usage type above the transfer type, so a real

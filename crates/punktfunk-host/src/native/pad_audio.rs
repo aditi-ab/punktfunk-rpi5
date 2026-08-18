@@ -2,7 +2,7 @@
 //! Windows: WASAPI loopback of a pre-provisioned endpoint ([`crate::audio::pad_endpoint`]);
 //! Linux: the per-pad PipeWire sink we mint (`crate::audio::pad_sink`) — → 4-ch de-interleave
 //! into the speaker (front) and voice-coil haptics (back) pairs → per-kind silence gate →
-//! stereo Opus (48 kHz, CBR, LowDelay)
+//! stereo Opus (48 kHz, CBR; LowDelay for haptics, Audio for the speaker)
 //! → [`PAD_AUDIO_MAGIC`](punktfunk_core::quic::PAD_AUDIO_MAGIC) datagrams. One thread per
 //! arriving pad, spawned/reaped by the input thread ([`super::input`]) as arrivals declare
 //! renderers and pads leave. Modeled on the session audio thread ([`super::audio`]): the same
@@ -49,10 +49,16 @@ const GATE_OPEN_PEAK: f32 = 1e-3;
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 const GATE_HANGOVER_MS: u32 = 250;
 
-/// Per-kind Opus bitrate — a stereo voice-coil / pad-speaker pair needs far less than the
-/// session plane's 128 kbps; 64 kbps CBR keeps every frame comfortably under one MTU.
+/// The haptics lane's Opus bitrate — voice-coil content is band-limited rumble; 64 kbps CBR
+/// keeps every frame comfortably under one MTU.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
-const PAD_AUDIO_BITRATE: i32 = 64_000;
+const HAPTICS_BITRATE: i32 = 64_000;
+/// The speaker lane's Opus bitrate. The pad speaker carries real programme audio (voice lines,
+/// effects), and 64 kbps CELT-only in 10 ms frames is audibly artifacty there — field report
+/// 2026-08-18: "sounds insanely compressed". 96 kbps CBR is still ~120 bytes per frame, far
+/// under one MTU.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+const SPEAKER_BITRATE: i32 = 96_000;
 
 /// The per-kind silence gate — the steady-state-cost feature: an idle pad endpoint (games
 /// rarely render pad audio) must cost ZERO encodes and ZERO datagrams, not a permanent 200 Hz
@@ -471,32 +477,35 @@ struct Lane {
     encode_errs: u64,
 }
 
-/// Build one stereo encoder per enabled kind: 48 kHz LowDelay hard-CBR like the session audio
-/// plane ([`super::audio`]), at the pad plane's 64 kbps.
+/// Build one stereo encoder per enabled kind: 48 kHz hard-CBR like the session audio plane
+/// ([`super::audio`]), each lane tuned to its content. Haptics are felt latency — LowDelay
+/// (CELT-only, 2.5 ms lookahead) at 64 kbps. The speaker is programme audio — the full
+/// `Application::Audio` coder at 96 kbps; its ~4 ms of extra algorithmic delay is inaudible on
+/// a speaker but the CELT-only artifacts were not (field, 2026-08-18).
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn build_lanes(kinds: u8) -> Result<Vec<Lane>, opus::Error> {
     let mut lanes = Vec::new();
-    for (bit, kind, frame_ms) in [
+    for (bit, kind, frame_ms, app, bitrate) in [
         (
             KIND_BIT_HAPTICS,
             punktfunk_core::quic::PAD_AUDIO_KIND_HAPTICS,
             HAPTICS_FRAME_MS,
+            opus::Application::LowDelay,
+            HAPTICS_BITRATE,
         ),
         (
             KIND_BIT_SPEAKER,
             punktfunk_core::quic::PAD_AUDIO_KIND_SPEAKER,
             SPEAKER_FRAME_MS,
+            opus::Application::Audio,
+            SPEAKER_BITRATE,
         ),
     ] {
         if kinds & bit == 0 {
             continue;
         }
-        let mut enc = opus::Encoder::new(
-            crate::audio::SAMPLE_RATE,
-            opus::Channels::Stereo,
-            opus::Application::LowDelay,
-        )?;
-        enc.set_bitrate(opus::Bitrate::Bits(PAD_AUDIO_BITRATE)).ok();
+        let mut enc = opus::Encoder::new(crate::audio::SAMPLE_RATE, opus::Channels::Stereo, app)?;
+        enc.set_bitrate(opus::Bitrate::Bits(bitrate)).ok();
         enc.set_vbr(false).ok();
         lanes.push(Lane {
             kind,
@@ -537,7 +546,7 @@ fn pad_audio_thread<C: crate::audio::AudioCapturer>(
         return; // spawn() refuses kinds == 0 — belt and braces
     }
     let mut framer = PadFramer::new(kinds);
-    // One Opus frame per datagram; 64 kbps CBR at ≤10 ms is ~80 bytes — sized with the session
+    // One Opus frame per datagram; 96 kbps CBR at ≤10 ms is ~120 bytes — sized with the session
     // plane's slack.
     let mut opus_buf = vec![0u8; 1500];
     // Reopen-with-backoff (the audio.rs discipline): a capture death (endpoint invalidated,
@@ -546,7 +555,7 @@ fn pad_audio_thread<C: crate::audio::AudioCapturer>(
     let mut capturer: Option<C> = None;
     let mut last_failed: Option<std::time::Instant> = None;
     // Datagrams the wire refused as oversized (`design/hi-res-audio.md` §4.8). Vanishingly
-    // unlikely on this plane — a 64 kbps CBR Opus frame at ≤10 ms is ~80 bytes — but it used to
+    // unlikely on this plane — a ≤96 kbps CBR Opus frame at ≤10 ms is ≤~120 bytes — but it used to
     // be indistinguishable from the connection ending, which is the actual defect being fixed.
     let mut oversized_drops: u64 = 0;
     tracing::info!(

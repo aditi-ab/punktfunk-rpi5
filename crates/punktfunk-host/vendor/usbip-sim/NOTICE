@@ -36,6 +36,13 @@ Modifications by the punktfunk project:
     `actual_length = 0`; `vhci_hcd` copies that field into the URB verbatim, so
     every synchronous writer (`write()` on hidraw, `HIDIOCSFEATURE`) was told it
     transferred 0 bytes and treated the write as failed.
+  - Isochronous completion is paced against an absolute per-endpoint deadline
+    ledger (`UsbDevice::iso_deadlines`) rather than a relative
+    `sleep(interval × packets)` per URB. The relative sleep added scheduling
+    overhead on top of every period, so the simulated device's audio clock ran
+    measurably slow (~26 % under load) — the PCM backed up into xruns and
+    anything clocked off the device dragged. Late completions now catch up;
+    a stall beyond 20 ms re-anchors instead of fast-forwarding.
 
 Only the USB/IP server *simulation* path is retained: the device model, the
 USB/IP wire protocol, and the `UsbInterfaceHandler` trait. The original MIT
