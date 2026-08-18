@@ -29,6 +29,14 @@ struct LibraryCoverflowView: View {
     /// Which titles the host already has up, keyed by library id — so a card the player can return
     /// to says `Resume` rather than looking like every other one. Empty on an older host.
     var running: [String: RunningGame] = [:]
+    /// Whether these titles are remembered rather than observed (served from the catalog cache),
+    /// and what the host is doing about it. Drawn on the detail band's subtitle line, leading —
+    /// exactly where the desktop shelf draws it — and never as an error.
+    var staleness: LibraryStaleness = .none
+    /// The title to assemble the strip around on mount — the one last opened from this shelf
+    /// (`LibraryScrollMemory`), so coming back from a stream lands where the player left rather
+    /// than on the first cover. Ignored when it is no longer in the list.
+    var initialSelection: String?
     /// Button B (back) — dismisses the library screen. No touch equivalent needed here (the toolbar
     /// Close button already covers that); this is what makes gamepad-only exit possible.
     var onDismiss: (() -> Void)?
@@ -129,6 +137,7 @@ struct LibraryCoverflowView: View {
             selection: $selection,
             itemWidth: coverWidth,
             spacing: 34,
+            initialItemID: initialSelection,
             onActivate: { onLaunch?($0.id) },
             onTertiary: onCopyLink.map { copy in { copyCentered(copy) } },
             onBack: { onDismiss?() },
@@ -211,7 +220,9 @@ struct LibraryCoverflowView: View {
             .foregroundStyle(ink.fg(0.45))
     }
 
-    /// The centered title + store tag — empty (not hidden) so the layout doesn't jump.
+    /// The centered title + store tag — empty (not hidden) so the layout doesn't jump. The
+    /// staleness note shares the subtitle line, leading, the way the desktop shelf draws it: the
+    /// titles stay, the wording says where they came from.
     @ViewBuilder private var detailPanel: some View {
         let game = games.first { $0.id == selection }
         VStack(spacing: 6) {
@@ -221,20 +232,50 @@ struct LibraryCoverflowView: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
                 .multilineTextAlignment(.center)
-            if let game {
-                // main's richer store label, in the palette's ink.
-                Text(
-                    game.isLauncher
-                        ? "\(game.storeLabel.uppercased()) · LAUNCHER" : game.storeLabel.uppercased()
-                )
-                .font(.geist(11, .semibold, relativeTo: .caption2))
-                .tracking(1.2)
-                .foregroundStyle(ink.fg(0.5))
+            // Three columns of equal give: the note leads and truncates, the subtitle stays
+            // centred, the trailing column is air — so on a narrow phone the two never overlap.
+            HStack(spacing: 8) {
+                Group {
+                    if let note = staleness.text {
+                        HStack(spacing: 5) {
+                            Image(systemName: staleness.symbol)
+                            Text(note)
+                        }
+                        .font(.geist(11, relativeTo: .caption2))
+                        .foregroundStyle(ink.fg(0.55))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    } else {
+                        Color.clear.frame(height: 1)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                if let game {
+                    Text(subtitle(for: game))
+                        .font(.geist(11, .semibold, relativeTo: .caption2))
+                        .tracking(1.2)
+                        .foregroundStyle(ink.fg(0.5))
+                        .lineLimit(1)
+                        .fixedSize()
+                }
+                Color.clear.frame(maxWidth: .infinity, maxHeight: 1)
             }
         }
         .frame(maxWidth: .infinity)
         .padding(.horizontal, 24)
         .animation(.smooth(duration: 0.25), value: selection)
+    }
+
+    /// `STORE · LAUNCHER` for a launcher, `STORE · PLATFORM` when the host named a platform, else
+    /// `STORE` — the desktop's detail-band rule.
+    private func subtitle(for game: GameEntry) -> String {
+        let store = game.storeLabel.uppercased()
+        if game.isLauncher { return "\(store) · LAUNCHER" }
+        if let platform = game.platform?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !platform.isEmpty {
+            return "\(store) · \(platform.uppercased())"
+        }
+        return store
     }
 
     // MARK: - Hint bar (pinned bottom-leading via safeAreaInset)

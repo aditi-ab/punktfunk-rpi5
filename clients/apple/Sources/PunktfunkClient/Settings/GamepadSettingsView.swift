@@ -94,6 +94,10 @@ struct GamepadSettingsView: View {
         = StatsVerbosity.current.rawValue
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = true
+    /// The library's arrangement (shelf/grid) — one key, two surfaces: the library's own view/sort
+    /// bar writes it too, so the field and this row can never disagree.
+    @AppStorage(DefaultsKey.libraryView) private var libraryViewRaw = LibraryArrangement.shelf.stored
+    @AppStorage(DefaultsKey.libraryCollections) private var libraryCollections = false
     @AppStorage(DefaultsKey.gamepadUIEnabled) private var gamepadUIEnabled = true
     /// When the switch above takes over — the row is only built while it is on.
     @AppStorage(DefaultsKey.gamepadUIMode) private var gamepadUIMode =
@@ -930,6 +934,23 @@ struct GamepadSettingsView: View {
                 id: "library", tab: .interface, icon: "square.grid.2x2", label: "Game library",
                 detail: "Browse and launch the host's games with \(buttonName(\.buttonY, "Y")).",
                 value: $libraryEnabled),
+            // The two console-parity library rows (the desktop's `library_view` and
+            // `library_collections`). Inert, not hidden, while the library is off: the rows keep
+            // their place so the tab doesn't reflow under a toggle.
+            choiceRow(
+                id: "libraryView", tab: .interface, icon: "rectangle.grid.3x2",
+                label: "Library view",
+                detail: "Shelf is the coverflow; Grid shows more titles at once.",
+                options: LibraryArrangement.all.map { (label: $0.label, tag: $0.stored) },
+                current: LibraryArrangement(stored: libraryViewRaw).stored,
+                enabled: libraryEnabled
+            ) { libraryViewRaw = $0 },
+            toggleRow(
+                id: "libraryCollections", tab: .interface, icon: "square.stack.3d.up",
+                label: "Start in collections",
+                detail: "Opens a library on its platform groups first; one-platform libraries "
+                    + "still open on the shelf.",
+                value: $libraryCollections, enabled: libraryEnabled),
             toggleRow(
                 id: "gamepadUI", tab: .interface, icon: "hand.tap",
                 label: "Controller-optimized UI",

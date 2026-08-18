@@ -214,11 +214,11 @@ enum ShotMock {
         let json = """
         [
           {"id": "custom:aurora", "store": "custom", "title": "Aurora Drift",
-           "art": {"portrait": "shot://art/aurora"}},
+           "platform": "PS3", "art": {"portrait": "shot://art/aurora"}},
           {"id": "steam:starfall", "store": "steam", "title": "Starfall Vale",
            "art": {"portrait": "shot://art/starfall"}},
           {"id": "heroic:neon", "store": "heroic", "title": "Neon Circuit",
-           "art": {"portrait": "shot://art/neon"}},
+           "platform": "PC", "art": {"portrait": "shot://art/neon"}},
           {"id": "gog:ember", "store": "gog", "title": "Ember Peaks",
            "art": {"portrait": "shot://art/ember"}},
           {"id": "steam:launcher", "store": "steam", "title": "Steam", "art": {},

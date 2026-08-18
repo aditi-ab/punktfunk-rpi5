@@ -40,6 +40,10 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
     /// insets center exactly one at a time.
     let itemWidth: CGFloat
     let spacing: CGFloat
+    /// The item to open ON when the strip mounts — a remembered position (the library's last
+    /// opened title). Consulted once, before the first `reconcile()`; ignored when it isn't in
+    /// `items`, in which case the strip opens on the first item as it always has.
+    var initialItemID: Item.ID?
     /// A → activate the centered item.
     let onActivate: (Item) -> Void
     /// Y → the screen's secondary action (e.g. open a host's library); nil disables it.
@@ -172,9 +176,12 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
                 .safeAreaPadding(.horizontal, inset)
                 .offset(x: bumpOffset)
                 #if os(tvOS)
-                // Land initial focus on the first card (the launcher's first host / the coverflow's
-                // first title) instead of wherever the engine guesses.
-                .defaultFocus($focusedID, items.first?.id)
+                // Land initial focus on the remembered card when there is one, else the first
+                // (the launcher's first host / the coverflow's first title) instead of wherever
+                // the engine guesses.
+                .defaultFocus(
+                    $focusedID,
+                    initialItemID.flatMap { index(of: $0) != nil ? $0 : nil } ?? items.first?.id)
                 // Focus moved (remote swipe / pad dpad) — chase it: cursor, detail selection,
                 // controller detent, and an imperative center scroll.
                 .onChange(of: focusedID) { _, newValue in
@@ -209,6 +216,12 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
             onBack: onBack)
         #endif
         .onAppear {
+            // Seat the cursor on the remembered item before the first reconcile publishes it as
+            // the scroll target — only while nothing has been aligned yet (a re-appear keeps
+            // wherever the strip already is).
+            if scrolledID == nil, let id = initialItemID, let idx = index(of: id) {
+                cursor = idx
+            }
             reconcile()
             wire()
             if isActive { input.start() }
