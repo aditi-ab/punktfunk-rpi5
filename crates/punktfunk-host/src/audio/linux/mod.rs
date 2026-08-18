@@ -183,7 +183,8 @@ pub struct PwAudioCapturer {
     chunks: Receiver<Vec<f32>>,
     channels: u32,
     quit: pipewire::channel::Sender<Terminate>,
-    /// `Some(node.name)` in stream-sink mode; `None` = legacy monitor follower.
+    /// `Some(node.name)` in both sink modes — the created null sink, or the capture stream
+    /// itself; `None` = legacy monitor follower.
     sink_name: Option<String>,
     /// Whether this capturer currently holds a [`stream_sink`] default-sink claim (session
     /// active). Toggled by open/[`drain`](AudioCapturer::drain) (claim) and
@@ -198,13 +199,13 @@ pub struct PwAudioCapturer {
     /// field host log carried ten such warnings, up to `dropped_chunks=11251` (= 30 s × 375
     /// chunks/s, i.e. every single chunk), each one straddling a session boundary and each one
     /// meaningless. Distinct from `claimed`, which tracks the sink-routing claim and only
-    /// exists when the stream sink is enabled at all.
+    /// exists when this host owns a sink at all.
     active: Arc<AtomicBool>,
     /// The rate the graph actually NEGOTIATED, written by the format callback on the PipeWire
     /// thread and read back by [`AudioCapturer::sample_rate`].
     ///
     /// Seeded with the rate we asked for, because that is the honest answer until the graph has
-    /// said otherwise — and in stream-sink mode it is nearly always the final one, since the
+    /// said otherwise — and in both sink modes it is nearly always the final one, since the
     /// host owns the sink and declares its format (`design/hi-res-audio.md` §4.4). In legacy
     /// monitor mode the value is a weaker claim: it is the rate of the resampled stream we are
     /// handed, not of the node upstream of it, which is why the §8.3 gate reads the monitored
@@ -1054,8 +1055,14 @@ fn pw_thread(
         // ── Which node is clocking us ────────────────────────────────────────────────────
         // `node.driver-id` on our own node names the driver of the group we are scheduled in.
         // It is deliberately NOT in the registry's announce set (`pw_impl_node_register`'s key
-        // list), so it takes a bind and the node's `info` event; the daemon republishes the
-        // props whenever the graph is recalculated.
+        // list), so it takes a bind and the node's `info` event.
+        //
+        // ⚠ `pw_impl_node_set_driver` writes the key and marks the props changed, but leaves
+        // the flush to the node's next info emission — which in practice is the state change
+        // that accompanies the same graph recalculation. So read this as *the last driver the
+        // daemon told us about*, which is what a diagnostic wants, and not as a real-time
+        // signal: a driver change with no state change anywhere would reach us late or not
+        // at all.
         //
         // This line exists because on 2026-08-14 the question "what is clocking desktop audio?"
         // cost four field logs, a bespoke probe script and a `pw-top` DRIVER column to answer —
@@ -1608,7 +1615,8 @@ fn pw_thread(
 
         // Request F32LE at the session's rate + channel count with explicit positions. In
         // legacy mode PipeWire's channel-mixer up/downmixes the sink monitor to this layout;
-        // in stream-sink mode this IS the sink's advertised layout (apps mix/route to it) —
+        // in stream-sink mode this IS the sink's advertised layout (apps mix/route to it), and
+        // in null-sink mode it is the monitor of a sink we created at this very layout —
         // which is exactly why hi-res is structurally honest there and has to be PROVEN in
         // monitor mode (`design/hi-res-audio.md` §4.4): a sink we OWN renders at the rate we
         // declare, while a monitor tap is handed a resampled copy that reports a clean rate
