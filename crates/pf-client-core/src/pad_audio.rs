@@ -231,6 +231,10 @@ pub(crate) fn props_say_ds5(
 #[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct SinkNode {
+    /// The registry's global id for this node — what [`pin_sink_volume`] binds to set the
+    /// node's `Props`. Zero for a node no walk produced (test fixtures, and the split parent
+    /// named by a sink we can see but never shown to us as an object of its own).
+    pub(crate) id: u32,
     /// `node.name` — what a stream targets via `target.object`.
     pub(crate) name: String,
     pub(crate) description: String,
@@ -401,6 +405,8 @@ pub(crate) fn sink_from_props(props: &pipewire::spa::utils::dict::DictRef) -> Op
         })
         .unwrap_or_default();
     Some(SinkNode {
+        // Filled by the caller from the node's own `info` — the proplist does not carry it.
+        id: 0,
         device_id: props.get("device.id").and_then(|v| v.parse().ok()),
         channels: props
             .get("audio.channels")
@@ -484,7 +490,8 @@ fn walk_graph() -> anyhow::Result<(Vec<SinkNode>, Vec<CardDevice>)> {
                                 let sinks = sinks.clone();
                                 move |info| {
                                     let Some(p) = info.props() else { return };
-                                    if let Some(s) = sink_from_props(p) {
+                                    if let Some(mut s) = sink_from_props(p) {
+                                        s.id = info.id();
                                         let mut v = sinks.borrow_mut();
                                         // `info` can fire more than once per node; keep one.
                                         if let Some(old) = v.iter_mut().find(|o| o.name == s.name) {
@@ -873,6 +880,157 @@ fn profile_pod(index: u32) -> anyhow::Result<Vec<u8>> {
     .into_inner())
 }
 
+/// The `Props` object pod that puts every channel of a sink at unity gain.
+///
+/// Unity is 1.0 in `channelVolumes`, which is NOT the "100%" a mixer shows: pulse (and every UI
+/// built on it) displays a CUBED scale, so WirePlumber's 0.4 default reads as 40% on screen and
+/// is 0.4³ = 0.064 — a hair under −24 dB — in the linear units this pod speaks. 1.0 is unity in
+/// both, which is the whole reason this pins to unity rather than to some other number.
+#[cfg(target_os = "linux")]
+fn unity_volume_pod(channels: u32) -> anyhow::Result<Vec<u8>> {
+    use anyhow::Context;
+    use pipewire::spa;
+    use spa::pod::{Object, Property, PropertyFlags, Value, ValueArray};
+    let obj = Object {
+        type_: spa::utils::SpaTypes::ObjectParamProps.as_raw(),
+        id: spa::param::ParamType::Props.as_raw(),
+        properties: vec![
+            Property {
+                key: spa::sys::SPA_PROP_volume,
+                flags: PropertyFlags::empty(),
+                value: Value::Float(1.0),
+            },
+            Property {
+                key: spa::sys::SPA_PROP_channelVolumes,
+                flags: PropertyFlags::empty(),
+                value: Value::ValueArray(ValueArray::Float(vec![1.0; channels.max(1) as usize])),
+            },
+        ],
+    };
+    Ok(spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &Value::Object(obj),
+    )
+    .context("serialize")?
+    .0
+    .into_inner())
+}
+
+/// Put the pad's sink at unity gain, because nobody chose the level it arrives at.
+///
+/// WirePlumber starts every new card's sink at `device.routes.default-sink-volume` — 0.4, which
+/// is −23.88 dB — and that setting is global: it cannot be scoped to one device in config, so
+/// there is no configuration fix to ship. It is a sane default for a laptop speaker somebody is
+/// about to turn up, and wrong for this sink twice over. The pad's is not a listening volume a
+/// user reaches for; and BOTH ends of a session mint one, so the two stack: −47.8 dB by the time
+/// a game's haptics reach a voice coil, which is felt as "the haptics are weak, maybe dead"
+/// rather than as a volume anyone would think to look at.
+///
+/// Deliberately NOT restored the way [`restore_profile`] restores a borrowed profile. A profile
+/// swap overrides a choice the user made; this overrides a default nobody made, and putting
+/// −24 dB back on the way out would be restoring the bug.
+///
+/// Best effort throughout: every failure here costs attenuation, never audio, so the caller logs
+/// and carries on. `PUNKTFUNK_PAD_SINK_VOLUME=0` leaves the sink exactly where it was found, for
+/// bisecting against a box where something else is doing the attenuating.
+#[cfg(target_os = "linux")]
+fn pin_sink_volume(node_id: u32, channels: u32) -> anyhow::Result<()> {
+    use anyhow::{anyhow, Context};
+    use pipewire as pw;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    static PW_INIT: std::sync::Once = std::sync::Once::new();
+    PW_INIT.call_once(pw::init);
+
+    let mainloop = pw::main_loop::MainLoopRc::new(None).context("pw MainLoop")?;
+    let context = pw::context::ContextRc::new(&mainloop, None).context("pw Context")?;
+    let core = context.connect_rc(None).context("pw connect")?;
+    let registry = core.get_registry_rc().context("pw registry")?;
+
+    let node: Rc<RefCell<Option<pw::node::Node>>> = Rc::default();
+    let _reg_listener = registry
+        .add_listener_local()
+        .global({
+            let (registry, node) = (registry.clone(), node.clone());
+            move |g| {
+                if g.id != node_id || g.type_ != pw::types::ObjectType::Node {
+                    return;
+                }
+                if let Ok(n) = registry.bind::<pw::node::Node, _>(g) {
+                    *node.borrow_mut() = Some(n);
+                }
+            }
+        })
+        .register();
+
+    let awaited: Rc<Cell<Option<pw::spa::utils::result::AsyncSeq>>> = Rc::new(Cell::new(None));
+    let _core_listener = core
+        .add_listener_local()
+        .done({
+            let (mainloop, awaited) = (mainloop.clone(), awaited.clone());
+            move |_, seq| {
+                if awaited.get() == Some(seq) {
+                    mainloop.quit();
+                }
+            }
+        })
+        .register();
+    let round = |issue: &dyn Fn() -> anyhow::Result<()>| -> anyhow::Result<()> {
+        issue()?;
+        awaited.set(Some(core.sync(0).context("pw sync")?));
+        mainloop.run();
+        Ok(())
+    };
+
+    round(&|| Ok(()))?; // 1: the registry replays its globals; our node gets bound
+    let pod = unity_volume_pod(channels).context("serialize Props pod")?;
+    round(&|| {
+        let n = node.borrow();
+        let n = n
+            .as_ref()
+            .ok_or_else(|| anyhow!("sink node {node_id} is not in the PipeWire graph"))?;
+        n.set_param(
+            pw::spa::param::ParamType::Props,
+            0,
+            pw::spa::pod::Pod::from_bytes(&pod).ok_or_else(|| anyhow!("bad Props pod"))?,
+        );
+        Ok(())
+    })?; // 2: flush the set_param before the loop and its proxies drop
+    Ok(())
+}
+
+/// Pass a picked node name through, pinning that node to unity gain on the way — see
+/// [`pin_sink_volume`] for why the level it arrives at is nobody's choice.
+///
+/// Runs on every (re)correlation rather than once, so a card that re-minted its nodes (a profile
+/// change, a replug) is pinned again without anything having to notice that it did.
+#[cfg(target_os = "linux")]
+fn pin_picked(name: String, sinks: &[SinkNode]) -> String {
+    if matches!(
+        std::env::var("PUNKTFUNK_PAD_SINK_VOLUME").as_deref(),
+        Ok("0" | "false" | "off" | "no")
+    ) {
+        return name;
+    }
+    // Only a node the walk actually saw. The `split_parent` pick is a NAME lifted off another
+    // node's proplist — there may be no object behind it we are allowed to bind, and pinning the
+    // sink that named it would be pinning the wrong node.
+    let Some(s) = sinks.iter().find(|s| s.name == name && s.id != 0) else {
+        return name;
+    };
+    match pin_sink_volume(s.id, s.channels) {
+        Ok(()) => tracing::debug!(node = %name, channels = s.channels, "pad sink pinned to 0 dB"),
+        Err(e) => tracing::debug!(
+            node = %name,
+            error = %format!("{e:#}"),
+            "could not pin the pad sink to 0 dB — haptics may be quiet if the session manager \
+             left it at its default 40%"
+        ),
+    }
+    name
+}
+
 /// Correlate: walk the graph, pick the pad's four-channel node, and move the card's profile if
 /// that is what stands between us and one. Returns the `node.name` to target.
 #[cfg(target_os = "linux")]
@@ -880,7 +1038,7 @@ pub fn correlate_pad_sink() -> anyhow::Result<String> {
     use anyhow::anyhow;
     let (sinks, cards) = walk_graph()?;
     match pick_pad_sink(&sinks, &cards) {
-        Some(PadSinkPick::Node(name)) => Ok(name),
+        Some(PadSinkPick::Node(name)) => Ok(pin_picked(name, &sinks)),
         Some(PadSinkPick::NeedsProfile(device_id)) => {
             if PROFILE_TRIED.lock().unwrap().contains(&device_id) {
                 return Err(anyhow!(
@@ -896,7 +1054,7 @@ pub fn correlate_pad_sink() -> anyhow::Result<String> {
                 std::thread::sleep(Duration::from_millis(100));
                 let (sinks, cards) = walk_graph()?;
                 if let Some(PadSinkPick::Node(name)) = pick_pad_sink(&sinks, &cards) {
-                    return Ok(name);
+                    return Ok(pin_picked(name, &sinks));
                 }
                 last = sinks;
             }
@@ -1883,6 +2041,34 @@ fn pad_render_thread(
 mod tests {
     use super::*;
 
+    /// The unity pod is what the 0 dB pin IS, so it has to be the shape PipeWire reads: one
+    /// unity float per channel. PipeWire ignores a `channelVolumes` whose length does not match
+    /// the port count, and an ignored pod looks exactly like the pin silently not working —
+    /// which is the -23.88 dB this exists to undo, back again and just as invisible.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unity_pod_is_one_float_per_channel() {
+        use pipewire::spa::pod::{deserialize::PodDeserializer, Value, ValueArray};
+        for channels in [1u32, 2, 4] {
+            let bytes = unity_volume_pod(channels).expect("serialize");
+            let (_, value) = PodDeserializer::deserialize_any_from(&bytes).expect("parse");
+            let Value::Object(obj) = value else {
+                panic!("not an object pod");
+            };
+            let vols = obj
+                .properties
+                .iter()
+                .find(|p| p.key == pipewire::spa::sys::SPA_PROP_channelVolumes)
+                .map(|p| p.value.clone())
+                .expect("channelVolumes");
+            let Value::ValueArray(ValueArray::Float(v)) = vols else {
+                panic!("channelVolumes is not a float array");
+            };
+            assert_eq!(v.len(), channels as usize);
+            assert!(v.iter().all(|&x| x == 1.0), "every channel must be unity");
+        }
+    }
+
     /// The speaker mode gate: only `"pad"` renders today; `"mix"` is the declared TODO and
     /// reads as off; unknown values (a future store, a typo) fail safe to off.
     #[test]
@@ -1979,6 +2165,9 @@ mod tests {
 
     fn sink(name: &str, channels: u32, positions: &str, device_id: Option<u32>) -> SinkNode {
         SinkNode {
+            // The picker never reads it (only the volume pin does), so these fixtures leave it
+            // at the "no walk produced this" value.
+            id: 0,
             name: name.into(),
             description: String::new(),
             device_id,

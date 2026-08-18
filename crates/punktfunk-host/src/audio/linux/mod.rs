@@ -28,6 +28,7 @@
 //! CLAUDE.md: a wedged link head-blocks the daemon).
 
 mod monitor_rate;
+mod pad_card_volume;
 pub(crate) mod pad_sink;
 pub(crate) mod pad_usb;
 mod stream_sink;
