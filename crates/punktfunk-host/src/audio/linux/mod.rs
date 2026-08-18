@@ -1,31 +1,46 @@
-//! PipeWire desktop-audio capture — via a **host-owned stream sink** (default), or the legacy
-//! default-sink-monitor follower (`PUNKTFUNK_STREAM_SINK=0`).
+//! PipeWire desktop-audio capture — through a **host-owned virtual sink** (default), the 0.30
+//! stream-sink node (`PUNKTFUNK_STREAM_SINK=stream`), or the legacy default-sink-monitor
+//! follower (`PUNKTFUNK_STREAM_SINK=0`).
 //!
-//! **Stream-sink mode.** The capture stream registers itself as an `Audio/Sink` node
-//! ("Punktfunk Stream Speaker", unique `node.name` per capturer): host apps play *into* it,
-//! PipeWire mixes them, and our `process()` callback receives the mix directly — the same
-//! stream-node architecture as [`PwMicSource`] below (inverted), and the documented
-//! `pw-loopback --capture-props='media.class=Audio/Sink'` virtual-sink recipe. A session-scoped
-//! [`stream_sink`] claim makes it the *default* sink so apps route to it (and back) with the
-//! session. Why: capture no longer depends on any hardware sink, whose availability is display
-//! hardware state — live-diagnosed 2026-07-14 on a bazzite/TV host, every gamescope modeset
-//! dropped the HDMI audio endpoint, WirePlumber ping-ponged the default HDMI↔auto_null ~8×/s,
-//! and the old monitor-follower relinked on every flip (Paused→renegotiate→Streaming storms =
-//! client crackle). Bonus: the sink advertises the session's true channel count, so games can
-//! produce real 5.1/7.1 even when the local hardware is stereo.
+//! **Null-sink mode (the default).** The host creates a real `support.null-audio-sink` adapter
+//! ("Punktfunk Stream Speaker", unique `node.name` per capturer) and captures its **monitor**;
+//! host apps play into it, PipeWire mixes them, and our `process()` callback receives the mix. A
+//! session-scoped [`stream_sink`] claim makes it the *default* sink so apps route to it (and
+//! back) with the session.
 //!
-//! **Legacy mode** connects an input stream with `stream.capture.sink=true`, which routes the
-//! *default* sink's monitor into us — no portal needed (unlike screen capture), but coupled to
-//! hardware-default churn as above.
+//! Why a node we create rather than our own capture stream wearing `media.class=Audio/Sink`:
+//! **a stream is structurally a follower and never drives**, so PipeWire schedules the resulting
+//! driver-less group — {game streams -> our sink} — on the highest-priority *running* driver
+//! anywhere on the box. Field-diagnosed 2026-08-18: on a host with a DualSense forwarded over
+//! VirtualHere, our capture group was clocked for a whole 15-minute session by that pad's
+//! USB-over-IP sound card — a device nothing was linked to, whose frame counter is a kernel stub
+//! (`vhci_get_frame_number()` logs and returns 0) — giving 3.9 delivery holes a second, and
+//! **15.4 % of the audio the user heard was silence this host synthesized** over them. A
+//! `support.null-audio-sink` is a **driver**: it carries its own `timerfd` inside the daemon's
+//! realtime data loop, so our group owns its clock and no hardware (or network-attached) device
+//! can be elected to schedule it. It is also exactly the node `pactl load-module
+//! module-null-sink` creates — the most exercised virtual-sink recipe on Linux.
 //!
-//! In both modes the (`!Send`) MainLoop/Stream live on a dedicated thread; interleaved `f32`
-//! chunks leave over a bounded channel (dropped if the encoder falls behind, never blocking
-//! the PipeWire loop). The stream is opened at the *session's* channel count (2/6/8); in
-//! legacy mode PipeWire's channel-mixer fills missing positions with silence (zero upmix).
-//! Dropping the capturer quits the loop thread (via a `pipewire::channel` Terminate message),
-//! tearing the stream — and in stream-sink mode the sink node itself — down promptly, so a
-//! surround session can replace a stereo capturer without leaking a PipeWire consumer (see
-//! CLAUDE.md: a wedged link head-blocks the daemon).
+//! **`=stream` (one-release escape hatch).** The 0.30 topology: the capture stream itself is the
+//! `Audio/Sink` node — same routing, same claim, but the group borrows a driver as above.
+//!
+//! **`=0` (legacy).** An input stream with `stream.capture.sink=true` and no target, which
+//! PipeWire routes to whatever the *default* sink is — so it is coupled to hardware-default
+//! churn: live-diagnosed 2026-07-14 on a bazzite/TV host, every gamescope modeset dropped the
+//! HDMI audio endpoint, WirePlumber ping-ponged the default HDMI<->auto_null ~8x/s, and the
+//! monitor follower relinked on every flip (Paused->renegotiate->Streaming storms = client
+//! crackle). Both sink modes are immune — nothing about a host-owned sink depends on display
+//! hardware — and both advertise the session's true channel count, so games can produce real
+//! 5.1/7.1 even when the local hardware is stereo.
+//!
+//! In every mode the (`!Send`) MainLoop/Stream live on a dedicated thread; interleaved `f32`
+//! chunks leave over a bounded channel (dropped if the encoder falls behind, never blocking the
+//! PipeWire loop). The stream is opened at the *session's* channel count (2/6/8); in legacy mode
+//! PipeWire's channel-mixer fills missing positions with silence (zero upmix). Dropping the
+//! capturer quits the loop thread (via a `pipewire::channel` Terminate message), tearing the
+//! stream — and in the sink modes the sink node itself — down promptly, so a surround session
+//! can replace a stereo capturer without leaking a PipeWire consumer (see CLAUDE.md: a wedged
+//! link head-blocks the daemon).
 
 mod monitor_rate;
 pub(crate) mod pad_sink;
@@ -34,7 +49,7 @@ mod stream_sink;
 
 use super::{AudioCapturer, MicBackendStats, VirtualMic, SAMPLE_RATE};
 use anyhow::{anyhow, Context, Result};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::sync::Arc;
@@ -44,24 +59,82 @@ use std::time::Duration;
 /// Message asking the PipeWire loop thread to quit (sent from `Drop`).
 struct Terminate;
 
-/// Whether the host-owned stream sink is active. **Default ON** — decouples capture (and app
-/// routing) from hardware-sink availability; see the module docs for the live-diagnosed
-/// crackle this fixes. `PUNKTFUNK_STREAM_SINK=0` (also `false`/`no`/`off`) is the escape hatch
-/// back to capturing the default sink's monitor.
-fn stream_sink_enabled() -> bool {
-    std::env::var("PUNKTFUNK_STREAM_SINK")
-        .map(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
-        .unwrap_or(true)
+/// Which topology this host captures desktop audio through — see the module docs for what each
+/// one costs and why the default moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureMode {
+    /// Create a `support.null-audio-sink` — a node that DRIVES its own graph group — and capture
+    /// its monitor. **Default.**
+    NullSink,
+    /// The capture stream itself is the `Audio/Sink` node (the 0.30 topology), so the group it
+    /// forms with its producers borrows a driver from elsewhere on the box. One-release escape
+    /// hatch, kept so a field A/B needs no build.
+    StreamSink,
+    /// No host-owned sink at all: follow whatever the default sink is and tap its monitor.
+    Monitor,
+}
+
+impl CaptureMode {
+    /// Both sink modes mint a sink node and [`claim`](stream_sink::claim) it as the default
+    /// output; only [`Monitor`](Self::Monitor) does not.
+    fn owns_sink(self) -> bool {
+        !matches!(self, CaptureMode::Monitor)
+    }
+
+    /// For the line that says which topology is live — the first thing to read in a log where
+    /// audio arrives in a shape nobody expected.
+    fn as_str(self) -> &'static str {
+        match self {
+            CaptureMode::NullSink => "null-sink",
+            CaptureMode::StreamSink => "stream-sink",
+            CaptureMode::Monitor => "monitor",
+        }
+    }
+}
+
+/// `PUNKTFUNK_STREAM_SINK`: `stream` = [`StreamSink`](CaptureMode::StreamSink),
+/// `0`/`false`/`no`/`off` = [`Monitor`](CaptureMode::Monitor), anything else (including unset) =
+/// [`NullSink`](CaptureMode::NullSink).
+///
+/// An unrecognised value resolves to the default rather than failing: this is a field-debugging
+/// lever, and a typo in it must not cost a session its audio.
+fn capture_mode() -> CaptureMode {
+    capture_mode_from(std::env::var("PUNKTFUNK_STREAM_SINK").ok().as_deref())
+}
+
+/// [`capture_mode`] without the environment, so the grammar is testable without a process-global
+/// mutation (and so the three modes each have a test at all).
+fn capture_mode_from(value: Option<&str>) -> CaptureMode {
+    match value.map(str::trim) {
+        Some("0" | "false" | "no" | "off") => CaptureMode::Monitor,
+        Some("stream") => CaptureMode::StreamSink,
+        _ => CaptureMode::NullSink,
+    }
+}
+
+/// The graph identity of one capturer: which topology, and the `node.name`s it owns.
+#[derive(Debug, Clone)]
+struct CaptureNodes {
+    mode: CaptureMode,
+    /// The `Audio/Sink` node's name — `Some` in both sink modes, and what the [`stream_sink`]
+    /// default-sink claim points at. In [`StreamSink`](CaptureMode::StreamSink) mode this IS the
+    /// capture stream; in [`NullSink`](CaptureMode::NullSink) mode it is the adapter the host
+    /// creates, whose monitor [`capture`](Self::capture) taps.
+    sink: Option<String>,
+    /// The capture stream's own `node.name`. Aliases [`sink`](Self::sink) only in
+    /// [`StreamSink`](CaptureMode::StreamSink) mode, where they are one node.
+    capture: String,
 }
 
 /// §8.4 condition 4 on Linux (`design/hi-res-audio.md` §4.4 / §8.3). The two capture modes give
 /// structurally different answers, and that difference is the whole content of §4.4:
 ///
-/// * **Stream-sink mode (the default).** We register the `Audio/Sink` node ourselves and
-///   [`pw_thread`] declares its format, so applications render into it at that rate natively.
-///   The rate we claim is the rate we get, by construction — there is no upstream resampler in
-///   the path to lie about it, so the answer is yes for every rate the plane supports, and no
-///   probe of any kind is needed to say so.
+/// * **Both sink modes (the default `null-sink`, and `stream`).** The `Audio/Sink` node is ours
+///   and we declare its format — as the created adapter's `audio.rate` in null-sink mode, as the
+///   stream's own negotiated format in stream-sink mode — so applications render into it at that
+///   rate natively. The rate we claim is the rate we get, by construction: there is no upstream
+///   resampler in the path to lie about it, so the answer is yes for every rate the plane
+///   supports, and no probe of any kind is needed to say so.
 /// * **`PUNKTFUNK_STREAM_SINK=0` (monitor mode).** We capture somebody else's sink through
 ///   PipeWire's resampler, which reports a clean rate whatever the node upstream of it really
 ///   runs at — the same blindness WASAPI's autoconvert has. So the answer cannot come from our
@@ -83,7 +156,7 @@ fn stream_sink_enabled() -> bool {
 /// only the monitor mode does, because in the default mode the host is the one declaring the
 /// format.
 pub(super) fn probe_capture_rate() -> super::CaptureRate {
-    if stream_sink_enabled() {
+    if capture_mode().owns_sink() {
         return super::CaptureRate::Declared;
     }
     match monitor_rate::monitored_sink_rate() {
@@ -110,7 +183,8 @@ pub struct PwAudioCapturer {
     chunks: Receiver<Vec<f32>>,
     channels: u32,
     quit: pipewire::channel::Sender<Terminate>,
-    /// `Some(node.name)` in stream-sink mode; `None` = legacy monitor follower.
+    /// `Some(node.name)` in both sink modes — the created null sink, or the capture stream
+    /// itself; `None` = legacy monitor follower.
     sink_name: Option<String>,
     /// Whether this capturer currently holds a [`stream_sink`] default-sink claim (session
     /// active). Toggled by open/[`drain`](AudioCapturer::drain) (claim) and
@@ -125,13 +199,13 @@ pub struct PwAudioCapturer {
     /// field host log carried ten such warnings, up to `dropped_chunks=11251` (= 30 s × 375
     /// chunks/s, i.e. every single chunk), each one straddling a session boundary and each one
     /// meaningless. Distinct from `claimed`, which tracks the sink-routing claim and only
-    /// exists when the stream sink is enabled at all.
+    /// exists when this host owns a sink at all.
     active: Arc<AtomicBool>,
     /// The rate the graph actually NEGOTIATED, written by the format callback on the PipeWire
     /// thread and read back by [`AudioCapturer::sample_rate`].
     ///
     /// Seeded with the rate we asked for, because that is the honest answer until the graph has
-    /// said otherwise — and in stream-sink mode it is nearly always the final one, since the
+    /// said otherwise — and in both sink modes it is nearly always the final one, since the
     /// host owns the sink and declares its format (`design/hi-res-audio.md` §4.4). In legacy
     /// monitor mode the value is a weaker claim: it is the rate of the resampled stream we are
     /// handed, not of the node upstream of it, which is why the §8.3 gate reads the monitored
@@ -146,26 +220,37 @@ impl PwAudioCapturer {
             "unsupported audio channel count {channels} (want 2, 6 or 8)"
         );
         anyhow::ensure!(rate_hz > 0, "audio capture rate must be positive");
+        let mode = capture_mode();
         // Unique per capturer: overlapping instances (mid-session reopen, concurrent sessions)
-        // must never alias in metadata claims, and a fresh name gets fresh (unity) WirePlumber
-        // volume state instead of whatever a previous run left behind.
-        let sink_name = stream_sink_enabled().then(|| {
-            use std::sync::atomic::AtomicU64;
+        // must never alias in metadata claims or in a `target.object` lookup, and a fresh name
+        // gets fresh (unity) WirePlumber volume state instead of whatever a previous run left
+        // behind. ONE sequence number for both names, so a line about the tap and a line about
+        // its sink are visibly the same capturer.
+        let seq = {
             static SEQ: AtomicU64 = AtomicU64::new(0);
-            format!(
-                "{}-{}-{}",
-                stream_sink::SINK_NAME_PREFIX,
-                std::process::id(),
-                SEQ.fetch_add(1, Ordering::Relaxed)
-            )
-        });
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        };
+        let pid = std::process::id();
+        let sink_node = format!("{}-{pid}-{seq}", stream_sink::SINK_NAME_PREFIX);
+        let nodes = CaptureNodes {
+            mode,
+            // In stream-sink mode the capture stream IS the sink, so it wears the sink's name.
+            // Otherwise it is a tap of its own and gets a name that can never be mistaken for a
+            // sink: `stream_sink`'s crash-staleness rule matches on the speaker prefix, and the
+            // graph-driver diagnostic finds our node by exactly this string.
+            capture: match mode {
+                CaptureMode::StreamSink => sink_node.clone(),
+                _ => format!("punktfunk-audio-{pid}-{seq}"),
+            },
+            sink: mode.owns_sink().then_some(sink_node),
+        };
         let (tx, rx) = sync_channel::<Vec<f32>>(64);
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Terminate>();
         // Bring-up handshake (mirrors the virtual mic): a PipeWire that isn't running must
         // surface as an open ERROR — engaging the callers' reopen backoff — and in stream-sink
         // mode the sink node must exist before we claim the default to its name.
         let (ready_tx, ready_rx) = sync_channel::<Result<()>>(1);
-        let thread_sink_name = sink_name.clone();
+        let sink_name = nodes.sink.clone();
         // Opens at session start (see the routing claim below), so the consumer is live from
         // the first chunk.
         let active = Arc::new(AtomicBool::new(true));
@@ -180,7 +265,7 @@ impl PwAudioCapturer {
                     quit_rx,
                     channels,
                     rate_hz,
-                    thread_sink_name,
+                    nodes,
                     ready_tx,
                     thread_active,
                     thread_rate,
@@ -277,31 +362,102 @@ impl AudioCapturer for PwAudioCapturer {
     }
 }
 
-/// SPA channel position array for the GameStream surround order FL FR FC LFE RL RR [SL SR]
-/// (= the PipeWire/PulseAudio default map for 6/8 channels, and the order Moonlight's
-/// renderers expect — moonlight-common-c: "we use FL FR C LFE RL RR SL SR"). Values are
-/// `enum spa_audio_channel` (spa/param/audio/raw.h): FL=3 FR=4 FC=5 LFE=6 SL=7 SR=8 RL=12
-/// RR=13.
-fn spa_positions(channels: u32) -> [u32; 64] {
-    const FL: u32 = 3;
-    const FR: u32 = 4;
-    const FC: u32 = 5;
-    const LFE: u32 = 6;
-    const SL: u32 = 7;
-    const SR: u32 = 8;
-    const RL: u32 = 12;
-    const RR: u32 = 13;
-    const MONO: u32 = 2;
-    let mut pos = [0u32; 64];
-    let order: &[u32] = match channels {
+/// The GameStream surround order FL FR FC LFE RL RR [SL SR] (= the PipeWire/PulseAudio default
+/// map for 6/8 channels, and the order Moonlight's renderers expect — moonlight-common-c: "we
+/// use FL FR C LFE RL RR SL SR"), as `(enum spa_audio_channel, name)` pairs.
+///
+/// Two things need this order in two spellings — a format pod ([`spa_positions`]) for a stream,
+/// and an `audio.position` string ([`spa_position_names`]) for a node we create by properties —
+/// and a channel map that disagrees with itself between them would mean the sink accepts audio
+/// in one layout and hands it on in another. They are two views of THIS one list, so they
+/// cannot drift.
+///
+/// Values are `enum spa_audio_channel` (spa/param/audio/raw.h): MONO=2 FL=3 FR=4 FC=5 LFE=6
+/// SL=7 SR=8 RL=12 RR=13; the names are the spellings `spa_audio_parse_position` accepts.
+fn channel_order(channels: u32) -> &'static [(u32, &'static str)] {
+    const MONO: (u32, &str) = (2, "MONO");
+    const FL: (u32, &str) = (3, "FL");
+    const FR: (u32, &str) = (4, "FR");
+    const FC: (u32, &str) = (5, "FC");
+    const LFE: (u32, &str) = (6, "LFE");
+    const SL: (u32, &str) = (7, "SL");
+    const SR: (u32, &str) = (8, "SR");
+    const RL: (u32, &str) = (12, "RL");
+    const RR: (u32, &str) = (13, "RR");
+    match channels {
         1 => &[MONO],
         2 => &[FL, FR],
         6 => &[FL, FR, FC, LFE, RL, RR],
         8 => &[FL, FR, FC, LFE, RL, RR, SL, SR],
         _ => unreachable!("validated in open()"),
-    };
-    pos[..order.len()].copy_from_slice(order);
+    }
+}
+
+/// [`channel_order`] as the SPA position array a format pod carries.
+fn spa_positions(channels: u32) -> [u32; 64] {
+    let mut pos = [0u32; 64];
+    for (slot, (id, _)) in pos.iter_mut().zip(channel_order(channels)) {
+        *slot = *id;
+    }
     pos
+}
+
+/// [`channel_order`] as `audio.position` spells it (`"[ FL FR ]"`) — the
+/// `support.null-audio-sink` adapter is configured by properties, not by a format pod.
+fn spa_position_names(channels: u32) -> String {
+    let names: Vec<&str> = channel_order(channels).iter().map(|(_, n)| *n).collect();
+    format!("[ {} ]", names.join(" "))
+}
+
+/// The property set of the host-owned `support.null-audio-sink` — the sink apps play into in
+/// [`NullSink`](CaptureMode::NullSink) mode.
+///
+/// A pure function returning `(key, value)` pairs rather than a built `Properties`, because the
+/// invariants below are the whole design and none of them is checkable at run time on the
+/// developer's machine — the tests at the bottom of this file are:
+///
+/// * `factory.name` + no `object.linger`: the adapter recipe pipewire-pulse's own
+///   `module-null-sink` uses (`pactl load-module module-null-sink`), and a node whose lifetime is
+///   this connection's — a host that crashes leaves no ghost sink behind, and WirePlumber falls
+///   back to automatic election for local audio.
+/// * `audio.rate`/`audio.channels`/`audio.position`: the sink is created at the *session's*
+///   format, which is what makes [`probe_capture_rate`]'s `Declared` answer honest and lets a
+///   game render real 5.1/7.1 into a host whose own hardware is stereo.
+/// * **`node.force-quantum`, not `node.latency`**: a driver's quantum is the smallest
+///   `node.latency` among its followers, clamped — and then, because PipeWire's
+///   `default.clock.power-of-two-quantum` defaults to *true*, rounded DOWN to a power of two.
+///   That is why our 240-frame (5 ms) ask has been silently served as 128 on every stock Linux
+///   host. `node.force-quantum` skips the rounding, and because this sink drives only its own
+///   group it forces nothing on anybody else's device — which is exactly why the same key would
+///   have been the wrong answer while we were borrowing somebody's hardware clock.
+/// * `priority.session = 50`: LOW on purpose. Between sessions the sink stays alive (the
+///   capturer is parked, not torn down) and must never win WirePlumber's *automatic* default
+///   election against real hardware; routing comes from the [`stream_sink`] claim.
+/// * **No `priority.driver`**: 0 means the graph never elects this node to clock somebody else's
+///   driver-less group. It drives ours because our stream is linked to it, and nothing else.
+/// * `session.suspend-timeout-seconds = 0`: Wine churns its audio device through a game's first
+///   minute; each suspend/resume round trip is a real hole in a stream someone is listening to.
+/// * `monitor.*`: pipewire-pulse's own defaults for a null sink, so the volume slider on
+///   "Punktfunk Stream Speaker" keeps behaving the way it does on the 0.30 stream sink.
+fn null_sink_props(name: &str, channels: u32, rate_hz: u32) -> Vec<(&'static str, String)> {
+    vec![
+        ("factory.name", "support.null-audio-sink".to_string()),
+        ("node.name", name.to_string()),
+        ("node.description", "Punktfunk Stream Speaker".to_string()),
+        ("media.class", "Audio/Sink".to_string()),
+        ("node.virtual", "true".to_string()),
+        ("audio.rate", rate_hz.to_string()),
+        ("audio.channels", channels.to_string()),
+        ("audio.position", spa_position_names(channels)),
+        ("priority.session", "50".to_string()),
+        ("session.suspend-timeout-seconds", "0".to_string()),
+        (
+            "node.force-quantum",
+            capture_quantum_frames(rate_hz).to_string(),
+        ),
+        ("monitor.channel-volumes", "true".to_string()),
+        ("monitor.passthrough", "true".to_string()),
+    ]
 }
 
 /// Virtual microphone: a PipeWire `Audio/Source` node host apps can record from. The host pushes
@@ -317,6 +473,12 @@ fn spa_positions(channels: u32) -> [u32; 64] {
 /// stream node below, with `RT_PROCESS` + `priority.session` (see the property comments), is
 /// validated working on PipeWire 1.4 (Bazzite) and 1.6 (this box) in both attach orderings.
 /// Do not "modernize" this to the adapter recipe without re-running that validation.
+///
+/// ⚠ The desktop **sink** now IS an adapter (`null_sink_props`), and that is not a contradiction:
+/// this result is about an `Audio/Source/Virtual` adapter — the direction WirePlumber has no
+/// monitor path for and reroutes feeders away from — while a null-sink adapter captured through
+/// its monitor is the direction every virtual-sink recipe uses. The two were validated
+/// separately, and neither result transfers to the other.
 ///
 /// **Liveness contract** (see [`VirtualMic`]): the loop thread exits on a core error (PipeWire
 /// daemon restart — the node is gone) or a stream error, which flips `alive` — `push` then
@@ -772,15 +934,23 @@ fn pw_thread(
     quit_rx: pipewire::channel::Receiver<Terminate>,
     channels: u32,
     rate_hz: u32,
-    sink_name: Option<String>,
+    nodes: CaptureNodes,
     ready: std::sync::mpsc::SyncSender<Result<()>>,
     active: Arc<AtomicBool>,
     negotiated_rate: Arc<AtomicU32>,
 ) -> Result<()> {
     use pipewire as pw;
+    use pw::proxy::ProxyT;
     use pw::{properties::properties, spa};
     use spa::param::audio::{AudioFormat, AudioInfoRaw};
     use spa::pod::Pod;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let CaptureNodes {
+        mode,
+        sink: sink_name,
+        capture: capture_name,
+    } = nodes;
     // ⚠ This boosts the MAINLOOP thread, which is NOT where the capture callback runs.
     //
     // The previous comment here asserted the opposite ("we never hand PipeWire a separate data
@@ -827,20 +997,237 @@ fn pw_thread(
             })
             .register();
 
-        // Which source the negotiated format below actually describes — see the note there.
-        let sink_mode = sink_name.is_some();
+        // In null-sink mode the sink apps play into is a REAL node this host creates: a
+        // `support.null-audio-sink` adapter, the same object `pactl load-module module-null-sink`
+        // makes. Unlike a stream node it is a **driver** — the null sink publishes
+        // `node.driver=true` and the adapter forwards it — carrying its own `timerfd` inside the
+        // daemon's realtime data loop, so the group {game streams → this sink → our monitor tap}
+        // owns its clock and PipeWire never borrows one from an unrelated device (module docs).
+        //
+        // Created BEFORE the capture stream connects, on the same connection, so the sink is
+        // registered first and the tap's `target.object` resolves without waiting. It is
+        // destroyed with this connection (no `object.linger`), which is what the loop thread's
+        // exit relies on.
+        let _sink_node = match mode {
+            CaptureMode::NullSink => {
+                let name = sink_name
+                    .as_deref()
+                    .context("null-sink mode without a sink name")?;
+                let mut props = pw::properties::PropertiesBox::new();
+                for (key, value) in null_sink_props(name, channels, rate_hz) {
+                    props.insert(key, value);
+                }
+                let node = core
+                    .create_object::<pw::node::Node>("adapter", &props)
+                    .context("create the punktfunk stream sink (support.null-audio-sink)")?;
+                // The server answers asynchronously: `bound` is the sink existing (and its graph
+                // id, which the driver diagnostic compares against), `error` is a daemon without
+                // the adapter factory or the null-sink plugin — rare, and today's only new way to
+                // have no audio at all, so it says what to set instead of dying quietly. The
+                // core-error listener above ends the thread either way, which puts the session's
+                // reopen-with-backoff in charge, exactly as a stream error does.
+                let listener = node
+                    .upcast_ref()
+                    .add_listener_local()
+                    .bound(|id| {
+                        tracing::debug!(node_id = id, "punktfunk stream sink registered");
+                    })
+                    .error(|_seq, res, message| {
+                        tracing::warn!(
+                            res,
+                            message,
+                            "the punktfunk stream sink could not be created — this host cannot \
+                             capture desktop audio until it can. Set PUNKTFUNK_STREAM_SINK=stream \
+                             for the 0.30 topology (no created sink) and please report it"
+                        );
+                    })
+                    .register();
+                Some((node, listener))
+            }
+            _ => None,
+        };
+
         // The `NODE_LATENCY` ask, built at run time because the rate is now a session value:
         // `<quantum frames>/<rate>` is how PipeWire spells a latency, and both halves move
         // together so the ask stays 5 ms at 48 kHz and at 96 kHz alike. Formatted once here
         // rather than at each use so the two property arms cannot drift apart.
         let node_latency = format!("{}/{}", capture_quantum_frames(rate_hz), rate_hz);
-        let props = match &sink_name {
+        // ── Which node is clocking us ────────────────────────────────────────────────────
+        // `node.driver-id` on our own node names the driver of the group we are scheduled in.
+        // It is deliberately NOT in the registry's announce set (`pw_impl_node_register`'s key
+        // list), so it takes a bind and the node's `info` event.
+        //
+        // ⚠ `pw_impl_node_set_driver` writes the key and marks the props changed, but leaves
+        // the flush to the node's next info emission — which in practice is the state change
+        // that accompanies the same graph recalculation. So read this as *the last driver the
+        // daemon told us about*, which is what a diagnostic wants, and not as a real-time
+        // signal: a driver change with no state change anywhere would reach us late or not
+        // at all.
+        //
+        // This line exists because on 2026-08-14 the question "what is clocking desktop audio?"
+        // cost four field logs, a bespoke probe script and a `pw-top` DRIVER column to answer —
+        // and the answer was a sound card attached over the network that nothing was linked to.
+        // Whatever the next such box is, it now says so itself, in the log the reporter already
+        // sends. Reported on CHANGE, not per window: it moves a handful of times a session, and
+        // the capture summary is written from the RT callback while this arrives on the main
+        // loop.
+        struct GraphDriver {
+            /// `node.name` of every Node global, so the driver can be NAMED and not just
+            /// numbered. Pruned on removal — a host runs for days and streams come and go.
+            names: HashMap<u32, String>,
+            /// Our own node, bound so that its `info` — and with it `node.driver-id` — arrives.
+            ours: Option<(pw::node::Node, pw::node::NodeListener)>,
+            /// The last driver reported, so only changes are logged.
+            driver: Option<u32>,
+        }
+        // In null-sink mode there is exactly one right answer and it is ours; the legacy
+        // topologies borrow a driver by design, so there the line names it without judging it.
+        let expected_driver = match mode {
+            CaptureMode::NullSink => sink_name.clone(),
+            _ => None,
+        };
+        let watch = Rc::new(RefCell::new(GraphDriver {
+            names: HashMap::new(),
+            ours: None,
+            driver: None,
+        }));
+        let registry = core.get_registry_rc().context("pw audio registry")?;
+        let _registry_listener = registry
+            .add_listener_local()
+            .global({
+                let watch = watch.clone();
+                let registry = registry.clone();
+                let capture_name = capture_name.clone();
+                move |global| {
+                    if global.type_ != pw::types::ObjectType::Node {
+                        return;
+                    }
+                    let Some(props) = global.props else { return };
+                    let Some(name) = props.get("node.name") else {
+                        return;
+                    };
+                    watch.borrow_mut().names.insert(global.id, name.to_string());
+                    if name != capture_name.as_str() || watch.borrow().ours.is_some() {
+                        return;
+                    }
+                    let Ok(node) = registry.bind::<pw::node::Node, _>(global) else {
+                        return;
+                    };
+                    let listener = node
+                        .add_listener_local()
+                        .info({
+                            let watch = watch.clone();
+                            let expected = expected_driver.clone();
+                            move |info| {
+                                let Some(props) = info.props() else { return };
+                                // Absent = we are between drivers (the daemon drops the key from
+                                // a node that has none), which is not worth a line: the next
+                                // assignment reports itself.
+                                let Some(id) = props
+                                    .get("node.driver-id")
+                                    .and_then(|v| v.parse::<u32>().ok())
+                                else {
+                                    return;
+                                };
+                                let mut w = watch.borrow_mut();
+                                if w.driver == Some(id) {
+                                    return;
+                                }
+                                w.driver = Some(id);
+                                let named = w.names.get(&id).cloned();
+                                let driver = named.as_deref().unwrap_or("<unnamed>");
+                                match expected.as_deref() {
+                                    Some(sink) if driver == sink => tracing::info!(
+                                        driver,
+                                        driver_id = id,
+                                        "audio capture graph driver"
+                                    ),
+                                    Some(sink) => tracing::warn!(
+                                        driver,
+                                        driver_id = id,
+                                        expected = sink,
+                                        "our audio capture group is being clocked by another \
+                                         node — every hole in this stream is that node's \
+                                         scheduling, not ours. Something has linked our sink to \
+                                         it (a loopback from its monitor is the usual cause); a \
+                                         USB or USB-over-IP sound card here is the 2026-08-18 \
+                                         defect"
+                                    ),
+                                    // Both legacy topologies have no driver of their own, so
+                                    // borrowing one is the design and not a fault — but WHICH one
+                                    // is still the first thing anybody investigating wants.
+                                    None => tracing::info!(
+                                        driver,
+                                        driver_id = id,
+                                        "audio capture graph driver (borrowed — this topology \
+                                         has none of its own)"
+                                    ),
+                                }
+                            }
+                        })
+                        .register();
+                    watch.borrow_mut().ours = Some((node, listener));
+                }
+            })
+            .global_remove({
+                let watch = watch.clone();
+                move |id| {
+                    watch.borrow_mut().names.remove(&id);
+                }
+            })
+            .register();
+
+        let props = match mode {
+            // Null-sink mode: the sink is the adapter created above and this stream is a MONITOR
+            // TAP of it — the same `stream.capture.sink=true` recipe as the legacy arm below,
+            // except aimed by name so it can only ever be ours.
+            CaptureMode::NullSink => {
+                let name = sink_name
+                    .as_deref()
+                    .context("null-sink mode without a sink name")?;
+                let mut p = properties! {
+                    *pw::keys::MEDIA_TYPE          => "Audio",
+                    *pw::keys::MEDIA_CATEGORY      => "Capture",
+                    *pw::keys::MEDIA_ROLE          => "Music",
+                    *pw::keys::STREAM_CAPTURE_SINK => "true",
+                    // A passive link does not, on its own, make either end runnable. Between
+                    // sessions — parked capturer, nothing playing into the sink — the group is
+                    // therefore idle and the null sink's timer parks with it, so this topology
+                    // costs nothing while nobody is streaming. That is the objection (R5) which
+                    // kept `node.always-process` off the 0.30 stream sink, answered by
+                    // construction rather than by a knob. While a game plays, its own
+                    // (non-passive) link makes the sink runnable and the graph walks that through
+                    // the monitor to us, so nothing about capture changes.
+                    *pw::keys::NODE_PASSIVE        => "true",
+                    // Wait for OUR sink; never fall back to a hardware sink's monitor, not even
+                    // for the moment before ours registers — recording the box's real output
+                    // would be the wrong audio, and briefly rejoining a hardware driver's group
+                    // is the defect this whole mode exists to remove.
+                    //
+                    // ⚠ These two are a PAIR. WirePlumber (0.5 `find-defined-target.lua`) reads
+                    // `node.dont-fallback` alone as licence to DESTROY this stream the moment the
+                    // target is not visible ("defined target not found"); `node.linger` is what
+                    // turns that into "wait for it". Never ship one without the other.
+                    "node.dont-fallback"           => "true",
+                    "node.linger"                  => "true",
+                };
+                p.insert(*pw::keys::NODE_NAME, capture_name.as_str());
+                // Spelled out because pipewire-rs only exposes `TARGET_OBJECT` behind its
+                // `v0_3_44` feature, and a key constant is not worth widening the API surface
+                // this crate compiles against. WirePlumber matches this value against
+                // `node.name` (or `object.serial`) — 0.5 `find-defined-target.lua`.
+                p.insert("target.object", name);
+                p.insert(*pw::keys::NODE_LATENCY, node_latency.as_str());
+                p
+            }
             // Stream-sink mode: this stream IS the sink (media.class + Direction::Input). Apps
             // play into it, PipeWire mixes them, process() receives the mix. Mirrors the
             // validated PwMicSource recipe (stream node + RT_PROCESS; see its property
-            // comments) — do NOT "modernize" either into a `support.null-audio-sink` adapter
-            // without re-running that validation.
-            Some(name) => {
+            // comments). Kept as the escape hatch from the mode above for one release.
+            CaptureMode::StreamSink => {
+                let name = sink_name
+                    .as_deref()
+                    .context("stream-sink mode without a sink name")?;
                 let mut p = properties! {
                     *pw::keys::MEDIA_TYPE       => "Audio",
                     *pw::keys::MEDIA_CLASS      => "Audio/Sink",
@@ -864,7 +1251,7 @@ fn pw_thread(
                     // suspend keeps the node available without asking anyone to drive it.
                     "session.suspend-timeout-seconds" => "0",
                 };
-                p.insert(*pw::keys::NODE_NAME, name.as_str());
+                p.insert(*pw::keys::NODE_NAME, name);
                 // Ask for a ~5 ms quantum (= one protocol audio frame) so buffers arrive
                 // smoothly rather than in bursts the client's jitter buffer would hear as
                 // glitching. Inserted rather than written in the `properties!` literal because
@@ -873,13 +1260,14 @@ fn pw_thread(
                 p
             }
             // Legacy: capture the default sink's monitor (system output), not a microphone.
-            None => {
+            CaptureMode::Monitor => {
                 let mut p = properties! {
                     *pw::keys::MEDIA_TYPE          => "Audio",
                     *pw::keys::MEDIA_CATEGORY      => "Capture",
                     *pw::keys::MEDIA_ROLE          => "Music",
                     *pw::keys::STREAM_CAPTURE_SINK => "true",
                 };
+                p.insert(*pw::keys::NODE_NAME, capture_name.as_str());
                 p.insert(*pw::keys::NODE_LATENCY, node_latency.as_str());
                 p
             }
@@ -1020,12 +1408,12 @@ fn pw_thread(
                         ud.rate_hz = now.1;
                         ud.negotiated_rate.store(now.1, Ordering::Relaxed);
                     }
-                    // `stream_sink` says WHICH source this format describes, and that changes how
-                    // much it is worth. In stream-sink mode the host owns the sink, so this IS the
-                    // format apps render into and the desktop mix cannot have been narrowed before
-                    // we saw it. In LEGACY monitor mode we are capturing someone else's sink
-                    // through PipeWire's resampler: a 16 kHz Bluetooth headset upstream would
-                    // still be reported here as a clean 48 kHz, exactly the way WASAPI's
+                    // `mode` says WHICH source this format describes, and that changes how much
+                    // it is worth. In both sink modes the host owns the sink, so this IS the
+                    // format apps render into and the desktop mix cannot have been narrowed
+                    // before we saw it. In LEGACY monitor mode we are capturing someone else's
+                    // sink through PipeWire's resampler: a 16 kHz Bluetooth headset upstream
+                    // would still be reported here as a clean 48 kHz, exactly the way WASAPI's
                     // autoconvert hid the same thing on Windows (the 2026-08-03 report). So this
                     // line is a fact about OUR stream and never about the content in legacy mode
                     // — the monitored node's own rate is a registry lookup, and it lives in
@@ -1034,7 +1422,7 @@ fn pw_thread(
                         format = ?info.format(),
                         rate = info.rate(),
                         channels = info.channels(),
-                        stream_sink = sink_mode,
+                        mode = mode.as_str(),
                         "audio format negotiated"
                     );
                 }
@@ -1227,7 +1615,8 @@ fn pw_thread(
 
         // Request F32LE at the session's rate + channel count with explicit positions. In
         // legacy mode PipeWire's channel-mixer up/downmixes the sink monitor to this layout;
-        // in stream-sink mode this IS the sink's advertised layout (apps mix/route to it) —
+        // in stream-sink mode this IS the sink's advertised layout (apps mix/route to it), and
+        // in null-sink mode it is the monitor of a sink we created at this very layout —
         // which is exactly why hi-res is structurally honest there and has to be PROVEN in
         // monitor mode (`design/hi-res-audio.md` §4.4): a sink we OWN renders at the rate we
         // declare, while a monitor tap is handed a resampled copy that reports a clean rate
@@ -1253,12 +1642,14 @@ fn pw_thread(
         .into_inner();
         let mut params = [Pod::from_bytes(&values).context("audio pod from bytes")?];
 
-        // RT_PROCESS in stream-sink mode for the same reason as the mic: the sink must be a
-        // *synchronous* graph node that joins its producers' driver group and is actually
+        // RT_PROCESS in both sink modes for the same reason as the mic: the node must be a
+        // *synchronous* graph node that joins the driver group it belongs to and is actually
         // driven (see the mic's connect comment — async device-class stream nodes on a busy
-        // graph never acquire a driver and their process() never fires).
+        // graph never acquire a driver and their process() never fires). It also puts the
+        // callback on a data loop libpipewire schedules at SCHED_RR, which is where a capture
+        // callback belongs and where the mainloop boost above can never reach.
         let mut flags = pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS;
-        if sink_name.is_some() {
+        if mode.owns_sink() {
             flags |= pw::stream::StreamFlags::RT_PROCESS;
         }
         stream
@@ -1275,6 +1666,12 @@ fn pw_thread(
         // default-sink claim lands a few ms before the node registers, WirePlumber simply
         // keeps the configured value and elects it the moment the node appears — verified
         // live: configured values persist unelected while their target is absent.)
+        tracing::info!(
+            mode = mode.as_str(),
+            sink = sink_name.as_deref().unwrap_or("<the default sink>"),
+            capture = capture_name.as_str(),
+            "desktop audio capture topology"
+        );
         let _ = ready.send(Ok(()));
         mainloop.run();
         tracing::debug!("pipewire audio loop exited (capturer dropped)");
@@ -1284,4 +1681,101 @@ fn pw_thread(
         let _ = ready.send(Err(anyhow!("{e:#}")));
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three spellings of `PUNKTFUNK_STREAM_SINK`, and the rule that anything else is the
+    /// default: a typo in a field-debugging variable must never be the reason a session has no
+    /// audio.
+    #[test]
+    fn capture_mode_grammar() {
+        assert_eq!(capture_mode_from(None), CaptureMode::NullSink);
+        for off in ["0", "false", "no", "off", " off "] {
+            assert_eq!(
+                capture_mode_from(Some(off)),
+                CaptureMode::Monitor,
+                "{off:?} selects the legacy monitor follower"
+            );
+        }
+        assert_eq!(capture_mode_from(Some("stream")), CaptureMode::StreamSink);
+        assert_eq!(capture_mode_from(Some(" stream ")), CaptureMode::StreamSink);
+        for junk in ["1", "yes", "null", "STREAM", ""] {
+            assert_eq!(
+                capture_mode_from(Some(junk)),
+                CaptureMode::NullSink,
+                "{junk:?} is not a mode and must fall to the default"
+            );
+        }
+        assert!(CaptureMode::NullSink.owns_sink() && CaptureMode::StreamSink.owns_sink());
+        assert!(!CaptureMode::Monitor.owns_sink());
+    }
+
+    /// The pod form and the property form of the channel map describe the SAME layout. They are
+    /// consumed by different things (a stream's format vs a created node's `audio.position`) and
+    /// a disagreement would mean the sink takes audio in one order and hands it on in another —
+    /// silently, as a channel swap nobody can see in a log.
+    #[test]
+    fn channel_map_views_agree() {
+        for ch in [1u32, 2, 6, 8] {
+            let ids = spa_positions(ch);
+            let order = channel_order(ch);
+            assert_eq!(order.len(), ch as usize, "{ch} channels");
+            for (i, (id, _)) in order.iter().enumerate() {
+                assert_eq!(ids[i], *id, "channel {i} of {ch}");
+            }
+            assert!(
+                ids[ch as usize..].iter().all(|&p| p == 0),
+                "positions past the channel count stay unset"
+            );
+        }
+        // Spelled out, because these exact strings are what PipeWire parses.
+        assert_eq!(spa_position_names(2), "[ FL FR ]");
+        assert_eq!(spa_position_names(6), "[ FL FR FC LFE RL RR ]");
+        assert_eq!(spa_position_names(8), "[ FL FR FC LFE RL RR SL SR ]");
+    }
+
+    /// The invariants of the created sink, each of which is a decision that cost a field
+    /// investigation to reach (see [`null_sink_props`]) and none of which fails loudly if it
+    /// silently changes.
+    #[test]
+    fn null_sink_props_hold_their_invariants() {
+        let props = null_sink_props("punktfunk-speaker-42-0", 6, 48_000);
+        let get = |k: &str| {
+            props
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("factory.name"), Some("support.null-audio-sink"));
+        assert_eq!(get("media.class"), Some("Audio/Sink"));
+        assert_eq!(get("node.name"), Some("punktfunk-speaker-42-0"));
+        assert!(
+            get("node.name").is_some_and(|n| n.starts_with(stream_sink::SINK_NAME_PREFIX)),
+            "the claim's staleness rule matches this prefix"
+        );
+        assert_eq!(get("audio.channels"), Some("6"));
+        assert_eq!(get("audio.rate"), Some("48000"));
+        assert_eq!(get("audio.position"), Some("[ FL FR FC LFE RL RR ]"));
+        // The 5 ms ask, stated in the one form PipeWire will not round down to 128.
+        assert_eq!(get("node.force-quantum"), Some("240"));
+        assert_eq!(get("session.suspend-timeout-seconds"), Some("0"));
+        assert_eq!(get("priority.session"), Some("50"));
+        // A sink that outlives its creator would wedge routing on a node nothing owns; a sink
+        // with a driver priority would be elected to clock OTHER people's driver-less groups,
+        // which is the very defect this mode exists to end.
+        assert_eq!(get("object.linger"), None);
+        assert_eq!(get("priority.driver"), None);
+        // Hi-res: the quantum is a LATENCY, so it scales with the rate (5 ms either way).
+        let hi = null_sink_props("punktfunk-speaker-42-1", 2, 96_000);
+        let hi_get = |k: &str| {
+            hi.iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(hi_get("audio.rate"), Some("96000"));
+        assert_eq!(hi_get("node.force-quantum"), Some("480"));
+    }
 }
