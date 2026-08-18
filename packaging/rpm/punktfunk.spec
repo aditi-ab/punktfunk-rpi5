@@ -328,6 +328,23 @@ install -Dm0644 scripts/60-punktfunk.rules %{buildroot}%{_udevrulesdir}/60-punkt
 # keep it from driving the graph clock. See the file's own comments.
 install -Dm0644 scripts/60-punktfunk-dualsense.conf %{buildroot}%{_datadir}/wireplumber/wireplumber.conf.d/60-punktfunk-dualsense.conf
 
+# ALSA UCM for the DualSense's own sound card — the `SpeakerHaptic` device `alsa-ucm-conf` has
+# never carried. Without it the card's only playback route is a 1-channel `Speaker` split,
+# GE-Proton mints its "Sony controller speaker" endpoint from that lone mono sink, and games
+# that open it overrun it (a reliable EXCEPTION_ACCESS_VIOLATION in Spider-Man Remastered).
+# Nothing here replaces an `alsa-ucm-conf` file: the vid:pid drop-ins under conf.d/ only
+# redefine which profile the DualSense resolves to. Complements the WirePlumber policy above
+# rather than overlapping it — that one governs how the card's nodes BEHAVE, this one governs
+# which nodes exist. See scripts/alsa-ucm2/ for the mechanism.
+install -Dm0644 scripts/alsa-ucm2/USB-Audio/conf.d/054c-0ce6.conf \
+  %{buildroot}%{_datadir}/alsa/ucm2/USB-Audio/conf.d/054c-0ce6.conf
+install -Dm0644 scripts/alsa-ucm2/USB-Audio/conf.d/054c-0df2.conf \
+  %{buildroot}%{_datadir}/alsa/ucm2/USB-Audio/conf.d/054c-0df2.conf
+install -Dm0644 scripts/alsa-ucm2/USB-Audio/Punktfunk/DualSense-PS5-Haptic.conf \
+  %{buildroot}%{_datadir}/alsa/ucm2/USB-Audio/Punktfunk/DualSense-PS5-Haptic.conf
+install -Dm0644 scripts/alsa-ucm2/USB-Audio/Punktfunk/DualSense-PS5-Haptic-HiFi.conf \
+  %{buildroot}%{_datadir}/alsa/ucm2/USB-Audio/Punktfunk/DualSense-PS5-Haptic-HiFi.conf
+
 # Managed gamescope takeover on DM-autologin boxes (Nobara's plasmalogin): a root helper + polkit
 # action let the host stop/restore the display manager for the stream without a hand-installed
 # polkit rule. The helper derives the DM unit itself — callers can't name arbitrary units.
@@ -582,6 +599,14 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %{_bindir}/punktfunk-tray
 %{_udevrulesdir}/60-punktfunk.rules
 %{_datadir}/wireplumber/wireplumber.conf.d/60-punktfunk-dualsense.conf
+# The DualSense UCM drop-in. Both directories are ours: alsa-ucm-conf ships neither
+# USB-Audio/conf.d nor USB-Audio/Punktfunk, so owning them collides with nothing.
+%dir %{_datadir}/alsa/ucm2/USB-Audio/conf.d
+%dir %{_datadir}/alsa/ucm2/USB-Audio/Punktfunk
+%{_datadir}/alsa/ucm2/USB-Audio/conf.d/054c-0ce6.conf
+%{_datadir}/alsa/ucm2/USB-Audio/conf.d/054c-0df2.conf
+%{_datadir}/alsa/ucm2/USB-Audio/Punktfunk/DualSense-PS5-Haptic.conf
+%{_datadir}/alsa/ucm2/USB-Audio/Punktfunk/DualSense-PS5-Haptic-HiFi.conf
 %dir %{_libexecdir}/punktfunk
 %{_libexecdir}/punktfunk/pf-dm-helper
 %{_libexecdir}/punktfunk/pf-update

@@ -67,6 +67,11 @@ impl PadUsbCapturer {
         let rx = pf_inject::dualsense_usbip::take_audio_rx(pad)
             .ok_or_else(|| anyhow!("no usbip pad audio published for pad {pad} (not attached?)"))?;
         tracing::info!(pad, "pad audio capturing from the USB isochronous endpoint");
+        // The pad's ALSA card is real, so WirePlumber greets it with its global 40 % default —
+        // which is -23.88 dB applied BEFORE the isochronous endpoint we capture from, and which
+        // stacks with the same default on the client. Undo it once the card shows up; see
+        // [`super::pad_card_volume`]. Best effort, off-thread, never fatal.
+        super::pad_card_volume::spawn_pin(pad);
         Ok(PadUsbCapturer { rx, pad })
     }
 }

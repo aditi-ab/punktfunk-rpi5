@@ -83,6 +83,18 @@ install -Dm0644 packaging/linux/49-punktfunk-update.rules \
                                                    "$STAGE/usr/share/polkit-1/rules.d/49-punktfunk-update.rules"
 install -Dm0644 scripts/60-punktfunk.rules         "$STAGE/usr/lib/udev/rules.d/60-punktfunk.rules"
 install -Dm0644 scripts/60-punktfunk-dualsense.conf "$STAGE/usr/share/wireplumber/wireplumber.conf.d/60-punktfunk-dualsense.conf"
+# ALSA UCM for the DualSense's own sound card — the `SpeakerHaptic` device alsa-ucm-conf has
+# never carried. Without it the card's only playback route is a 1-channel `Speaker` split and a
+# game that opens GE-Proton's "Sony controller speaker" endpoint overruns it. The conf.d files
+# are keyed by USB vid:pid and only redefine which profile the pad resolves to, so this REPLACES
+# NOTHING alsa-ucm-conf owns — no diversion, no Conflicts. Complements the WirePlumber rules
+# above rather than overlapping them: those hold the device open and keep it off the graph-driver
+# election, this decides which sinks the card offers in the first place. See scripts/alsa-ucm2/.
+for f in USB-Audio/conf.d/054c-0ce6.conf USB-Audio/conf.d/054c-0df2.conf \
+         USB-Audio/Punktfunk/DualSense-PS5-Haptic.conf \
+         USB-Audio/Punktfunk/DualSense-PS5-Haptic-HiFi.conf; do
+  install -Dm0644 "scripts/alsa-ucm2/$f" "$STAGE/usr/share/alsa/ucm2/$f"
+done
 # Managed gamescope takeover on DM-autologin boxes: root helper + polkit action so the host can
 # stop/restore the display manager for the stream (the helper derives the DM unit itself).
 install -Dm0755 scripts/pf-dm-helper               "$STAGE/usr/libexec/punktfunk/pf-dm-helper"

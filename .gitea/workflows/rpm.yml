@@ -35,6 +35,7 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'scripts/ci/**'
+      - 'scripts/alsa-ucm2/**'
       - '.gitea/workflows/rpm.yml'
     # Single project version: a `vX.Y.Z` tag is THE release. main publishes to the `*-canary` rpm
     # groups, tags to the base groups (`bazzite`/`fedora-44`) — separate repos, so the old
@@ -221,6 +222,15 @@ jobs:
       # never the board"; this is that. Host must carry NOTHING; the worker must carry exactly
       # cap_sys_nice=ep. `--self-test` first, so a guard that has quietly stopped being able to
       # fail takes the job down instead of waving the release through.
+      - name: The DualSense UCM drop-in must still bite
+        # scripts/alsa-ucm2/ hooks into alsa-ucm-conf's own dispatcher, so an upstream rename or
+        # reorder can neuter it with no error anywhere — and what comes back is the Spider-Man
+        # EXCEPTION_ACCESS_VIOLATION, not a quieter pad. This is the only leg that runs on a real
+        # Fedora tree, hence the two packages. Skips itself on any box without them.
+        run: |
+          dnf -y install alsa-ucm alsa-ucm-utils
+          sh scripts/ci/check-dualsense-ucm.sh
+
       - name: Assert the capability matrix (rpm)
         run: |
           bash scripts/ci/assert-cap-matrix.sh --self-test
