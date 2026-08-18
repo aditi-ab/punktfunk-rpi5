@@ -105,7 +105,7 @@ struct LibraryCollectionsView: View {
     /// The tile plus the home strip's focus treatment (recede in scale, brightness, saturation,
     /// blur and alpha) — the same arithmetic `GamepadHomeView.hostCard` applies.
     private func card(_ tile: CollectionTile, size: CGSize, entrance: CardEntrance) -> some View {
-        CollectionTileView(tile: tile, games: games, artLoader: artLoader, size: size)
+        CollectionTileView(tile: tile, games: games, artLoader: artLoader, size: size, compact: compact)
             .modifier(entrance)
             .scrollTransition { content, phase in
                 let d = CGFloat(min(abs(phase.value), 1))
@@ -127,6 +127,8 @@ private struct CollectionTileView: View {
     let games: [GameEntry]
     let artLoader: (any LibraryArtSource)?
     let size: CGSize
+    /// A landscape phone's shorter tile: the deck shrinks so it clears the label rail.
+    var compact = false
 
     #if os(tvOS)
     private static let titleFont: CGFloat = 33
@@ -196,7 +198,7 @@ private struct CollectionTileView: View {
 
     /// Up to three covers from the group's sort-first titles, fanned back-to-front.
     private var deck: some View {
-        let coverH = Self.coverH
+        let coverH = compact ? Self.coverH * 0.7 : Self.coverH
         let coverW = coverH * 2 / 3
         let slots = min(Self.fan, max(1, count))
         // The box the fan lives in: front cover + the back slots' rightward/upward drift.

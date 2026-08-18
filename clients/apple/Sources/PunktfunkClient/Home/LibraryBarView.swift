@@ -38,21 +38,17 @@ struct LibraryBarView: View {
     static let gap: CGFloat = 12
 
     var body: some View {
-        HStack(spacing: 0) {
-            group(caption: "SORT") {
-                ForEach(LibrarySortKey.all, id: \.self) { key in
-                    pill(key.label, selected: key == sort, namespace: sortHighlight) { onSort(key) }
-                }
+        // One row where it fits (every landscape screen); a portrait phone gets the two groups
+        // stacked rather than a row spilling off the edge.
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 0) {
+                sortGroup
+                Spacer(minLength: 12)
+                if showsView { viewGroup }
             }
-            Spacer(minLength: 12)
-            if showsView {
-                group(caption: "VIEW") {
-                    ForEach(LibraryArrangement.all, id: \.self) { view in
-                        pill(view.label, selected: view == arrangement, namespace: viewHighlight) {
-                            onArrangement(view)
-                        }
-                    }
-                }
+            VStack(alignment: .leading, spacing: 6) {
+                sortGroup
+                if showsView { viewGroup }
             }
         }
         .padding(.horizontal, 12)
@@ -66,7 +62,25 @@ struct LibraryBarView: View {
         }
         .animation(.smooth(duration: 0.18), value: focused)
         .padding(.horizontal, 12)
-        .frame(height: Self.bandHeight)
+        .frame(minHeight: Self.bandHeight)
+    }
+
+    private var sortGroup: some View {
+        group(caption: "SORT") {
+            ForEach(LibrarySortKey.all, id: \.self) { key in
+                pill(key.label, selected: key == sort, namespace: sortHighlight) { onSort(key) }
+            }
+        }
+    }
+
+    private var viewGroup: some View {
+        group(caption: "VIEW") {
+            ForEach(LibraryArrangement.all, id: \.self) { view in
+                pill(view.label, selected: view == arrangement, namespace: viewHighlight) {
+                    onArrangement(view)
+                }
+            }
+        }
     }
 
     /// A tracked small-caps caption followed by its pills.

@@ -242,8 +242,9 @@ struct LibraryGridView: View {
     private func heading(_ text: String?, height: CGFloat, k: CGFloat) -> some View {
         HStack {
             if let text {
+                // Captions scale with the field but never below legibility.
                 Text(text)
-                    .font(.geist(11 * k, .semibold, relativeTo: .caption2))
+                    .font(.geist(max(9, 11 * k), .semibold, relativeTo: .caption2))
                     .tracking(1.4)
                     .foregroundStyle(ink.fg(0.45))
             }
@@ -429,9 +430,14 @@ private struct GridGeometry {
     let viewH: CGFloat
 
     init(size: CGSize, len: Int, launchers: Int) {
-        k = min(max(min(size.width, size.height) / 800, 0.75), 3)
+        // The desktop clamps k at 0.75 (its smallest field is a Deck's 800). A landscape phone's
+        // field is ~290 pt tall; at 0.75 one row of 169-pt cells filled it. 0.5 (75×112 cells)
+        // gets two rows in — a grid, not a strip.
+        k = min(max(min(size.width, size.height) / 800, 0.5), 3)
         cellW = 150 * k; cellH = 225 * k; gap = 16 * k; margin = 48 * k
-        headingH = 30 * k; labelGap = 10 * k; halo = 10 * k
+        // The heading band never drops below what a caption plus a focused cell's pop and ring
+        // need on either side of it (the caption sits mid-band).
+        headingH = max(24, 30 * k); labelGap = 10 * k; halo = max(6, 10 * k)
         let avail = size.width - 2 * margin
         cols = min(max(Int((avail + gap) / (cellW + gap)), 2), 8)
         shape = LibraryGridShape(len: len, cols: cols, launchers: launchers)

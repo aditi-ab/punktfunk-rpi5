@@ -49,6 +49,14 @@ struct LibraryCoverflowView: View {
     /// focus, and the shell gates it mid-transition and under the connect takeover.
     var controllerActive = true
 
+    #if os(iOS)
+    /// `.compact` in a landscape phone window — a tighter poster so the title band gets air.
+    @Environment(\.verticalSizeClass) private var vSizeClass
+    private var compact: Bool { vSizeClass == .compact }
+    #else
+    private let compact = false // no size classes on macOS
+    #endif
+
     /// How many covers have settled (art loaded, or every candidate exhausted).
     @State private var artSettled = 0
     /// The backstop below has fired: play the entrance regardless of what the art is doing.
@@ -77,7 +85,9 @@ struct LibraryCoverflowView: View {
         // Fit the tallest poster into the height the container left us (the detail band and the
         // legend are already out of this budget) — capped so it never dwarfs a large iPad and
         // clamped by width on a narrow screen.
-        let reserved: CGFloat = 8 + (showsGroupHeading ? 26 : 0)
+        // In a landscape phone's height the title band sits right under the strip; hold a
+        // little of the cover's height back so the two don't touch.
+        let reserved: CGFloat = (compact ? 26 : 8) + (showsGroupHeading ? 26 : 0)
         let coverHeight = min(360, min(max(140, size.height - reserved), size.width * 0.9))
         let coverWidth = coverHeight * 2 / 3
 

@@ -120,12 +120,12 @@ struct LibraryConsoleView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             if !top.isCollections {
                 detailPanel
-                    .padding(.top, 8)
-                    .padding(.bottom, compact ? 4 : 10)
+                    .padding(.top, compact ? 4 : 8)
+                    .padding(.bottom, compact ? 2 : 10)
             } else {
                 // The tiles carry their own text; keep the band's height so the strip doesn't
                 // jump when a place is pushed over the shelf.
-                Color.clear.frame(height: compact ? 44 : 60)
+                Color.clear.frame(height: compact ? 30 : 60)
             }
             }
             // A push/pop is a state change inside `placeMotion` (see the mutations below), so the
@@ -266,14 +266,20 @@ struct LibraryConsoleView: View {
 
     // MARK: - Detail band
 
-    /// The focused title + its provenance — empty (not hidden) so the layout doesn't jump. The
-    /// staleness note shares the subtitle line, leading, the way the desktop shelf draws it: the
-    /// titles stay, the wording says where they came from.
+    /// Whether the band spells out `STORE · PLATFORM` under the title. Not on the shelf — the
+    /// cover's own chip already says it, and the line only made the band tight — and not in a
+    /// landscape phone's height on the grid either; the grid keeps it elsewhere, since its cells
+    /// draw no chip.
+    private var showsSubtitle: Bool { arrangement == .grid && !compact }
+
+    /// The focused title (+ its provenance where `showsSubtitle`) — empty (not hidden) so the
+    /// layout doesn't jump. The staleness note shares the second line, leading, the way the
+    /// desktop shelf draws it: the titles stay, the wording says where they came from.
     @ViewBuilder private var detailPanel: some View {
         let game = focused
-        VStack(spacing: 6) {
+        VStack(spacing: compact ? 3 : 6) {
             Text(game?.title ?? " ")
-                .font(.geist(compact ? 22 : 25, .bold, relativeTo: .title))
+                .font(.geist(compact ? 20 : 25, .bold, relativeTo: .title))
                 .foregroundStyle(ink.fg)
                 .lineLimit(1)
                 .minimumScaleFactor(0.75)
@@ -296,7 +302,7 @@ struct LibraryConsoleView: View {
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                if let game {
+                if let game, showsSubtitle {
                     Text(subtitle(for: game))
                         .font(.geist(11, .semibold, relativeTo: .caption2))
                         .tracking(1.2)
@@ -306,6 +312,8 @@ struct LibraryConsoleView: View {
                 }
                 Color.clear.frame(maxWidth: .infinity, maxHeight: 1)
             }
+            // With neither a subtitle nor a note the second line collapses to a hairline of air.
+            .frame(minHeight: showsSubtitle || staleness.text != nil ? nil : 1)
         }
         .frame(maxWidth: .infinity)
         .padding(.horizontal, 24)
@@ -326,16 +334,26 @@ struct LibraryConsoleView: View {
 
     // MARK: - Legend
 
-    /// Whether the legend advertises the shoulder jump. Held back on an iPhone, whose legend is
-    /// already at its width; never on tvOS (a Siri Remote has no shoulders) — the settings
-    /// strip's own rule.
+    /// Whether the legend advertises the shoulder jump. Held back on a phone — regular WIDTH on a
+    /// Pro Max in landscape notwithstanding, its legend is already at its width — and never on
+    /// tvOS (a Siri Remote has no shoulders); the settings strip's own rule, height-aware.
     private var showsShoulderHint: Bool {
         #if os(tvOS)
         false
         #elseif os(iOS)
-        hSizeClass == .regular
+        hSizeClass == .regular && !compact
         #else
         true
+        #endif
+    }
+
+    /// A portrait phone: the legend pill has room for three cells, not six. X and ▲ keep working;
+    /// their cells go, the way the settings strip drops its shoulder cell on a phone.
+    private var narrowLegend: Bool {
+        #if os(iOS)
+        hSizeClass == .compact && !compact
+        #else
+        false
         #endif
     }
 
@@ -365,7 +383,7 @@ struct LibraryConsoleView: View {
                 action: { openCollections() }))
         }
         // The desktop's `X Options` — a title's own actions live in a menu, not on a face button.
-        if offersOptions {
+        if offersOptions, !narrowLegend {
             hints.append(.init(
                 glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Options",
                 action: { openOptions() }))
@@ -375,7 +393,9 @@ struct LibraryConsoleView: View {
                 glyph: buttonGlyph(\.leftShoulder, fallback: "l1.rectangle.roundedbottom"),
                 text: "Jump"))
         }
-        hints.append(.init(glyph: "arrow.up", text: "Sort & view", action: { enterBar() }))
+        if !narrowLegend {
+            hints.append(.init(glyph: "arrow.up", text: "Sort & view", action: { enterBar() }))
+        }
         hints.append(.init(
             glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back",
             action: { onDismiss?() }))
@@ -399,10 +419,14 @@ struct LibraryConsoleView: View {
                 glyph: buttonGlyph(\.buttonY, fallback: "y.circle"), text: "All titles",
                 action: { openAllTitles() }))
         }
+        // The shoulders step the sort where the legend has room to say so; the tray (▲) is the
+        // way that is always advertised, and the only one a pointer can reach.
         if showsShoulderHint {
             hints.append(.init(
                 glyph: buttonGlyph(\.leftShoulder, fallback: "l1.rectangle.roundedbottom"),
                 text: "Sort"))
+        } else {
+            hints.append(.init(glyph: "arrow.up", text: "Sort", action: { enterBar() }))
         }
         hints.append(.init(
             glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back",
