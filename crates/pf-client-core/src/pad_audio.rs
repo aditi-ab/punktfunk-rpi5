@@ -1326,6 +1326,9 @@ pub(crate) fn spawn(
 }
 
 fn run(connector: &NativeClient, stop: &AtomicBool, haptics: bool, speaker: bool) {
+    // The pad's audio is a haptic: a late decode is a rumble that lands after the hit. Same
+    // best-effort priority as the main decode leg (`audio_rt`).
+    crate::audio_rt::boost_and_log("pf-pad-audio");
     // Per-kind decode state for the ONE rendered pad (v1: the first pad that streams; the
     // spec's per-(pad, kind) fan-out degenerates to per-kind once the pad is latched).
     let mut streams: [Option<KindStream>; 2] = [None, None];
@@ -1480,6 +1483,9 @@ impl PadOut {
         let thread = std::thread::Builder::new()
             .name("pf-pad-audio-out".into())
             .spawn(move || {
+                // The pad stream's `process` runs on THIS thread (no RT_PROCESS), so this is
+                // the thread that has to make the pad's device cycles. Best-effort.
+                crate::audio_rt::boost_and_log("pf-pad-audio-out");
                 if let Err(e) = pad_pw_thread(pcm_rx, recycle_tx, quit_rx, target) {
                     tracing::warn!(error = %format!("{e:#}"), "pad-audio playback thread ended");
                 }

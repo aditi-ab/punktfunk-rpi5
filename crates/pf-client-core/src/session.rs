@@ -2138,16 +2138,10 @@ fn spawn_audio(
             // the ring (target 15 ms and up), so it is not the callback's problem in kind — but
             // on a Steam Deck the same four cores decode 1440p120 and present it, and a decode
             // thread descheduled past the ring depth is a drought the callback then has to
-            // conceal. A plain `setpriority` is honoured wherever RLIMIT_NICE allows (rtkit is
-            // the sanctioned unprivileged path and a follow-up); where it is refused this is a
-            // no-op, which is exactly what it was before.
-            #[cfg(target_os = "linux")]
-            {
-                // SAFETY: three by-value integers, no pointers; `PRIO_PROCESS` with `who == 0`
-                // targets the calling thread on Linux and only adjusts its nice value.
-                let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, -10) };
-                tracing::debug!(raised = rc == 0, "audio decode thread priority");
-            }
+            // conceal. `setpriority` where RLIMIT_NICE allows, else the Realtime portal (in a
+            // flatpak) or rtkit — the sanctioned unprivileged paths; a refusal leaves the thread
+            // exactly as it was. See `audio_rt`.
+            crate::audio_rt::boost_and_log("punktfunk-audio-rx");
             let mut pcm = vec![0f32; scratch];
             let mut gaps = punktfunk_core::audio::AudioGapTracker::new();
             // Interleaved samples in the last decoded frame — the unit concealment is produced in.

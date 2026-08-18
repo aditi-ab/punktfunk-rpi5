@@ -132,6 +132,13 @@ rand = "0.9"
 # (SteamOS, flatpak runtimes, Arch, Ubuntu ≥ 22.10) clears.
 pipewire = { version = "0.9", features = ["v0_3_49"] }
 sdl3 = { version = "0.18", features = ["hidapi"] }
+# Audio-thread priority (`audio_rt`): one blocking D-Bus call per boosted thread — the Realtime
+# PORTAL (session bus) inside a flatpak, where the sandbox's PID namespace makes a direct rtkit
+# call unresolvable, and rtkit (system bus) outside one. The same zbus, features and backend
+# choice as `pf-frame`'s `thread_qos` (which the host uses for the same purpose): `tokio` because
+# core's `quic` already resolves tokio for this crate, `blocking-api` because the callers are
+# plain worker threads, no default `async-io`.
+zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
 # Native VAAPI decode (M6 of the native-decode program): the hand-declared libva buffer
 # layouts, the profile/format/surface decisions, the AuPlan → picparams/IQ/slice
 # conversion and the DRM-PRIME export descriptor that `video_vaapi_native` marshals.

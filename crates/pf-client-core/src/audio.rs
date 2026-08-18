@@ -623,6 +623,9 @@ impl MicStreamer {
         let thread = std::thread::Builder::new()
             .name("punktfunk-mic".into())
             .spawn(move || {
+                // The capture stream's `process` runs on THIS thread (no RT_PROCESS): capture,
+                // encode and send are all here, and a late tick is mic latency. Best-effort.
+                crate::audio_rt::boost_and_log("punktfunk-mic");
                 if let Err(e) = mic_thread(&connector, quit_rx, muted, echo_cancel) {
                     tracing::warn!(error = %e, "mic uplink thread ended");
                 }
