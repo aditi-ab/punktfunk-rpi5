@@ -180,7 +180,6 @@ fun LibraryScreen(
     settings: Settings,
     onLaunched: (ActiveSession) -> Unit,
     onBack: () -> Unit,
-    navActive: Boolean = true,
     /**
      * The profile this shelf launches with, when it was opened from a PINNED host+profile card
      * (design §5.2a) rather than the host's own tile: a one-off, exactly like the card's plain
@@ -188,13 +187,6 @@ fun LibraryScreen(
      * [ProfileStore.resolveFor] applies to every other connect.
      */
     pinnedProfileId: String? = null,
-    /**
-     * Which presentation to draw: the console coverflow (default — this screen's original and only
-     * form) or the touch poster grid. The CALLER decides rather than this screen reading the
-     * gamepad setting itself, because the two shells reach it by different routes and each already
-     * knows which one it is; a screen that guessed could disagree with the shell that pushed it.
-     */
-    console: Boolean = true,
 ) {
     BackHandler(onBack = onBack)
     val context = LocalContext.current
@@ -401,125 +393,16 @@ fun LibraryScreen(
     // consume it are one-shot on top of that.
     val resumeAt = remember(host.id) { LibraryPosition.last(context, host.id) }
 
-    if (console) {
-        ConsoleLibrary(
-            title = title,
-            state = state,
-            launching = launching,
-            navActive = navActive,
-            onBack = onBack,
-            onLaunch = { identity, game -> launch(identity, game) },
-            onCopyLink = { game -> copyLink(game) },
-            resumeAt = resumeAt,
-        )
-    } else {
-        TouchLibrary(
-            title = title,
-            state = state,
-            launching = launching,
-            onBack = onBack,
-            onReload = { reloadKey++ },
-            onLaunch = { identity, game -> launch(identity, game) },
-            onCopyLink = { game -> copyLink(game) },
-            resumeAt = resumeAt,
-        )
-    }
-}
-
-/** The console (gamepad) shelf: aurora, console header, coverflow, floating legend. */
-@Composable
-private fun ConsoleLibrary(
-    title: String,
-    state: LibState,
-    launching: Boolean,
-    navActive: Boolean,
-    onBack: () -> Unit,
-    onLaunch: (ClientIdentity, GameEntry) -> Unit,
-    onCopyLink: (GameEntry) -> Unit,
-    /** The title this shelf last launched — where the coverflow opens. Null on a first visit. */
-    resumeAt: String? = null,
-) {
-    val ink = LocalGamepadInk.current
-    val hazeState = remember { HazeState() }
-    val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
-    // The cover the legend's X acts on — the coverflow reports it as the cursor settles, so the
-    // hint and the press agree about which title they mean.
-    var focused by remember { mutableStateOf<GameEntry?>(null) }
-
-    Box(Modifier.fillMaxSize()) {
-        Box(Modifier.fillMaxSize().hazeSource(hazeState)) {
-            GamepadAuroraBackground(Modifier.fillMaxSize())
-            Column(Modifier.fillMaxSize().consoleSafeArea()) {
-                ConsoleHeader(title)
-                // Says the titles below are remembered rather than observed — shown only while
-                // that is true, and never as an error: a cached library is a working library, and
-                // a host that is still waking is the case this whole path exists to serve.
-                (state as? LibState.Ready)?.stale?.note?.let {
-                    Text(
-                        it,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = ink.fg(0.55f),
-                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
-                    )
-                }
-                Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                    when (state) {
-                        is LibState.Loading -> LoadingState()
-                        is LibState.Message -> MessageState(state.text)
-                        is LibState.Ready -> Coverflow(
-                            games = state.ordered,
-                            loader = state.loader,
-                            navActive = navActive && !launching,
-                            onFocus = { focused = it },
-                            onCopyLink = onCopyLink,
-                            onLaunch = { game -> onLaunch(state.identity, game) },
-                            running = state.running,
-                            resumeAt = resumeAt,
-                        )
-                    }
-                }
-            }
-        }
-        // Launching overlay — the connect + host-side game boot takes a moment; block the pad while it runs.
-        if (launching) {
-            Box(
-                Modifier.fillMaxSize().background(ink.modalScrim),
-                contentAlignment = Alignment.Center,
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(14.dp),
-                ) {
-                    CircularProgressIndicator(color = ink.fg)
-                    Text("Launching…", color = ink.fg, style = MaterialTheme.typography.bodyLarge)
-                }
-            }
-        }
-        // Floating legend at the shared spot — same landscape-aware inset as every other console
-        // screen (ignore the safe area in landscape, where the bottom edge isn't a tap target).
-        Box(
-            Modifier.align(Alignment.BottomStart)
-                .consoleLegendInsets(landscape)
-                .padding(ConsoleLegendInset),
-        ) {
-            GamepadHintBar(
-                buildList {
-                    if (state is LibState.Ready) {
-                        add(PadGlyph.hint('A', "Launch"))
-                        // A controller has no right-click, so the grid's context menu becomes a
-                        // face button and a legend entry — the one per-game action there is.
-                        add(
-                            PadGlyph.hint('X', "Copy link") {
-                                focused?.let(onCopyLink)
-                            },
-                        )
-                    }
-                    add(PadGlyph.hint('B', "Close", onClick = onBack))
-                },
-                hazeState = hazeState,
-            )
-        }
-    }
+    TouchLibrary(
+        title = title,
+        state = state,
+        launching = launching,
+        onBack = onBack,
+        onReload = { reloadKey++ },
+        onLaunch = { identity, game -> launch(identity, game) },
+        onCopyLink = { game -> copyLink(game) },
+        resumeAt = resumeAt,
+    )
 }
 
 /**
@@ -825,7 +708,18 @@ private fun TouchPoster(
     }
 }
 
-/** The tile's artwork: the candidates in order (portrait → header → hero), then a placeholder. */
+/**
+ * "This one is already up on the host" — the Resume affordance, overlaid on a poster.
+ *
+ * A badge rather than a changed action label because these tiles have no labels to change: the
+ * poster *is* the control. It says `Resume` rather than `Running` on purpose — the player does not
+ * need a status report, they need to know what tapping it will do.
+ *
+ * A fixed semantic green rather than the theme's primary: this is a state the HOST reports, not a
+ * Punktfunk surface, and it has to stay distinguishable from the launcher chip, which already owns
+ * the brand fill one corner away. Fixed also means it survives Material You seeding the touch theme
+ * from a wallpaper that happens to be green.
+ */
 @Composable
 private fun TouchPosterArt(game: GameEntry, loader: ImageLoader) {
     val candidates = game.art.posterCandidates
@@ -864,222 +758,6 @@ private fun TouchPosterArt(game: GameEntry, loader: ImageLoader) {
 }
 
 @Composable
-private fun LoadingState() {
-    val ink = LocalGamepadInk.current
-    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        CircularProgressIndicator(color = ink.fg)
-        Text("Loading library…", color = ink.fg(0.7f), style = MaterialTheme.typography.bodyLarge)
-    }
-}
-
-@Composable
-private fun MessageState(text: String) {
-    val ink = LocalGamepadInk.current
-    Text(
-        text,
-        color = ink.fg(0.75f),
-        style = MaterialTheme.typography.bodyLarge,
-        textAlign = TextAlign.Center,
-        modifier = Modifier.padding(horizontal = 24.dp),
-    )
-}
-
-// Internal (not private): the screenshot harness composes the real coverflow with mock games —
-// the library screen itself can't be shot, its state comes off the network.
-@Composable
-internal fun Coverflow(
-    games: List<GameEntry>,
-    loader: ImageLoader,
-    navActive: Boolean,
-    /** Reports the CENTRED title as the cursor settles, so the screen's legend acts on it too. */
-    onFocus: (GameEntry?) -> Unit = {},
-    /** X — copy the centred title's link. Defaulted so the screenshot harness needs no wiring. */
-    onCopyLink: (GameEntry) -> Unit = {},
-    /**
-     * Which titles the host already has up, keyed by library id — so a cover the player can
-     * return to says `Resume` rather than looking like every other one. Empty on an older host,
-     * an unreachable one, and while a shelf is being served from cache.
-     */
-    running: Map<String, RunningGame> = emptyMap(),
-    /** The title this shelf last launched — where the strip opens. Null on a first visit. */
-    resumeAt: String? = null,
-    onLaunch: (GameEntry) -> Unit,
-) {
-    val ink = LocalGamepadInk.current
-    BoxWithConstraints(Modifier.fillMaxSize()) {
-        // Fit a 2:3 poster into the height the detail line leaves; clamp so it never dwarfs the screen.
-        val coverHeight = (maxHeight * 0.72f).coerceAtMost(360.dp)
-        val coverWidth = coverHeight * 2f / 3f
-        val sidePad = ((maxWidth - coverWidth) / 2).coerceAtLeast(0.dp)
-        val pagerState = rememberPagerState(pageCount = { games.size })
-        val scope = rememberCoroutineScope()
-        var navTarget by remember { mutableIntStateOf(0) }
-        LaunchedEffect(pagerState.settledPage) { navTarget = pagerState.settledPage }
-        // Put the player back where they were. Leaving a stream re-composes this screen from
-        // scratch — a new PagerState — so a long library came back at page 0 every time, and the
-        // round trip this shelf exists for (browse → play → quit → browse) lost your place on
-        // every lap.
-        //
-        // Anchored on the TITLE, not an index: the strip is re-ordered under us at least twice
-        // per visit (the cached catalog gives way to the live one, then `/status` moves the
-        // running titles to the front), and an index would land on whichever cover happened to
-        // slide into that slot. Keyed on `games` so it can still land once the title it names
-        // actually arrives, and one-shot so a later re-order never yanks the strip out from
-        // under someone who has started browsing.
-        var restored by rememberSaveable { mutableStateOf(false) }
-        LaunchedEffect(games, resumeAt) {
-            if (restored || resumeAt == null) return@LaunchedEffect
-            val idx = games.indexOfFirst { it.id == resumeAt }
-            if (idx < 0) return@LaunchedEffect
-            restored = true
-            // Without animation: it should simply already be there, not visibly travel.
-            pagerState.scrollToPage(idx)
-        }
-        val current = games.getOrNull(navTarget)
-        // Publish the centred title outward. Keyed on the ENTRY, not the index, so a library
-        // refresh that shortens the strip can't leave the legend pointing at a title that moved.
-        LaunchedEffect(current) { onFocus(current) }
-
-        // Controller nav: the pad drives the coverflow. Left/right steps a coalesced target the pager
-        // chases; A launches the centred title; X copies its link; B closes via the screen's
-        // BackHandler.
-        GamepadNavEffect(
-            active = navActive && games.isNotEmpty(),
-            onMove = { dir ->
-                val t = (navTarget + dir).coerceIn(0, games.lastIndex)
-                if (t != navTarget) { navTarget = t; scope.launch { pagerState.animateScrollToPage(t) } }
-            },
-            onActivate = { games.getOrNull(navTarget)?.let(onLaunch) },
-            // Read at press time rather than closed over: `navTarget` moves under this callback,
-            // and the link must be the one the cover under the cursor now points at.
-            onTertiary = { games.getOrNull(navTarget)?.let(onCopyLink) },
-        )
-
-        // Design D4: the launcher entries lead the strip (the client groups them at parse time).
-        // A coverflow is one-dimensional, so instead of a second focus rail the heading names the
-        // group the cursor is in and changes as it crosses the boundary. Only drawn when the
-        // library actually has both groups — otherwise the screen is exactly what it was.
-        val bothGroups = games.any { it.isLauncher } && games.any { !it.isLauncher }
-        Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center) {
-            if (bothGroups) {
-                Text(
-                    if (current?.isLauncher == true) "LAUNCHERS" else "GAMES",
-                    style = MaterialTheme.typography.labelSmall,
-                    // The palette's ink, not white: on a pale field this heading was white on
-                    // near-white and simply wasn't there.
-                    color = ink.fg(0.45f),
-                    letterSpacing = 2.sp,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        // A live region: this heading is the ONLY signal that the cursor has
-                        // crossed from the launchers into the games, and a coverflow gives a
-                        // reader no other way to notice — it is one strip, not two lists.
-                        .semantics { liveRegion = LiveRegionMode.Polite }
-                        .padding(bottom = 8.dp),
-                )
-            }
-            HorizontalPager(
-                state = pagerState,
-                pageSize = PageSize.Fixed(coverWidth),
-                contentPadding = PaddingValues(horizontal = sidePad),
-                pageSpacing = 0.dp,          // translationX (below) does the spacing so covers sit closer
-                beyondViewportPageCount = 3, // render more neighbours so a denser fan is visible
-                modifier = Modifier.fillMaxWidth().height(coverHeight + 24.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) { page ->
-                val signed = (pagerState.currentPage - page) + pagerState.currentPageOffsetFraction
-                val d = signed.absoluteValue
-                Poster(
-                    game = games[page],
-                    loader = loader,
-                    running = running[games[page].id] != null,
-                    modifier = Modifier
-                        .zIndex(-d) // centred cover on top, neighbours stacked behind
-                        .width(coverWidth)
-                        .height(coverHeight)
-                        // Touch: tap the centred cover to launch it; tap a neighbour to bring it centre.
-                        // The label says which of the two a press does, because from the poster
-                        // alone they are indistinguishable — and the CENTRED one is the only one A
-                        // acts on, which nothing else in the tree says.
-                        .clickable(
-                            onClickLabel = if (page == pagerState.currentPage) {
-                                "Launch ${games[page].title}"
-                            } else {
-                                "Bring ${games[page].title} to the centre"
-                            },
-                        ) {
-                            if (page == pagerState.currentPage) onLaunch(games[page])
-                            else scope.launch { pagerState.animateScrollToPage(page) }
-                        }
-                        .semantics {
-                            if (page == pagerState.currentPage) selected = true
-                        }
-                        .graphicsLayer {
-                            // Centre at full size; EVERY neighbour settles to one size, so an even pitch
-                            // yields even VISUAL gaps. (A progressive shrink made the outer gaps grow —
-                            // the "edges spread apart while the centre gets crowded" look.)
-                            val scale = 1f - 0.28f * d.coerceAtMost(1f)
-                            scaleX = scale
-                            scaleY = scale
-                            alpha = (1f - 0.26f * d).coerceAtLeast(0.15f) // depth via fade, not size
-                            val rotDeg = signed.coerceIn(-2.5f, 2.5f) * 26f // tilt inward
-                            rotationY = rotDeg
-                            // Even neighbour pitch (0.8·cover) + a little extra outward push (ramped over
-                            // the first step so scrolling stays smooth) so the CENTRE card breathes.
-                            val base = signed * size.width * 0.2f - signed.coerceIn(-1f, 1f) * size.width * 0.14f
-                            // Counter-balance: a rotated card projects narrower (≈cos θ), which opens its
-                            // inner gap — pull it back toward centre by the half-width it loses so the
-                            // gaps stay even no matter the tilt.
-                            val halfW = size.width * scale * 0.5f
-                            val counter = sign(signed) * halfW * (1f - cos(rotDeg * (PI.toFloat() / 180f)))
-                            translationX = base + counter
-                            // Lower cameraDistance = stronger perspective (CSS `perspective`); the flat
-                            // 22 washed the tilt out. 9 makes the same angle read as real depth.
-                            cameraDistance = 9f * density
-                            transformOrigin = TransformOrigin(0.5f, 0.5f)
-                        },
-                )
-            }
-            Column(
-                Modifier.fillMaxWidth().padding(top = 14.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                Text(
-                    current?.title ?: " ",
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.Bold,
-                    color = ink.fg,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                if (current != null) {
-                    Text(
-                        if (current.isLauncher) "${current.storeLabel.uppercase()} \u00B7 LAUNCHER"
-                        else current.storeLabel.uppercase(),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = ink.fg(0.5f),
-                        letterSpacing = 2.sp,
-                    )
-                }
-            }
-        }
-    }
-}
-
-/**
- * "This one is already up on the host" — the Resume affordance, overlaid on a poster.
- *
- * A badge rather than a changed action label because these tiles have no labels to change: the
- * poster *is* the control. It says `Resume` rather than `Running` on purpose — the player does not
- * need a status report, they need to know what tapping it will do.
- *
- * A fixed semantic green rather than the theme's primary: this is a state the HOST reports, not a
- * Punktfunk surface, and it has to stay distinguishable from the launcher chip, which already owns
- * the brand fill one corner away. Fixed also means it survives Material You seeding the touch theme
- * from a wallpaper that happens to be green.
- */
-@Composable
 private fun RunningBadge(compact: Boolean = false) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -1117,95 +795,3 @@ private val RESUME_GREEN = Color(0xFF33D64A)
 /** Near-black on that green — a fixed pair, so neither theme nor palette can wash it out. */
 private val RESUME_INK = Color(0xFF0A1A0D)
 
-/** One cover: walks the art candidates (portrait → header → hero) then a text placeholder. */
-@Composable
-private fun Poster(
-    game: GameEntry,
-    loader: ImageLoader,
-    running: Boolean = false,
-    modifier: Modifier = Modifier,
-) {
-    val ink = LocalGamepadInk.current
-    val candidates = game.art.posterCandidates
-    var idx by remember(game.id) { mutableStateOf(0) }
-    val shape = ConsoleShape.Poster
-    Box(
-        modifier = modifier
-            .clip(shape)
-            // The ground a cover sits on while its art loads (and the permanent one for a launcher
-            // entry, which rarely has art). Palette-derived rather than a fixed indigo, so a poster
-            // wall on a pale field isn't a grid of dark holes.
-            .background(LocalGamepadPalette.current.groundColor)
-            .border(1.dp, ink.fg(0.12f), shape),
-        contentAlignment = Alignment.Center,
-    ) {
-        if (idx < candidates.size) {
-            AsyncImage(
-                model = ImageRequest.Builder(LocalContext.current).data(candidates[idx]).build(),
-                imageLoader = loader,
-                contentDescription = game.title,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
-                onError = { idx++ }, // this candidate failed — try the next, or fall to the placeholder
-            )
-        } else {
-            // A launcher ships no poster by design, so its brand mark IS the poster — drawn big and
-            // centred, tinted like the text it replaces. Falling back to the launcher's name says
-            // "opens Steam" for a mark we don't ship; the title would read as "a game whose cover
-            // failed to load".
-            val mark = launcherIcon(game.iconToken)
-            if (mark != null) {
-                Icon(
-                    imageVector = mark,
-                    contentDescription = game.title,
-                    tint = ink.fg(0.75f),
-                    modifier = Modifier.fillMaxSize(0.45f),
-                )
-            } else {
-                Text(
-                    if (game.isLauncher) game.storeLabel else game.title,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = ink.fg(0.75f),
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.padding(12.dp),
-                )
-            }
-        }
-        // Opposite corner from the store chip, so the two never meet in the middle of a cover.
-        if (running) {
-            Box(Modifier.fillMaxSize().padding(8.dp), contentAlignment = Alignment.TopEnd) {
-                RunningBadge()
-            }
-        }
-        // Store badge, top-start — brand-filled for a launcher entry (design D4).
-        Box(Modifier.fillMaxSize().padding(8.dp), contentAlignment = Alignment.TopStart) {
-            Text(
-                game.storeLabel,
-                style = MaterialTheme.typography.labelSmall,
-                // A launcher's badge is brand-filled, so it reads on the ACCENT; a game's sits on
-                // a plain dark wash over its own art.
-                color = if (game.isLauncher) ink.onAccent else Color.White,
-                modifier = Modifier
-                    // A bare store name read out after the title says nothing about WHY it is
-                    // there; the poster's own description already carries the title.
-                    .semantics {
-                        contentDescription = if (game.isLauncher) {
-                            "Opens ${game.storeLabel}"
-                        } else {
-                            "From ${game.storeLabel}"
-                        }
-                    }
-                    .clip(ConsoleShape.Pill)
-                    .background(
-                        // The console's palette accent, not `MaterialTheme.colorScheme.primary` —
-                        // that is the TOUCH theme's colour (Material You, seeded from the user's
-                        // wallpaper), which had nothing to do with the field this poster sits on.
-                        if (game.isLauncher) ink.accent
-                        else Color.Black.copy(alpha = 0.5f),
-                    )
-                    .padding(horizontal = 8.dp, vertical = 3.dp),
-            )
-        }
-    }
-}

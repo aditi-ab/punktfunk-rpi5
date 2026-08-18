@@ -56,7 +56,11 @@ import org.json.JSONObject
 object SkiaConsole {
     private const val TAG = "pf.console"
 
-    /** The sysprop that picks the console renderer during the transition (`compose` | `skia`). */
+    /**
+     * On-glass triage switch: `adb shell setprop debug.punktfunk.console_backend none` makes the
+     * app behave as if the native console host were absent (the touch UI fronts everything, a
+     * controller drives it through Compose focus). Anything else = the console.
+     */
     private const val BACKEND_PROP = "debug.punktfunk.console_backend"
 
     /** Where the console-owned settings keys (`library_view`, `reduce_motion`, …) persist. */
@@ -101,14 +105,14 @@ object SkiaConsole {
     // ---- availability -------------------------------------------------------------------
 
     /**
-     * Whether the Skia console should front the gamepad UI on this device: the native host must
-     * be present (64-bit ABIs only until WP6's armv7 archive) and the transition sysprop must not
-     * say `compose`. Default: Skia wherever it exists.
+     * Whether the console can front the gamepad UI on this device: the native host must be in
+     * this build (every shipping ABI today — see `nativeConsoleAvailable`) and the triage sysprop
+     * must not say `none`.
      */
     fun wanted(): Boolean {
         val available = runCatching { NativeBridge.nativeConsoleAvailable() }.getOrDefault(false)
         if (!available) return false
-        return backendProp() != "compose"
+        return backendProp() != "none"
     }
 
     private fun backendProp(): String = runCatching {

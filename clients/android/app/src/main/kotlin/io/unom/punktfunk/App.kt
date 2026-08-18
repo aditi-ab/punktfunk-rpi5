@@ -90,13 +90,13 @@ fun App(forceGamepadUi: Boolean = false) {
     // connect/disconnect — unless the mode is Always, where it simply stays.
     val tv = remember { isTvDevice(context) }
     val controllerConnected by rememberControllerConnected()
-    val gamepadUi = gamepadUiActive(
+    // …AND the native console host is in this build (every shipping ABI today; the sysprop
+    // `debug.punktfunk.console_backend=none` forces the touch UI for on-glass triage). Without a
+    // console to draw, a controller drives the touch UI through Compose's own focus.
+    val skiaConsole = remember { SkiaConsole.wanted() }
+    val gamepadUi = skiaConsole && gamepadUiActive(
         settings.gamepadUiEnabled, settings.gamepadUiMode, controllerConnected, tv, forceGamepadUi,
     )
-    // Which console renders when the gamepad UI is up: the Skia shell wherever the native host
-    // exists (64-bit ABIs) unless the transition sysprop `debug.punktfunk.console_backend`
-    // says `compose`.
-    val skiaConsole = remember { SkiaConsole.wanted() }
 
     // Publish the live session process-wide, so a `punktfunk://` link that arrives as a SECOND
     // activity instance (the normal case under `launchMode = standard`) can refuse it before that
@@ -173,9 +173,9 @@ fun App(forceGamepadUi: Boolean = false) {
                     } else {
                         null
                     }
-                // The Skia console (if it is the console) keeps its stack across the stream and
-                // wants to know how the session ended — a clean end is no toast, an abnormal one
-                // says why (the desktop shell's exact contract).
+                // The console keeps its stack across the stream and wants to know how the session
+                // ended — a clean end is no toast, an abnormal one says why (the desktop shell's
+                // exact contract).
                 if (skiaConsole) {
                     SkiaConsole.sessionEnded(
                         when (reason) {
@@ -188,21 +188,12 @@ fun App(forceGamepadUi: Boolean = false) {
                 }
                 session = null
             }
-        } else if (gamepadUi && skiaConsole) {
-            // The Skia console: the same shell the Linux/Windows session binary shows, drawn by
-            // native onto a SurfaceView (design/android-skia-console-port.md). The Compose
-            // GamepadShell below stays until the on-glass matrix and the 32-bit archive land.
-            SkiaConsoleShell(
-                settings = settings,
-                onSettingsChange = { settings = it; settingsStore.save(it) },
-                onConnected = { session = it },
-                deepLink = pendingLink,
-                onDeepLinkHandled = { activity?.pendingDeepLink = null },
-                reopenLibrary = reopenLibrary,
-                onReopenLibraryHandled = { reopenLibrary = null },
-            )
         } else if (gamepadUi) {
-            GamepadShell(
+            // The console: the same Skia shell the Linux/Windows session binary shows, drawn by
+            // native onto a SurfaceView (design/android-skia-console-port.md) — the Compose
+            // console it replaced is gone. `gamepadUi` already folds in whether the native host
+            // is present on this build (see `SkiaConsole.wanted` in the `gamepadUi` resolution).
+            SkiaConsoleShell(
                 settings = settings,
                 onSettingsChange = { settings = it; settingsStore.save(it) },
                 onConnected = { session = it },
@@ -214,8 +205,7 @@ fun App(forceGamepadUi: Boolean = false) {
         } else if (touchLibrary != null) {
             // The touch shell's library is a PUSHED screen, not a tab: it belongs to one host, and a
             // third permanent tab for something you reach from a card would be a nav item that is
-            // meaningless until you pick one. So it takes the whole window (bar included, like the
-            // console shell's does) and Back — the arrow or the system gesture — returns to the grid.
+            // meaningless until you pick one. So it takes the whole window (bar included) and Back — the arrow or the system gesture — returns to the grid.
             // Read once: `touchLibrary` is a `var`, so it does not smart-cast through the branch.
             val (host, pinId) = touchLibrary!!
             LibraryScreen(
@@ -224,7 +214,6 @@ fun App(forceGamepadUi: Boolean = false) {
                 onLaunched = { session = it },
                 onBack = { touchLibrary = null },
                 pinnedProfileId = pinId,
-                console = false,
             )
         } else {
             // Adaptive nav: a bottom bar on phones; on tablets / large windows a side NavigationRail
@@ -324,194 +313,6 @@ fun App(forceGamepadUi: Boolean = false) {
  * to the brand violet, which is also what a preview or a test composition gets.
  */
 val LocalGamepadPalette = compositionLocalOf { GamepadPalette.named("violet") }
-
-/**
- * Which console screen the gamepad shell is showing, and how deep it sits — Home is the root, and
- * everything reachable from it is one level in. The DEPTH is what decides whether a change is a
- * push or a pop, and therefore which way the screens travel.
- */
-private enum class GamepadScreen(val depth: Int) {
-    Home(0),
-    Settings(1),
-    Library(1),
-    // Reached FROM Settings, not from Home, so they sit a level deeper again — which is precisely
-    // what makes Settings → Controllers travel like a push and the way back like a pop. Give one of
-    // these depth 1 and the transition would read as a sideways swap between two peers.
-    Controllers(2),
-    Licenses(2),
-}
-
-/**
- * The console (gamepad) shell — the Android mirror of the Apple client's ContentView gamepad branch:
- * a full-screen host carousel with X → Settings and Y → a saved host's library, all sharing
- * [ConnectScreen]'s connect logic. No bottom bar; navigation is button-driven.
- */
-@Composable
-fun GamepadShell(
-    settings: Settings,
-    onSettingsChange: (Settings) -> Unit,
-    onConnected: (ActiveSession) -> Unit,
-    deepLink: String? = null,
-    onDeepLinkHandled: () -> Unit = {},
-    /**
-     * Open this library shelf instead of Home on the way in — set when a game launched from it has
-     * just exited. Null (the default) starts on Home exactly as before.
-     */
-    reopenLibrary: LibraryReturn? = null,
-    onReopenLibraryHandled: () -> Unit = {},
-) {
-    val context = LocalContext.current
-    var screen by remember { mutableStateOf(GamepadScreen.Home) }
-    var libraryHost by remember { mutableStateOf<io.unom.punktfunk.kit.security.KnownHost?>(null) }
-    // Which of that host's shelves is open: the pinned card's profile id, or null for the host's
-    // own tile (design §5.2a). Held beside `libraryHost` because it is the same navigation fact —
-    // a pinned card and its host are two tiles, and the library belongs to whichever you pressed.
-    var libraryPinId by remember { mutableStateOf<String?>(null) }
-    // Where the settings screen was when a sub-screen took over. The shell's AnimatedContent
-    // discards a screen's `remember`s the moment it stops being the target, so a trip out to the
-    // Controllers view and back would otherwise land on the Stream tab's first row — the couch
-    // equivalent of a browser losing your scroll position on Back. Held here because this is the
-    // only thing that outlives the screen.
-    var settingsPlace by remember { mutableStateOf<GpSettingsPlace?>(null) }
-
-    // Consume the "come back to this library" intent once, on entry. Keyed on the id so a second
-    // game exit re-fires it; the parent clears it immediately, so a manual Back stays backed out.
-    // A host that has since been forgotten simply leaves us on Home rather than failing.
-    LaunchedEffect(reopenLibrary) {
-        val (id, pinId) = reopenLibrary ?: return@LaunchedEffect
-        // Navigate BEFORE acknowledging: acknowledging clears the parent's state, which re-keys
-        // this effect and cancels the coroutine running it. Nothing suspends in between today, so
-        // either order happens to work — but this one cannot be broken by a later edit that adds a
-        // suspending call. A host that has since been forgotten just leaves us on Home.
-        KnownHostStore(context).all()
-            .firstOrNull { it.id == id }
-            // A pin unpinned while the game was running is no longer a shelf: fall back to the
-            // host's own, rather than a card that no longer exists.
-            ?.let { kh ->
-                libraryHost = kh
-                libraryPinId = pinId?.takeIf { it in kh.pinnedProfileIds }
-                screen = GamepadScreen.Library
-            }
-        onReopenLibraryHandled()
-    }
-
-    // On a TV, shrink the 10-foot UI so its elements aren't oversized. Density-aware: expand the
-    // effective dp footprint to at least CONSOLE_TV_MIN_WIDTH_DP (→ smaller elements) ONLY when the
-    // panel reports fewer dp than that; a low-density TV that's already spacious, and every phone /
-    // tablet, keep their real density unchanged. This is the "based on pixel density" scale the layout
-    // wanted — one uniform factor across text, cards, spacing, and insets.
-    val isTv = remember { isTvDevice(context) }
-    val baseDensity = LocalDensity.current
-    val screenWidthPx = LocalConfiguration.current.screenWidthDp * baseDensity.density
-    val fitDensity = screenWidthPx / CONSOLE_TV_MIN_WIDTH_DP
-    val consoleDensity = if (isTv && fitDensity < baseDensity.density) fitDensity else baseDensity.density
-
-    // The console's screen transition, and the desktop console's contract rather than a plain
-    // cross-fade (see ConsoleMotion for the numbers and where they come from): a PUSH slides the
-    // incoming screen up out of a fade while the outgoing one recedes; a POP runs it backwards, the
-    // leaving screen sliding down and the revealed one growing back. Direction comes from the
-    // screens' nav DEPTH, so Settings → Home pops even though nothing tracks a stack.
-    //
-    // Each slot's controller nav is gated on being the CURRENT target (`s == screen`), so mid-
-    // transition only the incoming screen drives the pad. All screens pin their legend at the same
-    // ConsoleLegendInset, so it reads as fixed while the content behind it moves.
-    val animated = animationsEnabled()
-    CompositionLocalProvider(LocalDensity provides Density(consoleDensity, baseDensity.fontScale)) {
-    // Measured INSIDE the console's own density, not the device's: on a TV the console UI runs at a
-    // reduced density to shrink the 10-foot layout, and a slide sized in device pixels would travel
-    // further than every other dp in the same animation.
-    val slidePx = with(LocalDensity.current) { ConsoleMotion.PUSH_SLIDE.toPx() }.roundToInt()
-    AnimatedContent(
-        targetState = screen,
-        transitionSpec = {
-            if (!animated) {
-                // Reduce-motion: no travel, no scale — just a fast cross-fade, the same courtesy
-                // the frozen backdrop pays.
-                fadeIn(tween(ConsoleMotion.REDUCED_MS)) togetherWith
-                    fadeOut(tween(ConsoleMotion.REDUCED_MS))
-            } else if (targetState.depth > initialState.depth) {
-                (
-                    fadeIn(ConsoleMotion.ease()) +
-                        slideInVertically(ConsoleMotion.ease()) { slidePx } +
-                        scaleIn(ConsoleMotion.ease(), initialScale = ConsoleMotion.ENTER_SCALE)
-                    ) togetherWith (
-                    fadeOut(ConsoleMotion.ease()) +
-                        scaleOut(ConsoleMotion.ease(), targetScale = ConsoleMotion.EXIT_SCALE)
-                    )
-            } else {
-                (
-                    fadeIn(ConsoleMotion.ease(), initialAlpha = ConsoleMotion.REVEAL_ALPHA) +
-                        scaleIn(ConsoleMotion.ease(), initialScale = ConsoleMotion.EXIT_SCALE)
-                    ) togetherWith (
-                    fadeOut(ConsoleMotion.ease()) +
-                        slideOutVertically(ConsoleMotion.ease()) { slidePx }
-                    )
-            }
-        },
-        label = "consoleScreen",
-    ) { s ->
-        when (s) {
-            GamepadScreen.Home -> ConnectScreen(
-                settings = settings,
-                onConnected = onConnected,
-                onSettingsChange = onSettingsChange,
-                deepLink = deepLink,
-                onDeepLinkHandled = onDeepLinkHandled,
-                gamepadUi = true,
-                onOpenSettings = { screen = GamepadScreen.Settings },
-                onOpenLibrary = { host, pinId ->
-                    libraryHost = host
-                    libraryPinId = pinId
-                    screen = GamepadScreen.Library
-                },
-                navGate = s == screen,
-            )
-            GamepadScreen.Settings -> GamepadSettingsScreen(
-                initial = settings,
-                onChange = onSettingsChange,
-                // Leaving for HOME forgets the place: coming back in from the carousel should start
-                // at the top of the first section, exactly as it always has. Only a sub-screen's
-                // Back is a return.
-                onBack = { screen = GamepadScreen.Home; settingsPlace = null },
-                navActive = s == screen,
-                resume = settingsPlace,
-                onPlace = { settingsPlace = it },
-                onOpenControllers = { screen = GamepadScreen.Controllers },
-                onOpenLicenses = { screen = GamepadScreen.Licenses },
-            )
-            GamepadScreen.Controllers -> ConsoleControllersScreen(
-                gamepadSetting = settings.gamepad,
-                onBack = { screen = GamepadScreen.Settings },
-                navActive = s == screen,
-            )
-            GamepadScreen.Licenses -> ConsoleLicensesScreen(
-                onBack = { screen = GamepadScreen.Settings },
-                navActive = s == screen,
-            )
-            GamepadScreen.Library -> libraryHost?.let { host ->
-                LibraryScreen(
-                    host = host,
-                    settings = settings,
-                    onLaunched = onConnected,
-                    onBack = { screen = GamepadScreen.Home; libraryHost = null; libraryPinId = null },
-                    navActive = s == screen,
-                    pinnedProfileId = libraryPinId,
-                )
-            } ?: run { screen = GamepadScreen.Home }
-        }
-    }
-    }
-}
-
-/** Minimum effective dp width the console UI targets on a TV (bigger → the 10-foot UI shrinks). */
-private const val CONSOLE_TV_MIN_WIDTH_DP = 1180f
-
-// --- Showing a TOUCH-written screen on the console's field -------------------------------------
-//
-// Two screens (Controllers, Licenses) exist once and are shown in both interfaces. They live beside
-// the shell rather than in `GamepadChrome.kt` because they are about the SHELL's job — putting a
-// screen that was written for one interface onto the other's field — rather than about the console's
-// own material.
 
 /**
  * Re-inks a screen written against the TOUCH theme so it can be shown on the console's field.

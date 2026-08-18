@@ -108,7 +108,6 @@ private fun connectCopy(phase: ConnectPhase): ConnectCopy = when (phase) {
 fun ConnectOverlay(
     connectingHostName: String?,
     waker: WakeController,
-    gamepadUi: Boolean,
     onCancelConnect: () -> Unit,
 ) {
     val waking = waker.waking
@@ -124,19 +123,8 @@ fun ConnectOverlay(
     // System Back / pad B (remapped) cancels whatever's in flight — a plain dial or the wake wait.
     val cancel = { if (waking != null) waker.cancel() else onCancelConnect() }
 
-    if (gamepadUi) {
-        BackHandler { cancel() }
-        // A retries once a wake has timed out; B falls through to the BackHandler above.
-        GamepadNavEffect2D(
-            active = true,
-            onDirection = {},
-            onActivate = { if (phase is ConnectPhase.WakeTimedOut) waker.retry() },
-        )
-        ConnectTakeover(phase = phase, onCancel = cancel, onRetry = { waker.retry() })
-    } else {
-        // The AlertDialog owns its own scrim + system-Back handling (routed to cancel).
-        ConnectModal(phase = phase, onCancel = cancel, onRetry = { waker.retry() })
-    }
+    // The AlertDialog owns its own scrim + system-Back handling (routed to cancel).
+    ConnectModal(phase = phase, onCancel = cancel, onRetry = { waker.retry() })
 }
 
 /**
@@ -178,118 +166,4 @@ internal fun ConnectModal(
             TextButton(onClick = onCancel) { Text(copy.cancelLabel) }
         },
     )
-}
-
-/**
- * The console / gamepad presentation: an opaque aurora backdrop with a centred spinner/title/subtitle
- * for [phase], plus a bottom hint bar spelling out the pad actions (B cancels, A retries once timed
- * out) — glyph-driven like every other console screen. onClick keeps the hints tappable too, so a
- * user without a working pad can still get out.
- */
-@Composable
-internal fun ConnectTakeover(
-    phase: ConnectPhase,
-    onCancel: () -> Unit,
-    onRetry: () -> Unit,
-) {
-    val ink = LocalGamepadInk.current
-    val copy = connectCopy(phase)
-    val timedOut = phase is ConnectPhase.WakeTimedOut
-
-    Box(
-        Modifier
-            .fillMaxSize()
-            // Swallow taps so the screen behind can't be touched through the takeover.
-            .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {},
-        contentAlignment = Alignment.Center,
-    ) {
-        GamepadAuroraBackground(Modifier.fillMaxSize())
-        Column(
-            // The backdrop runs full-bleed; the COPY keeps clear of the bars and the cutout. In
-            // landscape a hole punch is a side inset deeper than this 40 dp gutter, so centred text
-            // would otherwise sit under the camera.
-            Modifier.consoleSafeArea().padding(horizontal = 40.dp).widthIn(max = 460.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(18.dp),
-        ) {
-            if (timedOut) {
-                Box(Modifier.size(120.dp), contentAlignment = Alignment.Center) {
-                    Icon(
-                        Icons.Filled.Bedtime,
-                        contentDescription = null,
-                        tint = ink.fg(0.9f),
-                        modifier = Modifier.size(46.dp),
-                    )
-                }
-            } else {
-                PulsingSpinner()
-            }
-            Text(
-                copy.title,
-                color = ink.fg,
-                fontWeight = FontWeight.Bold,
-                fontSize = 24.sp,
-                textAlign = TextAlign.Center,
-            )
-            Text(
-                copy.subtitle,
-                color = ink.fg(0.65f),
-                fontSize = 14.sp,
-                textAlign = TextAlign.Center,
-                fontFamily = if (copy.monoSubtitle) FontFamily.Monospace else FontFamily.Default,
-            )
-        }
-        val hints = buildList {
-            add(PadGlyph.hint('B', copy.cancelLabel, onClick = onCancel))
-            if (timedOut) add(PadGlyph.hint('A', "Try Again", onClick = onRetry))
-        }
-        // The SAME bottom-start spot every console screen pins its legend at — this takeover sat
-        // its pill at bottom-CENTRE, so pressing Connect made the one piece of chrome that is
-        // supposed to read as fixed jump halfway across the screen (second on-glass verdict).
-        val landscape =
-            LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
-        Box(
-            Modifier
-                .align(Alignment.BottomStart)
-                .consoleLegendInsets(landscape)
-                .padding(ConsoleLegendInset),
-        ) {
-            GamepadHintBar(hints)
-        }
-    }
-}
-
-/**
- * The connecting/waking indicator: a white progress ring inside two brand-violet halo rings that
- * expand and fade on a staggered loop — a small sign of life so the takeover reads as working, not
- * stalled.
- */
-@Composable
-private fun PulsingSpinner() {
-    val ink = LocalGamepadInk.current
-    val transition = rememberInfiniteTransition(label = "connectPulse")
-    val pulse by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(1600, easing = LinearEasing), RepeatMode.Restart),
-        label = "pulse",
-    )
-    Box(Modifier.size(120.dp), contentAlignment = Alignment.Center) {
-        Canvas(Modifier.fillMaxSize()) {
-            val maxR = size.minDimension / 2f
-            for (i in 0..1) {
-                val p = (pulse + i * 0.5f) % 1f
-                drawCircle(
-                    color = ink.accent.copy(alpha = (1f - p) * 0.35f),
-                    radius = maxR * (0.42f + p * 0.58f),
-                    style = Stroke(width = 2.dp.toPx()),
-                )
-            }
-        }
-        CircularProgressIndicator(
-            color = ink.fg,
-            strokeWidth = 3.dp,
-            modifier = Modifier.size(54.dp),
-        )
-    }
 }

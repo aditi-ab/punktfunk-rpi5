@@ -19,38 +19,29 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
 import io.unom.punktfunk.models.PendingTrust
 
-// The prompts that say the SAME thing in both interfaces.
+// The touch UI's prompts, each described once — a title, a list of [DialogAction]s (primary
+// first) and a body — and drawn as a Material `AlertDialog`.
 //
-// Every one of these existed twice — a Material `AlertDialog` in ConnectDialogs.kt and a console
-// glass card in GamepadDialogs.kt — with the two copies maintained by hand. Predictably they
-// drifted, and always in the direction of the console losing something: "Pair with PIN…" lost its
-// ellipsis, "if no prompt appears when you tap Allow" became "after Allow", and the speed test
-// stopped telling console users which layer Apply would write to at all.
-//
-// What is shared here is the DESCRIPTION of a prompt — a title, a list of [DialogAction]s and a
-// body — and what stays per-interface is only how that description is drawn. That split is the
-// whole point: a copy change now lands in both places because there is only one place.
-//
-// ⚠ Deliberately NOT unified, and they belong apart: the PIN ceremony (a numeric keyboard field
-// and an editable device name on touch; four D-pad digit slots on the console — different input
-// models, not different skins), Add/Edit Host (a bottom sheet and a full screen with its own
-// on-screen keyboard), and the host action list (an anchored dropdown vs a modal stack, and the
-// touch one grows a row per profile).
+// History: these used to be drawn a second way, as the Compose console's glass card, and the two
+// renderers drifted by hand until the descriptions were shared here. The Compose console is gone
+// (the console is the Skia shell now — design/android-skia-console-port.md — and it draws its own
+// pairing/trust screens), so only the touch renderer remains; the shared-description shape stays
+// because it is the right shape regardless.
+
+/** One button of a prompt. [primary] lifts it into the confirm slot; the rest lay out beside. */
+class DialogAction(
+    val label: String,
+    val primary: Boolean = false,
+    val enabled: Boolean = true,
+    val onClick: () -> Unit,
+)
 
 /**
- * One prompt, drawn as whichever interface is running.
- *
- * [actions] is ordered PRIMARY FIRST — the console stacks them in that order with the cursor on
- * the first, and the touch renderer lifts that same first action into `confirmButton` and lays the
- * rest out beside it. One order, two idioms, no per-dialog bookkeeping.
- *
- * The two renderers cannot be one tree: an `AlertDialog` composes into its own platform window
- * while [ConsoleModal] is a plain Box in the calling tree — which is also why the console one
- * needs a `BackHandler` and the caller's `navActive` gate while the touch one needs neither.
+ * One prompt. [actions] is ordered PRIMARY FIRST — the first (or the one flagged primary) becomes
+ * `confirmButton`, the rest lay out beside it.
  */
 @Composable
 fun PunktfunkDialog(
-    gamepadUi: Boolean,
     title: String,
     onDismiss: () -> Unit,
     actions: List<DialogAction>,
@@ -62,10 +53,6 @@ fun PunktfunkDialog(
     dismissOnOutsideTap: Boolean = true,
     body: @Composable ColumnScope.() -> Unit,
 ) {
-    if (gamepadUi) {
-        GamepadDialog(title = title, onDismiss = onDismiss, actions = actions, body = body)
-        return
-    }
     val primary = actions.firstOrNull { it.primary } ?: actions.firstOrNull()
     val rest = actions.filter { it !== primary }
     AlertDialog(
@@ -90,28 +77,25 @@ fun PunktfunkDialog(
     )
 }
 
-/** A prompt's body paragraph, dimmed to sit under the title in either interface. */
+/** A prompt's body paragraph, dimmed to sit under the title. */
 @Composable
-private fun PromptText(text: String, gamepadUi: Boolean) {
-    val ink = LocalGamepadInk.current
+private fun PromptText(text: String) {
     Text(
         text,
         style = MaterialTheme.typography.bodyMedium,
-        color = if (gamepadUi) ink.fg(0.7f) else MaterialTheme.colorScheme.onSurfaceVariant,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
 }
 
 /** First connection to a host that advertised pair=optional: offer TOFU, but pitch PIN pairing. */
 @Composable
 fun TrustNewHostPrompt(
-    gamepadUi: Boolean,
     pt: PendingTrust,
     onTrust: () -> Unit,
     onPairInstead: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     PunktfunkDialog(
-        gamepadUi = gamepadUi,
         title = "Trust this host?",
         onDismiss = onDismiss,
         actions = listOf(
@@ -120,12 +104,11 @@ fun TrustNewHostPrompt(
             DialogAction("Cancel", onClick = onDismiss),
         ),
     ) {
-        PromptText("First connection to ${pt.host}:${pt.port}.", gamepadUi)
-        pt.advertisedFp?.let { PromptText("Fingerprint ${it.take(16)}…", gamepadUi) }
+        PromptText("First connection to ${pt.host}:${pt.port}.")
+        pt.advertisedFp?.let { PromptText("Fingerprint ${it.take(16)}…") }
         PromptText(
             "This host allows trust-on-first-use, but that can't tell an impostor from the real " +
                 "host. Pairing with a PIN is stronger — it proves both sides.",
-            gamepadUi,
         )
     }
 }
@@ -133,13 +116,11 @@ fun TrustNewHostPrompt(
 /** The pinned fingerprint no longer matches — force re-pairing (never a silent re-trust). */
 @Composable
 fun FingerprintChangedPrompt(
-    gamepadUi: Boolean,
     pt: PendingTrust,
     onRepair: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     PunktfunkDialog(
-        gamepadUi = gamepadUi,
         title = "Host identity changed",
         onDismiss = onDismiss,
         actions = listOf(
@@ -151,7 +132,6 @@ fun FingerprintChangedPrompt(
             "The pinned fingerprint for ${pt.host} no longer matches what it now advertises. " +
                 "This can mean a host reinstall — or an impostor. Re-pair with the host's PIN to " +
                 "continue.",
-            gamepadUi,
         )
     }
 }
@@ -163,14 +143,12 @@ fun FingerprintChangedPrompt(
  */
 @Composable
 fun RequestAccessPrompt(
-    gamepadUi: Boolean,
     pt: PendingTrust,
     onRequestAccess: () -> Unit,
     onUsePin: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     PunktfunkDialog(
-        gamepadUi = gamepadUi,
         title = "Pairing required",
         onDismiss = onDismiss,
         actions = listOf(
@@ -179,11 +157,10 @@ fun RequestAccessPrompt(
             DialogAction("Cancel", onClick = onDismiss),
         ),
     ) {
-        PromptText("${pt.host}:${pt.port} requires pairing before it will stream.", gamepadUi)
+        PromptText("${pt.host}:${pt.port} requires pairing before it will stream.")
         PromptText(
             "Request access and approve this device in the host's console (or web UI) — no PIN " +
                 "needed. Or pair with the 4-digit PIN the host displays.",
-            gamepadUi,
         )
     }
 }
@@ -197,10 +174,8 @@ fun RequestAccessPrompt(
  * a decision to abandon it.
  */
 @Composable
-fun AwaitingApprovalPrompt(gamepadUi: Boolean, hostLabel: String, onCancel: () -> Unit) {
-    val ink = LocalGamepadInk.current
+fun AwaitingApprovalPrompt(hostLabel: String, onCancel: () -> Unit) {
     PunktfunkDialog(
-        gamepadUi = gamepadUi,
         title = "Waiting for approval",
         onDismiss = onCancel,
         actions = listOf(DialogAction("Cancel", primary = true, onClick = onCancel)),
@@ -216,17 +191,16 @@ fun AwaitingApprovalPrompt(gamepadUi: Boolean, hostLabel: String, onCancel: () -
             CircularProgressIndicator(
                 modifier = Modifier.size(20.dp),
                 strokeWidth = 2.dp,
-                color = if (gamepadUi) ink.fg else MaterialTheme.colorScheme.primary,
+                color = MaterialTheme.colorScheme.primary,
             )
             Text(
                 "Approve this device on $hostLabel.",
-                color = if (gamepadUi) ink.fg else MaterialTheme.colorScheme.onSurface,
+                color = MaterialTheme.colorScheme.onSurface,
             )
         }
         PromptText(
             "Open the host's console (or web UI) and approve “$label”. It connects " +
                 "automatically once you approve — no PIN needed.",
-            gamepadUi,
         )
     }
 }
@@ -238,13 +212,11 @@ fun AwaitingApprovalPrompt(gamepadUi: Boolean, hostLabel: String, onCancel: () -
  */
 @Composable
 fun LocalNetworkPrompt(
-    gamepadUi: Boolean,
     onAllow: () -> Unit,
     onSettings: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     PunktfunkDialog(
-        gamepadUi = gamepadUi,
         title = "Allow local network access",
         onDismiss = onDismiss,
         actions = listOf(
@@ -256,12 +228,10 @@ fun LocalNetworkPrompt(
         PromptText(
             "Android blocks Punktfunk from talking to devices on your network, so it can't find " +
                 "or reach any host until you allow it.",
-            gamepadUi,
         )
         PromptText(
             "If no prompt appears after you allow it, enable “Nearby devices” for Punktfunk in " +
                 "system settings.",
-            gamepadUi,
         )
     }
 }
@@ -274,17 +244,14 @@ fun LocalNetworkPrompt(
  */
 @Composable
 fun SpeedTestPrompt(
-    gamepadUi: Boolean,
     hostName: String,
     target: SpeedTestTarget,
     phase: SpeedTestPhase,
     onApply: (toProfile: Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val ink = LocalGamepadInk.current
     val done = phase as? SpeedTestPhase.Done
     PunktfunkDialog(
-        gamepadUi = gamepadUi,
         title = "Network speed test",
         onDismiss = onDismiss,
         // Measuring bursts traffic for two seconds; a tap outside must not abandon it midway.
@@ -308,31 +275,29 @@ fun SpeedTestPrompt(
             add(DialogAction("Close", primary = done == null, onClick = onDismiss))
         },
     ) {
-        PromptText(hostName, gamepadUi)
+        PromptText(hostName)
         when (phase) {
-            SpeedTestPhase.Connecting -> PromptText("Connecting…", gamepadUi)
+            SpeedTestPhase.Connecting -> PromptText("Connecting…")
             SpeedTestPhase.Measuring ->
                 PromptText(
                     "Measuring — the host is bursting test traffic for two seconds.",
-                    gamepadUi,
                 )
             is SpeedTestPhase.Failed -> Text(
                 phase.message,
                 style = MaterialTheme.typography.bodyMedium,
-                color = if (gamepadUi) ink.danger else MaterialTheme.colorScheme.error,
+                color = MaterialTheme.colorScheme.error,
             )
             is SpeedTestPhase.Done -> {
                 Text(
                     "%.0f Mbit/s measured · %.1f %% loss".format(phase.measuredMbps, phase.lossPct),
                     style = MaterialTheme.typography.bodyLarge,
                     fontWeight = FontWeight.SemiBold,
-                    color = if (gamepadUi) ink.fg else MaterialTheme.colorScheme.onSurface,
+                    color = MaterialTheme.colorScheme.onSurface,
                 )
                 PromptText(
                     "Recommended bitrate: %.0f Mbit/s".format(phase.recommendedMbps),
-                    gamepadUi,
                 )
-                PromptText(speedTestTargetNote(target), gamepadUi)
+                PromptText(speedTestTargetNote(target))
             }
         }
     }
