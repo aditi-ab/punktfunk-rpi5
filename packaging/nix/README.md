@@ -467,19 +467,48 @@ service up *before* you set the secret that switches publishing on. The secret i
 exactly that reason: until it exists the publish no-ops with a warning and `main` stays green,
 the same way flatpak.yml's repo deploy does.
 
-1. **Edge proxy:** `nix.unom.io { reverse_proxy 192.168.50.50:3250 }` on home-reverse-proxy-1.
-2. **Port allowlist:** add `3250` to `caddy_target_ports` in `unom/infra` (proxmox/unom-1) +
-   terraform apply.
-3. **DNS:** ensure `nix.unom.io` resolves to the edge proxy.
-4. Dispatch `deploy-services.yml` (or `unom/infra`'s `deploy-all`) to bring the container up. It
+1. **DNS:** `nix.unom.io` → the unom-1 hcloud box, in the `unom.io` Cloudflare zone, **DNS-only**
+   (not proxied) — same as `docs` and `winget`.
+2. **Caddy vhost:** in **`unom/infra`, `caddy/Caddyfile`**, next to the existing
+   `docs.punktfunk.unom.io` block:
+
+   ```caddyfile
+   nix.unom.io {
+       import security_headers
+       reverse_proxy localhost:3250
+   }
+   ```
+
+   ⚠ **Not by hand on the box.** `~/caddy/Caddyfile` on unom-1 looks like the config but is a copy
+   that `deploy-all.sh` rsyncs over from `unom/infra`, with no `.git` there to warn you — a vhost
+   added only on the box survives until the next deploy and no longer (this bit the winget source
+   on 2026-07-26; see `packaging/winget/server/README.md` for the incident).
+
+   Until the vhost exists the hostname resolves but the TLS handshake fails, because Caddy has no
+   certificate for a name it does not serve. Expected on first setup — and also exactly how a later
+   clobber presents. Diagnose by SNI, not by port 80 (Caddy 308s every Host to https, including
+   names it has never heard of, so a redirect proves nothing):
+
+   ```sh
+   openssl s_client -connect nix.unom.io:443 -servername nix.unom.io </dev/null 2>&1 \
+     | grep -E '^subject=|alert'
+   ```
+3. Dispatch `deploy-services.yml` (or `unom/infra`'s `deploy-all`) to bring the container up. It
    serves an empty cache — every path 404s, which is exactly what a healthy empty cache does.
-5. Generate the signing key on a Nix box and store the secret half as the repo Actions secret
-   `NIX_CACHE_SIGNING_KEY` (the whole `name:base64` line):
+4. Generate the signing key and store the secret half as the repo Actions secret
+   `NIX_CACHE_SIGNING_KEY` (the whole `name:base64` line). On a Nix box:
    ```sh
    nix key generate-secret --key-name punktfunk-cache-1
    ```
-6. Push to `main` touching the flake. The publish step prints the **public** key — paste it into the
+   Or without one, on anything with docker:
+   ```sh
+   docker run --rm nixos/nix nix --extra-experimental-features nix-command \
+     key generate-secret --key-name punktfunk-cache-1
+   ```
+5. Push to `main` touching the flake. The publish step prints the **public** key — paste it into the
    "Binary cache" section above (and `docs-site/content/docs/install.md`) and commit.
+
+`scripts/setup-nix-cache.sh` walks through all five interactively.
 
 **Operational notes:**
 

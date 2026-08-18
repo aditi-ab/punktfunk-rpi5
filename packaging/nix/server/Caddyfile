@@ -1,5 +1,6 @@
-# Inner Caddy (plain HTTP on :3250); the edge proxy on home-reverse-proxy-1 does TLS for
-# nix.unom.io. Serves the punktfunk Nix binary cache — which is nothing but a static tree:
+# Inner Caddy (plain HTTP on :3250); the edge Caddy on the same unom-1 box does TLS for
+# nix.unom.io (its vhost lives in unom/infra `caddy/Caddyfile`, NOT on the box — see the README).
+# Serves the punktfunk Nix binary cache — which is nothing but a static tree:
 #
 #   /nix-cache-info          store dir + priority, fetched once per substituter
 #   /<32-char-hash>.narinfo  one per store path
