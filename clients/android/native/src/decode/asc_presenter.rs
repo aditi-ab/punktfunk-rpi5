@@ -106,8 +106,14 @@ pub(super) struct AscBackend {
     /// Images on SurfaceFlinger, oldest first, awaiting release.
     presented: VecDeque<Presented>,
 
-    // -- present clock, learned from real latch times --
+    // -- present clock --
+    /// The panel period learned from real latch spacings — a READOUT for the pf.present line only.
+    /// It must NOT drive the present target: the target produces the latch, so learning the period
+    /// from the latch and then targeting it locks the panel to whatever it first latched.
     panel: PanelGrid,
+    /// The honest panel period from the mode table (`panel_hz`) — what the smooth grid snaps to.
+    /// Fixed for the session; the mode table is authoritative for the panel's fastest refresh.
+    panel_seed_ns: i64,
     last_latch_ns: i64,
     /// HDR `ADataSpace` for the transaction (`0` = SDR / leave default).
     dataspace: i32,
@@ -210,6 +216,11 @@ impl AscBackend {
             fifo: VecDeque::new(),
             presented: VecDeque::new(),
             panel: PanelGrid::seeded(panel_hz),
+            panel_seed_ns: if panel_hz > 0 {
+                1_000_000_000 / panel_hz as i64
+            } else {
+                FALLBACK_PERIOD_NS
+            },
             last_latch_ns: 0,
             dataspace,
             frame_rate: if source_hz > 0 { source_hz as f32 } else { 0.0 },
@@ -279,12 +290,22 @@ impl AscBackend {
         None
     }
 
-    /// The next real panel vsync at or after `not_before` — predicted from the last measured latch
-    /// and the learned period. `0` (ASAP) until the first latch establishes the phase.
+    /// The desired present time for the frame being released, `CLOCK_MONOTONIC` (`0` = ASAP, only
+    /// used to bootstrap the phase before the first latch is known).
+    ///
+    /// Both modes snap `not_before` up to an explicit panel-grid point: without one, applying two
+    /// transactions close together lets SurfaceFlinger coalesce the pair onto a single vsync and
+    /// idle the next — the on-glass 60-on-a-120-panel result of a plain ASAP present. Giving each
+    /// frame its own grid-spaced present time makes SF present them on consecutive vsyncs.
+    ///
+    /// PERIOD is the mode-table seed (the honest panel maximum) — NEVER the latch-learned period,
+    /// or a slow latch would ratchet the target down and hold the panel at the lower rate. PHASE is
+    /// the last real latch. Latency passes `not_before = now + margin`; smooth additionally floors
+    /// it at the source due time.
     fn next_present_target(&self, now_mono: i64, not_before: i64) -> i64 {
-        let period = self.panel.period_ns();
+        let period = self.panel_seed_ns;
         if self.last_latch_ns <= 0 || period <= 0 {
-            return 0; // bootstrap: let SurfaceFlinger present at its next vsync
+            return 0; // bootstrap: no phase yet — present ASAP to establish the first latch
         }
         let floor = not_before.max(now_mono);
         let ahead = floor - self.last_latch_ns;
@@ -308,7 +329,7 @@ impl AscBackend {
         let frame = if self.fifo_capacity == 0 {
             self.candidate.take()
         } else {
-            let reach = now_mono + LATCH_MARGIN_NS + self.panel.period_ns().max(FALLBACK_PERIOD_NS);
+            let reach = now_mono + LATCH_MARGIN_NS + self.panel_seed_ns;
             match self.fifo.front() {
                 Some(f) if f.due_ns.is_none_or(|due| due <= reach) => self.fifo.pop_front(),
                 _ => return false,
@@ -329,11 +350,9 @@ impl AscBackend {
             frame.fence.take(),
             target,
             self.dataspace,
-            if self.next_seq == 0 {
-                self.frame_rate
-            } else {
-                0.0
-            },
+            // Re-asserted every frame (idempotent): the LTPO governor decays a one-shot rate vote
+            // and drops the panel to 60 — see `Layer::present`.
+            self.frame_rate,
             seq,
             ev_tx,
         );

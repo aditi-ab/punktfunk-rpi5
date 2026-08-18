@@ -535,10 +535,32 @@ class MainActivity : ComponentActivity() {
     fun setStreamDisplayMode(hz: Int) {
         if (hz <= 0) {
             setConsoleHighRefreshRate(false)
+            // Hand the LTPO governor back its power-saving freedom off-stream.
+            window.attributes = window.attributes.apply {
+                @Suppress("DEPRECATION")
+                run { preferredRefreshRate = 0f }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    isFrameRatePowerSavingsBalanced = true
+                }
+            }
             return
         }
         val target = streamModeFor(hz) ?: return
-        window.attributes = window.attributes.apply { preferredDisplayModeId = target.modeId }
+        window.attributes = window.attributes.apply {
+            preferredDisplayModeId = target.modeId
+            // The pin that actually holds an LTPO panel. `preferredDisplayModeId` only sets the base
+            // mode; the DisplayModeDirector still records the app's render range as [0, hz], and a
+            // MIN of 0 lets the governor seamlessly downshift 120→60 for power (observed on the NP3:
+            // starts 120, decays to 60 within seconds, SurfaceFlinger flickering between them). The
+            // deprecated `preferredRefreshRate` records a FIXED app request — min == max == hz —
+            // which is what pins the render floor at 120. `frameRatePowerSavingsBalanced=false`
+            // (API 34) additionally tells the governor not to trade the rate away for power.
+            @Suppress("DEPRECATION")
+            run { preferredRefreshRate = target.refreshRate }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                isFrameRatePowerSavingsBalanced = false
+            }
+        }
     }
 
     /**
