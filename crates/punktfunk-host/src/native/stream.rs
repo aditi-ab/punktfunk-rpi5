@@ -1913,8 +1913,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     let mut spawned_now = false;
     // The pid Windows hands back for the process it started, kept so the lease has something of its
     // own to watch and to signal even when the title carries no detect signals at all (see
-    // `gamelease::LeaseRequest::spawned`). `None` on every other platform and whenever nothing was
-    // spawned.
+    // `gamelease::LeaseRequest::spawned`). `None` on every other platform, whenever nothing was
+    // spawned, and — crucially — whenever what was spawned is a protocol hand-off rather than the
+    // game (`library::WinRecipe::owns_game`): a forwarder's pid is not a lifetime signal.
     #[allow(unused_mut)]
     let mut spawned_pid: Option<u32> = None;
     // Close whatever this client had running before, if the operator asked for that
@@ -1941,8 +1942,8 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             );
         } else {
             match crate::library::launch_title(id) {
-                Ok(pid) => {
-                    spawned_pid = Some(pid);
+                Ok(launched) => {
+                    spawned_pid = launched.tracked_pid();
                     spawned_now = true;
                 }
                 Err(e) => {

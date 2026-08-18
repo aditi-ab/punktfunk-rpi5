@@ -574,6 +574,10 @@ fn watch(
                         "the launch command exited immediately (a launcher handing off) and this \
                          title has no detect signals — stopping game tracking for it"
                     );
+                    // Nothing will ever observe this game again, so say that rather than leave the
+                    // console on "launching" forever — the same honest answer `open` reaches when it
+                    // starts no watcher at all.
+                    shared.set_state(GameState::Untracked);
                     return;
                 }
                 tracing::debug!(
@@ -618,6 +622,7 @@ fn watch(
                             LeaseKind::Matched
                         };
                         if matches!(kind, LeaseKind::Untracked) {
+                            shared.set_state(GameState::Untracked);
                             return;
                         }
                     } else {
@@ -643,6 +648,7 @@ fn watch(
                         LeaseKind::Matched
                     };
                     if matches!(kind, LeaseKind::Untracked) {
+                        shared.set_state(GameState::Untracked);
                         return;
                     }
                 }
@@ -654,17 +660,25 @@ fn watch(
         // detect signals is still fully tracked.
         //
         // But a launcher that is about to hand off and exit looks *exactly* like the game for its
-        // first few seconds. When the store gave us signals to recognize the real game by, wait out
-        // the shim window before believing this child is it — otherwise the lease leaves this phase
-        // on its very first poll, the reclassification above never gets to run, and the hand-off
-        // that follows is read as the game exiting. On Linux that ended a session ~7 s after
-        // launching any Steam title, before the game had even started (on glass, .41).
+        // first few seconds, so wait out the shim window before believing this child is it —
+        // otherwise the lease leaves this phase on its very first poll, the reclassification above
+        // never gets to run, and the hand-off that follows is read as the game exiting. On Linux
+        // that ended a session ~7 s after launching any Steam title, before the game had even
+        // started (on glass, .41).
         //
-        // With no signals the child is all we have, so it still counts immediately: a custom command
-        // is tracked exactly as before.
+        // ⚠ This used to be skipped whenever the title had **no** detect signals, on the reasoning
+        // that the child was then all we had — which quietly made the no-signals case the one shape
+        // the shim window could not protect. It is the shape that needs it most: a hint-less title
+        // is exactly the one whose launch is a bare protocol hand-off, and `spec.is_empty()` is
+        // *fewer* reasons to trust the child, not more. On Windows every launch recipe is a
+        // hand-off by construction (`explorer.exe "playnite://…"`, `Steam.exe "steam://…"`), so
+        // carrying its pid (0.30) made a hint-less title report `running` on its first poll and
+        // `exited` a second later, when the forwarder quit — ending the session and dropping the
+        // stream while the game was still starting. Both callers of the pid path already documented
+        // this window as their protection; now they have it.
         let child_alive = matches!(kind, LeaseKind::Child)
             && (child.is_some() || spawned.is_some())
-            && (shared.spec.is_empty() || spawned_at.elapsed() >= SHIM_WINDOW);
+            && spawned_at.elapsed() >= SHIM_WINDOW;
         let live = scanner.find(&shared.spec, shared.launch_stamp);
         if !live.is_empty() || child_alive {
             known = live.clone();
@@ -1744,10 +1758,16 @@ mod tests {
     /// The same launch, driven to its exit: the pid dying is the game exiting, and that fires the
     /// action that ends the session — which is precisely what never happened in the field report.
     ///
-    /// Ignored by default: it waits out [`EXIT_CONFIRM`] after a real process ends, ~10 s.
+    /// ⚠ The process must outlive [`SHIM_WINDOW`] for that reading to be the right one. It used to
+    /// be a 4-second `sleep`, which is *inside* the window — the test passed only because a lease
+    /// with no detect signals skipped the window entirely, which is the bug the sibling test below
+    /// pins. Keep this fixture longer than the window: a launch that quits sooner is a hand-off, and
+    /// treating it as a game exit is what dropped the stream a second after every Windows launch.
+    ///
+    /// Ignored by default: it outlives the shim window and then waits out [`EXIT_CONFIRM`], ~12 s.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "drives a real process for ~10s (exit confirmation)"]
+    #[ignore = "drives a real process for ~12s (shim window + exit confirmation)"]
     fn a_pid_only_launch_reports_its_exit() {
         use std::sync::atomic::AtomicUsize;
 
@@ -1755,7 +1775,7 @@ mod tests {
         // `/proc/<pid>` entry with an unchanged start time — so the scan would call it alive
         // forever and the exit under test could never be observed.
         let mut child = std::process::Command::new("sleep")
-            .arg("4")
+            .arg("8")
             .spawn()
             .expect("spawn the fake game");
         let pid = child.id();
@@ -1778,7 +1798,7 @@ mod tests {
         );
         let shared = lease.shared();
 
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline && shared.state() != GameState::Exited {
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -1787,6 +1807,71 @@ mod tests {
             PID_EXITS.load(Ordering::SeqCst),
             1,
             "the player quitting must end the session exactly once"
+        );
+    }
+
+    /// 🛑 The 2026-08-18 field report, in one test: a Windows launch is a **protocol hand-off**, and
+    /// a hand-off must never be mistaken for the game exiting.
+    ///
+    /// The shape is `explorer.exe "playnite://playnite/start/<id>"` — the host spawns a forwarder,
+    /// gets its pid, and the forwarder quits about a second later having handed the launch to
+    /// Playnite. The title carries no detect hint (the Playnite plugin only sends `install_dir` when
+    /// Playnite knows one), so the lease has the pid and nothing else.
+    ///
+    /// What shipped in 0.30 did this: the empty spec skipped [`SHIM_WINDOW`], so the lease called
+    /// the forwarder "the game running" on its first poll, and a second later called the
+    /// forwarder's exit "the game exited" — closing the connection with `APP_EXITED`. The player
+    /// saw the game start on the host and the stream drop, with the console reporting no running
+    /// game. Two things have to hold for that not to happen, and both are asserted here.
+    ///
+    /// Ignored by default: it must outlive [`SHIM_WINDOW`] and [`EXIT_CONFIRM`] to prove the
+    /// session is not ended *later* either.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "drives a real process for ~10s (shim window + exit confirmation)"]
+    fn a_pid_only_handoff_with_no_signals_never_ends_the_session() {
+        use std::sync::atomic::AtomicUsize;
+
+        // Reaped on its own thread — see the sibling test: a zombie keeps its `/proc` entry and
+        // would read as alive forever.
+        let mut child = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .expect("spawn the fake forwarder");
+        let pid = child.id();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        static HANDOFF_EXITS: AtomicUsize = AtomicUsize::new(0);
+        HANDOFF_EXITS.store(0, Ordering::SeqCst);
+        let lease = open(
+            LeaseRequest {
+                spawned: Some(pid),
+                spec: DetectSpec::default(),
+                launch_stamp: launch_clock(),
+                ..req("playnite:handoff", DetectSpec::default(), false)
+            },
+            Box::new(|| {
+                HANDOFF_EXITS.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let shared = lease.shared();
+
+        std::thread::sleep(SHIM_WINDOW + EXIT_CONFIRM + Duration::from_secs(2));
+        assert_eq!(
+            HANDOFF_EXITS.load(Ordering::SeqCst),
+            0,
+            "a launch command handing off must not end the session — this is the field report"
+        );
+        // ...and the console must not be told the game is up either. `Untracked` is the honest
+        // answer: nothing is watching this title, so nothing will ever report it starting or
+        // stopping. Sitting at `Launching` (or claiming `Running`) are the two lies 0.30 set out
+        // to remove, and giving up on tracking must not quietly reinstate one of them.
+        assert_eq!(
+            shared.state(),
+            GameState::Untracked,
+            "nothing is watching this title any more, and the row has to say so"
         );
     }
 
