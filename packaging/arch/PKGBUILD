@@ -213,6 +213,16 @@ package_punktfunk-host() {
   install -Dm0755 "$T/punktfunk-encode-worker"        "$pkgdir/usr/bin/punktfunk-encode-worker"
   # /dev/uinput + /dev/uhid -> input group (virtual gamepads + DualSense UHID)
   install -Dm0644 "$R/scripts/60-punktfunk.rules"     "$pkgdir/usr/lib/udev/rules.d/60-punktfunk.rules"
+  # ALSA UCM for the DualSense's own sound card — the `SpeakerHaptic` device alsa-ucm-conf has
+  # never carried. Without it the pad's only playback route is a 1-channel `Speaker` split, and a
+  # game that opens GE-Proton's "Sony controller speaker" endpoint overruns it. Keyed by USB
+  # vid:pid, these only redefine which profile the pad resolves to, so nothing alsa-ucm-conf owns
+  # is replaced — no `conflicts=`, no `backup=`. See scripts/alsa-ucm2/.
+  for f in USB-Audio/conf.d/054c-0ce6.conf USB-Audio/conf.d/054c-0df2.conf \
+           USB-Audio/Punktfunk/DualSense-PS5-Haptic.conf \
+           USB-Audio/Punktfunk/DualSense-PS5-Haptic-HiFi.conf; do
+    install -Dm0644 "$R/scripts/alsa-ucm2/$f" "$pkgdir/usr/share/alsa/ucm2/$f"
+  done
   # Managed gamescope takeover on DM-autologin boxes: root helper + polkit action so the host can
   # stop/restore the display manager for the stream. Arch has no /usr/libexec — install under
   # /usr/lib/punktfunk and rewrite the policy's exec.path annotation to match (the host probes both).

@@ -129,12 +129,24 @@ If you would rather manage the card yourself, set `PUNKTFUNK_PAD_AUDIO_PROFILE=0
 Punktfunk uses a four-channel profile if you have already selected one and logs what it needs if you
 have not.
 
-Most systems never reach the switch at all. Where your distribution ships a recent `alsa-ucm-conf` —
-Bazzite and SteamOS among them — a DualSense already exposes its four channels behind its split
-speaker and headphone outputs, and Punktfunk finds them there. The switch is the fallback for
-systems that only offer the older stereo profile. **If you run the client as a Flatpak**, your audio
-manager may not let a sandboxed app change a card's profile; if the log says so, switch the
-controller to Pro Audio yourself, which is the same fix.
+Many systems never reach the switch at all. On **SteamOS** a DualSense already exposes its four
+channels behind a combined speaker-and-haptics output, and Punktfunk finds them there. That is a
+Valve addition, though, not something every up-to-date system has: `alsa-ucm-conf` upstream — and
+so Fedora, Bazzite and Arch — describes the pad as a *mono speaker plus stereo headphones* and
+nothing else, which is precisely the shape that folds the coils away. The switch is the fallback
+for those. **If you run the client as a Flatpak**, your audio manager may not let a sandboxed app
+change a card's profile; if the log says so, switch the controller to Pro Audio yourself, which is
+the same fix.
+
+Punktfunk's **host** packages (rpm, deb, Arch, and the Bazzite sysext) close that gap at the
+source: they install a small ALSA profile for the DualSense that adds the combined
+speaker-and-haptics output SteamOS has, and give it priority over the mono one. It adds files
+rather than replacing any your distribution owns, so it upgrades cleanly and can be removed by
+uninstalling Punktfunk. A pad plugged into the host then presents four channels on its own, with
+no profile switching by anyone — and, because the lone mono output stops existing, games that
+crashed when they opened it stop crashing. A card reads its profile once, when it appears, so
+replug the pad after installing (or restart PipeWire) rather than expecting a pad that was
+already plugged in to pick it up.
 
 ### Checking the client side without a host
 
