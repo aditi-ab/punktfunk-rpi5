@@ -104,6 +104,7 @@ object SkiaConsole {
     private var onSettingsChange: ((Settings) -> Unit)? = null
     private var onQuit: (() -> Unit)? = null
     private var onPlatformScreen: ((String) -> Unit)? = null
+    private var onPadAction: ((String, String) -> Unit)? = null
     private var onPulse: ((String) -> Unit)? = null
 
     /** The connect in flight, if any — cancelable through `OverlayAction::CancelConnect`. */
@@ -251,12 +252,14 @@ object SkiaConsole {
         onSettingsChange: (Settings) -> Unit,
         onQuit: () -> Unit,
         onPlatformScreen: (String) -> Unit,
+        onPadAction: (String, String) -> Unit,
         onPulse: (String) -> Unit,
     ) {
         this.onConnected = onConnected
         this.onSettingsChange = onSettingsChange
         this.onQuit = onQuit
         this.onPlatformScreen = onPlatformScreen
+        this.onPadAction = onPadAction
         this.onPulse = onPulse
         discovery?.restart()
         // The touch UI may have paired/forgotten/edited hosts or profiles while we were away.
@@ -270,6 +273,7 @@ object SkiaConsole {
         onSettingsChange = null
         onQuit = null
         onPlatformScreen = null
+        onPadAction = null
         onPulse = null
     }
 
@@ -388,7 +392,7 @@ object SkiaConsole {
         NativeBridge.nativeConsoleSetKnownHosts(handle, ConsoleJson.knownHosts(knownHostStore.all()))
     }
 
-    private fun notice(text: String) {
+    internal fun notice(text: String) {
         if (handle != 0L) NativeBridge.nativeConsoleNotice(handle, text)
     }
 
@@ -539,6 +543,7 @@ object SkiaConsole {
                     c.optJSONObject("Wake")?.let(::wake)
                     c.optJSONObject("SetPin")?.let(::setPin)
                     c.optJSONObject("OpenPlatformScreen")?.let { onPlatformScreen?.invoke(it.optString("id")) }
+                    c.optJSONObject("PadAction")?.let { onPadAction?.invoke(it.optString("action"), it.optString("pad_key")) }
                     c.optString("OpenPlatformScreen").takeIf { c.has("OpenPlatformScreen") && c.opt("OpenPlatformScreen") is String }
                         ?.let { onPlatformScreen?.invoke(it) }
                 }

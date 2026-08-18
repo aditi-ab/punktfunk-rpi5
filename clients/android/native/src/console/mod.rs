@@ -83,6 +83,13 @@ struct PadJson {
     steam_virtual: bool,
     #[serde(default)]
     battery: Option<BatteryJson>,
+    /// `VID:PID · gamepad · dpad` — what the controllers screen prints under the name.
+    #[serde(default)]
+    detail: String,
+    #[serde(default)]
+    forwarded: bool,
+    #[serde(default)]
+    rumble: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -454,8 +461,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleNavi
 }
 
 /// `NativeBridge.nativeConsoleSetPads(handle, padsJson)` — the connected controllers for the
-/// chip + settings rows: `{"label": "DualSense", "pref": 1, "pads": [{name, key, pref,
-/// steam_virtual, battery: {percent, charging} | null}]}`.
+/// chip, the settings rows and the controllers screen: `{"label": "DualSense", "pref": 1,
+/// "pads": [{name, key, pref, steam_virtual, battery: {percent, charging} | null, detail,
+/// forwarded, rumble}]}`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSetPads(
     mut env: EnvUnowned,
@@ -479,6 +487,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSetP
                     percent: b.percent.min(100),
                     charging: b.charging,
                 }),
+                detail: j.detail,
+                forwarded: j.forwarded,
+                rumble: j.rumble,
             })
             .collect();
         h.shared.send(Cmd::Pads {

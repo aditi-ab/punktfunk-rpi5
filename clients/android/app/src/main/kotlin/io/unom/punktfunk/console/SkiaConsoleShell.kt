@@ -1,5 +1,9 @@
 package io.unom.punktfunk.console
 
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.hardware.usb.UsbManager
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -26,15 +30,20 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.viewinterop.AndroidView
-import io.unom.punktfunk.ConsoleControllersScreen
+import androidx.core.app.ActivityCompat
 import io.unom.punktfunk.ConsoleLicensesScreen
+import io.unom.punktfunk.DS_USB_PERMISSION_ACTION
 import io.unom.punktfunk.MainActivity
 import io.unom.punktfunk.Settings
+import io.unom.punktfunk.SettingsStore
+import io.unom.punktfunk.kit.DsDevice
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.models.ActiveSession
 import io.unom.punktfunk.models.LibraryReturn
+import io.unom.punktfunk.kit.Sc2BleLink
 import io.unom.punktfunk.rememberConsoleHaptics
+import io.unom.punktfunk.testRumble
 import kotlin.math.roundToInt
 
 /**
@@ -44,9 +53,9 @@ import kotlin.math.roundToInt
  *
  * What lives here is only what needs a composition: the surface lifecycle, the safe-area insets,
  * the pad probes (raw pad → the shared menu synthesizer, over JNI), the system Back, the
- * platform-native sub-screens the console can open (Controllers, Licences — Compose, drawn over the
- * surface), and the two intents the app hands over on the way in (a deep link, "come back to this
- * shelf").
+ * platform-native sub-screen the console can open (Licences — Compose, drawn over the surface;
+ * Connected controllers is the console's own Skia screen now), and the two intents the app hands
+ * over on the way in (a deep link, "come back to this shelf").
  */
 @Composable
 fun SkiaConsoleShell(
@@ -74,6 +83,7 @@ fun SkiaConsoleShell(
             onSettingsChange = { currentOnSettingsChange(it) },
             onQuit = { activity?.moveTaskToBack(true) },
             onPlatformScreen = { platformScreen = it },
+            onPadAction = { action, key -> padAction(activity, action, key) },
             onPulse = { pulse ->
                 when (pulse) {
                     "move" -> haptics.tick()
@@ -293,12 +303,97 @@ fun SkiaConsoleShell(
             },
         )
         when (platformScreen) {
-            "controllers" -> ConsoleControllersScreen(
-                gamepadSetting = settings.gamepad,
-                onBack = { platformScreen = null },
-                navActive = true,
-            )
             "licenses" -> ConsoleLicensesScreen(onBack = { platformScreen = null }, navActive = true)
+        }
+    }
+}
+
+/**
+ * A `ConsoleCmd::PadAction` from the console's Connected-controllers screen — the handful of
+ * things only the platform can do: a rumble pulse on the real [InputDevice], the USB/Bluetooth
+ * grant dialogs, the DualSense pad-audio self test. The touch Controllers screen keeps its own
+ * buttons for the same actions; both routes end in the same helpers ([testRumble], the grant
+ * intents, `nativePadAudioSelfTest`), so the support answer cannot drift between interfaces.
+ * Runs on the main thread (the command drain lives there); results ride [SkiaConsole.notice].
+ */
+private fun padAction(activity: MainActivity?, action: String, padKey: String) {
+    if (activity == null) return
+    val settings = SettingsStore(activity).load()
+    val usb = activity.getSystemService(Context.USB_SERVICE) as UsbManager
+    when (action) {
+        "rumble" ->
+            Gamepad.pads()
+                .firstOrNull { "${it.vendorId}:${it.productId}:${it.name}" == padKey }
+                ?.let(::testRumble)
+        "sc2_bluetooth" -> when {
+            !settings.sc2Capture ->
+                SkiaConsole.notice("Enable \"Steam Controller 2 passthrough\" in Settings first.")
+            Sc2BleLink.permissionGranted(activity) ->
+                SkiaConsole.notice("Bluetooth access is already granted.")
+            // The system dialog pauses the activity; onResume re-probes and engages the capture,
+            // the same way the menu-time auto-ask completes.
+            else -> Sc2BleLink.CONNECT_PERMISSION?.let {
+                ActivityCompat.requestPermissions(activity, arrayOf(it), 5)
+            }
+        }
+        "sc2_usb" ->
+            if (!settings.sc2Capture) {
+                SkiaConsole.notice("Enable \"Steam Controller 2 passthrough\" in Settings first.")
+            } else {
+                // Asks for the USB grant when one is missing and engages the capture on it.
+                activity.startSc2MenuNav(forceAsk = true)
+            }
+        "ds_usb" -> {
+            val dev = usb.deviceList.values.firstOrNull {
+                it.vendorId == DsDevice.VID_SONY && it.productId in DsDevice.USB_PIDS
+            }
+            when {
+                !settings.dsCapture ->
+                    SkiaConsole.notice(
+                        "Enable \"DualSense / DualShock passthrough (USB)\" in Settings first.",
+                    )
+                dev == null -> SkiaConsole.notice("No wired DualSense or DualShock 4 detected.")
+                usb.hasPermission(dev) -> SkiaConsole.notice("USB access is already granted.")
+                else -> usb.requestPermission(
+                    dev,
+                    PendingIntent.getBroadcast(
+                        activity, 3, // requestCode 3 — shared with the touch card's button
+                        Intent(DS_USB_PERMISSION_ACTION).setPackage(activity.packageName),
+                        // MUTABLE: the USB stack appends the grant extras to this intent.
+                        PendingIntent.FLAG_MUTABLE,
+                    ),
+                )
+            }
+        }
+        "ds_haptics" -> {
+            val dev = usb.deviceList.values.firstOrNull {
+                it.vendorId == DsDevice.VID_SONY && it.productId in DsDevice.USB_PIDS
+            }
+            when {
+                dev == null -> SkiaConsole.notice("No wired DualSense detected.")
+                DsDevice.modelFor(dev.productId) == DsDevice.Model.DUALSHOCK4 ->
+                    SkiaConsole.notice("The DualShock 4 has no haptics audio device.")
+                !usb.hasPermission(dev) -> SkiaConsole.notice("Grant USB access first.")
+                else -> Thread({
+                    // Its OWN connection: the renderer's descriptor must never be shared with
+                    // another transfer engine, and that applies to this test as much as to the
+                    // real path (same rule as the touch card's test).
+                    val conn = runCatching { usb.openDevice(dev) }.getOrNull()
+                    val fd = conn?.fileDescriptor ?: -1
+                    val r = if (fd >= 0) NativeBridge.nativePadAudioSelfTest(fd, 3, 60) else -1
+                    conn?.close()
+                    SkiaConsole.notice(
+                        when {
+                            r > 0 -> "Haptics test passed — $r frames to the pad."
+                            r == -1 ->
+                                "Could not open the pad's audio interface. Some kernels " +
+                                    "refuse it; the pad still works normally."
+                            r == -2 -> "The audio stream stopped part-way."
+                            else -> "The stream opened but no audio reached the pad."
+                        },
+                    )
+                }, "pf-pad-selftest-console").start()
+            }
         }
     }
 }

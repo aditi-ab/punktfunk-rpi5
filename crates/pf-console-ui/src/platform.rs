@@ -1,10 +1,9 @@
 //! Which platform the shell fronts. One shell, two hosts (design
 //! android-skia-console-port.md D3/D7): the screens are the same everywhere, but not every
 //! settings row means something on every platform — a decoder picker is a desktop concept,
-//! low-latency decode an Android one — and only Android has native sub-screens (its
-//! Controllers and Licenses views) for the settings list to open. Everything platform-shaped
-//! is decided by asking this enum, so the row tables stay one union and no screen carries a
-//! `cfg`.
+//! low-latency decode an Android one — and only Android has a native sub-screen (its
+//! Licenses view) for the settings list to open. Everything platform-shaped is decided by
+//! asking this enum, so the row tables stay one union and no screen carries a `cfg`.
 
 /// The host platform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,9 +19,10 @@ pub enum Platform {
 /// its own input until the host says the screen closed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlatformScreen {
-    /// Android's connected-controllers view (USB grant, rumble/haptics tests, DS capture).
-    Controllers,
-    /// The open-source licences view.
+    /// The open-source licences view. The last one: Connected controllers used to be here
+    /// too, and is a shared Skia screen now ([`crate::screens::controllers`]) — the console
+    /// keeps its own input on that page, and only the grant dialogs it cannot draw go back
+    /// to the host, as a [`crate::model::ConsoleCmd::PadAction`].
     Licenses,
 }
 
@@ -30,7 +30,6 @@ impl PlatformScreen {
     /// The stable id the host matches on (crosses JNI as a string).
     pub fn id(self) -> &'static str {
         match self {
-            PlatformScreen::Controllers => "controllers",
             PlatformScreen::Licenses => "licenses",
         }
     }

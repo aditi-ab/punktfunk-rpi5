@@ -40,7 +40,4 @@ class TvScreenshotTest {
     @Test
     fun streamDetailed() =
         shootRoot("stream-detailed") { StreamScene(io.unom.punktfunk.StatsVerbosity.DETAILED) }
-
-    @Test
-    fun consoleControllers() = shootRoot("console-controllers") { ConsoleControllersScene() }
 }

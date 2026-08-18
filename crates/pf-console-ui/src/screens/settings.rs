@@ -488,17 +488,27 @@ impl SettingsScreen {
                     ListMsg::None => pulse,
                 };
             }
-            // The platform's own screens: A asks the host to open one; nothing here edits.
-            RowId::Controllers | RowId::Licenses => {
+            // Connected controllers is one of ours now — a shared Skia screen, so the console
+            // keeps its own input on the page and only the grant dialogs go back to the host.
+            RowId::Controllers => {
                 return match msg {
                     ListMsg::Activate => {
-                        let screen = if focused == RowId::Controllers {
-                            crate::platform::PlatformScreen::Controllers
-                        } else {
-                            crate::platform::PlatformScreen::Licenses
-                        };
+                        fx.push(Screen::Controllers(
+                            super::controllers::ControllersScreen::new(),
+                        ));
+                        pulse
+                    }
+                    ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
+                    ListMsg::None => pulse,
+                };
+            }
+            // The one screen still the platform's: A asks the host to open it; nothing here
+            // edits.
+            RowId::Licenses => {
+                return match msg {
+                    ListMsg::Activate => {
                         fx.cmds.push(crate::model::ConsoleCmd::OpenPlatformScreen {
-                            id: screen.id().to_string(),
+                            id: crate::platform::PlatformScreen::Licenses.id().to_string(),
                         });
                         pulse
                     }

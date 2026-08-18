@@ -667,9 +667,12 @@ impl ServiceState {
                     r.request();
                 }
             }
-            // A platform-native screen (Android's Controllers/Licences views) — the desktop
-            // shell has no such rows, so this never arrives here.
+            // A platform-native screen (Android's Licences view) — the desktop shell has no
+            // such row, so this never arrives here.
             ConsoleCmd::OpenPlatformScreen { .. } => {}
+            // Grants and rumble tests from the controllers screen. Android-only for the same
+            // reason: the settings row that opens that screen is not on the desktop's list.
+            ConsoleCmd::PadAction { .. } => {}
             ConsoleCmd::SetPin {
                 key,
                 profile_id,
