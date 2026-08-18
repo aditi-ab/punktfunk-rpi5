@@ -239,8 +239,10 @@ If it still happens on a host that has the fix:
   this is your normal way to play, set **Virtual displays → Dedicated game sessions** to **Dedicated**
   — every launch then gets its own headless gamescope with only the game inside, and placement stops
   being a question of focus at all (needs `gamescope` installed).
-- **Setting the topology to Primary or Exclusive won't do it.** Neither is implemented on these two
-  backends — the console accepts the setting and the host logs that it dropped it. See
+- **Setting the topology to Primary won't do it.** Wayland has no primary output for these two
+  backends to set, so Primary behaves as Extend and the host says so in the log. **Exclusive** *is*
+  implemented here — it switches your physical monitors off for the session and back on afterwards,
+  which does put every window on the stream. See
   [Virtual displays → Topology](/docs/virtual-displays#topology).
 
 ## The screen stays black after switching to Game Mode (Nobara)

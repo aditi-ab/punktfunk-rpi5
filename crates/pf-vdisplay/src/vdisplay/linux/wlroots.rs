@@ -73,6 +73,23 @@ pub struct WlrootsDisplay {
     /// [`VirtualDisplay::last_portal_cursor_mode`], which is how the host learns that a cursor
     /// overlay is never coming instead of inferring it from an absence.
     last_cursor_mode: Option<crate::portal_cursor::Mode>,
+    /// The topology-restore action the last `create` prepared (re-enable the heads an `exclusive`
+    /// topology disabled), pending pickup by the registry via [`take_topology_restore`] — so the
+    /// operator's screens come back when the display GROUP's last member drops (design §6.1), not
+    /// when this one session ends. A backstop [`Drop`] runs it if the registry never took it, so a
+    /// physical head is never left dark. Mirrors `kwin.rs` and the Hyprland twin.
+    pending_restore: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Drop for WlrootsDisplay {
+    fn drop(&mut self) {
+        // Backstop only: the registry takes the restore right after `create` (moving it into the
+        // group), so this is normally `None`. If some path skipped the take, re-enable here rather
+        // than strand the operator's heads dark.
+        if let Some(restore) = self.pending_restore.take() {
+            restore();
+        }
+    }
 }
 
 impl WlrootsDisplay {
@@ -80,7 +97,31 @@ impl WlrootsDisplay {
         Ok(WlrootsDisplay {
             hw_cursor: false,
             last_cursor_mode: None,
+            pending_restore: None,
         })
+    }
+
+    /// Apply the effective [`crate::policy::Topology`] for the just-created output `ours`, and stash
+    /// the restore for the registry (see [`Self::pending_restore`]).
+    ///
+    /// Called at the very END of [`create`](VirtualDisplay::create), on purpose: nothing can fail
+    /// after it, so there is no path that disables the operator's heads and then unwinds past the
+    /// point where the restore is handed over. The cost is that the physical heads stay lit for the
+    /// duration of the portal handshake, which is the pre-existing `extend` behaviour anyway.
+    fn apply_topology(&mut self, ours: &str) {
+        use crate::policy::Topology;
+        match crate::effective_topology() {
+            // Nothing to do — the headless output joins the desk as one more head, which is what
+            // `create` has already built.
+            Topology::Extend | Topology::Auto => {}
+            Topology::Primary => warn_primary_is_not_expressible(),
+            Topology::Exclusive => {
+                let disabled = disable_other_heads(ours);
+                self.pending_restore = (!disabled.is_empty()).then(|| {
+                    Box::new(move || restore_heads(&disabled)) as Box<dyn FnOnce() + Send>
+                });
+            }
+        }
     }
 }
 
@@ -113,8 +154,11 @@ impl VirtualDisplay for WlrootsDisplay {
         self.last_cursor_mode
     }
 
+    fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        self.pending_restore.take()
+    }
+
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
-        warn_topology_is_extend_only();
         // Snapshot → create → identify, all under CREATE_LOCK. sway names the headless output
         // itself (`HEADLESS-N`), so the only way to know which one is ours is "the name that was not
         // there before" — and two concurrent creates each picking the other's output is a silent
@@ -180,6 +224,9 @@ impl VirtualDisplay for WlrootsDisplay {
             cursor = cursor_mode.name(),
             "sway headless output ready"
         );
+        // Display-management topology (design §5.2). Last, so no failure path unwinds past the
+        // hand-off of the restore — see [`WlrootsDisplay::apply_topology`].
+        self.apply_topology(&name);
         Ok(VirtualOutput {
             node_id,
             remote_fd: Some(fd),
@@ -342,22 +389,182 @@ fn focus_argv(name: &str) -> [&str; 3] {
     ["focus", "output", name]
 }
 
-/// The configured [`crate::policy::Topology`] is not implemented on this backend — say so once per
-/// create instead of leaving the management API's echo as the only signal that the pin was dropped
-/// (sweep 13.18). sway's virtual output is always an EXTENSION: [`focus_output`] steers new windows
-/// onto it, but nothing here promotes it to primary or disables the operator's heads.
-fn warn_topology_is_extend_only() {
-    let topology = crate::effective_topology();
-    if !matches!(
-        topology,
-        crate::policy::Topology::Extend | crate::policy::Topology::Auto
-    ) {
-        tracing::warn!(
-            ?topology,
-            "wlroots: this backend implements EXTEND only — the headless output is added beside the \
-             operator's heads and nothing is promoted or disabled. Configure `topology: extend` to \
-             stop the console promising otherwise."
+/// `topology: primary` has no expression on this compositor, and saying so once per create is the
+/// honest implementation — design §5.2 spells this row out: "**unsupported** (no primary concept)
+/// → log + treat as extend".
+///
+/// Wayland has no primary-output concept, and sway's nearest equivalent is the *focused* output —
+/// which [`focus_output`] already points at the streamed head for every session, whatever the
+/// topology says. So `primary` is not silently dropped so much as already granted, as far as this
+/// compositor can express it; what an operator does NOT get is a persistent designation other
+/// clients can read. Distinct from the `exclusive` path, which really does change the desk.
+fn warn_primary_is_not_expressible() {
+    tracing::info!(
+        "wlroots: `topology: primary` has no equivalent here — Wayland has no primary output and \
+         sway has only a FOCUSED output, which the streamed head already holds. Treating it as \
+         `extend`; use `exclusive` to actually disable the operator's heads."
+    );
+}
+
+/// Which heads an `exclusive` topology should disable: enabled, not ours, and **not managed**.
+///
+/// Pure so the group-awareness rule (design §6.1 — "exclusive means the *managed virtual displays*
+/// are the only enabled outputs; never disable a sibling slot") is unit-testable without a
+/// compositor. `managed` comes from [`list_monitors`], i.e. the `HEADLESS-` prefix, so a concurrent
+/// session's output is never blacked out by ours.
+///
+/// ⚠️ That prefix is [deliberately blunt](is_managed_output): sway names its OWN headless outputs
+/// the same way we do, so a sway started on the headless backend has a `HEADLESS-1` of its own that
+/// this filter also spares. The failure that buys is the harmless one — a bootstrap head stays lit
+/// on a box that has no physical screen anyway — whereas the alternative is disabling a live
+/// sibling's output. `ours` is excluded by name too, belt and braces.
+fn heads_to_disable(heads: &[crate::monitors::PhysicalMonitor], ours: &str) -> Vec<String> {
+    heads
+        .iter()
+        .filter(|h| h.enabled && !h.managed && h.connector != ours)
+        .map(|h| h.connector.clone())
+        .collect()
+}
+
+/// Disable every non-managed head for an `exclusive` session, returning the ones actually disabled
+/// (the input to [`restore_heads`]). Best-effort per head: one that refuses costs exclusivity on
+/// that screen, not the session.
+fn disable_other_heads(ours: &str) -> Vec<String> {
+    let heads = match list_monitors() {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "wlroots: could not enumerate outputs for `topology: exclusive` — leaving the \
+                 operator's heads enabled (the session still streams, as `extend`)"
+            );
+            return Vec::new();
+        }
+    };
+    let targets = heads_to_disable(&heads, ours);
+    if targets.is_empty() {
+        tracing::info!(
+            "wlroots: `topology: exclusive` had nothing to disable — no enabled output besides the \
+             headless ones (a headless box, or a sibling session already took the desk)"
         );
+        return Vec::new();
+    }
+    let mut disabled = Vec::new();
+    for name in targets {
+        match disable_head(&name) {
+            Ok(()) => disabled.push(name),
+            Err(e) => tracing::warn!(
+                output = %name, error = %format!("{e:#}"),
+                "wlroots: could not disable this output for `topology: exclusive` — it stays lit"
+            ),
+        }
+    }
+    if !disabled.is_empty() {
+        tracing::info!(
+            ?disabled,
+            "wlroots: `topology: exclusive` — the streamed output is now the desk"
+        );
+        // Disabling outputs moves their workspaces, and sway picks the replacement focus itself.
+        // Re-assert ours so window placement still lands on the stream (the #283 contract).
+        focus_output(ours);
+    }
+    disabled
+}
+
+/// Disable one head: `swaymsg output <name> disable`, confirmed by read-back.
+///
+/// The read-back is not ceremony. `swaymsg` does report a rejected command with a non-zero exit
+/// (unlike `hyprctl`, which answers at exit 0 — see the Hyprland twin), so a bad *command* is
+/// caught by [`swaymsg`] itself; what the read-back adds is proof the output actually went
+/// inactive, which is the state teardown will have to undo.
+fn disable_head(name: &str) -> Result<()> {
+    swaymsg(&disable_argv(name)).with_context(|| format!("swaymsg output {name} disable"))?;
+    if wait_head_enabled_is(name, false, DISABLE_BUDGET) {
+        return Ok(());
+    }
+    bail!("swaymsg accepted `output {name} disable` but the output never went inactive")
+}
+
+/// The `swaymsg` argv that disables `name`, split out so a test pins its SHAPE — the noun comes
+/// FIRST here (`output <name> disable`), the opposite of [`focus_argv`]'s `focus output <name>`.
+fn disable_argv(name: &str) -> [&str; 3] {
+    ["output", name, "disable"]
+}
+
+/// The `swaymsg` argv that re-enables `name`. sway keeps a disabled output's configuration, so a
+/// bare `enable` restores the mode/position/scale it had — there is no need to replay the rule the
+/// way the Hyprland twin's `reload` does.
+fn enable_argv(name: &str) -> [&str; 3] {
+    ["output", name, "enable"]
+}
+
+/// How long a `disable`/`enable` has to show up in `swaymsg -t get_outputs`. Generous next to a
+/// healthy IPC round trip; a miss is reported, never assumed.
+const DISABLE_BUDGET: Duration = Duration::from_secs(3);
+
+/// Poll until `name`'s enabled state equals `want`, up to `timeout`. `false` on timeout.
+fn wait_head_enabled_is(name: &str, want: bool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if matches!(head_is_enabled(name), Ok(Some(got)) if got == want) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Is output `name` currently enabled (sway's `active`)? `None` if it is not present at all.
+/// A disabled output is still listed by `get_outputs`, with `"active": false` — which is what makes
+/// this a usable read-back rather than a presence check.
+fn head_is_enabled(name: &str) -> Result<Option<bool>> {
+    let parsed = swaymsg_query("get_outputs")?;
+    let Some(arr) = parsed.as_array() else {
+        return Ok(None);
+    };
+    for o in arr {
+        if o.get("name").and_then(|n| n.as_str()) == Some(name) {
+            return Ok(Some(
+                o.get("active").and_then(|v| v.as_bool()).unwrap_or(true),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+/// Re-enable the outputs an `exclusive` session disabled. Run by the REGISTRY when the display
+/// group's last member is torn down (design §6.1) and, critically, **before** that member's output
+/// is unplugged — so sway never sees zero enabled outputs.
+///
+/// ⚠️ **Not exercised on a live sway.** No box in the fleet runs one (the 2026-08-18 probes had
+/// Hyprland only), which is the same gap PR #283's `focus output` half shipped with and which
+/// `design/display-management.md` records as "wlroots `exclusive` (needs a Sway box)". The argv is
+/// sway's documented command surface and is pinned by [`enable_argv`]'s test; the read-back below
+/// turns a wrong guess into a logged warning naming the outputs, rather than a screen that silently
+/// stays dark. Unlike Hyprland — where re-applying a rule provably does NOT undo a disable and only
+/// `hyprctl reload` does — sway's `enable` is the documented inverse of `disable`.
+fn restore_heads(disabled: &[String]) {
+    for name in disabled {
+        match swaymsg(&enable_argv(name)) {
+            Ok(_) => {
+                if wait_head_enabled_is(name, true, DISABLE_BUDGET) {
+                    tracing::info!(output = %name, "wlroots: re-enabled the output `topology: exclusive` disabled");
+                } else {
+                    tracing::warn!(
+                        output = %name,
+                        "wlroots: `output enable` was accepted but the output is still inactive — \
+                         re-enable it by hand with `swaymsg output {name} enable`"
+                    );
+                }
+            }
+            Err(e) => tracing::error!(
+                output = %name, error = %format!("{e:#}"),
+                "wlroots: could not re-enable this output — it is still dark. Run \
+                 `swaymsg output {name} enable` by hand."
+            ),
+        }
     }
 }
 
@@ -804,5 +1011,60 @@ mod tests {
     #[test]
     fn focus_names_the_output_after_the_verb() {
         assert_eq!(focus_argv("HEADLESS-2"), ["focus", "output", "HEADLESS-2"]);
+    }
+
+    /// The topology pair takes the OTHER shape — `output <name> <verb>`, noun first, like `mode` /
+    /// `unplug` and unlike [`focus_argv`]. Both are pinned because this file legitimately uses both
+    /// orders, which is exactly the condition under which one gets written the wrong way round.
+    #[test]
+    fn disable_and_enable_name_the_output_before_the_verb() {
+        assert_eq!(disable_argv("DP-1"), ["output", "DP-1", "disable"]);
+        assert_eq!(enable_argv("DP-1"), ["output", "DP-1", "enable"]);
+    }
+
+    fn head(connector: &str, enabled: bool) -> crate::monitors::PhysicalMonitor {
+        crate::monitors::PhysicalMonitor {
+            connector: connector.to_string(),
+            description: connector.to_string(),
+            width: 1920,
+            height: 1080,
+            refresh_mhz: 60_000,
+            x: 0,
+            y: 0,
+            scale: 1.0,
+            primary: false,
+            enabled,
+            // The real `list_monitors` derives this from the `HEADLESS-` prefix; mirror it here so
+            // the fixture can't drift into asserting a rule the backend doesn't actually apply.
+            managed: connector.starts_with("HEADLESS-"),
+        }
+    }
+
+    /// The group-awareness rule (design §6.1): `exclusive` disables the operator's outputs and
+    /// **only** those. A sibling session's `HEADLESS-N` must survive, or the second exclusive
+    /// session blacks out the first one's screen — the exact bug KWin's Stage 3 shipped.
+    #[test]
+    fn exclusive_disables_the_operators_outputs_and_never_a_headless_sibling() {
+        let ours = "HEADLESS-2";
+        let heads = [
+            head("DP-1", true),
+            head("HDMI-A-1", true),
+            head(ours, true),
+            // A concurrent session's output — and, indistinguishably, a headless sway's own
+            // bootstrap output. Both are spared; see `heads_to_disable`.
+            head("HEADLESS-1", true),
+            // Already off: nothing to disable, and it must NOT end up in the restore list, or
+            // teardown would switch on an output the operator had deliberately left dark.
+            head("DP-3", false),
+        ];
+        assert_eq!(heads_to_disable(&heads, ours), vec!["DP-1", "HDMI-A-1"]);
+    }
+
+    /// A box with no physical output (the CI/headless posture) has nothing to disable, so no
+    /// restore is prepared and teardown touches nothing.
+    #[test]
+    fn exclusive_on_a_headless_box_disables_nothing() {
+        let ours = "HEADLESS-1";
+        assert!(heads_to_disable(&[head(ours, true)], ours).is_empty());
     }
 }
