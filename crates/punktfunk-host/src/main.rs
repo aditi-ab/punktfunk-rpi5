@@ -190,10 +190,25 @@ fn main() {
         );
     }
 
-    // Tee every panic through `tracing` BEFORE the default hook: a panicking thread otherwise
+    // Tee every panic into the log ring BEFORE the default hook: a panicking thread otherwise
     // prints only to stderr — absent from the web console's Logs tab (the ring) and gone entirely
     // when stderr is detached — so a field report reads "host died, zero errors in the logs".
     // The default hook still runs afterwards for the usual stderr message/abort behavior.
+    //
+    // 🛑 **The tee goes straight to the ring, NOT through `tracing`.** A panic hook that emits a
+    // tracing event is a trap: `tracing_subscriber`'s registry is `sharded-slab`-backed and reads a
+    // `thread_local!` with `LocalKey::with`, so emitting from a thread whose TLS is being torn down
+    // panics — *inside the hook*. Rust treats a panic raised while the hook is running as
+    // `MustAbort::PanicInHook` and then deliberately does not format the message ("perhaps that is
+    // causing the panic"), so the log gets `panicked at <loc>:` followed by a BLANK line and
+    // `thread panicked while processing panic. aborting.` — the cause erased at exactly the moment
+    // it mattered. That is precisely what hid the 2026-08-18 teardown abort on .173 (four aborts,
+    // zero diagnosis) until it was reproduced standalone.
+    //
+    // Everything below is TLS-free and cannot panic: `LogRing` is a `OnceLock` + `Mutex`, and
+    // `thread::current().name()` / `Backtrace::force_capture()` were both verified safe during TLS
+    // destruction. This does not make a TLS-destructor panic survivable — Rust aborts on those
+    // regardless — but it does mean the message that names the cause always lands.
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Manual payload downcast (`payload_as_str` needs Rust 1.91; workspace MSRV is 1.82).
@@ -203,14 +218,24 @@ fn main() {
             .copied()
             .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
             .unwrap_or("<non-string panic payload>");
-        tracing::error!(
-            thread = std::thread::current().name().unwrap_or("<unnamed>"),
-            location = %info
-                .location()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "<unknown>".into()),
-            backtrace = %std::backtrace::Backtrace::force_capture(),
-            "PANIC: {payload}"
+        let location = info
+            .location()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "<unknown>".into());
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_string();
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        log_capture::ring().push_remote(
+            "ERROR",
+            "punktfunk_host::panic",
+            &format!("PANIC: {payload} (thread={thread}, at {location})\n{backtrace}"),
+            ts_ms,
         );
         default_panic(info);
     }));
