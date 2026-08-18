@@ -213,6 +213,8 @@ package_punktfunk-host() {
   install -Dm0755 "$T/punktfunk-encode-worker"        "$pkgdir/usr/bin/punktfunk-encode-worker"
   # /dev/uinput + /dev/uhid -> input group (virtual gamepads + DualSense UHID)
   install -Dm0644 "$R/scripts/60-punktfunk.rules"     "$pkgdir/usr/lib/udev/rules.d/60-punktfunk.rules"
+  install -Dm0644 "$R/scripts/60-punktfunk-dualsense.conf" \
+                                                      "$pkgdir/usr/share/wireplumber/wireplumber.conf.d/60-punktfunk-dualsense.conf"
   # Managed gamescope takeover on DM-autologin boxes: root helper + polkit action so the host can
   # stop/restore the display manager for the stream. Arch has no /usr/libexec — install under
   # /usr/lib/punktfunk and rewrite the policy's exec.path annotation to match (the host probes both).
