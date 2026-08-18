@@ -70,6 +70,11 @@ enum ShotScenes {
             ShotScene(name: "08-gamepad-addhost", orientation: .natural, colorScheme: .dark) {
                 AnyView(ShotGamepadAddHost())
             },
+            // The keyboard tray up, with the edited row seated above the keys (set
+            // PUNKTFUNK_SHOT_EDITING=address to type into a field other than the name).
+            ShotScene(name: "08b-gamepad-addhost-typing", orientation: .landscape, colorScheme: .dark) {
+                AnyView(ShotGamepadAddHost())
+            },
             ShotScene(name: "09-connecting", orientation: .natural, colorScheme: .dark) {
                 AnyView(ShotConnect(kind: .connecting))
             },

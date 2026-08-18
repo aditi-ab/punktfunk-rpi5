@@ -54,7 +54,20 @@ struct GamepadAddHostView: View {
     @State private var port = "9777"
     @State private var focusID: String?
     /// The field row the keyboard tray is editing; nil ⇒ the row list owns the controller.
-    @State private var editing: String?
+    @State private var editing: String? = Self.initialEditing
+    /// Shot harness only: open with a field being edited (`PUNKTFUNK_SHOT_EDITING=address`),
+    /// so the keyboard tray and the row seated above it can be rendered without a pad.
+    private static var initialEditing: String? {
+        #if DEBUG
+        guard ScreenshotMode.isActive else { return nil }
+        let field = ProcessInfo.processInfo.environment["PUNKTFUNK_SHOT_EDITING"] ?? ""
+        return field.isEmpty ? nil : field
+        #else
+        return nil
+        #endif
+    }
+    /// The edited row's flight between its place in the list and its seat above the keyboard.
+    @Namespace private var fieldFlight
 
     var body: some View {
         GamepadMenuList(
@@ -67,6 +80,10 @@ struct GamepadAddHostView: View {
             rowView(row, focused: focused)
                 .frame(maxWidth: metrics.rowMaxWidth)
                 .padding(.horizontal, 24)
+                // While the tray edits this row, the row IS the one seated above the keyboard
+                // (see `bottomTray`); its slot here stays empty and keeps the list's layout.
+                .matchedGeometryEffect(id: row.id, in: fieldFlight, isSource: editing != row.id)
+                .opacity(editing == row.id ? 0 : 1)
         }
         .frame(maxWidth: .infinity)
         .safeAreaInset(edge: .top, spacing: 0) {
@@ -173,29 +190,43 @@ struct GamepadAddHostView: View {
         #else
         if let editing {
             VStack(spacing: 10) {
-                GamepadKeyboard(
-                    text: editingBinding(editing),
-                    allowed: allowedCharacters(editing),
-                    onDone: { closeKeyboard() })
-                    // Fresh keyboard per field: a touch user can retarget the tray by tapping
-                    // another field row, and the keyboard's input wiring captured the previous
-                    // binding on appear — new identity forces a rewire to the new field.
-                    .id(editing)
-                GamepadHintBar(hints: [
-                    // "Type" names what A does to the key under the keyboard's cursor. There is
-                    // no tap equivalent — a touch user types by tapping the keycap itself — so
-                    // this one cell stays a label.
-                    .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Type"),
-                    .init(
-                        glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Delete",
-                        action: { backspace(editing) }),
-                    .init(
-                        glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done",
-                        action: { closeKeyboard() }),
-                ])
-                .frame(maxWidth: .infinity, alignment: .leading)
+                // The field being typed into sits HERE, directly above the keys — flown in from
+                // its place in the list on the tray's spring — so what the keyboard covers no
+                // longer depends on where the list happened to be scrolled. The same row view,
+                // so it reads as the row itself having come down to the keyboard.
+                if let row = rows.first(where: { $0.id == editing }) {
+                    rowView(row, focused: true)
+                        .frame(maxWidth: metrics.rowMaxWidth)
+                        .padding(.horizontal, 24)
+                        .frame(maxWidth: .infinity)
+                        .matchedGeometryEffect(id: row.id, in: fieldFlight, isSource: true)
+                        .transition(.opacity)
+                }
+                VStack(spacing: 10) {
+                    GamepadKeyboard(
+                        text: editingBinding(editing),
+                        allowed: allowedCharacters(editing),
+                        onDone: { closeKeyboard() })
+                        // Fresh keyboard per field: a touch user can retarget the tray by tapping
+                        // another field row, and the keyboard's input wiring captured the previous
+                        // binding on appear — new identity forces a rewire to the new field.
+                        .id(editing)
+                    GamepadHintBar(hints: [
+                        // "Type" names what A does to the key under the keyboard's cursor. There is
+                        // no tap equivalent — a touch user types by tapping the keycap itself — so
+                        // this one cell stays a label.
+                        .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Type"),
+                        .init(
+                            glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Delete",
+                            action: { backspace(editing) }),
+                        .init(
+                            glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done",
+                            action: { closeKeyboard() }),
+                    ])
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            .transition(.move(edge: .bottom).combined(with: .opacity))
         } else {
             GamepadHintBar(hints: [
                 .init(

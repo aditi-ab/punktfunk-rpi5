@@ -14,8 +14,9 @@
 // the bar. The detail band, legend and backdrop are `LibraryConsoleView`'s.
 //
 // Sizing follows the desktop's `k`: cells are 150×225 design units, gap 16, margin 48, scaled by
-// `min(width, height) / 800` clamped to 0.75…3, columns = what fits, clamped 2…8. A Deck-shaped
-// window gets 7, an iPad in landscape 6, a phone in landscape 6 small ones, an Apple TV 8.
+// `min(width, height) / 800` clamped to 0.75…3, columns = what fits, clamped 2…8, and the columns
+// then stretch to fill the field's width. A Deck-shaped window gets 7, an iPad in landscape 6–7,
+// a phone in landscape 7, an Apple TV 8.
 
 import PunktfunkKit
 import SwiftUI
@@ -430,16 +431,21 @@ private struct GridGeometry {
     let viewH: CGFloat
 
     init(size: CGSize, len: Int, launchers: Int) {
-        // The desktop clamps k at 0.75 (its smallest field is a Deck's 800). A landscape phone's
-        // field is ~290 pt tall; at 0.75 one row of 169-pt cells filled it. 0.5 (75×112 cells)
-        // gets two rows in — a grid, not a strip.
-        k = min(max(min(size.width, size.height) / 800, 0.5), 3)
-        cellW = 150 * k; cellH = 225 * k; gap = 16 * k; margin = 48 * k
+        // The desktop's k, floored at 0.75 (its smallest field is a Deck's 800): on a phone the
+        // covers stay poster-sized rather than thumbnails, and the field scrolls.
+        k = min(max(min(size.width, size.height) / 800, 0.75), 3)
+        gap = 16 * k; margin = 48 * k
         // The heading band never drops below what a caption plus a focused cell's pop and ring
         // need on either side of it (the caption sits mid-band).
-        headingH = max(24, 30 * k); labelGap = 10 * k; halo = max(6, 10 * k)
+        headingH = max(32, 30 * k); labelGap = 10 * k; halo = max(8, 10 * k)
         let avail = size.width - 2 * margin
-        cols = min(max(Int((avail + gap) / (cellW + gap)), 2), 8)
+        let base = 150 * k
+        cols = min(max(Int((avail + gap) / (base + gap)), 2), 8)
+        // The columns FILL the field: whatever width the last cell would have left over is
+        // shared out, so the grid spans the safe area on every screen instead of stopping short
+        // of the right edge (on a phone the slack was a fifth of the width). Cells keep 2:3.
+        cellW = max(base, (avail - CGFloat(cols - 1) * gap) / CGFloat(cols))
+        cellH = cellW * 1.5
         shape = LibraryGridShape(len: len, cols: cols, launchers: launchers)
         viewH = size.height
     }

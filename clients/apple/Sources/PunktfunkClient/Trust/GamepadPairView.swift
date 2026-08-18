@@ -53,6 +53,8 @@ struct GamepadPairView: View {
     @State private var focusID: String?
     /// The field row the keyboard tray is editing; nil ⇒ the row list owns the controller.
     @State private var editing: String?
+    /// The edited row's flight between its place in the list and its seat above the keyboard.
+    @Namespace private var fieldFlight
 
     var body: some View {
         GamepadMenuList(
@@ -68,6 +70,10 @@ struct GamepadPairView: View {
             rowView(row, focused: focused)
                 .frame(maxWidth: metrics.rowMaxWidth)
                 .padding(.horizontal, 24)
+                // While the tray edits this row, the row IS the one seated above the keyboard
+                // (see `bottomTray`); its slot here stays empty and keeps the list's layout.
+                .matchedGeometryEffect(id: row.id, in: fieldFlight, isSource: editing != row.id)
+                .opacity(editing == row.id ? 0 : 1)
         }
         .frame(maxWidth: .infinity)
         .safeAreaInset(edge: .top, spacing: 0) {
@@ -144,25 +150,37 @@ struct GamepadPairView: View {
     @ViewBuilder private var bottomTray: some View {
         if let editing {
             VStack(spacing: 10) {
-                GamepadKeyboard(
-                    text: editingBinding(editing),
-                    allowed: allowedCharacters(editing),
-                    onDone: { closeKeyboard() })
-                    // Fresh keyboard per field (see GamepadAddHostView) — the tray's input wiring
-                    // captured the previous binding on appear.
-                    .id(editing)
-                GamepadHintBar(hints: [
-                    .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Type"),
-                    .init(
-                        glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Delete",
-                        action: { backspace(editing) }),
-                    .init(
-                        glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done",
-                        action: { closeKeyboard() }),
-                ])
-                .frame(maxWidth: .infinity, alignment: .leading)
+                // The edited row sits directly above the keys, flown in from the list (see
+                // GamepadAddHostView's twin) — what the keyboard covers no longer matters.
+                if let row = rows.first(where: { $0.id == editing }) {
+                    rowView(row, focused: true)
+                        .frame(maxWidth: metrics.rowMaxWidth)
+                        .padding(.horizontal, 24)
+                        .frame(maxWidth: .infinity)
+                        .matchedGeometryEffect(id: row.id, in: fieldFlight, isSource: true)
+                        .transition(.opacity)
+                }
+                VStack(spacing: 10) {
+                    GamepadKeyboard(
+                        text: editingBinding(editing),
+                        allowed: allowedCharacters(editing),
+                        onDone: { closeKeyboard() })
+                        // Fresh keyboard per field (see GamepadAddHostView) — the tray's input
+                        // wiring captured the previous binding on appear.
+                        .id(editing)
+                    GamepadHintBar(hints: [
+                        .init(glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Type"),
+                        .init(
+                            glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Delete",
+                            action: { backspace(editing) }),
+                        .init(
+                            glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Done",
+                            action: { closeKeyboard() }),
+                    ])
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            .transition(.move(edge: .bottom).combined(with: .opacity))
         } else {
             VStack(alignment: .leading, spacing: 8) {
                 statusLine
