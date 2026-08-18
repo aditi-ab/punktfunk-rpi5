@@ -35,9 +35,12 @@ struct LibraryConsoleView: View {
     var initialSelection: String?
     /// Button B at the shelf — dismisses the library screen.
     var onDismiss: (() -> Void)?
-    /// Button X — copy the focused title's `punktfunk://` link. nil where the platform has no
-    /// clipboard (tvOS), which also drops the hint.
+    /// Copy a title's `punktfunk://` link — offered from the title's Options menu (X). nil where
+    /// the platform has no clipboard (tvOS), which drops the row and, with nothing else in the
+    /// menu worth a press, the X hint.
     var onCopyLink: ((GameEntry) -> Void)?
+    /// The host's name, for the Options menu's explainer.
+    var hostName: String?
     /// Whether this screen owns the controller — the shell gates it mid-transition and under the
     /// connect takeover.
     var controllerActive = true
@@ -49,6 +52,8 @@ struct LibraryConsoleView: View {
     var arrangementOverride: LibraryArrangement?
     var barFocusedInitially = false
     var startInCollectionsOverride: Bool?
+    /// Screenshot override: open the first title's Options menu on mount.
+    var optionsInitially = false
 
     @Environment(\.gamepadHostedInShell) private var hostedInShell
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -74,9 +79,8 @@ struct LibraryConsoleView: View {
     /// The focused title (the strip's centred cover / the grid's cell), published by the
     /// arrangement — feeds the detail band and every hint, read at press time.
     @State private var focusID: String?
-    /// The copy hint's acknowledgement (there is no toast on this surface — the legend says it
-    /// itself, and forgets it the moment the focus moves off the cover it was about).
-    @State private var copied = false
+    /// The title whose Options menu is up (X) — a layer over the field that takes the controller.
+    @State private var optionsFor: GameEntry?
     @State private var barInput = GamepadMenuInput(manager: .shared)
     @State private var barHaptics = MenuHaptics(manager: .shared)
     @State private var barBoundaryTick = 0
@@ -96,8 +100,10 @@ struct LibraryConsoleView: View {
         LibraryCollation.collate(games, sort: sort, groupBy: .platform)
     }
     private var focused: GameEntry? { displayed.first { $0.id == focusID } }
-    /// The field owns the controller only while the bar does not.
-    private var fieldActive: Bool { controllerActive && !barFocused }
+    /// The field owns the controller only while neither the bar nor a title's Options menu does.
+    private var fieldActive: Bool { controllerActive && !barFocused && optionsFor == nil }
+    /// Whether a title has an Options menu worth opening (today: only the Copy link row).
+    private var offersOptions: Bool { onCopyLink != nil }
     /// Whether Y opens Collections here: an unfiltered root shelf over a library worth browsing.
     private var canOpenCollections: Bool {
         places.canOpenCollections && LibraryCollation.worthBrowsing(games)
@@ -136,11 +142,34 @@ struct LibraryConsoleView: View {
                 reduceMotion
                     ? .opacity
                     : .gamepadScreen(slide: GamepadShellMotion.slide(compact: compact)))
+            // Under a title's Options menu the field recedes exactly as the launcher does under a
+            // shell layer (`covered` in GamepadHomeView): out of sight, a touch smaller, inert.
+            .opacity(optionsFor == nil ? 1 : 0)
+            .scaleEffect(optionsFor == nil ? 1 : GamepadShellMotion.underScale)
+            .allowsHitTesting(optionsFor == nil)
+            // A title's Options menu rides over the field as its own layer, with its own title
+            // band and legend; the field underneath goes inert until it closes.
+            if let game = optionsFor {
+                LibraryTitleOptionsView(
+                    game: game, hostName: hostName, onCopyLink: onCopyLink,
+                    close: { closeOptions() }, controllerActive: controllerActive)
+                    .zIndex(2)
+                    .transition(
+                        reduceMotion
+                            ? .opacity
+                            : .gamepadScreen(slide: GamepadShellMotion.slide(compact: compact)))
+            }
         }
+        // The legend, over a bottom tray blur — rows scroll under it, so it needs the same
+        // material the settings screen's tray has (bare, the grid drew straight through it).
         .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
-            GamepadHintBar(hints: barFocused ? barHints : (top.isCollections ? collectionHints : hints))
-                .padding(.leading, 22)
-                .padding(.vertical, compact ? 6 : 10)
+            if optionsFor == nil {
+                GamepadHintBar(hints: barFocused ? barHints : (top.isCollections ? collectionHints : hints))
+                    .padding(.leading, 22)
+                    .padding(.vertical, compact ? 6 : 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background { GamepadTrayBlur(edge: .bottom) }
+            }
         }
         // Hosted in the shell, the field is the shell's own persistent aurora (the library is an
         // aurora screen — the calm mix simply stays 0, so nothing even chases).
@@ -150,15 +179,10 @@ struct LibraryConsoleView: View {
         // Publish the palette's ink to this screen (text, glass, accent, scrims) — a pale
         // palette flips all of them, and no leaf should have to read the setting.
         .gamepadPaletteInk()
-        .task(id: copied) {
-            guard copied else { return }
-            try? await Task.sleep(for: .milliseconds(1600))
-            withAnimation(.smooth(duration: 0.2)) { copied = false }
-        }
-        .onChange(of: focusID) { _, _ in copied = false }
         .onAppear {
             decideHandover()
             barFocused = barFocusedInitially
+            if optionsInitially, offersOptions, let first = displayed.first { optionsFor = first }
             wireBar()
             if barFocused, controllerActive { barInput.start() }
         }
@@ -211,7 +235,7 @@ struct LibraryConsoleView: View {
                     running: running, initialSelection: focusID ?? initialSelection,
                     onBack: { back() },
                     onSecondary: { openCollections() },
-                    onTertiary: onCopyLink.map { copy in { copyFocused(copy) } },
+                    onTertiary: offersOptions ? { openOptions() } : nil,
                     onUp: { enterBar() },
                     controllerActive: fieldActive)
             case .grid:
@@ -220,7 +244,7 @@ struct LibraryConsoleView: View {
                     running: running, initialSelection: focusID ?? initialSelection,
                     onBack: { back() },
                     onSecondary: { openCollections() },
-                    onTertiary: onCopyLink.map { copy in { copyFocused(copy) } },
+                    onTertiary: offersOptions ? { openOptions() } : nil,
                     onUp: { enterBar() },
                     controllerActive: fieldActive)
             }
@@ -327,11 +351,11 @@ struct LibraryConsoleView: View {
                 glyph: buttonGlyph(\.buttonY, fallback: "y.circle"), text: "Collections",
                 action: { openCollections() }))
         }
-        if let onCopyLink {
+        // The desktop's `X Options` — a title's own actions live in a menu, not on a face button.
+        if offersOptions {
             hints.append(.init(
-                glyph: buttonGlyph(\.buttonX, fallback: "x.circle"),
-                text: copied ? "Copied" : "Copy link",
-                action: { copyFocused(onCopyLink) }))
+                glyph: buttonGlyph(\.buttonX, fallback: "x.circle"), text: "Options",
+                action: { openOptions() }))
         }
         if showsShoulderHint {
             hints.append(.init(
@@ -388,11 +412,16 @@ struct LibraryConsoleView: View {
 
     // MARK: - Actions
 
-    /// Hand the FOCUSED title to the copy action — read at press time, inert with nothing focused.
-    private func copyFocused(_ copy: (GameEntry) -> Void) {
-        guard let game = focused else { return }
-        copy(game)
-        withAnimation(.smooth(duration: 0.2)) { copied = true }
+    /// X: the FOCUSED title's Options menu — read at press time, inert with nothing focused.
+    private func openOptions() {
+        guard offersOptions, let game = focused else { return }
+        leaveBar()
+        barHaptics.move()
+        withAnimation(placeMotion) { optionsFor = game }
+    }
+
+    private func closeOptions() {
+        withAnimation(placeMotion) { optionsFor = nil }
     }
 
     private func setSort(_ key: LibrarySortKey) {

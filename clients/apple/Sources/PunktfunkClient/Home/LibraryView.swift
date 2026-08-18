@@ -229,8 +229,9 @@ struct LibraryView: View {
                     initialSelection: LibraryScrollMemory.last(forHost: host.id.uuidString),
                     onDismiss: { (onClose ?? { dismiss() })() },
                     // Nil where there is nothing to copy into (tvOS), which is what drops the
-                    // hint from the legend rather than leaving a button that does nothing.
+                    // Options row and its hint rather than leaving a menu with nothing in it.
                     onCopyLink: LinkClipboard.isAvailable ? { copyLink($0) } : nil,
+                    hostName: host.displayName,
                     controllerActive: controllerActive,
                     onCollectionChanged: { label in
                         collectionLabel = label

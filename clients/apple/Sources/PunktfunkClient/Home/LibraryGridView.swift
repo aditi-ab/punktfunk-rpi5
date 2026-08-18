@@ -1,7 +1,7 @@
 // The gamepad library's GRID arrangement — the desktop console's grid (`screens/library.rs`),
-// in SwiftUI: 2:3 poster cells in rows that scroll vertically behind a viewport, the focused row
-// riding a third of the way down, the launcher rows sitting squarely above the game rows with a
-// heading between. Every cell is equally readable (no coverflow recede); focus is a ×1.06 pop, an
+// in SwiftUI: 2:3 poster cells in rows that scroll vertically behind a viewport (a move scrolls
+// only as far as it must to keep the focused cell in view; a restored cursor is seated a third of
+// the way down), the launcher rows sitting squarely above the game rows with a heading between. Every cell is equally readable (no coverflow recede); focus is a ×1.06 pop, an
 // accent ring OUTSIDE the cover, and the shadow. The `Resume` badge keeps the coverflow's corner —
 // the same badge in two different corners on two arrangements of the same shelf would read as
 // two different badges.
@@ -95,6 +95,7 @@ struct LibraryGridView: View {
                         // entrance and focus pop are never clipped; the caption only when the
                         // field has two groups.
                         heading(s.split > 0 ? "LAUNCHERS" : nil, height: headingH, k: k)
+                            .id(Self.topID)
                         if s.split > 0 {
                             section(
                                 games[..<s.split].enumerated().map { ($0.offset, $0.element) },
@@ -119,7 +120,10 @@ struct LibraryGridView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .scrollIndicators(.never)
-                .scrollClipDisabled() // the focused cell's pop and ring may cross the viewport edge
+                // Clipped to the viewport, deliberately: with the clip off, rows drew over the
+                // pinned title and the legend's tray on glass, and the lazy grid still recycled
+                // them at the viewport edge — a row vanishing while "still in view". The margins
+                // and the heading bands are what give the focused cell's pop and ring their room.
                 .offset(bump)
                 .onAppear {
                     if cols != colsNow { cols = colsNow }
@@ -138,13 +142,25 @@ struct LibraryGridView: View {
                 }
                 .onChange(of: focusID) { _, id in
                     guard let id, seated else { return }
+                    // A MOVE scrolls only as far as it must to keep the focused cell in view
+                    // (`anchor: nil`), never to re-seat it: on glass, the desktop's "focused row
+                    // rides at 34 %" rule cut the row above half away after ONE step down with
+                    // the whole field still in reach — a jump, not a chase. The 34 % seat is
+                    // kept for the initial restore, where landing mid-view is the point.
+                    // On the top row, go all the way up so the heading band shows too.
+                    let onTopRow = shape.cell(of: cursor).row == 0
+                    let scroll = {
+                        if onTopRow {
+                            proxy.scrollTo(Self.topID, anchor: .top)
+                        } else {
+                            proxy.scrollTo(id, anchor: nil)
+                        }
+                    }
                     if reduceMotion {
-                        proxy.scrollTo(id, anchor: focusAnchor)
+                        scroll()
                     } else {
                         // `springs::FOCUS` — the desktop's scroll chase.
-                        withAnimation(.spring(response: 0.30, dampingFraction: 0.80)) {
-                            proxy.scrollTo(id, anchor: focusAnchor)
-                        }
+                        withAnimation(.spring(response: 0.30, dampingFraction: 0.80)) { scroll() }
                     }
                 }
                 .onChange(of: games.map(\.id)) { _, ids in
@@ -192,7 +208,11 @@ struct LibraryGridView: View {
         }
     }
 
-    /// The focused row rides at 34 % of the viewport, the desktop's `view_h·0.34`.
+    /// The scroll target for "all the way up" — the top heading band.
+    private static let topID = "library-grid-top"
+
+    /// Where a RESTORED cursor is seated on mount: 34 % down the viewport, the desktop's
+    /// `view_h·0.34` (moves after that scroll minimally — see `onChange(of: focusID)`).
     private var focusAnchor: UnitPoint { UnitPoint(x: 0.5, y: 0.34) }
 
     /// A heading band: leading, tracked, `fg(0.45)` — or the same band empty (the top inset).
@@ -218,10 +238,14 @@ struct LibraryGridView: View {
         _ entries: [(Int, GameEntry)], cols: Int, cellW: CGFloat, cellH: CGFloat, gap: CGFloat,
         labelGap: CGFloat, k: CGFloat, shape: LibraryGridShape
     ) -> some View {
-        LazyVGrid(
+        // Each cell carries an invisible vertical HALO inside the frame `scrollTo` targets, so a
+        // minimal scroll leaves the focused cell's ring and ×1.06 pop clear of the viewport edge
+        // instead of shaving them; the row spacing gives the halo back, so the pitch is unchanged.
+        let halo = 10 * k
+        return LazyVGrid(
             columns: Array(
                 repeating: GridItem(.fixed(cellW), spacing: gap, alignment: .top), count: cols),
-            alignment: .leading, spacing: gap + labelGap
+            alignment: .leading, spacing: max(0, gap + labelGap - 2 * halo)
         ) {
             ForEach(entries, id: \.1.id) { index, game in
                 #if os(tvOS)
@@ -234,9 +258,11 @@ struct LibraryGridView: View {
                 }
                 .buttonStyle(ConsoleBareButtonStyle())
                 .focused($tvFocus, equals: game.id)
+                .padding(.vertical, halo)
                 .id(game.id)
                 #else
                 cell(game, index: index, width: cellW, height: cellH, k: k, shape: shape)
+                    .padding(.vertical, halo)
                     .id(game.id)
                 #endif
             }

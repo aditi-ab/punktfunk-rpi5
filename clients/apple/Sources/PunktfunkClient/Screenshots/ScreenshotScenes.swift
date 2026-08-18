@@ -52,6 +52,10 @@ enum ShotScenes {
             ShotScene(name: "11d-collections", orientation: .landscape, colorScheme: .dark) {
                 AnyView(ShotLibrary(collections: true))
             },
+            // A title's Options menu (X) over the shelf.
+            ShotScene(name: "11e-library-options", orientation: .landscape, colorScheme: .dark) {
+                AnyView(ShotLibrary(options: true))
+            },
         ]
         #if os(iOS) || os(macOS)
         // The gamepad-mode console screens (no tvOS — native focus engine there). Dev-only shots
@@ -286,13 +290,38 @@ private struct ShotLibrary: View {
     var arrangement: LibraryArrangement?
     var barFocused = false
     var collections = false
+    var options = false
+
+    /// Dev knobs for driving the console library on a Mac from the shot harness: with
+    /// `PUNKTFUNK_FAKE_LIBRARY` set the scene shows that catalog (a real multi-row grid, the
+    /// shared collate vectors file works) instead of the five-title mock; with
+    /// `PUNKTFUNK_SHOT_INTERACTIVE=1` the screen owns the controller/keyboard, so arrow keys walk
+    /// the grid exactly as the pad would.
+    private var games: [GameEntry] {
+        let env = ProcessInfo.processInfo.environment
+        guard let path = env["PUNKTFUNK_FAKE_LIBRARY"], !path.isEmpty,
+              let data = FileManager.default.contents(atPath: path)
+        else { return ShotMock.games }
+        struct Wrapped: Decodable { let library: [GameEntry] }
+        let decoder = JSONDecoder()
+        if let list = try? decoder.decode([GameEntry].self, from: data) { return list.launchersFirst }
+        if let wrapped = try? decoder.decode(Wrapped.self, from: data) { return wrapped.library.launchersFirst }
+        return ShotMock.games
+    }
+
+    private var interactive: Bool {
+        ProcessInfo.processInfo.environment["PUNKTFUNK_SHOT_INTERACTIVE"] == "1"
+    }
 
     var body: some View {
         LibraryConsoleView(
-            games: ShotMock.games, artLoader: ShotPosterArt.source,
-            onLaunch: { _ in }, onDismiss: {}, controllerActive: false,
+            games: games, artLoader: ShotPosterArt.source,
+            onLaunch: { _ in }, onDismiss: {},
+            // The mock has a clipboard action so the Options menu has its row to show.
+            onCopyLink: { _ in }, hostName: "Battlestation",
+            controllerActive: interactive,
             arrangementOverride: arrangement, barFocusedInitially: barFocused,
-            startInCollectionsOverride: collections)
+            startInCollectionsOverride: collections, optionsInitially: options)
     }
 }
 
