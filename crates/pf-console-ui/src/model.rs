@@ -220,6 +220,12 @@ pub enum ConsoleCmd {
         profile_id: String,
         pin: bool,
     },
+    /// Open a screen the PLATFORM owns over the console (design android-skia-console-port.md
+    /// D7) — Android's connected-controllers view, the open-source licences. `id` is a
+    /// [`crate::platform::PlatformScreen::id`]. The host draws it, holds the console's input
+    /// while it is up, and the console never learns what it looked like. The desktop raises
+    /// none — its settings list has no such rows.
+    OpenPlatformScreen { id: String },
 }
 
 /// The overlay→binary command queue. A plain deque under the same locking discipline as

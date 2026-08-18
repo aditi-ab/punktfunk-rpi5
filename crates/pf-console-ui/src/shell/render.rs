@@ -59,6 +59,14 @@ impl Shell {
             .last_frame
             .replace(now)
             .map_or(1.0 / 60.0, |t| (now - t).as_secs_f64().clamp(0.0, 0.05));
+        #[cfg(test)]
+        let dt = match self.fake_clock.as_mut() {
+            Some((t, step)) => {
+                *t += *step;
+                *step
+            }
+            None => dt,
+        };
         self.sync();
         // Publish the palette's ink before ANYTHING draws — every widget, glyph and panel in
         // the crate reads it (see `theme::set_ink`), so a frame that skipped this would paint
@@ -113,8 +121,13 @@ impl Shell {
             self.bg_mix = bg_target;
         }
         self.draw_aurora(canvas, full_w, full_h, t, self.bg_mix);
-        canvas.save();
-        canvas.translate((ins.left, ins.top));
+        // Only an inset viewport takes the translate: with none this is the desktop's exact
+        // canvas state, and the screenshot dump is held byte-for-byte to that.
+        let inset = ins.left != 0.0 || ins.top != 0.0;
+        if inset {
+            canvas.save();
+            canvas.translate((ins.left, ins.top));
+        }
 
         // The screens, through the transition choreography.
         let content = Rect::from_ltrb(
@@ -277,7 +290,9 @@ impl Shell {
         }
 
         self.draw_overlays(canvas, w, h, k, dt, t, fonts);
-        canvas.restore();
+        if inset {
+            canvas.restore();
+        }
     }
 }
 

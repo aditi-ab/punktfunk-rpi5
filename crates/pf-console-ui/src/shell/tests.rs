@@ -959,6 +959,11 @@ fn dump_console_screens() {
     let (w, h) = (1280, 800);
     let pads: Vec<PadInfo> = Vec::new();
     let dump = |shell: &mut Shell, frames: usize, sleep_ms: u64, name: &str, pad: bool| {
+        // Deterministic time: each frame is one fixed step (the sleep it stands in for, plus
+        // the ~4 ms a raster frame costs), so the dump does not depend on the machine's speed
+        // or load — the whole point of comparing two of them.
+        let step = sleep_ms as f64 / 1000.0 + 0.004;
+        shell.fake_clock = Some((shell.fake_clock.map_or(0.0, |(t, _)| t), step));
         let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
         for _ in 0..frames {
             shell.render(

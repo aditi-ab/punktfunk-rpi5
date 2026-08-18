@@ -82,6 +82,70 @@ enum RowId {
     /// answer "what does the library look like when I get there", and this one is the only
     /// way to reach the collections screen without the shelf's Y.
     LibraryCollections,
+    // --- Android-only rows (design android-skia-console-port.md D3). Their values live in
+    // `trust::Settings::extra` under `android.*` keys, so the desktop's settings struct never
+    // grows a field one platform reads; `row_on` keeps them off the desktop's list. ---
+    /// The Android decode pipeline's low-latency mode (slice-progressive delivery, DSCP).
+    LowLatency,
+    /// Render the host's rumble on the phone's own motor when no pad is attached.
+    PhoneRumble,
+    /// Send the phone's gyro as the pad's motion when no pad is attached.
+    PhoneGyro,
+    /// Steam Controller 2 passthrough (raw BLE/USB capture instead of the OS pad).
+    Sc2Passthrough,
+    /// DualSense raw-USB capture (touchpad, motion, adaptive triggers).
+    DsCapture,
+    /// When the console UI fronts the app: with a controller attached, or always.
+    GamepadUiMode,
+    /// The platform's connected-controllers view (an action row — opens a native screen).
+    Controllers,
+    /// The platform's open-source-licences view (an action row).
+    Licenses,
+}
+
+/// The `Settings::extra` keys the Android rows read and write. Kotlin writes the same keys
+/// from its own settings (`ConsoleJson.settings`) and folds them back on save.
+mod android_keys {
+    pub const LOW_LATENCY: &str = "android.low_latency";
+    pub const PHONE_RUMBLE: &str = "android.rumble_on_phone";
+    pub const PHONE_GYRO: &str = "android.gyro_on_phone";
+    pub const SC2: &str = "android.sc2_capture";
+    pub const DS_CAPTURE: &str = "android.ds_capture";
+    pub const GAMEPAD_UI_MODE: &str = "android.gamepad_ui_mode";
+}
+
+/// The Android console-UI mode's stored values (`GamepadUi.kt`).
+const GAMEPAD_UI_MODES: [(&str, &str); 2] =
+    [("connected", "With a controller"), ("always", "Always")];
+
+fn extra_bool(s: &pf_client_core::trust::Settings, key: &str, default: bool) -> bool {
+    s.extra
+        .get(key)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(default)
+}
+
+fn set_extra_bool(s: &mut pf_client_core::trust::Settings, key: &str, value: bool) {
+    s.extra
+        .insert(key.to_string(), serde_json::Value::Bool(value));
+}
+
+fn extra_str<'a>(s: &'a pf_client_core::trust::Settings, key: &str, default: &'a str) -> &'a str {
+    s.extra.get(key).and_then(|v| v.as_str()).unwrap_or(default)
+}
+
+/// `toggle` over an `extra` boolean — same clamp/wrap grammar as the typed rows.
+fn toggle_extra(
+    s: &mut pf_client_core::trust::Settings,
+    key: &str,
+    default: bool,
+    delta: i32,
+    wrap: bool,
+) -> Option<()> {
+    let mut v = extra_bool(s, key, default);
+    toggle(&mut v, delta, wrap)?;
+    set_extra_bool(s, key, v);
+    Some(())
 }
 
 // The couch-relevant subset grew 2026-07-31: this screen is the ONLY settings editor in
@@ -110,6 +174,7 @@ const TABS: [(&str, &[RowId]); 7] = [
         &[
             RowId::Codec,
             RowId::Decoder,
+            RowId::LowLatency,
             RowId::Hdr,
             RowId::Chroma444,
             RowId::PresentPriority,
@@ -135,6 +200,11 @@ const TABS: [(&str, &[RowId]); 7] = [
             RowId::PadType,
             RowId::SystemButtons,
             RowId::GuideGesture,
+            RowId::PhoneRumble,
+            RowId::PhoneGyro,
+            RowId::Sc2Passthrough,
+            RowId::DsCapture,
+            RowId::Controllers,
         ],
     ),
     (
@@ -156,6 +226,8 @@ const TABS: [(&str, &[RowId]); 7] = [
             RowId::Stats,
             RowId::Fullscreen,
             RowId::AutoWake,
+            RowId::GamepadUiMode,
+            RowId::Licenses,
         ],
     ),
     ("Profiles", &[]),
@@ -416,6 +488,24 @@ impl SettingsScreen {
                     ListMsg::None => pulse,
                 };
             }
+            // The platform's own screens: A asks the host to open one; nothing here edits.
+            RowId::Controllers | RowId::Licenses => {
+                return match msg {
+                    ListMsg::Activate => {
+                        let screen = if focused == RowId::Controllers {
+                            crate::platform::PlatformScreen::Controllers
+                        } else {
+                            crate::platform::PlatformScreen::Licenses
+                        };
+                        fx.cmds.push(crate::model::ConsoleCmd::OpenPlatformScreen {
+                            id: screen.id().to_string(),
+                        });
+                        pulse
+                    }
+                    ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
+                    ListMsg::None => pulse,
+                };
+            }
             _ => {}
         }
         // Rebase the shell-lifetime snapshot on the file before an adjust-then-save: this
@@ -458,6 +548,10 @@ impl SettingsScreen {
                 Hint::new(HintKey::Back, "Done"),
             ],
             Some(RowId::NoProfiles) | None => vec![Hint::new(HintKey::Back, "Done")],
+            Some(RowId::Controllers | RowId::Licenses) => vec![
+                Hint::new(HintKey::Confirm, "Open"),
+                Hint::new(HintKey::Back, "Done"),
+            ],
             Some(_) => vec![
                 Hint::new(HintKey::Adjust, "Adjust"),
                 Hint::new(HintKey::Confirm, "Change"),
@@ -536,17 +630,29 @@ impl SettingsScreen {
 /// The desktop shows everything, exactly as before there was a second platform.
 fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
     use crate::platform::Platform;
+    let android_only = matches!(
+        id,
+        RowId::LowLatency
+            | RowId::PhoneRumble
+            | RowId::PhoneGyro
+            | RowId::Sc2Passthrough
+            | RowId::DsCapture
+            | RowId::GamepadUiMode
+            | RowId::Controllers
+            | RowId::Licenses
+    );
+    let desktop_only = matches!(
+        id,
+        RowId::Decoder
+            | RowId::Chroma444
+            | RowId::Vsync
+            | RowId::AllowVrr
+            | RowId::Fullscreen
+            | RowId::Shortcuts
+    );
     match platform {
-        Platform::Desktop => true,
-        Platform::Android => !matches!(
-            id,
-            RowId::Decoder
-                | RowId::Chroma444
-                | RowId::Vsync
-                | RowId::AllowVrr
-                | RowId::Fullscreen
-                | RowId::Shortcuts
-        ),
+        Platform::Desktop => !android_only,
+        Platform::Android => !desktop_only,
     }
 }
 
@@ -585,6 +691,8 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
         RowId::NoProfiles => {
             return RowSpec::action("No profiles yet", false);
         }
+        RowId::Controllers => return RowSpec::action("Connected controllers", true),
+        RowId::Licenses => return RowSpec::action("Open-source licences", true),
         _ => {}
     }
     let s = &ctx.settings;
@@ -782,7 +890,43 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             on_off(s.fullscreen_on_stream).into(),
         ),
         RowId::AutoWake => (None, "Wake hosts automatically", on_off(s.auto_wake).into()),
-        RowId::Profile(_) | RowId::NoProfiles => unreachable!("returned above"),
+        RowId::LowLatency => (
+            Some("Decoding"),
+            "Low-latency mode",
+            on_off(extra_bool(s, android_keys::LOW_LATENCY, true)).into(),
+        ),
+        RowId::PhoneRumble => (
+            Some("This device"),
+            "Rumble on this phone",
+            on_off(extra_bool(s, android_keys::PHONE_RUMBLE, false)).into(),
+        ),
+        RowId::PhoneGyro => (
+            None,
+            "Gyro from this phone",
+            on_off(extra_bool(s, android_keys::PHONE_GYRO, false)).into(),
+        ),
+        RowId::Sc2Passthrough => (
+            Some("Passthrough"),
+            "Steam Controller 2",
+            on_off(extra_bool(s, android_keys::SC2, true)).into(),
+        ),
+        RowId::DsCapture => (
+            None,
+            "DualSense over USB",
+            on_off(extra_bool(s, android_keys::DS_CAPTURE, true)).into(),
+        ),
+        RowId::GamepadUiMode => (
+            None,
+            "Controller UI",
+            label_for(
+                &GAMEPAD_UI_MODES,
+                extra_str(s, android_keys::GAMEPAD_UI_MODE, "connected"),
+            )
+            .into(),
+        ),
+        RowId::Profile(_) | RowId::NoProfiles | RowId::Controllers | RowId::Licenses => {
+            unreachable!("returned above")
+        }
     };
     RowSpec {
         header,
@@ -911,6 +1055,32 @@ fn detail(id: RowId) -> &'static str {
             "Send Wake-on-LAN to a sleeping host before connecting. Turn off for hosts \
              reached over a VPN, where the wake wait only adds delay."
         }
+        RowId::LowLatency => {
+            "Feeds the decoder slice by slice as frames arrive and marks the media sockets \
+             for priority. Off if a decoder shows artefacts under it."
+        }
+        RowId::PhoneRumble => {
+            "Play the host's rumble on this phone's own motor when no controller is \
+             attached. Costs battery; does nothing with a pad connected."
+        }
+        RowId::PhoneGyro => {
+            "Send this phone's motion as the controller's gyro when no controller is \
+             attached. Only games that read gyro notice; a pad's own gyro wins."
+        }
+        RowId::Sc2Passthrough => {
+            "Capture the Steam Controller 2 directly (touchpads, gyro, paddles) instead of \
+             the generic pad Android shows. Needs the Bluetooth or USB grant."
+        }
+        RowId::DsCapture => {
+            "Capture a wired DualSense directly (touchpad, motion, adaptive triggers). \
+             Needs the USB grant when the pad is plugged in."
+        }
+        RowId::GamepadUiMode => {
+            "When this console fronts the app: whenever a controller is attached, or \
+             always. The touch settings' \"Controller-optimized UI\" switch turns it off."
+        }
+        RowId::Controllers => "Connected controllers, their grants and a rumble/haptics test.",
+        RowId::Licenses => "The open-source licences this app ships under.",
         RowId::Profile(_) => {
             "Pin this profile to a host and it appears as its own card — one press \
              connects with these settings. Profiles are created and edited in the \
@@ -1113,8 +1283,22 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         RowId::LibraryCollections => toggle(&mut s.library_collections, delta, wrap),
         RowId::Fullscreen => toggle(&mut s.fullscreen_on_stream, delta, wrap),
         RowId::AutoWake => toggle(&mut s.auto_wake, delta, wrap),
+        RowId::LowLatency => toggle_extra(s, android_keys::LOW_LATENCY, true, delta, wrap),
+        RowId::PhoneRumble => toggle_extra(s, android_keys::PHONE_RUMBLE, false, delta, wrap),
+        RowId::PhoneGyro => toggle_extra(s, android_keys::PHONE_GYRO, false, delta, wrap),
+        RowId::Sc2Passthrough => toggle_extra(s, android_keys::SC2, true, delta, wrap),
+        RowId::DsCapture => toggle_extra(s, android_keys::DS_CAPTURE, true, delta, wrap),
+        RowId::GamepadUiMode => {
+            let mut v = extra_str(s, android_keys::GAMEPAD_UI_MODE, "connected").to_string();
+            step_str(&GAMEPAD_UI_MODES, &mut v, delta, wrap).map(|()| {
+                s.extra.insert(
+                    android_keys::GAMEPAD_UI_MODE.to_string(),
+                    serde_json::Value::String(v),
+                );
+            })
+        }
         // Navigation rows, handled before the settings path in `menu` — never a value edit.
-        RowId::Profile(_) | RowId::NoProfiles => None,
+        RowId::Profile(_) | RowId::NoProfiles | RowId::Controllers | RowId::Licenses => None,
     }
     .is_some()
 }
@@ -1773,20 +1957,39 @@ pub(super) mod tests {
     /// The desktop row set is untouched by the platform split (the non-regression contract),
     /// and Android drops exactly the desktop-only concepts — nothing else.
     #[test]
-    fn platform_row_split_hides_only_desktop_concepts_on_android() {
+    fn platform_row_split_hides_only_the_other_platforms_concepts() {
         use crate::platform::Platform;
         let all: Vec<RowId> = TABS
             .iter()
             .flat_map(|(_, rows)| rows.iter().copied())
             .collect();
-        assert!(all.iter().all(|id| row_on(*id, Platform::Desktop)));
-        let hidden: Vec<RowId> = all
+        // The desktop shows exactly what it showed before there was a second platform: the
+        // Android rows are the only ones missing there.
+        let off_desktop: Vec<RowId> = all
+            .iter()
+            .copied()
+            .filter(|id| !row_on(*id, Platform::Desktop))
+            .collect();
+        assert_eq!(
+            off_desktop,
+            vec![
+                RowId::LowLatency,
+                RowId::PhoneRumble,
+                RowId::PhoneGyro,
+                RowId::Sc2Passthrough,
+                RowId::DsCapture,
+                RowId::Controllers,
+                RowId::GamepadUiMode,
+                RowId::Licenses,
+            ]
+        );
+        let off_android: Vec<RowId> = all
             .iter()
             .copied()
             .filter(|id| !row_on(*id, Platform::Android))
             .collect();
         assert_eq!(
-            hidden,
+            off_android,
             vec![
                 RowId::Decoder,
                 RowId::Chroma444,
@@ -1796,6 +1999,33 @@ pub(super) mod tests {
                 RowId::Fullscreen,
             ]
         );
+        // Every row belongs to at least one platform.
+        assert!(all
+            .iter()
+            .all(|id| row_on(*id, Platform::Desktop) || row_on(*id, Platform::Android)));
+    }
+
+    /// The Android rows edit `Settings::extra` under their `android.*` keys and nothing
+    /// else — a toggle there must not touch a typed field, and a fresh store reads each row's
+    /// documented default.
+    #[test]
+    fn android_rows_live_in_extra() {
+        with_ctx(|ctx| {
+            ctx.platform = crate::platform::Platform::Android;
+            let before = ctx.settings.clone();
+            assert!(extra_bool(ctx.settings, android_keys::LOW_LATENCY, true));
+            assert!(adjust(RowId::LowLatency, 1, true, ctx));
+            assert!(!extra_bool(ctx.settings, android_keys::LOW_LATENCY, true));
+            assert!(adjust(RowId::GamepadUiMode, 1, true, ctx));
+            assert_eq!(
+                extra_str(ctx.settings, android_keys::GAMEPAD_UI_MODE, "connected"),
+                "always"
+            );
+            // Only `extra` moved.
+            let mut after = ctx.settings.clone();
+            after.extra = before.extra.clone();
+            assert_eq!(after, before);
+        });
     }
 
     #[test]
@@ -1810,7 +2040,9 @@ pub(super) mod tests {
         // The pre-tab flat list, plus the palette row, the lossless-audio row and the
         // reduce-motion row later passes added, minus the game-library toggle: this screen
         // never read it, and the library is offered on any paired host now.
-        assert_eq!(seen.len(), 33, "{seen:?}");
+        // 33 desktop rows + the eight Android-only ones (design android-skia-console-port.md
+        // D3): six `extra`-backed settings and two platform-screen action rows.
+        assert_eq!(seen.len(), 41, "{seen:?}");
         assert!(seen.contains(&RowId::Palette));
         assert!(seen.contains(&RowId::ReduceMotion));
         assert!(seen.contains(&RowId::AudioFormat));

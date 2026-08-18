@@ -74,6 +74,9 @@ tracing = "0.1"
 # that lives across a language boundary (Android's Kotlin services, over JNI) can hand them over
 # as JSON — the wire IS the model, no second set of mirror types to drift.
 serde = { version = "1", features = ["derive"] }
+# The Android-only settings rows live in `trust::Settings::extra` (a JSON map), so the desktop
+# settings struct never grows a field only one platform reads.
+serde_json = "1"
 # `config::GamepadPref` keys the button-glyph style (PlayStation shapes vs ABXY).
 punktfunk-core = { path = "../punktfunk-core" }
 

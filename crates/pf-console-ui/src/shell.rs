@@ -265,6 +265,12 @@ pub(crate) struct Shell {
     pub(crate) gpu_cache_bytes: usize,
     t0: Instant,
     last_frame: Option<Instant>,
+    /// Test-only: `(t, step)` — when set, the shell clock reads `t` and every frame advances
+    /// it by `step` instead of wall time, so the screenshot dump renders the SAME pixels on
+    /// any machine at any load (the aurora's phase is the clock; two real-time runs never agree
+    /// past the first scene). Never set outside `shell/tests.rs`.
+    #[cfg(test)]
+    pub(crate) fake_clock: Option<(f64, f64)>,
 }
 
 impl Shell {
@@ -329,6 +335,8 @@ impl Shell {
             gpu_cache_bytes: opts.gpu_cache_bytes,
             t0: Instant::now(),
             last_frame: None,
+            #[cfg(test)]
+            fake_clock: None,
         })
     }
 
@@ -403,6 +411,10 @@ impl Shell {
     }
 
     fn t(&self) -> f64 {
+        #[cfg(test)]
+        if let Some((t, _)) = self.fake_clock {
+            return t;
+        }
         self.t0.elapsed().as_secs_f64()
     }
 

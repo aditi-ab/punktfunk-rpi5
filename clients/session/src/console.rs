@@ -667,6 +667,9 @@ impl ServiceState {
                     r.request();
                 }
             }
+            // A platform-native screen (Android's Controllers/Licences views) — the desktop
+            // shell has no such rows, so this never arrives here.
+            ConsoleCmd::OpenPlatformScreen { .. } => {}
             ConsoleCmd::SetPin {
                 key,
                 profile_id,

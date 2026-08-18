@@ -57,6 +57,8 @@ import io.unom.punktfunk.kit.SessionEndReason
 import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.models.ActiveSession
+import io.unom.punktfunk.console.SkiaConsole
+import io.unom.punktfunk.console.SkiaConsoleShell
 import io.unom.punktfunk.models.LibraryReturn
 import io.unom.punktfunk.models.Tab
 import kotlin.math.roundToInt
@@ -91,6 +93,10 @@ fun App(forceGamepadUi: Boolean = false) {
     val gamepadUi = gamepadUiActive(
         settings.gamepadUiEnabled, settings.gamepadUiMode, controllerConnected, tv, forceGamepadUi,
     )
+    // Which console renders when the gamepad UI is up: the Skia shell wherever the native host
+    // exists (64-bit ABIs) unless the transition sysprop `debug.punktfunk.console_backend`
+    // says `compose`.
+    val skiaConsole = remember { SkiaConsole.wanted() }
 
     // Publish the live session process-wide, so a `punktfunk://` link that arrives as a SECOND
     // activity instance (the normal case under `launchMode = standard`) can refuse it before that
@@ -167,8 +173,34 @@ fun App(forceGamepadUi: Boolean = false) {
                     } else {
                         null
                     }
+                // The Skia console (if it is the console) keeps its stack across the stream and
+                // wants to know how the session ended — a clean end is no toast, an abnormal one
+                // says why (the desktop shell's exact contract).
+                if (skiaConsole) {
+                    SkiaConsole.sessionEnded(
+                        when (reason) {
+                            SessionEndReason.NONE, SessionEndReason.LOCAL,
+                            SessionEndReason.GAME_EXITED, SessionEndReason.HOST_ENDED -> null
+                            SessionEndReason.HOST_ERROR -> "the host reported an error"
+                            SessionEndReason.LOST -> "the connection was lost"
+                        },
+                    )
+                }
                 session = null
             }
+        } else if (gamepadUi && skiaConsole) {
+            // The Skia console: the same shell the Linux/Windows session binary shows, drawn by
+            // native onto a SurfaceView (design/android-skia-console-port.md). The Compose
+            // GamepadShell below stays until the on-glass matrix and the 32-bit archive land.
+            SkiaConsoleShell(
+                settings = settings,
+                onSettingsChange = { settings = it; settingsStore.save(it) },
+                onConnected = { session = it },
+                deepLink = pendingLink,
+                onDeepLinkHandled = { activity?.pendingDeepLink = null },
+                reopenLibrary = reopenLibrary,
+                onReopenLibraryHandled = { reopenLibrary = null },
+            )
         } else if (gamepadUi) {
             GamepadShell(
                 settings = settings,
