@@ -285,9 +285,15 @@ pub(super) struct Layer {
 
 impl Layer {
     /// Create the compositor layer over `window` (the SurfaceView's `ANativeWindow`), or `None` on
-    /// API < 29 / a null layer — the caller then uses the SurfaceView presenter. `dest_w/h` come
-    /// from the window's own pixel size (the SurfaceView is already laid out to the video aspect).
-    pub(super) fn create(window: &NativeWindow) -> Option<Layer> {
+    /// API < 29 / a null layer — the caller then uses the SurfaceView presenter.
+    ///
+    /// `dest_w/h` are the SurfaceView's **on-screen pixel size** — the coordinate space the child
+    /// layer is composited into, which is the display footprint of the (aspect-fitted) video view,
+    /// NOT the window's buffer size. `ANativeWindow_getWidth/Height` return the buffer geometry in a
+    /// rotated/scaled space (observed 1260×567 for a 2800×1260 full-bleed stream) — using it shrank
+    /// the picture to the top-left corner. A non-positive `dest_w/h` (Kotlin couldn't read the view
+    /// yet) falls back to that buffer size as the best remaining guess.
+    pub(super) fn create(window: &NativeWindow, dest_w: i32, dest_h: i32) -> Option<Layer> {
         let api = Api::resolve()?;
         // SAFETY: `window.ptr()` is the live `ANativeWindow` the decode thread owns; the name is a
         // static NUL-terminated string; the call returns null on failure (checked).
@@ -297,9 +303,21 @@ impl Layer {
             log::warn!("asc: createFromWindow returned null — falling back to SurfaceView");
             return None;
         }
-        let dest_w = window.width().max(1);
-        let dest_h = window.height().max(1);
-        log::info!("asc: layer created over {dest_w}x{dest_h} window");
+        let dest_w = if dest_w > 0 {
+            dest_w
+        } else {
+            window.width().max(1)
+        };
+        let dest_h = if dest_h > 0 {
+            dest_h
+        } else {
+            window.height().max(1)
+        };
+        log::info!(
+            "asc: layer created, dest {dest_w}x{dest_h} (window buffer {}x{})",
+            window.width(),
+            window.height(),
+        );
         Some(Layer {
             sc: Arc::new(ScHandle {
                 sc,

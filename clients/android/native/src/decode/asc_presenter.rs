@@ -143,12 +143,14 @@ impl AscBackend {
         window: &NativeWindow,
         src_w: i32,
         src_h: i32,
+        surface_w: i32,
+        surface_h: i32,
         panel_hz: i32,
         dataspace: i32,
         source_hz: u32,
         priority: PresentPriority,
     ) -> Option<AscBackend> {
-        let layer = Layer::create(window)?;
+        let layer = Layer::create(window, surface_w, surface_h)?;
         let usage = ndk::hardware_buffer::HardwareBufferUsage::GPU_SAMPLED_IMAGE
             | ndk::hardware_buffer::HardwareBufferUsage::COMPOSER_OVERLAY;
         let reader = match ImageReader::new_with_usage(

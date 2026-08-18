@@ -48,6 +48,10 @@ pub(super) fn run_sync(
         present_priority: _,
         smooth_buffer: _,
         panel_hz: _,
+        // The ASurfaceControl backend is async-loop only; the sync loop renders straight to the
+        // SurfaceView, so it never needs the view's on-screen size.
+        surface_w: _,
+        surface_h: _,
     } = opts;
     boost_thread_priority();
     let mode = client.mode();

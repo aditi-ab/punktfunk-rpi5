@@ -133,6 +133,12 @@ pub(crate) struct DecodeOptions {
     /// named here is not necessarily the one the panel ends up in. The measured timeline spacing
     /// corrects it in both directions ([`punktfunk_core::phase::PanelGrid`]).
     pub panel_hz: i32,
+    /// The video `SurfaceView`'s on-screen pixel size (the aspect-fitted display footprint), from
+    /// Kotlin at `surfaceCreated`. The ASurfaceControl backend composites its layer in this
+    /// coordinate space — NOT the window's buffer geometry, which is rotated/scaled. `0` = Kotlin
+    /// couldn't read it yet, and the backend falls back to the window buffer size.
+    pub surface_w: i32,
+    pub surface_h: i32,
 }
 
 /// The decode entry point on the `pf-decode` thread: dispatches to the async or synchronous loop.

@@ -96,6 +96,8 @@ pub(super) fn run_async(
         present_priority,
         smooth_buffer,
         panel_hz,
+        surface_w,
+        surface_h,
     } = opts;
     boost_thread_priority();
     let mode = client.mode();
@@ -199,6 +201,8 @@ pub(super) fn run_async(
             &window,
             mode.width as i32,
             mode.height as i32,
+            surface_w,
+            surface_h,
             panel_hz,
             initial_ds,
             mode.refresh_hz,
