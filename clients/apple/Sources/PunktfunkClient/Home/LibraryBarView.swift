@@ -6,8 +6,9 @@
 //
 // Focus is the WHOLE bar: an accent wash over the pill row — no border, no halo, no glass. The
 // C7 note on the desktop's wash being taller than the row it highlighted is the trap here: wash
-// the pill row's extent, not the band's. Reached with ▲ from the shelf (or the grid's top row);
-// while focused ◀▶ step the sort (clamped, no wrap), L1/R1 pick the arrangement outright, and
+// the pill row's extent, not the band's. On Apple the bar is a TRAY the container slides down over
+// the field on ▲ (a fixed band ate a third of a landscape phone), so it is only ever drawn focused;
+// while down ◀▶ step the sort (clamped, no wrap), L1/R1 pick the arrangement outright, and
 // ▼ / A / B hand the controller back — that routing lives in the container, this view only draws.
 // Pills are tappable/clickable where there is a pointer, and focusable Buttons on tvOS.
 

@@ -116,13 +116,6 @@ struct LibraryConsoleView: View {
         let top = places.top
         ZStack {
             VStack(spacing: 0) {
-            LibraryBarView(
-                sort: sort, arrangement: arrangement, focused: barFocused,
-                showsView: !top.isCollections, compact: compact,
-                onSort: { setSort($0) }, onArrangement: { setArrangement($0) }
-            )
-            .padding(.top, compact ? 2 : 6)
-            .padding(.bottom, LibraryBarView.gap - 4)
             field
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             if !top.isCollections {
@@ -147,6 +140,25 @@ struct LibraryConsoleView: View {
             .opacity(optionsFor == nil ? 1 : 0)
             .scaleEffect(optionsFor == nil ? 1 : GamepadShellMotion.underScale)
             .allowsHitTesting(optionsFor == nil)
+            // The view/sort bar is a TRAY, not a band: it slides down over the field on ▲ (and
+            // the legend's `Sort & view` cell) and back up on ▼/A/B, so the field keeps every
+            // point of height it has — a fixed band ate a third of a landscape phone. While it
+            // is down it owns the controller (`fieldActive`), and the legend says so.
+            .overlay(alignment: .top) {
+                if barFocused, optionsFor == nil {
+                    LibraryBarView(
+                        sort: sort, arrangement: arrangement, focused: true,
+                        showsView: !top.isCollections, compact: compact,
+                        onSort: { setSort($0) }, onArrangement: { setArrangement($0) }
+                    )
+                    .padding(.top, compact ? 4 : 8)
+                    .padding(.bottom, compact ? 6 : 10)
+                    .frame(maxWidth: .infinity)
+                    .background { GamepadTrayBlur(edge: .top) }
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .zIndex(1)
+                }
+            }
             // A title's Options menu rides over the field as its own layer, with its own title
             // band and legend; the field underneath goes inert until it closes.
             if let game = optionsFor {
@@ -226,6 +238,7 @@ struct LibraryConsoleView: View {
                 onAllTitles: places.offersAllTitles ? { openAllTitles() } : nil,
                 onBack: { back() },
                 onSortStep: { stepSort(by: $0, wrapping: true) },
+                onUp: { enterBar() },
                 controllerActive: fieldActive)
         } else {
             switch arrangement {
@@ -505,15 +518,21 @@ struct LibraryConsoleView: View {
 
     // MARK: - Bar input
 
+    /// The tray's slide — the console's INDICATOR spring (the keyboard tray's, too); a plain
+    /// fade under Reduce Motion.
+    private var trayMotion: Animation {
+        reduceMotion ? .easeOut(duration: 0.15) : .spring(response: 0.32, dampingFraction: 0.86)
+    }
+
     private func enterBar() {
         guard !barFocused else { return }
         barHaptics.move()
-        withAnimation(.smooth(duration: 0.18)) { barFocused = true }
+        withAnimation(trayMotion) { barFocused = true }
     }
 
     private func leaveBar() {
         guard barFocused else { return }
-        withAnimation(.smooth(duration: 0.18)) { barFocused = false }
+        withAnimation(trayMotion) { barFocused = false }
     }
 
     private func wireBar() {

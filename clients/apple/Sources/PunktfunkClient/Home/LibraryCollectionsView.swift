@@ -48,6 +48,8 @@ struct LibraryCollectionsView: View {
     var onBack: (() -> Void)?
     /// L1 (-1) / R1 (+1) — step the sort, wrapping.
     var onSortStep: (Int) -> Void
+    /// ▲ — the sort tray (the container's).
+    var onUp: (() -> Void)?
     var controllerActive = true
     #if os(iOS)
     @Environment(\.verticalSizeClass) private var vSizeClass
@@ -86,6 +88,7 @@ struct LibraryCollectionsView: View {
                         onActivate: { onOpen($0.group.key) },
                         onSecondary: onAllTitles,
                         onBack: onBack,
+                        onUp: onUp,
                         onShoulder: { right in onSortStep(right ? 1 : -1) },
                         isActive: controllerActive
                     ) { tile, entrance in
