@@ -3532,12 +3532,14 @@ dependencies = [
 name = "punktfunk-client-session"
 version = "0.30.0"
 dependencies = [
+ "log",
  "pf-client-core",
  "pf-console-ui",
  "pf-presenter",
  "punktfunk-core",
  "serde_json",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "winresource",
 ]
