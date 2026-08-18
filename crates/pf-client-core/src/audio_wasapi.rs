@@ -403,6 +403,10 @@ fn render_thread(
         let _ = ready.send(Err(e));
         return Ok(());
     }
+    // Event-driven at the endpoint's period on a plain thread until now: MMCSS "Pro Audio" +
+    // THREAD_PRIORITY_HIGHEST, what every audio engine on the platform gives its render loop.
+    // A missed period here is a click the ring cannot help with. Best-effort (`audio_rt`).
+    crate::audio_rt::boost_and_log("wasapi-render");
     let res = (|| -> Result<Option<u32>> {
         let channels = fmt.channels.clamp(1, 8) as u8;
         // 32-bit float interleaved: channels × 4 bytes/sample, at EVERY rate and depth this client
@@ -538,6 +542,15 @@ fn render_thread(
             if step.drop_front > 0 {
                 punktfunk_core::audio::crossfade_drop(&mut ring, step.drop_front, step.crossfade);
             }
+            // The mirror: the sync loop asked for a DEEPER ring, answered with one duplicated,
+            // crossfaded frame instead of a de-prime (see `JitterStep::insert_front`).
+            if step.insert_front > 0 {
+                punktfunk_core::audio::crossfade_insert(
+                    &mut ring,
+                    step.insert_front,
+                    step.crossfade,
+                );
+            }
 
             out.clear();
             out.resize(avail_frames * block_align, 0);
@@ -559,6 +572,7 @@ fn render_thread(
             vitals.note_callback(
                 ran_short,
                 step.drop_front > 0,
+                step.insert_front > 0,
                 policy.avg_depth_ms(),
                 policy.target_ms(),
             );
@@ -638,6 +652,8 @@ fn mic_thread(
     wasapi::initialize_mta()
         .ok()
         .context("CoInitializeEx (MTA)")?;
+    // Same treatment for the capture loop: capture, encode and send all run here.
+    crate::audio_rt::boost_and_log("wasapi-mic");
 
     let mut encoder = opus::Encoder::new(
         SAMPLE_RATE as u32,

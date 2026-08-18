@@ -684,6 +684,173 @@ final class AudioRingDriftTests: XCTestCase {
         XCTAssertTrue(scratch.contains { $0 != 0 }, "refilled to target — playback resumes")
     }
 
+    // MARK: - Sync-driven DEEPENING: the insert, the mirror of the shed
+    //
+    // The Swift half of core's insert tests (`a_sync_request_for_more_depth_*`,
+    // `growth_not_banked_still_re_primes`, `crossfade_insert_*`). Same vectors, same bounds: the
+    // ring could lower its depth gently but could only RAISE it by de-priming, and a sync request
+    // for a deeper ring made it `hollow` at once — so the next single late packet was a full
+    // re-prime's worth of silence. Now one crossfaded frame per sustain window, both directions.
+
+    /// A primed ring asked for +30 ms is NOT hollow (`hollow` is judged against the adaptive
+    /// target), so one short read leaves it primed; and once the average has sat below the request
+    /// for `insertSustainMS` of consumed audio, exactly one frame is duplicated. Mirrors
+    /// `a_sync_request_for_more_depth_never_de_primes`.
+    func testASyncRequestForMoreDepthNeverDeprimes() {
+        let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
+        let want = 5 * perMS
+        var scratch = [Float](repeating: 0, count: want)
+        let feed = [Float](repeating: 0.5, count: 60 * perMS)
+        func write(ms: Int) {
+            feed.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: ms * perMS) }
+        }
+        func read() {
+            scratch.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: want) }
+        }
+        // Prime at the 20 ms base and hold the depth there for 100 ms.
+        write(ms: 25); read()
+        XCTAssertTrue(scratch.contains { $0 != 0 }, "25 ms primes the base")
+        ring.setSyncTarget(50 * perMS)
+        for _ in 0..<20 { write(ms: 5); read() }
+        // ONE late packet: four reads drain the 20 ms exactly, the fifth runs short. Before the fix
+        // the sync-inflated target made the ring hollow and this single click re-primed it.
+        for _ in 0..<5 { read() }
+        XCTAssertEqual(ring.stats.underruns, 1, "exactly one short read")
+        // Refill to the base. A de-primed ring would need the full 50 ms request before it
+        // played again and would answer this with silence.
+        write(ms: 25); read()
+        XCTAssertTrue(
+            scratch.contains { $0 != 0 },
+            "a single short read on a sync-deepened ring must keep the hysteresis, not de-prime")
+        // Steady at 20 ms again; the insert arms once the sustain window (counted since the
+        // request, ~130 ms of it already spent above) is full, and adds exactly one frame.
+        let before = ring.bufferedSamples
+        var firstInsertAtMS: Int?
+        for step in 0..<800 {  // 4 s
+            write(ms: 5); read()
+            if firstInsertAtMS == nil, ring.stats.inserts > 0 { firstInsertAtMS = step * 5 }
+        }
+        guard let first = firstInsertAtMS else { return XCTFail("the insert never armed") }
+        XCTAssertGreaterThanOrEqual(first, 2_000 - 200, "armed before the sustain window")
+        XCTAssertLessThanOrEqual(first, 2_000 + 500, "armed long after the sustain window")
+        XCTAssertEqual(ring.stats.underruns, 1, "the deepening cost no clicks")
+        // One frame per sustain window: two of them in four seconds, each exactly a frame deep.
+        XCTAssertEqual(ring.stats.inserts, 2)
+        XCTAssertEqual(ring.bufferedSamples - before, 2 * ring.frameGeometry.frame)
+    }
+
+    /// The clean-link half of core's `a_sync_request_for_more_depth_deepens_without_a_de_prime_
+    /// on_a_clean_link`: sync asks for +20 ms, and the answer is a few inserts over a few seconds
+    /// with NO silent callback at all.
+    func testASyncRequestForMoreDepthDeepensWithoutADeprimeOnACleanLink() {
+        let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
+        let want = 5 * perMS
+        var scratch = [Float](repeating: 0, count: want)
+        let feed = [Float](repeating: 0.5, count: 60 * perMS)
+        func write(ms: Int) {
+            feed.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: ms * perMS) }
+        }
+        func read() {
+            scratch.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: want) }
+        }
+        write(ms: 25); read()
+        ring.setSyncTarget(40 * perMS)
+        var silent = 0
+        var settledAtMS: Int?
+        for step in 0..<12_000 {  // 60 s
+            write(ms: 5); read()
+            if scratch.allSatisfy({ $0 == 0 }) { silent += 1 }
+            // Settled once the ring holds the request minus the margin (5 ms), post-read.
+            if settledAtMS == nil, ring.bufferedMS >= 40 - 5 - 5 { settledAtMS = step * 5 }
+        }
+        XCTAssertEqual(silent, 0, "a clean link must stay silence-free")
+        XCTAssertEqual(ring.stats.underruns, 0)
+        XCTAssertGreaterThan(ring.stats.inserts, 0, "the deepening has to come from somewhere")
+        XCTAssertLessThanOrEqual(ring.stats.inserts, 8, "the insert kept firing once deep enough")
+        if let settledAtMS {
+            XCTAssertLessThanOrEqual(settledAtMS, 20_000, "deepening by 20 ms took \(settledAtMS) ms")
+        } else {
+            XCTFail("the ring never reached the sync target")
+        }
+    }
+
+    /// The seam of the insert, heard end to end: fill the ring with a ramp (any splice is a
+    /// visible jump), let one insert fire, and check every step of the PLAYED stream — including
+    /// the one into the duplicated frame and the one out of it — stays inside the fade's slope.
+    /// Mirrors `crossfade_insert_adds_exactly_one_frame_and_the_seam_is_continuous`.
+    func testTheInsertSeamIsContinuousInWhatIsPlayed() {
+        let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
+        let want = 5 * perMS
+        var scratch = [Float](repeating: 0, count: want)
+        var next: Float = 1_000  // the ramp: +1 per interleaved sample
+        func write(ms: Int) {
+            var chunk = [Float](repeating: 0, count: ms * perMS)
+            for i in 0..<chunk.count { chunk[i] = next; next += 1 }
+            chunk.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: chunk.count) }
+        }
+        var played: [Float] = []
+        func read() {
+            scratch.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: want) }
+            played.append(contentsOf: scratch)
+        }
+        write(ms: 25); read()
+        ring.setSyncTarget(35 * perMS)
+        // Run until exactly one insert has happened, then a little past it.
+        var steps = 0
+        while ring.stats.inserts < 1, steps < 1_000 { write(ms: 5); read(); steps += 1 }
+        XCTAssertEqual(ring.stats.inserts, 1, "expected exactly one insert by now")
+        for _ in 0..<10 { write(ms: 5); read() }
+        XCTAssertEqual(ring.stats.underruns, 0)
+        // A duplicated 5 ms frame with a 2 ms fade: the seam smears 480 samples of ramp over
+        // 192, so |step| ≤ 480/192 + 1 ≈ 3.5. A hard splice would step by 480.
+        let (frame, fade) = ring.frameGeometry
+        let maxSlope = Float(frame) / Float(fade) + 2
+        var worst: Float = 0
+        for i in 1..<played.count { worst = max(worst, abs(played[i] - played[i - 1])) }
+        XCTAssertLessThanOrEqual(worst, maxSlope, "a step of \(worst) is a splice, not a fade")
+        // And exactly one frame was added: everything written is either played or still buffered,
+        // plus the one duplicated frame.
+        let written = Int(next - 1_000)
+        XCTAssertEqual(played.count, written + frame - ring.bufferedSamples, "not exactly +1 frame")
+    }
+
+    /// The DROP's seam, checked the same way — against the sample the device played just before
+    /// it. This is the check the fade never had, and the one the old tail-sourced fade-out failed
+    /// by a step of `drop − fade` samples. Driven through the hard-cap trim, which is the drop
+    /// that actually fires in the field. Mirrors `crossfade_drop_is_continuous_with_what_was_just_
+    /// played`.
+    func testTheDropSeamIsContinuousWithWhatWasJustPlayed() {
+        let ring = AudioRing(seconds: 1, channels: channels, rateHz: 48_000)
+        let want = 5 * perMS
+        var scratch = [Float](repeating: 0, count: want)
+        var next: Float = 1_000
+        func write(ms: Int) {
+            var chunk = [Float](repeating: 0, count: ms * perMS)
+            for i in 0..<chunk.count { chunk[i] = next; next += 1 }
+            chunk.withUnsafeBufferPointer { ring.write($0.baseAddress!, count: chunk.count) }
+        }
+        var played: [Float] = []
+        func read() {
+            scratch.withUnsafeMutableBufferPointer { ring.read(into: $0.baseAddress!, count: want) }
+            played.append(contentsOf: scratch)
+        }
+        // Prime and play one callback, so "the sample just played" is a real one.
+        write(ms: 25); read()
+        // A 60 ms burst lands on the 20 ms left: 80 ms > the 50 ms cap, so 30 ms is trimmed off
+        // the FRONT — right behind the sample just played — with a 2 ms fade.
+        write(ms: 60)
+        read(); read()
+        let (_, fade) = ring.frameGeometry
+        let drop = 30 * perMS
+        let maxSlope = Float(drop) / Float(fade) + 2
+        var worst: Float = 0
+        for i in 1..<played.count { worst = max(worst, abs(played[i] - played[i - 1])) }
+        XCTAssertLessThanOrEqual(
+            worst, maxSlope,
+            "a step of \(worst) across the trim is a splice, not a fade (the old fade-out source "
+                + "would step by \(drop - fade))")
+    }
+
     /// The four client rings adopt sync one at a time; an un-wired one must behave exactly as it
     /// did. `nil` is the default, so this pins the initializer too — and every other test in this
     /// file runs without a sync target, which is the real guard that nothing moved underneath them.

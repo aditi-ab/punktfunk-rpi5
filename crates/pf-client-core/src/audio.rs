@@ -503,6 +503,17 @@ fn pw_thread(
                         step.crossfade,
                     );
                 }
+                // The mirror: the sync loop asked for a DEEPER ring, and the policy answers
+                // with one duplicated, crossfaded frame instead of a de-prime. Allocation-free
+                // on this realtime loop: the ring is reserved for the hard cap plus slack and
+                // the policy only inserts below its target.
+                if step.insert_front > 0 {
+                    punktfunk_core::audio::crossfade_insert(
+                        &mut ud.ring,
+                        step.insert_front,
+                        step.crossfade,
+                    );
+                }
 
                 let mut ran_short = false;
                 let n_frames = if let Some(slice) = data.data() {
@@ -529,6 +540,7 @@ fn pw_thread(
                 ud.vitals.note_callback(
                     ran_short,
                     step.drop_front > 0,
+                    step.insert_front > 0,
                     ud.policy.avg_depth_ms(),
                     ud.policy.target_ms(),
                 );
@@ -611,6 +623,9 @@ impl MicStreamer {
         let thread = std::thread::Builder::new()
             .name("punktfunk-mic".into())
             .spawn(move || {
+                // The capture stream's `process` runs on THIS thread (no RT_PROCESS): capture,
+                // encode and send are all here, and a late tick is mic latency. Best-effort.
+                crate::audio_rt::boost_and_log("punktfunk-mic");
                 if let Err(e) = mic_thread(&connector, quit_rx, muted, echo_cancel) {
                     tracing::warn!(error = %e, "mic uplink thread ended");
                 }

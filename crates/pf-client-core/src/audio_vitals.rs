@@ -7,7 +7,7 @@
 //! missed graph cycle, which is a click. So the callback publishes numbers into these atomics
 //! and the decode thread, an ordinary thread that already wakes every frame, prints them at the
 //! old cadence with the old field names (`audio playback buffer_ms= target_ms= underruns=
-//! drift_sheds= plc_ms=`), so a field-log grep keeps working. The WASAPI twin runs its render
+//! drift_sheds= drift_inserts= plc_ms=`), so a field-log grep keeps working. The WASAPI twin runs its render
 //! loop on a plain thread and could log in place, but publishes here too: one logging site,
 //! one line shape, on both platforms.
 
@@ -23,6 +23,10 @@ pub struct PlaybackVitals {
     pub underruns: AtomicU64,
     /// Drops the policy asked for: drift sheds and hard trims together.
     pub sheds: AtomicU64,
+    /// Inserts the policy asked for: sync-driven deepening, one duplicated crossfaded frame each
+    /// (`JitterStep::insert_front`). Logged next to `sheds` so concealment in BOTH directions
+    /// stays visible — a ring being quietly deepened is a picture moving away from its audio.
+    pub inserts: AtomicU64,
     /// The policy's smoothed ring depth, ms — what drift correction reacts to.
     pub buffer_ms: AtomicU32,
     /// The policy's LIVE target depth, ms (grows under underrun pressure, follows A/V sync).
@@ -36,14 +40,24 @@ pub struct PlaybackVitals {
 
 impl PlaybackVitals {
     /// Callback side: one callback done. `ran_short` = it could not be filled from the ring;
-    /// `shed` = the policy dropped something this callback.
-    pub fn note_callback(&self, ran_short: bool, shed: bool, buffer_ms: u32, target_ms: u32) {
+    /// `shed` = the policy dropped something this callback; `insert` = it duplicated a frame.
+    pub fn note_callback(
+        &self,
+        ran_short: bool,
+        shed: bool,
+        insert: bool,
+        buffer_ms: u32,
+        target_ms: u32,
+    ) {
         self.callbacks.fetch_add(1, Ordering::Relaxed);
         if ran_short {
             self.underruns.fetch_add(1, Ordering::Relaxed);
         }
         if shed {
             self.sheds.fetch_add(1, Ordering::Relaxed);
+        }
+        if insert {
+            self.inserts.fetch_add(1, Ordering::Relaxed);
         }
         self.buffer_ms.store(buffer_ms, Ordering::Relaxed);
         self.target_ms.store(target_ms, Ordering::Relaxed);
@@ -68,6 +82,7 @@ impl PlaybackVitals {
             callbacks: self.callbacks.load(Ordering::Relaxed),
             underruns: self.underruns.load(Ordering::Relaxed),
             sheds: self.sheds.load(Ordering::Relaxed),
+            inserts: self.inserts.load(Ordering::Relaxed),
             buffer_ms: self.buffer_ms.load(Ordering::Relaxed),
             target_ms: self.target_ms.load(Ordering::Relaxed),
             requested_frames: self.requested_frames.load(Ordering::Relaxed),
@@ -83,6 +98,7 @@ pub struct Snapshot {
     pub callbacks: u64,
     pub underruns: u64,
     pub sheds: u64,
+    pub inserts: u64,
     pub buffer_ms: u32,
     pub target_ms: u32,
     pub requested_frames: u32,
@@ -98,14 +114,16 @@ mod tests {
     fn counters_accumulate_and_gauges_overwrite() {
         let v = PlaybackVitals::default();
         assert!(!v.quantum_known());
-        v.note_callback(false, false, 15, 15);
-        v.note_callback(true, true, 9, 25);
-        v.note_callback(true, false, 12, 25);
+        v.note_callback(false, false, false, 15, 15);
+        v.note_callback(true, true, false, 9, 25);
+        v.note_callback(true, false, false, 12, 25);
+        v.note_callback(false, false, true, 12, 25);
         v.note_quantum(240, 8192, 240);
         let s = v.snapshot();
-        assert_eq!(s.callbacks, 3);
+        assert_eq!(s.callbacks, 4);
         assert_eq!(s.underruns, 2);
         assert_eq!(s.sheds, 1);
+        assert_eq!(s.inserts, 1);
         assert_eq!(
             (s.buffer_ms, s.target_ms),
             (12, 25),

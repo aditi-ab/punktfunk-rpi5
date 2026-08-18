@@ -15,7 +15,10 @@ import { type ConfigService, makeConfigService } from "../config.js";
 import { HostClient, type PluginInfo } from "../host-client.js";
 import { ProviderClient, type ProviderClientService } from "../reconcile.js";
 import { definePluginKit, type PluginKitDef } from "../runtime.js";
-import { makeSyncEngine } from "../sync-engine.js";
+import {
+	DEFAULT_FS_CHANGE_MIN_INTERVAL,
+	makeSyncEngine,
+} from "../sync-engine.js";
 import { serveUi } from "../ui-server.js";
 import type { ProviderEntry } from "../wire.js";
 import {
@@ -77,6 +80,13 @@ export interface LibraryPluginDef<S extends Schema.Top> {
 	readonly pollInterval?: Duration.Duration;
 	/** Debounce on filesystem events. Default `Duration.seconds(3)`. */
 	readonly debounce?: Duration.Duration;
+	/**
+	 * Floor between two filesystem-triggered syncs, on top of the debounce: a debounce collapses a
+	 * burst, this caps the rate under sustained churn (a launcher writing to its dirs while a game
+	 * runs). Changes inside the interval coalesce into one trailing sync. Default
+	 * `Duration.seconds(30)`.
+	 */
+	readonly minInterval?: Duration.Duration;
 	/** Display title (the console's sources row falls back to the scanner label). Defaults to `name`. */
 	readonly title?: string;
 	/** Extra CLI verbs beyond the standard `detect` / `scan` / `uninstall` set. */
@@ -106,6 +116,7 @@ export const defineLibraryPlugin = <S extends Schema.Top>(
 	const store = def.store === null ? undefined : (def.store ?? def.name);
 	const poll = def.pollInterval ?? Duration.minutes(15);
 	const debounce = def.debounce ?? Duration.seconds(3);
+	const minInterval = def.minInterval ?? DEFAULT_FS_CHANGE_MIN_INTERVAL;
 
 	/** The config service, built fresh wherever it is needed (it only requires `PluginInfo`). */
 	const config: Effect.Effect<
@@ -196,6 +207,7 @@ export const defineLibraryPlugin = <S extends Schema.Top>(
 					pollInterval: poll,
 					watch: true,
 					debounce,
+					minInterval,
 					watchDirs,
 				})),
 			),

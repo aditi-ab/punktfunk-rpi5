@@ -30,6 +30,10 @@ pub mod audio;
 // — atomics only, because the PipeWire callback runs on the graph's realtime loop.
 #[cfg(any(target_os = "linux", windows))]
 pub mod audio_vitals;
+// Best-effort priority for the threads that FEED the device callbacks (decode leg, pad-audio
+// renderer, the WASAPI loops): rtkit / the Realtime portal on Linux, MMCSS on Windows.
+#[cfg(any(target_os = "linux", windows))]
+pub mod audio_rt;
 #[cfg(any(target_os = "linux", windows))]
 pub mod discovery;
 #[cfg(any(target_os = "linux", windows))]
