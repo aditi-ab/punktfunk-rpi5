@@ -99,12 +99,14 @@ usbfs-iso = { git = "https://github.com/unom-io/usbfs-iso", rev = "f3de1fd62cec2
 # overlay actions); `default-features = false` like every other consumer (its default is the
 # PyroWave decoder, C++ nobody here wants).
 #
-# 🛑 GATED TO THE 64-BIT ABIs, not `target_os = "android"`: rust-skia publishes prebuilt Skia
-# archives for aarch64/x86_64/i686-linux-android but NOT armv7-linux-androideabi, and
-# skia-bindings does not fail when no archive matches — it silently builds Skia from source for
-# hours. armeabi-v7a (the 32-bit TV boxes) joins once WP6's self-hosted archive is up; until then
-# it keeps the Compose console (`nativeConsoleAvailable()` says which).
-[target.'cfg(all(target_os = "android", any(target_arch = "aarch64", target_arch = "x86_64")))'.dependencies]
+# All three shipping ABIs. rust-skia publishes prebuilt Skia archives for aarch64/x86_64/
+# i686-linux-android but NOT armv7-linux-androideabi (the 32-bit TV boxes) — that one comes from
+# OUR mirror through `SKIA_BINARIES_URL` (kit/build.gradle.kts forwards it; the CI variable of
+# the same name; sha256 table beside it), built once with skia-bindings itself (design
+# android-skia-console-port.md WP6). 🛑 skia-bindings does not fail when no archive matches — it
+# silently builds Skia from source — so an armeabi-v7a build WITHOUT the mirror url is a
+# multi-minute source build, and every ABI's log must show `DOWNLOAD AND INSTALL SUCCEEDED`.
+# (Continues the `cfg(target_os = "android")` table above — TOML allows a table header once.)
 pf-console-ui = { path = "../../../crates/pf-console-ui", default-features = false }
 pf-client-core = { path = "../../../crates/pf-client-core", default-features = false }
 # `gl` + `textlayout` = the prebuilt key `gl-jpegd-jpege-pdf-textlayout` (verify
