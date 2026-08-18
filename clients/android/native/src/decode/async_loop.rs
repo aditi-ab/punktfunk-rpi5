@@ -13,8 +13,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::asc_presenter::{asc_backend_selected, AscBackend};
 use super::display::{
-    apply_hdr_dataspace, install_render_callback, release_render_callback, DisplayTracker,
+    apply_hdr_dataspace, hdr_dataspace, install_render_callback, release_render_callback,
+    DisplayTracker,
 };
 use super::latency::{note_decoded_pts, now_realtime_ns, take_flags, take_stamp};
 use super::presenter::{presenter_disabled_by_sysprop, PresentMeter, PresentPriority, Presenter};
@@ -22,6 +24,7 @@ use super::setup::{
     android_hdr_static_info, boost_hot_threads, boost_thread_priority, codec_mime,
     configure_low_latency, create_codec, try_set_frame_rate,
 };
+use super::surface_control::PresentComplete;
 use super::vsync::{now_monotonic_ns, VsyncClock};
 use super::{
     DecodeOptions, FRAME_PARK_CAP, IN_FLIGHT_CAP, NO_OUTPUT_PATIENCE, NO_VIDEO_PATIENCE,
@@ -43,7 +46,7 @@ struct OutputReady {
 /// Events the async decode loop reacts to. The codec's async-notify callbacks (which run on its
 /// internal looper thread) push the codec ones; the feeder thread pushes `Au`. Each carries only
 /// owned/`Copy` data so the callback closures satisfy the `Send` bound and never touch the codec.
-enum DecodeEvent {
+pub(super) enum DecodeEvent {
     /// A received access unit from the feeder, ready to queue into the decoder. The `u32` is the
     /// feeder's [`NativeClient::note_frame_index`] verdict — the forward frame-index gap's WIDTH
     /// (0 = none), so the loop arms the freeze gate with the same signal and pre-credits the
@@ -63,6 +66,10 @@ enum DecodeEvent {
     FormatChanged,
     /// A panel vsync (from the [`VsyncClock`] thread) — the presenter's retry/pacing tick.
     Vsync,
+    /// An `ASurfaceControl` transaction completed (ASurfaceControl backend only): the real latch
+    /// time + the previous buffer's release fence, forwarded from the completion callback (a binder
+    /// thread) so the decode loop applies it on its own thread.
+    PresentComplete(super::surface_control::PresentComplete),
     /// The codec reported an error; `fatal` when neither recoverable nor transient.
     Error { fatal: bool },
 }
@@ -89,6 +96,8 @@ pub(super) fn run_async(
         present_priority,
         smooth_buffer,
         panel_hz,
+        surface_w,
+        surface_h,
     } = opts;
     boost_thread_priority();
     let mode = client.mode();
@@ -176,7 +185,40 @@ pub(super) fn run_async(
             }
         }
     }
-    if let Err(e) = codec.configure(&format, Some(&window), MediaCodecDirection::Decoder) {
+    // Resolve the present intent once (shared by both backends).
+    let priority = PresentPriority::resolve(present_priority, smooth_buffer);
+    // The present backend. ASurfaceControl (default) drives its own `AImageReader` output surface +
+    // compositor layer, scheduling against the panel's real present clock; the SurfaceView presenter
+    // below is the fallback for API < 29, an ASC init failure, or the `present_backend=surfaceview`
+    // sysprop. A non-null `asc` means the codec renders into the reader, not the SurfaceView window.
+    let mut asc = if asc_backend_selected() {
+        let initial_ds = if client.color.is_hdr() {
+            i32::from(ndk::data_space::DataSpace::Bt2020ItuPq)
+        } else {
+            0
+        };
+        AscBackend::create(
+            &window,
+            mode.width as i32,
+            mode.height as i32,
+            surface_w,
+            surface_h,
+            panel_hz,
+            initial_ds,
+            mode.refresh_hz,
+            priority,
+        )
+    } else {
+        log::info!("decode: present backend = SurfaceView (present_backend sysprop)");
+        None
+    };
+    // The decoder's output surface: the reader's window when ASC is active, else the SurfaceView.
+    let configure_window: &NativeWindow = asc.as_ref().map_or(&window, |a| a.reader_window());
+    if let Err(e) = codec.configure(
+        &format,
+        Some(configure_window),
+        MediaCodecDirection::Decoder,
+    ) {
         log::error!("decode: configure failed: {e}");
         return;
     }
@@ -190,8 +232,10 @@ pub(super) fn run_async(
         mode.height
     );
     // The forced TV mode switch (`is_tv` ⇒ ALWAYS strategy) is part of the experimental stack;
-    // off, every form factor gets the original soft seamless hint.
-    if mode.refresh_hz > 0
+    // off, every form factor gets the original soft seamless hint. ASC votes the rate on its own
+    // layer instead (the SurfaceView window shows nothing under the ASC path).
+    if asc.is_none()
+        && mode.refresh_hz > 0
         && !try_set_frame_rate(&window, mode.refresh_hz as f32, is_tv && low_latency_mode)
     {
         log::debug!(
@@ -205,6 +249,11 @@ pub(super) fn run_async(
     // output back to them. Behind a `Mutex` since two threads touch it — only ever locked while the
     // HUD is visible.
     let clock_offset = client.clock_offset_shared();
+    // The shared cell the audio plane steers its jitter ring by — video is the master, and the
+    // present path is the only point that knows when a frame actually reached glass. Both backends
+    // publish into it (the ASC path from its transaction completions, the SurfaceView path from the
+    // OnFrameRendered tracker).
+    let video_e2e = client.video_e2e_shared();
     // Whether the adaptive-bitrate controller wants the `decode` stage as its decoder-backlog
     // signal (Automatic, non-PyroWave): then `in_flight` is fed regardless of the HUD.
     let measure_decode = client.wants_decode_latency();
@@ -212,27 +261,30 @@ pub(super) fn run_async(
     // Display stage (spec `display` + the capture→displayed headline): the rendered frame is
     // parked in the tracker at release; the OnFrameRendered callback pairs it with
     // SurfaceFlinger's render timestamp. `render_cb` is the callback's leaked Arc refcount,
-    // reclaimed after the codec is dropped below.
+    // reclaimed after the codec is dropped below. SurfaceView backend only — the ASC path measures
+    // its display stage directly off the transaction completions.
     let meter = Arc::new(PresentMeter::new());
-    // The tracker also publishes each confirmed present's end-to-end into the shared cell the audio
-    // plane steers its jitter ring by (`design/audio-latency-overhaul.md`) — video is the master,
-    // and this is the only point that knows when a frame actually reached glass.
     let tracker = DisplayTracker::new(
         stats.clone(),
         clock_offset.clone(),
-        client.video_e2e_shared(),
+        video_e2e.clone(),
         meter.clone(),
     );
-    let render_cb = install_render_callback(&codec, &tracker);
+    let render_cb = if asc.is_none() {
+        install_render_callback(&codec, &tracker)
+    } else {
+        None
+    };
 
-    // The timeline presenter (see `presenter.rs`): newest-wins / smoothing store, one-in-flight
-    // glass budget, timeline-timed release. `debug.punktfunk.presenter = arrival` selects the
-    // legacy release-immediately path for a rebuild-free on-device A/B.
-    let mut presenter = if presenter_disabled_by_sysprop() {
+    // The SurfaceView timeline presenter (see `presenter.rs`): newest-wins / smoothing store,
+    // one-in-flight glass budget, timeline-timed release. `None` under the ASC backend, or when
+    // `debug.punktfunk.presenter = arrival` selects the legacy release-immediately path.
+    let mut presenter = if asc.is_some() {
+        None
+    } else if presenter_disabled_by_sysprop() {
         log::info!("decode: presenter = arrival (sysprop) — legacy immediate release");
         None
     } else {
-        let priority = PresentPriority::resolve(present_priority, smooth_buffer);
         log::info!(
             "decode: presenter = timeline ({})",
             match priority {
@@ -242,11 +294,15 @@ pub(super) fn run_async(
         );
         Some(Presenter::new(priority, mode.refresh_hz))
     };
-    stats.set_presenter_active(presenter.is_some());
+    stats.set_presenter_active(presenter.is_some() || asc.is_some());
     // The vsync clock, started LAZILY on the first decoded frame (see `vsync.rs`); its ticks ride
-    // the same event channel. The Sender parks here until that moment.
+    // the same event channel. The ASC backend derives its present clock from the real transaction
+    // latches instead, so it needs no choreographer.
     let mut vsync: Option<VsyncClock> = None;
     let mut vsync_tx = presenter.is_some().then(|| ev_tx.clone());
+    // A persistent Sender for the ASC path: the pump hands it to each transaction's completion
+    // callback, and it keeps the event channel alive for those callbacks.
+    let present_tx = asc.as_ref().map(|_| ev_tx.clone());
 
     // Feeder thread: block on the network so this loop doesn't (an AU's arrival becomes an event that
     // wakes us immediately, with no input-side poll latency). It also records the `received` HUD stat.
@@ -337,35 +393,52 @@ pub(super) fn run_async(
         let mut fmt_dirty = false;
         let mut vsync_tick = false;
         let mut aus_dropped: u64 = 0;
+        // ASurfaceControl transaction completions coalesced into this pass, applied after the
+        // event drain (they run on the decode thread, not the binder thread that posted them).
+        let mut present_completes: Vec<PresentComplete> = Vec::new();
         if let Some(ev) = ev0 {
-            aus_dropped += u64::from(dispatch_event(
-                ev,
-                &mut pending_aus,
-                &mut free_inputs,
-                &mut ready,
-                &mut fmt_dirty,
-                &mut vsync_tick,
-                &mut fatal,
-                &mut gate,
-                &mut recovery_flags,
-                &mut arrival_stamps,
-            ));
+            if let DecodeEvent::PresentComplete(pc) = ev {
+                present_completes.push(pc);
+            } else {
+                aus_dropped += u64::from(dispatch_event(
+                    ev,
+                    &mut pending_aus,
+                    &mut free_inputs,
+                    &mut ready,
+                    &mut fmt_dirty,
+                    &mut vsync_tick,
+                    &mut fatal,
+                    &mut gate,
+                    &mut recovery_flags,
+                    &mut arrival_stamps,
+                ));
+            }
         }
         // Coalesce every other event already queued into this one work pass — correct newest-only
         // presentation across a decode burst, and batched feeding.
         while let Ok(ev) = ev_rx.try_recv() {
-            aus_dropped += u64::from(dispatch_event(
-                ev,
-                &mut pending_aus,
-                &mut free_inputs,
-                &mut ready,
-                &mut fmt_dirty,
-                &mut vsync_tick,
-                &mut fatal,
-                &mut gate,
-                &mut recovery_flags,
-                &mut arrival_stamps,
-            ));
+            if let DecodeEvent::PresentComplete(pc) = ev {
+                present_completes.push(pc);
+            } else {
+                aus_dropped += u64::from(dispatch_event(
+                    ev,
+                    &mut pending_aus,
+                    &mut free_inputs,
+                    &mut ready,
+                    &mut fmt_dirty,
+                    &mut vsync_tick,
+                    &mut fatal,
+                    &mut gate,
+                    &mut recovery_flags,
+                    &mut arrival_stamps,
+                ));
+            }
+        }
+        if let Some(a) = asc.as_mut() {
+            let off = clock_offset.load(Ordering::Relaxed);
+            for pc in present_completes.drain(..) {
+                a.on_present_complete(pc, off, &stats, &video_e2e);
+            }
         }
         if vsync_tick {
             if let Some(p) = presenter.as_mut() {
@@ -374,7 +447,12 @@ pub(super) fn run_async(
         }
         stats.note_skipped_overflow(aus_dropped); // parked-AU overflow: skips, flagged as such
         if fmt_dirty {
-            apply_hdr_dataspace(&codec, &window, &mut applied_ds);
+            if let Some(a) = asc.as_mut() {
+                // ASC carries the HDR signal on the transaction, not the SurfaceView window.
+                a.set_dataspace(hdr_dataspace(&codec).map_or(0, i32::from));
+            } else {
+                apply_hdr_dataspace(&codec, &window, &mut applied_ds);
+            }
         }
         feed_ready(
             &codec,
@@ -399,26 +477,48 @@ pub(super) fn run_async(
             if let Some(p) = presenter.as_mut() {
                 p.reset_cadence();
             }
+            if let Some(a) = asc.as_mut() {
+                a.reset_cadence();
+            }
         }
         let had_output = !ready.is_empty();
         let rendered_before = rendered;
-        present_ready(
-            &codec,
-            &client,
-            measure_decode,
-            &mut ready,
-            &stats,
-            &in_flight,
-            &mut queued_stamps,
-            &meter,
-            clock_offset.load(Ordering::Relaxed),
-            &tracker,
-            &mut presenter,
-            &mut rendered,
-            &mut discarded,
-            &mut gate,
-            &mut recovery_flags,
-        );
+        if let Some(a) = asc.as_mut() {
+            // ASC path: fold the gate + record the decode-stage split (same as the SurfaceView
+            // path's measurement half), then render each approved output into the reader; the pump
+            // below composites it onto the layer.
+            asc_present_ready(
+                a,
+                &codec,
+                &client,
+                measure_decode,
+                &mut ready,
+                &stats,
+                &in_flight,
+                &mut queued_stamps,
+                clock_offset.load(Ordering::Relaxed),
+                &mut gate,
+                &mut recovery_flags,
+            );
+        } else {
+            present_ready(
+                &codec,
+                &client,
+                measure_decode,
+                &mut ready,
+                &stats,
+                &in_flight,
+                &mut queued_stamps,
+                &meter,
+                clock_offset.load(Ordering::Relaxed),
+                &tracker,
+                &mut presenter,
+                &mut rendered,
+                &mut discarded,
+                &mut gate,
+                &mut recovery_flags,
+            );
+        }
         // The presenter's decision point runs EVERY pass — frame arrivals, vsync ticks and the
         // 5 ms housekeeping wake all land here, which is what reopens the glass budget on time
         // even when the choreographer clock is absent.
@@ -474,6 +574,18 @@ pub(super) fn run_async(
                     }
                 }
             }
+        }
+        // The ASurfaceControl backend's decision point — same "runs every pass" contract as the
+        // SurfaceView presenter, but its clock is the real transaction latches, so no choreographer
+        // is consulted. `present_tx` is the persistent Sender each transaction's completion callback
+        // rides back on.
+        if let Some(a) = asc.as_mut() {
+            if let Some(tx) = present_tx.as_ref() {
+                if a.pump(now_monotonic_ns(), &stats, tx) {
+                    rendered += 1;
+                }
+            }
+            a.flush(&stats);
         }
         let presented_now = rendered > rendered_before;
         // Start the vsync clock LAZILY on the first decoded output (eager, it ticks the panel
@@ -584,6 +696,9 @@ pub(super) fn run_async(
     if let Some(p) = presenter.as_mut() {
         p.release_all(&codec); // hand every held output buffer back before the codec stops
     }
+    if let Some(a) = asc.as_mut() {
+        a.release_all(); // drop every held image back to the reader pool before it goes away
+    }
     drop(vsync); // stop + join the choreographer thread; its channel sends are harmless after
     let _ = codec.stop();
     shutdown.store(true, Ordering::SeqCst); // ensure the feeder wakes and exits, then join it
@@ -591,6 +706,10 @@ pub(super) fn run_async(
         let _ = j.join();
     }
     drop(codec); // AMediaCodec_delete — after this no render callback can fire
+                 // The ASC layer + reader outlive the codec (which rendered into the reader's window); dropping
+                 // now releases the reader and decrements the compositor control's refcount — the control itself
+                 // is freed only once every in-flight completion callback has also dropped its share.
+    drop(asc);
     if let Some(ud) = render_cb {
         // SAFETY: the codec was dropped above; this registration's single reclaim.
         unsafe { release_render_callback(ud) };
@@ -777,6 +896,9 @@ fn dispatch_event(
                 gate.arm(Instant::now());
             }
         }
+        // Intercepted by the caller before it ever reaches here (routed to the ASC backend on the
+        // decode thread); this arm keeps the match exhaustive.
+        DecodeEvent::PresentComplete(_) => {}
     }
     false
 }
@@ -1058,4 +1180,81 @@ fn present_ready(
         }
     }
     stats.note_skipped(skipped); // HUD `skipped` counter (newest-wins + held-off drops); no-op hidden
+}
+
+/// The ASurfaceControl backend's analogue of [`present_ready`]: record the same decode-stage split
+/// (the HUD histogram + the ABR decoder-backlog signal), then fold each decoded output through the
+/// re-anchor gate and render it into the reader (`present = true`) or drop it off-glass. The pump
+/// composites the rendered images onto the layer; the display stage is measured there from the real
+/// transaction latches, not here. `ready` is drained.
+#[allow(clippy::too_many_arguments)] // one call site; mirrors `present_ready`'s measurement half
+fn asc_present_ready(
+    asc: &mut AscBackend,
+    codec: &MediaCodec,
+    client: &NativeClient,
+    measure_decode: bool,
+    ready: &mut Vec<OutputReady>,
+    stats: &crate::stats::VideoStats,
+    in_flight: &Mutex<VecDeque<(u64, i128)>>,
+    queued_stamps: &mut VecDeque<(u64, i128)>,
+    clock_offset: i64,
+    gate: &mut ReanchorGate,
+    recovery_flags: &mut VecDeque<(u64, u32)>,
+) {
+    if ready.is_empty() {
+        return;
+    }
+    // Decode-stage measurement (identical to the SurfaceView path's first block, minus the
+    // PresentMeter — the ASC backend keeps its own 1 Hz line). Pairs each output's receipt +
+    // queued stamps for the `decode` histogram, the feed/codec split, and the ABR signal.
+    {
+        let want_stage = stats.enabled() || measure_decode;
+        let mut g = in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for o in ready.iter() {
+            let received_ns = if want_stage {
+                note_decoded_pts(
+                    client,
+                    measure_decode,
+                    stats,
+                    &mut g,
+                    clock_offset,
+                    o.pts_us,
+                    o.decoded_ns,
+                )
+            } else {
+                None
+            };
+            let queued = take_stamp(queued_stamps, o.pts_us);
+            let codec_us = queued.map(|q| ((o.decoded_ns - q).max(0) / 1000) as u64);
+            if let Some(c) = codec_us {
+                let feed_us = match (queued, received_ns) {
+                    (Some(q), Some(r)) => Some(((q - r).max(0) / 1000) as u64),
+                    _ => None,
+                };
+                stats.note_decode_split(feed_us, c);
+            }
+        }
+    }
+    // Fold every output through the gate in pts (== decode) order — a `false` verdict is withheld
+    // concealment (dropped off-glass, the ASC equivalent of the SurfaceView release-unrendered).
+    let now = Instant::now();
+    let mut withheld: u64 = 0;
+    for o in ready.drain(..) {
+        let flags = take_flags(recovery_flags, o.pts_us);
+        let present = gate.on_decoded(flags, false, now) == GateVerdict::Present;
+        if !present {
+            withheld += 1;
+        }
+        asc.on_output(
+            codec,
+            o.index,
+            o.pts_us,
+            o.decoded_ns,
+            o.decoded_mono_ns,
+            present,
+        );
+    }
+    stats.note_skipped(withheld); // gate-withheld frames (the reader-drop skips ride `asc.flush`)
 }

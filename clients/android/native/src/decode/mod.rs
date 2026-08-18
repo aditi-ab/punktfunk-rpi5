@@ -1,16 +1,25 @@
-//! Android video decode (android-only): pull HEVC access units from the connector and render them
-//! to the SurfaceView via NDK `AMediaCodec` — hardware decode, zero per-frame JNI.
+//! Android video decode (android-only): pull HEVC access units from the connector into NDK
+//! `AMediaCodec` — hardware decode, zero per-frame JNI.
+//!
+//! The decoded frames reach glass through one of two present backends (see [`asc_presenter`] and
+//! [`presenter`]). The default is the **ASurfaceControl** backend: the codec renders into an
+//! `AImageReader` and each frame is composited onto an `ASurfaceControl` layer via a transaction
+//! carrying a desired present time, scheduling against the panel's real present clock. The
+//! **SurfaceView** presenter — `releaseOutputBufferAtTime` straight to the SurfaceView's window — is
+//! the fallback for API < 29, an ASC init failure, or the `present_backend=surfaceview` sysprop.
 //!
 //! One-in/one-out: the host opens every stream with an IDR carrying VPS/SPS/PPS **in-band**, so the
 //! decoder needs no out-of-band codec-specific data — we configure with mime + the negotiated
 //! WxH (from [`NativeClient::mode`]) and feed each access unit as it arrives. The decode thread owns
-//! the codec + window for its whole life; [`crate::session`] signals it to stop via the shared flag.
+//! the codec + surface for its whole life; [`crate::session`] signals it to stop via the shared flag.
 
+mod asc_presenter;
 mod async_loop;
 mod display;
 mod latency;
 mod presenter;
 mod setup;
+mod surface_control;
 mod sync_loop;
 mod vsync;
 
@@ -124,6 +133,12 @@ pub(crate) struct DecodeOptions {
     /// named here is not necessarily the one the panel ends up in. The measured timeline spacing
     /// corrects it in both directions ([`punktfunk_core::phase::PanelGrid`]).
     pub panel_hz: i32,
+    /// The video `SurfaceView`'s on-screen pixel size (the aspect-fitted display footprint), from
+    /// Kotlin at `surfaceCreated`. The ASurfaceControl backend composites its layer in this
+    /// coordinate space — NOT the window's buffer geometry, which is rotated/scaled. `0` = Kotlin
+    /// couldn't read it yet, and the backend falls back to the window buffer size.
+    pub surface_w: i32,
+    pub surface_h: i32,
 }
 
 /// The decode entry point on the `pf-decode` thread: dispatches to the async or synchronous loop.

@@ -916,6 +916,12 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                                 activity?.streamPanelFps(streamHz)?.takeIf { it > 0 }
                                     ?: (runCatching { context.display }.getOrNull()?.refreshRate ?: 0f)
                                         .roundToInt(),
+                                // The SurfaceView's on-screen pixel size — the coordinate space the
+                                // ASurfaceControl layer composites in (the aspect-fitted video rect,
+                                // not the window's rotated buffer geometry). 0 if not laid out yet;
+                                // native falls back to the window buffer size.
+                                this@apply.width,
+                                this@apply.height,
                             )
                             NativeBridge.nativeStartAudio(handle, lowLatencyMode, isTv)
                             // The MIC grant is read live (a surface recreate re-runs this, and
