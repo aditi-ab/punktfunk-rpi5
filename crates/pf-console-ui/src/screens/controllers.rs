@@ -75,11 +75,7 @@ const PASSTHROUGH: [(PadAction, &str, &str); 4] = [
         "Grant",
     ),
     (PadAction::Sc2Usb, "Steam Controller 2 over USB", "Grant"),
-    (
-        PadAction::DsUsb,
-        "DualSense / DualShock over USB",
-        "Grant",
-    ),
+    (PadAction::DsUsb, "DualSense / DualShock over USB", "Grant"),
     (PadAction::DsHaptics, "DualSense haptics self-test", "Test"),
 ];
 
@@ -258,7 +254,14 @@ fn spec(row: Row, ctx: &Ctx) -> RowSpec {
             RowSpec {
                 header: (i == 0).then_some("Gamepads"),
                 label: pad.name.clone(),
-                value: Some(if pad.rumble { "Test rumble" } else { "No rumble" }.into()),
+                value: Some(
+                    if pad.rumble {
+                        "Test rumble"
+                    } else {
+                        "No rumble"
+                    }
+                    .into(),
+                ),
                 value_dim: !pad.rumble,
                 caret: false,
                 adjustable: false,
@@ -289,22 +292,26 @@ fn detail(row: Row, ctx: &Ctx) -> String {
             .into(),
         Row::Pad(i) => pad_detail(&ctx.pads[i]),
         Row::Passthrough(i) => match PASSTHROUGH[i].0 {
-            PadAction::Sc2Bluetooth =>
+            PadAction::Sc2Bluetooth => {
                 "A Steam Controller 2 paired over Bluetooth cannot be detected at all without \
                  Bluetooth access. Wired and Puck-dongle controllers need no permission."
-                    .into(),
-            PadAction::Sc2Usb =>
+                    .into()
+            }
+            PadAction::Sc2Usb => {
                 "A wired or Puck-dongle Steam Controller 2 needs USB access to be captured; \
                  until then it stays in its built-in keyboard/mouse mode."
-                    .into(),
-            PadAction::DsUsb =>
+                    .into()
+            }
+            PadAction::DsUsb => {
                 "A wired DualSense or DualShock 4 needs USB access to be captured — with it, \
                  streams drive rumble, adaptive triggers, lightbar and gyro directly."
-                    .into(),
-            PadAction::DsHaptics =>
+                    .into()
+            }
+            PadAction::DsHaptics => {
                 "Play a short tone through a wired DualSense's audio endpoint, to tell a pad \
                  that cannot do haptics from a stream that is not sending them."
-                    .into(),
+                    .into()
+            }
             // Not offered as a passthrough row — the pads carry it.
             PadAction::Rumble => String::new(),
         },
