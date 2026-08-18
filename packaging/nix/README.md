@@ -64,7 +64,7 @@ as usual, so the cache is deliberately small and adding it costs you nothing on 
 ```nix
 nix.settings = {
   substituters = [ "https://nix.unom.io" ];
-  trusted-public-keys = [ "punktfunk-cache-1:<PUBLIC KEY — see below>" ];
+  trusted-public-keys = [ "punktfunk-cache-1:yhOJmHxzg6tzXpxSFzlYn6Pc6r0jHprsWqt8MZC654o=" ];
 };
 ```
 
@@ -72,7 +72,7 @@ nix.settings = {
 
 ```conf
 extra-substituters = https://nix.unom.io
-extra-trusted-public-keys = punktfunk-cache-1:<PUBLIC KEY — see below>
+extra-trusted-public-keys = punktfunk-cache-1:yhOJmHxzg6tzXpxSFzlYn6Pc6r0jHprsWqt8MZC654o=
 ```
 
 The current public key is served by the cache itself, so you can always check it against the source
@@ -467,48 +467,59 @@ service up *before* you set the secret that switches publishing on. The secret i
 exactly that reason: until it exists the publish no-ops with a warning and `main` stays green,
 the same way flatpak.yml's repo deploy does.
 
-1. **DNS:** `nix.unom.io` → the unom-1 hcloud box, in the `unom.io` Cloudflare zone, **DNS-only**
-   (not proxied) — same as `docs` and `winget`.
-2. **Caddy vhost:** in **`unom/infra`, `caddy/Caddyfile`**, next to the existing
-   `docs.punktfunk.unom.io` block:
+1. **Ingress — both halves live in `unom/infra`, and they must move together.** Neither the DNS
+   record nor the vhost is a click: `terraform/cloudflare/records.tf` owns the zone and
+   `caddy/Caddyfile` owns the vhosts, and that file says so itself — *"a name here with no vhost
+   404s, a vhost with no name here never cuts over."*
 
-   ```caddyfile
-   nix.unom.io {
-       import security_headers
-       reverse_proxy localhost:3250
-   }
-   ```
+   - `terraform/cloudflare/records.tf` — add `"nix"` to `local.hostnames`. It inherits
+     `proxied = false`, which this service specifically needs: a proxy that masked the origin's
+     404s would fail users' builds for every package the cache does not hold.
+   - `caddy/Caddyfile` — next to the `docs.punktfunk.unom.io` block:
 
-   ⚠ **Not by hand on the box.** `~/caddy/Caddyfile` on unom-1 looks like the config but is a copy
-   that `deploy-all.sh` rsyncs over from `unom/infra`, with no `.git` there to warn you — a vhost
-   added only on the box survives until the next deploy and no longer (this bit the winget source
-   on 2026-07-26; see `packaging/winget/server/README.md` for the incident).
+     ```caddyfile
+     nix.unom.io {
+         import security_headers
+         reverse_proxy localhost:3250
+     }
+     ```
 
-   Until the vhost exists the hostname resolves but the TLS handshake fails, because Caddy has no
-   certificate for a name it does not serve. Expected on first setup — and also exactly how a later
-   clobber presents. Diagnose by SNI, not by port 80 (Caddy 308s every Host to https, including
-   names it has never heard of, so a redirect proves nothing):
+   Apply with the **`dns-cutover.yml`** workflow (`target=hcloud`, `action=plan` first — expect a
+   single added `cloudflare_record.a["nix"]`, stop if it shows anything else) and `deploy-all` for
+   the Caddyfile.
+
+   ⚠ **Neither by hand.** A record added in the Cloudflare dashboard is out-of-band and risks the
+   duplicate-record round-robin `records.tf` documents; `~/caddy/Caddyfile` on unom-1 looks like the
+   config but is a copy `deploy-all.sh` rsyncs from the repo, with no `.git` to warn you — a vhost
+   added only on the box survives until the next deploy and no longer (this bit the winget source on
+   2026-07-26; see `packaging/winget/server/README.md`).
+
+   Until both land the hostname fails the TLS handshake, because Caddy has no certificate for a name
+   it does not serve. Expected on first setup — and also exactly how a later clobber presents.
+   Diagnose by SNI, not by port 80 (Caddy 308s every Host to https, including names it has never
+   heard of, so a redirect proves nothing):
 
    ```sh
    openssl s_client -connect nix.unom.io:443 -servername nix.unom.io </dev/null 2>&1 \
      | grep -E '^subject=|alert'
    ```
-3. Dispatch `deploy-services.yml` (or `unom/infra`'s `deploy-all`) to bring the container up. It
+2. Dispatch `deploy-services.yml` (or `unom/infra`'s `deploy-all`) to bring the container up. It
    serves an empty cache — every path 404s, which is exactly what a healthy empty cache does.
-4. Generate the signing key and store the secret half as the repo Actions secret
-   `NIX_CACHE_SIGNING_KEY` (the whole `name:base64` line). On a Nix box:
-   ```sh
-   nix key generate-secret --key-name punktfunk-cache-1
-   ```
-   Or without one, on anything with docker:
-   ```sh
-   docker run --rm nixos/nix nix --extra-experimental-features nix-command \
-     key generate-secret --key-name punktfunk-cache-1
-   ```
-5. Push to `main` touching the flake. The publish step prints the **public** key — paste it into the
-   "Binary cache" section above (and `docs-site/content/docs/install.md`) and commit.
+3. **Signing key — done.** `NIX_CACHE_SIGNING_KEY` is installed as a repo Actions secret, and its
+   public half is pinned in the "Binary cache" section above and in
+   `docs-site/content/docs/install.md`. Regenerate only deliberately: a new key invalidates every
+   signature already published, and every user pinning the old one starts failing. If you ever must:
 
-`scripts/setup-nix-cache.sh` walks through all five interactively.
+   ```sh
+   nix key generate-secret --key-name punktfunk-cache-1          # on a Nix box
+   docker run --rm nixos/nix nix --extra-experimental-features nix-command \
+     key generate-secret --key-name punktfunk-cache-1            # or anywhere with docker
+   ```
+4. Push to `main` touching the flake. The publish step also writes the public key to
+   `https://nix.unom.io/punktfunk-cache.pub`, so users can always check the docs against the cache.
+
+`scripts/setup-nix-cache.sh` walks through it interactively, and each stage detects work already
+done — so it is safe to run now that the key exists.
 
 **Operational notes:**
 

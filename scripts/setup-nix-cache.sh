@@ -182,31 +182,38 @@ finish() {
 # ──────────────────────────────────────────────────────────────────────────
 # STAGES — bring the punktfunk Nix binary cache at https://nix.unom.io live.
 #
-# Everything here is a step only a human can take: a Cloudflare record, a vhost in another
-# repo, a Gitea secret. The wizard opens each page, says exactly what to click, and then
-# VERIFIES the result before moving on — each stage has a distinct failure signature and
-# they are easy to confuse (see the notes in each).
+# Everything here is a step only a human can take: merging an infra PR, running an apply,
+# dispatching a deploy. The wizard opens each page, says exactly what to do, and then
+# VERIFIES the result before moving on — the failure signatures are easy to confuse:
 #
-# Safe to re-run: every stage detects work already done and offers to skip.
+#   TLS handshake failure  -> the vhost is not applied (Caddy has no cert for that name)
+#   502 / 503              -> vhost fine, the container behind :3250 is not running
+#   404                    -> healthy, the cache is simply empty
+#   200                    -> serving content
+#
+# Safe to re-run: every stage detects work already done and skips it.
 # Full context: packaging/nix/README.md § "Cache infrastructure (maintainers)".
 # ──────────────────────────────────────────────────────────────────────────
 
-TOTAL_STAGES=5
+TOTAL_STAGES=4
 
 CACHE_HOST="nix.unom.io"
 CACHE_PORT=3250
 KEY_NAME="punktfunk-cache-1"
-GITEA_REPO="https://git.unom.io/unom/punktfunk"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GITEA="https://git.unom.io"
+GITEA_REPO="$GITEA/unom/punktfunk"
+INFRA_REPO="$GITEA/unom/infra"
 
-# nix_run ARGS… — run a new-style nix command, from a local nix if there is one, otherwise
-# from the official image. Keeps this wizard usable on a machine with no nix (the maintainer
-# box is macOS).
-nix_run() {
+# probe PATH — HTTP status for a path on the cache, or 000 if it cannot be reached at all.
+probe() { curl -sS -o /dev/null -w '%{http_code}' -m 15 "https://$CACHE_HOST$1" 2>/dev/null || echo 000; }
+
+# nix_key ARGS… — run `nix key …` from a local nix if there is one, otherwise from the
+# official image. Keeps this usable on a machine with no nix (the maintainer box is macOS).
+nix_key() {
   if command -v nix >/dev/null 2>&1; then
-    nix --extra-experimental-features nix-command "$@"
+    nix --extra-experimental-features nix-command key "$@"
   elif command -v docker >/dev/null 2>&1; then
-    docker run --rm -i nixos/nix nix --extra-experimental-features nix-command "$@"
+    docker run --rm -i nixos/nix nix --extra-experimental-features nix-command key "$@"
   else
     return 127
   fi
@@ -215,68 +222,55 @@ nix_run() {
 banner "punktfunk Nix binary cache — bring-up"
 
 # ── 1 ─────────────────────────────────────────────────────────────────────
-stage "DNS — point $CACHE_HOST at unom-1"
+stage "Ingress — DNS + the Caddy vhost (unom/infra)"
 
-# Derive the target from a sibling service rather than hardcoding an IP that can move.
+say "Both halves live in unom/infra and must move together: terraform/cloudflare/records.tf"
+say "owns the DNS record, caddy/Caddyfile owns the vhost. That file's own rule:"
+note "  \"a name here with no vhost 404s, a vhost with no name here never cuts over.\""
+printf '\n'
+warn "Neither is a click."
+note "  A record added in the Cloudflare dashboard is out-of-band and risks the duplicate-record"
+note "  round-robin records.tf documents. ~/caddy/Caddyfile on unom-1 looks like the config but is"
+note "  a copy deploy-all.sh rsyncs from the repo — a vhost added there lasts until the next deploy."
+printf '\n'
+
 TARGET_IP="$(dig +short flatpak.unom.io | tail -n1)"
-[[ -n "$TARGET_IP" ]] || TARGET_IP="167.233.145.172"
-
+[ -n "$TARGET_IP" ] || TARGET_IP="167.233.145.172"
 CURRENT="$(dig +short "$CACHE_HOST" | tail -n1)"
-if [[ "$CURRENT" == "$TARGET_IP" ]]; then
-  say "$CACHE_HOST already resolves to $TARGET_IP — nothing to do."
-  pause "Press Enter for the next stage"
-else
-  say "unom-1 (the hcloud box) is $TARGET_IP — the same address flatpak.unom.io uses."
-  open_url "https://dash.cloudflare.com/?to=/:account/unom.io/dns/records"
-  step "Add record → Type: A"
-  step "Name: nix        (Cloudflare appends the zone, giving $CACHE_HOST)"
-  step "IPv4 address: $TARGET_IP"
-  step "Proxy status: DNS only — click the orange cloud so it turns GREY."
-  warn "Proxied (orange) would break large NAR downloads and mask the origin's 404s,"
-  note "  which nix needs in order to treat a miss as a miss rather than a hard error."
-  step "Save."
-  pause "Saved? Press Enter to verify"
 
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+if [ -n "$CURRENT" ]; then
+  printf '  %s✓%s %s already resolves to %s\n' "$GREEN" "$RESET" "$CACHE_HOST" "$CURRENT"
+  [ "$CURRENT" = "$TARGET_IP" ] || warn "expected $TARGET_IP (where flatpak.unom.io points) — check for a stale duplicate record"
+else
+  open_url "$INFRA_REPO/pulls"
+  step "Merge the 'Serve nix.unom.io' PR (adds \"nix\" to local.hostnames + the vhost)."
+  step "Run dns-cutover.yml with target=hcloud, action=plan."
+  step "The plan must show exactly ONE added record: cloudflare_record.a[\"nix\"]."
+  warn "If it shows anything else, stop — that zone config is shared with every unom site."
+  step "Re-run it with action=apply."
+  step "Then run deploy-all so the box picks up the new Caddyfile."
+  pause "Applied? Press Enter to verify DNS"
+
+  i=0
+  while [ "$i" -lt 10 ]; do
     CURRENT="$(dig +short "$CACHE_HOST" | tail -n1)"
-    [[ -n "$CURRENT" ]] && break
-    printf '  %swaiting for DNS to propagate…%s\n' "$DIM" "$RESET"
-    sleep 6
+    [ -n "$CURRENT" ] && break
+    printf '  %swaiting for DNS (TTL is 300s)…%s\n' "$DIM" "$RESET"
+    sleep 10
+    i=$((i + 1))
   done
-  if [[ "$CURRENT" == "$TARGET_IP" ]]; then
-    printf '  %s✓%s %s → %s\n' "$GREEN" "$RESET" "$CACHE_HOST" "$CURRENT"
-  elif [[ -n "$CURRENT" ]]; then
-    warn "$CACHE_HOST resolves to $CURRENT, expected $TARGET_IP."
-    note "  If that is a Cloudflare address (104.x / 172.6x), the record is PROXIED — grey the cloud."
-    confirm "Continue anyway?" || exit 1
+  if [ -n "$CURRENT" ]; then
+    printf '  %s✓%s %s -> %s\n' "$GREEN" "$RESET" "$CACHE_HOST" "$CURRENT"
   else
     warn "$CACHE_HOST still does not resolve."
-    SKIPPED+=("DNS record for $CACHE_HOST")
+    SKIPPED+=("DNS record for $CACHE_HOST (unom/infra records.tf + dns-cutover apply)")
     confirm "Continue anyway?" || exit 1
   fi
 fi
 
-# ── 2 ─────────────────────────────────────────────────────────────────────
-stage "Caddy vhost — terminate TLS for $CACHE_HOST"
-
-say "The edge Caddy runs on unom-1 itself, and its config is VERSION CONTROLLED in unom/infra."
-printf '\n'
-warn "Do NOT edit ~/caddy/Caddyfile on the box."
-note "  That file looks like the config but is a copy deploy-all.sh rsyncs over from unom/infra,"
-note "  with no .git there to warn you. A vhost added only on the box survives until the next"
-note "  deploy and no longer — that is how the winget source vanished on 2026-07-26."
-printf '\n'
-say "Add this next to the existing docs.punktfunk.unom.io block, in caddy/Caddyfile:"
-printf '\n'
-printf '      %s%s {\n          import security_headers\n          reverse_proxy localhost:%s\n      }%s\n\n' \
-  "$DIM" "$CACHE_HOST" "$CACHE_PORT" "$RESET"
-open_url "https://git.unom.io/unom/infra"
-step "Edit caddy/Caddyfile, add the block above, commit and push."
-step "Apply it the way unom/infra normally deploys (deploy-all)."
-pause "Applied? Press Enter to verify the certificate"
-
-# Diagnose by SNI. Caddy 308s EVERY Host on :80 to https, including names it has never heard
-# of, so a redirect there proves nothing at all.
+# The certificate is the proof the vhost half landed. Diagnose by SNI: Caddy 308s EVERY Host
+# on :80 to https, including names it has never heard of, so probing port 80 proves nothing.
+printf '  %schecking for a certificate…%s\n' "$DIM" "$RESET"
 TLS_OUT="$(openssl s_client -connect "${CACHE_HOST}:443" -servername "$CACHE_HOST" \
             </dev/null 2>&1 | grep -E '^subject=|alert' | head -n3 || true)"
 if printf '%s' "$TLS_OUT" | grep -q '^subject='; then
@@ -284,131 +278,131 @@ if printf '%s' "$TLS_OUT" | grep -q '^subject='; then
 else
   warn "No certificate for $CACHE_HOST yet:"
   printf '      %s%s%s\n' "$DIM" "${TLS_OUT:-(no response)}" "$RESET"
-  note "  Expected before the vhost is applied — Caddy cannot present a cert for a name it"
-  note "  does not serve. If you DID apply it, the deploy likely never reached the box."
-  SKIPPED+=("Caddy vhost for $CACHE_HOST in unom/infra caddy/Caddyfile")
+  note "  Caddy issues one automatically once the name resolves AND the vhost is deployed."
+  note "  If DNS is good, the Caddyfile half has not reached the box — re-run deploy-all."
+  SKIPPED+=("Caddy vhost for $CACHE_HOST")
   confirm "Continue anyway?" || exit 1
 fi
 
-# ── 3 ─────────────────────────────────────────────────────────────────────
+# ── 2 ─────────────────────────────────────────────────────────────────────
 stage "Start the cache container on unom-1"
 
-say "deploy-services.yml places the compose file + Caddyfile + prune.sh and starts the"
-say "container on port $CACHE_PORT. It serves an EMPTY cache until the first publish."
-open_url "$GITEA_REPO/actions?workflow=deploy-services.yml"
-step "Run workflow → leave the input blank → Run."
-step "Wait for the nix-cache job to go green."
-pause "Green? Press Enter to verify"
+CODE="$(probe /nix-cache-info)"
+if [ "$CODE" = 404 ] || [ "$CODE" = 200 ]; then
+  printf '  %s✓%s Container already answering (HTTP %s)\n' "$GREEN" "$RESET" "$CODE"
+else
+  say "deploy-services.yml ships the compose file + Caddyfile + prune.sh and starts the"
+  say "container on port $CACHE_PORT. It serves an EMPTY cache until the first publish."
+  open_url "$GITEA_REPO/actions?workflow=deploy-services.yml"
+  step "Run workflow -> leave the input blank -> Run."
+  step "Wait for the nix-cache job to go green."
+  pause "Green? Press Enter to verify"
 
-CODE="$(curl -sS -o /dev/null -w '%{http_code}' -m 15 "https://$CACHE_HOST/nix-cache-info" 2>/dev/null || echo 000)"
-case "$CODE" in
-  404)
-    printf '  %s✓%s Cache is up and empty — 404 on every path, exactly right for an empty cache\n' "$GREEN" "$RESET" ;;
-  200)
-    printf '  %s✓%s Cache is up and already holds content\n' "$GREEN" "$RESET" ;;
-  502|503)
-    warn "Caddy answered $CODE — the vhost is live but nothing is listening on :$CACHE_PORT."
-    note "  Check the nix-cache job in deploy-services.yml, or docker compose ps on unom-1."
-    SKIPPED+=("cache container on unom-1:$CACHE_PORT")
-    confirm "Continue anyway?" || exit 1 ;;
-  *)
-    warn "Unexpected response ($CODE) from https://$CACHE_HOST/nix-cache-info"
-    SKIPPED+=("cache container on unom-1:$CACHE_PORT")
-    confirm "Continue anyway?" || exit 1 ;;
-esac
+  CODE="$(probe /nix-cache-info)"
+  case "$CODE" in
+    404) printf '  %s✓%s Up and empty — 404 on every path, exactly right for an empty cache\n' "$GREEN" "$RESET" ;;
+    200) printf '  %s✓%s Up and already holding content\n' "$GREEN" "$RESET" ;;
+    502|503)
+      warn "Caddy answered $CODE — the vhost is live but nothing is listening on :$CACHE_PORT."
+      note "  Check the nix-cache job, or docker compose ps on unom-1."
+      SKIPPED+=("cache container on unom-1:$CACHE_PORT")
+      confirm "Continue anyway?" || exit 1 ;;
+    *)
+      warn "Unexpected response ($CODE) from https://$CACHE_HOST/nix-cache-info"
+      SKIPPED+=("cache container on unom-1:$CACHE_PORT")
+      confirm "Continue anyway?" || exit 1 ;;
+  esac
+fi
 
-# ── 4 ─────────────────────────────────────────────────────────────────────
-stage "Signing key — generate it, store it, pin it"
+# ── 3 ─────────────────────────────────────────────────────────────────────
+stage "Signing key"
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 README_MD="$REPO_ROOT/packaging/nix/README.md"
 INSTALL_MD="$REPO_ROOT/docs-site/content/docs/install.md"
 
-if ! grep -q "$KEY_NAME:<" "$README_MD" 2>/dev/null; then
-  say "The docs already carry a real public key, so a key has been generated before."
-  warn "A new key would invalidate every signature already published."
-  if ! confirm "Generate a REPLACEMENT key anyway?"; then
-    say "Keeping the existing key."
-    SKIP_KEY=1
-    pause "Press Enter for the last stage"
-  fi
-fi
-
-if [[ "${SKIP_KEY:-0}" != 1 ]]; then
-  say "Generating an ed25519 signing key pair…"
-  SECRET_KEY="$(nix_run key generate-secret --key-name "$KEY_NAME" 2>/dev/null || true)"
-  if [[ -z "$SECRET_KEY" ]]; then
+if grep -q "$KEY_NAME:<" "$README_MD" 2>/dev/null; then
+  say "The docs still carry a placeholder, so no key has been installed yet."
+  say "Generating an ed25519 key pair…"
+  SECRET_KEY="$(nix_key generate-secret --key-name "$KEY_NAME" 2>/dev/null || true)"
+  if [ -z "$SECRET_KEY" ]; then
     warn "Could not run nix here (no local nix, and no docker to fall back to)."
-    say "Generate it on any Nix box and paste it back:"
     note "  nix key generate-secret --key-name $KEY_NAME"
     ask_secret SECRET_KEY "Paste the secret key line:"
   fi
 
-  if [[ -z "$SECRET_KEY" ]]; then
-    SKIPPED+=("NIX_CACHE_SIGNING_KEY secret + public key in the docs")
+  if [ -z "$SECRET_KEY" ]; then
+    SKIPPED+=("NIX_CACHE_SIGNING_KEY + the public key in the docs")
   else
-    PUBLIC_KEY="$(printf '%s' "$SECRET_KEY" | nix_run key convert-secret-to-public 2>/dev/null || true)"
-
-    printf '\n  %sSecret key — paste this into Gitea now; nothing here keeps a copy:%s\n\n' "$BOLD" "$RESET"
+    PUBLIC_KEY="$(printf '%s' "$SECRET_KEY" | nix_key convert-secret-to-public 2>/dev/null || true)"
+    printf '\n  %sSecret key — paste into Gitea now; nothing here keeps a copy:%s\n\n' "$BOLD" "$RESET"
     printf '      %s\n\n' "$SECRET_KEY"
     open_url "$GITEA_REPO/settings/actions/secrets"
-    step "Add Secret → Name: NIX_CACHE_SIGNING_KEY"
+    step "Add Secret -> Name: NIX_CACHE_SIGNING_KEY"
     step "Value: the whole line above, including the '$KEY_NAME:' prefix."
-    step "Add Secret."
-    warn "This is the only copy — it is never written to disk."
     pause "Stored? Press Enter"
     WRITTEN_SECRET+=("NIX_CACHE_SIGNING_KEY (Gitea)")
     SECRET_KEY=""
 
-    if [[ -n "$PUBLIC_KEY" ]]; then
-      printf '\n  %sPublic key%s — this is what users pin:\n\n      %s\n\n' "$BOLD" "$RESET" "$PUBLIC_KEY"
-      # Both docs carry a `punktfunk-cache-1:<…>` placeholder. Fill them in now rather than
-      # making someone wait an hour for the first publish to print the same value.
+    if [ -n "$PUBLIC_KEY" ]; then
+      printf '\n  %sPublic key%s — what users pin:\n\n      %s\n\n' "$BOLD" "$RESET" "$PUBLIC_KEY"
       for f in "$README_MD" "$INSTALL_MD"; do
-        [[ -f "$f" ]] || continue
+        [ -f "$f" ] || continue
         tmp="$(mktemp)"
         sed "s|${KEY_NAME}:<[^>]*>|${PUBLIC_KEY}|g" "$f" > "$tmp" && mv "$tmp" "$f"
         printf '  %s✓ pinned in%s %s\n' "$GREEN" "$RESET" "${f#"$REPO_ROOT"/}"
       done
-      printf '\n'
       say "Commit those two files — without the key nobody can trust the cache."
-    else
-      warn "Could not derive the public key; the first publish prints it in its log."
-      SKIPPED+=("public key in packaging/nix/README.md + docs-site install.md")
     fi
-    pause "Press Enter for the last stage"
   fi
+else
+  PUBLIC_KEY="$(grep -om1 "$KEY_NAME:[A-Za-z0-9+/=]*" "$README_MD" 2>/dev/null || true)"
+  printf '  %s✓%s A key is already installed and pinned in the docs\n' "$GREEN" "$RESET"
+  [ -n "$PUBLIC_KEY" ] && printf '      %s\n' "$PUBLIC_KEY"
+  printf '\n'
+  warn "Do not regenerate it casually."
+  note "  A new key invalidates every signature already published, and every user pinning the"
+  note "  old one starts failing. Rotating means updating the docs and telling users."
+  pause "Press Enter for the last stage"
 fi
 
-# ── 5 ─────────────────────────────────────────────────────────────────────
+# ── 4 ─────────────────────────────────────────────────────────────────────
 stage "Publish — land the flake on main and verify"
 
 say "The publish tier runs on a push to main touching the flake, Cargo.*, or packaging/nix."
-say "Merging the cache PR is exactly such a push, so it publishes on merge."
 printf '\n'
 note "  It builds the whole Rust workspace AND gamescope inside the nix sandbox — sccache"
 note "  cannot reach in there, so budget roughly an hour for the first run."
 note "  If it reddens on 'Build the bun packages', that is the known intermittent OOM"
 note "  (exit 137) rather than a real break — re-run the job."
 printf '\n'
-open_url "$GITEA_REPO/pulls"
-step "Merge the Nix binary cache PR."
+open_url "$GITEA_REPO/actions?workflow=nix.yml"
+step "Merge any outstanding cache PR, or push a flake-touching commit to main."
 step "Watch the nix workflow's 'Sign + publish to nix.unom.io' step."
 pause "Published? Press Enter to verify the live cache"
 
-CODE="$(curl -sS -o /dev/null -w '%{http_code}' -m 15 "https://$CACHE_HOST/nix-cache-info" 2>/dev/null || echo 000)"
-if [[ "$CODE" == 200 ]]; then
+CODE="$(probe /nix-cache-info)"
+if [ "$CODE" = 200 ]; then
   printf '  %s✓%s nix-cache-info is being served\n' "$GREEN" "$RESET"
   LIVE_PUB="$(curl -sS -m 15 "https://$CACHE_HOST/punktfunk-cache.pub" 2>/dev/null || true)"
-  [[ -n "$LIVE_PUB" ]] && printf '  %s✓%s published public key: %s\n' "$GREEN" "$RESET" "$LIVE_PUB"
-  # A cache that 200s on nix-cache-info but does not 404 a miss is the one failure mode that
-  # breaks USERS rather than us: nix reads any non-404 as a hard error, not as a cache miss.
-  MISS="$(curl -sS -o /dev/null -w '%{http_code}' -m 15 \
-    "https://$CACHE_HOST/0000000000000000000000000000000000.narinfo" 2>/dev/null || echo 000)"
-  if [[ "$MISS" == 404 ]]; then
+  if [ -n "$LIVE_PUB" ]; then
+    printf '  %s✓%s published key: %s\n' "$GREEN" "$RESET" "$LIVE_PUB"
+    if [ -n "${PUBLIC_KEY:-}" ] && [ "$LIVE_PUB" != "$PUBLIC_KEY" ]; then
+      warn "That does NOT match the key pinned in the docs:"
+      note "    docs:  ${PUBLIC_KEY}"
+      note "    cache: ${LIVE_PUB}"
+      note "  Users following the docs would reject everything this cache serves."
+      SKIPPED+=("public key mismatch between the docs and $CACHE_HOST")
+    fi
+  fi
+  # The one failure mode that breaks USERS rather than us: nix reads any non-404 as a hard
+  # error, not as a cache miss, so a miss MUST 404.
+  MISS="$(probe /0000000000000000000000000000000000.narinfo)"
+  if [ "$MISS" = 404 ]; then
     printf '  %s✓%s a miss returns 404 — nix falls through to cache.nixos.org correctly\n' "$GREEN" "$RESET"
   else
-    warn "a miss returns $MISS, not 404 — every user build would then fail on any package"
-    warn "this cache does not hold. Check for a proxy or auth layer in front of Caddy."
+    warn "a miss returns $MISS, not 404 — every user build would fail on any package this"
+    warn "cache does not hold. Check for a proxy or auth layer in front of Caddy."
     SKIPPED+=("404-on-miss behaviour at $CACHE_HOST")
   fi
 else
