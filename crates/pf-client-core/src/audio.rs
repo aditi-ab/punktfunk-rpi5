@@ -135,11 +135,6 @@ impl PlaybackFormat {
     fn quantum_frames(&self) -> u32 {
         ((self.rate_hz as u64 * self.frame_us as u64 / 1_000_000) as u32).max(1)
     }
-
-    /// Frames (per channel) per millisecond — 48 at the protocol default, 96 at 96 kHz.
-    fn frames_per_ms(&self) -> usize {
-        (self.rate_hz / 1000).max(1) as usize
-    }
 }
 
 pub struct AudioPlayer {
@@ -152,6 +147,9 @@ pub struct AudioPlayer {
     /// A/V sync hand-off with the PipeWire callback: it publishes the ring depth, the decode
     /// thread posts the depth the sync loop wants. See [`punktfunk_core::audio::AudioSyncCell`].
     sync: Arc<punktfunk_core::audio::AudioSyncCell>,
+    /// The callback's vitals, published as atomics and logged by the decode thread — the
+    /// callback runs on the graph's realtime loop and formats nothing (see [`crate::audio_vitals`]).
+    vitals: Arc<crate::audio_vitals::PlaybackVitals>,
 }
 
 impl AudioPlayer {
@@ -171,10 +169,12 @@ impl AudioPlayer {
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Terminate>();
         let sync: Arc<punktfunk_core::audio::AudioSyncCell> = Arc::default();
         let sync_cb = sync.clone();
+        let vitals: Arc<crate::audio_vitals::PlaybackVitals> = Arc::default();
+        let vitals_cb = vitals.clone();
         let thread = std::thread::Builder::new()
             .name("punktfunk-audio".into())
             .spawn(move || {
-                if let Err(e) = pw_thread(pcm_rx, recycle_tx, quit_rx, fmt, sync_cb) {
+                if let Err(e) = pw_thread(pcm_rx, recycle_tx, quit_rx, fmt, sync_cb, vitals_cb) {
                     tracing::warn!(error = %e, "audio playback thread ended");
                 }
             })
@@ -185,6 +185,7 @@ impl AudioPlayer {
             quit_tx,
             thread: Some(thread),
             sync,
+            vitals,
         })
     }
 
@@ -192,6 +193,11 @@ impl AudioPlayer {
     /// depth the sync loop wants back through it.
     pub fn sync_cell(&self) -> Arc<punktfunk_core::audio::AudioSyncCell> {
         self.sync.clone()
+    }
+
+    /// The callback's vitals — the decode thread logs them (see [`crate::audio_vitals`]).
+    pub fn vitals(&self) -> Arc<crate::audio_vitals::PlaybackVitals> {
+        self.vitals.clone()
     }
 
     /// A recycled chunk Vec from the pool, empty but with its capacity intact — fill it
@@ -263,13 +269,13 @@ struct PlayerData {
     /// What `param_changed` last saw, so a graph RESUME (which re-announces the same format) is
     /// not logged as a format change — the host's virtual sink learned the same lesson.
     negotiated: Option<(u32, u32)>,
-    /// Diagnostics (WP0.3), logged ~every 10 s: the audio plane used to be entirely silent in a
-    /// client log, so a latency or dropout report had nothing to go on.
-    underruns: u64,
-    sheds: u64,
-    callbacks: u64,
     /// A/V sync hand-off with the decode thread (depth out, target in).
     sync: Arc<punktfunk_core::audio::AudioSyncCell>,
+    /// Diagnostics (WP0.3): the audio plane used to be entirely silent in a client log, so a
+    /// latency or dropout report had nothing to go on. Published from the callback as atomics
+    /// and LOGGED by the decode thread — see [`crate::audio_vitals`] for why the callback itself
+    /// no longer formats a line.
+    vitals: Arc<crate::audio_vitals::PlaybackVitals>,
 }
 
 fn pw_thread(
@@ -278,6 +284,7 @@ fn pw_thread(
     quit_rx: pipewire::channel::Receiver<Terminate>,
     fmt: PlaybackFormat,
     sync: Arc<punktfunk_core::audio::AudioSyncCell>,
+    vitals: Arc<crate::audio_vitals::PlaybackVitals>,
 ) -> Result<()> {
     use pipewire as pw;
     use pw::{properties::properties, spa};
@@ -328,10 +335,25 @@ fn pw_thread(
     let stream =
         pw::stream::StreamBox::new(&core, "punktfunk-client", props).context("pw Stream")?;
 
+    // Pre-reserved so `extend` never reallocates on the realtime loop (the same shape as the
+    // Android callback's ring): the policy trims the ring back under its hard cap on every
+    // callback, so the most it can ever hold on entry is that cap plus everything the pump could
+    // have queued since the last callback — the whole 64-chunk channel of the plane's own frame.
+    // Sized from the resolved format on all three axes (rate, frame, channels), so a 96 kHz
+    // 7.1 lossless session reserves what it needs and a stereo Opus one does not over-reserve.
+    let ring_capacity = {
+        let per_ms = fmt.rate_hz as usize * channels / 1000;
+        let frame = punktfunk_core::audio::pcm::samples_per_frame(
+            fmt.rate_hz,
+            fmt.frame_us,
+            fmt.channels as u8,
+        );
+        per_ms * TUNING.hard_cap_ms as usize + 64 * frame
+    };
     let ud = PlayerData {
         rx: pcm_rx,
         recycle: recycle_tx,
-        ring: VecDeque::new(),
+        ring: VecDeque::with_capacity(ring_capacity),
         policy: {
             // Both at the RESOLVED format: `new_at_rate` denominates every depth/target/shed
             // figure — and the `buffer_ms`/`target_ms` this client reports — in the right
@@ -350,10 +372,8 @@ fn pw_thread(
         channels,
         fmt,
         negotiated: None,
-        underruns: 0,
-        sheds: 0,
-        callbacks: 0,
         sync,
+        vitals,
     };
 
     let _listener = stream
@@ -400,6 +420,21 @@ fn pw_thread(
                 );
             }
         })
+        // ⚠ REALTIME. With `RT_PROCESS` (the connect below) this closure runs on libpipewire's
+        // data loop — the thread the graph drives, scheduled realtime wherever the client's
+        // PipeWire has rtkit (`module-rt` in `client.conf`; SteamOS does). Everything in it has
+        // to be what a realtime callback is allowed to do: no allocation (the ring is
+        // pre-reserved, drained chunks keep their capacity), no locks that a lower-priority
+        // thread can hold (both channels are lock-free for one producer/one consumer), and no
+        // logging — the vitals go out as atomics and the decode thread prints them.
+        //
+        // Before this the stream connected WITHOUT `RT_PROCESS`, so `process` ran on our own
+        // main-loop thread at ordinary priority: PipeWire's data loop signalled it, and if this
+        // thread was not scheduled within the cycle the graph rendered silence for our node and
+        // moved on — an underrun neither our counters nor the ring saw, because by the time we
+        // ran the ring was full and the callback drained normally. On a Steam Deck decoding
+        // 1440p120 alongside, that is a real and invisible source of clicks. The host's own
+        // PipeWire stream nodes have run `RT_PROCESS` since they were written.
         .process(|stream, ud| {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let Some(mut buffer) = stream.dequeue_buffer() else {
@@ -443,19 +478,11 @@ fn pw_thread(
                 let want = want_frames * ud.channels;
                 // Once per stream, in the shape of the host's per-capture-open quantum log:
                 // whether the graph's request or the buffer ceiling is sizing our writes is
-                // exactly what an on-glass latency report needs to say.
-                if ud.callbacks == 0 {
-                    tracing::info!(
-                        requested_frames = requested,
-                        capacity_frames = max_frames,
-                        write_frames = want_frames,
-                        // From the session's rate, not from 48: a 96 kHz quantum divided by 48
-                        // reads as twice the latency it is, in the one line an on-glass latency
-                        // report is triaged from.
-                        write_ms = want_frames / ud.fmt.frames_per_ms(),
-                        rate_hz = ud.fmt.rate_hz,
-                        "audio playback quantum"
-                    );
+                // exactly what an on-glass latency report needs to say. Published, not logged
+                // (realtime, see above); the decode thread prints it the first time it sees it.
+                if !ud.vitals.quantum_known() {
+                    ud.vitals
+                        .note_quantum(requested as u32, max_frames as u32, want_frames as u32);
                 }
 
                 // A/V sync: take whatever depth the decode thread's sync loop last asked for, and
@@ -470,7 +497,6 @@ fn pw_thread(
                 // and a hard cap as the backstop.
                 let step = ud.policy.step(ud.ring.len(), want);
                 if step.drop_front > 0 {
-                    ud.sheds += 1;
                     punktfunk_core::audio::crossfade_drop(
                         &mut ud.ring,
                         step.drop_front,
@@ -499,23 +525,13 @@ fn pw_thread(
                 // No-op while un-primed (the policy ignores it), so a deliberate priming silence
                 // is never miscounted as an underrun.
                 ud.policy.note_read(ran_short);
-                ud.underruns += u64::from(ran_short);
-                ud.callbacks += 1;
-                // ~10 s at a 5 ms quantum; the exact cadence does not matter, only that the
-                // plane stops being invisible.
-                if ud.callbacks % 2_000 == 0 {
-                    tracing::debug!(
-                        buffer_ms = ud.policy.avg_depth_ms(),
-                        target_ms = ud.policy.target_ms(),
-                        underruns = ud.underruns,
-                        drift_sheds = ud.sheds,
-                        // Concealment must be visible next to the underruns it prevented: a
-                        // healthy `underruns` bought with a climbing `plc_ms` is a link in
-                        // trouble, not a link that is fine.
-                        plc_ms = ud.sync.plc_ms(),
-                        "audio playback"
-                    );
-                }
+                // The 10 s `audio playback` line is printed by the decode thread from these.
+                ud.vitals.note_callback(
+                    ran_short,
+                    step.drop_front > 0,
+                    ud.policy.avg_depth_ms(),
+                    ud.policy.target_ms(),
+                );
                 let chunk = data.chunk_mut();
                 *chunk.offset_mut() = 0;
                 *chunk.stride_mut() = stride as _;
@@ -552,11 +568,16 @@ fn pw_thread(
     .into_inner();
     let mut params = [Pod::from_bytes(&values).context("pod from bytes")?];
 
+    // `RT_PROCESS`: run `process` on libpipewire's realtime data loop rather than on this
+    // main-loop thread — see the callback's own note for what that buys and what it forbids.
+    // Same flag the host's virtual mic and stream sink connect with.
     stream
         .connect(
             spa::utils::Direction::Output,
             None,
-            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+            pw::stream::StreamFlags::AUTOCONNECT
+                | pw::stream::StreamFlags::MAP_BUFFERS
+                | pw::stream::StreamFlags::RT_PROCESS,
             &mut params,
         )
         .context("pw stream connect")?;
@@ -861,14 +882,10 @@ mod tests {
         }
     }
 
-    /// The one-shot quantum log divides by this, and reading it off a constant is how a 96 kHz
-    /// session reports twice the latency it actually has in the line a report is triaged from.
+    /// A nonsense format must not ask the graph for a zero quantum.
     #[test]
-    fn frames_per_ms_follows_the_negotiated_rate() {
-        assert_eq!(fmt(48_000, 5_000).frames_per_ms(), 48);
-        assert_eq!(fmt(96_000, 2_000).frames_per_ms(), 96);
-        // A nonsense rate must not divide by zero in a log line.
-        assert_eq!(fmt(0, 5_000).frames_per_ms(), 1);
+    fn a_nonsense_format_still_asks_for_a_frame() {
         assert_eq!(fmt(0, 0).quantum_frames(), 1);
+        assert_eq!(fmt(0, 5_000).quantum_frames(), 1);
     }
 }

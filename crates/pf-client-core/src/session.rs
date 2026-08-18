@@ -2099,6 +2099,9 @@ fn spawn_audio(
         Ok("1") | Ok("true")
     );
     let sync_cell = player.sync_cell();
+    // The device callback's counters. Logged from THIS thread, on wall clock — the PipeWire
+    // callback runs on the graph's realtime loop and formats nothing (`crate::audio_vitals`).
+    let vitals = player.vitals();
     let video_e2e = connector.video_e2e_shared();
     let av_offset_out = connector.audio_av_offset_shared();
     let buffer_ms_out = connector.audio_buffer_ms_shared();
@@ -2131,6 +2134,20 @@ fn spawn_audio(
     std::thread::Builder::new()
         .name("punktfunk-audio-rx".into())
         .spawn(move || {
+            // Best-effort priority for the decode leg. This thread's lateness is absorbed by
+            // the ring (target 15 ms and up), so it is not the callback's problem in kind — but
+            // on a Steam Deck the same four cores decode 1440p120 and present it, and a decode
+            // thread descheduled past the ring depth is a drought the callback then has to
+            // conceal. A plain `setpriority` is honoured wherever RLIMIT_NICE allows (rtkit is
+            // the sanctioned unprivileged path and a follow-up); where it is refused this is a
+            // no-op, which is exactly what it was before.
+            #[cfg(target_os = "linux")]
+            {
+                // SAFETY: three by-value integers, no pointers; `PRIO_PROCESS` with `who == 0`
+                // targets the calling thread on Linux and only adjusts its nice value.
+                let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, -10) };
+                tracing::debug!(raised = rc == 0, "audio decode thread priority");
+            }
             let mut pcm = vec![0f32; scratch];
             let mut gaps = punktfunk_core::audio::AudioGapTracker::new();
             // Interleaved samples in the last decoded frame — the unit concealment is produced in.
@@ -2152,7 +2169,44 @@ fn spawn_audio(
                 frame_us,
             );
             let mut last_packet = std::time::Instant::now();
+            // The playback vitals line, ~every 10 s on wall clock (it used to be every 2 000
+            // device callbacks from inside the callback — same fields, same name, so a field-log
+            // grep keeps working), plus the one-shot quantum line the first time the callback
+            // has published one.
+            let mut last_vitals = std::time::Instant::now();
+            let mut quantum_logged = false;
             while !stop.load(Ordering::SeqCst) {
+                if !quantum_logged && vitals.quantum_known() {
+                    quantum_logged = true;
+                    let v = vitals.snapshot();
+                    tracing::info!(
+                        requested_frames = v.requested_frames,
+                        capacity_frames = v.capacity_frames,
+                        write_frames = v.write_frames,
+                        // From the session's rate, not from 48: a 96 kHz quantum divided by 48
+                        // reads as twice the latency it is, in the one line an on-glass latency
+                        // report is triaged from.
+                        write_ms = v.write_frames / (rate_hz / 1000).max(1),
+                        rate_hz,
+                        "audio playback quantum"
+                    );
+                }
+                if last_vitals.elapsed() >= Duration::from_secs(10) {
+                    last_vitals = std::time::Instant::now();
+                    let v = vitals.snapshot();
+                    tracing::debug!(
+                        buffer_ms = v.buffer_ms,
+                        target_ms = v.target_ms,
+                        underruns = v.underruns,
+                        drift_sheds = v.sheds,
+                        callbacks = v.callbacks,
+                        // Concealment must be visible next to the underruns it prevented: a
+                        // healthy `underruns` bought with a climbing `plc_ms` is a link in
+                        // trouble, not a link that is fine.
+                        plc_ms = sync_cell.plc_ms(),
+                        "audio playback"
+                    );
+                }
                 // Wait at most one frame WHILE there is a stream to protect: the drought decision
                 // has to be made on the wire's schedule, not whenever the next packet happens to
                 // turn up. Before anything has decoded there is no state to conceal from and
