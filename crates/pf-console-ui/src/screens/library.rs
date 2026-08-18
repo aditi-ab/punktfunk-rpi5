@@ -3,7 +3,7 @@
 //! on the shell's stack. B pops back to the host list; A launches the focused title in
 //! the same window. The shell owns the aurora, chrome, and the connecting overlay.
 
-use crate::anim::{entrances, Entrance, EntranceAt, Spring};
+use crate::anim::{approach, entrances, Entrance, EntranceAt, Spring};
 use crate::glyphs::{Hint, HintKey};
 use crate::library::{
     card_matrix, grid_col_hint, grid_step, initials, step_cursor, store_label, GridDir, GridShape,
@@ -28,8 +28,10 @@ const GRID_MARGIN: f64 = 48.0;
 const GRID_LABEL: f64 = 10.0;
 /// The band a grid group heading occupies.
 const GRID_HEADING: f64 = 30.0;
-/// The band the focused title's name and store occupy under either arrangement.
-const DETAIL_BAND: f64 = 84.0;
+/// The band the focused title's name occupies under either arrangement. Shrunk from 84 when
+/// the store/platform subtitle left: the cover badge already carries that answer, and on a
+/// phone the 20 units bought most of a grid row back.
+const DETAIL_BAND: f64 = 64.0;
 /// The corner on the view/sort bar's own glass, once it has focus.
 const BAR_CORNER: f64 = 14.0;
 /// Air between the bar and the field under it. The shelf centres its cards and would never
@@ -394,6 +396,13 @@ pub(super) fn strip_caption(
 /// the persisted settings are the state and these only draw it and hit-test a click.
 struct LibraryBar {
     focus: bool,
+    /// How present the bar is, 0–1. The bar only APPEARS while it holds the pad (▲ from the
+    /// field, "Sort & view" in the legend) — the Apple client's behaviour, adopted after the
+    /// always-on band proved too expensive on a phone: it taxed every library visit a strip
+    /// of field height to answer a question ("what is the sort") that only matters in the
+    /// moment of changing it. Chased toward `focus` each frame; the field takes the band's
+    /// room back as this falls.
+    reveal: f64,
     sort_tabs: TabStrip,
     view_tabs: TabStrip,
 }
@@ -402,6 +411,7 @@ impl LibraryBar {
     fn new() -> LibraryBar {
         LibraryBar {
             focus: false,
+            reveal: 0.0,
             sort_tabs: TabStrip::new(),
             view_tabs: TabStrip::new(),
         }
@@ -1229,7 +1239,11 @@ impl LibraryScreen {
                 // reaches the bar (the shell turns that hint into a `Move(Up)`), but focus is
                 // not a choice — a mouse picks a sort by pressing the pill it wants, which is
                 // why both strips hit-test themselves rather than leaning on the legend.
-                let (sort_hit, view_hit) = if self.bar_shown() {
+                // …and only while the bar is actually PRESENT: it appears on focus now, so
+                // an unfocused library has no pills on screen and none to hit. The `TabStrip`s
+                // keep the geometry they last drew, and a press must not land on furniture
+                // that has faded out.
+                let (sort_hit, view_hit) = if self.bar_shown() && self.bar.focus {
                     (
                         self.bar
                             .sort_tabs
@@ -1424,9 +1438,21 @@ impl LibraryScreen {
                 if self.entrance.is_some_and(|e| e.done(ctx.t)) {
                     self.entrance = None;
                 }
-                // The bar takes its band off the TOP of the field. The detail band keeps the
-                // full rect — it is anchored to the bottom — and so does the loading path
-                // above, which is centred in a field the bar is not part of.
+                // The bar only takes its band off the TOP of the field while it is present
+                // (see [`LibraryBar::reveal`]) — hidden, the field keeps the whole rect. The
+                // detail band keeps the full rect either way — it is anchored to the bottom —
+                // and so does the loading path above, which is centred in a field the bar is
+                // not part of.
+                let bar_target = if self.bar.focus { 1.0 } else { 0.0 };
+                self.bar.reveal = if crate::theme::reduce_motion() {
+                    bar_target
+                } else {
+                    approach(self.bar.reveal, bar_target, dt, 0.10)
+                };
+                if (self.bar.reveal - bar_target).abs() < 0.005 {
+                    self.bar.reveal = bar_target;
+                }
+                let reveal = self.bar.reveal;
                 let bar = Rect::from_ltrb(
                     rect.left,
                     rect.top,
@@ -1435,7 +1461,7 @@ impl LibraryScreen {
                 );
                 let field = Rect::from_ltrb(
                     rect.left,
-                    bar.bottom + (BAR_GAP * k) as f32,
+                    rect.top + ((TAB_STRIP_H + BAR_GAP) * k * reveal) as f32,
                     rect.right,
                     rect.bottom,
                 );
@@ -1445,7 +1471,21 @@ impl LibraryScreen {
                 }
                 // After the cards, like the detail band: it is the screen's readout, and a
                 // short window must not let an arriving cover paint over the answer.
-                self.draw_bar(canvas, bar, k, fonts, dt);
+                // Faded as a unit while arriving/leaving, with a small rise — the crate's
+                // transition grammar. Bounded layer: unbounded would allocate a surface-sized
+                // offscreen for a strip of pills (see the twin warning in home.rs).
+                if reveal > 0.01 {
+                    let bounds = Rect::from_ltrb(
+                        bar.left,
+                        bar.top - (12.0 * k) as f32,
+                        bar.right,
+                        bar.bottom + (12.0 * k) as f32,
+                    );
+                    canvas.save_layer_alpha_f(bounds, reveal as f32);
+                    canvas.translate((0.0f32, (-(1.0 - reveal) * 10.0 * k) as f32));
+                    self.draw_bar(canvas, bar, k, fonts, dt);
+                    canvas.restore();
+                }
                 self.draw_detail_band(canvas, rect, k, fonts);
                 self.evict_art();
             }
@@ -1514,13 +1554,13 @@ impl LibraryScreen {
     /// The bar over the field: what this library is sorted by, what it is arranged as, and
     /// the control for both.
     ///
-    /// Drawn whether or not it has focus, because the SORT is the thing the field cannot
-    /// say. A coverflow under `Platform` and one under `A–Z` are the same screen with the
-    /// cards in a different order, and until this band existed the only place that answer
-    /// lived was the Collections screen — which a single-store library is never offered at
-    /// all ([`crate::collate::worth_browsing`]). The arrangement IS visible in the field, and
-    /// is named here anyway: one strip that answers both questions the same way is a control
-    /// the user finds once.
+    /// Drawn only while it holds the pad ([`LibraryBar::reveal`]): the field's legend keeps
+    /// "▲ Sort & view" up permanently, so the ANSWER is one press away instead of one strip
+    /// of always-spent field height — the Apple client's behaviour, adopted for the small
+    /// screens where that strip priced out a full grid row. A coverflow under `Platform` and
+    /// one under `A–Z` are still the same screen with the cards in a different order; this
+    /// band is still the only place that names it (the Collections screen is never offered
+    /// to a single-store library at all — [`crate::collate::worth_browsing`]).
     fn draw_bar(&mut self, canvas: &Canvas, bar: Rect, k: f64, fonts: &Fonts, dt: f64) {
         // Focused, the WHOLE band takes an accent WASH — the two groups are one control here
         // (◀ ▶ step the sort, the shoulders pick the arrangement), so a ring around one pill
@@ -1645,8 +1685,17 @@ impl LibraryScreen {
         // the cursor — is what put the focus ring in a different column from the cover the
         // scroll had just brought up.
         let shape = GridShape::new(self.len(), cols, self.launcher_count());
-        let (cw, ch) = (GRID_W * k, GRID_H * k);
-        let pitch_x = cw + GRID_GAP * k;
+        // `grid_cols` clamps at two columns, so on a narrow-enough viewport (a high-density
+        // phone in portrait, where the density floor raises `k` past what the panel width
+        // covers) two full-size covers plus margins can overflow the rect and clip at the
+        // edges. The covers shrink to fit instead — only ever downward, and only the CELLS:
+        // headings and labels keep the design scale, and geometry stays self-consistent
+        // because everything below draws and records from these same metrics.
+        let fit = ((f64::from(rect.width()) - 2.0 * GRID_MARGIN * k)
+            / ((cols as f64 * (GRID_W + GRID_GAP) - GRID_GAP) * k))
+            .clamp(0.25, 1.0);
+        let (cw, ch) = (GRID_W * k * fit, GRID_H * k * fit);
+        let pitch_x = cw + GRID_GAP * k * fit;
         let pitch_y = ch + GRID_GAP * k + GRID_LABEL * k;
         // The launcher prefix keeps its own band, which is how design D4 reads in two
         // dimensions: the shelf says it with a heading that changes as the cursor crosses,
@@ -1704,7 +1753,7 @@ impl LibraryScreen {
             (bump, self.scroll.pos)
         };
 
-        let grid_w = cols as f64 * pitch_x - GRID_GAP * k;
+        let grid_w = cols as f64 * pitch_x - GRID_GAP * k * fit;
         let x0 = f64::from(rect.left) + (f64::from(rect.width()) - grid_w) / 2.0 + bump_x;
         let y0 = f64::from(rect.top);
         let viewport = Rect::from_xywh(rect.left, rect.top, rect.width(), (view_h.max(0.0)) as f32);
@@ -2072,7 +2121,7 @@ impl LibraryScreen {
                 canvas,
                 note,
                 f64::from(rect.left) + EDGE_INSET * k,
-                f64::from(rect.bottom) - 30.0 * k,
+                f64::from(rect.bottom) - 12.0 * k,
                 W::Regular,
                 12.0 * k,
                 fg(0.55),
@@ -2081,6 +2130,9 @@ impl LibraryScreen {
         let Some(g) = self.focused() else { return };
         let w = f64::from(rect.width());
         let cx = f64::from(rect.left) + w / 2.0;
+        // The title alone. The store/platform subtitle that sat under it is gone: the cover
+        // badge already names the store, so the line said everything twice and cost the band
+        // 20 units of field height on every library visit.
         fonts.centered(
             canvas,
             &g.title,
@@ -2088,29 +2140,8 @@ impl LibraryScreen {
             27.0 * k,
             fg(1.0),
             cx,
-            f64::from(rect.bottom) - 64.0 * k,
+            f64::from(rect.bottom) - 34.0 * k,
             w * 0.8,
-        );
-        // Store, and the PLATFORM when the host named one — the reason `platform` was
-        // plumbed at all is that "Shadow of the Colossus" means something rather different
-        // with "PS2" under it.
-        let store = store_label(&g.store).to_uppercase();
-        let sub = match (&g.platform, g.launcher) {
-            (_, true) => format!("{store} · LAUNCHER"),
-            (Some(p), _) if !p.trim().is_empty() => format!("{store} · {}", p.to_uppercase()),
-            _ => store,
-        };
-        fonts.centered(
-            canvas,
-            &sub,
-            W::Regular,
-            12.0 * k,
-            // The subtitle rung of the 0.55 / 0.7 / 0.85 ladder every other detail line
-            // in the crate already sits on.
-            fg(0.55),
-            cx,
-            f64::from(rect.bottom) - 30.0 * k,
-            w * 0.5,
         );
     }
 }

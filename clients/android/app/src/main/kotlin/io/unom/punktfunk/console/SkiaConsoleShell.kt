@@ -31,6 +31,9 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.app.ActivityCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import io.unom.punktfunk.ConsoleLicensesScreen
 import io.unom.punktfunk.DS_USB_PERMISSION_ACTION
 import io.unom.punktfunk.MainActivity
@@ -112,8 +115,24 @@ fun SkiaConsoleShell(
         SkiaConsole.handleDeepLink(url)
     }
 
+    // The console owns the whole panel while it fronts the app, exactly like the stream: the
+    // status bar and the gesture bar are hidden (a swipe shows them transiently), restored on the
+    // way out. This is both the space win AND the safe-area fix — hidden bars report zero insets,
+    // so the scroll clips that used to end at the visible gesture-bar line (scrolled rows sliced
+    // off mid-air with bare backdrop below) now run to the panel edge. Only the display cutout
+    // stays a real inset.
+    DisposableEffect(activity) {
+        val window = activity?.window ?: return@DisposableEffect onDispose {}
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+        onDispose { controller.show(WindowInsetsCompat.Type.systemBars()) }
+    }
+
     // The safe area, in surface pixels: system bars ∪ display cutout — the NP3's landscape punch
     // is a SIDE inset, and the console's chrome must stay clear of it (its backdrop need not).
+    // With the bars hidden above, this is normally just the cutout.
     val density = LocalDensity.current
     val ld = LocalLayoutDirection.current
     val insets = WindowInsets.systemBars.union(WindowInsets.displayCutout)
@@ -125,12 +144,14 @@ fun SkiaConsoleShell(
     // the same 800-unit field as a Deck); a phone or tablet in the hand gets a density FLOOR
     // under that formula, so type never shrinks below what the touch UI draws at the same
     // density (design D5 — a bare height/800 on a 460 dpi phone lands ~26 % smaller than a Deck).
-    // The 0.6 is the on-glass tuning knob.
+    // The 0.75 is the on-glass tuning knob — raised from 0.6 after a 460 dpi phone (Nothing
+    // Phone) still read a step too small in the hand: the floor is what sets the phone scale
+    // (the couch term only wins on tablets and TVs), so this is a phones-only bump.
     val tv = remember { io.unom.punktfunk.isTvDevice(context) }
     val scale = if (tv) 0f else {
         val dm = context.resources.displayMetrics
         val couch = minOf(dm.widthPixels, dm.heightPixels) / 800f
-        maxOf(couch, density.density * 0.6f).coerceIn(0.75f, 3f)
+        maxOf(couch, density.density * 0.75f).coerceIn(0.75f, 3f)
     }
     LaunchedEffect(handle, left, top, right, bottom, scale) {
         if (handle != 0L) NativeBridge.nativeConsoleSetViewport(handle, left, top, right, bottom, scale)
