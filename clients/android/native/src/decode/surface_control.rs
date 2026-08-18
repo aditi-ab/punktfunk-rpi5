@@ -384,19 +384,17 @@ impl Layer {
             if !self.configured {
                 (self.api.txn_set_visibility)(txn, sc, VISIBILITY_SHOW);
                 (self.api.txn_set_z_order)(txn, sc, 0);
-                self.configured = true;
-            }
-            // Vote the layer's frame rate on EVERY transaction (idempotent), not just the first, so
-            // an LTPO governor that decays a one-shot vote keeps seeing it. compatibility 1 =
-            // FIXED_SOURCE — the conventional value for fixed-rate video the app can't re-pace.
-            // (On a compliant panel this + the window's mode/refresh pin holds the rate; a
-            // non-compliant OEM governor — e.g. Nothing OS, which keeps the app render-range floor
-            // at 0 regardless — downshifts to 60 for "video" content anyway, which no app-side API
-            // observed here overrides.)
-            if frame_rate > 0.0 {
-                if let Some(f) = self.api.txn_set_frame_rate {
-                    f(txn, sc, frame_rate, 1);
+                // Declare the layer as fixed-rate video at the source rate (compatibility 1 =
+                // FIXED_SOURCE) so a compliant display aligns its refresh to it. Best-effort: an
+                // LTPO governor may still run "video" content below its own floor for power (the
+                // NP3 does — no app-side rate hint raises its render-range floor; the display's
+                // Minimum-refresh-rate system setting is the only lever there).
+                if frame_rate > 0.0 {
+                    if let Some(f) = self.api.txn_set_frame_rate {
+                        f(txn, sc, frame_rate, 1);
+                    }
                 }
+                self.configured = true;
             }
             (self.api.txn_set_present_time)(txn, desired_present_ns);
             // One-shot completion context, reclaimed inside the callback. The `Arc` clone keeps the

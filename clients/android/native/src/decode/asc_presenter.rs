@@ -350,8 +350,7 @@ impl AscBackend {
             frame.fence.take(),
             target,
             self.dataspace,
-            // Re-asserted every frame (idempotent): the LTPO governor decays a one-shot rate vote
-            // and drops the panel to 60 — see `Layer::present`.
+            // The layer's fixed-source rate — applied once, at layer config (see `Layer::present`).
             self.frame_rate,
             seq,
             ev_tx,
