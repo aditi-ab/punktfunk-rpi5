@@ -244,6 +244,10 @@ jobs:
           "$NIX" build --print-build-logs \
             .#punktfunk-host .#punktfunk-client .#punktfunk-tray \
             .#punktfunk-web .#punktfunk-scripting .#punktfunk-gamescope
+          # This is now the heaviest job on the fleet — a full workspace build plus gamescope fills
+          # the store with tens of GB, and this fleet ran a runner out of disk on 2026-08-06. Record
+          # the headroom AFTER the build too, or a future "no space left on device" is a guess.
+          df -h / /nix /tmp || true
 
       - name: Sign + publish to nix.unom.io
         if: ${{ steps.cachecfg.outputs.go == 'true' }}
