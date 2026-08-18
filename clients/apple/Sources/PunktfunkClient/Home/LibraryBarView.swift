@@ -23,6 +23,8 @@ struct LibraryBarView: View {
     let arrangement: LibraryArrangement
     /// The bar owns the controller (▲ from the field). Draws the wash.
     let focused: Bool
+    /// The Collections screen shows the SORT group alone (its arrangement is the tiles).
+    var showsView = true
     var compact = false
     var onSort: (LibrarySortKey) -> Void
     var onArrangement: (LibraryArrangement) -> Void
@@ -42,10 +44,12 @@ struct LibraryBarView: View {
                 }
             }
             Spacer(minLength: 12)
-            group(caption: "VIEW") {
-                ForEach(LibraryArrangement.all, id: \.self) { view in
-                    pill(view.label, selected: view == arrangement, namespace: viewHighlight) {
-                        onArrangement(view)
+            if showsView {
+                group(caption: "VIEW") {
+                    ForEach(LibraryArrangement.all, id: \.self) { view in
+                        pill(view.label, selected: view == arrangement, namespace: viewHighlight) {
+                            onArrangement(view)
+                        }
                     }
                 }
             }

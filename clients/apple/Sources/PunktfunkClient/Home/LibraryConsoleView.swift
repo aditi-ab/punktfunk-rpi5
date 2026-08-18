@@ -41,9 +41,14 @@ struct LibraryConsoleView: View {
     /// Whether this screen owns the controller — the shell gates it mid-transition and under the
     /// connect takeover.
     var controllerActive = true
-    /// Screenshot/dev overrides: force an arrangement, open with the bar focused.
+    /// The collection the shelf is filtered to (its label), or nil — the container reports it so
+    /// the screen's title can read `host · profile · collection` like the desktop's.
+    var onCollectionChanged: ((String?) -> Void)?
+    /// Screenshot/dev overrides: force an arrangement, open with the bar focused, or start on
+    /// the Collections tiles regardless of the setting.
     var arrangementOverride: LibraryArrangement?
     var barFocusedInitially = false
+    var startInCollectionsOverride: Bool?
 
     @Environment(\.gamepadHostedInShell) private var hostedInShell
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -56,6 +61,14 @@ struct LibraryConsoleView: View {
     #endif
     @AppStorage(DefaultsKey.librarySort) private var sortRaw = ""
     @AppStorage(DefaultsKey.libraryView) private var viewRaw = ""
+    @AppStorage(DefaultsKey.libraryCollections) private var startInCollections = false
+    /// Where the controller is inside this shelf: the plain shelf, the Collections tiles, or a
+    /// filtered shelf — pushed and popped INSIDE this layer (see `LibraryPlaceStack`).
+    @State private var places = LibraryPlaceStack(root: .shelf(filter: nil))
+    /// The "start in collections" hand-over is decided ONCE per shelf.
+    @State private var handoverDecided = false
+    /// The focused Collections tile.
+    @State private var focusedTileID: String?
     /// The bar owns the controller.
     @State private var barFocused = false
     /// The focused title (the strip's centred cover / the grid's cell), published by the
@@ -73,30 +86,56 @@ struct LibraryConsoleView: View {
         arrangementOverride ?? LibraryArrangement(stored: viewRaw)
     }
     /// The shelf, collated: launchers lead in host order, then the titles under `sort`
-    /// (`filtered(nil)` flattens every group in collated order).
+    /// (`filtered(nil)` flattens every group in collated order); on a drilled shelf, that
+    /// group's titles alone.
     private var displayed: [GameEntry] {
-        LibraryCollation.filtered(games, sort: sort, filter: nil).map { games[$0] }
+        LibraryCollation.filtered(games, sort: sort, filter: places.top.filter).map { games[$0] }
+    }
+    /// The Collections tiles: group by platform under the current sort.
+    private var groups: [LibraryGroup] {
+        LibraryCollation.collate(games, sort: sort, groupBy: .platform)
     }
     private var focused: GameEntry? { displayed.first { $0.id == focusID } }
     /// The field owns the controller only while the bar does not.
     private var fieldActive: Bool { controllerActive && !barFocused }
+    /// Whether Y opens Collections here: an unfiltered root shelf over a library worth browsing.
+    private var canOpenCollections: Bool {
+        places.canOpenCollections && LibraryCollation.worthBrowsing(games)
+    }
 
     var body: some View {
-        VStack(spacing: 0) {
+        // Keyed on the top place: a push or pop mounts the incoming place fresh (its own entrance,
+        // its own cursor seeded on the focused title) and moves it with the shell's own push/pop
+        // choreography — the same slide-out-of-a-fade the shell uses between its layers.
+        let top = places.top
+        ZStack {
+            VStack(spacing: 0) {
             LibraryBarView(
-                sort: sort, arrangement: arrangement, focused: barFocused, compact: compact,
+                sort: sort, arrangement: arrangement, focused: barFocused,
+                showsView: !top.isCollections, compact: compact,
                 onSort: { setSort($0) }, onArrangement: { setArrangement($0) }
             )
             .padding(.top, compact ? 2 : 6)
             .padding(.bottom, LibraryBarView.gap - 4)
             field
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            detailPanel
-                .padding(.top, 8)
-                .padding(.bottom, compact ? 4 : 10)
+            if !top.isCollections {
+                detailPanel
+                    .padding(.top, 8)
+                    .padding(.bottom, compact ? 4 : 10)
+            } else {
+                // The tiles carry their own text; keep the band's height so the strip doesn't
+                // jump when a place is pushed over the shelf.
+                Color.clear.frame(height: compact ? 44 : 60)
+            }
+            }
+            // A push/pop is a state change inside `placeMotion` (see the mutations below), so the
+            // outgoing place leaves and the incoming one arrives with the shell's own transition.
+            .id(top)
+            .transition(.gamepadScreen(slide: GamepadShellMotion.slide(compact: compact)))
         }
         .safeAreaInset(edge: .bottom, alignment: .leading, spacing: 0) {
-            GamepadHintBar(hints: barFocused ? barHints : hints)
+            GamepadHintBar(hints: barFocused ? barHints : (top.isCollections ? collectionHints : hints))
                 .padding(.leading, 22)
                 .padding(.vertical, compact ? 6 : 10)
         }
@@ -115,9 +154,18 @@ struct LibraryConsoleView: View {
         }
         .onChange(of: focusID) { _, _ in copied = false }
         .onAppear {
+            decideHandover()
             barFocused = barFocusedInitially
             wireBar()
             if barFocused, controllerActive { barInput.start() }
+        }
+        .onChange(of: games.map(\.id)) { _, _ in
+            // A later list (the host answering behind a cached catalog) may make the library
+            // browsable — but only an undecided shelf may still move to the tiles.
+            decideHandover()
+        }
+        .onChange(of: places) { _, stack in
+            onCollectionChanged?(stack.top.filter?.label)
         }
         .onChange(of: barFocused) { _, focusedNow in
             if focusedNow, controllerActive { barInput.start() } else { barInput.stop() }
@@ -144,23 +192,35 @@ struct LibraryConsoleView: View {
     /// arrangement so a switch mounts the other field fresh (its own entrance, its own cursor
     /// seeded on the focused title).
     @ViewBuilder private var field: some View {
-        switch arrangement {
-        case .shelf:
-            LibraryCoverflowView(
-                games: displayed, artLoader: artLoader, focusID: $focusID, onLaunch: onLaunch,
-                running: running, initialSelection: focusID ?? initialSelection,
-                onBack: onDismiss,
-                onTertiary: onCopyLink.map { copy in { copyFocused(copy) } },
-                onUp: { enterBar() },
+        if places.top.isCollections {
+            LibraryCollectionsView(
+                games: games, groups: groups, artLoader: artLoader, focusID: $focusedTileID,
+                onOpen: { openCollection($0) },
+                onAllTitles: places.offersAllTitles ? { openAllTitles() } : nil,
+                onBack: { back() },
+                onSortStep: { stepSort(by: $0, wrapping: true) },
                 controllerActive: fieldActive)
-        case .grid:
-            LibraryGridView(
-                games: displayed, artLoader: artLoader, focusID: $focusID, onLaunch: onLaunch,
-                running: running, initialSelection: focusID ?? initialSelection,
-                onBack: onDismiss,
-                onTertiary: onCopyLink.map { copy in { copyFocused(copy) } },
-                onUp: { enterBar() },
-                controllerActive: fieldActive)
+        } else {
+            switch arrangement {
+            case .shelf:
+                LibraryCoverflowView(
+                    games: displayed, artLoader: artLoader, focusID: $focusID, onLaunch: onLaunch,
+                    running: running, initialSelection: focusID ?? initialSelection,
+                    onBack: { back() },
+                    onSecondary: { openCollections() },
+                    onTertiary: onCopyLink.map { copy in { copyFocused(copy) } },
+                    onUp: { enterBar() },
+                    controllerActive: fieldActive)
+            case .grid:
+                LibraryGridView(
+                    games: displayed, artLoader: artLoader, focusID: $focusID, onLaunch: onLaunch,
+                    running: running, initialSelection: focusID ?? initialSelection,
+                    onBack: { back() },
+                    onSecondary: { openCollections() },
+                    onTertiary: onCopyLink.map { copy in { copyFocused(copy) } },
+                    onUp: { enterBar() },
+                    controllerActive: fieldActive)
+            }
         }
     }
 
@@ -257,6 +317,13 @@ struct LibraryConsoleView: View {
                 glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: text,
                 action: { if let id = focusID { onLaunch(id) } }))
         }
+        // Hidden when there is nothing to browse (one platform, one store) and on any drilled
+        // shelf — the way back from those is B.
+        if canOpenCollections {
+            hints.append(.init(
+                glyph: buttonGlyph(\.buttonY, fallback: "y.circle"), text: "Collections",
+                action: { openCollections() }))
+        }
         if let onCopyLink {
             hints.append(.init(
                 glyph: buttonGlyph(\.buttonX, fallback: "x.circle"),
@@ -272,6 +339,34 @@ struct LibraryConsoleView: View {
         hints.append(.init(
             glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back",
             action: { onDismiss?() }))
+        return hints
+    }
+
+    /// The Collections legend: A Open · Y All titles (root only) · L1/R1 Sort · B Back.
+    private var collectionHints: [GamepadHint] {
+        var hints: [GamepadHint] = [
+            .init(
+                glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Open",
+                action: {
+                    if let id = focusedTileID,
+                       let g = groups.first(where: { CollectionTile(group: $0).id == id }) {
+                        openCollection(g.key)
+                    }
+                }),
+        ]
+        if places.offersAllTitles {
+            hints.append(.init(
+                glyph: buttonGlyph(\.buttonY, fallback: "y.circle"), text: "All titles",
+                action: { openAllTitles() }))
+        }
+        if showsShoulderHint {
+            hints.append(.init(
+                glyph: buttonGlyph(\.leftShoulder, fallback: "l1.rectangle.roundedbottom"),
+                text: "Sort"))
+        }
+        hints.append(.init(
+            glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back",
+            action: { back() }))
         return hints
     }
 
@@ -300,6 +395,75 @@ struct LibraryConsoleView: View {
     private func setSort(_ key: LibrarySortKey) {
         guard key != sort else { return }
         sortRaw = key.stored
+    }
+
+    /// Step the sort by ±1 — clamped on the bar, WRAPPING on the Collections tiles.
+    private func stepSort(by delta: Int, wrapping: Bool) {
+        let all = LibrarySortKey.all
+        guard let i = all.firstIndex(of: sort) else { return setSort(all[0]) }
+        var target = i + delta
+        if wrapping {
+            target = (target % all.count + all.count) % all.count
+        } else if !all.indices.contains(target) {
+            return barBoundary()
+        }
+        barHaptics.move()
+        setSort(all[target])
+    }
+
+    // MARK: - Places
+
+    /// The push/pop choreography between places — the shell's own (`GamepadShellMotion`), a plain
+    /// crossfade under Reduce Motion.
+    private var placeMotion: Animation {
+        reduceMotion ? .easeOut(duration: 0.2) : GamepadShellMotion.screen
+    }
+
+    /// The "start in collections" hand-over — decided once per shelf. This view is mounted only
+    /// while there is a catalog (a cached one counts), so "ready" is true by construction here.
+    private func decideHandover() {
+        let on = startInCollectionsOverride ?? startInCollections
+        switch CollectionsHandover.decide(
+            settingOn: on, alreadyDecided: handoverDecided, drilled: !places.isRoot,
+            ready: !games.isEmpty, worthBrowsing: LibraryCollation.worthBrowsing(games))
+        {
+        case .wait:
+            return
+        case .shelf:
+            handoverDecided = true
+        case .collections:
+            handoverDecided = true
+            // The Collections place REPLACES the shelf as the root (stack length unchanged),
+            // exactly as the desktop's hand-over does.
+            places = LibraryPlaceStack(root: .collections)
+        }
+    }
+
+    /// Y on the shelf: push Collections — or a boundary pulse where it is refused (a drilled
+    /// shelf, or nothing worth browsing).
+    private func openCollections() {
+        guard canOpenCollections else { return barBoundary() }
+        barHaptics.move()
+        leaveBar()
+        withAnimation(placeMotion) { places.push(.collections) }
+    }
+
+    /// A on a tile: push that group as a filtered shelf.
+    private func openCollection(_ key: LibraryGroupKey) {
+        withAnimation(placeMotion) { places.push(.shelf(filter: key)) }
+    }
+
+    /// Y on the Collections root: the plain shelf, as a drill-in ("All titles").
+    private func openAllTitles() {
+        guard places.offersAllTitles else { return barBoundary() }
+        withAnimation(placeMotion) { places.push(.shelf(filter: nil)) }
+    }
+
+    /// B: pop a place; at the root, dismiss the layer.
+    private func back() {
+        leaveBar()
+        guard !places.isRoot else { return onDismiss?() ?? () }
+        _ = withAnimation(placeMotion) { places.pop() }
     }
 
     private func setArrangement(_ view: LibraryArrangement) {
@@ -339,14 +503,9 @@ struct LibraryConsoleView: View {
     private func barMove(_ direction: GamepadMenuInput.Direction) {
         switch direction {
         case .left, .right:
-            // Step the sort, CLAMPED — no wrap (the collections screen's pill row wraps, this
-            // bar does not; the desktop draws the same distinction).
-            let all = LibrarySortKey.all
-            guard let i = all.firstIndex(of: sort) else { return setSort(all[0]) }
-            let target = i + (direction == .right ? 1 : -1)
-            guard all.indices.contains(target) else { return barBoundary() }
-            barHaptics.move()
-            setSort(all[target])
+            // Step the sort, CLAMPED — no wrap (the Collections tiles' shoulders wrap, this bar
+            // does not; the desktop draws the same distinction).
+            stepSort(by: direction == .right ? 1 : -1, wrapping: false)
         case .down:
             leaveBar()
         case .up:

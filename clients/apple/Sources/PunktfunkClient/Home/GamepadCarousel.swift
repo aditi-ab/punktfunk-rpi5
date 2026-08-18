@@ -61,6 +61,9 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
     var onUp: (() -> Void)?
     /// L1/R1 → jump this many items at once (clamped to the ends); 0 disables the shoulders.
     var shoulderJump: Int = 0
+    /// L1 (`false`) / R1 (`true`) → the screen's own shoulder action (the Collections screen steps
+    /// its sort with them). Set, it takes the shoulders away from `shoulderJump`.
+    var onShoulder: ((Bool) -> Void)?
     /// Whether this carousel currently owns controller input. A presenting screen (e.g. the host
     /// launcher) stays mounted behind a presented one (e.g. the library), and both carousels would
     /// otherwise poll the SAME controller at once — driving both. The parent sets this false while
@@ -342,7 +345,7 @@ struct GamepadCarousel<Item: Identifiable, Card: View>: View where Item.ID: Hash
         input.onSecondary = onSecondary
         input.onTertiary = onTertiary
         input.onBack = onBack
-        input.onShoulder = shoulderJump > 0 ? { shoulder(right: $0) } : nil
+        input.onShoulder = onShoulder ?? (shoulderJump > 0 ? { shoulder(right: $0) } : nil)
         #endif
     }
 

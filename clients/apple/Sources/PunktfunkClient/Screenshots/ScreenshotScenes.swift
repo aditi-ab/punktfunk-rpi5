@@ -48,6 +48,10 @@ enum ShotScenes {
             ShotScene(name: "11c-library-bar", orientation: .landscape, colorScheme: .dark) {
                 AnyView(ShotLibrary(arrangement: .shelf, barFocused: true))
             },
+            // The Collections tiles (group by platform), as "start in collections" opens them.
+            ShotScene(name: "11d-collections", orientation: .landscape, colorScheme: .dark) {
+                AnyView(ShotLibrary(collections: true))
+            },
         ]
         #if os(iOS) || os(macOS)
         // The gamepad-mode console screens (no tvOS — native focus engine there). Dev-only shots
@@ -281,12 +285,14 @@ private struct ShotHome: View {
 private struct ShotLibrary: View {
     var arrangement: LibraryArrangement?
     var barFocused = false
+    var collections = false
 
     var body: some View {
         LibraryConsoleView(
             games: ShotMock.games, artLoader: ShotPosterArt.source,
             onLaunch: { _ in }, onDismiss: {}, controllerActive: false,
-            arrangementOverride: arrangement, barFocusedInitially: barFocused)
+            arrangementOverride: arrangement, barFocusedInitially: barFocused,
+            startInCollectionsOverride: collections)
     }
 }
 

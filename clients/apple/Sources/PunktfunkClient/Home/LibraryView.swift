@@ -68,6 +68,11 @@ struct LibraryView: View {
     /// and while the connect takeover is up. Presentations that cover the launcher keep the
     /// default (their being up IS the launcher's gate).
     var controllerActive = true
+    /// The collection the gamepad shelf is drilled into (its label), or nil — reported so a host
+    /// screen (GamepadLibraryScreen's pinned title) can read `host · profile · collection`.
+    var onCollectionChanged: ((String?) -> Void)?
+    /// The same, for this view's own navigation title (the sheet/cover presentations).
+    @State private var collectionLabel: String?
     @Environment(\.dismiss) private var dismiss
     /// Resolves a pinned shelf's profile NAME for the title (the target carries only its id).
     @ObservedObject private var profiles = ProfileStore.shared
@@ -118,7 +123,7 @@ struct LibraryView: View {
 
     var body: some View {
         content
-            .navigationTitle("\(target.title(in: profiles)) — Library")
+            .navigationTitle("\(shelfTitle) — Library")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
@@ -213,7 +218,11 @@ struct LibraryView: View {
                     // Nil where there is nothing to copy into (tvOS), which is what drops the
                     // hint from the legend rather than leaving a button that does nothing.
                     onCopyLink: LinkClipboard.isAvailable ? { copyLink($0) } : nil,
-                    controllerActive: controllerActive)
+                    controllerActive: controllerActive,
+                    onCollectionChanged: { label in
+                        collectionLabel = label
+                        onCollectionChanged?(label)
+                    })
             } else {
                 // Above the grid rather than over it: the coverflow owns its whole surface and has
                 // its own legend row, so the note rides the plain-grid presentation only.
@@ -623,6 +632,14 @@ struct LibraryView: View {
             LibraryScrollMemory.remember(id, forHost: host.id.uuidString)
             onLaunch(id)
         }
+    }
+
+    /// `host` → `host · profile` (a pinned card's shelf) → `host · profile · collection` (drilled
+    /// into one group), joined with `·` — the desktop's title shape.
+    private var shelfTitle: String {
+        let base = target.title(in: profiles)
+        guard let collectionLabel else { return base }
+        return "\(base) \u{b7} \(collectionLabel)"
     }
 
     /// The catalog in display order — `LibraryOrder.display`, the desktop's `order()`: launcher
