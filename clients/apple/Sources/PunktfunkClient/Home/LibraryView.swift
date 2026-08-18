@@ -73,6 +73,11 @@ struct LibraryView: View {
     var onCollectionChanged: ((String?) -> Void)?
     /// The same, for this view's own navigation title (the sheet/cover presentations).
     @State private var collectionLabel: String?
+    /// The touch grid's sort (the shared `library_sort` key, the same one the console's bar
+    /// writes) and its grouping (touch-only — sections are the touch analogue of the console's
+    /// Collections place).
+    @AppStorage(DefaultsKey.librarySort) private var sortRaw = ""
+    @AppStorage(DefaultsKey.libraryGroupBy) private var groupByRaw = ""
     @Environment(\.dismiss) private var dismiss
     /// Resolves a pinned shelf's profile NAME for the title (the target carries only its id).
     @ObservedObject private var profiles = ProfileStore.shared
@@ -129,9 +134,17 @@ struct LibraryView: View {
             #endif
             .toolbar {
                 #if os(macOS)
-                ToolbarItemGroup { reloadButton }
+                ToolbarItemGroup {
+                    if !gamepadUIActive { sortMenu }
+                    reloadButton
+                }
                 #else
                 ToolbarItem(placement: .primaryAction) { reloadButton }
+                // The console presentation carries its own sort/view bar; the plain grid gets a
+                // menu in the bar it already has.
+                if !gamepadUIActive {
+                    ToolbarItem(placement: .primaryAction) { sortMenu }
+                }
                 #endif
                 // A gamepad-only user can't swipe-to-dismiss the sheet this view is presented in
                 // (ContentView's `.sheet(item: $libraryTarget)`) — give it a focusable, dpad-reachable
@@ -281,23 +294,34 @@ struct LibraryView: View {
     }
     #endif
 
+    /// The grid's sections: the catalog collated by the shared rules — launchers lead (design
+    /// D4), then one section per group under the chosen grouping (none = one section of games),
+    /// each in the chosen sort. Headers only when there is more than one section, so an
+    /// ungrouped, launcher-less library renders exactly as it always did.
+    private var sections: [(label: String, games: [GameEntry])] {
+        let groupBy: LibraryGroupBy?
+        switch groupByRaw {
+        case "platform": groupBy = .platform
+        case "store": groupBy = .store
+        default: groupBy = nil
+        }
+        return LibraryCollation.collate(ordered, sort: LibrarySortKey(stored: sortRaw), groupBy: groupBy)
+            .map { group in
+                // The ungrouped bucket names itself "All"; on this grid it has always been "Games".
+                let label = (groupBy == nil && group.key != .launchers) ? "Games" : group.label
+                return (label, group.indices.map { ordered[$0] })
+            }
+    }
+
     private var grid: some View {
-        // Design D4: launcher entries get their own section above the titles, never interleaved.
-        // Both headers appear only when both groups exist, so a library without launcher entries
-        // renders exactly as it did before.
-        let launchers = ordered.filter(\.isLauncher)
-        let titles = ordered.filter { !$0.isLauncher }
-        let both = !launchers.isEmpty && !titles.isEmpty
+        let sections = self.sections
+        let showsHeaders = sections.count > 1
         return ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    if !launchers.isEmpty {
-                        if both { sectionHeader("Launchers") }
-                        tiles(launchers)
-                    }
-                    if !titles.isEmpty {
-                        if both { sectionHeader("Games") }
-                        tiles(titles)
+                    ForEach(Array(sections.enumerated()), id: \.offset) { _, section in
+                        if showsHeaders { sectionHeader(section.label) }
+                        tiles(section.games)
                     }
                 }
                 .padding()
@@ -335,7 +359,7 @@ struct LibraryView: View {
             .gamepadKeyNavigation(
                 active: onLaunch != nil,
                 onMove: { direction in
-                    guard let next = gridNav(launchers: launchers, titles: titles)
+                    guard let next = gridNav(sections: sections.map(\.games))
                         .move(from: keyCursor, direction) else { return }
                     keyCursor = next
                     withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(next, anchor: .center) }
@@ -351,9 +375,9 @@ struct LibraryView: View {
     #if os(iOS) || os(macOS)
     /// The keyboard cursor's model over the two grid sections. Rebuilt per press from the live
     /// sections so it can never point into a stale list.
-    private func gridNav(launchers: [GameEntry], titles: [GameEntry]) -> LibraryGridNav {
+    private func gridNav(sections: [[GameEntry]]) -> LibraryGridNav {
         LibraryGridNav(
-            sections: [launchers, titles].filter { !$0.isEmpty }.map { $0.map(\.id) },
+            sections: sections.filter { !$0.isEmpty }.map { $0.map(\.id) },
             columns: columnCount)
     }
 
@@ -473,6 +497,26 @@ struct LibraryView: View {
             Label("Reload", systemImage: "arrow.clockwise")
         }
         .disabled(loading)
+    }
+
+    /// Sort and group for the plain grid — the console's bar, as a menu. The sort is the shared
+    /// key (Default · A–Z · Platform · Store); the grouping is this grid's own (sections stand in
+    /// for the console's Collections place).
+    private var sortMenu: some View {
+        Menu {
+            Picker("Sort", selection: $sortRaw) {
+                ForEach(LibrarySortKey.all, id: \.stored) { key in
+                    Text(key.label).tag(key.stored)
+                }
+            }
+            Picker("Group by", selection: $groupByRaw) {
+                Text("None").tag("")
+                Text("Platform").tag("platform")
+                Text("Store").tag("store")
+            }
+        } label: {
+            Label("Sort & group", systemImage: "line.3.horizontal.decrease.circle")
+        }
     }
 
     private func load() async {
