@@ -100,7 +100,7 @@ gamescope from source — about an hour. With it you get prebuilt binaries:
 ```nix
 nix.settings = {
   substituters = [ "https://nix.unom.io" ];
-  trusted-public-keys = [ "punktfunk-cache-1:<key>" ];   # curl https://nix.unom.io/punktfunk-cache.pub
+  trusted-public-keys = [ "punktfunk-cache-1:yhOJmHxzg6tzXpxSFzlYn6Pc6r0jHprsWqt8MZC654o=" ];   # curl https://nix.unom.io/punktfunk-cache.pub
 };
 ```
 
