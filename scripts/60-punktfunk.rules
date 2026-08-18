@@ -48,6 +48,19 @@ KERNEL=="hidraw*", KERNELS=="*28DE:1205*", GROUP="input", MODE="0660", TAG+="uac
 KERNEL=="hidraw*", KERNELS=="*28DE:1102*", GROUP="input", MODE="0660", TAG+="uaccess"
 KERNEL=="hidraw*", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1205", GROUP="input", MODE="0660", TAG+="uaccess"
 KERNEL=="hidraw*", ATTRS{idVendor}=="28de", ATTRS{idProduct}=="1102", GROUP="input", MODE="0660", TAG+="uaccess"
+# The usbip DualSense's SOUND card (haptics + speaker land on /dev/snd/pcmC*D0p as channels
+# ch0/ch1 = speaker, ch2/ch3 = the voice coils). Same story as the hidraw nodes above, but worse:
+# the card is minted mid-session-bringup while no seat session is active, so logind's uaccess ACL
+# never materialises, WirePlumber's probe fails EACCES (the card then never appears in PipeWire at
+# all — no pad sink for a game to route to), and GE-Proton's direct ALSA leg
+# (`find_dualsense_haptic_alsa_path`) cannot open the PCM either. The distro's own rules don't
+# cover it because a real pad on a desktop is always uaccess'd via the seat. Field-diagnosed
+# 2026-08-18 on Bazzite: `spa.alsa: can't open control for card hw:2: Permission denied`.
+# DualSense (054C:0CE6) / DualSense Edge (054C:0DF2); matches real pads too, which is desirable —
+# a headless streaming session with a physically plugged pad has the identical gap.
+SUBSYSTEM=="sound", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0ce6", GROUP="input", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="sound", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0df2", GROUP="input", MODE="0660", TAG+="uaccess"
+
 # Steam Controller 2 (Triton): wired 28DE:1302 and the Puck dongle 28DE:1304 — the two identities
 # `steam_backend_product` mints. Steam is the ONLY consumer of this pad: no kernel driver claims
 # the PID (mainline hid-steam stops at the Deck), so its state reports ride a vendor collection
