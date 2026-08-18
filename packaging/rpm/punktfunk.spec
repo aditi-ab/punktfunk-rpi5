@@ -323,7 +323,6 @@ install -Dm0755 target/release/punktfunk-encode-worker %{buildroot}%{_bindir}/pu
 
 # udev rule — /dev/uinput access for virtual gamepads (input group).
 install -Dm0644 scripts/60-punktfunk.rules %{buildroot}%{_udevrulesdir}/60-punktfunk.rules
-%{_datadir}/wireplumber/wireplumber.conf.d/60-punktfunk-dualsense.conf
 
 # WirePlumber policy — hold a DualSense's sound card open (GE-Proton's raw-open self-race) and
 # keep it from driving the graph clock. See the file's own comments.
