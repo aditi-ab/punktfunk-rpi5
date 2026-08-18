@@ -158,6 +158,17 @@ final class AudioRing: @unchecked Sendable {
     /// …and must stay there for this much consumed audio. Long, because a shed is the only thing
     /// here a listener could notice; it must never fire on a transient.
     private static let shedSustainMS = 2_000
+    /// The mirror for the sync-driven INSERT: the depth average must sit below the requested
+    /// target for this much consumed audio before one frame is duplicated. Equal to the shed's,
+    /// so the two corrections are the same instrument in both directions and cannot fight; kept
+    /// separate so the insert can be sped up alone if a listen test proves it inaudible. Mirrors
+    /// `INSERT_SUSTAIN_MS`.
+    private static let insertSustainMS = shedSustainMS
+    /// How far below the sync-requested target the depth average must sit before the insert
+    /// arms. NOT `shedExcessMS`: the sync loop only asks for more depth once the offset has left
+    /// its ±`AvSync.deadbandMS`, so a margin at or above the deadband would leave every request it
+    /// is allowed to make permanently unanswered. Half the deadband. Mirrors `INSERT_MARGIN_MS`.
+    private static let insertMarginMS = AvSync.deadbandMS / 2
     private static let crossfadeMS = 2
     /// Time constant of the depth average.
     private static let ewmaTauMS = 1_000
@@ -206,6 +217,9 @@ final class AudioRing: @unchecked Sendable {
     private var emptyRun = 0
     private var depthAvg: Double = 0
     private var overRun = 0
+    /// The mirror: consumed samples for which the average has sat more than `insertMarginMS`
+    /// below the sync-requested target (see the insert branch in `read`).
+    private var underRun = 0
     /// The live target in interleaved samples — `targetMS` grown by underrun pressure
     /// (`noteRead`), never below the base. Set in `init` (needs the rate).
     private var targetLive = 0
@@ -219,6 +233,9 @@ final class AudioRing: @unchecked Sendable {
     /// which is a different problem from the depth being wrong.
     private var underrunCount = 0
     private var shedCount = 0
+    /// Sync-driven inserts: one duplicated, crossfaded frame each. Concealment in BOTH directions
+    /// must be visible — a ring being quietly deepened is a picture moving away from its audio.
+    private var insertCount = 0
     /// The depth the A/V sync loop would like, in interleaved samples (`AvSync.desiredDepth`).
     /// `nil` — the default, and what an un-wired session keeps — reproduces the pre-sync
     /// behaviour exactly, so this ring could adopt sync without the other three diverging.
@@ -230,8 +247,9 @@ final class AudioRing: @unchecked Sendable {
     /// episode (a RUN of consecutive near-misses while the ring refills) buys one measured
     /// step, not a sprint to the ceiling.
     private var nearMissGrown = false
-    /// The depth average runs a `deprimeDebtMS` debt against the target (set in `read`): an
-    /// underrun should re-prime at once instead of waiting out the hysteresis.
+    /// The depth average runs a `deprimeDebtMS` debt against the ADAPTIVE target — the one
+    /// underrun pressure grew, never the sync-inflated one (set in `read`): an underrun should
+    /// re-prime at once instead of waiting out the hysteresis.
     private var hollow = false
     /// Interleaved samples left in the current shrink-probe window (0 = no probe outstanding).
     private var probeRun = 0
@@ -378,10 +396,18 @@ final class AudioRing: @unchecked Sendable {
     /// oversized read would otherwise inflate the debt threshold forever and turn the very next
     /// late packet into a full re-prime.
     private func target(lift quantum: Int) -> Int {
-        let floor = max(targetLive, quantum + frameSamples)
+        let floor = adaptiveTarget(lift: quantum)
         guard let want = syncTarget else { return floor }
         let cap = max(msSamples(Self.hardCapMS), floor)
         return min(max(want, floor), cap)
+    }
+
+    /// The ADAPTIVE target: the live target underrun pressure has grown, lifted so it can always
+    /// serve one quantum plus a packet. The floor the sync request is clamped against, and —
+    /// because it is what underrun evidence has PROVEN this link needs — what `hollow` is judged
+    /// against. Mirrors `JitterPolicy::adaptive_target`.
+    private func adaptiveTarget(lift quantum: Int) -> Int {
+        max(targetLive, quantum + frameSamples)
     }
 
     /// The sync loop is asking to run shallower than the adaptive target has grown to — the
@@ -391,6 +417,15 @@ final class AudioRing: @unchecked Sendable {
     private var syncWantsLess: Bool {
         guard let want = syncTarget else { return false }
         return want < targetLive
+    }
+
+    /// The sync loop is asking to run DEEPER than the adaptive target — audio is early against
+    /// the picture. This is what arms the insert in `read`; without a sync request the ring never
+    /// adds depth by itself, so an un-wired ring behaves exactly as it did before the insert
+    /// existed. Mirrors `JitterPolicy::sync_wants_more`.
+    private var syncWantsMore: Bool {
+        guard let want = syncTarget else { return false }
+        return want > targetLive
     }
 
     /// Hand the ring the depth the A/V sync loop wants (`AvSync.desiredDepth`), in interleaved
@@ -460,6 +495,7 @@ final class AudioRing: @unchecked Sendable {
             dropFront(writeIdx - readIdx - cap)
             depthAvg = Double(writeIdx - readIdx)
             overRun = 0
+            underRun = 0
         }
     }
 
@@ -496,20 +532,51 @@ final class AudioRing: @unchecked Sendable {
         // this instant: a single late packet empties the ring for a callback without making it
         // hollow, and must keep the consecutive-empties hysteresis. Lifted by THIS callback's
         // size, not the high-water quantum — see `target(lift:)`.
-        hollow = depthAvg + Double(msSamples(Self.deprimeDebtMS)) < Double(target(lift: count))
+        //
+        // Judged against the ADAPTIVE target, never the sync-inflated one. The debt this exists
+        // to call in is GROWTH that was never banked — underrun evidence raised the promise — and
+        // only a re-prime cashes that. A sync request is not evidence of starvation; it is a
+        // request for alignment, and it has its own gentle instrument (the insert below).
+        // Measured against the effective target, a request for ≥ `deprimeDebtMS` more depth made
+        // the ring hollow on the very next callback and turned the next single late packet into a
+        // full re-prime. The effective target is never below the adaptive one, so this can only be
+        // LESS hollow. Mirrors `JitterPolicy::step`.
+        hollow = depthAvg + Double(msSamples(Self.deprimeDebtMS)) < Double(adaptiveTarget(lift: count))
 
         // Drift correction: shed exactly one frame, crossfaded, once the AVERAGE has sat above
         // the threshold for the sustain window. Anything shorter is jitter and must be left alone.
         if depthAvg > Double(target + msSamples(Self.shedExcessMS)) {
             overRun += count
+            underRun = 0
             if overRun >= msSamples(Self.shedSustainMS) {
                 overRun = 0
                 shedOneFrame()
                 shedCount += 1
                 depthAvg = Double(writeIdx - readIdx)
             }
+        } else if syncWantsMore, depthAvg + Double(msSamples(Self.insertMarginMS)) < Double(target) {
+            // The mirror of the shed. The sync loop has asked for a DEEPER ring than the adaptive
+            // target (audio is early against the picture) and the AVERAGE has sat more than the
+            // margin below what it asked for, for the sustain window: duplicate ONE frame at the
+            // front, crossfaded. Below-target-only, so it can never fight the trim; sync-only, so
+            // an un-wired ring never adds depth by itself and the hollow re-prime keeps its job
+            // for growth that was never banked. (Primed-only comes free: an un-primed read
+            // returned above.) The ring must hold a whole frame to duplicate — if it does not it
+            // is running dry, and the drought path is the tool for that. Mirrors the insert
+            // branch in `JitterPolicy::step`.
+            overRun = 0
+            underRun += count
+            if underRun >= msSamples(Self.insertSustainMS), writeIdx - readIdx >= frameSamples {
+                underRun = 0
+                insertOneFrame()
+                insertCount += 1
+                // Whatever we duplicated is buffered now — reflect it at once so the next
+                // callbacks don't re-fire on a stale average.
+                depthAvg += Double(frameSamples)
+            }
         } else {
             overRun = 0
+            underRun = 0
         }
 
         let n = min(writeIdx - readIdx, count)
@@ -660,21 +727,68 @@ final class AudioRing: @unchecked Sendable {
     ///
     /// The fade is `crossfadeSamples` — capped at half a frame — then clamped again to what this
     /// particular drop can actually spare on either side of the seam.
+    ///
+    /// The fade-OUT source is the HEAD of what is discarded — the continuation of the sample the
+    /// device just played — blending into the head of what survives, so both ends of the seam are
+    /// continuous. (It used to fade out from the discarded region's TAIL, which is adjacent to the
+    /// survivors but not to the sample just played, so the seam still opened with a step of
+    /// `drop − fade` samples of waveform. Core's `crossfade_drop` had the same defect and the same
+    /// fix; `AudioRingDriftTests` now checks the seam against the sample played before it.)
     private func dropFront(_ drop: Int) {
         let available = writeIdx - readIdx
         guard drop > 0, available > drop else { return }
         let fade = min(crossfadeSamples, min(drop, available - drop))
         let capacity = buf.count
         if fade > 0 {
-            // The tail of what we discard fades out into the head of what survives.
             for i in 0..<fade {
-                let old = buf[(readIdx + drop - fade + i) % capacity]
+                let old = buf[(readIdx + i) % capacity]
                 let new = buf[(readIdx + drop + i) % capacity]
                 let t = Float(i + 1) / Float(fade + 1)
                 buf[(readIdx + drop + i) % capacity] = old * (1 - t) + new * t
             }
         }
         readIdx += drop
+    }
+
+    /// Duplicate one audio frame at the front — the sync-driven deepening, the mirror of
+    /// `shedOneFrame`. The session's REAL frame (`setFrameUs`).
+    private func insertOneFrame() { insertFront(frameSamples) }
+
+    /// Duplicate the first `insert` interleaved samples at the front — the ring plays them, then
+    /// plays them again — linearly crossfading the seam so the correction is continuous rather
+    /// than a click. Mirrors `punktfunk_core::audio::crossfade_insert`; caller holds the lock.
+    ///
+    /// Index-based where core's is a `VecDeque`: the copy lands in the `insert` slots just BEFORE
+    /// `readIdx`, which are free exactly when the ring has that much spare capacity (they hold
+    /// audio already consumed), and `readIdx` steps back over it. `readIdx`/`writeIdx` are plain
+    /// offsets reduced modulo the capacity wherever they touch `buf`, so when `readIdx` is too
+    /// small to step back both are shifted forward by one whole capacity first — every position
+    /// they name is unchanged, and neither can go negative (which `%` would turn into a negative
+    /// index).
+    ///
+    /// The seam: what would have followed the copy's last sample is the original's `insert`-th
+    /// sample onward, so THAT fades out into the original's head, in place. The copy is written
+    /// before the seam is blended, so it is verbatim; the fade-out reads sit `insert` past every
+    /// write, so one ascending pass is safe.
+    private func insertFront(_ insert: Int) {
+        let available = writeIdx - readIdx
+        let capacity = buf.count
+        guard insert > 0, available >= insert, available + insert <= capacity else { return }
+        let fade = min(crossfadeSamples, min(insert, available - insert))
+        if readIdx < insert {
+            readIdx += capacity
+            writeIdx += capacity
+        }
+        for i in 0..<insert {
+            buf[(readIdx - insert + i) % capacity] = buf[(readIdx + i) % capacity]
+        }
+        for i in 0..<fade {
+            let old = buf[(readIdx + insert + i) % capacity]
+            let new = buf[(readIdx + i) % capacity]
+            let t = Float(i + 1) / Float(fade + 1)
+            buf[(readIdx + i) % capacity] = old * (1 - t) + new * t
+        }
+        readIdx -= insert
     }
 
     /// Current buffered depth in milliseconds — for the stats overlay and the drain thread's
@@ -692,6 +806,9 @@ final class AudioRing: @unchecked Sendable {
         let targetMS: Int
         let underruns: Int
         let sheds: Int
+        /// Sync-driven inserts — one duplicated, crossfaded frame each (`insertOneFrame`). Read
+        /// next to `sheds`: the same correction, the other direction.
+        let inserts: Int
         /// The A/V sync loop's smoothed offset (ms): **positive = audio playing BEHIND the
         /// picture**, negative = ahead of it. `0` before the loop has evidence, or with sync off.
         ///
@@ -712,6 +829,7 @@ final class AudioRing: @unchecked Sendable {
             targetMS: samplesMs(target),
             underruns: underrunCount,
             sheds: shedCount,
+            inserts: insertCount,
             avOffsetMS: avOffsetMS,
             plcMS: plcMS)
     }
@@ -751,7 +869,7 @@ struct AvSync {
     /// discontinuity and buys nothing a listener can perceive — detectability for A/V misalignment
     /// sits an order of magnitude above it. The deadband is what keeps the loop from hunting
     /// forever around zero, which would be audible in a way the misalignment it chased was not.
-    private static let deadbandMS = 10
+    static let deadbandMS = 10
     /// Observations folded before the first correction is offered. The offset is derived from a
     /// clock skew estimate and a video figure that both need a moment to settle after connect;
     /// acting on the first sample would chase the handshake, not the stream.
