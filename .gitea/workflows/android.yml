@@ -95,14 +95,12 @@ env:
   # cache, dev boxes keep incremental.
   CARGO_INCREMENTAL: "0"
   # The Skia console (pf-console-ui over skia-bindings, design/android-skia-console-port.md):
-  # prebuilt Skia archives, keyed by target + features. rust-skia's GitHub releases carry the
-  # aarch64/x86_64 keys; armv7-linux-androideabi (the 32-bit TV ABI) exists ONLY on our mirror
-  # (built once with skia-bindings itself, ~80 s on a Mac — see the plan's WP6; sha256s in
-  # clients/android/kit/build.gradle.kts). The repo variable holds the url template
-  # (`{tag}`/`{key}` placeholders); kit/build.gradle.kts forwards it to every cargo-ndk run.
-  # Unset = GitHub only, which is fine while the console stays gated to the 64-bit ABIs.
-  # 🛑 skia-bindings never fails when no archive matches — it silently builds Skia from
-  # source. Every ABI's log must show `DOWNLOAD AND INSTALL SUCCEEDED`.
+  # prebuilt Skia archives for all three Android ABIs come from our own release
+  # (git.unom.io/unom/skia-binaries, tag = the skia-bindings version) — kit/build.gradle.kts
+  # bakes that url template in as the default, so this workflow needs no configuration. The
+  # repo variable, when set, OVERRIDES it (e.g. to stage the next skia-safe bump's archives
+  # before they are released). 🛑 skia-bindings never fails when no archive matches — it
+  # silently builds Skia from source. Every ABI's log must show `DOWNLOAD AND INSTALL SUCCEEDED`.
   SKIA_BINARIES_URL: ${{ vars.SKIA_BINARIES_URL }}
 
 jobs:
