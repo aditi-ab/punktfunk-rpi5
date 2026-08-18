@@ -145,9 +145,11 @@ async fn handle_iso_submit(
 /// rather than one URB failing. Real hardware truncates here, so we do too: a handler bug then
 /// costs one wrong reply instead of the pad.
 ///
-/// An OUT transfer returns nothing at all. `usbip_recv_xbuff()` returns early for `usb_pipeout`,
-/// so any payload appended to an OUT reply is bytes the kernel never reads — and every byte after
-/// it in the stream is then misframed.
+/// An OUT transfer returns no payload at all. `usbip_recv_xbuff()` returns early for
+/// `usb_pipeout`, so any payload appended to an OUT reply is bytes the kernel never reads — and
+/// every byte after it in the stream is then misframed. (Its `actual_length` is another matter:
+/// that must still count the bytes accepted, see
+/// [`UsbIpResponse::usbip_ret_submit_out_success`].)
 ///
 /// Field-diagnosed 2026-08-17: a 42-byte DualSense calibration report answering a 41-byte request
 /// killed `hid-playstation`'s probe with `-EPROTO` and took the controller with it. Every backend
@@ -303,10 +305,24 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                                 }
                                 if out {
                                     trace!("<-Wrote {}", data.len());
+                                    // Acknowledge the bytes we took, not the (empty) reply:
+                                    // `actual_length` is what `write()` on the device node
+                                    // returns to the process that wrote it. (punktfunk fix —
+                                    // upstream said 0 here, and winebus read that as failure.)
+                                    UsbIpResponse::usbip_ret_submit_out_success(
+                                        &header,
+                                        data.len() as u32,
+                                    )
                                 } else {
                                     trace!("<-Resp {resp:02x?}");
+                                    UsbIpResponse::usbip_ret_submit_success(
+                                        &header,
+                                        0,
+                                        0,
+                                        resp,
+                                        vec![],
+                                    )
                                 }
-                                UsbIpResponse::usbip_ret_submit_success(&header, 0, 0, resp, vec![])
                             }
                             Err(err) => {
                                 warn!("Error handling URB: {err}");
