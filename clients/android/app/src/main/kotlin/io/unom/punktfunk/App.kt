@@ -49,6 +49,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import android.widget.Toast
 import io.unom.punktfunk.kit.link.DeepLinkResult
 import io.unom.punktfunk.kit.link.DeepLinks
@@ -100,6 +103,26 @@ fun App(forceGamepadUi: Boolean = false) {
     val gamepadUi = skiaConsole && SkiaConsole.healthy && gamepadUiActive(
         settings.gamepadUiEnabled, settings.gamepadUiMode, controllerConnected, tv, forceGamepadUi,
     )
+
+    // System bars have ONE owner: this effect. The stream and the console shell both want the
+    // whole panel (bars hidden, a swipe shows them transiently); the touch shell wants them back.
+    // It cannot live inside the screens themselves: `AnimatedContent` below keeps the outgoing
+    // screen composed until its fade ends, so a per-screen `onDispose { show(...) }` fired AFTER
+    // the incoming screen's hide — console → stream left the status and gesture bars parked over
+    // the video. Keyed on the resolved intent, not the screens.
+    val immersive = session != null || gamepadUi
+    DisposableEffect(immersive) {
+        val window = activity?.window ?: return@DisposableEffect onDispose {}
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        if (immersive) {
+            controller.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller.hide(WindowInsetsCompat.Type.systemBars())
+        } else {
+            controller.show(WindowInsetsCompat.Type.systemBars())
+        }
+        onDispose {}
+    }
 
     // Publish the live session process-wide, so a `punktfunk://` link that arrives as a SECOND
     // activity instance (the normal case under `launchMode = standard`) can refuse it before that

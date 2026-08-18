@@ -58,7 +58,6 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
@@ -420,10 +419,8 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         if (lowLatencyMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window?.setPreferMinimalPostProcessing(true)
         }
-        controller?.let {
-            it.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            it.hide(WindowInsetsCompat.Type.systemBars())
-        }
+        // System bars: NOT hidden here — App.kt owns hide/show (one owner; the AnimatedContent
+        // handoff broke per-screen ownership, see the `immersive` effect there).
         // The soft keyboard (three-finger swipe up → KeyCaptureView below) must OVERLAY the
         // stream, never pan/resize it — the video is a fixed-mode surface, not a document.
         // Scoped to the stream; the app's other screens keep the default for their text fields.
@@ -817,7 +814,6 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                     w.attributes = w.attributes.apply { layoutInDisplayCutoutMode = priorCutout }
                 }
             }
-            controller?.show(WindowInsetsCompat.Type.systemBars())
             window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             if (lowLatencyMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 window?.setPreferMinimalPostProcessing(false)
