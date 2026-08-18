@@ -94,7 +94,10 @@ fun App(forceGamepadUi: Boolean = false) {
     // `debug.punktfunk.console_backend=none` forces the touch UI for on-glass triage). Without a
     // console to draw, a controller drives the touch UI through Compose's own focus.
     val skiaConsole = remember { SkiaConsole.wanted() }
-    val gamepadUi = skiaConsole && gamepadUiActive(
+    // …AND it actually came up: a console whose native create failed or whose render thread died
+    // ([SkiaConsole.healthy], observable) would front a SurfaceView nothing ever paints — a gray
+    // screen with a working pad probe, which is worse than the touch UI it replaced.
+    val gamepadUi = skiaConsole && SkiaConsole.healthy && gamepadUiActive(
         settings.gamepadUiEnabled, settings.gamepadUiMode, controllerConnected, tv, forceGamepadUi,
     )
 
