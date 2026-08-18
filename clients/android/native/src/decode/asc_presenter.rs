@@ -519,13 +519,33 @@ impl AscBackend {
         let (latch_p50, latch_max) = p50_max_ms(std::mem::take(&mut self.latch_us));
         let (pace_p50, pace_max) = p50_max_ms(std::mem::take(&mut self.pace_us));
         let (e2e_p50, e2e_max) = p50_max_ms(std::mem::take(&mut self.e2e_us));
+        // Under the smoothness intent, tail the source-cadence loop's health: `late‰` of all frames
+        // folded (a due time already past when the frame became presentable — the direct signal the
+        // cushion is too small, WP8's acceptance criterion), `jitter` (the loop residual's mean
+        // absolute deviation), `cushion`, and `reanchors`. Absent under latency (no loop). Counters
+        // are cumulative since the last re-anchor, so `late` reads as a rate over enough frames.
+        let cadence = self
+            .cadence
+            .as_ref()
+            .map(CadenceClock::health)
+            .map(|h| {
+                format!(
+                    " late={}‰ jitterMs={:.2} cushionMs={:.2} reanchors={}",
+                    h.late.saturating_mul(1000) / h.frames.max(1),
+                    h.jitter_ns as f64 / 1e6,
+                    h.cushion_ns as f64 / 1e6,
+                    h.reanchors,
+                )
+            })
+            .unwrap_or_default();
         log::info!(
             target: "pf.present",
-            "asc released={} displays={} inflight={} paceMs p50={:.2} max={:.2} \
-             latchMs p50={:.2} max={:.2} e2eMs p50={:.2} max={:.2} panelMs={:.2} forced={}",
+            "asc released={} displays={} inflight={} qDepth={} paceMs p50={:.2} max={:.2} \
+             latchMs p50={:.2} max={:.2} e2eMs p50={:.2} max={:.2} panelMs={:.2} forced={}{}",
             self.released,
             self.displays,
             self.inflight,
+            self.fifo.len(),
             pace_p50,
             pace_max,
             latch_p50,
@@ -534,6 +554,7 @@ impl AscBackend {
             e2e_max,
             self.panel.period_ns() as f64 / 1e6,
             self.forced,
+            cadence,
         );
         self.released = 0;
         self.displays = 0;
