@@ -1,0 +1,32 @@
+# Inner Caddy (plain HTTP on :3250); the edge proxy on home-reverse-proxy-1 does TLS for
+# nix.unom.io. Serves the punktfunk Nix binary cache — which is nothing but a static tree:
+#
+#   /nix-cache-info          store dir + priority, fetched once per substituter
+#   /<32-char-hash>.narinfo  one per store path
+#   /nar/<hash>.nar.xz       the archives themselves
+#
+# ⚠ A MISSING PATH MUST 404, NOT 403. Nix reads 404 as "not in this cache, try the next
+# substituter" and treats anything else as a hard error that fails the build — so a cache
+# answering 403 for unknown hashes breaks every user who adds it, including for packages it
+# was never meant to serve. `file_server` 404s correctly; do not put an auth wrapper in front
+# of this without preserving that. This is also the concrete reason the cache is NOT a bucket
+# on storage.unom.io: S3 answers 403 for a missing key unless the bucket policy grants
+# anonymous ListBucket, and that box is on the home uplink besides.
+:3250 {
+	root * /srv
+	file_server browse
+
+	# Everything except nix-cache-info is content-addressed by the store hash and can never
+	# change meaning — a narinfo for a given hash is as immutable as the NAR it points at.
+	@immutable path /nar/* *.narinfo
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+
+	# The only mutable file, and cheap to revalidate: nix reads it once per substituter per run.
+	@info path /nix-cache-info
+	header @info Cache-Control "public, max-age=300"
+
+	# nix does not care about Content-Type, but a browser poking at the cache should not be
+	# offered a download for what is a two-line text file.
+	@text path *.narinfo /nix-cache-info
+	header @text Content-Type "text/plain; charset=utf-8"
+}

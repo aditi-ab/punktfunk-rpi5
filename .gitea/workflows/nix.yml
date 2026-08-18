@@ -4,8 +4,9 @@
 # `nix build .#punktfunk-web` was broken for 553 commits before anyone noticed (see the bun-nix job
 # in ci.yml for that story).
 #
-# Two tiers, because a full `nix flake check` builds the whole Rust workspace with crane and would
-# run for an hour on every push:
+# Three tiers, because a full `nix flake check` builds the whole Rust workspace with crane and would
+# run for an hour on every push — so the two cheap tiers gate every PR and the expensive one runs
+# only where its cost buys something (a published cache):
 #
 #   * eval  — `nix flake check --no-build`: instantiates every package, app, check and devShell
 #             without building them. Catches the failures that actually happen to this flake — a
@@ -32,15 +33,28 @@
 #             covers what the ci.yml drift gate cannot, e.g. a tarball the registry no longer
 #             serves, or the codegen going quietly message-less (see packages.nix's inlang note).
 #
-# The Rust packages (punktfunk-host, punktfunk-client) and punktfunk-gamescope are NOT built here.
-# They are the expensive ones and their inputs are already gated by the `rust` job in ci.yml; build
-# them by hand on a Nix box, or with the `build-rust` dispatch input below.
+#   * cache — PUSH TO MAIN ONLY. Builds the Rust packages + gamescope for real and publishes every
+#             punktfunk store path to the binary cache at https://nix.unom.io, so a NixOS user gets
+#             prebuilt binaries instead of an hour of rustc and a gamescope compile. This is the
+#             expensive tier and it is why the job timeout is 180 rather than 90.
 #
-# ⚠ punktfunk-gamescope deserves the dispatch run more than it looks: `host.gamescopeHdr` DEFAULTS
-# TRUE, so it is on the critical path of every `services.punktfunk.host.enable = true` build, while
-# being the one package nothing here compiles. It patches whatever gamescope the pinned nixpkgs
-# carries, so a nixpkgs bump — not a change of ours — is what breaks it, and the first person to
-# find out would be an operator whose system rebuild fails. Run the dispatch after a flake.lock bump.
+#             It needs NO extra trigger for releases: a release bumps the workspace version in
+#             Cargo.toml, which is already in the path filter below, so the tag's content is
+#             published by the version-bump commit on main.
+#
+#             Only OUR paths are published — see the step for why that is both correct and the
+#             difference between ~300 MB and several GB per publish.
+#
+# The Rust packages and punktfunk-gamescope are still not built on PRs: they are the expensive ones
+# and their inputs are already gated by the `rust` job in ci.yml. Build them on a PR by hand on a
+# Nix box, or with the `build-rust` / `build-gamescope` dispatch inputs below.
+#
+# ⚠ punktfunk-gamescope matters more than it looks: `host.gamescopeHdr` DEFAULTS TRUE, so it is on
+# the critical path of every `services.punktfunk.host.enable = true` build. It patches whatever
+# gamescope the pinned nixpkgs carries, so a nixpkgs bump — not a change of ours — is what breaks
+# it, and the first person to find out would be an operator whose system rebuild fails. The `cache`
+# tier now compiles it on every main push, so a flake.lock bump that breaks it goes red HERE; the
+# dispatch input below is for checking it on a branch before merging.
 #
 # ⚠ pull_request is deliberately present. flatpak.yml shipped with push-only triggers and manifest
 # breakage reached main invisibly for weeks — do not "simplify" this workflow by dropping it.
@@ -107,8 +121,15 @@ jobs:
       # real node (so actions/checkout works with no pre-checkout install dance), and audit.yml
       # already pulls it on this fleet, so it is proven to resolve here. Nix is installed below.
       image: node:22-bookworm
-    timeout-minutes: 90
+    # 180, not 90: the `cache` tier on a main push compiles the whole Rust workspace AND gamescope
+    # from source inside the nix sandbox, where the sccache every other Rust job leans on cannot
+    # reach (no network in a derivation, and RUSTC_WRAPPER is not set inside one).
+    timeout-minutes: 180
     env:
+      # Where the published cache lives on unom-1, and the URL users substitute from. Kept next to
+      # the flatpak repo (3230) and winget source (3240) — see packaging/nix/server/.
+      DEPLOY_DIR: unom-nix-cache
+      CACHE_URL: https://nix.unom.io
       # The flake needs both experimental features. Also baked into the installer's --extra-conf
       # below; this covers any step that shells out before that config is read.
       NIX_CONFIG: "experimental-features = nix-command flakes"
@@ -126,11 +147,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The Determinate installer needs curl + xz; git so nix can read the flake from the checkout.
-      # (node:22-bookworm is the full image and already has all three — this is belt-and-braces
-      # against a future slim-image swap, and costs one cached apt call.)
+      # The Determinate installer needs curl + xz; git so nix can read the flake from the checkout;
+      # rsync + ssh to ship the built cache to unom-1. (node:22-bookworm is the full image and
+      # already has all but rsync — this is belt-and-braces against a future slim-image swap, and
+      # costs one cached apt call.)
       - name: Installer prerequisites
-        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils git
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils git rsync openssh-client
 
       # `--init none` is the container mode: no systemd, no daemon. Running as root, nix then talks
       # to the store directly. Determinate Nix is also what the Nix box (.21) runs, so CI and the
@@ -182,6 +204,133 @@ jobs:
           grep -q 'Bun\.serve' "$web/share/punktfunk-web/.output/server/index.mjs" \
             || { echo "installed console is not a bun bundle" >&2; exit 1; }
           echo "bun packages OK: $web  $scripting"
+
+      # ── binary cache (push to main only) ───────────────────────────────────────────────────────
+      #
+      # Decided against a bucket on storage.unom.io even though sccache already uses it and the
+      # credentials already exist: it is local RustFS on the home uplink with no CDN in front, so
+      # every NixOS user's download would come off the same pipe every CI runner uses — and S3
+      # answers 403, not 404, for a missing key, which nix treats as a hard error rather than a
+      # cache miss (see packaging/nix/server/Caddyfile). unom-1 already serves the flatpak repo
+      # this way from a cloud IP; a Nix cache is the same static-files-behind-caddy shape.
+      #
+      # Gitea itself cannot host this at all: it has 23 package registry types and none is Nix, and
+      # the binary cache protocol wants fixed anonymous paths at a URL root (/nix-cache-info,
+      # /<hash>.narinfo, /nar/<hash>.nar.xz) that /api/packages/{owner}/generic/… cannot express.
+      - name: Cache publish preflight
+        id: cachecfg
+        if: ${{ github.event_name == 'push' }}
+        env:
+          NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        # Guard BEFORE the build, not before the upload: an unconfigured cache must not cost an
+        # hour of rustc first. No-ops cleanly until the secret exists, exactly as flatpak.yml's
+        # repo deploy does, so this workflow stays green through setup.
+        run: |
+          set -eu
+          if [ -n "${NIX_CACHE_SIGNING_KEY:-}" ] && [ -n "${DEPLOY_HOST:-}" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::NIX_CACHE_SIGNING_KEY/DEPLOY_HOST not set — skipping the binary cache publish (see packaging/nix/README.md)."
+          fi
+
+      - name: Build the publishable packages
+        if: ${{ steps.cachecfg.outputs.go == 'true' }}
+        # Everything a user can install. punktfunk-gamescope earns its place here more than any
+        # other: host.gamescopeHdr DEFAULTS TRUE, so without it in the cache every
+        # `services.punktfunk.host.enable = true` still compiles a compositor from source.
+        run: |
+          "$NIX" build --print-build-logs \
+            .#punktfunk-host .#punktfunk-client .#punktfunk-tray \
+            .#punktfunk-web .#punktfunk-scripting .#punktfunk-gamescope
+          # This is now the heaviest job on the fleet — a full workspace build plus gamescope fills
+          # the store with tens of GB, and this fleet ran a runner out of disk on 2026-08-06. Record
+          # the headroom AFTER the build too, or a future "no space left on device" is a guess.
+          df -h / /nix /tmp || true
+
+      - name: Sign + publish to nix.unom.io
+        if: ${{ steps.cachecfg.outputs.go == 'true' }}
+        env:
+          NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          # `set -eu`, NOT `set -euo pipefail`: act_runner may execute a step's `run:` under dash in
+          # these containers (see scripts/ci/ensure-sccache.sh), and dash dies on `-o pipefail` with
+          # "Illegal option". The two places below where a pipeline's LEFT side must be able to fail
+          # the step are written as redirects instead, so nothing depends on pipefail.
+          set -eu
+          PKGS=".#punktfunk-host .#punktfunk-client .#punktfunk-tray .#punktfunk-web .#punktfunk-scripting .#punktfunk-gamescope"
+
+          # 1) Pick what to publish. PUBLISH ONLY OUR OWN PATHS — this is the difference between
+          #    ~300 MB and several GB per run, and it is not a corner cut: a runtime closure here
+          #    is our binaries plus stock nixpkgs (ffmpeg, gtk4, glibc, …), and every stock path is
+          #    already on cache.nixos.org, served by a real CDN. Mirroring them onto unom-1 would
+          #    cost disk and home-to-cloud bandwidth to serve a WORSE copy of what users already
+          #    have. Nothing in nixpkgs is named punktfunk, so the name filter is exact.
+          paths="$("$NIX" path-info -r $PKGS | grep -- '-punktfunk' || true)"
+          [ -n "$paths" ] || { echo "::error::no punktfunk store paths in the closure — the name filter is broken"; exit 1; }
+          echo "$paths"
+          # The filter is a string match, so it would fail SILENTLY if a pname ever changed — and
+          # the package most likely to drift is gamescope, the most expensive one to lose. Assert
+          # every built output is actually covered rather than discovering it as a user rebuild.
+          for out in $("$NIX" build --print-out-paths $PKGS); do
+            printf '%s\n' "$paths" | grep -qxF "$out" \
+              || { echo "::error::$out is not matched by the '-punktfunk' filter — publish would silently omit it"; exit 1; }
+          done
+
+          # 2) Sign into a local binary cache. The secret is the whole `name:base64` line from
+          #    `nix key generate-secret`; the matching public key is what users pin (README).
+          KEYDIR="$(mktemp -d)"; chmod 700 "$KEYDIR"
+          printf '%s' "$NIX_CACHE_SIGNING_KEY" > "$KEYDIR/key"; chmod 600 "$KEYDIR/key"
+          printf '%s\n' "$paths" | xargs "$NIX" copy --to "file://$PWD/nix-cache?secret-key=$KEYDIR/key"
+          # Publish the PUBLIC half beside the cache and echo it here. Users must pin this key, so
+          # it needs to be fetchable from the cache itself rather than only from a doc that can
+          # drift — and on the first run this log line is where the value for README.md comes from.
+          # Redirect, not `| tee`: without pipefail a failing nix would be masked by tee's success
+          # and publish an EMPTY public key, which every user would then pin.
+          "$NIX" key convert-secret-to-public < "$KEYDIR/key" > nix-cache/punktfunk-cache.pub
+          cat nix-cache/punktfunk-cache.pub
+          rm -rf "$KEYDIR"
+          echo "publishing $(find nix-cache -name '*.narinfo' | wc -l) paths, $(du -sh nix-cache | cut -f1)"
+
+          # 3) Ship it. Same deploy key and retry discipline as flatpak.yml — this runner's link to
+          #    unom-1 drops TCP dials under load.
+          install -d -m700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy; chmod 600 ~/.ssh/deploy
+          SSH="ssh -i $HOME/.ssh/deploy -p ${DEPLOY_PORT:-22} -o StrictHostKeyChecking=accept-new"
+          DEST="${DEPLOY_USER}@${DEPLOY_HOST}"
+          bash scripts/ci/retry.sh 5 $SSH "$DEST" "mkdir -p ~/$DEPLOY_DIR/site/nar"
+          # ⚠ ORDER IS LOAD-BEARING: NARs first, narinfos second. A narinfo whose NAR has not landed
+          # yet is a HARD download failure for whoever fetches it in that window; a NAR nothing
+          # points at yet is simply invisible. rsync renames each file into place atomically, so a
+          # cancelled run (this workflow has cancel-in-progress) can only ever under-publish.
+          # No --delete: superseded paths are aged out by prune.sh below instead, so a client
+          # mid-download is never pulled out from under.
+          bash scripts/ci/retry.sh 5 rsync -az --info=stats1 -e "$SSH" nix-cache/nar/ "$DEST:$DEPLOY_DIR/site/nar/"
+          bash scripts/ci/retry.sh 5 rsync -az -e "$SSH" nix-cache/nix-cache-info nix-cache/punktfunk-cache.pub nix-cache/*.narinfo "$DEST:$DEPLOY_DIR/site/"
+          bash scripts/ci/retry.sh 5 rsync -az -e "$SSH" \
+            packaging/nix/server/compose.production.yml packaging/nix/server/Caddyfile packaging/nix/server/prune.sh \
+            "$DEST:$DEPLOY_DIR/"
+          bash scripts/ci/retry.sh 5 $SSH "$DEST" "cd ~/$DEPLOY_DIR && docker compose -f compose.production.yml up -d"
+
+          # 4) Bound it. The flatpak repo next door reached 3.84 GB publishing this same way with
+          #    no sweep, on a box that has run out of disk before; this one gets the sweep from the
+          #    first publish. Never allowed to fail the job — the cache is already live by now, and
+          #    a growing disk is a slower problem than a red main.
+          bash scripts/ci/retry.sh 3 $SSH "$DEST" "sh ~/$DEPLOY_DIR/prune.sh ~/$DEPLOY_DIR/site 180" \
+            || echo "::warning::cache prune failed — published cache may be growing unbounded"
+
+          # 5) Prove the published cache actually answers, rather than assuming the rsync landed.
+          #    A substituter that 200s on nix-cache-info but 403s on a miss is the failure mode that
+          #    breaks users' builds, so check both.
+          bash scripts/ci/retry.sh 5 curl -fsS "$CACHE_URL/nix-cache-info"
+          miss="$(curl -sS -o /dev/null -w '%{http_code}' "$CACHE_URL/0000000000000000000000000000000000.narinfo")"
+          [ "$miss" = 404 ] || { echo "::error::cache returns $miss for an absent path; nix needs 404 or every user build fails"; exit 1; }
+          echo "published → $CACHE_URL"
 
       # Opt-in only: the full Rust workspace through crane, which is the hour-long leg.
       # `github.event.inputs.*` (string) rather than `inputs.*` — the portable spelling.

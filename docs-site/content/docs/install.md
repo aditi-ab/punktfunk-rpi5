@@ -32,8 +32,9 @@ On **Windows**, the host ships as a signed installer instead — see [Windows](#
 
 Each registry is public — no auth, you just trust the repo's signing key. Adding the repo is a
 one-time step covered in the linked guide; after that, normal `apt upgrade` / `dnf upgrade` /
-`pacman -Syu` (or `sudo punktfunk-sysext update` on Bazzite) tracks new builds. On **NixOS** there
-is no repo to add — you add the flake as an input and enable its module, see [NixOS](#nixos).
+`pacman -Syu` (or `sudo punktfunk-sysext update` on Bazzite) tracks new builds. On **NixOS** you add
+the flake as an input and enable its module rather than adding a package repo — but do add the
+[binary cache](#nixos), or every build compiles from source.
 
 > **Stable vs canary.** The repos in the per-distro guides are the **stable** channel — it only
 > moves when a `vX.Y.Z` release is cut. For the latest `main` build (fast, possibly broken), point
@@ -92,6 +93,22 @@ This is also the path for **canary** builds, which winget doesn't carry — see
 The repo's `flake.nix` is a supported install path: it builds `punktfunk-host`, `punktfunk-client`,
 `punktfunk-web` and `punktfunk-scripting`, and ships a NixOS module. **`x86_64-linux` only**, and
 NixOS **24.11 or newer**.
+
+**Add the binary cache first.** Without it, a build compiles the whole Rust workspace *and*
+gamescope from source — about an hour. With it you get prebuilt binaries:
+
+```nix
+nix.settings = {
+  substituters = [ "https://nix.unom.io" ];
+  trusted-public-keys = [ "punktfunk-cache-1:<key>" ];   # curl https://nix.unom.io/punktfunk-cache.pub
+};
+```
+
+Off NixOS, put the same two values in `/etc/nix/nix.conf` as `extra-substituters` /
+`extra-trusted-public-keys`. One caveat worth knowing before you copy a flake snippet from
+elsewhere: setting `inputs.punktfunk.inputs.nixpkgs.follows = "nixpkgs"` changes every store path
+and so misses the cache entirely — details in
+[packaging/nix](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/nix/README.md#binary-cache-do-this-before-your-first-build).
 
 You can run it straight from the flake without NixOS (on other distros, wrap it in
 [nixGL](https://github.com/nix-community/nixGL) so the GPU drivers resolve):
