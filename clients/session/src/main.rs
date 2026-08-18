@@ -840,6 +840,29 @@ mod session_main {
             // speaker pair.
             let speaker = arg_flag("--speaker");
             let coils = arg_flag("--coils") || !speaker;
+            // Say up front whether a real session would render what this is about to prove
+            // works. The devtest drives the pad DIRECTLY, so it is deliberately blind to the
+            // settings — which makes "the tone plays here but the game is silent" a genuinely
+            // confusing result, and one that has cost a whole debugging evening: the toggle is
+            // on the client while every instinct sends you measuring the host. The capability
+            // is never advertised when the toggle is off, so no later log line can catch this.
+            {
+                let s = trust::Settings::load();
+                if speaker && !pf_client_core::pad_audio::speaker_active(&s.pad_speaker) {
+                    println!(
+                        "note: \"Controller speaker\" is OFF in your settings (pad_speaker = \
+                         {:?}), so a streaming session will NOT render the pad's speaker even if \
+                         the tone below is audible.",
+                        s.pad_speaker
+                    );
+                }
+                if coils && !s.pad_haptics {
+                    println!(
+                        "note: \"Controller haptics\" is OFF in your settings, so a streaming \
+                         session will NOT render the voice coils even if the tone below is felt."
+                    );
+                }
+            }
             return match pf_client_core::pad_audio::pad_audio_test(seconds, coils, speaker) {
                 Ok(()) => 0,
                 Err(e) => {

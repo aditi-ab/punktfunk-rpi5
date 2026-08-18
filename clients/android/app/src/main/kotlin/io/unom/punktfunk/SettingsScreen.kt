@@ -962,9 +962,14 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
                 enabled = s.gamepadForwarding && s.dsCapture,
                 onCheckedChange = { on -> update(s.copy(padHaptics = on)) },
             )
+            // The one row here that is OFF by default (see Settings.padSpeaker for why), which
+            // makes a silent pad speaker look exactly like broken hardware — the failure this
+            // subtitle exists to pre-empt, after it cost a full evening of host-side measuring.
+            // Say the default out loud rather than describing only what "on" does.
             ToggleRow(
                 title = "Controller speaker",
-                subtitle = "Play audio the game sends to the controller's own speaker",
+                subtitle = "Play audio the game sends to the controller's own speaker — " +
+                    "off by default, so the pad's speaker stays silent until you turn this on",
                 checked = s.padSpeaker,
                 enabled = s.gamepadForwarding && s.dsCapture,
                 onCheckedChange = { on -> update(s.copy(padSpeaker = on)) },
