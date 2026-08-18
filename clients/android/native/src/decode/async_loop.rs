@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use super::asc_presenter::{asc_backend_selected, AscBackend};
 use super::display::{
-    apply_hdr_dataspace, hdr_dataspace, install_render_callback, release_render_callback,
+    apply_hdr_dataspace, color_dataspace, hdr_dataspace, install_render_callback,
+    release_render_callback,
     DisplayTracker,
 };
 use super::latency::{note_decoded_pts, now_realtime_ns, take_flags, take_stamp};
@@ -192,11 +193,9 @@ pub(super) fn run_async(
     // below is the fallback for API < 29, an ASC init failure, or the `present_backend=surfaceview`
     // sysprop. A non-null `asc` means the codec renders into the reader, not the SurfaceView window.
     let mut asc = if asc_backend_selected() {
-        let initial_ds = if client.color.is_hdr() {
-            i32::from(ndk::data_space::DataSpace::Bt2020ItuPq)
-        } else {
-            0
-        };
+        // The negotiated colour is authoritative (PQ vs HLG, range) — not a guess the codec's
+        // output format later corrects; many decoders never echo `color-transfer` at all.
+        let initial_ds = color_dataspace(&client.color);
         AscBackend::create(
             &window,
             mode.width as i32,
@@ -449,7 +448,12 @@ pub(super) fn run_async(
         if fmt_dirty {
             if let Some(a) = asc.as_mut() {
                 // ASC carries the HDR signal on the transaction, not the SurfaceView window.
-                a.set_dataspace(hdr_dataspace(&codec).map_or(0, i32::from));
+                // Refine only when the codec actually reports an HDR transfer — a `None` echo
+                // (decoders commonly omit `color-transfer`) must not clobber the negotiated
+                // dataspace back to SDR before the first present.
+                if let Some(ds) = hdr_dataspace(&codec) {
+                    a.set_dataspace(i32::from(ds));
+                }
             } else {
                 apply_hdr_dataspace(&codec, &window, &mut applied_ds);
             }

@@ -274,3 +274,20 @@ pub(super) fn hdr_dataspace(codec: &MediaCodec) -> Option<DataSpace> {
         _ => None, // SDR (BT.709 / SDR_VIDEO) or unspecified
     }
 }
+
+/// Map the *negotiated* session colour ([`ColorInfo`], carried on Welcome) to the HDR `ADataSpace`
+/// the presenter should tag buffers with, or `0` for SDR. This is the authoritative source — the
+/// wire contract says clients configure the presenter from these code points, not from what the
+/// decoder happens to echo back (many decoders omit `color-transfer` from the output format).
+pub(super) fn color_dataspace(color: &punktfunk_core::quic::ColorInfo) -> i32 {
+    use punktfunk_core::quic::ColorInfo;
+    let full = color.full_range != 0;
+    let ds = match color.transfer {
+        ColorInfo::TRC_PQ if full => DataSpace::Bt2020Pq,
+        ColorInfo::TRC_PQ => DataSpace::Bt2020ItuPq,
+        ColorInfo::TRC_HLG if full => DataSpace::Bt2020Hlg,
+        ColorInfo::TRC_HLG => DataSpace::Bt2020ItuHlg,
+        _ => return 0, // SDR — leave the layer default
+    };
+    i32::from(ds)
+}
