@@ -255,11 +255,11 @@ private fun ControllersBody(
     val haptics by rememberUpdatedState(rememberConsoleHaptics())
 
     DisposableEffect(observeInput) {
-        // Stable probe refs, and a teardown that releases the slot only if WE still hold it — the
-        // rule GamepadNavEffect2D follows. Without it this screen's dispose nulls whatever is in the
-        // slot: during the console shell's push/pop BOTH screens are briefly composed, so leaving
-        // here would kill the pad navigation the arriving screen had just installed. The same
-        // teardown also runs when this screen hands the pad to its own input test and back.
+        // One entry on the MainActivity probe stack, removed by identity on the way out — the rule
+        // GamepadNavEffect2D follows. During the console shell's push/pop BOTH screens are briefly
+        // composed, and only the identity removal keeps this screen's teardown from taking the
+        // arriving screen's claim with it. The same teardown also runs when this screen hands the
+        // pad to its own input test and back.
         val keyProbe: (KeyEvent) -> Boolean = probe@{ event ->
             if (!Gamepad.isPad(event.device)) return@probe false
             // Read ONCE, up front: the test can end inside this very event, and the release that
@@ -317,15 +317,10 @@ private fun ControllersBody(
             axes["HY"] = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
             consuming
         }
-        if (observeInput) {
-            activity?.padKeyProbe = keyProbe
-            activity?.padMotionProbe = motionProbe
-        }
+        val probes = if (observeInput) MainActivity.PadProbes(keyProbe, motionProbe) else null
+        probes?.let { activity?.pushPadProbes(it) }
         onDispose {
-            activity?.let { a ->
-                if (a.padKeyProbe === keyProbe) a.padKeyProbe = null
-                if (a.padMotionProbe === motionProbe) a.padMotionProbe = null
-            }
+            probes?.let { activity?.removePadProbes(it) }
         }
     }
     // Hold-B-to-exit: with events consumed, the pad can't reach the Switch — a 1.2 s hold ends the

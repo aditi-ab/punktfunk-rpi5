@@ -109,12 +109,29 @@ class MainActivity : ComponentActivity() {
     var gamepadRouter: GamepadRouter? = null
 
     /**
-     * Input observers for the Controllers debug screen (set while it is shown, like [streamHandle]).
-     * Called for every key/motion event while not streaming; a `true` return consumes the event —
-     * the screen's "test inputs" mode uses that to keep pad input from also driving focus navigation.
+     * One screen's claim on the pad while not streaming: its key/motion observers, consulted for
+     * every event before the focus-navigation fallbacks below; a `true` return consumes the event.
+     * Holders are the Skia console shell, [GamepadNavEffect2D] on the Compose screens the console
+     * opens over itself, and the Controllers screen's input test.
      */
-    var padKeyProbe: ((KeyEvent) -> Boolean)? = null
-    var padMotionProbe: ((MotionEvent) -> Boolean)? = null
+    class PadProbes(val key: (KeyEvent) -> Boolean, val motion: (MotionEvent) -> Boolean)
+
+    /**
+     * The pad-probe claims, a STACK — only the top entry sees events. A single last-writer-wins
+     * slot is how the console shell used to lose the pad for good: a screen composed over it
+     * (Controllers/Licenses) overwrote the slot, then nulled it on its way out, and the shell —
+     * whose install effect had no reason to re-run — never got it back. Pushing on install and
+     * removing BY IDENTITY on dispose survives every ordering Compose produces (cross-fades
+     * compose both screens at once, and dispose is not always LIFO): whatever leaves takes only
+     * its own entry, and whatever is left on top resumes seeing the pad.
+     */
+    private val padProbes = mutableListOf<PadProbes>()
+
+    fun pushPadProbes(p: PadProbes) { padProbes += p }
+    fun removePadProbes(p: PadProbes) { padProbes.remove(p) }
+
+    private val padKeyProbe: ((KeyEvent) -> Boolean)? get() = padProbes.lastOrNull()?.key
+    private val padMotionProbe: ((MotionEvent) -> Boolean)? get() = padProbes.lastOrNull()?.motion
 
     /**
      * Physical-mouse forwarder for the active session (built/released by StreamScreen, like

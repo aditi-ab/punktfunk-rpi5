@@ -228,13 +228,13 @@ fun SkiaConsoleShell(
             padState.push(handle)
             true
         }
-        activity.padKeyProbe = keyProbe
-        activity.padMotionProbe = motionProbe
+        val probes = MainActivity.PadProbes(keyProbe, motionProbe)
+        activity.pushPadProbes(probes)
         SkiaConsole.padsChanged(Gamepad.firstPad())
         onDispose {
-            // Only clear what is still ours: a screen composed after us must not lose its probes.
-            if (activity.padKeyProbe === keyProbe) activity.padKeyProbe = null
-            if (activity.padMotionProbe === motionProbe) activity.padMotionProbe = null
+            // Remove OUR claim only — a platform screen pushed over us keeps its own, and when it
+            // pops, this one resurfaces (the stack is what fixed the pad dying after Controllers).
+            activity.removePadProbes(probes)
             padState.reset()
             if (handle != 0L) padState.push(handle)
         }
