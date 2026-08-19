@@ -16,8 +16,7 @@ use std::time::{Duration, Instant};
 use super::asc_presenter::{asc_backend_selected, AscBackend};
 use super::display::{
     apply_hdr_dataspace, color_dataspace, hdr_dataspace, install_render_callback,
-    release_render_callback,
-    DisplayTracker,
+    release_render_callback, DisplayTracker,
 };
 use super::latency::{note_decoded_pts, now_realtime_ns, take_flags, take_stamp};
 use super::presenter::{presenter_disabled_by_sysprop, PresentMeter, PresentPriority, Presenter};
