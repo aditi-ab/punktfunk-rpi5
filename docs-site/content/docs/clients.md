@@ -5,15 +5,13 @@ description: The ways to connect to a Punktfunk host — the Apple app, Moonligh
 
 A Punktfunk host accepts clients over its own `punktfunk/1` protocol (the macOS, Linux, Windows, and
 Android apps) and over GameStream (Moonlight). Pick whichever fits the device you're streaming *to*.
-Ready to install?
-**[Install a Client](/docs/install-client)** has the step-by-step for every device — plus how to
+**[Install a Client](/docs/install-client)** has the step-by-step for every device, plus how to
 [update](/docs/install-client#keeping-a-client-up-to-date) and
 [remove](/docs/install-client#removing-a-client) each one.
 
-Two things apply to every app, whichever you pick:
-[profiles and `punktfunk://` links](#profiles-and-links-every-app), and the keys and chords that
-work [while you're streaming](#while-youre-streaming). What each one lets you change — resolution,
-bitrate, codec, HDR, audio, controllers — is catalogued in
+Two things apply to every app: [profiles and `punktfunk://` links](#profiles-and-links-every-app),
+and the keys and chords that work [while you're streaming](#while-youre-streaming). What each app
+lets you change — resolution, bitrate, codec, HDR, audio, controllers — is catalogued in
 [Client settings](/docs/client-settings).
 
 ## Apple app (Mac, iPhone, iPad, Apple TV)
@@ -29,9 +27,9 @@ protocol — the lowest-latency, most resilient path, with the full feature set:
 - A live **stats overlay** (resolution, fps, bitrate, latency) and a built-in **network speed test**
   to pick a bitrate for your link.
 - **Widgets, Live Activities and Shortcuts** — a hosts widget and a game-library widget for the
-  home screen (the library one opens a host you pick straight into its library), a Live Activity
-  while a session runs, and App Intents so Siri and the Shortcuts app can start a stream or jump
-  into a host's game library.
+  home screen (the library one opens a picked host's library), a Live Activity while a session
+  runs, and App Intents so Siri and the Shortcuts app can start a stream or jump into a host's game
+  library.
 
 Open the app, pick your host, [pair](/docs/pairing) once, and stream. It builds from the
 `clients/apple` directory in the repo (Swift / VideoToolbox / Metal).
@@ -40,11 +38,9 @@ Open the app, pick your host, [pair](/docs/pairing) once, and stream. It builds 
 
 Punktfunk also speaks the **GameStream** protocol, so any [Moonlight](https://moonlight-stream.org/)
 client — a browser, a smart TV, an old phone, a games console — connects with no punktfunk-specific
-software. (Most platforms also have a native Punktfunk app below — Moonlight is the catch-all.) See
-[Connect with Moonlight](/docs/moonlight).
-
-This is the broadest-compatibility option and great for couch gaming. It doesn't use the native
-protocol's FEC/encryption extensions, but for a healthy LAN that rarely matters.
+software; it's the catch-all where no native Punktfunk app exists. See
+[Connect with Moonlight](/docs/moonlight). It doesn't use the native protocol's FEC/encryption
+extensions, but on a healthy LAN that rarely matters.
 
 ## Linux desktop client (GTK4)
 
@@ -52,26 +48,26 @@ protocol's FEC/encryption extensions, but for a healthy LAN that rarely matters.
 `punktfunk/1` directly, with vendor-ordered hardware decode (**Vulkan Video first on NVIDIA and
 AMD**, **VAAPI dmabuf first on Intel**; whichever isn't first is the fallback, and software decode
 is last), PipeWire audio, and SDL3 controllers (rumble, lightbar, DualSense touchpad/motion). The
-decoders are Punktfunk's own — the client links no FFmpeg at all, and talks to your GPU's Vulkan
-and VAAPI drivers directly. To force one, pick it in *Preferences → Display → Video decoder* or
-set `PUNKTFUNK_DECODER=native-vulkan|native-vaapi|software`. Like the Apple app it discovers hosts
-on your network automatically, does PIN pairing, pins reconnects, and browses the host's
-**game library** (with cover art) so you can launch a title straight into the stream.
+decoders are Punktfunk's own — the client links no FFmpeg and talks to your GPU's Vulkan and VAAPI
+drivers directly. To force one, pick it in *Preferences → Display → Video decoder* or set
+`PUNKTFUNK_DECODER=native-vulkan|native-vaapi|software`. Like the Apple app it discovers hosts
+automatically, does PIN pairing, pins reconnects, and browses the host's **game library** (with
+cover art) to launch a title straight into the stream.
 
-It ships as a real package, not just a source build — full steps in
+It ships as real packages — full steps in
 [Install a Client](/docs/install-client#linux-desktop-flatpak):
 
-- **Any Flatpak distro (recommended)** — one command from the hosted `flatpak.unom.io` repo; the
-  guide linked above has the exact command and how updates work. It's also the client the
+- **Any Flatpak distro (recommended)** — one command from the hosted `flatpak.unom.io` repo (exact
+  command and update flow in the guide above). It's also the client the
   [Decky plugin](/docs/steam-deck) uses by default, though the plugin drives a native
   `punktfunk-client` just as well.
 - **Ubuntu 26.04 or newer** — `apt install punktfunk-client` from the Punktfunk apt registry. The
   client package needs SDL3 and GTK4 ≥ 4.20, which Ubuntu 24.04 LTS doesn't ship — on 24.04 use the
-  Flatpak above.
+  Flatpak.
 - **Fedora** — `sudo dnf install punktfunk-client` from the Gitea RPM registry (add the repo as in
   the [Fedora guide](/docs/fedora)).
-- **Fedora Atomic / Bazzite** — use the Flatpak above. `rpm-ostree install punktfunk-client` works,
-  but layering slows every OS update, so it's a last resort on an image-based system (see
+- **Fedora Atomic / Bazzite** — use the Flatpak. `rpm-ostree install punktfunk-client` works, but
+  layering slows every OS update, so it's a last resort on an image-based system (see
   [Bazzite](/docs/bazzite)).
 - **Arch** — `sudo pacman -Syu punktfunk-client` from the signed binary repo (see [Arch Linux](/docs/arch)).
 
@@ -88,7 +84,7 @@ The client also updates itself (`punktfunk-client --check-update` / `--apply-upd
 
 ## Android app (phone + Android TV)
 
-The native Android app speaks `punktfunk/1` directly, on both phones and Android TV. It does hardware
+The native Android app speaks `punktfunk/1` directly, on phones and Android TV. It does hardware
 HEVC decode (including [HDR10](/docs/hdr#per-client)), Opus audio with a mic uplink, game
 controllers with rumble and DualSense feedback, automatic host discovery, PIN pairing with pinned
 reconnects, the host's **game library** with cover art, and a live stats overlay — with D-pad and
@@ -96,29 +92,28 @@ game-controller focus navigation for the couch. It builds from the `clients/andr
 (Kotlin + a shared Rust core).
 
 **Controllers.** Plug a **DualSense**, **DualSense Edge** or **DualShock 4** into the phone or tablet
-by USB and grant the USB permission Android asks for when it attaches — Punktfunk then drives the pad
-itself instead of taking what Android's gamepad layer exposes, so the host gets rumble, adaptive
-triggers, the lightbar and gyro. The app's **Controllers** screen lists attached pads and their
-capture state, and the switch that turns this off is *DualSense / DualShock passthrough (USB)* in
-Settings. Over **Bluetooth** the pad still works as an ordinary gamepad, but adaptive triggers and
-the lightbar need the USB connection.
+by USB and grant the USB permission Android asks for — Punktfunk then drives the pad itself instead
+of taking what Android's gamepad layer exposes, so the host gets rumble, adaptive triggers, the
+lightbar and gyro. The app's **Controllers** screen lists attached pads and their capture state; the
+switch that turns this off is *DualSense / DualShock passthrough (USB)* in Settings. Over
+**Bluetooth** the pad still works as an ordinary gamepad, but adaptive triggers and the lightbar
+need USB.
 
 The app is on **[Google Play](https://play.google.com/store/apps/details?id=io.unom.punktfunk)** as a
-public listing — no invite — or you can sideload the public APK instead (see
+public listing — no invite — or sideload the public APK (see
 [Install a Client](/docs/install-client#android)); canary builds ride a separate, invite-only Play
-Internal testing track. Then open the app, pick your host, [pair](/docs/pairing) once, and stream.
+Internal testing track. Open the app, pick your host, [pair](/docs/pairing) once, and stream.
 
 ## Windows desktop client
 
-`punktfunk-client` for Windows (`clients/windows`) is the native graphical client for Windows — pure
-Rust, the same `punktfunk/1` core as the Apple, Linux, and Android apps, with a **WinUI 3** UI (host
-list, settings, PIN pairing); the stream itself runs in Punktfunk's Vulkan presenter. Its decoder
-order is per-vendor: **Vulkan Video, then D3D11VA, then software** on NVIDIA and AMD, and
-**D3D11VA first** on Intel and other GPUs (Intel's driver advertises Vulkan Video, but DXVA is the
-proven path there), with [10-bit/HDR present](/docs/hdr#per-client), WASAPI audio + mic,
-SDL3 controllers (rumble, lightbar, DualSense), network discovery, the host's **game library** with
-cover art, and the full PIN-pairing trust surface. It builds for both `x86_64` and `aarch64` and
-ships as a **signed MSIX**. Launch it and pick a host from the list, just like the other native apps.
+`punktfunk-client` for Windows (`clients/windows`) is the native graphical client — pure Rust, the
+same `punktfunk/1` core as the Apple, Linux, and Android apps, with a **WinUI 3** UI (host list,
+settings, PIN pairing); the stream itself runs in Punktfunk's Vulkan presenter. Decoder order is
+per-vendor: **Vulkan Video, then D3D11VA, then software** on NVIDIA and AMD, and **D3D11VA first**
+on Intel and other GPUs (Intel's driver advertises Vulkan Video, but DXVA is the proven path there).
+It has [10-bit/HDR present](/docs/hdr#per-client), WASAPI audio + mic, SDL3 controllers (rumble,
+lightbar, DualSense), network discovery, the host's **game library** with cover art, and the full
+PIN-pairing trust surface. It builds for `x86_64` and `aarch64` and ships as a **signed MSIX**.
 
 The package installs **two** Start-menu entries — **Punktfunk**, the desktop window, and
 **Punktfunk Console**, a controller-driven fullscreen interface for a TV or HTPC (host list, pairing,
@@ -130,7 +125,7 @@ settings and game library, all navigable with a pad) — plus the headless
 > is a proven alternative for Windows.
 
 For scripting, prefer the [`punktfunk` CLI](#scripting-the-punktfunk-cli). The window binary's own
-headless flags stay supported too:
+headless flags stay supported:
 
 ```sh
 punktfunk-client                                              # open the WinUI 3 window (host list / settings)
@@ -138,12 +133,10 @@ punktfunk-client --discover                                  # list hosts on the
 punktfunk-client --headless --speed-test --connect <host>:9777  # no window: probe the link, print measured/recommended bitrate
 ```
 
-Prefer the broadest compatibility, or no install? **Moonlight** also streams to Windows (see below).
-
 ## webOS (LG TV) — community
 
 [`pf-webos`](https://github.com/dyptan-io/pf-webos) is a native client for LG webOS TVs, built and
-maintained by the community ([dyptan-io](https://github.com/dyptan-io)) on top of Punktfunk's
+maintained by the community ([dyptan-io](https://github.com/dyptan-io)) on Punktfunk's
 `punktfunk/1` protocol and core. It's not an official Punktfunk app, but it speaks the real protocol
 directly (not Moonlight/GameStream) — LAN discovery or add-by-IP, PIN pairing with pinned reconnects,
 hardware video decode via webOS's NDL DirectMedia API, and a browsable game library with cover art,
@@ -178,21 +171,21 @@ named, **6** it needs a person (pairing, or an unknown host).
 
 Under the Flatpak, run it as `flatpak run --command=punktfunk io.unom.Punktfunk <args>`.
 
-> The older headless flags stay supported for existing scripts — `punktfunk-client --connect`,
-> `--discover` and `--headless --speed-test` on both Linux and Windows. `punktfunk` is the surface
-> to build new things on: it wakes a sleeping host before connecting, which those never did.
+> The older `punktfunk-client --connect`, `--discover` and `--headless --speed-test` flags stay
+> supported on Linux and Windows for existing scripts, but build new things on `punktfunk`: it wakes
+> a sleeping host before connecting, which those never did.
 >
-> `punktfunk-probe` is a different thing again — an in-repo protocol test and latency-measurement
-> tool for development. It isn't shipped in any package; you build it from source.
+> `punktfunk-probe` is different again — an in-repo protocol test and latency-measurement tool for
+> development, not shipped in any package; you build it from source.
 
 ## Profiles and links (every app)
 
 Two things work the same in the Apple, Linux, Windows and Android apps. **Settings profiles** are
 named sets of stream overrides — bitrate, resolution, codec, HDR and the rest — that you bind to a
-host or pick for a single connect, with every field you didn't touch still following your defaults.
-And a **`punktfunk://` link** starts a stream from a browser, a desktop shortcut, a home-automation
-rule or `punktfunk open`, carrying only *references* to things that already exist on your device —
-never a setting, and never a trust decision.
+host or pick for a single connect; every field you didn't touch still follows your defaults. A
+**`punktfunk://` link** starts a stream from a browser, a desktop shortcut, a home-automation rule
+or `punktfunk open`, carrying only *references* to things that already exist on your device — never
+a setting, never a trust decision.
 
 [Profiles and links](/docs/profiles-and-links) has both in full: the link grammar, where each app
 puts **Copy link** and **Create shortcut…**, and what a link is refused for. From a script,
@@ -203,14 +196,14 @@ puts **Copy link** and **Create shortcut…**, and what a link is refused for. F
 Click the stream and the desktop clients **capture** your keyboard and mouse — everything goes to
 the host until you let go. **Ctrl+Alt+Shift+Q** (⌃⌥⇧Q or ⌘⎋ on a Mac) gives it back.
 
-That chord, the three others a stream reserves, the controller chord that works with no keyboard in
-reach, which app honours which of them, the two mouse modes, the three touch modes and stylus input
-are all on [Mouse, touch and pen](/docs/input#getting-your-input-back).
+That chord, the three others a stream reserves, the controller chord that needs no keyboard, which
+app honours which, the two mouse modes, the three touch modes and stylus input are all on
+[Mouse, touch and pen](/docs/input#getting-your-input-back).
 
 Copying between the two machines is a separate opt-in: the host operator allows it in `host.env`
-and you turn it on for that one host in your client. Content crosses today from the macOS, iOS,
-iPadOS, Windows and Android apps — the Linux client has the switch but no bridge behind it yet, and
-tvOS has no pasteboard to share. See [Shared clipboard](/docs/clipboard).
+and you turn it on per host in your client. Content crosses today from the macOS, iOS, iPadOS,
+Windows and Android apps — the Linux client has the switch but no bridge behind it yet, and tvOS
+has no pasteboard to share. See [Shared clipboard](/docs/clipboard).
 
 ## Which should I use?
 
@@ -226,5 +219,4 @@ tvOS has no pasteboard to share. See [Shared clipboard](/docs/clipboard).
 | Scripts, plugins, home automation | The headless **[`punktfunk`](#scripting-the-punktfunk-cli)** CLI |
 | Protocol development / latency measurement | **`punktfunk-probe`** (source build only) |
 
-Whichever you choose, the first connection needs a one-time [pairing](/docs/pairing), and
-[Install a Client](/docs/install-client) covers installing, updating and removing it.
+Whichever you choose, the first connection needs a one-time [pairing](/docs/pairing).

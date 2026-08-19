@@ -5,9 +5,9 @@ description: Install the Punktfunk client for the device you're streaming to —
 
 This page is the **install path for each client device**. For what each client *is* and which to
 pick, see [Clients](/docs/clients); to install the **host**, see [Install the Host](/docs/install).
-Whichever client you install, the first connection needs a one-time [pairing](/docs/pairing). If the
-app installs but your host doesn't appear in its list, start at [Troubleshooting → The host isn't
-found on the network](/docs/troubleshooting#the-host-isnt-found-on-the-network).
+Every client needs a one-time [pairing](/docs/pairing) on its first connection. If the app installs
+but your host doesn't appear in its list, start at [Troubleshooting → The host isn't found on the
+network](/docs/troubleshooting#the-host-isnt-found-on-the-network).
 
 Already installed? Skip to [Keeping a client up to date](#keeping-a-client-up-to-date) or
 [Removing a client](#removing-a-client).
@@ -31,9 +31,8 @@ Already installed? Skip to [Keeping a client up to date](#keeping-a-client-up-to
 
 ## Linux desktop (Flatpak)
 
-The **recommended** path on any Flatpak distro — install once, then `flatpak update` tracks new
-builds. One command adds the signed `unom` remote, pulls the GNOME runtime from Flathub
-automatically, and installs the client:
+The **recommended** path on any Flatpak distro. One command adds the signed `unom` remote, pulls the
+GNOME runtime from Flathub automatically, and installs the client:
 
 ```sh
 flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref
@@ -47,10 +46,9 @@ touches the *system* scope and silently skips it):
 flatpak update                       # or: flatpak update --user io.unom.Punktfunk
 ```
 
-Prefer your native package manager? The client also ships as real packages (add the repo once —
-see the linked guide — then it tracks updates with your normal `apt upgrade` / `dnf upgrade` /
-`pacman -Syu`; a *layered* Atomic install needs one extra step, under
-[Keeping a client up to date](#keeping-a-client-up-to-date)):
+Prefer your native package manager? Add the repo once (see the linked guide); updates then ride your
+normal `apt upgrade` / `dnf upgrade` / `pacman -Syu` (a *layered* Atomic install needs
+[one extra step](#keeping-a-client-up-to-date)):
 
 | Distro | Install | Guide |
 |--------|---------|-------|
@@ -60,9 +58,9 @@ see the linked guide — then it tracks updates with your normal `apt upgrade` /
 | **Arch** | `sudo pacman -Syu punktfunk-client` (signed binary repo) | [Arch Linux](/docs/arch) |
 
 > **The client `.deb` needs SDL3 and GTK4 ≥ 4.20**, which Ubuntu 24.04 LTS doesn't ship, so
-> `apt install punktfunk-client` can't satisfy its dependencies there. On 24.04 (or any older
-> distro) use the **Flatpak above** — it carries its own libadwaita and SDL3. This limit is the
-> *client's* alone: the host `.deb` is built separately and installs on 24.04 LTS through 26.04.
+> `apt install punktfunk-client` can't resolve there. On 24.04 (or any older distro) use the
+> **Flatpak above** — it carries its own libadwaita and SDL3. The limit is the *client's* alone: the
+> host `.deb` is built separately and installs on 24.04 LTS through 26.04.
 
 Then launch it, pick your host from the list, and stream. Every one of these packages — Flatpak
 included — also installs the headless **`punktfunk`** command for scripts:
@@ -78,18 +76,17 @@ list: [Clients → the `punktfunk` CLI](/docs/clients#scripting-the-punktfunk-cl
 
 ## Steam Deck
 
-Most Deck users want **Gaming Mode**: install the **[Decky plugin](/docs/steam-deck)** and a
-**Punktfunk** panel lands in the Quick Access Menu, so you can find a host, get let in (a PIN, or a
-request the host's operator approves), and stream **without dropping to the desktop**. Everything
-else — settings, the game library, adding a host by address — is one tap away in the client's own
-gamepad UI. Follow the **[Steam Deck (Decky) guide](/docs/steam-deck)** — it walks through Decky
+Most Deck users want **Gaming Mode**: the **[Decky plugin](/docs/steam-deck)** puts a **Punktfunk**
+panel in the Quick Access Menu — find a host, get let in (a PIN, or a request the host's operator
+approves), and stream **without dropping to the desktop**; settings, the game library and adding a
+host by address are one tap away in the client's own gamepad UI. That guide walks through Decky
 Loader, the plugin, and the one-time client install.
 
 > The plugin doesn't decode video itself — it drives whichever `punktfunk-client` is installed on
 > the Deck. The Flatpak below is the tested default; a native package or a sysext works too. If your
 > client isn't one the plugin can update for you (a sysext, a nix profile, a source build), the panel
 > shows you the update command instead of an **Update** button. The Gaming Mode panel comes from the
-> plugin, so a client on its own won't add it. The Decky guide covers installing both, so start there.
+> plugin, so a client on its own won't add it; the Decky guide covers installing both.
 
 For **Desktop Mode** (or to add the client to Game Mode as a non-Steam app yourself), install the
 Flatpak exactly as [above](#linux-desktop-flatpak) — it carries its own libadwaita + SDL3 and
@@ -104,7 +101,7 @@ See [packaging/flatpak](https://git.unom.io/unom/punktfunk/src/branch/main/packa
 ## Windows
 
 The Windows client ships as a **signed MSIX** in the package registry, signed with a publicly
-trusted certificate — so there is nothing to import and nothing to trust by hand. Download, install.
+trusted certificate — nothing to import or trust by hand.
 
 1. Download the package. Each channel keeps one fixed URL, so this line always fetches the current
    build — in PowerShell:
@@ -115,7 +112,7 @@ trusted certificate — so there is nothing to import and nothing to trust by ha
 
    Swap `_x64` for `_arm64` on an Arm device, and `latest` for `canary` to track `main`. The same
    file is attached to every [release](https://git.unom.io/unom/punktfunk/releases), and every
-   build is also kept under its own version on the
+   build is kept under its own version on the
    [packages page](https://git.unom.io/unom/-/packages) (generic group, `punktfunk-client-windows`).
 2. Install it:
 
@@ -129,8 +126,8 @@ trusted certificate — so there is nothing to import and nothing to trust by ha
    (the MSIX depends on `Microsoft.WindowsAppRuntime.2`), then re-run `Add-AppxPackage`.
 
    Install from a signed-in desktop session. Over a remote, non-interactive session (SSH, an RMM
-   tool) `Add-AppxPackage` can fail with `0x80070005` when the Windows App Runtime it depends on is
-   in use and Windows can't restart the apps holding it.
+   tool) `Add-AppxPackage` can fail with `0x80070005` when the Windows App Runtime is in use and
+   Windows can't restart the apps holding it.
 
 3. Launch **Punktfunk** from the Start menu and pick your host. The package also adds a second
    entry, **Punktfunk Console** — the same client as a controller-driven fullscreen interface for a
@@ -142,11 +139,10 @@ trusted certificate — so there is nothing to import and nothing to trust by ha
 
 ## macOS
 
-Download the notarized disk image from the [releases page](https://git.unom.io/unom/punktfunk/releases)
-— `Punktfunk-<version>.dmg`. It's Developer-ID signed, notarized, and stapled, so Gatekeeper opens
-it without warnings:
+Download `Punktfunk-<version>.dmg` from the [releases page](https://git.unom.io/unom/punktfunk/releases).
+It's Developer-ID signed, notarized, and stapled, so Gatekeeper opens it without warnings:
 
-1. Open `Punktfunk-<version>.dmg` and drag **Punktfunk** to **Applications**.
+1. Open the `.dmg` and drag **Punktfunk** to **Applications**.
 2. Launch it, pick your host from *On this network*, and [pair](/docs/pairing).
 
 The Mac app is also in the [TestFlight beta](https://testflight.apple.com/join/Qr7uSemk); the DMG
@@ -159,19 +155,19 @@ Mac. Install Apple's [TestFlight](https://apps.apple.com/app/testflight/id899247
 
 **[Join the Punktfunk beta on TestFlight →](https://testflight.apple.com/join/Qr7uSemk)**
 
-Open the app, and your hosts appear automatically under *On this network*.
+Open the app; your hosts appear automatically under *On this network*.
 
 ## Android
 
-The Android client (phone + Android TV — one package, the TV layout is the same app in leanback
-mode) is published on **Google Play**. It's a public listing: no invite, no tester list.
+The Android client (phone + Android TV — one package; the TV layout is the same app in leanback
+mode) is on **Google Play** as a public listing: no invite, no tester list.
 
 **[Get Punktfunk on Google Play →](https://play.google.com/store/apps/details?id=io.unom.punktfunk)**
 
 Install it, open the app, and pick your host.
 
-**Prefer not to go through Play?** The signed APK is published publicly on every build, so you can
-sideload it instead — no Play account needed:
+**Prefer not to go through Play?** The signed APK is published publicly on every build — sideload it
+instead, no Play account needed:
 
 ```text
 https://git.unom.io/api/packages/unom/generic/punktfunk-android/latest/punktfunk-android.apk
@@ -195,13 +191,13 @@ LG's webOS doesn't allow apps outside the LG Content Store without sideloading, 
 **Developer Mode** and the **Homebrew Channel** once:
 
 1. Enable Developer Mode on the TV and install the [Homebrew Channel](https://www.webosbrew.org/) —
-   follow its [install guide](https://www.webosbrew.org/guide/getting-started.html) if you haven't
-   done this before.
+   its [install guide](https://www.webosbrew.org/guide/getting-started.html) covers it if you
+   haven't done this before.
 2. Grab the latest `.ipk` from the
    [pf-webos releases page](https://github.com/dyptan-io/pf-webos/releases/latest).
-3. Install it: either sideload with `ares-install` / the project's `task deploy TV_HOST=root@<tv-ip>`
-   (see the repo's README), or side-copy the `.ipk` onto the TV and install it from the Homebrew
-   Channel's app.
+3. Install it: sideload with `ares-install` / the project's `task deploy TV_HOST=root@<tv-ip>` (see
+   the repo's README), or copy the `.ipk` onto the TV and install it from the Homebrew Channel's
+   app.
 4. Launch **Punktfunk** from the TV's launcher, discover your host over LAN (or add it by IP), and
    [pair](/docs/pairing) with a PIN.
 
@@ -230,9 +226,9 @@ but keeping them close is the least surprising. (Updating the **host** is its ow
 | **LG webOS** | install the newer `.ipk` the same way you installed the first one |
 
 **Fedora Atomic, if you layered the client.** `rpm-ostree upgrade` upgrades the *base image* and
-only re-resolves layered packages when that base actually changes — so on a base that sits still it
-keeps reporting no updates while a newer `punktfunk-client` waits in the repo. Force a re-resolve of
-just that layer, in one transaction, then reboot to activate it:
+only re-resolves layered packages when that base changes — on a base that sits still it keeps
+reporting no updates while a newer `punktfunk-client` waits in the repo. Force a re-resolve of just
+that layer, in one transaction, then reboot to activate it:
 
 ```sh
 sudo rpm-ostree refresh-md --force
@@ -240,27 +236,27 @@ sudo rpm-ostree update --uninstall punktfunk-client --install punktfunk-client
 systemctl reboot
 ```
 
-The client's own updater below runs exactly that dance for you, if you'd rather not remember it. (A
-layered **host** has the same trap — [Updating](/docs/updating) covers it.)
+The client's own updater below runs exactly that for you. (A layered **host** has the same trap —
+[Updating](/docs/updating) covers it.)
 
 **Windows, coming from 0.28.1 or earlier — uninstall first.** Those builds were signed with our own
 self-signed certificate. The move to a publicly trusted one changes the package's *publisher*, and an
 MSIX's identity is its name **plus** its publisher — so Windows treats the new package as a different
-app rather than an update, and installing it leaves you with two **Punktfunk** entries. Remove the
-old one first, then install the new `.msix` as above:
+app, not an update, and installing it leaves you with two **Punktfunk** entries. Remove the old one
+first, then install the new `.msix` as above:
 
 ```powershell
 Get-AppxPackage *Punktfunk* | Remove-AppxPackage
 ```
 
-This is one-time; releases after that upgrade in place. Note that a packaged app's settings live
-*inside* its package, so removing the old one also removes this client's identity and its paired
-hosts — expect to [pair](/docs/pairing) again once. Nothing on the host side is affected.
+This is one-time; releases after that upgrade in place. A packaged app's settings live *inside* its
+package, so removing the old one also removes this client's identity and its paired hosts — expect
+to [pair](/docs/pairing) again once. Nothing on the host side is affected.
 
 ### The Linux client can update itself
 
-The native Linux client checks its own channel and can apply the update in place, so you don't have
-to remember which package manager installed it:
+The native Linux client checks its own channel and can apply the update in place, whichever package
+manager installed it:
 
 ```sh
 punktfunk-client --check-update    # prints installed vs available for this box's channel
@@ -272,16 +268,16 @@ available, and **1** when it couldn't tell (offline, or the check is disabled) �
 deliberately not "up to date". Add `--json` to either for machine-readable output.
 
 Applying an update needs root, so it's **opt-in**: join the `punktfunk-update` group once, and a
-packaged root helper does the install (the same group and the same grant as the host's one-click
-updating, described in [Updating](/docs/updating)).
+packaged root helper does the install (the same group and grant as the host's one-click updating,
+described in [Updating](/docs/updating)).
 
 ```sh
 sudo usermod -aG punktfunk-update $USER
 ```
 
-Membership is re-read on every check, so there's no need to log out and back in. Without it,
+Membership is re-read on every check, so no need to log out and back in. Without it,
 `--check-update` prints the opt-in line and the plain package-manager command instead. On a Flatpak
-install `--apply-update` isn't used at all — the client tells you to run `flatpak update`.
+install `--apply-update` isn't used — the client tells you to run `flatpak update`.
 
 ## Removing a client
 

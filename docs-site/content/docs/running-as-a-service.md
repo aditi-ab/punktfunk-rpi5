@@ -3,9 +3,9 @@ title: Running as a Service
 description: Start the host at boot — for a desktop you log into, or a fully headless always-on machine.
 ---
 
-Running `serve` in a terminal is fine for trying Punktfunk out. To make a machine an
-always-available host, run it as a service. First, what that service starts — then the two cases, a
-desktop you log into and a fully headless box.
+Running `serve` in a terminal is fine for trying Punktfunk out; an always-available host runs as a
+service. First what the service starts, then the two cases: a desktop you log into, and a headless
+box.
 
 ## What the unit starts
 
@@ -30,8 +30,8 @@ PUNKTFUNK_GAMESTREAM=1
 systemctl --user restart punktfunk-host
 ```
 
-Then also open the `punktfunk-gamestream` firewall service alongside `punktfunk-native` — the
-firewall step in your distro guide has the exact commands.
+Then open the `punktfunk-gamestream` firewall service alongside `punktfunk-native` — your distro
+guide's firewall step has the commands.
 
 > **Upgrading?** Earlier releases baked `--gamestream` into the unit's `ExecStart`, so a packaged
 > host served Moonlight by default. The upgrade replaces that unit with the native-only one — if
@@ -39,18 +39,19 @@ firewall step in your distro guide has the exact commands.
 > `systemctl --user edit` drop-in that sets its own `ExecStart` keeps winning either way —
 > `systemctl --user cat punktfunk-host` shows what is in effect.)
 
-Windows works the same way: an install from the setup `.exe` leaves GameStream **off** unless you
-tick it, configured through its own mechanism — see [Windows](#windows) below.
+Windows is the same by default — GameStream **off** unless you tick it in the installer, through
+its own mechanism — see [Windows](#windows).
 
 ## A. A desktop you log into
 
 If you sit at the machine (or it auto-logs-in to a desktop), run the host as a **systemd user
 service** that starts with your session.
 
-**Put your `host.env` in place first.** The unit reads `~/.config/punktfunk/host.env` and won't start
-until that file exists — no package creates it for you, they only ship a template to copy. The
-defaults in it are right for an ordinary desktop; your distro and desktop guides say if yours wants
-a different template (on Bazzite it's `host.env.bazzite`):
+**`host.env` is optional.** The unit reads `~/.config/punktfunk/host.env` if it exists (no package
+creates it — they ship templates under `/usr/share`) and runs with sane defaults without it: the host
+auto-detects the live session, so an ordinary desktop needs no file. Copy a template when you want
+to set a knob (the Bazzite one is `host.env.bazzite`; every knob is in
+[Configuration](/docs/configuration)):
 
 ```sh
 mkdir -p ~/.config/punktfunk
@@ -59,8 +60,8 @@ cp /usr/share/punktfunk/host.env.example ~/.config/punktfunk/host.env
 ```
 
 **Installed from a package** (apt, dnf, pacman, or the Bazzite sysext) — the unit is already at
-`/usr/lib/systemd/user/punktfunk-host.service`, with its `ExecStart` pointing at the installed
-binary. There's nothing to copy:
+`/usr/lib/systemd/user/punktfunk-host.service`, its `ExecStart` pointing at the installed binary.
+Nothing to copy:
 
 ```sh
 systemctl --user daemon-reload             # the sysext route needs this; harmless elsewhere
@@ -69,8 +70,8 @@ systemctl --user enable --now punktfunk-host
 
 **Built from source** — install the unit from your checkout, and take `host.env` from there too
 (`cp scripts/host.env.example ~/.config/punktfunk/host.env`). The unit's `ExecStart` points at
-`%h/punktfunk/target/release/punktfunk-host` (`%h` is your home directory), so edit the copy if your
-checkout lives somewhere else:
+`%h/punktfunk/target/release/punktfunk-host` (`%h` is your home directory); edit the copy if your
+checkout lives elsewhere:
 
 ```sh
 mkdir -p ~/.config/systemd/user
@@ -80,19 +81,19 @@ systemctl --user enable --now punktfunk-host
 ```
 
 Don't do the copy on a packaged install: a unit in `~/.config/systemd/user/` shadows the packaged
-one, and the source unit points at a build tree you don't have — the service then fails with
+one, and the source unit points at a build tree you don't have — the service fails with
 `status=203/EXEC`.
 
-The host now starts whenever you log in. Check it with `systemctl --user status punktfunk-host`.
+The host now starts whenever you log in. Check with `systemctl --user status punktfunk-host`.
 
 **You don't need to export anything for it.** The host finds the live compositor session itself on
 every connect and works out where to reach it (`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, the session bus,
-sway's `SWAYSOCK`, Hyprland's instance signature) from the running compositor — so `host.env` is for
+sway's `SWAYSOCK`, Hyprland's instance signature) from the running compositor — `host.env` is for
 policy, not session plumbing, and `systemctl --user import-environment` is not a prerequisite.
 
 ### Restart the host with your desktop
 
-Add one drop-in so the host follows your session's lifetime:
+One drop-in makes the host follow your session's lifetime:
 
 ```sh
 mkdir -p ~/.config/systemd/user/punktfunk-host.service.d
@@ -106,9 +107,8 @@ systemctl --user restart punktfunk-host
 ```
 
 Without it, restarting Plasma or GNOME — a crash, a log out and back in, "restart the shell" — leaves
-the host running against a compositor that no longer exists. It keeps listening and answering, and
-every session after that fails at capture, which is a confusing way to find out. The drop-in makes a
-compositor restart a host restart.
+the host running against a compositor that no longer exists: it keeps listening and answering, and
+every session after that fails at capture. The drop-in makes a compositor restart a host restart.
 
 On **NixOS** don't copy anything — the module has the option:
 
@@ -118,25 +118,24 @@ services.punktfunk.host.desktopSession = true;
 
 Skip it on the headless/appliance route below (which has its own session unit), and on **Sway or
 Hyprland**, which don't hand their session to systemd: they never reach `graphical-session.target`, so
-the drop-in is harmless there but does nothing. To make the host come and go with the session on
-those, start it from the compositor's own config instead of enabling the unit — add
-`exec systemctl --user start punktfunk-host` to your sway config, or
-`exec-once = systemctl --user start punktfunk-host` to Hyprland's — and leave the unit itself
-disabled (`systemctl --user disable punktfunk-host`), so it isn't also started at login.
+the drop-in is harmless but does nothing. There, start the host from the compositor's own config
+instead of enabling the unit — `exec systemctl --user start punktfunk-host` in your sway config, or
+`exec-once = systemctl --user start punktfunk-host` in Hyprland's — and leave the unit disabled
+(`systemctl --user disable punktfunk-host`), so it isn't also started at login.
 
 ## B. A headless, always-on host
 
-To run with **no monitor and no login** — a machine in a closet that's always ready — you need two
-things: a desktop session that comes up at boot, and the host service started without a login.
+**No monitor and no login** — a machine in a closet that's always ready — needs two things: a
+desktop session that comes up at boot, and the host service started without a login.
 
-Start by making the host service start at boot even when nobody logs in:
+First let the host service start at boot with nobody logged in:
 
 ```sh
 sudo loginctl enable-linger "$USER"
 ```
 
-Then bring up a session automatically. How you do that is desktop-specific — auto-login, lock
-disable, and the session unit differ per compositor, so each is documented on its own page:
+Then bring up a session automatically. Auto-login, lock disable and the session unit differ per
+compositor, so each has its own page:
 
 - GNOME: [GNOME → Headless session](/docs/gnome#headless-session).
 - KDE Plasma: [KDE → Headless session](/docs/kde#headless-session).
@@ -147,41 +146,40 @@ disable, and the session unit differ per compositor, so each is documented on it
   so every connect quietly mirrors the box's own screen — which, headless, is a black one. See
   [gamescope → autologin display managers](/docs/gamescope#nobara-and-other-autologin-display-managers).
 
-Once a session comes up at boot, enable the host user service (section A) and reboot. The host comes up
-on that session.
+Once a session comes up at boot, enable the host user service (section A) and reboot. The host comes
+up on that session.
 
 ### Headless Bazzite
 
-On Bazzite, the host launches its own gamescope/Steam session per client, so you don't need a separate
-session unit — see [Bazzite](/docs/bazzite) and [gamescope](/docs/gamescope).
+On Bazzite the host launches its own gamescope/Steam session per client, so no separate session
+unit is needed — see [Bazzite](/docs/bazzite) and [gamescope](/docs/gamescope).
 
 ## Windows
 
-> Punktfunk has first-class **Linux and Windows** hosts. On Windows it ships as a signed installer
-> with an SCM service and a virtual-display driver — including Punktfunk's own **indirect display
-> driver** the host pushes frames straight into. The Windows host is newer than the Linux host. (Not
-> to be confused with the Windows *client*, which streams *to* a Windows PC.)
+> The Windows host (newer than the Linux one; not the Windows *client*, which streams *to* a PC)
+> ships as a signed installer with an SCM service and Punktfunk's own **indirect display driver**
+> the host pushes frames straight into.
 
-On Windows the host runs as a `LocalSystem` service that launches into the interactive session, so it
-captures the secure desktop (UAC / lock screen) and survives reboots with nobody logged in — the same
-model Sunshine/Apollo use. Because it runs at that privilege level, keep it on a trusted network and be
-deliberate about which machine you host on — see [Security & Safe Use](/docs/security).
+The host runs as a `LocalSystem` service that launches into the interactive session, so it captures
+the secure desktop (UAC / lock screen) and survives reboots with nobody logged in — the same model
+Sunshine/Apollo use. At that privilege level, keep it on a trusted network and be deliberate about
+which machine you host on — see [Security & Safe Use](/docs/security).
 
 The easy path is the **signed installer**: download `punktfunk-host-setup-<ver>.exe` from the package
 registry ([`punktfunk-host-windows`](https://git.unom.io/unom/-/packages)) and run it. It drops the host
 into `C:\Program Files\punktfunk`, installs the bundled **pf-vdisplay** virtual-display driver, and
-registers + starts the service for you (`/VERYSILENT` for unattended). Upgrades and uninstall are
-handled through Add/Remove Programs.
+registers + starts the service (`/VERYSILENT` for unattended). Upgrades and uninstall go through
+Add/Remove Programs.
 
-Prefer the CLI? Run `punktfunk-host service install` from an elevated prompt — see
-[Windows Host](/docs/windows-host). For hardware encode you need a GPU — NVIDIA (NVENC), AMD (AMF), or
+Prefer the CLI? `punktfunk-host service install` from an elevated prompt — see
+[Windows Host](/docs/windows-host). Hardware encode needs a GPU — NVIDIA (NVENC), AMD (AMF), or
 Intel (QSV); the host falls back to software H.264 without one.
 
-**GameStream on Windows.** Unlike the Linux unit, the installer leaves Moonlight compatibility
-**off** — it's a checkbox in the wizard (`/MERGETASKS="gamestream"` to select it unattended). There's
-no `ExecStart` to edit here: the service launches whatever `PUNKTFUNK_HOST_CMD` in
-`%ProgramData%\punktfunk\host.env` says, which is also where the rest of the Windows host's
-configuration lives. To change it later, from an elevated prompt:
+**GameStream on Windows.** The installer leaves Moonlight compatibility **off** — a checkbox in the
+wizard (`/MERGETASKS="gamestream"` to select it unattended). There's no `ExecStart` to edit: the
+service launches whatever `PUNKTFUNK_HOST_CMD` in `%ProgramData%\punktfunk\host.env` says, which is
+also where the rest of the Windows host's configuration lives. To change it later, from an elevated
+prompt:
 
 ```powershell
 punktfunk-host service install --gamestream=on   # or --gamestream=off
@@ -189,9 +187,8 @@ punktfunk-host service restart
 ```
 
 Registering the service by hand is the exception. A bare `punktfunk-host service install` writes a
-fresh `host.env` with `PUNKTFUNK_HOST_CMD` left commented out, and with no value set the service
-falls back to `serve --gamestream` — so add `--gamestream=off` to that command if you want the
-native-only host.
+fresh `host.env` with `PUNKTFUNK_HOST_CMD` commented out, and with no value set the service falls
+back to `serve --gamestream` — add `--gamestream=off` to that command for the native-only host.
 
 > **Firewall scope.** The installer opens the streaming + console ports on **Private and Domain**
 > networks only — not **Public**. If your LAN is (mis)classified Public, clients won't connect until
@@ -211,39 +208,37 @@ punktfunk hosts list --probe       # every saved host, online or offline
 
 `punktfunk` is the headless client CLI — it ships in the Linux client packages (`punktfunk-client`)
 and with the Windows client. From a source checkout, `punktfunk-probe --discover` browses the LAN
-instead; it's a dev tool and isn't packaged. Or just open a native client / Moonlight and look for
-the host.
+instead; it's a dev tool and isn't packaged. Or open a native client / Moonlight and look for the
+host.
 
 If the host answers, it's up. If not, check `journalctl --user -u punktfunk-host` on the host — on
-a Windows host, run `punktfunk-host service status` from an elevated prompt on the machine itself.
+Windows, `punktfunk-host service status` from an elevated prompt on the machine itself.
 
 ## GPU scheduling priority
 
-The [PyroWave](/docs/pyrowave) codec encodes on the same GPU shader cores your game is using, so a
-demanding game can crowd it out and the stream's frame rate drops with it. The fix is to ask the
-driver to schedule that encode ahead of the game, and every driver we tested gates the request on a
-single Linux capability, `CAP_SYS_NICE`. The other codecs use a separate video engine on the GPU and
-are unaffected either way.
+The [PyroWave](/docs/pyrowave) codec encodes on the same GPU shader cores your game uses, so a
+demanding game can crowd it out and the stream's frame rate drops. The fix is to ask the driver to
+schedule that encode ahead of the game, and every driver we tested gates the request on a single
+Linux capability, `CAP_SYS_NICE`. The other codecs use a separate video engine on the GPU and are
+unaffected either way.
 
 That capability cannot live on the host, so it lives next to it. Every way of installing a Linux
 host — apt, dnf, pacman, the Bazzite sysext, the NixOS module, the Steam Deck script — ships a
-second, deliberately small program alongside it, **`punktfunk-encode-worker`**, and grants
-`cap_sys_nice=ep` to *that*. The host starts one per PyroWave session, hands it the captured frames,
-and takes the compressed video back; the worker talks to nothing else, not your desktop and not the
-network.
-`punktfunk-host` itself carries **no capability, on any channel** — the posture it has had since
-0.25.0, and the one KDE needs.
+second, deliberately small program, **`punktfunk-encode-worker`**, and grants `cap_sys_nice=ep` to
+*that*. The host starts one per PyroWave session, hands it the captured frames, and takes the
+compressed video back; the worker talks to nothing else, not your desktop and not the network.
+`punktfunk-host` itself carries **no capability, on any channel** — its posture since 0.25.0, and
+the one KDE needs.
 
 > **Never `setcap` `punktfunk-host`.** Not by hand, not through a systemd `AmbientCapabilities=`
 > line, not through a NixOS `security.wrappers` entry. All three put the capability in the same
 > place, and all three take KDE desktop streaming away completely. There is no capability the host
-> wants: the worker is the thing that needs one, and your packages already gave it one.
+> wants: the worker needs one, and your packages already gave it one.
 
-Here is why a privileged host is so much worse than a privileged worker. To hand the host its
-virtual display, KWin first has to work out *which* program is asking, which it does by reading the
-connecting process's `/proc/<pid>/exe` and matching it against the `.desktop` file the packages
-install. Linux refuses that read unless the reader already holds every capability the target holds —
-and KWin holds none. So a host carrying a capability is a host KWin cannot identify, its restricted
+Why: to hand the host its virtual display, KWin first works out *which* program is asking, by
+reading the connecting process's `/proc/<pid>/exe` and matching it against the `.desktop` file the
+packages install. Linux refuses that read unless the reader holds every capability the target holds
+— and KWin holds none. So a host carrying a capability is one KWin cannot identify, its restricted
 protocols are never offered, and every session fails at capture with:
 
 ```
@@ -251,11 +246,11 @@ KWin virtual output failed: KWin does not expose zkde_screencast_unstable_v1 to 
 ```
 
 which reads exactly like a missing or mis-installed `.desktop` file and survives reinstalling both
-ends. The first 0.26.0 packages granted the host the capability for the reason above and shipped
-precisely this, on every Linux channel; the grant was revoked everywhere later the same day, and
-0.27.0 is the first release whose version number carries that revocation to a machine that already
-installed one of them. If you ever see that error, check the binaries before anything else — the
-host's own message names the capability when it finds one:
+ends. The first 0.26.0 packages granted the host the capability and shipped precisely this, on every
+Linux channel; the grant was revoked everywhere later the same day, and 0.27.0 is the first release
+whose version number carries that revocation to a machine that already installed one of them. If
+you see that error, check the binaries first — the host's own message names the capability when it
+finds one:
 
 ```sh
 getcap /usr/bin/punktfunk-host              # correct output is nothing at all
@@ -266,8 +261,8 @@ sudo setcap -r /usr/bin/punktfunk-host      # clear it, then restart the host
 
 On the Bazzite image `/usr` is read-only, so there is nothing to repair in place — take the next
 image (`sudo punktfunk-sysext update`). On NixOS the worker *is* wrapped, because a file capability
-cannot live on a read-only store path: the module creates the wrapper and points the host at it, and
-the host's own `ExecStart` stays on the plain store path.
+cannot live on a read-only store path: the module creates the wrapper and points the host at it,
+and the host's own `ExecStart` stays on the plain store path.
 
 **The grant is best-effort, and no session depends on it.** A worker without the capability still
 encodes — it asks for the elevated priority, is refused, says so once, and runs at the normal one.
@@ -279,10 +274,10 @@ keeps the encode in the host process — both on
 
 ## Stopping and removing
 
-After a Linux package update the user service keeps running the old binary until it's restarted, and
-a package can't restart another user's `--user` units for you — [Updating](/docs/updating) has the
-update command for every install method and the restart that finishes the job. The Windows installer
-restarts its own service.
+After a Linux package update the user service keeps running the old binary until restarted, and a
+package can't restart another user's `--user` units for you — [Updating](/docs/updating) has the
+update command for every install method and the restart that finishes the job. The Windows
+installer restarts its own service.
 
 To stop the host for now:
 
@@ -301,7 +296,7 @@ sudo loginctl disable-linger "$USER"                     # only if you enabled l
 ```
 
 On Windows, `punktfunk-host service uninstall` from an elevated prompt stops the service, removes it,
-and removes the firewall rules it added. To remove the whole install instead, use Add/Remove Programs.
+and removes the firewall rules it added. To remove the whole install, use Add/Remove Programs.
 
 Neither removes `~/.config/punktfunk` (Linux) or `%ProgramData%\punktfunk` (Windows) — your
 certificate, pairings and console password stay, so a reinstall picks up where you left off. See

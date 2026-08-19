@@ -1,140 +1,78 @@
 ---
 title: Quick Start
-description: From nothing to streaming — set up a host and connect your first client.
+description: From nothing to streaming in five steps — install a host, open its console, pair a client, play.
 ---
 
-This is the shortest path to a working stream. Each step links to the details.
+Five steps, each linking to the detail only if you need it. Punktfunk is built for a **trusted home
+network** — keep the host on your LAN or a VPN, never open it to the internet
+([why](/docs/security)).
 
-> A streaming host is remote control of the machine, so it's built for **trusted local networks** — keep
-> it on your LAN or a VPN and don't expose it to the internet. Two minutes on
-> [Security & Safe Use](/docs/security) before you start is worth it.
+## 1. Install the host
 
-## 1. Set up the host
+On the PC you want to stream *from*, follow the one-page guide for its system — each one is the
+install command, the group to join, and nothing else:
 
-On your gaming machine (NVIDIA, AMD, or Intel GPU), follow the install guide for your system:
+| Linux | Windows |
+|---|---|
+| [Ubuntu](/docs/ubuntu) · [Debian](/docs/debian) · [Fedora](/docs/fedora) · [Arch / CachyOS](/docs/arch) · [Bazzite](/docs/bazzite) · [SteamOS](/docs/steamos-host) · [NixOS](/docs/nixos) | [Windows 11](/docs/windows-host) |
 
-- [Ubuntu](/docs/ubuntu)
-- [Fedora](/docs/fedora)
-- [Arch](/docs/arch)
-- [Bazzite](/docs/bazzite)
-- [SteamOS](/docs/steamos-host)
-- [Windows host](/docs/windows-host)
+Not sure your machine qualifies? [Requirements](/docs/requirements) is the checklist.
 
-Each one covers the GPU driver, the dependencies, and how to install and run the host. After
-installing, configure for your desktop ([KDE](/docs/kde) / [GNOME](/docs/gnome) /
-[gamescope](/docs/gamescope) / [Hyprland](/docs/hyprland) / [Sway](/docs/sway)). Check the
-[Requirements](/docs/requirements) first if you're not sure your machine is a fit.
+## 2. Start it
 
-## 2. Start the host
+- **Windows and SteamOS:** nothing to do — the installer started the host and the web console, and
+  they come back on every boot.
+- **Linux packages:** from a terminal inside your desktop session, start the host and the console
+  once; they restart at every login from then on:
 
-**On Windows there's nothing to start.** The installer registered and started the `PunktfunkHost`
-service, so the host is already running and comes back on every boot. Confirm it:
+  ```sh
+  systemctl --user enable --now punktfunk-host punktfunk-web
+  ```
 
-```powershell
-Get-Service PunktfunkHost
-```
+  On Arch install `punktfunk-web` first (your install page says how). Running a firewall? Your
+  install page has the one line that opens it.
 
-Don't run `punktfunk-host serve` on top of it — a second host process refuses to touch the
-virtual-display driver and collides with the service on its ports. Details:
-[Running as a Service → Windows](/docs/running-as-a-service#windows).
-
-**On Linux you don't run the host by hand either.** Every Linux package ships a systemd **user** unit.
-That unit reads `~/.config/punktfunk/host.env` and won't start until the file exists, so put it in
-place first — your distro and desktop pages (step 1) have the template to copy and what to put in it.
-Then enable the unit once, from a terminal **inside your desktop session**, and it comes back at
-every login:
-
-```sh
-systemctl --user enable --now punktfunk-host
-journalctl --user -u punktfunk-host -f   # watch it come up and print its identity fingerprint
-```
-
-Once up, the host advertises itself on your local network, so clients find it by name. It works out
-where your compositor is by itself, so there is nothing to export.
-
-That unit runs the **secure native-only host** (Punktfunk clients + the management API). Want stock
-[Moonlight](/docs/moonlight) clients too? GameStream compat is **opt-in** — add
-`PUNKTFUNK_GAMESTREAM=1` to `~/.config/punktfunk/host.env` and restart the unit (trusted LANs only;
-its pairing runs over plain HTTP) — see
-[What the unit starts](/docs/running-as-a-service#what-the-unit-starts).
-
-If the host runs a firewall (Fedora enables firewalld, CachyOS enables ufw), open its ports — the
-firewall step in your distro guide has the exact commands: `punktfunk-native` always, plus
-`punktfunk-gamestream` only if you enabled Moonlight compat.
-
-On **SteamOS** even that is done for you — the install script wrote its own `punktfunk-host` user
-service and started it (GameStream on by default there too; pass `--no-gamestream` to the install
-script for a native-only host). Check it with `systemctl --user status punktfunk-host`.
+The host announces itself on your network, so clients find it by name. It works out which desktop you
+run by itself — there is nothing to configure for a first stream.
 
 ## 3. Open the web console
 
-The console is a **separate** process from the host, and you need it in the next step — arming PIN
-pairing is done there.
+The console is where you admit new devices. Open **`https://<host-ip>:47992`** in a browser (the
+certificate is the host's own, so your browser warns once — continue) and log in:
 
-- **Windows:** the installer already set it up and starts it at boot. Open
-  `https://<host-ip>:47992`. The login password is the one the installer showed you on its final
-  page; it's stored in `%ProgramData%\punktfunk\web-password`.
-- **Linux:** on Ubuntu, Fedora and Bazzite the `punktfunk-web` package comes in with the host
-  but isn't enabled for you. On Arch it's an optional dependency, so install it first
-  (`sudo pacman -Syu punktfunk-web` — a full `-Syu`, never a bare `-S`). Either way, start it as
-  your desktop user, then open `https://<host-ip>:47992`:
+- **Linux:** the password was generated on first start — print it with
+  `sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password`
+  (SteamOS: the install script printed it; it's in `~/.config/punktfunk/web.env`).
+- **Windows:** the installer showed it on its last page.
 
-  ```sh
-  systemctl --user enable --now punktfunk-web
-  sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password
-  ```
+Lost it? [Forgot your password](/docs/forgot-password). Everything else about the console:
+[The Web Console](/docs/web-console).
 
-  The second command prints the login password generated on first start.
-- **SteamOS:** the install script already started the console and printed its URL when it finished.
-  It generated the login password into `~/.config/punktfunk/web.env`.
+## 4. Install a client and pair it
 
-The certificate is the host's own self-signed one, so your browser warns once — trust it and
-continue. Full details: [The Web Console](/docs/web-console).
+On the device you want to stream *to*, install the app — [Install a Client](/docs/install-client)
+has the link for every device (Mac, iPhone/iPad/Apple TV, Linux, Windows, Android, Steam Deck), and
+any Moonlight client works too once you [turn GameStream on](/docs/moonlight).
 
-## 4. Connect and pair a client
-
-On the device you want to stream to, use a [native Punktfunk client](/docs/clients) for the lowest
-latency, or any Moonlight client:
-
-- **Native client (Apple, Linux, Windows, Android):** install it first —
-  [Install a Client](/docs/install-client) has the download for every device (Steam Deck: the
-  [Decky plugin](/docs/steam-deck)). Then open the Punktfunk app — your host appears in the list of
-  hosts found on your network. Select it, and when prompted, **pair**.
-- **Anything with Moonlight:** add the host (it should be discovered automatically), then pair.
-
-To pair, the host needs to show a PIN. [Arm pairing](/docs/web-console#arm-pairing) from the web
-console you opened in step 3 — the host displays a 4-digit PIN, you type it into the client, and they
-trust each other from then on. Pairing is required by default. Full details:
-[Pairing & Trust](/docs/pairing).
+Open the app: your host is already in the list. Select it and **connect**. Back in the console, the
+device appears under **Pairing → Waiting for approval** — click **Approve** and it's in, no PIN to
+type. (Prefer a PIN? Click **Pair a device** in the console and type the 4-digit code into the
+client.) Pairing happens once; the device reconnects on its own from then on.
+Details: [Pairing & Trust](/docs/pairing).
 
 ## 5. Stream
 
-Once paired, select the host and start streaming. The host creates a virtual display at your device's
-resolution and refresh, and the picture comes up. Mouse, keyboard, and controllers flow back to the
-host.
-
-Worth knowing before you need it: on the desktop clients the stream *takes* your mouse and keyboard
-when it starts, and again whenever you click into it. **Ctrl+Alt+Shift+Q** (**⌃⌥⇧Q** on macOS) hands
-them back. The other in-stream shortcuts, and the mouse, touch and pen modes, are on
-[Mouse, touch and pen](/docs/input).
+Select the host, start streaming. The host creates a display at your device's exact resolution and
+refresh rate; mouse, keyboard and controllers flow back. On a desktop client the stream takes your
+mouse and keyboard — **Ctrl+Alt+Shift+Q** (⌃⌥⇧Q on a Mac) hands them back.
 
 ## Now that it works
 
-Punktfunk does more than mirror a screen:
-
-- Browse the host's installed games and launch one straight into the stream —
-  [Game library](/docs/game-library).
-- Save named stream settings, bind them to a host, and start a session from a shortcut or a script —
-  [Profiles and links](/docs/profiles-and-links).
-- Copy on one machine and paste on the other — [Shared clipboard](/docs/clipboard).
-- Connect to a host that's asleep — [Wake-on-LAN](/docs/wake-on-lan).
-- Get a 10-bit HDR picture where the whole chain allows it — [HDR](/docs/hdr).
-
-## Keep it running
-
-- Tune the picture — resolution, refresh, bitrate, codec and HDR are all
-  [client settings](/docs/client-settings); the host's own knobs are in
-  [Configuration](/docs/configuration).
-- Make it always-on — no login, no monitor: [Running as a Service](/docs/running-as-a-service).
-- Keep it current with [Updating](/docs/updating); changed your mind? [Uninstall](/docs/uninstall).
-- Hit a snag? See [Troubleshooting](/docs/troubleshooting).
+- Launch installed games straight into the stream — [Game library](/docs/game-library) (install the
+  [plugin](/docs/plugins) for each launcher you use).
+- Tune resolution, bitrate, codec and HDR per device — [Client settings](/docs/client-settings).
+- Copy here, paste there — [Shared clipboard](/docs/clipboard). Wake a sleeping host —
+  [Wake-on-LAN](/docs/wake-on-lan).
+- Run the host headless, with nobody logged in — [Running as a service](/docs/running-as-a-service).
+- Already running Sunshine or Apollo? [Switching from Sunshine](/docs/switching-from-sunshine).
+- Stuck? [Troubleshooting](/docs/troubleshooting) starts from the symptom.

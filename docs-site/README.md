@@ -29,6 +29,19 @@ of `api/openapi.json`, and the `rust` job regenerates the spec and diffs it agai
 one — so a management-API change can't publish stale API docs any more, it fails CI until you run
 the two commands above.
 
+## Install commands and ports
+
+`src/data/platforms.json` is a byte-identical snapshot of the repo-root
+[`data/platforms.json`](../data/platforms.json) — the single source for install commands, repo
+URLs, port facts and the Sunshine/Apollo/Vibeshine conflict facts. The `<Install platform="…" />`
+and `<Ports />` MDX components (`src/components/platforms.tsx`) render from it, so no page restates
+a command or a port. It's a snapshot for the same reason as `openapi.json` (the Docker build context
+is this directory alone), and the same `docs-drift` job fails unless it matches:
+
+```sh
+cp data/platforms.json docs-site/src/data/platforms.json   # from the repo root, after editing the canonical file
+```
+
 ## Develop
 
 ```sh

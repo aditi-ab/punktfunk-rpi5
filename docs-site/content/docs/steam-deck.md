@@ -4,27 +4,26 @@ description: Install the Punktfunk Decky plugin to discover, pair, and stream fr
 ---
 
 The **Decky plugin** adds a **Punktfunk** panel to the Steam Deck's Quick Access Menu (the `…`
-button), so you can find a host, pair, and start streaming **without leaving Gaming Mode**. It's the
-couch-friendly front end for the Steam Deck — built from real Steam UI, gamepad-navigable end to end.
+button), so you can find a host, pair, and start streaming **without leaving Gaming Mode** —
+gamepad-navigable end to end.
 
 The plugin is a **launcher**, not a second client. It doesn't decode video, browse your library or
 hold settings of its own — it starts the regular
 [Linux client](/docs/clients#linux-desktop-client-gtk4) (usually the `io.unom.Punktfunk` Flatpak)
-the way gamescope needs so it fullscreens correctly. Everything the panel doesn't do is one tap
-away in that client's own gamepad UI. So the Deck has two ways to stream, and they share one
-client + one paired identity:
+the way gamescope needs so it fullscreens correctly; everything the panel doesn't do is one tap
+away in that client's own gamepad UI. So the Deck has two ways to stream, sharing one client and
+one paired identity:
 
 - **Gaming Mode** → the **Decky plugin** (this page).
 - **Desktop Mode** → run the [Flatpak](/docs/install-client#steam-deck) directly, like any Linux app.
 
 ## Before you start
 
-You need three things on the Deck:
+Three things on the Deck:
 
-1. **Decky Loader** — the plugin loader. Install it from [decky.xyz](https://decky.xyz/) if you
-   haven't already.
-2. **A Punktfunk client on the Deck** — the plugin doesn't decode video itself, it launches a
-   client. On a normal Deck that's the Flatpak, installed once in **Desktop Mode**:
+1. **Decky Loader** — install it from [decky.xyz](https://decky.xyz/) if you haven't already.
+2. **A Punktfunk client on the Deck** — the plugin launches a client rather than decoding video
+   itself. On a normal Deck that's the Flatpak, installed once in **Desktop Mode**:
 
    ```sh
    flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref
@@ -34,18 +33,18 @@ You need three things on the Deck:
    no Flatpak but a native `punktfunk-client` — a sysext, a distro package, a nix profile, your own
    build — the plugin uses that instead; with both installed the Flatpak wins, unless
    `PF_DECKY_CLIENT=native` (or `flatpak`) is set in the plugin backend's environment. Both kinds
-   share `~/.config/punktfunk`, so your identity, known hosts and settings are the same either way.
+   share `~/.config/punktfunk`, so identity, known hosts and settings are the same either way.
 
    **The client must be v0.22.0 or newer.** The panel drives everything through the client's
    headless `punktfunk` command, which shipped in that release. An older client says so in the
    panel, with the update button that fixes it right there.
-3. **A Punktfunk host** running on your LAN — see [Install the Host](/docs/install). The Deck finds
-   it automatically over mDNS, so nothing to configure here.
+3. **A Punktfunk host** on your LAN — see [Install the Host](/docs/install). The Deck finds it
+   over mDNS, so nothing to configure.
 
 ## Install the plugin
 
-The plugin is published as a ready-to-install zip on every build. You don't need the Decky CLI or a
-developer toolchain — just paste a URL into Decky:
+The plugin is published as a ready-to-install zip on every build — no Decky CLI or developer
+toolchain, just a URL pasted into Decky:
 
 1. On the Deck, open the **Quick Access Menu** (`…`) → the **plug** icon (Decky) → the **gear**
    (Settings) → enable **Developer Mode**.
@@ -73,9 +72,8 @@ stream — plus a door into the client's own gamepad UI for everything else.
 
 - **Hosts** — hosts on your network appear automatically (mDNS), alongside the ones you've already
   saved. A saved host is also probed directly, so a box reached over a VPN or Tailscale shows as
-  online even though it never advertises. Tap **Refresh** to rescan. The list sorts online hosts
-  first, then whichever you streamed most recently. A lock icon means the host still has to let
-  this Deck in.
+  online even though it never advertises. Tap **Refresh** to rescan. Online hosts sort first, then
+  whichever you streamed most recently. A lock icon means the host still has to let this Deck in.
 - **Let a host in** — tapping a locked host opens a small sheet with two ways through:
   - **Request access** — no PIN at all. See [Request access](#request-access) below.
   - **Use a PIN instead** — [arm pairing on the host](/docs/pairing) (its console or web console
@@ -83,27 +81,27 @@ stream — plus a door into the client's own gamepad UI for everything else.
 
   Either way the host is remembered, so the next connection is silent.
 - **Stream** — tap a host and the stream launches fullscreen in Gaming Mode. The plugin drives a
-  hidden Steam shortcut behind the scenes so gamescope focuses and fullscreens it.
+  hidden Steam shortcut so gamescope focuses and fullscreens it.
 - **Sleeping host?** Streaming sends a [Wake-on-LAN](/docs/wake-on-lan) packet and waits for the
   host to actually come back before dialling, so a stream survives a resume from sleep. Nothing to
   enable — it's a no-op until the client has learned that host's MAC address, and the packet only
   lands if the host machine is armed to wake in its BIOS and its network card.
 - **Pinned cards** — a host with pinned [settings profiles](/docs/client-settings) shows them
   nested underneath it as `▸ <Profile name>`. Tapping one streams that host with that profile
-  applied — your "4K on the TV" and "battery saver" presets, one tap each. Pins are made in the
+  applied — "4K on the TV" and "battery saver" presets, one tap each. Pins are made in the
   Punktfunk app (or any other client) and shared across all of them; the panel shows them, it
   doesn't create them.
 - **Open Punktfunk** — opens the client's console home: the host picker, adding a host by address,
-  pairing, browsing a host's [game library](/docs/game-library), and the **full settings screen**.
-  This is where resolution, bitrate, codec, audio, controllers and the stats overlay live.
-- **Library entry** — a visible, branded **Punktfunk** app also appears in your Steam library, and
+  pairing, browsing a host's [game library](/docs/game-library), and the **full settings screen** —
+  resolution, bitrate, codec, audio, controllers and the stats overlay.
+- **Library entry** — a visible, branded **Punktfunk** app also appears in your Steam library;
   launching it opens that same console home — it does not resume a stream. If it ever disappears,
   the Quick Access Menu panel has a button to put it back.
 
 > **Where did the plugin's settings tab go?** Into the app, at **Open Punktfunk → Settings** — the
-> same rows over the same settings, gamepad-navigable, and one tap from the same panel. The plugin
-> used to carry its own copy of that screen, which meant two places to change one setting and a
-> copy that fell behind. There is now one.
+> same rows over the same settings, gamepad-navigable, one tap from the same panel. The plugin's
+> own copy of that screen meant two places to change one setting, and one fell behind; there is
+> now one.
 
 With **Controller type** on *Automatic* the Deck's built-in controller is forwarded as a **Steam
 Deck** pad (paddles, both trackpads, gyro) — that needs Steam Input set to **Off** for Punktfunk
@@ -118,25 +116,24 @@ screen.
 
 Tap the host → **Request access**. The Deck says *"Approve this Deck in <host>'s console — the
 stream starts by itself"*, and the stream opens and waits. The moment somebody approves it, the
-picture comes up — no going back to the panel, nothing else to tap. If nobody approves within
-about three minutes, it gives up like any failed connection and you can try again or use a PIN.
+picture comes up — nothing else to tap. If nobody approves within about three minutes, it gives up
+like any failed connection and you can try again or use a PIN.
 
 It's the better option when you're not the person sitting at the host, or when reading a PIN off
 another screen is awkward. Two things to know:
 
 - The host must be **advertising on your network** for this to be offered. A host you added by
   address (a VPN box, another subnet) has no advertised identity for the Deck to pin, so the sheet
-  offers the PIN path only and says so. That's a safety rule, not a limitation to work around:
-  pinning the advertised identity is what stops something else answering in the host's place while
-  the Deck waits.
+  offers the PIN path only and says so. That's a safety rule: pinning the advertised identity is
+  what stops something else answering in the host's place while the Deck waits.
 - Once approved, the host shows as **paired** and every later stream connects silently.
 
 > **Steam Input off is a trade-off, not a free win.** The plugin installs a Steam Input layout
-> called **Punktfunk** and points its shortcuts at it, and that layout's whole job is making the
-> Deck's touchscreen arrive at the stream as *real touch*. Leaving Steam Input **On** with that
-> layout gives you native touch plus a standard gamepad; setting it **Off** gives you the full Steam
-> Deck pad — paddles, both trackpads, gyro — but the touchscreen stops working as touch. Pick per
-> game, on the game page → ⚙ → **Controller Settings**.
+> called **Punktfunk** and points its shortcuts at it; that layout's whole job is making the Deck's
+> touchscreen arrive at the stream as *real touch*. Leaving Steam Input **On** with that layout
+> gives you native touch plus a standard gamepad; setting it **Off** gives you the full Steam Deck
+> pad — paddles, both trackpads, gyro — but the touchscreen stops working as touch. Pick per game,
+> on the game page → ⚙ → **Controller Settings**.
 
 To **leave a stream**: **hold [L1 + R1 + Start + Select](/docs/input#leaving-with-a-controller)**
 for about a second and a half, or close the "game" from the Steam overlay. Either ends the session
@@ -144,25 +141,24 @@ and drops you straight back to Gaming Mode. A quick press of the same four only 
 input, so it is safe to hit by accident.
 
 **The Steam and `…` buttons stay with the Deck while streaming.** SteamOS opens its own menus for
-them no matter what, so forwarding the raw press as well opened *both* menus at once — the Deck's
-covering the stream. To reach the **host's** menus instead: **hold Select** for the host's Steam
-menu ([how it works](/docs/input#the-guide-button-xbox--ps--steam-and-quick-access)), or open the
+them no matter what, so forwarding the raw press too opened *both* menus at once — the Deck's
+covering the stream. To reach the **host's** menus: **hold Select** for the host's Steam menu
+([how it works](/docs/input#the-guide-button-xbox--ps--steam-and-quick-access)), or open the
 Punktfunk panel — while a stream runs it grows a **Host menus** section whose two buttons,
 **Steam menu on host** and **Quick access on host**, press the button on the host and close the
-Deck's own menu so the host's shows through. Want the raw forwarding back? **Open Punktfunk →
-Settings → Steam / guide button** → *Send to host*.
+Deck's own menu so the host's shows through. Raw forwarding back: **Open Punktfunk → Settings →
+Steam / guide button** → *Send to host*.
 
 ## Updating
 
 The plugin **checks for updates itself** — no Decky store needed. It covers **both** the plugin *and*
-the streaming client (they version independently), so when either has a newer build the panel shows an
-**Update** button at the top of the panel. Tap it: the client updates in place, and if the plugin
-itself changed it downloads, verifies, replaces itself, and reloads — all without leaving Gaming
-Mode.
+the streaming client (they version independently): when either has a newer build the panel shows
+an **Update** button at the top. Tap it: the client updates in place, and if the plugin itself
+changed it downloads, verifies, replaces itself, and reloads — without leaving Gaming Mode.
 
-One exception: if your client isn't one the plugin can install for you (a sysext, a nix profile, a
-source build), the panel shows you the update **command** instead of a button — tap-to-install would
-only fail. A pending plugin update still gets its button.
+One exception: if your client isn't one the plugin can install (a sysext, a nix profile, a source
+build), the panel shows the update **command** instead of a button. A pending plugin update still
+gets its button.
 
 The plugin check follows the [channel](/docs/channels) you installed from: a plugin installed from the
 **stable** link tracks stable releases; one installed from the **canary** link tracks `main` builds.

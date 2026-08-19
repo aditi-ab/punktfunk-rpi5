@@ -5,10 +5,10 @@ description: Enable the Punktfunk browser console, read or change its login pass
 
 The web console is the browser UI for a Punktfunk host — live status, pairing, display policy, the
 game library, logs, plugins and host updates. It ships as the **`punktfunk-web`** systemd user unit
-on Linux and runs under the **Punktfunk Host service** on Windows, and serves on **`https://<host-ip>:47992`**
+on Linux, runs under the **Punktfunk Host service** on Windows, and serves on **`https://<host-ip>:47992`**
 (HTTPS with the host's own self-signed identity cert — your browser warns once; trust it and
 continue). It's the surface you expose on the LAN to administer the host; the host's own management
-API (47990) keeps every admin action loopback-only and off-loopback serves only read-only status +
+API (47990) keeps every admin action loopback-only and off-loopback serves only read-only status and
 game-library browsing to paired clients.
 
 > New here? Read [Security & Safe Use](/docs/security) first — a streaming host is remote control of
@@ -16,41 +16,40 @@ game-library browsing to paired clients.
 
 ## Two ports, not one
 
-The console also listens on **TCP 47993**, and plugin interfaces are served from there — same host,
-same certificate, **different port**.
+The console also listens on **TCP 47993**, where plugin interfaces are served — same host, same
+certificate, **different port**.
 
-That is a deliberate boundary rather than a second console. A plugin's interface is third-party
-code, and on the console's own port the browser would treat it as part of the console: it could act
-as you, with your logged-in session, against every admin action the console can reach. A different
-port is a different *origin*, so the browser itself keeps the two apart — while staying the same
-*site*, which is what lets your login still carry over so you don't sign in twice.
+That is a deliberate boundary. A plugin's interface is third-party code; on the console's own port
+the browser would let it act as you, with your logged-in session, against every admin action the
+console can reach. A different port is a different *origin*, so the browser keeps the two apart —
+but the same *site*, so your login still carries over.
 
-What this means in practice:
+In practice:
 
 - **Open 47993 alongside 47992** on the host's firewall if you browse the console from another
   device. The packaged firewall profiles already list both.
 - **Trust the certificate twice.** Browsers store a self-signed certificate exception *per port*.
-  The first time you open a plugin, the console will notice it can't reach 47993 yet and offer a
-  link to open it in a tab — accept the warning there once, come back, and it works from then on.
+  The first time you open a plugin, the console notices it can't reach 47993 yet and offers a link
+  to open it in a tab — accept the warning there once and it works from then on.
 - If a plugin's page is an empty panel, see
   [A plugin's interface doesn't load](/docs/troubleshooting#a-plugins-interface-doesnt-load).
 
 ## Enable the console
 
-- **Linux packages (apt / RPM / Bazzite):** on Ubuntu the host package is `punktfunk-host`
-  and on Fedora/Bazzite it's `punktfunk`; either way it *recommends* `punktfunk-web`, so your
-  package manager pulls the console in with the host (the Bazzite sysext image already contains
-  it). Enable and start it as your desktop user, then open the URL:
+- **Linux packages (apt / RPM / Bazzite):** the host package (`punktfunk-host` on Ubuntu,
+  `punktfunk` on Fedora/Bazzite) *recommends* `punktfunk-web`, so your package manager pulls the
+  console in with the host (the Bazzite sysext image already contains it). Enable it as your
+  desktop user:
 
   ```sh
   systemctl --user enable --now punktfunk-web
   # then browse to https://<host-ip>:47992
   ```
 
-- **Arch / CachyOS (pacman):** the console is an *optional* package here, and pacman never installs
-  optional dependencies — so install it yourself from the same repo the host came from (see
-  [Arch Linux](/docs/arch)), then enable it exactly as above. Take it as a full `-Syu`, never a bare
-  `pacman -S`, so you don't end up on a partial upgrade:
+- **Arch / CachyOS (pacman):** the console is an *optional* package and pacman never installs
+  optional dependencies — install it from the same repo the host came from (see
+  [Arch Linux](/docs/arch)), then enable it as above. Use a full `-Syu`, never a bare `pacman -S`,
+  to avoid a partial upgrade:
 
   ```sh
   sudo pacman -Syu punktfunk-web
@@ -58,20 +57,19 @@ What this means in practice:
   ```
 
 - **Windows host:** the installer sets up the console and its runtime; the Punktfunk Host service
-  runs it and automatically brings it back if it ever stops. There is nothing to enable — open
-  `https://<this-PC>:47992`.
+  runs it and brings it back if it ever stops. Nothing to enable — open `https://<this-PC>:47992`.
 
-- **SteamOS host:** the install script builds and starts the console as a user service for you. It
-  prints the URL when it finishes.
+- **SteamOS host:** the install script builds and starts the console as a user service and prints
+  the URL when it finishes.
 
 ## Login password
 
-The console is password-protected. Where that password lives and how you change it depends on the
+The console is password-protected; where the password lives and how you change it depends on the
 host platform.
 
 **Linux packages (apt / RPM / Bazzite).** On first start `punktfunk-web-init` generates a random
 password and saves it to `~/.config/punktfunk/web-password` (as `PUNKTFUNK_UI_PASSWORD=…`). Read it
-back from the init service's journal or straight from the file:
+from the init service's journal or the file:
 
 ```sh
 journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'
@@ -93,7 +91,7 @@ Edit that file and `systemctl --user restart punktfunk-web` to change it.
 **Windows host.** You choose the password during install — a secure random default is pre-filled and
 shown again on the installer's final page. It's stored in `%ProgramData%\punktfunk\web-password` (as
 `PUNKTFUNK_UI_PASSWORD=…`), readable only by Administrators and SYSTEM. To change it, edit the file
-and restart the Punktfunk Host service (which runs the console) in an **elevated** PowerShell:
+and restart the Punktfunk Host service from an **elevated** PowerShell:
 
 ```powershell
 notepad "$env:ProgramData\punktfunk\web-password"   # set PUNKTFUNK_UI_PASSWORD=<your-password>
@@ -104,12 +102,11 @@ Forgot it? See [Forgot your Password?](/docs/forgot-password).
 
 ## Arm pairing
 
-The host **requires PIN pairing** by default (secure on a LAN). To connect the first time, open the
-console, log in, then open **Pairing** in the sidebar and click **Pair a device**. The host shows a
-one-time 4-digit PIN — enter it on your [client](/docs/clients) to pair. If the device already tried
-to connect it appears under **Waiting for approval** instead; approving it pairs it immediately, no
-PIN needed. See [Pairing & Trust](/docs/pairing) for the full trust model and how to approve or
-remove devices later.
+The host **requires PIN pairing** by default (secure on a LAN). To connect the first time, log in to
+the console, open **Pairing** in the sidebar and click **Pair a device**. The host shows a one-time
+4-digit PIN — enter it on your [client](/docs/clients). If the device already tried to connect it
+appears under **Waiting for approval** instead; approving it pairs it immediately, no PIN needed.
+[Pairing & Trust](/docs/pairing) has the full trust model and how to approve or remove devices later.
 
 ## What's in it
 
@@ -117,7 +114,7 @@ Nine destinations in the sidebar (a **More** tab on a phone holds the last five)
 
 - **Dashboard** — live status: whether video and audio are streaming, the active sessions with
   their codec, resolution, frame rate and bitrate, which games are running, and how many clients
-  are paired. Buttons here stop a session or ask the encoder for a fresh keyframe.
+  are paired. Buttons stop a session or ask the encoder for a fresh keyframe.
 - **Host** — this host's identity (hostname, OS, local IP, version, unique id), the codecs it
   advertises, its ports, the **Updates** card (see [Updating the Host](/docs/updating)), the
   **GPUs** card — Automatic, or prefer one GPU for capture and encode, applied to the next session
