@@ -8,15 +8,15 @@ disconnects, a stream starts or stops, a pairing request arrives, a virtual disp
 the library changes, the host starts or shuts down. Two ways to consume them:
 
 - **Hooks** — zero-code: entries in `~/.config/punktfunk/hooks.json` run a **command** or POST a
-  **webhook** when a matching event fires. This covers the common automation: Do-Not-Disturb
-  during a stream, a phone notification on a pairing request, pausing downloads while playing.
+  **webhook** when a matching event fires. Covers the common automation: Do-Not-Disturb during a
+  stream, a phone notification on a pairing request, pausing downloads while playing.
 - **The event stream** — code: `GET /api/v1/events` on the management API is a standard
   [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
   stream of the same events, for scripts and integrations that want to *decide* things (e.g.
   auto-approve pairing from a known subnet by calling the approve endpoint).
 
 Hooks **observe** — they can never veto or delay a connection, a stream, or a pairing decision,
-and nothing you configure here runs anywhere near the streaming path.
+and nothing configured here runs anywhere near the streaming path.
 
 ## The events
 
@@ -38,7 +38,7 @@ and nothing you configure here runs anywhere near the streaming path.
 | `host.started` / `host.stopping` | the serve planes come up / wind down | version, whether GameStream is enabled |
 
 Every event is a small JSON document with a monotonic `seq`, a `ts_ms` timestamp, a `schema`
-version (additive-only — fields get added, never renamed), and the fields above. Example:
+version (additive-only — fields get added, never renamed), and the fields above:
 
 ```json
 { "seq": 42, "ts_ms": 1784227449526, "schema": 1,
@@ -81,13 +81,12 @@ Each entry:
 ### What the host refuses
 
 The document is validated as a whole, and **one bad entry disables every hook** — the host logs
-`hooks.json invalid — hooks disabled until fixed` and runs none of them until you correct it. The
-rules:
+`hooks.json invalid — hooks disabled until fixed` and runs none until you correct it. The rules:
 
 - An entry needs a non-empty `on`, plus `run` and/or `webhook`.
 - `webhook` must be an `http(s)://` URL, and must **not** point at loopback, `localhost` or a
-  link-local address (which is also what blocks the cloud metadata endpoint). A receiver on this
-  same machine is what a `run` command is for. Ordinary LAN addresses — `192.168.x.x`, a ULA, a
+  link-local address (which also blocks the cloud metadata endpoint). A receiver on this same
+  machine is what a `run` command is for. Ordinary LAN addresses — `192.168.x.x`, a ULA, a
   hostname — are fine, so Home Assistant on another box on your network works as written.
 - `timeout_s` must be 1–600.
 - If `hmac_secret_file` is set but unreadable, the host **skips** that POST rather than sending it
@@ -107,10 +106,10 @@ A `run` command's shell one-liner vocabulary — the event flattened to env, val
 [ "$PF_EVENT_KIND" = stream.started ] && makoctl mode -a do-not-disturb
 ```
 
-Richer payloads (and the full document) are on stdin — `jq` away. On a Windows host running as
-the service, the command runs **in your interactive session** (never as SYSTEM); that path can't
-carry per-process env or stdin, so the event JSON's path is appended as the command's last
-argument instead.
+Richer payloads (and the full document) are on stdin for `jq`. On a Windows host running as the
+service, the command runs **in your interactive session** (never as SYSTEM); that path can't carry
+per-process env or stdin, so the event JSON's path is appended as the command's last argument
+instead.
 
 Verify a signed webhook (Python):
 
@@ -120,15 +119,15 @@ expected = "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
 ok = hmac.compare_digest(request.headers["X-Punktfunk-Signature"], expected)
 ```
 
-**Rules of the road:** hooks are fire-and-forget and bounded — at most 8 in flight (extra
-firings are dropped with a log line, never queued), and a command that outlives its timeout is
-killed. Hook commands run as the host user, so `hooks.json` is operator-privileged config. On
-Linux, when a command starts with an **absolute path** to a script, the host checks that file is
-owned by you (or root) and not group/world-writable, and refuses to run it — loudly, in the log —
-if it isn't. Write the full path (`/home/me/.config/punktfunk/scripts/on-stream.sh`, not `~/…`) if
-you want that check: the shell expands `~` and looks up PATH names like `makoctl` only afterwards,
-so those are never checked. On Windows there is no per-script check — the ACL on the config
-directory is the boundary.
+**Rules of the road:** hooks are fire-and-forget and bounded — at most 8 in flight (extra firings
+are dropped with a log line, never queued), and a command that outlives its timeout is killed.
+Hook commands run as the host user, so `hooks.json` is operator-privileged config. On Linux, when a
+command starts with an **absolute path** to a script, the host checks that file is owned by you (or
+root) and not group/world-writable, and refuses to run it — loudly, in the log — if it isn't. Write
+the full path (`/home/me/.config/punktfunk/scripts/on-stream.sh`, not `~/…`) if you want that
+check: the shell expands `~` and looks up PATH names like `makoctl` only afterwards, so those are
+never checked. On Windows there is no per-script check — the ACL on the config directory is the
+boundary.
 
 The two simplest cases also exist as plain [host.env](/docs/configuration) settings, no
 `hooks.json` needed: `PUNKTFUNK_ON_CONNECT_CMD` and `PUNKTFUNK_ON_DISCONNECT_CMD`.
@@ -137,9 +136,8 @@ The two simplest cases also exist as plain [host.env](/docs/configuration) setti
 
 For per-title setup (HDR toggle, MangoHud, a VRR tweak), attach `prep` steps to a GameStream
 `apps.json` entry or to a [custom library entry](/docs/game-library#adding-a-game-by-hand) — each
-`do` runs **before** the title launches
-(synchronously — the launch waits), each `undo` runs at session end in **reverse order**,
-best-effort, even if the session crashed:
+`do` runs **before** the title launches (synchronously — the launch waits), each `undo` runs at
+session end in **reverse order**, best-effort, even if the session crashed:
 
 ```json
 { "id": 2, "title": "Steam", "compositor": "gamescope", "cmd": "steam -gamepadui",
@@ -153,11 +151,9 @@ A `do` that fails logs, keeps going, and its own `undo` is skipped (it never too
 
 ## Reacting to a game, not a stream
 
-`stream.stopped` tells you the *stream* ended; `game.exited` tells you the *game* did. They are
-often the same moment, but not always — a desktop stream has no game at all, and a stream can
-outlive its game if you turned off "end the session when the game exits".
-
-If you have been polling the host to work out when a game finished, you don't need to any more:
+`stream.stopped` tells you the *stream* ended; `game.exited` tells you the *game* did. Often the
+same moment, but not always — a desktop stream has no game at all, and a stream can outlive its
+game if you turned off "end the session when the game exits". No polling needed:
 
 ```json
 { "hooks": [
@@ -170,8 +166,8 @@ Both carry the title in `PF_EVENT_GAME_TITLE` / `PF_EVENT_GAME_APP`, and `game.e
 `PF_EVENT_REASON` so a script can tell "the player quit" (`exited`) from "the host closed it"
 (`terminated`) — worth checking before you, say, power the TV off.
 
-Ending the session yourself when a game exits needs no script at all: it is the default behavior,
-on the console's **Virtual displays** page under
+Ending the session when a game exits needs no script: it is the default, on the console's
+**Virtual displays** page under
 [When a game or a session ends](/docs/virtual-displays#when-a-game-ends-and-when-a-session-does).
 
 ## The event stream (`GET /api/v1/events`)
@@ -227,22 +223,21 @@ The canonical "decide, don't just observe" pattern — approve pairing from your
 ## Recipe: full controller passthrough (VirtualHere)
 
 To get a controller's *native* features on the host — DualSense gyro, touchpad, adaptive
-triggers, USB rumble — or to use a device no emulation can stand in for, like a racing wheel or a
-HOTAS, hand the physical device from the couch to the host over
+triggers, USB rumble — or to use a device no emulation can stand in for (a racing wheel, a HOTAS),
+hand the physical device from the couch to the host over
 [VirtualHere](https://www.virtualhere.com/) (USB-over-IP) while you play.
 
-**Use the plugin.** [VirtualHere passthrough](/docs/plugins#virtualhere-usb-passthrough) does all of
-this for you: it finds the device by name (so it survives the couch rebooting), brackets it around
-the session, gives it back if anything crashes, and tells you which half of the setup is broken when
-it isn't working. That is the supported route, and the rest of this section is only for people who
-would rather not install a plugin.
+**Use the plugin.** [VirtualHere passthrough](/docs/plugins#virtualhere-usb-passthrough) finds the
+device by name (so it survives the couch rebooting), brackets it around the session, gives it back
+if anything crashes, and tells you which half of the setup is broken. That is the supported route;
+the rest of this section is for people who would rather not install a plugin.
 
-**Turn off controller forwarding on the couch.** Whatever route you take below, the client that
-hands the device over should stop *also* forwarding it: Settings → **Forward controllers**, off
-([Client settings](/docs/client-settings#input)). Otherwise the host ends up with two controllers
-for one pair of hands and games read both. On Linux and Windows it matters twice over — while the
-client has the pad open it has *claimed* the device node, and VirtualHere cannot bind a device
-somebody else is holding.
+**Turn off controller forwarding on the couch.** Whatever route you take, the client that hands the
+device over should stop *also* forwarding it: Settings → **Forward controllers**, off
+([Client settings](/docs/client-settings#input)). Otherwise the host gets two controllers for one
+pair of hands and games read both. On Linux and Windows it matters twice over — while the client
+has the pad open it has *claimed* the device node, and VirtualHere cannot bind a device somebody
+else is holding.
 
 **The two sides.** VirtualHere is a server/client pair, and you run both: the **server on the couch**
 (where the device is plugged in) shares it, and the **client on the host** mounts it. The client's
@@ -265,12 +260,11 @@ Bracket it on the stream with two [hooks](#hooks-hooksjson):
 
 `couch-deck.11` is the device's address from `vhclientx86_64 -t LIST`.
 
-Know what this trades away, because the plugin exists to fix exactly these: the address is
-hard-coded, so it breaks when the couch reboots or the device moves port; and if the stream ends
-abnormally the `stream.stopped` hook never fires, leaving the device stranded on the host until
-somebody notices. There is also a
+The trade-offs the plugin exists to fix: the address is hard-coded, so it breaks when the couch
+reboots or the device moves port; and if the stream ends abnormally the `stream.stopped` hook never
+fires, leaving the device stranded on the host until somebody notices. There is also a
 [`virtualhere-dualsense.ts`](https://git.unom.io/unom/punktfunk/src/branch/main/sdk/examples/virtualhere-dualsense.ts)
-SDK example if you want a worked script to build your own on.
+SDK example to build your own script on.
 
 > VirtualHere is a commercial product, sold separately by VirtualHere Pty. Ltd. — free for one
 > shared device, licensed beyond that. Punktfunk is not affiliated with it.

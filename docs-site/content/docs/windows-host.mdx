@@ -68,10 +68,7 @@ Packaging internals live in
 Punktfunk ships the same signed installer through its own winget source. Register the source once
 per machine, from an **elevated** terminal:
 
-```powershell
-winget source add -n punktfunk https://winget.punktfunk.unom.io -t Microsoft.Rest
-winget install unom.PunktfunkHost
-```
+<Install platform="windows" />
 
 Before it downloads anything, winget shows the package's agreements — that audio needs Steam
 installed on the host, and that Moonlight compatibility is off by default — and asks you to
@@ -101,7 +98,13 @@ bundled third-party pieces keep whatever their own vendors shipped.)
 
 Releases **0.28.1 and earlier** were signed with our own self-signed certificate, and the docs then
 asked you to import `punktfunk-host-windows_<ver>.cer`. Current builds no longer produce or need it —
-[Install → Windows](/docs/install#windows) shows how to remove it if you imported one.
+if you imported it back then, you can remove it from `Cert:\LocalMachine\Root` and
+`Cert:\LocalMachine\TrustedPublisher` (the certificate issued to **unom**, thumbprint
+`CD1EFDEEEC9743AFC38F56C5AF30C5A3009BE941`).
+
+SmartScreen is a separate mechanism that builds reputation per publisher, so shortly after a new
+signing certificate starts being used it can still show *"Windows protected your PC"* on the first
+downloads — **More info → Run anyway**. It settles as installs accumulate.
 
 The bundled drivers carry a **second, separate** self-signed certificate (`CN=punktfunk-driver`,
 SHA-1 thumbprint `4B8493E7CD565758D335F8F4F05C5A7261A13E02`). The installer adds it to the machine's

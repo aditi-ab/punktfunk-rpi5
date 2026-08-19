@@ -5,63 +5,26 @@ description: Common problems setting up or using a Punktfunk host, and how to fi
 
 ## Another streaming host (Sunshine, Apollo, …) is installed
 
-Punktfunk is a Moonlight-compatible host. So are **Sunshine** and its forks (**Apollo**,
-**Vibeshine**, **Vibepollo**, **LuminalShine**, …). Running one of them **at the same time** as
-Punktfunk is **not supported**: they bind the *same* GameStream ports (47984/47989 and
-47998–48010, plus a web UI on 47990 that collides with Punktfunk's management API), advertise the
-*same* `_nvstream` mDNS name, and often install a *conflicting virtual-display driver*. The result
-is `address already in use` errors, pairing that silently fails, the wrong host answering a client,
-and capture/display glitches.
+Punktfunk's Moonlight-compatible mode and **Sunshine** / its forks (**Apollo**, **Vibeshine**,
+Vibepollo, LuminalShine, …) bind the *same* GameStream ports, advertise the *same* `_nvstream` mDNS
+name, and on Windows often install a *conflicting virtual-display driver* — and even native-only,
+Punktfunk's management API and their web UI both want **TCP 47990**. The symptoms: `address already
+in use` in the host log, pairing that silently fails, the wrong host answering a client, display
+glitches, or a host that "worked until one day it didn't" (a boot race for 47990: Punktfunk exits
+when it loses, Sunshine just loses its config page).
 
-- Punktfunk detects this automatically. It warns in the host's startup log — so it's on the web
-  console's **Logs** page — and carries the finding in the status summary the management API
-  serves. The Windows installer additionally warns before installing, but only when a competing
-  host's *service* is set to start on its own; a dormant install isn't flagged. The tray icon
-  doesn't flag it at all. To check on demand, run:
-
-  ```sh
-  punktfunk-host detect-conflicts
-  ```
-
-  It lists any conflicting host found (installed or running) and exits non-zero if there is one.
-- **Fix:** stop and uninstall the other host, then start Punktfunk — e.g. stop the service
-  (`sudo systemctl disable --now sunshine` / on Windows `sc stop SunshineService`) and uninstall it.
-  If you only want to try Punktfunk without removing the other host, at least make sure the other
-  host is fully **stopped** first (they cannot both run at once).
-
-### If you must run both anyway
-
-Still unsupported, and you are on your own for the parts below — but if you keep Punktfunk's
-GameStream compat **off** (the default), the overlap narrows to two things you can move.
-
-1. **The port.** With compat off, the Punktfunk *host* binds only UDP 9777, UDP 5353 and TCP
-   **47990** — the web console is a separate service on 47992/47993, which nothing else wants — and
-   47990 is the only one the other host wants, as its web UI. Whoever starts first takes it; the
-   loser is not symmetric, because Punktfunk treats the failure as fatal and exits (the streaming
-   plane goes with the console), while Sunshine merely loses its config UI. That is why it can look
-   like it "worked until one day it didn't" — it is a boot race, not a setting. Move ours:
-
-   ```sh
-   # ~/.config/punktfunk/host.env
-   PUNKTFUNK_MGMT_BIND=0.0.0.0:47991
-   ```
-
-   Nothing else needs changing: clients learn the port from discovery, and the web console, the
-   plugin runner (so every library plugin) and the status tray read it from
-   `~/.config/punktfunk/mgmt-endpoint` (`%ProgramData%\punktfunk\mgmt-endpoint` on Windows), which
-   the host rewrites on every start. A host added
-   manually **by IP address** is the exception — it assumes 47990 and its library will stop loading,
-   so re-add it from discovery. (You can move the other host instead: Sunshine and its forks derive
-   every port from one base setting.)
-
-2. **The display, on Windows.** Punktfunk defaults to an *exclusive* topology — while streaming it
-   disables the other displays so its virtual one is the whole desktop, and re-asserts that every
-   two seconds. Apollo-family forks are virtual-display-driven, so their monitor is what gets
-   switched off, repeatedly. Set `PUNKTFUNK_NO_ISOLATE=1`, or pick a different topology in the web
-   console, before blaming the other host.
-
-To see who currently holds the port: `ss -lptn 'sport = :47990'` on Linux,
-`netstat -ano | findstr :47990` on Windows.
+- **Check:** `punktfunk-host detect-conflicts` lists every Sunshine-family host it finds and exits
+  **1 only if one is running or set to start on its own** — a dormant leftover (files on disk, a
+  disabled service) prints but exits 0. The host logs the same finding at startup (so it's on the
+  console's **Logs** page) and carries it in the status summary; the Windows installer warns
+  before installing on the same rule. `ss -lptn 'sport = :47990'` (Linux) /
+  `netstat -ano | findstr :47990` (Windows) shows who holds the port right now.
+- **Fix:** stop and uninstall the other host (`sudo systemctl disable --now sunshine`; on Windows
+  `sc stop SunshineService`, then its uninstaller and its display driver), then start Punktfunk.
+- **Keeping both for a while?** Leave GameStream compat off and move Punktfunk's management port
+  (`PUNKTFUNK_MGMT_BIND`), and on Windows pick a non-exclusive display topology — the whole recipe,
+  and what maps to what when you migrate, is on
+  [Switching from Sunshine](/docs/switching-from-sunshine).
 
 ## The host isn't found on the network
 
@@ -193,10 +156,66 @@ accept the one-time ~2.5 s punch-timeout, or not run a host firewall on a truste
 
 ## `nvidia-smi` says it can't communicate with the driver
 
-- The NVIDIA kernel module didn't load. With **Secure Boot** enabled, enrol the module's signing key:
-  `sudo mokutil --import /var/lib/shim-signed/mok/MOK.der`, reboot, **Enrol MOK** at the blue screen
-  (or disable Secure Boot). On Fedora, follow RPM Fusion's Secure Boot steps.
-- After a kernel update the module may need a rebuild — reinstall the driver package.
+The NVIDIA kernel module didn't load. With **Secure Boot** enabled (`mokutil --sb-state`), the
+module is signed with a locally generated key that must be enrolled once — or disable Secure Boot in
+firmware, fine for a dedicated box. Import the key, reboot, and on the blue **MOK Manager** screen
+(on the machine's own console, not over SSH) choose *Enroll MOK → Continue → Yes → (the password)
+→ Reboot*:
+
+```sh
+sudo mokutil --import /var/lib/shim-signed/mok/MOK.der     # Ubuntu
+sudo mokutil --import /var/lib/dkms/mok.pub                # Debian (DKMS-built module)
+sudo akmods --force && sudo mokutil --import /etc/pki/akmods/certs/public_key.der   # Fedora (akmod)
+```
+
+After a kernel update the module may need a rebuild — reinstall the driver package. Then confirm
+`nvidia-smi` loads and `cat /sys/module/nvidia_drm/parameters/modeset` prints `Y` (Wayland needs
+KMS; if it doesn't, `echo 'options nvidia-drm modeset=1' | sudo tee /etc/modprobe.d/nvidia-drm.conf`,
+regenerate the initramfs, reboot).
+
+## No video on Fedora: NVENC fails (ffmpeg-libs is missing)
+
+Fedora's own `ffmpeg-free` is built **without NVENC**, and RPM Fusion's `ffmpeg-libs` is only a
+*recommended* dependency of the `punktfunk` RPM (`Recommends: ffmpeg-libs`) — so the package installs
+happily without it, and NVENC then fails at runtime with no video. Enable RPM Fusion and swap the
+FFmpeg (the [Fedora guide](/docs/fedora#1-gpu-driver), step 1), then check the encoders are there:
+
+```sh
+sudo dnf install --allowerasing ffmpeg ffmpeg-libs
+ffmpeg -hide_banner -encoders | grep nvenc   # expect hevc_nvenc / av1_nvenc / h264_nvenc
+```
+
+The same applies on a layered Bazzite / Fedora Atomic install; the sysext image carries its own.
+
+## pacman: error: could not register 'punktfunk' database (database already registered)
+
+The repo block got appended to `/etc/pacman.conf` twice — the add line is an append, so running it
+a second time leaves two `[punktfunk]` sections, and every later pacman run opens with this line.
+It's harmless (pacman ignores the duplicate), but to silence it delete the extra block from
+`/etc/pacman.conf`. (The [current add line](/docs/arch#2-install-the-host) checks first and won't
+append a second copy.)
+
+## pacman: unable to satisfy dependency 'libavcodec.so=…'
+
+```
+:: unable to satisfy dependency 'libavcodec.so=62-64' required by punktfunk-host
+```
+
+`punktfunk-host` links FFmpeg and depends on the exact libav sonames it was built against — FFmpeg 8
+provides `libavcodec.so=62`, FFmpeg 9 `libavcodec.so=63`. The package on offer was built against a
+*different* FFmpeg major than your box has, and because pacman prepares the whole transaction at
+once, it stops your entire `pacman -Syu`. The bound is deliberate: without it the upgrade succeeds
+and leaves a host that cannot start at all (exit 127 before `main()`, in a restart loop, with
+nothing in its log — `ldd /usr/bin/punktfunk-host | grep 'not found'` is the one-line diagnosis).
+
+1. `sudo pacman -Syyu` — a forced refresh, in case the matching build is already published.
+   Compare `pacman -Si punktfunk-host` against `pacman -Q ffmpeg`.
+2. Still refused? We published a build against the wrong FFmpeg — please report it. The repair is a
+   higher **pkgrel** of the same version (`0.25.0-2`), so a later `-Syu` picks it up with nothing to undo.
+3. Meanwhile, to let the rest of the system upgrade: `sudo pacman -Syu --ignore punktfunk-host`. If
+   pacman still refuses (your *installed* copy carries the bound), `sudo pacman -Rdd punktfunk-host`,
+   upgrade, and install it again once the rebuild lands. The host stays down until then — that is
+   the soname break itself, not a second fault.
 
 ## The desktop won't start, or "GPU … not supported by EGL"
 
@@ -410,6 +429,32 @@ Joining the group is optional, and there is a real reason it is not automatic: w
 It is not only the pad, though: the same group authorizes the helper that stops the display manager
 for a managed **Gaming Mode** takeover, so on a box that autologins into Game Mode, skipping it also
 costs you [the takeover](#game-mode-black-screen-on-connect-or-the-stream-is-stuck-at-the-boxs-resolution).
+
+## Stream lags, then freezes, with a DualSense pad (Bazzite, SELinux)
+
+On Bazzite (and other SELinux-enforcing Fedora Atomic spins), a **DualSense / DualShock 4**-type
+virtual pad can make the stream lag and then freeze — gamescope at 0 fps, `tx_mbps` collapsing —
+measured live on Bazzite 43. The virtual pad binds the kernel's `hid-playstation` driver, and Valve's
+`ds_inhibit` (inside `steamos-manager`) reacts to *any* such hidraw by walking `/proc/*/fd/` on every
+open/close. SELinux denies `steamos_manager_t` that walk — **~324 `avc: denied` per second** — and
+`setroubleshootd` amplifies the flood into a box-wide fork storm that starves the stream.
+
+Two traps while diagnosing: the AVC lines read `comm="tokio-rt-worker"` — that is **steamos-manager,
+not punktfunk** (check `scontext=…steamos_manager_t…`); and once started, the `setroubleshootd`
+storm **outlives the denials by 15+ minutes**, so the box stays starved after the pad is gone.
+
+- **Fix:** punktfunk ships a `dontaudit` SELinux drop-in that silences the flood (ds_inhibit then
+  simply leaves the pad uninhibited — harmless). The sysext installs it on install/update; on an
+  existing install run `sudo punktfunk-sysext reapply`. On a layered or bootc host:
+  `sudo semodule -i /usr/share/punktfunk/selinux/punktfunk-ds-inhibit.cil` (remove with
+  `sudo semodule -r punktfunk-ds-inhibit`).
+- **Hardening, recommended on any streaming host:** `sudo systemctl mask --now setroubleshootd`.
+  It is purely a desktop alert daemon — nothing depends on it (`systemctl list-dependencies
+  --reverse setroubleshootd` returns only itself) — and masking it makes the box robust against
+  *any* AVC burst. Reversible with `unmask`.
+- **Workaround with a feature loss:** set the *client's* controller type to Xbox 360 (uinput, no
+  `hid-playstation`) — costs adaptive triggers, lightbar and touchpad. The host-side
+  `PUNKTFUNK_GAMEPAD` knob does **not** help: an explicit client choice outranks it.
 
 ## A Steam Controller 2 is captured, but Steam's controller list stays empty
 

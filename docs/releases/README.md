@@ -14,6 +14,12 @@ release is born complete and the announcement always has something to say.
 
 1. **Write the notes.** Add `docs/releases/vX.Y.Z.md` in the same commit (or PR) as the version
    bump. Copy `TEMPLATE.md` and fill it in. This file is the single source of truth for the body.
+   **Docs freshness, while you have the diff in front of you:** every user-facing fact the release
+   changes has its docs-site page updated (CONTRIBUTING.md "Where facts live" — `docs-drift` in CI
+   catches renamed knobs and dead links, not a stale sentence). If an install command, repo URL or
+   port changed, `data/platforms.json` changed with it — then run `bun run sync-platforms` in
+   punktfunk-website and commit, because its download page vendors that file and only refreshes
+   when someone does.
 2. **Tag & push.** `git tag -a vX.Y.Z … && git push origin vX.Y.Z` fans out to the build
    workflows. Whichever one wins the create race seeds the release body from this file
    (`scripts/ci/gitea-release.sh` → `ensure_release`, and its PowerShell twin). The release page

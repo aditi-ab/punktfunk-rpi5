@@ -1,0 +1,62 @@
+---
+title: Install the Host
+description: Pick the system you stream from — each guide is one page with the install command, the group to join, and how to start the host.
+---
+
+import { Cards, Card } from 'fumadocs-ui/components/card'
+
+The **host** is the program on the PC you stream *from*. It installs from Punktfunk's own package
+repositories on Linux and from a signed installer on Windows — pick your system:
+
+<Cards>
+  <Card title="Ubuntu 26.04+" href="/docs/ubuntu" description="apt — one repo line, then sudo apt install punktfunk-host." />
+  <Card title="Debian 13+ (and LMDE)" href="/docs/debian" description="The same apt repo as Ubuntu." />
+  <Card title="Fedora 43+" href="/docs/fedora" description="dnf — add the RPM repo, then sudo dnf install punktfunk." />
+  <Card title="Arch / CachyOS" href="/docs/arch" description="pacman — a signed binary repo, then pacman -Syu punktfunk-host." />
+  <Card title="Bazzite / Fedora Atomic" href="/docs/bazzite" description="A systemd sysext — no layering, no reboot." />
+  <Card title="SteamOS (Steam Deck as host)" href="/docs/steamos-host" description="One script, built on-device." />
+  <Card title="NixOS" href="/docs/nixos" description="A flake input and a NixOS module, with a binary cache." />
+  <Card title="Windows 11" href="/docs/windows-host" description="winget or a signed installer — a service, a virtual display driver, done." />
+</Cards>
+
+Streaming **to** a device instead? That's a client — see [Install a Client](/docs/install-client).
+
+## Guided install (preview)
+
+On Linux, one command does what the pages above walk you through — detects your distro, adds the
+repo, installs the host, notices a Sunshine/Apollo/Vibeshine already on the box and moves one port
+so both can run, joins the `input` group, opens the firewall if you run one, starts the host and the
+console, and tells you how to pair:
+
+<Installer />
+
+Prefer to read what runs first (it's plain `sh`, ~350 lines):
+
+<Installer inspect />
+
+It asks before anything optional (Moonlight compat, the shared clipboard, the `punktfunk` group,
+starting at boot) and every answer has a default, so `sh install.sh --yes` — or piping it with no
+terminal — runs unattended; `--channel canary`, `--mgmt-port`, `--no-start` and the environment
+twins (`PUNKTFUNK_INSTALL_YES`, `PUNKTFUNK_INSTALL_CHANNEL`, `PUNKTFUNK_INSTALL_GAMESTREAM`,
+`PUNKTFUNK_INSTALL_CLIPBOARD`, `PUNKTFUNK_INSTALL_PUNKTFUNK_GROUP`, `PUNKTFUNK_INSTALL_LINGER`,
+`PUNKTFUNK_INSTALL_MGMT_PORT`) are listed by `--help`. It covers Ubuntu/Debian, Fedora, Arch-family
+and Bazzite/Fedora Atomic; NixOS, SteamOS and Windows it points at their pages. **Preview:** the
+per-system pages above remain the documented path, and the script runs exactly the install commands
+they show (CI fails if the two drift apart). Re-running is safe.
+
+## Good to know
+
+- **Read [Security & Safe Use](/docs/security) once.** A streaming host is remote control of the
+  machine: keep it on your LAN or a VPN, and keep pairing on (the default).
+- **Already running Sunshine, Apollo or Vibeshine?** They can coexist, with one port moved — see
+  [Switching from Sunshine](/docs/switching-from-sunshine) before you install.
+- **What gets installed.** `punktfunk-host` is the host; `punktfunk-web` is the browser console
+  (pairing, status, library — apt and RPM pull it in automatically, on Arch you name it yourself,
+  the Bazzite image contains it); `punktfunk-scripting` is the plugin runner that brings your
+  game launchers into the [library](/docs/game-library) (started for you everywhere except Arch and
+  source builds — `systemctl --user enable --now punktfunk-scripting` there).
+- **Stable by default.** Every guide points at the **stable** channel, which moves on `vX.Y.Z`
+  releases. The latest `main` build is the **canary** channel — [Release Channels](/docs/channels).
+- **Updating and removing** are one page each: [Updating the Host](/docs/updating) (the console
+  tells you when a newer build is out) and [Uninstall](/docs/uninstall).
+- **No package for your platform?** [Build from source](/docs/build-from-source).

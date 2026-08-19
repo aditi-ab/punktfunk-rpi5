@@ -35,7 +35,43 @@ so one package spans the range — which makes the gap easy to mistake for a bug
 ships no compositor new enough, and no `gamescope` (the patched
 [`punktfunk-gamescope`](/docs/gamescope) cannot run there either — 24.04 is too old on wayland,
 libinput, libavif and pixman). The same gap is why
-[Linux Mint 22.x cannot host](/docs/debian#linux-mint-22x-cannot-host-yet).
+[Linux Mint 22.x cannot host](#cinnamon-linux-mint-and-lmde).
+
+### Cinnamon, Linux Mint and LMDE
+
+**A Cinnamon desktop cannot host a virtual display, and no setting changes that.** Punktfunk gives
+each client its own screen at that device's exact resolution by asking the compositor to create a
+virtual output. Cinnamon's compositor, **Muffin**, has no such API: it forked from Mutter 3.36, and
+its `org.cinnamon.Muffin.ScreenCast` interface offers only `RecordMonitor` and `RecordWindow` —
+never the `RecordVirtual` that Mutter gained in 42. Its portal backend
+(`xdg-desktop-portal-xapp`) implements no ScreenCast either, so the route that serves Sway and
+Hyprland is closed too. This is upstream's to fix, not a Punktfunk setting.
+
+Which Mint you run decides whether there is any route at all:
+
+| Edition | Base | Can it host? |
+|---|---|---|
+| **LMDE 7 "Gigi"** | Debian 13 | ✅ Yes — via gamescope ([Debian page](/docs/debian#4-start-it)) |
+| **Linux Mint 22.x** ("Wilma"…"Zena") | Ubuntu 24.04 | ❌ No — see below |
+| **Linux Mint 23** | Ubuntu 26.04 | ✅ Expected — due December 2026 |
+
+On **LMDE 7** what works is **gamescope**: the host starts its own headless gamescope for each
+connecting client and runs the game inside it, so it needs no desktop compositor at all. Your
+Cinnamon session keeps running untouched; the stream is the game, not the desktop. Install
+`punktfunk-gamescope` (Debian ships no gamescope of its own; the patched build is what gives the
+stream HDR, a visible cursor and the client's real refresh rate) and pin
+`PUNKTFUNK_COMPOSITOR=gamescope` — auto-detection reads the live session, finds Cinnamon, and stops
+with an error rather than guessing. To stream the *desktop* from an LMDE box, log into a GNOME or
+Sway session instead — Debian 13 ships GNOME 48.7 and sway 1.10, both above the floors (its KDE is
+KWin 6.3.6, below the 6.5.6 floor, so Plasma is not an option there yet).
+
+**Linux Mint 22.x cannot host.** `punktfunk-host` installs, which makes this easy to miss, but
+nothing on the box can produce a stream: Cinnamon can't (above); gamescope isn't packaged for Ubuntu
+24.04 and the patched `punktfunk-gamescope` can't run there either (24.04 is short on wayland ≥ 1.23.1,
+libinput ≥ 1.26, libavif ≥ 1.2.1, pixman ≥ 0.44, and has no `libdisplay-info2` or `libxcb-errors0`);
+and switching desktop doesn't rescue it — 24.04's KWin 5.27 and GNOME Shell 46 are below the
+floors, leaving only sway 1.9 as a candidate. Use **LMDE 7** on Mint hardware today, or wait for
+**Mint 23**.
 
 **Distros — install the package:**
 
@@ -45,6 +81,7 @@ libinput, libavif and pixman). The same gap is why
 - [Arch](/docs/arch)
 - [Bazzite](/docs/bazzite)
 - [SteamOS](/docs/steamos-host)
+- [NixOS](/docs/nixos)
 
 **Desktops — configure and quirks:**
 

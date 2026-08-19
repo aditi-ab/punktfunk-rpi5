@@ -7,8 +7,8 @@ Plugins extend the host through the **scripting runner** (see [Events & hooks](/
 plugin runs alongside the host, reconciles titles into your [game library](/docs/game-library) as a
 provider — so they appear in the grid on every client — and can add its own page to the [web console](/docs/web-console).
 
-**Your game library is built from plugins.** From v0.28.0 the host scans no launcher on its own, so
-install the one for each launcher you use — that is what puts games in the grid.
+**Your game library is built from plugins.** From v0.28.0 the host scans no launcher on its own;
+install the one for each launcher you use.
 
 | Plugin | Host | What it does |
 |---|---|---|
@@ -23,37 +23,33 @@ install the one for each launcher you use — that is what puts games in the gri
 
 ## Installing from the console
 
-Every plugin runs inside the **plugin runner**, a separate service that is off until you switch it
-on. Installing a plugin while it's off succeeds and starts nothing, so do this first:
+Every plugin runs inside the **plugin runner**, a separate service. Installing a plugin while it's
+off succeeds and starts nothing, so check it first:
 
 1. Open the [web console](/docs/web-console) → **Plugins** → **Installed** and look at the **Plugin
-   runner** card. If it says *Not installed*, install the runner package first (see
-   [Troubleshooting](#troubleshooting) below). If it says *Disabled*, press **Enable runner** —
-   once per host. *Running* means you're set; *Stopped* means the runner is enabled but not up right
-   now, and its log says why (see [Troubleshooting](#troubleshooting)).
+   runner** card. *Not installed*: install the runner package first (see
+   [Troubleshooting](#troubleshooting)). *Disabled*: press **Enable runner** — once per host.
+   *Running* means you're set; *Stopped* means the runner is enabled but not up right now, and its
+   log says why (see [Troubleshooting](#troubleshooting)).
 2. Go to **Browse**, pick a plugin from the catalog and confirm. The host installs it and restarts
    the runner, and the plugin's own page appears in the console's nav.
 
 **Sources** is the third tab: where catalogs come from.
 
-The rest of this page covers the CLI, which does the same thing, and the trust model behind the
-badges — worth reading once, because a plugin runs with the same privileges as the host.
-
 ### What "Verified" means
 
-Every catalogued plugin pins **one exact version** and that version's package hash. A verified entry
-means somebody at unom reviewed *that exact package* — not the project in general, and not whatever
-it publishes next. When a plugin releases a new version, the store keeps offering the reviewed one
-until the new release is reviewed too. Before anything is downloaded, the host re-checks the pinned
-hash against the registry, so a package that was quietly republished under the same version number
-is refused rather than installed.
+Every catalogued plugin pins **one exact version** and its package hash. **Verified** means somebody
+at unom reviewed *that exact package* — not the project in general, not whatever it publishes next;
+when a plugin releases a new version, the store keeps offering the reviewed one until the new release
+is reviewed too. Before anything is downloaded, the host re-checks the pinned hash against the
+registry, so a package quietly republished under the same version number is refused.
 
 A catalog can also **revoke** a version. When an advisory covers an entry, the console shows the
-reason against it and won't install that version — on **Browse** as a red-ringed panel with the
-install button disabled, on **Installed** as a warning against the plugin you already have. It
-never removes running code for you; that stays your decision.
+reason and won't install that version — on **Browse** as a red-ringed panel with the install button
+disabled, on **Installed** as a warning against the plugin you already have. It never removes
+running code for you.
 
-Three things a plugin can be:
+The three badges:
 
 | Badge | Where it came from |
 |---|---|
@@ -67,8 +63,8 @@ Three things a plugin can be:
 `ed25519:…` public key — with a key set, the host refuses any index from that source that isn't
 correctly signed, rather than falling back to an unsigned one.
 
-Adding a source is a trust decision you make once: its plugins become installable on this host.
-They are always attributed to it and never carry the Verified badge, which belongs to the built-in
+Adding a source is a trust decision you make once: its plugins become installable on this host,
+always attributed to it and never carrying the Verified badge, which belongs to the built-in
 catalog alone.
 
 To publish a plugin to the built-in catalog, open a pull request against
@@ -111,15 +107,13 @@ the full path: `& "$env:ProgramFiles\punktfunk\punktfunk-host.exe" plugins add p
 </Tab>
 </Tabs>
 
-Open the [web console](/docs/web-console) and the plugin's page appears in the nav automatically —
-that's the whole install.
+The plugin's page then appears in the [web console](/docs/web-console)'s nav automatically.
 
 The runner is **on by default** on a new install — your game sources are plugins, so a host without
-it would show an empty library. (On a host that predates this, it stays however you left it; turn it
-on with `punktfunk-host plugins enable`, which you only need once.) The runner discovers plugins
-when it starts, so one installed later needs a restart to come up
-(`systemctl --user restart punktfunk-scripting`, or `Restart` the `PunktfunkScripting` task) — the
-console does that restart for you as part of installing.
+it would show an empty library. (A host that predates this stays however you left it; turn it on
+with `punktfunk-host plugins enable`, once.) The runner discovers plugins when it starts, so one
+installed later needs a restart (`systemctl --user restart punktfunk-scripting`, or `Restart` the
+`PunktfunkScripting` task) — the console does that restart for you as part of installing.
 
 Don't want it? It is a normal service you can switch off: `systemctl --user mask punktfunk-scripting`
 on Linux, or disable the `PunktfunkScripting` scheduled task on Windows. Your host keeps streaming;
@@ -143,8 +137,7 @@ and it carries its catalog badge instead.
 A bare name resolves to the first-party package — `playnite` installs `@punktfunk/plugin-playnite`,
 always from Punktfunk's own package registry. Any other name (`punktfunk-plugin-*`, a foreign
 `@scope/pkg`) would install from the **public npm registry** and is refused unless you add
-`--allow-public-registry` — a guard against typos and look-alike packages pulling untrusted code
-onto your host.
+`--allow-public-registry` — a guard against typos and look-alike packages.
 
 > Plugins are operator-installed code with operator privileges — they can launch games and run
 > commands. Install only plugins you trust, from a registry you control.
@@ -155,17 +148,16 @@ onto your host.
 catalog pins a newer version than the one you have; it installs through the same confirmation as a
 fresh install, and the console restarts the runner for you. There is no `plugins update` command —
 from a terminal, re-run `punktfunk-host plugins add <name>`. That installs the newest version the
-package registry has rather than the version the catalog pins, and it does **not** restart the
-runner: restart it yourself so the new code is picked up
-(`systemctl --user restart punktfunk-scripting`, or `Restart` the `PunktfunkScripting` task).
+package registry has rather than the version the catalog pins, and does **not** restart the runner:
+restart it yourself (`systemctl --user restart punktfunk-scripting`, or `Restart` the
+`PunktfunkScripting` task) so the new code is picked up.
 
 **Remove.** The **Uninstall** (bin) button on the **Installed** tab removes the package *and*
 restarts the runner, so the plugin stops straight away. `punktfunk-host plugins remove <name>`
-removes the package only — restart the runner yourself, as above, to stop a plugin that is still
-running.
+removes the package only — restart the runner yourself, as above, to stop a plugin still running.
 
-Uninstalling removes the package and nothing else. A plugin's own config and cache stay where it
-wrote them — `~/.config/punktfunk/plugin-state/<plugin>/` on Linux,
+Uninstalling removes the package only; a plugin's own config and cache stay where it wrote them —
+`~/.config/punktfunk/plugin-state/<plugin>/` on Linux,
 `%ProgramData%\punktfunk\plugin-state\<plugin>\` on Windows — so re-installing later picks your
 settings back up. Delete that directory yourself if you want it gone.
 
@@ -233,8 +225,8 @@ GOG, Epic, Xbox, itch, emulators, manually-added games — everything Playnite m
 library. Launching a title hands it back to Playnite, which performs the real launch, so there are no
 per-store launch commands to maintain. Covers are served by the host, so it scales to large libraries.
 
-Playnite is Windows-only, so both halves of this one live on the **Windows host**. Because Playnite
-keeps its library locked while running, there are **two parts**:
+Playnite is Windows-only, so both halves live on the **Windows host**. Because Playnite keeps its
+library locked while running, there are **two parts**:
 
 1. **The plugin** — from an elevated PowerShell:
 
@@ -255,9 +247,9 @@ seconds of any library change. Filters (installed-only, per-store, hidden) live 
 ## VirtualHere (USB passthrough)
 
 `@punktfunk/plugin-virtualhere` — hands a **physical USB device** on your couch machine to the
-host while you play, and gives it back afterwards. The game sees the real device, so this is the
-answer for a racing wheel, a HOTAS, pedals, an arcade stick, or any controller whose value is that
-it is not emulated.
+host while you play, and gives it back afterwards. The game sees the real device — the answer for a
+racing wheel, a HOTAS, pedals, an arcade stick, or any controller whose value is that it is not
+emulated.
 
 <Callout type="warn">
 This plugin drives [VirtualHere](https://www.virtualhere.com/), a commercial USB-over-IP product
@@ -273,8 +265,7 @@ You need both halves of VirtualHere running before the plugin is any use:
 - **The USB Client on the host**, ideally installed as a service so it survives logging out.
 
 Servers exist for Windows, Linux, macOS and Android couches. **There is no VirtualHere server for
-iOS or tvOS**, so iPhones, iPads and Apple TVs cannot pass devices through — nothing on the
-Punktfunk side can change that.
+iOS or tvOS**, so iPhones, iPads and Apple TVs cannot pass devices through.
 
 ```sh
 punktfunk-host plugins add virtualhere
@@ -288,8 +279,8 @@ starts and returned when it stops, so the couch keeps its own controller the res
 you can widen that to the whole session, or to the entire time a client is connected.
 
 If nothing happens, the **Diagnostics** tab walks the whole two-sided setup and tells you which
-part to fix. The same checks are available as `punktfunk-plugin-virtualhere doctor`, which is the
-useful thing to paste into a support thread.
+part to fix. The same checks run as `punktfunk-plugin-virtualhere doctor` — the useful thing to
+paste into a support thread.
 
 Full configuration is in
 [the plugin's repo](https://git.unom.io/unom/punktfunk-plugin-virtualhere).
@@ -311,10 +302,10 @@ default whenever the host is). On Windows, re-run the installer and keep the scr
 If the runner *is* installed and the host still says it isn't, the host could not find the
 `punktfunk-scripting` executable. It looks beside its own binary, then on `PATH`, then in the
 packaged `/usr` and `~/.local` layouts — so a runner installed somewhere else needs
-`PUNKTFUNK_SCRIPTING` pointed at it (see [Configuration](/docs/configuration)). Note that the
-console installs plugins from inside the host *service*, whose `PATH` is usually much shorter than
-your shell's: a runner that `punktfunk-host plugins add` finds and the console does not is that
-difference, and the env var is the fix.
+`PUNKTFUNK_SCRIPTING` pointed at it (see [Configuration](/docs/configuration)). The console installs
+plugins from inside the host *service*, whose `PATH` is usually much shorter than your shell's: a
+runner that `punktfunk-host plugins add` finds and the console does not is that difference, and the
+env var is the fix.
 
 **Where a plugin's log output goes** — the console's **Logs** page, under the **Plugins** filter.
 The runner ships everything your plugins print to the host, so a plugin's own lines sit next to the
@@ -327,12 +318,11 @@ with `punktfunk-host plugins status`.
 
 <Callout>
 Nothing is lost if the host is down: the runner keeps buffering and sends the backlog when the host
-comes back. It says so in the log if the buffer overflowed, rather than presenting a gap as
-continuity.
+comes back, and says so in the log if the buffer overflowed.
 </Callout>
 
-**Reading the runner's log directly** — rarely needed now, but it is the ground truth if the runner
-can't reach the host at all:
+**Reading the runner's log directly** — rarely needed, but the ground truth if the runner can't
+reach the host at all:
 
 <Tabs items={['Linux', 'Windows']}>
 <Tab value="Linux">
@@ -345,9 +335,9 @@ journalctl --user -u punktfunk-scripting -f
 <Tab value="Windows">
 
 The runner task writes its output to `%ProgramData%\punktfunk\plugin-state\runner.log` (the
-previous run is kept as `runner.log.1`). This is the file to read — or send — when the console's
-Plugins view stays empty although the runner is running: everything the runner and its plugins
-printed lands here even when they can't reach the host.
+previous run is kept as `runner.log.1`). Read — or send — this file when the console's Plugins view
+stays empty although the runner is running: everything the runner and its plugins printed lands
+here even when they can't reach the host.
 
 ```powershell
 Get-Content "$env:ProgramData\punktfunk\plugin-state\runner.log" -Tail 100
@@ -367,10 +357,9 @@ foreground (stop it with <kbd>Ctrl</kbd>+<kbd>C</kbd>):
 
 **A plugin can't reach a service running on the same box (Linux)** — plugins that drive a local
 daemon usually talk to it over a socket or FIFO in `/tmp`. The runner's unit shipped with
-`PrivateTmp=yes` in earlier releases, which gave it a private `/tmp` and hid all of it: the plugin would
-launch the vendor's binary happily and then time out reaching the daemon behind it, while the same
-command worked perfectly in your own shell. If you are on an older host, or you have a drop-in that
-reinstates it, put the real `/tmp` back:
+`PrivateTmp=yes` in earlier releases, hiding the real `/tmp`: the plugin would launch the vendor's
+binary and then time out reaching the daemon, while the same command worked in your own shell. On an
+older host, or with a drop-in that reinstates it, put the real `/tmp` back:
 
 ```sh
 systemctl --user edit punktfunk-scripting

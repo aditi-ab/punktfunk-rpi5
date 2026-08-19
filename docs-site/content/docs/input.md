@@ -5,15 +5,15 @@ description: The in-stream keyboard shortcuts that give your mouse back, the two
 
 A stream takes your mouse and keyboard the moment you click into it. This page starts with how to
 get them back, then covers driving the host with a mouse, a touchscreen and a pen. The rows that
-pick these modes sit in your client's **Input** settings; the toggles that share that page with
-them are in [Client settings](/docs/client-settings#input).
+pick these modes sit in your client's **Input** settings; the toggles that share that page are in
+[Client settings](/docs/client-settings#input).
 
 ## Getting your input back
 
 On the Linux and Windows clients the stream runs in its own session window. Input is **captured**
 when the stream starts and whenever you click the video: your local cursor disappears and keys go to
-the host instead of your desktop. In the default mouse mode the pointer is also locked to the
-window — see [Mouse modes](#mouse-modes) below.
+the host. In the default mouse mode the pointer is also locked to the window — see
+[Mouse modes](#mouse-modes).
 
 | Shortcut | What it does |
 |---|---|
@@ -31,45 +31,41 @@ Click the stream to capture input · Ctrl+Alt+Shift+Q releases · Ctrl+Alt+Shift
 Ctrl+Alt+Shift+D disconnects · Ctrl+Alt+Shift+S stats
 ```
 
-With a controller in use the same hint names the controller chord instead of the mouse-mode and
-stats entries. The full list is always available without a stream running — see below.
+With a controller in use the hint names the controller chord instead of the mouse-mode and stats
+entries. The full list is always available without a stream running — see below.
 
 ### Muting your microphone
 
-**Ctrl+Alt+Shift+V** stops sending your microphone to the host, and pressing it again resumes.
-The uplink itself keeps running underneath, so unmuting is instant rather than a second of the
-device warming back up.
+**Ctrl+Alt+Shift+V** stops sending your microphone to the host; pressing it again resumes. The
+uplink keeps running underneath, so unmuting is instant.
 
-While you are muted a **Microphone muted** badge sits in the top-right corner of the stream. It
-is deliberately separate from the [stats overlay](/docs/stats): it shows even with stats off,
-because "am I still muted?" is a question you ask ten minutes later.
+While muted, a **Microphone muted** badge sits in the top-right corner of the stream — separate
+from the [stats overlay](/docs/stats), so it shows even with stats off.
 
 The mute lasts for that stream only — the next session starts unmuted, and nothing is written to
 your settings. If the stream isn't sending a microphone at all (**Stream microphone** off in
-[client settings](/docs/client-settings#audio)) the shortcut does nothing and no badge appears,
-rather than pretending to mute something.
+[client settings](/docs/client-settings#audio)) the shortcut does nothing and no badge appears.
 
-This is on the **Linux and Windows** clients — including a Steam Deck stream, which is the Linux
-client, so an attached keyboard gets the chord. The Apple and Android clients have no mute shortcut
-yet; turn **Stream microphone** off in their settings instead.
+**Linux and Windows** clients only — a Steam Deck stream is the Linux client, so an attached
+keyboard gets the chord. The Apple and Android clients have no mute shortcut yet; turn **Stream
+microphone** off in their settings instead.
 
 Alt-Tabbing away releases input on its own and takes it back when you return. A release you asked
 for with the chord stays released until you opt back in. Either way, keys and buttons you were
 holding are released on the host, so nothing sticks down.
 
-You can look the shortcuts up again without a stream running: the Linux client has **Keyboard
-Shortcuts** in its main menu, and the Windows client has a **Shortcuts** screen reached from its
-host list. Both list the microphone mute; the in-stream hint over the video doesn't, to keep it
-to one readable line.
+Without a stream running, the Linux client lists the shortcuts under **Keyboard Shortcuts** in its
+main menu, and the Windows client on a **Shortcuts** screen reached from its host list. Both list the
+microphone mute; the in-stream hint over the video doesn't, to stay one readable line.
 
 ### On the other clients
 
 - **macOS** honours the release, mouse-mode, disconnect and stats combos, written
-  **⌃⌥⇧Q / M / D / S** — but not the microphone mute. **⌘⎋** also toggles capture,
-  **⌃⌘F** toggles fullscreen, and **⌃⌥⇧C** starts or stops [clipboard sharing](/docs/clipboard). The
-  **Stream** menu lists them all except the mouse-mode combo, which works but has no menu item.
-  Every *other* ⌘ chord goes to the host while input is captured — ⌘Q reaches the host's compositor
-  rather than quitting the app — unless you turn **Capture system shortcuts** off in
+  **⌃⌥⇧Q / M / D / S** — but not the microphone mute. **⌘⎋** also toggles capture, **⌃⌘F** toggles
+  fullscreen, and **⌃⌥⇧C** starts or stops [clipboard sharing](/docs/clipboard). The **Stream** menu
+  lists them all except the mouse-mode combo, which works but has no menu item. Every *other* ⌘
+  chord goes to the host while input is captured — ⌘Q reaches the host's compositor rather than
+  quitting the app — unless you turn **Capture system shortcuts** off in
   [client settings](/docs/client-settings#input). ⌘⎋ and ⌃⌘F are held back either way, so there is
   always a way out.
 - **iPhone and iPad** with a hardware keyboard: **⌃⌥⇧Q** releases input while it is captured, and
@@ -91,32 +87,30 @@ Every client reserves one controller chord: **L1 + R1 + Start + Select** (LB + R
 an Xbox pad), held on any connected pad.
 
 - **Linux, Windows** — a press releases captured input, and leaves fullscreen if you didn't start
-  fullscreen. Keep it held about 1.5 seconds and it disconnects.
+  fullscreen. Hold about 1.5 seconds and it disconnects.
 - **Steam Deck** — a press releases captured input only. The Decky plugin always launches the client
   fullscreen, and a stream that started fullscreen stays that way. Holding disconnects, as above.
-- **macOS, iPhone/iPad, Apple TV** — holding it about 1.5 seconds disconnects. There is no
-  quick-press step.
-- **Android** — holding it about a second disconnects. A quick press does nothing; the moment the
-  chord completes a **Hold to quit…** cue appears so you know it registered.
+- **macOS, iPhone/iPad, Apple TV** — holding about 1.5 seconds disconnects. There is no quick-press
+  step.
+- **Android** — holding about a second disconnects. A quick press does nothing; the moment the chord
+  completes a **Hold to quit…** cue appears so you know it registered.
 
 The chord is read off the pads a client forwards, so turning
 [**Forward controllers**](/docs/client-settings#input) off takes it away on **Linux and Windows** —
-there the client stops opening the controller at all, which is the point of the setting. Use
+there the client stops opening the controller at all. Use
 **Ctrl+Alt+Shift+D** or the client's own UI to leave instead. The Apple and Android apps keep
 watching for the chord either way.
 
 ### Statistics with a controller
 
 The **Apple** apps reserve a second chord: **Select + X**, which cycles the
-[stats overlay](/docs/stats) one level each time you complete it. It is for the moment your hands
-are on a controller and the usual routes aren't — no keyboard for **⌃⌥⇧S**, no free screen for the
-three-finger tap — and on **Apple TV** it is the only way there with a pad. X is deliberately none
-of the four leave-chord buttons, so reaching for one chord never trips the other. Both buttons
-still reach the game; only the overlay changes locally.
+[stats overlay](/docs/stats) one level each time you complete it. For when you have a pad but no
+keyboard for **⌃⌥⇧S** and no free screen for the three-finger tap; on **Apple TV** it is the only
+way there with a pad. X is deliberately none of the four leave-chord buttons, so reaching for one
+chord never trips the other. Both buttons still reach the game; only the overlay changes locally.
 
-On the **Siri Remote**, **hold Play/Pause** for about half a second instead. A quick tap of that
-button is still a right click — the click is simply sent when you let go, so the hold has
-something to be.
+On the **Siri Remote**, **hold Play/Pause** for about half a second instead. A quick tap is still a
+right click, sent when you let go.
 
 ### The guide button (Xbox / PS / Steam) and Quick Access
 
@@ -126,30 +120,30 @@ devices want that button for themselves, so every client also carries a gesture 
 everywhere:
 
 **Hold Select (Back / View) on its own for about a third of a second.** The host sees its guide
-button go down, and it stays down for as long as you hold — so keeping it held reads as a long
-press on the host, which is how SteamOS opens the **Quick Access Menu** for a regular pad. A quick
-tap of Select still reaches the game, delivered when you let go (a beat late). Select pressed as
-part of a combo — including the leave chord above — passes through untouched.
+button held down for as long as you hold — a long press, which is how SteamOS opens the **Quick
+Access Menu** for a regular pad. A quick tap of Select still reaches the game, delivered when you
+let go (a beat late). Select pressed as part of a combo — including the leave chord above — passes
+through untouched.
 
 What the raw button does, per client:
 
-- **Linux & Windows desktop, macOS, Android** — the guide press is forwarded to the host. If
-  Steam Big Picture or the Xbox Game Bar is also watching for it *on the device in your hands*,
-  both may react — that's a local setting on that device, not something the stream can suppress.
+- **Linux & Windows desktop, macOS, Android** — the guide press is forwarded to the host. If Steam
+  Big Picture or the Xbox Game Bar is also watching for it *on the device in your hands*, both may
+  react — that's a local setting on that device, not something the stream can suppress.
 - **Steam Deck / Gaming Mode** — the **Steam** and **`…`** buttons stay with the Deck by default:
-  SteamOS always opens its own menus for them, so forwarding the raw press as well opened BOTH
-  menus at once, the Deck's on top of the stream. Reach the host's menus with **hold-Select**, or
-  with the Punktfunk panel's **Host menus** buttons ([Steam Deck page](/docs/steam-deck)). The
-  old behavior is one setting away: **Steam / guide button → Send to host**.
+  SteamOS always opens its own menus for them, so forwarding the raw press as well opened BOTH menus
+  at once, the Deck's on top of the stream. Reach the host's menus with **hold-Select**, or with the
+  Punktfunk panel's **Host menus** buttons ([Steam Deck page](/docs/steam-deck)). The old behavior
+  is one setting away: **Steam / guide button → Send to host**.
 - **iPhone / iPad** — iOS reserves the Home press for its own Game Overlay, so hold-Select is the
-  reliable route to the host's overlay. On iOS 27 or later you can also hand the button to the
-  app yourself, in the system's per-controller Home-button setting.
+  reliable route to the host's overlay. On iOS 27 or later you can also hand the button to the app
+  yourself, in the system's per-controller Home-button setting.
 - **Apple TV** — tvOS never delivers the Home press to apps; hold-Select is the only route.
 
 Both halves are [settings](/docs/client-settings#input), per profile like everything else:
 **Steam / guide button** (Automatic / Send to host / This device) and **Hold Select for guide**
-(Automatic / On / Off). Automatic picks the behavior above for each platform — the gesture stays
-off where the raw button already works, so games that use a *held* Select keep it.
+(Automatic / On / Off). Automatic picks the behavior above for each platform — the gesture stays off
+where the raw button already works, so games that use a *held* Select keep it.
 
 ## Mouse modes
 
@@ -159,14 +153,13 @@ There are two, and they are a per-client setting called **Mouse input**:
   cursor you see is the host's. This is what mouse-look in a game needs. The session window also
   grabs the keyboard here, so Alt+Tab and the Windows key (Super on Linux) reach the host rather than
   your own desktop — on macOS that is the ⌘ chords, ⌘Q included, with ⌘⎋ kept back as the way out.
-  Turn **Capture system shortcuts** off in
-  [client settings](/docs/client-settings#input) to keep them local.
+  Turn **Capture system shortcuts** off in [client settings](/docs/client-settings#input) to keep
+  them local.
 - **Desktop (absolute)** — the pointer is not locked. It moves in and out of the stream freely and
   its position is sent as an absolute point — what you want for remote desktop work. Your local
   cursor is hidden over the stream; the one you see there is the host's.
 
-**Capture is the default** on the Linux, Windows and macOS clients. **Android defaults to Desktop**
-— a phone or TV is more often driven by touch or a pad than by a locked mouse.
+**Capture is the default** on the Linux, Windows and macOS clients. **Android defaults to Desktop**.
 
 Switch live with **Ctrl+Alt+Shift+M** (**⌃⌥⇧M** on macOS), whether input is captured or not. On
 Android, Ctrl+Alt+Shift+Q flips the capture instead. The picker is macOS-only among the Apple apps;
@@ -217,7 +210,7 @@ The trackpad and pointer models are unaffected by all of this: they send ordinar
 
 A stylus is not treated as a finger. Punktfunk carries **position, tip pressure, tilt angle and tilt
 direction, barrel roll, hover distance, the eraser end, and two barrel buttons** on their own input
-plane, so drawing and handwriting behave the way they do locally.
+plane.
 
 **Clients that send pen input:**
 
@@ -241,8 +234,8 @@ The Linux, Windows, macOS and Apple TV clients do not send stylus input.
   tilt, rotation, the barrel button and the eraser. This needs **Windows 10 1809 or newer**.
 
 **Before it can work on Linux**, the host needs access to `/dev/uinput` — the same `input` group step
-the virtual gamepads need, covered under [After installing](/docs/install#after-installing). Without
-it the host never offers pen at all.
+the virtual gamepads need, step 3 of your [install guide](/docs/install). Without it the host never
+offers pen at all.
 
 **If the host is too old, or pen is switched off**, nothing breaks: the client keeps folding the
 stylus into its ordinary touch or pointer path. You can still draw — just without pressure and tilt.

@@ -53,19 +53,11 @@ Vulkan encode behind that flag, and without it sessions quietly fall back to VAA
   gamescope clone). Budget around 25 minutes for a first install. Later rebuilds are incremental,
   and the gamescope step is a no-op unless its sources changed.
 
-## 1. Get the source
+## 1. Get the source and run the installer
 
 In Desktop Mode open **Konsole** (or ssh in), then:
 
-```sh
-git clone https://git.unom.io/unom/punktfunk ~/punktfunk
-```
-
-## 2. Run the installer
-
-```sh
-bash ~/punktfunk/scripts/steamdeck/install.sh
-```
+<Install platform="steamos" />
 
 It is idempotent — safe to re-run. In one pass it:
 
@@ -88,19 +80,17 @@ Useful flags:
 | Flag | Effect |
 |------|--------|
 | `--open` | Accept **unpaired** clients (trust-on-first-use) — convenient on a fully trusted LAN. Default is PIN pairing required. |
-| `--no-gamestream` | Run a **secure native-only** host — skip the GameStream/Moonlight-compat planes (see below). Default keeps them on so stock Moonlight works. |
+| `--gamestream` | Also serve stock [Moonlight](/docs/moonlight) clients (GameStream compat, off by default — see below). `--no-gamestream` is the explicit off, kept for old command lines. |
 | `--no-web` | Skip the management web console. |
 | `--src=DIR` | Build from source at `DIR` instead of `~/punktfunk`. **Only if you must** — the post-OS-update rebuild check and the web console's one-click update both look for `~/punktfunk/scripts/steamdeck/update.sh`, so with a relocated source you have to update by hand: `PUNKTFUNK_SRC=DIR bash DIR/scripts/steamdeck/update.sh --pull` (without `PUNKTFUNK_SRC` the script still looks for `~/punktfunk`). A symlink (`ln -s DIR ~/punktfunk`) restores both. |
 
 When it finishes it prints the web-console URL and how to pair.
 
-> **GameStream/Moonlight compat is on by default.** The native `punktfunk/1` plane (used by
-> Punktfunk's own clients — SPAKE2 PIN pairing, per-direction AEAD) is **always on** and is the secure
-> path. The installer also enables the **GameStream/Moonlight-compat planes** so stock
-> [Moonlight](/docs/moonlight) works — but those carry inherent on-path weaknesses (pairing over plain
-> HTTP; legacy control encryption that can reuse GCM nonces), so enable them only on a **trusted LAN**.
-> If you only ever use native clients, install with `--no-gamestream` for a host with no GameStream
-> surface at all.
+> **GameStream/Moonlight compat is opt-in.** The native `punktfunk/1` plane (used by Punktfunk's
+> own clients — SPAKE2 PIN pairing, per-direction AEAD) is **always on** and is the secure path. Pass
+> `--gamestream` to also enable the **GameStream/Moonlight-compat planes** so stock
+> [Moonlight](/docs/moonlight) works — they carry inherent on-path weaknesses (pairing over plain
+> HTTP; legacy control encryption that can reuse GCM nonces), so do that only on a **trusted LAN**.
 
 > **First install — reboot once before streaming.** KWin only authorizes Desktop-mode screen capture
 > on a fresh session, and the new `input` and `punktfunk` groups (native Steam Deck controller
@@ -111,11 +101,11 @@ When it finishes it prints the web-console URL and how to pair.
 > session ends with `KWin does not expose zkde_screencast_unstable_v1` or the pad shows up as an Xbox
 > 360 controller, you haven't rebooted yet.
 
-## 3. Pair a device
+## 2. Pair a device
 
 By default the host **requires PIN pairing** (secure). Two ways to pair:
 
-- **Web console** (printed at the end of step 2): open `https://<device-ip>:47992` (self-signed host
+- **Web console** (printed at the end of step 1): open `https://<device-ip>:47992` (self-signed host
   cert — your browser warns once; trust it and continue),
   [arm pairing](/docs/web-console#arm-pairing), and enter the PIN on your client.
 - **From the client directly**: pick this host (it advertises over mDNS as `_punktfunk._udp`) and
@@ -125,7 +115,7 @@ On a trusted home LAN you can instead install with `--open` and skip pairing ent
 
 ### Console login password
 
-The installer generates a random console login password (printed at the end of step 2) and writes it
+The installer generates a random console login password (printed at the end of step 1) and writes it
 to `~/.config/punktfunk/web.env`. To read it back or set your own, see
 [The Web Console](/docs/web-console#login-password).
 
@@ -136,15 +126,15 @@ to `~/.config/punktfunk/web.env`. To read it back or set your own, see
 > already readable. Change `PUNKTFUNK_UI_PASSWORD` in `~/.config/punktfunk/web.env`, then
 > `systemctl --user restart punktfunk-web`.
 
-## 4. Verify
+## 3. Verify
 
 ```sh
 systemctl --user status punktfunk-host          # active (running)
 journalctl --user -u punktfunk-host -f          # watch a client connect
 ```
 
-Connect from a [native client](/docs/clients), or from [Moonlight](/docs/moonlight) (unless you
-installed with `--no-gamestream`). In Game Mode the host attaches to the running gamescope session and
+Connect from a [native client](/docs/clients), or from [Moonlight](/docs/moonlight) (if you
+installed with `--gamestream`). In Game Mode the host attaches to the running gamescope session and
 streams it at your client's resolution; in Desktop Mode it streams the KDE desktop. The host
 auto-detects which session is live per connection. See [Steam / gamescope](/docs/gamescope) for the
 attach-vs-managed detail and known limits.
