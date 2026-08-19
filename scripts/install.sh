@@ -84,8 +84,10 @@ die()  { printf '\033[1;31m  xx\033[0m %s\n' "$*" >&2; exit 1; }
 
 # Prompts read from the terminal, not stdin — stdin is the script itself under `curl | sh`.
 # No terminal (CI, cron, a pipe) behaves like --yes.
+# Probe by opening it: in a container or under a service /dev/tty is a node that exists but
+# can't be opened (ENXIO — no controlling terminal), so -r/-w would say yes and the redirect fail.
 TTY=/dev/tty
-[ -r "$TTY" ] && [ -w "$TTY" ] || { TTY=; YES=1; }
+(exec 3<>/dev/tty) 2>/dev/null || { TTY=; YES=1; }
 
 # ask "question" default(y|n) → 0 = yes, 1 = no
 ask() {
