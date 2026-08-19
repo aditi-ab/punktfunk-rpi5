@@ -61,3 +61,9 @@ jobs:
           punktfunk-host detect-conflicts
       - name: Re-running is a no-op install
         run: sh scripts/install.sh --yes --no-start | grep -q 'already installed'
+      - name: --uninstall takes the packages and the repo off again
+        run: |
+          sh scripts/install.sh --yes --uninstall
+          ! command -v punktfunk-host
+          ! test -e /etc/apt/sources.list.d/punktfunk.list -o -e /etc/yum.repos.d/punktfunk.repo
+          ! grep -q '^\[punktfunk\]' /etc/pacman.conf 2>/dev/null

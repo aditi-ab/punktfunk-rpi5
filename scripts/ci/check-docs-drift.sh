@@ -28,6 +28,9 @@
 #      states — every `install` line of an apt/pacman/dnf/sysext host platform must appear in
 #      the script verbatim (it edits channel/group into the string at run time, never the
 #      literal), and the script must parse under sh.
+#   7. The installer under --dry-run against faked os-release files detects every family it claims
+#      to (and --uninstall prints each family's removal) — the committed half of the manual
+#      16-file matrix PR #345 was verified with. Needs curl on PATH (the script's own prerequisite).
 #
 # Textual gates, so textual limits: gate 2/3 match token spelling, not env reads — a var name in
 # a code comment counts as "exists", and a quoted constant that isn't an env var counts toward
@@ -122,5 +125,36 @@ if command -v bun >/dev/null 2>&1; then
 elif command -v node >/dev/null 2>&1; then
     node -e "$installer_check" || fail=1
 fi
+
+# ---------------------------------------------------------------- gate 7: installer detection matrix (--dry-run)
+# Faked os-release files through the real script, nothing executed: each family must be detected
+# and print its own package-manager line, both for the install and for --uninstall; the unsupported
+# ones must stop with their pointer. A fix to the installer adds its case here.
+osr=$(mktemp -d)
+installer_case() {   # name os-release-body expected-substring [extra args...]
+    name=$1; printf '%b' "$2" > "$osr/$name"; want=$3; shift 3
+    out=$(PUNKTFUNK_INSTALL_OS_RELEASE="$osr/$name" sh scripts/install.sh --dry-run --yes --no-start "$@" 2>&1)
+    case "$out" in *"$want"*) ;; *)
+        echo "::error::scripts/install.sh --dry-run $* on a fake $name os-release did not print '$want':"
+        printf '%s\n' "$out" | sed 's/^/    /'
+        fail=1 ;;
+    esac
+}
+installer_case debian   'ID=debian\nVERSION_ID=13\n'                    'sudo apt install -y punktfunk-host'
+installer_case ubuntu   'ID=ubuntu\nID_LIKE=debian\nVERSION_ID=26.04\n'  'sudo apt install -y punktfunk-host'
+installer_case mint22   'ID=linuxmint\nID_LIKE="ubuntu debian"\nVERSION_ID=22.1\n' 'cannot host'
+installer_case fedora   'ID=fedora\nVERSION_ID=44\n'                    'sudo dnf install -y punktfunk'
+installer_case fedora43 'ID=fedora\nVERSION_ID=43\n'                    '/rpm/bazzite'
+installer_case arch     'ID=arch\n'                                    'sudo pacman -Syu --noconfirm punktfunk-host'
+installer_case cachyos  'ID=cachyos\nID_LIKE="arch"\n'                  'sudo pacman -Syu --noconfirm punktfunk-host'
+installer_case bazzite  'ID=bazzite\nID_LIKE="fedora"\nVERSION_ID=43\n' 'punktfunk-sysext.sh install'
+installer_case nixos    'ID=nixos\n'                                   'docs/nixos'
+installer_case steamos  'ID=steamos\nID_LIKE=arch\n'                    'docs/steamos-host'
+installer_case gentoo   'ID=gentoo\n'                                  'build-from-source'
+installer_case debian-rm 'ID=debian\nVERSION_ID=13\n'                   'sources.list.d/punktfunk.list' --uninstall
+installer_case fedora-rm 'ID=fedora\nVERSION_ID=44\n'                   'yum.repos.d/punktfunk.repo' --uninstall
+installer_case arch-rm   'ID=arch\n'                                   '/etc/pacman.conf' --uninstall
+installer_case bazzite-rm 'ID=bazzite\nID_LIKE="fedora"\nVERSION_ID=43\n' 'punktfunk-sysext remove' --uninstall
+rm -rf "$osr"
 
 exit "$fail"

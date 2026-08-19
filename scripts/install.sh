@@ -31,6 +31,7 @@ LINGER=${PUNKTFUNK_INSTALL_LINGER:-}             # 1/0, empty = ask (default no)
 MGMT_PORT=${PUNKTFUNK_INSTALL_MGMT_PORT:-47991}  # where the management API moves to on a conflict
 START=1
 DRY=${PUNKTFUNK_INSTALL_DRY_RUN:-0}
+UNINSTALL=0
 
 usage() {
     cat <<EOF
@@ -45,6 +46,7 @@ usage: sh install.sh [options]
   --linger | --no-linger           start the host at boot with nobody logged in (default no)
   --mgmt-port N         port to move the management API to if Sunshine/Apollo holds 47990 (default $MGMT_PORT)
   --no-start            install and configure, but don't enable the services
+  --uninstall           stop the services and remove the packages + repo (config stays: $DOCS/uninstall)
   --dry-run             print every command it would run, change nothing
   -h, --help            this text
 
@@ -67,6 +69,7 @@ while [ $# -gt 0 ]; do
         --mgmt-port) shift; MGMT_PORT=${1:-} ;;
         --mgmt-port=*) MGMT_PORT=${1#*=} ;;
         --no-start) START=0 ;;
+        --uninstall) UNINSTALL=1 ;;
         --dry-run) DRY=1 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -106,7 +109,10 @@ run() {
         cmd=$(printf '%s' "$cmd" | sed \
             -e 's/^sudo apt install /sudo apt install -y /' \
             -e 's/^sudo dnf install /sudo dnf install -y /' \
-            -e 's/^sudo pacman -Syu /sudo pacman -Syu --noconfirm /')
+            -e 's/^sudo pacman -Syu /sudo pacman -Syu --noconfirm /' \
+            -e 's/^sudo apt purge /sudo apt purge -y /' \
+            -e 's/^sudo dnf remove /sudo dnf remove -y /' \
+            -e 's/^sudo pacman -Rns /sudo pacman -Rns --noconfirm /')
     fi
     printf '  + %s\n' "$cmd"
     [ "$DRY" = 1 ] && return 0
@@ -171,6 +177,43 @@ else
     die "no package repo for '$PRETTY' yet — $DOCS/build-from-source"
 fi
 say "Detected $PRETTY → $FAMILY (guide: $DOCS_PAGE)"
+
+# ---------------------------------------------------------------------------- --uninstall
+# The reverse of step 1 + step 6, as $DOCS/uninstall spells it out per family: user units off first
+# (package removal can't see the enable symlinks in $HOME), then only the punktfunk packages that
+# are actually installed, then the repo. Config, groups and firewall rules stay — the page lists them.
+if [ "$UNINSTALL" = 1 ]; then
+    say "Uninstalling the host ($DOCS/uninstall)"
+    run 'systemctl --user disable --now punktfunk-host punktfunk-web punktfunk-scripting 2>/dev/null || true'
+    case "$FAMILY" in
+        apt)
+            pkgs=$(dpkg-query -W -f='${Package} ${db:Status-Status}\n' 'punktfunk*' 2>/dev/null | awk '$2=="installed"{printf "%s ", $1}')
+            [ -n "$pkgs" ] && run "sudo apt purge $pkgs"
+            run 'sudo rm -f /etc/apt/sources.list.d/punktfunk.list /etc/apt/keyrings/punktfunk.asc'
+            run 'sudo apt update'
+            ;;
+        dnf)
+            pkgs=$(rpm -qa --qf '%{NAME} ' 'punktfunk*' 2>/dev/null)
+            [ -n "$pkgs" ] && run "sudo dnf remove $pkgs"
+            run 'sudo rm -f /etc/yum.repos.d/punktfunk.repo'
+            ;;
+        pacman)
+            pkgs=$(pacman -Qq 2>/dev/null | grep '^punktfunk' | tr '\n' ' ')
+            [ -n "$pkgs" ] && run "sudo pacman -Rns $pkgs"
+            run "sudo sed -i '/^\\[punktfunk\\(-canary\\)\\{0,1\\}\\]\$/,/^Server = /d' /etc/pacman.conf"
+            ;;
+        sysext)
+            run 'sudo punktfunk-sysext remove'
+            ;;
+    esac
+    cat <<EOF
+
+  Removed. Left on purpose: ~/.config/punktfunk (identity, pairings, host.env, plugins — a reinstall
+  picks them up), the punktfunk / punktfunk-update groups, and any firewall rules you opened.
+  The one-command cleanups for each are on $DOCS/uninstall#linux-hosts
+EOF
+    exit 0
+fi
 
 # Version floors the package can't express: below these the install succeeds and nothing can stream.
 major=${VERSION_ID%%.*}
@@ -361,11 +404,20 @@ if [ "$START" = 1 ] && [ "$DRY" != 1 ]; then
     if command -v ss >/dev/null 2>&1 && ss -lun 2>/dev/null | grep -q ':9777 '; then ok "listening on UDP 9777 (punktfunk/1)"
     else warn "nothing on UDP 9777 yet — give it a second, then: journalctl --user -u punktfunk-host -e"; fi
 fi
-# GPU drivers are the docs pages' job (one step, per distro) — but the one silent failure worth
-# calling out: Fedora + NVIDIA with Fedora's own ffmpeg has no NVENC, and the RPM only Recommends
-# RPM Fusion's build, so the install succeeded and encoding won't.
-if [ "$FAMILY" = dnf ] && grep -qs 0x10de /sys/bus/pci/devices/*/vendor 2>/dev/null && ! rpm -q ffmpeg-libs >/dev/null 2>&1; then
-    warn "NVIDIA GPU, but RPM Fusion's ffmpeg-libs isn't installed — NVENC won't work until it is: step 1 of $DOCS_PAGE"
+# GPU drivers are the docs pages' job (one step, per distro) — but the silent failures worth
+# calling out, because the install succeeded and streaming won't: an NVIDIA card whose kernel
+# module didn't load (Secure Boot blocks the unenrolled key — nvidia-smi can't talk to it), or no
+# driver at all; and Fedora + NVIDIA with Fedora's own ffmpeg, which has no NVENC (the RPM only
+# Recommends RPM Fusion's build).
+if grep -qs 0x10de /sys/bus/pci/devices/*/vendor 2>/dev/null; then
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        warn "NVIDIA GPU without the NVIDIA driver — nothing can encode until it's installed: step 1 of $DOCS_PAGE"
+    elif ! nvidia-smi >/dev/null 2>&1; then
+        warn "NVIDIA GPU, but nvidia-smi can't talk to the driver — the kernel module didn't load (Secure Boot? run: mokutil --sb-state): $DOCS/troubleshooting#nvidia-smi-says-it-cant-communicate-with-the-driver"
+    fi
+    if [ "$FAMILY" = dnf ] && ! rpm -q ffmpeg-libs >/dev/null 2>&1; then
+        warn "NVIDIA GPU, but RPM Fusion's ffmpeg-libs isn't installed — NVENC won't work until it is: step 1 of $DOCS_PAGE"
+    fi
 fi
 ip=$(hostname -I 2>/dev/null | awk '{print $1}')
 [ -n "$ip" ] || ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')

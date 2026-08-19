@@ -23,6 +23,10 @@ Jump to what you installed:
 
 ## Linux hosts
 
+If you installed with the guided script, `sh install.sh --uninstall` runs this section and the
+package removal for your family in one go (fetch it again with `curl -fsSLO https://punktfunk.unom.io/install.sh`);
+what it leaves behind is the same list below.
+
 ### Stop the services first
 
 The Linux packages ship systemd **user** units, and `systemctl --user enable` writes symlinks into

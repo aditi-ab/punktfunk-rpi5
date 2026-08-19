@@ -417,7 +417,7 @@ jobs:
       # oven/bun ships neither git nor a real node, and the slim base has no CA bundle —
       # actions/checkout needs all three (see the web job).
       - name: Install git + node + CA certs
-        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git nodejs
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git nodejs
       - uses: actions/checkout@v4
       # OpenAPI snapshot in sync, PUNKTFUNK_* vars in docs still exist, undocumented-var
       # ratchet (baseline: scripts/ci/docs-undocumented-env-baseline.txt), host-cli.md commands

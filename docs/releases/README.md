@@ -19,7 +19,8 @@ release is born complete and the announcement always has something to say.
    catches renamed knobs and dead links, not a stale sentence). If an install command, repo URL or
    port changed, `data/platforms.json` changed with it — then run `bun run sync-platforms` in
    punktfunk-website and commit, because its download page vendors that file and only refreshes
-   when someone does.
+   when someone does. Same pass for the website itself: does the landing page still describe what
+   this release ships (features, platforms, the blog post the CMS expects per release)?
 2. **Tag & push.** `git tag -a vX.Y.Z … && git push origin vX.Y.Z` fans out to the build
    workflows. Whichever one wins the create race seeds the release body from this file
    (`scripts/ci/gitea-release.sh` → `ensure_release`, and its PowerShell twin). The release page
