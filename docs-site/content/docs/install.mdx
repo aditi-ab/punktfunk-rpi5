@@ -30,13 +30,13 @@ console, and tells you how to pair:
 
 <Installer />
 
-Prefer to read what runs first (it's plain `sh`, ~350 lines):
+Prefer to read what runs first (it's plain `sh`, ~450 lines):
 
 <Installer inspect />
 
 It asks before anything optional (Moonlight compat, the shared clipboard, the `punktfunk` group,
 starting at boot) and every answer has a default, so `sh install.sh --yes` — or piping it with no
-terminal — runs unattended; `--channel canary`, `--mgmt-port`, `--no-start` and the environment
+terminal — runs unattended; `--channel canary`, `--mgmt-port`, `--no-start`, `--uninstall` and the environment
 twins (`PUNKTFUNK_INSTALL_YES`, `PUNKTFUNK_INSTALL_CHANNEL`, `PUNKTFUNK_INSTALL_GAMESTREAM`,
 `PUNKTFUNK_INSTALL_CLIPBOARD`, `PUNKTFUNK_INSTALL_PUNKTFUNK_GROUP`, `PUNKTFUNK_INSTALL_LINGER`,
 `PUNKTFUNK_INSTALL_MGMT_PORT`) are listed by `--help`. It covers Ubuntu/Debian, Fedora, Arch-family

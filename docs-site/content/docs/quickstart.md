@@ -45,6 +45,8 @@ certificate is the host's own, so your browser warns once — continue) and log 
   (SteamOS: the install script printed it; it's in `~/.config/punktfunk/web.env`).
 - **Windows:** the installer showed it on its last page.
 
+![The console sign-in card: one password field](/img/console-login.png)
+
 Lost it? [Forgot your password](/docs/forgot-password). Everything else about the console:
 [The Web Console](/docs/web-console).
 
@@ -54,11 +56,12 @@ On the device you want to stream *to*, install the app — [Install a Client](/d
 has the link for every device (Mac, iPhone/iPad/Apple TV, Linux, Windows, Android, Steam Deck), and
 any Moonlight client works too once you [turn GameStream on](/docs/moonlight).
 
-Open the app: your host is already in the list. Select it and **connect**. Back in the console, the
-device appears under **Pairing → Waiting for approval** — click **Approve** and it's in, no PIN to
-type. (Prefer a PIN? Click **Pair a device** in the console and type the 4-digit code into the
-client.) Pairing happens once; the device reconnects on its own from then on.
-Details: [Pairing & Trust](/docs/pairing).
+Open the app: your host is already in the list. Select it and **connect**, then click **Approve**
+next to the device in the console's **Pairing** page — no PIN to type. (Prefer a PIN? **Pair a device**
+shows a 4-digit code to type into the client.) Pairing happens once; the device reconnects on its
+own from then on. Details: [Pairing & Trust](/docs/pairing).
+
+![The console's Pairing page: two devices waiting for approval, and an armed 4-digit PIN](/img/console-pairing.png)
 
 ## 5. Stream
 

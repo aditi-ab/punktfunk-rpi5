@@ -36,15 +36,15 @@ stream on a host this device already trusts.
 
 ## Choosing access when you admit a device
 
-Approving and deciding what the device may do are one dialog. Alongside the name:
+Approving and deciding what the device may do are one dialog:
 
-- **Access level** — **Full control**, **Controller only**, or **View only** (an **Advanced**
-  expander has the individual toggles — [Access levels](/docs/access-levels)).
-- **Expires** — **Forever**, or 1 h / 4 h / 8 h / custom.
+![Approve this device: name, access level, expiry, and the one-click Approve as guest](/img/console-approve-device.png)
 
-Defaults are *Full control · Forever* — right for your own new laptop. For a friend's device there
-is a one-click **Approve as guest**: Controller only, for 4 hours, then it expires on its own. The
-same two controls sit on the **Pair a device** card, and apply to whichever device completes the PIN.
+The levels are **Full control**, **Controller only** and **View only** (**Advanced** opens the
+individual toggles — [Access levels](/docs/access-levels)); expiry is **Never** or 1 h / 4 h / 8 h /
+custom. The defaults are right for your own new laptop; **Approve as guest** is for a friend's
+device — Controller only, for 4 hours, then it expires on its own. The same two controls sit on the
+**Pair a device** card, and apply to whichever device completes the PIN.
 
 ## Managing paired devices
 
