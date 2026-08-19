@@ -1125,8 +1125,9 @@ fn discover_session_display_env() -> Option<(Option<String>, Option<String>, Opt
 /// ⚠ Only for callers whose timeout answer is the SAFE one. Both current callers time out into
 /// "assume active"/"keep looping", so a miss costs a poll tick. A caller whose timeout would invert
 /// the answer into the refusing direction must NOT use this bound — `loginctl show-user -p Linger`
-/// was given it and became a hard connect failure on a correctly-configured box (see
-/// [`linger_enabled`], now on [`UNIT_QUERY_BUDGET`]): 300 ms is an in-memory-read budget, and
+/// was given it and became a hard connect failure on a correctly-configured box (the linger probe
+/// that produced it is gone with the DM-stop path, but the lesson is not): 300 ms is an
+/// in-memory-read budget, and
 /// anything that spawns a process and makes a D-Bus round trip is not that.
 const UNIT_STATE_BUDGET: Duration = Duration::from_millis(300);
 
@@ -2214,6 +2215,12 @@ fn kill_unit(unit: &str) {
 /// box leaves it (a mid-stream switch to a desktop session), [`lift_autologin_mask`] must lift it, or
 /// the way back is barred until reboot (`--runtime` lives in tmpfs — which is exactly why "it works
 /// again after a reboot").
+/// ⚠ Nothing in the takeover lays a mask any more — it idles the autologin session instead
+/// ([`install_idle_dropin`]), precisely because a masked unit FAILS and a failing unit is what the
+/// display manager relogin-loops against. This is kept for the test that builds the state
+/// [`lift_autologin_mask`] exists to clean up: a takeover adopted from a host old enough to have
+/// masked. That lift is still live code, so the state has to stay constructible.
+#[cfg(test)]
 fn mask_unit(unit: &str) {
     let _ = crate::proc::status_within(
         Command::new("systemctl").args(["--user", "mask", "--runtime", unit]),
@@ -2702,120 +2709,9 @@ fn systemctl_system(args: &[&str]) -> bool {
     out.status.success()
 }
 
-/// Would stopping the display manager also stop US? A packaged host runs as a `systemd --user`
-/// unit, so its lifetime hangs off the user manager — and the DM stop ends the user's last login
-/// session. logind then stops `user@<uid>.service` once `UserStopDelaySec` (10 s by default)
-/// elapses, taking the host with it: the stream dies mid-takeover, and nothing is left to restart
-/// the display manager, so the box stays dark until someone reaches a VT. **Field-proven on 0.20.0**
-/// (Nobara, 2026-07-27): DM stopped at 12:34:18.9, the user manager stopped the host at 12:34:29.0
-/// — 10.1 s, textbook `UserStopDelaySec`. It never showed on the repro VM because lingering was
-/// enabled there for the sessionless tests.
-///
-/// Lingering (`loginctl enable-linger` — which the KDE/GNOME/Arch setup docs already ask for) is
-/// what breaks the dependency: logind keeps the user manager up with no session at all. So ensure
-/// it BEFORE touching the DM, and refuse the takeover when it can't be ensured — the caller then
-/// degrades to attach, which mirrors the box's own session and never stops the DM.
-///
-/// `Err` carries **why** it could not be ensured, because the helper path is reached here first:
-/// on a sessionless host the `linger` verb goes through the same [`dm_helper`] gate the `stop`
-/// verb does, so a user outside the `punktfunk` group fails at THIS step and never reaches the
-/// DM-stop one. Dropping the reason here would just move the misdiagnosis one message earlier.
-fn ensure_host_survives_dm_stop() -> std::result::Result<(), String> {
-    if !host_is_under_user_manager() {
-        return Ok(()); // root / a system unit — the DM stop cannot reach us
-    }
-    if linger_enabled() {
-        return Ok(());
-    }
-    // `set-self-linger` is `allow_active` in logind's own policy, so a host started inside the
-    // user's session can do this itself; a sessionless one (the packaged unit) goes through the
-    // helper, whose grant is scoped to the calling uid.
-    let uid = uid_string();
-    let _ = crate::proc::status_within(
-        Command::new("loginctl").args(["--no-ask-password", "enable-linger", &uid]),
-        UNIT_QUERY_BUDGET,
-    );
-    let helper = if linger_enabled() {
-        Ok(()) // the plain verb was enough — the helper was never needed
-    } else {
-        dm_helper("linger").map_err(|e| e.to_string())
-    };
-    match helper {
-        Ok(()) if linger_enabled() => {
-            tracing::info!(
-                uid,
-                "enabled lingering for this user — the managed takeover stops the display manager, \
-                 which ends this login session, and without lingering logind would stop the host \
-                 along with it (`loginctl disable-linger` reverts it)"
-            );
-            Ok(())
-        }
-        // The verb reported success and `loginctl` still says no: not a privilege problem, so say
-        // that instead of blaming the grant the operator would then go and re-check.
-        Ok(()) => Err(format!(
-            "`loginctl enable-linger {uid}` reported success but lingering is still off"
-        )),
-        Err(why) => Err(why),
-    }
-}
-
-/// Is this process's lifetime tied to a `systemd --user` manager (i.e. would logind's user-manager
-/// stop take us down)? Read from our own cgroup path.
-fn host_is_under_user_manager() -> bool {
-    std::fs::read_to_string("/proc/self/cgroup")
-        .as_deref()
-        .map(cgroup_under_user_manager)
-        .unwrap_or(false)
-}
-
-/// [`host_is_under_user_manager`]'s test: does this `/proc/self/cgroup` content sit under a
-/// `user@<uid>.service` manager? Pure + unit-tested. A system unit
-/// (`/system.slice/punktfunk-host.service`) does not, and neither does a bare process started from
-/// a login shell (`/user.slice/user-1000.slice/session-2.scope`) — logind's user-manager stop only
-/// reaches units the user manager owns.
-fn cgroup_under_user_manager(cgroup: &str) -> bool {
-    cgroup.contains("user@")
-}
-
 /// Our uid as a string — what `loginctl` wants for a user argument.
 fn uid_string() -> String {
     crate::proc::current_uid().to_string()
-}
-
-/// Is lingering on for this user (logind keeps the `--user` manager alive with no session)? An
-/// unanswered one reads as "not lingering", which refuses the takeover rather than risking the DM
-/// stop taking the host down with it.
-///
-/// [`UNIT_QUERY_BUDGET`], not [`UNIT_STATE_BUDGET`], and the failure DIRECTION is why. The 300 ms
-/// bound is documented as "anything near it means the manager is wedged — the case each caller's
-/// failure path already covers", and that holds for the other two callers, whose timeout answers
-/// `true`/keep-looping (benign). Here a timeout INVERTS the answer to `false`, and `false` is the
-/// refusing direction: `ensure_host_survives_dm_stop` then reports "`enable-linger` reported success
-/// but lingering is still off" and the bare-spawn Steam path fails a connect that would have worked,
-/// blaming a lingering configuration that is in fact correct. And this is not an in-memory read the
-/// way `systemctl is-active` is: it is a process spawn plus libsystemd's dynamic link plus a logind
-/// D-Bus round trip, sampled at the busiest moment on the box (a takeover, with Steam and a
-/// compositor being torn down). Only a genuinely wedged logind exceeds 5 s.
-fn linger_enabled() -> bool {
-    crate::proc::output_within(
-        Command::new("loginctl").args(["show-user", &uid_string(), "-p", "Linger", "--value"]),
-        UNIT_QUERY_BUDGET,
-    )
-    .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "yes")
-    .unwrap_or(false)
-}
-
-/// Stop the display manager for a takeover on a mask-fragile DM flavor. Plain `systemctl stop` on
-/// the SYSTEM bus first — succeeds as root or under an operator polkit rule scoped to the DM unit
-/// (see docs); fails cleanly otherwise ("interactive authentication required") — then the
-/// packaged pkexec helper. The `Err` is the HELPER's reason (the plain verb's failure is expected
-/// and carries no information: an unprivileged host is meant to fail it), and the caller puts it
-/// in front of the operator instead of guessing.
-fn try_stop_display_manager(dm: &str) -> std::result::Result<(), DmHelperError> {
-    if systemctl_system(&["stop", dm]) {
-        return Ok(());
-    }
-    dm_helper("stop")
 }
 
 /// Restore the display manager: `reset-failed` (a relogin loop may have tripped the unit's start
@@ -5336,15 +5232,14 @@ impl Drop for GamescopeProc {
 mod tests {
     use super::{
         any_output_size_is, cancel_pending_restore, cgroup_is_punktfunk_owned,
-        cgroup_under_user_manager, classify_output_size, connected_connector_under,
-        display_manager_unit_under, dm_plan, game_hz, gamescope_output_size, hdr_args,
-        is_steam_launch, mask_unit, missing_flags, mode_mismatch, nested_wrapper_script,
-        our_wsi_layer_dir, plan_bind, release_autologin_mask, script_hardcodes_gamescope,
-        sentinel_advanced, shape_dedicated_command, switch_ends_mask_window,
-        takeover_state_is_live, unmask_unit, xwayland_refusal_marker, BindOff, BindPlan,
-        BoxOutputSize, DmHelperError, SessionBind, TakeoverState, WsiPlan, AUTOLOGIN_MASKED,
-        DISTRO_GAMESCOPE_PATH, PENDING_RESTORE, RESTORE_FLIGHT, STOPPED_AUTOLOGIN, WSI_OFF_ENV,
-        X11_SOCKET_DIR,
+        classify_output_size, connected_connector_under, display_manager_unit_under, dm_plan,
+        game_hz, gamescope_output_size, hdr_args, is_steam_launch, mask_unit, missing_flags,
+        mode_mismatch, nested_wrapper_script, our_wsi_layer_dir, plan_bind, release_autologin_mask,
+        script_hardcodes_gamescope, sentinel_advanced, shape_dedicated_command,
+        switch_ends_mask_window, takeover_state_is_live, unmask_unit, xwayland_refusal_marker,
+        BindOff, BindPlan, BoxOutputSize, DmHelperError, SessionBind, TakeoverState, WsiPlan,
+        AUTOLOGIN_MASKED, DISTRO_GAMESCOPE_PATH, PENDING_RESTORE, RESTORE_FLIGHT,
+        STOPPED_AUTOLOGIN, WSI_OFF_ENV, X11_SOCKET_DIR,
     };
     use std::time::{Duration, Instant};
 
@@ -5517,26 +5412,6 @@ mod tests {
             "without the force flag the headless connector reports no HDR support, so the WSI \
              layer advertises no HDR surfaces and games render SDR"
         );
-    }
-
-    #[test]
-    fn user_manager_lifetime_detection() {
-        // The packaged host: a `--user` unit, so logind's user-manager stop takes it down with the
-        // login session the DM stop ends — this is the case that needs lingering.
-        assert!(cgroup_under_user_manager(
-            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/punktfunk-host.service\n"
-        ));
-        assert!(cgroup_under_user_manager(
-            "0::/user.slice/user-1000.slice/user@1000.service/session.slice/punktfunk-gamescope.service\n"
-        ));
-        // A system unit outlives every session — the DM stop cannot reach it.
-        assert!(!cgroup_under_user_manager(
-            "0::/system.slice/punktfunk-host.service\n"
-        ));
-        // Started from a login shell: owned by the session scope, not the user manager.
-        assert!(!cgroup_under_user_manager(
-            "0::/user.slice/user-1000.slice/session-2.scope\n"
-        ));
     }
 
     #[test]
