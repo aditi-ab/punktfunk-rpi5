@@ -1,0 +1,3 @@
+• The controller interface is now the same console the desktop app shows — on every phone and TV, 32-bit boxes included — with a Controllers page of its own.
+• A much faster picture: frames land on the panel's real timing, so on the reference phone latency fell from 30 to about 18 ms and dropped frames from 40–50 a second to none.
+• Fixed: the gamepad going dead after opening Controllers or Licences, a grey screen when the console could not draw, and audio gaps when the buffer needed to grow.
