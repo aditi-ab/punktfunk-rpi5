@@ -173,7 +173,19 @@ jobs:
       # with "no space left on device" mid-`bun install`), and a Nix build is the heaviest thing
       # here — so record the headroom, or a future failure is a guess.
       - name: Environment
-        run: df -h / /nix /tmp || true
+        # Disk AND memory. This job's recurring failure is an OOM kill, and `df` cannot explain
+        # one — a run that dies at exit 137 with only disk numbers in the log is a guess.
+        run: |
+          df -h / /nix /tmp || true
+          free -h 2>/dev/null || grep -E '^(MemTotal|MemAvailable|SwapTotal)' /proc/meminfo || true
+          nproc 2>/dev/null || true
+          # THE number for this job's recurring exit 137. `free` and /proc/meminfo report the HOST
+          # inside a container, so they showed 125Gi total / 48Gi available on a run that then got
+          # bun SIGKILLed (19444) — a cgroup cap is invisible to them and is the only remaining
+          # explanation. cgroup v2 first, then v1; "max" means uncapped.
+          cat /sys/fs/cgroup/memory.max 2>/dev/null \
+            || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null \
+            || echo "no cgroup memory limit readable"
 
       # Evaluates + instantiates every flake output without building any of it.
       - name: nix flake check (eval only)
