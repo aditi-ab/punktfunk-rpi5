@@ -68,15 +68,7 @@ impl Shell {
         let takeover: Option<(f64, bool, String, String, Vec<Hint>)> =
             if let Some(c) = &mut self.connecting {
                 c.appear = approach(c.appear, 1.0, dt, 0.07);
-                if c.canceling {
-                    Some((
-                        c.appear,
-                        true,
-                        "Canceling…".to_string(),
-                        String::new(),
-                        vec![],
-                    ))
-                } else if c.request_access {
+                if c.request_access {
                     Some((
                         c.appear,
                         true,

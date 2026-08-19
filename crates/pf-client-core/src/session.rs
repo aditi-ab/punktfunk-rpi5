@@ -883,6 +883,12 @@ fn pump(
         params.pin,
         Some(params.identity),
         params.connect_timeout,
+        // THE session's stop flag, so the embedder's cancel reaches a dial that has not landed
+        // yet. Without it this call parks the pump thread for the whole budget — 185 s on a
+        // request-access connect the host holds pending approval — and the embedder's cancel
+        // could not be answered until it returned: the console's takeover sat on "Canceling…"
+        // with no session event to clear it.
+        Some(stop.clone()),
     ) {
         Ok(c) => Arc::new(c),
         Err(e) => {

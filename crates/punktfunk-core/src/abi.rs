@@ -2619,6 +2619,10 @@ unsafe fn connect_ex_impl(
             pin,
             identity,
             std::time::Duration::from_millis(timeout_ms as u64),
+            // No abort switch in the C ABI: `punktfunk_connect*` is a blocking call with
+            // nothing to poll a flag from. An `ex` variant can take one when an ABI embedder
+            // grows a cancelable connect screen.
+            None,
         ) {
             Ok(c) => {
                 if !observed_sha256_out.is_null() {
