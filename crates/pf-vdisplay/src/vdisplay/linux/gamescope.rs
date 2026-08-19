@@ -128,6 +128,11 @@ static STOPPED_DM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None
 /// [`restore_takeover_on_startup`] sets it for a stranded takeover it adopts: unmasking a unit we
 /// never masked is a no-op, while missing one that IS masked leaves the box unable to enter its
 /// own Game Mode until reboot.
+///
+/// ⚠ The takeover itself no longer masks anything — it idles the autologin session instead
+/// ([`install_idle_dropin`]), because a masked unit FAILS and a failing unit is what the display
+/// manager relogin-loops against. So this is now only ever true for a takeover adopted from a
+/// host old enough to have laid one, and the lift paths stay for exactly that box.
 static AUTOLOGIN_MASKED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 /// mtime of the `steamos-session-select` sentinel as of the takeover — the baseline the in-stream
@@ -157,6 +162,10 @@ static SWITCH_HONORED_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::
 /// How long after honoring an in-stream desktop switch the managed path refuses to relaunch,
 /// giving the DM's desktop session time to come up so re-detection follows it instead.
 const SWITCH_HONOR_GRACE: Duration = Duration::from_secs(120);
+
+/// Whether [`install_idle_dropin`] has one outstanding. Process memory only — the sweep in
+/// [`restore_takeover_on_startup`] is what covers a host that died holding one.
+static IDLE_DROPIN_ARMED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 /// A pending debounced TV-session restore: the instant [`do_restore_tv_session`] should fire after
 /// the last client disconnect. A reconnect inside the window clears it (and reuses the still-warm
@@ -372,6 +381,15 @@ pub fn restore_takeover_on_startup() {
              everything it binds lives in tmpfs, so after a reboot that unit could not start at all"
         );
         systemctl_user(&["daemon-reload"]);
+    }
+    // Same shape, same reason: a host that died mid-stream leaves the box's Game Mode replaced by
+    // a session that does nothing at all, which looks exactly like broken hardware. Runtime-dir
+    // state, so a reboot clears it too — this covers the restart that does not.
+    if remove_idle_dropin() {
+        tracing::warn!(
+            "gamescope: removed a leftover idle drop-in from a previous host instance — the box's \
+             own Game Mode session would have started and then done nothing"
+        );
     }
     let Ok(bytes) = std::fs::read(takeover_state_path()) else {
         return; // no takeover file — clean start
@@ -1107,8 +1125,9 @@ fn discover_session_display_env() -> Option<(Option<String>, Option<String>, Opt
 /// ⚠ Only for callers whose timeout answer is the SAFE one. Both current callers time out into
 /// "assume active"/"keep looping", so a miss costs a poll tick. A caller whose timeout would invert
 /// the answer into the refusing direction must NOT use this bound — `loginctl show-user -p Linger`
-/// was given it and became a hard connect failure on a correctly-configured box (see
-/// [`linger_enabled`], now on [`UNIT_QUERY_BUDGET`]): 300 ms is an in-memory-read budget, and
+/// was given it and became a hard connect failure on a correctly-configured box (the linger probe
+/// that produced it is gone with the DM-stop path, but the lesson is not): 300 ms is an
+/// in-memory-read budget, and
 /// anything that spawns a process and makes a D-Bus round trip is not that.
 const UNIT_STATE_BUDGET: Duration = Duration::from_millis(300);
 
@@ -1285,6 +1304,74 @@ fn legacy_session_plus_dropin_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/deck".to_string());
     std::path::Path::new(&home)
         .join(".config/systemd/user/gamescope-session-plus@.service.d/zz-punktfunk-bind.conf")
+}
+
+/// Where the takeover's IDLE drop-in lives. Same runtime-dir argument as
+/// [`session_plus_dropin_path`], and here it is the safety property the mechanism rests on rather
+/// than a tidiness one: this drop-in replaces the box's game-mode `ExecStart`, so a copy that
+/// outlived the host would leave the box unable to enter Game Mode at all. Under
+/// `$XDG_RUNTIME_DIR` it dies with the login session, and a reboot restores game mode by itself —
+/// on top of the unconditional sweep [`restore_takeover_on_startup`] does.
+fn idle_dropin_path() -> std::path::PathBuf {
+    let base = crate::session::runtime_dir();
+    std::path::Path::new(&base)
+        .join("systemd/user/gamescope-session-plus@.service.d/zz-punktfunk-idle.conf")
+}
+
+/// `sleep`'s path on this box. The idle `ExecStart` must not be a command that can fail to
+/// EXECUTE: a unit that dies on start is precisely the relogin storm this drop-in exists to avoid
+/// ([`mask_unit`] has that chain), so resolve it instead of hardcoding one distro's layout.
+fn sleep_binary() -> &'static str {
+    ["/usr/bin/sleep", "/bin/sleep"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .unwrap_or("/usr/bin/sleep")
+}
+
+/// Idle the box's autologin game session for the stream's duration: a drop-in over the
+/// `gamescope-session-plus@` TEMPLATE (so it reaches whichever instance this box autologs into)
+/// that replaces `ExecStart` with a process which merely sleeps.
+///
+/// This is what the takeover uses INSTEAD of stopping the display manager, and it satisfies all
+/// three things that path has to get right at once. Steam is freed (the session runs nothing).
+/// The DM does not storm: its autologin still SUCCEEDS, so there is no failed session to relogin
+/// against — unlike a masked unit, which fails in milliseconds and is the storm's engine. And the
+/// box keeps a live display manager, so a session switch the user asks for can still be serviced;
+/// that is the one a stopped DM could not, and it stranded `.41` on Steam's "Switch to Desktop"
+/// modal until a reboot.
+///
+/// Measured on that box: with this installed, `steam` is down, `sddm` stays active, the unit sits
+/// `active (running)` with `NRestarts=0`, and a subsequent `switch-to-desktop-mode` brings Plasma
+/// up in ~10 s.
+fn install_idle_dropin() -> Result<()> {
+    let path = idle_dropin_path();
+    let dir = path
+        .parent()
+        .context("the idle drop-in path has no parent directory")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    std::fs::write(
+        &path,
+        format!(
+            "[Service]\nExecStart=\nExecStart={} infinity\n",
+            sleep_binary()
+        ),
+    )
+    .with_context(|| format!("write {}", path.display()))?;
+    systemctl_user(&["daemon-reload"]);
+    *IDLE_DROPIN_ARMED.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    Ok(())
+}
+
+/// Remove the idle drop-in so the box's own Game Mode runs for real again; reports whether one was
+/// there. Deliberately NOT gated on [`IDLE_DROPIN_ARMED`] — the flag is this process's memory, and
+/// the drop-in outliving a host that died is exactly the case that has to be swept.
+fn remove_idle_dropin() -> bool {
+    let removed = std::fs::remove_file(idle_dropin_path()).is_ok();
+    *IDLE_DROPIN_ARMED.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    if removed {
+        systemctl_user(&["daemon-reload"]);
+    }
+    removed
 }
 
 /// Write the box-session drop-in carrying the same two fixes the transient path gets: the bind, and
@@ -2128,6 +2215,12 @@ fn kill_unit(unit: &str) {
 /// box leaves it (a mid-stream switch to a desktop session), [`lift_autologin_mask`] must lift it, or
 /// the way back is barred until reboot (`--runtime` lives in tmpfs — which is exactly why "it works
 /// again after a reboot").
+/// ⚠ Nothing in the takeover lays a mask any more — it idles the autologin session instead
+/// ([`install_idle_dropin`]), precisely because a masked unit FAILS and a failing unit is what the
+/// display manager relogin-loops against. This is kept for the test that builds the state
+/// [`lift_autologin_mask`] exists to clean up: a takeover adopted from a host old enough to have
+/// masked. That lift is still live code, so the state has to stay constructible.
+#[cfg(test)]
 fn mask_unit(unit: &str) {
     let _ = crate::proc::status_within(
         Command::new("systemctl").args(["--user", "mask", "--runtime", unit]),
@@ -2230,16 +2323,24 @@ struct DmPlan {
     /// no Steam, masking them while a DM is up is the relogin storm ([`mask_unit`]), and stopping
     /// the DM would kill the user's live desktop for it.
     skip: bool,
-    /// Stop the DM for the stream's duration (only a live instance justifies it). Masking is not
-    /// a plan input: it is laid only once this stop has LANDED, so it can never substitute for it.
-    stop_dm: bool,
+    /// A display manager drives this LIVE gaming session, so its autologin brings the session
+    /// straight back the moment we free Steam. That is what the idle drop-in answers
+    /// ([`install_idle_dropin`]) — not, any longer, stopping the DM.
+    ///
+    /// Stopping it satisfied the same requirement and broke a different one: a box with no DM has
+    /// nothing that can start a desktop session, so the user's own "Switch to Desktop" hung on
+    /// Steam's modal until a reboot (field report 2026-08-18). It hung UNDETECTABLY, which is why
+    /// no amount of watching fixes it: on a `steamos-manager` box the switch is a D-Bus call whose
+    /// every trace — the sddm state file, the session units, the login mode — is written by the
+    /// display manager we had just stopped. Leave the DM up and there is nothing to detect.
+    dm_relogins: bool,
 }
 
 /// See [`DmPlan`].
 fn dm_plan(dm: Option<&str>, any_live: bool) -> DmPlan {
     DmPlan {
         skip: !any_live,
-        stop_dm: dm.is_some() && any_live,
+        dm_relogins: dm.is_some() && any_live,
     }
 }
 
@@ -2608,120 +2709,9 @@ fn systemctl_system(args: &[&str]) -> bool {
     out.status.success()
 }
 
-/// Would stopping the display manager also stop US? A packaged host runs as a `systemd --user`
-/// unit, so its lifetime hangs off the user manager — and the DM stop ends the user's last login
-/// session. logind then stops `user@<uid>.service` once `UserStopDelaySec` (10 s by default)
-/// elapses, taking the host with it: the stream dies mid-takeover, and nothing is left to restart
-/// the display manager, so the box stays dark until someone reaches a VT. **Field-proven on 0.20.0**
-/// (Nobara, 2026-07-27): DM stopped at 12:34:18.9, the user manager stopped the host at 12:34:29.0
-/// — 10.1 s, textbook `UserStopDelaySec`. It never showed on the repro VM because lingering was
-/// enabled there for the sessionless tests.
-///
-/// Lingering (`loginctl enable-linger` — which the KDE/GNOME/Arch setup docs already ask for) is
-/// what breaks the dependency: logind keeps the user manager up with no session at all. So ensure
-/// it BEFORE touching the DM, and refuse the takeover when it can't be ensured — the caller then
-/// degrades to attach, which mirrors the box's own session and never stops the DM.
-///
-/// `Err` carries **why** it could not be ensured, because the helper path is reached here first:
-/// on a sessionless host the `linger` verb goes through the same [`dm_helper`] gate the `stop`
-/// verb does, so a user outside the `punktfunk` group fails at THIS step and never reaches the
-/// DM-stop one. Dropping the reason here would just move the misdiagnosis one message earlier.
-fn ensure_host_survives_dm_stop() -> std::result::Result<(), String> {
-    if !host_is_under_user_manager() {
-        return Ok(()); // root / a system unit — the DM stop cannot reach us
-    }
-    if linger_enabled() {
-        return Ok(());
-    }
-    // `set-self-linger` is `allow_active` in logind's own policy, so a host started inside the
-    // user's session can do this itself; a sessionless one (the packaged unit) goes through the
-    // helper, whose grant is scoped to the calling uid.
-    let uid = uid_string();
-    let _ = crate::proc::status_within(
-        Command::new("loginctl").args(["--no-ask-password", "enable-linger", &uid]),
-        UNIT_QUERY_BUDGET,
-    );
-    let helper = if linger_enabled() {
-        Ok(()) // the plain verb was enough — the helper was never needed
-    } else {
-        dm_helper("linger").map_err(|e| e.to_string())
-    };
-    match helper {
-        Ok(()) if linger_enabled() => {
-            tracing::info!(
-                uid,
-                "enabled lingering for this user — the managed takeover stops the display manager, \
-                 which ends this login session, and without lingering logind would stop the host \
-                 along with it (`loginctl disable-linger` reverts it)"
-            );
-            Ok(())
-        }
-        // The verb reported success and `loginctl` still says no: not a privilege problem, so say
-        // that instead of blaming the grant the operator would then go and re-check.
-        Ok(()) => Err(format!(
-            "`loginctl enable-linger {uid}` reported success but lingering is still off"
-        )),
-        Err(why) => Err(why),
-    }
-}
-
-/// Is this process's lifetime tied to a `systemd --user` manager (i.e. would logind's user-manager
-/// stop take us down)? Read from our own cgroup path.
-fn host_is_under_user_manager() -> bool {
-    std::fs::read_to_string("/proc/self/cgroup")
-        .as_deref()
-        .map(cgroup_under_user_manager)
-        .unwrap_or(false)
-}
-
-/// [`host_is_under_user_manager`]'s test: does this `/proc/self/cgroup` content sit under a
-/// `user@<uid>.service` manager? Pure + unit-tested. A system unit
-/// (`/system.slice/punktfunk-host.service`) does not, and neither does a bare process started from
-/// a login shell (`/user.slice/user-1000.slice/session-2.scope`) — logind's user-manager stop only
-/// reaches units the user manager owns.
-fn cgroup_under_user_manager(cgroup: &str) -> bool {
-    cgroup.contains("user@")
-}
-
 /// Our uid as a string — what `loginctl` wants for a user argument.
 fn uid_string() -> String {
     crate::proc::current_uid().to_string()
-}
-
-/// Is lingering on for this user (logind keeps the `--user` manager alive with no session)? An
-/// unanswered one reads as "not lingering", which refuses the takeover rather than risking the DM
-/// stop taking the host down with it.
-///
-/// [`UNIT_QUERY_BUDGET`], not [`UNIT_STATE_BUDGET`], and the failure DIRECTION is why. The 300 ms
-/// bound is documented as "anything near it means the manager is wedged — the case each caller's
-/// failure path already covers", and that holds for the other two callers, whose timeout answers
-/// `true`/keep-looping (benign). Here a timeout INVERTS the answer to `false`, and `false` is the
-/// refusing direction: `ensure_host_survives_dm_stop` then reports "`enable-linger` reported success
-/// but lingering is still off" and the bare-spawn Steam path fails a connect that would have worked,
-/// blaming a lingering configuration that is in fact correct. And this is not an in-memory read the
-/// way `systemctl is-active` is: it is a process spawn plus libsystemd's dynamic link plus a logind
-/// D-Bus round trip, sampled at the busiest moment on the box (a takeover, with Steam and a
-/// compositor being torn down). Only a genuinely wedged logind exceeds 5 s.
-fn linger_enabled() -> bool {
-    crate::proc::output_within(
-        Command::new("loginctl").args(["show-user", &uid_string(), "-p", "Linger", "--value"]),
-        UNIT_QUERY_BUDGET,
-    )
-    .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "yes")
-    .unwrap_or(false)
-}
-
-/// Stop the display manager for a takeover on a mask-fragile DM flavor. Plain `systemctl stop` on
-/// the SYSTEM bus first — succeeds as root or under an operator polkit rule scoped to the DM unit
-/// (see docs); fails cleanly otherwise ("interactive authentication required") — then the
-/// packaged pkexec helper. The `Err` is the HELPER's reason (the plain verb's failure is expected
-/// and carries no information: an unprivileged host is meant to fail it), and the caller puts it
-/// in front of the operator instead of guessing.
-fn try_stop_display_manager(dm: &str) -> std::result::Result<(), DmHelperError> {
-    if systemctl_system(&["stop", dm]) {
-        return Ok(());
-    }
-    dm_helper("stop")
 }
 
 /// Restore the display manager: `reset-failed` (a relogin loop may have tripped the unit's start
@@ -2974,88 +2964,37 @@ fn stop_autologin_sessions() -> Result<()> {
     if plan.skip {
         return Ok(());
     }
-    if plan.stop_dm {
-        let dm = dm.expect("stop_dm ⇒ Some");
-        // The DM stop ends this user's last login session. If our own lifetime hangs off the user
-        // manager and lingering can't be turned on, that stop kills the host ~10s later — with the
-        // box's display manager down and nobody left to bring it back.
-        //
-        // BOTH arms below now BAIL, on every DM flavor. They did not always: SDDM used to degrade
-        // to mask-only here, on the reasoning that the mask still protects Steam and the cost is
-        // just relogin churn. It is not just churn — the mask is IN sddm's relogin path, so a
-        // mask without the stop is a 4–5 logins/s fork storm that drops the pad from 250 Hz to
-        // 1.4 Hz ([`mask_unit`]). Degrading to attach costs the client's mode; degrading to
-        // mask-only costs the user their input plane. Attach wins.
-        //
-        // Both bails quote the REASON they were handed rather than describing one.
-        // 0.26.0/0.27.0 described one — "the packaged pf-dm-helper polkit action is missing or was
-        // denied (reinstall the punktfunk package, or install the display-manager polkit rule from
-        // the docs)" — and on the box that produced it the action was installed, permissive,
-        // correctly annotated, and pkexec had already RUN the helper; the helper's refusal ("user
-        // 'x' is not in the 'punktfunk' group") was thrown away with its stderr. Both suggested
-        // remedies were dead ends: neither a reinstall nor a polkit rule adds anyone to a group.
-        if let Err(why) = ensure_host_survives_dm_stop() {
-            // The reason goes LAST in both bails: the helper's own refusal ends in a command
-            // to paste, and burying that mid-sentence is how it stops being read.
-            bail!(
-                "stopping {dm} ends this user's last login session, and without lingering \
-                 logind would stop the user manager — and this host with it — about 10s \
-                 later, leaving the box with no display manager and nothing to restore it; \
-                 lingering could not be enabled, so the managed takeover is unavailable. \
-                 Either run `sudo loginctl enable-linger $USER` once, as the setup docs ask, \
-                 and reconnect — or fix the privileged path: {why}"
-            );
-        }
-        if let Err(why) = try_stop_display_manager(&dm) {
-            // ERROR, not WARN, and it names the SHAPE: this is the branch whose silence cost an
-            // evening on .41 — the takeover degraded, nothing failed loudly, and the storm that
-            // followed read as a pad bug. The `bail!` below reaches the caller's own warn line;
-            // this one exists so the shape survives into the journal even if the caller's does
-            // not, because the four shapes need four different fixes.
-            tracing::error!(
-                %dm,
-                shape = why.shape(),
-                reason = %why,
-                "the managed takeover planned to stop the display manager and could not — \
-                 degrading to ATTACH rather than fighting its autologin: a killed session under \
-                 a running DM relogin-loops at 4-5/s and starves the box's input plane"
-            );
-            bail!(
-                "the box's gaming session is driven by {dm}, and stopping it for the stream needs \
-                 privilege this host does not have; taking over without stopping it would leave \
-                 its autologin relogin-looping against us for the whole stream, so the managed \
-                 takeover is unavailable — {why}"
-            );
-        }
-        tracing::info!(
-            %dm,
-            "freed Steam: stopped the display manager for this stream (its autologin \
-             Relogin loop would otherwise churn against the takeover)"
-        );
-        // Baseline the switch sentinel HERE, not just at a successful launch: setting
-        // STOPPED_DM is what arms the honor gate, so from this instant an unbaselined
-        // sentinel would read as an in-stream "Switch to Desktop" — including the write from
-        // the switch that just brought the box INTO game mode. A successful launch
-        // re-baselines (tighter still).
-        record_session_select_baseline();
-        *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()) = Some(dm);
+    // Already idled by an earlier connect in this stream's life? Then the session listed as "live"
+    // above is our own idled one — it holds no Steam and there is nothing left to free. Without
+    // this, every reconnect and every in-place rebuild would kill and restart the box's session
+    // again to accomplish exactly nothing.
+    if *IDLE_DROPIN_ARMED.lock().unwrap_or_else(|e| e.into_inner()) {
+        return Ok(());
     }
-    // Reaching here means no display manager can relogin against us: either there is none
-    // (`!plan.stop_dm` with `dm == None`), or the stop above LANDED — both failure arms bail. That
-    // is the precondition the mask needs, and the only one under which it is a defense rather than
-    // the storm's accelerator ([`mask_unit`]).
+    // The display manager STAYS UP. Freeing Steam means ending the session its autologin owns, and
+    // the two ways to stop that autologin fighting us are not equivalent: stopping the DM works
+    // until the user asks for a desktop session, at which point nothing on the box can give them
+    // one ([`DmPlan::dm_relogins`]). Idling the session instead keeps the autologin succeeding —
+    // no failed unit to relogin against, no storm — while leaving the DM able to service that
+    // switch.
+    if plan.dm_relogins {
+        install_idle_dropin().context("idling the box's autologin game session for the stream")?;
+    }
     let units: Vec<String> = listed.into_iter().map(|(u, _)| u).collect();
     let mut stopped = Vec::new();
-    // Record that a mask is outstanding BEFORE laying it: every hand-back path lifts it off this
-    // flag, and one that ran between the mask and an unrecorded flag would leave it on forever.
-    *AUTOLOGIN_MASKED.lock().unwrap_or_else(|e| e.into_inner()) = true;
     for unit in units {
-        mask_unit(&unit); // belt-and-braces: no DM is up to relogin through it
         kill_unit(&unit); // SIGKILL teardown — avoid the F44 GPU-context leak
+        if plan.dm_relogins {
+            // Bring it back ourselves rather than waiting for the DM to notice: deterministic, and
+            // it closes the window in which the DM sees a dead session and starts churning. The
+            // drop-in above is already loaded, so what comes back runs nothing.
+            systemctl_user(&["restart", &unit]);
+        }
         tracing::info!(
             %unit,
-            dm_stopped = plan.stop_dm,
-            "freed Steam: masked and stopped the autologin gaming session for this stream"
+            idled = plan.dm_relogins,
+            "freed Steam: the box's autologin gaming session is idled for this stream (its \
+             display manager stays up, so the box can still switch sessions)"
         );
         stopped.push(unit);
     }
@@ -3591,6 +3530,17 @@ fn do_restore_tv_session() {
     // rests on. It used to sit after the desktop-active and DM returns, so those two paths leaked
     // it.
     disarm_session_plus_dropin();
+    // The idle drop-in belongs to the same rule and leaks the same way — worse, in fact: the bind
+    // one leaves the box's Game Mode running OUR gamescope, this one leaves it running NOTHING.
+    // The desktop-active return below is the live case (the user switched away, so we never
+    // restart the units), and a drop-in left there is a box whose Game Mode silently does nothing
+    // for the rest of the login.
+    if remove_idle_dropin() {
+        tracing::info!(
+            "gamescope: removed the takeover's idle drop-in — the box's own Game Mode runs for \
+             real again"
+        );
+    }
     unset_forced_session_screen_env();
     // Only bring the gaming autologin BACK if the box is still meant to be in gaming mode. If the
     // user switched to a desktop session (KDE/GNOME/wlroots/Hyprland) in the meantime, don't yank
@@ -3648,12 +3598,16 @@ fn do_restore_tv_session() {
         clear_takeover();
         return;
     }
+    // (The idle drop-in is already gone — removed above every early return, so the restarts
+    // below bring the box's real session back rather than another idle one.)
     for unit in units {
         // Checked, not discarded: this call and the SteamOS `restart` above were the two places
         // that logged an unconditional success over a thrown-away exit status. A `--user start`
         // fails for reasons an operator can act on (the unit is masked, its start limit tripped),
         // and the DM branch thirty lines up already shows the shape — say what happened.
-        match issue_restore_verb(&["start", &unit]) {
+        // `restart`, not `start`: the idle takeover leaves the unit ACTIVE, and `start` on an
+        // active unit is a no-op that would report success over a session still running nothing.
+        match issue_restore_verb(&["restart", &unit]) {
             RestoreVerb::Done => tracing::info!(
                 unit,
                 "restored the TV's autologin gaming session (debounce elapsed, no client)"
@@ -5278,15 +5232,14 @@ impl Drop for GamescopeProc {
 mod tests {
     use super::{
         any_output_size_is, cancel_pending_restore, cgroup_is_punktfunk_owned,
-        cgroup_under_user_manager, classify_output_size, connected_connector_under,
-        display_manager_unit_under, dm_plan, game_hz, gamescope_output_size, hdr_args,
-        is_steam_launch, mask_unit, missing_flags, mode_mismatch, nested_wrapper_script,
-        our_wsi_layer_dir, plan_bind, release_autologin_mask, script_hardcodes_gamescope,
-        sentinel_advanced, shape_dedicated_command, switch_ends_mask_window,
-        takeover_state_is_live, unmask_unit, xwayland_refusal_marker, BindOff, BindPlan,
-        BoxOutputSize, DmHelperError, SessionBind, TakeoverState, WsiPlan, AUTOLOGIN_MASKED,
-        DISTRO_GAMESCOPE_PATH, PENDING_RESTORE, RESTORE_FLIGHT, STOPPED_AUTOLOGIN, WSI_OFF_ENV,
-        X11_SOCKET_DIR,
+        classify_output_size, connected_connector_under, display_manager_unit_under, dm_plan,
+        game_hz, gamescope_output_size, hdr_args, is_steam_launch, mask_unit, missing_flags,
+        mode_mismatch, nested_wrapper_script, our_wsi_layer_dir, plan_bind, release_autologin_mask,
+        script_hardcodes_gamescope, sentinel_advanced, shape_dedicated_command,
+        switch_ends_mask_window, takeover_state_is_live, unmask_unit, xwayland_refusal_marker,
+        BindOff, BindPlan, BoxOutputSize, DmHelperError, SessionBind, TakeoverState, WsiPlan,
+        AUTOLOGIN_MASKED, DISTRO_GAMESCOPE_PATH, PENDING_RESTORE, RESTORE_FLIGHT,
+        STOPPED_AUTOLOGIN, WSI_OFF_ENV, X11_SOCKET_DIR,
     };
     use std::time::{Duration, Instant};
 
@@ -5462,26 +5415,6 @@ mod tests {
     }
 
     #[test]
-    fn user_manager_lifetime_detection() {
-        // The packaged host: a `--user` unit, so logind's user-manager stop takes it down with the
-        // login session the DM stop ends — this is the case that needs lingering.
-        assert!(cgroup_under_user_manager(
-            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/punktfunk-host.service\n"
-        ));
-        assert!(cgroup_under_user_manager(
-            "0::/user.slice/user-1000.slice/user@1000.service/session.slice/punktfunk-gamescope.service\n"
-        ));
-        // A system unit outlives every session — the DM stop cannot reach it.
-        assert!(!cgroup_under_user_manager(
-            "0::/system.slice/punktfunk-host.service\n"
-        ));
-        // Started from a login shell: owned by the session scope, not the user manager.
-        assert!(!cgroup_under_user_manager(
-            "0::/user.slice/user-1000.slice/session-2.scope\n"
-        ));
-    }
-
-    #[test]
     fn session_select_sentinel_needs_a_baseline() {
         let t0 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
         let t1 = t0 + std::time::Duration::from_secs(1);
@@ -5583,27 +5516,27 @@ mod tests {
     }
 
     #[test]
-    fn dm_plan_stops_any_dm_that_drove_a_live_session() {
-        // A live gaming session behind a DM: stop the DM, whatever the flavor. The mask alone does
-        // NOT stop the relogin loop — on .41 it is what makes the loop fast, because the session
-        // script's last act is `systemctl --user --wait start gamescope-session-plus@…` and a
-        // masked unit fails that in milliseconds (4-5 logins/s, pad at 1.4 Hz, 2026-08-18).
+    fn dm_plan_idles_any_dm_that_drove_a_live_session() {
+        // A live gaming session behind a DM: idle it, whatever the flavor. Neither of the two
+        // things that do NOT work is flavor-dependent — a mask fails the unit in milliseconds and
+        // makes the relogin loop fast (4-5 logins/s, pad at 1.4 Hz, 2026-08-18), and stopping the
+        // DM leaves nothing able to start a desktop session when the user asks for one.
         let p = dm_plan(Some("sddm.service"), true);
-        assert!(!p.skip && p.stop_dm);
+        assert!(!p.skip && p.dm_relogins);
         // Flavor is no longer an input: plasmalogin gets the same plan as sddm. It used to differ
         // only to pick a DEGRADED mode (mask-only for sddm), and that degrade is now gone —
         // `stop_autologin_sessions` bails to ATTACH instead.
         let q = dm_plan(Some("plasmalogin.service"), true);
-        assert!(q.skip == p.skip && q.stop_dm == p.stop_dm);
+        assert!(q.skip == p.skip && q.dm_relogins == p.dm_relogins);
         // Nothing live, DM present: hands off entirely, on EVERY flavor. Killing loaded-but-
         // inactive leftovers frees no Steam; masking them while the DM is up is the storm; and
         // stopping the DM would kill the user's live desktop for it.
         assert!(dm_plan(Some("sddm.service"), false).skip);
         assert!(dm_plan(Some("plasmalogin.service"), false).skip);
-        // No DM at all (getty autologin), live: mask+kill, nothing to stop — masking is sound
-        // here precisely because no relogin loop exists to run into it.
+        // No DM at all (getty autologin), live: kill and leave it stopped. Nothing relogins, so
+        // there is no autologin to idle — and no reason to leave a drop-in on the box.
         let p = dm_plan(None, true);
-        assert!(!p.skip && !p.stop_dm);
+        assert!(!p.skip && !p.dm_relogins);
         assert!(dm_plan(None, false).skip);
     }
 

@@ -135,13 +135,12 @@ sysext creates it on merge:
 sudo usermod -aG punktfunk "$USER"   # then log out and back in
 ```
 
-This box **is** a Gaming Mode box, so that group is not optional in practice: it authorizes the
-helper the host uses to stop the display manager when it takes the Gaming Mode session over at your
-client's resolution, and it gates the usbip `attach` file the **virtual Steam Deck controller**
-(paddles, trackpads, gyro) attaches through. It is a separate group on purpose — writing that file
+This box **is** a Gaming Mode box, so that group is worth having: it gates the usbip `attach` file
+the **virtual Steam Deck controller** (paddles, trackpads, gyro) attaches through. (The Gaming Mode
+takeover itself no longer needs it — it idles the box's session with a user-level drop-in rather
+than stopping the display manager.) It is a separate group on purpose — writing that file
 can materialise arbitrary emulated USB hardware, so it is not folded into the group everyone is
-told to join for gamepads. Without it the pad arrives as an ordinary Xbox 360 controller, and the
-takeover degrades to mirroring the box's own screen — see
+told to join for gamepads. Without it the pad arrives as an ordinary Xbox 360 controller — see
 [gamescope](/docs/gamescope#nobara-and-other-autologin-display-managers).
 
 ## Configure
@@ -172,8 +171,9 @@ and on Bazzite (which ships `gamescope-session-plus`) that is **managed**:
   relaunches it **headless** at the *client's* exact resolution and refresh — Game Mode on the
   virtual screen — restoring the box on idle. This is the model that gives the client a display of
   its **own**, and the only one under which a game launched from a client's library gets a
-  dedicated session. It needs the [`punktfunk` group](#allow-controller-input): the takeover stops
-  the display manager for the length of the stream, and without that grant it cannot.
+  dedicated session. The takeover idles the box's own session for the length of the
+  stream (a user-level drop-in — no privilege needed, and the display manager stays up, so Steam's
+  "Switch to Desktop" still works mid-stream).
 - **Attach** (`PUNKTFUNK_GAMESCOPE_ATTACH=1`) — the **box** owns its gamescope session on its own
   display, and the host attaches to whatever's live without ever tearing it down (on a headless
   box, a box-owned autologin session is restarted at the client's resolution on a mismatch; with a
