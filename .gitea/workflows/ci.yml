@@ -175,6 +175,19 @@ jobs:
       - name: Test (unit + loopback + proptest + C ABI harness)
         run: cargo test --workspace --locked
 
+      # The deep half of the docs-drift gates (the `docs-drift` job checks the docs-site copy
+      # and the textual rest): the committed spec must match what the binary actually serves.
+      # Build already compiled punktfunk-host with default features, so this re-links at worst.
+      # Byte diff on purpose — the generator is deterministic, and if that ever stops being
+      # true it deserves to surface here.
+      - name: OpenAPI spec drift gate
+        run: |
+          cargo run -p punktfunk-host --locked -- openapi > /tmp/openapi.regen.json
+          diff -u api/openapi.json /tmp/openapi.regen.json >/dev/null || {
+            echo "::error::api/openapi.json is stale — regenerate: cargo run -p punktfunk-host -- openapi > api/openapi.json && cp api/openapi.json docs-site/public/openapi.json"
+            exit 1
+          }
+
       # The GPU encode backends are OFF by default, so every step above compiles ~none of them:
       # `nvenc` gates enc/linux/nvenc_cuda.rs (+ nvenc_core/nvenc_status) and `vulkan-encode` gates
       # enc/linux/vulkan_video.rs (+ the vendored vk_av1_encode/vk_valve_rgb bindings) — ~8,150
@@ -390,3 +403,28 @@ jobs:
       # schema stability across bun2nix releases). Fix with: scripts/ci/check-bun-nix.sh --fix
       - name: bun.nix drift gate
         run: sh scripts/ci/check-bun-nix.sh
+
+  # Docs drift gates — pure git-grep textual checks, no cargo, no bun install (the deep half,
+  # regenerating the OpenAPI spec from the built host, rides in the `rust` job above). Same
+  # reasoning as bun-nix for being UNFILTERED: docs drift arrives through commits that look
+  # unrelated to docs — a renamed env var, a removed subcommand, a moved page.
+  docs-drift:
+    runs-on: ubuntu-24.04
+    container:
+      image: oven/bun:1
+    timeout-minutes: 15
+    steps:
+      # oven/bun ships neither git nor a real node, and the slim base has no CA bundle —
+      # actions/checkout needs all three (see the web job).
+      - name: Install git + node + CA certs
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git nodejs
+      - uses: actions/checkout@v4
+      # OpenAPI snapshot in sync, PUNKTFUNK_* vars in docs still exist, undocumented-var
+      # ratchet (baseline: scripts/ci/docs-undocumented-env-baseline.txt), host-cli.md commands
+      # still exist, data/platforms.json parses.
+      - name: Docs drift gates
+        run: sh scripts/ci/check-docs-drift.sh
+      # Internal links only: /docs/* page links in docs-site content, relative file links in
+      # the repo's markdown. External URLs and #anchors are deliberately not checked.
+      - name: Docs link check
+        run: sh scripts/ci/check-docs-links.sh

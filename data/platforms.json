@@ -1,0 +1,126 @@
+{
+  "$comment": "Single source for the install/port facts that used to drift across four surfaces (docs-and-onboarding-overhaul WP1). Consumers: docs-site install pages (WP2), the website download page (WP3), the guided install script (WP4). A port number, repo URL or install command lives HERE and nowhere else — pages quote it, they don't restate it. Validated by scripts/ci/check-docs-drift.sh (parse only; ponytail: cross-check against code literals when a consumer exists).",
+
+  "ports": {
+    "mgmt": {
+      "port": 47990,
+      "proto": "tcp",
+      "what": "management REST API + web console endpoint",
+      "env": "PUNKTFUNK_MGMT_BIND",
+      "conflict": "Sunshine / Apollo / Vibeshine serve their web UI on 47990 too — the one port still shared with them once GameStream compat is off. Move it via PUNKTFUNK_MGMT_BIND; clients relearn it from discovery."
+    },
+    "native": {
+      "port": 9777,
+      "proto": "udp",
+      "what": "punktfunk/1 QUIC control port",
+      "env": "PUNKTFUNK_NATIVE_PORT"
+    },
+    "data": {
+      "port": null,
+      "proto": "udp",
+      "what": "per-session video data plane — random port + hole-punch by default, pinnable",
+      "env": "PUNKTFUNK_DATA_PORT"
+    },
+    "mdns": {
+      "port": 5353,
+      "proto": "udp",
+      "what": "mDNS discovery"
+    },
+    "gamestream": {
+      "tcp": [47984, 47989, 48010],
+      "udp": [47998, 47999, 48000],
+      "what": "GameStream/Moonlight-compat planes (opt-in, `serve --gamestream`)",
+      "conflict": "Sunshine / Apollo / Vibeshine bind these same fixed ports and advertise the same mDNS name — run only one GameStream host at a time, or keep punktfunk native-only."
+    }
+  },
+
+  "conflicts": {
+    "hosts": ["Sunshine", "Apollo", "Vibeshine"],
+    "detect": "punktfunk-host detect-conflicts",
+    "detectExit": "1 only when a conflicting host runs or will start on its own; dormant leftovers print but exit 0",
+    "docs": "/docs/troubleshooting#another-streaming-host-sunshine-apollo--is-installed"
+  },
+
+  "platforms": [
+    {
+      "id": "debian",
+      "name": "Debian 13 / Ubuntu 24.04+",
+      "installs": "host",
+      "packageManager": "apt",
+      "docs": "/docs/debian",
+      "install": [
+        "echo \"deb [signed-by=/etc/apt/keyrings/punktfunk.asc] https://git.unom.io/api/packages/unom/debian stable main\" | sudo tee /etc/apt/sources.list.d/punktfunk.list",
+        "sudo apt update",
+        "sudo apt install punktfunk-host"
+      ]
+    },
+    {
+      "id": "arch",
+      "name": "Arch Linux / CachyOS",
+      "installs": "host",
+      "packageManager": "pacman",
+      "docs": "/docs/arch",
+      "install": [
+        "curl -fsS https://git.unom.io/api/packages/unom/arch/repository.key | sudo pacman-key --add -",
+        "sudo pacman-key --lsign-key E0CA04465C99C936E0B0C6510A317015A34DDD69",
+        "printf '\\n[punktfunk]\\nServer = https://git.unom.io/api/packages/unom/arch/$repo/$arch\\n' | sudo tee -a /etc/pacman.conf >/dev/null",
+        "sudo pacman -Sy punktfunk-host"
+      ]
+    },
+    {
+      "id": "fedora",
+      "name": "Fedora 43+",
+      "installs": "host",
+      "packageManager": "dnf",
+      "docs": "/docs/fedora",
+      "repo": "https://git.unom.io/api/packages/unom/rpm/fedora-44",
+      "install": [
+        "sudo dnf install punktfunk",
+        "sudo usermod -aG input \"$USER\""
+      ]
+    },
+    {
+      "id": "bazzite",
+      "name": "Bazzite / Fedora Atomic",
+      "installs": "host",
+      "packageManager": "sysext",
+      "docs": "/docs/bazzite",
+      "install": [
+        "curl -fsSLO https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/bazzite/punktfunk-sysext.sh",
+        "sudo bash punktfunk-sysext.sh install"
+      ]
+    },
+    {
+      "id": "nixos",
+      "name": "NixOS",
+      "installs": "host",
+      "packageManager": "nix",
+      "docs": "/docs/install",
+      "install": [
+        "# flake input: inputs.punktfunk.url = \"git+https://git.unom.io/unom/punktfunk\";",
+        "# then: imports = [ punktfunk.nixosModules.default ]; services.punktfunk.host.enable = true;"
+      ]
+    },
+    {
+      "id": "windows",
+      "name": "Windows 10/11",
+      "installs": "host",
+      "packageManager": "winget",
+      "docs": "/docs/windows-host",
+      "install": [
+        "winget install unom.PunktfunkHost --interactive"
+      ]
+    },
+    {
+      "id": "linux-client",
+      "name": "Linux client (any distro)",
+      "installs": "client",
+      "packageManager": "flatpak",
+      "docs": "/docs/install-client",
+      "install": [
+        "flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref"
+      ]
+    }
+  ]
+
+}

@@ -4,7 +4,12 @@ The Punktfunk documentation site: [Fumadocs](https://fumadocs.dev) on
 [TanStack Start](https://tanstack.com/start) (Vite + Nitro/bun preset).
 
 Content lives in [`content/docs/`](content/docs) as `.md`/`.mdx`. This site is the source of truth
-for the **user-facing** guides; design rationale lives in the internal punktfunk-planning repo.
+for the **user-facing** guides; design rationale lives in the internal punktfunk-planning repo, and
+READMEs and the marketing site link here instead of restating anything — see "Where facts live" in
+[CONTRIBUTING.md](../CONTRIBUTING.md). Pages serve one of two audiences, not both at once: the
+**get-started track** (quickstart, install, pairing) assumes no Linux expertise — short pages, one
+task each, happy path only; the **reference track** (configuration, CLI, API, per-compositor
+pages) is allowed to be dense.
 
 ## API reference
 
@@ -19,16 +24,10 @@ cargo run -p punktfunk-host -- openapi > api/openapi.json
 cp api/openapi.json docs-site/public/openapi.json
 ```
 
-Nothing in CI diffs the two, so the snapshot goes stale silently — that manual `cp` is the only
-thing keeping them in sync. Before publishing docs, check that they match:
-
-```bash
-diff <(jq -S . api/openapi.json) <(jq -S . docs-site/public/openapi.json)
-```
-
-That should print nothing. Right now it doesn't: the committed snapshot predates the
-`/api/v1/update/check`, `/api/v1/update/apply` and `/api/v1/update/status` endpoints, so the
-published `/api` reference is missing the host self-update surface — re-copy it.
+CI keeps the pair honest: the `docs-drift` job fails unless the snapshot is a byte-for-byte copy
+of `api/openapi.json`, and the `rust` job regenerates the spec and diffs it against the committed
+one — so a management-API change can't publish stale API docs any more, it fails CI until you run
+the two commands above.
 
 ## Develop
 
