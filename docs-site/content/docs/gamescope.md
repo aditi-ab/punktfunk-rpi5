@@ -40,12 +40,23 @@ set** — which is what every shipped template does — a box that has gamescope
 
 ### Nobara and other autologin display managers
 
-The managed takeover has to stop the box's Gaming Mode session to free Steam — and when that
-session is a display-manager autologin, it has to stop the **display manager** too, for the length
-of the stream. That is a privileged operation, and the privilege is granted to one group.
+The managed takeover has to stop the box's Gaming Mode session to free Steam — and when a display
+manager autologs into that session, stopping it alone accomplishes nothing: the autologin puts it
+straight back. So the host **idles** that session for the length of the stream instead, with a
+systemd drop-in that replaces its `ExecStart` with a process that just sleeps. The autologin still
+succeeds (nothing relogin-loops), the session it logs into does nothing (Steam is free), and the
+**display manager keeps running** — which is what lets you still switch the box to Desktop Mode
+from Steam while a stream is up.
 
-> **Join the `punktfunk` group on any box you stream Game Mode from.** The takeover's root helper
-> runs for members of that group and for nobody else, so this one command is what authorizes it:
+That needs no privilege at all: the drop-in is a user-level unit override, written under
+`$XDG_RUNTIME_DIR` so it cannot outlive the login session, and a reboot clears it regardless.
+Versions before this one stopped the display manager for the stream's duration — which needed a
+root helper, the `punktfunk` group, and lingering, and left the box with nothing able to start a
+desktop session, so Steam's own "Switch to Desktop" hung until a reboot.
+
+> **Join the `punktfunk` group on any box you stream Game Mode from.** The takeover itself no
+> longer needs it — the group now gates the usbip nodes the virtual Steam Deck pad attaches
+> through, so without it the pad arrives as an ordinary Xbox 360 controller:
 >
 > ```sh
 > sudo usermod -aG punktfunk "$USER"   # then log out and back in
@@ -60,14 +71,12 @@ of the stream. That is a privileged operation, and the privilege is granted to o
 > symptom side is [Game Mode: black screen on
 > connect](/docs/troubleshooting#game-mode-black-screen-on-connect-or-the-stream-is-stuck-at-the-boxs-resolution).
 
-How the takeover gets that privilege depends on the display manager driving the autologin:
+The display-manager flavor is no longer an input — SDDM, plasmalogin and the rest all get the
+idled session above, and none of them is stopped. The root helper described below is therefore no
+longer part of a normal takeover; it is kept for the restore path, and for a box where an older
+host left a display manager stopped:
 
-- **SDDM** (Bazzite, SteamOS): SDDM survives having the session unit masked, so a box without the
-  grant still streams — at the cost of SDDM relogin-looping against the takeover for the whole
-  stream, which churns logind sessions and can starve the game.
-- **plasmalogin** (Nobara) and other display managers: masking is fatal there (the autologin
-  start-limit-kills the display manager), so the host stops the display manager itself and
-  restarts it afterwards. The packages ship that privilege: a root helper
+- The packages ship it: a root helper
   (`/usr/libexec/punktfunk/pf-dm-helper`, or `/usr/lib/punktfunk/pf-dm-helper` from the Arch
   package) behind its own polkit action (`io.unom.punktfunk.dm-helper`), invoked automatically
   when the plain `systemctl` verbs are denied. The helper only stops/restores the unit the
