@@ -750,6 +750,7 @@ impl NativeClient {
             pin,
             identity,
             timeout,
+            None,
         )
     }
 
@@ -810,6 +811,16 @@ impl NativeClient {
         pin: Option<[u8; 32]>,
         identity: Option<(String, String)>,
         timeout: Duration,
+        // The caller's abort switch, polled while this call is still blocked: setting it returns
+        // [`PunktfunkError::Timeout`] straight away instead of parking the caller for the rest of
+        // `timeout` — which is 185 s on a request-access dial the host has PARKED pending an
+        // operator's approval, and a UI that offers Cancel cannot honour it while its dialing
+        // thread is stuck in here. Taking it is the same give-up as running out of budget (quit
+        // close + shutdown), so the worker stops re-dialing and the host tears down rather than
+        // lingering for a reconnect nobody wants. Read ONLY here — deliberately not aliased onto
+        // the client's own `shutdown`, which the pump uses to mean "this connection died" and
+        // whose end reason a caller-set flag would race. `None` = a connect nobody can cancel.
+        cancel: Option<Arc<AtomicBool>>,
     ) -> Result<NativeClient> {
         let frame_chan = Arc::new(FrameChannel::new());
         let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<AudioPacket>(AUDIO_QUEUE);
@@ -967,18 +978,34 @@ impl NativeClient {
             })
             .map_err(PunktfunkError::Io)?;
 
-        let negotiated = match ready_rx.recv_timeout(timeout) {
-            Ok(Ok(t)) => t,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                // A connect we already reported as failed must not leave a lingering host
-                // session if the handshake lands late: mark it a deliberate QUIT (not a plain
-                // drop / close code 0) so the worker's close tells the host to tear down now
-                // instead of holding the session (and its virtual display) for a reconnect
-                // that will never come.
-                quit.store(true, Ordering::SeqCst);
-                shutdown.store(true, Ordering::SeqCst);
-                return Err(PunktfunkError::Timeout);
+        // Polled rather than one long `recv_timeout(timeout)`: the wait has to end on the
+        // caller's `cancel` as well as on the budget, and a handshake the host has PARKED
+        // (request-access, pending approval) produces nothing to wake on for minutes.
+        const READY_POLL: Duration = Duration::from_millis(50);
+        let deadline = std::time::Instant::now() + timeout;
+        let negotiated = loop {
+            match ready_rx.recv_timeout(READY_POLL) {
+                Ok(Ok(t)) => break t,
+                Ok(Err(e)) => return Err(e),
+                // Timed out with the worker still going: keep waiting unless the budget is
+                // spent or the caller cancelled. Disconnected means the worker died without
+                // reporting — the give-up path below covers it, same as it always did.
+                // Both give-ups land in one arm on purpose: a cancel and an expiry owe the
+                // host the same close, and the caller that cancelled is not listening to the
+                // error it gets back anyway.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    if std::time::Instant::now() < deadline
+                        && !cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) => {}
+                Err(_) => {
+                    // A connect we already reported as failed must not leave a lingering host
+                    // session if the handshake lands late: mark it a deliberate QUIT (not a plain
+                    // drop / close code 0) so the worker's close tells the host to tear down now
+                    // instead of holding the session (and its virtual display) for a reconnect
+                    // that will never come.
+                    quit.store(true, Ordering::SeqCst);
+                    shutdown.store(true, Ordering::SeqCst);
+                    return Err(PunktfunkError::Timeout);
+                }
             }
         };
         *mode_slot.lock().unwrap() = negotiated.mode;

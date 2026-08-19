@@ -139,7 +139,6 @@ struct Toast {
 
 struct Connecting {
     title: String,
-    canceling: bool,
     appear: f64,
     /// A request-access wait (parked on the host until the operator approves) — the
     /// takeover reads "Waiting for approval" rather than "Connecting".
@@ -436,7 +435,6 @@ impl Shell {
                 self.last_connect_title = Some(title.clone());
                 self.connecting = Some(Connecting {
                     title,
-                    canceling: false,
                     appear: 0.0,
                     request_access: false,
                 })
@@ -504,7 +502,6 @@ impl Shell {
                 .last_connect_title
                 .clone()
                 .unwrap_or_else(|| "the host".to_string()),
-            canceling: false,
             appear: 1.0,
             request_access: false,
         });
@@ -683,9 +680,19 @@ impl Shell {
     pub(crate) fn handle_menu(&mut self, ev: MenuEvent) -> Option<MenuPulse> {
         self.sync();
         // Modal precedence: the connect card, then the wake card, then the screens.
-        if let Some(c) = &mut self.connecting {
-            if ev == MenuEvent::Back && !c.canceling {
-                c.canceling = true;
+        if self.connecting.is_some() {
+            if ev == MenuEvent::Back {
+                // The takeover comes down HERE, not when the host answers. It used to wait for
+                // the next `session_phase` and show "Canceling…" until one arrived — and one is
+                // not guaranteed to: the dial is a blocking call on the host's side of this
+                // interface, so the wait was the whole connect budget (185 s on a request-access
+                // connect the host parks pending approval), and an embedder that simply drops a
+                // canceled dial never sends a phase at all. Either way the console sat on
+                // "Canceling…" with no input that could reach it — only killing the app cleared
+                // it. Cancel is the USER's decision and needs no confirmation from the wire; the
+                // action below still goes out, and every host already handles a dial that lands
+                // after it (quit-close the connector, route the end back silently).
+                self.connecting = None;
                 self.actions.push_back(OverlayAction::CancelConnect);
                 return Some(MenuPulse::Confirm);
             }

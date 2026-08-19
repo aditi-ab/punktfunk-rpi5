@@ -451,6 +451,10 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         // Handshake budget from Kotlin: ~10 s for a normal connect, ~185 s for "request access"
         // (the host parks the connection until the operator approves the device — see ConnectScreen).
         Duration::from_millis(timeout_ms.max(0) as u64),
+        // The Kotlin side cancels by dropping the result (`Dial.cancelled`), not by aborting
+        // the dial — its connect runs on a pool thread, so a parked one costs a thread, not a
+        // stuck UI. Wire a flag through here if that ever stops being true.
+        None,
     ) {
         Ok(client) => {
             let handle = SessionHandle {

@@ -178,15 +178,17 @@ fn connect_flow_raises_launch_and_cancel() {
         Some(OverlayAction::Launch { launch: None, .. })
     ));
     assert!(s.connecting.is_some());
-    // While connecting: B cancels exactly once.
+    // While connecting: B cancels — and the takeover comes down on the spot. It must NOT wait
+    // for a session phase to clear it: the dial is blocking on the host's side of this
+    // interface, so that wait was the whole connect budget, and an embedder that just drops a
+    // canceled dial sends no phase at all — the console stuck on "Canceling…" until the app died.
     s.handle_menu(MenuEvent::Back);
     assert!(matches!(
         s.take_action(),
         Some(OverlayAction::CancelConnect)
     ));
-    s.handle_menu(MenuEvent::Back);
-    assert!(s.take_action().is_none(), "cancel is idempotent");
-    // The canceled dial ends silently.
+    assert!(s.connecting.is_none(), "cancel drops the takeover itself");
+    // A dial that resolves afterwards (or never) changes nothing.
     s.session_ended(None);
     assert!(s.connecting.is_none());
 }
