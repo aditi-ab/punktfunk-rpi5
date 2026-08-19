@@ -376,7 +376,9 @@ an empty extension. Use **Primary** or **Exclusive** so your desktop actually la
 **KWin can't create the virtual output.** On a normal Plasma session KWin runs its **DRM backend**,
 which creates virtual outputs at any version. The 6.5.6 floor applies only to the **virtual backend**
 (`kwin_wayland --virtual`, used for headless and test sessions) — below that the request fails with
-"Could not find output". See [requirements](/docs/requirements).
+"Could not find output". On **KWin 6.6+** that same message also covers an output KWin *did* create
+and then left disabled; [KDE Plasma](/docs/kde#troubleshooting) walks that one. See
+[requirements](/docs/requirements).
 
 **Reconnecting into game mode reconnects cleanly now.** On a Steam Deck / Bazzite box, disconnecting
 and reconnecting within game mode reuses the still-warm session (or cleanly recreates it) instead of
