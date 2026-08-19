@@ -66,6 +66,16 @@ use zkde::zkde_screencast_unstable_v1::ZkdeScreencastUnstableV1 as Screencast;
 const POINTER_METADATA: u32 = 4;
 const POINTER_EMBEDDED: u32 = 2;
 
+/// Marks the one KWin refusal a retry can clear: the disabled-output repair ran and changed the
+/// box between attempts ([`kwin_output_mgmt::enable_disabled_output`]).
+///
+/// It is load-bearing in TWO places and both are easy to break. The opener keys on it to skip the
+/// `KWin virtual output failed` wrapper below — and that wrapper's prefix is exactly what the
+/// host's `is_permanent_build_error` matches to short-circuit the retry loop, so a repaired
+/// refusal carrying it would be classified permanent and the retry that consumes the repair would
+/// never run. It is also the human-readable half of the message; keep it a phrase, not a code.
+const REPAIRED_HINT: &str = "enabled it over output management";
+
 /// The name we give the created output; KWin exposes it to output-management as `Virtual-<name>`.
 const VOUT_NAME: &str = "punktfunk";
 
@@ -268,6 +278,10 @@ impl VirtualDisplay for KwinDisplay {
                 .context("spawn KWin virtual-output thread")?;
             match setup_rx.recv_timeout(OPENER_BUDGET) {
                 Ok(Ok(v)) => Ok((v, stop)),
+                // Repaired: report it as-is. The wrapper below would prepend the phrase the host
+                // reads as "permanent, do not retry", and this is the one refusal whose retry is
+                // the entire point — the repair only fixes the NEXT request.
+                Ok(Err(e)) if e.contains(REPAIRED_HINT) => bail!("{e}"),
                 // KWin's reason is TRANSLATED into the session's language, so it is often
                 // unsearchable for the person reading the log. Say what it means once, here.
                 Ok(Err(e)) => bail!(
@@ -1793,14 +1807,41 @@ fn run(
     );
 
     // Pump events until KWin reports the node id (or an error, or the budget).
-    let node_id = await_created(
+    //
+    // A refusal here is where the KWin >= 6.6 disabled-output trap lands, and it is repairable
+    // FROM INSIDE THIS SCOPE and nowhere else: KWin destroys the output when our stream is
+    // destroyed, so the connection has to stay up while we enable it (see
+    // [`kwin_output_mgmt::enable_disabled_output`] for why the output is still alive at all, and
+    // why enabling it fixes the NEXT request rather than this one).
+    let node_id = match await_created(
         &conn,
         &mut queue,
         &mut state,
         stop,
         "stream_virtual_output",
         started,
-    )?;
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            // `Virtual-<name>` is the address KWin exposes our output under (the same prefix the
+            // topology path resolves against).
+            match crate::kwin_output_mgmt::enable_disabled_output(&format!("Virtual-{name}")) {
+                // Deliberately does NOT carry the "KWin virtual output failed" prefix: that string
+                // is what marks a KWin refusal PERMANENT for the session's retry loop, and this is
+                // the one refusal where something DID change between attempts. Retrying is the
+                // whole point of repairing.
+                Some(repaired) => bail!(
+                    "KWin created the virtual output disabled and refused to stream it ({e}); \
+                     {REPAIRED_HINT} (head {repaired}) — the retry picks up the configuration \
+                     KWin just persisted"
+                ),
+                // Nothing to repair (no such head, already enabled, or the apply was refused):
+                // the refusal stands, and its own prefix keeps it permanent so the session fails
+                // fast instead of burning the retry budget on an unchanged box.
+                None => return Err(e),
+            }
+        }
+    };
     setup_tx
         .send(Ok(node_id))
         .map_err(|_| anyhow!("virtual-output opener went away"))?;
