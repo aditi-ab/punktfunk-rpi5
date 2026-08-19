@@ -2326,12 +2326,15 @@ pub unsafe extern "C" fn punktfunk_connect_ex10(
 /// `audio_rate_hz` — `48000`, `96000`, or the 44.1 kHz family `44100` / `88200` / `176400` — and
 /// `audio_bits` (`16` or `24`).
 ///
-/// Passing anything other than `48000`/`16` sets `CLIENT_CAP_AUDIO_HIRES` in the `Hello` and asks
-/// the host for the LOSSLESS `0xD3` plane — bit-exact PCM instead of Opus. That is an opt-in on
-/// both ends, and it is meant to be: it costs **1.5–4.6 Mbps** taken off the top of the link
-/// (audio rides QUIC datagrams outside the ABR loop, so ABR can neither see it nor reclaim it),
-/// against the ~256 kbps Opus this replaces. Only call it with a non-default format when the
-/// user turned the feature on AND this embedder can genuinely open an output device at it.
+/// Passing a format AT ALL — any non-zero `audio_rate_hz`/`audio_bits`, `48000`/`16` included —
+/// sets `CLIENT_CAP_AUDIO_HIRES` in the `Hello` and asks the host for the LOSSLESS `0xD3` plane,
+/// bit-exact PCM instead of Opus. (This line once said "anything other than `48000`/`16`", which
+/// was the rule until the cheapest rung turned out to be the one nobody could ask for; the ⚠ below
+/// is the whole story.) That is an opt-in on both ends, and it is meant to be: it costs
+/// **1.5–4.6 Mbps** taken off the top of the link (audio rides QUIC datagrams outside the ABR
+/// loop, so ABR can neither see it nor reclaim it), against the ~256 kbps Opus this replaces. Only
+/// pass a format when the user turned the feature on AND this embedder can genuinely open an
+/// output device at it.
 ///
 /// **The request is not the answer.** The host runs a five-condition gate
 /// (`design/hi-res-audio.md` §8.4 — client asked, operator policy allows, stereo, the capture
