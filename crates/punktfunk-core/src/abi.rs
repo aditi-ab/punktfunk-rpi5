@@ -5971,7 +5971,10 @@ mod log_sink_tests {
     use super::*;
     use std::sync::Mutex;
 
-    static LINES: Mutex<Vec<(u8, String, String)>> = Mutex::new(Vec::new());
+    /// `(level, target, message, user token)` per delivered line. The collector asserts nothing
+    /// itself (an `extern "C"` fn must not panic — the hygiene gate enforces it); the test body
+    /// checks what landed.
+    static LINES: Mutex<Vec<(u8, String, String, usize)>> = Mutex::new(Vec::new());
 
     unsafe extern "C" fn collect(
         level: u8,
@@ -5979,22 +5982,20 @@ mod log_sink_tests {
         message: *const c_char,
         user: *mut c_void,
     ) {
-        assert_eq!(
-            user as usize, 0x5151,
-            "the user token must come back unchanged"
-        );
         // SAFETY: the core hands NUL-terminated strings valid for this call, per the callback contract.
         let (t, m) = unsafe { (CStr::from_ptr(target), CStr::from_ptr(message)) };
-        LINES.lock().unwrap().push((
+        lock_recover(&LINES).push((
             level,
             t.to_string_lossy().into_owned(),
             m.to_string_lossy().into_owned(),
+            user as usize,
         ));
     }
 
     /// End to end through both doors: a `log` record and a `tracing` event (via tracing's `log`
-    /// feature) reach the C callback with level, real target and message; an interior NUL is
-    /// dropped rather than truncating the line; the level ceiling is honoured; NULL detaches.
+    /// feature) reach the C callback with level, real target, message and the user token; an
+    /// interior NUL is dropped rather than truncating the line; the level ceiling is honoured;
+    /// NULL detaches.
     #[test]
     fn callback_receives_log_and_tracing_lines() {
         // SAFETY: `collect` is a valid fn for the life of the test binary, the user token is an
@@ -6006,13 +6007,14 @@ mod log_sink_tests {
         tracing::info!(target: "punktfunk_core::transport", buf = 4096, "socket buffer clamped");
         log::debug!(target: "quinn::connection", "must not arrive (above the ceiling)");
 
-        let lines = LINES.lock().unwrap().clone();
+        let lines = lock_recover(&LINES).clone();
         let warn = lines
             .iter()
             .find(|l| l.1 == "quinn::connection")
             .expect("log record delivered");
         assert_eq!(warn.0, 2);
         assert_eq!(warn.2, "handshake  done", "interior NUL dropped, line kept");
+        assert_eq!(warn.3, 0x5151, "the user token must come back unchanged");
         let info = lines
             .iter()
             .find(|l| l.1 == "punktfunk_core::transport")
@@ -6028,10 +6030,10 @@ mod log_sink_tests {
         // SAFETY: NULL callback detaches; no pointer is retained.
         let detached = unsafe { punktfunk_set_log_callback(3, None, ptr::null_mut()) };
         assert_eq!(detached, PunktfunkStatus::Ok);
-        let before = LINES.lock().unwrap().len();
+        let before = lock_recover(&LINES).len();
         log::error!(target: "quinn::connection", "after detach");
         assert_eq!(
-            LINES.lock().unwrap().len(),
+            lock_recover(&LINES).len(),
             before,
             "a detached sink hears nothing"
         );
