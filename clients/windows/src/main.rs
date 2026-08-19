@@ -173,18 +173,12 @@ fn main() {
 /// processes are left alone. Must run before any window exists.
 #[cfg(windows)]
 fn set_app_user_model_id() {
-    use windows::Win32::appmodel::GetCurrentPackageFullName;
     use windows::Win32::shobjidl_core::SetCurrentProcessExplicitAppUserModelID;
-    use windows::Win32::winerror::APPMODEL_ERROR_NO_PACKAGE;
-    // SAFETY: `GetCurrentPackageFullName` is called with `len = 0` and no buffer, which is the
-    // documented identity PROBE — it writes nothing and only reports whether this process is
-    // packaged; `SetCurrentProcessExplicitAppUserModelID` takes a static wide literal.
+    if deeplink::has_package_identity() {
+        return; // packaged (or indeterminate) — leave the identity alone
+    }
+    // SAFETY: `SetCurrentProcessExplicitAppUserModelID` takes a static wide literal.
     unsafe {
-        let mut len: u32 = 0;
-        // No buffer: just probe whether the process has package identity.
-        if GetCurrentPackageFullName(&mut len, None) != APPMODEL_ERROR_NO_PACKAGE {
-            return; // packaged (or indeterminate) — leave the identity alone
-        }
         // Must stay in sync with pf-presenter's win32.rs, or the windows stop grouping.
         let _ = SetCurrentProcessExplicitAppUserModelID(windows::core::w!("unom.punktfunk.client"));
     }

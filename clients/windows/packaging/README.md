@@ -1,11 +1,30 @@
-# punktfunk Windows client — MSIX packaging
+# punktfunk Windows client — packaging
 
-The Windows client ships as **signed MSIX** packages so Windows boxes get a real package (Start
-tile, clean install/uninstall) instead of a loose exe. CI builds + publishes them from
-[`.gitea/workflows/windows-client.yml`](../../../.gitea/workflows/windows-client.yml) to Gitea's
+The Windows client ships **three ways, packed from one assembled layout** by CI
+([`.gitea/workflows/windows-client.yml`](../../../.gitea/workflows/windows-client.yml)) to Gitea's
 **generic** package registry (`https://git.unom.io/unom/-/packages`), on every `main` push that
 touches the client (canary) and on `vX.Y.Z` release tags (stable) — see
-[Release Channels](https://punktfunk.unom.io/docs/channels).
+[Release Channels](https://punktfunk.unom.io/docs/channels):
+
+1. **Inno Setup installer** (`punktfunk-client-setup_<arch>.exe`) — the **default download**. A
+   per-user, no-UAC install to `%LOCALAPPDATA%\Programs\Punktfunk`. It exists because the MSIX
+   install shape breaks the top user-reported flows: the exe lands under the ACL'd
+   `C:\Program Files\WindowsApps`, which Steam's *Add a Non-Steam Game* picker can't browse, and
+   the alias/`shell:AppsFolder` activation defeats the Steam overlay's injection and Big Picture
+   launch — Steam must spawn the exe itself from a normal path. `punktfunk-client.iss` +
+   `pack-client-installer.ps1`; it re-creates the manifest's declarative grants per-user
+   (`punktfunk://` in HKCU Classes, Start shortcuts, `{app}` on the user PATH for the
+   `punktfunk` CLI) and fetches the Windows App Runtime when missing.
+2. **Portable zip** (`punktfunk-client-windows_<arch>-portable.zip`) — the same signed file set,
+   nothing registered.
+3. **Signed MSIX** (`punktfunk-client-windows_<arch>.msix`) — kept for **Microsoft Store**
+   compatibility. Everything below the fold documents this path.
+
+`pack-msix.ps1` assembles the layout and packs the MSIX; `pack-client-installer.ps1` then consumes
+that same `layout/` for the installer + zip (and signs the four exes individually — the MSIX only
+signs its container).
+
+# MSIX packaging
 
 **Two architectures, one x64 runner.** Both `x64` and `arm64` packages are produced off the single
 x64 Windows runner — `x86_64-pc-windows-msvc` builds natively, `aarch64-pc-windows-msvc` is

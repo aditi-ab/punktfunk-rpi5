@@ -32,7 +32,8 @@ track per machine; switching is a one-line change.
 | **pacman** (Arch host/client) | `[punktfunk-canary]` repo section | `[punktfunk]` (`Server = …/api/packages/unom/arch/$repo/$arch`) |
 | **Flatpak** (client) | `flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.Canary.flatpakref` | `…/io.unom.Punktfunk.flatpakref` |
 | **Decky** (Steam Deck) | install-from-URL `…/generic/punktfunk-decky/canary/punktfunk.zip` | `…/punktfunk-decky/latest/punktfunk.zip` |
-| **Windows client** (MSIX) | `…/generic/punktfunk-client-windows/canary/punktfunk-client-windows_x64.msix` | `…/latest/…` + the release page |
+| **Windows client** (installer) | `…/generic/punktfunk-client-windows/canary/punktfunk-client-setup_x64.exe` | `…/latest/…` + the release page |
+| **Windows client** (MSIX / portable zip) | `…/generic/punktfunk-client-windows/canary/punktfunk-client-windows_x64.msix` (or `…_x64-portable.zip`) | `…/latest/…` + the release page |
 | **Windows host** (installer) | `…/generic/punktfunk-host-windows/canary/punktfunk-host-setup.exe` | `…/latest/…` + the release page |
 | **Windows host** (winget) | — *(stable only)* | `winget install unom.PunktfunkHost` / `winget upgrade unom.PunktfunkHost`, after `winget source add -n punktfunk https://winget.punktfunk.unom.io -t Microsoft.Rest` |
 | **Android** | Play **Internal testing** (invite-only) + sideload `…/generic/punktfunk-android/canary/punktfunk-android.apk` | **[Google Play](https://play.google.com/store/apps/details?id=io.unom.punktfunk)** (production) + the release page |

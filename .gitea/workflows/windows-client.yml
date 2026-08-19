@@ -56,8 +56,12 @@
 #
 # ── Packaging (the `Pack + sign MSIX` step onward; skipped on pull requests) ──────────────────────
 #
-# Publishes signed MSIX packages (x64 + ARM64) to Gitea's generic package registry, so Windows boxes
-# can install a real package (Start tile, clean install/uninstall) instead of a loose exe.
+# Publishes THREE artifacts per arch (x64 + ARM64) to Gitea's generic package registry, all packed
+# from one assembled layout:
+#   punktfunk-client-setup_<arch>.exe   — Inno Setup per-user installer, the DEFAULT download
+#                                         (stable path Steam can launch: overlay + Big Picture work)
+#   punktfunk-client-windows_<arch>-portable.zip — the same file set, no installer
+#   punktfunk-client-windows_<arch>.msix — kept for Microsoft Store compatibility
 #
 # Registry (public, unom org): https://git.unom.io/unom/-/packages  (generic group)
 # Packaging internals: clients/windows/packaging/README.md.
@@ -283,6 +287,28 @@ jobs:
             -Version $env:MSIX_VERSION -Arch ${{ matrix.arch }} `
             -TargetDir ${{ matrix.td }}\${{ matrix.target }}\release -OutDir ${{ matrix.td }}\msix
 
+      # The DEFAULT download: a per-user Inno Setup exe + a portable zip, packed from the layout
+      # the MSIX step just assembled. The MSIX shape (WindowsApps ACLs, alias-only activation)
+      # breaks Steam's non-Steam-game picker, the Steam overlay injection and Big Picture launch;
+      # the installer's stable %LOCALAPPDATA%\Programs\Punktfunk path is the fix. The MSIX stays
+      # published for Microsoft Store compatibility. Same signing env as the MSIX step above.
+      - name: Pack + sign installer + portable zip
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          AZURE_CODESIGNING_ENDPOINT: https://neu.codesigning.azure.net/
+          AZURE_CODESIGNING_ACCOUNT: unomsigning
+          AZURE_CODESIGNING_PROFILE: unom-io
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          MSIX_CERT_PFX_B64: ${{ secrets.MSIX_CERT_PFX_B64 }}
+          MSIX_CERT_PASSWORD: ${{ secrets.MSIX_CERT_PASSWORD }}
+        run: |
+          & clients/windows/packaging/pack-client-installer.ps1 `
+            -Version $env:MSIX_VERSION -Arch ${{ matrix.arch }} `
+            -LayoutDir ${{ matrix.td }}\msix\layout -OutDir ${{ matrix.td }}\installer
+
       - name: Publish to Gitea generic registry
         if: github.event_name != 'pull_request'
         shell: pwsh
@@ -301,7 +327,10 @@ jobs:
           # on that accident, so removing the quotes can't silently reintroduce it.
           $aliasNames = @{ "$($env:MSIX_PATH)" = "$($env:PKG)_${{ matrix.arch }}.msix" }
           if ($env:MSIX_CER_PATH) { $aliasNames[$env:MSIX_CER_PATH] = "$($env:PKG)_${{ matrix.arch }}.cer" }
-          $files = @($env:MSIX_PATH, $env:MSIX_CER_PATH) | Where-Object { $_ -and (Test-Path $_) }
+          # The installer + portable zip (the default download; docs point at these alias URLs).
+          if ($env:CLIENT_SETUP_PATH) { $aliasNames[$env:CLIENT_SETUP_PATH] = "punktfunk-client-setup_${{ matrix.arch }}.exe" }
+          if ($env:CLIENT_ZIP_PATH) { $aliasNames[$env:CLIENT_ZIP_PATH] = "$($env:PKG)_${{ matrix.arch }}-portable.zip" }
+          $files = @($env:MSIX_PATH, $env:MSIX_CER_PATH, $env:CLIENT_SETUP_PATH, $env:CLIENT_ZIP_PATH) | Where-Object { $_ -and (Test-Path $_) }
           if (-not $files) { throw "pack produced no artifacts to publish" }
           function Put($f, $url) {
             # The generic registry makes a versioned path immutable and 409s a re-upload, so a tag
@@ -324,10 +353,11 @@ jobs:
             Put $f "$base/$alias/$an"
           }
 
-      # On a real release, also attach the MSIX (+ its .cer) to the unified Gitea Release. Both
-      # arch legs attach to the same release concurrently — the helper's create-or-fetch handles
-      # the race, and x64/arm64 filenames differ so the assets don't collide.
-      - name: Attach MSIX to the Gitea release (stable tags only)
+      # On a real release, also attach the installer + portable zip + MSIX (+ its .cer) to the
+      # unified Gitea Release. Both arch legs attach to the same release concurrently — the
+      # helper's create-or-fetch handles the race, and x64/arm64 filenames differ so the assets
+      # don't collide.
+      - name: Attach client artifacts to the Gitea release (stable tags only)
         if: startsWith(gitea.ref, 'refs/tags/v')
         shell: pwsh
         env:
@@ -335,6 +365,6 @@ jobs:
         run: |
           . scripts/ci/gitea-release.ps1
           $rid = Ensure-GiteaRelease -Tag $env:GITHUB_REF_NAME -Name $env:GITHUB_REF_NAME -Prerelease 'auto'
-          foreach ($f in @($env:MSIX_PATH, $env:MSIX_CER_PATH)) {
+          foreach ($f in @($env:CLIENT_SETUP_PATH, $env:CLIENT_ZIP_PATH, $env:MSIX_PATH, $env:MSIX_CER_PATH)) {
             if ($f -and (Test-Path $f)) { Upsert-GiteaAsset -ReleaseId $rid -File $f }
           }
