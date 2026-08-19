@@ -264,7 +264,12 @@ pub extern "C" fn punktfunk_abi_version() -> u32 {
 /// long (it sits on the transport and pump threads), and must not call back into the core's
 /// logging (it would be re-entered).
 pub type PunktfunkLogCb = Option<
-    unsafe extern "C" fn(level: u8, target: *const c_char, message: *const c_char, user: *mut c_void),
+    unsafe extern "C" fn(
+        level: u8,
+        target: *const c_char,
+        message: *const c_char,
+        user: *mut c_void,
+    ),
 >;
 
 #[derive(Clone, Copy)]
@@ -293,7 +298,9 @@ impl log::Log for CallbackLogger {
     fn log(&self, record: &log::Record) {
         // Copy the sink OUT of the lock before calling it: a callback that logs (it shouldn't, but
         // an embedder's mistake must be a duplicate line, not a deadlock) re-enters `log` cleanly.
-        let Some(sink) = *lock_recover(&LOG_SINK) else { return };
+        let Some(sink) = *lock_recover(&LOG_SINK) else {
+            return;
+        };
         let cstr = |s: String| {
             // An interior NUL can't cross as a C string; drop the byte rather than the line.
             let mut bytes = s.into_bytes();
@@ -304,7 +311,14 @@ impl log::Log for CallbackLogger {
         let message = cstr(record.args().to_string());
         // SAFETY: the sink was registered through the ABI with exactly this signature; both
         // strings outlive the call (they are locals dropped after it) and are NUL-terminated.
-        unsafe { (sink.cb)(record.level() as u8, target.as_ptr(), message.as_ptr(), sink.user) };
+        unsafe {
+            (sink.cb)(
+                record.level() as u8,
+                target.as_ptr(),
+                message.as_ptr(),
+                sink.user,
+            )
+        };
     }
 
     fn flush(&self) {}
@@ -5959,8 +5973,16 @@ mod log_sink_tests {
 
     static LINES: Mutex<Vec<(u8, String, String)>> = Mutex::new(Vec::new());
 
-    unsafe extern "C" fn collect(level: u8, target: *const c_char, message: *const c_char, user: *mut c_void) {
-        assert_eq!(user as usize, 0x5151, "the user token must come back unchanged");
+    unsafe extern "C" fn collect(
+        level: u8,
+        target: *const c_char,
+        message: *const c_char,
+        user: *mut c_void,
+    ) {
+        assert_eq!(
+            user as usize, 0x5151,
+            "the user token must come back unchanged"
+        );
         // SAFETY: the core hands NUL-terminated strings valid for this call, per the callback contract.
         let (t, m) = unsafe { (CStr::from_ptr(target), CStr::from_ptr(message)) };
         LINES.lock().unwrap().push((
@@ -5985,7 +6007,10 @@ mod log_sink_tests {
         log::debug!(target: "quinn::connection", "must not arrive (above the ceiling)");
 
         let lines = LINES.lock().unwrap().clone();
-        let warn = lines.iter().find(|l| l.1 == "quinn::connection").expect("log record delivered");
+        let warn = lines
+            .iter()
+            .find(|l| l.1 == "quinn::connection")
+            .expect("log record delivered");
         assert_eq!(warn.0, 2);
         assert_eq!(warn.2, "handshake  done", "interior NUL dropped, line kept");
         let info = lines
@@ -5993,14 +6018,25 @@ mod log_sink_tests {
             .find(|l| l.1 == "punktfunk_core::transport")
             .expect("tracing event delivered through the log bridge");
         assert_eq!(info.0, 3);
-        assert!(info.2.contains("socket buffer clamped") && info.2.contains("buf=4096"), "{}", info.2);
+        assert!(
+            info.2.contains("socket buffer clamped") && info.2.contains("buf=4096"),
+            "{}",
+            info.2
+        );
         assert!(!lines.iter().any(|l| l.2.contains("must not arrive")));
 
         // SAFETY: NULL callback detaches; no pointer is retained.
-        assert_eq!(unsafe { punktfunk_set_log_callback(3, None, ptr::null_mut()) }, PunktfunkStatus::Ok);
+        assert_eq!(
+            unsafe { punktfunk_set_log_callback(3, None, ptr::null_mut()) },
+            PunktfunkStatus::Ok
+        );
         let before = LINES.lock().unwrap().len();
         log::error!(target: "quinn::connection", "after detach");
-        assert_eq!(LINES.lock().unwrap().len(), before, "a detached sink hears nothing");
+        assert_eq!(
+            LINES.lock().unwrap().len(),
+            before,
+            "a detached sink hears nothing"
+        );
     }
 }
 
