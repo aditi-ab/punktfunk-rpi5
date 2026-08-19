@@ -46,7 +46,7 @@ three ABIs, which removes the Compose screenshot scenes.
 | `api/openapi.json` | 0.29.0 | **0.29.0** | unchanged — no management-API surface moved this cycle; both copies (`api/` and `docs-site/public/`) are byte-identical to each other and to the tag |
 | gamescope patch level (`+pfhdrN`) | 8 | **8** | unchanged; no new patch files. ⚠ `packaging/gamescope/PKGBUILD` still says `pfhdr7` — pre-existing at v0.30.0, not a regression this cycle, but the Arch package builds a binary the host's `>= 8` probe rejects for the keymap path |
 | `@punktfunk/host` (SDK) | 0.1.4 | **0.1.4** | unchanged in `package.json` — but `sdk/src/config.ts` and `runner-cli.ts` changed (the `mgmt-endpoint` fix below), so a `sdk-v0.1.5` cut is **owed**; plugins resolve the SDK from the registry and cannot pick the fix up until it ships |
-| `@punktfunk/plugin-kit` | 0.4.2 | **0.4.2** | unchanged in `package.json` — but `sync-engine.ts` gained `minInterval` (below), so a `plugin-kit-v0.4.3` cut is **owed** for the same reason |
+| `@punktfunk/plugin-kit` | 0.4.2 | **0.4.3** | cut, for the two `sync-engine.ts` changes that cannot reach a plugin any other way: `minInterval` (below) and the always-apply sync reasons (`startup`/`manual` publish even when the fingerprint matches, so a host-side art drop is recoverable by restarting rather than by deleting the plugin's cache). Note the registry skips 0.4.2: `plugin-kit-v0.4.2` was tagged but its publish never landed, and the tag is left where it is rather than moved |
 
 ⚠ The SDK and plugin-kit version independently of the app (`sdk-v*` / `plugin-kit-v*` tags,
 `sdk-publish.yml` / `plugin-kit-publish.yml`); this release commit does not bump them. Both have
