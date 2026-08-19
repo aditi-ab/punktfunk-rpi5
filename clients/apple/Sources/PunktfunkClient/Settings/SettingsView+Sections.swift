@@ -522,7 +522,25 @@ extension SettingsView {
             }
             described(inhibitShortcutsDescription, field: "inhibit_shortcuts") {
                 Toggle("Capture system shortcuts", isOn: scoped(SettingsFields.inhibitShortcuts))
+                    // Turning it ON is the moment to ask for Accessibility — never at stream start,
+                    // where a TCC dialog over a captured stream would be the surprise.
+                    .onChange(of: effective.inhibitShortcuts) { was, on in
+                        if on, !was, !accessibilityTrusted { InputCapture.requestSystemShortcutAccess() }
+                    }
+                if effective.inhibitShortcuts, !accessibilityTrusted {
+                    Button("Allow Accessibility access…") {
+                        InputCapture.requestSystemShortcutAccess()
+                        // The prompt's own "Open System Settings" only shows the FIRST time the system
+                        // asks; after that the user has to find the pane themselves — open it for them.
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                }
             }
+            .onReceive(NotificationCenter.default.publisher(
+                for: NSApplication.didBecomeActiveNotification
+            )) { _ in accessibilityTrusted = InputCapture.systemShortcutsAvailable }
             #endif
             described(
                 (ModifierLayout(rawValue: effective.modifierLayout) ?? .mac).detail,
@@ -549,8 +567,13 @@ extension SettingsView {
         if (MouseInputMode(rawValue: effective.mouseMode) ?? .capture) == .desktop {
             return "No effect under the desktop mouse model — switch Mouse input to Capture."
         }
-        return "Sends ⌘ shortcuts to the host while captured. ⌘⎋ always stays local — it "
-            + "releases capture."
+        if accessibilityTrusted {
+            return "Sends ⌘ shortcuts — ⌘Space, ⌘Tab and Mission Control included — to the host "
+                + "while captured. ⌘⎋ always stays local — it releases capture."
+        }
+        return "Sends the app's ⌘ shortcuts (⌘Q, ⌘W, ⌘H…) to the host while captured. ⌘Space, "
+            + "⌘Tab and Mission Control need Accessibility access — macOS claims them before any "
+            + "app sees them. ⌘⎋ always stays local — it releases capture."
     }
 
     /// The SELECTED mouse model explained — dynamic, like the touch-mode caption.

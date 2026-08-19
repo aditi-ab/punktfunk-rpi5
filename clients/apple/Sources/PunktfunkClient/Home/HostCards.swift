@@ -137,6 +137,9 @@ struct HostCardView: View {
     var onWake: (() -> Void)? = nil
     /// Open the edit sheet (name / address / port / Wake-on-LAN MAC).
     var onEdit: (() -> Void)? = nil
+    /// Upload this device's recent log to the host (`SendLogs`). `nil` when the host is unpaired —
+    /// the upload is authenticated by the pairing, so there is nothing to offer before it.
+    var onSendLogs: (() -> Void)? = nil
     /// This card's profile affordances — nil on surfaces that don't offer them.
     var profileMenu: HostProfileMenu? = nil
     /// Set on a PINNED card: the profile this card connects with. nil = the host's primary card,
@@ -251,6 +254,9 @@ struct HostCardView: View {
             Button("Test Network Speed…", action: onSpeedTest)
             if let onBrowseLibrary {
                 Button("Browse Library…", action: onBrowseLibrary)
+            }
+            if let onSendLogs {
+                Button("Send Logs to Host", action: onSendLogs)
             }
             if !isOnline, !host.wakeMacs.isEmpty, PunktfunkConnection.wakeOnLANAvailable, let onWake {
                 Button("Wake Host", systemImage: "power", action: onWake)

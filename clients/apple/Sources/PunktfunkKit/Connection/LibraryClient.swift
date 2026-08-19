@@ -235,6 +235,40 @@ public enum LibraryClient {
         return status.games ?? []
     }
 
+    /// Upload this client's recent log (`ClientLogRing`) to the host — `POST /api/v1/client-logs`,
+    /// the one WRITE a paired certificate may make (the host's `mgmt/client_logs.rs`). Same lane
+    /// and identity as the library; the host files the bundle under this device and shows it on
+    /// its web console's Logs page next to its own log. Returns the stored bundle id (empty for a
+    /// host that predates the id in the reply).
+    ///
+    /// Why it exists: on an Apple TV (or a phone, for anyone who is not a developer) there is no
+    /// way to get the client's log off the device, so every fault report arrived with only the
+    /// host's half of the story. `hostFingerprint` is required, not optional: this is an outbound
+    /// write carrying the device's diagnostics, and it goes to the host the user paired with.
+    public static func sendLogs(
+        address: String,
+        port: UInt16 = punktfunkDefaultMgmtPort,
+        certPEM: String,
+        keyPEM: String,
+        hostFingerprint: Data
+    ) async throws -> String {
+        let identity = try clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
+        let body = Data(ClientLogRing.render(header: ClientLogRing.header()).utf8)
+        let response = try await send(
+            path: "/api/v1/client-logs", address: address, port: port,
+            identity: identity, hostFingerprint: hostFingerprint,
+            body: (body, "text/plain; charset=utf-8"))
+        switch response.status {
+        case 200, 201:
+            let json = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any]
+            return json?["id"] as? String ?? ""
+        case 401, 403:
+            throw LibraryError.unauthorized
+        default:
+            throw LibraryError.http(response.status)
+        }
+    }
+
     /// Just the slice of `/status` this client reads. Everything else on that payload is the
     /// operator console's business, and decoding only what we use keeps an unrelated schema change
     /// on the host from breaking the library screen.
@@ -259,12 +293,20 @@ public enum LibraryClient {
         }
     }
 
-    /// One GET against the host, with transport failures mapped onto `LibraryError`.
+    /// One request against the host — a GET, or a POST when `body` is given — with transport
+    /// failures mapped onto `LibraryError`.
     static func send(
         path: String, address: String, port: UInt16,
-        identity: SecIdentity, hostFingerprint: Data?
+        identity: SecIdentity, hostFingerprint: Data?,
+        body: (data: Data, contentType: String)? = nil
     ) async throws -> HTTPResponse {
         do {
+            if let body {
+                return try await MgmtTransport.post(
+                    host: address, port: port, path: path, body: body.data,
+                    contentType: body.contentType,
+                    identity: identity, pinnedHostFingerprint: hostFingerprint)
+            }
             return try await MgmtTransport.get(
                 host: address, port: port, path: path,
                 identity: identity, pinnedHostFingerprint: hostFingerprint)

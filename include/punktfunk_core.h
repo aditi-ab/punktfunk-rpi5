@@ -175,7 +175,17 @@
 // this reads and writes landed with the plane itself, appended behind the existing trailing-field
 // discipline (old peers skip them in both directions, and a legacy request encodes byte-identical
 // to the pre-hi-res messages), so [`WIRE_VERSION`] is still unchanged.
-#define PUNKTFUNK_ABI_VERSION 24
+// **v25** adds [`abi::punktfunk_set_log_callback`] — a `log` backend behind a C callback, so an
+// embedder that installs no Rust subscriber (the Swift clients, any C host) can receive the
+// core's own log lines: transport warnings, quinn connection events, rustls handshake notes,
+// everything this crate and its dependencies say through `tracing`/`log`. Until now those went
+// nowhere on Apple, and a client log bundle sent to the host carried the shell's half only.
+// ADDED, not widened: one new function and one callback typedef; nothing existing moved, and an
+// embedder that never calls it behaves exactly as on v24. Client-local in every sense — the host
+// never sees it and [`WIRE_VERSION`] is unchanged. It relies on tracing's `log` feature, now
+// declared explicitly by this crate (it was on transitively through quinn's defaults, which is
+// not a thing an ABI promise should rest on).
+#define PUNKTFUNK_ABI_VERSION 25
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -2116,6 +2126,15 @@ typedef struct PunktfunkSession PunktfunkSession;
 // tracker behind [`crate::client::NativeClient::note_frame_index`]) — the gate never touches the wire.
 typedef struct ReanchorGate ReanchorGate;
 
+// A log line from the core (ABI v25, [`punktfunk_set_log_callback`]). `level` is 1 = error,
+// 2 = warn, 3 = info, 4 = debug, 5 = trace. `target` is the Rust module path the line came from
+// (`punktfunk_core::transport::udp`, `quinn::connection`, …) and `message` the formatted text;
+// both are NUL-terminated UTF-8, borrowed for the duration of the call only — copy them out.
+// Called from whichever thread logged, so the callback must be thread-safe, must not block for
+// long (it sits on the transport and pump threads), and must not call back into the core's
+// logging (it would be re-entered).
+typedef void (*PunktfunkLogCb)(uint8_t level, const char *target, const char *message, void *user);
+
 // Forward-compatible session configuration. The caller MUST set `struct_size` to
 // `sizeof(PunktfunkConfig)`; the core uses it to detect ABI skew.
 typedef struct {
@@ -2576,6 +2595,27 @@ extern "C" {
 
 // Current ABI version. Mismatch with [`crate::ABI_VERSION`] means incompatible core.
 uint32_t punktfunk_abi_version(void);
+
+// Receive the core's log lines (ABI v25). The core logs through `tracing`; on the desktop and
+// Android shells a subscriber/logger installed by the shell picks those up, but an embedder that
+// installs none (Swift, any C host) saw NOTHING — every transport warning (socket-buffer clamp,
+// QoS refusal), every quinn connection event and every rustls handshake note vanished, and a
+// client log bundle carried the shell's half of the story only. This routes them to `cb`.
+//
+// `max_level` is the most verbose level delivered (1 = error … 5 = trace; 0 = nothing) —
+// `log::set_max_level`, so anything above it costs no formatting. 3 (info) is the right default
+// for a field log ring; quinn's debug/trace is per-packet and would churn any bounded ring.
+// `cb == NULL` detaches the sink (lines are dropped again). `user` is handed back on every call.
+//
+// Returns `Ok`, or `Unsupported` when another `log` backend is already installed in this
+// process (e.g. the Android shell's `android_logger`) — the core cannot replace it, and that
+// backend already receives everything this one would. Idempotent: call again to change the
+// level or the sink.
+//
+// # Safety
+// `cb`, if non-null, must remain a valid function for as long as it is installed (until the next
+// call with NULL), and `user` must stay valid for every call the core may make meanwhile.
+PunktfunkStatus punktfunk_set_log_callback(uint8_t max_level, PunktfunkLogCb cb, void *user);
 
 // Send a Wake-on-LAN magic packet to wake sleeping host NIC(s).
 //

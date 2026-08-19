@@ -106,6 +106,25 @@ final class CommandChordTests: XCTestCase {
         XCTAssertEqual(InputCapture.keyCodeToVK[leftArrow], 0x25) // VK_LEFT
     }
 
+    /// The system-shortcut tap (⌘Space, ⌘Tab — the keys macOS claims before the app sees them)
+    /// takes keys off the system ONLY while captured, under the capture mouse model, with the app
+    /// frontmost. Any other state must pass through: a tap that eats keys for the whole Mac is the
+    /// failure to pin here.
+    func testTheSystemShortcutTapOnlyClaimsWhileCapturedAndFrontmost() {
+        XCTAssertTrue(InputCapture.tapClaims(forwarding: true, desktopMouse: false, appActive: true))
+        XCTAssertFalse(InputCapture.tapClaims(forwarding: false, desktopMouse: false, appActive: true))
+        XCTAssertFalse(InputCapture.tapClaims(forwarding: true, desktopMouse: true, appActive: true))
+        XCTAssertFalse(InputCapture.tapClaims(forwarding: true, desktopMouse: false, appActive: false))
+    }
+
+    /// The keys the tap exists for must have host VKs — it reposts them into the ordinary key path,
+    /// which drops unmapped keyCodes on the floor.
+    func testTheSystemShortcutKeysMapToHostVKs() {
+        XCTAssertEqual(InputCapture.keyCodeToVK[49], 0x20) // Space (⌘Space)
+        XCTAssertEqual(InputCapture.keyCodeToVK[48], 0x09) // Tab (⌘Tab)
+        XCTAssertEqual(InputCapture.keyCodeToVK[126], 0x26) // Up arrow (⌃↑ Mission Control)
+    }
+
     private func keyEvent(_ keyCode: UInt16, _ flags: NSEvent.ModifierFlags) -> NSEvent? {
         NSEvent.keyEvent(
             with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,

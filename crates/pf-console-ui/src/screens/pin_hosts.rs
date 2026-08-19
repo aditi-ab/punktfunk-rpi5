@@ -207,6 +207,7 @@ mod tests {
             online: true,
             mgmt_port: 47990,
             can_wake: false,
+            clipboard_sync: false,
             last_used: None,
             os: String::new(),
             pin: pin.map(|id| ProfileChip {

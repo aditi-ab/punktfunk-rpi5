@@ -26,7 +26,7 @@ import os
 /// Same diagnostic switch as InputCapture: PUNKTFUNK_INPUT_DEBUG=1 logs when the macOS
 /// NSEvent mouse monitor (relative motion + buttons) is installed/removed, so the user can
 /// confirm the new motion path is actually live for a session.
-private let streamInputLog = Logger(subsystem: "io.unom.punktfunk", category: "input")
+private let streamInputLog = ClientLog(category: "input")
 private let streamInputDebug =
     ProcessInfo.processInfo.environment["PUNKTFUNK_INPUT_DEBUG"] == "1"
 

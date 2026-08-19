@@ -147,6 +147,14 @@ object NativeBridge {
     ): String
 
     /**
+     * The native client's recent log ring rendered as one text bundle, oldest first,
+     * prefixed by [header] (this app's identity line) — the body for "Send logs to host"
+     * (`POST /api/v1/client-logs` over the same mTLS client the library fetch uses).
+     * Never empty; cheap (string copy, no I/O).
+     */
+    external fun nativeRenderLogs(header: String): String
+
+    /**
      * The machine token of the most recent failed [nativeConnect]/[nativePair], cleared on read
      * (`""` when none) — call right after a `0` handle / `""` fingerprint. A typed host rejection
      * yields its wire token ("not-armed", "denied", "approval-timeout", "superseded", "busy",

@@ -34,7 +34,7 @@ import Foundation
 import Metal
 import os
 
-private let waveletLog = Logger(subsystem: "io.unom.punktfunk", category: "pyrowave")
+private let waveletLog = ClientLog(category: "pyrowave")
 
 /// The per-(component, level, band) 32x32-block table — the exact Swift port of
 /// `WaveletBuffers::init_block_meta` (pyrowave_common.cpp): the walk order (level 4→0,

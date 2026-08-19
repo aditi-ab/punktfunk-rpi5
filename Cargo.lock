@@ -3582,6 +3582,7 @@ dependencies = [
  "hmac 0.13.0",
  "if-addrs",
  "libc",
+ "log",
  "opus",
  "proptest",
  "quinn",

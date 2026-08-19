@@ -37,8 +37,10 @@ import io.unom.punktfunk.models.ActiveSession
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -213,6 +215,14 @@ object SkiaConsole {
         main.post(object : Runnable {
             override fun run() {
                 if (handle == 0L) return
+                // Only while the console is ON SCREEN (attached): parked behind the touch UI
+                // or a stream there is nobody to show the presence pips to — and mid-stream
+                // the radio belongs to the session, which is exactly why discovery stops for
+                // it. The timer keeps ticking so probes resume within a cadence of re-attach.
+                if (onConnected == null) {
+                    main.postDelayed(this, 12_000)
+                    return
+                }
                 val targets = knownHostStore.all().filter { kh -> discovered.none { kh.matches(it) } }
                 ioPool.execute {
                     val up = targets.filter { NativeBridge.nativeProbe(it.address, it.port, 3_000) }
@@ -536,12 +546,14 @@ object SkiaConsole {
                     c.optJSONObject("FetchLibrary")?.let { fetchLibrary(it, refreshOnly = false) }
                     c.optJSONObject("RefreshRunning")?.let { fetchLibrary(it, refreshOnly = true) }
                     c.optJSONObject("Pair")?.let(::pair)
-                    c.optJSONObject("SendLogs")?.let { notice("Sending logs isn't available on this device yet") }
+                    c.optJSONObject("SendLogs")?.let(::sendLogs)
                     c.optJSONObject("SaveHost")?.let(::saveHost)
                     c.optJSONObject("UpdateHost")?.let(::updateHost)
                     c.optJSONObject("ForgetHost")?.let(::forgetHost)
                     c.optJSONObject("Wake")?.let(::wake)
                     c.optJSONObject("SetPin")?.let(::setPin)
+                    c.optJSONObject("BindProfile")?.let(::bindProfile)
+                    c.optJSONObject("SetClipboard")?.let(::setClipboard)
                     c.optJSONObject("OpenPlatformScreen")?.let { onPlatformScreen?.invoke(it.optString("id")) }
                     c.optJSONObject("PadAction")?.let { onPadAction?.invoke(it.optString("action"), it.optString("pad_key")) }
                     c.optString("OpenPlatformScreen").takeIf { c.has("OpenPlatformScreen") && c.opt("OpenPlatformScreen") is String }
@@ -582,6 +594,22 @@ object SkiaConsole {
         pushHosts(); pushKnownHosts()
     }
 
+    /** `ConsoleCmd::BindProfile` — the host's default binding (`KnownHost.profileId`); null clears. */
+    private fun bindProfile(c: JSONObject) {
+        val kh = hostForKey(c.optString("key")) ?: return
+        val pid = c.optString("profile_id")
+            .takeIf { c.has("profile_id") && !c.isNull("profile_id") && it.isNotEmpty() }
+        knownHostStore.save(kh.copy(profileId = pid))
+        pushHosts(); pushKnownHosts()
+    }
+
+    /** `ConsoleCmd::SetClipboard` — the per-host clipboard trust toggle. */
+    private fun setClipboard(c: JSONObject) {
+        val kh = hostForKey(c.optString("key")) ?: return
+        knownHostStore.save(kh.copy(clipboardSync = c.optBoolean("on")))
+        pushHosts(); pushKnownHosts()
+    }
+
     private fun setPin(c: JSONObject) {
         val kh = hostForKey(c.optString("key")) ?: return
         val pid = c.optString("profile_id"); val pin = c.optBoolean("pin")
@@ -589,6 +617,52 @@ object SkiaConsole {
         if (pin && pid !in pins) pins.add(pid) else if (!pin) pins.remove(pid)
         knownHostStore.save(kh.copy(pinnedProfileIds = pins))
         pushHosts(); pushKnownHosts()
+    }
+
+    /**
+     * `ConsoleCmd::SendLogs` — the native log ring (`nativeRenderLogs`) posted to this
+     * paired host's `POST /api/v1/client-logs` over the same mTLS client the library fetch
+     * uses; the result comes back as a notice, in the desktop console's wording. The header
+     * mirrors the desktop's identity line (`punktfunk-session <ver> (<os> <arch>) — client
+     * log bundle`).
+     */
+    private fun sendLogs(c: JSONObject) {
+        val addr = c.optString("addr"); val mgmt = c.optInt("mgmt"); val fp = c.optString("fp_hex")
+        val hostName = c.optString("host_name").ifEmpty { addr }
+        val id = identity
+        if (id == null) {
+            notice("Identity not ready yet — try again in a moment")
+            return
+        }
+        val version = appContext?.let { app ->
+            runCatching { app.packageManager.getPackageInfo(app.packageName, 0).versionName }.getOrNull()
+        } ?: "?"
+        val header = "punktfunk-android $version (android ${android.os.Build.VERSION.RELEASE}; " +
+            "${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"}) — client log bundle"
+        ioPool.execute {
+            val err = runCatching {
+                val body = NativeBridge.nativeRenderLogs(header)
+                val client = io.unom.punktfunk.kit.library.mtlsHttpClient(
+                    id.certPem, id.privateKeyPem, addr, fp,
+                )
+                val req = Request.Builder()
+                    .url("https://$addr:$mgmt/api/v1/client-logs")
+                    .post(body.toRequestBody("text/plain; charset=utf-8".toMediaType()))
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    if (resp.code == 200) "" else "host answered HTTP ${resp.code}"
+                }
+            }.getOrElse { it.message ?: "upload failed" }
+            main.post {
+                notice(
+                    if (err.isEmpty()) {
+                        "Logs sent to $hostName — download them from its web console's Logs page"
+                    } else {
+                        "Couldn't send logs — $err"
+                    },
+                )
+            }
+        }
     }
 
     private fun pair(c: JSONObject) {

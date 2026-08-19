@@ -56,6 +56,15 @@ enum RowId {
     PadType,
     SystemButtons,
     GuideGesture,
+    /// The DualSense voice-coil haptics stream, rendered on the (wired) pad itself — see
+    /// `trust::Settings::pad_haptics`. Negotiated: it changes nothing without a capable
+    /// host and a wired DS5, which is why the row says what it is for, not what it does.
+    PadHaptics,
+    /// Where the pad's built-in-speaker stream renders — `trust::Settings::pad_speaker`.
+    /// Offered as On (`"pad"`) / Off, exactly like the GTK switch over the same key: the
+    /// third stored value (`"mix"`) is a declared TODO that renders as off, and a picker
+    /// offering it would be a control that changes nothing.
+    PadSpeaker,
     Touch,
     Mouse,
     InvertScroll,
@@ -117,6 +126,14 @@ mod android_keys {
 /// The Android console-UI mode's stored values (`GamepadUi.kt`).
 const GAMEPAD_UI_MODES: [(&str, &str); 2] =
     [("connected", "With a controller"), ("always", "Always")];
+
+/// `pad_audio::speaker_active`'s answer, restated: only `"pad"` renders today ("mix" is
+/// the declared TODO that renders as off). Local because that module owns the actual
+/// renderer and is `cfg(linux|windows)` — this row also ships on Android, where the
+/// SETTING still travels with the stream request even though no local renderer exists.
+fn pad_speaker_on(mode: &str) -> bool {
+    mode == "pad"
+}
 
 fn extra_bool(s: &pf_client_core::trust::Settings, key: &str, default: bool) -> bool {
     s.extra
@@ -200,6 +217,8 @@ const TABS: [(&str, &[RowId]); 7] = [
             RowId::PadType,
             RowId::SystemButtons,
             RowId::GuideGesture,
+            RowId::PadHaptics,
+            RowId::PadSpeaker,
             RowId::PhoneRumble,
             RowId::PhoneGyro,
             RowId::Sc2Passthrough,
@@ -388,6 +407,12 @@ impl SettingsScreen {
     #[cfg(test)]
     pub(crate) fn tab_for_test(&self) -> usize {
         self.tab
+    }
+
+    /// Row `i`'s rect as last drawn — the shell's touch tests press real coordinates.
+    #[cfg(test)]
+    pub(crate) fn row_rect_for_test(&self, i: usize) -> Option<Rect> {
+        self.list.row_rect(i)
     }
 
     /// L1/R1 (and Tab/PgUp/PgDn) — move one tab, wrapping (the strip is a ring, like A's
@@ -608,7 +633,10 @@ impl SettingsScreen {
             .collect();
         self.list
             .render(canvas, list_rect, &rows, fonts, k, dt, true);
-        let detail = ids.get(self.list.cursor).copied().map_or("", detail);
+        let detail = ids
+            .get(self.list.cursor)
+            .copied()
+            .map_or("", |id| detail(id, ctx.platform));
         fonts.centered(
             canvas,
             detail,
@@ -732,9 +760,12 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
         // reading the same settings file on this same machine. Delete this arm when that
         // client-side filter learns the frame ladder — not before.
         RowId::AudioFormat => s.audio_channels == 2,
-        RowId::Pad | RowId::PadType | RowId::SystemButtons | RowId::GuideGesture => {
-            s.gamepad_forwarding
-        }
+        RowId::Pad
+        | RowId::PadType
+        | RowId::SystemButtons
+        | RowId::GuideGesture
+        | RowId::PadHaptics
+        | RowId::PadSpeaker => s.gamepad_forwarding,
         _ => true,
     };
     let (header, label, value): (Option<&'static str>, &str, String) = match id {
@@ -861,6 +892,12 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             "Hold Select for guide",
             label_for(&GUIDE_GESTURE, &s.guide_gesture).into(),
         ),
+        RowId::PadHaptics => (None, "Controller haptics", on_off(s.pad_haptics).into()),
+        RowId::PadSpeaker => (
+            None,
+            "Controller speaker",
+            on_off(pad_speaker_on(&s.pad_speaker)).into(),
+        ),
         RowId::Touch => (None, "Touch mode", s.touch_mode().label().into()),
         RowId::Mouse => (None, "Mouse mode", s.mouse_mode().label().into()),
         RowId::InvertScroll => (None, "Invert scroll", on_off(s.invert_scroll).into()),
@@ -949,7 +986,11 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
     }
 }
 
-fn detail(id: RowId) -> &'static str {
+/// The focused row's one-line explainer. Takes the platform because two desktop rows
+/// advertise desktop-only live chords (Ctrl+Alt+Shift+…) that no Android build has — a
+/// shortcut the device cannot press must not be taught.
+fn detail(id: RowId, platform: crate::platform::Platform) -> &'static str {
+    use crate::platform::Platform;
     match id {
         RowId::Resolution => {
             "The host creates a virtual display at exactly this size — no scaling. \
@@ -1023,15 +1064,29 @@ fn detail(id: RowId) -> &'static str {
              the host's quick-access menu. Automatic arms it only where the real button \
              can't reach the host. A Select tap still goes through, slightly delayed."
         }
+        RowId::PadHaptics => {
+            "Play a DualSense's fine-grained haptics on the pad itself instead of plain \
+             rumble. Negotiated — it changes nothing without a capable host and a wired pad."
+        }
+        RowId::PadSpeaker => {
+            "Play the audio a game sends to the controller's own speaker on the pad, \
+             not through this device's output."
+        }
         RowId::Touch => {
             "How the touchscreen drives the host: Trackpad (relative cursor), \
              Direct pointer (cursor jumps to your finger), or Touch passthrough (raw contacts)."
         }
-        RowId::Mouse => {
-            "How a physical mouse drives the host: Capture locks the pointer (relative, \
-             for games), Desktop leaves it free and sends absolute positions. \
-             Ctrl+Alt+Shift+M switches live while streaming."
-        }
+        RowId::Mouse => match platform {
+            Platform::Desktop => {
+                "How a physical mouse drives the host: Capture locks the pointer (relative, \
+                 for games), Desktop leaves it free and sends absolute positions. \
+                 Ctrl+Alt+Shift+M switches live while streaming."
+            }
+            Platform::Android => {
+                "How a physical mouse drives the host: Capture locks the pointer (relative, \
+                 for games), Desktop leaves it free and sends absolute positions."
+            }
+        },
         RowId::InvertScroll => "Reverses the wheel and trackpad scroll direction sent to the host.",
         RowId::Shortcuts => {
             "Alt+Tab, Super and friends reach the host while input is captured. \
@@ -1056,10 +1111,15 @@ fn detail(id: RowId) -> &'static str {
              stores as tiles — instead of the whole shelf. A library with only one \
              collection opens on the shelf as usual."
         }
-        RowId::Stats => {
-            "How much the overlay shows: Compact (one line) → Normal → Detailed. \
-             Ctrl+Alt+Shift+S cycles it live while streaming."
-        }
+        RowId::Stats => match platform {
+            Platform::Desktop => {
+                "How much the overlay shows: Compact (one line) → Normal → Detailed. \
+                 Ctrl+Alt+Shift+S cycles it live while streaming."
+            }
+            Platform::Android => {
+                "How much the overlay shows: Compact (one line) → Normal → Detailed."
+            }
+        },
         RowId::Fullscreen => "Streams open fullscreen instead of windowed.",
         RowId::AutoWake => {
             "Send Wake-on-LAN to a sleeping host before connecting. Turn off for hosts \
@@ -1258,6 +1318,23 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
                 return false;
             }
             step_str(&GUIDE_GESTURE, &mut s.guide_gesture, delta, wrap)
+        }
+        RowId::PadHaptics => {
+            if !s.gamepad_forwarding {
+                return false;
+            }
+            toggle(&mut s.pad_haptics, delta, wrap)
+        }
+        RowId::PadSpeaker => {
+            if !s.gamepad_forwarding {
+                return false;
+            }
+            // On/Off over the stored string, the way the GTK switch edits the same key: a
+            // stored "mix" reads as Off (it renders as off today) and any step writes the
+            // two values that do something.
+            let mut on = pad_speaker_on(&s.pad_speaker);
+            toggle(&mut on, delta, wrap)
+                .map(|()| s.pad_speaker = if on { "pad" } else { "off" }.to_string())
         }
         RowId::Touch => {
             let cur = TouchMode::ALL.iter().position(|m| *m == s.touch_mode());
@@ -1557,6 +1634,44 @@ pub(super) mod tests {
             };
             assert!(!s.pointer(p, ctx, &mut fx));
         });
+    }
+
+    /// The controller-audio rows: they follow the forwarding switch like every other pad
+    /// row, and the speaker row edits the stored STRING exactly the way the GTK switch
+    /// over the same key does — a stored "mix" (the declared TODO that renders as off)
+    /// reads as Off, and any step writes only the two values that do something.
+    #[test]
+    fn controller_audio_rows_follow_forwarding_and_speak_the_gtk_dialect() {
+        let (mut settings, pads) = ctx_parts();
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
+            pads: &pads,
+            deck: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        // Defaults: haptics on, speaker on the pad.
+        assert!(ctx.settings.pad_haptics);
+        assert_eq!(ctx.settings.pad_speaker, "pad");
+        assert!(adjust(RowId::PadHaptics, 1, true, &mut ctx));
+        assert!(!ctx.settings.pad_haptics);
+        assert!(adjust(RowId::PadSpeaker, 1, true, &mut ctx));
+        assert_eq!(ctx.settings.pad_speaker, "off");
+        assert!(adjust(RowId::PadSpeaker, 1, true, &mut ctx));
+        assert_eq!(ctx.settings.pad_speaker, "pad");
+        // A stored "mix" reads as Off and steps onto a value that works.
+        ctx.settings.pad_speaker = "mix".into();
+        assert!(adjust(RowId::PadSpeaker, 1, true, &mut ctx));
+        assert_eq!(ctx.settings.pad_speaker, "pad");
+        // Forwarding off parks both, like the sibling pad rows.
+        ctx.settings.gamepad_forwarding = false;
+        assert!(!adjust(RowId::PadHaptics, 1, true, &mut ctx));
+        assert!(!adjust(RowId::PadSpeaker, 1, true, &mut ctx));
     }
 
     #[test]
@@ -1871,6 +1986,7 @@ pub(super) mod tests {
             online: true,
             mgmt_port: 47990,
             can_wake: false,
+            clipboard_sync: false,
             last_used: None,
             os: String::new(),
             pin: Some(crate::model::ProfileChip {
@@ -2047,12 +2163,14 @@ pub(super) mod tests {
                 seen.push(*id);
             }
         }
-        // The pre-tab flat list, plus the palette row, the lossless-audio row and the
-        // reduce-motion row later passes added, minus the game-library toggle: this screen
-        // never read it, and the library is offered on any paired host now.
-        // 33 desktop rows + the eight Android-only ones (design android-skia-console-port.md
+        // The pre-tab flat list, plus the palette row, the lossless-audio row, the
+        // reduce-motion row and the two controller-audio rows (haptics + speaker — the
+        // 2026-08 sweep found them bridged but unreachable) later passes added, minus the
+        // game-library toggle: this screen never read it, and the library is offered on any
+        // paired host now.
+        // 35 desktop rows + the eight Android-only ones (design android-skia-console-port.md
         // D3): six `extra`-backed settings and two platform-screen action rows.
-        assert_eq!(seen.len(), 41, "{seen:?}");
+        assert_eq!(seen.len(), 43, "{seen:?}");
         assert!(seen.contains(&RowId::Palette));
         assert!(seen.contains(&RowId::ReduceMotion));
         assert!(seen.contains(&RowId::AudioFormat));

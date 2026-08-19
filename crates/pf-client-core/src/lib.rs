@@ -63,7 +63,11 @@ pub mod library;
 // Per-host catalog cache, so a library screen has titles to show while a sleeping host boots.
 #[cfg(any(target_os = "linux", windows))]
 pub mod library_cache;
-#[cfg(any(target_os = "linux", windows))]
+// Android-enabled for the RING half (note/render — std only): the client's "Send logs to
+// host" needs the ring on every platform. The `send_to_host` uploader inside stays
+// desktop-gated with the rest of the ureq fetches; Android posts the rendered bundle
+// through its own mTLS OkHttp client (`SkiaConsole.sendLogs`).
+#[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod logring;
 // The `punktfunk://` grammar (design/client-deep-links.md §2): one parser/emitter for the
 // shells, the session and the CLI, held to the Swift/Kotlin ports by a shared vector file.

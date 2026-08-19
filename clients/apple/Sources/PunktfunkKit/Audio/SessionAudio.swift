@@ -38,7 +38,7 @@
 import AVFoundation
 import os
 
-private let log = Logger(subsystem: "io.unom.punktfunk", category: "audio")
+private let log = ClientLog(category: "audio")
 
 /// Render-block-owned scratch storage: freed exactly when the closure (and thus the
 /// last possible render call) is released — never racing CoreAudio.

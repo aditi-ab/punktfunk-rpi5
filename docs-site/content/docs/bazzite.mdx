@@ -26,9 +26,9 @@ are. After an update restart the host: `systemctl --user restart punktfunk-web p
 ## 2. Let it use your controllers
 
 On Bazzite the `input` group is managed by a recipe, so don't `usermod` it — use the helper. The
-`punktfunk` group is ours (the sysext creates it), and on a Gaming Mode box it isn't optional: it
-authorizes the host to take the Gaming Mode session over at your client's resolution, and gates the
-virtual Steam Deck controller. Then **log out and back in**:
+`punktfunk` group is ours (the sysext creates it) and gates the **virtual Steam Deck controller**
+(paddles, trackpads, gyro) — without it that pad arrives as an ordinary Xbox 360 controller. Then
+**log out and back in**:
 
 ```sh
 ujust add-user-to-input-group
@@ -76,8 +76,9 @@ app for Apple TV and iPad.
 ## When you want more
 
 - **Gaming Mode: what the client gets.** By default the host relaunches Gaming Mode *headless* at the
-  client's exact resolution (a display of its own, real HDR, the compositor's cursor) and restores
-  the box on idle. `PUNKTFUNK_GAMESCOPE_ATTACH=1` makes it attach to the box's own session instead —
+  client's exact resolution (a display of its own, real HDR, the compositor's cursor), idling the
+  box's own session with a user-level drop-in for the length of the stream — no privilege needed,
+  and Steam's "Switch to Desktop" keeps working — and restores the box on idle. `PUNKTFUNK_GAMESCOPE_ATTACH=1` makes it attach to the box's own session instead —
   rock-solid switching, but a box with a screen serves a *mirror* of it, and loses HDR and the cursor.
   [How the host gets a gamescope](/docs/gamescope#how-the-host-gets-a-gamescope) has the whole
   model; the Bazzite template (`/usr/share/punktfunk/host.env.bazzite`) forces neither.

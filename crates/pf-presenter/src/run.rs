@@ -2723,6 +2723,11 @@ fn apply_capture(
 /// Only DIRECT touch devices are offered; an indirect trackpad already drives the mouse,
 /// and forwarding both would double every tap.
 fn overlay_pointer(event: &Event, window: &sdl3::video::Window) -> Option<PointerInput> {
+    // SDL's mouse id on mouse events it SYNTHESIZED from a touch (`SDL_TOUCH_MOUSEID`,
+    // not re-exported by the sdl3 crate). The finger arms below already forward the real
+    // touch stream; letting the synthesized twin through would land every tap twice —
+    // once deferred (touch), once immediate (mouse) — so those events are dropped here.
+    const TOUCH_MOUSEID: u32 = u32::MAX;
     let (pw, ph) = window.size_in_pixels();
     let (lw, lh) = window.size();
     // Logical → physical. A zero-sized window (minimized) would divide by zero.
@@ -2734,20 +2739,29 @@ fn overlay_pointer(event: &Event, window: &sdl3::video::Window) -> Option<Pointe
         _ => None,
     };
     Some(match event {
-        Event::MouseMotion { x, y, .. } => PointerInput::Move {
+        Event::MouseMotion { which, x, y, .. } if *which != TOUCH_MOUSEID => PointerInput::Move {
             x: x * sx,
             y: y * sy,
         },
         Event::MouseButtonDown {
-            mouse_btn, x, y, ..
-        } => PointerInput::Down {
+            which,
+            mouse_btn,
+            x,
+            y,
+            ..
+        } if *which != TOUCH_MOUSEID => PointerInput::Down {
             x: x * sx,
             y: y * sy,
             button: button(*mouse_btn)?,
+            touch: false,
         },
         Event::MouseButtonUp {
-            mouse_btn, x, y, ..
-        } => PointerInput::Up {
+            which,
+            mouse_btn,
+            x,
+            y,
+            ..
+        } if *which != TOUCH_MOUSEID => PointerInput::Up {
             x: x * sx,
             y: y * sy,
             button: button(*mouse_btn)?,
@@ -2767,6 +2781,7 @@ fn overlay_pointer(event: &Event, window: &sdl3::video::Window) -> Option<Pointe
                 x: x * pw as f32,
                 y: y * ph as f32,
                 button: PointerButton::Primary,
+                touch: true,
             }
         }
         Event::FingerMotion { touch_id, x, y, .. } if is_direct_touch(*touch_id) => {

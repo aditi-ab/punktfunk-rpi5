@@ -124,6 +124,15 @@ unwrapped.overrideAttrs (old: {
       "$layerJson" "$TMPDIR/pf-layer.json" \
       "$out/lib/punktfunk/libVkLayer_PUNKTFUNK_gamescope_wsi.so"
 
+    # gamescope's own default_extras_install.sh lays the reshade shaders and textures down under
+    # read-only DIRECTORIES (mode 555). `rm` needs write permission on the CONTAINING directory,
+    # not on the file, so the prune below otherwise dies with "Permission denied" on every one of
+    # them — after a full compositor build, with the compositor itself already installed and the
+    # log looking finished. MEASURED 2026-08-19 (run 19341), reachable only once the enableWsi
+    # override got the build past the layer assertion above. Nix seals $out read-only after the
+    # builder exits, so widening it here costs nothing and changes nothing in the output.
+    chmod -R u+w $out
+
     find $out -mindepth 1 -maxdepth 1 ! -name bin -exec rm -rf {} +
     find $out/bin -mindepth 1 ! -name gamescope -delete
     mv $out/bin/gamescope $out/bin/punktfunk-gamescope

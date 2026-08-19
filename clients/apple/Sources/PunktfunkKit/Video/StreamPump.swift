@@ -8,7 +8,7 @@ import AVFoundation
 import Foundation
 import os
 
-private let pumpLog = Logger(subsystem: "io.unom.punktfunk", category: "video")
+private let pumpLog = ClientLog(category: "video")
 
 /// One pump per instance; create a fresh StreamPump per start (the stop is permanent —
 /// a restart hands the old pump its own token, so it can never be revived by a newer start()).

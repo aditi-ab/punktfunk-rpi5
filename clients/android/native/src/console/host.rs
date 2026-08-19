@@ -249,6 +249,13 @@ impl ConsoleHost {
     }
 }
 
+/// No input for this long = the console is being looked at, not used — halve the redraw
+/// rate (`IDLE_FRAME_STEP` slept between swaps). 60 s keeps every interaction and its
+/// afterglow at full smoothness and only calms a genuinely parked screen.
+const IDLE_AFTER: Duration = Duration::from_secs(60);
+/// One extra ~vsync period per frame while idle: 60 Hz → ~30, 120 Hz → ~40.
+const IDLE_FRAME_STEP: Duration = Duration::from_millis(16);
+
 /// The render thread. Owns EGL + Skia + the console; runs until `Cmd::Quit`.
 fn render_loop(mut console: Console, shared: Arc<Shared>, store: Arc<SnapshotStore>) -> Result<()> {
     let egl = EglContext::new()?;
@@ -267,6 +274,8 @@ fn render_loop(mut console: Console, shared: Arc<Shared>, store: Arc<SnapshotSto
     let mut was_editing = console.editing();
     let mut saved_gen = store.saved_gen();
     let mut menu_out: Vec<MenuEvent> = Vec::new();
+    // When the last input arrived — the idle throttle's clock (see the draw site below).
+    let mut last_input = Instant::now();
     // Consecutive GL setup failures (window surface / Skia wrap). One is a transient (a window
     // torn down mid-create); a run of them is a context that is not coming back — most likely
     // reclaimed by Android while the app was backgrounded. Only exiting reports that: each
@@ -304,21 +313,28 @@ fn render_loop(mut console: Console, shared: Arc<Shared>, store: Arc<SnapshotSto
                     return Ok(());
                 }
                 Cmd::Menu(ev) => {
+                    last_input = Instant::now();
                     if let Some(p) = console.menu(ev) {
                         shared.emit(HostEvent::Pulse(p));
                     }
                 }
                 Cmd::PadSample(s) => {
+                    last_input = Instant::now();
                     sample = s;
                     poll_now = true;
                 }
                 Cmd::Pointer(p) => {
+                    last_input = Instant::now();
                     console.pointer(p);
                 }
                 Cmd::Key { key, shift, repeat } => {
+                    last_input = Instant::now();
                     console.key(key, shift, repeat);
                 }
-                Cmd::Text(t) => console.text(&t),
+                Cmd::Text(t) => {
+                    last_input = Instant::now();
+                    console.text(&t);
+                }
                 Cmd::Phase(ph) => {
                     match &ph {
                         Phase::Connecting => console.session_phase(SessionPhase::Connecting),
@@ -413,6 +429,13 @@ fn render_loop(mut console: Console, shared: Arc<Shared>, store: Arc<SnapshotSto
         }
 
         // Draw, if there is somewhere to draw.
+        // ponytail: half-rate after 60 s without input — one extra frame period between
+        // swaps, so an idle carousel stops redrawing a phone's panel at its full rate
+        // (the aurora still breathes, at half tempo). Any input restores full rate on
+        // its own frame; damage-driven rendering if a TV box ever needs more.
+        if last_input.elapsed() >= IDLE_AFTER {
+            std::thread::sleep(IDLE_FRAME_STEP);
+        }
         if let (Some(s), Some(g)) = (surface.as_mut(), gpu.as_mut()) {
             let (w, h) = (s.width, s.height);
             let need_wrap = match &skia {
