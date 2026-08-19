@@ -31,11 +31,39 @@
 {
   lib,
   gamescope,
+  fetchFromGitHub,
   python3,
   patchDir,
   manifestRewriter,
 }:
 let
+  # PIN THE COMPOSITOR SOURCE, rather than patching whatever gamescope nixpkgs happens to carry.
+  # Every other channel already ships this exact commit — packaging/gamescope/README.md,
+  # punktfunk-gamescope.spec, the PKGBUILD and build-punktfunk-gamescope.sh — and nix was the
+  # only one tracking nixpkgs' version and hoping ten patches still applied.
+  #
+  # They did not, and the failures were not academic (MEASURED 2026-08-19/20):
+  #   * nixpkgs shipped 3.16.24 and patch 0009's context did not exist there at all, so the
+  #     build died at patchPhase — every `services.punktfunk.host.enable = true` with it.
+  #   * bumping the lock to 3.16.25 fixed that, then `--version` printed NOTHING: upstream's
+  #     `gamescope::PrintVersion()` landed AFTER the 3.16.25 tag. The host reads that banner to
+  #     decide a session's bit depth and cursor compositing BEFORE the virtual display exists,
+  #     so a silent banner means a silent fall back to SDR — the exact failure every guard in
+  #     this file is written to prevent.
+  # Both are the same bug: nixpkgs' gamescope is older than the tree these patches target.
+  # Pinning makes the nix package agree with every other channel byte for byte.
+  #
+  # Bumping this: move the rev, then `nix-prefetch-git --url https://github.com/ValveSoftware/gamescope
+  # --rev <new> --fetch-submodules` for the hash, and keep packaging/gamescope/README.md in step.
+  pfRev = "5fb8dce4a09d0a68d097b9faf9513782106bc843";
+  pfVersion = "3.16.25-11-g5fb8dce";
+  pfSrc = fetchFromGitHub {
+    owner = "ValveSoftware";
+    repo = "gamescope";
+    rev = pfRev;
+    fetchSubmodules = true;
+    hash = "sha256-pGBiO+7LSdIc0k9K+SQnv/Og2DYD/cjvOImxIl91L2A=";
+  };
   # As of nixos-unstable (checked 2026-07-28) `gamescope` IS the buildable derivation — pname
   # "gamescope", version 3.16.25, carrying `src`/`patches`/`mesonFlags`. Revisions that wrap it
   # (to wire the WSI layer + capabilities) expose the build as `.unwrapped`, so prefer that where
@@ -76,6 +104,8 @@ let
 in
 unwrapped.overrideAttrs (old: {
   pname = "punktfunk-gamescope";
+  version = pfVersion;
+  src = pfSrc;
 
   # Read the patch DIRECTORY rather than naming files: `builtins.attrNames` sorts
   # lexicographically, which for `000N-` prefixes is exactly the apply order, and a patch added or
@@ -96,7 +126,7 @@ unwrapped.overrideAttrs (old: {
     substituteInPlace src/meson.build \
       --replace-fail \
         "vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()" \
-        "vcs_tag = '${old.version}'"
+        "vcs_tag = '${pfVersion}'"
   '';
 
   # Ship the compositor, renamed, AND the WSI layer built beside it. Everything else nixpkgs
