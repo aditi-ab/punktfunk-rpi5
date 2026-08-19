@@ -34,6 +34,9 @@ mod audio;
 // shell over EGL/GLES, on every ABI (the armv7 Skia archive is self-hosted — see Cargo.toml).
 #[cfg(target_os = "android")]
 mod console;
+// "Send logs to host": the log-ring upload (`pf-client-core` is Android-target-only here).
+#[cfg(target_os = "android")]
+mod logs;
 // The RESOLVED audio format + its ms ⇄ sample arithmetic, split out of `audio` and — unlike it —
 // ungated, because that arithmetic is what a rate the ladder does not divide gets wrong (44 100 Hz
 // used to come out 2.3 % off in every direction at once) and it must be provable without a phone.
@@ -60,22 +63,58 @@ mod wol;
 // it off the main thread to light saved-host "online" pips independently of mDNS.
 mod probe;
 
-/// Initialize `android_logger` once when the JVM loads the library. Logs land in logcat under the
-/// `punktfunk` tag. Core `tracing` events (transport warnings: socket-buffer clamp, QoS failures)
-/// arrive here too: tracing's "log" feature — declared explicitly in Cargo.toml rather than relied
-/// on via quinn's defaults — forwards them as `log` records since no tracing subscriber is ever
-/// installed. Android-only — there is no JVM (and no logcat) on the host build.
+/// Every `log` record, teed: to logcat (via [`android_logger::AndroidLogger`]) AND into
+/// `pf_client_core::logring` — the source for the console's "Send logs to host" action
+/// ([`logs`]). The ring line mirrors the desktop `ring_layer`'s shape (wallclock, level,
+/// target, message) so a bundle reads the same on the host's Logs page whichever client
+/// sent it. Both sinks share the crate's Info ceiling — the field ring gets exactly what
+/// logcat gets, which also keeps per-frame DEBUG chatter out of it by construction.
+#[cfg(target_os = "android")]
+struct RingTee(android_logger::AndroidLogger);
+
+#[cfg(target_os = "android")]
+impl log::Log for RingTee {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record) {
+        self.0.log(record);
+        pf_client_core::logring::note(format!(
+            "{} {:5} {} {}",
+            pf_client_core::logring::wallclock(),
+            record.level().as_str(),
+            record.target(),
+            record.args()
+        ));
+    }
+
+    fn flush(&self) {
+        self.0.flush();
+    }
+}
+
+/// Initialize logging once when the JVM loads the library: logcat under the `punktfunk` tag,
+/// teed into the client log ring (see [`RingTee`]). Core `tracing` events (transport warnings:
+/// socket-buffer clamp, QoS failures) arrive here too: tracing's "log" feature — declared
+/// explicitly in Cargo.toml rather than relied on via quinn's defaults — forwards them as
+/// `log` records since no tracing subscriber is ever installed. Android-only — there is no
+/// JVM (and no logcat) on the host build.
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn JNI_OnLoad(
     _vm: *mut jni::sys::JavaVM,
     _reserved: *mut std::ffi::c_void,
 ) -> jint {
-    android_logger::init_once(
+    let logcat = android_logger::AndroidLogger::new(
         android_logger::Config::default()
             .with_max_level(log::LevelFilter::Info)
             .with_tag("punktfunk"),
     );
+    // `set_boxed_logger` (unlike `init_once`) does not set the max level itself.
+    if log::set_boxed_logger(Box::new(RingTee(logcat))).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
     log::info!(
         "punktfunk_android loaded (core ABI v{})",
         punktfunk_core::ABI_VERSION

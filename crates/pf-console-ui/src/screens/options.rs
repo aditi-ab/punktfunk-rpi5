@@ -124,7 +124,10 @@ impl OptionsScreen {
         key.split('\0').next().unwrap_or(key)
     }
 
-    fn actions(&self, platform: crate::platform::Platform) -> Vec<Action> {
+    // `_platform` is the seam platform-conditional rows plug into (Send logs used it until
+    // Android grew an uploader); unused today, kept so the next such row has its question
+    // already answered at every call site.
+    fn actions(&self, _platform: crate::platform::Platform) -> Vec<Action> {
         let host = match &self.subject {
             Subject::Host(h) => h,
             // Deliberately not [Play, …]: the host menu does not repeat its tile's own A
@@ -146,9 +149,9 @@ impl OptionsScreen {
         // error. This is the log-escape hatch for platforms whose own filesystem the user
         // can't reach (Deck Gaming Mode, tvOS): the bundle lands on the host, listed in
         // its web console next to the host's own logs.
-        // Only where a service exists to upload them: the Android client has no log-ring
-        // uploader yet, and a row that can only toast "not available" is a promise broken.
-        if host.paired && host.online && platform == crate::platform::Platform::Desktop {
+        // Every platform has an uploader now (Android's rides `nativeSendLogs` over the
+        // same `logring` the desktop drains), so paired-and-reachable is the whole gate.
+        if host.paired && host.online {
             a.push(Action::SendLogs);
         }
         a.extend([
@@ -477,12 +480,12 @@ mod tests {
             .contains(&Action::Wake));
     }
 
-    /// "Send logs" is offered only where a service exists to act on it: the Android host
-    /// answers the command with a not-available notice (`SkiaConsole.drainCommands`), so
-    /// until its log-ring uploader lands the row must not render there. When that uploader
-    /// ships, this test is the line to flip alongside the gate in [`OptionsScreen::actions`].
+    /// "Send logs" is offered wherever a paired, reachable host can receive it — on BOTH
+    /// platforms since Android's uploader landed (`SkiaConsole.sendLogs` → `nativeSendLogs`
+    /// over the shared `logring`); before that the row was desktop-only, because a row that
+    /// can only toast "not available" is a promise broken.
     #[test]
-    fn send_logs_is_desktop_only_until_android_can_upload() {
+    fn send_logs_is_offered_on_every_platform_with_an_uploader() {
         let reachable = OptionsScreen::for_host(&HostRow {
             paired: true,
             online: true,
@@ -491,7 +494,7 @@ mod tests {
         assert!(reachable
             .actions(crate::platform::Platform::Desktop)
             .contains(&Action::SendLogs));
-        assert!(!reachable
+        assert!(reachable
             .actions(crate::platform::Platform::Android)
             .contains(&Action::SendLogs));
     }
