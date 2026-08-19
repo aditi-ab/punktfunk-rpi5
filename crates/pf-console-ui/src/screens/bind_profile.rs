@@ -313,7 +313,6 @@ mod tests {
         assert!(matches!(pulse, Some(MenuPulse::Boundary)));
 
         // An unbound host: "No default" is already the state.
-        drop(ctx);
         let hosts = [host(None)];
         let mut settings = Settings::default();
         let mut ctx = Ctx {
