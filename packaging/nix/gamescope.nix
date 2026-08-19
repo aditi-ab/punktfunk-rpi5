@@ -46,7 +46,23 @@ let
   # our own name — the single worst outcome here, because the host reads the name as a promise of
   # HDR. (`installCheckPhase` below greps for the marker as the second line of defence; this one
   # fails at eval, before anything is built.)
-  base = gamescope.unwrapped or gamescope;
+  # `enableWsi = true` is NOT optional here, and it is a FUNCTION ARGUMENT — `overrideAttrs`
+  # cannot reach it. nixpkgs defaults `enableWsi ? false` and feeds it to
+  # `mesonBool "enable_gamescope_wsi_layer"`, so the plain derivation installs the compositor and
+  # no layer at all; nixpkgs gets its layer by instantiating a SECOND copy inside the wrapper.
+  # Without the override the build gets all the way through compile, link and install before
+  # postInstall's find turns up nothing and fails with "built no WSI layer" (MEASURED 2026-08-19,
+  # run 19323) — an expensive way to discover a default.
+  #
+  # `.override` before `.overrideAttrs`: the former re-invokes the package function with the new
+  # argument, so the latter must come after or it would be applied to the derivation being
+  # replaced. The `? override` test only skips the call for something that is not overridable at
+  # all (a symlinkJoin) — it does NOT make an unknown argument safe: a nixpkgs whose gamescope
+  # dropped `enableWsi` fails at EVAL with "function has no argument named 'enableWsi'". That is
+  # the right failure. It names the cause outright, and it costs nothing, where the alternative is
+  # discovering the same fact after a full compositor build.
+  raw = gamescope.unwrapped or gamescope;
+  base = if raw ? override then raw.override { enableWsi = true; } else raw;
   unwrapped =
     if base ? src then
       base
