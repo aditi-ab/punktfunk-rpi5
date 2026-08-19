@@ -36,6 +36,15 @@ enum Action {
     SendLogs,
     CopyLink,
     Edit,
+    /// Choose the profile the host's primary tile connects with (opens the
+    /// [`Screen::BindProfile`] chooser). Offered on saved primary tiles only — a pinned
+    /// card's profile IS the card, and a title's menu addresses the title.
+    BindProfile,
+    /// Share this device's clipboard with THIS host while streaming
+    /// (`KnownHost::clipboard_sync`). Per-host because it is a trust decision about that
+    /// host — which is why it lives on the host and not in Settings. A toggle: the label
+    /// carries the current state, activating flips it.
+    Clipboard,
     Forget,
     Unpin,
     Cancel,
@@ -145,6 +154,8 @@ impl OptionsScreen {
         a.extend([
             Action::CopyLink,
             Action::Edit,
+            Action::BindProfile,
+            Action::Clipboard,
             Action::Forget,
             Action::Cancel,
         ]);
@@ -159,6 +170,15 @@ impl OptionsScreen {
             Action::SendLogs => "Send logs to host".into(),
             Action::CopyLink => "Copy link".into(),
             Action::Edit => "Edit\u{2026}".into(),
+            Action::BindProfile => "Default profile\u{2026}".into(),
+            Action::Clipboard => format!(
+                "Shared clipboard: {}",
+                if self.host().clipboard_sync {
+                    "On"
+                } else {
+                    "Off"
+                }
+            ),
             Action::Forget if self.armed => "Forget \u{2014} press again".into(),
             Action::Forget => "Forget".into(),
             Action::Unpin => "Unpin card".into(),
@@ -269,6 +289,24 @@ impl OptionsScreen {
             Action::Edit => fx.replace(Screen::AddHost(super::add_host::AddHostScreen::edit(
                 self.host(),
             ))),
+            Action::BindProfile => fx.replace(Screen::BindProfile(
+                super::bind_profile::BindProfileScreen::new(
+                    key,
+                    self.host().name.clone(),
+                    store.profiles(),
+                ),
+            )),
+            Action::Clipboard => {
+                let host = self.host();
+                let on = !host.clipboard_sync;
+                fx.toast = Some(if on {
+                    format!("Clipboard shared with {}", host.name)
+                } else {
+                    format!("Clipboard no longer shared with {}", host.name)
+                });
+                fx.cmds.push(ConsoleCmd::SetClipboard { key, on });
+                fx.pop();
+            }
             Action::Forget if !self.armed => self.armed = true,
             Action::Forget => {
                 fx.cmds.push(ConsoleCmd::ForgetHost { key });
@@ -378,6 +416,7 @@ mod tests {
             online: true,
             mgmt_port: 9778,
             can_wake: false,
+            clipboard_sync: false,
             last_used: None,
             os: String::new(),
             pin: None,
@@ -438,6 +477,25 @@ mod tests {
             .contains(&Action::Wake));
     }
 
+    /// "Send logs" is offered only where a service exists to act on it: the Android host
+    /// answers the command with a not-available notice (`SkiaConsole.drainCommands`), so
+    /// until its log-ring uploader lands the row must not render there. When that uploader
+    /// ships, this test is the line to flip alongside the gate in [`OptionsScreen::actions`].
+    #[test]
+    fn send_logs_is_desktop_only_until_android_can_upload() {
+        let reachable = OptionsScreen::for_host(&HostRow {
+            paired: true,
+            online: true,
+            ..host()
+        });
+        assert!(reachable
+            .actions(crate::platform::Platform::Desktop)
+            .contains(&Action::SendLogs));
+        assert!(!reachable
+            .actions(crate::platform::Platform::Android)
+            .contains(&Action::SendLogs));
+    }
+
     #[test]
     fn a_pinned_card_cannot_forget_or_edit_the_host() {
         let s = OptionsScreen::for_host(&pinned());
@@ -447,6 +505,57 @@ mod tests {
         );
         // …and its commands still address the HOST, not the pin's composite key.
         assert_eq!(s.host_key(), "aa");
+    }
+
+    /// "Default profile…" swaps the menu for the chooser — a Replace like Edit's, and for
+    /// the same reason — addressed to the HOST's plain key even from rows that carry a
+    /// composite one.
+    #[test]
+    fn default_profile_opens_the_chooser_on_the_hosts_plain_key() {
+        let mut s = OptionsScreen::for_host(&host());
+        assert!(s
+            .actions(crate::platform::Platform::Desktop)
+            .contains(&Action::BindProfile));
+        let mut fx = Outbox::default();
+        s.run(Action::BindProfile, crate::store::file_store(), &mut fx);
+        match fx.nav {
+            Some(crate::screens::Nav::Replace(screen)) => match *screen {
+                Screen::BindProfile(b) => assert_eq!(b.host_name(), "Desk"),
+                _ => panic!("expected the bind-profile chooser"),
+            },
+            _ => panic!("expected a replace"),
+        }
+    }
+
+    /// The clipboard toggle: the label says where the host stands, activating flips it —
+    /// and both address the HOST's plain key.
+    #[test]
+    fn the_clipboard_toggle_flips_the_stored_state() {
+        let mut s = OptionsScreen::for_host(&host());
+        assert!(s.label(Action::Clipboard).ends_with("Off"));
+        let mut fx = Outbox::default();
+        s.run(Action::Clipboard, crate::store::file_store(), &mut fx);
+        assert_eq!(
+            fx.cmds,
+            vec![ConsoleCmd::SetClipboard {
+                key: "aa".into(),
+                on: true,
+            }]
+        );
+        let mut s = OptionsScreen::for_host(&HostRow {
+            clipboard_sync: true,
+            ..host()
+        });
+        assert!(s.label(Action::Clipboard).ends_with("On"));
+        let mut fx = Outbox::default();
+        s.run(Action::Clipboard, crate::store::file_store(), &mut fx);
+        assert_eq!(
+            fx.cmds,
+            vec![ConsoleCmd::SetClipboard {
+                key: "aa".into(),
+                on: false,
+            }]
+        );
     }
 
     #[test]

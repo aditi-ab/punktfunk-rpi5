@@ -41,6 +41,11 @@ pub struct HostRow {
     pub mgmt_port: u16,
     /// Offline + a stored MAC → activating wakes first ("Wake & Connect").
     pub can_wake: bool,
+    /// Share this device's clipboard with THIS host while streaming
+    /// (`KnownHost::clipboard_sync`) — surfaced so the host menu can show and flip it.
+    /// `serde(default)`: a producer predating the field still parses (as not-shared).
+    #[serde(default)]
+    pub clipboard_sync: bool,
     /// Last successful connect (UNIX seconds) — the most-recent accent.
     pub last_used: Option<u64>,
     /// The host's OS-identity chain (live advert preferred, else the stored one), for a
@@ -220,6 +225,19 @@ pub enum ConsoleCmd {
         profile_id: String,
         pin: bool,
     },
+    /// Bind (or clear) a saved host's DEFAULT profile — `KnownHost::profile_id`, the one a
+    /// plain A-press on the primary tile connects with (the port design's WP5 leftover;
+    /// [`ConsoleCmd::SetPin`] is presentation, this is the binding). `key` is the HOST
+    /// row's key; `None` clears the binding. Idempotent like `SetPin`: re-binding the
+    /// bound profile is a no-op.
+    BindProfile {
+        key: String,
+        profile_id: Option<String>,
+    },
+    /// Share (or stop sharing) this device's clipboard with a saved host while streaming —
+    /// `KnownHost::clipboard_sync`, the host menu's toggle. Per-host, never global:
+    /// handing a host your clipboard is a trust decision about that host.
+    SetClipboard { key: String, on: bool },
     /// Open a screen the PLATFORM owns over the console (design android-skia-console-port.md
     /// D7) — Android's connected-controllers view, the open-source licences. `id` is a
     /// [`crate::platform::PlatformScreen::id`]. The host draws it, holds the console's input
@@ -276,6 +294,7 @@ mod tests {
             online: false,
             mgmt_port: 47990,
             can_wake: false,
+            clipboard_sync: false,
             last_used: None,
             os: String::new(),
             pin: None,

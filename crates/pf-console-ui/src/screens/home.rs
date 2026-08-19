@@ -811,6 +811,7 @@ mod tests {
             online,
             mgmt_port: 47990,
             can_wake,
+            clipboard_sync: false,
             last_used: None,
             os: String::new(),
             pin: None,

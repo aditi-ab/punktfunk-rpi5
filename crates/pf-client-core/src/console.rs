@@ -67,6 +67,12 @@ pub enum PointerInput {
         x: f32,
         y: f32,
         button: PointerButton,
+        /// A finger (or stylus) on the glass, as opposed to a mouse button. The console
+        /// defers a touch press until the lift so a swipe can scroll instead of acting on
+        /// whatever the finger first lands on; a mouse press keeps acting immediately.
+        /// Only `Down` carries it — the console tracks the gesture it opened, so the
+        /// matching `Up`/`Move`/`Cancel` need no flag of their own.
+        touch: bool,
     },
     Up {
         x: f32,

@@ -89,6 +89,7 @@ fn hosts() -> Vec<HostRow> {
         online: false,
         mgmt_port: 47990,
         can_wake: false,
+        clipboard_sync: false,
         last_used: None,
         os: String::new(),
         pin: None,
@@ -491,6 +492,164 @@ fn every_settings_tab_rasters() {
     // A narrow window is the case the strip has to shrink for (the pills are laid out from
     // measured text, so a too-small width must clamp rather than lay out off-screen).
     s.render(surface.canvas(), 640, 400, &fonts, None, None, &pads);
+}
+
+/// The settings screen with one frame rendered, so its rows have real rects to press.
+fn rendered_settings() -> (Shell, skia_safe::Rect) {
+    let fonts = crate::theme::build_fonts().unwrap();
+    let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.handle_menu(MenuEvent::Tertiary); // X → Settings
+    finish_motion(&mut s);
+    s.render(surface.canvas(), 1280, 800, &fonts, None, None, &[]);
+    let row = match s.stack.last() {
+        Some(Screen::Settings(scr)) => scr.row_rect_for_test(0).expect("the list drew its rows"),
+        _ => panic!("settings is not on top"),
+    };
+    (s, row)
+}
+
+/// The whole point of the touch tracker: a finger swiping across the settings list is
+/// SCROLLING, and must not flip the value it happened to land on — which is exactly what
+/// the press-acts-on-contact model did to every swipe before the `touch` flag existed.
+/// The same contact lifted in place IS the tap, delivered on the lift at the anchor.
+#[test]
+fn a_touch_swipe_scrolls_settings_without_changing_a_value() {
+    use pf_client_core::console::{PointerButton, PointerInput};
+    let (mut s, row) = rendered_settings();
+    let (cx, cy) = (row.center_x(), row.center_y());
+    // The Resolution row's whole observable state: activating it steps the D1 tri-state
+    // Native -> Match window, which flips the FLAG while width/height stay (0, 0).
+    let state = |s: &Shell| (s.settings.match_window, s.settings.width, s.settings.height);
+    let before = state(&s);
+
+    // Finger lands on the Resolution row and swipes up, well past slop and several ticks.
+    s.pointer_input(PointerInput::Down {
+        x: cx,
+        y: cy,
+        button: PointerButton::Primary,
+        touch: true,
+    });
+    for i in 1..=6 {
+        s.pointer_input(PointerInput::Move {
+            x: cx,
+            y: cy - (i as f32) * 40.0,
+        });
+    }
+    s.pointer_input(PointerInput::Up {
+        x: cx,
+        y: cy - 240.0,
+        button: PointerButton::Primary,
+    });
+    assert_eq!(
+        state(&s),
+        before,
+        "a swipe across a row is a scroll, not a value change"
+    );
+
+    // The same contact, lifted where it landed: a tap. Deferred — nothing on contact,
+    // the step on the lift.
+    s.pointer_input(PointerInput::Down {
+        x: cx,
+        y: cy,
+        button: PointerButton::Primary,
+        touch: true,
+    });
+    assert_eq!(state(&s), before, "a touch press must not act on contact");
+    s.pointer_input(PointerInput::Up {
+        x: cx,
+        y: cy,
+        button: PointerButton::Primary,
+    });
+    assert_ne!(
+        state(&s),
+        before,
+        "the tap lands on the lift, at the anchor"
+    );
+}
+
+/// A mouse is not a finger: its press keeps acting on contact, exactly as before the
+/// touch flag existed.
+#[test]
+fn a_mouse_press_still_acts_on_contact() {
+    use pf_client_core::console::{PointerButton, PointerInput};
+    let (mut s, row) = rendered_settings();
+    let state = |s: &Shell| (s.settings.match_window, s.settings.width, s.settings.height);
+    let before = state(&s);
+    s.pointer_input(PointerInput::Down {
+        x: row.center_x(),
+        y: row.center_y(),
+        button: PointerButton::Primary,
+        touch: false,
+    });
+    assert_ne!(state(&s), before, "a mouse click acts on the press");
+}
+
+/// A horizontal drag on Home steps the carousel — one tick per `DRAG_TICK_DP` of travel
+/// past the slop — and the lift after a drag presses nothing. Needs no render: ticks act
+/// on the cursor, not on drawn rects.
+#[test]
+fn a_horizontal_drag_steps_the_home_carousel() {
+    use pf_client_core::console::{PointerButton, PointerInput};
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.sync();
+    s.pointer_input(PointerInput::Down {
+        x: 640.0,
+        y: 400.0,
+        button: PointerButton::Primary,
+        touch: true,
+    });
+    // First move leaves the slop (locks the horizontal axis); the second travels one full
+    // tick leftward — content follows the finger, so the NEXT tile comes up.
+    s.pointer_input(PointerInput::Move { x: 620.0, y: 400.0 });
+    s.pointer_input(PointerInput::Move {
+        x: 620.0 - DRAG_TICK_DP as f32,
+        y: 400.0,
+    });
+    s.pointer_input(PointerInput::Up {
+        x: 620.0 - DRAG_TICK_DP as f32,
+        y: 400.0,
+        button: PointerButton::Primary,
+    });
+    // The fixture's second host (Office Tower) is offline with a stored MAC: Confirm on it
+    // raises the wake card. That proves the drag moved the cursor — and that the lift
+    // after a drag pressed nothing (a press would have acted before Confirm ran).
+    assert!(
+        s.wake.is_none(),
+        "the drag itself must not activate anything"
+    );
+    s.handle_menu(MenuEvent::Confirm);
+    assert!(
+        s.wake.is_some(),
+        "Confirm after a one-tick drag lands on the second host's wake"
+    );
+}
+
+/// A canceled touch (the finger left the window, the toolkit stole the gesture) is
+/// dropped whole: no press ever lands.
+#[test]
+fn a_canceled_touch_never_acts() {
+    use pf_client_core::console::{PointerButton, PointerInput};
+    let (mut s, row) = rendered_settings();
+    let state = |s: &Shell| (s.settings.match_window, s.settings.width, s.settings.height);
+    let before = state(&s);
+    s.pointer_input(PointerInput::Down {
+        x: row.center_x(),
+        y: row.center_y(),
+        button: PointerButton::Primary,
+        touch: true,
+    });
+    s.pointer_input(PointerInput::Cancel);
+    s.pointer_input(PointerInput::Up {
+        x: row.center_x(),
+        y: row.center_y(),
+        button: PointerButton::Primary,
+    });
+    assert_eq!(
+        state(&s),
+        before,
+        "cancel dropped the gesture; the stray lift presses nothing"
+    );
 }
 
 /// The work package's whole reason for existing: Back pressed mid-push is HEARD, and it
