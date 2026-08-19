@@ -109,36 +109,11 @@ installer (all-vendor: NVIDIA, AMD, Intel).
 
 `punktfunk-host` is the streaming host; `punktfunk-web` is the browser console (pairing + status).
 
-**Linux:** every package ships systemd **user** units, so you don't launch the host by hand. The
-host unit won't start until `~/.config/punktfunk/host.env` exists, so copy the template your package
-installed first:
-
-```sh
-mkdir -p ~/.config/punktfunk
-# /usr/share/punktfunk/ on Fedora/Arch/Bazzite, /usr/share/punktfunk-host/ on Debian/Ubuntu
-# (on Bazzite take host.env.bazzite instead)
-cp /usr/share/punktfunk/host.env.example ~/.config/punktfunk/host.env
-
-systemctl --user enable --now punktfunk-host   # the streaming host
-systemctl --user enable --now punktfunk-web    # the web console (Arch: install punktfunk-web first)
-```
-
-The shipped host unit runs `serve --gamestream` — the native `punktfunk/1` plane **plus** the
-GameStream/Moonlight-compat planes, which belong on a trusted LAN only; for a native-only host drop
-the flag with a `systemctl --user edit punktfunk-host` drop-in (which needs an empty `ExecStart=`
-line before the replacement — the install guide has the snippet). Then open
-`https://<host-ip>:47992` and pair.
-
-How the virtual display and input are wired up depends on your desktop — see
-[KDE](https://docs.punktfunk.unom.io/docs/kde) · [GNOME](https://docs.punktfunk.unom.io/docs/gnome) ·
+The per-platform guide walks you through the rest — first run, the web console, pairing, and the
+desktop-specific wiring ([KDE](https://docs.punktfunk.unom.io/docs/kde) ·
+[GNOME](https://docs.punktfunk.unom.io/docs/gnome) ·
 [Steam / gamescope](https://docs.punktfunk.unom.io/docs/gamescope) ·
-[Sway](https://docs.punktfunk.unom.io/docs/sway).
-
-**Windows:** the installer registers and starts the host as a `LocalSystem` service, so there is
-nothing to run by hand — open the web console and pair. Use
-`punktfunk-host service start|stop|restart|status` if you need to control it. Upgrades happen in
-place — the console's **Updates** card, `winget upgrade unom.PunktfunkHost`, or the newer
-`setup.exe` over the old install; uninstall from Add/Remove Programs.
+[Sway](https://docs.punktfunk.unom.io/docs/sway)).
 
 Full instructions: **[docs.punktfunk.unom.io/docs/install](https://docs.punktfunk.unom.io/docs/install)**.
 

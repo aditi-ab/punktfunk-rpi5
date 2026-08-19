@@ -33,26 +33,12 @@ flatpak fallback).
 
 ## Install (recommended): the hosted repo
 
-One command adds the signed `unom` remote and installs the client; it auto-adds Flathub for the
-GNOME runtime, and `flatpak update` tracks new builds from then on:
-
-```sh
-flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref
-flatpak run io.unom.Punktfunk
-```
-
-Equivalent two-step (add the whole remote, then install by app id):
-
-```sh
-flatpak remote-add --user --if-not-exists unom https://flatpak.unom.io/unom.flatpakrepo
-flatpak install --user unom io.unom.Punktfunk
-```
-
-Updates — the whole point of the hosted repo:
-
-```sh
-flatpak update                    # or: flatpak update io.unom.Punktfunk
-```
+The user-facing walkthrough (the `.flatpakref` one-liner, updates) lives on the docs pages —
+[Install a client](https://docs.punktfunk.unom.io/docs/install-client) /
+[Steam Deck](https://docs.punktfunk.unom.io/docs/steam-deck) — stated once so it can't drift (see
+"Where facts live" in [`CONTRIBUTING.md`](../../CONTRIBUTING.md)). Mechanically: the flatpakref
+adds the signed `unom` remote, auto-adds Flathub for the GNOME runtime, and `flatpak update`
+tracks new builds from then on.
 
 ## Install on the Deck via the bundle (no-remote fallback)
 

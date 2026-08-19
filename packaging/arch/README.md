@@ -35,29 +35,17 @@ them). Enable exactly one.
 The registry **signs the repo database and every package**, so first import its key into
 pacman's keyring (a one-time step — after this, packages install signature-verified):
 
-```sh
-# 1. Trust the registry signing key.
-curl -fsS https://git.unom.io/api/packages/unom/arch/repository.key \
-  | sudo pacman-key --add -
-sudo pacman-key --lsign-key E0CA04465C99C936E0B0C6510A317015A34DDD69
+The user-facing walkthrough — key import, repo add, `pacman -Syu` install — lives on the
+[Arch docs page](https://docs.punktfunk.unom.io/docs/arch), stated once so it can't drift (see
+"Where facts live" in [`CONTRIBUTING.md`](../../CONTRIBUTING.md)). Packager notes: no `SigLevel`
+line is needed (pacman's default `Required DatabaseOptional` verifies the signed packages against
+the imported key), the repo-add uses `printf` rather than a heredoc so it works in fish (CachyOS's
+default shell has no `<<EOF`), and Arch is rolling — packages are built against current Arch
+sonames, so the box itself must stay updated.
 
-# 2. Add the repo (pick ONE channel — punktfunk for releases, punktfunk-canary for main builds).
-#    printf, not a heredoc, so this works in fish too (CachyOS's default shell has no `<<EOF`).
-printf '\n[punktfunk]\nServer = https://git.unom.io/api/packages/unom/arch/$repo/$arch\n' \
-  | sudo tee -a /etc/pacman.conf >/dev/null
-
-# 3. Sync + install.
-sudo pacman -Sy punktfunk-host        # gaming rig
-sudo pacman -Sy punktfunk-client      # the native GTK4 Linux client
-sudo pacman -Sy punktfunk-web         # optional browser management console
-```
-
-(No `SigLevel` line needed — pacman's default `Required DatabaseOptional` verifies the signed
-packages against the key you just trusted. Arch is rolling, so the packages are built against
-current Arch sonames — keep the box itself updated too.)
-
-Step 2 **appends**, so running it twice leaves two `[punktfunk]` blocks and every later pacman
-run opens with `error: could not register 'punktfunk' database (database already registered)`.
+The repo-add **appends** to `/etc/pacman.conf`, so running it twice leaves two `[punktfunk]`
+blocks and every later pacman run opens with
+`error: could not register 'punktfunk' database (database already registered)`.
 It is harmless — pacman ignores the duplicate and carries on — but to silence it, delete the
 extra block from `/etc/pacman.conf`.
 

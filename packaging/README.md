@@ -9,8 +9,9 @@ present; the NVIDIA-specific notes below apply to the NVENC path.
 > [`debian/README.md`](debian/README.md) (`apt update && apt upgrade` for new builds).
 
 > 👉 **End-to-end Bazzite setup walkthrough** (install → udev/group → `host.env` → service →
-> firewall → verify → troubleshooting): [`bazzite/README.md`](bazzite/README.md). This file is the
-> higher-level packaging rationale.
+> firewall → verify): [docs.punktfunk.unom.io/docs/bazzite](https://docs.punktfunk.unom.io/docs/bazzite).
+> [`bazzite/README.md`](bazzite/README.md) keeps the install-path/packaging view (sysext vs bootc
+> vs layering); this file is the higher-level packaging rationale.
 
 ```
 packaging/

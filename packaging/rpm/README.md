@@ -17,28 +17,18 @@ This is the same package as the [COPR](../copr/README.md) / [bootc](../bootc/Con
 paths — same spec (`punktfunk.spec`) — just self-hosted in Gitea instead of COPR, mirroring the
 [Debian/apt](../debian/README.md) setup.
 
-## Install on a Bazzite host (one-time)
+## Install on a host (one-time)
 
-```sh
-# Add the repo. Packages are GPG-signed (gpgcheck=1, the packages@unom.io key) AND the repo
-# metadata is Gitea-signed (repo_gpgcheck=1); gpgkey lists both so dnf/rpm-ostree imports each.
-sudo tee /etc/yum.repos.d/punktfunk.repo >/dev/null <<'REPO'
-[gitea-unom-bazzite]
-name=punktfunk (unom, Bazzite)
-baseurl=https://git.unom.io/api/packages/unom/rpm/bazzite
-enabled=1
-gpgcheck=1
-repo_gpgcheck=1
-gpgkey=https://git.unom.io/api/packages/unom/rpm/repository.key
-       https://git.unom.io/api/packages/unom/generic/punktfunk-keys/1/RPM-GPG-KEY-punktfunk
-REPO
-
-# Layer the host + the web console (pairing/status), then reboot into the new deployment.
-# (punktfunk Recommends punktfunk-web; list it explicitly so it's pulled regardless of weak-dep
-# settings. The registry carries punktfunk-web because CI builds the spec --with web; COPR can't.)
-rpm-ostree install punktfunk punktfunk-web
-systemctl reboot
-```
+The user-facing walkthrough — the `.repo` file (same shape for the `fedora-NN` and `bazzite`
+baseurl groups) and the install command — lives on the docs pages
+([Fedora](https://docs.punktfunk.unom.io/docs/fedora) /
+[Bazzite](https://docs.punktfunk.unom.io/docs/bazzite), where the sysext, not layering, is the
+supported default), stated once so it can't drift (see "Where facts live" in
+[`CONTRIBUTING.md`](../../CONTRIBUTING.md)). Packager notes: packages are GPG-signed
+(`gpgcheck=1`, the packages@unom.io key) AND the repo metadata is Gitea-signed
+(`repo_gpgcheck=1`) — the `gpgkey` line lists both so dnf/rpm-ostree imports each; on a layered
+box list `punktfunk-web` explicitly (weak-dep settings vary), and the registry — not COPR —
+carries it because CI builds the spec `--with web` (COPR's chroot has no `bun`).
 
 > If `rpm-ostree` can't complete the metadata GPG check non-interactively, set `repo_gpgcheck=0`
 > (TLS-only trust to the self-hosted registry).
