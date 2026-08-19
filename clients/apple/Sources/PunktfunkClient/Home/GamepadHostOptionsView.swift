@@ -64,6 +64,9 @@ struct GamepadHostOptionsView: View {
     /// Delete the saved record outright.
     let onRemove: () -> Void
     let onUnpin: () -> Void
+    /// Upload this device's recent log to the host; answers with what to tell the user. nil on an
+    /// unpaired host — the upload rides the pairing, so there is nothing to offer before it.
+    var onSendLogs: (() async -> (ok: Bool, message: String))?
     var close: (() -> Void)?
     var controllerActive = true
 
@@ -81,13 +84,21 @@ struct GamepadHostOptionsView: View {
     /// strict as it is, and none at all to be looser.
     @State private var armed = false
     @State private var copied = false
+    /// The send-logs row's own state: its label and the detail band report the outcome in place,
+    /// the same way Copy link says "Copied" — this surface has no toast.
+    @State private var sendLogs: SendLogsState = .idle
     @State private var focusID: String?
+
+    private enum SendLogsState: Equatable {
+        case idle, sending, done(ok: Bool, message: String)
+    }
 
     private enum Action: String {
         case wake
         case copyLink
         case edit
         case forgetPairing
+        case sendLogs
         case remove
         case unpin
         case cancel
@@ -195,6 +206,15 @@ struct GamepadHostOptionsView: View {
         }
         list.append(Row(action: .copyLink, label: copied ? "Copied" : "Copy link", icon: "link"))
         list.append(Row(action: .edit, label: "Edit\u{2026}", icon: "pencil"))
+        if onSendLogs != nil {
+            let label: String
+            switch sendLogs {
+            case .idle: label = "Send logs to host"
+            case .sending: label = "Sending logs\u{2026}"
+            case .done(let ok, _): label = ok ? "Logs sent" : "Couldn't send logs"
+            }
+            list.append(Row(action: .sendLogs, label: label, icon: "doc.text"))
+        }
         // Only a paired host has a pairing to drop.
         if host.pinnedSHA256 != nil {
             list.append(Row(
@@ -221,6 +241,9 @@ struct GamepadHostOptionsView: View {
         case .forgetPairing:
             return "Drop the stored fingerprint. The host stays saved and the next connect "
                 + "pairs again."
+        case .sendLogs:
+            if case .done(_, let message) = sendLogs { return message }
+            return "Upload this device's recent log to the host, for its web console's Logs page."
         case .remove:
             return armed
                 ? "Press again to remove — this cannot be undone."
@@ -263,6 +286,15 @@ struct GamepadHostOptionsView: View {
         case .forgetPairing:
             onForgetPairing()
             performClose()
+        case .sendLogs:
+            guard let onSendLogs, sendLogs != .sending else { return }
+            withAnimation(.smooth(duration: 0.2)) { sendLogs = .sending }
+            Task {
+                let outcome = await onSendLogs()
+                withAnimation(.smooth(duration: 0.2)) {
+                    sendLogs = .done(ok: outcome.ok, message: outcome.message)
+                }
+            }
         case .remove:
             guard armed else {
                 withAnimation(.smooth(duration: 0.2)) { armed = true }

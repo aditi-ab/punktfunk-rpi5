@@ -48,7 +48,7 @@ import os
 /// PUNKTFUNK_INPUT_DEBUG=1 in the environment to surface whether relative motion + buttons
 /// are actually being SENT to the host without needing host-side logs. Motion is throttled
 /// to once per second (see `motionDebugTick`); buttons log every transition.
-private let inputLog = Logger(subsystem: "io.unom.punktfunk", category: "input")
+private let inputLog = ClientLog(category: "input")
 private let inputDebug = ProcessInfo.processInfo.environment["PUNKTFUNK_INPUT_DEBUG"] == "1"
 
 public final class InputCapture {

@@ -19,7 +19,11 @@ import SwiftUI
 /// on-screen HUD (Console.app, wirelessly on an iPad/Apple TV). The HUD is not a neutral
 /// instrument: any visible overlay forces the metal layer through the compositor, which costs a
 /// refresh period on the vsync-latched platforms — this is how to measure with it off.
-private let statsLog = Logger(subsystem: "io.unom.punktfunk", category: "stats")
+private let statsLog = ClientLog(category: "stats")
+/// The session's lifecycle — connect asked/landed/refused, how it ended. Until this existed a
+/// client log bundle had a 1 Hz stats line and no sentence saying which host it was streaming
+/// from, with what, or why it stopped; the host's own log has always said all three.
+private let sessionLog = ClientLog(category: "session")
 /// Mirror the 1 Hz vitals line to STDOUT as well as the unified log.
 ///
 /// Exists for **tvOS, where the unified log is unreachable**: `log stream --device` is gone from
@@ -448,6 +452,11 @@ final class SessionModel: ObservableObject {
         // default (PUNKTFUNK_444, default on), so this toggle is the one real switch; the
         // hardware-decode probe below still gates what can actually be advertised.
         let want444 = effective.enable444
+        let connectLine = "connect \(host.displayName) \(host.address):\(host.port) "
+            + "mode=\(width)x\(height)@\(hz) codec=\(effective.codec) bitrate=\(bitrateKbps)kbps "
+            + "hdr=\(hdrCapable) 444=\(want444) audio=\(audioChannels)ch/\(audioRateHz)Hz/\(audioBits)bit "
+            + "pinned=\(pin != nil) tofu=\(allowTofu) launch=\(launchID ?? "-")"
+        sessionLog.info("\(connectLine, privacy: .public)")
         Task.detached(priority: .userInitiated) {
             // PunktfunkConnection.init blocks on the QUIC handshake — keep it off the main
             // actor. The persistent identity is presented on every connect so a paired
@@ -530,6 +539,14 @@ final class SessionModel: ObservableObject {
                 }
                 switch result {
                 case .success(let conn):
+                    let landed = "connected \(host.displayName) "
+                        + "mode=\(conn.width)x\(conn.height)@\(conn.refreshHz) "
+                        + "codec=\(conn.videoCodec) bitrate=\(conn.resolvedBitrateKbps)kbps "
+                        + "depth=\(conn.bitDepth) chroma=\(conn.isChroma444 ? "444" : "420") hdr=\(conn.isHDR) "
+                        + "audio=\(conn.resolvedAudioChannels)ch/\(conn.resolvedAudioRateHz)Hz/\(conn.resolvedAudioBits)bit "
+                        + "shard=\(conn.shardPayload) compositor=\(conn.resolvedCompositor.rawValue) "
+                        + "gamepad=\(conn.resolvedGamepad.rawValue) mgmt=\(conn.hostMgmtPort)"
+                    sessionLog.info("\(landed, privacy: .public)")
                     if pin != nil || autoTrust || requestAccess {
                         // requestAccess: the operator approved this device on the host, so the
                         // session is trusted — stream directly (the caller pins it as paired).
@@ -553,6 +570,8 @@ final class SessionModel: ObservableObject {
                             + "Pair with its PIN before streaming."
                     }
                 case .failure(let error):
+                    sessionLog.warning(
+                        "connect \(host.displayName, privacy: .public) failed: \(String(describing: error), privacy: .public)")
                     self.phase = .idle
                     self.activeHost = nil
                     SessionSettings.end() // the dial failed — back to the plain globals
@@ -782,6 +801,10 @@ final class SessionModel: ObservableObject {
     /// `disconnectQuit()` so the host skips the keep-alive linger; `sessionEnded()` (a host-ended /
     /// dropped session) passes `false` to leave the linger intact.
     func disconnect(deliberate: Bool = true) {
+        if connection != nil {
+            let line = "disconnect \(activeHost?.displayName ?? "-") deliberate=\(deliberate) phase=\(phase)"
+            sessionLog.info("\(line, privacy: .public)")
+        }
         statsTimer?.invalidate()
         statsTimer = nil
         // Release the session's resolved settings: from here every reader falls back to the plain
@@ -902,6 +925,9 @@ final class SessionModel: ObservableObject {
         // The shelf it came off — falling back to the host's own if a caller launched a title
         // without naming one, which is what that launch effectively browsed.
         let shelf = launchedShelf ?? activeHost.map { LibraryTarget(host: $0) }
+        let endLine = "session ended by \(name) reason=\(reason) "
+            + "rejection=\(rejection.map { String(describing: $0) } ?? "-")"
+        sessionLog.info("\(endLine, privacy: .public)")
         disconnect(deliberate: false) // host/network ended it — keep the linger for a reconnect
         if let rejection {
             // The shared typed-rejection wording ("Your access to this host has expired…").

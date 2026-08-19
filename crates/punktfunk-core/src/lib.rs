@@ -246,7 +246,17 @@ pub use stats::Stats;
 /// this reads and writes landed with the plane itself, appended behind the existing trailing-field
 /// discipline (old peers skip them in both directions, and a legacy request encodes byte-identical
 /// to the pre-hi-res messages), so [`WIRE_VERSION`] is still unchanged.
-pub const ABI_VERSION: u32 = 24;
+/// **v25** adds [`abi::punktfunk_set_log_callback`] — a `log` backend behind a C callback, so an
+/// embedder that installs no Rust subscriber (the Swift clients, any C host) can receive the
+/// core's own log lines: transport warnings, quinn connection events, rustls handshake notes,
+/// everything this crate and its dependencies say through `tracing`/`log`. Until now those went
+/// nowhere on Apple, and a client log bundle sent to the host carried the shell's half only.
+/// ADDED, not widened: one new function and one callback typedef; nothing existing moved, and an
+/// embedder that never calls it behaves exactly as on v24. Client-local in every sense — the host
+/// never sees it and [`WIRE_VERSION`] is unchanged. It relies on tracing's `log` feature, now
+/// declared explicitly by this crate (it was on transitively through quinn's defaults, which is
+/// not a thing an ABI promise should rest on).
+pub const ABI_VERSION: u32 = 25;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

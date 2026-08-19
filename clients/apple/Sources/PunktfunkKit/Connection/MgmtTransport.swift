@@ -57,6 +57,41 @@ enum MgmtTransport {
         pinnedHostFingerprint: Data?,
         timeout: TimeInterval = 15
     ) async throws -> HTTPResponse {
+        try await request(
+            host: host, port: port, method: "GET", path: path, body: nil, contentType: nil,
+            identity: identity, pinnedHostFingerprint: pinnedHostFingerprint, timeout: timeout)
+    }
+
+    /// `POST https://host:port/path` with a body — same transport, trust and retry rule as `get`.
+    /// The one write a paired device may make is the client-log upload, which is idempotent in
+    /// the only sense that matters (a retried bundle is a second bundle, not a corrupted one).
+    static func post(
+        host: String,
+        port: UInt16,
+        path: String,
+        body: Data,
+        contentType: String,
+        identity: SecIdentity,
+        pinnedHostFingerprint: Data?,
+        timeout: TimeInterval = 15
+    ) async throws -> HTTPResponse {
+        try await request(
+            host: host, port: port, method: "POST", path: path, body: body,
+            contentType: contentType, identity: identity,
+            pinnedHostFingerprint: pinnedHostFingerprint, timeout: timeout)
+    }
+
+    private static func request(
+        host: String,
+        port: UInt16,
+        method: String,
+        path: String,
+        body: Data?,
+        contentType: String?,
+        identity: SecIdentity,
+        pinnedHostFingerprint: Data?,
+        timeout: TimeInterval
+    ) async throws -> HTTPResponse {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw MgmtTransportError.invalidPort(port)
         }
@@ -70,7 +105,9 @@ enum MgmtTransport {
             }
             let wasReused = connection.hasServedRequest
             do {
-                let response = try await connection.perform(path: path, timeout: timeout)
+                let response = try await connection.perform(
+                    method: method, path: path, body: body, contentType: contentType,
+                    timeout: timeout)
                 await MgmtConnectionPool.shared.release(connection, key: key)
                 return response
             } catch {
@@ -230,7 +267,10 @@ final class MgmtConnection: @unchecked Sendable {
     private let rejection: RejectionFlag
     private final class RejectionFlag: @unchecked Sendable { var value = false }
 
-    func perform(path: String, timeout: TimeInterval) async throws -> HTTPResponse {
+    func perform(
+        method: String = "GET", path: String, body: Data? = nil, contentType: String? = nil,
+        timeout: TimeInterval
+    ) async throws -> HTTPResponse {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 guard self.phase != .dead else {
@@ -240,7 +280,9 @@ final class MgmtConnection: @unchecked Sendable {
                 self.operation += 1
                 let op = self.operation
                 self.pending = continuation
-                self.pendingRequest = self.requestBytes(path: path)
+                self.pendingRequest = Self.requestBytes(
+                    host: self.host, port: self.port,
+                    method: method, path: path, body: body, contentType: contentType)
                 self.buffer.removeAll(keepingCapacity: true)
                 self.queue.asyncAfter(deadline: .now() + timeout) { [weak self] in
                     guard let self, self.operation == op else { return }
@@ -361,17 +403,24 @@ final class MgmtConnection: @unchecked Sendable {
         rejection.value ? .pinMismatch : .connection(String(describing: error))
     }
 
-    private func requestBytes(path: String) -> Data {
+    /// The wire bytes of one request. Pure (and `static`) so the framing is unit-testable.
+    static func requestBytes(
+        host: String, port: UInt16,
+        method: String, path: String, body: Data?, contentType: String?
+    ) -> Data {
         // An IPv6 literal is bracketed in the Host header (RFC 9110 §7.2); a name or IPv4 is not.
         let authority = host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
-        let request = """
-            GET \(path) HTTP/1.1\r
-            Host: \(authority)\r
-            User-Agent: punktfunk-apple\r
-            Accept: */*\r
-            \r
-
-            """
-        return Data(request.utf8)
+        var head = "\(method) \(path) HTTP/1.1\r\nHost: \(authority)\r\n"
+            + "User-Agent: punktfunk-apple\r\nAccept: */*\r\n"
+        if let body {
+            // Always framed by length — a request body has no EOF to end it on a kept-alive
+            // connection, and the host's axum would otherwise wait for one.
+            head += "Content-Type: \(contentType ?? "application/octet-stream")\r\n"
+            head += "Content-Length: \(body.count)\r\n"
+        }
+        head += "\r\n"
+        var request = Data(head.utf8)
+        if let body { request.append(body) }
+        return request
     }
 }

@@ -16,7 +16,7 @@ import os
 import CoreAudio
 #endif
 
-private let log = Logger(subsystem: "io.unom.punktfunk", category: "audio")
+private let log = ClientLog(category: "audio")
 
 final class AudioDeviceWatcher {
     /// Why the owner is being told. Only for the log line — every reason leads to the same

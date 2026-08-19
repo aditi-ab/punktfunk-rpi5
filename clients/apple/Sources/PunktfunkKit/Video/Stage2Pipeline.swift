@@ -56,9 +56,9 @@ let presentDebug = ProcessInfo.processInfo.environment["PUNKTFUNK_PRESENT_DEBUG"
 /// SessionModel "stats" mirror's sibling, so DEADLINE sessions stream their pacing decomposition
 /// to Console.app wirelessly with no env var / Xcode attach. Always on for deadline pacing (the
 /// stats are a few arrays + one log line per second); other pacings keep the env-gated print.
-private let presentLog = Logger(subsystem: "io.unom.punktfunk", category: "present")
+private let presentLog = ClientLog(category: "present")
 /// Pump-side events (loss recovery, format seeding) — the stage-2 sibling of StreamPump's log.
-private let pumpLog = Logger(subsystem: "io.unom.punktfunk", category: "pump")
+private let pumpLog = ClientLog(category: "pump")
 
 /// Decoded-frame hand-off between the decode half and the render thread. The POLICY is the
 /// user's presentation intent (design/apple-presentation-rebuild.md — the 2026-07 rebuild that

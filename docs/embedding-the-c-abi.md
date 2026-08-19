@@ -145,6 +145,23 @@ carries). The ABI can grow — new `connect_ex` variants, new planes — without
 newer client keeps talking to a deployed host. Only equal `WIRE_VERSION`s interoperate on the wire;
 the core enforces that inside the handshake.
 
+### 2.6 Hear what the core says (optional, v25+)
+
+The core logs through Rust's `tracing`; an embedder that installs no Rust subscriber hears none of
+it — transport warnings, connection events, handshake notes. Register a sink once at startup:
+
+```c
+static void on_core_log(uint8_t level, const char *target, const char *message, void *user) {
+    // level 1=error 2=warn 3=info 4=debug 5=trace; both strings are borrowed for this call only.
+    my_log(level, "%s %s", target, message);
+}
+punktfunk_set_log_callback(3 /* info and up */, on_core_log, NULL);
+```
+
+The callback runs on whichever core thread logged: keep it short and thread-safe. Pass `NULL` to
+detach. Returns `PUNKTFUNK_STATUS_UNSUPPORTED` when a `log` backend is already installed in the
+process (a Rust shell that brought its own) — that backend already receives these lines.
+
 ---
 
 ## 3. Core concepts
