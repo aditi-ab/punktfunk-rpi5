@@ -4,6 +4,7 @@
 //! every screen animates and reads identically.
 
 pub(crate) mod add_host;
+pub(crate) mod bind_profile;
 pub(crate) mod collections;
 pub(crate) mod controllers;
 pub(crate) mod home;
@@ -180,6 +181,10 @@ pub(crate) enum Screen {
     AddHost(add_host::AddHostScreen),
     Pair(pair::PairScreen),
     PinHosts(pin_hosts::PinHostsScreen),
+    /// "Default for <host>": which profile the host's primary tile connects with — the
+    /// binding sibling of [`Screen::PinHosts`]'s presentation cards. Raised by the host
+    /// menu's "Default profile…" action.
+    BindProfile(bind_profile::BindProfileScreen),
     /// "Connected controllers": the attached pads and their identity lines, plus the grants
     /// and tests only the platform can perform. Android-reachable only — the settings row
     /// that opens it is in `settings::row_on`'s Android-only list.
@@ -205,6 +210,7 @@ impl Screen {
             Screen::AddHost(s) => s.menu(ev, ctx, fx),
             Screen::Pair(s) => s.menu(ev, ctx, fx),
             Screen::PinHosts(s) => s.menu(ev, ctx, fx),
+            Screen::BindProfile(s) => s.menu(ev, ctx, fx),
             Screen::Controllers(s) => s.menu(ev, ctx, fx),
             Screen::HostOptions(s) => s.menu(ev, ctx, fx),
         }
@@ -224,6 +230,7 @@ impl Screen {
             Screen::AddHost(s) => s.pointer(p, ctx, fx),
             Screen::Pair(s) => s.pointer(p, ctx, fx),
             Screen::PinHosts(s) => s.pointer(p, ctx, fx),
+            Screen::BindProfile(s) => s.pointer(p, ctx, fx),
             Screen::Controllers(s) => s.pointer(p, ctx, fx),
             Screen::HostOptions(s) => s.pointer(p, ctx, fx),
         }
@@ -274,6 +281,7 @@ impl Screen {
             Screen::AddHost(s) => s.title(),
             Screen::Pair(s) => format!("Pair with {}", s.host_name()),
             Screen::PinHosts(s) => format!("Pin \u{201c}{}\u{201d}", s.profile_name()),
+            Screen::BindProfile(s) => format!("Default for {}", s.host_name()),
             Screen::Controllers(_) => "Connected controllers".into(),
             Screen::HostOptions(s) => s.title(),
         }
@@ -288,6 +296,7 @@ impl Screen {
             Screen::AddHost(s) => s.hints(ctx),
             Screen::Pair(s) => s.hints(ctx),
             Screen::PinHosts(s) => s.hints(ctx),
+            Screen::BindProfile(s) => s.hints(ctx),
             Screen::Controllers(s) => s.hints(ctx),
             Screen::HostOptions(s) => s.hints(ctx),
         }
@@ -313,6 +322,7 @@ impl Screen {
             Screen::AddHost(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::Pair(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::PinHosts(s) => s.render(canvas, rect, k, dt, fonts, ctx),
+            Screen::BindProfile(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::Controllers(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::HostOptions(s) => s.render(canvas, rect, k, dt, fonts, ctx),
         }

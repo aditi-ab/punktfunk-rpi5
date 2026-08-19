@@ -823,6 +823,7 @@ mod tests {
             online: true,
             mgmt_port: 9778,
             can_wake: false,
+            clipboard_sync: false,
             last_used: None,
             os: String::new(),
             pin: None,

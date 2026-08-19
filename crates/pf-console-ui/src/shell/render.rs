@@ -101,6 +101,7 @@ impl Shell {
             full_h - f64::from(ins.top) - f64::from(ins.bottom),
         );
         self.last_insets = (ins.left, ins.top);
+        self.last_k = k;
         let t = self.t();
 
         // Advance the transition. `None` means "settled" — which is also what makes the

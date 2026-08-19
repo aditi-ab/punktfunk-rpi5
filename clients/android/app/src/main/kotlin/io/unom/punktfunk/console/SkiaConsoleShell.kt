@@ -287,10 +287,14 @@ fun SkiaConsoleShell(
                     })
                     // Touch → the console's pointer (surface pixels): the escape hatch when no
                     // pad is attached, and the natural way to press a legend hint on a phone.
+                    // A finger's down is kind 6 (the shell defers it so a swipe scrolls); a
+                    // mouse — which Android delivers through this same listener — keeps kind 1
+                    // and acts on the press, as a mouse should.
                     setOnTouchListener { v, ev ->
                         if (handle == 0L) return@setOnTouchListener false
                         val kind = when (ev.actionMasked) {
-                            MotionEvent.ACTION_DOWN -> 1
+                            MotionEvent.ACTION_DOWN ->
+                                if (ev.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE) 1 else 6
                             MotionEvent.ACTION_MOVE -> 0
                             MotionEvent.ACTION_UP -> 2
                             MotionEvent.ACTION_CANCEL -> 5

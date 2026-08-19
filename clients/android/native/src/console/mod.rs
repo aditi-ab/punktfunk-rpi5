@@ -323,8 +323,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleMenu
 }
 
 /// `NativeBridge.nativeConsolePointer(handle, kind, x, y, dy)` — touch/mouse in surface pixels:
-/// kind 0 move, 1 primary down, 2 primary up, 3 secondary down (= Back), 4 wheel (`dy` steps,
-/// + = up), 5 cancel.
+/// kind 0 move, 1 primary down (a mouse — acts immediately), 2 primary up, 3 secondary down
+/// (= Back), 4 wheel (`dy` steps, + = up), 5 cancel, 6 primary down from a finger/stylus on
+/// the glass — the shell defers it so a swipe scrolls instead of acting on contact.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsolePointer(
     _env: EnvUnowned,
@@ -341,6 +342,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsolePoin
             x,
             y,
             button: PointerButton::Primary,
+            touch: false,
         },
         2 => PointerInput::Up {
             x,
@@ -351,9 +353,16 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsolePoin
             x,
             y,
             button: PointerButton::Secondary,
+            touch: false,
         },
         4 => PointerInput::Wheel { x, y, dy },
         5 => PointerInput::Cancel,
+        6 => PointerInput::Down {
+            x,
+            y,
+            button: PointerButton::Primary,
+            touch: true,
+        },
         _ => return,
     };
     if let Some(h) = host(handle) {

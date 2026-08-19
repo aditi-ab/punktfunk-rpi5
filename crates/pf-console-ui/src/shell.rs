@@ -58,6 +58,38 @@ const NAV_INPUT_OPENS: f64 = 0.85;
 const TOP_BAND: f64 = 64.0;
 const BOTTOM_BAND: f64 = 86.0;
 
+/// How far a finger may wander (design units × the frame's `k`) and still be a tap. Past
+/// this the gesture is a drag and the lift acts on nothing. ~12dp is the classic touch
+/// slop; in device pixels it lands near Android's own ViewConfiguration figure.
+const TOUCH_SLOP_DP: f64 = 12.0;
+/// One drag step (design units × `k`): each `DRAG_TICK_DP` of dominant-axis travel emits
+/// one synthetic scroll tick. 56 is the menu list's row pitch (`widgets::ROW_H` + gap), so
+/// a list under the finger moves about as far as the finger does. The on-glass tuning knob.
+const DRAG_TICK_DP: f64 = 56.0;
+
+/// The active touch gesture, tracked by [`Shell::pointer_input`] (see the `touch` flag on
+/// `PointerInput::Down`). A mouse never enters this machine — its press acts immediately,
+/// which is what a mouse means. A second finger while one gesture is live is ignored
+/// (single-tracked; multi-touch gestures are a non-goal).
+#[derive(Clone, Copy, Debug)]
+enum TouchGesture {
+    /// Finger down, still within slop of the anchor. A lift here is a tap: the Press is
+    /// delivered AT THE ANCHOR — the focused item scrolls toward the centre, so the down
+    /// point is where the user aimed and the lift point is where the content dragged
+    /// their eye; widgets hit-test last frame's rects and already tolerate exactly this
+    /// one-frame skew.
+    Armed { x: f64, y: f64 },
+    /// Slop exceeded: a drag, locked to the axis it left the slop on (diagonal jitter
+    /// must not alternate a carousel with a list). `last` is the dominant-axis position
+    /// the previous tick was emitted at.
+    Drag {
+        x: f64,
+        y: f64,
+        horizontal: bool,
+        last: f64,
+    },
+}
+
 /// Which way a transition is choreographed. The paint recipes differ (a push slides the
 /// incoming screen up out of a fade; a pop grows the revealed one back while the leaving
 /// one drops away), so the kind outlives the direction the spring happens to be heading.
@@ -259,6 +291,11 @@ pub(crate) struct Shell {
     /// surface pixels and are brought into the same space `hint_rects` and every screen's
     /// hit boxes were published in.
     last_insets: (f32, f32),
+    /// The design-unit scale the last frame rendered at, for the touch tracker's slop and
+    /// tick distances — gesture geometry must grow with the UI it drags.
+    last_k: f64,
+    /// The touch gesture in flight, if any (see [`TouchGesture`]).
+    gesture: Option<TouchGesture>,
     /// Skia's resource-cache budget for the host that renders this shell (see
     /// [`ConsoleOptions::gpu_cache_bytes`]).
     pub(crate) gpu_cache_bytes: usize,
@@ -331,6 +368,8 @@ impl Shell {
             pads: Vec::new(),
             hint_rects: Vec::new(),
             last_insets: (0.0, 0.0),
+            last_k: 1.0,
+            gesture: None,
             gpu_cache_bytes: opts.gpu_cache_bytes,
             t0: Instant::now(),
             last_frame: None,
@@ -361,25 +400,69 @@ impl Shell {
     /// The host-facing pointer vocabulary onto the shell's own: primary press/release,
     /// secondary-down = Back (its release is dropped, or a right-click would pop two
     /// screens), wheel = discrete scroll steps, cancel.
+    ///
+    /// A TOUCH primary down (`touch: true`) takes the gesture lane instead: the press is
+    /// deferred, and the lift decides whether it was a tap (Press at the anchor) or a drag
+    /// (scroll ticks were already emitted along the way, the lift acts on nothing). A press
+    /// that acted on contact made every swipe across the settings list flip a value — the
+    /// finger has to be allowed to mean "scroll" until it has said otherwise.
     pub(crate) fn pointer_input(&mut self, input: pf_client_core::console::PointerInput) -> bool {
         use pf_client_core::console::{PointerButton, PointerInput};
         let (x, y, kind) = match input {
-            PointerInput::Move { x, y } => (x, y, PointerKind::Move),
+            PointerInput::Move { x, y } => {
+                if self.gesture.is_some() {
+                    return self.gesture_move(f64::from(x), f64::from(y));
+                }
+                (x, y, PointerKind::Move)
+            }
             PointerInput::Down {
                 x,
                 y,
                 button: PointerButton::Primary,
-            } => (x, y, PointerKind::Press),
+                touch,
+            } => {
+                if touch {
+                    // A second finger while a gesture is live is ignored — single-tracked.
+                    if self.gesture.is_none() {
+                        self.gesture = Some(TouchGesture::Armed {
+                            x: f64::from(x),
+                            y: f64::from(y),
+                        });
+                    }
+                    return true;
+                }
+                (x, y, PointerKind::Press)
+            }
             PointerInput::Down {
                 x,
                 y,
                 button: PointerButton::Secondary,
+                ..
             } => (x, y, PointerKind::Back),
             PointerInput::Up {
                 x,
                 y,
                 button: PointerButton::Primary,
-            } => (x, y, PointerKind::Release),
+            } => match self.gesture.take() {
+                Some(TouchGesture::Armed { x, y }) => {
+                    // A tap: the deferred Press lands now, at the anchor, followed by the
+                    // Release the widgets ignore today (and a fling closes on tomorrow).
+                    let consumed = self.pointer(Pointer {
+                        x,
+                        y,
+                        kind: PointerKind::Press,
+                    });
+                    self.pointer(Pointer {
+                        x,
+                        y,
+                        kind: PointerKind::Release,
+                    });
+                    return consumed;
+                }
+                // A drag ends where its last tick left it; the lift itself does nothing.
+                Some(TouchGesture::Drag { .. }) => return true,
+                None => (x, y, PointerKind::Release),
+            },
             PointerInput::Up { .. } => return true,
             PointerInput::Wheel { x, y, dy } => {
                 if dy == 0.0 {
@@ -387,13 +470,70 @@ impl Shell {
                 }
                 (x, y, PointerKind::Scroll { up: dy > 0.0 })
             }
-            PointerInput::Cancel => (0.0, 0.0, PointerKind::Cancel),
+            PointerInput::Cancel => {
+                self.gesture = None;
+                (0.0, 0.0, PointerKind::Cancel)
+            }
         };
         self.pointer(Pointer {
             x: f64::from(x),
             y: f64::from(y),
             kind,
         })
+    }
+
+    /// Advance the touch gesture by a Move. Within slop nothing happens; past it the
+    /// gesture locks to its dominant axis and every [`DRAG_TICK_DP`]·k of travel becomes
+    /// one synthetic scroll tick at the anchor. Direction reads as "content follows the
+    /// finger": drag down/right = the previous item (a wheel-up), drag up/left = the next.
+    fn gesture_move(&mut self, x: f64, y: f64) -> bool {
+        let Some(gesture) = self.gesture else {
+            return false;
+        };
+        match gesture {
+            TouchGesture::Armed { x: ax, y: ay } => {
+                let (dx, dy) = (x - ax, y - ay);
+                if dx.hypot(dy) >= TOUCH_SLOP_DP * self.last_k {
+                    let horizontal = dx.abs() > dy.abs();
+                    self.gesture = Some(TouchGesture::Drag {
+                        x: ax,
+                        y: ay,
+                        horizontal,
+                        // Ticks count from where the slop was left, not from the anchor —
+                        // the slop's travel was spent proving this is a drag.
+                        last: if horizontal { x } else { y },
+                    });
+                }
+                true
+            }
+            TouchGesture::Drag {
+                x: ax,
+                y: ay,
+                horizontal,
+                last,
+            } => {
+                let pos = if horizontal { x } else { y };
+                let tick = DRAG_TICK_DP * self.last_k;
+                let steps = ((pos - last) / tick).trunc();
+                if steps != 0.0 {
+                    self.gesture = Some(TouchGesture::Drag {
+                        x: ax,
+                        y: ay,
+                        horizontal,
+                        last: last + steps * tick,
+                    });
+                    let up = steps > 0.0;
+                    for _ in 0..steps.abs() as u32 {
+                        self.pointer(Pointer {
+                            x: ax,
+                            y: ay,
+                            kind: PointerKind::Scroll { up },
+                        });
+                    }
+                }
+                true
+            }
+        }
     }
 
     /// The host reports a session edge. `Connecting` is a no-op — the shell raised the

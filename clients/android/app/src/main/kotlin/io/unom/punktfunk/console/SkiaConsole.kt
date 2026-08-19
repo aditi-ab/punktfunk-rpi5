@@ -213,6 +213,14 @@ object SkiaConsole {
         main.post(object : Runnable {
             override fun run() {
                 if (handle == 0L) return
+                // Only while the console is ON SCREEN (attached): parked behind the touch UI
+                // or a stream there is nobody to show the presence pips to — and mid-stream
+                // the radio belongs to the session, which is exactly why discovery stops for
+                // it. The timer keeps ticking so probes resume within a cadence of re-attach.
+                if (onConnected == null) {
+                    main.postDelayed(this, 12_000)
+                    return
+                }
                 val targets = knownHostStore.all().filter { kh -> discovered.none { kh.matches(it) } }
                 ioPool.execute {
                     val up = targets.filter { NativeBridge.nativeProbe(it.address, it.port, 3_000) }
@@ -542,6 +550,8 @@ object SkiaConsole {
                     c.optJSONObject("ForgetHost")?.let(::forgetHost)
                     c.optJSONObject("Wake")?.let(::wake)
                     c.optJSONObject("SetPin")?.let(::setPin)
+                    c.optJSONObject("BindProfile")?.let(::bindProfile)
+                    c.optJSONObject("SetClipboard")?.let(::setClipboard)
                     c.optJSONObject("OpenPlatformScreen")?.let { onPlatformScreen?.invoke(it.optString("id")) }
                     c.optJSONObject("PadAction")?.let { onPadAction?.invoke(it.optString("action"), it.optString("pad_key")) }
                     c.optString("OpenPlatformScreen").takeIf { c.has("OpenPlatformScreen") && c.opt("OpenPlatformScreen") is String }
@@ -579,6 +589,22 @@ object SkiaConsole {
         val kh = hostForKey(c.optString("key")) ?: return
         knownHostStore.remove(kh)
         appContext?.let { LibraryCache.standard(it.cacheDir).forget(kh.id) }
+        pushHosts(); pushKnownHosts()
+    }
+
+    /** `ConsoleCmd::BindProfile` — the host's default binding (`KnownHost.profileId`); null clears. */
+    private fun bindProfile(c: JSONObject) {
+        val kh = hostForKey(c.optString("key")) ?: return
+        val pid = c.optString("profile_id")
+            .takeIf { c.has("profile_id") && !c.isNull("profile_id") && it.isNotEmpty() }
+        knownHostStore.save(kh.copy(profileId = pid))
+        pushHosts(); pushKnownHosts()
+    }
+
+    /** `ConsoleCmd::SetClipboard` — the per-host clipboard trust toggle. */
+    private fun setClipboard(c: JSONObject) {
+        val kh = hostForKey(c.optString("key")) ?: return
+        knownHostStore.save(kh.copy(clipboardSync = c.optBoolean("on")))
         pushHosts(); pushKnownHosts()
     }
 

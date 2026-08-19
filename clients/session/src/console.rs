@@ -82,6 +82,7 @@ pub fn run(target: Option<&str>) -> u8 {
                     .or_else(|| k.and_then(|h| h.mgmt_port))
                     .unwrap_or(library::DEFAULT_MGMT_PORT),
                 can_wake: false,
+                clipboard_sync: k.is_some_and(|h| h.clipboard_sync),
                 last_used: k.and_then(|h| h.last_used),
                 os: k.map(|h| h.os.clone()).unwrap_or_default(),
                 pin: None,
@@ -336,6 +337,7 @@ fn fake_host_row() -> HostRow {
         online: true,
         mgmt_port: library::DEFAULT_MGMT_PORT,
         can_wake: false,
+        clipboard_sync: false,
         last_used: None,
         os: "linux/arch/steamos".into(),
         pin: None,
@@ -698,6 +700,40 @@ impl ServiceState {
                 // `run` refreshes the rows right after this drain, so the carousel and
                 // the pin screen reflect the new card within the same service pass.
             }
+            ConsoleCmd::BindProfile { key, profile_id } => {
+                // The BINDING half of the profile pair — `KnownHost::profile_id`, what a
+                // plain A-press on the primary tile connects with. `SetPin` above is the
+                // presentation half and never touches this field; this never touches the
+                // pins. Same store discipline, same refresh-after-drain.
+                let mut known = trust::KnownHosts::load();
+                let idx = index_for_key(&known, &key);
+                let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
+                    tracing::warn!(%key, "profile bind for an unknown host — ignoring");
+                    return;
+                };
+                if h.profile_id != profile_id {
+                    h.profile_id = profile_id;
+                    if let Err(e) = known.save() {
+                        tracing::warn!(error = %format!("{e:#}"), "saving known hosts");
+                    }
+                }
+            }
+            ConsoleCmd::SetClipboard { key, on } => {
+                // Per-host clipboard trust (`KnownHost::clipboard_sync`) — the host
+                // menu's toggle. Same store discipline as the two arms above.
+                let mut known = trust::KnownHosts::load();
+                let idx = index_for_key(&known, &key);
+                let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
+                    tracing::warn!(%key, "clipboard toggle for an unknown host — ignoring");
+                    return;
+                };
+                if h.clipboard_sync != on {
+                    h.clipboard_sync = on;
+                    if let Err(e) = known.save() {
+                        tracing::warn!(error = %format!("{e:#}"), "saving known hosts");
+                    }
+                }
+            }
         }
     }
 
@@ -787,6 +823,7 @@ impl ServiceState {
                         .or(h.mgmt_port)
                         .unwrap_or(library::DEFAULT_MGMT_PORT),
                     can_wake: !online && !h.mac.is_empty(),
+                    clipboard_sync: h.clipboard_sync,
                     last_used: h.last_used,
                     os: advert
                         .filter(|d| !d.os.is_empty())
@@ -845,6 +882,7 @@ impl ServiceState {
                 online: true,
                 mgmt_port: d.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
                 can_wake: false,
+                clipboard_sync: false,
                 last_used: None,
                 os: d.os.clone(),
                 pin: None,
