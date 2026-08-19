@@ -114,7 +114,7 @@ mechanics. The one exception is a gamescope the host only *attaches* to, which k
     `RecordMonitor` / `RecordWindow` and never Mutter 42's `RecordVirtual`, and its portal backend
     (`xdg-desktop-portal-xapp`) implements no ScreenCast at all. Nothing in Punktfunk can change
     this. A Mint or LMDE box can still stream **games** through a headless gamescope, which needs no
-    desktop compositor — see [Debian → Cinnamon](/docs/debian#cinnamon-linux-mint-and-lmde).
+    desktop compositor — see [Requirements → Cinnamon](/docs/requirements#cinnamon-linux-mint-and-lmde).
 
 ### Input, cursor and HDR
 

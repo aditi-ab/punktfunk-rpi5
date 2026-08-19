@@ -4,17 +4,16 @@ description: Copy on one machine and paste on the other — the two switches tha
 ---
 
 Punktfunk can share the clipboard between the machine you are sitting at and the host you are
-streaming. Copy a URL on your laptop, paste it into a browser on the host. Copy an error message on
-the host, paste it into a chat app on your laptop.
+streaming, in both directions — copy a URL on your laptop, paste it on the host, and back.
 
 **Two separate switches have to be on:**
 
-1. The **host** operator has to allow it, with a line in `host.env` and a host restart. This one is
-   off by default.
-2. **You** have to turn it on for that one host, in that host's edit sheet on your client. This one
-   is off by default on the macOS, Windows and Linux clients — but **on by default on Android**.
+1. The **host** operator has to allow it, with a line in `host.env` and a host restart. Off by
+   default.
+2. **You** have to turn it on for that one host, in that host's edit sheet on your client. Off by
+   default on the macOS, Windows and Linux clients — **on by default on Android**.
 
-Flipping one and not the other looks exactly like the feature not existing. So check both.
+Flipping one and not the other looks exactly like the feature not existing. Check both.
 
 ## 1. Allow it on the host
 
@@ -52,14 +51,14 @@ punktfunk-host service restart
 See [Configuration](/docs/configuration) for the rest of `host.env`.
 
 > **About the file mode.** No client shipping today asks for file transfer, and no host clipboard
-> backend offers file formats yet. `on` and `text-only` therefore behave the same in practice —
-> `text-only` is how you make that explicit and keep it that way.
+> backend offers file formats yet, so `on` and `text-only` behave the same in practice — `text-only`
+> makes that explicit and keeps it that way.
 
 ## 2. Turn it on for that host, in your client
 
-The client switch is **per saved host**, not global: handing a machine your clipboard is a decision
-about *that* machine. You set it in the host's edit sheet, and it is deliberately not something a
-[settings profile can carry](/docs/profiles-and-links#what-a-profile-cant-change).
+The client switch is **per saved host**, not global — handing a machine your clipboard is a decision
+about *that* machine — so it lives in the host's edit sheet, deliberately not in a
+[settings profile](/docs/profiles-and-links#what-a-profile-cant-change).
 
 | Client | Where the switch is | Label | Default |
 |---|---|---|---|
@@ -69,39 +68,38 @@ about *that* machine. You set it in the host's edit sheet, and it is deliberatel
 | Linux (GTK) | Host card menu → **Edit…** | **Share clipboard** | Off |
 | Android (touch) | Host card menu → **Edit…** | **Shared clipboard** | **On** |
 
-On Android the switch is only in the touch edit dialog. The controller/TV interface — what you get
-on Android TV, and on a phone when a controller is attached — has its own **Edit Host** screen with
-no clipboard row, so there is nowhere to change it there. It stays on, which is the Android default.
+On Android the switch is only in the touch edit dialog. The controller/TV interface — Android TV,
+and a phone with a controller attached — has its own **Edit Host** screen with no clipboard row, so
+it stays on, the Android default.
 
 The setting is read when a session starts, so if you change it while streaming, reconnect.
 
 macOS can also flip it mid-session: **Stream ▸ Share Clipboard** (⌃⌥⇧C), which becomes **Stop
 Sharing Clipboard** once the host has acknowledged it. On an iPad with a hardware keyboard the same
 combo works, though there is no menu bar to show it in — and only while the pointer is released, as
-a captured session sends the keys to the host instead.
+a captured session sends the keys to the host.
 
 tvOS and a Steam Deck in Gaming Mode have no clipboard switch — the Apple TV has no pasteboard to
-share at all, and neither the Decky panel nor the client's console home has a host edit sheet — see
+share, and neither the Decky panel nor the client's console home has a host edit sheet — see
 [what each client does](#which-hosts-and-clients-support-it) below.
 
 ## Nothing crosses until something pastes
 
 A copy costs nothing. When you copy, your machine announces only the **list of formats** it now
-holds — no bytes. The bytes are pulled across on a separate transfer, and only when an application
-on the other end actually pastes. Copying a large image and never pasting it transfers nothing.
+holds — no bytes. The bytes are pulled across on a separate transfer, only when an application on
+the other end actually pastes. Copying a large image and never pasting it transfers nothing.
 
 That holds for everything you copy on your own machine, and for both directions on the host. It
 does **not** hold for a host copy arriving at a Windows or Android client: those two fetch the
-content straight away and put it on your local clipboard, whether or not you ever paste. On Windows
-that is because the lazy path needs Windows delayed rendering, which the client doesn't implement
-yet; on Android there is no way to satisfy a paste from the network at all. The macOS and iOS
-clients are lazy in both directions.
+content straight away and put it on your local clipboard, whether or not you ever paste — on
+Windows because the lazy path needs Windows delayed rendering, which the client doesn't implement
+yet; on Android because there is no way to satisfy a paste from the network at all. The macOS and
+iOS clients are lazy in both directions.
 
-On iOS there is one deliberate exception. Backgrounding the app ends the session, and a promise
-nobody can answer is worse than no promise at all — so if the host copied something and you have not
-pasted it yet, those bytes are pulled across as the session ends, up to 8 MiB. That is what makes
-"copy on the host, switch to Safari, paste" work on an iPad. Nothing is fetched if you never leave
-the app, or if you already pasted.
+iOS has one deliberate exception. Backgrounding the app ends the session, so if the host copied
+something you have not pasted yet, those bytes are pulled across as the session ends, up to 8 MiB. That is what makes "copy on the host,
+switch to Safari, paste" work on an iPad. Nothing is fetched if you never leave the app, or if you
+already pasted.
 
 A single transfer is capped at 64 MiB. Nothing else limits size, so a very large host-side copy can
 cross to a Windows or Android client for a paste that never happens.
@@ -119,9 +117,7 @@ from a Punktfunk client. A Moonlight client has no clipboard.
 ## Which hosts and clients support it
 
 **Hosts.** The host runs on Linux and Windows, and both have a clipboard backend — but on Linux it
-depends on the desktop session.
-
-On Linux the host needs one of two mechanisms in the session it is streaming:
+depends on the desktop session, which needs one of two mechanisms:
 
 - `ext-data-control-v1` — KWin, wlroots/Sway and Hyprland. Tried first.
 - GNOME's own `org.gnome.Mutter.RemoteDesktop.Session` clipboard, used directly. Tried second.
@@ -154,8 +150,8 @@ registered `PNG` clipboard format. Many Windows apps publish only a bitmap, and 
 announced yet. The other direction is fine: an image copied on the host reaches the Windows client
 either way.
 
-The host side is richer than any client: it can offer and accept text, HTML, RTF, PNG, JPEG and
-GIF. What you get is therefore whatever your client supports.
+The host side is richer than any client: it can offer and accept text, HTML, RTF, PNG, JPEG and GIF.
+What you get is whatever your client supports.
 
 ## Why the toggle does nothing (or is greyed out)
 
@@ -164,18 +160,18 @@ connected host did not advertise a clipboard. On the other clients there is noth
 the per-host switch always looks available, and a host that can't do it simply does nothing. Work
 through these in order:
 
-- **The host has it off.** The default. Nothing was added to `host.env`, or the value is `off`,
-  `0`, `false` or empty. Fix it with step 1 above.
+- **The host has it off.** The default. Nothing was added to `host.env`, or the value is `off`, `0`,
+  `false` or empty. Fix it with step 1 above.
 - **`host.env` was edited but the host wasn't restarted.** The file is read once, at startup.
 - **The switch is off for this host in your client.** It is per saved host, and off by default
   everywhere except Android. Check the host's **Edit…** sheet — step 2 above.
 - **The host's session has no supported backend.** The host allows the clipboard, so it still
-  advertises the capability, but it has nothing to read the desktop's clipboard with. This is a
-  gamescope session, a compositor with only the old `zwlr-data-control-unstable-v1`, or a GNOME
-  session whose Mutter doesn't expose the direct RemoteDesktop clipboard. Nothing on screen tells
-  you this apart — the host log does.
+  advertises the capability, but has nothing to read the desktop's clipboard with: a gamescope
+  session, a compositor with only the old `zwlr-data-control-unstable-v1`, or a GNOME session whose
+  Mutter doesn't expose the direct RemoteDesktop clipboard. Nothing on screen tells you this apart —
+  the host log does.
 - **The host is older than the feature.** A host from before clipboard sync never advertises it.
-- **Your client doesn't implement it** — Linux, Steam Deck, iOS, iPadOS or tvOS. Nothing crosses
+- **Your client doesn't implement it** — Linux (GTK), Steam Deck or tvOS. Nothing crosses
   regardless of what the host allows.
 - **You changed the switch while connected.** Reconnect, or use ⌃⌥⇧C on macOS.
 - **The copy was a secret, or a format nobody handles.** Concealed content is skipped on purpose on

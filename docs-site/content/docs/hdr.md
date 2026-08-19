@@ -4,23 +4,23 @@ description: How an HDR10 stream is decided end to end — the four things that 
 ---
 
 An HDR session carries a **10-bit BT.2020 PQ (HDR10)** picture from the host's display to your
-screen. It is on by default wherever it works, and a session that can't be HDR streams 8-bit BT.709
-SDR instead. Which one you get is decided **before the first frame**: the host resolves every gate
-below, then tells the client what it is really going to send. Nothing on this page takes effect
-mid-stream, so reconnect after changing any of it.
+screen. It is on by default wherever it works; otherwise the session streams 8-bit BT.709 SDR. The
+host decides **before the first frame** — it resolves every gate below and tells the client what it
+will really send — so nothing on this page takes effect mid-stream; reconnect after changing any of
+it.
 
 ## The chain
 
-Four things must all be true. If your stream is SDR when you expected HDR, one of these is why.
+Four things must all be true. If you got SDR when you expected HDR, one of these is why.
 
-1. **The source.** What the host captures must hand it 10-bit PQ pixels. This is the link that fails
-   most often, and it is entirely a host-side question — see [Per host](#per-host).
-2. **The encoder.** The host GPU must encode 10-bit for the codec the session picked. The host
-   probes this by opening a tiny real encoder once per GPU and codec, and believes the answer.
-   (PyroWave skips the probe — it has its own rule, below.)
+1. **The source.** What the host captures must hand it 10-bit PQ pixels. This link fails most often
+   and is entirely host-side — see [Per host](#per-host).
+2. **The encoder.** The host GPU must encode 10-bit for the session's codec. The host probes by
+   opening a tiny real encoder once per GPU and codec, and believes the answer. (PyroWave skips the
+   probe — its own rule is below.)
 3. **The codec.** Only HEVC, AV1 and PyroWave have a 10-bit path — see [Codec rules](#codec-rules).
-4. **The client.** Your client must advertise 10-bit and HDR (its **HDR** setting), and be able to
-   present or tone-map PQ.
+4. **The client.** It must advertise 10-bit and HDR (its **HDR** setting) and be able to present or
+   tone-map PQ.
 
 The host allows 10-bit by default (`PUNKTFUNK_10BIT`). It only ever *allows* — the client's setting
 is the real per-session switch.
@@ -29,78 +29,75 @@ is the real per-session switch.
 
 ### Windows
 
-The Windows host creates a virtual display for your session and **turns HDR on for that display
-itself** when the session negotiated 10-bit. You do not have to enable "Use HDR" in Windows Settings
-first: Punktfunk enables advanced colour at capture open, waits for it to settle, then composes in
-FP16 and encodes P010 BT.2020 PQ. The reverse is enforced too — a session that negotiated **SDR**
-forces advanced colour **off** on that display, so a client that asked for 8-bit is never handed PQ.
-If enabling it fails, the host logs a loud error and encodes 8-bit anyway: the client was already
-told HDR, so that is the one place a Punktfunk label can outrun the picture. The log says so.
-
-Two details worth knowing:
+The Windows host **turns HDR on for the session's virtual display itself** when 10-bit was
+negotiated — you don't have to enable "Use HDR" in Windows Settings. It enables advanced colour at
+capture open, waits for it to settle, then composes in FP16 and encodes P010 BT.2020 PQ. The
+reverse holds too: an **SDR** session forces advanced colour **off** on that display, so a client
+that asked for 8-bit is never handed PQ. If enabling it fails, the host logs a loud error and encodes
+8-bit anyway — the client was already told HDR, so that is the one place a Punktfunk label can
+outrun the picture.
 
 - **HDR and 4:4:4 compose on Windows, not on Linux.** A **Windows** host carries both: the capture
   path writes full-resolution 10-bit chroma and NVENC encodes HEVC Main 4:4:4 10, so
-  [full chroma](/docs/client-settings) costs you nothing on an HDR desktop.
-  [PyroWave](/docs/pyrowave) does the same there, in 16-bit planes. On **Linux** the 4:4:4 route is
-  8-bit, so a session that negotiates both resolves back down to SDR — full chroma wins. AV1 never
-  carries 4:4:4 anywhere: Range Extensions are HEVC-only.
+  [full chroma](/docs/client-settings) costs nothing on an HDR desktop; [PyroWave](/docs/pyrowave)
+  does the same there, in 16-bit planes. On **Linux** the 4:4:4 route is 8-bit, so a session that
+  negotiates both resolves back down to SDR — full chroma wins. AV1 never carries 4:4:4 anywhere:
+  Range Extensions are HEVC-only.
 - **Vulkan games need the bundled layer.** NVIDIA and AMD Vulkan drivers refuse to advertise any HDR
   colour space for a surface on an indirect (virtual) display, so Vulkan games decide the device
-  "does not support HDR" — even though the driver happily presents an HDR swapchain there. The host
+  "does not support HDR" — though the driver happily presents an HDR swapchain there. The host
   installer ships an implicit Vulkan layer, `VK_LAYER_PUNKTFUNK_hdr_inject`, that adds those formats
   back (installer task **Install the HDR Vulkan layer**, ticked by default). It self-gates on the
-  monitor's live advanced-colour state, so it does nothing on an SDR session, and it already skips a
-  built-in list of kernel-anti-cheat titles. `DISABLE_PF_VKHDR=1` in a game's environment switches it
-  off for that process; `PF_VKHDR_EXCLUDE=foo.exe,bar.exe` skips further executables by name.
-  D3D11/D3D12 games need none of this.
+  monitor's live advanced-colour state, so it does nothing on an SDR session, and it skips a built-in
+  list of kernel-anti-cheat titles. `DISABLE_PF_VKHDR=1` in a game's environment switches it off for
+  that process; `PF_VKHDR_EXCLUDE=foo.exe,bar.exe` skips further executables by name. D3D11/D3D12
+  games need none of this.
 
 ### Linux + gamescope
 
-A stock gamescope tone-maps its composite down to 8 bits before handing it over, so its capture
-output is SDR no matter what the game rendered. Real HDR needs **`punktfunk-gamescope`**, a build
-carrying a patch that adds the 10-bit PQ formats to its PipeWire node. It installs beside your system
-gamescope rather than replacing it; [HDR on gamescope](/docs/gamescope#hdr-on-gamescope) has the
-package for each distro.
+Stock gamescope tone-maps its composite down to 8 bits before handing it over, so its capture output
+is SDR whatever the game rendered. Real HDR needs **`punktfunk-gamescope`**, a build carrying a patch
+that adds the 10-bit PQ formats to its PipeWire node. It installs beside your system gamescope rather
+than replacing it; [HDR on gamescope](/docs/gamescope#hdr-on-gamescope) has the package for each
+distro.
 
-The host settles two facts before spawning anything: the gamescope binary it will run carries the
+Before spawning anything the host settles two facts: the gamescope binary it will run carries the
 patch (its `--version` banner contains `+pfhdr`), and this host is the one **starting** the session
 rather than attaching to a node someone else started.
 
 **Attach mode is the trap.** The patched build only reaches sessions the host spawns itself —
 managed, `PUNKTFUNK_GAMESCOPE_SESSION`, or a bare spawn. A session started by your display manager
-runs the distro's own gamescope, which offers neither the 10-bit formats nor the in-node cursor. The
-host cannot tell that from the outside unless you pinned `PUNKTFUNK_GAMESCOPE_NODE`: with
+runs the distro's own gamescope, which offers neither the 10-bit formats nor the in-node cursor, and
+the host cannot tell that from the outside unless you pinned `PUNKTFUNK_GAMESCOPE_NODE`. With
 `PUNKTFUNK_GAMESCOPE_ATTACH=1` and the patched build installed it reads the binary, believes HDR is
-available, and offers it. The attached session can't answer that negotiation, so the connect fails
+available, and offers it; the attached session can't answer that negotiation, so the connect fails
 with no picture, the host latches an SDR downgrade for the rest of its life, and the next connect
 streams — in SDR.
 
-That combination bites on [Bazzite](/docs/bazzite), where the sysext installs `punktfunk-gamescope`
-alongside a stock session gamescope. No template pins attach any more, so the managed default gets
-you HDR and the compositor-drawn cursor — but an older template did, and an upgrade never rewrites a
-`host.env` you already have, so check yours for `PUNKTFUNK_GAMESCOPE_ATTACH=1` and delete the line.
-If you deliberately stay on attach, set `PUNKTFUNK_GAMESCOPE_HDR=0` so the failed attempt never
-happens. Staying on attach also leaves the stream with no cursor;
-[HDR on gamescope](/docs/gamescope#hdr-on-gamescope) has the fix for that half.
+That bites on [Bazzite](/docs/bazzite), where the sysext installs `punktfunk-gamescope` alongside a
+stock session gamescope. No template pins attach any more, so the managed default gets you HDR and
+the compositor-drawn cursor — but an older template did, and an upgrade never rewrites a `host.env`
+you already have: check yours for `PUNKTFUNK_GAMESCOPE_ATTACH=1` and delete the line. If you
+deliberately stay on attach, set `PUNKTFUNK_GAMESCOPE_HDR=0` so the failed attempt never happens.
+Attach also leaves the stream with no cursor; [HDR on gamescope](/docs/gamescope#hdr-on-gamescope)
+has the fix for that half.
 
-SDR content rides the same PQ container — the desktop, the Steam overlay, an SDR game — mapped in at
-`PUNKTFUNK_GAMESCOPE_SDR_NITS`, which defaults to **203 nits**. That is BT.2408 reference white, and
-it is the level our clients decode against, so the two ends agree out of the box. gamescope's own
-default is 400, nearly a stop brighter; hosts that let it float showed a glaring, over-saturated
-Steam UI and washed-out HDR game content on the same stream. Move the knob if you want a brighter or
-dimmer desktop, but be aware that moving it re-opens that gap.
+SDR content — the desktop, the Steam overlay, an SDR game — rides the same PQ container, mapped in
+at `PUNKTFUNK_GAMESCOPE_SDR_NITS`, default **203 nits**. That is BT.2408 reference white and the
+level our clients decode against, so the two ends agree out of the box. gamescope's own default is
+400, nearly a stop brighter; hosts that let it float showed a glaring, over-saturated Steam UI and
+washed-out HDR game content on the same stream. Moving the knob re-opens that gap.
 
 ### Linux + GNOME
 
-A Punktfunk host serves [two protocols](/docs/how-it-works#two-protocols): its own `punktfunk/1`,
-which the Linux, Windows, Apple and Android apps speak, and GameStream, which
-[Moonlight](/docs/moonlight) speaks. GNOME HDR is available on the GameStream side only.
+A host serves [two protocols](/docs/how-it-works#two-protocols): its own `punktfunk/1` (the Linux,
+Windows, Apple and Android apps) and GameStream ([Moonlight](/docs/moonlight)). GNOME HDR is
+available on the GameStream side only.
 
 GNOME 50 added HDR screencast for **real monitors** only, so this route mirrors a monitor instead of
 creating a virtual display: set `PUNKTFUNK_VIDEO_SOURCE=portal`, put the monitor in HDR mode in
 **Settings → Displays**, and connect an HDR-capable client. `PUNKTFUNK_CAPTURE_MONITOR=<connector>`
-pins which head, and when it is set the host checks *that* monitor's colour mode rather than asking
+pins which head; when it is set the host checks *that* monitor's colour mode rather than asking
 whether any monitor is in HDR. If none is, the session degrades to 8-bit SDR and says so in the log.
 
 A Punktfunk app connecting to a GNOME host over `punktfunk/1` gets SDR. On that protocol the only
@@ -109,10 +106,10 @@ Linux HDR source is the gamescope virtual output.
 ### Linux virtual displays on KWin, Mutter and wlroots
 
 **These are SDR.** Mutter's `RecordVirtual` streams and the KWin and wlroots virtual outputs are
-8-bit upstream, so there is nothing for the host to capture in 10 bits — no setting changes this.
-Streaming a *physical* monitor with the [Streamed screen](/docs/virtual-displays) setting is SDR to
-a Punktfunk app too, HDR panel or not; the GNOME/GameStream route above is the only Linux monitor
-mirror that can be HDR.
+8-bit upstream, so there is nothing to capture in 10 bits — no setting changes this. Streaming a
+*physical* monitor with the [Streamed screen](/docs/virtual-displays) setting is SDR to a Punktfunk
+app too, HDR panel or not; the GNOME/GameStream route above is the only Linux monitor mirror that can
+be HDR.
 
 ## Per client
 
@@ -125,12 +122,12 @@ mirror that can be HDR.
 | **Moonlight** | Its own HDR toggle, which appears only when the host advertises a 10-bit codec | — |
 
 The Linux and Windows clients are deliberately looser: they advertise HDR whenever the setting is on
-and let the presenter sort out the display side — HDR10 swapchain where the compositor offers one,
+and let the presenter sort out the display — HDR10 swapchain where the compositor offers one,
 tone-mapped to SDR where it doesn't. The stats overlay says which happened: `HDR` versus `HDR→SDR`.
 
 One exception: frames from **software decode** never take the HDR10 swapchain, whatever the surface
-offers. On a client with no hardware HEVC decode an HDR stream is therefore presented on the SDR
-swapchain without a tone-map, which looks washed out. Turn the client's HDR setting off there. The
+offers, so a client with no hardware HEVC decode presents an HDR stream on the SDR swapchain without
+a tone-map — washed out. Turn the client's HDR setting off there. The
 [Steam Deck plugin](/docs/steam-deck) streams through this same client.
 
 ## Codec rules
@@ -139,15 +136,15 @@ swapchain without a tone-map, which looks washed out. Turn the client's HDR sett
 - **AV1** — 10-bit, where the GPU encodes it. Advertised separately from HEVC, so a box that does
   one and not the other tells the truth about each.
 - **H.264** — never. High10 is not an encode mode on the hardware Punktfunk targets, so negotiation
-  never even asks. Pinning H.264 in your client settings pins the session to SDR.
+  never asks. Pinning H.264 in your client settings pins the session to SDR.
 - **[PyroWave](/docs/pyrowave)** — carries HDR in 16-bit planes, but **only from a Windows host**.
   The Linux PyroWave capture path has no HDR colour conversion, so a Linux-hosted PyroWave session
   is SDR. Use HEVC or AV1 for HDR from Linux.
 
-One more rule if you also use full chroma: a **Linux** host encodes 4:4:4 at 8 bits, so a session
-that negotiates both resolves back down to SDR before the stream starts — on Linux, 4:4:4 wins. A
-**Windows** host has no such trade: it carries HDR and full chroma at once. Full chroma is off until
-you turn it on, so this only bites if you did.
+With full chroma: a **Linux** host encodes 4:4:4 at 8 bits, so a session that negotiates both
+resolves back down to SDR before the stream starts — on Linux, 4:4:4 wins. A **Windows** host
+carries HDR and full chroma at once. Full chroma is off until you turn it on, so this only bites if
+you did.
 
 ## Check it
 
@@ -170,8 +167,8 @@ set -a; . ~/.config/punktfunk/host.env; set +a
 punktfunk-host hdr-probe
 ```
 
-There is no `hdr-probe` on Windows. What Windows has instead is a GPU colour self-test for the
-capture conversion, which needs no display or session:
+There is no `hdr-probe` on Windows. Windows has instead a GPU colour self-test for the capture
+conversion, which needs no display or session:
 
 ```powershell
 punktfunk-host hdr-p010-selftest 1920x1080 nvidia
@@ -193,13 +190,12 @@ Host, in [`host.env`](/docs/configuration):
 |---|---|---|
 | `PUNKTFUNK_10BIT` | **on** | Allow 10-bit (HEVC Main10 / AV1 10-bit) at all. `0`, `false`, `off` or `no` forces every session to 8-bit SDR. |
 | `PUNKTFUNK_GAMESCOPE_HDR` | **on** | Allow HDR on the gamescope backend. It only decides whether HDR is *attempted* — a host without `punktfunk-gamescope` stays SDR either way. `0` is the escape hatch that puts the gamescope backend back on the old SDR path, spawn flags included. |
-| `PUNKTFUNK_GAMESCOPE_SDR_NITS` | gamescope's own (400) | How bright SDR content is inside the PQ container of an HDR gamescope session. |
-| `PUNKTFUNK_VIDEO_SOURCE=portal` | unset | Required for the GNOME 50+ monitor-mirror route. GameStream/Moonlight only — it has no effect on `punktfunk/1` sessions. |
+| `PUNKTFUNK_GAMESCOPE_SDR_NITS` | **203** | How bright SDR content is inside the PQ container of an HDR gamescope session. |
+| `PUNKTFUNK_VIDEO_SOURCE=portal` | unset | Required for the GNOME 50+ monitor-mirror route. GameStream/Moonlight only — no effect on `punktfunk/1` sessions. |
 
 Client: one toggle, in Settings under **Quality** with
 [the rest of the video settings](/docs/client-settings#video) — **10-bit HDR** on the Linux, macOS,
 iOS, iPadOS and tvOS apps, **HDR (10-bit, BT.2020 PQ)** on Windows, **HDR** on Android. It is **on
-by default** on all of them. Turning it off means "never send me 10-bit", and the host then never
-upgrades the session. Like the other video settings it can be set per
-[profile](/docs/profiles-and-links), so a Work profile can prefer 4:4:4 while a Couch profile
-prefers HDR.
+by default** on all of them. Off means "never send me 10-bit", and the host then never upgrades the
+session. Like the other video settings it can be set per [profile](/docs/profiles-and-links), so a
+Work profile can prefer 4:4:4 while a Couch profile prefers HDR.

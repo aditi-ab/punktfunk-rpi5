@@ -4,8 +4,8 @@ description: Stream from a Punktfunk host using any Moonlight client.
 ---
 
 Punktfunk speaks the **GameStream** protocol, so [Moonlight](https://moonlight-stream.org/) connects
-to it like it would to any GameStream host — no punktfunk-specific app needed. It's a great option for
-a browser, a smart TV, or any device without a native client.
+to it like any GameStream host — no punktfunk-specific app needed. A good option for a browser, a
+smart TV, or any device without a native client.
 
 > Many platforms also have a **native Punktfunk client** with lower latency and built-in
 > discovery/pairing — including **Windows** and **Android** (phone and Android TV). See
@@ -41,15 +41,15 @@ the secure native-only host):
   ```
 
 (Bare `serve` is the secure native-only default and stock Moonlight clients can't connect to it; the
-native plane is always on, and `--gamestream` adds the Moonlight-compat surface.) GameStream pairs over
-plain HTTP and its legacy control encryption is weaker than the native plane's, so only enable it on a
-**trusted LAN**. See [Running as a Service](/docs/running-as-a-service) for the bundled unit. The host
-advertises itself on the network, so Moonlight usually finds it on its own.
+native plane is always on, and `--gamestream` adds the Moonlight-compat surface.) GameStream pairs
+over plain HTTP and its legacy control encryption is weaker than the native plane's, so only enable
+it on a **trusted LAN**. See [Running as a Service](/docs/running-as-a-service) for the bundled
+unit. The host advertises itself on the network, so Moonlight usually finds it on its own.
 
 ## 2. Add the host in Moonlight
 
-Open Moonlight. Your host should appear automatically on the same network. If it doesn't, use **Add
-Host manually** and enter the host machine's IP address.
+Open Moonlight. Your host should appear automatically on the same network. If not, use **Add Host
+manually** and enter the host machine's IP address.
 
 Still nothing? Two causes account for almost all of it:
 
@@ -74,7 +74,7 @@ Both are covered in more detail in [Troubleshooting](/docs/troubleshooting).
 ## 3. Pair
 
 Moonlight's PIN is typed in on the **host** side, so you need the host's
-[web console](/docs/web-console) running — it's the only UI where a Moonlight PIN can be entered.
+[web console](/docs/web-console) running — the only UI where a Moonlight PIN can be entered.
 
 1. Open the console at `https://<host-ip>:47992` and go to **Pairing**.
 2. In Moonlight, select the host and choose **Pair** — it shows a 4-digit PIN.

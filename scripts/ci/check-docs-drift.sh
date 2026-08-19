@@ -20,7 +20,10 @@
 #   4. Every command the host-cli.md tables list must still exist as a string literal in
 #      crates/punktfunk-host (same "docs describing removed things" class as gate 2).
 #   5. data/platforms.json (the single source for install/port facts that docs, the website
-#      download page and the guided installer consume) must parse.
+#      download page and the guided installer consume) must parse, and docs-site/src/data/
+#      platforms.json — the snapshot the <Install/> and <Ports/> MDX components render from
+#      (the docs Docker build context is docs-site/ alone) — must be a byte copy of it, same
+#      rule as gate 1.
 #
 # Textual gates, so textual limits: gate 2/3 match token spelling, not env reads — a var name in
 # a code comment counts as "exists", and a quoted constant that isn't an env var counts toward
@@ -97,6 +100,11 @@ elif command -v bun >/dev/null 2>&1; then
     bun -e "$json_check" || { echo "::error::data/platforms.json is not valid JSON"; fail=1; }
 elif command -v node >/dev/null 2>&1; then
     node -e "$json_check" || { echo "::error::data/platforms.json is not valid JSON"; fail=1; }
+fi
+if [ "$(cksum < data/platforms.json)" != "$(cksum < docs-site/src/data/platforms.json 2>/dev/null)" ]; then
+    echo "::error::docs-site/src/data/platforms.json is not a copy of data/platforms.json — re-sync it:"
+    echo "  cp data/platforms.json docs-site/src/data/platforms.json"
+    fail=1
 fi
 
 exit "$fail"

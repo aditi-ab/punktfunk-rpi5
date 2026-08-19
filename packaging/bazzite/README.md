@@ -146,44 +146,19 @@ desktop mode, verifying the first stream — lives on the
 install paths. Don't restate it here; a fact stated twice is a fact that drifts (see
 "Where facts live" in [`CONTRIBUTING.md`](../../CONTRIBUTING.md)).
 
-## 3. Gotchas the docs don't carry (yet)
+## 3. Gotchas
 
-<!-- WP2 of the docs overhaul moves these into /docs/troubleshooting; until then this is their
-     only home, so they stay. -->
+All user-facing ones live on the docs site now — the ffmpeg-libs weak dependency (NVENC fails at
+runtime without RPM Fusion's build:
+[Troubleshooting](https://docs.punktfunk.unom.io/docs/troubleshooting#no-video-on-fedora-nvenc-fails-ffmpeg-libs-is-missing))
+and the ds_inhibit SELinux storm with DualSense-type pads
+([Troubleshooting](https://docs.punktfunk.unom.io/docs/troubleshooting#stream-lags-then-freezes-with-a-dualsense-pad-bazzite-selinux);
+the `dontaudit`-vs-`allow` rationale is the header of `punktfunk-ds-inhibit.cil`).
 
-- **No video / NVENC fails to encode.** RPM Fusion's `ffmpeg-libs` (with NVENC) is a **weak
-  dependency** (`Recommends:` in the spec) — the package installs without it, and NVENC then
-  fails at runtime. Re-run the RPM Fusion step in Path C step 1.
-  (`packaging/rpm/punktfunk.spec`: `Recommends: ffmpeg-libs`.)
-
-- **Dev-layout unit.** `scripts/punktfunk-host.service` (the upstream/dev unit) assumes the binary
-  at `%h/punktfunk/target/release/punktfunk-host`; the packaged binary is `/usr/bin/punktfunk-host`.
-  If `systemctl --user cat punktfunk-host` shows `ExecStart` pointing into a home dir, drop an
-  override (`systemctl --user edit punktfunk-host`) setting
-  `ExecStart=/usr/bin/punktfunk-host serve --gamestream` (or bare `serve` for native-only).
-
-- **Stream lags, then freezes, with a DualSense-type client pad (SELinux enforcing).** The virtual
-  DualSense / DualShock 4 binds the kernel's `hid-playstation` driver, and Valve's `ds_inhibit`
-  (inside `steamos-manager`, shipped on Bazzite) reacts to *any* such hidraw by walking
-  `/proc/*/fd/` on every open/close. SELinux denies `steamos_manager_t` that walk, spraying
-  **~324 `avc: denied` per second**, and `setroubleshootd` amplifies the flood into a box-wide
-  fork storm that starves the stream (gamescope 0 fps, `tx_mbps` collapsing) — measured live on
-  Bazzite 43, 2026-08-15. Two traps while diagnosing: the AVC lines read `comm="tokio-rt-worker"`
-  — that is **steamos-manager, not punktfunk** (check `scontext=…steamos_manager_t…`); and once
-  started the setroubleshootd storm **outlives the denials by 15+ minutes**, so the box stays
-  starved after the pad is gone. Fixes:
-  - punktfunk ships a `dontaudit` SELinux drop-in that silences the flood (ds_inhibit then simply
-    leaves the pad uninhibited — harmless). The sysext installs it automatically on
-    install/update; on an existing install run `sudo punktfunk-sysext reapply`. On a layered or
-    bootc host: `sudo semodule -i /usr/share/punktfunk/selinux/punktfunk-ds-inhibit.cil`
-    (remove with `sudo semodule -r punktfunk-ds-inhibit`).
-  - **Hardening (recommended on any streaming host):** `sudo systemctl mask --now
-    setroubleshootd`. It is purely a desktop alert daemon — nothing depends on it
-    (`systemctl list-dependencies --reverse setroubleshootd` returns only itself) — and masking
-    it makes the box robust against *any* AVC burst, not just this one. Reversible with `unmask`.
-  - Workaround with the feature loss: set the **client's** Controller type to Xbox 360 (uinput,
-    no `hid-playstation`) — costs adaptive triggers, lightbar and touchpad. The host-side
-    `PUNKTFUNK_GAMEPAD` knob does **not** help: an explicit client choice outranks it.
+One packager-only note: `scripts/punktfunk-host.service` (the upstream/dev unit) assumes the binary
+at `%h/punktfunk/target/release/punktfunk-host`; the packaged binary is `/usr/bin/punktfunk-host`.
+If `systemctl --user cat punktfunk-host` shows `ExecStart` pointing into a home dir, drop an override
+(`systemctl --user edit punktfunk-host`) setting `ExecStart=/usr/bin/punktfunk-host serve`.
 
 ## Appendix — if the COPR isn't published yet
 
