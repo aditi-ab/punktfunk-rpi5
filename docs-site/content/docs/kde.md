@@ -149,7 +149,10 @@ The session unit brings up headless KWin; the host unit follows it and starts li
   it, so the grant above is fine and only the output creation is not. Two shapes. Its **backend**
   can't create one — a nested KWin, or `kwin_wayland --virtual` below 6.5.6; a normal Plasma
   session on the DRM backend always can. Or, on **KWin 6.6+**, KWin created the output and then
-  left it **disabled**, which reports identically: check `punktfunk-host list-monitors` for a
+  left it **disabled**. That reports identically, and it is new: 6.6 put a
+  `workspace()->findOutput()` hop in front of the stream, so from 6.6 on the output must also be
+  *enabled and workspace-managed*, where 6.5 and earlier streamed it either way. Check
+  `punktfunk-host list-monitors` for a
   `Virtual-punktfunk-*` marked *disabled*, a stale entry in `~/.config/kwinoutputconfig.json`, and
   `journalctl --user -b -t kwin_wayland` for *"Applying output configuration failed!"* — KWin logs
   that when it declines to enable one more output next to your current monitors, and keeps the old
