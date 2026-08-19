@@ -52,11 +52,13 @@ const run = <A>(eff: Effect.Effect<A, unknown, Scope.Scope>): Promise<A> =>
 
 describe("SyncEngine", () => {
 	test("first sync applies; unchanged content skips the apply", async () => {
+		// A LOOP reason, deliberately: the fingerprint skip is what keeps a 5-minute poll from
+		// PUTting the whole library forever. `startup`/`manual` opt out of it (below).
 		const { first, second, count } = await run(
 			Effect.gen(function* () {
 				const h = yield* harness();
-				const first = yield* h.engine.sync("manual");
-				const second = yield* h.engine.sync("manual");
+				const first = yield* h.engine.sync("poll");
+				const second = yield* h.engine.sync("poll");
 				return {
 					first,
 					second,
@@ -68,6 +70,34 @@ describe("SyncEngine", () => {
 		if (first._tag === "Applied") expect(first.count).toBe(2);
 		expect(second._tag).toBe("Unchanged");
 		expect(count).toBe(1);
+	});
+
+	/**
+	 * The host can store LESS than it was sent (an out-of-root cover is stripped, the games kept),
+	 * and the fingerprint cannot see that — it only says we would compute the same thing again. So
+	 * the two triggers a person is waiting on re-publish regardless, and the fix for a mangled
+	 * host-side copy is a restart or the Sync button rather than deleting the plugin's cache.
+	 */
+	test("startup and manual re-apply even when nothing changed", async () => {
+		const counts = await run(
+			Effect.gen(function* () {
+				const h = yield* harness();
+				yield* h.engine.sync("poll"); // first apply, fingerprint stored
+				const afterPoll = yield* Ref.get(h.applied);
+				const startup = yield* h.engine.sync("startup");
+				const manual = yield* h.engine.sync("manual");
+				// …and the loops still skip, with the same fingerprint in place.
+				const loop = yield* h.engine.sync("fs-change");
+				return {
+					afterPoll,
+					tags: [startup._tag, manual._tag, loop._tag],
+					total: yield* Ref.get(h.applied),
+				};
+			}),
+		);
+		expect(counts.afterPoll).toBe(1);
+		expect(counts.tags).toEqual(["Applied", "Applied", "Unchanged"]);
+		expect(counts.total).toBe(3);
 	});
 
 	test("changed content re-applies", async () => {

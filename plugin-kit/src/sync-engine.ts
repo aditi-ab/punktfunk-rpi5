@@ -4,7 +4,8 @@
 // Semantics are a faithful port of the original Engine guard:
 //   - single-flight: a sync while one runs records a pending trigger and returns
 //     AlreadyRunning; the running pass re-fires once ("coalesced") when it finishes
-//   - content fingerprint (sha256 of the entries JSON) skips the apply when unchanged
+//   - content fingerprint (sha256 of the entries JSON) skips the apply when unchanged —
+//     except for the two reasons a person is waiting on the answer (`ALWAYS_APPLY`)
 //   - interval poll + best-effort fs watchers (recursive where the OS supports it, top-dir
 //     fallback on Linux) with debounce; the poll is the real safety net on SMB/NFS
 //   - every transition publishes a SyncStatus (the UI's SSE feed)
@@ -68,6 +69,28 @@ export interface SyncSettings {
 	 */
 	readonly minInterval?: Duration.Duration;
 }
+
+/**
+ * Sync reasons that push to the host even when the fingerprint says nothing changed.
+ *
+ * A fingerprint match means WE would compute the same entries again — NOT that the host still
+ * holds them. The host may accept a payload and store less of it than was sent: an art path
+ * outside its allowed roots is stripped and the games kept (deliberately — a cover must not cost
+ * a library), and a launcher tile it cannot open is dropped the same way. Once that happens the
+ * plugin's fingerprint is a permanent "no changes": the operator fixes the host side, nothing
+ * re-publishes, and the only way out is to delete the plugin's cache file. That was real
+ * field advice for a portable-Playnite library whose 70 covers were dropped.
+ *
+ * So the two triggers with a person behind them always apply. `startup` is the restart every
+ * operator reaches for, and `manual` is the console's Sync-now button and the CLI's `sync` —
+ * both mean "publish my library NOW", and answering "no changes" to that is the trap. The loop
+ * reasons (`poll`, `fs-change`, `config-change`, `coalesced`) keep the short-circuit, which is
+ * where it earns its keep: they are what would otherwise PUT the whole library every few minutes.
+ */
+const ALWAYS_APPLY: ReadonlySet<SyncReason> = new Set<SyncReason>([
+	"startup",
+	"manual",
+]);
 
 /** `SyncSettings.minInterval` when a plugin does not set one. */
 export const DEFAULT_FS_CHANGE_MIN_INTERVAL: Duration.Duration =
@@ -175,7 +198,7 @@ export const makeSyncEngine = <
 				yield* Ref.set(lastReport, report);
 				const fp = fingerprint(entries);
 				const prev = yield* run(opts.lastSync.get);
-				if (prev?.fingerprint === fp) {
+				if (!ALWAYS_APPLY.has(reason) && prev?.fingerprint === fp) {
 					yield* Effect.log(
 						`sync (${reason}): no changes (${entries.length} entries)`,
 					);

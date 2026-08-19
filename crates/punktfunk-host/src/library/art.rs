@@ -153,10 +153,12 @@ fn percent_decode(s: &str) -> String {
 /// Default: the users base (`C:\Users`), where the launchers that install per-user keep their art —
 /// Playnite stores covers under `%APPDATA%\Playnite`, Heroic under `%APPDATA%\heroic`. Derived from
 /// `%PUBLIC%`'s parent because the host runs as SYSTEM, whose own `%USERPROFILE%` is
-/// `…\config\systemprofile` and tells us nothing about where the operator's launchers live. Plus
-/// the Steam install root ([`steam_art_roots`]), which is the one launcher that does NOT live under
-/// the users base. `PUNKTFUNK_LIBRARY_ART_ROOTS` (`;`-separated) replaces the whole default for an
-/// operator whose library is somewhere else again.
+/// `…\config\systemprofile` and tells us nothing about where the operator's launchers live. Plus the
+/// two launchers that need NOT live under the users base: the Steam install root
+/// ([`steam_art_roots`]), and every Playnite root this box can find
+/// ([`super::launch::playnite_art_roots`]) — a PORTABLE Playnite keeps its whole library, covers and
+/// all, beside the exe, wherever the operator unzipped it. `PUNKTFUNK_LIBRARY_ART_ROOTS`
+/// (`;`-separated) replaces the whole default for an operator whose library is somewhere else again.
 fn art_roots() -> Vec<PathBuf> {
     if let Some(configured) = std::env::var_os("PUNKTFUNK_LIBRARY_ART_ROOTS") {
         return std::env::split_paths(&configured)
@@ -177,6 +179,11 @@ fn art_roots() -> Vec<PathBuf> {
     }
     #[cfg(windows)]
     roots.extend(steam_art_roots());
+    // Playnite, for the same reason: a portable install (`D:\Apps\Playnite`) puts `library\files\…`
+    // — every cover it exports — outside every profile. An installed Playnite adds a root that is
+    // already inside the users base, which costs nothing.
+    #[cfg(windows)]
+    roots.extend(super::launch::playnite_art_roots());
     // POSIX: the user's home, which is the exact analogue of the Windows users base above — and
     // where every launcher this host reads art from actually keeps it. Steam's
     // `appcache/librarycache` and `userdata/<id>/config/grid`, Lutris's `coverart`/`banners` (both
@@ -1045,6 +1052,25 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Whatever Playnite roots this box has, the confinement must be told about them with NO
+    /// `PUNKTFUNK_LIBRARY_ART_ROOTS` set. That `extend` is the whole fix for the portable-install
+    /// report (`D:\Apps\Playnite\library\files\…`, 70 covers dropped), and it is one line a
+    /// refactor can silently drop. Vacuous on a box with no Playnite — the registry half cannot be
+    /// faked from a test, so `launch::exe_from_shell_command`'s own test carries that load instead.
+    #[cfg(windows)]
+    #[test]
+    fn playnite_roots_reach_the_art_confinement() {
+        let _env = ArtRootsEnv::set(&[("PUNKTFUNK_LIBRARY_ART_ROOTS", None)]);
+        let roots = art_roots();
+        for root in crate::library::launch::playnite_art_roots() {
+            assert!(root.is_dir(), "{root:?} is offered as an art root");
+            assert!(
+                roots.contains(&root),
+                "{root:?} must be an allowed art root with no env var set"
+            );
+        }
     }
 
     #[test]
