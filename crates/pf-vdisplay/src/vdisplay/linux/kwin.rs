@@ -268,7 +268,16 @@ impl VirtualDisplay for KwinDisplay {
                 .context("spawn KWin virtual-output thread")?;
             match setup_rx.recv_timeout(OPENER_BUDGET) {
                 Ok(Ok(v)) => Ok((v, stop)),
-                Ok(Err(e)) => bail!("KWin virtual output failed: {e}"),
+                // KWin's reason is TRANSLATED into the session's language, so it is often
+                // unsearchable for the person reading the log. Say what it means once, here.
+                Ok(Err(e)) => bail!(
+                    "KWin virtual output failed: {e} — KWin declined to create the output. It \
+                     needs a Plasma WAYLAND session on KWin's DRM backend; a nested or \
+                     `kwin_wayland --virtual` KWin can only do this since 6.5.6, and on KWin 6.6+ \
+                     an output KWin creates but leaves DISABLED (stored \
+                     ~/.config/kwinoutputconfig.json, or a display config it refused to apply) \
+                     reports the same. kwin_wayland's own journal says which"
+                ),
                 Err(_) => {
                     // Nothing else will ever flip this `stop`: it is dropped with the error, and
                     // the `StopGuard` that normally owns it is only built on the success path. So

@@ -144,6 +144,18 @@ The session unit brings up headless KWin; the host unit follows it and starts li
   print **nothing at all**. A host binary carrying a Linux capability cannot be identified by KWin
   and is never offered the protocol, however correctly its grant is installed — see
   [GPU scheduling priority](/docs/running-as-a-service#gpu-scheduling-priority).
+- **"KWin virtual output failed: Could not find output"** (the message arrives translated — a
+  Brazilian session reads *"Não foi possível encontrar saída"*): KWin got the request and refused
+  it, so the grant above is fine and only the output creation is not. Two shapes. Its **backend**
+  can't create one — a nested KWin, or `kwin_wayland --virtual` below 6.5.6; a normal Plasma
+  session on the DRM backend always can. Or, on **KWin 6.6+**, KWin created the output and then
+  left it **disabled**, which reports identically: check `punktfunk-host list-monitors` for a
+  `Virtual-punktfunk-*` marked *disabled*, a stale entry in `~/.config/kwinoutputconfig.json`, and
+  `journalctl --user -b -t kwin_wayland` for *"Applying output configuration failed!"* — KWin logs
+  that when it declines to enable one more output next to your current monitors, and keeps the old
+  configuration instead. Streaming a real monitor
+  ([`PUNKTFUNK_CAPTURE_MONITOR`](/docs/configuration), or **Streamed screen** in the console) skips
+  virtual-output creation entirely and is the workaround while you sort the above out.
 - **Black screen / no picture:** confirm you're on a Wayland session (not X11) and, on NVIDIA, that
   the GL userspace is installed. More in [Troubleshooting](/docs/troubleshooting).
 

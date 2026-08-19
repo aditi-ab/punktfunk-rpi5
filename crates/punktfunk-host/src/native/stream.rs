@@ -4611,9 +4611,14 @@ fn is_permanent_build_error(chain: &str) -> bool {
         "virtual displays require linux",
         "unknown punktfunk_compositor",
         "could not detect compositor",
-        "could not find output", // KWin < 6.5.6: createVirtualOutput unsupported
-        "must be a node id",     // PUNKTFUNK_GAMESCOPE_NODE not an integer
-        "is it installed",       // gamescope / kscreen-doctor not on PATH
+        // KWin refused the virtual output. Its own reason arrives TRANSLATED (a field report read
+        // "Não foi possível encontrar saída" and burned all 8 retries), so match OUR English
+        // prefix, not KWin's payload. Every `failed` KWin sends on this path is a config/backend
+        // fact — unsupported compositing type, a backend without `createVirtualOutput`, an output
+        // the workspace declined to enable — none of which a retry 500 ms later changes.
+        "kwin virtual output failed",
+        "must be a node id", // PUNKTFUNK_GAMESCOPE_NODE not an integer
+        "is it installed",   // gamescope / kscreen-doctor not on PATH
         // 4:4:4 NVENC got a CUDA frame — should never happen now the Linux capturer honors gpu=false,
         // but fail fast instead of 8× retry (~90 s) rather than wedge the session if it ever recurs.
         "capture/encoder negotiation mismatch",
@@ -5328,6 +5333,10 @@ mod tests {
         // Permanent: config / version / missing-tool — retrying within a session can't fix these.
         assert!(is_permanent_build_error(
             "create virtual output: KWin virtual output failed: Could not find output"
+        ));
+        // Same refusal from a localized KWin — the reason is translated, our prefix is not.
+        assert!(is_permanent_build_error(
+            "create virtual output: KWin virtual output failed: Não foi possível encontrar saída"
         ));
         assert!(is_permanent_build_error(
             "unknown PUNKTFUNK_COMPOSITOR 'foo' (kwin|wlroots|mutter|gamescope)"
