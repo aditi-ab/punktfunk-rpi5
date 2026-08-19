@@ -21,7 +21,7 @@ import Metal
 import QuartzCore
 import os
 
-private let presenterLog = Logger(subsystem: "io.unom.punktfunk", category: "presenter")
+private let presenterLog = ClientLog(category: "presenter")
 
 #if os(macOS)
 /// HOW a windowed (composited) macOS session pushes finished frames to glass — the DCP

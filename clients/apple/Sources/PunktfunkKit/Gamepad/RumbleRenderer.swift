@@ -3,7 +3,7 @@ import Foundation
 import GameController
 import os
 
-private let log = Logger(subsystem: "io.unom.punktfunk", category: "gamepad")
+private let log = ClientLog(category: "gamepad")
 
 /// Tuning constants + the pure scheduling decisions of the rumble renderer, split out so the
 /// policy is unit-testable without a `CHHapticEngine` or a physical pad.

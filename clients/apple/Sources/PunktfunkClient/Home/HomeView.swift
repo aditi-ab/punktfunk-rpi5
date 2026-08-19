@@ -45,6 +45,8 @@ struct HomeView: View {
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = true
     /// The host being edited (name / address / port / Wake-on-LAN MAC) — drives the edit sheet.
     @State private var editTarget: StoredHost?
+    /// The outcome of the last "Send Logs to Host" — drives its alert.
+    @State private var sendLogsResult: (ok: Bool, message: String)?
     // How this device shows its own list. `.added` is the default because it is what the grid
     // did before it could sort at all — an update should not rearrange anyone's hosts.
     @AppStorage(DefaultsKey.hostSort) private var sortRaw = HostSort.added.rawValue
@@ -194,6 +196,16 @@ struct HomeView: View {
             }
             #endif
         }
+        .alert(
+            sendLogsResult?.ok == true ? "Logs Sent" : "Couldn't Send Logs",
+            isPresented: Binding(
+                get: { sendLogsResult != nil },
+                set: { if !$0 { sendLogsResult = nil } })
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(sendLogsResult?.message ?? "")
+        }
         #if os(macOS)
         .frame(minWidth: 480, minHeight: 360)
         #endif
@@ -292,6 +304,8 @@ struct HomeView: View {
             onBrowseLibrary: onBrowseLibrary,
             onWake: { wake(host) },
             onEdit: { editTarget = host },
+            onSendLogs: host.pinnedSHA256 != nil
+                ? { Task { sendLogsResult = await SendLogs.toHost(host) } } : nil,
             profileMenu: profileMenu(for: host),
             pinnedProfile: pinned)
     }

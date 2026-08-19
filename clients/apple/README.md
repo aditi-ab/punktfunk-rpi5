@@ -31,6 +31,10 @@ Opus audio, cert pinning — lives in the shared Rust **`punktfunk-core`** (stat
   Keychain-stored identity.
 - **Tune the stream** — a fps / Mb·s / **latency** HUD (skew-corrected across machines), a bitrate
   control, a per-host **network speed test** with a recommended bitrate, and a host-compositor picker.
+- **Send logs to host** — the app keeps its recent log in a bounded in-memory ring (`ClientLog`, a
+  drop-in for `os.Logger` that also writes the unified log); a host card's menu (or the gamepad
+  UI's host options) posts it to the paired host's `/api/v1/client-logs`, where the web console's
+  Logs page shows it next to the host's own — the same action the Gaming Mode console has.
 
 Runs from one shared codebase across **macOS, iOS, iPadOS, and tvOS**.
 

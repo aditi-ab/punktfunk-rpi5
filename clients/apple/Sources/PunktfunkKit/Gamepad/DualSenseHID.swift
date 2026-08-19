@@ -19,7 +19,7 @@ import IOKit
 import IOKit.hid
 import os
 
-private let log = Logger(subsystem: "io.unom.punktfunk", category: "gamepad")
+private let log = ClientLog(category: "gamepad")
 
 /// Opens one connected Sony DualSense and forwards motor rumble to it over raw HID.
 ///

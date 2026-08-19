@@ -654,6 +654,7 @@ struct GamepadHomeView: View {
                 guard let profile = target.profile else { return }
                 store.setPinned(host.id, profileID: profile.id, pinned: false)
             },
+            onSendLogs: host.pinnedSHA256 != nil ? { await SendLogs.toHost(host) } : nil,
             close: { if !transitioning { hostOptionsTarget = nil } },
             controllerActive: active)
     }

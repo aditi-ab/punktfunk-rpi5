@@ -47,7 +47,7 @@ import AVKit // AVDisplayManager — the per-session display-mode (HDR10/refresh
 /// resolved pointer-lock state each time capture engages, so the user can see whether the
 /// scene actually locked (GCMouse only delivers deltas while it did) or whether we're on
 /// the touch fallback.
-private let iosInputLog = Logger(subsystem: "io.unom.punktfunk", category: "input")
+private let iosInputLog = ClientLog(category: "input")
 private let iosInputDebug = ProcessInfo.processInfo.environment["PUNKTFUNK_INPUT_DEBUG"] == "1"
 
 public struct StreamView: UIViewControllerRepresentable {
