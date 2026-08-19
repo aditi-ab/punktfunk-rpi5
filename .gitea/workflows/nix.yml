@@ -333,9 +333,16 @@ jobs:
           echo "published → $CACHE_URL"
 
       # Opt-in only: the full Rust workspace through crane, which is the hour-long leg.
-      # `github.event.inputs.*` (string) rather than `inputs.*` — the portable spelling.
+      # Accept BOTH shapes. A checkbox dispatched from the Gitea UI arrives as the STRING
+      # "true", but an API dispatch (scripts, cross-repo automation) can deliver a real JSON
+      # boolean, and `== 'true'` silently misses it — the step is skipped, the run goes green,
+      # and the log looks identical to a run that genuinely had nothing to do. MEASURED
+      # 2026-08-19: dispatched with build-gamescope while verifying a flake.lock bump, and this
+      # step skipped while the job reported success — a green that proved nothing about the
+      # very package being fixed. Still no `inputs.*`: that context is the thing Gitea's parser
+      # is least reliable about, which is why this file used github.event.inputs to begin with.
       - name: Build the Rust packages (dispatch opt-in)
-        if: ${{ github.event.inputs.build-rust == 'true' }}
+        if: ${{ github.event.inputs.build-rust == 'true' || github.event.inputs.build-rust == true }}
         run: |
           "$NIX" build --print-build-logs .#punktfunk-host .#punktfunk-client
 
@@ -345,6 +352,6 @@ jobs:
       # longer exposes a patchable derivation, a `+pfhdr` grep in installCheckPhase) — but only if
       # something actually builds it.
       - name: Build the patched gamescope (dispatch opt-in)
-        if: ${{ github.event.inputs.build-gamescope == 'true' }}
+        if: ${{ github.event.inputs.build-gamescope == 'true' || github.event.inputs.build-gamescope == true }}
         run: |
           "$NIX" build --print-build-logs .#punktfunk-gamescope
