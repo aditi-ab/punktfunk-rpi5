@@ -113,7 +113,7 @@ per-vendor: **Vulkan Video, then D3D11VA, then software** on NVIDIA and AMD, and
 on Intel and other GPUs (Intel's driver advertises Vulkan Video, but DXVA is the proven path there).
 It has [10-bit/HDR present](/docs/hdr#per-client), WASAPI audio + mic, SDL3 controllers (rumble,
 lightbar, DualSense), network discovery, the host's **game library** with cover art, and the full
-PIN-pairing trust surface. It builds for `x86_64` and `aarch64` and ships as a **signed MSIX**.
+PIN-pairing trust surface. It builds for `x86_64` and `aarch64` and ships as a **signed installer** (plus a portable zip, and an MSIX for Microsoft Store compatibility).
 
 The package installs **two** Start-menu entries — **Punktfunk**, the desktop window, and
 **Punktfunk Console**, a controller-driven fullscreen interface for a TV or HTPC (host list, pairing,
@@ -148,7 +148,7 @@ It ships as a sideloadable `.ipk` (homebrew package) rather than through the LG 
 ## Scripting: the `punktfunk` CLI
 
 `punktfunk` is the headless client — the same core the graphical apps use, with no window. It ships
-in **every Linux client package** (apt, dnf, pacman and the Flatpak) and in the **Windows MSIX**, so
+in **every Linux client package** (apt, dnf, pacman and the Flatpak) and in the **Windows installer**, so
 if you have a desktop client you already have it:
 
 ```sh
@@ -213,7 +213,7 @@ has no pasteboard to share. See [Shared clipboard](/docs/clipboard).
 | A Linux desktop or laptop | **[`punktfunk-client`](#linux-desktop-client-gtk4)** (GTK4) |
 | A **Steam Deck** | The **[Decky plugin](/docs/steam-deck)** in Gaming Mode, or the [GTK4 client](#linux-desktop-client-gtk4) in Desktop Mode |
 | An Android phone or TV | The **[Android app](#android-app-phone--android-tv)** |
-| Windows | The native **[`punktfunk-client`](#windows-desktop-client)** (signed MSIX) or **[Moonlight](/docs/moonlight)** |
+| Windows | The native **[`punktfunk-client`](#windows-desktop-client)** (signed installer) or **[Moonlight](/docs/moonlight)** |
 | An **LG webOS TV** | The community **[`pf-webos`](https://github.com/dyptan-io/pf-webos)** client, or **[Moonlight](/docs/moonlight)** |
 | A browser, another smart TV, or any other device | **[Moonlight](/docs/moonlight)** |
 | Scripts, plugins, home automation | The headless **[`punktfunk`](#scripting-the-punktfunk-cli)** CLI |

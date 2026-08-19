@@ -203,14 +203,30 @@ pub(crate) fn queue(url: String) {
     INBOX.lock().unwrap().push(url);
 }
 
+/// Whether this process runs with MSIX package identity. Decides how a shortcut must target us
+/// (`write_shortcut` below) and whether the process may stamp its own AppUserModelID
+/// (`set_app_user_model_id` in main.rs).
+pub(crate) fn has_package_identity() -> bool {
+    use windows::Win32::appmodel::GetCurrentPackageFullName;
+    use windows::Win32::winerror::APPMODEL_ERROR_NO_PACKAGE;
+    // SAFETY: `GetCurrentPackageFullName` with `len = 0` and no buffer is the documented identity
+    // PROBE — it writes nothing and only reports whether this process is packaged.
+    unsafe {
+        let mut len: u32 = 0;
+        GetCurrentPackageFullName(&mut len, None) != APPMODEL_ERROR_NO_PACKAGE
+    }
+}
+
 /// Write a `.lnk` on the Desktop that launches this URL, and return its path.
 ///
-/// The shortcut targets the app execution alias with the URL as an ARGUMENT, rather than being
-/// a `.url` internet shortcut. Both would work while the scheme is registered; only this one
-/// still works if it isn't, because it invokes the client directly — which is the whole point
-/// of a shortcut being a container for a URL rather than a second launch mechanism
-/// (design/client-deep-links.md §5). Targeting the alias (not the package path) is what keeps
-/// it valid across updates, since the install path changes and the alias doesn't.
+/// The shortcut targets the client exe with the URL as an ARGUMENT, rather than being a `.url`
+/// internet shortcut. Both would work while the scheme is registered; only this one still works
+/// if it isn't, because it invokes the client directly — which is the whole point of a shortcut
+/// being a container for a URL rather than a second launch mechanism
+/// (design/client-deep-links.md §5). Which exe reference is durable depends on how we were
+/// installed: under MSIX the install path changes on every update but the app execution alias
+/// doesn't, so packaged runs target the alias; the Inno Setup / portable installs have no alias
+/// but a stable install dir, so unpackaged runs target the absolute exe path.
 pub(crate) fn write_shortcut(label: &str, url: &str) -> Result<std::path::PathBuf, String> {
     use windows::core::{Interface, HSTRING};
     use windows::Win32::combaseapi::{CoCreateInstance, CoInitializeEx};
@@ -223,6 +239,15 @@ pub(crate) fn write_shortcut(label: &str, url: &str) -> Result<std::path::PathBu
         .map(|p| std::path::PathBuf::from(p).join("Desktop"))
         .map_err(|_| "USERPROFILE isn't set".to_string())?;
     let path = desktop.join(format!("{}.lnk", file_name(label)));
+    // Alias when packaged, absolute path when not — see the doc comment above.
+    let target = if has_package_identity() {
+        "punktfunk-client.exe".to_string()
+    } else {
+        std::env::current_exe()
+            .map_err(|e| format!("current exe: {e}"))?
+            .to_string_lossy()
+            .into_owned()
+    };
     // SAFETY: COM calls on this thread's apartment. `CoCreateInstance` returns an owned interface
     // checked by `?`, and every setter below takes a borrowed `HSTRING`/`PCWSTR` that outlives its
     // synchronous call; nothing here dereferences a pointer the caller supplied.
@@ -233,7 +258,7 @@ pub(crate) fn write_shortcut(label: &str, url: &str) -> Result<std::path::PathBu
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED as u32);
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
             .map_err(|e| format!("shell link: {e}"))?;
-        link.SetPath(&HSTRING::from("punktfunk-client.exe"))
+        link.SetPath(&HSTRING::from(target.as_str()))
             .ok()
             .map_err(|e| format!("shortcut target: {e}"))?;
         link.SetArguments(&HSTRING::from(url))

@@ -22,7 +22,7 @@ Already installed? Skip to [Keeping a client up to date](#keeping-a-client-up-to
 |--------|---------|
 | **Linux** desktop / laptop | [Flatpak](#linux-desktop-flatpak) (any distro) or native apt/rpm/Arch packages |
 | **Steam Deck** | [Decky plugin](/docs/steam-deck) for Gaming Mode, or [Flatpak in Desktop Mode](#steam-deck) |
-| **Windows** | [Signed MSIX](#windows) from the package registry |
+| **Windows** | [Signed installer](#windows) from the package registry (portable zip and MSIX too) |
 | **macOS** | [Notarized `.dmg`](#macos) from the releases page |
 | **iPhone / iPad / Apple TV** | [TestFlight beta](#ios-ipados-apple-tv) |
 | **Android / Android TV** | [Google Play](#android), or sideload the APK |
@@ -100,38 +100,51 @@ See [packaging/flatpak](https://git.unom.io/unom/punktfunk/src/branch/main/packa
 
 ## Windows
 
-The Windows client ships as a **signed MSIX** in the package registry, signed with a publicly
-trusted certificate — nothing to import or trust by hand.
+The Windows client ships as a **signed installer** in the package registry, signed with a publicly
+trusted certificate — nothing to import or trust by hand. It installs per-user (no admin prompt) to
+`%LOCALAPPDATA%\Programs\Punktfunk`.
 
-1. Download the package. Each channel keeps one fixed URL, so this line always fetches the current
-   build — in PowerShell:
+1. Download the installer. Each channel keeps one fixed URL, so this line always fetches the
+   current build — in PowerShell:
 
    ```powershell
-   curl.exe -LO https://git.unom.io/api/packages/unom/generic/punktfunk-client-windows/latest/punktfunk-client-windows_x64.msix
+   curl.exe -LO https://git.unom.io/api/packages/unom/generic/punktfunk-client-windows/latest/punktfunk-client-setup_x64.exe
    ```
 
    Swap `_x64` for `_arm64` on an Arm device, and `latest` for `canary` to track `main`. The same
    file is attached to every [release](https://git.unom.io/unom/punktfunk/releases), and every
    build is kept under its own version on the
    [packages page](https://git.unom.io/unom/-/packages) (generic group, `punktfunk-client-windows`).
-2. Install it:
-
-   ```powershell
-   # use the _arm64 file instead on an Arm device
-   Add-AppxPackage .\punktfunk-client-windows_x64.msix
-   ```
-
-   If Windows reports a missing dependency, install the
+2. Run it. The installer registers `punktfunk://` links, puts the headless `punktfunk` command on
+   your PATH, and fetches the
    [Windows App Runtime 2.x](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads)
-   (the MSIX depends on `Microsoft.WindowsAppRuntime.2`), then re-run `Add-AppxPackage`.
+   automatically if this PC doesn't have it yet.
+3. Launch **Punktfunk** from the Start menu and pick your host. A second entry, **Punktfunk
+   Console**, is the same client as a controller-driven fullscreen interface for a TV or HTPC.
 
-   Install from a signed-in desktop session. Over a remote, non-interactive session (SSH, an RMM
-   tool) `Add-AppxPackage` can fail with `0x80070005` when the Windows App Runtime is in use and
-   Windows can't restart the apps holding it.
+### Launching through Steam (overlay, Big Picture)
 
-3. Launch **Punktfunk** from the Start menu and pick your host. The package also adds a second
-   entry, **Punktfunk Console** — the same client as a controller-driven fullscreen interface for a
-   TV or HTPC — and the headless `punktfunk` command on your PATH.
+Because the client is a normal exe at a stable path, you can hand it to Steam: **Add a Non-Steam
+Game** → browse to `%LOCALAPPDATA%\Programs\Punktfunk\punktfunk-client.exe` (or
+`punktfunk-console.exe` for the couch interface). Launched that way, the **Steam overlay** and
+controller configs work in the stream, and it's launchable from **Big Picture**. This is exactly
+what the older MSIX package couldn't do — Steam can neither browse nor inject into an app under
+`WindowsApps` — so if you set that up before, reinstall with the installer above and re-add it.
+
+### Portable zip and MSIX
+
+Two alternates, same signed binaries, published next to the installer on every build:
+
+- **Portable** — `…/latest/punktfunk-client-windows_x64-portable.zip`: unzip anywhere and run
+  `punktfunk-client.exe`. Nothing is registered, so `punktfunk://` links and the `punktfunk`
+  command on PATH stay with the installer. Needs the
+  [Windows App Runtime 2.x](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads)
+  installed once.
+- **MSIX** — `…/latest/punktfunk-client-windows_x64.msix`, kept for Microsoft Store
+  compatibility: `Add-AppxPackage .\punktfunk-client-windows_x64.msix`. If Windows reports a
+  missing dependency, install the Windows App Runtime 2.x above and re-run it. Install from a
+  signed-in desktop session — over SSH/RMM, `Add-AppxPackage` can fail with `0x80070005`. Note the
+  Steam integration above does **not** work from the MSIX.
 
 > The Windows client's hardware decode and HDR10 present are validated on glass on NVIDIA and Intel
 > (including HDR pass-through on the Intel D3D11VA path). If anything misbehaves,
@@ -218,7 +231,8 @@ but keeping them close is the least surprising. (Updating the **host** is its ow
 | **Linux Flatpak** | `flatpak update --user io.unom.Punktfunk` — **without `sudo`** (see the [Flatpak section](#linux-desktop-flatpak)) |
 | **Linux apt / dnf / pacman** | your normal `sudo apt upgrade` / `sudo dnf upgrade` / `sudo pacman -Syu`, or the app's own updater below |
 | **Fedora Atomic (layered)** | `rpm-ostree upgrade` on its own is not enough — see the note below the table |
-| **Windows MSIX** | no self-update — download the newer `.msix` as in [Windows](#windows) and re-run `Add-AppxPackage`. Coming from **0.28.1 or earlier**, see the note below the table |
+| **Windows installer** | download the newer `punktfunk-client-setup_<arch>.exe` as in [Windows](#windows) and run it — it upgrades in place, keeping your saved hosts and pairing. Switching **from the MSIX**, see the note below the table |
+| **Windows MSIX / portable** | no self-update — download the newer `.msix` and re-run `Add-AppxPackage` (from **0.28.1 or earlier**, see the note below the table), or unzip the newer portable build over the old one |
 | **macOS `.dmg`** | download the newer `Punktfunk-<version>.dmg` and drag it over the copy in Applications |
 | **iOS / iPadOS / tvOS** | TestFlight updates it |
 | **Android** | Google Play updates it; if you sideloaded, download the APK again and install over it |
@@ -252,6 +266,11 @@ Get-AppxPackage *Punktfunk* | Remove-AppxPackage
 This is one-time; releases after that upgrade in place. A packaged app's settings live *inside* its
 package, so removing the old one also removes this client's identity and its paired hosts — expect
 to [pair](/docs/pairing) again once. Nothing on the host side is affected.
+
+**Switching from the MSIX to the installer** (for the [Steam integration](#launching-through-steam-overlay-big-picture),
+or just to follow the new default): remove the MSIX first — `Get-AppxPackage unom.Punktfunk |
+Remove-AppxPackage` — then run the installer. Same caveat as above: the packaged app's saved hosts
+and pairing identity go with the package, so expect to pair again once.
 
 ### The Linux client can update itself
 

@@ -33,11 +33,14 @@ the fast **`punktfunk/1`** protocol.
   hooks with Moonlight-style capture: Ctrl+Alt+Shift+Q releases the pointer, a click on the stream
   re-captures it, and system shortcuts (Alt+Tab, Win, …) can act locally or forward to the host.
 
-Builds and ships for both **x64** and **ARM64** as a signed **MSIX**.
+Builds and ships for both **x64** and **ARM64**, three ways from one layout: a signed **installer**
+(the default — a per-user setup.exe whose stable install path Steam can launch, so the Steam
+overlay and Big Picture work), a **portable zip**, and a signed **MSIX** (kept for Microsoft Store
+compatibility).
 
 ## Get it
 
-Install the signed MSIX from the package registry — see
+Install the signed installer from the package registry — see
 **[docs.punktfunk.unom.io/docs/install-client](https://docs.punktfunk.unom.io/docs/install-client)**.
 A stock [Moonlight](https://moonlight-stream.org/) client also works over GameStream if you prefer.
 
@@ -58,7 +61,7 @@ punktfunk-client --headless --speed-test --connect host[:port]  # probe burst �
 ```
 
 > `CARGO_HOME` must be an ASCII path — non-ASCII characters break SDL3's MSVC precompiled-header
-> build. Packaging (MSIX manifest, signing) lives in [`packaging/`](packaging/).
+> build. Packaging (MSIX manifest, the Inno Setup installer, signing) lives in [`packaging/`](packaging/).
 
 ## Layout
 
@@ -79,7 +82,7 @@ src/
   trust.rs · discovery.rs persistent identity, TOFU/PIN pairing, mDNS browse
   probe.rs · wol.rs       speed probe · Wake-on-LAN
   logfile.rs              log tee to %LOCALAPPDATA%
-packaging/                MSIX manifest, signing, pack script
+packaging/                MSIX manifest + Inno Setup installer, signing, pack scripts
 ```
 
 ## Manual smoke checklist

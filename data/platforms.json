@@ -185,11 +185,11 @@
       "id": "windows-client",
       "name": "Windows client",
       "installs": "client",
-      "packageManager": "msix",
+      "packageManager": "installer",
       "docs": "/docs/install-client#windows",
       "install": [
-        "curl.exe -LO https://git.unom.io/api/packages/unom/generic/punktfunk-client-windows/latest/punktfunk-client-windows_x64.msix",
-        "Add-AppxPackage .\\punktfunk-client-windows_x64.msix"
+        "curl.exe -LO https://git.unom.io/api/packages/unom/generic/punktfunk-client-windows/latest/punktfunk-client-setup_x64.exe",
+        ".\\punktfunk-client-setup_x64.exe"
       ]
     },
     {

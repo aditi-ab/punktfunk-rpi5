@@ -289,6 +289,18 @@ Then remove the repository as described under the host sections above, if this b
 it. To clear the client's own state without uninstalling — saved hosts and stream settings, keeping
 the paired identity — run `punktfunk-client --reset` instead.
 
+### Windows client (installer)
+
+Uninstall **Punktfunk** from **Settings → Apps → Installed apps** (it's a per-user install, so no
+admin prompt), or silently:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\Punktfunk\unins000.exe" /VERYSILENT
+```
+
+The uninstaller removes the Start-menu entries, the `punktfunk://` registration, and its own PATH
+entry. A **portable** unzip has nothing registered — just delete the folder.
+
 ### Windows client (MSIX)
 
 ```powershell
