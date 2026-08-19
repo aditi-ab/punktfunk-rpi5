@@ -764,11 +764,21 @@ impl ServiceState {
                         || (d.addr == h.addr && d.port == h.port)
                 });
                 let online = advert.is_some() || probed.get(&key).copied().unwrap_or(false);
-                // Write the advertised mgmt port down while the host is visible, so this console
-                // keeps working against a moved port once it is not. No-op (and no disk write)
+                // Write down everything the advert teaches while the host is visible: the mgmt
+                // port (so this console keeps working against a moved one once it is not), the
+                // OS chain, and the wake MAC — which matters most here, because this console and
+                // the Decky panel are the only surfaces a Deck in Gaming Mode ever runs, and a
+                // record that never learned a MAC can never be woken. No-op (and no disk write)
                 // when unchanged, so this is safe on every refresh tick.
-                if let Some(p) = advert.and_then(|d| d.mgmt_port) {
-                    pf_client_core::trust::learn_mgmt_port(&h.fp_hex, &h.addr, h.port, p);
+                if let Some(a) = advert {
+                    pf_client_core::trust::learn_from_advert(
+                        &h.fp_hex,
+                        &h.addr,
+                        h.port,
+                        &a.mac,
+                        &a.os,
+                        a.mgmt_port,
+                    );
                 }
                 let row = HostRow {
                     key: key.clone(),

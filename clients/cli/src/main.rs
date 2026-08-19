@@ -370,15 +370,26 @@ from the config directory for a true factory reset."
             .unwrap_or(DISCOVER_DEFAULT_SECS)
             .min(DISCOVER_MAX_SECS);
         let found = pf_client_core::discovery::discover_for(Duration::from_secs_f64(secs));
-        // `read`, not `load`: this verb only LOOKS at the records to annotate what it found, and
-        // never hands their ids back. `load` would mint ids for a pre-mint store and save them —
-        // a write from a read-only verb, and one that races the `hosts list` a caller is very
-        // likely running at the same moment (the Decky panel issues both together).
+        // `read`, not `load`: this verb never hands a record's id back, so it has no business
+        // MINTING one. `load` would mint ids for a pre-mint store and save them, racing the
+        // `hosts list` a caller is very likely running at the same moment (the Decky panel issues
+        // both together) — after which the ids one of them already handed out no longer resolve.
         let known = KnownHosts::read();
         let rows: Vec<(
             &pf_client_core::discovery::DiscoveredHost,
             Option<&KnownHost>,
         )> = found.iter().map(|d| (d, match_saved(&known, d))).collect();
+        // The one write this verb does make, and why it doesn't contradict the above: an advert
+        // is the only place a host's wake MAC is ever published, and this verb is the only one
+        // the Decky panel runs that ever sees one. Without it a Deck in Gaming Mode never learns
+        // a MAC at all and Wake-on-LAN cannot fire, with nothing to show for it (#322).
+        // `learn_from_advert` mints nothing either, and writes only when an advert genuinely
+        // taught the record something new — so a steady-state panel refresh touches no disk.
+        for (d, saved) in &rows {
+            if let Some(k) = saved {
+                trust::learn_from_advert(&k.fp_hex, &k.addr, k.port, &d.mac, &d.os, d.mgmt_port);
+            }
+        }
         if has(args, "--json") {
             let hosts: Vec<serde_json::Value> = rows
                 .iter()
@@ -733,7 +744,9 @@ from the config directory for a true factory reset."
         };
         let host = &known.hosts[i];
         if host.mac.is_empty() {
-            eprintln!("no Wake-on-LAN address known for {} — connect to it once while it's awake so the client can learn it", host.name);
+            // A MAC is learned from the host's mDNS advert, never from a connect — say so, since
+            // "connect to it once" sent at least one Deck owner looking in the wrong place (#322).
+            eprintln!("no Wake-on-LAN address known for {} — run `punktfunk discover` while it's awake (the Deck panel does this every time it opens) so the client learns it from the host's advert", host.name);
             return UNRESOLVED;
         }
         if !has(args, "--wait") {
