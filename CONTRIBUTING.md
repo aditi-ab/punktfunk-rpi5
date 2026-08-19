@@ -113,7 +113,7 @@ PR.
 
 CI enforces the cheap half of this (`scripts/ci/check-docs-drift.sh` and `check-docs-links.sh`):
 the OpenAPI snapshot must match `api/openapi.json`, the docs-site copy of `data/platforms.json` must
-match the canonical one, every `PUNKTFUNK_*` variable the docs mention
+match the canonical one, `scripts/install.sh` must carry the file's install lines verbatim, every `PUNKTFUNK_*` variable the docs mention
 must still exist in the tree, the counts of undocumented `PUNKTFUNK_*` variables and undocumented
 `punktfunk-host` subcommands may never grow (document the new knob, or consciously raise the
 baseline in the script), and internal docs links must resolve.
