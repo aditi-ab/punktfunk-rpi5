@@ -173,7 +173,12 @@ jobs:
       # with "no space left on device" mid-`bun install`), and a Nix build is the heaviest thing
       # here — so record the headroom, or a future failure is a guess.
       - name: Environment
-        run: df -h / /nix /tmp || true
+        # Disk AND memory. This job's recurring failure is an OOM kill, and `df` cannot explain
+        # one — a run that dies at exit 137 with only disk numbers in the log is a guess.
+        run: |
+          df -h / /nix /tmp || true
+          free -h 2>/dev/null || grep -E '^(MemTotal|MemAvailable|SwapTotal)' /proc/meminfo || true
+          nproc 2>/dev/null || true
 
       # Evaluates + instantiates every flake output without building any of it.
       - name: nix flake check (eval only)
@@ -187,8 +192,20 @@ jobs:
       # starts going red on runner disk rather than on real defects, demote it to the dispatch
       # opt-in below rather than leaving an infra-red gate on the board.
       - name: Build the bun packages
+        # `--max-jobs 1`, because punktfunk-web's `bun run build` is the memory high-water mark of
+        # this whole workflow and nix would otherwise bundle it CONCURRENTLY with
+        # punktfunk-scripting's. That pairing is what the runner cannot afford: MEASURED
+        # 2026-08-19, five runs across main and two branches died here with
+        #   punktfunk-web> error: script "build" was terminated by signal SIGKILL (Forced quit)
+        #   Reason: builder failed with exit code 137
+        # while unrelated runs on the same commits passed — the signature of memory pressure, not
+        # of a broken bundle. It cost more red runs that day than every real bug combined, and it
+        # sits BEFORE the publish tier, so it also blocks the cache from ever filling.
+        #
+        # Nearly free: --max-jobs limits how many DERIVATIONS build at once, not the cores inside
+        # one, so two bun bundles that each pin a core simply run one after the other.
         run: |
-          "$NIX" build --print-build-logs .#punktfunk-web .#punktfunk-scripting
+          "$NIX" build --print-build-logs --max-jobs 1 .#punktfunk-web .#punktfunk-scripting
 
       # Both launchers exec pkgs.bun from the store; confirm they were produced and are real entry
       # points rather than dangling wrappers.
@@ -241,7 +258,7 @@ jobs:
         # other: host.gamescopeHdr DEFAULTS TRUE, so without it in the cache every
         # `services.punktfunk.host.enable = true` still compiles a compositor from source.
         run: |
-          "$NIX" build --print-build-logs \
+          "$NIX" build --print-build-logs --max-jobs 1 \
             .#punktfunk-host .#punktfunk-client .#punktfunk-tray \
             .#punktfunk-web .#punktfunk-scripting .#punktfunk-gamescope
           # This is now the heaviest job on the fleet — a full workspace build plus gamescope fills
