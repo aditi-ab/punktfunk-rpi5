@@ -124,6 +124,10 @@ struct SettingsView: View {
     /// instead of the app menu while captured). macOS-only: it is the one platform whose window
     /// system hands a plain app no keyboard grab, so the client has to claim the chords itself.
     @AppStorage(DefaultsKey.inhibitShortcuts) var inhibitShortcuts = true
+    /// Accessibility granted? Gates the system-shortcut half of `inhibit_shortcuts` (⌘Space, ⌘Tab…
+    /// need the event tap). Re-read whenever the app comes back to the front — that is when the
+    /// user returns from flipping the switch in System Settings.
+    @State var accessibilityTrusted = InputCapture.systemShortcutsAvailable
     @AppStorage(DefaultsKey.speakerUID) var speakerUID = ""
     @AppStorage(DefaultsKey.micUID) var micUID = ""
     @AppStorage(DefaultsKey.micChannel) var micChannel = 0

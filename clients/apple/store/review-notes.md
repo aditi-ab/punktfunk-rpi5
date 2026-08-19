@@ -81,6 +81,15 @@ WHY THE APP ASKS FOR WHAT IT ASKS FOR
 - network.server (macOS): the app is outbound-only, but the App Sandbox gates bind() itself. Our
   QUIC endpoint and UDP socket each bind a local port to receive host-to-client datagrams;
   without this, no video, audio or rumble arrives.
+- Accessibility (macOS, optional, never requested unprompted): "Capture system shortcuts" in
+  Settings > Input lets ⌘Space, ⌘Tab and Mission Control reach the remote desktop instead of the
+  Mac while the stream has captured the keyboard -- the same thing every remote-desktop/VM app
+  offers. macOS delivers those keys to Spotlight/the Dock before any app, so the only way to
+  receive them is a keyboard event tap, which needs Accessibility. The prompt appears only when
+  the user turns the toggle on or presses "Allow Accessibility access…"; the tap exists only while
+  a stream has the keyboard captured and the app is frontmost, and it reads nothing -- keys are
+  handed to the app's own stream window, never logged or stored. Without the grant, the toggle
+  still works for the app's own ⌘ shortcuts and simply says the system ones need Accessibility.
 - UIBackgroundModes "audio" (iPhone/iPad): a session carries real, audible audio from the host,
   and this keeps it alive if the user steps away briefly. Backgrounded, video decoding stops, only
   the real audio keeps rendering, and a bounded timer disconnects automatically. We never play
