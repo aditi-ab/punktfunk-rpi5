@@ -46,7 +46,7 @@ export default definePluginKit({
 | `makeConfigService` | Schema-driven config: raw shape on disk, defaults ONLY in the Schema (`withDecodingDefaultKey` + `encodingStrategy: "omit"`), atomic writes, world-writable refusal, `changes` stream |
 | `makeCacheStore` | disposable derived state (corrupt/absent → empty, write-through) |
 | `ProviderClient` + wire schemas | typed library-provider reconcile over the untyped wire — including the optional `detect` hint (see below) |
-| `makeSyncEngine` | poll + fs-watch + debounce + single-flight coalescing + fingerprint skip + status feed |
+| `makeSyncEngine` | poll + fs-watch + debounce + single-flight coalescing + fingerprint skip (loop triggers only — `startup` and `manual` always publish) + status feed |
 | `serveUi` / `httpApiEnv` | an `effect/unstable/httpapi` HttpApi behind the SDK's `servePluginUi`, core-only layers |
 | `sseRoute` | the status SSE endpoint (httpapi has no event-stream media type) |
 | `runPluginCli` | `<bin> <command>` dispatcher reusing the plugin's layer graph (deliberately not `effect/unstable/cli` — that would drag platform packages into every plugin) |
