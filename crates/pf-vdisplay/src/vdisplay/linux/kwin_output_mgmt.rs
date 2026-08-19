@@ -1274,6 +1274,76 @@ pub(crate) fn reenable_outputs(outputs: &[(String, String)]) -> bool {
     complete
 }
 
+/// Enable a virtual output KWin created but left DISABLED, addressed by the `Virtual-<name>`
+/// prefix it exposes ours under. Returns the head's name when one matched, was disabled, and the
+/// enable applied.
+///
+/// This is the repair for the KWin ≥ 6.6 refusal (`"Could not find output"`, translated into the
+/// session's language). `streamVirtualOutput` there creates the output on the backend and then
+/// hands `workspace()->findOutput(output)` to the stream — and that returns null for an output the
+/// workspace does not manage, which `wantsToManage` defines as `isEnabled() && !isNonDesktop()`.
+/// KWin 6.4/6.5 passed the backend output straight through, so a disabled one streamed anyway;
+/// from 6.6 it is a hard refusal, and one that repeats forever: the host asks for a STABLE
+/// per-client name so KWin persists that client's scale and mode, and a stored setup naming it
+/// `enabled: false` is therefore reapplied to every future session.
+///
+/// Two properties of KWin make the repair possible, both verified against Plasma/6.7:
+///
+/// * `sendFailed` only sends the event — it does not emit `finished`, and `removeVirtualOutput` is
+///   wired to `finished`. So the disabled output stays alive for exactly as long as the caller
+///   holds its (failed) stream open, which is the window this runs in.
+/// * `WaylandServer::handleOutputAdded` offers EVERY backend output to the output-device registry,
+///   gating only placeholders and non-desktop ones. A disabled output has no `wl_output` — that
+///   side is gated on the workspace — but it is addressable over `kde_output_management_v2`.
+///
+/// Enabling it through output management is a user-applied configuration, so KWin persists it
+/// against that output's identity: the caller's next `stream_virtual_output` under the same name
+/// finds a stored setup that enables it. Which is why the caller must RETRY after this returns
+/// `Some` — the request that failed cannot be salvaged, only the one after it.
+pub(crate) fn enable_disabled_output(prefix: &str) -> Option<String> {
+    let mut sess = Session::open("enable_disabled").ok()?;
+    let deadline = Instant::now() + OP_BUDGET;
+    // Newest-wins, exactly as the supersede resolve elsewhere in this file: a reconnect can leave
+    // a predecessor of the same name briefly announced, and enabling THAT one repairs an output
+    // that is already going away.
+    let dev = sess
+        .state
+        .devices
+        .values()
+        .filter(|d| d.name.as_deref().is_some_and(|n| n.starts_with(prefix)) && d.proxy.is_some())
+        .max_by_key(|d| (d.global, d.seq))
+        .cloned()?;
+    let name = dev.name.clone()?;
+    if dev.enabled {
+        // Not the shape we repair. Say so rather than applying a no-op config that would `applied`
+        // successfully and read as a fix — the caller decides whether to retry on this.
+        tracing::debug!(
+            %name,
+            "KWin output management: our virtual output is already enabled — nothing to repair"
+        );
+        return None;
+    }
+    let proxy = dev.proxy.as_ref()?;
+    let config = sess.new_config();
+    config.enable(proxy, 1);
+    let ok = sess.apply(&config, deadline);
+    config.destroy();
+    if !ok {
+        tracing::warn!(
+            %name,
+            reason = ?sess.state.failure_reason,
+            "KWin output management: could not enable the virtual output KWin created disabled"
+        );
+        return None;
+    }
+    tracing::info!(
+        %name,
+        "KWin output management: KWin created our virtual output DISABLED and refused to stream \
+         it; enabled it — KWin persists that, so the retry's request comes back enabled"
+    );
+    Some(name)
+}
+
 /// Position the output identified by `uuid` at `(x, y)` in the desktop layout, in-process. Returns
 /// `true` if applied; `false` tells the caller to fall back to `kscreen-doctor`.
 pub(crate) fn set_position(uuid: &str, x: i32, y: i32) -> bool {

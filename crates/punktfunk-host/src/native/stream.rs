@@ -5345,6 +5345,17 @@ mod tests {
             "spawn gamescope (is it installed? `apt install gamescope`)"
         ));
         assert!(is_permanent_build_error("virtual displays require Linux"));
+        // The ONE KWin refusal that must stay retryable: pf-vdisplay repaired the box (it enabled
+        // the output KWin created disabled, which KWin persists), so the next attempt is not the
+        // same attempt. That path deliberately reports WITHOUT the `KWin virtual output failed`
+        // prefix above — if it ever regains it, the retry that consumes the repair stops running
+        // and the repair is dead code.
+        assert!(!is_permanent_build_error(
+            "create virtual output: KWin created the virtual output disabled and refused to \
+             stream it (stream_virtual_output failed: Não foi possível encontrar saída); enabled \
+             it over output management (head Virtual-punktfunk-a1b2) — the retry picks up the \
+             configuration KWin just persisted"
+        ));
         // Transient: negotiation/timeout races — exactly what backoff is for.
         assert!(!is_permanent_build_error(
             "first frame: no PipeWire frame within 10s (node 42): format negotiation never completed"
