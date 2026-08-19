@@ -633,6 +633,11 @@ fn playnite_fullscreen_exe() -> Option<std::path::PathBuf> {
 ///   Local`, so the default-install fallback cannot trust the variable — it enumerates the profiles
 ///   under the users base instead, the same breadth [`super::art::art_roots`] already allows.
 ///
+/// A **portable** Playnite is none of those: it is unzipped wherever the operator wanted it
+/// (`D:\Apps\Playnite`), registers no uninstall entry, and is not under any profile. Its one
+/// registry trace is the `playnite://` handler Playnite registers for itself
+/// ([`playnite_dir_from_uri_handler`]) — the same registration this host's own launch path follows.
+///
 /// Order matters only as a preference: a registry `InstallLocation` is what the installer actually
 /// did, so it is consulted before the conventional path. Every candidate is probed for the exe, so
 /// a stale entry costs one `is_file` and nothing else.
@@ -645,22 +650,33 @@ fn playnite_install_dirs() -> Vec<std::path::PathBuf> {
     // so the WOW view is a machine-hive concern only.
     const UNINSTALL: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall";
     const UNINSTALL_WOW: &str = r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
+    // Playnite's own `playnite://` registration, in both spellings: bare inside a `…_Classes` hive,
+    // and via the `Software\Classes` link everywhere else.
+    const URI_COMMAND: &str = r"playnite\shell\open\command";
+    const CLASSES_URI_COMMAND: &str = r"Software\Classes\playnite\shell\open\command";
 
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
 
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     playnite_dirs_from_uninstall(&hklm, UNINSTALL, &mut dirs);
     playnite_dirs_from_uninstall(&hklm, UNINSTALL_WOW, &mut dirs);
+    playnite_dir_from_uri_handler(&hklm, CLASSES_URI_COMMAND, &mut dirs);
 
     let users = RegKey::predef(HKEY_USERS);
     for sid in users.enum_keys().flatten() {
-        // The `…_Classes` companion hives carry file associations, never uninstall entries.
+        let Ok(hive) = users.open_subkey_with_flags(&sid, KEY_READ) else {
+            continue;
+        };
+        // The `…_Classes` companion hives carry file associations — which is exactly where the
+        // `playnite://` handler lives, `HKCU\Software\Classes` BEING that hive — and never uninstall
+        // entries. Both spellings are probed rather than reasoned about: the in-hive `Software\Classes`
+        // link is a link, and a probe that misses costs one failed `open_subkey`.
         if sid.ends_with("_Classes") {
+            playnite_dir_from_uri_handler(&hive, URI_COMMAND, &mut dirs);
             continue;
         }
-        if let Ok(hive) = users.open_subkey_with_flags(&sid, KEY_READ) {
-            playnite_dirs_from_uninstall(&hive, UNINSTALL, &mut dirs);
-        }
+        playnite_dirs_from_uninstall(&hive, UNINSTALL, &mut dirs);
+        playnite_dir_from_uri_handler(&hive, CLASSES_URI_COMMAND, &mut dirs);
     }
 
     // The conventional per-user location, for every profile on the box — this is where Playnite's
@@ -703,6 +719,80 @@ fn playnite_dirs_from_uninstall(
             }
         }
     }
+}
+
+/// Take the directory of Playnite's registered `playnite://` handler from `root\path`, if there is one.
+///
+/// This is what finds a **portable** Playnite. It leaves no uninstall entry and lives under no user
+/// profile, so every other probe here is blind to it — but Playnite registers its own URI scheme,
+/// and that registration is the very one `explorer.exe "playnite://…"` follows when this host starts
+/// a Playnite title. If it resolves, this box already opens games with that copy.
+#[cfg(windows)]
+fn playnite_dir_from_uri_handler(
+    root: &winreg::RegKey,
+    path: &str,
+    out: &mut Vec<std::path::PathBuf>,
+) {
+    use winreg::enums::KEY_READ;
+
+    let Ok(command) = root
+        .open_subkey_with_flags(path, KEY_READ)
+        .and_then(|k| k.get_value::<String, _>(""))
+    else {
+        return;
+    };
+    if let Some(dir) = exe_from_shell_command(&command)
+        .map(std::path::Path::new)
+        .and_then(std::path::Path::parent)
+        .filter(|d| !d.as_os_str().is_empty())
+    {
+        push_unique(out, dir.to_path_buf());
+    }
+}
+
+/// The executable out of a registered shell-open command line:
+/// `"D:\Apps\Playnite\Playnite.DesktopApp.exe" --uridata "%1"` → `D:\Apps\Playnite\Playnite.DesktopApp.exe`.
+///
+/// Quoted form first, because that is what a registrar writes. The cut at the first `.exe` is the
+/// fallback for the unquoted spelling, whose path may itself contain spaces and so cannot be split on
+/// whitespace. `None` when neither shape matches; the result is only ever a directory to probe for an
+/// exe, so a miss costs one `is_file` and nothing else.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn exe_from_shell_command(command: &str) -> Option<&str> {
+    let command = command.trim();
+    if let Some(rest) = command.strip_prefix('"') {
+        return rest.split('"').next().filter(|p| !p.is_empty());
+    }
+    let end = command.to_ascii_lowercase().find(".exe")? + ".exe".len();
+    Some(&command[..end])
+}
+
+/// Windows: every Playnite root on this box, as an **art** root.
+///
+/// A portable Playnite keeps its library beside the exe — covers land in
+/// `<PlayniteDir>\library\files\…` — so for that layout the install dir IS where the art lives, and
+/// the users base can never cover it: the whole point of portable is that it sits wherever the
+/// operator put it (`D:\Apps\Playnite` in the report that prompted this). Without it a portable
+/// install synced its games and had EVERY cover dropped by the confinement. An installed Playnite
+/// keeps the same tree under `%APPDATA%\Playnite`, already inside the users base; naming that
+/// directory twice costs one `canonicalize` in [`super::art::art_path_is_confined`].
+///
+/// Same shape and same reasoning as [`super::art::steam_art_roots`], and it does not widen what the
+/// host can be *tricked* into reading: every candidate comes from the host's own registry and
+/// filesystem probes, never from the plugin lane that supplies the art path, and the extension,
+/// regular-file, magic-byte and config-dir gates all still apply on top.
+///
+/// The per-user hives these candidates partly come from are writable by that user — which is a bar
+/// this host already stands on, and one rung lower here than where it already stood: the same
+/// lookup picks the `Playnite.FullscreenApp.exe` a launcher tile SPAWNS. Trusting it to name a
+/// directory whose image files may be read is strictly weaker than trusting it to name a program to
+/// run.
+#[cfg(windows)]
+pub(crate) fn playnite_art_roots() -> Vec<std::path::PathBuf> {
+    playnite_install_dirs()
+        .into_iter()
+        .filter(|d| d.is_dir())
+        .collect()
 }
 
 /// Every user profile directory on the box (`C:\Users\*`), minus the shared `Public` pseudo-profile.
@@ -1084,6 +1174,36 @@ mod tests {
         assert!(!valid_aumid("Foo!Game\" & calc"));
         assert!(!valid_aumid("Foo\\..\\Bar!Game"));
         assert!(!valid_aumid("Foo Bar!Game"));
+    }
+
+    /// The portable-Playnite probe, at the only part of it that can be wrong off-Windows: pulling the
+    /// exe out of the registered `playnite://` command line. A miss here is a portable install the
+    /// host cannot find — no launcher tile, and (through [`playnite_art_roots`]) every cover dropped.
+    #[test]
+    fn exe_is_read_out_of_a_registered_shell_command() {
+        // What Playnite actually registers, portable install on a second drive.
+        assert_eq!(
+            exe_from_shell_command(r#""D:\Apps\Playnite\Playnite.DesktopApp.exe" --uridata "%1""#),
+            Some(r"D:\Apps\Playnite\Playnite.DesktopApp.exe")
+        );
+        // Unquoted, with a space in the path — which is why this cannot split on whitespace.
+        assert_eq!(
+            exe_from_shell_command(r"C:\Program Files\Playnite\Playnite.DesktopApp.exe %1"),
+            Some(r"C:\Program Files\Playnite\Playnite.DesktopApp.exe")
+        );
+        // Case is the registrar's business, not ours.
+        assert_eq!(
+            exe_from_shell_command(r"D:\Apps\Playnite\PLAYNITE.DESKTOPAPP.EXE"),
+            Some(r"D:\Apps\Playnite\PLAYNITE.DESKTOPAPP.EXE")
+        );
+        // Nothing exe-shaped, and the empty quoted form: no candidate beats a bogus one, because a
+        // bogus one would become an allowed art root.
+        assert_eq!(
+            exe_from_shell_command("rundll32 shell32.dll,Control_RunDLL"),
+            None
+        );
+        assert_eq!(exe_from_shell_command(r#""" %1"#), None);
+        assert_eq!(exe_from_shell_command(""), None);
     }
 
     /// Windows' launcher tile opens Playnite's FULLSCREEN app. Both negatives are the point: the
