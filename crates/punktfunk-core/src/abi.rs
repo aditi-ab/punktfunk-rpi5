@@ -59,9 +59,7 @@ use std::ptr;
 /// for. The slots behind these mutexes are plain last-value caches (frame/audio/cursor/clip), so
 /// whatever a poisoned writer left behind is still structurally valid data to overwrite or hand
 /// out; recovering the guard is strictly better than aborting the embedding application.
-/// (`quic`-gated with its only callers, the `punktfunk_connection_*` entry points — a
-/// `default-features = false` consumer like the tray would otherwise see dead code.)
-#[cfg(feature = "quic")]
+/// (Ungated since v25: [`punktfunk_set_log_callback`]'s sink slot uses it on every build.)
 fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -256,6 +254,103 @@ fn new_handle(session: Session) -> *mut PunktfunkSession {
 #[unsafe(no_mangle)]
 pub extern "C" fn punktfunk_abi_version() -> u32 {
     crate::ABI_VERSION
+}
+
+/// A log line from the core (ABI v25, [`punktfunk_set_log_callback`]). `level` is 1 = error,
+/// 2 = warn, 3 = info, 4 = debug, 5 = trace. `target` is the Rust module path the line came from
+/// (`punktfunk_core::transport::udp`, `quinn::connection`, …) and `message` the formatted text;
+/// both are NUL-terminated UTF-8, borrowed for the duration of the call only — copy them out.
+/// Called from whichever thread logged, so the callback must be thread-safe, must not block for
+/// long (it sits on the transport and pump threads), and must not call back into the core's
+/// logging (it would be re-entered).
+pub type PunktfunkLogCb = Option<
+    unsafe extern "C" fn(level: u8, target: *const c_char, message: *const c_char, user: *mut c_void),
+>;
+
+#[derive(Clone, Copy)]
+struct LogSink {
+    cb: unsafe extern "C" fn(u8, *const c_char, *const c_char, *mut c_void),
+    user: *mut c_void,
+}
+// SAFETY: the user pointer is an opaque token handed back to the caller's own callback, which the
+// contract above requires to be thread-safe; the core never dereferences it.
+unsafe impl Send for LogSink {}
+
+static LOG_SINK: std::sync::Mutex<Option<LogSink>> = std::sync::Mutex::new(None);
+static LOG_INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// The `log` backend behind [`punktfunk_set_log_callback`]: every record the core (and its
+/// dependencies that log through `log`, plus its own `tracing` events via tracing's `log` bridge)
+/// emits is handed to the registered sink. Installed once; the sink slot is swappable after.
+struct CallbackLogger;
+
+impl log::Log for CallbackLogger {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        // Level gating is `log::set_max_level`, applied by `punktfunk_set_log_callback`.
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        // Copy the sink OUT of the lock before calling it: a callback that logs (it shouldn't, but
+        // an embedder's mistake must be a duplicate line, not a deadlock) re-enters `log` cleanly.
+        let Some(sink) = *lock_recover(&LOG_SINK) else { return };
+        let cstr = |s: String| {
+            // An interior NUL can't cross as a C string; drop the byte rather than the line.
+            let mut bytes = s.into_bytes();
+            bytes.retain(|&b| b != 0);
+            std::ffi::CString::new(bytes).unwrap_or_default()
+        };
+        let target = cstr(record.target().to_string());
+        let message = cstr(record.args().to_string());
+        // SAFETY: the sink was registered through the ABI with exactly this signature; both
+        // strings outlive the call (they are locals dropped after it) and are NUL-terminated.
+        unsafe { (sink.cb)(record.level() as u8, target.as_ptr(), message.as_ptr(), sink.user) };
+    }
+
+    fn flush(&self) {}
+}
+
+/// Receive the core's log lines (ABI v25). The core logs through `tracing`; on the desktop and
+/// Android shells a subscriber/logger installed by the shell picks those up, but an embedder that
+/// installs none (Swift, any C host) saw NOTHING — every transport warning (socket-buffer clamp,
+/// QoS refusal), every quinn connection event and every rustls handshake note vanished, and a
+/// client log bundle carried the shell's half of the story only. This routes them to `cb`.
+///
+/// `max_level` is the most verbose level delivered (1 = error … 5 = trace; 0 = nothing) —
+/// `log::set_max_level`, so anything above it costs no formatting. 3 (info) is the right default
+/// for a field log ring; quinn's debug/trace is per-packet and would churn any bounded ring.
+/// `cb == NULL` detaches the sink (lines are dropped again). `user` is handed back on every call.
+///
+/// Returns `Ok`, or `Unsupported` when another `log` backend is already installed in this
+/// process (e.g. the Android shell's `android_logger`) — the core cannot replace it, and that
+/// backend already receives everything this one would. Idempotent: call again to change the
+/// level or the sink.
+///
+/// # Safety
+/// `cb`, if non-null, must remain a valid function for as long as it is installed (until the next
+/// call with NULL), and `user` must stay valid for every call the core may make meanwhile.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_set_log_callback(
+    max_level: u8,
+    cb: PunktfunkLogCb,
+    user: *mut c_void,
+) -> PunktfunkStatus {
+    guard(|| {
+        let installed = *LOG_INSTALLED.get_or_init(|| log::set_logger(&CallbackLogger).is_ok());
+        if !installed {
+            return PunktfunkStatus::Unsupported;
+        }
+        *lock_recover(&LOG_SINK) = cb.map(|cb| LogSink { cb, user });
+        log::set_max_level(match (cb.is_some(), max_level) {
+            (false, _) | (_, 0) => log::LevelFilter::Off,
+            (_, 1) => log::LevelFilter::Error,
+            (_, 2) => log::LevelFilter::Warn,
+            (_, 3) => log::LevelFilter::Info,
+            (_, 4) => log::LevelFilter::Debug,
+            _ => log::LevelFilter::Trace,
+        });
+        PunktfunkStatus::Ok
+    })
 }
 
 /// Send a Wake-on-LAN magic packet to wake sleeping host NIC(s).
@@ -5855,6 +5950,58 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_is_holding(
         }
         PunktfunkStatus::Ok
     })
+}
+
+#[cfg(test)]
+mod log_sink_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static LINES: Mutex<Vec<(u8, String, String)>> = Mutex::new(Vec::new());
+
+    unsafe extern "C" fn collect(level: u8, target: *const c_char, message: *const c_char, user: *mut c_void) {
+        assert_eq!(user as usize, 0x5151, "the user token must come back unchanged");
+        // SAFETY: the core hands NUL-terminated strings valid for this call, per the callback contract.
+        let (t, m) = unsafe { (CStr::from_ptr(target), CStr::from_ptr(message)) };
+        LINES.lock().unwrap().push((
+            level,
+            t.to_string_lossy().into_owned(),
+            m.to_string_lossy().into_owned(),
+        ));
+    }
+
+    /// End to end through both doors: a `log` record and a `tracing` event (via tracing's `log`
+    /// feature) reach the C callback with level, real target and message; an interior NUL is
+    /// dropped rather than truncating the line; the level ceiling is honoured; NULL detaches.
+    #[test]
+    fn callback_receives_log_and_tracing_lines() {
+        // SAFETY: `collect` is a valid fn for the life of the test binary, the user token is an
+        // opaque integer.
+        let st = unsafe { punktfunk_set_log_callback(3, Some(collect), 0x5151 as *mut c_void) };
+        assert_eq!(st, PunktfunkStatus::Ok);
+
+        log::warn!(target: "quinn::connection", "handshake \0 done");
+        tracing::info!(target: "punktfunk_core::transport", buf = 4096, "socket buffer clamped");
+        log::debug!(target: "quinn::connection", "must not arrive (above the ceiling)");
+
+        let lines = LINES.lock().unwrap().clone();
+        let warn = lines.iter().find(|l| l.1 == "quinn::connection").expect("log record delivered");
+        assert_eq!(warn.0, 2);
+        assert_eq!(warn.2, "handshake  done", "interior NUL dropped, line kept");
+        let info = lines
+            .iter()
+            .find(|l| l.1 == "punktfunk_core::transport")
+            .expect("tracing event delivered through the log bridge");
+        assert_eq!(info.0, 3);
+        assert!(info.2.contains("socket buffer clamped") && info.2.contains("buf=4096"), "{}", info.2);
+        assert!(!lines.iter().any(|l| l.2.contains("must not arrive")));
+
+        // SAFETY: NULL callback detaches; no pointer is retained.
+        assert_eq!(unsafe { punktfunk_set_log_callback(3, None, ptr::null_mut()) }, PunktfunkStatus::Ok);
+        let before = LINES.lock().unwrap().len();
+        log::error!(target: "quinn::connection", "after detach");
+        assert_eq!(LINES.lock().unwrap().len(), before, "a detached sink hears nothing");
+    }
 }
 
 #[cfg(all(test, feature = "quic"))]

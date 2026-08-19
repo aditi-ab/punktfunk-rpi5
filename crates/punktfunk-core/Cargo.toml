@@ -49,7 +49,12 @@ socket2 = { version = "0.6", features = [
     "all",
 ] } # SO_SNDBUF/SO_RCVBUF growth (default UDP buffers too small for 4K/5K bursts) + DSCP/SO_PRIORITY media QoS
 thiserror = "2"
-tracing = { version = "0.1", default-features = false, features = ["std"] }
+# `log`: tracing events are mirrored as `log` records when no tracing subscriber is installed —
+# what `abi::punktfunk_set_log_callback` (ABI v25) delivers to an embedder. On transitively via
+# quinn's defaults already; declared here because the ABI promise must not hinge on that.
+tracing = { version = "0.1", default-features = false, features = ["std", "log"] }
+# The backend `punktfunk_set_log_callback` installs (`log::set_logger` + `log::Log`).
+log = "0.4"
 rand = "0.9"
 zeroize = "1"
 # Interface enumeration for Wake-on-LAN: computes each NIC's subnet-directed broadcast so a

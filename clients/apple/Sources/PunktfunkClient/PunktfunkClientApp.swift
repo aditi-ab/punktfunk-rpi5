@@ -4,6 +4,7 @@
 #if os(macOS)
 import AppKit
 #endif
+import PunktfunkKit
 import SwiftUI
 
 @main
@@ -13,6 +14,9 @@ struct PunktfunkClientApp: App {
     #endif
 
     init() {
+        // Before anything touches the core, so its first lines (identity load, the first connect's
+        // transport setup) land in the log ring "Send logs to host" uploads.
+        CoreLog.install()
         #if os(iOS)
         // Put Geist on the navigation titles before any bar is built.
         BrandTheme.apply()
