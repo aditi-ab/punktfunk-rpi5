@@ -42,13 +42,11 @@ uplink keeps running underneath, so unmuting is instant.
 While muted, a **Microphone muted** badge sits in the top-right corner of the stream — separate
 from the [stats overlay](/docs/stats), so it shows even with stats off.
 
-The mute lasts for that stream only — the next session starts unmuted, and nothing is written to
-your settings. If the stream isn't sending a microphone at all (**Stream microphone** off in
-[client settings](/docs/client-settings#audio)) the shortcut does nothing and no badge appears.
-
-**Linux and Windows** clients only — a Steam Deck stream is the Linux client, so an attached
-keyboard gets the chord. The Apple and Android clients have no mute shortcut yet; turn **Stream
-microphone** off in their settings instead.
+The mute lasts for that stream only — the next session starts unmuted; nothing is written to your
+settings. With **Stream microphone** off in [client settings](/docs/client-settings#audio) the
+shortcut does nothing and no badge appears. **Linux and Windows** clients only (a Steam Deck stream
+is the Linux client, so an attached keyboard gets the chord); on Apple and Android turn **Stream
+microphone** off in settings instead.
 
 Alt-Tabbing away releases input on its own and takes it back when you return. A release you asked
 for with the chord stays released until you opt back in. Either way, keys and buttons you were
@@ -104,10 +102,9 @@ watching for the chord either way.
 ### Statistics with a controller
 
 The **Apple** apps reserve a second chord: **Select + X**, which cycles the
-[stats overlay](/docs/stats) one level each time you complete it. For when you have a pad but no
-keyboard for **⌃⌥⇧S** and no free screen for the three-finger tap; on **Apple TV** it is the only
-way there with a pad. X is deliberately none of the four leave-chord buttons, so reaching for one
-chord never trips the other. Both buttons still reach the game; only the overlay changes locally.
+[stats overlay](/docs/stats) one level each time you complete it — for a pad with no keyboard and
+no free screen for the three-finger tap; on **Apple TV** it is the only way there with a pad. Both
+buttons still reach the game; only the overlay changes locally.
 
 On the **Siri Remote**, **hold Play/Pause** for about half a second instead. A quick tap is still a
 right click, sent when you let go.
@@ -115,26 +112,23 @@ right click, sent when you let go.
 ### The guide button (Xbox / PS / Steam) and Quick Access
 
 A controller's **guide button** — the Xbox logo, the PS button, the Deck's **Steam** button — is
-meant to open menus **on the host**: the Steam overlay, or a Gaming-Mode host's Steam menu. Some
-devices want that button for themselves, so every client also carries a gesture that works
-everywhere:
-
-**Hold Select (Back / View) on its own for about a third of a second.** The host sees its guide
-button held down for as long as you hold — a long press, which is how SteamOS opens the **Quick
-Access Menu** for a regular pad. A quick tap of Select still reaches the game, delivered when you
-let go (a beat late). Select pressed as part of a combo — including the leave chord above — passes
-through untouched.
+meant to open menus **on the host**. Some devices want that button for themselves, so every client
+also carries a gesture that works everywhere: **hold Select (Back / View) on its own for about a
+third of a second**. The host sees its guide button held for as long as you hold — a long press,
+which is how SteamOS opens the **Quick Access Menu** for a regular pad. A quick tap of Select still
+reaches the game, delivered when you let go (a beat late); Select in a combo — including the leave
+chord above — passes through untouched.
 
 What the raw button does, per client:
 
 - **Linux & Windows desktop, macOS, Android** — the guide press is forwarded to the host. If Steam
   Big Picture or the Xbox Game Bar is also watching for it *on the device in your hands*, both may
   react — that's a local setting on that device, not something the stream can suppress.
-- **Steam Deck / Gaming Mode** — the **Steam** and **`…`** buttons stay with the Deck by default:
-  SteamOS always opens its own menus for them, so forwarding the raw press as well opened BOTH menus
-  at once, the Deck's on top of the stream. Reach the host's menus with **hold-Select**, or with the
-  Punktfunk panel's **Host menus** buttons ([Steam Deck page](/docs/steam-deck)). The old behavior
-  is one setting away: **Steam / guide button → Send to host**.
+- **Steam Deck / Gaming Mode** — the **Steam** and **`…`** buttons stay with the Deck by default
+  (SteamOS always opens its own menus for them; forwarding the raw press too opens both menus at
+  once). Reach the host's menus with **hold-Select**, or the Punktfunk panel's **Host menus**
+  buttons ([Steam Deck page](/docs/steam-deck)); **Steam / guide button → Send to host** restores
+  the old behavior.
 - **iPhone / iPad** — iOS reserves the Home press for its own Game Overlay, so hold-Select is the
   reliable route to the host's overlay. On iOS 27 or later you can also hand the button to the app
   yourself, in the system's per-controller Home-button setting.
@@ -200,11 +194,9 @@ Touch passthrough depends on the host being able to inject touch, and that varie
 | Sway, Hyprland and other wlroots compositors | Not injected — contacts are dropped |
 | gamescope Gaming Mode | Degraded to a single absolute pointer — see [gamescope](/docs/gamescope) |
 
-The gamescope row is a rule, not an exception: wherever the compositor offers no touchscreen device
-to drive, only the first finger is used, as an absolute pointer. Tapping still clicks; pinches and
-other multi-finger gestures do not survive.
-
-The trackpad and pointer models are unaffected by all of this: they send ordinary mouse events.
+Wherever the compositor offers no touchscreen device to drive, only the first finger is used, as
+an absolute pointer — tapping still clicks; pinches and multi-finger gestures don't survive. The
+trackpad and pointer models are unaffected: they send ordinary mouse events.
 
 ## Pen and stylus
 
@@ -237,10 +229,9 @@ The Linux, Windows, macOS and Apple TV clients do not send stylus input.
 the virtual gamepads need, step 3 of your [install guide](/docs/install). Without it the host never
 offers pen at all.
 
-**If the host is too old, or pen is switched off**, nothing breaks: the client keeps folding the
-stylus into its ordinary touch or pointer path. You can still draw — just without pressure and tilt.
-Whether pen splits out is decided by the host, not by your touch mode: you can be in Trackpad mode
-and still draw with full fidelity.
+**If the host is too old, or pen is switched off**, the client folds the stylus into its ordinary
+touch or pointer path — you can still draw, without pressure and tilt. Whether pen splits out is
+decided by the host, not your touch mode.
 
 **Operators** can turn the whole feature off by setting `PUNKTFUNK_PEN=0` in the host's `host.env`
 (see [Configuration](/docs/configuration)). The host then stops advertising pen to Punktfunk and
