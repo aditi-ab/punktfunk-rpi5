@@ -47,6 +47,20 @@
     "web": "punktfunk-web"
   },
 
+  "installer": {
+    "$comment": "The guided Linux installer (WP4, preview). Canonical URL is the website's /install.sh, a redirect to the raw script on main so it's versioned with the code it installs; the docs hub and the download page quote these lines.",
+    "status": "preview",
+    "url": "https://punktfunk.unom.io/install.sh",
+    "source": "https://git.unom.io/unom/punktfunk/raw/branch/main/scripts/install.sh",
+    "oneLiner": "curl -fsSL https://punktfunk.unom.io/install.sh | sh",
+    "inspectFirst": [
+      "curl -fsSLO https://punktfunk.unom.io/install.sh",
+      "less install.sh",
+      "sh install.sh"
+    ],
+    "docs": "/docs/install#guided-install-preview"
+  },
+
   "conflicts": {
     "hosts": ["Sunshine", "Apollo", "Vibeshine"],
     "detect": "punktfunk-host detect-conflicts",

@@ -24,6 +24,10 @@
 #      platforms.json — the snapshot the <Install/> and <Ports/> MDX components render from
 #      (the docs Docker build context is docs-site/ alone) — must be a byte copy of it, same
 #      rule as gate 1.
+#   6. scripts/install.sh (the guided installer, WP4) runs the install lines platforms.json
+#      states — every `install` line of an apt/pacman/dnf/sysext host platform must appear in
+#      the script verbatim (it edits channel/group into the string at run time, never the
+#      literal), and the script must parse under sh.
 #
 # Textual gates, so textual limits: gate 2/3 match token spelling, not env reads — a var name in
 # a code comment counts as "exists", and a quoted constant that isn't an env var counts toward
@@ -105,6 +109,18 @@ if [ "$(cksum < data/platforms.json)" != "$(cksum < docs-site/src/data/platforms
     echo "::error::docs-site/src/data/platforms.json is not a copy of data/platforms.json — re-sync it:"
     echo "  cp data/platforms.json docs-site/src/data/platforms.json"
     fail=1
+fi
+
+# ---------------------------------------------------------------- gate 6: installer quotes platforms.json
+if ! sh -n scripts/install.sh; then
+    echo "::error::scripts/install.sh does not parse under sh"
+    fail=1
+fi
+installer_check='const fs=require("fs");const p=JSON.parse(fs.readFileSync("data/platforms.json","utf8"));const sh=fs.readFileSync("scripts/install.sh","utf8");let bad=0;for(const x of p.platforms){if(x.installs!=="host"||!["apt","pacman","dnf","sysext"].includes(x.packageManager))continue;for(const line of x.install||[]){if(!sh.includes(line)){console.error(`::error::scripts/install.sh no longer carries platforms.json\x27s ${x.id} install line verbatim: ${line}`);bad=1}}}process.exit(bad)'
+if command -v bun >/dev/null 2>&1; then
+    bun -e "$installer_check" || fail=1
+elif command -v node >/dev/null 2>&1; then
+    node -e "$installer_check" || fail=1
 fi
 
 exit "$fail"

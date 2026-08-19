@@ -1,0 +1,63 @@
+# Smoke test for the guided installer (scripts/install.sh, docs-and-onboarding overhaul WP4).
+# Runs the script unattended inside a clean container per package family against the REAL
+# package registry — the one path a textual gate can't cover: does the repo line, the key import
+# and the install actually work today on a fresh box. `--no-start` because a container has no
+# user systemd; the script degrades to printing the enable command, which is also under test.
+#
+# Path-filtered on purpose: it pulls ~100 MB of packages per family, so it runs when the script
+# or its fact source changes, not on every push (check-docs-drift.sh gate 6 covers the cheap
+# half — the install lines in the script must match data/platforms.json verbatim — on every push).
+name: installer-smoke
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - scripts/install.sh
+      - data/platforms.json
+      - .gitea/workflows/installer-smoke.yml
+  pull_request:
+    paths:
+      - scripts/install.sh
+      - data/platforms.json
+      - .gitea/workflows/installer-smoke.yml
+
+jobs:
+  smoke:
+    name: smoke (${{ matrix.family }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # actions/checkout needs git + node + CA certs in the container; curl is the
+          # script's own prerequisite (it says so and stops without it).
+          - family: debian-13
+            image: debian:trixie
+            prep: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl git nodejs
+          - family: fedora-44
+            image: fedora:44
+            prep: dnf install -y -q curl git nodejs
+          - family: arch
+            image: archlinux:base
+            prep: pacman -Sy --noconfirm --needed curl git nodejs && (pacman-key --init >/dev/null 2>&1 || true)
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Prepare the container (${{ matrix.family }})
+        run: ${{ matrix.prep }}
+      - uses: actions/checkout@v4
+      # No tty → the script runs as --yes; --no-start because there is no user systemd here.
+      # Root without sudo → the script's sudo shim, another path under test.
+      - name: Run the installer unattended
+        run: sh scripts/install.sh --yes --no-start
+      - name: The host is installed and conflict-free
+        run: |
+          punktfunk-host --version
+          punktfunk-host detect-conflicts
+      - name: Re-running is a no-op install
+        run: sh scripts/install.sh --yes --no-start | grep -q 'already installed'

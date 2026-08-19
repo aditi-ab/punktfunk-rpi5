@@ -35,6 +35,24 @@ export function Install({ platform, title }: { platform: string; title?: string 
   )
 }
 
+/** `<Installer />` — the guided installer's one-liner and its inspect-first form, from platforms.json. */
+export function Installer({ inspect }: { inspect?: boolean }) {
+  const lines = inspect ? platforms.installer.inspectFirst : [platforms.installer.oneLiner]
+  return (
+    <CodeBlock>
+      <Pre>
+        <code>
+          {lines.map((line, i) => (
+            <span key={i} className="line">
+              {line}
+            </span>
+          ))}
+        </code>
+      </Pre>
+    </CodeBlock>
+  )
+}
+
 /** `<Ports />` — every port the host and console use, with the firewall profile that opens it. */
 export function Ports() {
   const { ports, firewall } = platforms
