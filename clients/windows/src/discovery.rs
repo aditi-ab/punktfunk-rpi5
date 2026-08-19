@@ -29,7 +29,7 @@ pub struct DiscoveredHost {
     /// persisted like `mac`. Empty if absent (older host).
     pub os: String,
     /// The management API's port from the mDNS `mgmt` TXT — where the game library is served.
-    /// Persisted like `mac` (`trust::learn_mgmt_port`), and load-bearing rather than cosmetic:
+    /// Persisted like `mac` (`trust::learn_from_advert`), and load-bearing rather than cosmetic:
     /// a host moved off 47990 loses its library once mDNS is gone unless we write this down.
     /// `None` if absent (older host) — resolve via `library::DEFAULT_MGMT_PORT`.
     pub mgmt_port: Option<u16>,

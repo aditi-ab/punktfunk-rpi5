@@ -700,31 +700,23 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 .iter()
                 .any(|h| h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port))
                 || props.probed.get(&k.fp_hex).copied().unwrap_or(false);
-            // Learn this host's wake MAC(s) from its live advert while it's online, so we can wake
-            // it once it sleeps (no-op / no disk write when unchanged).
-            if let Some(a) = hosts.iter().find(|h| {
-                (h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port))
-                    && !h.mac.is_empty()
-            }) {
-                crate::trust::learn_mac(&k.fp_hex, &k.addr, k.port, &a.mac);
-            }
-            // Same for its OS chain — the tile's mark then survives the host going offline.
-            if let Some(a) = hosts.iter().find(|h| {
-                (h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port)) && !h.os.is_empty()
-            }) {
-                crate::trust::learn_os(&k.fp_hex, &k.addr, k.port, &a.os);
-            }
-            // Same for its management port — load-bearing, unlike the two above: a host moved off
-            // 47990 loses its library entirely once mDNS is gone unless we write the port down.
-            if let Some(p) = hosts
+            // Learn what this host's live advert teaches while it's online: its wake MAC(s) (so we
+            // can wake it once it sleeps), its OS chain (so the tile's mark survives it going
+            // offline), and its management port — the last load-bearing rather than cosmetic, as
+            // a host moved off 47990 loses its library entirely once mDNS is gone unless we write
+            // the port down. No-op, and no disk write, when unchanged.
+            if let Some(a) = hosts
                 .iter()
-                .find(|h| {
-                    (h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port))
-                        && h.mgmt_port.is_some()
-                })
-                .and_then(|h| h.mgmt_port)
+                .find(|h| h.fp_hex == k.fp_hex || (h.addr == k.addr && h.port == k.port))
             {
-                crate::trust::learn_mgmt_port(&k.fp_hex, &k.addr, k.port, p);
+                crate::trust::learn_from_advert(
+                    &k.fp_hex,
+                    &k.addr,
+                    k.port,
+                    &a.mac,
+                    &a.os,
+                    a.mgmt_port,
+                );
             }
             let can_wake = !online && !k.mac.is_empty();
             let menu = {

@@ -1087,33 +1087,20 @@ impl HostsPage {
                 // Online = advertising on mDNS OR proven reachable by the last probe sweep.
                 let online = self.adverts.values().any(|a| matches(k, a))
                     || self.probed.get(&saved_key(k)).copied().unwrap_or(false);
-                // Learn this host's wake MAC(s) from its live advert while it's online.
-                if let Some(a) = self
-                    .adverts
-                    .values()
-                    .find(|a| matches(k, a) && !a.mac.is_empty())
-                {
-                    crate::trust::learn_mac(&k.fp_hex, &k.addr, k.port, &a.mac);
-                }
-                // Same for its OS chain — the icon then survives the host going offline.
-                if let Some(a) = self
-                    .adverts
-                    .values()
-                    .find(|a| matches(k, a) && !a.os.is_empty())
-                {
-                    crate::trust::learn_os(&k.fp_hex, &k.addr, k.port, &a.os);
-                }
-                // Same for its management port — and this one is not cosmetic: without it a host
-                // that moved off 47990 loses its library the moment mDNS is unavailable, because
-                // the advert was the only place the real port ever lived.
-                if let Some(a) = self
-                    .adverts
-                    .values()
-                    .find(|a| matches(k, a) && a.mgmt_port.is_some())
-                {
-                    if let Some(p) = a.mgmt_port {
-                        crate::trust::learn_mgmt_port(&k.fp_hex, &k.addr, k.port, p);
-                    }
+                // Learn what this host's live advert teaches while it's online: its wake MAC(s),
+                // its OS chain (so the icon survives it going offline), and its management port
+                // — the last one not cosmetic, since a host that moved off 47990 loses its
+                // library the moment mDNS is unavailable and the advert is the only place the
+                // real port ever lived.
+                if let Some(a) = self.adverts.values().find(|a| matches(k, a)) {
+                    crate::trust::learn_from_advert(
+                        &k.fp_hex,
+                        &k.addr,
+                        k.port,
+                        &a.mac,
+                        &a.os,
+                        a.mgmt_port,
+                    );
                 }
                 saved.push_back(HostCard {
                     connecting: self.connecting.as_deref() == Some(k.fp_hex.as_str()),

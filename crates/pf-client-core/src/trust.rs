@@ -675,10 +675,10 @@ pub fn forget_placeholder(addr: &str, port: u16) {
     }
 }
 
-/// The record [`learn_mac`]/[`learn_os`] should write what an advert taught them onto:
-/// the fingerprint match if there is one, else whatever the address resolves to. Fingerprint
-/// FIRST — a single pass that took "either" would hand a stale record at the same address the
-/// data the live host advertised, purely because it came earlier in the file.
+/// The record an advert's lesson should land on: the fingerprint match if there is one, else
+/// whatever the address resolves to. Fingerprint FIRST — a single pass that took "either" would
+/// hand a stale record at the same address the data the live host advertised, purely because it
+/// came earlier in the file.
 fn learn_target<'a>(
     known: &'a mut KnownHosts,
     fp_hex: &str,
@@ -692,61 +692,62 @@ fn learn_target<'a>(
     known.hosts.get_mut(i)
 }
 
-/// Learn/refresh a saved host's Wake-on-LAN MAC(s) from its live advert (called while the host
-/// is online, matched by fingerprint or address). No-op — and no disk write — when unchanged, so
-/// the hosts page can call it on every discovery tick without churning the store.
-pub fn learn_mac(fp_hex: &str, addr: &str, port: u16, mac: &[String]) {
-    if mac.is_empty() {
-        return;
-    }
-    let mut known = KnownHosts::load();
-    let Some(h) = learn_target(&mut known, fp_hex, addr, port) else {
-        return;
-    };
-    if h.mac == mac {
-        return;
-    }
-    h.mac = mac.to_vec();
-    let _ = known.save();
-}
-
-/// Learn/refresh a saved host's OS-identity chain from its live advert (mDNS `os` TXT), matched
-/// like [`learn_mac`]: by fingerprint or address. No-op — and no disk write — when unchanged, so
-/// the hosts page can call it on every discovery tick without churning the store.
-pub fn learn_os(fp_hex: &str, addr: &str, port: u16, os: &str) {
-    if os.is_empty() {
-        return;
-    }
-    let mut known = KnownHosts::load();
-    let Some(h) = learn_target(&mut known, fp_hex, addr, port) else {
-        return;
-    };
-    if h.os == os {
-        return;
-    }
-    h.os = os.to_string();
-    let _ = known.save();
-}
-
-/// Learn/refresh a saved host's management-API port from its live advert (mDNS `mgmt` TXT),
-/// matched like [`learn_mac`]: by fingerprint or address. No-op — and no disk write — when
-/// unchanged, so the hosts page can call it on every discovery tick without churning the store.
+/// Copy everything an advert can teach onto a saved record — wake MAC(s), OS-identity chain,
+/// management port — and report whether anything actually moved, so the caller writes only when
+/// there is something to write. Pure (no disk, no clock), which is what makes it testable.
 ///
-/// This is what makes a moved mgmt port outlive mDNS. Until it existed the port was read straight
-/// off the live advert and thrown away, so the library worked on the LAN and went blank over a VPN.
-pub fn learn_mgmt_port(fp_hex: &str, addr: &str, port: u16, mgmt_port: u16) {
-    if mgmt_port == 0 {
-        return;
+/// A field the advert does not carry is left alone, never cleared: an older host simply omits the
+/// TXT, and forgetting a MAC already learned would cost the user their wake.
+fn apply_advert(h: &mut KnownHost, mac: &[String], os: &str, mgmt_port: Option<u16>) -> bool {
+    let mut changed = false;
+    if !mac.is_empty() && h.mac != mac {
+        h.mac = mac.to_vec();
+        changed = true;
     }
-    let mut known = KnownHosts::load();
+    if !os.is_empty() && h.os != os {
+        h.os = os.to_string();
+        changed = true;
+    }
+    // 0 is how "not advertised" reaches us from a caller whose own type has no `Option`.
+    if mgmt_port.is_some_and(|p| p != 0 && h.mgmt_port != Some(p)) {
+        h.mgmt_port = mgmt_port;
+        changed = true;
+    }
+    changed
+}
+
+/// Write down everything a live advert teaches the saved record it matched — wake MAC(s), OS
+/// chain, management port — matched by fingerprint or address. No-op, and no disk write, when
+/// the record already says all three, so a surface can call this on every discovery tick.
+///
+/// ONE call rather than three. Each field used to be learned by its own function, which meant
+/// every front-end had to remember all three, and only the two desktop hosts pages ever did:
+/// the console home and the headless CLI learned the management port alone. On a Steam Deck,
+/// whose Gaming Mode runs nothing but those two, that left every saved host with no MAC forever
+/// — and every wake gate in the codebase reads `!mac.is_empty()` against this record, so
+/// Wake-on-LAN there could not fire at all, with no error to show for it (#322).
+///
+/// [`KnownHosts::read`], not [`KnownHosts::load`]: `punktfunk discover` calls this, and that verb
+/// is deliberately not an id-minter (see [`KnownHosts::read`] for the race that avoids). Learning
+/// a MAC is no reason to become one.
+///
+/// Takes the three learned fields rather than a `DiscoveredHost` because there are two of those
+/// — core's and the WinUI shell's verbatim port — and this has to serve both.
+pub fn learn_from_advert(
+    fp_hex: &str,
+    addr: &str,
+    port: u16,
+    mac: &[String],
+    os: &str,
+    mgmt_port: Option<u16>,
+) {
+    let mut known = KnownHosts::read();
     let Some(h) = learn_target(&mut known, fp_hex, addr, port) else {
         return;
     };
-    if h.mgmt_port == Some(mgmt_port) {
-        return;
+    if apply_advert(h, mac, os, mgmt_port) {
+        let _ = known.save();
     }
-    h.mgmt_port = Some(mgmt_port);
-    let _ = known.save();
 }
 
 /// Re-key a saved host's address/port after it rediscovered on a new DHCP lease (matched by
@@ -785,7 +786,7 @@ pub fn touch_last_used(fp_hex: &str) {
 /// Save a host's management-API port learned from the **session's own `Welcome`**, keyed by
 /// fingerprint alone — the identity a just-connected client is certain of.
 ///
-/// This is the mDNS-free path, and the one that matters most: [`learn_mgmt_port`] can only fire
+/// This is the mDNS-free path, and the one that matters most: [`learn_from_advert`] can only fire
 /// where an advert is visible, whereas this fires on any successful connect, including a host
 /// added by IP on a network where discovery has never worked. No-op — and no disk write — when
 /// the fingerprint isn't stored or the value is unchanged, so it is safe on every connect.
@@ -2291,6 +2292,33 @@ mod tests {
         assert_eq!(k.find_by_fp(&dead).unwrap().os, "");
         // An advert for a host this store has never seen writes nothing.
         assert!(learn_target(&mut k, &fp('e'), "10.0.0.9", 9777).is_none());
+    }
+
+    /// What an advert carries lands on the record; what it omits is left alone; and a repeat of
+    /// the same advert reports no change — which is what lets every surface call this on every
+    /// discovery tick without churning the store.
+    #[test]
+    fn apply_advert_learns_what_it_carries_and_keeps_what_it_omits() {
+        let mut h = KnownHost::default();
+        let mac = vec!["aa:bb:cc:dd:ee:ff".to_string()];
+        assert!(apply_advert(&mut h, &mac, "linux/arch", Some(47991)));
+        assert_eq!(h.mac, mac);
+        assert_eq!(h.os, "linux/arch");
+        assert_eq!(h.mgmt_port, Some(47991));
+        // The same advert a tick later: nothing moved, so there is nothing to persist.
+        assert!(!apply_advert(&mut h, &mac, "linux/arch", Some(47991)));
+        // An older host advertises none of the three. Clearing a learned MAC here is exactly what
+        // would cost the user their wake, so an absent field must never overwrite a known one.
+        assert!(!apply_advert(&mut h, &[], "", None));
+        assert_eq!(h.mac, mac);
+        assert_eq!(h.os, "linux/arch");
+        assert_eq!(h.mgmt_port, Some(47991));
+        // 0 is how "not advertised" reaches us from a consumer that has no Option — not a port.
+        assert!(!apply_advert(&mut h, &[], "", Some(0)));
+        assert_eq!(h.mgmt_port, Some(47991));
+        // A host that genuinely moved: the new value wins.
+        assert!(apply_advert(&mut h, &[], "", Some(47992)));
+        assert_eq!(h.mgmt_port, Some(47992));
     }
 
     /// Pins render in card order, deduplicated, with deleted profiles simply gone — a pin is
