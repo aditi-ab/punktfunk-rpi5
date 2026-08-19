@@ -115,7 +115,7 @@ pub(super) struct AscBackend {
     /// Fixed for the session; the mode table is authoritative for the panel's fastest refresh.
     panel_seed_ns: i64,
     last_latch_ns: i64,
-    /// HDR `ADataSpace` for the transaction (`0` = SDR / leave default).
+    /// `ADataSpace` for the transaction (BT709 for SDR — never untagged; see `color_dataspace`).
     dataspace: i32,
     /// Layer frame-rate vote (source Hz), applied once.
     frame_rate: f32,
@@ -143,7 +143,7 @@ impl AscBackend {
     /// Create the reader + compositor layer, or `None` on API < 29 / init failure (the caller then
     /// runs the SurfaceView presenter). `window` is the SurfaceView's `ANativeWindow`; `src_w/h` the
     /// negotiated decode size; `panel_hz` the mode-table panel rate (seeds the learner);
-    /// `dataspace` the HDR `ADataSpace` (`0` = SDR); `source_hz` the negotiated stream rate.
+    /// `dataspace` the `ADataSpace` from the negotiated colour; `source_hz` the negotiated stream rate.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn create(
         window: &NativeWindow,
@@ -571,9 +571,9 @@ impl AscBackend {
 }
 
 impl AscBackend {
-    /// Update the HDR `ADataSpace` applied to every subsequent transaction (from the codec's
-    /// output format once it is known — the analogue of the SurfaceView path's
-    /// `apply_hdr_dataspace`). `0` leaves the surface SDR.
+    /// Update the `ADataSpace` applied to every subsequent transaction (a refinement from the
+    /// codec's output format — the analogue of the SurfaceView path's `apply_hdr_dataspace`; the
+    /// negotiated colour set the initial value at create).
     pub(super) fn set_dataspace(&mut self, dataspace: i32) {
         if self.dataspace != dataspace {
             self.dataspace = dataspace;

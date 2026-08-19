@@ -333,7 +333,8 @@ impl Layer {
     /// Present one decoded buffer at `desired_present_ns` (`CLOCK_MONOTONIC`; `0` = ASAP). Consumes
     /// `acquire_fence` (ownership passes to SurfaceFlinger via `setBuffer`). Registers a one-shot
     /// completion that reports the real latch + the previous buffer's release fence on `ev_tx`,
-    /// tagged with `seq`. `dataspace` is the HDR `ADataSpace` value (`0` = leave default/SDR).
+    /// tagged with `seq`. `dataspace` is the `ADataSpace` value (`0` = leave the layer default —
+    /// only the `setBufferDataSpace`-less API-29 fallback ever presents untagged).
     /// `frame_rate` votes the layer's rate once (`0.0` skips). Returns `false` if the transaction
     /// could not be created (the caller then frees the buffer itself).
     #[allow(clippy::too_many_arguments)]

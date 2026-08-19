@@ -274,3 +274,26 @@ pub(super) fn hdr_dataspace(codec: &MediaCodec) -> Option<DataSpace> {
         _ => None, // SDR (BT.709 / SDR_VIDEO) or unspecified
     }
 }
+
+/// Map the *negotiated* session colour ([`ColorInfo`], carried on Welcome) to the `ADataSpace`
+/// the presenter should tag buffers with. This is the authoritative source — the wire contract
+/// says clients configure the presenter from these code points, not from what the decoder happens
+/// to echo back (many decoders omit `color-transfer` from the output format).
+///
+/// SDR maps to `BT709` (limited-range video), never `0`/untagged: an untagged buffer on an
+/// ASurfaceControl transaction leaves SurfaceFlinger to guess, and a full-range guess shows
+/// limited-range black (16) as gray — the elevated-blacks bug.
+// ponytail: full-range SDR would need hand-composed dataspace bits (no named constant); the host
+// only encodes limited-range SDR today (ColorInfo::SDR_BT709), so BT709 covers every SDR session.
+pub(super) fn color_dataspace(color: &punktfunk_core::quic::ColorInfo) -> i32 {
+    use punktfunk_core::quic::ColorInfo;
+    let full = color.full_range != 0;
+    let ds = match color.transfer {
+        ColorInfo::TRC_PQ if full => DataSpace::Bt2020Pq,
+        ColorInfo::TRC_PQ => DataSpace::Bt2020ItuPq,
+        ColorInfo::TRC_HLG if full => DataSpace::Bt2020Hlg,
+        ColorInfo::TRC_HLG => DataSpace::Bt2020ItuHlg,
+        _ => DataSpace::Bt709, // SDR — limited-range BT.709 video
+    };
+    i32::from(ds)
+}

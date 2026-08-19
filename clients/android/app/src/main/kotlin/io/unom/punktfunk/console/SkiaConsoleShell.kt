@@ -31,9 +31,6 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.app.ActivityCompat
-import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.WindowInsetsControllerCompat
 import io.unom.punktfunk.ConsoleLicensesScreen
 import io.unom.punktfunk.DS_USB_PERMISSION_ACTION
 import io.unom.punktfunk.MainActivity
@@ -116,19 +113,11 @@ fun SkiaConsoleShell(
     }
 
     // The console owns the whole panel while it fronts the app, exactly like the stream: the
-    // status bar and the gesture bar are hidden (a swipe shows them transiently), restored on the
-    // way out. This is both the space win AND the safe-area fix — hidden bars report zero insets,
-    // so the scroll clips that used to end at the visible gesture-bar line (scrolled rows sliced
-    // off mid-air with bare backdrop below) now run to the panel edge. Only the display cutout
-    // stays a real inset.
-    DisposableEffect(activity) {
-        val window = activity?.window ?: return@DisposableEffect onDispose {}
-        val controller = WindowCompat.getInsetsController(window, window.decorView)
-        controller.systemBarsBehavior =
-            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        controller.hide(WindowInsetsCompat.Type.systemBars())
-        onDispose { controller.show(WindowInsetsCompat.Type.systemBars()) }
-    }
+    // status bar and the gesture bar are hidden (a swipe shows them transiently). This is both the
+    // space win AND the safe-area fix — hidden bars report zero insets, so the scroll clips that
+    // used to end at the visible gesture-bar line now run to the panel edge. Only the display
+    // cutout stays a real inset. The hide/show itself lives in App.kt (one owner; a per-screen
+    // `onDispose { show }` fired after the stream's hide during the AnimatedContent cross-fade).
 
     // The safe area, in surface pixels: system bars ∪ display cutout — the NP3's landscape punch
     // is a SIDE inset, and the console's chrome must stay clear of it (its backdrop need not).
