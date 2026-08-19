@@ -14,16 +14,19 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ## v0.31.0
 
-90 commits since v0.30.0 (65 non-merge).
+163 commits since v0.30.0 (109 non-merge).
 
-Nothing versioned moves. `WIRE_VERSION` stays **2**, the C ABI stays **24** — `include/punktfunk_core.h`
-is byte-identical to the v0.30.0 tag — the driver protocol, gamepad channel and plugin index schema
-are all unchanged, and no `trust::Settings` field, capability bit or control-message type byte was
-added. Every 0.30.x host, client, driver and plugin keeps interoperating in both directions, with no
-re-pairing.
+One versioned surface moves, additively: the **C ABI goes 24 → 25**, a single new symbol
+(`punktfunk_set_log_callback`) that lets an embedder hear the core's own log lines. Nothing else
+does — `WIRE_VERSION` stays **2**, the driver protocol, gamepad channel and plugin index schema are
+unchanged, and no `trust::Settings` field, capability bit or control-message type byte was added.
+No existing C function changed its signature or behaviour and no `#[repr(C)]` struct grew a field,
+so an embedder that adopts nothing rebuilds against the new header and is done. Every 0.30.x host,
+client, driver and plugin keeps interoperating in both directions, with no re-pairing.
 
-What did move is beneath the versioned surfaces, and three parts of it are worth a packager's or
-embedder's attention: the Linux host package installs **three new system files** (a udev rule, a
+Beneath the versioned surfaces, four things are worth a packager's or embedder's attention: the
+**Windows client's default download changes** to a per-user installer plus a portable zip, with the
+MSIX kept for the Store; the Linux host package installs **three new system files** (a udev rule, a
 WirePlumber policy and an ALSA UCM drop-in) that the DualSense audio path depends on; the Linux
 desktop-audio capture **flipped topology by default** (`PUNKTFUNK_STREAM_SINK` unset now means a
 host-owned `null-audio-sink`, with `=stream` a one-release escape hatch to the 0.30 shape); and the
@@ -35,7 +38,7 @@ three ABIs, which removes the Compose screenshot scenes.
 | | v0.30.0 | v0.31.0 | Notes |
 |---|---|---|---|
 | Wire protocol | 2 | **2** | unchanged |
-| C ABI | 24 | **24** | unchanged — `include/punktfunk_core.h` is byte-identical to the v0.30.0 tag; the only new `pub` items in `punktfunk-core` are three RT-safe DSP helpers (`crossfade_insert`, `pcm::raised_cosine_tail`, `pcm::raised_cosine_head`), Rust-only, no `pub const` for cbindgen to pick up |
+| C ABI | 24 | **25** | one additive step: v25 adds `punktfunk_set_log_callback` and the `PunktfunkLogCb` typedef (below). No existing declaration moved and no struct grew a field. Also new in `punktfunk-core`, Rust-only: three RT-safe DSP helpers (`crossfade_insert`, `pcm::raised_cosine_tail`, `pcm::raised_cosine_head`) |
 | Rust edition | 2024 | **2024** | unchanged |
 | MSRV (`rust-version`) | 1.85 | **1.85** | unchanged |
 | Workspace crate dirs | 27 | **27** | unchanged (39 `[workspace] members`, also unchanged) |
@@ -43,20 +46,39 @@ three ABIs, which removes the Compose screenshot scenes.
 | Windows virtual-gamepad channel | 3 | **3** | unchanged |
 | Plugin index schema | 1 | **1** | unchanged |
 | Host event schema | 1 | **1** | unchanged (`punktfunk-host/src/events.rs`) |
-| `api/openapi.json` | 0.29.0 | **0.29.0** | unchanged — no management-API surface moved this cycle; both copies (`api/` and `docs-site/public/`) are byte-identical to each other and to the tag |
+| `api/openapi.json` | 0.29.0 | **0.31.0** | **the stamp only** — no management-API surface moved this cycle. The file had been left at 0.29.0 while the crate was already 0.31.0; #337's regenerate-and-diff caught it and it was regenerated, which is a one-line change to both copies. `api/` and `docs-site/public/` are byte-identical to each other |
 | gamescope patch level (`+pfhdrN`) | 8 | **8** | unchanged; no new patch files. ⚠ `packaging/gamescope/PKGBUILD` still says `pfhdr7` — pre-existing at v0.30.0, not a regression this cycle, but the Arch package builds a binary the host's `>= 8` probe rejects for the keymap path |
 | `@punktfunk/host` (SDK) | 0.1.4 | **0.1.5** | cut — `sdk/src/config.ts` and `runner-cli.ts` carry the `mgmt-endpoint` fix below, and plugins resolve the SDK from the registry, so it could not reach them until it shipped |
 | `@punktfunk/plugin-kit` | 0.4.2 | **0.4.3** | cut, for the two `sync-engine.ts` changes that cannot reach a plugin any other way: `minInterval` (below) and the always-apply sync reasons (`startup`/`manual` publish even when the fingerprint matches, so a host-side art drop is recoverable by restarting rather than by deleting the plugin's cache). Note the registry skips 0.4.2: `plugin-kit-v0.4.2` was tagged but its publish never landed, and the tag is left where it is rather than moved |
 
 ⚠ The SDK and plugin-kit version independently of the app (`sdk-v*` / `plugin-kit-v*` tags,
-`sdk-publish.yml` / `plugin-kit-publish.yml`); this release commit does not bump them. Both have
-unpublished code changes, called out in the table so they are cut deliberately rather than
-discovered.
+`sdk-publish.yml` / `plugin-kit-publish.yml`), so their rows record what the registry holds, not
+what this tag ships. Both were cut during this cycle rather than left owed — a plugin resolves them
+from the registry, so a fix that never ships there never reaches one.
 
 ### ⚠ Breaking changes
 
-**None on any versioned surface.** No wire change, no C ABI change, no driver-protocol change, no
-plugin-contract change. Four things are worth attention anyway; none breaks a build:
+**None that break a build.** No wire change, no driver-protocol change, no plugin-contract change.
+The C ABI moves 24 → 25 by **addition only**:
+
+- **v25 — `punktfunk_set_log_callback(max_level, cb, user)`.** The core logs through `tracing`; an
+  embedder that installs no Rust subscriber hears none of it — transport warnings, connection events,
+  handshake notes — and a client log bundle carries the shell's half alone, which is exactly what an
+  Apple TV field report turned out to be. The call registers a `log::Log` backend behind a C callback
+  (`PunktfunkLogCb`: level, target, message, user), gated by `log::set_max_level` so anything above
+  the ceiling costs no formatting; `NULL` detaches, and it answers `Unsupported` when another log
+  backend already owns the process (`android_logger`). Both strings are borrowed for the call only,
+  and an interior NUL drops the line rather than truncating it. `punktfunk-core` now declares
+  `tracing`'s `log` feature explicitly — it had been on transitively via quinn, which an ABI promise
+  must not rest on. An embedder that never calls it is byte-compatible with v24; see
+  `docs/embedding-the-c-abi.md` §2.6.
+- **One header comment was wrong and is corrected, with no signature change:**
+  `punktfunk_connect_ex10`'s summary still stated the pre-2026-08-16 rule that only a format other
+  than 48000/16 requests the lossless plane. Any non-zero format at all does, 48000/16 included —
+  which is what its own warning already said and what the code always did. Embedders reading the
+  summary were reading the old rule.
+
+Five more things are worth attention; none breaks a build:
 
 - **`refactor(android)!` — the Compose console is deleted.** `pf-console-ui` (the Skia shell the
   desktop session binary draws) is now Android's console on arm64-v8a, x86_64 **and** armeabi-v7a;
@@ -78,6 +100,11 @@ plugin-contract change. Four things are worth attention anyway; none breaks a bu
   monitors disabled for the session now (closes #284).
 - **Three new system files in the Linux host package** — the DualSense audio path does not work
   without them. Downstream repackagers: see the packaging section.
+- **The Windows client's default download is a per-user installer, not the MSIX.** The MSIX stays,
+  for the Store; the installer and a portable zip are what the download page now offers, and the
+  release carries `punktfunk-client-setup_<arch>.exe` and `..._<arch>-portable.zip` alongside it.
+  Anyone scripting against the MSIX asset name is unaffected; anyone scripting against "the Windows
+  client download" gets a different artifact. See the Windows client section.
 
 ### DualSense audio and haptics on Linux: five faults, and the files they needed
 
@@ -295,6 +322,25 @@ gains two direct deps already in the graph.
   `frameRatePowerSavingsBalanced`) raises the render-range floor — so the ineffective pins were
   removed again and `pf.present` gained the cadence loop's late-permille / jitter / cushion /
   re-anchors / qDepth.
+- **Colour tagging, which the SurfaceView path never had to do.** MediaCodec tags its own window
+  buffers; with `AImageReader` → `ASurfaceControl` the transaction is the only carrier, and a
+  dataspace of 0 means `setBufferDataSpace` is never called. Two consequences, both fixed inside the
+  cycle: **HDR** was seeded from a hardcoded `BT2020_ITU_PQ` guess and then overwritten by whatever
+  the codec echoed on the first output-format change — a decoder that omits color-transfer (common)
+  echoes None, clobbering the dataspace to 0 before the first present, so P010 buffers composited as
+  sRGB, and an HLG stream was mis-seeded PQ. The initial dataspace now derives from `client.color`
+  (PQ vs HLG, range) and a format change only *refines* it when the codec actually reports an HDR
+  transfer, never resets it — the SurfaceView path's semantics. And **SDR** was untagged entirely:
+  a limited-range BT.709 buffer read as full range shows black (16) as grey, so SDR now maps to
+  `ADATASPACE_BT709` and every ASC buffer is tagged.
+- **One owner for the system bars.** Console → stream rides an `AnimatedContent` cross-fade, so the
+  outgoing console shell stays composed until the fade ends and its
+  `onDispose { show(systemBars()) }` fired *after* `StreamScreen`'s hide — parking the status and
+  gesture bars over the video for the whole session. Hide/show now lives once in `App.kt`, keyed on
+  the resolved intent (streaming or console fronting = immersive, touch shell = bars back), and both
+  screens' per-screen bar management is deleted.
+- **Idle gates** (from the console-ui sweep): the reachability sweep only probes while the console is
+  attached, and the render thread drops to half rate after 60 s without input.
 
 ### Hyprland / sway: `topology: exclusive` (closes #284)
 
@@ -314,20 +360,92 @@ with non-legacy parsers"). `primary` stays extend and warns distinctly. ⚠ **Th
 exercised on a live sway** — no box in the fleet runs one; both argv shapes are pinned by tests and
 the read-back turns a wrong guess into a warning naming the outputs. Six new unit tests.
 
-### Gaming Mode takeover: the mask was the relogin storm
+### Gaming Mode takeover: it no longer touches the display manager at all
 
-On an SDDM-autologin box the runtime mask the takeover laid sat in SDDM's relogin path, so every
-autologin failed in milliseconds and `Relogin=true` has no backoff: 962 logind sessions in 3.7 min,
-system buttons re-scanned 5,688×, udev `change` at ~20/s, iio-sensor-proxy crash-looping ~16
-starts/s, load 26 on 12 cores — and Wine's bus driver, re-enumerating udev per event, read the pad at
-~1.4 Hz. `dm_plan` loses its `mask` input and `dm_survives_masked_unit`; the mask is laid **only after
-the stop has landed** and every restore path unmasks before restarting; a planned DM stop that does
-not land now **fails the takeover** and the caller degrades to ATTACH. `skip` is `!any_live` on every
-flavor; `any_live` now counts `deactivating` and `reloading`. New `DmHelperError::shape()`;
-`watch_for_relogin_storm()` (two `read_dir`s of `/run/systemd/sessions` 5 s apart, ERROR above 1/s,
-detect-only); `systemctl_system` captures stderr at DEBUG (the "requires interactive authentication"
-line was going to the journal on the *successful* path). `cargo test -p pf-vdisplay --lib gamescope`
-52 passed, 1 ignored.
+This landed in two steps within the cycle, and the second retired the first — read the end state.
+
+**The storm.** On an SDDM-autologin box the runtime mask the takeover laid sat in SDDM's relogin
+path, so every autologin failed in milliseconds and `Relogin=true` has no backoff: 962 logind
+sessions in 3.7 min, system buttons re-scanned 5,688×, udev `change` at ~20/s, iio-sensor-proxy
+crash-looping ~16 starts/s, load 26 on 12 cores — and Wine's bus driver, re-enumerating udev per
+event, read the pad at ~1.4 Hz. Masking without stopping the display manager is not a weaker
+defence; it is the storm's engine.
+
+**Then stopping the DM proved wrong too.** With no display manager there is nothing on the box able
+to start a desktop session, so Steam's own "Switch to Desktop" sat on its modal until a reboot
+(field report 2026-08-18, `.41`). It could not even be detected and worked around: on a
+steamos-manager box every trace of that switch is written by the component we had just stopped —
+the `~/.config/steamos-session-select` sentinel is never written (that is the ChimeraOS/Nobara
+layout), `/var/lib/sddm/state.conf` only advances when sddm actually *starts* a session,
+`get-default-login-mode` stays `game` for a non-persistent switch, and `graphical-session.target`
+going inactive fires at takeover time as well.
+
+**End state: idle the autologin, leave the display manager alone.** The takeover drops a unit
+override over the `gamescope-session-plus@` template replacing `ExecStart` with a process that
+sleeps. The autologin still *succeeds*, so there is no failed unit to relogin against; the session
+runs nothing, so Steam is free; and the DM is alive, so the box can service its own session switch.
+No privilege, no DM-flavour matrix, no detection. Measured on `.41` in both directions: takeover
+leaves `steam` down, `sddm` active, the unit `active (running)` with `NRestarts=0`; the switch that
+used to hang brings Plasma up in ~10 s; the restore puts Steam back within 5 s. The drop-in lives
+under `$XDG_RUNTIME_DIR` (a copy outliving the host would be a box whose Game Mode silently does
+nothing), is swept unconditionally at startup, and its removal sits above every early return in the
+restore — the desktop-active return is exactly the path that would leak it. The restore *restarts*
+rather than starts, because `start` on an active-but-idle unit is a no-op that would log success
+over it.
+
+With nothing stopping a display manager any more, the whole chain built to survive doing so is
+deleted: `try_stop_display_manager`, `ensure_host_survives_dm_stop`, `host_is_under_user_manager`,
+`cgroup_under_user_manager`, `linger_enabled` and `dm_plan`'s mask input — 142 lines out, 17 in.
+**Two shipped facts became false and are corrected:** the takeover no longer has to stop the display
+manager, and it no longer needs the `punktfunk` group (the docs and the shipped Bazzite `host.env`
+both said it did). That group still gates the usbip nodes the virtual Steam Deck pad attaches
+through, which is what the advice now narrows to. Kept from the first step: `any_live` counts
+`deactivating` and `reloading` (a unit mid-teardown used to read as a dead leftover, so a box that
+*is* in gaming mode sampled as idle); `DmHelperError::shape()`; `watch_for_relogin_storm()` (two
+`read_dir`s of `/run/systemd/sessions` 5 s apart, ERROR above 1/s, detect-only, and it states that
+no audio, input or PipeWire measurement taken during a storm is valid); and `systemctl_system`
+capturing stderr at DEBUG, since that verb is *expected* to fail on an unprivileged host and its
+"requires interactive authentication" line was going to the journal on the successful path.
+
+### KWin 6.6 creates our virtual output disabled, and refuses to stream it
+
+On KWin ≥ 6.6 `streamVirtualOutput` creates the output on the backend and then hands
+`workspace()->findOutput(output)` to the stream — null for an output the workspace does not manage
+(`wantsToManage` = `isEnabled() && !isNonDesktop()`). An output KWin creates **disabled** is
+therefore refused with "Could not find output", translated into the session's language and logged
+nowhere, because disabling an output is a perfectly valid configuration that applies successfully.
+6.4/6.5 passed the backend output straight through and streamed it either way. It repeats forever:
+the host asks for a *stable* per-client output name precisely so KWin persists that client's scale
+and mode against it, so a stored configuration naming it `enabled: false` is reapplied to every
+future session for that client — and the user cannot fix it in System Settings, because the output
+only exists for the few milliseconds the request is alive. The host now enables the output and
+retries. Related, from the same investigation: a **translated** KWin refusal used to burn all 8
+retries because the match was against KWin's message rather than our own prefix.
+
+### Windows client: a per-user installer and a portable zip, because Steam must spawn the exe
+
+A user report — launching through Big Picture does not work and the Steam overlay never appears —
+turned out to be nothing to do with the app being UWP (it is full-trust Win32 under MSIX too) and
+everything to do with the MSIX install **shape**: the exe lives under the ACL'd `WindowsApps`
+directory that Steam's non-Steam-game picker cannot browse, and alias / `shell:AppsFolder`
+activation defeats the overlay's injection. Steam has to spawn the exe itself, from a normal path.
+
+- **`punktfunk-client.iss`** — a per-user Inno Setup install (no UAC) to
+  `%LOCALAPPDATA%\Programs\Punktfunk`, re-creating in `HKCU` what the MSIX manifest granted: the
+  `punktfunk://` scheme, the Start entries, and `{app}` on the user PATH for the `punktfunk` CLI. It
+  fetches the Windows App Runtime when missing.
+- **`pack-client-installer.ps1`** consumes `pack-msix.ps1`'s layout (one assembly, three artifacts),
+  signs the four exes individually and emits `setup.exe` plus a portable zip — same signing backends
+  and fail-closed-on-tags rule as its siblings, and no `.cer`, because an exe runs untrusted.
+- **`windows-client.yml`** packs after the MSIX and publishes/attaches the new artifacts;
+  canary/latest aliases are `punktfunk-client-setup_<arch>.exe` and `..._<arch>-portable.zip`.
+- **`deeplink.rs`**: `write_shortcut` targets the app-execution alias only under package identity —
+  an unpackaged install has no alias but does have a stable path, so it targets `current_exe()`.
+  `has_package_identity()` is now shared with `main.rs`'s AppUserModelID probe.
+- Uninstall is `Settings → Apps → Installed apps` (per-user, no admin prompt) or
+  `unins000.exe /VERYSILENT`; a portable unzip registers nothing and is deleted by hand. Documented
+  in install-client (with a "Launching through Steam" section), channels, clients, uninstall, and
+  both copies of `platforms.json`.
 
 ### Windows host: two session-killers
 
@@ -350,6 +468,74 @@ line was going to the journal on the *successful* path). `cargo test -p pf-vdisp
   bare child or pid whatever the spec holds; giving up on tracking lands on `GameState::Untracked`
   instead of `launching` forever. Fixture in `a_pid_only_launch_reports_its_exit` widened 4 → 8 s
   (it passed only because of the bug); new ignored test drives the field report.
+
+### `scripts/install.sh`: a guided Linux host install (preview)
+
+Plain POSIX `sh`, dash-clean, `curl -fsSL https://punktfunk.unom.io/install.sh | sh`. Detect the
+distro from os-release (apt / dnf / pacman / rpm-ostree→sysext; NixOS, SteamOS, Windows and unknown
+distros get a one-line pointer and stop; Debian 12 / Ubuntu 24.04 / Mint 22 / Fedora 45 hit the
+documented floors with the right docs link) → install using the `data/platforms.json` lines
+**verbatim** (channel and the Fedora group are edited into the string at run time) → run
+`punktfunk-host detect-conflicts` (exit 1 = an active Sunshine-family host) → offer to keep both by
+moving the management API port (`PUNKTFUNK_MGMT_BIND`, default 47991, which the firewall step then
+opens) → input group (`ujust` on Bazzite) → optional `punktfunk` group, GameStream compat and shared
+clipboard, all defaulting to no → firewalld/ufw profiles → enable host + console (+ the plugin
+runner where it is not) → optional linger → verify (unit active, UDP 9777 bound) and print the
+console URL, the password command and the pairing steps.
+
+`--dry-run` prints every command and changes nothing; `--uninstall` reverses the install and the
+service enable per family (user units off first, then only the punktfunk packages actually
+installed, then the repo — config, groups and firewall stay, as `/docs/uninstall` states). Every
+prompt has a `PUNKTFUNK_INSTALL_*` environment twin so `--yes` (or no terminal) runs unattended, and
+stdin is never read, because under `curl | sh` stdin *is* the script. Re-running is safe. The
+end-of-run check catches the two NVIDIA silent failures on every family — no driver at all, and a
+module the kernel refused to load under Secure Boot — via an `nvidia-smi` probe pointing at the
+troubleshooting anchor.
+
+It is labelled **PREVIEW** on purpose: the per-distro docs pages remain the documented default until
+it has mileage. CI runs it: a new `installer-smoke.yml` exercises install and `--uninstall` per
+package family, and `check-docs-drift.sh` gate 7 runs the 16-file os-release detection matrix
+through the real script under `--dry-run` on every push. One bug fixed by the first smoke run: the
+`/dev/tty` probe used `-r`/`-w`, which answer yes in a container that has the node but no
+controlling terminal, so the redirect failed — it opens the device instead now.
+
+### One home per fact: `data/platforms.json`, and CI gates against drift
+
+Install commands, repo URLs and port numbers had drifted across four surfaces. They now live in
+`data/platforms.json` and nowhere else: the docs-site install pages quote it through an
+`<Install platform="…"/>` MDX component reading a byte-identical snapshot at
+`docs-site/src/data/platforms.json` (the Docker build context is `docs-site/` alone, the same
+arrangement `openapi.json` uses), `<Ports/>` renders the port table from it, the website download
+page vendors it, and `install.sh` runs it. `scripts/ci/check-docs-drift.sh` gates the parse, the
+snapshot sync, undocumented `PUNKTFUNK_*` knobs (against a checked-in baseline) and the detection
+matrix; `check-docs-links.sh` covers dead links.
+
+⚠ **Two consequences for whoever cuts this release.** The website vendors `platforms.json` and only
+refreshes when someone runs `bun run sync-platforms` in punktfunk-website and commits — the release
+flow in `docs/releases/README.md` gained that step, and `platforms.json` **did** change this cycle
+(the Windows client download). And the `.gitea/PULL_REQUEST_TEMPLATE.md` now asks the one question
+CI cannot: did a user-facing fact change, and is the page that owns it updated in the same PR.
+
+### Clients can send their logs to the host, on every platform that has a console
+
+0.30 shipped "Send logs to host" on the Gaming Mode console alone and named the Apple and Android
+legs as follow-ups. Both landed here.
+
+- **Apple** — a `ClientLog` drop-in for `Logger(subsystem: "io.unom.punktfunk", category:)` with the
+  same call shape, writing os_log *and* a process-global ring bounded at 4096 lines / 768 KiB (under
+  the host's 1 MiB cap), stamped wall-clock ISO-8601 so a bundle lines up with the host log;
+  `.debug` stays out of the ring, which is the Steam Deck DPB lesson applied in advance. 13 `Logger`
+  declarations swapped. `MgmtTransport`/`MgmtConnection` POST a length-framed body on the same
+  pooled, pinned mTLS connection; `SendLogs.toHost` requires identity and pinned fingerprint, the
+  same gates as the library. Reachable from the host card's context menu and the gamepad host
+  options. Paired with ABI v25 above, the Swift client finally hears the core's own lines too
+  (`core.<crate>`, info ceiling by default, `PUNKTFUNK_CORE_LOG_LEVEL` raises it).
+- **Android** — `pf-client-core`'s logring RING half (note/render/wallclock, std-only) is
+  Android-enabled, with `send_to_host` still desktop-gated alongside the ureq fetches; `wallclock`
+  moves in from the session's ring layer so every feeder stamps lines identically. `JNI_OnLoad`
+  installs a `RingTee`, so every `log` record goes to logcat **and** into the ring in the desktop
+  ring layer's line shape; `nativeRenderLogs(header)` hands Kotlin the rendered bundle, and the
+  upload rides the client's own mTLS.
 
 ### Everything else an integrator might notice
 
@@ -402,8 +588,57 @@ line was going to the journal on the *successful* path). `cargo test -p pf-vdisp
   (screenshot harness only).
 - **New environment variables:** `PUNKTFUNK_PAD_SINK_VOLUME` (`=0` skips both pad-sink pins),
   `PUNKTFUNK_DUALSENSE_USBIP_GRACE_MS` (pad-arrival grace), `PUNKTFUNK_USBIP_TRACE` (byte-level
-  USB/IP trace prefix, off by default), and the three Apple screenshot-harness hooks above.
+  USB/IP trace prefix, off by default), `PUNKTFUNK_CORE_LOG_LEVEL` (Apple: raises the ABI v25 log
+  sink's ceiling above its info default), the three Apple screenshot-harness hooks above, and nine
+  `PUNKTFUNK_INSTALL_*` twins for `install.sh`'s prompts (`_YES`, `_CHANNEL`, `_GAMESTREAM`,
+  `_CLIPBOARD`, `_PUNKTFUNK_GROUP`, `_LINGER`, `_MGMT_PORT`, `_DRY_RUN`, `_OS_RELEASE`).
   `PUNKTFUNK_STREAM_SINK` gained the `stream` value and is documented for the first time.
+- **A Steam Deck never learned a host's wake MAC, so Wake-on-LAN was skipped there in silence.**
+  Every wake gate reads `!host.mac.is_empty()`, and the MAC only ever reached the store through
+  `trust::learn_mac`, whose two callers were the GTK and WinUI hosts pages — neither of which runs
+  in Gaming Mode. Rather than add the missing call twice, the three per-field learners (`learn_mac`,
+  `learn_os`, `learn_mgmt_port`) collapse into one `learn_from_advert`, called wherever an advert
+  meets a saved record: both desktop hosts pages, the console home, and the CLI's `discover`.
+  Remembering one call is not something a front-end can half-do; remembering three is what produced
+  this (#322).
+- **`HostRow` gains `clipboard_sync`** (`#[serde(default)]`) and `ConsoleCmd` two variants,
+  `BindProfile` and `SetClipboard` — additive and default-tolerant. From the 2026-08-19 console-ui
+  sweep, which also brought touch deferred-tap and drag-to-scroll to the console (a swipe across the
+  settings list used to cycle whatever value it landed on, because `MenuList` presses focus *and*
+  activate), Controller haptics/speaker rows, and two Android idle gates (the reachability sweep
+  only probes while the console is attached, and the render thread halves its rate after 60 s
+  without input).
+- **Cancelling a connect returns the console immediately.** The takeover could only be dismissed by
+  a session phase coming back from the embedder and nothing guaranteed one would: Android's shell
+  sent no phase at all on the cancelled path, and the desktop shell waited on a pump parked inside
+  the blocking `NativeClient::connect*`, which had no abort — 15 s on a normal dial, **185 s** on a
+  request-access connect the host holds pending approval. The private `connect_*` inner fn takes a
+  trailing `cancel: Option<Arc<AtomicBool>>`; not exported through the C ABI.
+- **A portable Playnite's covers survive the art confinement.** A Playnite unzipped outside the
+  users base keeps its library beside the exe, so every cover it exports sits outside every default
+  art root: the games synced and all **70** covers were dropped, with `PUNKTFUNK_LIBRARY_ART_ROOTS`
+  the only way out. The Playnite install dirs are art roots now, exactly as Steam's install root
+  already was, and `playnite_install_dirs` learned to find a portable copy at all — it registers no
+  uninstall entry and sits under no profile, but it does register the `playnite://` handler, which
+  is the very registration the launch path already follows. So a portable install also gets its
+  Fullscreen launcher tile, which it never had. The confinement is not loosened: roots come from the
+  host's own registry and filesystem probes, never from the plugin lane that supplies the art path.
+  Paired with the plugin-kit fix below, a fixed host no longer needs a cache file deleted.
+- **`plugin-kit`: `startup` and `manual` sync reasons always publish.** The fingerprint says the
+  plugin would compute the same entries again; it does *not* say the host still holds them — and the
+  host may accept a payload and store less of it (an art path outside its roots is stripped and the
+  games kept, deliberately, because a cover must not cost a library). Once that happened the
+  fingerprint was a permanent "no changes", and the only way out was deleting the plugin's cache
+  file, which is exactly the advice a portable-Playnite library with 70 dropped covers was given.
+  The two triggers with a person behind them now always apply.
+- **Nix:** nixpkgs bumped because its gamescope 3.16.24 no longer took our patch 0009 (the publish
+  tier was red on every build); `enableWsi` is a nixpkgs *function argument* defaulting to false, so
+  the plain derivation shipped a compositor with **no WSI layer at all** and nothing under it could
+  obtain an HDR10 swapchain — our own postInstall assertion caught it. Also: the prune makes `$out`
+  writable first (reshade installs read-only), the bun builds are serialised and the OOM is measured
+  against the real 7 GiB cgroup cap rather than guessed at, and a dispatch opt-in compared against
+  the string `"true"` silently skipped when the API delivered a real JSON boolean — the step was
+  skipped and the job still reported success.
 - **New packaging payload (Linux host, rpm/deb/arch; nix where noted):** `scripts/60-punktfunk.rules`
   (+2 sound rules), `scripts/60-punktfunk-dualsense.conf` (WirePlumber, also nix),
   `scripts/alsa-ucm2/…` (UCM drop-in, **not** nix). Bazzite sysext inherits all three from the RPMs.
@@ -415,31 +650,49 @@ line was going to the journal on the *successful* path). `cargo test -p pf-vdisp
 ### Verification status
 
 Gates run on the release tree (this MacBook, rustc/rustfmt 1.96.0 per `rust-toolchain.toml`):
-`cargo fmt --all --check` clean — **after** a whitespace-only commit on the release branch: two files
-(`pf-console-ui/src/screens/controllers.rs`, `punktfunk-host/src/audio/linux/pad_card_volume.rs`)
-had landed on main formatted differently from rustfmt 1.96.0, so `ci.yml`'s Format step was red on
-the tip this is cut from; `cargo metadata --offline` ok with the `Cargo.lock` diff versions-only
-(36/36 lines); `cargo test -p punktfunk-core` **272 passed** in the unit suite; the android.yml Play
-notes gate run verbatim — 498/500 characters and not byte-identical to any prior release's; both
-openapi copies `cmp` identical and unchanged since the tag; `include/punktfunk_core.h` regenerated
-by the build and `git diff` clean against the tag.
+`cargo fmt --all --check` clean; `cargo metadata --offline` ok with the `Cargo.lock` diff
+versions-only (36/36 lines); `cargo test -p punktfunk-core --lib` **273 passed**; the android.yml
+Play notes gate run verbatim — 456/500 characters and not byte-identical to any prior release's;
+both openapi copies `cmp` identical, both stamped 0.31.0; notes voice scan clean outside the
+For developers section.
 
-⚠ **The C ABI harness (`tests/c_abi.rs`) did not run on this cut**: it links the staticlib with
-`-lopus` and this machine has no libopus (`ld: library 'opus' not found`), which is an environment
-gap, not a code fault. The header it exercises is byte-identical to v0.30.0's, where the harness
-passed (261 + 1 + 8), and nothing in `punktfunk-core`'s C surface changed. The CI runner is its
-first execution for this tag.
+⚠ **This release was cut twice.** The first cut (`601f040f`, merged as #320) was never tagged, and
+41 more non-merge commits landed on top of it — the Windows client installer, the guided Linux
+installer, the docs overhaul, ABI v25, the KWin 6.6 repair and the takeover's final shape among
+them. This section, the version table and the notes are all re-measured on the second tip; where
+the two cuts disagreed, the earlier text was **rewritten rather than appended to**, because none of
+the intervening work ever shipped. Specifically: the "C ABI unchanged / header byte-identical"
+claim is gone (it is 25 now), the openapi row moved off 0.29.0, the SDK and plugin-kit rows record
+cuts that have happened rather than cuts that were owed, and the Gaming Mode takeover section
+describes idling the autologin rather than stopping the display manager — a within-cycle correction
+no user could have seen.
 
-⚠ **Verified by reading only** — compiled nowhere available to the cutting host: the Windows runner
-log redirect (`scripting-run.cmd`), the tray's `Option<u16>` port on Windows, and the sway half of
-`topology: exclusive` (no live sway in the fleet, as with #283).
+⚠ **The C ABI harness (`tests/c_abi.rs`) did not run on this cut**, and this time the header *did*
+change: it links the staticlib with `-lopus` and this machine has no libopus (`ld: library 'opus'
+not found`), which is an environment gap, not a code fault. `punktfunk_set_log_callback` is
+therefore compiled by cbindgen and by the Rust unit tests here, but the generated header has not
+been compiled by a C compiler on this cut — the CI runner is its first. Worth naming because ABI 25
+is the one versioned surface that moved.
+
+⚠ **Verified by reading only** — compiled nowhere available to the cutting host: the Windows client
+installer and portable zip (`punktfunk-client.iss`, `pack-client-installer.ps1` — the pack step is a
+Windows runner's), the Windows runner log redirect (`scripting-run.cmd`), the tray's `Option<u16>`
+port on Windows, and the sway half of `topology: exclusive` (no live sway in the fleet, as with
+#283).
 
 ⚠ **Not verified on hardware by this cut**, named rather than left to be discovered: the null-sink
 capture topology's on-glass validation (pw-top showing our sink at the top of its own group, 5 min
 of loud audio at `delivered_pct=100 gaps=0` on a box where a hardware sink also runs) was still owed
-when it landed; the 96 kbps speaker lane was judged on glass by ear only; and the Android
-`ASurfaceControl` path was verified on one device (Nothing Phone 3) — the fallback presenter is
-byte-for-byte the 0.30 one.
+when it landed; the 96 kbps speaker lane was judged on glass by ear only; the Android
+`ASurfaceControl` path was verified on one device (Nothing Phone 3), with the fallback presenter
+byte-for-byte the 0.30 one; the Mac Accessibility intercept (the tap ahead of Spotlight, inside the
+sandbox) needs a granted Accessibility switch the dev machine does not have; and `install.sh` is
+smoke-tested per package family in CI containers but is shipped **preview** precisely because it has
+no real-box mileage, Bazzite above all.
+
+⚠ **Owed outside this repository:** `data/platforms.json` changed this cycle (the Windows client
+download), and the website's download page vendors a copy that only refreshes when someone runs
+`bun run sync-platforms` in punktfunk-website and commits — step 1 of `docs/releases/README.md`.
 
 ---
 
