@@ -43,11 +43,10 @@ the imported key), the repo-add uses `printf` rather than a heredoc so it works 
 default shell has no `<<EOF`), and Arch is rolling — packages are built against current Arch
 sonames, so the box itself must stay updated.
 
-The repo-add **appends** to `/etc/pacman.conf`, so running it twice leaves two `[punktfunk]`
-blocks and every later pacman run opens with
-`error: could not register 'punktfunk' database (database already registered)`.
-It is harmless — pacman ignores the duplicate and carries on — but to silence it, delete the
-extra block from `/etc/pacman.conf`.
+The repo-add **appends** to `/etc/pacman.conf`; the documented line is guarded with a `grep -q` so a
+second run is a no-op, and the symptom of an unguarded double add (`database already registered`)
+is on the
+[troubleshooting page](https://docs.punktfunk.unom.io/docs/troubleshooting#pacman-error-could-not-register-punktfunk-database-database-already-registered).
 
 Then the same first-run steps as a source build (printed by the install scriptlet): `input`
 group, `host.env`, `systemctl --user enable --now punktfunk-host` — see the next section.

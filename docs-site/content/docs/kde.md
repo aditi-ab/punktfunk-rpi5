@@ -95,9 +95,8 @@ systemctl --user enable --now punktfunk-host
 journalctl --user -u punktfunk-host -f   # watch it come up and print its identity fingerprint
 ```
 
-This unit runs `serve --gamestream`, so it serves stock [Moonlight](/docs/moonlight) clients as well
-as the native ones. For a native-only host, see
-[What the unit starts](/docs/running-as-a-service#what-the-unit-starts).
+This unit runs the secure native-only host; to serve stock [Moonlight](/docs/moonlight) clients as
+well, see [What the unit starts](/docs/running-as-a-service#what-the-unit-starts).
 
 A desktop-login host should also follow your session's lifetime, or restarting Plasma leaves the host
 wired to a compositor that is gone — it keeps answering, and every session after that fails at

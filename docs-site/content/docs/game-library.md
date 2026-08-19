@@ -3,23 +3,22 @@ title: Your game library
 description: How Punktfunk finds your installed games, how to add one by hand, and how to launch a title from a client, from Moonlight, or from the command line.
 ---
 
-Every Punktfunk host keeps one **game library** — a single list of titles that every surface reads
-from. It has two sources: the [plugins](/docs/plugins) you install for the launchers you actually
-use, and entries you add by hand in the [web console](/docs/web-console).
+A Punktfunk host keeps one **game library** that every surface reads from. It has two sources: the
+[plugins](/docs/plugins) you install for the launchers you use, and entries you add by hand in the
+[web console](/docs/web-console).
 
-Whichever source a title came from, it looks the same everywhere: a poster, a name, and a stable id
-like `steam:570` or `custom:9f2a1c…`. Pick one on a client and the host launches it into the stream.
+Whatever its source, a title looks the same everywhere: a poster, a name, and a stable id like
+`steam:570` or `custom:9f2a1c…`. Pick one on a client and the host launches it into the stream.
 
 ## Where your games come from
 
 **Install a plugin for each launcher you want in the library.** A fresh host holds no games until
-you do — go to the console's **Library** page, open **Game sources**, and install the ones you use.
-It takes a click each.
+you do — on the console's **Library** page, open **Game sources** and install the ones you use, a
+click each.
 
-Each plugin reads that launcher's **own local files** on the host. There are no accounts to connect
-and no API keys — nothing leaves the machine to build the list. A launcher that isn't installed
-contributes nothing, so installing a plugin you turn out not to need costs you an empty source and
-nothing else.
+Each plugin reads that launcher's **own local files** on the host — no accounts to connect, no API
+keys, nothing leaves the machine to build the list. A launcher that isn't installed contributes
+nothing, so an unneeded plugin costs you an empty source and nothing else.
 
 | Plugin | Linux host | Windows host | What it reads |
 |---|---|---|---|
@@ -31,31 +30,30 @@ nothing else.
 | **Playnite** | — | ✅ | Your Playnite library, whichever stores it aggregates |
 | **ROM Manager** | ✅ | ✅ | Your ROM folders, matched against a metadata source |
 
-> Through v0.27.x six of these scanners were built into the host itself and ran whether you wanted
-> them or not. From **v0.28.0** they are plugins like any other. If you were already running the
-> plugin for a launcher, nothing changes — the ids, art and app ids are identical by design. If you
-> were relying on the built-in scanner, install that launcher's plugin once and your grid comes back
-> exactly as it was, including anything you had switched off or hidden.
+> Through v0.27.x six of these scanners were built into the host and always on; from **v0.28.0**
+> they are plugins like any other. Already running the plugin for a launcher? Nothing changes — ids,
+> art and app ids are identical by design. Relied on the built-in scanner? Install that launcher's
+> plugin once and your grid comes back exactly as it was, including anything you had switched off or
+> hidden.
 
-A few things are deliberately left out. Steam's tooling — Proton, the Steam Linux Runtimes, Steamworks
-Common Redistributables, SteamVR — is filtered out, so your grid holds games rather than plumbing. A
-non-Steam shortcut you have hidden inside Steam stays hidden here too.
+Deliberately left out: Steam's tooling — Proton, the Steam Linux Runtimes, Steamworks Common
+Redistributables, SteamVR — so your grid holds games rather than plumbing, and any non-Steam
+shortcut you have hidden inside Steam.
 
-To see exactly what the host resolved, run [`punktfunk-host library`](/docs/host-cli) on the host: it
-prints the whole library as JSON. That answers "does the host see my games?" without involving a
-client.
+[`punktfunk-host library`](/docs/host-cli), run on the host, prints the whole library as JSON —
+"does the host see my games?" without involving a client.
 
 ## Turning a source off
 
-The console's **Library** page has a **Game sources** card with one chip per source this host has.
-A chip is highlighted when that source is contributing titles; click it to turn the source off.
+On the console's **Library** page, the **Game sources** card shows one chip per source this host
+has; a highlighted chip is contributing titles, and clicking it turns the source off.
 
-Turning a source off hides its titles from **everywhere at once** — the console grid, every native
-client, the Moonlight app list, and launching. Nothing is deleted and the change needs no restart:
-the plugin keeps its titles, they simply stop being shown, and turning the source back on brings
-them straight back on the next read. (To remove a source's titles for good, uninstall its plugin.)
+That hides its titles **everywhere at once** — the console grid, every native client, the Moonlight
+app list, and launching — with nothing deleted and no restart: the plugin keeps its titles, and
+turning the source back on brings them straight back on the next read. (To remove a source's titles
+for good, uninstall its plugin.)
 
-Your hand-added entries are not a source and have no chip — they are always shown.
+Hand-added entries are not a source and have no chip — they are always shown.
 
 The choice is stored per host in `library-scanners.json`, next to the rest of the host config
 (`~/.config/punktfunk/` on Linux, `%ProgramData%\punktfunk\` on Windows). Only the sources you turned
@@ -64,10 +62,10 @@ The choice is stored per host in `library-scanners.json`, next to the rest of th
 ## Adding a game by hand
 
 Anything your launchers don't know about — an emulator, a ROM, a DRM-free build, a tool you want on
-the couch — goes in by hand. On the console's **Library** page, click **Add custom game**.
+the couch — goes in by hand: on the console's **Library** page, click **Add custom game**.
 
-**Title** is the only required field. **Launch command** is the command the host runs for this title;
-leave it empty and the entry is a poster the host has nothing to launch from.
+**Title** is the only required field. **Launch command** is what the host runs for this title; leave
+it empty and the entry is a poster with nothing to launch.
 
 Under **Details (optional)** a title can carry:
 
@@ -90,8 +88,8 @@ runs, so it is locked down to the host user (0600 on Linux, a SYSTEM+Administrat
 treat what you type there as operator-level configuration.
 
 > **Editing replaces the whole entry.** The console form re-sends every field it knows about, so
-> nothing you can see is lost. Fields the form has no input for — prep/undo steps in particular — are
-> **cleared** when you save an entry through the form.
+> nothing you can see is lost — but fields the form has no input for (prep/undo steps in particular)
+> are **cleared** when you save through the form.
 
 ### Cover art
 
@@ -105,9 +103,9 @@ host can see is fine. A plain Linux path like `/home/me/cover.jpg` is **not** re
 
 Scanned titles need no art. Steam covers come from your local Steam cache, falling back to Steam's
 public CDN. On a Windows host, GOG and Xbox covers are the one thing the library looks up over the
-network: a background pass asks GOG's and Microsoft's public catalogs for them when the host starts,
-and repeats every five minutes for any title it hasn't resolved yet. Neither needs an account or a
-key, the answer is cached on the host, and a lookup that fails just leaves a title-only tile.
+network: a background pass asks GOG's and Microsoft's public catalogs when the host starts and
+repeats every five minutes for any title still unresolved. Neither needs an account or a key, the
+answer is cached on the host, and a failed lookup just leaves a title-only tile.
 
 ## Games from a plugin
 
@@ -116,39 +114,40 @@ Manager and Playnite plugins get your collection into the grid, box art and all.
 
 A library plugin can also publish a **launcher tile** — an entry that opens Steam Big Picture,
 Heroic, Lutris or Playnite itself rather than a game, so you can install or fix something from the
-couch. Clients group those into their own row above your titles, and each one draws its launcher's
-logo. A launcher tile you don't want is a switch in that plugin's settings.
+couch. Clients group those into their own row above your titles, each drawing its launcher's logo.
+A launcher tile you don't want is a switch in that plugin's settings.
 
-Entries a plugin owns are read-only to you. The host refuses a hand edit or a delete of one, because
+Entries a plugin owns are read-only to you. The host refuses a hand edit or delete of one, because
 the next sync would overwrite it anyway — change the title at its source and let the plugin sync
 again. Only the plugin can remove its own entries, and it removes every one of them at once. Your
 hand-added entries are never touched by a sync.
 
 The console grid can't tell you which entries those are: a plugin's titles carry the same **Custom**
-badge as your own and still show **Edit** and **Delete** on hover. The form and the delete
-confirmation open as usual, but the host refuses the change and the entry stays exactly as it was.
+badge as your own and still show **Edit** and **Delete** on hover — the form and the delete
+confirmation open as usual, but the host refuses the change and the entry stays as it was.
 
 ## Launching a game
 
-Whatever the surface, the client sends only an **id**. The host looks that id up in its own library
-and runs what it already knows about the title, so a client can never hand the host a command to run.
+Whatever the surface, the client sends only an **id**. The host looks it up in its own library and
+runs what it already knows about the title, so a client can never hand the host a command to run.
 
-- **Native clients** — the browser needs a **paired** host, and that is the only condition: a paired
-  host's card offers **Browse library…** (**Browse Library…** on Apple) with nothing to switch on
-  first. Pick a title and the stream starts with the host launching it. The Apple and Android apps
+- **Native clients** — a **paired** host's card offers **Browse library…** (**Browse Library…** on
+  Apple) with nothing to switch on first; pairing is the only condition. Pick a title and the stream
+  starts with the host launching it. The Apple and Android apps
   keep a **Show game library** switch, on by default, for turning it off. See
   [Client settings](/docs/client-settings).
 - **Android** — the library lives only in the controller-optimized home, which a TV always uses and a
   phone or tablet switches to when a controller is connected. Press **Y** on a saved host, or open its
   options and choose **Library**.
 - **Steam Deck (Decky)** — the panel is a launcher and browses nothing itself: tap **Open
-  Punktfunk**, which opens the client's console home, and a paired host's **Library** button is
-  right there — full-screen covers, gamepad-navigable, and a press starts the stream with the title
-  launching. See [Steam Deck](/docs/steam-deck).
-- **Moonlight** — when the host runs with `--gamestream`, your library appears in Moonlight's app
-  list beside `Desktop`, with covers served by the host. A title keeps the same app id across host
-  restarts, so Moonlight's cached tiles stay correct. Titles with no launch recipe are left out.
-  See [Moonlight](/docs/moonlight).
+  Punktfunk**, which opens the client's console home, where a paired host's **Library** button is —
+  full-screen covers, gamepad-navigable, and a press starts the stream with the title launching. See
+  [Steam Deck](/docs/steam-deck).
+- **Moonlight** — when the host runs GameStream compat (opt-in: `PUNKTFUNK_GAMESTREAM=1` in
+  `host.env`, or `serve --gamestream` — see [Moonlight](/docs/moonlight)), your library appears in
+  Moonlight's app list beside `Desktop`, with covers served by the host. A title keeps the same app id
+  across host restarts, so Moonlight's cached tiles stay correct. Titles with no launch recipe are
+  left out.
 - **A link** — a [`punktfunk://` link](/docs/profiles-and-links) carries the id in a `launch=`
   parameter, so a desktop shortcut, a browser bookmark or a home-automation rule starts the stream
   with the title already launching: `punktfunk://connect/couch-pc?launch=steam:570`. On the Apple

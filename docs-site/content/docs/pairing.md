@@ -1,165 +1,65 @@
 ---
 title: Pairing & Trust
-description: How a client and host establish trust — PIN pairing once, pinned reconnects after.
+description: Admit a new device once — approve it from the web console or type a PIN — and it reconnects on its own from then on.
 ---
 
-Punktfunk has no accounts and no cloud. Trust is established directly between a client and a host,
-on your network, with a one-time pairing — either an **approval click in the host's
-[web console](/docs/web-console)** or a **PIN ceremony**. After that, the device reconnects
-automatically on a pinned cryptographic identity.
+Punktfunk has no accounts and no cloud. A new device is let in **once**, by you, on your network;
+after that it reconnects automatically on a pinned identity, and the host lists it until you remove
+it. There are two ways to let a device in.
 
-## How it works
+## Approve it from the console (no PIN)
 
-- Each host has a stable **identity** (a certificate). Clients remember its fingerprint, so they know
-  they're talking to the same host next time.
-- The first time a client connects, you **pair** it: with the native protocol the **host** shows a
-  short **4-digit PIN** and you type it into the client. (With Moonlight it runs the other way round
-  — Moonlight shows the PIN and you type it into the host's console.) Either way a secure exchange
-  (SPAKE2) binds the two identities, and an attacker who doesn't know the PIN gets a single online
-  guess — no offline cracking.
-- After pairing, the host stores the client's identity in its allow-list, and the client stores the
-  host's fingerprint. Reconnects are automatic — no PIN. Having seen the host on your network while
-  it was awake also teaches the client its MAC address, so a later connect can
-  [wake it from sleep](/docs/wake-on-lan).
+The fastest way: just **connect** from the new device. The attempt shows up in the
+[web console](/docs/web-console) under **Pairing → Waiting for approval**, with the device's name
+and fingerprint. Click **Approve** — optionally give it a label like "Living Room TV" — and it's
+paired on the spot; its next connect goes straight through.
 
-## Approving a device from the console (no PIN)
+**Deny** only dismisses the request (it can knock again; it isn't a blocklist). Requests expire on
+their own after 10 minutes.
 
-The fastest way to admit a new device: just **try to connect** from it. On a pairing-required host,
-the attempt shows up in the web console's Pairing page under **Waiting for approval** — with the
-device's name and identity fingerprint. Click **Approve** (and optionally give it a label like
-"Living Room TV"), and the device is paired on the spot: its next connect goes straight through. No
-PIN to read or type.
+## Pair with a PIN
 
-**Deny** just dismisses the request (the device can knock again later — it's "not now", not a
-blocklist). Requests expire on their own after **10 minutes**.
+When you're at the device and the console isn't handy, or for the very first device: in the console
+open **Pairing** and click **Pair a device**. The host shows a **4-digit PIN** and counts down a
+2-minute window — type the PIN into the client:
 
-This works because approval happens on the host's authenticated management surface — only someone
-with console access can admit a device.
+- **Native apps (Apple, Linux, Windows, Android):** select the host, or *Pair with PIN…* from its
+  menu, and enter it.
+- **Steam Deck (Decky plugin):** pick the host in the Quick Access panel — an unpaired one offers
+  **Request access** (the console approval above) or **Use a PIN instead**.
+- **Moonlight:** it runs the other way round — Moonlight shows a PIN, and you type it into the
+  console's **Moonlight (GameStream) pairing** card. Arming doesn't apply. (Moonlight needs
+  [GameStream compat on](/docs/moonlight) first.)
+
+If the window lapses, arm it again. A `punktfunk://` link can't pair for you — it only starts a
+stream on a host this device already trusts.
 
 ## Choosing access when you admit a device
 
-Admitting a device and deciding what it may do are **one dialog**, not two trips. The Approve
-dialog carries, alongside the device's name:
+Approving and deciding what the device may do are one dialog. Alongside the name:
 
-- **Access level** — **Full control**, **Controller only**, or **View only**, with an **Advanced**
-  expander for the individual toggles. See [Access levels](/docs/access-levels) for exactly what
-  each covers.
-- **Expires** — **Forever**, or **1 h / 4 h / 8 h / custom**.
+- **Access level** — **Full control**, **Controller only**, or **View only** (an **Advanced**
+  expander has the individual toggles — [Access levels](/docs/access-levels)).
+- **Expires** — **Forever**, or 1 h / 4 h / 8 h / custom.
 
-The defaults are **Full control · Forever** — approving your *own* new laptop is the common case,
-and it should behave like pairing always has. The guest case gets its own button instead: a
-distinct secondary action, **"Approve as guest"**, admits the device as **Controller only for
-4 hours** in one click. The whole co-play flow is: your friend installs a client, connects, the
-knock appears in your console, you tap **Approve as guest** — and their pad lights up as
-controller #2. When the evening's over, the access expires on its own.
-
-The same two controls appear on the **arm pairing** card for the PIN path: whatever access and
-expiry you choose while arming applies to whichever device completes the PIN ceremony in that
-window.
-
-Everything here can be changed later from the Paired devices table — see
-[Managing paired devices](#managing-paired-devices) below.
-
-## Pairing with a PIN
-
-PIN pairing is the **default and required** path for any new host: unless the host has explicitly
-opted into trust-on-first-use (see below), a client connecting to an unknown host must complete the
-PIN ceremony — or be approved from the console, as above — before it can stream. It's the right path
-for the *first* device (before the console has admitted anything) or when you're at the client and
-the console isn't handy.
-
-Pairing has to be **armed** on the host before a client can pair (so a random device can't pair
-itself). On the production host (`serve`), this is done from the **web console**: open the
-host's management console, click to arm pairing, and the host displays a 4-digit PIN along with the
-list of paired devices. This works on a headless host over the network — there is no command-line flag
-to arm pairing on `serve`.
-
-The armed window lasts **2 minutes** — the console counts it down under the PIN and offers a
-**Cancel** button. Arm it once you're standing at the device; if it lapses, just arm it again.
-
-Pairing from the console needs the console running. On Linux that's the separate `punktfunk-web`
-systemd user unit, which you enable once — see [The Web Console](/docs/web-console).
-
-Then, on the client:
-
-- **[Native clients](/docs/clients) (Apple, Linux, Windows, Android):** select the host (or use
-  *Pair with PIN…* from its menu) and enter the PIN the host displays.
-- **[Steam Deck](/docs/steam-deck) (the Decky plugin):** open Punktfunk from the Quick Access menu
-  and pick the host — an unpaired one opens a sheet offering **Request access** (no PIN: somebody
-  approves the Deck at the host) or **Use a PIN instead**, which opens the 4-digit pad.
-- **[Moonlight](/docs/moonlight):** choose **Pair**; Moonlight shows a 4-digit PIN, and you type
-  that PIN into the console's **Moonlight (GameStream) pairing** card and press **Submit PIN**.
-  (This direction is the reverse of the native flow, and arming doesn't apply to it.)
-
-A link can't stand in for any of this. A
-[`punktfunk://` link](/docs/profiles-and-links#what-a-link-can-and-cant-do) starts a stream on a
-host this device already trusts; `punktfunk://pair/…` is refused outright, and a link naming a host
-you've never paired with can at most open the app's own trust prompt.
-
-### Pairing from a terminal
-
-On Linux the client package also installs `punktfunk`, a headless CLI. Arm pairing in the console,
-read the PIN, then run:
-
-```sh
-punktfunk pair 192.168.1.50 --pin 1234 --name "Living Room"
-```
-
-It prints `paired <addr>:<port> fp=<fingerprint>` and saves the host in the same store the desktop
-client uses, so later connects are silent. `--name` is the label the host files this device under
-(default: this machine's name), and the port defaults to **9777** — write `host:port` to use another
-one. Without `--pin` the command asks for one; in a script with no terminal it exits **6** rather
-than hanging, and exit **3** means the host refused or the PIN was wrong.
-
-The GTK client can do the same thing without opening a window:
-
-```sh
-punktfunk-client --connect 192.168.1.50:9777 --pair 1234 --name "Living Room"
-```
-
-## Requiring pairing (the default)
-
-By default, the native host **requires** pairing — only devices that have paired can stream. This is
-the right setting on a shared network: a device has to complete the PIN ceremony once before it can
-connect.
-
-If you're on a fully trusted single-user network and want to skip pairing, run the host open with
-`serve --open` — it then advertises `pair=optional` and accepts unpaired clients. Requiring pairing
-is strongly recommended.
-
-## Trust-on-first-use (host opt-in)
-
-Trust-on-first-use (TOFU) is **off by default** and is an explicit *host* opt-in for fully trusted
-networks. A host enables it by running open — `serve --open` — which makes it advertise
-`pair=optional` over mDNS and accept unpaired clients. Only then does a client offer the
-TOFU path: connecting to such a host for the first time shows the host's fingerprint and asks you to
-confirm it (compare it with the one the host logged at startup), then pins it. The client presents
-this clearly as the reduced-security option, alongside **Pair with PIN**.
-
-> **Warning:** TOFU cannot detect an impostor on the first connection — if someone is impersonating
-> the host the very first time you connect, you'll pin the attacker's fingerprint. PIN pairing closes
-> that gap (the SPAKE2 ceremony binds both identities), which is why it's the default. Use TOFU only
-> on a network you fully trust — see [Security & Safe Use](/docs/security).
-
-For every other case — a host advertising `pair=required` (the default), a host you typed in by hand,
-or a discovered host whose pair policy is unknown — TOFU is not offered and the client routes straight
-to the PIN ceremony.
-
-Once a host is pinned, a fingerprint change is treated as the impostor signal: the client forces
-re-pairing through the PIN ceremony rather than offering to re-trust the new identity.
+Defaults are *Full control · Forever* — right for your own new laptop. For a friend's device there
+is a one-click **Approve as guest**: Controller only, for 4 hours, then it expires on its own. The
+same two controls sit on the **Pair a device** card, and apply to whichever device completes the PIN.
 
 ## Managing paired devices
 
-The [web console](/docs/web-console) lists every paired device and lets you remove one (revoking its
-access). Each row also shows the device's **Access** — the preset and, for temporary grants, a live
-countdown ("Controller · 2 h left") — and an edit sheet to change the level, extend or cut the
-expiry, or expire it right now; edits reach a live session immediately. See
-[Access levels](/docs/access-levels). Re-pairing is just the PIN ceremony again — and it keeps the
-device's existing access rather than widening it.
+The console lists every paired device with its access (and a live countdown for temporary grants).
+From there you can change the level, extend or cut the expiry, or **remove** the device — removing
+revokes it immediately, even mid-session. Re-pairing a removed device is just the PIN ceremony again.
 
-If a client can't pair at all, see [Troubleshooting → Pairing is
-rejected](/docs/troubleshooting#pairing-is-rejected--the-client-cant-connect).
+Can't pair at all? [Troubleshooting → Pairing is rejected](/docs/troubleshooting#pairing-is-rejected--the-client-cant-connect).
 
-(There is also a developer/measurement host, `punktfunk-host punktfunk1-host` — a subcommand of the
-same binary, not the host you install. It has its own `--allow-tofu` / `--pairing-pin` flags for test
-harnesses; nothing on this page applies to it.)
+## How it works, briefly
+
+Each host has a stable identity (a certificate); clients pin its fingerprint, the host stores the
+client's. The PIN ceremony is SPAKE2, so someone who doesn't know the PIN gets one online guess and
+no offline attack. A host whose fingerprint changes is treated as an impostor — the client forces a
+fresh PIN ceremony rather than re-trusting it. Pairing is **required by default**; the reduced-security
+alternatives (`serve --open`, trust-on-first-use) exist for fully trusted single-user networks and
+are covered in [Security & Safe Use](/docs/security#pairing-policy-open-hosts-and-trust-on-first-use).
+Scripts can pair from a terminal — [the `punktfunk` CLI](/docs/clients#scripting-the-punktfunk-cli).

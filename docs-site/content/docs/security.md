@@ -108,6 +108,23 @@ pinned. The layers, from the outside in:
   rather than a global one — because letting a machine read and write what you copy is a decision
   about that machine (Android is the one client where that switch starts on).
 
+### Pairing policy: open hosts and trust-on-first-use
+
+By default the host **requires** pairing: a device that hasn't completed the PIN ceremony (or been
+approved from the console) can't stream. That's the right setting on any shared network.
+
+`serve --open` turns it off. The host then advertises `pair=optional` and accepts unpaired clients,
+and clients offer a **trust-on-first-use** (TOFU) path: the first connect shows the host's
+fingerprint, you confirm it against the one the host logged at startup, and the client pins it. TOFU
+cannot detect an impostor on that first connection — if someone is impersonating the host the very
+first time, you pin the attacker. PIN pairing closes that gap (the SPAKE2 ceremony binds both
+identities), which is why it's the default. Clients never offer TOFU to a host advertising
+`pair=required`, a host typed in by hand, or one whose policy is unknown — those route straight to
+the PIN. Once pinned, a fingerprint change forces re-pairing rather than re-trust.
+
+(The developer/measurement host, `punktfunk-host punktfunk1-host`, has its own `--allow-tofu` /
+`--pairing-pin` flags for test harnesses; nothing here applies to it.)
+
 ### GameStream / Moonlight compatibility is the weak-crypto path
 
 To interoperate with stock [Moonlight](/docs/moonlight) clients, Punktfunk can also speak the legacy
@@ -117,19 +134,14 @@ could sit in the middle of a pairing, or recover input from a session. It is saf
 fully trust. The native `punktfunk/1` plane is unaffected and always on; GameStream is a second
 plane running beside it.
 
-**Check whether your host has it on — the default differs by install path, and most Linux installs
-have it on:**
-
-- **Linux packages: on.** The bundled systemd user unit runs `serve --gamestream`, and the deb, rpm,
-  Arch and Bazzite sysext packages all install that unit as it ships. If you installed Punktfunk from
-  a package and enabled the service, GameStream is on.
-- **SteamOS / Steam Deck installer: on**, unless you ran it with `--no-gamestream`.
-- **NixOS module: on** — `services.punktfunk.host.gamestream` defaults to `true`.
-- **Windows installer: off.** The wizard's GameStream checkbox is unticked by default, and an upgrade
-  leaves your existing setting alone. One exception: a service you register by hand with a bare
-  `punktfunk-host service install` gets the built-in default, which *is* `serve --gamestream`.
-- **A host you started yourself** with `punktfunk-host serve`: off. Only `serve --gamestream` (or
-  `--moonlight`) enables it.
+**It is off by default on every install route** — the Linux packages' unit runs the native-only
+`serve`, the SteamOS installer, the NixOS module and the Windows installer all leave it off, and a
+host you start yourself with `punktfunk-host serve` has it off. It comes on only when you ask:
+`PUNKTFUNK_GAMESTREAM=1` in `host.env`, the installer's checkbox on Windows, `--gamestream` on SteamOS,
+`services.punktfunk.host.gamestream = true` on NixOS, or `serve --gamestream` by hand — see
+[Moonlight](/docs/moonlight). One exception: a Windows service you register by hand with a bare
+`punktfunk-host service install` gets the built-in default, which *is* `serve --gamestream`. (Installs from before the opt-in change served Moonlight by default; an
+upgrade switches them to native-only until you set the knob.)
 
 The host doesn't hide it: whenever the compat planes come up, it logs a warning at startup naming
 exactly this risk.
@@ -241,8 +253,8 @@ Install plugins only from sources you trust, and prefer Verified catalog entries
 - **Restrict who can reach TCP 47992** at the host firewall if your LAN is shared — that port is the
   console, and the console is remote administration.
 - **Stay on a trusted network** — LAN or VPN. Never port-forward to the internet.
-- **Turn GameStream off** unless you specifically need Moonlight compatibility — every Linux package
-  ships it **on**, so on Linux this is something you do, not something you leave alone. See
+- **Leave GameStream off** unless you specifically need Moonlight compatibility — it's opt-in on
+  every route; if you turned it on for a trial, turn it back off. See
   [above](#gamestream--moonlight-compatibility-is-the-weak-crypto-path).
 - **Only install plugins you trust** — prefer Verified catalog entries.
 - **Review paired devices** in the web console periodically; remove anything you don't recognize.

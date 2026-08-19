@@ -3,17 +3,16 @@ title: Uninstalling
 description: Remove the Punktfunk host or client for every install method — and what each one deliberately leaves behind.
 ---
 
-Every install method has a clean removal path. This page walks through each one, and — just as
-important — says what stays on the machine afterwards: the Linux packages run no removal scripts of
-their own, and the Windows uninstaller leaves a few things in place on purpose.
+Every install method has a clean removal path. This page gives each one and what stays on the
+machine afterwards: the Linux packages run no removal scripts of their own, and the Windows
+uninstaller leaves a few things in place on purpose.
 
 > **Your configuration always survives.** Removing Punktfunk never deletes its config directory —
 > `~/.config/punktfunk` on Linux, `%ProgramData%\punktfunk` for the Windows host. It holds the
 > host's identity certificate and key, its management token, your paired devices, the web-console
 > login password, `host.env`, the game library, the logs, and any installed
-> [plugins](/docs/plugins) and their state. Keeping it is what lets a reinstall pick up where you
-> left off — each section below gives the one command that clears it, for when you want a clean
-> slate instead.
+> [plugins](/docs/plugins) and their state — which is what lets a reinstall pick up where you left
+> off. Each section below gives the one command that clears it for a clean slate.
 
 Jump to what you installed:
 
@@ -34,7 +33,7 @@ you'll be left with dangling links and a unit that fails at every login:
 systemctl --user disable --now punktfunk-host punktfunk-web
 ```
 
-Add `punktfunk-scripting` to that line if you enabled the [plugin runner](/docs/plugins), and
+Add `punktfunk-scripting` if you enabled the [plugin runner](/docs/plugins), and
 `punktfunk-kde-session` if you set up the [headless KDE session](/docs/kde#headless-session).
 
 If you turned on linger so the host ran without a login, and nothing else on the box needs it:
@@ -43,6 +42,11 @@ If you turned on linger so the host ran without a login, and nothing else on the
 sudo loginctl disable-linger "$USER"
 ```
 
+Every Linux package also leaves two system groups it created: `punktfunk-update` (empty; for
+[one-click updates](/docs/updating)) and `punktfunk` (the virtual Steam Deck pad's usbip nodes).
+Drop `punktfunk` rather than keeping it: it can present arbitrary emulated USB hardware, and with
+the host gone nothing uses it. The per-method sections below give the commands.
+
 ### Ubuntu (apt)
 
 ```sh
@@ -50,17 +54,15 @@ sudo apt purge punktfunk-host punktfunk-web punktfunk-client punktfunk-scripting
 sudo apt autoremove
 ```
 
-Name only the packages you actually installed — the others are simply reported as not installed.
-Then drop the repository and its key, so `apt update` stops contacting it:
+Name only the packages you installed — the others are reported as not installed. Then drop the
+repository and its key, so `apt update` stops contacting it:
 
 ```sh
 sudo rm -f /etc/apt/sources.list.d/punktfunk.list /etc/apt/keyrings/punktfunk.asc
 sudo apt update
 ```
 
-**Left behind:** `~/.config/punktfunk`, and the two system groups the package created — the empty
-`punktfunk-update` for [one-click updates](/docs/updating), and `punktfunk` for the virtual Steam
-Deck pad's usbip nodes. Clear them with:
+**Left behind:** `~/.config/punktfunk` and the two groups. Clear them with:
 
 ```sh
 rm -rf ~/.config/punktfunk
@@ -68,12 +70,10 @@ sudo groupdel punktfunk-update
 sudo gpasswd -d "$USER" punktfunk; sudo groupdel punktfunk
 ```
 
-Your `input` group membership is harmless to keep (it is a stock Ubuntu group). Drop it with
-`sudo gpasswd -d "$USER" input` if you'd rather not have it. The `punktfunk` group above is worth
-dropping rather than keeping: it can present arbitrary emulated USB hardware, and with the host
-gone nothing uses it. If you opened the firewall, close it
-again: `sudo ufw delete allow punktfunk-native` (and `punktfunk-gamestream` / `punktfunk-web` if you
-allowed those too).
+Your `input` group membership is harmless to keep (a stock Ubuntu group); drop it with
+`sudo gpasswd -d "$USER" input` if you'd rather not have it. If you opened the firewall, close it
+again: `sudo ufw delete allow punktfunk-native` (and `punktfunk-gamestream` / `punktfunk-web` if
+you allowed those too).
 
 ### Fedora (dnf)
 
@@ -84,13 +84,11 @@ sudo dnf remove punktfunk punktfunk-web punktfunk-client punktfunk-scripting
 sudo rm -f /etc/yum.repos.d/punktfunk.repo
 ```
 
-**Left behind:** `~/.config/punktfunk`, the `punktfunk-update` and `punktfunk` groups, and the
-signing key dnf
-imported into the rpm keyring when it first installed a Punktfunk package. Clear the first two with
-`rm -rf ~/.config/punktfunk` and `sudo groupdel punktfunk-update`; drop `punktfunk` too
-(`sudo gpasswd -d "$USER" punktfunk; sudo groupdel punktfunk`) — it can present arbitrary
-emulated USB hardware and nothing uses it once the host is gone. The key is harmless to leave — on
-its own it only marks packages from our registry as trusted, and nothing fetches them once the repo
+**Left behind:** `~/.config/punktfunk`, the two groups, and the signing key dnf imported into the
+rpm keyring when it first installed a Punktfunk package. Clear the first two with
+`rm -rf ~/.config/punktfunk`, `sudo groupdel punktfunk-update` and
+`sudo gpasswd -d "$USER" punktfunk; sudo groupdel punktfunk`. The key is harmless to leave — on its
+own it only marks packages from our registry as trusted, and nothing fetches them once the repo
 file is gone.
 
 On firewalld, close the ports you opened:
@@ -116,7 +114,7 @@ The change only takes effect in the new deployment, so the reboot is part of the
 
 ### Bazzite / Fedora Atomic (systemd-sysext)
 
-This is the supported Bazzite path and the tidiest one — the whole install is a single image under
+The supported Bazzite path and the tidiest one — the whole install is a single image under
 `/var/lib/extensions/`. Stop the services **before** you unmerge, because once the image is gone
 their binaries are gone and the units just keep failing:
 
@@ -138,7 +136,7 @@ sudo gpasswd -d "$USER" punktfunk; sudo groupdel punktfunk
 ```
 
 And your config, if you want it gone: `rm -rf ~/.config/punktfunk`. See
-[Bazzite](/docs/bazzite#install) for the same sequence in context.
+[Bazzite](/docs/bazzite#1-install-the-host) for the same sequence in context.
 
 ### Arch / CachyOS (pacman)
 
@@ -151,18 +149,16 @@ Name only what you installed. `-Rns` also takes the dependencies nothing else ne
 packages' own configuration files.
 
 Then delete the `[punktfunk]` section (or `[punktfunk-canary]`) from `/etc/pacman.conf` — the two
-lines you appended when you [added the repo](/docs/arch#2-add-the-signed-repo). Optionally drop the
+lines you appended when you [added the repo](/docs/arch#2-install-the-host). Optionally drop the
 repo's signing key from pacman's keyring:
 
 ```sh
 sudo pacman-key --delete E0CA04465C99C936E0B0C6510A317015A34DDD69
 ```
 
-**Left behind:** `~/.config/punktfunk` and the `punktfunk-update` and `punktfunk` groups —
-`rm -rf ~/.config/punktfunk`, `sudo groupdel punktfunk-update`, and
-`sudo gpasswd -d "$USER" punktfunk; sudo groupdel punktfunk` clear them. Drop that last one
-rather than keeping it: it can present arbitrary emulated USB hardware. On CachyOS, close the
-ufw rules you opened: `sudo ufw delete allow punktfunk-native`.
+**Left behind:** `~/.config/punktfunk` and the two groups — `rm -rf ~/.config/punktfunk`,
+`sudo groupdel punktfunk-update`, and `sudo gpasswd -d "$USER" punktfunk; sudo groupdel punktfunk`
+clear them. On CachyOS, close the ufw rules you opened: `sudo ufw delete allow punktfunk-native`.
 
 ### SteamOS / Steam Deck host (on-device build)
 
@@ -178,14 +174,14 @@ systemctl --user daemon-reload
 
 Then follow [SteamOS (Host) → Uninstalling](/docs/steamos-host#uninstalling) for the build
 container, the files under your home, and the root-owned tuning. Don't skip the last of those: the
-atomic-update keep list is what carries those files through every SteamOS update, so left alone they
-stay on the device indefinitely.
+atomic-update keep list carries those files through every SteamOS update, so left alone they stay
+on the device indefinitely.
 
 **Left behind:** `~/.config/punktfunk` (`rm -rf ~/.config/punktfunk` for a clean slate), your
 `input` and `punktfunk` group memberships, and — if the installer seeded it because you had none —
-the KDE RemoteDesktop portal grant at `~/.local/share/flatpak/db/kde-authorized`. Drop the second
-group once the host is gone — it can present arbitrary emulated USB hardware and nothing else on a
-Deck uses it: `sudo gpasswd -d "$USER" punktfunk; sudo groupdel punktfunk`.
+the KDE RemoteDesktop portal grant at `~/.local/share/flatpak/db/kde-authorized`. Drop the
+`punktfunk` group once the host is gone — nothing else on a Deck uses it:
+`sudo gpasswd -d "$USER" punktfunk; sudo groupdel punktfunk`.
 
 ### NixOS
 
@@ -209,9 +205,9 @@ if you installed with winget:
 winget uninstall unom.PunktfunkHost
 ```
 
-Both run the same uninstaller, which takes the `PunktfunkHost` service, the scheduled tasks, the
-virtual-display and gamepad drivers and every firewall rule it added back off the machine — the
-full inventory is on [Windows Host → Uninstalling](/docs/windows-host#uninstalling).
+Both run the same uninstaller, which removes the `PunktfunkHost` service, the scheduled tasks, the
+virtual-display and gamepad drivers and every firewall rule it added — the full inventory is on
+[Windows Host → Uninstalling](/docs/windows-host#uninstalling).
 
 Three things are left on purpose:
 
@@ -234,23 +230,23 @@ Three things are left on purpose:
   **Trusted Root Certification Authorities**. (This is *not* the driver certificate above, which the
   uninstaller does remove.)
 
-If you registered the winget source, drop it too — in an **admin** PowerShell, the same as
-registering it:
+If you registered the winget source, drop it too — in an **admin** PowerShell, as when registering
+it:
 
 ```powershell
 winget source remove -n punktfunk
 ```
 
 **If a Punktfunk display or gamepad survives in Device Manager** — an older build could leave one
-behind — run the host's own cleanup from an elevated prompt, which is exactly what the uninstaller
-calls. Do this **while the host is still installed**:
+behind — run the host's own cleanup from an elevated prompt (exactly what the uninstaller calls),
+**while the host is still installed**:
 
 ```powershell
 punktfunk-host driver uninstall
 punktfunk-host driver uninstall --gamepad
 ```
 
-If you have already uninstalled, `punktfunk-host.exe` went with it. Install the current version
+If you have already uninstalled, `punktfunk-host.exe` went with it: install the current version
 again and uninstall it — its uninstaller runs both commands for you.
 
 See [Windows Host → Install](/docs/windows-host#install) for the installer's side of the same story.
@@ -272,7 +268,7 @@ directory (that is what lets the Flatpak, a native package and the Decky plugin 
 identity). Remove it with `rm -rf ~/.config/punktfunk`.
 
 The remote it was installed from also stays. Its name depends on how you installed: if you added the
-repo by hand it is **`unom`**, and if you installed straight from the `.flatpakref` — the route
+repo by hand it is **`unom`**; if you installed straight from the `.flatpakref` — the route
 [Install a Client](/docs/install-client#linux-desktop-flatpak) gives — Flatpak named its own origin
 remote for it. List them and delete the one that served Punktfunk, if no other app uses it:
 
@@ -364,8 +360,7 @@ Windows it is part of the host installer and goes with it.
 
 ## Removing the pairing, not the software
 
-If you only want to undo a pairing, you don't need to uninstall anything. The two halves are
-separate:
+To undo only a pairing, you don't need to uninstall anything. The two halves are separate:
 
 - **On the host** — unpair the device from the [web console](/docs/web-console); it stops being
   trusted immediately.
