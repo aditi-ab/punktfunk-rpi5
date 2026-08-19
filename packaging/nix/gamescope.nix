@@ -147,8 +147,21 @@ unwrapped.overrideAttrs (old: {
   doInstallCheck = true;
   installCheckPhase = ''
     runHook preInstallCheck
-    $out/bin/punktfunk-gamescope --version 2>&1 | grep -q '+pfhdr' \
-      || { echo "punktfunk-gamescope: the +pfhdr marker is missing — the patches did not take"; exit 1; }
+    # Capture the banner, then assert on it — a guard that reports "missing" without showing
+    # what it actually read cannot be acted on. MEASURED 2026-08-19 (run 19551): this fired with
+    # patch 0005 applied cleanly to src/meson.build, which leaves two very different causes
+    # indistinguishable from the log — the binary failing to start at all (a shrunk RPATH, a
+    # missing loader dep; --version never prints), versus upstream no longer sourcing the banner
+    # from VCS_TAG. Printing the output separates them in one run instead of one run per guess.
+    ver=$($out/bin/punktfunk-gamescope --version 2>&1 || true)
+    printf '%s\n' "$ver" | grep -q '+pfhdr' || {
+      echo "punktfunk-gamescope: the +pfhdr marker is missing — the patches did not take" >&2
+      echo "  punktfunk-gamescope --version printed:" >&2
+      printf '%s\n' "$ver" | sed 's/^/    | /' >&2
+      echo "  (empty above = the binary did not run; a version with no +pfhdrN = patch 0005" >&2
+      echo "   applied but upstream no longer builds the banner from VCS_TAG)" >&2
+      exit 1
+    }
     # The manifest must name a library this derivation actually installed. A manifest pointing at a
     # path that does not exist is the worst shape of this bug: the loader reads it, finds nothing,
     # and carries on silently, so the box looks healthy and every game renders SDR.
