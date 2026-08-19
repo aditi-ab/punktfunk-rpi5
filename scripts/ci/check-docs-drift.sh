@@ -54,7 +54,7 @@ while IFS= read -r var; do
 done < "$tmp/docs-vars"
 
 # ---------------------------------------------------------------- gate 3: undocumented ratchet
-# Quoted occurrences only: env reads are string literals ("PUNKTFUNK_X"); bare identifiers are
+# Quoted occurrences only: env reads are quoted string literals; bare identifiers are
 # Rust constants / C symbols, not knobs. The committed baseline enumerates today's undocumented
 # set so a violation names exactly the new knob.
 baseline=scripts/ci/docs-undocumented-env-baseline.txt
