@@ -130,18 +130,16 @@ fn pin_pad_sinks() -> Result<usize> {
             move |g| {
                 let Some(props) = g.props else { return };
                 let usb_id = |k: &str| {
-                    props
-                        .get(k)
-                        .and_then(|v| {
-                            let v = v.trim();
-                            // The specimen publishes `0x054c`; a bare `054c` read with base 0
-                            // is octal and yields nonsense, so the radix is chosen explicitly.
-                            v.strip_prefix("0x")
-                                .or_else(|| v.strip_prefix("0X"))
-                                .map(|h| u32::from_str_radix(h, 16))
-                                .unwrap_or_else(|| u32::from_str_radix(v, 16))
-                                .ok()
-                        })
+                    props.get(k).and_then(|v| {
+                        let v = v.trim();
+                        // The specimen publishes `0x054c`; a bare `054c` read with base 0
+                        // is octal and yields nonsense, so the radix is chosen explicitly.
+                        v.strip_prefix("0x")
+                            .or_else(|| v.strip_prefix("0X"))
+                            .map(|h| u32::from_str_radix(h, 16))
+                            .unwrap_or_else(|| u32::from_str_radix(v, 16))
+                            .ok()
+                    })
                 };
                 match g.type_ {
                     // Cards announce their identity keys, so no second round is needed for them.
