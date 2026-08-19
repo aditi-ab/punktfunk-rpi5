@@ -6026,10 +6026,8 @@ mod log_sink_tests {
         assert!(!lines.iter().any(|l| l.2.contains("must not arrive")));
 
         // SAFETY: NULL callback detaches; no pointer is retained.
-        assert_eq!(
-            unsafe { punktfunk_set_log_callback(3, None, ptr::null_mut()) },
-            PunktfunkStatus::Ok
-        );
+        let detached = unsafe { punktfunk_set_log_callback(3, None, ptr::null_mut()) };
+        assert_eq!(detached, PunktfunkStatus::Ok);
         let before = LINES.lock().unwrap().len();
         log::error!(target: "quinn::connection", "after detach");
         assert_eq!(
