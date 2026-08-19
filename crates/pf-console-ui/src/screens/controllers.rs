@@ -415,20 +415,30 @@ mod tests {
         let pads = [pad("DualSense", true)];
         let mut settings = Settings::default();
         let library = crate::library::LibraryShared::default();
-        let ctx = |platform, settings: &mut Settings| Ctx {
-            hosts: &[],
-            library: &library,
-            settings,
-            store: crate::store::file_store(),
-            platform,
-            pads: &pads,
-            deck: false,
-            device_name: "t",
-            t: 0.0,
-        };
-        assert_eq!(rows_for(&ctx(Platform::Desktop, &mut settings)).len(), 1);
+        fn ctx<'a>(
+            platform: Platform,
+            settings: &'a mut Settings,
+            library: &'a crate::library::LibraryShared,
+            pads: &'a [PadInfo],
+        ) -> Ctx<'a> {
+            Ctx {
+                hosts: &[],
+                library,
+                settings,
+                store: crate::store::file_store(),
+                platform,
+                pads,
+                deck: false,
+                device_name: "t",
+                t: 0.0,
+            }
+        }
         assert_eq!(
-            rows_for(&ctx(Platform::Android, &mut settings)).len(),
+            rows_for(&ctx(Platform::Desktop, &mut settings, &library, &pads)).len(),
+            1
+        );
+        assert_eq!(
+            rows_for(&ctx(Platform::Android, &mut settings, &library, &pads)).len(),
             1 + PASSTHROUGH.len()
         );
 
