@@ -14,15 +14,12 @@ are here for.
 
 ## How it works
 
-While running, the host advertises itself over mDNS, including `mac` — the address of the card
-carrying the IP clients reach it on first, then any other non-loopback cards as fallbacks, at most
-four.
-
-Each app stores those addresses on its **saved host** record. Linux, Windows and Android refresh
-them whenever they see the host advertise; the Apple app when you save the host and on every
-connect. A sleeping host stops advertising, but the client still has the addresses on disk.
-
-That ordering is the whole prerequisite:
+While running, the host advertises itself over mDNS, including `mac` — the card carrying the IP
+clients reach it on first, then any other non-loopback cards as fallbacks, at most four. Each app
+stores those addresses on its **saved host** record: Linux, Windows and Android refresh them
+whenever they see the host advertise, the Apple app when you save the host and on every connect. A
+sleeping host stops advertising, but the client still has the addresses on disk. That ordering is
+the whole prerequisite:
 
 > **The client must have seen the host awake at least once**, on a network where the host's mDNS
 > advert reached it. Until then no address is known and there is nothing to wake with — the client
@@ -31,10 +28,9 @@ That ordering is the whole prerequisite:
 
 The packet goes **out of every one of the client's network interfaces** — from a socket bound to
 that interface's own address, aimed at both its subnet broadcast address and `255.255.255.255` — on
-UDP ports 9 and 7, repeated three times, plus a unicast to the host's last known address. The spread
-is deliberate: a sleeping machine has no ARP entry, so a plain unicast cannot find it, and a
-broadcast sent without binding an interface leaves by the default route only — on a machine running
-a VPN or a mesh network, not the LAN the host sleeps on.
+UDP ports 9 and 7, repeated three times, plus a unicast to the host's last known address. (A
+sleeping machine has no ARP entry, and an unbound broadcast leaves by the default route only — on a
+VPN or mesh machine, not the LAN the host sleeps on.)
 
 Neither the advert nor a magic packet is authenticated. A wrong address only makes the wake fail;
 the host's certificate fingerprint still gates the connection. See [Security](/docs/security).
@@ -59,11 +55,9 @@ Two things can still stop it, neither visible from Punktfunk:
 ## Waking from a client
 
 **Auto-wake on connect** is a client setting, **on by default**, in Settings under **Session**
-([Client settings](/docs/client-settings#behavior) covers what sits beside it); the TV and
-controller layouts list it among the other general settings. It is a property of the device and
-the network, so it is *not* part of a
-[settings profile](/docs/profiles-and-links#what-a-profile-cant-change) — "Game" and "Work" cannot
-disagree about it.
+([Client settings](/docs/client-settings#behavior)); the TV and controller layouts list it among
+the general settings. A property of the device and the network, so *not* part of a
+[settings profile](/docs/profiles-and-links#what-a-profile-cant-change).
 
 With auto-wake on, opening a saved host that is not advertising:
 
@@ -108,12 +102,9 @@ shows an explanation with a link to system settings if you decline.
 ### On the Steam Deck
 
 The [Decky plugin](/docs/steam-deck) has no wake button or wake setting of its own. It starts every
-stream through the client, so the wake is the client's, on exactly the terms above — packet, 6-second
-re-send, once-a-second watch, dial only when the host is really back. It follows **Wake hosts
-automatically** in the client's own settings (**Open Punktfunk → Settings** from the same panel)
-and is a no-op until the client has learned that host's MAC address. (The plugin used to fire a
-packet itself and stretch the connect budget to 75 seconds to cover the resume; a wait that watches
-for the host beats a fixed budget, so that is gone.)
+stream through the client, so the wake is the client's, on exactly the terms above. It follows
+**Wake hosts automatically** in the client's own settings (**Open Punktfunk → Settings** from the
+same panel) and is a no-op until the client has learned that host's MAC address.
 
 ### From the command line
 
@@ -173,10 +164,9 @@ Wake-on-WLAN is NOT armed on this host's Wi-Fi NIC — clients cannot wake it fr
 ```
 
 The warning line names the interface and the exact command to fix it. The host only reports; it
-never changes the card's settings. It stays silent when it cannot tell — `iw` or `ethtool` missing,
-a driver that doesn't answer, or not enough privilege — rather than guessing, and says nothing at
-all when mDNS adverts are off (`PUNKTFUNK_MDNS=0` or `--no-mdns`), because then no address is
-published either.
+never changes the card's settings, stays silent when it cannot tell (`iw`/`ethtool` missing, a
+driver that doesn't answer, not enough privilege), and says nothing when mDNS adverts are off
+(`PUNKTFUNK_MDNS=0` or `--no-mdns`) — then no address is published either.
 
 Read the line on the web console's **Logs** page, or with
 `journalctl --user -u punktfunk-host`. See [Troubleshooting](/docs/troubleshooting#still-stuck).
