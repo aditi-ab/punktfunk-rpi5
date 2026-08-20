@@ -288,16 +288,19 @@ These change how the client itself looks and behaves. None touches a stream, so 
 **Gamepad-optimized browsing** — *default: on.* Swaps the touch or desktop home for the
 controller-optimized one: the host carousel, larger focus targets, a swipeable cover browser, and
 settings you can step with a thumbstick. The Apple and Android apps have this switch. Turn it off to
-stay in the touch interface even with a pad in your hands. On Linux, Windows and the Steam Deck the
-controller-optimized home is a separate entry point rather than a switch, so there is nothing to
-turn off. An Android TV is always in this mode — its remote is the only input it has.
+stay in the touch interface even with a pad in your hands. On Android it is in both places — the
+ordinary Settings and the controller-optimized settings themselves — so you can leave that home
+from inside it; turning it off returns you to the touch home at once. On Linux, Windows and the
+Steam Deck the controller-optimized home is a separate entry point rather than a switch, so there is
+nothing to turn off. An Android TV is always in this mode — its remote is the only input it has, so
+the switch is not offered there at all.
 
 **Show it** — *default: With a controller.* Only shown while the switch above is on, and it decides
 *when* that switch takes effect. **With a controller**: the controller-optimized home appears as a
 pad connects and the touch interface returns when the last one disconnects. **Always** keeps the
 controller-optimized home either way — for a phone or tablet docked to a TV, where the pad isn't
-always awake. Apple and Android. (An Android TV is in that mode regardless, so the choice changes nothing
-there.)
+always awake. Apple and Android. (An Android TV is in that mode regardless, so the row is not
+offered there.)
 
 **Background** — *default: Violet.* The colour family the controller-optimized home's living backdrop
 drifts through. Thirteen of them: seven dark fields — **Violet**, **OLED**, **Nebula**, **Abyss**,
