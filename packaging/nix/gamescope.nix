@@ -177,19 +177,24 @@ unwrapped.overrideAttrs (old: {
   doInstallCheck = true;
   installCheckPhase = ''
     runHook preInstallCheck
-    # Capture the banner, then assert on it — a guard that reports "missing" without showing
-    # what it actually read cannot be acted on. MEASURED 2026-08-19 (run 19551): this fired with
-    # patch 0005 applied cleanly to src/meson.build, which leaves two very different causes
-    # indistinguishable from the log — the binary failing to start at all (a shrunk RPATH, a
-    # missing loader dep; --version never prints), versus upstream no longer sourcing the banner
-    # from VCS_TAG. Printing the output separates them in one run instead of one run per guess.
-    ver=$($out/bin/punktfunk-gamescope --version 2>&1 || true)
-    printf '%s\n' "$ver" | grep -q '+pfhdr' || {
-      echo "punktfunk-gamescope: the +pfhdr marker is missing — the patches did not take" >&2
-      echo "  punktfunk-gamescope --version printed:" >&2
-      printf '%s\n' "$ver" | sed 's/^/    | /' >&2
-      echo "  (empty above = the binary did not run; a version with no +pfhdrN = patch 0005" >&2
-      echo "   applied but upstream no longer builds the banner from VCS_TAG)" >&2
+    # Assert the marker is compiled INTO the shipped binary, rather than running it.
+    #
+    # Running it does not work here and never did: `--version` produced EMPTY output under the
+    # build sandbox on BOTH nixpkgs' 3.16.25 and the pinned 5fb8dce4 (MEASURED 2026-08-19/20,
+    # runs 19551 / 19573 / 19594). That is a property of the sandbox, not a defect in the binary:
+    # gamescope calls PrintVersion() before the getopt loop (src/main.cpp:721 at the pinned rev),
+    # so `gamescope --version` DOES print the banner on a real system — which is what the host's
+    # capability probe reads.
+    #
+    # packaging/gamescope/build-punktfunk-gamescope.sh makes the same call, asserting on
+    # src/meson.build. Grepping the installed ELF is strictly stronger: the version string reaches
+    # .rodata through GamescopeVersion.h's k_szGamescopeVersion, so this proves the marker survived
+    # patching, meson configuration AND compilation into the artifact we actually ship, and it
+    # cannot be defeated by the binary being unable to start.
+    grep -aq '+pfhdr' $out/bin/punktfunk-gamescope || {
+      echo "punktfunk-gamescope: the +pfhdr marker is not in the installed binary —" >&2
+      echo "  patch 0005 did not reach GamescopeVersion.h. Check that src/meson.build still" >&2
+      echo "  carries 'version_tag = vcs_tag + ...' for 0005 to rewrite." >&2
       exit 1
     }
     # The manifest must name a library this derivation actually installed. A manifest pointing at a
