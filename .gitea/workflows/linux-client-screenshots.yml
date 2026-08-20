@@ -111,3 +111,20 @@ jobs:
           name: punktfunk-linux-client-screenshots
           path: clients/linux/screenshots
           retention-days: 30
+
+      # The artifact above is browser-only (Gitea's API doesn't serve v3 artifacts), which
+      # blocked reusing these shots for the docs. Publish them to the generic package registry
+      # too — fixed version `ci`, delete-then-PUT so each run overwrites, anonymous GET on a
+      # public repo:
+      #   https://git.unom.io/api/packages/unom/generic/punktfunk-linux-client-screenshots/ci/<scene>.png
+      - name: Publish screenshots to the package registry
+        env:
+          TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          BASE="https://git.unom.io/api/packages/unom/generic/punktfunk-linux-client-screenshots/ci"
+          for f in clients/linux/screenshots/*.png; do
+            name=$(basename "$f")
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" -X DELETE "$BASE/$name" || true
+            curl -fsS -o /dev/null --user "enricobuehler:$TOKEN" --upload-file "$f" "$BASE/$name"
+            echo "published $BASE/$name"
+          done
