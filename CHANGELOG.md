@@ -537,6 +537,50 @@ legs as follow-ups. Both landed here.
   ring layer's line shape; `nativeRenderLogs(header)` hands Kotlin the rendered bundle, and the
   upload rides the client's own mTLS.
 
+### A provider plugin can report which of its titles are **running**
+
+New: `PUT /api/v1/library/provider/{provider}/running`, body
+`{"running":[{"external_id":"…","pid":1234}]}` — the **live** counterpart to the static `detect`
+hints a reconcile carries. `detect` says *how to recognize* a title's process; this says *it is
+running now*, and carries the pid where the provider knows one. Additive: no existing route,
+payload or behaviour changes, and a host with no reporting plugin behaves exactly as before.
+
+It exists because one class of title could never be tracked at all. The host derives liveness by
+scanning (`procscan` + `DetectSpec`), which needs something recognizable on disk — an install
+directory, an executable, a Steam reaper. A Playnite-launched emulated game, a manually added one,
+or a library plugin that records no install directory has none of that, and its launch is a
+`playnite://` hand-off, so the host holds no process either: the lease went `Untracked`, its exit
+was never noticed, `session_on_game_exit` could not fire, and `POST /game/end` had nothing to aim
+at. Playnite knew the whole time — it starts the game, tracks it in the mode the person configured,
+and fires an event on both edges carrying the pid. That was being thrown away.
+
+- **Declarative and idempotent**, like the reconcile beside it: the body is the provider's
+  **complete** running set, so a missed event, a plugin restart or an install mid-game self-correct
+  on the next report instead of drifting. Absent from the set = stopped.
+- **Reports expire** (`crate::runstate::REPORT_TTL`, 90 s; the answer carries `ttl_s`). This is what
+  makes it safe for a live provider to hold a streaming session open for a game the host cannot
+  see: a plugin that dies with a game running stops counting shortly after and the host falls back
+  to scanning. Reporters must restate well inside the window.
+- **New `gamelease::LeaseKind::Reported`** — a lease with no process signal of its own, tracked by
+  what its provider says. `open` reaches it when the spec is empty and a provider speaks for the id;
+  the shim-reclassification paths (every Windows launch is a hand-off by construction) fall back to
+  it too, where they previously fell to `Untracked`. Phase 1 accepts "running" as the game
+  appearing; phase 2 treats "stopped" as the exit, and — unlike `procscan::running_hint`, which may
+  only ever *delay* an exit because Steam's registry flag survives an unclean exit — a fresh
+  provider report is decisive in both directions. A reported pid joins the termination ladders on
+  the same terms as a spawned one (re-resolved and start-time-pinned at the moment of use).
+- **Route authority**: the plugin lane, like the reconcile (`mgmt::auth::plugin_may_access`, and its
+  exhaustive classification table). No new authority — the host maps `external_id` through the
+  catalog, so a provider can only ever speak about entries it published; an unknown id is *counted*,
+  not refused, because a report legitimately races its own reconcile and 400-ing the batch would
+  throw away the liveness of every other running title.
+- **`@punktfunk/plugin-kit`: `ProviderClient.reportRunning(providerId, running)`**, returning
+  `{matched, unknown, ttlS}`; a 404 from an older host means "this host tracks games by scanning".
+  Rides the owed `plugin-kit-v0.4.3` publish.
+
+The Playnite half (the C# exporter hooking `OnGameStarted`/`OnGameStopped` and the plugin relaying
+it on a heartbeat) lives in `punktfunk-plugin-playnite` and needs a host carrying this route.
+
 ### Everything else an integrator might notice
 
 - **`mgmt-endpoint` is followed everywhere.** `PUNKTFUNK_MGMT_BIND` moved off 47990 left every plugin,

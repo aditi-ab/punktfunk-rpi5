@@ -105,6 +105,9 @@ mod plugins;
 // session⇄game lifetime binding (design/session-game-lifetime.md §4). Per-OS matchers inside; on a
 // platform with neither (macOS, which has no launch path either) the module is an empty shell.
 mod procscan;
+// The live half of the same binding: what a provider PLUGIN reports about its titles' liveness,
+// where `procscan` can only look at the process table.
+mod runstate;
 mod send_pacing;
 #[cfg(target_os = "windows")]
 #[path = "windows/service.rs"]

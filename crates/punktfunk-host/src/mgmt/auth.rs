@@ -250,6 +250,10 @@ pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
         (&Method::DELETE, "/api/v1/library/custom/{}"),
         (&Method::PUT, "/api/v1/library/provider/{}"),
         (&Method::DELETE, "/api/v1/library/provider/{}"),
+        // Liveness reporting for a provider's OWN titles. No new authority: the host maps the
+        // report through the catalog, so a plugin can only ever speak about entries it published,
+        // and the worst a defective one can do to someone else's session is nothing at all.
+        (&Method::PUT, "/api/v1/library/provider/{}/running"),
         // Stats / telemetry.
         (&Method::POST, "/api/v1/stats/capture/start"),
         (&Method::POST, "/api/v1/stats/capture/stop"),

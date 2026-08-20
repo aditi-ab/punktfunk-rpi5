@@ -372,6 +372,7 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
             library::reconcile_provider_entries,
             library::delete_provider_entries
         ))
+        .routes(routes!(library::report_provider_running))
         .routes(routes!(library::get_library_art))
         .routes(routes!(stats::stats_capture_start))
         .routes(routes!(stats::stats_capture_stop))

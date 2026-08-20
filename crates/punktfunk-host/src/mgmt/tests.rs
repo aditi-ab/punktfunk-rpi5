@@ -1440,6 +1440,16 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("DELETE", "/api/v1/library/custom/{id}", true, false),
         ("PUT", "/api/v1/library/provider/{provider}", true, false),
         ("DELETE", "/api/v1/library/provider/{provider}", true, false),
+        // Liveness for a provider's own titles: the plugin lane's, like the reconcile beside it,
+        // and for the same reason — the host maps the report through the catalog, so a provider can
+        // only ever speak about entries it published. Never the cert lane: a streaming client has
+        // no titles of its own to report on.
+        (
+            "PUT",
+            "/api/v1/library/provider/{provider}/running",
+            true,
+            false,
+        ),
         // ---- stats.
         ("POST", "/api/v1/stats/capture/start", true, false),
         ("POST", "/api/v1/stats/capture/stop", true, false),
@@ -2934,4 +2944,55 @@ async fn provider_reconcile_validation() {
         .unwrap();
     let (s, _) = send(&app, del).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
+}
+
+/// Liveness reporting: the provider id is validated like every other provider write, and a title
+/// the provider does not publish is *counted*, not refused.
+///
+/// That tolerance is the point. A report races its own reconcile by construction — a game can start
+/// before the entry that describes it has landed — and 400-ing the whole report over one unknown id
+/// would throw away the liveness of every other running title, which is precisely the failure the
+/// launcher-tile 400 taught us to avoid (`sanitize_launcher_entries`). The developer's real catalog
+/// is not touched here, so every id in this test is `unknown` by construction — which is exactly
+/// the case being pinned.
+#[tokio::test]
+async fn provider_running_report_validation() {
+    let app = test_app(test_state(), None);
+    let put = |provider: &str, body: serde_json::Value| {
+        axum::http::Request::put(format!("/api/v1/library/provider/{provider}/running"))
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    let (s, json) = send(&app, put("manual", serde_json::json!({"running": []}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(json["error"].as_str().unwrap().contains("reserved"));
+    let (s, _) = send(&app, put("Bad%2FName", serde_json::json!({"running": []}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // An unreported provider is a legitimate report of "nothing is running".
+    let (s, json) = send(&app, put("playnite", serde_json::json!({"running": []}))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json["matched"], 0);
+    assert_eq!(json["unknown"], 0);
+    assert!(json["ttl_s"].as_u64().unwrap() > 0);
+
+    // An id this provider does not publish is ignored, not an error.
+    let (s, json) = send(
+        &app,
+        put(
+            "playnite",
+            serde_json::json!({"running": [{"external_id": "no-such-title", "pid": 4242}]}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(json["matched"], 0);
+    assert_eq!(json["unknown"], 1);
+
+    // A report leaves no opinion behind about a title nobody published, so nothing this test did
+    // can hold a real lease open.
+    assert!(!crate::runstate::speaks_for(Some("playnite:no-such-title")));
+    crate::runstate::forget("playnite");
 }
