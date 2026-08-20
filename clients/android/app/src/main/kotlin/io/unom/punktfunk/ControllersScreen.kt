@@ -96,7 +96,11 @@ internal fun ControllersScreen(
         InputDevice.getDeviceIds()
             .toList()
             .mapNotNull { InputDevice.getDevice(it) }
-            .filter { !it.isVirtual && !Gamepad.isPad(it) }
+            // Everything real that is NOT counted as a controller — including a device that claims
+            // a pad source with no pad hardware behind it, which the Gamepads list above now
+            // rejects. One list or the other, never neither: this screen is where someone looks
+            // when the client's idea of "a pad is attached" disagrees with the room.
+            .filter { !it.isVirtual && !Gamepad.looksLikeController(it) }
     }
     DisposableEffect(Unit) {
         val im = context.getSystemService(InputManager::class.java)

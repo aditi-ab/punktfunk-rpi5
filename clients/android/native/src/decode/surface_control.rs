@@ -24,6 +24,7 @@ use ndk::hardware_buffer::HardwareBuffer;
 use ndk::native_window::NativeWindow;
 use std::ffi::c_void;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
 use super::async_loop::DecodeEvent;
@@ -276,9 +277,14 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ASurfaceTrans
 pub(super) struct Layer {
     api: Api,
     sc: Arc<ScHandle>,
-    /// Destination rectangle (the SurfaceView's pixel size) — the buffer is scaled to fill it.
-    dest_w: i32,
-    dest_h: i32,
+    /// The SurfaceView's LIVE pixel size, packed by `pack_surface_size` and re-read before every
+    /// present — the destination rectangle the buffer is scaled to fill. Live rather than captured
+    /// because the view resizes under a surface that is never recreated (see `dest`).
+    surface_size: Arc<AtomicU64>,
+    /// Fallback destination for as long as `surface_size` is still `0` (Kotlin hadn't measured the
+    /// view when video started): the window's own buffer geometry, the best remaining guess.
+    fallback_w: i32,
+    fallback_h: i32,
     /// `true` once the first transaction has made the layer visible + set its z-order + frame rate.
     configured: bool,
 }
@@ -287,13 +293,16 @@ impl Layer {
     /// Create the compositor layer over `window` (the SurfaceView's `ANativeWindow`), or `None` on
     /// API < 29 / a null layer — the caller then uses the SurfaceView presenter.
     ///
-    /// `dest_w/h` are the SurfaceView's **on-screen pixel size** — the coordinate space the child
-    /// layer is composited into, which is the display footprint of the (aspect-fitted) video view,
-    /// NOT the window's buffer size. `ANativeWindow_getWidth/Height` return the buffer geometry in a
-    /// rotated/scaled space (observed 1260×567 for a 2800×1260 full-bleed stream) — using it shrank
-    /// the picture to the top-left corner. A non-positive `dest_w/h` (Kotlin couldn't read the view
-    /// yet) falls back to that buffer size as the best remaining guess.
-    pub(super) fn create(window: &NativeWindow, dest_w: i32, dest_h: i32) -> Option<Layer> {
+    /// `surface_size` carries the SurfaceView's **on-screen pixel size** — the coordinate space the
+    /// child layer is composited into, which is the display footprint of the (aspect-fitted) video
+    /// view, NOT the window's buffer size. `ANativeWindow_getWidth/Height` return the buffer
+    /// geometry in a rotated/scaled space (observed 1260×567 for a 2800×1260 full-bleed stream) —
+    /// using it shrank the picture to the top-left corner. It is read fresh on every present
+    /// because that view RESIZES mid-stream under a surface that is never recreated: the stream
+    /// screen hides the system bars and switches on cutout drawing a frame or two after
+    /// `surfaceCreated`, and each one grows it. An empty `surface_size` (Kotlin hadn't measured the
+    /// view yet) falls back to the buffer size as the best remaining guess.
+    pub(super) fn create(window: &NativeWindow, surface_size: Arc<AtomicU64>) -> Option<Layer> {
         let api = Api::resolve()?;
         // SAFETY: `window.ptr()` is the live `ANativeWindow` the decode thread owns; the name is a
         // static NUL-terminated string; the call returns null on failure (checked).
@@ -303,20 +312,11 @@ impl Layer {
             log::warn!("asc: createFromWindow returned null — falling back to SurfaceView");
             return None;
         }
-        let dest_w = if dest_w > 0 {
-            dest_w
-        } else {
-            window.width().max(1)
-        };
-        let dest_h = if dest_h > 0 {
-            dest_h
-        } else {
-            window.height().max(1)
-        };
+        let fallback_w = window.width().max(1);
+        let fallback_h = window.height().max(1);
         log::info!(
-            "asc: layer created, dest {dest_w}x{dest_h} (window buffer {}x{})",
-            window.width(),
-            window.height(),
+            "asc: layer created, dest {:?} (window buffer {fallback_w}x{fallback_h})",
+            crate::session::unpack_surface_size(surface_size.load(Ordering::Relaxed)),
         );
         Some(Layer {
             sc: Arc::new(ScHandle {
@@ -324,10 +324,18 @@ impl Layer {
                 release: api.ac_release,
             }),
             api,
-            dest_w,
-            dest_h,
+            surface_size,
+            fallback_w,
+            fallback_h,
             configured: false,
         })
+    }
+
+    /// The destination rectangle for this present: the live view size, or the window's buffer
+    /// geometry while Kotlin has reported nothing.
+    fn dest(&self) -> (i32, i32) {
+        crate::session::unpack_surface_size(self.surface_size.load(Ordering::Relaxed))
+            .unwrap_or((self.fallback_w, self.fallback_h))
     }
 
     /// Present one decoded buffer at `desired_present_ns` (`CLOCK_MONOTONIC`; `0` = ASAP). Consumes
@@ -370,11 +378,12 @@ impl Layer {
                 right: src_w.max(1),
                 bottom: src_h.max(1),
             };
+            let (dest_w, dest_h) = self.dest();
             let dst = ARect {
                 left: 0,
                 top: 0,
-                right: self.dest_w,
-                bottom: self.dest_h,
+                right: dest_w,
+                bottom: dest_h,
             };
             (self.api.txn_set_geometry)(txn, sc, &src, &dst, TRANSFORM_IDENTITY);
             if dataspace != 0 {

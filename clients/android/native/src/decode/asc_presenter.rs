@@ -142,21 +142,21 @@ pub(super) struct AscBackend {
 impl AscBackend {
     /// Create the reader + compositor layer, or `None` on API < 29 / init failure (the caller then
     /// runs the SurfaceView presenter). `window` is the SurfaceView's `ANativeWindow`; `src_w/h` the
-    /// negotiated decode size; `panel_hz` the mode-table panel rate (seeds the learner);
+    /// negotiated decode size; `surface_size` the LIVE view size the layer composites into;
+    /// `panel_hz` the mode-table panel rate (seeds the learner);
     /// `dataspace` the `ADataSpace` from the negotiated colour; `source_hz` the negotiated stream rate.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn create(
         window: &NativeWindow,
         src_w: i32,
         src_h: i32,
-        surface_w: i32,
-        surface_h: i32,
+        surface_size: std::sync::Arc<std::sync::atomic::AtomicU64>,
         panel_hz: i32,
         dataspace: i32,
         source_hz: u32,
         priority: PresentPriority,
     ) -> Option<AscBackend> {
-        let layer = Layer::create(window, surface_w, surface_h)?;
+        let layer = Layer::create(window, surface_size)?;
         let usage = ndk::hardware_buffer::HardwareBufferUsage::GPU_SAMPLED_IMAGE
             | ndk::hardware_buffer::HardwareBufferUsage::COMPOSER_OVERLAY;
         let reader = match ImageReader::new_with_usage(

@@ -26,7 +26,7 @@ mod probe;
 
 use punktfunk_core::client::NativeClient;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -87,6 +87,37 @@ pub(crate) struct SessionHandle {
     /// `nativeAccessState` poll ([`access`]) — how the Kotlin poller tells a fresh update
     /// (the host's expiry warnings) arrived without holding a blocking event thread.
     pub(crate) access_seq: AtomicU32,
+    /// The video `SurfaceView`'s LIVE on-screen pixel size ([`pack_surface_size`]), written by
+    /// `nativeStartVideo` and by every `nativeVideoSurfaceSize` the `surfaceChanged` callback
+    /// sends, read by the ASurfaceControl presenter before each present.
+    ///
+    /// Shared and live rather than a start-time parameter because the view RESIZES under a surface
+    /// that is never recreated: hiding the system bars and switching the window to
+    /// `LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS` both happen a frame or two AFTER `surfaceCreated`,
+    /// and each one grows the video view. A destination rect captured once at creation then keeps
+    /// compositing the picture at its old, smaller size anchored at the layer's origin — the
+    /// "stream in the top-left corner" field report. `0` = nothing reported yet, and the layer
+    /// falls back to the window's buffer geometry.
+    pub surface_size: Arc<AtomicU64>,
+}
+
+/// Pack a surface's pixel size into one `u64` — so the presenter reads width and height as a
+/// single atomic load and can never see a torn pair (a new width against an old height).
+/// Non-positive values pack as `0`, the "not reported yet" sentinel.
+pub(crate) fn pack_surface_size(w: i32, h: i32) -> u64 {
+    if w <= 0 || h <= 0 {
+        return 0;
+    }
+    ((w as u64) << 32) | (h as u64 & 0xffff_ffff)
+}
+
+/// The inverse of [`pack_surface_size`]: `None` for the `0` sentinel.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn unpack_surface_size(packed: u64) -> Option<(i32, i32)> {
+    if packed == 0 {
+        return None;
+    }
+    Some((((packed >> 32) as u32) as i32, (packed as u32) as i32))
 }
 
 struct VideoThread {
@@ -159,4 +190,30 @@ fn parse_hex32(s: &str) -> Option<[u8; 32]> {
         *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pack_surface_size, unpack_surface_size};
+
+    /// The pair the presenter reads as one atomic load must survive the round trip — including a
+    /// size wider than a signed 16-bit value, which every panel this runs on now is.
+    #[test]
+    fn surface_size_round_trips() {
+        assert_eq!(
+            unpack_surface_size(pack_surface_size(2800, 1260)),
+            Some((2800, 1260))
+        );
+        assert_eq!(unpack_surface_size(pack_surface_size(1, 1)), Some((1, 1)));
+    }
+
+    /// "Not reported yet" — and anything nonsensical — is the one sentinel, so the layer falls back
+    /// to the window's buffer geometry rather than composing into an empty rectangle.
+    #[test]
+    fn non_positive_sizes_are_the_sentinel() {
+        assert_eq!(pack_surface_size(0, 0), 0);
+        assert_eq!(pack_surface_size(1920, 0), 0);
+        assert_eq!(pack_surface_size(-1, 1080), 0);
+        assert_eq!(unpack_surface_size(0), None);
+    }
 }

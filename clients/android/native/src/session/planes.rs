@@ -72,6 +72,13 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
         let client = h.client.clone();
         let sd = shutdown.clone();
         let st = h.stats.clone(); // session-lifetime stats (gate survives surface recreate)
+
+        // Seed the live view size with what the view measures right now; `surfaceChanged` keeps it
+        // current from here on (the bars hide and the cutout mode changes AFTER this call).
+        h.surface_size.store(
+            super::pack_surface_size(surface_w, surface_h),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let opts = crate::decode::DecodeOptions {
             decoder_name: decoder,
             ll_feature,
@@ -80,8 +87,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
             present_priority,
             smooth_buffer,
             panel_hz: panel_fps,
-            surface_w,
-            surface_h,
+            surface_size: h.surface_size.clone(),
         };
         let join = std::thread::Builder::new()
             .name("pf-decode".into())
@@ -91,6 +97,37 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
         Ok(())
     })
     .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeVideoSurfaceSize(handle, width, height)` — the video `SurfaceView`'s
+/// on-screen pixel size, re-reported on every `surfaceChanged`.
+///
+/// The ASurfaceControl presenter composites its child layer into exactly this rectangle, and the
+/// view resizes UNDER a surface that is never recreated: the stream screen hides the system bars
+/// and asks to draw into the display cutout a frame or two after `surfaceCreated`, both of which
+/// grow it. Without this the layer would keep painting the picture at its start-up size, in the
+/// corner of a bigger surface. Non-positive values are ignored (they'd blank the picture).
+/// No-op on a `0` handle. Stored whether or not video is running — the next `nativeStartVideo`
+/// then starts from a measured view rather than the window's guess. Not android-gated: pure `jni`
+/// + an atomic store, so it links on the host build too.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoSurfaceSize(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    width: jni::sys::jint,
+    height: jni::sys::jint,
+) {
+    jni_guard((), || {
+        let packed = super::pack_surface_size(width, height);
+        if handle == 0 || packed == 0 {
+            return;
+        }
+        // SAFETY: live handle per the nativeConnect/nativeClose contract.
+        let h = unsafe { &*(handle as *const SessionHandle) };
+        h.surface_size
+            .store(packed, std::sync::atomic::Ordering::Relaxed);
+    })
 }
 
 /// `NativeBridge.nativeVideoMime(handle): String` — the MediaCodec MIME for the codec the host
