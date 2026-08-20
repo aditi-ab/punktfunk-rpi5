@@ -12,6 +12,254 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ---
 
+## v0.31.1
+
+27 commits since v0.31.0 (17 non-merge), counted at the tip this was cut from.
+
+**No versioned surface moves.** `WIRE_VERSION` stays **2**, the C ABI stays **25**, and so do the
+driver protocol, the gamepad channel, the plugin index schema and the host event schema. No C
+function changed its signature, no `#[repr(C)]` struct grew a field, and `include/punktfunk_core.h`
+gains exactly one line: a `#define` for a new control-message type byte. An embedder rebuilds
+against the new header and is done; a packager has one thing to notice (the Windows firewall rule
+below) and one thing to be glad of (the Arch compositor package finally declares the level it
+builds).
+
+Two surfaces grow, both by pure addition: the **management API** gains
+`PUT /library/provider/{provider}/running` and its three schemas, and **`@punktfunk/plugin-kit`
+goes 0.4.3 → 0.4.4** to export the client call for it. A plugin that adopts neither is unaffected,
+and an older host answers the route with a 404 that means "this host tracks games by scanning".
+
+One control message is **added** to the wire — `DeliveryReport`, type byte **`0x0B`** — which is a
+`#define`, not an ABI step, exactly as `PipelineGap` (`0x0A`) was at v0.30.0. It takes a free byte
+in its block rather than lengthening an existing message, deliberately: see below.
+
+Two behaviour changes are worth reading before you package or embed this release: on Windows,
+`service install` now provisions a **program-scoped inbound UDP rule** for the host executable, and
+the **GameStream plane's default virtual-Xbox backend flips from the XUSB companion to the UMDF HID
+pad**, matching what the native plane has done since 2026-08-09.
+
+### Versions
+
+| | v0.31.0 | v0.31.1 | Notes |
+|---|---|---|---|
+| Wire protocol | 2 | **2** | unchanged. One additive control message, `DeliveryReport` (`0x0B`), which an older peer does not parse and does not need — see **The wire** below |
+| C ABI | 25 | **25** | unchanged. `include/punktfunk_core.h` differs from the v0.31.0 tag by one `#define` (`PUNKTFUNK_MSG_DELIVERY_REPORT = 11`, under `PUNKTFUNK_FEATURE_QUIC`), which is a constant, not a declaration. Rust-only addition in `punktfunk-core`: `client::NO_VIDEO_RETRY` is now public beside `client::FLUSH_COOLDOWN` |
+| Rust edition | 2024 | **2024** | unchanged |
+| MSRV (`rust-version`) | 1.85 | **1.85** | unchanged |
+| Workspace crate dirs | 27 | **27** | unchanged (39 `[workspace] members`, also unchanged) |
+| Virtual-display driver protocol | 6 | **6** | unchanged (minimum accepted still 3); `pf-driver-proto` shows no diff against the v0.31.0 tag |
+| Windows virtual-gamepad channel | 3 | **3** | unchanged. What changed is which *backend* the GameStream plane picks, not the channel — see **Windows: the GameStream plane builds the pad games can see** |
+| Plugin index schema | 1 | **1** | unchanged |
+| Host event schema | 1 | **1** | unchanged (`punktfunk-host/src/events.rs`) |
+| `api/openapi.json` | 0.31.0 | **0.31.1** | one route **added** — `PUT /library/provider/{provider}/running` plus its three schemas — and the stamp moved with the crate (`info.version` is `CARGO_PKG_VERSION`). Regenerated in #361 and re-stamped here; nothing else in the document differs. `api/` and `docs-site/public/` are byte-identical to each other |
+| gamescope patch level (`+pfhdrN`) | 8 | **8** | unchanged; no new patch files. ⚠ **`packaging/gamescope/PKGBUILD` is fixed here**: it declared `pfhdr7` while patch 0010 stamps `+pfhdr8` into the banner, so pacman saw no upgrade at all — see below |
+| `@punktfunk/host` (SDK) | 0.1.5 | **0.1.5** | unchanged; nothing under `sdk/` moved |
+| `@punktfunk/plugin-kit` | 0.4.3 | **0.4.4** | cut, for `ProviderClient.reportRunning` and its two types: they were reachable only through the deep `./reconcile.js` path, because `index.ts` re-exports an explicit list rather than a star, so no plugin could import them from the package root. Tagged `plugin-kit-v0.4.4` and **published** — the registry's `latest` (0.4.2 is still skipped there, as it has been since v0.30.0). The playnite plugin deliberately does *not* depend on it, calling the route through the untyped host seam so it was never gated on this publish |
+
+### ⚠ Breaking changes
+
+**None.** No wire change, no ABI change, no driver-protocol change, no plugin-contract change. Every
+0.31.0 host, client, driver and plugin keeps interoperating in both directions with no re-pairing.
+
+Two **behaviour** changes that break no build but change what a machine does:
+
+- **Windows `service install` adds a second firewall rule.** `Punktfunk UDP (data plane)` —
+  `dir=in action=allow protocol=UDP program=<host exe>`, on the same profile set the port rules use.
+  `service uninstall` deletes it by name. If you provision firewall rules yourself instead of
+  letting `service install` do it, you need the equivalent, or your hosts keep the black-picture
+  failure below. Program-scoped rather than port-scoped by design: the data plane binds `0.0.0.0:0`,
+  and a pinned port inside 47998-48010 would collide with Sunshine/Apollo.
+- **`PUNKTFUNK_XBOX_BACKEND` now governs both planes on Windows, and the GameStream plane's default
+  moves to the HID pad.** `PUNKTFUNK_XBOX_BACKEND=xusb` reverts both planes together; it previously
+  reverted only the native one, because `windows_xbox_hid` was `pub(super)` and unreachable from
+  `gamestream/control.rs`. It is `pub(crate)` now, with one definition and one name.
+
+### A provider plugin can report which of its titles are running
+
+The host derives liveness by **scanning**, which needs something recognizable on disk. A
+Playnite-launched emulated game, a manually added one, or a library plugin that records no install
+directory has none — and its launch is a `playnite://` hand-off, so the host holds no process
+either. The lease went `Untracked`: the exit was never noticed, `session_on_game_exit` could not
+fire, and `POST /game/end` had nothing to aim at.
+
+**`PUT /library/provider/{provider}/running`** takes a provider's *complete* running set (with the
+pid where it knows one) — declarative and idempotent like the reconcile beside it, so a missed event
+or a plugin restart self-corrects rather than drifting. `crate::runstate` holds it and **expires it
+after 90 s unless restated**, which is what makes it safe for a live provider to hold a session open
+for a game the host cannot see: a plugin that dies stops counting and the host falls back to
+scanning. The route is the plugin lane's, like the reconcile, and carries **no new authority** — the
+host maps `external_id` through the catalog, so a provider can only speak about entries it
+published. An unknown id is *counted, not refused*, because a report legitimately races its own
+reconcile and 400-ing the batch would discard the liveness of every other running title.
+
+**`LeaseKind::Reported`** is the lease that follows. `open` reaches it when the spec is empty and a
+provider speaks for the id, and — load-bearing on Windows, where every launch is a hand-off by
+construction — the three shim reclassification paths now fall back to it where they fell to
+`Untracked`. Phase 1 takes "running" as the game appearing; phase 2 takes "stopped" as the exit.
+Unlike `procscan::running_hint`, which may only ever *delay* an exit (Steam's registry flag survives
+an unclean one), a fresh report is decisive in both directions. A reported pid joins the termination
+ladders on the same terms as a spawned one: re-resolved and start-time-pinned at the moment of use.
+
+Client side, `ProviderClient.reportRunning` is exported from the plugin-kit root in 0.4.4 (see the
+table). A **404 from an older host means "this host tracks games by scanning"** — it is not an error
+a plugin should retry.
+
+### The wire: `DeliveryReport` (`0x0B`)
+
+`LossReport` carries `loss_ppm`, which is a ratio over the packets that **arrived** — so a flawless
+link and a link delivering nothing both report `0`. A host reading total silence as perfection
+decayed adaptive FEC to its floor and logged confident wording about the client's network.
+
+Clients now also send `DeliveryReport`, carrying the session's received-packet count. It is a **new
+type byte, not a field appended to `LossReport`**: that message is length-checked exactly, so
+lengthening it would make every shipped host reject the loss reports its FEC runs on. Send policy is
+deliberately sparse — every window while the count is zero, once when the first packets land, then
+never — because an older host warns per unknown message type and must not be flooded across a good
+session.
+
+`client::NO_VIDEO_RETRY` (the client got nothing) and `client::FLUSH_COOLDOWN` (the client is
+drowning) were both 2000 ms, so the host's cadence classifier could not tell two opposite faults
+apart and named the wrong one out loud. `NO_VIDEO_RETRY` moves into `punktfunk-core` beside
+`FLUSH_COOLDOWN` at **2600 ms**, and both sides now compare against the shared constant rather than
+against a local copy.
+
+### Windows: the data plane was never open, on any host
+
+The firewall rules `service install` writes are `localport=`-scoped (47998-48010, 9777, 5353), and
+the media data plane binds an **ephemeral** port per session. No such rule can cover it, so Windows
+Firewall dropped the client's hole-punch on **every session on every Windows host** — `punched=false`
+on the "data plane bound" line, in all six sessions across two field logs, including sessions that
+appeared to work. Video then fell back to blind-sending at the address the client *reported*; where
+the path needed the flow opened client-first, the control plane stayed healthy and the picture never
+arrived. One field host sent 1,919 frames into a black screen while blaming the client.
+
+Diagnosis changed with it: it now leads with the delivery count (zero is an **error** naming the data
+plane; a confirmed count keeps the old confident wording; a client that cannot answer gets a warning
+that says so), and a punch that never arrives is its own warning rather than a debug field on an info
+line.
+
+### Windows: the GameStream plane builds the pad games can see
+
+There are two virtual Xbox backends on Windows and they are not interchangeable to a game. The XUSB
+companion registers only `GUID_DEVINTERFACE_XUSB` and exposes no HID collection (`pf_xusb.inx`:
+"a non-HID UMDF2 driver", `Class = System`), so Steam's hidapi enumeration, SDL, RawInput,
+DirectInput, `joy.cpl` and WGI/GameInput cannot see it at all — only classic `XInputGetState` can.
+The native plane moved to the real HID pad as its default in `bd5735b8` for exactly that reason.
+
+`gamestream/control.rs` had bound `crate::inject::gamepad` since the first gamepad commit, when that
+name meant uinput and Windows had no second backend; Windows later gave the same name the XUSB
+companion, so this plane inherited it by module-name coincidence rather than by decision. Every
+Moonlight-compatible session since has presented a pad most games cannot enumerate. A `SessionPads`
+enum is now the one place this plane picks a backend, reading the same knob the native plane reads.
+The HID pad's rich-feedback plane is dropped rather than plumbed: an Xbox pad has no lightbar or
+adaptive triggers, and GameStream's rumble message (`0x010B`) carries the two handle motors only.
+
+### Android: buttons resolved from the scancode
+
+Android names a pad's buttons through a **key layout file** matched on VID/PID; a pad with no
+matching file falls back to AOSP's `Generic.kl`, which assigns keycodes by **scancode position**
+(`0x130`→`BUTTON_A`, `0x131`→`BUTTON_B`, …). A HID gamepad with no kernel driver numbers its buttons
+`1..n` in its own report order, so every keycode past the first divergence is somebody else's button.
+AOSP ships no layout for the Elite Series 2 over Bluetooth (`045e:0b05`) on any version, and the
+DualSense's (`054c:0ce6`) postdates Fire OS and requires `CONFIG_HID_PLAYSTATION`, which a Fire TV
+kernel has not.
+
+`Gamepad.padKeyCode(event)` is a drop-in for `event.keyCode` and **every** pad reader now goes
+through it — the streaming branch, the Skia console shell's probe, the older Compose navigation, and
+the Controllers tester. Two guards keep it off pads that already work: the correction applies only
+where the delivered keycode is what `Generic.kl` would have said, and which report order to read is
+decided from what the device *declares* (a pad numbering straight through claims `BUTTON_C` and
+`BUTTON_Z`, keycodes no real controller has a button for) rather than from a model table. Axes get
+the same treatment, with trigger rest position measured from the device's own range instead of
+assumed. The Xbox Bluetooth product ids (One S, Elite Series 2 and its Core) join the identity table.
+
+Also here: `pads()` filters on `looksLikeController` (the source claim **and** hardware behind it)
+rather than on `isPad`, which kept the console UI pinned on for any device merely claiming the
+gamepad source class; and the `ASurfaceControl` layer's destination rect is now read per-present from
+a packed atomic on the session handle (new JNI symbol `nativeVideoSurfaceSize`, fed from every
+`surfaceChanged`) rather than captured once at `surfaceCreated`, which is why the picture sat at the
+origin once the bars and cutout grew the view.
+
+### gamescope and the takeover
+
+- **`packaging/gamescope/PKGBUILD` moves `pfhdr7` → `pfhdr8`.** The banner has said `+pfhdr8` since
+  patch 0010 (the seat's stub keyboard carrying the compiled `XKB_DEFAULT_*` keymap), and the host
+  probes the banner for `>= 8` on the keymap path — but pacman compares `pkgver-pkgrel`, read
+  `3.16.25.pfhdr7-1` on both v0.30.0 and v0.31.0, and **offered no upgrade at all**. deb and rpm
+  derive their version from the binary banner and moved by themselves; Arch is the only channel that
+  hardcodes it. This is the mismatch the v0.31.0 table flagged as pre-existing.
+- **The in-stream session-select gate is armed again.** v0.31.0's takeover stopped stopping the
+  display manager and started idling the autologin session (`c2f5e91b`), which also deleted the two
+  lines the old path carried (`record_session_select_baseline()`, `STOPPED_DM = Some(dm)`);
+  `38a0f54b` then removed every remaining writer, leaving `honor_session_select_switch` unreachable.
+  Bazzite/SteamOS never noticed — their `os-session-select` writes no sentinel and
+  `is_steam_htpc_platform()` defaults the mid-stream watcher on. `ID=nobara` matches no HTPC default
+  and its ChimeraOS-layout `os-session-select` **does** write the sentinel, so on Nobara a mid-stream
+  "Switch to Desktop" went entirely unhandled. `takeover_idled()` now reads `IDLE_DROPIN_ARMED`, the
+  idle drop-in re-baselines the sentinel, and `STOPPED_DM` is documented as adoption-only state for a
+  takeover stranded by a pre-0.31.0 host. Both hand-back paths also restore the box's own Game Mode
+  unit, which neither did — a mid-stream switch is not a disconnect, so the disconnect sweep never
+  reached the `ExecStart=/usr/bin/sleep infinity` drop-in.
+- **Nix shipped a wrapper with no target.** nixpkgs wraps this package: the real ELF is
+  `bin/.gamescope-wrapped` and `bin/gamescope` is a makeWrapper launcher. The prune
+  (`find $out/bin -mindepth 1 ! -name gamescope -delete`) deleted the compositor and kept the
+  launcher — measured at 16 KB. That single line explains the empty `--version` output and the
+  "missing `+pfhdr` marker", both of which had been attributed to the build sandbox and to upstream.
+  The prune keeps the target now and the guard asserts on the **wrapped ELF**. Separately,
+  `packaging/nix/gamescope.nix` now pins `src` to `5fb8dce4` like every other channel — it was the
+  only one patching whatever version nixpkgs happened to carry, which broke `host.gamescopeHdr`
+  (default true) builds outright when nixpkgs shipped 3.16.24.
+
+### Everything else an integrator might notice
+
+- **`pf-console-ui`:** `ConsoleOptions.fallback_ui` (new, threaded to `Ctx` beside `deck`) gates the
+  Android-only "Controller-optimized UI" row, written through `extra` under
+  `android.gamepad_ui_enabled`; it is true only for the Android touch shell. Down on the carousel
+  opens Settings (`▼` is a new hint glyph — the `▲` triangle inverted, not a second draw routine),
+  and the host options menu gains a Library row on the same terms `Y` offers it (saved **and**
+  paired), replacing the menu rather than stacking on it. Both exist because a TV remote emits only
+  Move/Confirm/Back.
+- **`scripts/ci/docs-undocumented-env-baseline.txt`** gains `PUNKTFUNK_MSG_DELIVERY_REPORT`.
+  `check-docs-drift.sh` scans for `PUNKTFUNK_*` identifiers and cannot tell an operator knob from a
+  cbindgen-exported `#define`; every other `PUNKTFUNK_MSG_*` is already baselined beside it.
+- **`clients/probe`** reads the new delivery counter.
+
+### Verification status
+
+Gates run on the release tree (this MacBook, rustc/rustfmt per `rust-toolchain.toml`):
+`cargo fmt --all --check` clean; `cargo metadata --offline` ok with the `Cargo.lock` diff
+versions-only (36/36 lines); `cargo test -p punktfunk-core --lib` **273 passed**; the C ABI harness
+(`tests/c_abi.rs`) **passed**, reporting `abi_version=25` and four frames round-tripped byte-exact
+through lossy loopback — it did **not** run on the v0.31.0 cut, so this is the first cut since ABI 25
+where a C compiler has actually built the generated header; `scripts/ci/check-docs-drift.sh` clean;
+the android.yml Play notes gate run verbatim — 442/500 characters and not byte-identical to any prior
+release's; both openapi copies `cmp` identical, both stamped 0.31.1; notes voice scan clean.
+
+⚠ **`api/openapi.json` was re-stamped here, not regenerated.** The document itself was regenerated
+in #361 (with the new route and its three schemas) on a runner where
+`openapi_document_is_complete_and_checked_in` actually executes; this commit moves only
+`info.version`, which utoipa fills from `CARGO_PKG_VERSION`. `punktfunk-host` does not build on
+macOS, so that test could not be re-run here — but `0.31.0` appears nowhere else in either copy, so
+regeneration would produce this byte-for-byte. If it ever fails on this commit, regenerate with
+`cargo run -p punktfunk-host -- openapi > api/openapi.json` and `cp` to `docs-site/public/`.
+
+⚠ **Verified by reading only** — compiled nowhere available to the cutting host: everything under
+`crates/punktfunk-host` (Windows and Linux arms alike), `packaging/nix/gamescope.nix`, and the
+Android/Kotlin half. That includes `crate::runstate` and the new route; its own tests turned up a
+collision on their first run in an environment that executes them (all three shared the provider id
+`playnite` and cleared the process-global table between cases, so parallel scheduling flipped their
+answers) — fixed in #361 by giving each test ids only it uses and retiring the blunt `reset()`. The Windows GameStream pad change was checked on `.133` when it landed
+(`cargo check` and `cargo clippy -p punktfunk-host -- -D warnings` clean, both compiling arms), and
+`windows-host.yml` has **no `pull_request` trigger**, so a PR will not re-check that arm.
+
+⚠ **Not confirmed on glass:** the Android scancode remap (the reporter's Fire TV Stick 4K Max is the
+test that settles it), the Windows data-plane firewall rule in a field session, and the
+Moonlight-compatible HID pad — the log line to look for there is
+`virtual Xbox pad created (Windows UMDF HID)` where it used to say
+`virtual Xbox 360 created (Windows XUSB companion)`.
+
+---
+
 ## v0.31.0
 
 170 commits since v0.30.0 (113 non-merge), counted at the tip this was cut from.
