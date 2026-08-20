@@ -311,9 +311,11 @@ true black — most of the frame is pixels switched off, which on an OLED or AMO
 glow and no power drawn, with only a faint violet ember left in one corner. Stored under the same
 name on every client, so a phone, a Deck and a desktop set to Mint all look alike.
 
-The row lives in the controller-optimized settings themselves — the screen you reach with **X** from
-the controller-optimized home — on every platform that has one, which includes the Steam Deck and the
-Linux and Windows console home. The Apple TV is the exception: it carries **Background** in its
+The row lives in the controller-optimized settings themselves — the screen you reach with **X**, or
+by pressing **down** on the host carousel, from the controller-optimized home — on every platform
+that has one, which includes the Steam Deck and the Linux and Windows console home. Down is the
+route on a device with no face buttons to press, such as an Android TV remote, and the hint bar
+names whichever of the two your device has. The Apple TV is the exception: it carries **Background** in its
 ordinary Settings instead, next to **Show it**, because its controller-optimized home needs a real
 controller to open and the palettes would otherwise be unreachable from the Siri Remote.
 

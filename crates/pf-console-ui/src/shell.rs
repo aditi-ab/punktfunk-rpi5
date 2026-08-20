@@ -961,6 +961,10 @@ impl Shell {
                     // navigation but "open this tile's menu". Without this the context menu —
                     // and with it the only way to copy a host's link — is pad-only.
                     crate::glyphs::HintKey::Up => Some(MenuEvent::Move(MenuDir::Up)),
+                    // ▼ is the same kind of hint: a direction that steers nothing, because
+                    // the only screen publishing it is the home carousel, where down means
+                    // "open Settings". A finger must be able to press what it advertises.
+                    crate::glyphs::HintKey::Down => Some(MenuEvent::Move(MenuDir::Down)),
                     _ => None,
                 };
                 if let Some(ev) = ev {

@@ -206,7 +206,17 @@ impl HomeScreen {
                 }
                 _ => Some(MenuPulse::Boundary),
             },
-            MenuEvent::Move(_) => None,
+            // Down is Settings — the same screen X opens. The carousel is horizontal, so
+            // down is the other free direction, and it is the only route to Settings on a
+            // device whose input has no face buttons: an Android TV remote is a D-pad, OK
+            // and Back, and X never arrives. (Apple hit this on the Siri Remote too, and
+            // answered it by moving rows out to the ordinary Settings app.)
+            MenuEvent::Move(MenuDir::Down) => {
+                fx.push(Screen::Settings(super::settings::SettingsScreen::new(
+                    ctx.store,
+                )));
+                Some(MenuPulse::Confirm)
+            }
         }
     }
 
@@ -279,7 +289,15 @@ impl HomeScreen {
         {
             hints.push(Hint::new(HintKey::Up, "Options"));
         }
-        hints.push(Hint::new(HintKey::Tertiary, "Settings"));
+        // Name the route this device actually has. With no pad attached the legend is
+        // already speaking keyboard, and the one input that reaches here with neither a
+        // pad NOR letter keys is a TV remote — for which X is not a button that exists.
+        // Down opens Settings for everyone; only the advertisement changes.
+        hints.push(if ctx.pads.is_empty() {
+            Hint::new(HintKey::Down, "Settings")
+        } else {
+            Hint::new(HintKey::Tertiary, "Settings")
+        });
         hints.push(Hint::new(HintKey::Back, "Quit"));
         hints
     }
@@ -884,6 +902,67 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Everything this screen offers must be reachable from a D-pad, OK and Back alone —
+    /// an Android TV remote has no face buttons, so Settings (X) and the options menu
+    /// would otherwise be unreachable there. Up is the menu, down is Settings, and the
+    /// legend names the direction rather than X when nothing is plugged in.
+    #[test]
+    fn a_remote_reaches_settings_and_options_without_face_buttons() {
+        let mut settings = ctx_settings();
+        let hosts = [host("paired", true, true, false)];
+        let pads: Vec<pf_client_core::menu_nav::PadInfo> = Vec::new();
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &hosts,
+            library: &library,
+            settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Android,
+            pads: &pads,
+            deck: false,
+            fallback_ui: true,
+            device_name: "test",
+            t: 0.0,
+        };
+        let mut s = HomeScreen::new();
+
+        // Down opens the same screen X opens.
+        let mut fx = Outbox::default();
+        s.menu(MenuEvent::Move(MenuDir::Down), &mut ctx, &mut fx);
+        assert!(
+            matches!(fx.nav, Some(crate::screens::Nav::Push(ref sc)) if matches!(**sc, Screen::Settings(_))),
+            "down must open Settings"
+        );
+        // Up still opens the host's own menu — the library hangs off that menu now.
+        let mut fx = Outbox::default();
+        s.menu(MenuEvent::Move(MenuDir::Up), &mut ctx, &mut fx);
+        assert!(
+            matches!(fx.nav, Some(crate::screens::Nav::Push(ref sc)) if matches!(**sc, Screen::HostOptions(_))),
+            "up must open the host options menu"
+        );
+        // With no pad the legend advertises the direction, not a button that isn't there.
+        assert!(
+            s.hints(&ctx).iter().any(|h| h.key == HintKey::Down),
+            "a padless device is told about down"
+        );
+        // With a pad it goes back to naming X, which is faster to press.
+        let pads = vec![pf_client_core::menu_nav::PadInfo {
+            name: "Pad".into(),
+            key: "045e:028e:Pad".into(),
+            pref: punktfunk_core::config::GamepadPref::Xbox360,
+            steam_virtual: false,
+            battery: None,
+            detail: "045E:028E · gamepad".into(),
+            forwarded: true,
+            rumble: false,
+        }];
+        ctx.pads = &pads;
+        assert!(
+            s.hints(&ctx).iter().any(|h| h.key == HintKey::Tertiary),
+            "a pad is told about X"
+        );
     }
 
     /// A pinned card's A-press is a connect WITH its profile (one-off), titled so the
