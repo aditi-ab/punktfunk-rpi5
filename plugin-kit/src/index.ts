@@ -22,6 +22,7 @@ export {
 } from "./paths.js";
 export {
 	Artwork,
+	DEFAULT_RUNNING_TTL_S,
 	DetectHint,
 	GameMeta,
 	LaunchSpec,
@@ -29,6 +30,8 @@ export {
 	ProviderClient,
 	type ProviderClientService,
 	ProviderEntry,
+	type RunningAccepted,
+	type RunningTitle,
 } from "./reconcile.js";
 export {
 	definePluginKit,

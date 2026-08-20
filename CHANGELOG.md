@@ -576,10 +576,15 @@ and fires an event on both edges carrying the pid. That was being thrown away.
   throw away the liveness of every other running title.
 - **`@punktfunk/plugin-kit`: `ProviderClient.reportRunning(providerId, running)`**, returning
   `{matched, unknown, ttlS}`; a 404 from an older host means "this host tracks games by scanning".
-  Rides the owed `plugin-kit-v0.4.3` publish.
+  Version bumped to **0.4.4** — **unpublished, `plugin-kit-v0.4.4` owed.**
 
-The Playnite half (the C# exporter hooking `OnGameStarted`/`OnGameStopped` and the plugin relaying
-it on a heartbeat) lives in `punktfunk-plugin-playnite` and needs a host carrying this route.
+The Playnite half lives in `punktfunk-plugin-playnite` (**0.4.5**, exporter **0.4.0**): the C#
+exporter hooks Playnite's `OnGameStarted`/`OnGameStopped`/`OnGameStartupCancelled` and writes a
+small `punktfunk-running.json` beside the library export, re-stamped every 30 s and *deleted* when
+Playnite closes; the plugin polls it and restates the set to this route. It calls the route through
+the kit's untyped host seam rather than `reportRunning`, deliberately — depending on the method
+would make that repo unbuildable until the kit publishes, for the same request. Needs a host
+carrying this route; an older one 404s and the plugin carries on without it.
 
 ### Everything else an integrator might notice
 
