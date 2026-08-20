@@ -159,7 +159,12 @@ fun SkiaConsoleShell(
             if (ev.action != KeyEvent.ACTION_DOWN && ev.action != KeyEvent.ACTION_UP) return@probe false
             val fromPad = ev.isFromSource(InputDevice.SOURCE_GAMEPAD)
             if (fromPad) {
-                val bit = when (ev.keyCode) {
+                // The CORRECTED keycode: a pad Android has no key layout for delivers its buttons
+                // under other buttons' names, so read raw this console answered ✕ with whatever
+                // sat in BUTTON_A's scancode slot. Same resolution the stream uses — the console
+                // and the game must not disagree about which button a user pressed.
+                val code = Gamepad.padKeyCode(ev)
+                val bit = when (code) {
                     KeyEvent.KEYCODE_BUTTON_A -> 0
                     KeyEvent.KEYCODE_BUTTON_B -> 1
                     KeyEvent.KEYCODE_BUTTON_X -> 2
@@ -179,7 +184,7 @@ fun SkiaConsoleShell(
                     }
                     return@probe true
                 }
-                val dbit = when (ev.keyCode) {
+                val dbit = when (code) {
                     KeyEvent.KEYCODE_DPAD_UP -> 0
                     KeyEvent.KEYCODE_DPAD_DOWN -> 1
                     KeyEvent.KEYCODE_DPAD_LEFT -> 2
@@ -191,7 +196,7 @@ fun SkiaConsoleShell(
                     padState.push(handle)
                     return@probe true
                 }
-                if (ev.keyCode == KeyEvent.KEYCODE_BUTTON_SELECT && down && ev.repeatCount == 0) {
+                if (code == KeyEvent.KEYCODE_BUTTON_SELECT && down && ev.repeatCount == 0) {
                     NativeBridge.nativeConsoleMenu(handle, 0) // ▲ opens the tile's options on Home
                     return@probe true
                 }
