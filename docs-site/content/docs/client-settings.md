@@ -4,346 +4,273 @@ description: Every setting a Punktfunk client stores — what it does, what it d
 ---
 
 The host has [its own settings reference](/docs/configuration). This page is the other half: the
-settings each **client** keeps, which together decide what a session looks like.
-
-Most of them are a *request*. The client asks, the host answers in the handshake — so a setting the
-host can't honor is usually a quiet downgrade rather than an error.
+settings each **client** keeps. Most are a *request* — the client asks, the host answers in the
+handshake, and a setting the host can't honor is a quiet downgrade rather than an error.
 
 ## Where the settings live
 
 The Linux, Windows, Mac, iPhone/iPad and Android apps group settings the same way — **General**,
 **Display**, **Input**, **Audio**, **Controllers** — under *Preferences* on Linux and *Settings*
-elsewhere. The Apple TV app shows one scrolling list instead, as does any client's settings screen
-reached with a controller. A controller-driven launch (Steam Deck Gaming Mode) opens the client's
-**console home**, whose settings screen is one steppable list of sections — **Stream**, **Video**,
-**Presentation**, **Audio**, **Controller**, **Touchscreen**, **Interface**, **Profiles**. On a
-Steam Deck that list *is* the settings surface: the [Decky plugin](/docs/steam-deck) is a launcher
-and keeps no settings of its own, and its **Open Punktfunk** button puts the console home one tap
-from the Quick Access Menu. The console home is part of the client — it is not the host's
-[web console](/docs/web-console).
+elsewhere. The Apple TV app and any settings screen reached with a controller show one steppable
+list instead — **Stream**, **Video**, **Presentation**, **Audio**, **Controller**, **Touchscreen**,
+**Interface**, **Profiles** — the client's **console home** (not the host's
+[web console](/docs/web-console)). On a Steam Deck that list *is* the settings surface: the
+[Decky plugin](/docs/steam-deck) is a launcher with no settings of its own, and its **Open
+Punktfunk** button opens the console home from the Quick Access Menu.
 
-Linux stores them in `~/.config/punktfunk/client-gtk-settings.json`, the same file the console home
-writes, so a change in either shows up in the other. Windows uses
-`%APPDATA%\punktfunk\client-windows-settings.json`; the Apple and Android apps use their own stores.
+Linux stores them in `~/.config/punktfunk/client-gtk-settings.json` (shared with the console home);
+Windows in `%APPDATA%\punktfunk\client-windows-settings.json`; the Apple and Android apps use their
+own stores.
 
-Changes apply to the **next** session — a running stream keeps what it started with. (*Match window*
-is the exception in effect, not in reading: it too is read at connect, but once a session is running
-with it on, every window resize renegotiates the mode.)
-
-Not every client offers every setting; the names below are the Linux app's, and differences that
-matter are noted per setting.
+Changes apply to the **next** session. (*Match window* is also read at connect, but once on, every
+window resize renegotiates the mode.) Names below are the Linux app's; differences that matter are
+noted per setting.
 
 ## Video
 
-**Resolution** — *default: Native display.* The host builds a virtual display at exactly this size
-and streams it; nothing is scaled. Native resolves at connect to the mode of the display your window
-is on. The Apple app instead stores an explicit size (1920 × 1080 out of the box): on iPhone, iPad
-and Mac a **Use this display's mode** button fills in what you're looking at, and the Apple TV app
-picks a combined **Stream mode** preset instead ("This TV (native)", 720p, 1080p or 4K at 60 Hz). If
-the host has been pinned to stream a *real* monitor rather than make one, your request is declined
-and your client scales what it gets — see
-[Virtual displays](/docs/virtual-displays#stream-a-real-monitor-instead).
+**Resolution** — *default: Native display.* The host builds a virtual display at exactly this size;
+nothing is scaled. Native resolves at connect to the mode of the display your window is on. The
+Apple app stores an explicit size (1920 × 1080 out of the box) with a **Use this display's mode**
+button on iPhone/iPad/Mac; Apple TV picks a combined **Stream mode** preset ("This TV (native)",
+720p, 1080p or 4K at 60 Hz). A host pinned to stream a *real* monitor declines the request and your
+client scales — see [Virtual displays](/docs/virtual-displays#stream-a-real-monitor-instead).
 
-**Match window** — *default: off.* The stream mode follows your window instead, and each resize
-renegotiates the host's display and encoder, so a windowed session stays pixel-exact. Fullscreen
-degenerates to the display's native mode. Offered by the Linux, Windows, Mac, iPhone/iPad and
-console-home screens (in the console home it is an option inside the Resolution picker, and a
-Gaming-Mode stream is always fullscreen, so there it lands on native); not by Android.
+**Match window** — *default: off.* The stream mode follows your window; each resize renegotiates
+the host's display and encoder. Fullscreen degenerates to the display's native mode. Linux,
+Windows, Mac, iPhone/iPad and the console home (inside the Resolution picker; a Gaming-Mode stream
+is always fullscreen, so there it lands on native); not Android.
 
 **Refresh rate** — *default: Native*, the refresh of the display your window is on. The Apple app
-stores an explicit rate (60 Hz by default): iPhone and iPad offer the rates the device can display,
-on a Mac you type one in, and on Apple TV the rate rides along with the Stream mode preset above.
+stores an explicit rate (60 Hz default): iPhone and iPad offer the device's displayable rates, on a
+Mac you type one in, and Apple TV's rate rides with the Stream mode preset.
 
-**Bitrate** — *default: Automatic.* For H.264, HEVC and AV1, Automatic means the host's own default,
-**20 Mbps**, and it turns on two things an explicit rate switches off: adaptive bitrate, and a short
-link-capacity probe about two seconds in that measures what your link really carries and lets the
-rate climb past 20 Mbps. An explicit rate is fixed for the session, and clamped by the host to
-**500 kbps – 8 Gbps**. A host card's menu has a **Test network speed…** entry that measures your link
-and suggests a value.
+**Bitrate** — *default: Automatic.* For H.264, HEVC and AV1, Automatic means the host's default,
+**20 Mbps**, plus two things an explicit rate switches off: adaptive bitrate, and a link-capacity
+probe about two seconds in that lets the rate climb past 20 Mbps. An explicit rate is fixed for the
+session, clamped to **500 kbps – 8 Gbps**. A host card's menu has **Test network speed…** to suggest
+a value.
 
-PyroWave is the exception: it has no useful low-rate regime, so its Automatic rate is a fixed
-per-pixel budget for the negotiated mode (hundreds of Mbps), and both adaptive bitrate and the
-capacity probe stay off for the whole session.
+PyroWave has no useful low-rate regime: its Automatic is a fixed per-pixel budget for the negotiated
+mode (hundreds of Mbps), with adaptive bitrate and the probe off for the whole session.
 
-**Render scale** — *default: Native (1×).* The host renders and encodes at your chosen mode
-multiplied by this, and your device resamples the result to its window. Above 1× supersamples for
-sharpness, at more bandwidth *and* more decode work; below 1× is lighter on both the host and the
-link. The stops run 0.5× to 4×. The result is floored to an even size and capped per axis at
+**Render scale** — *default: Native (1×).* The host renders and encodes at your mode times this;
+your device resamples to its window. Above 1× supersamples at more bandwidth and decode work; below
+1× is lighter on both. Stops 0.5×–4×; the result is floored to an even size and capped per axis at
 4096 px for H.264, 8192 px otherwise. Offered everywhere.
 
-**Video codec** — *default: Automatic.* A soft preference: the host emits your choice when it can
-also produce it, otherwise the best codec you both speak, in the order HEVC → AV1 → H.264.
-**PyroWave** is never auto-picked — pick it explicitly on Linux, Windows, the console home, or an
-Apple device whose decode probe passes; anywhere else it isn't offered, and asking for it lands on
-that same order. See [PyroWave](/docs/pyrowave). The Android and Apple apps hide AV1 unless the
-device has a hardware AV1 decoder; Android never offers PyroWave.
+**Video codec** — *default: Automatic.* A soft preference: your choice when the host can produce
+it, else the best codec you both speak, in the order HEVC → AV1 → H.264. **PyroWave** is never
+auto-picked — pick it explicitly on Linux, Windows, the console home, or an Apple device whose
+decode probe passes; elsewhere asking for it lands on that same order. See
+[PyroWave](/docs/pyrowave). Android and Apple hide AV1 without a hardware AV1 decoder; Android never
+offers PyroWave.
 
-**10-bit HDR** — *default: on.* Off means "never send me 10-bit", and the host then never upgrades.
-On, the stream goes 10-bit BT.2020 PQ only when the host has HDR content *and* the encoder can do
-10-bit. Android disables the toggle, and never advertises HDR, on a panel that can't present HDR10.
-Full detail: [HDR](/docs/hdr).
+**10-bit HDR** — *default: on.* Off means "never send me 10-bit". On, the stream goes 10-bit
+BT.2020 PQ only when the host has HDR content *and* the encoder can do 10-bit. Android disables the
+toggle, and never advertises HDR, on a panel that can't present HDR10. Full detail: [HDR](/docs/hdr).
 
-**Full chroma (4:4:4)** — *default: off.* Crisp small text and thin lines, at more bandwidth. It
-needs HEVC or PyroWave, the host's own 4:4:4 policy left on, a capture path that delivers full
-chroma, and a GPU that can encode it; if any gate fails the host says 4:2:0 before your decoder is
-built. The Apple, Linux and Windows apps all advertise it (Apple additionally requires its hardware
-decode probe to pass). The console home offers the toggle; Android doesn't.
+**Full chroma (4:4:4)** — *default: off.* Crisp small text and thin lines, at more bandwidth. Needs
+HEVC or PyroWave, the host's 4:4:4 policy on, a capture path that delivers full chroma, and a GPU
+that can encode it; if any gate fails the host says 4:2:0 before your decoder is built. Apple
+(hardware decode probe required), Linux, Windows and the console home; not Android.
 
-**Prioritize** — *default: Lowest latency.* What the client optimizes for when a decoded frame is
-ready. **Lowest latency** shows every frame the moment the display can take it, so a network hiccup
-becomes an occasional repeated or skipped frame. **Smoothness** holds a small buffer that evens those
-hiccups out, at that buffer's worth of added delay. Linux and Windows apps and the console home; the
-Apple and Android apps have it too, stored under the same name, so a
+**Prioritize** — *default: Lowest latency.* **Lowest latency** shows every frame the moment the
+display can take it — a network hiccup becomes an occasional repeated or skipped frame.
+**Smoothness** holds a small buffer that evens hiccups out, at that buffer's worth of added delay.
+Linux, Windows, the console home, Apple and Android — stored under the same name everywhere, so a
 [profile](/docs/profiles-and-links) means the same thing on every device.
 
-**Smoothness buffer** — *default: Automatic (two frames).* How many frames are held back before
-showing. Each frame absorbs roughly one screen refresh of network hiccup and costs one refresh of
-delay — so on a 120 Hz screen, two frames is about 17 ms of extra delay bought against 17 ms of
-jitter. If you never see stutter, you don't need this. The row appears wherever **Prioritize** is
-offered, and only once you have picked **Smoothness**.
+**Smoothness buffer** — *default: Automatic (two frames).* Frames held back before showing. Each
+absorbs roughly one screen refresh of jitter and costs one refresh of delay — on a 120 Hz screen,
+two frames ≈ 17 ms both ways. Appears wherever **Prioritize** is offered, once **Smoothness** is
+picked.
 
-**V-Sync** — *default: on.* Tear-free presentation. Off asks the GPU to show each frame the instant
-it's ready instead of waiting for the screen's next refresh: the lowest delay a display can give
-you, at the cost of visible tearing on fast motion. It is **best-effort** — not every driver or
-compositor offers a tearing mode, and where none is available the stream stays tear-free. The
-Detailed [stats overlay](/docs/stats) names the mode actually in use, so you can tell "off" from
-"off but unavailable". Linux and Windows apps and the console home.
+**V-Sync** — *default: on.* Tear-free presentation. Off shows each frame the instant it's ready:
+the lowest delay a display can give, with visible tearing on fast motion. Best-effort — where the
+driver or compositor has no tearing mode the stream stays tear-free, and the Detailed
+[stats overlay](/docs/stats) names the mode actually in use. Linux, Windows, console home.
 
-**Follow variable refresh rate** — *default: on.* On a VRR / FreeSync / G-Sync screen, let the panel
-refresh in step with the stream rather than on a fixed cadence — which removes the wait between a
-frame being ready and the screen being willing to show it. Applies to **fullscreen** sessions (a
-windowed one is at the compositor's mercy) and is harmless on a fixed-refresh screen. It needs a
-graphics driver that offers the modern queue-free display mode; on an older driver it does nothing
-unless you also set `PUNKTFUNK_VRR_FIFO=1` (see [configuration](/docs/configuration)), because the
-older way of following a panel costs noticeable latency on a fixed-refresh screen. The stats overlay
-reports `vrr yes` once it has *measured* that the panel really is following. Linux and Windows apps
-and the console home.
+**Follow variable refresh rate** — *default: on.* On a VRR / FreeSync / G-Sync screen, the panel
+refreshes in step with the stream. Applies to **fullscreen** sessions; harmless on a fixed-refresh
+screen. Needs a driver with the modern queue-free display mode; on an older driver it does nothing
+unless `PUNKTFUNK_VRR_FIFO=1` is set (see [configuration](/docs/configuration)). The stats overlay
+reports `vrr yes` once it has *measured* the panel following. Linux, Windows, console home.
 
-**Host compositor** — *default: Automatic.* Which backend a **Linux** host uses to drive the virtual
-output. Advisory: a host without that backend quietly auto-detects instead.
+**Host compositor** — *default: Automatic.* Which backend a **Linux** host uses to drive the
+virtual output. Advisory: a host without that backend auto-detects instead.
 
 ## Audio
 
-**Audio channels** — *default: Stereo.* You can ask for **5.1** or **7.1**; anything else is read as
-stereo. The count the host will really send comes back in the handshake, and your client builds its
-decoder from *that*, never from the request. What surround means differs by host: a **Linux** host
-claims a sink advertising exactly that many channels, so applications produce real surround, while a
-**Windows** host loopback-captures your current output endpoint and lets Windows convert it — so 5.1
-from a stereo endpoint is an upmix, not new channels. Offered everywhere.
+**Audio channels** — *default: Stereo.* **5.1** or **7.1** on request; anything else reads as
+stereo. The count the host will really send comes back in the handshake and your decoder is built
+from *that*. A **Linux** host claims a sink with exactly that many channels (real surround); a
+**Windows** host loopback-captures the current output endpoint and lets Windows convert — 5.1 from
+a stereo endpoint is an upmix. Offered everywhere.
 
 **Microphone** — *default: off on Linux, Windows, Android and the console home; on in the Apple
-app.* Sends this device's microphone to the host's virtual mic. On Linux and Windows the row is
-spelled *Stream microphone*, and **Ctrl+Alt+Shift+V** mutes it mid-stream without ending anything —
-see [Muting your microphone](/docs/input#muting-your-microphone).
+app.* Sends this device's microphone to the host's virtual mic. Spelled *Stream microphone* on
+Linux and Windows; **Ctrl+Alt+Shift+V** mutes it mid-stream — see
+[Muting your microphone](/docs/input#muting-your-microphone).
 
-**Echo cancellation** — *default: on.* Stops the host's audio, playing out of this device's speakers,
-from being picked up by the microphone and sent straight back. It hands the microphone to the
-system's own canceller rather than doing the work itself: on **Linux** that means capturing from an
-echo-cancelled PipeWire source when your desktop provides one, on **Windows** asking WASAPI for the
-Communications stream category so the endpoint's processing engages, and on **Apple** and
-**Android** the platform's voice-processing mode. Turn it off if your microphone already runs its
-own processing, or if the canceller makes your voice sound thin. The row sits under the microphone
-toggle and greys out while the microphone is off. Offered by the Linux, Windows, Apple, Android and
-console-home clients. What it can and can't fix is in [Why do I hear myself](/docs/echo).
+**Echo cancellation** — *default: on.* Stops the host's audio, playing from this device's speakers,
+from re-entering the microphone. It uses the system's own canceller: an echo-cancelled PipeWire
+source on **Linux**, the WASAPI Communications stream category on **Windows**, the platform
+voice-processing mode on **Apple** and **Android**. Turn it off if your microphone runs its own
+processing or the canceller thins your voice. Sits under the microphone toggle, greyed out while
+the mic is off. Linux, Windows, Apple, Android, console home. See
+[Why do I hear myself](/docs/echo).
 
-**Speaker** and **Microphone** device pickers — *default: System default.* Which endpoint stream
-audio plays out of, and which input feeds the uplink. Only the Linux app (PipeWire nodes) and the
-**Mac** app (which also has a microphone *channel* picker) have these — iPhone, iPad, Apple TV,
-Android and the console home have none, and the Windows app has none and ignores a stored speaker
-choice. On Linux, a device that has since disappeared keeps a "(not detected)" entry rather than
-silently snapping back to the default; the Mac shows it as "Unavailable device". A Steam Deck in
-Gaming Mode therefore has no endpoint picker at all: the session uses whatever the Desktop-Mode app
-last stored, and the system default otherwise.
+**Speaker** and **Microphone** device pickers — *default: System default.* Which endpoint plays the
+stream, and which input feeds the uplink. Only the Linux app (PipeWire nodes) and the **Mac** app
+(plus a microphone *channel* picker) have these; the Windows app ignores a stored speaker choice. A
+vanished device keeps a "(not detected)" entry on Linux, "Unavailable device" on the Mac. A Steam
+Deck in Gaming Mode has no endpoint picker: the session uses what the Desktop-Mode app last stored.
 
 ## Input
 
 Touch modes, mouse modes and the in-stream chords have their own page: [Input](/docs/input). Five
 more settings are worth naming here.
 
-**Forward controllers** — *default: on*, on every client. Off, the controllers connected to *this*
-device are not sent to the host at all. That is what you want when your controller already reaches
-the host by some other route —
-[USB passthrough](/docs/automation#recipe-full-controller-passthrough-virtualhere) such as
-VirtualHere, or a pad plugged into the host itself. Leaving forwarding on there hands the host two
-controllers for one pair of hands, and games read both: a stick drifts because the second pad is
-centred, or a menu takes every input twice.
+**Forward controllers** — *default: on*, everywhere. Off, controllers connected to *this* device
+are not sent to the host — what you want when the controller already reaches the host another way
+([USB passthrough](/docs/automation#recipe-full-controller-passthrough-virtualhere) such as
+VirtualHere, or a pad plugged into the host), where forwarding would hand games two controllers for
+one pair of hands.
 
-On Linux and Windows, opening a controller is what *claims* it — the client's SDL takes the device
-node — and a passthrough tool cannot bind a claimed device; with this off the session never opens
-the controller at all, leaving it free for VirtualHere to hand over. The consequence: the
-[controller escape chord](/docs/input#leaving-with-a-controller) is read off forwarded pads, so it is
-unavailable on those two while this is off — leave a stream with the keyboard chord or the client's
-own UI. The Apple and Android apps claim nothing, so their chords keep working either way; the
-Android app does stop its DualSense and Steam Controller 2 USB captures, which *do* claim the device.
-
-The rows below it — which pad, and what type — have nothing to act on while this is off, and every
-client greys them out to say so.
+On Linux and Windows, opening a controller *claims* it (SDL takes the device node), and a
+passthrough tool can't bind a claimed device; off, the session never opens the pad. Consequence:
+the [controller escape chord](/docs/input#leaving-with-a-controller) is read off forwarded pads, so
+on those two it is unavailable while this is off — leave with the keyboard chord or the client's
+UI. The Apple and Android apps claim nothing, so their chords keep working; Android does stop its
+DualSense and Steam Controller 2 USB captures, which do claim the device. The rows below grey out
+while this is off.
 
 **Gamepad type** (*Controller type* on Apple, Android and the console home) — *default: Automatic*,
-which matches each physical controller. The pickers offer Xbox 360, Xbox One, DualSense and
-DualShock 4 everywhere, plus Steam Deck on Linux, Android and the console home. Your client declares
-a type per pad as it connects — Automatic declares what that controller really is, an explicit
-choice declares your choice — and the host builds each virtual pad from that. A type the host has no
-backend for degrades to an Xbox 360 pad rather than failing: Xbox One on a Windows host, for
-instance, or any Sony pad on a Linux host that can't open `/dev/uhid`.
+which matches each physical controller. Pickers offer Xbox 360, Xbox One, DualSense and DualShock 4
+everywhere, plus Steam Deck on Linux, Android and the console home. The host builds each virtual
+pad from the declared type; a type the host has no backend for degrades to an Xbox 360 pad (Xbox
+One on a Windows host, any Sony pad on a Linux host that can't open `/dev/uhid`).
 
-That degrade matters for **motion**. An Xbox-class virtual pad has no gyroscope in its HID
-contract, so a session that ends up on one throws every motion sample away — your controller's gyro
-does nothing. Automatic lands there for any controller punktfunk doesn't recognise as Sony or Valve (an 8BitDo
-with a gyro, say), and so does a Switch Pro streaming to a Windows host, which has no Nintendo
-backend to build. **If you want motion, pick a DualSense-class type** — DualSense, DualSense Edge,
-DualShock 4, Switch Pro or Steam Deck all carry a motion plane. The clients detect this case and say
-so on-screen for a few seconds when it happens; the setting applies from the next session, not the
-one you are in.
-
-On a **Steam Deck as the client**, motion also needs Steam Input switched off for punktfunk — with
-it on, Steam hands the app its own virtual Xbox pad, which has no gyro to forward no matter which
-type you pick.
+That degrade matters for **motion**: an Xbox-class virtual pad has no gyroscope, so a session on
+one throws every motion sample away. Automatic lands there for any pad not recognised as Sony or
+Valve (an 8BitDo with a gyro, say), and for a Switch Pro streaming to a Windows host. **If you want
+motion, pick a DualSense-class type** — DualSense, DualSense Edge, DualShock 4, Switch Pro or Steam
+Deck all carry a motion plane. Clients say so on-screen when it happens; the setting applies from
+the next session. On a **Steam Deck as the client**, motion also needs Steam Input off for
+punktfunk — with it on, Steam hands the app its own virtual Xbox pad.
 
 **Forwarded controller** (*Use controller* on Apple and the console home) — *default: Automatic*,
-which forwards *every* connected controller, each as its own player, on Linux, Windows, Apple and the
-console home. Pinning one restricts the session to that controller alone — single-player. The Android
-app has no such picker.
+which forwards *every* connected controller, each as its own player. Pinning one restricts the
+session to that controller alone. Linux, Windows, Apple, console home; not Android.
 
-**Steam / guide button** (*Guide button* on Apple and Android) — *default: Automatic*, on every
-client. Where the guide (Xbox/PS/Steam) and quick-access presses go while streaming: **Send to
-host** forwards them raw, **This device** keeps them local. Automatic forwards everywhere except
-Gaming Mode, where SteamOS opens its own menus for those buttons no matter what — forwarding raw
-there opens *both* menus at once, the local one covering the stream. The full story, including how
-to reach the host's menus when the raw press stays local, is on the
-[Input page](/docs/input#the-guide-button-xbox--ps--steam-and-quick-access).
+**Steam / guide button** (*Guide button* on Apple and Android) — *default: Automatic*, everywhere.
+Where guide (Xbox/PS/Steam) and quick-access presses go while streaming: **Send to host** forwards
+them raw, **This device** keeps them local. Automatic forwards everywhere except Gaming Mode, where
+SteamOS opens its own menus for those buttons regardless — forwarding raw there opens both menus at
+once. Full story:
+[the guide button](/docs/input#the-guide-button-xbox--ps--steam-and-quick-access).
 
-**Hold Select for guide** — *default: Automatic*, on every client. The gesture that presses the
-host's guide button from any controller: hold Select (Back/View) on its own for about a third of a
-second, and keep holding for the host's long-press (a Gaming-Mode host's Quick Access Menu, on a
-regular pad). Automatic arms it only where the raw guide press can't reach the host cleanly —
-Gaming Mode, iPhone/iPad, Apple TV — because the gesture has a cost: a Select *tap* arrives a beat
-late, and a game that expects a *held* Select would trigger it. Set **On** or **Off** to overrule.
+**Hold Select for guide** — *default: Automatic*, everywhere. The gesture that presses the host's
+guide button from any controller: hold Select (Back/View) alone ~⅓ s; keep holding for the host's
+long-press. Automatic arms it only where the raw press can't reach the host cleanly — Gaming Mode,
+iPhone/iPad, Apple TV — because the gesture costs: a Select *tap* arrives a beat late, and a game
+expecting a *held* Select would trigger it. **On**/**Off** overrule.
 
-**Controller haptics** — *default: on*, and **Controller speaker** — *default: on* on the Linux and
-Windows apps, *off* on Android. The two halves of [controller audio](/docs/controller-audio): a
-DualSense's voice-coil haptics, and the little speaker in the middle of the pad. Both need a
-**wired** DualSense or DualSense Edge — over Bluetooth a controller exposes no audio device at all,
-and both settings quietly do nothing. Neither costs anything without a host that sends them: the
-plane is negotiated, and silence is never encoded or transmitted. Turn **Controller speaker** off if
-you would rather all game audio came out of your speakers or headset.
+**Controller haptics** — *default: on*, and **Controller speaker** — *default: on* on Linux and
+Windows, *off* on Android. The two halves of [controller audio](/docs/controller-audio): a
+DualSense's voice-coil haptics and the pad's speaker. Both need a **wired** DualSense or DualSense
+Edge — Bluetooth exposes no audio device, and both settings quietly do nothing. The plane is
+negotiated, so neither costs anything without a host that sends them. Linux, Windows and Android.
+On Linux the client also switches the pad's sound card to Pro Audio while it needs the voice coils
+and puts it back afterwards — see
+[the controller-audio page](/docs/controller-audio#on-a-linux-client-the-pads-own-profile-matters-too).
 
-Offered by the Linux, Windows and Android apps. On Linux, the client also switches the controller's
-sound card to Pro Audio while it needs the voice coils, and puts it back afterwards — see
-[the controller-audio page](/docs/controller-audio#on-a-linux-client-the-pads-own-profile-matters-too)
-for why that is necessary and how to turn it off.
+**Capture system shortcuts** — *default: on.* Linux, Windows (spelled *Capture system shortcuts
+(Alt+Tab, Win, …)*), macOS and the console home; on a Deck it matters only for an attached keyboard
+(gamescope holds nothing back). On, Alt+Tab and the Windows/Super key reach the host while input is
+captured; off, they act locally. Either way the chords return when you release capture with
+**Ctrl+Alt+Shift+Q**, the window loses focus, or the stream ends —
+[Desktop mouse mode](/docs/input#mouse-modes) never takes them at all. Leaving it on means
+**Ctrl+Alt+Shift+Q is your way out**, since Alt+Tab no longer is.
 
-**Capture system shortcuts** — *default: on.* Offered by the Linux, Windows and macOS apps and the
-console home; Windows spells the row out as *Capture system shortcuts (Alt+Tab, Win, …)*. On a Deck it
-matters only for a keyboard you attached yourself: Gaming Mode is gamescope, which has nothing to
-hold back. On, Alt+Tab and the Windows key (Super on Linux)
-reach the host while the stream has input captured. Off, they act on this machine instead — what you
-want when the stream shares a screen with local work. Either way the chords come back the moment you
-release capture with **Ctrl+Alt+Shift+Q**, the window loses focus, or the stream ends, and
-[Desktop mouse mode](/docs/input#mouse-modes) never takes them at all. Leaving this on does mean
-**Ctrl+Alt+Shift+Q is your way out** of a captured stream, since Alt+Tab no longer is.
+On macOS the chords in question are the **⌘** ones — on, ⌘Q, ⌘W, ⌘H and the rest go to the host
+while input is captured (⌘Q arrives as Super+Q); off, they act on the Mac, which means ⌘Q quits
+Punktfunk mid-stream. **⌘⎋ always stays local** — it releases capture, as does ⌃⌥⇧Q, and ⌃⌘F keeps
+working on the window. ⌘Tab, ⌘Space and the Mission Control keys never reach the host either way —
+macOS claims them first.
 
-On macOS the chords in question are the **⌘** ones — ⌘Q above all, which reaches the host as Super+Q,
-one of the most-bound chords on a Linux desktop. On, ⌘Q, ⌘W, ⌘H and the rest go to the host instead
-of this app's menu bar while input is captured. Off, they act on the Mac as usual, which means ⌘Q
-quits Punktfunk mid-stream. **⌘⎋ always stays local whichever way the toggle is set** — it is what
-releases capture, as is ⌃⌥⇧Q, and ⌃⌘F keeps working on the window. A few chords never reach the host
-either way, because macOS claims them before any app can see them: ⌘Tab, ⌘Space, and the Mission
-Control keys.
-
-On Linux this needs a compositor that supports keyboard-shortcuts-inhibit — KDE Plasma, GNOME and
-the wlroots compositors all do, and X11 sessions grab the keyboard directly. Under
-[gamescope](/docs/gamescope) there is nothing to inhibit: it hands the session everything already.
+On Linux this needs a compositor with keyboard-shortcuts-inhibit — KDE Plasma, GNOME and wlroots
+compositors have it, X11 sessions grab the keyboard directly. Under [gamescope](/docs/gamescope)
+there is nothing to inhibit.
 
 **Invert scroll direction** — *default: off*, i.e. the host scrolls the way this machine does.
 
 ## Behavior
 
 **Auto-wake on connect** — *default: on.* Connecting to a saved host that looks offline sends
-Wake-on-LAN and waits for it to boot — only for a host whose MAC address this client has already
-learned. Turn it off for hosts you reach over a VPN, where "offline" usually means "not reachable by
-broadcast" and the wake only adds a delay. The Linux, Windows, Apple and Android apps have this
-toggle, as does the console home — and on a Steam Deck it governs the
-[Decky plugin's](/docs/steam-deck) launches too, because the plugin starts every stream through the
-client. The console home also offers wake as an
-explicit action on an offline host, whatever the toggle says. See
-[Wake-on-LAN](/docs/wake-on-lan).
+Wake-on-LAN and waits — only for a host whose MAC this client has learned. Turn it off for hosts
+reached over a VPN, where the wake only adds delay. Linux, Windows, Apple, Android and the console
+home; on a Steam Deck it also governs the [Decky plugin's](/docs/steam-deck) launches. The console
+home additionally offers wake as an explicit action on an offline host, whatever the toggle says.
+See [Wake-on-LAN](/docs/wake-on-lan).
 
 **Show game library** — *Apple and Android only, default: on.* Browse a paired host's games and
-launch one directly. The Linux and Windows apps have nothing to switch on — **Browse library…** sits
-on every paired host's card — and neither does the console home, whose **Library** button was always
-offered on any paired host. See [Game library](/docs/game-library).
+launch one directly. Linux and Windows have **Browse library…** on every paired host's card, and
+the console home a **Library** button — nothing to switch. See [Game library](/docs/game-library).
 
 **Start streams in fullscreen** — *default: on.* On Linux and Windows, F11 or Alt+Enter leaves
-fullscreen live. On a Mac the setting is **Fullscreen while streaming**, and the window comes back
-when you return to the host list. The console home carries the row for the desktop client that
-shares the store — a Gaming-Mode launch is fullscreen whatever it says. iPhone, iPad, Apple TV and
-Android have no equivalent.
+fullscreen live. On a Mac the setting is **Fullscreen while streaming**, and the window returns
+with the host list. The console home carries the row for the desktop client that shares the store —
+a Gaming-Mode launch is fullscreen regardless. Not on iPhone, iPad, Apple TV or Android.
 
 ## Interface
 
-These change how the client itself looks and behaves. None touches a stream, so none can live in a
-[profile](/docs/profiles-and-links) — they are decisions about the device in front of you.
+How the client itself looks. None touches a stream, so none can live in a
+[profile](/docs/profiles-and-links).
 
-**Gamepad-optimized browsing** — *default: on.* Swaps the touch or desktop home for the
-controller-optimized one: the host carousel, larger focus targets, a swipeable cover browser, and
-settings you can step with a thumbstick. The Apple and Android apps have this switch. Turn it off to
-stay in the touch interface even with a pad in your hands. On Linux, Windows and the Steam Deck the
-controller-optimized home is a separate entry point rather than a switch, so there is nothing to
-turn off. An Android TV is always in this mode — its remote is the only input it has.
+**Gamepad-optimized browsing** — *default: on.* Swaps the touch/desktop home for the
+controller-optimized one: host carousel, larger focus targets, a swipeable cover browser, steppable
+settings. Apple and Android have the switch; on Linux, Windows and the Steam Deck the
+controller-optimized home is a separate entry point. An Android TV is always in this mode.
 
-**Show it** — *default: With a controller.* Only shown while the switch above is on, and it decides
-*when* that switch takes effect. **With a controller**: the controller-optimized home appears as a
-pad connects and the touch interface returns when the last one disconnects. **Always** keeps the
-controller-optimized home either way — for a phone or tablet docked to a TV, where the pad isn't
-always awake. Apple and Android. (An Android TV is in that mode regardless, so the choice changes nothing
-there.)
+**Show it** — *default: With a controller.* Shown while the switch above is on. **With a
+controller**: the controller-optimized home appears as a pad connects, the touch interface returns
+when the last one disconnects. **Always** keeps it either way — for a phone or tablet docked to a
+TV. Apple and Android (an Android TV is in that mode regardless).
 
-**Background** — *default: Violet.* The colour family the controller-optimized home's living backdrop
-drifts through. Thirteen of them: seven dark fields — **Violet**, **OLED**, **Nebula**, **Abyss**,
-**Ember**, **Moss**, **Graphite** — then six pale ones, **Holo**, **Sunset**, **Bloom**, **Dawn**,
-**Mint** and **Opal**, which flip the whole interface to dark text on a light field. The backdrop
-recolours as you step the row, so pick by looking. **OLED** is the one with a practical point: it is
-true black — most of the frame is pixels switched off, which on an OLED or AMOLED panel means no
-glow and no power drawn, with only a faint violet ember left in one corner. Stored under the same
-name on every client, so a phone, a Deck and a desktop set to Mint all look alike.
-
-The row lives in the controller-optimized settings themselves — the screen you reach with **X** from
-the controller-optimized home — on every platform that has one, which includes the Steam Deck and the
-Linux and Windows console home. The Apple TV is the exception: it carries **Background** in its
-ordinary Settings instead, next to **Show it**, because its controller-optimized home needs a real
-controller to open and the palettes would otherwise be unreachable from the Siri Remote.
+**Background** — *default: Violet.* The colour family of the controller-optimized home's backdrop.
+Thirteen: seven dark — **Violet**, **OLED**, **Nebula**, **Abyss**, **Ember**, **Moss**,
+**Graphite** — and six pale — **Holo**, **Sunset**, **Bloom**, **Dawn**, **Mint**, **Opal** — which
+flip the interface to dark text on a light field. The backdrop recolours as you step the row.
+**OLED** is true black: most of the frame is pixels switched off — no glow, no power on an
+OLED/AMOLED panel. Stored under the same name on every client. The row lives in the
+controller-optimized settings (**X** from the controller-optimized home) everywhere that has one,
+including the Steam Deck and the Linux/Windows console home; the Apple TV carries it in ordinary
+Settings next to **Show it** instead, so it's reachable from the Siri Remote.
 
 ## Overlay
 
 **Statistics overlay** — *default: Normal.* Four tiers — Off, Compact, Normal, Detailed — each a
-superset of the one before. This setting only picks the tier a session *starts* at — you can cycle
-them live in-stream, with a shortcut that differs by platform. The Apple app additionally lets you
-choose which corner the overlay sits in (Top Left, Top Right, Bottom Left, Bottom Right). The
-console home has the tier picker too, as **Statistics overlay** under **Interface**. The shortcuts,
-and every number in the overlay, are in [Understanding the stats overlay](/docs/stats).
+superset of the last. This picks the tier a session *starts* at; cycle live in-stream with a
+per-platform shortcut. The Apple app also picks the corner (Top/Bottom × Left/Right). The console
+home has the tier picker under **Interface**. Shortcuts and every number:
+[Understanding the stats overlay](/docs/stats).
 
 ## Settings that are facts about your device
 
-A few of these describe the machine you're sitting at rather than how you want a host streamed. They
-stay global and **cannot be put in a settings profile**:
+These describe the machine you're sitting at, stay global, and **cannot be put in a settings
+profile**:
 
 - **Video decoder** and **GPU** — the decode path and adapter this device uses. Automatic is
-  vendor-ordered and falls back on its own; change it only when debugging, and note that
-  `PUNKTFUNK_DECODER` overrides it
-  ([Configuration](/docs/configuration#client-side-native-clients)). The decoder picker is on Linux,
-  Windows and in the console home; the GPU picker on Windows, and on Linux only when the machine has
-  more than one adapter — the console home has none, and a Deck has a single adapter anyway. The
-  Apple and Android apps have neither.
+  vendor-ordered and falls back on its own; change only when debugging; `PUNKTFUNK_DECODER`
+  overrides it ([Configuration](/docs/configuration#client-side-native-clients)). Decoder picker:
+  Linux, Windows, console home. GPU picker: Windows, and Linux with more than one adapter. Apple
+  and Android have neither.
 - **Speaker** and **Microphone** device pickers — this device's audio endpoints.
-- **Forwarded controller** — which physical pad is in your hands. The *type* the host creates is a
-  preference and can live in a profile; which pad you hold cannot. **Forward controllers** is a
-  preference too, and does live in a profile — a work profile can decline to forward what a game
-  profile forwards.
-- **Auto-wake on connect**, and **Show game library** where it still exists (the Apple and Android
-  apps) — decisions about this device and this network, not about how a given host is streamed.
-- Everything under **Interface** — **Gamepad-optimized browsing**, **Show it** and **Background**.
-  How this client looks has nothing to do with how a host streams to it.
+- **Forwarded controller** — which physical pad is in your hands. (The *type* the host creates is a
+  preference and can live in a profile, as can **Forward controllers**.)
+- **Auto-wake on connect**, and **Show game library** where it exists (Apple, Android).
+- Everything under **Interface**.
 
 One switch you might expect here isn't in Settings at all: **Share clipboard** lives in a saved
 host's own edit sheet, because handing a machine your clipboard is a decision about that one host —
