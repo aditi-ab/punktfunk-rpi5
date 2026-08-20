@@ -30,6 +30,10 @@ pub(super) async fn run(
     encoder_ceiling_kbps: Arc<AtomicU32>,
     cadence_degraded: Arc<AtomicBool>,
     cadence_behind_score: Arc<AtomicU32>,
+    // Delivery truth, published from every `DeliveryReport` for the data plane's stall diagnosis:
+    // the packets the client says it has received all session (`u32::MAX` = a client too old to
+    // send one, the pre-seeded value).
+    client_packets_received: Arc<AtomicU32>,
     fec_target_ctl: Arc<AtomicU8>,
     // Phase-locked capture bridge: client PhaseReports land here latest-wins; the encode loop's
     // controller drains at its own ~1 Hz cadence (design/phase-locked-capture.md).
@@ -162,6 +166,16 @@ pub(super) async fn run(
                     if rfi_tx.send((req.first_frame, req.last_frame)).is_err() {
                         break; // data plane gone
                     }
+                } else if let Ok(rep) = punktfunk_core::quic::DeliveryReport::decode(&msg) {
+                    // What the client has actually RECEIVED — published unconditionally, because it
+                    // is what lets the data plane read `loss_ppm = 0` correctly and must survive
+                    // both the `adaptive_fec` opt-out and a pinned FEC percentage (a host with
+                    // PUNKTFUNK_FEC_PCT set is exactly as blind to a dead data plane otherwise).
+                    // Saturated into the u32 bridge; the value only ever matters near zero.
+                    client_packets_received.store(
+                        rep.packets_received.min(u32::MAX as u64 - 1) as u32,
+                        Ordering::Relaxed,
+                    );
                 } else if let Ok(rep) = LossReport::decode(&msg) {
                     // Adaptive FEC: size recovery to the loss the client is seeing. The data-plane
                     // send loop reads `fec_target_ctl` and applies it per frame. Ignored when FEC

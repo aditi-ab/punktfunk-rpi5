@@ -1404,6 +1404,12 @@ async fn serve_session(
     // evidence (a refusal without the score left a 23-minute floor-pinned field session with no
     // trace of why).
     let cadence_behind_score = Arc::new(AtomicU32::new(0));
+    // Delivery truth, control task → data plane: the packet count the client reports having
+    // received all session (`u32::MAX` until a client new enough to answer sends one). The data
+    // plane needs it to tell a clean link from a dead one — `loss_ppm = 0` means both — before it
+    // blames the client for a stream that never reached it.
+    let client_packets_received = Arc::new(AtomicU32::new(u32::MAX));
+    let client_packets_received_ctl = client_packets_received.clone();
     let (probe_tx, probe_rx) = std::sync::mpsc::channel::<ProbeRequest>();
     let (probe_result_tx, probe_result_rx) = tokio::sync::mpsc::unbounded_channel::<ProbeResult>();
     // Mode-switch outcome, data plane → control task (same pattern as `probe_result_tx`): the accept
@@ -1535,6 +1541,7 @@ async fn serve_session(
         encoder_ceiling_kbps.clone(),
         cadence_degraded.clone(),
         cadence_behind_score.clone(),
+        client_packets_received_ctl,
         fec_target_ctl,
         phase_ctl_control,
         reconfig_tx,
@@ -2093,6 +2100,26 @@ async fn serve_session(
                  address with no hole-punch; else punched=true → the client's observed source, \
                  false → no punch seen, the reported address)"
             );
+            // A punch that never arrives is not a routine fallback — it is the fingerprint of a
+            // data port the client cannot reach INBOUND, and every client punches (5/s for the
+            // first three seconds, then every two). Video then goes to an address the client only
+            // CLAIMED, unverified, and if anything on the path needed the flow opened client-first
+            // it silently goes nowhere: black picture, healthy control plane, no error anywhere.
+            // On Windows the usual cause is a firewall rule that opens fixed ports only, while
+            // this port is ephemeral and different every session (fixed by the program-scoped rule
+            // `service install` now adds — an install predating it still has the old rules).
+            // `direct` skips the punch by operator choice, so it is not a failure there.
+            if !direct && !punched {
+                tracing::warn!(
+                    %client_udp,
+                    udp_port,
+                    "no hole-punch reached this host's data port — inbound UDP to it looks \
+                     BLOCKED, so video is being sent to the address the client reported without \
+                     any confirmed return path. If the picture stays black while the session is \
+                     otherwise healthy, this line is the reason: allow inbound UDP for the host \
+                     executable (any port), or pin --data-port and open that one"
+                );
+            }
             let mut session = Session::new(cfg, Box::new(transport))
                 .map_err(|e| anyhow!("host session: {e:?}"))?;
             match source {
@@ -2127,6 +2154,7 @@ async fn serve_session(
                         encoder_ceiling_kbps,
                         cadence_degraded,
                         cadence_behind_score,
+                        client_packets_received,
                         bitrate_auto,
                         bit_depth,
                         chroma,

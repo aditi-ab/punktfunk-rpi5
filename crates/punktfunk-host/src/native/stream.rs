@@ -1319,6 +1319,14 @@ pub(super) struct SessionContext {
     /// of what held it there — the score is the missing discriminator between "the detector's
     /// budget is wrong" and "this encoder genuinely can't hold cadence").
     pub(super) cadence_behind_score: Arc<AtomicU32>,
+    /// Data-plane packets the CLIENT says it has received all session, from the latest
+    /// [`punktfunk_core::quic::DeliveryReport`] ([`u32::MAX`] = a client too old to send one).
+    ///
+    /// The one signal that distinguishes "the link is clean" from "nothing is arriving": both look
+    /// like `loss_ppm = 0`, because loss is a ratio over the packets that DID arrive. Read by the
+    /// keyframe-cadence diagnosis below, which without it accuses the client of being too slow for
+    /// a stream it has never received a byte of.
+    pub(super) client_packets_received: Arc<AtomicU32>,
     /// The client asked for "Automatic" (`Hello::bitrate_kbps == 0`), so `bitrate_kbps` came from
     /// the host's codec-aware default. For PyroWave that default is the ~1.6 bpp operating point of
     /// the NEGOTIATED MODE (`resolve_bitrate_kbps_for`) — a mid-stream mode switch re-resolves it
@@ -1598,6 +1606,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         encoder_ceiling_kbps,
         cadence_degraded,
         cadence_behind_score,
+        client_packets_received,
         bitrate_auto,
         bit_depth,
         // The resolved chroma is already captured in `plan` (above); ignore the duplicate here.
@@ -3006,16 +3015,65 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     // subsystems while the real chain was: client refused the codec → demoted to
                     // a slower decode rung → could not sustain the rate → standing queue.
                     // Perfect periodicity argues FOR a software cooldown, not against it.
-                    if matches_client_flush_cadence(period) {
-                        tracing::warn!(
+                    let client_rx = client_packets_received.load(Ordering::Relaxed);
+                    // The client has TOLD us it has received nothing all session (a v1 client
+                    // leaves the `u32::MAX` seed, so this only fires on an explicit zero). That
+                    // outranks both cadence verdicts below, which are about a client drowning in
+                    // frames — the opposite failure, and indistinguishable by period alone because
+                    // a client that got no picture re-asks on its own no-video timer at very
+                    // nearly the same spacing. Diagnosing this as "too slow" cost a 2026-08-20
+                    // field investigation days: the host was blameless-looking (`sent` climbing,
+                    // `loss_ppm = 0`, FEC decayed to the floor) while not one byte of video ever
+                    // reached the client.
+                    if client_rx == 0 {
+                        tracing::error!(
                             period_s = format!("{:.1}", period.as_secs_f64()),
-                            "client keyframe recoveries match the client's jump-to-live cooldown \
-                             — the CLIENT cannot sustain the stream and is shedding a standing \
-                             receive queue (check its log for 'receive backlog stopped draining' \
-                             with queue_depth, and for a decode rung that demoted); a slower \
-                             decode path or a link below the bitrate does this, and it is NOT a \
-                             host display disturbance"
+                            frames_sent = sent,
+                            "THE VIDEO DATA PLANE IS NOT REACHING THE CLIENT — it reports 0 \
+                             packets received all session while this host has sent the frames \
+                             counted here, so the picture is black and every keyframe we force is \
+                             wasted. The control plane is healthy (this report arrived on it), so \
+                             the session looks alive: audio, input and the library keep working. \
+                             This is a PATH problem, not decode — check that inbound UDP to this \
+                             host's per-session data port is allowed (the 'data plane bound' line \
+                             above shows `punched=false` when the client's hole-punch never \
+                             arrived, which is the fingerprint), and that no other host or \
+                             firewall is intercepting it"
                         );
+                    } else if matches_client_recovery_cooldown(period) {
+                        if client_rx == u32::MAX {
+                            // This client predates the delivery count, so the period alone has to
+                            // carry the verdict — and it CANNOT: both client cooldowns live in this
+                            // band and they mean opposite things. Say so instead of picking one.
+                            // The old confident wording sent a field investigation after the
+                            // decoder for days while the real fault was that nothing arrived.
+                            tracing::warn!(
+                                period_s = format!("{:.1}", period.as_secs_f64()),
+                                frames_sent = sent,
+                                "client keyframe recoveries land on a client software cooldown, \
+                                 but this client is too old to report whether any video reached \
+                                 it — so this is EITHER a client that cannot sustain the stream \
+                                 and is shedding a standing receive queue, OR a client that has \
+                                 received nothing at all and is re-asking on its no-video timer. \
+                                 They are opposite faults; the host cannot tell them apart from \
+                                 the period. Its log does: 'receive backlog stopped draining' \
+                                 (with queue_depth) means the first, 'no video received … into \
+                                 the session' means the second. Upgrading the client makes this \
+                                 line decide on its own"
+                            );
+                        } else {
+                            tracing::warn!(
+                                period_s = format!("{:.1}", period.as_secs_f64()),
+                                client_packets_received = client_rx,
+                                "client keyframe recoveries match the client's jump-to-live \
+                                 cooldown, and it confirms video IS arriving — the CLIENT cannot \
+                                 sustain the stream and is shedding a standing receive queue \
+                                 (check its log for 'receive backlog stopped draining' with \
+                                 queue_depth, and for a decode rung that demoted); a slower \
+                                 decode path or a link below the bitrate does this, and it is NOT \
+                                 a host display disturbance"
+                            );
+                        }
                     } else {
                         tracing::warn!(
                             period_s = format!("{:.1}", period.as_secs_f64()),
@@ -4191,6 +4249,26 @@ fn matches_client_flush_cadence(period: std::time::Duration) -> bool {
     period.abs_diff(flush) < flush / 10
 }
 
+/// The client's OTHER re-ask cooldown: it has received no video whatsoever and is asking for a
+/// keyframe on its no-video timer. Kept separate from [`matches_client_flush_cadence`] because the
+/// two describe opposite faults — drowning in frames versus receiving none — and only the client's
+/// reported delivery count can say which. Both are host-side-irrelevant either way: a fixed
+/// software cooldown is never the periodic *disturbance* the metronomic branch reports.
+///
+/// Compared against the SHARED constant, never a copy of the number — the same discipline
+/// [`matches_client_flush_cadence`] follows, and the one that was missing when the two cooldowns
+/// were both 2000 ms and the host could not even tell that it was guessing.
+fn matches_client_no_video_cadence(period: std::time::Duration) -> bool {
+    let no_video = punktfunk_core::client::NO_VIDEO_RETRY;
+    period.abs_diff(no_video) < no_video / 10
+}
+
+/// Either client cooldown — the band in which a period tells us about the CLIENT's software, not
+/// about anything physical on this host.
+fn matches_client_recovery_cooldown(period: std::time::Duration) -> bool {
+    matches_client_flush_cadence(period) || matches_client_no_video_cadence(period)
+}
+
 /// One mode's capture/encode pipeline: (capturer, encoder, first frame, frame interval).
 /// Dropping the capturer tears down the PipeWire stream and the virtual output with it.
 type Pipeline = (
@@ -5066,6 +5144,29 @@ mod tests {
         assert!(!matches_client_flush_cadence(flush * 2));
         assert!(!matches_client_flush_cadence(flush + flush / 5));
         assert!(!matches_client_flush_cadence(std::time::Duration::ZERO));
+    }
+
+    /// The two client cooldowns must stay TELLABLE APART by period, and both must stay out of the
+    /// display-disturbance branch. While they were both 2000 ms a black-screen field case (nothing
+    /// ever reached the client) was reported as "the client cannot sustain the stream" — the exact
+    /// opposite fault — because the periods were identical and the host guessed.
+    #[test]
+    fn the_two_client_cooldowns_are_distinguishable_and_both_excluded_from_display_blame() {
+        let flush = punktfunk_core::client::FLUSH_COOLDOWN;
+        let no_video = punktfunk_core::client::NO_VIDEO_RETRY;
+        assert_ne!(
+            flush, no_video,
+            "identical cooldowns make the host's verdict a coin flip"
+        );
+        // Neither may fall inside the other's ±10% band, or the period stops discriminating.
+        assert!(!matches_client_flush_cadence(no_video));
+        assert!(!matches_client_no_video_cadence(flush));
+        // Both are client software cooldowns: never the metronomic display-disturbance branch.
+        assert!(matches_client_recovery_cooldown(flush));
+        assert!(matches_client_recovery_cooldown(no_video));
+        // A real periodic disturbance still reaches that branch.
+        assert!(!matches_client_recovery_cooldown(flush * 3));
+        assert!(!matches_client_recovery_cooldown(std::time::Duration::ZERO));
     }
 
     #[test]

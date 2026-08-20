@@ -1587,6 +1587,7 @@ fn add_firewall_rules(allow_public: bool) {
             eprintln!("warning: could not add firewall rule '{name}' (add it manually if needed)");
         }
     }
+    add_data_plane_firewall_rule(profile);
     if !allow_public {
         println!(
             "Note: streaming ports are open on Private/Domain networks only. On a network Windows \
@@ -1596,7 +1597,75 @@ fn add_firewall_rules(allow_public: bool) {
     }
 }
 
+/// Rule name for the program-scoped data-plane rule (see [`add_data_plane_firewall_rule`]).
+const FW_DATA_PLANE_RULE: &str = "Punktfunk UDP (data plane)";
+
+/// Inbound UDP for the host executable itself, at **any** local port.
+///
+/// The media data plane binds an EPHEMERAL port per session (`0.0.0.0:0`, reported to the client in
+/// the Welcome), so no `localport=` rule can cover it — the port-scoped rules above open the fixed
+/// control/GameStream/mDNS ports and nothing else. Without this, Windows Firewall drops the client's
+/// hole-punch (`PUNCH_MAGIC` → the host's data port) on EVERY session: that is what `punched=false`
+/// on the host's "data plane bound" line means. The punch then never opens the return path, video
+/// falls back to blind-sending at the address the client merely *reported*, and the moment anything
+/// on the path needs the flow opened client-first the stream goes black while the control plane
+/// stays healthy — no reconnect, no error, just a session that never shows a picture.
+///
+/// Program-scoped rather than a pinned port: it covers whatever port the session picks, needs no
+/// second rule when the range moves, and cannot collide with another host (a pinned data port in
+/// 47998-48010 would land on Sunshine/Apollo's GameStream range). The port rules above are kept as
+/// they are — an install whose recorded exe path later moves still has its fixed ports open.
+fn add_data_plane_firewall_rule(profile: &str) {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "warning: could not resolve the host executable path ({e}) — skipping the \
+                 data-plane firewall rule; streams may show a black picture behind a healthy \
+                 connection on networks that need the client's hole-punch to open the path"
+            );
+            return;
+        }
+    };
+    let ok = run_quiet(
+        "netsh",
+        &[
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            &format!("name={FW_DATA_PLANE_RULE}"),
+            "dir=in",
+            "action=allow",
+            "protocol=UDP",
+            &format!("program={}", exe.to_string_lossy()),
+            profile,
+        ],
+    );
+    if ok {
+        println!(
+            "Firewall rule added: {FW_DATA_PLANE_RULE} (any UDP port for {}) [{profile}]",
+            exe.display()
+        );
+    } else {
+        eprintln!(
+            "warning: could not add firewall rule '{FW_DATA_PLANE_RULE}' — the per-session video \
+             data port stays closed to inbound, so the client's hole-punch cannot reach it"
+        );
+    }
+}
+
 fn remove_firewall_rules() {
+    let _ = run_quiet(
+        "netsh",
+        &[
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={FW_DATA_PLANE_RULE}"),
+        ],
+    );
     for suffix in ["TCP", "UDP"] {
         // Capital P is the brand; netsh matches a rule name case-INSENSITIVELY, so this still
         // reaps the lowercase rules every release up to 0.22.1 created — no orphans on upgrade.

@@ -42,7 +42,7 @@ mod recovery;
 mod rumble;
 mod worker;
 
-pub use self::frame_channel::FLUSH_COOLDOWN;
+pub use self::frame_channel::{FLUSH_COOLDOWN, NO_VIDEO_RETRY};
 pub use self::planes::AudioPacket;
 pub use self::probe::ProbeOutcome;
 pub use self::rumble::{ActuatorQuirks, RumbleCommand};

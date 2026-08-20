@@ -1225,6 +1225,11 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Type byte of [`DeliveryReport`].
+#define PUNKTFUNK_MSG_DELIVERY_REPORT 11
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Type byte of [`ProbeRequest`].
 #define PUNKTFUNK_MSG_PROBE_REQUEST 32
 #endif
