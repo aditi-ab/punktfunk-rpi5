@@ -176,7 +176,17 @@ unwrapped.overrideAttrs (old: {
     chmod -R u+w $out
 
     find $out -mindepth 1 -maxdepth 1 ! -name bin -exec rm -rf {} +
-    find $out/bin -mindepth 1 ! -name gamescope -delete
+    # KEEP `.gamescope-wrapped`. nixpkgs wraps this package: makeWrapper leaves the real
+    # compositor ELF at bin/.gamescope-wrapped and installs a small launcher at bin/gamescope
+    # that sets PATH (xwininfo) before exec'ing it. A prune that keeps only `gamescope` deletes
+    # the compositor and ships the launcher alone — MEASURED 2026-08-20 (run 19622): $out/bin
+    # held a single 16 KB file, `--version` printed nothing because the launcher exec'd a path
+    # that no longer existed, and no +pfhdr marker was present because a wrapper carries no
+    # version string. Every symptom chased for three builds came from this one line.
+    #
+    # The launcher references its target by ABSOLUTE path, so renaming the launcher is safe
+    # while the target keeps its name.
+    find $out/bin -mindepth 1 ! -name gamescope ! -name '.gamescope-wrapped' -delete
     mv $out/bin/gamescope $out/bin/punktfunk-gamescope
 
     install -Dm0755 "$TMPDIR/pf-layer.so" \
@@ -203,7 +213,12 @@ unwrapped.overrideAttrs (old: {
     # .rodata through GamescopeVersion.h's k_szGamescopeVersion, so this proves the marker survived
     # patching, meson configuration AND compilation into the artifact we actually ship, and it
     # cannot be defeated by the binary being unable to start.
-    grep -aq '+pfhdr' $out/bin/punktfunk-gamescope || {
+    # Grep the WRAPPED ELF: bin/punktfunk-gamescope is nixpkgs' launcher and carries no version
+    # string at all, so asserting on it would pass only by accident. Fall back to the launcher
+    # for a future nixpkgs that stops wrapping.
+    gsElf=$out/bin/.gamescope-wrapped
+    [ -f "$gsElf" ] || gsElf=$out/bin/punktfunk-gamescope
+    grep -aq '+pfhdr' "$gsElf" || {
       echo "punktfunk-gamescope: the +pfhdr marker is not in the installed binary." >&2
       echo "  src/meson.build carried it (asserted in postPatch), so it was lost between" >&2
       echo "  meson configuration and the linked artifact. Evidence:" >&2
@@ -212,7 +227,7 @@ unwrapped.overrideAttrs (old: {
       echo "  --- anything under $out mentioning pfhdr ---" >&2
       grep -ral 'pfhdr' $out 2>/dev/null | sed 's/^/    | /' >&2 || echo "    | (nothing)" >&2
       echo "  --- version-ish strings in the binary ---" >&2
-      grep -aoE '[0-9]+\.[0-9]+\.[0-9]+[^ ]*' $out/bin/punktfunk-gamescope 2>/dev/null \
+      grep -aoE '[0-9]+\.[0-9]+\.[0-9]+[^ ]*' "$gsElf" 2>/dev/null \
         | sort -u | head -5 | sed 's/^/    | /' >&2 || true
       exit 1
     }
