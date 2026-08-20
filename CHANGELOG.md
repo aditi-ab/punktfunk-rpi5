@@ -14,7 +14,7 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ## v0.31.0
 
-163 commits since v0.30.0 (109 non-merge).
+173 commits since v0.30.0 (115 non-merge).
 
 One versioned surface moves, additively: the **C ABI goes 24 → 25**, a single new symbol
 (`punktfunk_set_log_callback`) that lets an embedder hear the core's own log lines. Nothing else
@@ -645,7 +645,24 @@ legs as follow-ups. Both landed here.
 - **Docs:** `AGENTS.md` + `docs/agents/` (issue tracker is Gitea via the `gitea` MCP server; the
   five triage labels; single-context domain docs). A host audio-source comment corrected
   (`pw_impl_node_set_driver` marks props changed but leaves the flush to the next info emission).
-- **CI:** Nix publish job records `df` after the build as well as before.
+- **CI:** the Nix publish job records `df` after the build as well as before; the
+  `linux-client-screenshots` run publishes its PNGs to the generic package registry as well as the
+  v3 artifact store (which is browser-only, so nothing could reuse the shots for the docs — that is
+  how the get-started track got its fifth screenshot, a client's host list); and **every Linux
+  `bun install` is now wrapped in `scripts/ci/retry.sh`**. That last one is a real failure, not
+  tidying: `bun install` streams download-and-extract, so a tarball truncated by the runner's
+  packet loss under parallel load surfaces as `error: Fail extracting tarball for "<pkg>"` and
+  names a package that is perfectly intact — measured on run 19630, where docs-site died on
+  `@rolldown/binding-linux-x64-gnu` while the web job installed the same registry in the same run
+  and run 19632 installed the identical lockfile seven minutes later. The tarball's sha512 matches
+  the lockfile and bun 1.3.13 and 1.3.14 both extract it from disk, so neither the package nor the
+  floating `oven/bun:1` bump was ever at fault. `retry.sh`'s header had already diagnosed this
+  class and said to wrap every single-shot network command; `bun install` was the one still
+  unwrapped. Three attempts rather than the usual five, so a genuinely stale lockfile still fails
+  fast under `--frozen-lockfile`.
+- **The web console's Virtual displays page** put the Streamed-screen and session-lifetime cards
+  below the tab shell, so both rendered on both tabs; they are policy surfaces and now sit inside
+  the Configuration tab, leaving the Live tab as the live list plus arrangement.
 
 ### Verification status
 
@@ -656,11 +673,13 @@ Play notes gate run verbatim — 456/500 characters and not byte-identical to an
 both openapi copies `cmp` identical, both stamped 0.31.0; notes voice scan clean outside the
 For developers section.
 
-⚠ **This release was cut twice.** The first cut (`601f040f`, merged as #320) was never tagged, and
-41 more non-merge commits landed on top of it — the Windows client installer, the guided Linux
-installer, the docs overhaul, ABI v25, the KWin 6.6 repair and the takeover's final shape among
-them. This section, the version table and the notes are all re-measured on the second tip; where
-the two cuts disagreed, the earlier text was **rewritten rather than appended to**, because none of
+⚠ **This release was cut more than once.** The first cut (`601f040f`, merged as #320) was never
+tagged, and 41 more non-merge commits landed on top of it — the Windows client installer, the
+guided Linux installer, the docs overhaul, ABI v25, the KWin 6.6 repair and the takeover's final
+shape among them; a handful more (the Virtual displays tab fix, the fifth get-started screenshot)
+arrived while the second cut was being written. This section, the version table and the notes are
+all re-measured on the latest tip; where the cuts disagreed, the earlier text was **rewritten
+rather than appended to**, because none of
 the intervening work ever shipped. Specifically: the "C ABI unchanged / header byte-identical"
 claim is gone (it is 25 now), the openapi row moved off 0.29.0, the SDK and plugin-kit rows record
 cuts that have happened rather than cuts that were owed, and the Gaming Mode takeover section
