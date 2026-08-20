@@ -607,10 +607,128 @@ pub(crate) async fn delete_provider_entries(Path(provider): Path<String>) -> Res
             if removed > 0 {
                 tracing::info!(provider, removed, "library provider entries removed");
             }
+            // Its entries are gone, so its opinions about them are meaningless — and a lease must
+            // never be held open by a provider that no longer exists.
+            crate::runstate::forget(&provider);
             Json(ProviderRemoved { removed }).into_response()
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+/// One running title in a provider's liveness report.
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct RunningTitle {
+    /// The provider's own stable id for the title — the same key its reconcile payload uses.
+    pub external_id: String,
+    /// The process id the provider started for it, when it knows one. Optional, and never trusted
+    /// as a bare number: the host re-resolves it and pins it to its start time before it is ever
+    /// signalled, so a stale or recycled pid simply contributes nothing.
+    #[serde(default)]
+    pub pid: Option<u32>,
+}
+
+/// Request body for `reportProviderRunning`.
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct ProviderRunningInput {
+    /// Every title of this provider's that is running **right now**. The full set, not a delta:
+    /// anything absent from it is reported as stopped.
+    #[serde(default)]
+    pub running: Vec<RunningTitle>,
+}
+
+/// The result of a liveness report.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ProviderRunningAccepted {
+    /// How many reported titles matched an entry this provider currently publishes.
+    matched: usize,
+    /// How many were ignored because no such entry exists (a report that raced a reconcile).
+    unknown: usize,
+    /// Seconds this report stays authoritative without being restated — re-report inside it while
+    /// anything is running.
+    ttl_s: u64,
+}
+
+/// Report which of a provider's titles are running
+///
+/// The **live** counterpart to the `detect` hints in a reconcile payload: that one says *how to
+/// recognize* a title's process, this one says *it is running now* (design §9,
+/// [`crate::runstate`]). For a provider that starts games itself and knows when they stop —
+/// Playnite tracks every launch and fires an event on both edges — this is a fact the host would
+/// otherwise have to re-derive by scanning, and for a title with nothing to scan for (an emulated
+/// game, a manually added one) could not derive at all.
+///
+/// Declarative and idempotent, like the reconcile: the body is the provider's **complete** running
+/// set, so a missed event, a plugin restart or an install mid-game all self-correct on the next
+/// report rather than drifting.
+///
+/// The report **expires** after `ttl_s` (90s) unless restated, which is what makes it safe for a
+/// live provider to keep a streaming session open for a game the host cannot see: a plugin that
+/// dies with a game running stops counting shortly after, and the host falls back to process
+/// scanning exactly as it does without one. Re-report on every change **and** on a timer well
+/// inside the window.
+///
+/// Titles the provider does not currently publish are ignored (counted in `unknown`), not an error:
+/// a report may legitimately race its own reconcile.
+#[utoipa::path(
+    put,
+    path = "/library/provider/{provider}/running",
+    tag = "library",
+    operation_id = "reportProviderRunning",
+    params(("provider" = String, Path, description = "The provider id ([a-z0-9._-], `manual` reserved)")),
+    request_body = ProviderRunningInput,
+    responses(
+        (status = OK, description = "The report was accepted", body = ProviderRunningAccepted),
+        (status = BAD_REQUEST, description = "Invalid provider id or payload", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn report_provider_running(
+    Path(provider): Path<String>,
+    ApiJson(input): ApiJson<ProviderRunningInput>,
+) -> Response {
+    if let Err(e) = crate::library::validate_provider_name(&provider) {
+        return api_error(StatusCode::BAD_REQUEST, &e);
+    }
+    // Resolve the provider's own keys to the ids the rest of the host uses. A plugin knows its
+    // titles by `external_id`; a lease knows them by the library id the catalog assigned
+    // (`playnite:<guid>`), and only the catalog can map between the two — which is also what makes
+    // this authorization-safe, since a provider can only ever speak about entries it published.
+    let mine: Vec<(String, String)> = crate::library::load_custom()
+        .into_iter()
+        .filter(|e| e.provider.as_deref() == Some(provider.as_str()))
+        .filter_map(|e| {
+            let external = e.external_id.clone()?;
+            Some((external, crate::library::library_id_for(&e)))
+        })
+        .collect();
+    let owned: std::collections::HashSet<String> = mine.iter().map(|(_, id)| id.clone()).collect();
+
+    let mut running = std::collections::HashMap::new();
+    let mut unknown = 0usize;
+    for t in &input.running {
+        match mine.iter().find(|(external, _)| *external == t.external_id) {
+            Some((_, id)) => {
+                running.insert(id.clone(), t.pid);
+            }
+            None => unknown += 1,
+        }
+    }
+    let matched = running.len();
+    tracing::debug!(
+        provider,
+        owned = owned.len(),
+        matched,
+        unknown,
+        "provider liveness report"
+    );
+    crate::runstate::report(&provider, owned, running);
+    Json(ProviderRunningAccepted {
+        matched,
+        unknown,
+        ttl_s: crate::runstate::REPORT_TTL.as_secs(),
+    })
+    .into_response()
 }
 
 /// Fetch one cover-art image for a library entry

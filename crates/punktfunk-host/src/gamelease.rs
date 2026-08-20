@@ -114,9 +114,18 @@ pub enum LeaseKind {
     Child,
     /// A launcher owns the game; it is recognized by its [`DetectSpec`].
     Matched,
-    /// Nothing identifies this title's process — no detect signals and no child we own. Both
-    /// lifetime behaviors stay inert for it, and the host says so once in the log rather than
-    /// guessing.
+    /// A launcher owns the game and **tells us** when it starts and stops
+    /// ([`crate::runstate`]) — no process signal of our own.
+    ///
+    /// The one lease kind whose liveness the host does not determine for itself, and the answer to
+    /// a title that has nothing to scan for: Playnite launches an emulated or manually-added game
+    /// through its own tracking and reports the edges, where the host could see only a
+    /// `playnite://` forwarder exiting. Before this such a title was [`Untracked`](Self::Untracked)
+    /// — the honest answer at the time, and a dead end.
+    Reported,
+    /// Nothing identifies this title's process — no detect signals, no child we own, and no
+    /// provider reporting on it. Both lifetime behaviors stay inert for it, and the host says so
+    /// once in the log rather than guessing.
     Untracked,
 }
 
@@ -126,6 +135,7 @@ impl LeaseKind {
             Self::Nested => "nested",
             Self::Child => "child",
             Self::Matched => "matched",
+            Self::Reported => "reported",
             Self::Untracked => "untracked",
         }
     }
@@ -387,6 +397,12 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         LeaseKind::Child
     } else if !spec.is_empty() {
         LeaseKind::Matched
+    } else if crate::runstate::speaks_for(game.id.as_deref()) {
+        // Nothing to scan for, but the provider that published this title is reporting liveness for
+        // it — so it is tracked after all. Asked once, here, rather than every poll: a lease's kind
+        // is what decides whether it is watched at all, and a title that flipped kind mid-flight
+        // would make both lifetime behaviors depend on a plugin's uptime.
+        LeaseKind::Reported
     } else {
         LeaseKind::Untracked
     };
@@ -551,6 +567,27 @@ fn watch(
         s.is_some_and(|p| !scanner.alive(&[p]).is_empty())
     };
 
+    // What this title's provider says about it, when one reports at all ([`crate::runstate`]) —
+    // `None` on every host with no reporting plugin, which is what keeps all of this inert until
+    // someone opts in. Re-read each poll rather than captured: the whole value of it is that it
+    // changes while the lease is alive.
+    let reported = || shared.game.id.as_deref().and_then(crate::runstate::opinion);
+
+    // What a `Child` lease falls back to once its child turns out to be a shim: the store's own
+    // signals, else the provider's reporting, else nothing. The same ladder [`open`] walks, minus
+    // the child that has just gone away — and the reason a hint-less Playnite title is tracked at
+    // all on Windows, where the launch is `explorer.exe "playnite://…"` and therefore ALWAYS a
+    // hand-off, so every such lease arrives here.
+    let fallback_kind = || {
+        if !shared.spec.is_empty() {
+            LeaseKind::Matched
+        } else if crate::runstate::speaks_for(shared.game.id.as_deref()) {
+            LeaseKind::Reported
+        } else {
+            LeaseKind::Untracked
+        }
+    };
+
     // ---- Phase 1: wait for the game to show up. ----
     let start_deadline = spawned_at + START_GRACE;
     loop {
@@ -567,8 +604,10 @@ fn watch(
             && !spawned_up(&spawned)
         {
             spawned = None;
-            if spawned_at.elapsed() < SHIM_WINDOW {
-                if shared.spec.is_empty() {
+            let quick = spawned_at.elapsed() < SHIM_WINDOW;
+            kind = fallback_kind();
+            if quick {
+                if matches!(kind, LeaseKind::Untracked) {
                     tracing::info!(
                         title = %shared.game.title,
                         "the launch command exited immediately (a launcher handing off) and this \
@@ -582,11 +621,10 @@ fn watch(
                 }
                 tracing::debug!(
                     title = %shared.game.title,
-                    "the launch command handed off and exited — recognizing the game by its store \
-                     signals instead"
+                    kind = kind.as_str(),
+                    "the launch command handed off and exited — recognizing the game another way"
                 );
-                kind = LeaseKind::Matched;
-            } else if shared.spec.is_empty() {
+            } else if matches!(kind, LeaseKind::Untracked) {
                 // It ran long enough to have BEEN the game, and nothing else identifies it.
                 shared.was_running.store(true, Ordering::Relaxed);
                 finish(&shared, &on_exit, "the launched process exited");
@@ -604,31 +642,30 @@ fn watch(
                     shared.forget_child();
                     if quick && status.success() {
                         // A launcher that handed the game off and exited. Fall back to recognizing
-                        // the game by its store's signals; with none, stop tracking entirely rather
-                        // than pretend the shim's exit was the game's.
-                        kind = if shared.spec.is_empty() {
+                        // the game by its store's signals (or its provider's reporting); with
+                        // neither, stop tracking entirely rather than pretend the shim's exit was
+                        // the game's.
+                        kind = fallback_kind();
+                        if matches!(kind, LeaseKind::Untracked) {
                             tracing::info!(
                                 title = %shared.game.title,
                                 "the launch command exited immediately (a launcher handing off) and \
                                  this title has no detect signals — stopping game tracking for it"
                             );
-                            LeaseKind::Untracked
-                        } else {
-                            tracing::debug!(
-                                title = %shared.game.title,
-                                "the launch command handed off and exited — recognizing the game by \
-                                 its store signals instead"
-                            );
-                            LeaseKind::Matched
-                        };
-                        if matches!(kind, LeaseKind::Untracked) {
                             shared.set_state(GameState::Untracked);
                             return;
                         }
+                        tracing::debug!(
+                            title = %shared.game.title,
+                            kind = kind.as_str(),
+                            "the launch command handed off and exited — recognizing the game \
+                             another way"
+                        );
                     } else {
                         // It ran long enough to have BEEN the game (or failed outright). Either way
                         // the game is gone; only a success after a real run counts as "played".
-                        if shared.spec.is_empty() {
+                        kind = fallback_kind();
+                        if matches!(kind, LeaseKind::Untracked) {
                             if spawned_at.elapsed() >= SHIM_WINDOW {
                                 shared.was_running.store(true, Ordering::Relaxed);
                                 finish(&shared, &on_exit, "the launched process exited");
@@ -642,11 +679,7 @@ fn watch(
                 Some(Err(e)) => {
                     tracing::debug!(error = %e, "could not poll the launched child — falling back to scanning");
                     child = None;
-                    kind = if shared.spec.is_empty() {
-                        LeaseKind::Untracked
-                    } else {
-                        LeaseKind::Matched
-                    };
+                    kind = fallback_kind();
                     if matches!(kind, LeaseKind::Untracked) {
                         shared.set_state(GameState::Untracked);
                         return;
@@ -680,7 +713,12 @@ fn watch(
             && (child.is_some() || spawned.is_some())
             && spawned_at.elapsed() >= SHIM_WINDOW;
         let live = scanner.find(&shared.spec, shared.launch_stamp);
-        if !live.is_empty() || child_alive {
+        // A provider saying so is as good as seeing it — better, for a title there is nothing to
+        // see: it is the launcher that started the game telling us it did. This is the only way a
+        // [`LeaseKind::Reported`] lease ever leaves this phase, and for a `Matched` one it just
+        // gets there sooner than the scan would.
+        let said_running = reported().is_some_and(|l| l.running);
+        if !live.is_empty() || child_alive || said_running {
             known = live.clone();
             publish(&live);
             shared.was_running.store(true, Ordering::Relaxed);
@@ -754,6 +792,27 @@ fn watch(
             gone_since = None;
             vetoed = false;
             shared.last_seen_ms.store(now_ms(), Ordering::Relaxed);
+        } else if let Some(said) = reported() {
+            // Nothing of the game is visible to us, but its provider is still reporting on it — and
+            // that report is decisive in BOTH directions, where `running_hint` below may only ever
+            // delay an exit.
+            //
+            // The difference is what backs each claim. Steam's registry flag is a leftover that
+            // survives an unclean exit, so believing it indefinitely produces a session that never
+            // ends; a provider report is an event from the launcher that started the game, restated
+            // continuously, and it stops counting the moment it goes stale
+            // ([`crate::runstate::REPORT_TTL`]) — after which this branch simply stops being taken
+            // and the scan-only path below resumes. So a *live* provider is allowed to hold the
+            // session open for a game the host cannot see at all, which is the entire point for a
+            // title with no detect signals, and a dead one costs at most one TTL.
+            if said.running {
+                gone_since = None;
+                vetoed = false;
+                shared.last_seen_ms.store(now_ms(), Ordering::Relaxed);
+            } else {
+                finish(&shared, &on_exit, "its provider reported the game stopped");
+                return;
+            }
         } else {
             // How long the game's processes have been CONTINUOUSLY absent. Deliberately not reset by
             // the veto below — letting it run on is exactly what bounds the veto.
@@ -909,7 +968,7 @@ fn terminate_blocking(shared: &LeaseShared) {
                 "released the nested session's kept display to end its game"
             );
         }
-        LeaseKind::Child | LeaseKind::Matched => {
+        LeaseKind::Child | LeaseKind::Matched | LeaseKind::Reported => {
             #[cfg(target_os = "linux")]
             unix_term_ladder(shared);
             #[cfg(windows)]
@@ -917,6 +976,26 @@ fn terminate_blocking(shared: &LeaseShared) {
         }
         LeaseKind::Untracked => {}
     }
+}
+
+/// The process this lease's provider reports for its game, re-resolved and pinned to its start
+/// time, or `None`.
+///
+/// The reason the wire carries a pid at all: for a [`LeaseKind::Reported`] title the matcher finds
+/// nothing by construction, so without this "End" would have no target and would silently do
+/// nothing — the exact failure a spawned pid was folded into the Windows ladder to fix. Resolved at
+/// the moment of use rather than stored on the lease, so a report that has since gone stale, or a
+/// pid the kernel has since recycled, contributes nothing.
+#[cfg(any(target_os = "linux", windows))]
+fn reported_proc(shared: &LeaseShared) -> Option<crate::procscan::ProcRef> {
+    let pid = shared
+        .game
+        .id
+        .as_deref()
+        .and_then(crate::runstate::opinion)
+        .filter(|l| l.running)?
+        .pid?;
+    crate::procscan::resolve(pid)
 }
 
 /// SIGTERM everything that belongs to the game, wait, then SIGKILL whatever ignored it.
@@ -942,11 +1021,22 @@ fn unix_term_ladder(shared: &LeaseShared) {
         // `OwnedChild::group_leader`) — never for a child sharing the host's own group.
         unsafe { libc::kill(target, sig) == 0 }
     };
+    // Everything the matcher can find, plus the pid the provider reported (see `reported_proc`) —
+    // which for a `Reported` lease is the only member of this set.
+    let targets = || {
+        let mut procs = scanner.find(&shared.spec, shared.launch_stamp);
+        if let Some(p) = reported_proc(shared) {
+            if !procs.iter().any(|q| q.pid == p.pid) {
+                procs.push(p);
+            }
+        }
+        procs
+    };
     let signal_matched = |sig: i32| -> usize {
         // Re-scan and re-verify immediately before signalling, so a pid recycled since the last
         // sweep is never hit.
         scanner
-            .alive(&scanner.find(&shared.spec, shared.launch_stamp))
+            .alive(&targets())
             .into_iter()
             // SAFETY: as above, for a single pid just re-verified to be the process we adopted.
             .filter(|p| unsafe { libc::kill(p.pid as i32, sig) == 0 })
@@ -965,9 +1055,7 @@ fn unix_term_ladder(shared: &LeaseShared) {
     let deadline = Instant::now() + TERM_GRACE;
     while Instant::now() < deadline {
         std::thread::sleep(POLL);
-        let still = scanner
-            .alive(&scanner.find(&shared.spec, shared.launch_stamp))
-            .len();
+        let still = scanner.alive(&targets()).len();
         // Signal 0 only probes for existence — the child (or its group) is gone once it fails.
         let child_gone = !signal_child(0);
         if still == 0 && child_gone {
@@ -1000,11 +1088,19 @@ fn windows_term_ladder(shared: &LeaseShared) {
     let live = || {
         let mut procs = scanner.alive(&scanner.find(&shared.spec, shared.launch_stamp));
         // Re-verified like everything else, so a dead or recycled pid contributes nothing, and
-        // de-duplicated: the matcher may well have found this same process by its image.
-        if let Some(p) = shared.spawned {
+        // de-duplicated: the matcher may well have found this same process by its image. The
+        // provider's reported pid joins on the same terms, and for a `Reported` lease it is the
+        // only thing here (see `reported_proc`).
+        let mut fold = |p: crate::procscan::ProcRef| {
             if !scanner.alive(&[p]).is_empty() && !procs.iter().any(|q| q.pid == p.pid) {
                 procs.push(p);
             }
+        };
+        if let Some(p) = shared.spawned {
+            fold(p);
+        }
+        if let Some(p) = reported_proc(shared) {
+            fold(p);
         }
         procs
     };
@@ -1568,6 +1664,54 @@ mod tests {
         );
         assert!(matches!(l.shared().kind(), LeaseKind::Untracked));
         assert!(!l.shared().is_trackable());
+    }
+
+    /// A title with nothing to scan for is tracked after all when its provider reports on it.
+    ///
+    /// This is the Playnite case the static `detect` hints could never reach: an emulated game, a
+    /// manually added one, a library plugin that records no install directory. The launch is a
+    /// `playnite://` hand-off, so the host holds nothing; the spec is empty, so the matcher finds
+    /// nothing; and the honest verdict used to be [`LeaseKind::Untracked`] — no exit detection, and
+    /// `POST /game/end` with nothing to aim at. Playnite knew the whole time.
+    #[test]
+    fn a_reported_title_is_tracked_where_it_used_to_be_untracked() {
+        // The same request with no provider reporting: unchanged, and the control for what follows.
+        let l = open(
+            req("playnite:lease-test", DetectSpec::default(), false),
+            Box::new(|| {}),
+        );
+        assert!(matches!(l.shared().kind(), LeaseKind::Untracked));
+        assert!(!l.shared().is_trackable());
+        drop(l);
+
+        // A provider that speaks for the title — while reporting it NOT running, which is exactly
+        // what a report looks like at the moment a game is launched. Trackability follows from the
+        // provider *reporting*, not from what it currently says; a lease whose kind flipped with
+        // the answer would make both lifetime behaviours depend on a plugin's timing.
+        crate::runstate::report(
+            "playnite-lease-test",
+            ["playnite:lease-test".to_string()].into_iter().collect(),
+            std::collections::HashMap::new(),
+        );
+        let l = open(
+            req("playnite:lease-test", DetectSpec::default(), false),
+            Box::new(|| {}),
+        );
+        assert!(matches!(l.shared().kind(), LeaseKind::Reported));
+        assert!(
+            l.shared().is_trackable(),
+            "so its exit is noticed and `POST /game/end` has a target"
+        );
+        drop(l);
+        crate::runstate::forget("playnite-lease-test");
+
+        // …and once the provider is gone, so is the tracking. Pinned because a report that outlived
+        // its plugin is the one way this could hold a session open forever.
+        let l = open(
+            req("playnite:lease-test", DetectSpec::default(), false),
+            Box::new(|| {}),
+        );
+        assert!(matches!(l.shared().kind(), LeaseKind::Untracked));
     }
 
     #[test]

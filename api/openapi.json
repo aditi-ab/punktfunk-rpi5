@@ -1860,6 +1860,69 @@
         }
       }
     },
+    "/api/v1/library/provider/{provider}/running": {
+      "put": {
+        "tags": [
+          "library"
+        ],
+        "summary": "Report which of a provider's titles are running",
+        "description": "The **live** counterpart to the `detect` hints in a reconcile payload: that one says *how to\nrecognize* a title's process, this one says *it is running now* (design §9,\n[`crate::runstate`]). For a provider that starts games itself and knows when they stop —\nPlaynite tracks every launch and fires an event on both edges — this is a fact the host would\notherwise have to re-derive by scanning, and for a title with nothing to scan for (an emulated\ngame, a manually added one) could not derive at all.\n\nDeclarative and idempotent, like the reconcile: the body is the provider's **complete** running\nset, so a missed event, a plugin restart or an install mid-game all self-correct on the next\nreport rather than drifting.\n\nThe report **expires** after `ttl_s` (90s) unless restated, which is what makes it safe for a\nlive provider to keep a streaming session open for a game the host cannot see: a plugin that\ndies with a game running stops counting shortly after, and the host falls back to process\nscanning exactly as it does without one. Re-report on every change **and** on a timer well\ninside the window.\n\nTitles the provider does not currently publish are ignored (counted in `unknown`), not an error:\na report may legitimately race its own reconcile.",
+        "operationId": "reportProviderRunning",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "The provider id ([a-z0-9._-], `manual` reserved)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderRunningInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The report was accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderRunningAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid provider id or payload",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/library/scanners": {
       "get": {
         "tags": [
@@ -7792,6 +7855,46 @@
           }
         }
       },
+      "ProviderRunningAccepted": {
+        "type": "object",
+        "description": "The result of a liveness report.",
+        "required": [
+          "matched",
+          "unknown",
+          "ttl_s"
+        ],
+        "properties": {
+          "matched": {
+            "type": "integer",
+            "description": "How many reported titles matched an entry this provider currently publishes.",
+            "minimum": 0
+          },
+          "ttl_s": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds this report stays authoritative without being restated — re-report inside it while\nanything is running.",
+            "minimum": 0
+          },
+          "unknown": {
+            "type": "integer",
+            "description": "How many were ignored because no such entry exists (a report that raced a reconcile).",
+            "minimum": 0
+          }
+        }
+      },
+      "ProviderRunningInput": {
+        "type": "object",
+        "description": "Request body for `reportProviderRunning`.",
+        "properties": {
+          "running": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RunningTitle"
+            },
+            "description": "Every title of this provider's that is running **right now**. The full set, not a delta:\nanything absent from it is reported as stopped."
+          }
+        }
+      },
       "ReleaseDisplayRequest": {
         "type": "object",
         "description": "Request body for `releaseDisplay`.",
@@ -7843,6 +7946,28 @@
           "text": {
             "type": "string",
             "description": "Plain-language instruction. English fallback — the console overrides it by check id."
+          }
+        }
+      },
+      "RunningTitle": {
+        "type": "object",
+        "description": "One running title in a provider's liveness report.",
+        "required": [
+          "external_id"
+        ],
+        "properties": {
+          "external_id": {
+            "type": "string",
+            "description": "The provider's own stable id for the title — the same key its reconcile payload uses."
+          },
+          "pid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The process id the provider started for it, when it knows one. Optional, and never trusted\nas a bare number: the host re-resolves it and pins it to its start time before it is ever\nsignalled, so a stale or recycled pid simply contributes nothing.",
+            "minimum": 0
           }
         }
       },

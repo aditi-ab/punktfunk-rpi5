@@ -9,6 +9,14 @@ import type { ProviderEntry } from "./wire.js";
 
 export * from "./wire.js";
 
+/**
+ * The host's liveness-report TTL, in seconds, when it does not say.
+ *
+ * Only a fallback for parsing an unexpected answer — the authority is the `ttlS` the host returns.
+ * A reporter should refresh at a fraction of this, so one missed call is not a lapse.
+ */
+export const DEFAULT_RUNNING_TTL_S = 90;
+
 /** What the host echoed back for one reconciled entry — enough to tell whether a claim took. */
 export interface ReconciledEntry {
 	readonly id: string;
@@ -36,12 +44,65 @@ export interface ProviderClientService {
 		store?: string,
 	) => Effect.Effect<ReadonlyArray<ReconciledEntry>, HostRequestError>;
 	/**
+	 * Report which of this provider's titles are running **right now** — the live counterpart to the
+	 * static `detect` hints in {@link reconcile}.
+	 *
+	 * `detect` says *how to recognize* a title's process; this says *it is running*, and carries the
+	 * pid where the provider knows one. For a launcher that starts games itself and is told when
+	 * they stop, this is a fact the host would otherwise re-derive by scanning — and for a title
+	 * with nothing to scan for (an emulated game, a manually added one, a launcher that records no
+	 * install directory) could not derive at all: its lease is `untracked`, its exit is never
+	 * noticed, and the streaming session outlives the game.
+	 *
+	 * **Send the complete set, not a delta.** Anything absent is reported stopped, so a missed
+	 * event, a plugin restart or an install mid-game all self-correct on the next call.
+	 *
+	 * **The host expires a report** (`ttlS` in the answer, 90s at the time of writing) unless it is
+	 * restated — which is what makes it safe for the host to keep a session open for a game it
+	 * cannot see. Call this on every change **and** on a timer well inside that window while
+	 * anything is running; a plugin that stops reporting simply hands tracking back to the host's
+	 * process scan.
+	 *
+	 * Titles the host has no entry for are counted in `unknown`, not refused: a report may
+	 * legitimately race its own reconcile.
+	 *
+	 * Fails on a host that predates the route (404) — treat that as "this host tracks games by
+	 * scanning" and carry on, exactly as with any other optional capability.
+	 */
+	readonly reportRunning: (
+		providerId: string,
+		running: ReadonlyArray<RunningTitle>,
+	) => Effect.Effect<RunningAccepted, HostRequestError>;
+	/**
 	 * Remove every entry this provider owns **and release its store claim** (the explicit-uninstall
 	 * path). Releasing is what brings the host's built-in scanner back.
 	 */
 	readonly remove: (
 		providerId: string,
 	) => Effect.Effect<void, HostRequestError>;
+}
+
+/** One running title in a {@link ProviderClientService.reportRunning} call. */
+export interface RunningTitle {
+	/** The provider's own stable id — the same key its reconcile payload uses. */
+	readonly external_id: string;
+	/**
+	 * The process the provider started for it, when it knows one. Optional, and never trusted as a
+	 * bare number: the host re-resolves it and pins it to its start time before it is ever
+	 * signalled, so a stale or recycled pid contributes nothing. Worth sending anyway — it is what
+	 * gives "End game" something to aim at for a title the host's matcher cannot find.
+	 */
+	readonly pid?: number;
+}
+
+/** What the host answered to a liveness report. */
+export interface RunningAccepted {
+	/** How many reported titles matched an entry this provider currently publishes. */
+	readonly matched: number;
+	/** How many were ignored because no such entry exists (a report that raced a reconcile). */
+	readonly unknown: number;
+	/** Seconds the report stays authoritative without being restated. */
+	readonly ttlS: number;
 }
 
 export class ProviderClient extends Context.Service<
@@ -71,6 +132,27 @@ export class ProviderClient extends Context.Service<
 										? (body as ReadonlyArray<ReconciledEntry>)
 										: [],
 								),
+							),
+					reportRunning: (providerId, running) =>
+						host
+							.request("PUT", `/library/provider/${providerId}/running`, {
+								running,
+							})
+							.pipe(
+								// Same posture as the reconcile echo above: the counts are a
+								// diagnostic, not a contract, so a host that answers something
+								// unexpected must not fail a plugin's report loop. The TTL falls
+								// back to the host's own documented default.
+								Effect.map((body) => {
+									const b = (body ?? {}) as Record<string, unknown>;
+									const num = (v: unknown, fallback: number) =>
+										typeof v === "number" && Number.isFinite(v) ? v : fallback;
+									return {
+										matched: num(b.matched, 0),
+										unknown: num(b.unknown, 0),
+										ttlS: num(b.ttl_s, DEFAULT_RUNNING_TTL_S),
+									} satisfies RunningAccepted;
+								}),
 							),
 					remove: (providerId) =>
 						host
