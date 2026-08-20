@@ -230,13 +230,15 @@ How the client itself looks. None touches a stream, so none can live in a
 
 **Gamepad-optimized browsing** — *default: on.* Swaps the touch/desktop home for the
 controller-optimized one: host carousel, larger focus targets, a swipeable cover browser, steppable
-settings. Apple and Android have the switch; on Linux, Windows and the Steam Deck the
-controller-optimized home is a separate entry point. An Android TV is always in this mode.
+settings. Apple and Android have the switch — on Android in both places, ordinary Settings and the
+controller-optimized settings themselves, so that home can be left from inside it; on Linux, Windows
+and the Steam Deck the controller-optimized home is a separate entry point. An Android TV is always
+in this mode, so the switch is not offered there.
 
 **Show it** — *default: With a controller.* Shown while the switch above is on. **With a
 controller**: the controller-optimized home appears as a pad connects, the touch interface returns
 when the last one disconnects. **Always** keeps it either way — for a phone or tablet docked to a
-TV. Apple and Android (an Android TV is in that mode regardless).
+TV. Apple and Android (an Android TV is in that mode regardless, so the row is not offered there).
 
 **Background** — *default: Violet.* The colour family of the controller-optimized home's backdrop.
 Thirteen: seven dark — **Violet**, **OLED**, **Nebula**, **Abyss**, **Ember**, **Moss**,
@@ -244,9 +246,11 @@ Thirteen: seven dark — **Violet**, **OLED**, **Nebula**, **Abyss**, **Ember**,
 flip the interface to dark text on a light field. The backdrop recolours as you step the row.
 **OLED** is true black: most of the frame is pixels switched off — no glow, no power on an
 OLED/AMOLED panel. Stored under the same name on every client. The row lives in the
-controller-optimized settings (**X** from the controller-optimized home) everywhere that has one,
-including the Steam Deck and the Linux/Windows console home; the Apple TV carries it in ordinary
-Settings next to **Show it** instead, so it's reachable from the Siri Remote.
+controller-optimized settings (**X**, or **down** on the host carousel, from the controller-optimized
+home) everywhere that has one, including the Steam Deck and the Linux/Windows console home — down is
+the route where there are no face buttons to press, such as an Android TV remote, and the hint bar
+names whichever your device has; the Apple TV carries it in ordinary Settings next to **Show it**
+instead, so it's reachable from the Siri Remote.
 
 ## Overlay
 

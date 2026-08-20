@@ -402,10 +402,11 @@ fn a_replace_carries_the_screen_it_replaced() {
     assert!(matches!(s.stack.last(), Some(Screen::HostOptions(_))));
     finish_motion(&mut s);
 
-    // Walk to "Edit…" and take it. The first fixture host is paired and online and cannot
-    // wake, so its menu is [Send logs, Copy link, Edit…, Forget, Cancel] — Edit is two down.
-    // Pressed exactly rather than searched, so that reordering the menu fails HERE instead of
-    // quietly landing this test's Confirm on "Forget".
+    // Walk to "Edit…" and take it. The first fixture host is paired, saved and online and
+    // cannot wake, so its menu is [Send logs, Library, Copy link, Edit…, …] — Edit is three
+    // down. Pressed exactly rather than searched, so that reordering the menu fails HERE
+    // instead of quietly landing this test's Confirm on something destructive.
+    s.handle_menu(MenuEvent::Move(MenuDir::Down));
     s.handle_menu(MenuEvent::Move(MenuDir::Down));
     s.handle_menu(MenuEvent::Move(MenuDir::Down));
     s.handle_menu(MenuEvent::Confirm);

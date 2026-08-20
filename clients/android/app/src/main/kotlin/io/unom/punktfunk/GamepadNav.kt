@@ -11,6 +11,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.platform.LocalContext
+import io.unom.punktfunk.kit.Gamepad
 import kotlin.math.abs
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -96,7 +97,7 @@ fun GamepadNavEffect(
         val keyProbe: (KeyEvent) -> Boolean = probe@{ ev ->
             val down = ev.action == KeyEvent.ACTION_DOWN
             val edge = down && ev.repeatCount == 0
-            when (ev.keyCode) {
+            when (Gamepad.padKeyCode(ev)) {
                 KeyEvent.KEYCODE_DPAD_LEFT -> { state.dpadX = if (down) -1 else 0; true }
                 KeyEvent.KEYCODE_DPAD_RIGHT -> { state.dpadX = if (down) 1 else 0; true }
                 // TV remote (no face buttons): Up → Settings, Down → a saved host's Options.
@@ -202,7 +203,7 @@ fun GamepadNavEffect2D(
         val keyProbe: (KeyEvent) -> Boolean = probe@{ ev ->
             val down = ev.action == KeyEvent.ACTION_DOWN
             val edge = down && ev.repeatCount == 0
-            when (ev.keyCode) {
+            when (Gamepad.padKeyCode(ev)) {
                 KeyEvent.KEYCODE_DPAD_LEFT -> { state.dpadX = if (down) -1 else 0; true }
                 KeyEvent.KEYCODE_DPAD_RIGHT -> { state.dpadX = if (down) 1 else 0; true }
                 KeyEvent.KEYCODE_DPAD_UP -> { state.dpadY = if (down) -1 else 0; true }

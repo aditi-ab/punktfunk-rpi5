@@ -605,7 +605,7 @@ class GamepadRouter(
         // for the slot's life; the sensor path reads it on every sample.
         val slot = Slot(
             index,
-            Gamepad.AxisMapper(handle, index),
+            Gamepad.AxisMapper(handle, index, Gamepad.padMap(dev)),
             NativeBridge.nativePadMotionReaches(handle, pref),
         )
         slots[dev.id] = slot

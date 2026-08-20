@@ -137,8 +137,9 @@ runs what it already knows about the title, so a client can never hand the host 
   keep a **Show game library** switch, on by default, for turning it off. See
   [Client settings](/docs/client-settings).
 - **Android** — the library lives only in the controller-optimized home, which a TV always uses and a
-  phone or tablet switches to when a controller is connected. Press **Y** on a saved host, or open its
-  options and choose **Library**.
+  phone or tablet switches to when a controller is connected. Press **Y** on a saved host, or press
+  **up** for its options and choose **Library** — the route a TV remote takes, having no **Y** to
+  press.
 - **Steam Deck (Decky)** — the panel is a launcher and browses nothing itself: tap **Open
   Punktfunk**, which opens the client's console home, where a paired host's **Library** button is —
   full-screen covers, gamepad-navigable, and a press starts the stream with the title launching. See
