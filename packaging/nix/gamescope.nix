@@ -31,11 +31,39 @@
 {
   lib,
   gamescope,
+  fetchFromGitHub,
   python3,
   patchDir,
   manifestRewriter,
 }:
 let
+  # PIN THE COMPOSITOR SOURCE, rather than patching whatever gamescope nixpkgs happens to carry.
+  # Every other channel already ships this exact commit — packaging/gamescope/README.md,
+  # punktfunk-gamescope.spec, the PKGBUILD and build-punktfunk-gamescope.sh — and nix was the
+  # only one tracking nixpkgs' version and hoping ten patches still applied.
+  #
+  # They did not, and the failures were not academic (MEASURED 2026-08-19/20):
+  #   * nixpkgs shipped 3.16.24 and patch 0009's context did not exist there at all, so the
+  #     build died at patchPhase — every `services.punktfunk.host.enable = true` with it.
+  #   * bumping the lock to 3.16.25 fixed that, then `--version` printed NOTHING: upstream's
+  #     `gamescope::PrintVersion()` landed AFTER the 3.16.25 tag. The host reads that banner to
+  #     decide a session's bit depth and cursor compositing BEFORE the virtual display exists,
+  #     so a silent banner means a silent fall back to SDR — the exact failure every guard in
+  #     this file is written to prevent.
+  # Both are the same bug: nixpkgs' gamescope is older than the tree these patches target.
+  # Pinning makes the nix package agree with every other channel byte for byte.
+  #
+  # Bumping this: move the rev, then `nix-prefetch-git --url https://github.com/ValveSoftware/gamescope
+  # --rev <new> --fetch-submodules` for the hash, and keep packaging/gamescope/README.md in step.
+  pfRev = "5fb8dce4a09d0a68d097b9faf9513782106bc843";
+  pfVersion = "3.16.25-11-g5fb8dce";
+  pfSrc = fetchFromGitHub {
+    owner = "ValveSoftware";
+    repo = "gamescope";
+    rev = pfRev;
+    fetchSubmodules = true;
+    hash = "sha256-pGBiO+7LSdIc0k9K+SQnv/Og2DYD/cjvOImxIl91L2A=";
+  };
   # As of nixos-unstable (checked 2026-07-28) `gamescope` IS the buildable derivation — pname
   # "gamescope", version 3.16.25, carrying `src`/`patches`/`mesonFlags`. Revisions that wrap it
   # (to wire the WSI layer + capabilities) expose the build as `.unwrapped`, so prefer that where
@@ -76,6 +104,8 @@ let
 in
 unwrapped.overrideAttrs (old: {
   pname = "punktfunk-gamescope";
+  version = pfVersion;
+  src = pfSrc;
 
   # Read the patch DIRECTORY rather than naming files: `builtins.attrNames` sorts
   # lexicographically, which for `000N-` prefixes is exactly the apply order, and a patch added or
@@ -96,7 +126,19 @@ unwrapped.overrideAttrs (old: {
     substituteInPlace src/meson.build \
       --replace-fail \
         "vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()" \
-        "vcs_tag = '${old.version}'"
+        "vcs_tag = '${pfVersion}'"
+
+    # Source-level gate, the same one packaging/gamescope/build-punktfunk-gamescope.sh applies.
+    # Splits a missing marker into its two possible stages: fire HERE and patch 0005 or the
+    # substitution above lost it; pass here and fail the ELF check later, and it was lost in
+    # meson configuration or compilation instead. Without this the two are indistinguishable,
+    # at a full compositor build per guess.
+    grep -q '+pfhdr' src/meson.build || {
+      echo "punktfunk-gamescope: +pfhdr is not in src/meson.build after patching" >&2
+      echo "  --- version block as patched: ---" >&2
+      sed -n '/^vcs_tag_cmd/,/^gamescope_version_conf/p' src/meson.build | sed 's/^/    | /' >&2
+      exit 1
+    }
   '';
 
   # Ship the compositor, renamed, AND the WSI layer built beside it. Everything else nixpkgs
@@ -134,7 +176,17 @@ unwrapped.overrideAttrs (old: {
     chmod -R u+w $out
 
     find $out -mindepth 1 -maxdepth 1 ! -name bin -exec rm -rf {} +
-    find $out/bin -mindepth 1 ! -name gamescope -delete
+    # KEEP `.gamescope-wrapped`. nixpkgs wraps this package: makeWrapper leaves the real
+    # compositor ELF at bin/.gamescope-wrapped and installs a small launcher at bin/gamescope
+    # that sets PATH (xwininfo) before exec'ing it. A prune that keeps only `gamescope` deletes
+    # the compositor and ships the launcher alone — MEASURED 2026-08-20 (run 19622): $out/bin
+    # held a single 16 KB file, `--version` printed nothing because the launcher exec'd a path
+    # that no longer existed, and no +pfhdr marker was present because a wrapper carries no
+    # version string. Every symptom chased for three builds came from this one line.
+    #
+    # The launcher references its target by ABSOLUTE path, so renaming the launcher is safe
+    # while the target keeps its name.
+    find $out/bin -mindepth 1 ! -name gamescope ! -name '.gamescope-wrapped' -delete
     mv $out/bin/gamescope $out/bin/punktfunk-gamescope
 
     install -Dm0755 "$TMPDIR/pf-layer.so" \
@@ -147,8 +199,38 @@ unwrapped.overrideAttrs (old: {
   doInstallCheck = true;
   installCheckPhase = ''
     runHook preInstallCheck
-    $out/bin/punktfunk-gamescope --version 2>&1 | grep -q '+pfhdr' \
-      || { echo "punktfunk-gamescope: the +pfhdr marker is missing — the patches did not take"; exit 1; }
+    # Assert the marker is compiled INTO the shipped binary, rather than running it.
+    #
+    # Running it does not work here and never did: `--version` produced EMPTY output under the
+    # build sandbox on BOTH nixpkgs' 3.16.25 and the pinned 5fb8dce4 (MEASURED 2026-08-19/20,
+    # runs 19551 / 19573 / 19594). That is a property of the sandbox, not a defect in the binary:
+    # gamescope calls PrintVersion() before the getopt loop (src/main.cpp:721 at the pinned rev),
+    # so `gamescope --version` DOES print the banner on a real system — which is what the host's
+    # capability probe reads.
+    #
+    # packaging/gamescope/build-punktfunk-gamescope.sh makes the same call, asserting on
+    # src/meson.build. Grepping the installed ELF is strictly stronger: the version string reaches
+    # .rodata through GamescopeVersion.h's k_szGamescopeVersion, so this proves the marker survived
+    # patching, meson configuration AND compilation into the artifact we actually ship, and it
+    # cannot be defeated by the binary being unable to start.
+    # Grep the WRAPPED ELF: bin/punktfunk-gamescope is nixpkgs' launcher and carries no version
+    # string at all, so asserting on it would pass only by accident. Fall back to the launcher
+    # for a future nixpkgs that stops wrapping.
+    gsElf=$out/bin/.gamescope-wrapped
+    [ -f "$gsElf" ] || gsElf=$out/bin/punktfunk-gamescope
+    grep -aq '+pfhdr' "$gsElf" || {
+      echo "punktfunk-gamescope: the +pfhdr marker is not in the installed binary." >&2
+      echo "  src/meson.build carried it (asserted in postPatch), so it was lost between" >&2
+      echo "  meson configuration and the linked artifact. Evidence:" >&2
+      echo "  --- $out/bin ---" >&2
+      ls -l $out/bin 2>&1 | sed 's/^/    | /' >&2
+      echo "  --- anything under $out mentioning pfhdr ---" >&2
+      grep -ral 'pfhdr' $out 2>/dev/null | sed 's/^/    | /' >&2 || echo "    | (nothing)" >&2
+      echo "  --- version-ish strings in the binary ---" >&2
+      grep -aoE '[0-9]+\.[0-9]+\.[0-9]+[^ ]*' "$gsElf" 2>/dev/null \
+        | sort -u | head -5 | sed 's/^/    | /' >&2 || true
+      exit 1
+    }
     # The manifest must name a library this derivation actually installed. A manifest pointing at a
     # path that does not exist is the worst shape of this bug: the loader reads it, finds nothing,
     # and carries on silently, so the box looks healthy and every game renders SDR.
