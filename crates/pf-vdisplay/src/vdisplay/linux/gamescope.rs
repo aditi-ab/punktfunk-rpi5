@@ -116,11 +116,16 @@ static MANAGED_LAUNCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// (single-instance), so [`schedule_restore_tv_session`] can restart them when the client disconnects.
 static STOPPED_AUTOLOGIN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// The display-manager unit we stopped for the takeover (any DM that drove a LIVE gaming session
-/// is stopped for the stream — see [`dm_plan`]), so the restore brings the box back via
+/// A display-manager unit stopped for a takeover, so the restore brings the box back via
 /// `reset-failed` + `restart` of the DM instead of a `--user start` of the gamescope unit (which
 /// cannot work on a mask-fragile flavor: without a DM login session there is no seat, so gamescope
 /// never gets DRM master — live-proven on the Nobara repro VM 2026-07-24).
+///
+/// ⚠ **Adoption-only since 0.31.0**: the takeover idles the box's autologin session
+/// ([`install_idle_dropin`]) and leaves the DM up, so nothing in this process ever writes this any
+/// more — only [`restore_takeover_on_startup`], for a takeover stranded by a host old enough to
+/// have stopped one. It is therefore NOT the marker of a live takeover; [`takeover_idled`] is.
+/// Reading it as that marker is what silently unreachable-d the in-stream switch gate in 0.31.0.
 static STOPPED_DM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Whether this takeover runtime-masked the [`STOPPED_AUTOLOGIN`] units ([`mask_unit`]) — i.e.
@@ -136,12 +141,16 @@ static STOPPED_DM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None
 static AUTOLOGIN_MASKED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 /// mtime of the `steamos-session-select` sentinel as of the takeover — the baseline the in-stream
-/// "Switch to Desktop" detector compares against. Steam's session-select script writes
-/// `~/.config/steamos-session-select` unconditionally in its USER pass, before any of its
-/// display-manager checks — so it advances even under a DM-stop takeover, where the script's
-/// config-rewrite tail is a silent no-op (every write branch is gated on the DM *running*;
-/// diagnosed live on the Nobara repro VM 2026-07-24). An advanced mtime after a capture loss is
-/// therefore the one durable trace of the user's switch request.
+/// "Switch to Desktop" detector compares against. The ChimeraOS-layout `os-session-select`
+/// (Nobara, ChimeraOS) writes `~/.config/steamos-session-select` unconditionally in its USER pass,
+/// before any of its display-manager checks, so an advanced mtime after a capture loss is the one
+/// durable trace of the user's switch request — the switch itself leaves nothing else behind that
+/// this host can see.
+///
+/// ⚠ Bazzite/SteamOS write NO sentinel: their `os-session-select` is a thin wrapper over
+/// `steamosctl` D-Bus calls. The detector is therefore inert there by construction, which is
+/// exactly right — those platforms default the mid-stream session watcher ON
+/// ([`is_steam_htpc_platform`]) and follow the switch with it instead.
 ///
 /// Two levels of `Option`, because "no baseline" and "no sentinel" mean opposite things:
 /// * **outer `None`** — never baselined (no takeover this host lifetime). Nothing can read as an
@@ -674,21 +683,28 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
     if steamos_session_present() {
         return create_managed_session_steamos(mode, hdr);
     }
-    // In-stream "Switch to Desktop" under a DM-stop takeover: the user's session-select inside
-    // the streamed game mode advanced the sentinel, but its config rewrite was a silent no-op
-    // (every write branch needs the DM running, and the takeover stopped it) — so without this,
-    // the capture loss it caused would just relaunch game mode ("thrown back in", field-tested
-    // 2026-07-24). Honor the request instead: restore the DM and replay the switch.
-    let dm_takeover = STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if let Some(dm) = dm_takeover {
-        if session_select_requested() {
-            *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            honor_session_select_switch(dm);
-            return Err(anyhow!(
-                "the user switched the box to the desktop session — display manager restored; \
-                 re-detection follows the desktop compositor as it comes up"
-            ));
-        }
+    // In-stream "Switch to Desktop": the user's session-select inside the streamed game mode
+    // advanced the sentinel, so the box is on its way to a desktop session. Without this, the
+    // capture loss that switch causes just relaunches game mode over the booting desktop — the
+    // "thrown back in" field report of 2026-07-24, and again on Nobara 2026-08-20.
+    //
+    // ⚠ Gated on the IDLED takeover, not on [`STOPPED_DM`]. Until 0.31.0 the takeover stopped the
+    // display manager, and setting that static was what armed this gate; the idled takeover
+    // replaced both the stop and the static ([`install_idle_dropin`]) and nothing re-armed the
+    // gate, so this branch became unreachable on every box. Bazzite did not notice — its
+    // `os-session-select` is a `steamosctl` D-Bus call that writes no sentinel, and its session
+    // watcher is on by default ([`is_steam_htpc_platform`]) so the stream follows the switch
+    // anyway. The ChimeraOS-layout distros are the ones that lost their handling: their
+    // `os-session-select` DOES write the sentinel, and `ID=nobara` matches no HTPC default.
+    if takeover_idled() && session_select_requested() {
+        // `take`, so an adopted DM stop is consumed exactly once — see
+        // [`honor_session_select_switch`] for why a 0.31.0 takeover has none to consume.
+        let adopted_dm = std::mem::take(&mut *STOPPED_DM.lock().unwrap_or_else(|e| e.into_inner()));
+        honor_session_select_switch(adopted_dm);
+        return Err(anyhow!(
+            "the user switched the box to the desktop session — the box's own game mode is handed \
+             back; re-detection follows the desktop compositor as it comes up"
+        ));
     }
     // Post-honor grace: while the selected desktop boots, a managed relaunch would win the race
     // (gamescope+Steam start faster than KWin) and a delivering pipeline ends the rebuild's
@@ -1349,17 +1365,32 @@ fn install_idle_dropin() -> Result<()> {
         .parent()
         .context("the idle drop-in path has no parent directory")?;
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    std::fs::write(
-        &path,
-        format!(
-            "[Service]\nExecStart=\nExecStart={} infinity\n",
-            sleep_binary()
-        ),
-    )
-    .with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(&path, idle_dropin_body(sleep_binary()))
+        .with_context(|| format!("write {}", path.display()))?;
     systemctl_user(&["daemon-reload"]);
     *IDLE_DROPIN_ARMED.lock().unwrap_or_else(|e| e.into_inner()) = true;
     Ok(())
+}
+
+/// The idle drop-in's body (the unit-testable core of [`install_idle_dropin`]).
+///
+/// The **empty `ExecStart=` comes first and is load-bearing**: `ExecStart` is a list-valued
+/// directive, so a drop-in that only adds a line APPENDS to the box's own — which would run the
+/// real gamescope session *and* the sleep, i.e. exactly the Steam-fighting session the takeover
+/// exists to get out of the way, with no symptom pointing here. The reset is what replaces it.
+fn idle_dropin_body(sleep_bin: &str) -> String {
+    format!("[Service]\nExecStart=\nExecStart={sleep_bin} infinity\n")
+}
+
+/// Does THIS host hold the box's game mode idled right now? The successor to "did we stop the
+/// display manager" as the marker of a live managed takeover, and so what arms the in-stream
+/// switch gate in [`create_managed_session`].
+///
+/// Reads [`IDLE_DROPIN_ARMED`] — this process's own memory — deliberately, unlike
+/// [`remove_idle_dropin`]: a drop-in on disk that we did not write belongs to a dead host, and
+/// honoring a "switch" against someone else's takeover would hand back a box we never took.
+fn takeover_idled() -> bool {
+    *IDLE_DROPIN_ARMED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Remove the idle drop-in so the box's own Game Mode runs for real again; reports whether one was
@@ -2282,10 +2313,36 @@ fn switch_ends_mask_window(kind: super::ActiveKind) -> bool {
 }
 
 /// The host's mid-stream session watcher calls this on every switch it confirms; see
-/// [`switch_ends_mask_window`] for which ones actually lift the mask.
+/// [`switch_ends_mask_window`] for which ones end the takeover's hold on the box's own game mode.
+///
+/// This is the SECOND of the two ways a box can leave our takeover mid-stream — the sentinel
+/// detector in [`create_managed_session`] is the other — and both owe the box the same hand-back.
+/// The watcher is the one that covers Bazzite/SteamOS, where it is on by default
+/// ([`is_steam_htpc_platform`]) and no sentinel is ever written; the detector covers the
+/// ChimeraOS-layout distros, which are the reverse. Fixing only one leaves the other's boxes
+/// holding an idled game mode.
 pub fn release_autologin_mask(switched_to: super::ActiveKind) {
-    if switch_ends_mask_window(switched_to) {
-        lift_autologin_mask();
+    if !switch_ends_mask_window(switched_to) {
+        return;
+    }
+    lift_autologin_mask();
+    // The idle drop-in is the mask's successor and inherits its whole hazard: it replaces the
+    // box's game-mode `ExecStart` with a sleep, and a switch to a desktop is exactly where that
+    // stops being ours to hold. Left on, the user's "Return to Gaming Mode" starts a unit that
+    // only sleeps — the same barred way back this function's mask lift exists to prevent, and
+    // measured in that state on Bazzite `.41` 2026-08-20 (`ExecStart=/usr/bin/sleep infinity`
+    // still on the unit after a completed switch to KDE).
+    //
+    // Deliberately NOT a full [`clear_takeover`]: the takeover outlives this window, exactly as
+    // the mask lift's own note says. The box may come back to game mode, and the disconnect
+    // restore still owes [`STOPPED_AUTOLOGIN`] a start. All this says is "the box's own game mode
+    // runs for real again".
+    if remove_idle_dropin() {
+        tracing::info!(
+            switched_to = ?switched_to,
+            "gamescope: the box left our game session for a desktop — removed the takeover's idle \
+             drop-in so its own Game Mode runs for real again"
+        );
     }
 }
 
@@ -2754,11 +2811,12 @@ fn session_select_mtime() -> Option<std::time::SystemTime> {
 
 /// Record the sentinel baseline, so a LATER write (the user's in-stream "Switch to Desktop") is
 /// distinguishable from the switch that led into this session. Taken at **takeover** (the moment
-/// [`STOPPED_DM`] is set, which is what arms the honor gate) and again at a successful launch: the
-/// switch INTO game mode writes the sentinel on its way in, and that write must never read as a
-/// request to go back out. Baselining only at launch left the window in between — a takeover whose
-/// launch failed, then a client retry inside the restore debounce — reading a months-old sentinel
-/// as a live request and pushing the box to the desktop the user never asked for.
+/// the idle drop-in goes in, which is what arms the honor gate — see [`takeover_idled`]) and again
+/// at a successful launch: the switch INTO game mode writes the sentinel on its way in, and that
+/// write must never read as a request to go back out. Baselining only at launch left the window in
+/// between — a takeover whose launch failed, then a client retry inside the restore debounce —
+/// reading a months-old sentinel as a live request and pushing the box to the desktop the user
+/// never asked for.
 fn record_session_select_baseline() {
     *SESSION_SELECT_BASELINE
         .lock()
@@ -2801,11 +2859,11 @@ fn sentinel_advanced(
 ///
 /// The caller then refuses managed relaunches for [`SWITCH_HONOR_GRACE`] so the capture-loss
 /// re-detection follows the desktop compositor once it's up instead of racing it.
-fn honor_session_select_switch(dm: String) {
+fn honor_session_select_switch(adopted_dm: Option<String>) {
     tracing::info!(
-        %dm,
-        "gamescope: in-stream session-select detected — restoring the display manager and \
-         switching the box to the desktop session"
+        adopted_dm = ?adopted_dm,
+        "gamescope: in-stream session-select detected — handing the box's own game mode back and \
+         following the desktop session the user selected"
     );
     // Consume the takeover state up front: from here on the box is the DM's again. The mask goes
     // FIRST and while the unit list still exists — this path discards that list, and it is the only
@@ -2818,7 +2876,43 @@ fn honor_session_select_switch(dm: String) {
     clear_takeover();
     *MANAGED_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
     stop_session(SESSION_UNIT); // dead already (the switch shut its Steam down) — clear the unit
-    if let Err(e) = restore_display_manager(&dm) {
+                                // Give the box its own Game Mode back before anything else can ask for it. The takeover
+                                // replaced that session's `ExecStart` with a sleep ([`install_idle_dropin`]), and a switch is
+                                // the one exit that used to leave it behind: the disconnect restore sweeps it, but a switch is
+                                // not a disconnect. Without this the user's next "Return to Gaming Mode" starts a unit that
+                                // does nothing at all — measured on the Nobara VM 2026-08-20, and on glass it is
+                                // indistinguishable from broken hardware.
+    if remove_idle_dropin() {
+        tracing::info!(
+            "gamescope: removed the takeover's idle drop-in — the box's own Game Mode runs for \
+             real again"
+        );
+    }
+    // Only an ADOPTED takeover still owes a display-manager restore. 0.31.0 leaves the DM up for
+    // exactly this reason, so by the time we get here the OS's own switch has already done the
+    // whole job — config rewrite and relogin (measured end to end on the Nobara VM). A takeover
+    // inherited from a host old enough to have STOPPED the DM has not: for it the switch really
+    // was the silent no-op that every write branch of `os-session-select` becomes without a
+    // running DM, so that one still has to be replayed.
+    if let Some(dm) = adopted_dm {
+        replay_switch_under_restored_dm(&dm);
+    }
+    record_session_select_baseline();
+    *SWITCH_HONORED_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+}
+
+/// Restore a display manager an ADOPTED takeover stopped, then replay the user's switch under it —
+/// every verb live-validated on the Nobara repro VM:
+/// 1. start the DM (its autologin heads back into game mode briefly — the config still names it);
+/// 2. run the distro's own `os-session-select desktop` as the user (its internal pkexec is
+///    `allow_any`-authorized), which rewrites the DM autologin config to the desktop session;
+/// 3. stop the autologin gamescope unit — the login session exits, and `Relogin=true` relogs
+///    into the now-selected desktop.
+///
+/// Reachable only from [`honor_session_select_switch`], and only for a takeover inherited from a
+/// pre-0.31.0 host: nothing stops a display manager any more.
+fn replay_switch_under_restored_dm(dm: &str) {
+    if let Err(e) = restore_display_manager(dm) {
         tracing::warn!(
             %dm,
             reason = %e,
@@ -2831,7 +2925,7 @@ fn honor_session_select_switch(dm: String) {
         // Budgeted: this is a 10 s loop, and a single unbounded `is-active` against a system
         // manager that is itself mid-restart would consume the whole window in one tick.
         let active = crate::proc::output_within(
-            Command::new("systemctl").args(["is-active", &dm]),
+            Command::new("systemctl").args(["is-active", dm]),
             UNIT_STATE_BUDGET,
         )
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
@@ -2888,8 +2982,6 @@ fn honor_session_select_switch(dm: String) {
              session instead of switching to the desktop"
         );
     }
-    record_session_select_baseline();
-    *SWITCH_HONORED_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
 }
 
 /// Stop every autologin gaming-mode session (`gamescope-session-plus@*.service`) so its
@@ -2979,6 +3071,13 @@ fn stop_autologin_sessions() -> Result<()> {
     // switch.
     if plan.dm_relogins {
         install_idle_dropin().context("idling the box's autologin game session for the stream")?;
+        // Baseline the switch sentinel HERE, not only at a successful launch: arming the idle
+        // drop-in is what arms the honor gate in [`create_managed_session`], so from this instant
+        // an unbaselined sentinel would read as an in-stream "Switch to Desktop" — including the
+        // write left by the switch that just brought the box INTO game mode. A successful launch
+        // re-baselines (tighter still). This moved here from the display-manager stop that 0.31.0
+        // retired; losing it with that stop is what left the gate unarmed.
+        record_session_select_baseline();
     }
     let units: Vec<String> = listed.into_iter().map(|(u, _)| u).collect();
     let mut stopped = Vec::new();
@@ -5233,9 +5332,10 @@ mod tests {
     use super::{
         any_output_size_is, cancel_pending_restore, cgroup_is_punktfunk_owned,
         classify_output_size, connected_connector_under, display_manager_unit_under, dm_plan,
-        game_hz, gamescope_output_size, hdr_args, is_steam_launch, mask_unit, missing_flags,
-        mode_mismatch, nested_wrapper_script, our_wsi_layer_dir, plan_bind, release_autologin_mask,
-        script_hardcodes_gamescope, sentinel_advanced, shape_dedicated_command,
+        game_hz, gamescope_output_size, hdr_args, idle_dropin_body, idle_dropin_path,
+        install_idle_dropin, is_steam_launch, mask_unit, missing_flags, mode_mismatch,
+        nested_wrapper_script, our_wsi_layer_dir, plan_bind, release_autologin_mask,
+        remove_idle_dropin, script_hardcodes_gamescope, sentinel_advanced, shape_dedicated_command,
         switch_ends_mask_window, takeover_state_is_live, unmask_unit, xwayland_refusal_marker,
         BindOff, BindPlan, BoxOutputSize, DmHelperError, SessionBind, TakeoverState, WsiPlan,
         AUTOLOGIN_MASKED, DISTRO_GAMESCOPE_PATH, PENDING_RESTORE, RESTORE_FLIGHT,
@@ -5432,6 +5532,25 @@ mod tests {
         assert!(!sentinel_advanced(Some(Some(t0)), Some(t0)));
         assert!(!sentinel_advanced(Some(Some(t1)), Some(t0)));
         assert!(!sentinel_advanced(Some(Some(t0)), None));
+    }
+
+    /// `ExecStart` is list-valued, so the reset line is the whole mechanism: without it the
+    /// drop-in APPENDS the sleep to the box's own session command and both run — the takeover
+    /// would then be fighting the very Steam it set out to free, and nothing on the box would say
+    /// why. Pins the reset, its order, and that the resolved `sleep` is the one that gets run.
+    #[test]
+    fn idle_dropin_replaces_exec_start_rather_than_appending() {
+        let body = idle_dropin_body("/usr/bin/sleep");
+        assert_eq!(
+            body, "[Service]\nExecStart=\nExecStart=/usr/bin/sleep infinity\n",
+            "{body}"
+        );
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines[1], "ExecStart=", "the reset must come first: {body}");
+        // The path is resolved per box ([`sleep_binary`]) and must reach the unit verbatim — a
+        // bare `sleep` would depend on the unit's PATH, and an ExecStart that fails to EXECUTE is
+        // the failing unit the display manager relogin-loops against.
+        assert!(idle_dropin_body("/bin/sleep").contains("ExecStart=/bin/sleep infinity"));
     }
 
     #[test]
@@ -5661,10 +5780,32 @@ mod tests {
         release_autologin_mask(crate::ActiveKind::None);
         assert_eq!(is_enabled(), "masked-runtime");
 
+        // The idle drop-in is the mask's successor and shares this exact window, so it has to come
+        // off with it. A takeover that leaves it on has replaced the box's game-mode `ExecStart`
+        // with a sleep — a "Return to Gaming Mode" that starts and does nothing, which is the same
+        // barred way back, measured on Bazzite `.41` 2026-08-20.
+        install_idle_dropin().expect("arm the takeover's idle drop-in");
+        assert!(idle_dropin_path().exists());
+
+        // Mid-stream, with the box still ours: the mask is doing its job and must stay. `Gaming` is
+        // what our own managed session reads as, and `None` is one momentarily down between
+        // relaunches — lifting on either would void the mask for the whole stream.
+        release_autologin_mask(crate::ActiveKind::Gaming);
+        release_autologin_mask(crate::ActiveKind::None);
+        assert_eq!(is_enabled(), "masked-runtime");
+        assert!(
+            idle_dropin_path().exists(),
+            "the idle drop-in must survive a switch that is not to a desktop"
+        );
+
         // The user switched the box to its own desktop mid-stream: the window is over, and the way
         // back into game mode has to be clear before they ask for it.
         release_autologin_mask(crate::ActiveKind::DesktopKde);
         assert_ne!(is_enabled(), "masked-runtime");
+        assert!(
+            !idle_dropin_path().exists(),
+            "the idle drop-in outlived the switch — the box's Game Mode is a sleep now"
+        );
         // The restart list SURVIVES the lift: the mask's lifetime is shorter than the takeover's,
         // and the disconnect restore still owes these units a `start`.
         assert_eq!(STOPPED_AUTOLOGIN.lock().unwrap().as_slice(), [PROBE]);
@@ -5673,6 +5814,7 @@ mod tests {
         assert_ne!(is_enabled(), "masked-runtime");
 
         unmask_unit(PROBE);
+        remove_idle_dropin();
         STOPPED_AUTOLOGIN.lock().unwrap().clear();
         *AUTOLOGIN_MASKED.lock().unwrap() = false;
     }
