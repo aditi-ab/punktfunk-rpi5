@@ -298,6 +298,18 @@ object NativeBridge {
         surfaceH: Int,
     )
 
+    /**
+     * Re-report the video SurfaceView's on-screen pixel size — call it from every `surfaceChanged`.
+     *
+     * The ASurfaceControl present backend composites the picture into exactly this rectangle, and
+     * the view grows AFTER [nativeStartVideo] has run: the stream screen hides the system bars and
+     * switches the window to draw into the display cutout a frame or two later, and neither
+     * recreates the surface. Without this the layer keeps painting at its start-up size in the
+     * corner of a now-bigger surface. Non-positive values are ignored. No-op on a `0` handle;
+     * cheap (one atomic store), UI-safe.
+     */
+    external fun nativeVideoSurfaceSize(handle: Long, width: Int, height: Int)
+
     /** Stop + join the decode thread without closing the session. No-op on `0`. */
     external fun nativeStopVideo(handle: Long)
 

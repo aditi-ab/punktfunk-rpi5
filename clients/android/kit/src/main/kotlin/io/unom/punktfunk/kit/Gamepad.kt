@@ -193,9 +193,53 @@ object Gamepad {
             s and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
     }
 
-    /** All connected gamepad/joystick [InputDevice]s, in system enumeration order. */
-    fun pads(): List<InputDevice> =
-        InputDevice.getDeviceIds().toList().mapNotNull { InputDevice.getDevice(it) }.filter { isPad(it) }
+    /**
+     * True when [dev] is a controller someone can actually hold: a pad source ([isPad]) that is a
+     * REAL device carrying real pad hardware — a stick, a HAT, or the A/B face buttons.
+     *
+     * [isPad] alone answers "did this event come from a pad source", which is the right question
+     * for ROUTING an event and the wrong one for "is a controller attached". Devices publish
+     * inputs that claim `SOURCE_GAMEPAD`/`SOURCE_JOYSTICK` while being no such thing — OEM
+     * game-mode overlays and the gaming-phone shoulder triggers among them — and one of those is
+     * enough to pin the console UI on forever: a pad that was never there cannot disconnect, so
+     * "With a controller" has no way back to the touch UI.
+     *
+     * The capability probe is what separates them: a source class is a claim, a stick or a face
+     * button is hardware. It is not a complete defence — an OEM device that declares `BTN_GAMEPAD`
+     * and a pair of axes is indistinguishable from a pad at this layer — so the master switch stays
+     * the guaranteed way out. `isVirtual` only means "device id < 0" (the platform's own synthetic
+     * device), which is worth excluding but catches none of the above.
+     */
+    fun looksLikeController(dev: InputDevice?): Boolean {
+        val d = dev ?: return false
+        return looksLikeController(
+            padSource = isPad(d),
+            virtual = d.isVirtual,
+            hasStick = d.getMotionRange(MotionEvent.AXIS_X, InputDevice.SOURCE_JOYSTICK) != null ||
+                d.getMotionRange(MotionEvent.AXIS_HAT_X, InputDevice.SOURCE_JOYSTICK) != null,
+            // `hasKeys` answers for the DEVICE, so a pad with no sticks at all (an arcade stick,
+            // a d-pad-only pad) still counts.
+            hasFaceButtons = d.hasKeys(KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_BUTTON_B)
+                .any { it },
+        )
+    }
+
+    /** [looksLikeController]'s decision, over plain facts — the seam its truth table is tested at
+     * (an [InputDevice] cannot be built off a device). */
+    fun looksLikeController(
+        padSource: Boolean,
+        virtual: Boolean,
+        hasStick: Boolean,
+        hasFaceButtons: Boolean,
+    ): Boolean = padSource && !virtual && (hasStick || hasFaceButtons)
+
+    /**
+     * All connected controllers, in system enumeration order — the devices that answer "is a pad
+     * attached", so the filter is [looksLikeController] rather than the looser [isPad].
+     */
+    fun pads(): List<InputDevice> = InputDevice.getDeviceIds().toList()
+        .mapNotNull { InputDevice.getDevice(it) }
+        .filter { looksLikeController(it) }
 
     /** First connected gamepad/joystick [InputDevice], or null when none is attached. */
     fun firstPad(): InputDevice? = pads().firstOrNull()

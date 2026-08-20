@@ -940,6 +940,17 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                         }
 
                         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                            // The view's CURRENT pixel size, for the ASurfaceControl layer's
+                            // destination rect. It is reported here and not only at
+                            // surfaceCreated because the view grows a frame or two after the
+                            // stream screen appears — hiding the system bars and switching on
+                            // cutout drawing both resize it, and neither recreates the surface.
+                            // A layer left on the start-up rect paints the picture small, in the
+                            // top-left corner. The view's own size, not the buffer geometry in
+                            // `width`/`height`: the layer composites in the view's space.
+                            NativeBridge.nativeVideoSurfaceSize(
+                                handle, this@apply.width, this@apply.height,
+                            )
                             // Re-assert the frame-rate vote: a buffer-geometry change can reset
                             // the surface's frame-rate setting on some OEM builds, silently
                             // dropping the 120 Hz pin mid-stream. Mirrors the native hint's
