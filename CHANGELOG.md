@@ -14,7 +14,7 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ## v0.31.0
 
-173 commits since v0.30.0 (115 non-merge).
+170 commits since v0.30.0 (113 non-merge), counted at the tip this was cut from.
 
 One versioned surface moves, additively: the **C ABI goes 24 → 25**, a single new symbol
 (`punktfunk_set_log_callback`) that lets an embedder hear the core's own log lines. Nothing else
