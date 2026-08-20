@@ -39,8 +39,11 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # Retried: bun's download-and-extract is single-shot, and a truncated tarball reads as
+      # `Fail extracting tarball` (ci.yml's web job has the measurement). A publish job is the
+      # worst place to lose to a dropped packet — the tag is already pushed.
       - name: Install dependencies
-        run: bun install --frozen-lockfile --ignore-scripts
+        run: bash ../scripts/ci/retry.sh 3 bun install --frozen-lockfile --ignore-scripts
 
       - name: Typecheck
         run: bun run typecheck

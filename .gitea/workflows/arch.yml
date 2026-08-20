@@ -248,7 +248,9 @@ jobs:
         if: steps.webconsole.outputs.cache-hit != 'true'
         run: |
           cd web
-          bun install --frozen-lockfile --ignore-scripts
+          # Retried: bun's download-and-extract is single-shot, and a truncated tarball reads as
+          # `Fail extracting tarball` (ci.yml's web job has the measurement).
+          bash ../scripts/ci/retry.sh 3 bun install --frozen-lockfile --ignore-scripts
           bun run build
 
       - name: The console must exist (cache hit or fresh build)
