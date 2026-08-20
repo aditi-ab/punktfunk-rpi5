@@ -616,7 +616,7 @@ class MainActivity : ComponentActivity() {
             // no BUTTON_SELECT scancode delivers its Select: see [Gamepad.padButtonBit], which is
             // why this asks it rather than `buttonBit`).
             if (event.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
-                val bit = Gamepad.padButtonBit(event.keyCode, event.flags)
+                val bit = Gamepad.padButtonBit(Gamepad.padKeyCode(event), event.flags)
                 if (bit != 0) {
                     // The router forwards the bit on this device's own wire pad index and tracks held
                     // state per pad. The emergency-exit chord (Select + Start + L1 + R1) is handled
@@ -708,8 +708,10 @@ class MainActivity : ComponentActivity() {
             if (event.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
                 // Not streaming: a game controller drives the Compose UI (TV + phone). Map the face
                 // buttons to the navigation the focus system / back stack understand; D-pad *keys*
-                // already move focus on their own, so they fall through to super untouched.
-                when (event.keyCode) {
+                // already move focus on their own, so they fall through to super untouched. Read
+                // through [Gamepad.padKeyCode] so a pad Android has no key layout for reaches the
+                // menus on the right buttons too, not only the stream.
+                when (Gamepad.padKeyCode(event)) {
                     // B → back. Drive the OnBackPressedDispatcher directly rather than synthesising a
                     // BACK KeyEvent: a synthetic event isn't "tracking", so the framework's default
                     // onKeyUp(BACK) never calls onBackPressed() and Compose BackHandlers wouldn't fire.

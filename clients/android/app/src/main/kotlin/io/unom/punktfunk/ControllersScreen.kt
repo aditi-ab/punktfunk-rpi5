@@ -136,14 +136,19 @@ internal fun ControllersScreen(
             // Read ONCE, up front: the test can end inside this very event, and the release that
             // ended it still has to be swallowed here — see the B branch below.
             val consume = consuming
+            // The CORRECTED keycode, so this screen shows the button the stream will send and not
+            // the one Android guessed for a pad it has no key layout for — the two differ on every
+            // controller [Gamepad.padKeyCode] exists for, and a tester that disagrees with the
+            // stream is worse than no tester. The raw pair is still reported in "Last input".
+            val code = Gamepad.padKeyCode(event)
             when (event.action) {
                 KeyEvent.ACTION_DOWN -> {
-                    held[event.keyCode] = true
-                    if (event.keyCode == KeyEvent.KEYCODE_BUTTON_B) bHeld = true
+                    held[code] = true
+                    if (code == KeyEvent.KEYCODE_BUTTON_B) bHeld = true
                 }
                 KeyEvent.ACTION_UP -> {
-                    held[event.keyCode] = false
-                    if (event.keyCode == KeyEvent.KEYCODE_BUTTON_B) {
+                    held[code] = false
+                    if (code == KeyEvent.KEYCODE_BUTTON_B) {
                         bHeld = false
                         if (consume) {
                             if (event.eventTime - event.downTime >= HOLD_TO_FINISH_MS) {
@@ -167,23 +172,43 @@ internal fun ControllersScreen(
                     }
                 }
             }
-            lastInput = "${event.device?.name}: ${KeyEvent.keyCodeToString(event.keyCode)}"
+            // Raw scancode AND keycode, plus the correction when one fired: this line is what a
+            // field report needs to pin an unmapped pad's report order without the device in hand.
+            val raw = KeyEvent.keyCodeToString(event.keyCode).removePrefix("KEYCODE_")
+            val fixed = KeyEvent.keyCodeToString(code).removePrefix("KEYCODE_")
+            lastInput = "${event.device?.name}: scan 0x%X · %s%s".format(
+                event.scanCode,
+                raw,
+                if (code != event.keyCode) " → $fixed" else "",
+            )
             consume
         }
         val motionProbe: (MotionEvent) -> Boolean = probe@{ event ->
             if (!Gamepad.isPad(event.device)) return@probe false
+            // Through the device's resolved map, exactly as `Gamepad.AxisMapper` reads it while
+            // streaming — on a pad Android has no key layout for, the right stick and the triggers
+            // are not on the axes their names suggest.
+            val map = Gamepad.padMap(event.device)
             axes["LX"] = event.getAxisValue(MotionEvent.AXIS_X)
             axes["LY"] = event.getAxisValue(MotionEvent.AXIS_Y)
-            axes["RX"] = event.getAxisValue(MotionEvent.AXIS_Z)
-            axes["RY"] = event.getAxisValue(MotionEvent.AXIS_RZ)
-            axes["LT"] = maxOf(
-                event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
-                event.getAxisValue(MotionEvent.AXIS_BRAKE),
-            )
-            axes["RT"] = maxOf(
-                event.getAxisValue(MotionEvent.AXIS_RTRIGGER),
-                event.getAxisValue(MotionEvent.AXIS_GAS),
-            )
+            axes["RX"] = event.getAxisValue(map.rightStickX)
+            axes["RY"] = event.getAxisValue(map.rightStickY)
+            axes["LT"] = if (map.leftTrigger == Gamepad.AXIS_NONE) {
+                maxOf(
+                    event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
+                    event.getAxisValue(MotionEvent.AXIS_BRAKE),
+                )
+            } else {
+                map.level(event.getAxisValue(map.leftTrigger))
+            }
+            axes["RT"] = if (map.rightTrigger == Gamepad.AXIS_NONE) {
+                maxOf(
+                    event.getAxisValue(MotionEvent.AXIS_RTRIGGER),
+                    event.getAxisValue(MotionEvent.AXIS_GAS),
+                )
+            } else {
+                map.level(event.getAxisValue(map.rightTrigger))
+            }
             axes["HX"] = event.getAxisValue(MotionEvent.AXIS_HAT_X)
             axes["HY"] = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
             consuming
@@ -689,6 +714,16 @@ private fun PadRow(info: PadInfo, gamepadSetting: Int) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            // Only when a correction is actually in force: on a pad Android has a key layout for
+            // there is nothing to say, and a line that says "normal" on every device teaches
+            // nobody anything. Named rather than merely flagged, so a field report can quote it.
+            padButtonsNote(info.buttons)?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             if (info.canRumble) {
                 OutlinedButton(onClick = { info.dev?.let(::testRumble) }) { Text("Test rumble") }
             } else {
@@ -784,6 +819,12 @@ internal data class PadInfo(
     val controllerNumber: Int,
     val resolvedPref: Int,
     val canRumble: Boolean,
+    /**
+     * The report order this pad's buttons were resolved to ([Gamepad.padButtons]). Defaults to
+     * the pad Android already knows, which is what a screenshot scene wants and what the note
+     * under the card stays silent about.
+     */
+    val buttons: Gamepad.PadButtons = Gamepad.PadButtons.NATIVE,
     val dev: InputDevice? = null,
 )
 
@@ -793,6 +834,7 @@ internal fun padInfoOf(dev: InputDevice): PadInfo = PadInfo(
     forwarded = isForwarded(dev),
     controllerNumber = dev.controllerNumber,
     resolvedPref = Gamepad.prefFor(dev),
+    buttons = Gamepad.padMap(dev).buttons, // via padMap so the list refresh reuses the cache
     canRumble = deviceHasVibrator(dev),
     dev = dev,
 )
@@ -823,6 +865,20 @@ internal fun testRumble(dev: InputDevice) {
 }
 
 /** Identity line: VID:PID + the source classes Android assigned. */
+/**
+ * What to say about a pad whose buttons had to be resolved from their scancodes because Android
+ * has no key layout for it — null for a pad it does know, which needs no explanation.
+ */
+private fun padButtonsNote(buttons: Gamepad.PadButtons): String? = when (buttons) {
+    Gamepad.PadButtons.NATIVE -> null
+    Gamepad.PadButtons.GENERIC_SONY ->
+        "Android has no button layout for this controller — read as a PlayStation pad"
+    Gamepad.PadButtons.GENERIC_XBOX ->
+        "Android has no button layout for this controller — read as an Xbox pad"
+    Gamepad.PadButtons.SONY_MODERN ->
+        "Android has no button layout for this controller — face buttons corrected"
+}
+
 private fun deviceDetail(dev: InputDevice): String =
     "%04X:%04X · %s".format(dev.vendorId, dev.productId, sourcesLabel(dev.sources))
 

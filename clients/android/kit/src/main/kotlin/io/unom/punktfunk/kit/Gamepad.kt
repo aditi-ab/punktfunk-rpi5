@@ -3,6 +3,7 @@ package io.unom.punktfunk.kit
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.roundToInt
 
 /**
@@ -127,8 +128,12 @@ object Gamepad {
 
     // Microsoft Xbox One / Series product ids (wired + the common Bluetooth/dongle revisions). All
     // behave like Xbox 360 on the host minus the glyph identity, so they share one pref byte.
+    // The Bluetooth revisions (0x02E0/0x02FD Xbox One S, 0x0B05/0x0B22 Elite Series 2 and its
+    // Core) are here for the same reason as the wired ones: they are the pads a couch actually
+    // pairs to a TV box, and without them an Elite streams under the Xbox 360 identity.
     private val PID_XBOXONE = setOf(
-        0x02D1, 0x02DD, 0x02E3, 0x02EA, 0x0B00, 0x0B12, 0x0B13, 0x0B20,
+        0x02D1, 0x02DD, 0x02E0, 0x02E3, 0x02EA, 0x02FD,
+        0x0B00, 0x0B05, 0x0B12, 0x0B13, 0x0B20, 0x0B22,
     )
 
     /**
@@ -293,6 +298,303 @@ object Gamepad {
         else -> BTN_BACK
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Controllers Android has no key layout for
+    //
+    // Android turns a pad's raw evdev scancode into a `KeyEvent.keyCode` through a KEY LAYOUT
+    // file matched on USB VID/PID (`Vendor_054c_Product_0ce6.kl` & co.). A pad with no matching
+    // file falls back to AOSP's `Generic.kl`, which assigns keycodes by SCANCODE POSITION —
+    // `0x130`→BUTTON_A, `0x131`→BUTTON_B, `0x132`→BUTTON_C, and so on up. That is only right if
+    // the pad's buttons happen to sit at the positions the file assumes, and a HID gamepad with
+    // no kernel driver behind it numbers its buttons 1..n straight through IN ITS OWN REPORT
+    // ORDER — so every keycode after the first divergence is somebody else's button.
+    //
+    // Reported from a Fire TV Stick 4K Max (2026-08-20): a DualSense and an Xbox Elite Series 2,
+    // both over Bluetooth, both identified correctly but with buttons landing on the wrong
+    // actions ("L1 being L2"). Neither has a layout there — AOSP ships none for the Elite
+    // Series 2 over Bluetooth (`045e:0b05`) on ANY version, and the DualSense's
+    // (`054c:0ce6`) both postdates Fire OS and carries `requires_kernel_config
+    // CONFIG_HID_PLAYSTATION`, which a Fire TV kernel does not have. A DualSense reporting
+    // straight through puts L2 on `0x136`, which `Generic.kl` calls BUTTON_L1: the reported
+    // symptom exactly.
+    //
+    // The fix is to resolve buttons from the SCANCODE, which is the pad's own report position and
+    // is immune to the layout file — the same reason [Keymap.toVk] reads `scanCode` for keyboards.
+    // Two things keep it from breaking a pad that already works:
+    //
+    //  1. The correction is applied ONLY when the delivered keycode is what `Generic.kl` would
+    //     have said ([genericKeyCode]). A different keycode means a device-specific layout IS in
+    //     force and already knows this pad better than we do, so we leave it alone.
+    //  2. Which report order to read is decided from what the DEVICE declares, never a model
+    //     table: a pad numbering straight through claims BUTTON_C and BUTTON_Z ([PadButtons]),
+    //     keycodes no real controller has a button for.
+    //
+    // Moonlight carries the same two tables (`ControllerHandler`'s `isNonStandardDualShock4` /
+    // `isNonStandardXboxBtController`), which is why both pads work there on the same box.
+
+    /** [MotionEvent] axis id meaning "this pad has no such axis" — see [PadMap]. */
+    const val AXIS_NONE = -1
+
+    /**
+     * The report order a controller's buttons are numbered in, and with it which scancode carries
+     * which physical button. Resolved once per device by [padButtons] from what the device
+     * declares; [correct] then maps one scancode to the keycode it should have produced.
+     */
+    enum class PadButtons {
+        /**
+         * The keycode Android delivered is already right — a device-specific key layout is in
+         * force, or the generic one happens to agree. [correct] changes nothing.
+         */
+        NATIVE,
+
+        /**
+         * A Sony pad numbering straight through with no kernel driver behind it: □ ✕ ○ △ L1 R1
+         * L2 R2 Create Options L3 R3 PS, i.e. `0x130`..`0x13c` in that order. The analog trigger
+         * value rides `AXIS_RX`/`AXIS_RY` on such a pad, so the digital L2/R2 fold to keycodes
+         * [buttonBit] deliberately drops — the wire carries the axis, never both.
+         */
+        GENERIC_SONY,
+
+        /**
+         * An Xbox-layout pad numbering straight through: A B X Y LB RB View Menu LS RS, i.e.
+         * `0x130`..`0x139`. Also the fallback for an unbranded pad, which near-universally
+         * clones the Xbox layout — the same assumption [styleFor] makes for its glyphs.
+         */
+        GENERIC_XBOX,
+
+        /**
+         * A Sony pad WITH a kernel driver (`hid-playstation` / `hid-sony`) but still no key
+         * layout — the combination an Android 11 box on a 5.10 kernel lands in. Such a driver
+         * emits the modern Linux gamepad codes, where `0x133` is BTN_NORTH (△) and `0x134` is
+         * BTN_WEST (□); `Generic.kl` reads those two as BUTTON_X and BUTTON_Y, so exactly the
+         * face pair comes out swapped and nothing else is wrong.
+         */
+        SONY_MODERN,
+        ;
+
+        /**
+         * The keycode scancode [scan] should have produced, given Android delivered [keyCode].
+         *
+         * Returns [keyCode] untouched unless it is precisely what [genericKeyCode] would have
+         * said for [scan] — anything else is a device-specific layout's answer, which outranks
+         * this table. That guard is what makes the correction idempotent and safe to run on
+         * every pad: it can only ever fire where Android was guessing in the first place.
+         */
+        fun correct(scan: Int, keyCode: Int): Int {
+            if (this == NATIVE) return keyCode
+            if (keyCode != genericKeyCode(scan)) return keyCode
+            val fixed = when (this) {
+                GENERIC_SONY -> when (scan) {
+                    0x130 -> KeyEvent.KEYCODE_BUTTON_X // □
+                    0x131 -> KeyEvent.KEYCODE_BUTTON_A // ✕
+                    0x132 -> KeyEvent.KEYCODE_BUTTON_B // ○
+                    0x133 -> KeyEvent.KEYCODE_BUTTON_Y // △
+                    0x134 -> KeyEvent.KEYCODE_BUTTON_L1
+                    0x135 -> KeyEvent.KEYCODE_BUTTON_R1
+                    0x136 -> KeyEvent.KEYCODE_BUTTON_L2 // analog: AXIS_RX
+                    0x137 -> KeyEvent.KEYCODE_BUTTON_R2 // analog: AXIS_RY
+                    0x138 -> KeyEvent.KEYCODE_BUTTON_SELECT // Create / Share
+                    0x139 -> KeyEvent.KEYCODE_BUTTON_START // Options
+                    0x13a -> KeyEvent.KEYCODE_BUTTON_THUMBL
+                    0x13b -> KeyEvent.KEYCODE_BUTTON_THUMBR
+                    0x13c -> KeyEvent.KEYCODE_BUTTON_MODE // PS
+                    // 0x13d touchpad click / 0x13e mute: no wire button, dropped as before.
+                    else -> KeyEvent.KEYCODE_UNKNOWN
+                }
+                GENERIC_XBOX -> when (scan) {
+                    0x132 -> KeyEvent.KEYCODE_BUTTON_X
+                    0x133 -> KeyEvent.KEYCODE_BUTTON_Y
+                    0x134 -> KeyEvent.KEYCODE_BUTTON_L1
+                    0x135 -> KeyEvent.KEYCODE_BUTTON_R1
+                    0x136 -> KeyEvent.KEYCODE_BUTTON_SELECT // View
+                    0x137 -> KeyEvent.KEYCODE_BUTTON_START // Menu
+                    0x138 -> KeyEvent.KEYCODE_BUTTON_THUMBL
+                    0x139 -> KeyEvent.KEYCODE_BUTTON_THUMBR
+                    else -> keyCode // 0x130 A / 0x131 B already agree
+                }
+                // Only the face pair; every other row of Generic.kl is right for these codes.
+                SONY_MODERN -> when (scan) {
+                    0x133 -> KeyEvent.KEYCODE_BUTTON_Y // BTN_NORTH = △
+                    0x134 -> KeyEvent.KEYCODE_BUTTON_X // BTN_WEST  = □
+                    else -> keyCode
+                }
+                NATIVE -> keyCode
+            }
+            return fixed
+        }
+    }
+
+    /**
+     * AOSP `Generic.kl`'s gamepad rows — the layout Android falls back to when no device-specific
+     * key layout matches the pad's VID/PID. Scancodes outside it answer [KeyEvent.KEYCODE_UNKNOWN],
+     * which never equals a real delivered keycode, so [PadButtons.correct]'s guard leaves those
+     * events alone.
+     */
+    fun genericKeyCode(scan: Int): Int = when (scan) {
+        0x130 -> KeyEvent.KEYCODE_BUTTON_A
+        0x131 -> KeyEvent.KEYCODE_BUTTON_B
+        0x132 -> KeyEvent.KEYCODE_BUTTON_C
+        0x133 -> KeyEvent.KEYCODE_BUTTON_X
+        0x134 -> KeyEvent.KEYCODE_BUTTON_Y
+        0x135 -> KeyEvent.KEYCODE_BUTTON_Z
+        0x136 -> KeyEvent.KEYCODE_BUTTON_L1
+        0x137 -> KeyEvent.KEYCODE_BUTTON_R1
+        0x138 -> KeyEvent.KEYCODE_BUTTON_L2
+        0x139 -> KeyEvent.KEYCODE_BUTTON_R2
+        0x13a -> KeyEvent.KEYCODE_BUTTON_SELECT
+        0x13b -> KeyEvent.KEYCODE_BUTTON_START
+        0x13c -> KeyEvent.KEYCODE_BUTTON_MODE
+        0x13d -> KeyEvent.KEYCODE_BUTTON_THUMBL
+        0x13e -> KeyEvent.KEYCODE_BUTTON_THUMBR
+        else -> KeyEvent.KEYCODE_UNKNOWN
+    }
+
+    /**
+     * How one controller must be read: its button report order plus the axes its right stick and
+     * analog triggers actually arrive on. Resolved once per device by [padMap].
+     */
+    class PadMap(
+        val buttons: PadButtons,
+        val rightStickX: Int = MotionEvent.AXIS_Z,
+        val rightStickY: Int = MotionEvent.AXIS_RZ,
+        /**
+         * The trigger axes, or [AXIS_NONE] for a pad Android already names them on — that case
+         * keeps folding LTRIGGER with BRAKE and RTRIGGER with GAS by max, which is what pads that
+         * report one pair, the other, or both have always needed.
+         */
+        val leftTrigger: Int = AXIS_NONE,
+        val rightTrigger: Int = AXIS_NONE,
+        /** Those trigger axes rest at −1 rather than 0, measured off the device's own range. */
+        val triggersSigned: Boolean = false,
+    ) {
+        /** One resolved trigger axis value, folded to the 0..1 the wire scale expects. */
+        fun level(v: Float): Float = if (triggersSigned) (v + 1f) / 2f else v
+    }
+
+    /** The map every pad with a key layout uses: Android's own names, unchanged. */
+    private val NATIVE_MAP = PadMap(PadButtons.NATIVE)
+
+    /**
+     * Resolved [PadMap]s, keyed by [InputDevice.getDescriptor] — the device's stable identity
+     * hash, so a pad that reconnects is recognised and a model resolves once for the process.
+     * Nothing here depends on a live connection, so entries never need evicting.
+     */
+    private val padMaps = ConcurrentHashMap<String, PadMap>()
+
+    /**
+     * Which report order [dev]'s buttons follow, asked of the device rather than a model table.
+     *
+     * A pad numbering its HID buttons straight through reaches BUTTON_C and BUTTON_Z, keycodes
+     * that exist only as `Generic.kl` positions — no controller has a physical C or Z button, and
+     * a pad with a kernel driver behind it emits the modern Linux gamepad codes, which skip both.
+     * Declaring the pair is therefore the signature of a pad Android is guessing at.
+     */
+    fun padButtons(dev: InputDevice): PadButtons {
+        val has = dev.hasKeys(KeyEvent.KEYCODE_BUTTON_C, KeyEvent.KEYCODE_BUTTON_Z, 0)
+        val straightThrough = has[0] && has[1]
+        return when {
+            straightThrough && dev.vendorId == VID_SONY -> PadButtons.GENERIC_SONY
+            straightThrough -> PadButtons.GENERIC_XBOX
+            dev.vendorId == VID_SONY -> PadButtons.SONY_MODERN
+            else -> PadButtons.NATIVE
+        }
+    }
+
+    /**
+     * The [PadMap] for [dev] — its button report order and the axes its right stick and triggers
+     * arrive on, resolved once per device model and cached.
+     *
+     * Axes get the same treatment as buttons: a pad Android has a layout for names its triggers
+     * LTRIGGER/RTRIGGER (or BRAKE/GAS, or BRAKE/THROTTLE) and is left exactly as it was. A pad
+     * with NONE of those names is one Android never mapped, and its triggers are sitting on two
+     * raw axes under the names the HID report gave them. Which two depends on the same report
+     * order the buttons did:
+     *
+     *  - a Sony pad reporting straight through lays out X, Y, Z, Rz, Rx, Ry = left stick, right
+     *    stick, then the triggers — so the right stick is already right and only the triggers
+     *    (`AXIS_RX`/`AXIS_RY`) are missed;
+     *  - every other such pad puts the right stick on Rx/Ry and the triggers on Z/Rz, which is
+     *    the shape that makes pulling a trigger swing the right stick.
+     *
+     * Whether those axes idle at −1 is MEASURED from the device's own range rather than assumed,
+     * so a pad that reports an honest 0..1 is not rescaled to a permanent half-pull.
+     */
+    fun padMap(dev: InputDevice?): PadMap {
+        if (dev == null) return NATIVE_MAP
+        padMaps[dev.descriptor]?.let { return it }
+        val buttons = padButtons(dev)
+        fun has(a: Int) = axis(dev, a) != null
+        val named = (has(MotionEvent.AXIS_LTRIGGER) && has(MotionEvent.AXIS_RTRIGGER)) ||
+            (has(MotionEvent.AXIS_BRAKE) && has(MotionEvent.AXIS_GAS)) ||
+            (has(MotionEvent.AXIS_BRAKE) && has(MotionEvent.AXIS_THROTTLE))
+        val rx = axis(dev, MotionEvent.AXIS_RX)
+        val hasRxRy = rx != null && has(MotionEvent.AXIS_RY)
+        // Whichever pair the fallback is about to pick, ask THAT one where it rests.
+        val restsNegative = if (buttons == PadButtons.GENERIC_SONY) {
+            (rx?.min ?: 0f) < -0.5f
+        } else {
+            (axis(dev, MotionEvent.AXIS_Z)?.min ?: 0f) < -0.5f
+        }
+        val map = padMap(buttons, namedTriggers = named, hasRxRy = hasRxRy, restsNegative = restsNegative)
+        padMaps[dev.descriptor] = map
+        return map
+    }
+
+    /**
+     * The axis half of [padMap], decided from four facts about the device so it can be pinned
+     * without one — see `PadButtonsTest`. [namedTriggers] is whether the pad calls its triggers
+     * anything Android knows (LTRIGGER/RTRIGGER, BRAKE/GAS, BRAKE/THROTTLE); if it does, nothing
+     * here applies and the pad is read exactly as it always was. [restsNegative] is measured off
+     * whichever axis pair the fallback picks, never assumed.
+     */
+    fun padMap(
+        buttons: PadButtons,
+        namedTriggers: Boolean,
+        hasRxRy: Boolean,
+        restsNegative: Boolean,
+    ): PadMap = when {
+        namedTriggers || !hasRxRy -> PadMap(buttons)
+        // X, Y, Z, Rz, Rx, Ry = left stick, right stick, triggers. The sticks already read right.
+        buttons == PadButtons.GENERIC_SONY -> PadMap(
+            buttons,
+            leftTrigger = MotionEvent.AXIS_RX,
+            rightTrigger = MotionEvent.AXIS_RY,
+            triggersSigned = restsNegative,
+        )
+        // Right stick on Rx/Ry and triggers on Z/Rz — the shape in which reading Z/Rz as the
+        // right stick makes pulling a trigger swing it.
+        else -> PadMap(
+            buttons,
+            rightStickX = MotionEvent.AXIS_RX,
+            rightStickY = MotionEvent.AXIS_RY,
+            leftTrigger = MotionEvent.AXIS_Z,
+            rightTrigger = MotionEvent.AXIS_RZ,
+            triggersSigned = restsNegative,
+        )
+    }
+
+    /** [dev]'s range for one joystick [axis], under either source class a pad reports on. */
+    private fun axis(dev: InputDevice, axis: Int): InputDevice.MotionRange? =
+        dev.getMotionRange(axis, InputDevice.SOURCE_JOYSTICK)
+            ?: dev.getMotionRange(axis, InputDevice.SOURCE_GAMEPAD)
+
+    /**
+     * The keycode [event] should have carried, given the controller it came from — [event]'s own
+     * keycode for every pad Android has a key layout for, and the scancode's true button for one
+     * it does not (see the block comment above [PadButtons]).
+     *
+     * A drop-in for `event.keyCode` at every gamepad reader: the console UI's navigation, the
+     * Controllers screen's tester, and the streaming branch all route through it, so a mis-mapped
+     * pad is fixed in the menus and in the game at once. Events from anything that is not a
+     * controller, and events with no scancode (soft keyboards, synthetic events), pass through
+     * untouched.
+     */
+    fun padKeyCode(event: KeyEvent): Int {
+        val dev = event.device ?: return event.keyCode
+        if (event.scanCode == 0 || !isPad(dev)) return event.keyCode
+        return padMap(dev).buttons.correct(event.scanCode, event.keyCode)
+    }
+
     /**
      * Maps one controller's joystick MotionEvents to axis (+ HAT→dpad) sends on wire pad index [pad],
      * **on change only**. Holds the previous axis/hat state so an unchanged frame emits nothing. One
@@ -306,7 +608,12 @@ object Gamepad {
      * node (DualSense/DS4 motion sensors), which reports every pad axis as 0. [onMotion] therefore
      * folds the event straight in without re-qualifying it.
      */
-    class AxisMapper(private val handle: Long, private val pad: Int) {
+    class AxisMapper(
+        private val handle: Long,
+        private val pad: Int,
+        /** Which axes this controller's right stick and triggers arrive on — see [padMap]. */
+        private val map: PadMap = NATIVE_MAP,
+    ) {
         // Sentinel so the first real value (incl. 0) always sends once after attach (Linux parity).
         private val last = IntArray(6) { Int.MIN_VALUE }
         private var hatX = 0 // -1 / 0 / +1
@@ -317,30 +624,18 @@ object Gamepad {
             // Sticks: Android floats −1..1, +y = down → ±32767, negate Y for the wire's +y = up.
             sendAxis(AXIS_LS_X, stick(event.getAxisValue(MotionEvent.AXIS_X)))
             sendAxis(AXIS_LS_Y, stick(-event.getAxisValue(MotionEvent.AXIS_Y)))
-            sendAxis(AXIS_RS_X, stick(event.getAxisValue(MotionEvent.AXIS_Z)))
-            sendAxis(AXIS_RS_Y, stick(-event.getAxisValue(MotionEvent.AXIS_RZ)))
+            sendAxis(AXIS_RS_X, stick(event.getAxisValue(map.rightStickX)))
+            sendAxis(AXIS_RS_Y, stick(-event.getAxisValue(map.rightStickY)))
 
             // Triggers: pads report LTRIGGER/RTRIGGER or BRAKE/GAS (some mirror both) — merge
             // with max, the same fold as the Controllers screen probe, so a pad that reports
-            // only one pair and a pad that reports both behave identically; 0..1 → 0..255.
-            sendAxis(
-                AXIS_LT,
-                trigger(
-                    maxOf(
-                        event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
-                        event.getAxisValue(MotionEvent.AXIS_BRAKE),
-                    ),
-                ),
-            )
-            sendAxis(
-                AXIS_RT,
-                trigger(
-                    maxOf(
-                        event.getAxisValue(MotionEvent.AXIS_RTRIGGER),
-                        event.getAxisValue(MotionEvent.AXIS_GAS),
-                    ),
-                ),
-            )
+            // only one pair and a pad that reports both behave identically; 0..1 → 0..255. A pad
+            // reporting NONE of those names is one Android has no key layout for, and [map]
+            // carries the raw axes its triggers really landed on instead.
+            val lt = resolved(event, map.leftTrigger, MotionEvent.AXIS_LTRIGGER, MotionEvent.AXIS_BRAKE)
+            val rt = resolved(event, map.rightTrigger, MotionEvent.AXIS_RTRIGGER, MotionEvent.AXIS_GAS)
+            sendAxis(AXIS_LT, trigger(lt))
+            sendAxis(AXIS_RT, trigger(rt))
 
             // HAT → dpad button transitions. Android BATCHES joystick ACTION_MOVEs, so a rapid d-pad
             // tap (press+release inside one batch window) lives only in the historical samples — the
@@ -382,6 +677,17 @@ object Gamepad {
             hatX = 0
             hatY = 0
         }
+
+        /**
+         * One trigger's 0..1 value: [resolvedAxis] when this pad needed one resolved for it,
+         * else the max of the two names Android gives a trigger it does know.
+         */
+        private fun resolved(event: MotionEvent, resolvedAxis: Int, named: Int, alias: Int): Float =
+            if (resolvedAxis == AXIS_NONE) {
+                maxOf(event.getAxisValue(named), event.getAxisValue(alias))
+            } else {
+                map.level(event.getAxisValue(resolvedAxis))
+            }
 
         private fun sendAxis(id: Int, v: Int) {
             if (last[id] == v) return
