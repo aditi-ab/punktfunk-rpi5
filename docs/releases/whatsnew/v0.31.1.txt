@@ -1,0 +1,4 @@
+• Fixes controllers pressing the wrong buttons on boxes Android has no layout for — on a Fire TV a DualSense's L2 arrived as L1, and Circle and R1 did nothing.
+• The controller console can be switched off from inside it, and no longer stays on because of a device that only claims to be a controller.
+• The picture no longer sits in the top-left corner once the system bars hide.
+• A TV remote can reach Settings and your game library again.
