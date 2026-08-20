@@ -14,7 +14,7 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ## v0.31.1
 
-27 commits since v0.31.0 (17 non-merge), counted at the tip this was cut from.
+30 commits since v0.31.0 (19 non-merge), counted at the tip this was cut from.
 
 **No versioned surface moves.** `WIRE_VERSION` stays **2**, the C ABI stays **25**, and so do the
 driver protocol, the gamepad channel, the plugin index schema and the host event schema. No C
@@ -223,6 +223,20 @@ origin once the bars and cutout grew the view.
   `check-docs-drift.sh` scans for `PUNKTFUNK_*` identifiers and cannot tell an operator knob from a
   cbindgen-exported `#define`; every other `PUNKTFUNK_MSG_*` is already baselined beside it.
 - **`clients/probe`** reads the new delivery counter.
+- **`trust::Settings::extra` is `#[serde(flatten)]`**, so `android.*` keys are **top-level** keys of
+  the settings document, beside `width` and `codec`. `ConsoleJson` wrote and read them nested under
+  an `"extra"` object, which serde stored under the literal key `"extra"` — so no console row ever
+  found `android.gamepad_ui_enabled`, every Android-only row (low latency, phone rumble/gyro, SC2 and
+  DualSense capture, the console-UI mode picker) read its own default, and the value the console
+  saved came back to Kotlin unchanged, so `applySettings` raised no callback. Fixed in #362, which is
+  what makes the `feat` above work at all. A store written by the nesting build carries the dead
+  wrapper and drops it on the next write. The new test pins the shape from **both sides**: a
+  round-trip alone could not catch this, because both halves agreed on the same wrong nesting.
+- **`pf-console-ui` focus halo / `panel_highlight` radii.** A rounded rect grown by `d` keeps its
+  corners concentric with the original only if its radius grows by `d` too; both helpers kept the
+  card's own radius, so the halo read as a squared-off outline at the four corners. `drop_shadow`
+  only offsets and was already right; the collections plate uses `RRect::with_outset`, which adjusts
+  radii itself. Every card path goes through the two fixed helpers.
 
 ### Verification status
 
@@ -251,6 +265,16 @@ collision on their first run in an environment that executes them (all three sha
 answers) — fixed in #361 by giving each test ids only it uses and retiring the blunt `reset()`. The Windows GameStream pad change was checked on `.133` when it landed
 (`cargo check` and `cargo clippy -p punktfunk-host -- -D warnings` clean, both compiling arms), and
 `windows-host.yml` has **no `pull_request` trigger**, so a PR will not re-check that arm.
+
+⚠ **`audit.yml` is red on main and this release does not fix it.** `cargo audit` reports
+**RUSTSEC-2026-0258** (`h2` 0.4.15, "unbounded empty DATA frames", published 2026-08-17, fixed in
+0.4.16); `h2` is transitive through `hyper`. It **predates this cut** — the same job failed on
+`669a1bc0` and on the v0.31.0 tag commit — so it is not a regression here, and it was deliberately
+**not** bundled into the release commit: `cargo update -p h2 --precise 0.4.16` bumps h2 in eleven
+lock lines but also rewrites several `windows-sys` references downward (0.61.2 → 0.59.0/0.52.0) on
+the pinned 1.96.0 toolchain, and re-resolving the graph for the Windows build is not a change to
+make inside a version bump that cannot be compiled for Windows on the cutting host. It wants its own
+commit and its own CI.
 
 ⚠ **Not confirmed on glass:** the Android scancode remap (the reporter's Fire TV Stick 4K Max is the
 test that settles it), the Windows data-plane firewall rule in a field session, and the
