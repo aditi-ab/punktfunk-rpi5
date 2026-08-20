@@ -40,8 +40,10 @@ jobs:
       - uses: actions/checkout@v4
       # --ignore-scripts skips the prepare→codegen hook (mirrors ci.yml); run codegen
       # explicitly since build-storybook has no prebuild hook of its own.
+      # Retried: bun's download-and-extract is single-shot, and a truncated tarball reads as
+      # `Fail extracting tarball` (ci.yml's web job has the measurement).
       - name: Install dependencies
-        run: bun install --frozen-lockfile --ignore-scripts
+        run: bash ../scripts/ci/retry.sh 3 bun install --frozen-lockfile --ignore-scripts
       - name: Generate API client + i18n messages
         run: bun run codegen
       # Pulls the matching Chromium build + the apt libs it needs (root in-container).

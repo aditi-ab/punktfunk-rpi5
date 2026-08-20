@@ -231,7 +231,9 @@ jobs:
           # scripts, and web's `postinstall` is `bun2nix -o bun.nix` — a Nix codegen step this job
           # neither consumes nor commits, whose only effect here is to make the install depend on
           # bun2nix resolving. `build` re-runs its own `prebuild` codegen regardless.
-          bun install --frozen-lockfile --ignore-scripts
+          # Retried: bun's download-and-extract is single-shot, and a truncated tarball reads as
+          # `Fail extracting tarball` (ci.yml's web job has the measurement).
+          bash ../scripts/ci/retry.sh 3 bun install --frozen-lockfile --ignore-scripts
           bun run build
           if ! grep -q 'Bun\.serve' .output/server/index.mjs; then
             echo "ERROR: web build is not a bun bundle — need the 'bun' preset + custom entry"; exit 1
