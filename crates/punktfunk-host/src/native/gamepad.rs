@@ -363,8 +363,13 @@ fn degrade_xbox_identity(chosen: GamepadPref) -> GamepadPref {
 ///
 /// The two backends are mutually exclusive per pad by construction (one match arm or the other) —
 /// presenting both would hand a game two controllers for one pair of hands.
+///
+/// Read by BOTH input planes. The native plane branches on it in `Pads::handle`; the GameStream
+/// plane in `gamestream::control::SessionPads`. It was `pub(super)` while only the native plane
+/// consulted it, and that is exactly how Moonlight sessions spent two releases on the XUSB pad
+/// after this default flipped — the knob was unreachable from the module that needed it.
 #[cfg(target_os = "windows")]
-pub(super) fn windows_xbox_hid() -> bool {
+pub(crate) fn windows_xbox_hid() -> bool {
     match std::env::var("PUNKTFUNK_XBOX_BACKEND") {
         Ok(v) if v.trim().eq_ignore_ascii_case("xusb") => false,
         // Anything else — unset, empty, "hid", or a typo — takes the default. A misspelled opt-out

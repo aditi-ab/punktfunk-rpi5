@@ -30,7 +30,7 @@
 use super::{AppState, CONTROL_PORT};
 use crate::inject::gamepad::GamepadManager;
 use anyhow::{anyhow, Context, Result};
-use punktfunk_core::input::InputEvent;
+use punktfunk_core::input::{GamepadEvent, InputEvent};
 use punktfunk_core::quic::{classify, GrantClass, HdrMeta, GRANT_ALL};
 use rusty_enet::{Event, Host, HostSettings, Packet, PeerID};
 use std::net::UdpSocket;
@@ -229,6 +229,65 @@ fn permitted(mask: u32, class: GrantClass, drops: &mut GrantDrops) -> bool {
     false
 }
 
+/// The virtual Xbox pad a Moonlight session presents, and the one place this plane decides which
+/// backend builds it.
+///
+/// On Windows there are two, and they are not interchangeable to a game: the XUSB companion
+/// registers only `GUID_DEVINTERFACE_XUSB` and exposes no HID collection, so Steam's hidapi
+/// enumeration, SDL, RawInput, DirectInput, `joy.cpl` and WGI/GameInput cannot see it at all —
+/// only classic `XInputGetState` can. The native plane made the HID pad its default on
+/// 2026-08-09 for exactly that reason; this plane kept constructing
+/// [`GamepadManager`](crate::inject::gamepad::GamepadManager) directly and so kept handing
+/// Moonlight clients a pad most games cannot enumerate. Both planes now read the same knob —
+/// `native::gamepad::windows_xbox_hid` (not an intra-doc link: it is `cfg(windows)`, so the link
+/// would not resolve on any other target) — so `PUNKTFUNK_XBOX_BACKEND=xusb` reverts both
+/// together and neither can drift again.
+///
+/// Everywhere else the choice does not exist: Linux has one uinput X-Box pad, and the stub
+/// backend on other platforms drops events.
+enum SessionPads {
+    /// Linux uinput / the Windows XUSB companion — `crate::inject::gamepad`.
+    Xusb(GamepadManager),
+    /// The Windows UMDF HID Xbox pad, what the native plane builds by default.
+    #[cfg(target_os = "windows")]
+    Hid(crate::inject::xbox_windows::XboxWindowsManager),
+}
+
+impl SessionPads {
+    /// Build this session's pad manager, honoring the shared Windows backend knob.
+    fn new() -> SessionPads {
+        #[cfg(target_os = "windows")]
+        if crate::native::gamepad::windows_xbox_hid() {
+            return SessionPads::Hid(crate::inject::xbox_windows::XboxWindowsManager::new());
+        }
+        SessionPads::Xusb(GamepadManager::new())
+    }
+
+    /// Apply one decoded controller event (create/destroy by mask, then state).
+    fn handle(&mut self, ev: &GamepadEvent) {
+        match self {
+            SessionPads::Xusb(m) => m.handle(ev),
+            #[cfg(target_os = "windows")]
+            SessionPads::Hid(m) => m.handle(ev),
+        }
+    }
+
+    /// Service the pads' feedback protocol and relay changed rumble levels. Games block inside the
+    /// kernel/driver handshake until answered, so call this every tick.
+    ///
+    /// The HID pad's rich-feedback plane is discarded rather than plumbed: an Xbox pad has no
+    /// lightbar or adaptive triggers to report, and GameStream has no vocabulary for one either —
+    /// its rumble message (`0x010B`, [`super::gamepad::rumble_plaintext`]) carries the two handle
+    /// motors and nothing else, which is also why the trigger levels are dropped at the call site.
+    fn pump_rumble(&mut self, rumble: impl FnMut(u16, u16, u16, u16, u16)) {
+        match self {
+            SessionPads::Xusb(m) => m.pump_rumble(rumble),
+            #[cfg(target_os = "windows")]
+            SessionPads::Hid(m) => m.pump(rumble, |_| {}),
+        }
+    }
+}
+
 /// Reconcile the control port to the paired-client list: bound while at least one pairing
 /// exists, closed when none remain. Idempotent and race-free (see [`Gate::running`]); call it
 /// wherever the paired list changes — startup, pairing phase 4, unpair.
@@ -362,7 +421,7 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
             // by every outbound message (rumble + the HDR-mode signal): the GCM nonce is derived
             // from `seq`, so a per-message-type counter would reuse (key, nonce) pairs across
             // message types in the host direction.
-            let mut pads = GamepadManager::new();
+            let mut pads = SessionPads::new();
             // Pen/touch translator (SS_PEN/SS_TOUCH → virtual tablet / wire touch). Sent only
             // by clients that saw our SS_FF_PEN_TOUCH_EVENTS feature flag (rtsp.rs).
             let mut pointer = super::pen::GsPointer::new();
@@ -480,7 +539,7 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                                 hdr_sent = false;
                                 // Unplug the session's virtual pads + tablet (destroying the
                                 // uinput pen releases any held tool/tip kernel-side).
-                                pads = GamepadManager::new();
+                                pads = SessionPads::new();
                                 pointer = super::pen::GsPointer::new();
                                 // Surface the session's enforcement-drop totals (WP13).
                                 drops.end_of_session();
@@ -583,7 +642,7 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                         detected = None;
                         decrypt_fails = 0;
                         hdr_sent = false;
-                        pads = GamepadManager::new();
+                        pads = SessionPads::new();
                         pointer = super::pen::GsPointer::new();
                         drops.end_of_session();
                     }
@@ -689,7 +748,7 @@ fn on_receive(
     detected: &mut Option<Scheme>,
     decrypt_fails: &mut u64,
     inj_tx: &Sender<InputEvent>,
-    pads: &mut GamepadManager,
+    pads: &mut SessionPads,
     pointer: &mut super::pen::GsPointer,
     grants: u32,
     drops: &mut GrantDrops,

@@ -48,8 +48,10 @@ mod compositor;
 use compositor::resolve_compositor;
 
 /// Virtual-gamepad backend resolution (plan §W1); `serve_session` + the `Pads` state machine reach
-/// `resolve_gamepad`/`resolve_pad_kind`/`route_decision` here.
-mod gamepad;
+/// `resolve_gamepad`/`resolve_pad_kind`/`route_decision` here. Crate-visible because the choice of
+/// Windows Xbox backend (`windows_xbox_hid`) is not the native plane's alone — the GameStream plane
+/// presents the same virtual pad and has to make the same choice, from one definition.
+pub(crate) mod gamepad;
 use gamepad::{resolve_gamepad, resolve_pad_kind, route_decision};
 
 /// The SPAKE2 pairing ceremony (plan §W1); `serve_session` dispatches a PairRequest connection here.
