@@ -128,13 +128,6 @@ pub fn speaks_for(app_id: Option<&str>) -> bool {
     app_id.is_some_and(|id| opinion(id).is_some())
 }
 
-/// Drop every report. Test-only: the table is process-global, so a test that seeds it must be able
-/// to unseed it.
-#[cfg(test)]
-pub fn reset() {
-    table().clear();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,36 +140,40 @@ mod tests {
         ids.iter().map(|(s, p)| ((*s).to_string(), *p)).collect()
     }
 
+    // The table is process-global and these tests run in parallel, so each takes a provider id and
+    // app ids only it uses, and cleans up only its own row. An earlier draft shared the id
+    // `playnite` and cleared the whole table between cases, which made the three of them flip each
+    // other's answers depending on scheduling — the same shape as `mgmt`'s `local_summary` race.
+
     /// The three answers, and the distinction the whole module turns on: a title its provider omits
     /// is *not running*, while a title nobody speaks for has *no opinion*. Conflating them would
     /// make every unreported game on the box look like it had just quit.
     #[test]
     fn omitted_is_not_running_but_unknown_is_no_opinion() {
-        reset();
         report(
-            "playnite",
-            owned(&["playnite:a", "playnite:b"]),
-            running(&[("playnite:a", Some(4242))]),
+            "answers-test",
+            owned(&["answers:a", "answers:b"]),
+            running(&[("answers:a", Some(4242))]),
         );
         assert_eq!(
-            opinion("playnite:a"),
+            opinion("answers:a"),
             Some(Liveness {
                 running: true,
                 pid: Some(4242)
             })
         );
         assert_eq!(
-            opinion("playnite:b"),
+            opinion("answers:b"),
             Some(Liveness {
                 running: false,
                 pid: None
             })
         );
-        assert_eq!(opinion("steam:570"), None);
-        assert!(speaks_for(Some("playnite:b")));
-        assert!(!speaks_for(Some("steam:570")));
+        assert_eq!(opinion("answers:never-published"), None);
+        assert!(speaks_for(Some("answers:b")));
+        assert!(!speaks_for(Some("answers:never-published")));
         assert!(!speaks_for(None));
-        reset();
+        forget("answers-test");
     }
 
     /// A report replaces its predecessor wholesale. The set is the message: a title that dropped out
@@ -184,40 +181,37 @@ mod tests {
     /// state this exists to prevent.
     #[test]
     fn a_report_replaces_the_previous_one() {
-        reset();
         report(
-            "playnite",
-            owned(&["playnite:a"]),
-            running(&[("playnite:a", None)]),
+            "replace-test",
+            owned(&["replace:a"]),
+            running(&[("replace:a", None)]),
         );
-        report("playnite", owned(&["playnite:a"]), running(&[]));
+        report("replace-test", owned(&["replace:a"]), running(&[]));
         assert_eq!(
-            opinion("playnite:a"),
+            opinion("replace:a"),
             Some(Liveness {
                 running: false,
                 pid: None
             })
         );
-        forget("playnite");
-        assert_eq!(opinion("playnite:a"), None);
-        reset();
+        forget("replace-test");
+        assert_eq!(opinion("replace:a"), None);
     }
 
     /// A stale report stops counting — the bound that makes it safe to let a plugin's claim hold a
     /// session open. Seeded with an aged timestamp rather than by sleeping for 90 seconds.
     #[test]
     fn a_stale_report_has_no_opinion() {
-        reset();
         table().insert(
-            "playnite".to_string(),
+            "stale-test".to_string(),
             Report {
                 at: Instant::now() - REPORT_TTL - Duration::from_secs(1),
-                owned: owned(&["playnite:a"]),
-                running: running(&[("playnite:a", Some(7))]),
+                owned: owned(&["stale:a"]),
+                running: running(&[("stale:a", Some(7))]),
             },
         );
-        assert_eq!(opinion("playnite:a"), None);
-        assert!(!speaks_for(Some("playnite:a")));
-        reset();
+        assert_eq!(opinion("stale:a"), None);
+        assert!(!speaks_for(Some("stale:a")));
+        forget("stale-test");
     }
 }
