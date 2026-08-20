@@ -396,8 +396,15 @@ pub(crate) fn panel_highlight(canvas: &Canvas, rect: Rect, corner: f32, k: f32) 
         ),
         None,
     ));
-    canvas.draw_rrect(RRect::new_rect_xy(inset, corner * k, corner * k), &p);
+    // Concentric, the same rule the halo states: pulled in by half a unit, so the radius
+    // comes in by half a unit too or the lit edge crosses the panel's own corner arc.
+    let r = ((corner - 0.5) * k).max(0.0);
+    canvas.draw_rrect(RRect::new_rect_xy(inset, r, r), &p);
 }
+
+/// How far [`focus_halo`] is grown past the card on every side, in design units. Both the
+/// rect AND the corner radius take it — see the draw there.
+const HALO_OUTSET: f32 = 4.0;
 
 /// An accent-tinted glow under the focused card — the palette-aware mark that says "this
 /// one" from across a room, where a 2 % scale difference says nothing at all. Drawn behind
@@ -439,8 +446,13 @@ pub(crate) fn focus_halo(canvas: &Canvas, rect: Rect, corner: f32, k: f32, f: f3
     // it overran the coverflow's 58 dp focused-to-neighbour gap, and since the strip paints
     // farthest-first the focused card's corona landed on top of its neighbours — which is
     // what made every card look like it was glowing.
-    let spread = rect.with_outset((4.0 * k, 4.0 * k));
-    canvas.draw_rrect(RRect::new_rect_xy(spread, corner * k, corner * k), &p);
+    let spread = rect.with_outset((HALO_OUTSET * k, HALO_OUTSET * k));
+    // Concentric: a shape grown by `d` on every side keeps its corners parallel to the
+    // original's only if its radius grows by `d` too (the two arcs then share a centre).
+    // Reusing the card's own radius left the halo squarer than the card it sits under, so
+    // it read as a misaligned outline at the four corners and a clean glow along the edges.
+    let r = (corner + HALO_OUTSET) * k;
+    canvas.draw_rrect(RRect::new_rect_xy(spread, r, r), &p);
 }
 
 pub(crate) fn drop_shadow(canvas: &Canvas, rect: Rect, corner: f32, k: f32, alpha: f32) {

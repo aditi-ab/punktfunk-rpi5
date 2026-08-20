@@ -317,16 +317,20 @@ internal object ConsoleJson {
         j.put("invert_scroll", s.invertScroll)
         j.put("pad_haptics", s.padHaptics)
         j.put("pad_speaker", if (s.padSpeaker) "pad" else "off")
-        // Android-only rows ride `extra` (WP5 gives them RowIds); nothing on the desktop reads them.
-        val extra = j.optJSONObject("extra") ?: JSONObject()
-        extra.put("android.low_latency", s.lowLatencyMode)
-        extra.put("android.rumble_on_phone", s.rumbleOnPhone)
-        extra.put("android.gyro_on_phone", s.gyroOnPhone)
-        extra.put("android.sc2_capture", s.sc2Capture)
-        extra.put("android.ds_capture", s.dsCapture)
-        extra.put("android.gamepad_ui_mode", s.gamepadUiMode)
-        extra.put("android.gamepad_ui_enabled", s.gamepadUiEnabled)
-        j.put("extra", extra)
+        // Android-only rows ride `Settings::extra`, which is `#[serde(flatten)]` — so they are
+        // TOP-LEVEL keys of this document, not a nested `extra` object. Nesting them put the
+        // whole object into the map under the literal key "extra", where no console row could
+        // read it and every value the console wrote came straight back as the one we had sent.
+        j.put("android.low_latency", s.lowLatencyMode)
+        j.put("android.rumble_on_phone", s.rumbleOnPhone)
+        j.put("android.gyro_on_phone", s.gyroOnPhone)
+        j.put("android.sc2_capture", s.sc2Capture)
+        j.put("android.ds_capture", s.dsCapture)
+        j.put("android.gamepad_ui_mode", s.gamepadUiMode)
+        j.put("android.gamepad_ui_enabled", s.gamepadUiEnabled)
+        // A store written by the nesting build carries the stale wrapper; drop it rather than
+        // round-trip a copy of these keys that nothing reads for the life of the install.
+        j.remove("extra")
         return j
     }
 
@@ -336,7 +340,8 @@ internal object ConsoleJson {
      */
     fun applySettings(s: Settings, j: JSONObject): Settings {
         fun str(k: String, cur: String) = j.optString(k, cur).ifEmpty { cur }
-        val extra = j.optJSONObject("extra") ?: JSONObject()
+        // The `android.*` keys are TOP-LEVEL here, not nested: `Settings::extra` is
+        // `#[serde(flatten)]`, so the console writes them beside `width` and `codec`.
         return s.copy(
             width = j.optInt("width", s.width),
             height = j.optInt("height", s.height),
@@ -373,14 +378,14 @@ internal object ConsoleJson {
                 "off" -> false
                 else -> s.padSpeaker
             },
-            lowLatencyMode = extra.optBoolean("android.low_latency", s.lowLatencyMode),
-            rumbleOnPhone = extra.optBoolean("android.rumble_on_phone", s.rumbleOnPhone),
-            gyroOnPhone = extra.optBoolean("android.gyro_on_phone", s.gyroOnPhone),
-            sc2Capture = extra.optBoolean("android.sc2_capture", s.sc2Capture),
-            dsCapture = extra.optBoolean("android.ds_capture", s.dsCapture),
-            gamepadUiMode = extra.optString("android.gamepad_ui_mode", s.gamepadUiMode)
+            lowLatencyMode = j.optBoolean("android.low_latency", s.lowLatencyMode),
+            rumbleOnPhone = j.optBoolean("android.rumble_on_phone", s.rumbleOnPhone),
+            gyroOnPhone = j.optBoolean("android.gyro_on_phone", s.gyroOnPhone),
+            sc2Capture = j.optBoolean("android.sc2_capture", s.sc2Capture),
+            dsCapture = j.optBoolean("android.ds_capture", s.dsCapture),
+            gamepadUiMode = j.optString("android.gamepad_ui_mode", s.gamepadUiMode)
                 .ifEmpty { s.gamepadUiMode },
-            gamepadUiEnabled = extra.optBoolean("android.gamepad_ui_enabled", s.gamepadUiEnabled),
+            gamepadUiEnabled = j.optBoolean("android.gamepad_ui_enabled", s.gamepadUiEnabled),
         )
     }
 }
