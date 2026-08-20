@@ -127,6 +127,18 @@ unwrapped.overrideAttrs (old: {
       --replace-fail \
         "vcs_tag = run_command(vcs_tag_cmd, check: false).stdout().strip()" \
         "vcs_tag = '${pfVersion}'"
+
+    # Source-level gate, the same one packaging/gamescope/build-punktfunk-gamescope.sh applies.
+    # Splits a missing marker into its two possible stages: fire HERE and patch 0005 or the
+    # substitution above lost it; pass here and fail the ELF check later, and it was lost in
+    # meson configuration or compilation instead. Without this the two are indistinguishable,
+    # at a full compositor build per guess.
+    grep -q '+pfhdr' src/meson.build || {
+      echo "punktfunk-gamescope: +pfhdr is not in src/meson.build after patching" >&2
+      echo "  --- version block as patched: ---" >&2
+      sed -n '/^vcs_tag_cmd/,/^gamescope_version_conf/p' src/meson.build | sed 's/^/    | /' >&2
+      exit 1
+    }
   '';
 
   # Ship the compositor, renamed, AND the WSI layer built beside it. Everything else nixpkgs
@@ -192,9 +204,16 @@ unwrapped.overrideAttrs (old: {
     # patching, meson configuration AND compilation into the artifact we actually ship, and it
     # cannot be defeated by the binary being unable to start.
     grep -aq '+pfhdr' $out/bin/punktfunk-gamescope || {
-      echo "punktfunk-gamescope: the +pfhdr marker is not in the installed binary —" >&2
-      echo "  patch 0005 did not reach GamescopeVersion.h. Check that src/meson.build still" >&2
-      echo "  carries 'version_tag = vcs_tag + ...' for 0005 to rewrite." >&2
+      echo "punktfunk-gamescope: the +pfhdr marker is not in the installed binary." >&2
+      echo "  src/meson.build carried it (asserted in postPatch), so it was lost between" >&2
+      echo "  meson configuration and the linked artifact. Evidence:" >&2
+      echo "  --- $out/bin ---" >&2
+      ls -l $out/bin 2>&1 | sed 's/^/    | /' >&2
+      echo "  --- anything under $out mentioning pfhdr ---" >&2
+      grep -ral 'pfhdr' $out 2>/dev/null | sed 's/^/    | /' >&2 || echo "    | (nothing)" >&2
+      echo "  --- version-ish strings in the binary ---" >&2
+      grep -aoE '[0-9]+\.[0-9]+\.[0-9]+[^ ]*' $out/bin/punktfunk-gamescope 2>/dev/null \
+        | sort -u | head -5 | sed 's/^/    | /' >&2 || true
       exit 1
     }
     # The manifest must name a library this derivation actually installed. A manifest pointing at a
