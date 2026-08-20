@@ -255,6 +255,7 @@ mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -301,6 +302,7 @@ mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -323,6 +325,7 @@ mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };

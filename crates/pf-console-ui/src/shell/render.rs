@@ -172,6 +172,7 @@ impl Shell {
             platform: self.platform,
             pads: &self.pads,
             deck: self.deck,
+            fallback_ui: self.fallback_ui,
             device_name: &self.device_name,
             t,
             glyphs: self.glyphs,
@@ -331,6 +332,8 @@ struct LayerEnv<'a> {
     platform: crate::platform::Platform,
     pads: &'a [PadInfo],
     deck: bool,
+    /// See [`crate::shell::ConsoleOptions::fallback_ui`] — a screen's row set can ask.
+    fallback_ui: bool,
     device_name: &'a str,
     t: f64,
     glyphs: GlyphStyle,
@@ -365,6 +368,7 @@ impl LayerEnv<'_> {
             platform: self.platform,
             pads: self.pads,
             deck: self.deck,
+            fallback_ui: self.fallback_ui,
             device_name: self.device_name,
             t: self.t,
         };

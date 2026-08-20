@@ -396,6 +396,7 @@ mod tests {
             platform: crate::platform::Platform::Desktop,
             pads,
             deck,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         }

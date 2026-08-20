@@ -325,6 +325,7 @@ internal object ConsoleJson {
         extra.put("android.sc2_capture", s.sc2Capture)
         extra.put("android.ds_capture", s.dsCapture)
         extra.put("android.gamepad_ui_mode", s.gamepadUiMode)
+        extra.put("android.gamepad_ui_enabled", s.gamepadUiEnabled)
         j.put("extra", extra)
         return j
     }
@@ -379,6 +380,7 @@ internal object ConsoleJson {
             dsCapture = extra.optBoolean("android.ds_capture", s.dsCapture),
             gamepadUiMode = extra.optString("android.gamepad_ui_mode", s.gamepadUiMode)
                 .ifEmpty { s.gamepadUiMode },
+            gamepadUiEnabled = extra.optBoolean("android.gamepad_ui_enabled", s.gamepadUiEnabled),
         )
     }
 }

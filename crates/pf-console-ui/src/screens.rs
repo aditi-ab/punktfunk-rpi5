@@ -63,6 +63,10 @@ pub(crate) struct Ctx<'a> {
     pub pads: &'a [PadInfo],
     /// Steam Deck: never draw our keyboard — Steam's types via SDL text input.
     pub deck: bool,
+    /// The host app has another interface to fall back to when the console is switched
+    /// off (an Android phone/tablet's touch shell) — see
+    /// [`crate::shell::ConsoleOptions::fallback_ui`]. Gates the console-off settings row.
+    pub fallback_ui: bool,
     /// The name the HOST stores this client under when pairing (the machine's
     /// hostname, resolved by the binary).
     pub device_name: &'a str,

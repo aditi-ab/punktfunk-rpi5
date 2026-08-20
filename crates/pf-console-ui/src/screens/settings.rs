@@ -104,6 +104,12 @@ enum RowId {
     Sc2Passthrough,
     /// DualSense raw-USB capture (touchpad, motion, adaptive triggers).
     DsCapture,
+    /// Whether the console UI fronts the app at all — the touch settings' switch
+    /// (`Settings.gamepadUiEnabled`), reachable from inside the console it turns off.
+    /// Only offered where there is another interface to fall back to
+    /// ([`Ctx::fallback_ui`]): on a TV or the desktop session this console is the only
+    /// UI, and an off switch would strand the user in nothing.
+    GamepadUi,
     /// When the console UI fronts the app: with a controller attached, or always.
     GamepadUiMode,
     /// The platform's connected-controllers view (an action row — opens a native screen).
@@ -121,6 +127,7 @@ mod android_keys {
     pub const SC2: &str = "android.sc2_capture";
     pub const DS_CAPTURE: &str = "android.ds_capture";
     pub const GAMEPAD_UI_MODE: &str = "android.gamepad_ui_mode";
+    pub const GAMEPAD_UI: &str = "android.gamepad_ui_enabled";
 }
 
 /// The Android console-UI mode's stored values (`GamepadUi.kt`).
@@ -245,6 +252,7 @@ const TABS: [(&str, &[RowId]); 7] = [
             RowId::Stats,
             RowId::Fullscreen,
             RowId::AutoWake,
+            RowId::GamepadUi,
             RowId::GamepadUiMode,
             RowId::Licenses,
         ],
@@ -384,7 +392,7 @@ impl SettingsScreen {
                 .1
                 .iter()
                 .copied()
-                .filter(|id| row_on(*id, ctx.platform) && row_applies(*id, ctx.settings))
+                .filter(|id| row_on(*id, ctx.platform) && row_applies(*id, ctx))
                 .collect();
         }
         if self.profiles.is_empty() {
@@ -675,6 +683,7 @@ fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
             | RowId::PhoneGyro
             | RowId::Sc2Passthrough
             | RowId::DsCapture
+            | RowId::GamepadUi
             | RowId::GamepadUiMode
             | RowId::Controllers
             | RowId::Licenses
@@ -694,9 +703,22 @@ fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
     }
 }
 
-fn row_applies(id: RowId, s: &pf_client_core::trust::Settings) -> bool {
+fn row_applies(id: RowId, ctx: &Ctx) -> bool {
     match id {
-        RowId::SmoothBuffer => s.present_priority == "smooth",
+        RowId::SmoothBuffer => ctx.settings.present_priority == "smooth",
+        // The console-off switch needs somewhere for "off" to land: only clients with a
+        // fallback interface (an Android phone/tablet's touch shell) get the row — on a TV
+        // this console is the only UI, and off would strand the user (the touch settings'
+        // subtitle even promises "A TV always uses it").
+        RowId::GamepadUi => ctx.fallback_ui,
+        // The same two conditions the mode decides anything under: a TV is in console mode
+        // whatever the mode says (`GamepadUi.kt`: the tv term alone satisfies the OR), and
+        // while the switch above is off nothing fronts the console at all. Hidden rather
+        // than dimmed, like the touch screen's picker, and it sits directly below the row
+        // that drops it so the cursor is never under anything that moves.
+        RowId::GamepadUiMode => {
+            ctx.fallback_ui && extra_bool(ctx.settings, android_keys::GAMEPAD_UI, true)
+        }
         _ => true,
     }
 }
@@ -962,9 +984,17 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             "DualSense over USB",
             on_off(extra_bool(s, android_keys::DS_CAPTURE, true)).into(),
         ),
+        RowId::GamepadUi => (
+            None,
+            "Controller-optimized UI",
+            on_off(extra_bool(s, android_keys::GAMEPAD_UI, true)).into(),
+        ),
         RowId::GamepadUiMode => (
             None,
-            "Controller UI",
+            // The touch screen's word for the same picker, which now sits under the same
+            // switch it does there — "Controller UI" beside "Controller-optimized UI"
+            // would be two rows a reader has to tell apart by their tails.
+            "Show it",
             label_for(
                 &GAMEPAD_UI_MODES,
                 extra_str(s, android_keys::GAMEPAD_UI_MODE, "connected"),
@@ -1145,9 +1175,14 @@ fn detail(id: RowId, platform: crate::platform::Platform) -> &'static str {
             "Capture a wired DualSense directly (touchpad, motion, adaptive triggers). \
              Needs the USB grant when the pad is plugged in."
         }
+        RowId::GamepadUi => {
+            "Front the app with this console instead of the touch interface. Off returns \
+             to the touch home immediately — switch it back on there."
+        }
         RowId::GamepadUiMode => {
             "When this console fronts the app: whenever a controller is attached, or \
-             always. The touch settings' \"Controller-optimized UI\" switch turns it off."
+             always — for a device that lives docked to a TV. The switch above turns it \
+             off altogether."
         }
         RowId::Controllers => "Connected controllers, their grants and a rumble/haptics test.",
         RowId::Licenses => "The open-source licences this app ships under.",
@@ -1375,6 +1410,7 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         RowId::PhoneGyro => toggle_extra(s, android_keys::PHONE_GYRO, false, delta, wrap),
         RowId::Sc2Passthrough => toggle_extra(s, android_keys::SC2, true, delta, wrap),
         RowId::DsCapture => toggle_extra(s, android_keys::DS_CAPTURE, true, delta, wrap),
+        RowId::GamepadUi => toggle_extra(s, android_keys::GAMEPAD_UI, true, delta, wrap),
         RowId::GamepadUiMode => {
             let mut v = extra_str(s, android_keys::GAMEPAD_UI_MODE, "connected").to_string();
             step_str(&GAMEPAD_UI_MODES, &mut v, delta, wrap).map(|()| {
@@ -1504,6 +1540,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -1538,6 +1575,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -1603,6 +1641,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -1652,6 +1691,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -1686,6 +1726,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -1727,6 +1768,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -1757,6 +1799,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -1793,6 +1836,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -1867,6 +1911,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -1900,6 +1945,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -1931,6 +1977,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -1960,6 +2007,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -2009,6 +2057,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -2060,6 +2109,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -2105,6 +2155,7 @@ pub(super) mod tests {
                 RowId::Sc2Passthrough,
                 RowId::DsCapture,
                 RowId::Controllers,
+                RowId::GamepadUi,
                 RowId::GamepadUiMode,
                 RowId::Licenses,
             ]
@@ -2147,10 +2198,41 @@ pub(super) mod tests {
                 extra_str(ctx.settings, android_keys::GAMEPAD_UI_MODE, "connected"),
                 "always"
             );
+            assert!(extra_bool(ctx.settings, android_keys::GAMEPAD_UI, true));
+            assert!(adjust(RowId::GamepadUi, 1, true, ctx));
+            assert!(!extra_bool(ctx.settings, android_keys::GAMEPAD_UI, true));
             // Only `extra` moved.
             let mut after = ctx.settings.clone();
             after.extra = before.extra.clone();
             assert_eq!(after, before);
+        });
+    }
+
+    /// The console-off switch exists only where there is a fallback interface for "off"
+    /// to land in, and the mode row under it only where the mode decides anything: not on
+    /// a TV (always console, whatever the mode says) and not while the switch is off.
+    #[test]
+    fn console_off_switch_needs_a_fallback_ui() {
+        with_ctx(|ctx| {
+            ctx.platform = crate::platform::Platform::Android;
+            // A TV: no off switch (it would strand the user), and no mode row either —
+            // `gamepadUiActive`'s tv term satisfies the OR on its own.
+            assert!(
+                !row_applies(RowId::GamepadUi, ctx),
+                "a TV offers no off switch"
+            );
+            assert!(!row_applies(RowId::GamepadUiMode, ctx));
+            // A phone or tablet with the console on: both rows.
+            ctx.fallback_ui = true;
+            assert!(row_applies(RowId::GamepadUi, ctx));
+            assert!(row_applies(RowId::GamepadUiMode, ctx));
+            // Switched off: the switch stays (it is the way back), the mode row goes.
+            set_extra_bool(ctx.settings, android_keys::GAMEPAD_UI, false);
+            assert!(row_applies(RowId::GamepadUi, ctx));
+            assert!(
+                !row_applies(RowId::GamepadUiMode, ctx),
+                "the mode row decides nothing while the switch above it is off"
+            );
         });
     }
 
@@ -2168,9 +2250,9 @@ pub(super) mod tests {
         // 2026-08 sweep found them bridged but unreachable) later passes added, minus the
         // game-library toggle: this screen never read it, and the library is offered on any
         // paired host now.
-        // 35 desktop rows + the eight Android-only ones (design android-skia-console-port.md
-        // D3): six `extra`-backed settings and two platform-screen action rows.
-        assert_eq!(seen.len(), 43, "{seen:?}");
+        // 35 desktop rows + the nine Android-only ones (design android-skia-console-port.md
+        // D3): seven `extra`-backed settings and two platform-screen action rows.
+        assert_eq!(seen.len(), 44, "{seen:?}");
         assert!(seen.contains(&RowId::Palette));
         assert!(seen.contains(&RowId::ReduceMotion));
         assert!(seen.contains(&RowId::AudioFormat));
@@ -2209,6 +2291,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -2250,6 +2333,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -2295,6 +2379,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };
@@ -2373,6 +2458,7 @@ pub(super) mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &pads,
             deck: false,
+            fallback_ui: false,
             device_name: "t",
             t: 0.0,
         };

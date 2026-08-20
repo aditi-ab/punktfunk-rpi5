@@ -183,6 +183,11 @@ pub struct ConsoleOptions {
     pub device_name: String,
     /// Steam Deck: Steam's keyboard types (SDL text input); ours never draws.
     pub deck: bool,
+    /// Whether the host app has another interface to fall back to when the console is
+    /// switched off — an Android phone/tablet's touch shell. Shows the console-off switch
+    /// on the settings screen; false where this console is the only UI there is (the
+    /// desktop session, an Android TV), where offering "off" would strand the user.
+    pub fallback_ui: bool,
     /// Where settings persist and the profile catalog comes from. `None` = the desktop
     /// file store (`pf_client_core::trust`), which is what the Vulkan session wants and the
     /// only store there is on Linux/Windows; every other host must supply one.
@@ -203,6 +208,7 @@ impl ConsoleOptions {
         ConsoleOptions {
             device_name,
             deck,
+            fallback_ui: false,
             store: None,
             platform: Platform::Desktop,
             gpu_cache_bytes: DEFAULT_GPU_CACHE_BYTES,
@@ -247,6 +253,8 @@ pub(crate) struct Shell {
     hosts_gen: u64,
     device_name: String,
     deck: bool,
+    /// See [`ConsoleOptions::fallback_ui`].
+    fallback_ui: bool,
     pub(crate) in_stream: bool,
     connecting: Option<Connecting>,
     /// The last host title a connect was raised for, kept past the connect itself so
@@ -352,6 +360,7 @@ impl Shell {
             hosts_gen: u64::MAX,
             device_name: opts.device_name,
             deck: opts.deck,
+            fallback_ui: opts.fallback_ui,
             in_stream: false,
             connecting: None,
             last_connect_title: None,
@@ -888,6 +897,7 @@ impl Shell {
                 platform: self.platform,
                 pads: &self.pads,
                 deck: self.deck,
+                fallback_ui: self.fallback_ui,
                 device_name: &self.device_name,
                 t: self.t0.elapsed().as_secs_f64(),
             };
@@ -970,6 +980,7 @@ impl Shell {
                 platform: self.platform,
                 pads: &self.pads,
                 deck: self.deck,
+                fallback_ui: self.fallback_ui,
                 device_name: &self.device_name,
                 t: self.t0.elapsed().as_secs_f64(),
             };
