@@ -159,6 +159,9 @@ object SkiaConsole {
         val opts = JSONObject()
             .put("device_name", deviceName(app))
             .put("gpu_cache_bytes", gpuCacheBytes(app))
+            // The touch shell exists as a fallback on phones/tablets but not on a TV —
+            // gates the console's own "Controller-optimized UI" off switch.
+            .put("fallback_ui", !io.unom.punktfunk.isTvDevice(app))
             .put("settings", ConsoleJson.settings(initial, base))
             .put("profiles", JSONArray(ConsoleJson.profiles(profiles)))
             .put("known_hosts", JSONObject(ConsoleJson.knownHosts(knownHostStore.all())))

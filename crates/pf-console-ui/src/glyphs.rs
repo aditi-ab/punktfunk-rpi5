@@ -148,6 +148,10 @@ pub(crate) enum HintKey {
     /// there isn't (the library grid spends up on rows) the same menu hangs off
     /// [`HintKey::Tertiary`] instead; the button differs, the word "Options" does not.
     Up,
+    /// ▼ — the home carousel's other spare direction, which opens Settings. Advertised in
+    /// place of [`HintKey::Tertiary`] where no pad is attached, because that is exactly the
+    /// device that has no X to press: a TV remote is a D-pad, OK and Back.
+    Down,
     Key(&'static str),
 }
 
@@ -272,7 +276,7 @@ fn glyph_width(fonts: &Fonts, key: HintKey, style: GlyphStyle, k: f64) -> f64 {
     match resolved(key, style) {
         Resolved::Badge(_) | Resolved::Adjust => BADGE_D * k,
         Resolved::Shoulders => 2.0 * shoulder_w(fonts, k) + 3.0 * k,
-        Resolved::Up => BADGE_D * k,
+        Resolved::Up | Resolved::Down => BADGE_D * k,
         Resolved::Key(text) => keycap_w(fonts, text, k),
     }
 }
@@ -294,6 +298,9 @@ enum Resolved {
     /// The d-pad's up — drawn the same in every style, because it is a direction rather
     /// than a button whose label changes with the pad.
     Up,
+    /// The d-pad's down — the same triangle stood on its head, and style-free for the
+    /// same reason [`Resolved::Up`] is.
+    Down,
     Key(&'static str),
 }
 
@@ -317,6 +324,7 @@ fn resolved(key: HintKey, style: GlyphStyle) -> Resolved {
             HintKey::Shoulders => Resolved::Key("Tab"),
             HintKey::Adjust => Resolved::Adjust,
             HintKey::Up => Resolved::Up,
+            HintKey::Down => Resolved::Down,
             HintKey::Key(t) => Resolved::Key(t),
         };
     }
@@ -327,6 +335,7 @@ fn resolved(key: HintKey, style: GlyphStyle) -> Resolved {
         HintKey::Secondary => Resolved::Badge(Face::Y),
         HintKey::Shoulders => Resolved::Shoulders,
         HintKey::Adjust => Resolved::Adjust,
+        HintKey::Down => Resolved::Down,
         HintKey::Up => Resolved::Up,
         HintKey::Key(t) => Resolved::Key(t),
     }
@@ -394,17 +403,23 @@ fn draw_glyph(
                 pen += w + 3.0 * k;
             }
         }
-        Resolved::Up => {
-            // ▲ — one solid triangle in a badge-sized slot.
+        g @ (Resolved::Up | Resolved::Down) => {
+            // ▲ / ▼ — one solid triangle in a badge-sized slot, the same triangle either
+            // way up: apex toward the direction it names, base at the other end.
             let r = BADGE_D * k / 2.0;
             let (cx, cyf) = ((x + r) as f32, cy as f32);
             let (tw, th) = ((5.5 * k) as f32, (4.5 * k) as f32);
-            let mut up = PathBuilder::new();
-            up.move_to((cx, cyf - th));
-            up.line_to((cx - tw, cyf + th));
-            up.line_to((cx + tw, cyf + th));
-            up.close();
-            canvas.draw_path(&up.detach(), &fill(fg(0.85)));
+            let (apex, base) = if matches!(g, Resolved::Down) {
+                (cyf + th, cyf - th)
+            } else {
+                (cyf - th, cyf + th)
+            };
+            let mut tri = PathBuilder::new();
+            tri.move_to((cx, apex));
+            tri.line_to((cx - tw, base));
+            tri.line_to((cx + tw, base));
+            tri.close();
+            canvas.draw_path(&tri.detach(), &fill(fg(0.85)));
         }
         Resolved::Adjust => {
             // ◀ ▶ — two small solid triangles.

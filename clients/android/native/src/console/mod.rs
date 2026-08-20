@@ -45,6 +45,10 @@ struct CreateOptions {
     device_name: String,
     /// Skia's resource budget, bytes (Kotlin sizes it from `ActivityManager.memoryClass`).
     gpu_cache_bytes: usize,
+    /// Whether the touch shell exists as a fallback (phones/tablets; false on a TV) —
+    /// gates the console-off settings row. Default false: absent means don't offer it.
+    #[serde(default)]
+    fallback_ui: bool,
     /// The settings snapshot the shell starts from (`pf_client_core::trust::Settings` JSON).
     settings: pf_client_core::trust::Settings,
     /// The profile catalog as `[[id, name], …]`.
@@ -150,6 +154,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleCrea
         let console_opts = ConsoleOptions {
             device_name: opts.device_name,
             deck: false,
+            fallback_ui: opts.fallback_ui,
             store: Some(store.clone()),
             platform: Platform::Android,
             gpu_cache_bytes: opts.gpu_cache_bytes.max(16 << 20),

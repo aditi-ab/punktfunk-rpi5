@@ -34,6 +34,10 @@ use skia_safe::{Canvas, Rect};
 enum Action {
     Wake,
     SendLogs,
+    /// Open this host's game library — the same shelf the home carousel's Y opens, offered
+    /// here because Y is a face button and a TV remote has none. Saved-and-paired only,
+    /// exactly like that Y (an unpaired host has no shelf to fetch).
+    Library,
     CopyLink,
     Edit,
     /// Choose the profile the host's primary tile connects with (opens the
@@ -154,6 +158,12 @@ impl OptionsScreen {
         if host.paired && host.online {
             a.push(Action::SendLogs);
         }
+        // The shelf, on the same terms the carousel's Y offers it. Ahead of Copy link
+        // because it is the one row here that goes somewhere rather than acting on the
+        // host — and on a remote-only device it is the ONLY way to the library.
+        if host.paired && host.saved {
+            a.push(Action::Library);
+        }
         a.extend([
             Action::CopyLink,
             Action::Edit,
@@ -171,6 +181,7 @@ impl OptionsScreen {
         match a {
             Action::Wake => "Wake host".into(),
             Action::SendLogs => "Send logs to host".into(),
+            Action::Library => "Library".into(),
             Action::CopyLink => "Copy link".into(),
             Action::Edit => "Edit\u{2026}".into(),
             Action::BindProfile => "Default profile\u{2026}".into(),
@@ -234,7 +245,7 @@ impl OptionsScreen {
             ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
             ListMsg::None => pulse,
             ListMsg::Activate => {
-                self.run(action, ctx.store, fx);
+                self.run(action, ctx, fx);
                 pulse
             }
         }
@@ -257,7 +268,8 @@ impl OptionsScreen {
         }
     }
 
-    fn run(&mut self, action: Action, store: &dyn crate::store::SettingsStore, fx: &mut Outbox) {
+    fn run(&mut self, action: Action, ctx: &Ctx, fx: &mut Outbox) {
+        let store = ctx.store;
         let key = self.host_key().to_string();
         match action {
             Action::Wake => {
@@ -288,6 +300,24 @@ impl OptionsScreen {
                     None => fx.toast = Some("This host isn't saved any more".into()),
                 }
                 fx.pop();
+            }
+            // Same two steps the home carousel's Y takes: ask for the shelf, then open it
+            // on the epoch read BEFORE the command drains, so the screen can tell its own
+            // fetch's titles from the ones already in the model. `replace`, not push — the
+            // menu has said its piece, and Back from the shelf belongs on the carousel
+            // rather than on a menu about the host you just left.
+            Action::Library => {
+                let host = self.host();
+                fx.cmds.push(ConsoleCmd::FetchLibrary {
+                    addr: host.addr.clone(),
+                    mgmt: host.mgmt_port,
+                    fp_hex: host.fp_hex.clone(),
+                });
+                let epoch = ctx.library.fetch_epoch();
+                fx.replace(Screen::Library(super::library::LibraryScreen::new(
+                    self.host(),
+                    epoch,
+                )));
             }
             Action::Edit => fx.replace(Screen::AddHost(super::add_host::AddHostScreen::edit(
                 self.host(),
@@ -407,6 +437,27 @@ mod tests {
     use crate::model::ProfileChip;
     use crate::screens::Nav;
 
+    /// Activate one row. `run` reads the store, and — for Library — the shared library's
+    /// fetch epoch; nothing else in this menu touches the context, so one throwaway is
+    /// enough for every action test here.
+    fn run_action(s: &mut OptionsScreen, action: Action, fx: &mut Outbox) {
+        let mut settings = pf_client_core::trust::Settings::default();
+        let library = crate::library::LibraryShared::default();
+        let ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
+            pads: &[],
+            deck: false,
+            fallback_ui: false,
+            device_name: "test",
+            t: 0.0,
+        };
+        s.run(action, &ctx, fx);
+    }
+
     fn host() -> HostRow {
         HostRow {
             key: "aa".into(),
@@ -510,6 +561,38 @@ mod tests {
         assert_eq!(s.host_key(), "aa");
     }
 
+    /// The shelf is on this menu, which is the only route to it that survives a device with
+    /// no face buttons: home's Y opens it too, but an Android TV remote has no Y. Offered on
+    /// the same terms that Y is (saved AND paired), and it REPLACES the menu, so Back from
+    /// the shelf lands on the carousel rather than on a menu about the host just left.
+    #[test]
+    fn the_library_hangs_off_the_menu_for_a_padless_device() {
+        let mut s = OptionsScreen::for_host(&host());
+        assert!(s
+            .actions(crate::platform::Platform::Android)
+            .contains(&Action::Library));
+
+        let mut fx = Outbox::default();
+        run_action(&mut s, Action::Library, &mut fx);
+        assert!(
+            matches!(fx.cmds.first(), Some(ConsoleCmd::FetchLibrary { .. })),
+            "opening the shelf asks for it first"
+        );
+        match fx.nav {
+            Some(Nav::Replace(screen)) => assert!(matches!(*screen, Screen::Library(_))),
+            _ => panic!("expected the shelf to replace the menu"),
+        }
+
+        // An unpaired host has no shelf to fetch — the row is absent, not inert.
+        let unpaired = OptionsScreen::for_host(&HostRow {
+            paired: false,
+            ..host()
+        });
+        assert!(!unpaired
+            .actions(crate::platform::Platform::Android)
+            .contains(&Action::Library));
+    }
+
     /// "Default profile…" swaps the menu for the chooser — a Replace like Edit's, and for
     /// the same reason — addressed to the HOST's plain key even from rows that carry a
     /// composite one.
@@ -520,7 +603,7 @@ mod tests {
             .actions(crate::platform::Platform::Desktop)
             .contains(&Action::BindProfile));
         let mut fx = Outbox::default();
-        s.run(Action::BindProfile, crate::store::file_store(), &mut fx);
+        run_action(&mut s, Action::BindProfile, &mut fx);
         match fx.nav {
             Some(crate::screens::Nav::Replace(screen)) => match *screen {
                 Screen::BindProfile(b) => assert_eq!(b.host_name(), "Desk"),
@@ -537,7 +620,7 @@ mod tests {
         let mut s = OptionsScreen::for_host(&host());
         assert!(s.label(Action::Clipboard).ends_with("Off"));
         let mut fx = Outbox::default();
-        s.run(Action::Clipboard, crate::store::file_store(), &mut fx);
+        run_action(&mut s, Action::Clipboard, &mut fx);
         assert_eq!(
             fx.cmds,
             vec![ConsoleCmd::SetClipboard {
@@ -551,7 +634,7 @@ mod tests {
         });
         assert!(s.label(Action::Clipboard).ends_with("On"));
         let mut fx = Outbox::default();
-        s.run(Action::Clipboard, crate::store::file_store(), &mut fx);
+        run_action(&mut s, Action::Clipboard, &mut fx);
         assert_eq!(
             fx.cmds,
             vec![ConsoleCmd::SetClipboard {
@@ -569,12 +652,12 @@ mod tests {
         s.list.cursor = i;
         let mut fx = Outbox::default();
 
-        s.run(Action::Forget, crate::store::file_store(), &mut fx);
+        run_action(&mut s, Action::Forget, &mut fx);
         assert!(fx.cmds.is_empty(), "the first press only arms");
         assert!(s.armed);
         assert!(s.label(Action::Forget).contains("press again"));
 
-        s.run(Action::Forget, crate::store::file_store(), &mut fx);
+        run_action(&mut s, Action::Forget, &mut fx);
         assert_eq!(
             fx.cmds,
             vec![ConsoleCmd::ForgetHost { key: "aa".into() }],
@@ -597,6 +680,7 @@ mod tests {
             platform: crate::platform::Platform::Desktop,
             pads: &[],
             deck: false,
+            fallback_ui: false,
             device_name: "test",
             t: 0.0,
         };
@@ -659,7 +743,7 @@ mod tests {
             OptionsScreen::for_game(&host(), &game()),
         ] {
             let mut fx = Outbox::default();
-            s.run(Action::CopyLink, crate::store::file_store(), &mut fx);
+            run_action(&mut s, Action::CopyLink, &mut fx);
             assert!(matches!(fx.nav, Some(Nav::Pop)));
             assert!(fx.toast.is_some());
         }
