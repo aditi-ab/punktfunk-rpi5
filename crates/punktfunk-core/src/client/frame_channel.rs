@@ -57,6 +57,21 @@ pub(crate) const FLUSH_AFTER: Duration = Duration::from_millis(250);
 /// the number, so the two can never drift apart.
 pub const FLUSH_COOLDOWN: Duration = Duration::from_secs(2);
 
+/// Spacing of a client's keyframe re-asks while it has received **no video at all** — the other
+/// reason a client asks on a perfectly fixed cadence, and the OPPOSITE fault to [`FLUSH_COOLDOWN`]'s
+/// (nothing arriving, versus more arriving than it can drain).
+///
+/// **Public, and deliberately a different value, for the same reason [`FLUSH_COOLDOWN`] is public.**
+/// While both were 2000 ms the host's recovery-cadence detector could not tell which failure it was
+/// looking at, and reported the confident wrong one: a 2026-08-20 field case where not one byte of
+/// video ever reached the client was diagnosed for days as a client too slow to keep up. Embedders
+/// own the no-video timer (it lives in each decode loop), so this is the value they must use — a
+/// local copy is exactly the drift that made the two indistinguishable in the first place.
+///
+/// The delivery count on [`crate::quic::LossReport`] settles it outright for clients new enough to
+/// send one; this keeps the period itself informative for those that are not.
+pub const NO_VIDEO_RETRY: Duration = Duration::from_millis(2600);
+
 /// A clock-triggered jump-to-live that discarded fewer datagrams than this (and no queued AUs)
 /// found NO local backlog: the frames read as late, but nothing here was actually behind. Two
 /// causes, and flushing helps neither: a **wall-clock step** (NTP mid-session on either end)

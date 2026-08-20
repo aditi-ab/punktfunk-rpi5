@@ -77,6 +77,12 @@ impl DataPump {
                                           // size FEC to the link. Suppressed during a speed test (its FLAG_PROBE filler would skew it).
         const ADAPT_REPORT_INTERVAL: Duration = Duration::from_millis(750);
         let mut last_report = Instant::now();
+        // Has the host been told, once, that data-plane packets are reaching us? See the send site:
+        // the delivery count is reported every window while it is ZERO (the state the host acts on)
+        // and once more when the first packets land, then never again. A host that predates the
+        // message logs "unknown control message" for each one, so a healthy session must not stream
+        // them — one line per session is a fair price on an old host, eighty a minute is not.
+        let mut delivery_confirmed = false;
         let (
             mut last_recovered,
             mut last_late,
@@ -415,6 +421,27 @@ impl DataPump {
                     );
                 } else {
                     let _ = ctrl_tx.try_send(CtrlRequest::Loss(LossReport { loss_ppm }));
+                    // Rides with the loss report — it is what makes `loss_ppm = 0` readable at the
+                    // host, which cannot otherwise tell a flawless link from one delivering
+                    // nothing. The session TOTAL, not this window's, so one message stands on its
+                    // own. Deliberately inside the same arm: a discarded window is discarded
+                    // because the host was rebuilding or a probe distorted it, and staying silent
+                    // there keeps that contract exact. Nothing is lost — the state this reports
+                    // (no packets at all) produces no discards, so its windows always send.
+                    //
+                    // Sent every window while the count is ZERO, then ONCE when the first packets
+                    // land (so the host stops guessing and can name the other failure confidently),
+                    // then never again: a healthy session must not stream a message that older
+                    // hosts log as unknown on every arrival.
+                    // ponytail: only start-of-session death is covered. A path that dies MID-stream
+                    // leaves the count frozen above zero and silent, which the host still reads as
+                    // healthy — detecting that needs a stalled-counter check with its own timing,
+                    // worth adding if a mid-session case is ever reported.
+                    if should_report_delivery(st.packets_received, &mut delivery_confirmed) {
+                        let _ = ctrl_tx.try_send(CtrlRequest::Delivery(DeliveryReport {
+                            packets_received: st.packets_received,
+                        }));
+                    }
                 }
                 // Standing-latency bleed: close the detector's window with this report's loss
                 // verdict and run its escalation ladder — re-sync first (free; a stale offset
@@ -757,9 +784,57 @@ fn take_pipeline_gap(slot: &AtomicU32) -> Option<u32> {
     }
 }
 
+/// Does this report window owe the host a [`DeliveryReport`], and record that it has been told?
+///
+/// Every window while `packets_received` is ZERO — that is the state the host escalates on, and it
+/// must keep hearing it — then exactly ONCE more when the first packets land, so the host learns
+/// delivery works and can stop hedging its stall diagnosis. Silent after that: a host that predates
+/// the message logs every unknown control message, and a healthy hours-long session must not fill
+/// its log with them.
+fn should_report_delivery(packets_received: u64, confirmed: &mut bool) -> bool {
+    let owed = packets_received == 0 || !*confirmed;
+    *confirmed = packets_received > 0;
+    owed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host must keep hearing "zero" for as long as it is true (that is the black-screen
+    /// signal), get exactly one confirmation when video starts, and then silence — the noise budget
+    /// on an older host, which warns per unknown message, is what pays for the first two.
+    #[test]
+    fn the_delivery_count_is_reported_while_zero_then_once_more_and_never_again() {
+        let mut confirmed = false;
+        // Nothing arriving: reported every window, for as long as it stays true.
+        for _ in 0..5 {
+            assert!(
+                should_report_delivery(0, &mut confirmed),
+                "a dead data plane must be re-reported every window"
+            );
+        }
+        // First packets land: one confirmation, so the host can name the other failure confidently.
+        assert!(should_report_delivery(500, &mut confirmed));
+        // Healthy from here: silent.
+        for n in [900, 1_200, 90_000] {
+            assert!(
+                !should_report_delivery(n, &mut confirmed),
+                "a healthy session must not stream delivery reports"
+            );
+        }
+    }
+
+    /// A session that never receives anything must never look confirmed, no matter how long it runs
+    /// — the whole point is that the host keeps being told.
+    #[test]
+    fn a_session_that_receives_nothing_never_reports_itself_healthy() {
+        let mut confirmed = false;
+        for _ in 0..100 {
+            assert!(should_report_delivery(0, &mut confirmed));
+            assert!(!confirmed);
+        }
+    }
 
     #[test]
     fn a_pipeline_gap_is_taken_exactly_once() {
@@ -935,8 +1010,8 @@ mod tests {
             .expect("the window after the gap reports on schedule");
         assert!(
             matches!(reported, Some(CtrlRequest::Loss(_))),
-            "the window after the gap must produce a loss report — an idle session's only \
-             outbound request"
+            "the window after the gap must produce a loss report — the first of the two requests \
+             an idle session makes (the delivery count follows it)"
         );
         assert!(
             started.elapsed() >= Duration::from_millis(1_400),

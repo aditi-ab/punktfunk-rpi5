@@ -53,9 +53,9 @@ use punktfunk_core::config::Role;
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::packet::FLAG_PROBE;
 use punktfunk_core::quic::{
-    endpoint, io, window_loss_ppm, BitrateChanged, CursorRenderMode, Hello, LossReport,
-    ProbeRequest, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, SetBitrate, Start,
-    Welcome,
+    endpoint, io, window_loss_ppm, BitrateChanged, CursorRenderMode, DeliveryReport, Hello,
+    LossReport, ProbeRequest, ProbeResult, Reconfigure, Reconfigured, RequestKeyframe, SetBitrate,
+    Start, Welcome,
 };
 use punktfunk_core::transport::UdpTransport;
 use punktfunk_core::{CompositorPref, Mode, PunktfunkError, Session};
@@ -987,10 +987,18 @@ async fn session(args: Args) -> Result<()> {
         let mut ls = send;
         let lp = loss_ppm.clone();
         let df = dropped_frames.clone();
+        // Delivery truth for the host's dead-data-plane check: report what actually landed on the
+        // wire, so the probe reproduces a real client's answer rather than the "cannot answer"
+        // sentinel — which is exactly what makes it usable for testing that path.
+        let rxp = rx_wire_packets.clone();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             let mut last_report = std::time::Instant::now();
             let mut last_dropped = 0u64;
+            // Mirrors the real clients' rule (see `pump/data.rs`): report the delivery count every
+            // window while it is zero, once when the first packets land, then stop — so a host that
+            // predates the message is not flooded with "unknown control message" on a good session.
+            let mut delivery_confirmed = false;
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 let d = df.load(Relaxed);
@@ -1007,6 +1015,25 @@ async fn session(args: Args) -> Result<()> {
                 if last_report.elapsed() >= std::time::Duration::from_millis(750) {
                     last_report = std::time::Instant::now();
                     let v = lp.swap(u32::MAX, Relaxed);
+                    // Independent of whether there is a fresh loss sample: "no fresh sample" is
+                    // exactly the shape a dead data plane has, so gating it on one would silence
+                    // it in the state it exists to report.
+                    let received = rxp.load(Relaxed);
+                    if received == 0 || !delivery_confirmed {
+                        delivery_confirmed = received > 0;
+                        if io::write_msg(
+                            &mut ls,
+                            &DeliveryReport {
+                                packets_received: received,
+                            }
+                            .encode(),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break; // control stream gone
+                        }
+                    }
                     if v != u32::MAX
                         && io::write_msg(&mut ls, &LossReport { loss_ppm: v }.encode())
                             .await

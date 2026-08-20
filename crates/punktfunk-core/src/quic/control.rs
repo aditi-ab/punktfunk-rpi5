@@ -97,6 +97,33 @@ pub struct LossReport {
     pub loss_ppm: u32,
 }
 
+/// `client → host`, sent immediately after each [`LossReport`]: data-plane packets this client has
+/// received all session, cumulative.
+///
+/// ⚠ Exists because `loss_ppm` alone is **ambiguous at zero**: a client receiving a flawless stream
+/// and a client receiving *nothing at all* both report `loss_ppm = 0` — loss is a ratio over a
+/// window whose denominator is the packets that arrived, so no-packets is indistinguishable from
+/// no-loss. That ambiguity let a host decay adaptive FEC to its floor while the client sat behind a
+/// black screen having received zero bytes, and the host's own stall diagnosis blamed the client for
+/// "not sustaining the stream" it had never been sent (field 2026-08-20: a Windows host whose
+/// per-session data port was closed inbound, so the client's hole-punch never opened the return
+/// path). `0` while the host has sent frames is the one unambiguous statement of "the video data
+/// plane is not reaching me" — the control plane carrying this report is, by construction, healthy.
+///
+/// ⚠ A SEPARATE MESSAGE rather than a field appended to [`LossReport`], and that is load-bearing:
+/// `LossReport::decode` length-checks EXACTLY, so a longer report is rejected outright by every host
+/// already shipped — a new client would silently lose adaptive FEC against them. Mixed versions are
+/// normal here (the field case that motivated this ran a current host against a months-old client),
+/// so the compatible shape is a new type byte an older host simply ignores, exactly as it already
+/// ignores every other control message it predates.
+///
+/// Cumulative, not per-window, so a single message is self-contained; `u64` to match the counter it
+/// mirrors, with no saturation to reason about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeliveryReport {
+    pub packets_received: u64,
+}
+
 /// `client → host`, any time after [`Start`]: reconfigure the encoder to a new target bitrate
 /// without reconnecting — the mid-stream lever of adaptive bitrate. The host clamps the request
 /// exactly like [`Hello::bitrate_kbps`] (its `[MIN, MAX]` band; `0` → host default), answers with
@@ -270,6 +297,8 @@ pub const MSG_SHARD_PAYLOAD_ACK: u8 = 0x09;
 /// and [`BitrateChanged`] already feed. Deliberately NOT in the 0x30 clock block — it carries a
 /// duration precisely so that no clock domain is involved.
 pub const MSG_PIPELINE_GAP: u8 = 0x0A;
+/// Type byte of [`DeliveryReport`].
+pub const MSG_DELIVERY_REPORT: u8 = 0x0B;
 /// Type byte of [`ProbeRequest`].
 pub const MSG_PROBE_REQUEST: u8 = 0x20;
 /// Type byte of [`ProbeResult`].
@@ -432,6 +461,26 @@ impl LossReport {
         }
         Ok(LossReport {
             loss_ppm: u32::from_le_bytes(b[5..9].try_into().unwrap()),
+        })
+    }
+}
+
+impl DeliveryReport {
+    pub fn encode(&self) -> Vec<u8> {
+        // magic[0..4] type[4] packets_received[5..13]
+        let mut b = Vec::with_capacity(13);
+        b.extend_from_slice(CTL_MAGIC);
+        b.push(MSG_DELIVERY_REPORT);
+        b.extend_from_slice(&self.packets_received.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Result<DeliveryReport> {
+        if b.len() != 13 || &b[0..4] != CTL_MAGIC || b[4] != MSG_DELIVERY_REPORT {
+            return Err(PunktfunkError::InvalidArg("bad DeliveryReport"));
+        }
+        Ok(DeliveryReport {
+            packets_received: u64::from_le_bytes(b[5..13].try_into().unwrap()),
         })
     }
 }
@@ -1289,6 +1338,41 @@ mod tests {
             &[LossReport { loss_ppm: 0 }.encode().as_slice(), &[0]].concat()
         )
         .is_err());
+    }
+
+    #[test]
+    fn delivery_report_roundtrip() {
+        for packets_received in [0u64, 1, 9_999, u32::MAX as u64 + 1, u64::MAX] {
+            let r = DeliveryReport { packets_received };
+            assert_eq!(DeliveryReport::decode(&r.encode()).unwrap(), r);
+        }
+        assert!(DeliveryReport::decode(&RequestKeyframe.encode()).is_err());
+        assert!(DeliveryReport::decode(&LossReport { loss_ppm: 0 }.encode()).is_err());
+    }
+
+    /// The delivery count MUST NOT ride on [`LossReport`]: that message is length-checked EXACTLY,
+    /// so lengthening it would make every already-shipped host reject the loss reports its adaptive
+    /// FEC runs on — a silent regression for a new client against an old host, which is the normal
+    /// mixed-version case here (the field report that motivated this ran a current host against a
+    /// months-old client). Its own type byte keeps `LossReport` byte-identical while an older host
+    /// simply ignores the message it does not know.
+    #[test]
+    fn the_delivery_count_does_not_disturb_the_loss_report_wire_form() {
+        let loss = LossReport { loss_ppm: 42 }.encode();
+        assert_eq!(loss.len(), 9, "LossReport must stay the 9-byte wire form");
+        assert_eq!(loss[4], MSG_LOSS_REPORT);
+
+        let delivery = DeliveryReport {
+            packets_received: 0,
+        }
+        .encode();
+        assert_ne!(
+            delivery[4], MSG_LOSS_REPORT,
+            "a distinct type byte is what makes an old host ignore it instead of failing"
+        );
+        // Neither can be silently mis-parsed as the other.
+        assert!(LossReport::decode(&delivery).is_err());
+        assert!(DeliveryReport::decode(&loss).is_err());
     }
 
     #[test]

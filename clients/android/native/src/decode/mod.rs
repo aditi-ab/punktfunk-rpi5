@@ -91,7 +91,14 @@ const NO_VIDEO_PATIENCE: std::time::Duration = std::time::Duration::from_millis(
 
 /// Re-ask cadence once [`NO_VIDEO_PATIENCE`] has elapsed with still nothing received. Slow, because
 /// this state is either self-healing on the first ask or not ours to heal — and each pass logs.
-const NO_VIDEO_RETRY: std::time::Duration = std::time::Duration::from_millis(2000);
+///
+/// ⚠ Taken from core, NOT a local number. `FLUSH_COOLDOWN` (the jump-to-live rate limit) is 2000 ms,
+/// and the host classifies a keyframe-recovery cadence by matching a cooldown's period ±10 % to
+/// decide WHICH client failure it is looking at. The two are opposites — "I have received nothing"
+/// versus "I am drowning in frames I cannot drain" — so while this was also 2000 ms the host
+/// confidently reported the wrong one, and a black-screen field case was diagnosed as a slow decoder
+/// for days (2026-08-20). Keeping the value in core is what stops the two drifting back together.
+const NO_VIDEO_RETRY: std::time::Duration = punktfunk_core::client::NO_VIDEO_RETRY;
 
 /// Whether low-latency mode uses the event-driven async decode loop (default) or the synchronous
 /// poll loop. Flip to `false` to A/B the two on the HUD (`design/…`); the async loop presents a

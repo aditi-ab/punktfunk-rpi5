@@ -1,7 +1,9 @@
 //! `CtrlRequest` (the embedder's control-stream requests) and `Negotiated` (the handshake result).
 
 use crate::config::{CompositorPref, GamepadPref, Mode};
-use crate::quic::{ClipControl, ClipOffer, ColorInfo, LossReport, ProbeRequest, RfiRequest};
+use crate::quic::{
+    ClipControl, ClipOffer, ColorInfo, DeliveryReport, LossReport, ProbeRequest, RfiRequest,
+};
 
 /// A control-stream request the embedder makes on the open handshake stream: a mode switch or a
 /// speed test. One outbound channel carries both so the worker's `select!` has a single writer
@@ -15,6 +17,10 @@ pub(crate) enum CtrlRequest {
     /// forcing a full IDR. See [`RfiRequest`].
     Rfi(RfiRequest),
     Loss(LossReport),
+    /// How many data-plane packets have reached us all session — sent straight after every
+    /// [`CtrlRequest::Loss`], because `loss_ppm` is ambiguous at zero (no loss and no packets look
+    /// identical) and only this separates them. See [`DeliveryReport`].
+    Delivery(DeliveryReport),
     /// Adaptive bitrate: ask the host to re-target its encoder (kbps). Sent by the pump's
     /// [`BitrateController`] when the user's bitrate setting is Automatic.
     SetBitrate(u32),
