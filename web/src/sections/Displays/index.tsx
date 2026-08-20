@@ -14,6 +14,10 @@ import { SessionGameCard } from "./SessionGameCard";
  * The session⇄game lifetime card sits here rather than on its own page because it is the same
  * question one step further out: keep-alive decides how long a *display* outlives a disconnect, and
  * this decides whether the *game* does.
+ *
+ * Both extra cards ride INSIDE the Configuration tab (they are policy surfaces): as plain siblings
+ * below the tab shell they were visible from either tab, which read as the Live tab's content
+ * bleeding into Configuration.
  */
 export const SectionDisplays: FC = () => {
 	useLocale();
@@ -21,9 +25,14 @@ export const SectionDisplays: FC = () => {
 		<Section maxWidth={false}>
 			<div className="flex flex-col gap-card">
 				<h1 className="text-2xl font-semibold">{m.nav_displays()}</h1>
-				<DisplaySection />
-				<MonitorCard />
-				<SessionGameCard />
+				<DisplaySection
+					configurationExtra={
+						<>
+							<MonitorCard />
+							<SessionGameCard />
+						</>
+					}
+				/>
 			</div>
 		</Section>
 	);

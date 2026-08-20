@@ -56,7 +56,10 @@ import { m } from "@/paraglide/messages";
  * (this is the host's *next-connect* behavior). The live-display list + multi-monitor arrangement
  * table below act on whatever is currently streaming.
  */
-export const DisplaySection: FC = () => {
+export const DisplaySection: FC<{
+	/** See [`DisplayTabs`] — the page's other configuration cards, tabbed along with the form. */
+	configurationExtra?: ReactNode;
+}> = ({ configurationExtra }) => {
 	const qc = useQueryClient();
 	const { confirm } = useDialogs();
 	const q = useGetDisplaySettings();
@@ -181,6 +184,7 @@ export const DisplaySection: FC = () => {
 	return (
 		<DisplayTabs
 			dirty={dirty}
+			configurationExtra={configurationExtra}
 			live={<LiveDisplays />}
 			configuration={
 				<>
@@ -245,8 +249,13 @@ export const DisplaySection: FC = () => {
 export const DisplayTabs: FC<{
 	dirty: boolean;
 	configuration: ReactNode;
+	/** Further self-contained cards that belong to the Configuration tab (streamed screen,
+	 * session⇄game lifetime). Rendered as siblings of the config card, INSIDE the tab: parked
+	 * below the tab shell they showed on both tabs, which read as the live tab's content being
+	 * duplicated into Configuration. */
+	configurationExtra?: ReactNode;
 	live: ReactNode;
-}> = ({ dirty, configuration, live }) => (
+}> = ({ dirty, configuration, configurationExtra, live }) => (
 	<Tabs defaultValue="configuration" className="gap-card">
 		<TabsList>
 			<TabsTrigger value="configuration">
@@ -266,10 +275,11 @@ export const DisplayTabs: FC<{
 			<TabsTrigger value="live">{m.display_live()}</TabsTrigger>
 		</TabsList>
 
-		<TabsContent value="configuration">
+		<TabsContent value="configuration" className="flex flex-col gap-card">
 			<Card>
 				<CardContent className="space-y-4">{configuration}</CardContent>
 			</Card>
+			{configurationExtra}
 		</TabsContent>
 
 		<TabsContent value="live">
