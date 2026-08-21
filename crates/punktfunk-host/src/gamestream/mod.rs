@@ -682,13 +682,21 @@ pub(crate) fn primary_local_ip() -> Option<IpAddr> {
         .ok()
         .map(|a| a.ip())
         .filter(|ip| usable_lan_ip(*ip));
-    routed.or_else(|| {
-        if_addrs::get_if_addrs()
-            .ok()?
-            .into_iter()
-            .map(|i| i.ip())
-            .find(|ip| ip.is_ipv4() && usable_lan_ip(*ip))
-    })
+    routed.or_else(first_lan_ipv4)
+}
+
+/// First reachable IPv4 an interface holds, ignoring the routing table entirely.
+///
+/// Split out because this is the branch the boot race actually takes, and the one nothing would
+/// otherwise exercise: the route probe above needs a default route, which lands *after* the NIC
+/// has its address on a cold boot. Between those two moments the old code had no answer and fell
+/// back to loopback for good.
+fn first_lan_ipv4() -> Option<IpAddr> {
+    if_addrs::get_if_addrs()
+        .ok()?
+        .into_iter()
+        .map(|i| i.ip())
+        .find(|ip| ip.is_ipv4() && usable_lan_ip(*ip))
 }
 
 /// Is `ip` an address a client could actually reach this host on? Loopback and the unspecified
@@ -778,7 +786,7 @@ mod host_name_tests {
 
 #[cfg(test)]
 mod local_ip_tests {
-    use super::{primary_local_ip, usable_lan_ip};
+    use super::{first_lan_ipv4, primary_local_ip, usable_lan_ip};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
@@ -811,6 +819,14 @@ mod local_ip_tests {
         // address, or we admit we have none. `None` is what lets `Host::local_ip()` and the mDNS
         // advert keep retrying instead of freezing a wrong answer in place.
         assert!(primary_local_ip().is_none_or(usable_lan_ip));
+    }
+
+    #[test]
+    fn interface_fallback_never_offers_loopback() {
+        // The branch a cold boot takes, before the default route exists. It may legitimately find
+        // nothing (a machine with no NIC up, e.g. an isolated CI container) — what it must never
+        // do is hand back the loopback that `get_if_addrs` also reports.
+        assert!(first_lan_ipv4().is_none_or(usable_lan_ip));
     }
 }
 
