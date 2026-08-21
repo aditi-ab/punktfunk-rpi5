@@ -366,15 +366,26 @@ object Gamepad {
     // is immune to the layout file — the same reason [Keymap.toVk] reads `scanCode` for keyboards.
     // Two things keep it from breaking a pad that already works:
     //
-    //  1. The correction is applied ONLY when the delivered keycode is what `Generic.kl` would
-    //     have said ([genericKeyCode]). A different keycode means a device-specific layout IS in
-    //     force and already knows this pad better than we do, so we leave it alone.
-    //  2. Which report order to read is decided from what the DEVICE declares, never a model
-    //     table: a pad numbering straight through claims BUTTON_C and BUTTON_Z ([PadButtons]),
-    //     keycodes no real controller has a button for.
+    //  1. Nothing is corrected on a pad that names its triggers ([padButtons]). A descriptor
+    //     well-formed enough to call them Accelerator/Brake puts its buttons at the standard
+    //     positions too, and that is the fact — not the model — that separates the two firmwares
+    //     of the SAME Xbox pad, only the older of which needs any of this.
+    //  2. Past that gate the correction still applies ONLY where the delivered keycode is what
+    //     `Generic.kl` would have said ([genericKeyCode]). A different keycode means a
+    //     device-specific layout IS in force and knows this pad better than we do.
     //
-    // Moonlight carries the same two tables (`ControllerHandler`'s `isNonStandardDualShock4` /
-    // `isNonStandardXboxBtController`), which is why both pads work there on the same box.
+    // Moonlight carries the same two tables AND the same gate (`ControllerHandler`'s
+    // `isNonStandardDualShock4` / `isNonStandardXboxBtController`, the latter on `gasRange == null`),
+    // which is why both pads work there on the same box.
+    //
+    // The first cut of this asked `hasKeys(BUTTON_C, BUTTON_Z)` on its own, on the reasoning that a
+    // pad numbering straight through reaches keycodes no controller has a button for. It does — but
+    // so does every pad that merely DECLARES six buttons, because `hid-input` allocates `BTN_A + n`
+    // straight through for the whole descriptor whether or not the pad ever presses them. That fired
+    // the correction on pads Android was already reading correctly (2026-08-21: an Xbox pad
+    // answering X with Y, Y with LB, and both shoulders with a menu button), and it could not have
+    // done otherwise: the signal is identical on the firmware that needs correcting and the one that
+    // does not. Declaration is not report order. Only the axes tell them apart.
 
     /** [MotionEvent] axis id meaning "this pad has no such axis" — see [PadMap]. */
     const val AXIS_NONE = -1
@@ -526,22 +537,42 @@ object Gamepad {
     private val padMaps = ConcurrentHashMap<String, PadMap>()
 
     /**
-     * Which report order [dev]'s buttons follow, asked of the device rather than a model table.
+     * Which report order [dev]'s buttons follow — [namedTriggers] is whether the pad reports its
+     * triggers under a name Android knows (see [padMap]), and [declaresCZ] whether it declares
+     * BUTTON_C and BUTTON_Z.
      *
-     * A pad numbering its HID buttons straight through reaches BUTTON_C and BUTTON_Z, keycodes
-     * that exist only as `Generic.kl` positions — no controller has a physical C or Z button, and
-     * a pad with a kernel driver behind it emits the modern Linux gamepad codes, which skip both.
-     * Declaring the pair is therefore the signature of a pad Android is guessing at.
+     * `namedTriggers` decides it, and a pad that has them is [PadButtons.NATIVE] whatever else it
+     * says. A HID gamepad describes its triggers either as the Accelerator/Brake usages, which
+     * become `ABS_GAS`/`ABS_BRAKE` and axis names Android has words for, or as two more generic
+     * axes on `ABS_Z`/`ABS_RZ`, which it does not — and a report descriptor well-formed enough to
+     * name its triggers puts its buttons at the standard positions too, the ones `Generic.kl`
+     * already reads correctly. It is the same fact Moonlight decides this on (`gasRange == null`
+     * beside the `"Xbox Wireless Controller"` name), and it is the one that separates the two
+     * firmwares of the SAME pad: an Xbox Wireless Controller over Bluetooth reports GAS/BRAKE
+     * after its firmware update and Z/Rz before it, and only the older one needs correcting.
+     *
+     * `declaresCZ` cannot make that call and must never be asked to. `hasKeys` answers for what a
+     * device DECLARES, not what it reports: `hid-input` allocates `BTN_A + n` straight through for
+     * every button in the descriptor, so BTN_C (`0x132`) and BTN_Z (`0x135`) are set on any pad
+     * declaring six or more — a standard-layout pad that never presses either included. Read alone
+     * it fired the correction on pads whose buttons were already right, which is how an Xbox pad
+     * came to answer X with Y and Y with LB (field reports, 2026-08-21). It stays as the narrower
+     * question it can answer — WHICH straight-through order, once `namedTriggers` has established
+     * there is one — where a false positive costs nothing.
      */
-    fun padButtons(dev: InputDevice): PadButtons {
+    fun padButtons(dev: InputDevice, namedTriggers: Boolean): PadButtons {
         val has = dev.hasKeys(KeyEvent.KEYCODE_BUTTON_C, KeyEvent.KEYCODE_BUTTON_Z, 0)
-        val straightThrough = has[0] && has[1]
-        return when {
-            straightThrough && dev.vendorId == VID_SONY -> PadButtons.GENERIC_SONY
-            straightThrough -> PadButtons.GENERIC_XBOX
-            dev.vendorId == VID_SONY -> PadButtons.SONY_MODERN
-            else -> PadButtons.NATIVE
-        }
+        return padButtons(namedTriggers, dev.vendorId == VID_SONY, declaresCZ = has[0] && has[1])
+    }
+
+    /** [padButtons]'s choice over plain facts — the seam its truth table is tested at (an
+     * [InputDevice] cannot be built off a device). */
+    fun padButtons(namedTriggers: Boolean, sony: Boolean, declaresCZ: Boolean): PadButtons = when {
+        namedTriggers -> PadButtons.NATIVE
+        declaresCZ && sony -> PadButtons.GENERIC_SONY
+        declaresCZ -> PadButtons.GENERIC_XBOX
+        sony -> PadButtons.SONY_MODERN
+        else -> PadButtons.NATIVE
     }
 
     /**
@@ -566,11 +597,11 @@ object Gamepad {
     fun padMap(dev: InputDevice?): PadMap {
         if (dev == null) return NATIVE_MAP
         padMaps[dev.descriptor]?.let { return it }
-        val buttons = padButtons(dev)
         fun has(a: Int) = axis(dev, a) != null
         val named = (has(MotionEvent.AXIS_LTRIGGER) && has(MotionEvent.AXIS_RTRIGGER)) ||
             (has(MotionEvent.AXIS_BRAKE) && has(MotionEvent.AXIS_GAS)) ||
             (has(MotionEvent.AXIS_BRAKE) && has(MotionEvent.AXIS_THROTTLE))
+        val buttons = padButtons(dev, namedTriggers = named)
         val rx = axis(dev, MotionEvent.AXIS_RX)
         val hasRxRy = rx != null && has(MotionEvent.AXIS_RY)
         // Whichever pair the fallback is about to pick, ask THAT one where it rests.

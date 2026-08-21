@@ -200,4 +200,55 @@ class PadButtonsTest {
             assertEquals(generic, Gamepad.PadButtons.NATIVE.correct(scan, generic))
         }
     }
+
+    /**
+     * The regression that made this gate necessary (field reports, 2026-08-21): an Xbox Wireless
+     * Controller and a GameSir G8+, both with their buttons at the standard positions and both
+     * corrected anyway, because `hasKeys` says BUTTON_C and BUTTON_Z for any pad that DECLARES six
+     * buttons — `hid-input` allocates the whole descriptor `BTN_A + n` straight through whether the
+     * pad ever presses them or not. Naming the triggers is what tells the two apart.
+     */
+    @Test
+    fun `a pad that names its triggers is never corrected, whatever it declares`() {
+        for (sony in listOf(false, true)) {
+            for (declaresCZ in listOf(false, true)) {
+                assertEquals(
+                    Gamepad.PadButtons.NATIVE,
+                    Gamepad.padButtons(namedTriggers = true, sony = sony, declaresCZ = declaresCZ),
+                )
+            }
+        }
+    }
+
+    /**
+     * The four buttons the field reports named, on a pad whose report order is already standard:
+     * X answering Y, Y answering LB, and both shoulders answering a menu button. NATIVE is what
+     * keeps them themselves — the correction tables are right for the pads they are for, and this
+     * is about not reaching one of them.
+     */
+    @Test
+    fun `an Xbox pad at the standard positions keeps X, Y and its shoulders`() {
+        val native = Gamepad.PadButtons.NATIVE
+        assertEquals(KeyEvent.KEYCODE_BUTTON_X, native.correct(0x133, KeyEvent.KEYCODE_BUTTON_X))
+        assertEquals(KeyEvent.KEYCODE_BUTTON_Y, native.correct(0x134, KeyEvent.KEYCODE_BUTTON_Y))
+        assertEquals(KeyEvent.KEYCODE_BUTTON_L1, native.correct(0x136, KeyEvent.KEYCODE_BUTTON_L1))
+        assertEquals(KeyEvent.KEYCODE_BUTTON_R1, native.correct(0x137, KeyEvent.KEYCODE_BUTTON_R1))
+        // What the old heuristic did to each of them, kept here so the difference stays visible.
+        val wrong = Gamepad.PadButtons.GENERIC_XBOX
+        assertEquals(KeyEvent.KEYCODE_BUTTON_Y, wrong.correct(0x133, KeyEvent.KEYCODE_BUTTON_X))
+        assertEquals(KeyEvent.KEYCODE_BUTTON_L1, wrong.correct(0x134, KeyEvent.KEYCODE_BUTTON_Y))
+        assertEquals(KeyEvent.KEYCODE_BUTTON_SELECT, wrong.correct(0x136, KeyEvent.KEYCODE_BUTTON_L1))
+        assertEquals(KeyEvent.KEYCODE_BUTTON_START, wrong.correct(0x137, KeyEvent.KEYCODE_BUTTON_R1))
+    }
+
+    /** Past the gate, which straight-through order to read is still the question it always was. */
+    @Test
+    fun `an unnamed-trigger pad still resolves its report order`() {
+        fun order(sony: Boolean, declaresCZ: Boolean) =
+            Gamepad.padButtons(namedTriggers = false, sony = sony, declaresCZ = declaresCZ)
+        assertEquals(Gamepad.PadButtons.GENERIC_SONY, order(sony = true, declaresCZ = true))
+        assertEquals(Gamepad.PadButtons.GENERIC_XBOX, order(sony = false, declaresCZ = true))
+        assertEquals(Gamepad.PadButtons.SONY_MODERN, order(sony = true, declaresCZ = false))
+        assertEquals(Gamepad.PadButtons.NATIVE, order(sony = false, declaresCZ = false))
+    }
 }
