@@ -26,8 +26,7 @@ use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::Duration;
 
 /// The native-protocol mDNS service type. Clients browse this to find punktfunk/1 hosts.
@@ -87,13 +86,10 @@ pub(crate) fn dns_label(name: &str) -> String {
 /// Holds the mDNS daemon; dropping it unregisters the service and stops the re-announce loop.
 pub struct Advert {
     _daemon: ServiceDaemon,
-    stop: Arc<AtomicBool>,
-}
-
-impl Drop for Advert {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
+    /// Never sent on. Dropping it disconnects the channel the re-announce thread waits on, which
+    /// wakes that thread immediately and ends it — so an `Advert` takes its loop with it instead
+    /// of leaving one behind polling for a service nobody advertises.
+    _stop: mpsc::Sender<()>,
 }
 
 /// How often a live advert re-checks the address it is announcing.
@@ -127,12 +123,16 @@ pub(crate) fn advertise_live(
         .register(build(registered)?)
         .with_context(|| format!("register {service} mDNS service"))?;
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let (bg_daemon, bg_stop) = (daemon.clone(), stop.clone());
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let bg_daemon = daemon.clone();
     std::thread::spawn(move || {
         let mut announced = registered;
-        while !bg_stop.load(Ordering::Relaxed) {
-            std::thread::sleep(IP_RECHECK);
+        // Doubles as the sleep: times out every `IP_RECHECK` to re-check, and returns
+        // `Disconnected` the moment the `Advert` drops its sender, which ends the loop.
+        while matches!(
+            stop_rx.recv_timeout(IP_RECHECK),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
             let now = current_ip();
             if now == announced {
                 continue;
@@ -153,7 +153,7 @@ pub(crate) fn advertise_live(
     });
     Ok(Advert {
         _daemon: daemon,
-        stop,
+        _stop: stop_tx,
     })
 }
 
