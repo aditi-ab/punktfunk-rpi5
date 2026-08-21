@@ -156,9 +156,33 @@ pub struct Punktfunk1Options {
 /// the client's reported address, no hole-punch"; `false` (random port, or a busy fixed port) means
 /// "hole-punch". The socket is held from the handshake through streaming — no drop-then-rebind
 /// window in which a concurrent session could steal a fixed port.
-fn bind_data_socket(data_port: Option<u16>) -> std::io::Result<(std::net::UdpSocket, bool)> {
+///
+/// `local_ip` is the address the client's QUIC connection was RECEIVED on (`Connection::local_ip`),
+/// and binding to it is load-bearing on a multi-homed host. The client's data socket is
+/// `connect`ed to the host IP it dialed, so its kernel accepts video only from THAT source
+/// address; a wildcard bind here lets the routing table pick the egress interface independently of
+/// the one the control plane arrived on, and the two differ whenever a host has two paths to the
+/// client — Ethernet and Wi-Fi both up on the same LAN is the everyday case. Every video datagram
+/// is then dropped by the client's kernel before userspace: nothing counts it, `loss_ppm` stays 0
+/// (no packets, no gaps), the hole-punch still arrives so the host logs `punched=true`, and the
+/// control plane — which quinn pins to the right local address — stays perfectly healthy. That is
+/// the "connects fine, black screen forever" shape with every gauge green, and it is invisible on
+/// both ends. `None` (platform can't report it) or a bind failure falls back to the wildcard.
+fn bind_data_socket(
+    data_port: Option<u16>,
+    local_ip: Option<std::net::IpAddr>,
+) -> std::io::Result<(std::net::UdpSocket, bool)> {
+    // An IPv4-mapped v6 local address (dual-stack endpoint) must be unmapped before it can bind a
+    // socket that will `connect` to a v4 peer — the families have to match.
+    let local_ip = local_ip.map(|ip| match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+        v4 => v4,
+    });
+    let wildcard = |ip: Option<std::net::IpAddr>| {
+        ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+    };
     if let Some(p) = data_port.filter(|p| *p != 0) {
-        match std::net::UdpSocket::bind(("0.0.0.0", p)) {
+        match std::net::UdpSocket::bind((wildcard(local_ip), p)) {
             Ok(sock) => return Ok((sock, true)),
             Err(e) => tracing::warn!(
                 data_port = p,
@@ -168,7 +192,23 @@ fn bind_data_socket(data_port: Option<u16>) -> std::io::Result<(std::net::UdpSoc
             ),
         }
     }
-    Ok((std::net::UdpSocket::bind("0.0.0.0:0")?, false))
+    match std::net::UdpSocket::bind((wildcard(local_ip), 0)) {
+        Ok(sock) => Ok((sock, false)),
+        // The control plane arrived on this address moments ago, so a failure here means it just
+        // went away (an adapter dropped mid-handshake). The wildcard still reaches a client the
+        // routing table can route to — degraded, not dead — so take it and say why.
+        Err(e) if local_ip.is_some() => {
+            tracing::warn!(
+                local_ip = ?local_ip,
+                error = %e,
+                "could not bind the data plane to the address the control connection arrived on \
+                 — falling back to the wildcard. On a multi-homed host video may now egress from \
+                 a different interface than the client dialed, which it silently drops."
+            );
+            Ok((std::net::UdpSocket::bind("0.0.0.0:0")?, false))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The native (punktfunk/1) trust store + on-demand arming PIN, shared with the management API.
@@ -2057,6 +2097,10 @@ async fn serve_session(
     // stages ride the same per-session trace; resizes write their totals into the shared slot.
     let bringup_dp = bringup.clone();
     let resize_ms_dp = resize_ms.clone();
+    // The address the control connection arrived on, for the data plane's source-address check
+    // below — the one comparison that distinguishes "the client is filtering our video" from
+    // "the video never left". Captured here because the send loop runs on a blocking thread.
+    let control_local_ip = conn.local_ip();
     let result: Result<()> = async {
         let stream_thread = tokio::task::spawn_blocking(move || -> Result<()> {
             // Bring up the (already-bound) data-plane socket. Default: hole-punch — wait briefly
@@ -2091,15 +2135,44 @@ async fn serve_session(
                 }
             };
             bringup_dp.mark("punch_done");
+            // Post-`connect`, `local_addr` reports the source address the kernel will actually
+            // stamp on every video datagram — the number that has to match the host IP the client
+            // dialed, because its data socket is connected and its kernel drops anything else
+            // before userspace. Logged unconditionally: a black-screen report is unanswerable
+            // without it (this session's showed only the port).
+            let local = transport.local_addr().ok();
             tracing::info!(
                 %client_udp,
                 udp_port,
                 direct,
                 punched,
+                local = ?local,
                 "data plane bound (direct=true → fixed --data-port, streaming to the reported \
                  address with no hole-punch; else punched=true → the client's observed source, \
                  false → no punch seen, the reported address)"
             );
+            // A video source address that isn't the one the control plane arrived on means the
+            // client will discard every datagram we send, however healthy this end looks.
+            if let (Some(l), Some(c)) = (local.map(|a| a.ip()), control_local_ip) {
+                let c = match c {
+                    std::net::IpAddr::V6(v6) => {
+                        v6.to_ipv4_mapped().map_or(c, std::net::IpAddr::V4)
+                    }
+                    v4 => v4,
+                };
+                if !l.is_unspecified() && l != c {
+                    tracing::warn!(
+                        video_source_ip = %l,
+                        control_local_ip = %c,
+                        "the video data plane egresses from a DIFFERENT host address than the one \
+                         this client connected to — its data socket is connected to the address it \
+                         dialed, so its kernel drops every video datagram before userspace: black \
+                         screen, zero reported loss, healthy control plane. Usual cause is two \
+                         live paths to the client (Ethernet and Wi-Fi both up on the same LAN, or \
+                         a VPN/overlay adapter claiming the route)"
+                    );
+                }
+            }
             // A punch that never arrives is not a routine fallback — it is the fingerprint of a
             // data port the client cannot reach INBOUND, and every client punches (5/s for the
             // first three seconds, then every two). Video then goes to an address the client only
@@ -2515,7 +2588,7 @@ mod tests {
         // No fixed port (and the explicit-0 alias) → a random ephemeral port, and NOT direct: the
         // caller hole-punches.
         for req in [None, Some(0)] {
-            let (sock, direct) = bind_data_socket(req).expect("bind random data socket");
+            let (sock, direct) = bind_data_socket(req, None).expect("bind random data socket");
             assert!(!direct, "req={req:?} must hole-punch, not stream direct");
             assert_ne!(sock.local_addr().unwrap().port(), 0);
         }
@@ -2532,19 +2605,44 @@ mod tests {
             .port();
 
         // A free fixed port binds exactly it, in DIRECT mode (no hole-punch).
-        let (held, direct) = bind_data_socket(Some(free)).expect("bind fixed data socket");
+        let (held, direct) = bind_data_socket(Some(free), None).expect("bind fixed data socket");
         assert!(direct, "a fixed --data-port must stream direct");
         assert_eq!(held.local_addr().unwrap().port(), free);
 
         // While it's held, a second session on the same fixed port can't bind it → it must fall
         // back to a random port + hole-punch rather than fail (so concurrency never regresses).
-        let (fallback, direct2) = bind_data_socket(Some(free)).expect("busy fixed port falls back");
+        let (fallback, direct2) =
+            bind_data_socket(Some(free), None).expect("busy fixed port falls back");
         assert!(!direct2, "a busy fixed port must fall back to hole-punch");
         assert_ne!(
             fallback.local_addr().unwrap().port(),
             free,
             "the fallback must not reuse the busy fixed port"
         );
+    }
+
+    /// The multi-homed black screen: video must egress from the address the client's control
+    /// connection arrived on, because the client's data socket is connected to the host address it
+    /// dialed and its kernel drops every datagram from any other source — silently, before
+    /// userspace, so nothing on either end counts it. A wildcard bind here lets the routing table
+    /// choose a different interface whenever the host has two paths to the client.
+    #[test]
+    fn data_socket_binds_the_address_the_control_plane_arrived_on() {
+        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let (sock, direct) =
+            bind_data_socket(None, Some(loopback)).expect("bind pinned data socket");
+        assert!(!direct);
+        assert_eq!(sock.local_addr().unwrap().ip(), loopback);
+
+        // An IPv4-mapped v6 local address (a dual-stack QUIC endpoint reports one) has to be
+        // unmapped, or the socket binds v6 and can never `connect` to the v4 client.
+        let mapped = std::net::IpAddr::V6(std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped());
+        let (sock, _) = bind_data_socket(None, Some(mapped)).expect("bind mapped data socket");
+        assert_eq!(sock.local_addr().unwrap().ip(), loopback);
+
+        // No reported local address (platform can't say) keeps the old wildcard behaviour.
+        let (sock, _) = bind_data_socket(None, None).expect("bind wildcard data socket");
+        assert!(sock.local_addr().unwrap().ip().is_unspecified());
     }
 
     /// Freeze the gamepad wire contract: every button bit + axis id pinned to its exact value in
