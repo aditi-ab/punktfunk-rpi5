@@ -39,7 +39,7 @@ pub fn serverinfo_xml(host: &Host, https: bool, paired: bool) -> String {
         uniqueid = host.uniqueid,
         https_port = host.https_port,
         http_port = host.http_port,
-        local_ip = host.local_ip,
+        local_ip = host.local_ip(),
     )
 }
 
@@ -205,7 +205,6 @@ mod tests {
         let host = Host {
             hostname: "test".into(),
             uniqueid: "uid".into(),
-            local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             http_port: 47989,
             https_port: 47984,
             os_chain: "linux".into(),

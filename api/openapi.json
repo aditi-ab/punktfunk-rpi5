@@ -6688,7 +6688,7 @@
       },
       "HostInfo": {
         "type": "object",
-        "description": "Host identity and advertised capabilities (static for the life of the process).",
+        "description": "Host identity and advertised capabilities (static for the life of the process, except\n`local_ip`).",
         "required": [
           "hostname",
           "uniqueid",
@@ -6734,7 +6734,7 @@
           },
           "local_ip": {
             "type": "string",
-            "description": "Best-effort primary LAN IP."
+            "description": "Best-effort primary LAN IP, read fresh on every request — a host that started before its\nnetwork did (cold boot) reports `127.0.0.1` only until it actually has an address, and a\nhost that moves networks reports the new one. Poll it rather than caching it."
           },
           "os": {
             "type": "string",

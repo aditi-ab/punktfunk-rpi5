@@ -47,7 +47,6 @@ use axum::body::Body;
 use axum::http::StatusCode;
 use http_body_util::BodyExt;
 use sha2::{Digest, Sha256};
-use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::Ordering;
 use tower::ServiceExt;
 
@@ -73,7 +72,6 @@ fn test_state() -> Arc<AppState> {
     let host = Host {
         hostname: "test-host".into(),
         uniqueid: "deadbeef".into(),
-        local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
         http_port: HTTP_PORT,
         https_port: HTTPS_PORT,
         os_chain: "linux/arch/steamos".into(),

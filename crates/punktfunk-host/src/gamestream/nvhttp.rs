@@ -250,7 +250,7 @@ async fn h_launch(
                 fps = session.fps,
                 rikeyid = session.rikeyid,
                 "launch — session created; RTSP at rtsp://{}:{RTSP_PORT}",
-                st.host.local_ip
+                st.host.local_ip()
             );
             xml(session_url_xml(&st, "gamesession")).into_response()
         }
@@ -405,7 +405,7 @@ fn gamestream_admission(
 fn session_url_xml(st: &AppState, tag: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"200\">\n<sessionUrl0>rtsp://{}:{RTSP_PORT}</sessionUrl0>\n<{tag}>1</{tag}>\n</root>\n",
-        st.host.local_ip
+        st.host.local_ip()
     )
 }
 
@@ -485,13 +485,11 @@ fn error_xml() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
 
     fn test_state() -> Arc<AppState> {
         let host = super::super::Host {
             hostname: "t".into(),
             uniqueid: "id".into(),
-            local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             http_port: HTTP_PORT,
             https_port: HTTPS_PORT,
             os_chain: "linux".into(),
