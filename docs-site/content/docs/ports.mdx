@@ -17,9 +17,12 @@ list; the install guides quote the one or two lines that apply to each distro.
   one](/docs/web-console#two-ports-not-one)).
 - **`punktfunk-gamestream`** is needed only once you turn on Moonlight compat
   (`PUNKTFUNK_GAMESTREAM=1` in `host.env` — [Moonlight](/docs/moonlight)).
-- **Video needs nothing opened.** The data plane uses an ephemeral UDP port the *client* opens with a
-  hole-punch; the host streams back through the path the client opened, so only outbound UDP has to
-  be allowed (the default in both ufw and firewalld).
+- **Video needs nothing opened on Linux.** The data plane uses an ephemeral UDP port the *client*
+  opens with a hole-punch; the host streams back through the path the client opened, so only
+  outbound UDP has to be allowed (the default in both ufw and firewalld). **Windows is the
+  exception** — it drops the client's hole-punch, which is why `service install` adds an inbound UDP
+  rule scoped to the host executable rather than to a port number (no fixed rule can cover a port
+  chosen fresh each session).
 
 ## Enabling the profiles
 
@@ -39,6 +42,15 @@ sudo ufw allow punktfunk-gamestream              # only with Moonlight compat on
 Stock Arch and Debian ship no firewall; Ubuntu installs ufw but leaves it inactive; Fedora, Bazzite
 and most Fedora-family spins run firewalld; CachyOS enables ufw. On **NixOS** the module's
 `openFirewall = true` does all of this; on **Windows** the installer registers the rules.
+
+<Callout type="warn">
+**Windows: the rules are scoped to Punktfunk from 0.31.2 on.** Each rule names the executable that
+listens on it as well as the port, so those ports are open to Punktfunk rather than to anything on
+the machine that binds them first — before 0.31.2 they named only the port. The one thing this can
+change for you is **5353**: if something else on that PC relied on Punktfunk's rule to answer
+discovery, it now needs a rule of its own. `service install` re-applies the rules on every upgrade,
+so a normal update is enough.
+</Callout>
 
 ## Moving a port
 

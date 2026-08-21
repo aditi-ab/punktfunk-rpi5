@@ -1,0 +1,2 @@
+• Fixes controllers pressing the wrong buttons after the last update — on a GameSir G8+ and an Xbox Elite Series 2 over Bluetooth, X answered Y and both shoulders answered menu buttons.
+• The button correction from the last release now applies only to controllers Android has no layout for, so a pad that worked before this update is left exactly as it was.

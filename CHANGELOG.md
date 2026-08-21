@@ -12,6 +12,199 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ---
 
+## v0.31.2
+
+10 commits since v0.31.1 (6 non-merge), counted at the tip this was cut from.
+
+**Nothing versioned moves, and this time nothing versioned even changes shape.** `WIRE_VERSION`
+stays **2**, the C ABI stays **25**, and so do the driver protocol, the gamepad channel, the plugin
+index schema and the host event schema. `include/punktfunk_core.h` is **byte-identical to the
+v0.31.1 tag** — unlike the last two releases, which each added a `#define` — and `pf-driver-proto`
+shows no diff either. No route is added or removed, no `#[repr(C)]` struct moves, and neither
+`@punktfunk/host` (0.1.5) nor `@punktfunk/plugin-kit` (0.4.4) is re-cut. An embedder can take this
+release without recompiling anything, and a packager has one thing to notice: the Windows firewall
+rules below.
+
+`api/openapi.json` changes in **documentation only** — two `description` strings on `HostInfo`, no
+route, schema, field or type — plus the `info.version` stamp. That documentation change is
+load-bearing, though, because it records a behaviour change: `local_ip` is now read per request.
+
+The release is entirely fix-shaped. Three of the six non-merge commits are the same class of fault —
+the host using the wrong local address — reached from three directions: the data socket's source
+address (#367), the advertised address after a cold boot (#366), and the firewall rules that
+admitted anyone to the ports those addresses point at (#368). The fourth is an Android regression
+from v0.31.1 (#365); the remaining two are a refactor and a test in support of #366.
+
+### Versions
+
+| | v0.31.1 | v0.31.2 | Notes |
+|---|---|---|---|
+| Wire protocol | 2 | **2** | unchanged. No message added, removed or re-shaped; `DeliveryReport` (`0x0B`) from v0.31.1 is the most recent addition and is untouched |
+| C ABI | 25 | **25** | unchanged. `include/punktfunk_core.h` has **no diff at all** against the v0.31.1 tag — not even a constant |
+| Rust edition | 2024 | **2024** | unchanged |
+| MSRV (`rust-version`) | 1.85 | **1.85** | unchanged |
+| Workspace crate dirs | 27 | **27** | unchanged (39 `[workspace] members`, also unchanged) |
+| Virtual-display driver protocol | 6 | **6** | unchanged (minimum accepted still 3); `pf-driver-proto` shows no diff against the v0.31.1 tag |
+| Windows virtual-gamepad channel | 3 | **3** | unchanged; no file under the gamepad backends is touched by this release |
+| Plugin index schema | 1 | **1** | unchanged |
+| Host event schema | 1 | **1** | unchanged (`punktfunk-host/src/events.rs`) |
+| `api/openapi.json` | 0.31.1 | **0.31.2** | **description-only**, plus the stamp (`info.version` is `CARGO_PKG_VERSION`). The two `HostInfo` strings that change are quoted under **`Host::local_ip`** below; no route, schema, required-field or type differs. Re-stamped here, not regenerated — `punktfunk-host` does not build on macOS; the document itself was regenerated in #366 on a runner where `openapi_document_is_complete_and_checked_in` executes. `api/` and `docs-site/public/` are byte-identical to each other |
+| gamescope patch level (`+pfhdrN`) | 8 | **8** | unchanged; no new patch files, and `packaging/gamescope/PKGBUILD` still declares `pfhdr8` after the v0.31.1 correction |
+| `@punktfunk/host` (SDK) | 0.1.5 | **0.1.5** | unchanged; nothing under `sdk/` moved |
+| `@punktfunk/plugin-kit` | 0.4.4 | **0.4.4** | unchanged; nothing under `plugin-kit/` moved. 0.4.4 remains the registry's `latest` |
+
+### ⚠ Breaking changes
+
+**None.** No wire change, no ABI change, no driver-protocol change, no plugin-contract change, no
+API-surface change. Every 0.31.x host, client, driver and plugin keeps interoperating in both
+directions with no re-pairing and no rebuild.
+
+Two **behaviour** changes that break no build but change what a machine does:
+
+- **Windows `service install` now scopes every inbound rule to a program.** The five fixed-port
+  rules gain `program=<exe>` while keeping their `localport=`. If you provision firewall rules
+  yourself rather than letting `service install` do it, the equivalent is `program=` on each; if you
+  do nothing, `service install` re-runs on every upgrade and rewrites them for you. **Externally
+  visible:** 5353 is punktfunk's alone now, so anything else on the machine that was reachable on
+  mDNS through punktfunk's any-program rule needs its own rule.
+- **`HostInfo.local_ip` is no longer static for the life of the process.** It was a field
+  snapshotted at `Host::detect()`; it is a method that re-reads on every request. A consumer that
+  cached it once at startup was caching a value that could be `127.0.0.1` forever (see below) and
+  should poll instead. The two `description` strings in `api/openapi.json` say so.
+
+### Windows: the fixed-port firewall rules admitted any program on the machine
+
+`service install` added `dir=in action=allow` rules carrying only `localport=`. A rule of that shape
+admits **any process** that binds the port — GameStream (47984/47989/47998-48010/48010), the native
+plane (9777), mgmt (47990), mDNS (5353) and the console pair (47992/47993). Binding a high port on
+Windows requires no elevation, so an unprivileged program could take any of them and become
+LAN-reachable simply by binding first, and **silently**: our rule is precisely what suppresses the
+"Allow this app to communicate on…" prompt that would otherwise be the only way in.
+
+Every rule is now scoped to the executable that actually listens on it, keeping the ports — program
+**and** port is strictly tighter than either alone. The host rules name the host exe (resolved once
+via `current_exe()` and shared with the data-plane rule, which already worked this way and is the
+pattern the rest now follow); the console rules name the bundled `<app>/bun/bun.exe` the supervisor
+spawns. `fw_add_rule_args` is the new single constructor for the whole shape.
+
+The old argument for leaving them unscoped — "an install whose recorded exe path later moves still
+has its fixed ports open" — does not hold: `service install` re-runs the whole remove-then-add on
+every upgrade, so the path is refreshed rather than left stale.
+
+Fallbacks are deliberate and **asymmetric**. A fixed-port rule whose program cannot be resolved
+falls back to the old any-program form, because a looser rule still streams and no rule is a black
+screen. The data-plane rule instead **skips**: it has no `localport=` to fall back to, so a
+program-less version of it would not be a looser rule but an open host. The installer prints the
+5353 note only when the scoping actually happened — claiming it while the rules are still wide open
+would be worse than saying nothing.
+
+Reported by a user on 2026-08-21, immediately after the source-IP fix below cleared their black
+screen.
+
+### The data socket binds the address the control plane arrived on
+
+`bind_data_socket` bound `0.0.0.0:0`, so the kernel chose the video source address from the routing
+table, **independently of the address the client's control connection actually arrived on**. The
+client's data socket is `connect`ed to the host IP it dialled, so its kernel drops every datagram
+from any other source — in the kernel, before userspace, where nothing counts it.
+
+On a host with two live paths to the client (Ethernet and Wi-Fi both up on the same LAN; a
+VPN/overlay adapter claiming the route) that is a permanent black screen with every gauge green: the
+hole-punch still arrives so the host logs `punched=true`, `loss_ppm` stays 0 because there are no
+packets to see gaps in, and QUIC — which quinn pins to the right local address — carries control,
+audio and input perfectly. `from_socket_punch` already documented the mirror of this assumption for
+the *client's* source IP; the host side was never checked.
+
+The socket now binds `Connection::local_ip()` (unmapping an IPv4-mapped v6 address so it can still
+`connect` to a v4 peer), falling back to the wildcard **loudly** when that is unavailable.
+
+Two diagnostics changed with it, because the field session's log could not answer the question:
+
+- the `data plane bound` line carries the socket's post-`connect` `local=` address — the source the
+  kernel will actually stamp — and WARNs when it differs from the address the control plane arrived
+  on.
+- the black-screen ERROR no longer asserts "This is a PATH problem, not decode" and no longer names
+  `punched=false` as *the* fingerprint. It fired with `punched=true` in the field, contradicting its
+  own advice and sending an investigation to the firewall. It now branches on what the bring-up line
+  says, and admits its counter is incremented after decrypt and replay checks, so a session whose
+  every datagram failed to open reports the same zero as one that received nothing.
+
+### `Host::local_ip` re-reads, and mDNS adverts follow it
+
+`Host::detect()` snapshotted the LAN address once at process start and every consumer read that
+frozen field forever. On a cold boot the host wins the race against the network — the Windows
+service is registered `AutoStart` with no dependencies — so `primary_local_ip()`'s route probe to
+8.8.8.8 failed with `ENETUNREACH` and the loopback fallback stuck for the life of the process.
+Restarting the host re-ran `detect()` on a live network, which is the workaround users found.
+
+Four surfaces broke together off that one field: both mDNS adverts (`_punktfunk._udp`,
+`_nvstream._tcp`) published `127.0.0.1` as their A record; `session_url_xml()` handed Moonlight
+`rtsp://127.0.0.1:48010` after `/launch`; `wol::wake_macs()` found no interface for loopback and
+dropped the `mac` TXT record, silently disabling Wake-on-LAN; and `HostInfo.local_ip` reported
+loopback to the web console.
+
+Fixed at the choke point rather than per caller:
+
+- `primary_local_ip()` never returns loopback or the unspecified address. When the route probe
+  fails it falls back to `first_lan_ipv4` — the first non-loopback interface address, which exists
+  as soon as the NIC is configured even if the default route is not installed yet, the common shape
+  of the boot race. It is split out so a test can assert the one thing that matters: it never hands
+  back the loopback `get_if_addrs` also reports.
+- `Host::local_ip` becomes a method that re-reads instead of a field that freezes. A `connect(2)` on
+  an unconnected UDP socket sends no packets and costs nothing beside the HTTP response it is
+  serialized into.
+- mDNS records are **pushed, not polled**: a live advert re-registers when the routed address
+  changes (`discovery::advertise_live`, shared by both service types). It polls the routed address
+  rather than subscribing to the daemon's `IpAdd` events because the boot race usually resolves
+  without one — the NIC often has its address before we register, and only the route lands late.
+
+This also covers the sibling cases that were never reported: DHCP handing out a different lease, and
+a host moved between Wi-Fi and Ethernet.
+
+The re-announce loop's stop signal is now the `mpsc` channel it already sleeps on, rather than an
+`Arc<AtomicBool>` plus a `Drop` impl: the `Advert` dropping its sender wakes the thread immediately
+instead of leaving it to notice a flag up to `IP_RECHECK` (10 s) later.
+
+### Android: the button correction is gated on named triggers, not declared keys
+
+v0.31.1 corrected button positions for pads Android has no key layout for, and gated it on
+`hasKeys(BUTTON_C, BUTTON_Z)`. That gate answers for what a device **declares**, not what it
+reports: `hid-input` allocates `BTN_A + n` straight through for every button in the descriptor, so
+`BTN_C` (`0x132`) and `BTN_Z` (`0x135`) are set on **any** pad declaring six or more buttons —
+including a standard-layout pad that never presses either. The signal was therefore identical on the
+pad that needs correcting and the pad that does not, and no tightening of it could have separated
+them.
+
+Two field reports on 2026-08-21 (a GameSir G8+ and an "Xbox Wireless Controller" over Bluetooth) had
+X answering Y, Y answering LB, and both shoulders answering menu buttons — exactly what
+`GENERIC_XBOX` does to scancodes `0x133`/`0x134`/`0x136`/`0x137`. It is the same pad model on both
+sides of the bug: an Elite Series 2 needed the correction on a Fire TV, and another was broken by it
+here.
+
+What separates them is the **axes**. A HID gamepad describes its triggers either as the
+Accelerator/Brake usages — which become `ABS_GAS`/`ABS_BRAKE`, names Android has words for — or as
+two generic axes on `ABS_Z`/`ABS_RZ`, which it does not. A descriptor well-formed enough to name its
+triggers puts its buttons at the standard positions too. It is also the firmware line on the pad in
+the report: an Xbox Wireless Controller reports GAS/BRAKE after its firmware update and Z/Rz before
+it, and only the older one was ever wrong.
+
+`padButtons` now takes `namedTriggers` and answers `NATIVE` whenever it is set — no correction of
+any kind, on buttons or axes, for a pad Android already reads. `padMap` computed that fact one line
+below and only ever spent it on the axes; it now decides both. `hasKeys` stays for the narrower
+question it can answer — *which* straight-through order, once the axes have established there is
+one — where a false positive costs nothing. This is the same discriminator Moonlight uses
+(`ControllerHandler`, `gasRange == null` beside the `"Xbox Wireless Controller"` name); v0.31.1
+cited its tables and then replaced its discriminator, which is where this came in.
+
+`PadButtonsTest` is at 16 cases, 3 new: the gate holds for every vendor/declaration combination, the
+four reported buttons stay themselves, and the report-order choice past the gate is unchanged.
+
+**Not fixed here:** a DualSense report filed alongside these, with Triangle dead in both the client
+UI and the stream. A button reaching neither is one `buttonBit` maps to nothing, which no branch of
+the correction produces for Triangle.
+
+---
+
 ## v0.31.1
 
 30 commits since v0.31.0 (19 non-merge), counted at the tip this was cut from.
