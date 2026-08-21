@@ -780,7 +780,9 @@ pub(super) async fn negotiate(
     // bind→read→drop→rebind window a concurrent session could race for a fixed port). A fixed
     // `--data-port` yields `direct = true` (stream straight to the client's reported address,
     // no punch-wait); otherwise a random ephemeral port + hole-punch.
-    let (data_sock, direct) = bind_data_socket(data_port)?;
+    // Bound to the address THIS connection arrived on, not the wildcard: the client only accepts
+    // video from the host IP it dialed (see `bind_data_socket`).
+    let (data_sock, direct) = bind_data_socket(data_port, conn.local_ip())?;
     let udp_port = data_sock.local_addr()?.port();
 
     // The session's video geometry (see the `shard_payload` field below). Resolved before the

@@ -3034,11 +3034,19 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                              counted here, so the picture is black and every keyframe we force is \
                              wasted. The control plane is healthy (this report arrived on it), so \
                              the session looks alive: audio, input and the library keep working. \
-                             This is a PATH problem, not decode — check that inbound UDP to this \
-                             host's per-session data port is allowed (the 'data plane bound' line \
-                             above shows `punched=false` when the client's hole-punch never \
-                             arrived, which is the fingerprint), and that no other host or \
-                             firewall is intercepting it"
+                             READ THE 'data plane bound' LINE ABOVE — it says which leg failed, \
+                             and this line cannot. `punched=false`: the client's hole-punch never \
+                             arrived, so inbound UDP to this host's per-session data port is \
+                             blocked — open it (the ports are ephemeral, so the rule must be \
+                             program-scoped, not port-scoped). `punched=true`: inbound is FINE and \
+                             the failure is on the return leg — compare that line's `local=` \
+                             source address against the host address this client dialed, because \
+                             its data socket is connected and its kernel silently drops video from \
+                             any other source. If those match, the datagrams left this host \
+                             correctly and the client either never received them (a hop on the \
+                             path) or received them and could not open them: this counter is \
+                             incremented AFTER decrypt and replay checks, so a session whose every \
+                             datagram failed to open reports exactly this same zero"
                         );
                     } else if matches_client_recovery_cooldown(period) {
                         if client_rx == u32::MAX {
