@@ -365,7 +365,6 @@ pub(crate) async fn serve(
         match crate::gamestream::Host::detect() {
         Ok(h) => crate::discovery::advertise_native(
             &h.hostname,
-            h.local_ip,
             opts.port,
             &fingerprint_hex(&fingerprint),
             opts.require_pairing,

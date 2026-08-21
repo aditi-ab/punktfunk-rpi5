@@ -138,7 +138,6 @@ pub struct Host {
     pub hostname: String,
     /// Stable per-host id (persisted), echoed in serverinfo + matched on pairing.
     pub uniqueid: String,
-    pub local_ip: IpAddr,
     pub http_port: u16,
     pub https_port: u16,
     /// OS identity chain (`windows` | `macos` | `linux[/<family>][/<id>]`), advertised in the
@@ -155,12 +154,24 @@ impl Host {
         Ok(Host {
             hostname: hostname_string(),
             uniqueid: load_or_create_uniqueid()?,
-            local_ip: primary_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             http_port: HTTP_PORT,
             https_port: HTTPS_PORT,
             os_chain: os.chain.clone(),
             os_name: os.pretty.clone(),
         })
+    }
+
+    /// Best-effort primary LAN IP, re-read on every call.
+    ///
+    /// Deliberately NOT a field: [`Host::detect`] runs as the host process starts, which on a cold
+    /// boot is before the machine has an address at all, and a snapshot taken there used to stick
+    /// for the life of the process — the host then advertised itself over mDNS as `127.0.0.1`,
+    /// handed Moonlight an `rtsp://127.0.0.1` session URL, and dropped its Wake-on-LAN MAC record,
+    /// until someone restarted it by hand. Reading live costs a `connect(2)` on an unconnected UDP
+    /// socket (no packets are sent), which is nothing beside the HTTP responses it is serialized
+    /// into. Loopback here means "still no LAN address", not a stale one.
+    pub fn local_ip(&self) -> IpAddr {
+        primary_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
     }
 }
 
@@ -432,7 +443,7 @@ pub fn serve(
     tracing::info!(
         hostname = %state.host.hostname,
         uniqueid = %state.host.uniqueid,
-        ip = %state.host.local_ip,
+        ip = %state.host.local_ip(),
         native_port = native.port,
         require_pairing = native.require_pairing,
         gamestream,
@@ -656,10 +667,35 @@ fn load_or_create_uniqueid() -> Result<String> {
 
 /// Best-effort primary LAN IP: open a UDP socket "toward" a public address and read the
 /// local address the OS would route through. No packets are actually sent.
-fn primary_local_ip() -> Option<IpAddr> {
-    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
-    sock.connect("8.8.8.8:80").ok()?;
-    sock.local_addr().ok().map(|a| a.ip())
+///
+/// Returns `None` — never loopback — when the machine has no LAN address yet, so callers have to
+/// decide what "unknown" means instead of silently inheriting `127.0.0.1`. During a cold boot the
+/// route probe fails outright (the host outruns DHCP: the Windows service is `AutoStart` with no
+/// network dependency), so it falls back to the first non-loopback interface address, which the
+/// NIC has as soon as it is configured even if the default route is not installed yet.
+pub(crate) fn primary_local_ip() -> Option<IpAddr> {
+    let routed = UdpSocket::bind("0.0.0.0:0")
+        .and_then(|sock| {
+            sock.connect("8.8.8.8:80")?;
+            sock.local_addr()
+        })
+        .ok()
+        .map(|a| a.ip())
+        .filter(|ip| usable_lan_ip(*ip));
+    routed.or_else(|| {
+        if_addrs::get_if_addrs()
+            .ok()?
+            .into_iter()
+            .map(|i| i.ip())
+            .find(|ip| ip.is_ipv4() && usable_lan_ip(*ip))
+    })
+}
+
+/// Is `ip` an address a client could actually reach this host on? Loopback and the unspecified
+/// address are both "we don't know yet" dressed up as an answer, and advertising either is the
+/// boot race that made a freshly-restarted host publish itself as `127.0.0.1`.
+fn usable_lan_ip(ip: IpAddr) -> bool {
+    !ip.is_loopback() && !ip.is_unspecified()
 }
 
 /// Where the paired-client allow-list persists (survives host restarts, like Sunshine).
@@ -741,6 +777,44 @@ mod host_name_tests {
 }
 
 #[cfg(test)]
+mod local_ip_tests {
+    use super::{primary_local_ip, usable_lan_ip};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn loopback_and_unspecified_are_never_advertisable() {
+        // The bug: a host that started before its network did advertised these as its address and
+        // kept doing so for the life of the process.
+        for unusable in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        ] {
+            assert!(
+                !usable_lan_ip(unusable),
+                "{unusable} must not be advertised"
+            );
+        }
+        for usable in [
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 173)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)),
+        ] {
+            assert!(usable_lan_ip(usable), "{usable} is reachable and must pass");
+        }
+    }
+
+    #[test]
+    fn probe_reports_no_address_rather_than_loopback() {
+        // Holds on a networked box and on an isolated CI runner alike: either we found a real LAN
+        // address, or we admit we have none. `None` is what lets `Host::local_ip()` and the mDNS
+        // advert keep retrying instead of freezing a wrong answer in place.
+        assert!(primary_local_ip().is_none_or(usable_lan_ip));
+    }
+}
+
+#[cfg(test)]
 mod session_tests {
     use super::*;
 
@@ -748,7 +822,6 @@ mod session_tests {
         let host = Host {
             hostname: "test-host".into(),
             uniqueid: "deadbeef".into(),
-            local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             http_port: HTTP_PORT,
             https_port: HTTPS_PORT,
             os_chain: "linux".into(),

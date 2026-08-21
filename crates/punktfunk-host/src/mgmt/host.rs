@@ -23,13 +23,16 @@ pub(crate) struct Health {
     abi_version: u32,
 }
 
-/// Host identity and advertised capabilities (static for the life of the process).
+/// Host identity and advertised capabilities (static for the life of the process, except
+/// `local_ip`).
 #[derive(Serialize, ToSchema)]
 pub(crate) struct HostInfo {
     hostname: String,
     /// Stable per-host id (persisted across restarts), matched on pairing.
     uniqueid: String,
-    /// Best-effort primary LAN IP.
+    /// Best-effort primary LAN IP, read fresh on every request — a host that started before its
+    /// network did (cold boot) reports `127.0.0.1` only until it actually has an address, and a
+    /// host that moves networks reports the new one. Poll it rather than caching it.
     local_ip: String,
     /// `punktfunk-host` crate version.
     version: String,
@@ -324,7 +327,7 @@ pub(crate) async fn get_host_info(State(st): State<Arc<MgmtState>>) -> Json<Host
     Json(HostInfo {
         hostname: h.hostname.clone(),
         uniqueid: h.uniqueid.clone(),
-        local_ip: h.local_ip.to_string(),
+        local_ip: h.local_ip().to_string(),
         version: env!("PUNKTFUNK_VERSION").into(),
         abi_version: punktfunk_core::ABI_VERSION,
         app_version: APP_VERSION.into(),

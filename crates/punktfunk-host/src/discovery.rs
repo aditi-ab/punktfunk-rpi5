@@ -25,7 +25,10 @@
 use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// The native-protocol mDNS service type. Clients browse this to find punktfunk/1 hosts.
 pub const NATIVE_SERVICE: &str = "_punktfunk._udp.local.";
@@ -81,9 +84,77 @@ pub(crate) fn dns_label(name: &str) -> String {
     }
 }
 
-/// Holds the mDNS daemon; dropping it unregisters the service.
+/// Holds the mDNS daemon; dropping it unregisters the service and stops the re-announce loop.
 pub struct Advert {
     _daemon: ServiceDaemon,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Advert {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// How often a live advert re-checks the address it is announcing.
+const IP_RECHECK: Duration = Duration::from_secs(10);
+
+/// The address to advertise right now — loopback only while the machine still has none.
+fn current_ip() -> IpAddr {
+    crate::gamestream::primary_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+/// Register `build(ip)` for the host's current address, and re-register it whenever that address
+/// changes. Shared by both adverts ([`advertise_native`] and [`crate::gamestream::mdns`]).
+///
+/// mDNS records are PUSHED, not polled: whatever address was true at `register()` keeps being
+/// announced until something registers a newer one. The host process comes up during boot, which
+/// on a cold start is before the machine has an address — so the first registration could be
+/// `127.0.0.1`, and it stayed that way until the host was restarted by hand. `mdns-sd` documents a
+/// second `register()` of the same fullname as an update, so re-announcing is just calling it
+/// again.
+///
+/// Polls the *routed* address rather than subscribing to the daemon's `IpAdd` events, because the
+/// boot race usually resolves without one: the NIC often has its address before we register and
+/// only the default route lands late, so no interface event ever fires.
+pub(crate) fn advertise_live(
+    service: &'static str,
+    build: impl Fn(IpAddr) -> Result<ServiceInfo> + Send + 'static,
+) -> Result<Advert> {
+    let daemon = ServiceDaemon::new().context("create mDNS daemon")?;
+    let registered = current_ip();
+    daemon
+        .register(build(registered)?)
+        .with_context(|| format!("register {service} mDNS service"))?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let (bg_daemon, bg_stop) = (daemon.clone(), stop.clone());
+    std::thread::spawn(move || {
+        let mut announced = registered;
+        while !bg_stop.load(Ordering::Relaxed) {
+            std::thread::sleep(IP_RECHECK);
+            let now = current_ip();
+            if now == announced {
+                continue;
+            }
+            match build(now)
+                .and_then(|info| bg_daemon.register(info).context("re-register mDNS service"))
+            {
+                Ok(()) => {
+                    tracing::info!(service, from = %announced, to = %now, "host address changed — re-announced");
+                    announced = now;
+                }
+                // Leave the previous record standing and retry next tick rather than going dark.
+                Err(e) => {
+                    tracing::warn!(service, error = %format!("{e:#}"), "mDNS re-announce failed");
+                }
+            }
+        }
+    });
+    Ok(Advert {
+        _daemon: daemon,
+        stop,
+    })
 }
 
 /// Advertise the native host on the LAN. `fingerprint` is the host cert SHA-256 (lowercase hex);
@@ -95,7 +166,6 @@ pub struct Advert {
 #[allow(clippy::too_many_arguments)]
 pub fn advertise_native(
     hostname: &str,
-    ip: IpAddr,
     port: u16,
     fingerprint: &str,
     require_pairing: bool,
@@ -103,14 +173,17 @@ pub fn advertise_native(
     mgmt_port: Option<u16>,
     os_chain: &str,
 ) -> Result<Advert> {
-    let daemon = ServiceDaemon::new().context("create mDNS daemon")?;
     // `hostname` is the DISPLAY name (the instance label clients read back); the A-record target
     // has to be a legal DNS name, hence the separate sanitized label.
     let host_name = format!("{}.local.", dns_label(hostname));
-    let mut props: HashMap<String, String> = HashMap::new();
-    props.insert("proto".into(), NATIVE_PROTO.into());
-    props.insert("fp".into(), fingerprint.to_string());
-    props.insert(
+    // Owned, because the record is rebuilt whenever the host's address changes — see
+    // [`advertise_live`]. Everything except the address (and the MACs derived from it) is fixed,
+    // so it is computed once here and moved into the builder.
+    let instance = hostname.to_string();
+    let mut fixed: HashMap<String, String> = HashMap::new();
+    fixed.insert("proto".into(), NATIVE_PROTO.into());
+    fixed.insert("fp".into(), fingerprint.to_string());
+    fixed.insert(
         "pair".into(),
         if require_pairing {
             "required"
@@ -119,31 +192,14 @@ pub fn advertise_native(
         }
         .into(),
     );
-    props.insert("id".into(), uniqueid.to_string());
+    fixed.insert("id".into(), uniqueid.to_string());
     if let Some(mgmt) = mgmt_port {
-        props.insert("mgmt".into(), mgmt.to_string());
+        fixed.insert("mgmt".into(), mgmt.to_string());
     }
     // `os` — advisory OS-identity chain for the client's host-card icon (see module doc).
     if !os_chain.is_empty() {
-        props.insert("os".into(), os_chain.to_string());
+        fixed.insert("os".into(), os_chain.to_string());
     }
-    // `mac` — the host's wake-capable NIC MAC(s), comma-separated `aa:bb:cc:dd:ee:ff`, routed NIC
-    // first. A client persists these while the host is awake so it can send a Wake-on-LAN magic
-    // packet to wake it later (when it's asleep and no longer advertising). Unauthenticated like
-    // the rest of the advert, but a wrong MAC only makes a wake fail — the magic packet is inert
-    // and the cert fingerprint still gates the actual connection. Omitted when none can be read.
-    let macs = crate::wol::wake_macs(ip);
-    if !macs.is_empty() {
-        props.insert("mac".into(), macs.join(","));
-    }
-    // Detect & warn (never modifies) if the routed NIC isn't armed to wake — the usual reason WoL
-    // silently fails.
-    crate::wol::warn_if_not_armed(ip);
-    let service = ServiceInfo::new(NATIVE_SERVICE, hostname, &host_name, ip, port, props)
-        .context("build native mDNS ServiceInfo")?;
-    daemon
-        .register(service)
-        .context("register native mDNS service")?;
     tracing::info!(
         service = "_punktfunk._udp",
         port,
@@ -151,7 +207,26 @@ pub fn advertise_native(
         pair = if require_pairing { "required" } else { "optional" },
         "native punktfunk/1 mDNS advertising"
     );
-    Ok(Advert { _daemon: daemon })
+    advertise_live(NATIVE_SERVICE, move |ip| {
+        let mut props = fixed.clone();
+        // `mac` — the host's wake-capable NIC MAC(s), comma-separated `aa:bb:cc:dd:ee:ff`, routed
+        // NIC first. A client persists these while the host is awake so it can send a
+        // Wake-on-LAN magic packet to wake it later (when it's asleep and no longer advertising).
+        // Unauthenticated like the rest of the advert, but a wrong MAC only makes a wake fail —
+        // the magic packet is inert and the cert fingerprint still gates the actual connection.
+        // Omitted when none can be read, which is what a host that came up before its network did
+        // used to report forever.
+        let macs = crate::wol::wake_macs(ip);
+        if !macs.is_empty() {
+            props.insert("mac".into(), macs.join(","));
+        }
+        // Detect & warn (never modifies) if the routed NIC isn't armed to wake — the usual reason
+        // WoL silently fails. Re-checked on an address change because the routed NIC may be a
+        // different one now.
+        crate::wol::warn_if_not_armed(ip);
+        ServiceInfo::new(NATIVE_SERVICE, &instance, &host_name, ip, port, props)
+            .context("build native mDNS ServiceInfo")
+    })
 }
 
 #[cfg(test)]
