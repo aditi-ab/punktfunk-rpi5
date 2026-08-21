@@ -770,8 +770,24 @@ fn web_setup(args: &[String]) -> Result<()> {
     //    (security-review 2026-08-05 H-3). Same host, same certificate, different port — which is
     //    what makes it a different origin to the browser while staying same-site for the session
     //    cookie. Without this rule, plugin interfaces simply do not load from another device.
+    //    Both rules are scoped to the bundled bun binary that actually listens on them, not left
+    //    open to any program: a port-only `dir=in action=allow` rule admits whatever binds the port
+    //    first, needs no elevation to do so, and suppresses the Windows prompt that would otherwise
+    //    be the only way in (see `service::fw_add_rule_args`). The console child is
+    //    `<app>/bun/bun.exe` — the same path `service.rs`'s supervisor spawns — so the rule follows
+    //    it. If that binary isn't there, fall back to the port-only rule rather than leaving the
+    //    console unreachable, and say which happened.
     let fw_profile =
         crate::service::firewall_profile_arg(crate::service::allow_public_network(args)?);
+    let bun = app_dir.join("bun").join("bun.exe");
+    let program = bun.exists().then_some(bun.as_path());
+    if program.is_none() {
+        eprintln!(
+            "warning: {} not found — the console firewall rules stay open to any program on those \
+             ports instead of only the console",
+            bun.display()
+        );
+    }
     for (name, port) in [
         ("Punktfunk web console (TCP 47992)", "47992"),
         ("Punktfunk plugin UIs (TCP 47993)", "47993"),
@@ -786,21 +802,13 @@ fn web_setup(args: &[String]) -> Result<()> {
                 &format!("name={name}"),
             ],
         );
-        if !run_quiet(
-            "netsh",
-            &[
-                "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                &format!("name={name}"),
-                "dir=in",
-                "action=allow",
-                "protocol=TCP",
-                &format!("localport={port}"),
-                fw_profile,
-            ],
-        ) {
+        if !crate::service::run_netsh(&crate::service::fw_add_rule_args(
+            name,
+            "TCP",
+            Some(port),
+            program,
+            fw_profile,
+        )) {
             eprintln!("warning: could not add the firewall rule for TCP {port}");
         }
     }

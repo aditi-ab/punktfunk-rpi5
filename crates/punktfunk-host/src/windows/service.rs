@@ -1550,14 +1550,79 @@ pub(crate) fn allow_public_network(args: &[String]) -> Result<bool> {
     Ok(fw_public_marker().exists())
 }
 
+/// Build the `netsh advfirewall firewall add rule` argument vector for one inbound allow rule.
+///
+/// `program` is the whole point of this helper existing. A `dir=in action=allow` rule carrying only
+/// `localport=` admits **any process on the machine** on those ports, and binding a high port on
+/// Windows needs no elevation — so such a rule is a standing hole that any unprivileged program can
+/// step into simply by binding first, and it does so *silently*, because our rule is exactly what
+/// suppresses the "Allow this app to communicate on…" prompt Windows would otherwise raise (that
+/// prompt is the UAC gate; without a matching rule there is no way in without one). Naming the
+/// owning executable keeps the ports open for punktfunk and no one else. Reported by a user on
+/// 2026-08-21, and correct: the fixed rules were the last any-program ones we shipped.
+///
+/// `ports` stays alongside it rather than being replaced by it — program AND port is strictly
+/// tighter than either alone, and it is only ever dropped where the port genuinely cannot be known
+/// in advance ([`add_data_plane_firewall_rule`], whose port is ephemeral per session).
+///
+/// `None` for `program` reproduces the old any-program rule, and every caller falls back to it
+/// rather than skipping the rule when it cannot resolve its executable: a looser rule still streams,
+/// no rule at all is a black screen.
+pub(crate) fn fw_add_rule_args(
+    name: &str,
+    proto: &str,
+    ports: Option<&str>,
+    program: Option<&std::path::Path>,
+    profile: &str,
+) -> Vec<String> {
+    let mut args: Vec<String> = ["advfirewall", "firewall", "add", "rule"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.push(format!("name={name}"));
+    args.push("dir=in".into());
+    args.push("action=allow".into());
+    args.push(format!("protocol={proto}"));
+    if let Some(p) = ports {
+        args.push(format!("localport={p}"));
+    }
+    if let Some(exe) = program {
+        args.push(format!("program={}", exe.display()));
+    }
+    args.push(profile.to_string());
+    args
+}
+
+/// [`run_quiet`] for an arg vector built by [`fw_add_rule_args`].
+pub(crate) fn run_netsh(args: &[String]) -> bool {
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_quiet("netsh", &borrowed)
+}
+
 /// Inbound firewall rules for the streaming + mgmt ports (best-effort; logs but never fails the
 /// install). Scoped by [`firewall_profile_arg`]: Domain + Private by default, all profiles when
-/// `allow_public`. TCP 47990 is deliberate: `serve` binds the mgmt/library REST API to all interfaces
-/// so paired clients can browse the game library over mTLS, and off-loopback `mgmt::require_auth`
-/// exposes only the read-only status/library allowlist to a paired client cert — the bearer-token
-/// admin surface stays loopback-only regardless of the bind — so opening it adds no admin exposure.
+/// `allow_public`, and — since 2026-08-21 — to this host executable, so the ports below are open to
+/// punktfunk rather than to anything on the machine that binds them first (see
+/// [`fw_add_rule_args`]). TCP 47990 is deliberate: `serve` binds the mgmt/library REST API to all
+/// interfaces so paired clients can browse the game library over mTLS, and off-loopback
+/// `mgmt::require_auth` exposes only the read-only status/library allowlist to a paired client cert
+/// — the bearer-token admin surface stays loopback-only regardless of the bind — so opening it adds
+/// no admin exposure.
 fn add_firewall_rules(allow_public: bool) {
     let profile = firewall_profile_arg(allow_public);
+    // Resolved once and shared with the data-plane rule below. `service install` re-runs this whole
+    // remove-then-add on every upgrade, so a path recorded here cannot go stale behind a moved
+    // install — which is what previously argued for leaving these rules unscoped.
+    let exe = match std::env::current_exe() {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!(
+                "warning: could not resolve the host executable path ({e}) — the rules below stay \
+                 open to any program on those ports, and the per-session data-plane rule is skipped"
+            );
+            None
+        }
+    };
     // (name suffix, protocol, ports). 47990 = mgmt/library (LAN = read-only, paired-cert only); the
     // rest are the GameStream (47984/47989/48010, 47998-48010) + native (9777) + mDNS (5353) ports.
     let rules = [
@@ -1566,28 +1631,35 @@ fn add_firewall_rules(allow_public: bool) {
     ];
     for (suffix, proto, ports) in rules {
         let name = format!("Punktfunk {suffix}");
-        let ok = run_quiet(
-            "netsh",
-            &[
-                "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                &format!("name={name}"),
-                "dir=in",
-                "action=allow",
-                &format!("protocol={proto}"),
-                &format!("localport={ports}"),
-                profile,
-            ],
-        );
+        let ok = run_netsh(&fw_add_rule_args(
+            &name,
+            proto,
+            Some(ports),
+            exe.as_deref(),
+            profile,
+        ));
         if ok {
-            println!("Firewall rule added: {name} ({ports}) [{profile}]");
+            let scope = match &exe {
+                Some(p) => format!(" for {}", p.display()),
+                None => String::new(),
+            };
+            println!("Firewall rule added: {name} ({ports}{scope}) [{profile}]");
         } else {
             eprintln!("warning: could not add firewall rule '{name}' (add it manually if needed)");
         }
     }
-    add_data_plane_firewall_rule(profile);
+    add_data_plane_firewall_rule(profile, exe.as_deref());
+    // 5353 is now ours alone. Anything else on this machine that answered mDNS through the old
+    // any-program rule needs its own — say so, because it is the one externally visible change.
+    // Only when the scoping actually happened: with no exe path these rules are still wide open,
+    // and claiming otherwise in installer output is worse than saying nothing.
+    if exe.is_some() {
+        println!(
+            "Note: these rules are scoped to the punktfunk host executable, so they no longer open \
+             those ports to every program on this machine. Another mDNS/GameStream application \
+             that relied on punktfunk's rules to be reachable now needs a rule of its own."
+        );
+    }
     if !allow_public {
         println!(
             "Note: streaming ports are open on Private/Domain networks only. On a network Windows \
@@ -1613,35 +1685,29 @@ const FW_DATA_PLANE_RULE: &str = "Punktfunk UDP (data plane)";
 ///
 /// Program-scoped rather than a pinned port: it covers whatever port the session picks, needs no
 /// second rule when the range moves, and cannot collide with another host (a pinned data port in
-/// 47998-48010 would land on Sunshine/Apollo's GameStream range). The port rules above are kept as
-/// they are — an install whose recorded exe path later moves still has its fixed ports open.
-fn add_data_plane_firewall_rule(profile: &str) {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "warning: could not resolve the host executable path ({e}) — skipping the \
-                 data-plane firewall rule; streams may show a black picture behind a healthy \
-                 connection on networks that need the client's hole-punch to open the path"
-            );
-            return;
-        }
+/// 47998-48010 would land on Sunshine/Apollo's GameStream range). This rule is the pattern the
+/// fixed-port rules above now follow too — it is only the `localport=` they keep and this one
+/// cannot have.
+///
+/// `exe` is resolved once by the caller and shared; `None` means it could not be resolved, and this
+/// rule is skipped rather than widened, because a program-less "any inbound UDP on any port" rule is
+/// not a looser version of this — it is an open host.
+fn add_data_plane_firewall_rule(profile: &str, exe: Option<&std::path::Path>) {
+    let Some(exe) = exe else {
+        eprintln!(
+            "warning: no host executable path — skipping the data-plane firewall rule; streams may \
+             show a black picture behind a healthy connection on networks that need the client's \
+             hole-punch to open the path"
+        );
+        return;
     };
-    let ok = run_quiet(
-        "netsh",
-        &[
-            "advfirewall",
-            "firewall",
-            "add",
-            "rule",
-            &format!("name={FW_DATA_PLANE_RULE}"),
-            "dir=in",
-            "action=allow",
-            "protocol=UDP",
-            &format!("program={}", exe.to_string_lossy()),
-            profile,
-        ],
-    );
+    let ok = run_netsh(&fw_add_rule_args(
+        FW_DATA_PLANE_RULE,
+        "UDP",
+        None,
+        Some(exe),
+        profile,
+    ));
     if ok {
         println!(
             "Firewall rule added: {FW_DATA_PLANE_RULE} (any UDP port for {}) [{profile}]",
@@ -1870,5 +1936,57 @@ fn maybe_boot_loop_rollback(restarts: u32, attempted: &mut bool) {
         // Detached on purpose: it stops this service and reinstalls the previous version.
         Ok(child) => drop(child),
         Err(e) => tracing::error!(error = %e, "failed to spawn the rollback installer"),
+    }
+}
+
+#[cfg(test)]
+mod firewall_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Every fixed-port rule must carry BOTH `program=` and `localport=`. Dropping the program
+    /// scope is the regression that matters: the rule still works, streaming still works, and the
+    /// only visible difference is that any unprivileged process on the machine can bind those
+    /// ports and be reachable from the LAN without ever raising a Windows prompt.
+    #[test]
+    fn fixed_port_rules_are_scoped_to_the_program_and_the_ports() {
+        let exe = Path::new(r"C:\Program Files\Punktfunk\punktfunk-host.exe");
+        let args = fw_add_rule_args(
+            "Punktfunk UDP",
+            "UDP",
+            Some("47998-48010,9777,5353"),
+            Some(exe),
+            "profile=domain,private",
+        );
+        assert!(args.contains(&format!("program={}", exe.display())));
+        assert!(args.contains(&"localport=47998-48010,9777,5353".to_string()));
+        assert!(args.contains(&"dir=in".to_string()));
+        assert!(args.contains(&"action=allow".to_string()));
+        assert!(args.contains(&"profile=domain,private".to_string()));
+        assert_eq!(&args[..4], &["advfirewall", "firewall", "add", "rule"]);
+    }
+
+    /// The data plane is the one rule that legitimately has no port: its socket binds `0.0.0.0:0`
+    /// per session. It must therefore never lose its program scope — a program-less "any inbound
+    /// UDP on any port" rule is not a looser version of this rule, it is an open host.
+    #[test]
+    fn the_data_plane_rule_has_a_program_but_no_port() {
+        let exe = Path::new(r"C:\Program Files\Punktfunk\punktfunk-host.exe");
+        let args = fw_add_rule_args(FW_DATA_PLANE_RULE, "UDP", None, Some(exe), "profile=any");
+        assert!(args.contains(&format!("program={}", exe.display())));
+        assert!(
+            !args.iter().any(|a| a.starts_with("localport=")),
+            "the per-session data port is ephemeral — pinning one would close the others"
+        );
+    }
+
+    /// An unresolvable executable falls back to the old any-program rule rather than to no rule:
+    /// a looser rule still streams, a missing one is a black screen. Pinned so the fallback stays
+    /// deliberate rather than becoming an accident.
+    #[test]
+    fn a_missing_program_falls_back_to_the_port_only_rule() {
+        let args = fw_add_rule_args("Punktfunk TCP", "TCP", Some("47990"), None, "profile=any");
+        assert!(!args.iter().any(|a| a.starts_with("program=")));
+        assert!(args.contains(&"localport=47990".to_string()));
     }
 }
