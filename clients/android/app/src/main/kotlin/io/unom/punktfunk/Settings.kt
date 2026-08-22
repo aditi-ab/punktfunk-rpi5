@@ -478,7 +478,12 @@ fun nativeDisplayMode(context: Context): Triple<Int, Int, Int> {
     val mode = display.mode
     val w = mode.physicalWidth
     val h = mode.physicalHeight
-    val hz = mode.refreshRate.toInt().coerceAtLeast(1)
+    // ROUNDED, not truncated: TVs report the fractional NTSC rates over HDMI (59.94, 29.97,
+    // 23.976), and `toInt()` turns 59.94 into 59 — a rate no display mode anywhere has, which the
+    // host then serves by clamping DOWN to the highest mode it advertises at or below it. Rounding
+    // also keeps this agreeing with `MainActivity.streamPanelFps`, which already rounds; the two
+    // describe the same panel and must not disagree.
+    val hz = kotlin.math.round(mode.refreshRate).toInt().coerceAtLeast(1)
     return Triple(maxOf(w, h), minOf(w, h), hz)
 }
 
