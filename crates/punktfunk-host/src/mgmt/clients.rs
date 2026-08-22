@@ -11,7 +11,17 @@ pub(crate) struct PairedClient {
     #[schema(example = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")]
     fingerprint: String,
     /// Certificate subject (e.g. `CN=NVIDIA GameStream Client`), if the DER parses.
+    ///
+    /// Do not display this as a device name. Every moonlight-common-c client self-signs with that
+    /// same fixed subject, so it identifies the *protocol*, not the device — a list of paired
+    /// phones, TVs and handhelds all read identically. [`Self::label`] is the field to show.
     subject: Option<String>,
+    /// Operator-assigned display name for this device, if one has been set (`PATCH /clients/{fp}`).
+    ///
+    /// This is the ONLY thing that can tell two paired Moonlight devices apart in a list, because
+    /// their certificates cannot: see [`Self::subject`]. Absent until somebody names the device.
+    #[schema(example = "Living Room TV")]
+    label: Option<String>,
     /// Certificate validity start (unix seconds).
     not_before_unix: Option<i64>,
     /// Certificate validity end (unix seconds).
@@ -55,25 +65,110 @@ pub(crate) async fn list_paired_clients(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    Json(ders.iter().map(|der| client_info(der)).collect())
+    // One read of the label sidecar for the whole list, not one per row.
+    let labels = crate::gamestream::load_client_labels();
+    Json(ders.iter().map(|der| client_info(der, &labels)).collect())
 }
 
-pub(crate) fn client_info(der: &[u8]) -> PairedClient {
+pub(crate) fn client_info(
+    der: &[u8],
+    labels: &std::collections::BTreeMap<String, String>,
+) -> PairedClient {
     let fingerprint = hex::encode(Sha256::digest(der));
+    let label = labels.get(&fingerprint).cloned();
     match x509_parser::parse_x509_certificate(der) {
         Ok((_, x509)) => PairedClient {
-            fingerprint,
             subject: Some(x509.subject().to_string()),
             not_before_unix: Some(x509.validity().not_before.timestamp()),
             not_after_unix: Some(x509.validity().not_after.timestamp()),
+            label,
+            fingerprint,
         },
         Err(_) => PairedClient {
-            fingerprint,
             subject: None,
             not_before_unix: None,
             not_after_unix: None,
+            label,
+            fingerprint,
         },
     }
+}
+
+/// Body of `PATCH /clients/{fingerprint}` — the device's display name.
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct RenameClient {
+    /// The name to show for this device. `null` (or an empty/whitespace-only string) clears it and
+    /// the device goes back to being listed by fingerprint alone.
+    ///
+    /// Scrubbed before storage by the same sanitizer the native plane runs on device names:
+    /// control characters and Unicode bidi overrides are stripped (they could make one paired
+    /// device impersonate another in this very list), whitespace collapsed, and the result capped
+    /// at 64 characters.
+    #[schema(example = "Living Room TV")]
+    label: Option<String>,
+}
+
+/// Rename a paired client
+///
+/// Sets or clears the operator-visible display name for one paired Moonlight client. This is
+/// purely cosmetic — it touches no certificate and no trust decision — but it is the only way to
+/// tell paired devices apart: every moonlight-common-c client self-signs with the identical
+/// subject `CN=NVIDIA GameStream Client`, so an unnamed list is a row of clones distinguishable
+/// only by fingerprint. The name is stored beside the pairing store and survives host restarts;
+/// unpairing the device forgets it.
+#[utoipa::path(
+    patch,
+    path = "/clients/{fingerprint}",
+    tag = "clients",
+    operation_id = "renameClient",
+    params(
+        ("fingerprint" = String, Path,
+         description = "Hex SHA-256 fingerprint of the client certificate DER (64 chars, case-insensitive)")
+    ),
+    request_body = RenameClient,
+    responses(
+        (status = OK, description = "The client as it now reads", body = PairedClient),
+        (status = BAD_REQUEST, description = "Malformed fingerprint", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = NOT_FOUND, description = "No paired client with that fingerprint", body = ApiError),
+    )
+)]
+pub(crate) async fn rename_client(
+    State(st): State<Arc<MgmtState>>,
+    Path(fingerprint): Path<String>,
+    Json(body): Json<RenameClient>,
+) -> Response {
+    if fingerprint.len() != 64 || !fingerprint.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "fingerprint must be the 64-char hex SHA-256 of the client certificate DER",
+        );
+    }
+    // Only name a device that is actually paired: a label for an unknown fingerprint would be
+    // invisible (nothing lists it) and would sit in the file forever, since the unpair cleanup
+    // only ever removes labels whose device WAS paired.
+    let paired = st.app.paired.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(der) = paired
+        .iter()
+        .find(|der| hex::encode(Sha256::digest(der)).eq_ignore_ascii_case(&fingerprint))
+        .cloned()
+    else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "no paired client with that fingerprint",
+        );
+    };
+    drop(paired);
+    // An all-whitespace name is a cleared name, not a device called "   ": the sanitizer would
+    // otherwise turn it into the "device <fp8>" fallback and the row would look renamed.
+    let wanted = body
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty());
+    crate::gamestream::set_client_label(&fingerprint, wanted);
+    let labels = crate::gamestream::load_client_labels();
+    (StatusCode::OK, Json(client_info(&der, &labels))).into_response()
 }
 
 /// Unpair a client
@@ -119,6 +214,9 @@ pub(crate) async fn unpair_client(
         // restart, which now also matters below: a resurrected pairing would silently
         // re-open the control port.
         crate::gamestream::save_paired(&paired);
+        // Forget this device's display name with it, so the file can't grow without bound and a
+        // later re-pairing of the same certificate starts unnamed.
+        crate::gamestream::retain_client_labels(&paired);
         drop(paired);
         // Revocation reaches a LIVE session too: a mid-stream client whose pairing was just
         // removed must not keep streaming until it chooses to leave. Clearing the launch makes
@@ -187,6 +285,8 @@ pub(crate) async fn unpair_all_clients(State(st): State<Arc<MgmtState>>) -> Resp
     // Persist under the lock, as the single unpair does: a pairing resurrected by a restart would
     // silently re-open the control port.
     crate::gamestream::save_paired(&paired);
+    // Nothing is paired any more, so no label can still belong to anyone.
+    crate::gamestream::retain_client_labels(&paired);
     drop(paired);
     // A mid-stream client must not keep streaming once its pairing is gone. Clearing the launch
     // makes the ENet control thread send the standard TERMINATION+disconnect. (An owner-less

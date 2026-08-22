@@ -1,10 +1,11 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
-import { SlidersHorizontal, Trash2 } from "lucide-react";
+import { Pencil, SlidersHorizontal, Trash2 } from "lucide-react";
 import { type FC, useState } from "react";
 import {
 	getListPairedClientsQueryKey,
 	useListPairedClients,
+	useRenameClient,
 	useUnpairAllClients,
 	useUnpairClient,
 } from "@/api/gen/clients/clients";
@@ -40,8 +41,18 @@ export type PairedProtocol = "native" | "moonlight";
 export interface PairedRow {
 	protocol: PairedProtocol;
 	fingerprint: string;
-	/** Native devices carry a name; Moonlight clients carry a cert subject; either may be empty. */
+	/**
+	 * What to show in the Name column. Native devices carry a name from pairing; a Moonlight client
+	 * shows its operator-given label if it has one, and otherwise falls back to its cert subject —
+	 * which is the same fixed string for every Moonlight client alive, hence [`label`].
+	 */
 	name: string;
+	/**
+	 * The operator-assigned label, Moonlight rows only — `null` when the device has never been
+	 * named. Distinct from `name` because the rename dialog must open on the label alone: seeding
+	 * it with the `CN=…` fallback would make every rename start by deleting boilerplate.
+	 */
+	label?: string | null;
 	/**
 	 * Access fields — native rows only, and only from hosts that have them (the console pairs
 	 * against older hosts: all four stay `undefined` then, and the Access column shows "—").
@@ -67,13 +78,14 @@ const hasAccess = (r: PairedRow): boolean =>
  */
 export const PairedDevicesSection: FC = () => {
 	const qc = useQueryClient();
-	const { confirm } = useDialogs();
+	const { confirm, promptText } = useDialogs();
 	const native = useListNativeClients();
 	const moonlight = useListPairedClients();
 	const unpairNative = useUnpairNativeClient();
 	const unpairMoonlight = useUnpairClient();
 	const unpairAllNative = useUnpairAllNativeClients();
 	const unpairAllMoonlight = useUnpairAllClients();
+	const renameMoonlight = useRenameClient();
 	const patchAccess = useUpdateNativeClientAccess();
 	// One clock for every countdown in the card AND the sheet — recomputed client-side from
 	// `expires_unix`, so the tick never refetches anything.
@@ -97,7 +109,8 @@ export const PairedDevicesSection: FC = () => {
 			(c): PairedRow => ({
 				protocol: "moonlight",
 				fingerprint: c.fingerprint,
-				name: c.subject ?? "",
+				name: c.label ?? c.subject ?? "",
+				label: c.label,
 			}),
 		),
 	];
@@ -127,6 +140,32 @@ export const PairedDevicesSection: FC = () => {
 				},
 			);
 		}
+	};
+
+	/**
+	 * Name a Moonlight device. Every Moonlight client presents the identical certificate subject,
+	 * so without this the list is a column of `CN=NVIDIA GameStream Client` rows and the only way
+	 * to tell a phone from a TV — or to know which one you are about to unpair — is the
+	 * fingerprint. Submitting an empty field clears the name (the host reads that as "unnamed"),
+	 * which is why cancel (`null`) and empty are handled differently here.
+	 */
+	const onRename = async (row: PairedRow) => {
+		const next = await promptText({
+			title: m.clients_rename_title(),
+			description: m.clients_rename_body(),
+			label: m.clients_rename_label(),
+			defaultValue: row.label ?? "",
+			confirmLabel: m.action_rename(),
+		});
+		if (next === null) return;
+		renameMoonlight.mutate(
+			{ fingerprint: row.fingerprint, data: { label: next.trim() || null } },
+			{
+				onSuccess: () =>
+					qc.invalidateQueries({ queryKey: getListPairedClientsQueryKey() }),
+				onError: () => toast.error(m.clients_rename_failed()),
+			},
+		);
 	};
 
 	const savedAccess = () => {
@@ -218,6 +257,7 @@ export const PairedDevicesSection: FC = () => {
 						expiresUnix: r.expiresUnix,
 					})
 				}
+				onRename={onRename}
 				onUnpair={onUnpair}
 				onUnpairAll={onUnpairAll}
 				pendingFingerprint={pendingFingerprint}
@@ -246,6 +286,11 @@ export const PairedDevices: FC<{
 	nowUnix: number;
 	/** Open the access editor for a native row (only offered where `hasAccess`). */
 	onEditAccess: (row: PairedRow) => void;
+	/**
+	 * Name a Moonlight row. Offered only on those: a native device already carries the name it gave
+	 * at pairing, while a Moonlight certificate carries nothing that identifies the device at all.
+	 */
+	onRename: (row: PairedRow) => void;
 	onUnpair: (protocol: PairedProtocol, fingerprint: string) => void;
 	/** Unpair every row, behind one confirmation. */
 	onUnpairAll: () => void;
@@ -260,6 +305,7 @@ export const PairedDevices: FC<{
 	refetch,
 	nowUnix,
 	onEditAccess,
+	onRename,
 	onUnpair,
 	onUnpairAll,
 	pendingFingerprint,
@@ -342,6 +388,20 @@ export const PairedDevices: FC<{
 									</TableCell>
 									<TableCell>
 										<div className="flex justify-end">
+											{r.protocol === "moonlight" && (
+												<Button
+													variant="ghost"
+													size="icon"
+													aria-label={m.action_rename()}
+													disabled={
+														isUnpairingAll ||
+														pendingFingerprint === r.fingerprint
+													}
+													onClick={() => onRename(r)}
+												>
+													<Pencil className="size-4" />
+												</Button>
+											)}
 											{hasAccess(r) && (
 												<Button
 													variant="ghost"

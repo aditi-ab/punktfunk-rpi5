@@ -328,7 +328,8 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
             clients::list_paired_clients,
             clients::unpair_all_clients
         ))
-        .routes(routes!(clients::unpair_client));
+        // DELETE and PATCH share `/clients/{fingerprint}` — one `routes!`, same rule as above.
+        .routes(routes!(clients::unpair_client, clients::rename_client));
     // The GameStream PIN flow exists only when the compat planes do (WP19) — a native-only
     // build's API (and its OpenAPI document) simply has no such endpoints.
     #[cfg(feature = "gamestream")]

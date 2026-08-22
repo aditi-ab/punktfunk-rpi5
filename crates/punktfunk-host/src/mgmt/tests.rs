@@ -1001,6 +1001,154 @@ async fn paired_clients_list_and_unpair() {
     assert_eq!(body["unpaired"], 0);
 }
 
+/// Renaming a paired Moonlight client: the round trip, the scrub, the clear, and the cleanup.
+///
+/// Worth a test because the label is the ONLY thing that distinguishes two paired Moonlight
+/// devices — their certificates all carry the same subject — so "the name silently didn't stick"
+/// is indistinguishable from "the device is the other one" in the console.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn client_label_round_trips_scrubs_and_is_forgotten_on_unpair() {
+    struct EnvGuard(Option<std::ffi::OsString>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                // SAFETY: dropped while this test still holds CONFIG_DIR_TEST_LOCK.
+                Some(v) => unsafe { std::env::set_var("PUNKTFUNK_CONFIG_DIR", v) },
+                // SAFETY: as above.
+                None => unsafe { std::env::remove_var("PUNKTFUNK_CONFIG_DIR") },
+            }
+        }
+    }
+    let _serial = crate::identity::CONFIG_DIR_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = EnvGuard(std::env::var_os("PUNKTFUNK_CONFIG_DIR"));
+    // SAFETY: `_serial` holds CONFIG_DIR_TEST_LOCK, serializing every test touching this var.
+    unsafe { std::env::set_var("PUNKTFUNK_CONFIG_DIR", tmp.path()) };
+
+    let state = test_state();
+    let app = test_app(state.clone(), None);
+    let stand_in = crate::identity::ephemeral().unwrap();
+    let (_, pem) = x509_parser::pem::parse_x509_pem(stand_in.cert_pem.as_bytes()).unwrap();
+    let der = pem.contents.clone();
+    let fingerprint = hex::encode(Sha256::digest(&der));
+    {
+        let mut p = state.paired.lock().unwrap();
+        p.clear();
+        p.push(der.clone());
+    }
+
+    let patch = |fp: String, body: serde_json::Value| {
+        axum::http::Request::patch(format!("/api/v1/clients/{fp}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    // Unnamed until somebody names it — the field is absent, not an empty string.
+    let (_, body) = send(&app, get_req("/api/v1/clients")).await;
+    assert!(body[0]["label"].is_null());
+
+    // Name it (uppercase fingerprint must match too — the path is documented case-insensitive).
+    let (status, body) = send(
+        &app,
+        patch(
+            fingerprint.to_uppercase(),
+            serde_json::json!({ "label": "Living Room TV" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["label"], "Living Room TV");
+    let (_, body) = send(&app, get_req("/api/v1/clients")).await;
+    assert_eq!(body[0]["label"], "Living Room TV");
+
+    // The scrub runs: a bidi override could make one paired device read like another in the very
+    // list an operator uses to decide what to unpair, and the whitespace collapse keeps the name
+    // one line. (`\u{202E}` = RIGHT-TO-LEFT OVERRIDE.)
+    let (_, body) = send(
+        &app,
+        patch(
+            fingerprint.clone(),
+            serde_json::json!({ "label": "  Deck\u{202E}evil\n\nx  " }),
+        ),
+    )
+    .await;
+    assert_eq!(body["label"], "Deckevil x");
+
+    // Whitespace-only clears rather than storing a device called "   " (or the sanitizer's
+    // "device <fp8>" fallback, which would look like a successful rename).
+    let (_, body) = send(
+        &app,
+        patch(fingerprint.clone(), serde_json::json!({ "label": "   " })),
+    )
+    .await;
+    assert!(body["label"].is_null());
+
+    // …and an explicit null clears too.
+    send(
+        &app,
+        patch(
+            fingerprint.clone(),
+            serde_json::json!({ "label": "Bedroom" }),
+        ),
+    )
+    .await;
+    let (_, body) = send(
+        &app,
+        patch(fingerprint.clone(), serde_json::json!({ "label": null })),
+    )
+    .await;
+    assert!(body["label"].is_null());
+
+    // Malformed fingerprint → 400; unknown-but-well-formed → 404 (naming a device that is not
+    // paired would write a label nothing can ever list or clean up).
+    assert_eq!(
+        send(
+            &app,
+            patch("zz".into(), serde_json::json!({ "label": "x" }))
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        send(
+            &app,
+            patch("aa".repeat(32), serde_json::json!({ "label": "x" }))
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+
+    // Unpairing forgets the name: it must not survive to be inherited by a later re-pairing of
+    // the same certificate.
+    send(
+        &app,
+        patch(
+            fingerprint.clone(),
+            serde_json::json!({ "label": "Living Room TV" }),
+        ),
+    )
+    .await;
+    let del = axum::http::Request::delete(format!("/api/v1/clients/{fingerprint}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&app, del).await.0, StatusCode::NO_CONTENT);
+    let on_disk: std::collections::BTreeMap<String, String> =
+        std::fs::read(tmp.path().join("client-labels.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+    assert!(
+        !on_disk.contains_key(&fingerprint),
+        "unpair must forget the device's label, got {on_disk:?}"
+    );
+}
+
 #[cfg(feature = "gamestream")]
 #[tokio::test]
 async fn submit_pin_validates_and_requires_pending_pairing() {
@@ -1378,6 +1526,12 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         // roster's read permission must never carry over to emptying it.
         ("DELETE", "/api/v1/clients", false, false),
         ("DELETE", "/api/v1/clients/{fingerprint}", false, false),
+        // Renaming is cosmetic but NOT harmless, so it takes the same lanes as removal rather than
+        // the roster's read permission: the label is the only thing distinguishing one paired
+        // Moonlight device from another in the console, so anything that could set it could dress
+        // its own device up as the operator's TV — and be trusted, or spared an unpair, on that
+        // basis. Sharing a path with the plugin-forbidden DELETE, it needs its own row anyway.
+        ("PATCH", "/api/v1/clients/{fingerprint}", false, false),
         ("GET", "/api/v1/native/clients", true, false),
         ("DELETE", "/api/v1/native/clients", false, false),
         (
