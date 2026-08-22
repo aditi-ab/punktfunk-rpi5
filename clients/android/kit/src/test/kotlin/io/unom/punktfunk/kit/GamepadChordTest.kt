@@ -1,6 +1,7 @@
 package io.unom.punktfunk.kit
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -153,6 +154,44 @@ class GamepadChordTest {
         pad.press(Gamepad.BTN_X)
         pad.press(Gamepad.BTN_Y)
         assertEquals(instantChords, pad.press(Gamepad.BTN_BACK))
+    }
+
+    /**
+     * A pad's own mute button (a DualSense's) is a second trigger for the mic toggle, and
+     * `slotButton` reads it through the SAME edge rule expressed as a one-button chord.
+     *
+     * That is not decoration. `onButton` deliberately still calls `slotButton(down = true)` on
+     * auto-repeat and suppresses only the wire send (its repeatCount guard), so a plain
+     * `bit == BTN_MISC1` would toggle the mic on every repeat — hold the button and the mic
+     * flaps. `completesChord` against a single-bit mask is exactly "a fresh press of it".
+     *
+     * The other half is which buttons must NOT reach it. `0x13e` is R3 on every pad but a
+     * driverless Sony one, so a mapping that leaked touchpad/mute meanings outside
+     * [Gamepad.PadButtons.GENERIC_SONY] would put the mic toggle on every R3 press in the house.
+     *
+     * `slotButton` ANDs this rule with `Slot.hasMuteButton`, because BTN_MISC1 is the wire's
+     * misc/QAM bit and a Steam Controller 2's QAM button rides it too. That term needs a live
+     * `Slot`, which needs an InputManager and a main Looper, so it is out of reach from here —
+     * the edge rule below is the half a unit test can hold.
+     */
+    @Test
+    fun `the mute button toggles the mic once per press`() {
+        fun fires(wasHeld: Int, bit: Int) =
+            GamepadRouter.completesChord(wasHeld, bit, Gamepad.BTN_MISC1)
+
+        assertTrue("a fresh press must toggle", fires(0, Gamepad.BTN_MISC1))
+        assertFalse("auto-repeat re-fired the toggle", fires(Gamepad.BTN_MISC1, Gamepad.BTN_MISC1))
+        assertTrue(
+            "a press while other buttons are held is still a fresh press",
+            fires(Gamepad.BTN_A or Gamepad.BTN_BACK, Gamepad.BTN_MISC1),
+        )
+        for (other in listOf(
+            Gamepad.BTN_A, Gamepad.BTN_X, Gamepad.BTN_Y, Gamepad.BTN_BACK,
+            Gamepad.BTN_LS_CLICK, Gamepad.BTN_RS_CLICK, Gamepad.BTN_GUIDE, Gamepad.BTN_TOUCHPAD,
+        )) {
+            assertFalse("$other toggled the mic", fires(0, other))
+            assertFalse("$other toggled the mic under a held mute", fires(Gamepad.BTN_MISC1, other))
+        }
     }
 
     /** The chord bits are the wire's, so they must stay inside the 32-bit button mask. */

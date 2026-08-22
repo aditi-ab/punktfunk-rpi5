@@ -64,12 +64,44 @@ class PadButtonsTest {
         assertEquals(KeyEvent.KEYCODE_BUTTON_MODE, sony(0x13c)) // PS
     }
 
-    /** The touchpad click and mute have no wire button; they must resolve to nothing, not to R3. */
+    /**
+     * The touchpad click and the mute button reach the wire, on the two bits that exist for them.
+     * Android has no keycode for either, so [Gamepad.PadButtons.GENERIC_SONY] borrows BUTTON_15
+     * and BUTTON_16 to carry them into [Gamepad.buttonBit] — the keycode is an implementation
+     * detail of that hop, the BIT is the contract, so both halves are pinned here.
+     */
     @Test
-    fun `a DualSense's touchpad and mute are dropped rather than mistaken`() {
-        assertEquals(KeyEvent.KEYCODE_UNKNOWN, sony(0x13d))
-        assertEquals(KeyEvent.KEYCODE_UNKNOWN, sony(0x13e))
-        assertEquals(0, Gamepad.buttonBit(sony(0x13d)))
+    fun `a DualSense's touchpad and mute reach their wire buttons`() {
+        assertEquals(KeyEvent.KEYCODE_BUTTON_15, sony(0x13d))
+        assertEquals(KeyEvent.KEYCODE_BUTTON_16, sony(0x13e))
+        assertEquals(Gamepad.BTN_TOUCHPAD, Gamepad.buttonBit(sony(0x13d)))
+        assertEquals(Gamepad.BTN_MISC1, Gamepad.buttonBit(sony(0x13e)))
+    }
+
+    /**
+     * The regression the touchpad/mute mapping is one hoist away from causing, and the reason it
+     * lives inside GENERIC_SONY rather than anywhere above `padMap(dev)`.
+     *
+     * `0x13d`/`0x13e` are `BTN_THUMBL`/`BTN_THUMBR` — L3 and R3 — in the standard Linux/AOSP
+     * mapping, which is what [Gamepad.genericKeyCode] says they are. They mean touchpad click and
+     * mute ONLY inside the straight-through enumeration a driverless Sony pad uses. Read as
+     * touchpad and mute anywhere else, every Xbox pad, Switch Pro, 8BitDo, Steam Deck and
+     * `hid-playstation` DualSense loses both stick clicks — and R3 starts toggling the microphone.
+     */
+    @Test
+    fun `every other pad keeps L3 and R3 on those scancodes`() {
+        for (p in listOf(
+            Gamepad.PadButtons.NATIVE,
+            Gamepad.PadButtons.GENERIC_XBOX,
+            Gamepad.PadButtons.SONY_MODERN,
+        )) {
+            val l3 = p.correct(0x13d, Gamepad.genericKeyCode(0x13d))
+            val r3 = p.correct(0x13e, Gamepad.genericKeyCode(0x13e))
+            assertEquals("$p L3", KeyEvent.KEYCODE_BUTTON_THUMBL, l3)
+            assertEquals("$p R3", KeyEvent.KEYCODE_BUTTON_THUMBR, r3)
+            assertEquals("$p L3 bit", Gamepad.BTN_LS_CLICK, Gamepad.buttonBit(l3))
+            assertEquals("$p R3 bit", Gamepad.BTN_RS_CLICK, Gamepad.buttonBit(r3))
+        }
     }
 
     /** An Xbox-layout pad numbering straight through: A B X Y LB RB View Menu LS RS. */
@@ -113,6 +145,30 @@ class PadButtonsTest {
         assertEquals(
             KeyEvent.KEYCODE_BACK,
             Gamepad.PadButtons.GENERIC_SONY.correct(158, KeyEvent.KEYCODE_BACK),
+        )
+    }
+
+    /**
+     * The guard's NEGATIVE path — the half that decides anything.
+     *
+     * The cases above all deliver the keycode `Generic.kl` would have produced, so the guard is
+     * transparent in every one of them and the assertions would hold with it deleted. These are
+     * the ones that fail without it: a device-specific key layout answering something the table
+     * disagrees with, on a scancode the table has an opinion about. The layout wins — it knows
+     * this controller, and the table is only ever a guess about a pad nothing knew.
+     */
+    @Test
+    fun `a device layout outranks the table on a scancode the table would have rewritten`() {
+        // `Generic.kl` calls 0x134 BUTTON_Y, and GENERIC_SONY/GENERIC_XBOX both rewrite that
+        // scancode to BUTTON_L1. A layout that says BUTTON_X must survive both.
+        for (p in listOf(Gamepad.PadButtons.GENERIC_SONY, Gamepad.PadButtons.GENERIC_XBOX)) {
+            assertEquals("$p", KeyEvent.KEYCODE_BUTTON_X, p.correct(0x134, KeyEvent.KEYCODE_BUTTON_X))
+        }
+        // And the two rows added for the touchpad and mute are no different: a pad whose layout
+        // resolved 0x13d itself keeps that answer rather than the borrowed BUTTON_15.
+        assertEquals(
+            KeyEvent.KEYCODE_BUTTON_1,
+            Gamepad.PadButtons.GENERIC_SONY.correct(0x13d, KeyEvent.KEYCODE_BUTTON_1),
         )
     }
 
