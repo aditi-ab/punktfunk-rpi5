@@ -126,6 +126,14 @@ impl Scanner {
         Some(ProcRef { pid, start })
     }
 
+    /// This process's `comm` — its short name, as `ps` shows it. Diagnostics only (see
+    /// [`super::names`]); `?` for a process that has already gone, which is routine.
+    pub fn name_of(&self, p: ProcRef) -> String {
+        std::fs::read_to_string(self.root.join(p.pid.to_string()).join("comm"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "?".into())
+    }
+
     /// Which of `procs` are still the same live processes — pid present **and** start time unchanged,
     /// so a recycled pid is never reported alive (rule 2).
     pub fn alive(&self, procs: &[ProcRef]) -> Vec<ProcRef> {
@@ -180,16 +188,29 @@ impl Scanner {
             if let Some(tok) = steam_tok {
                 // Both tokens together, exact-matched, so `AppId=57` never satisfies appid 570 and
                 // Steam's own (non-reaper) helper steps aren't mistaken for the game.
+                //
+                // …with one exception, because the reaper is *not* only the game's: Steam wraps its
+                // shader pre-caching for a title in the same `SteamLaunch AppId=<appid>` reaper it
+                // wraps the game in, so that job satisfies this recipe exactly while the game has
+                // not started yet. Adopting it points the lease at a tree that exits when the
+                // compile finishes, which reads as the game exiting — on Linux that dropped a
+                // Rocket League stream 10 s into a launch, mid-"Processing Vulkan shaders", and the
+                // player had to launch a second time to get a session that stayed up (field report
+                // 2026-08-22). The payload names itself: `fossilize_replay` is Steam's replayer and
+                // is never a game.
                 let mut launch = false;
                 let mut appid = false;
+                let mut shader = false;
                 for arg in cmdline.split(|&b| b == 0) {
                     if arg == b"SteamLaunch" {
                         launch = true;
                     } else if arg == tok.as_bytes() {
                         appid = true;
+                    } else if program_name(arg) == b"fossilize_replay" {
+                        shader = true;
                     }
                 }
-                if launch && appid {
+                if launch && appid && !shader {
                     return true;
                 }
             }
@@ -244,6 +265,15 @@ impl Scanner {
         let stat = std::fs::read_to_string(dir_path.join("stat")).ok()?;
         let tail = &stat[stat.rfind(')')? + 1..];
         tail.split_whitespace().nth(19)?.parse().ok()
+    }
+}
+
+/// The last `/`-separated component of an argv entry — the program's own name, when the entry is a
+/// path to one. Bytes rather than `str` because an argv entry is not required to be UTF-8.
+fn program_name(arg: &[u8]) -> &[u8] {
+    match arg.iter().rposition(|&b| b == b'/') {
+        Some(i) => &arg[i + 1..],
+        None => arg,
     }
 }
 
@@ -470,6 +500,42 @@ mod tests {
         let s = scanner(td.path());
         assert_eq!(pids(s.find(&DetectSpec::steam(570), None)), vec![30]);
         assert_eq!(pids(s.find(&DetectSpec::steam(57), None)), vec![31]);
+    }
+
+    /// The 2026-08-22 field report: Steam's **shader pre-caching** runs under the game's own
+    /// `SteamLaunch AppId=` reaper, so it satisfies the appid recipe while the game has not started.
+    ///
+    /// Adopting it is what dropped a Rocket League stream 10 s into a launch — the lease called that
+    /// tree the game, and its exit (the compile finishing) the game exiting. The reaper's payload is
+    /// the whole tell, and it is only ever Steam's replayer.
+    #[test]
+    fn steam_shader_pre_caching_is_not_the_game() {
+        let td = fake_proc_root(
+            1000.0,
+            &[
+                // The shader job for this very appid — the game is still being brought up.
+                FakeProc::new(35, 50_000).cmdline(&[
+                    "/home/p/.steam/ubuntu12_32/reaper",
+                    "SteamLaunch",
+                    "AppId=252950",
+                    "--",
+                    "/home/p/.steam/steamapps/common/SteamLinuxRuntime/fossilize_replay",
+                    "/home/p/.steam/steamapps/shadercache/252950/fozpipelinesv6/steamapprun_pipeline_cache.foz",
+                ]),
+                // The game itself, same appid, same reaper. This one IS the game.
+                FakeProc::new(36, 50_000).cmdline(&[
+                    "/home/p/.steam/ubuntu12_32/reaper",
+                    "SteamLaunch",
+                    "AppId=252950",
+                    "--",
+                    "/home/p/.steam/steamapps/common/Proton/proton",
+                    "waitforexitandrun",
+                    "/home/p/.steam/steamapps/common/rocketleague/RocketLeague.exe",
+                ]),
+            ],
+        );
+        let s = scanner(td.path());
+        assert_eq!(pids(s.find(&DetectSpec::steam(252_950), None)), vec![36]);
     }
 
     #[test]
