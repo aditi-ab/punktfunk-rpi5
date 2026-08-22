@@ -3748,7 +3748,8 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             inflight.clear();
             last_au_at = std::time::Instant::now();
             encoder_resets = 0;
-            last_forced_idr = Some(std::time::Instant::now()); // a fresh encoder opens on an IDR
+            // A fresh encoder opens on an IDR — anchor the cooldown.
+            last_forced_idr = Some(std::time::Instant::now());
             // The client's mode slot still says the old size, and its stats/aspect follow it.
             // Publish what it is really decoding now, exactly as an accepted resize does.
             live_mode.store(
