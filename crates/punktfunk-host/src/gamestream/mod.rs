@@ -760,6 +760,106 @@ pub(crate) fn save_paired(paired: &[Vec<u8>]) {
     }
 }
 
+/// Where the operator's per-client display labels persist, keyed by certificate fingerprint.
+///
+/// A SIDECAR to [`paired_path`] rather than a field inside it, for two reasons. `paired.json` is a
+/// bare `Vec<Vec<u8>>` of certificate DERs — giving it a shape would be a migration on the one file
+/// that decides who may connect — and a label is not part of that trust decision, so a corrupt or
+/// missing label file must never be able to lock anybody out. Losing this file loses names, nothing
+/// else.
+///
+/// Why labels have to exist at all: every moonlight-common-c client self-signs with the SAME
+/// subject (`CN=NVIDIA GameStream Client`), so the certificate carries no device identity
+/// whatsoever. Without an operator-supplied name, a list of five paired devices is five identical
+/// rows and the only way to tell them apart — or to know which one to unpair — is the fingerprint.
+fn labels_path() -> Option<std::path::PathBuf> {
+    Some(pf_paths::config_dir().join("client-labels.json"))
+}
+
+/// Serializes the read-modify-write in [`set_client_label`]. Two concurrent renames would
+/// otherwise race on a whole-file rewrite and silently drop one of the two names.
+static LABELS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Load the fingerprint → label map (empty on first run, unreadable file, or parse failure — a
+/// label is cosmetic, so every failure degrades to "no names" and never to an error).
+pub(crate) fn load_client_labels() -> std::collections::BTreeMap<String, String> {
+    let Some(path) = labels_path() else {
+        return Default::default();
+    };
+    let Ok(raw) = std::fs::read(&path) else {
+        return Default::default();
+    };
+    serde_json::from_slice(&raw).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "client-labels.json unreadable — listing clients without names");
+        Default::default()
+    })
+}
+
+/// Set (`Some`) or clear (`None`) one client's label, persisted atomically. Returns the stored
+/// label. Fingerprints are normalized to lowercase hex so a rename and a later lookup agree
+/// regardless of how the caller cased the path parameter.
+pub(crate) fn set_client_label(fp_hex: &str, label: Option<&str>) -> Option<String> {
+    let _guard = LABELS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fp = fp_hex.to_ascii_lowercase();
+    let mut labels = load_client_labels();
+    let stored = match label {
+        Some(l) => {
+            let clean = crate::native_pairing::sanitize_device_name(l, &fp);
+            labels.insert(fp, clean.clone());
+            Some(clean)
+        }
+        None => {
+            labels.remove(&fp);
+            None
+        }
+    };
+    save_client_labels(&labels);
+    stored
+}
+
+/// Drop the labels of fingerprints that are no longer paired. Called from the unpair paths so the
+/// file cannot grow without bound as devices come and go, and so a re-pairing of the same
+/// certificate starts unnamed rather than inheriting a stranger's name.
+pub(crate) fn retain_client_labels(still_paired: &[Vec<u8>]) {
+    use sha2::{Digest, Sha256};
+    let _guard = LABELS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let live: std::collections::BTreeSet<String> = still_paired
+        .iter()
+        .map(|der| hex::encode(Sha256::digest(der)))
+        .collect();
+    let mut labels = load_client_labels();
+    let before = labels.len();
+    labels.retain(|fp, _| live.contains(fp));
+    if labels.len() != before {
+        save_client_labels(&labels);
+    }
+}
+
+/// Persist the label map — same atomic temp-file + rename as [`save_paired`], so a crash mid-write
+/// cannot truncate it.
+fn save_client_labels(labels: &std::collections::BTreeMap<String, String>) {
+    let Some(path) = labels_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = pf_paths::create_private_dir(dir);
+    }
+    let bytes = match serde_json::to_vec(labels) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "serializing client labels failed");
+            return;
+        }
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = pf_paths::write_secret_file(&tmp, &bytes) {
+        tracing::warn!(error = %e, "persisting client labels failed (temp write)");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        tracing::warn!(error = %e, "persisting client labels failed (rename)");
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 #[cfg(test)]
 mod host_name_tests {
     use super::sanitize_display_name;

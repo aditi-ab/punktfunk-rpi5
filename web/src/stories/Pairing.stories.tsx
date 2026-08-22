@@ -29,7 +29,8 @@ const nativeRows: PairedRow[] = nativeClients.map((c) => ({
 const moonlightRows: PairedRow[] = pairedClients.map((c) => ({
 	protocol: "moonlight" as const,
 	fingerprint: c.fingerprint,
-	name: c.subject ?? "",
+	name: c.label ?? c.subject ?? "",
+	label: c.label,
 }));
 
 // Renders the REAL page layout (PairingView) — the same component index.tsx uses. The live page
@@ -84,6 +85,7 @@ export const Armed: Story = {
 				refetch={noop}
 				nowUnix={accessNowUnix}
 				onEditAccess={noop}
+				onRename={noop}
 				onUnpair={noop}
 				onUnpairAll={noop}
 				pendingFingerprint={null}

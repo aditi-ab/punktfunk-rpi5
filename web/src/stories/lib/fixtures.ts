@@ -120,6 +120,9 @@ export const pairedClients: PairedClient[] = [
 		fingerprint:
 			"ff00eeddccbbaa998877665544332211009f8e7d6c5b4a39281706f5e4d3c2b1",
 		subject: "living-room-tv",
+		// Named by the operator — the row that shows what a rename buys you next to a sibling that
+		// still reads as its (identical-for-everyone) certificate subject.
+		label: "Living Room TV",
 		not_before_unix: 1_718_500_000,
 		not_after_unix: 2_030_000_000,
 	},

@@ -364,6 +364,77 @@
             }
           }
         }
+      },
+      "patch": {
+        "tags": [
+          "clients"
+        ],
+        "summary": "Rename a paired client",
+        "description": "Sets or clears the operator-visible display name for one paired Moonlight client. This is\npurely cosmetic — it touches no certificate and no trust decision — but it is the only way to\ntell paired devices apart: every moonlight-common-c client self-signs with the identical\nsubject `CN=NVIDIA GameStream Client`, so an unnamed list is a row of clones distinguishable\nonly by fingerprint. The name is stored beside the pairing store and survives host restarts;\nunpairing the device forgets it.",
+        "operationId": "renameClient",
+        "parameters": [
+          {
+            "name": "fingerprint",
+            "in": "path",
+            "description": "Hex SHA-256 fingerprint of the client certificate DER (64 chars, case-insensitive)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenameClient"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The client as it now reads",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PairedClient"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed fingerprint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No paired client with that fingerprint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/compositors": {
@@ -7375,6 +7446,14 @@
             "description": "Lowercase hex SHA-256 of the client certificate DER — the client's stable id here.",
             "example": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
           },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Operator-assigned display name for this device, if one has been set (`PATCH /clients/{fp}`).\n\nThis is the ONLY thing that can tell two paired Moonlight devices apart in a list, because\ntheir certificates cannot: see [`Self::subject`]. Absent until somebody names the device.",
+            "example": "Living Room TV"
+          },
           "not_after_unix": {
             "type": [
               "integer",
@@ -7396,7 +7475,7 @@
               "string",
               "null"
             ],
-            "description": "Certificate subject (e.g. `CN=NVIDIA GameStream Client`), if the DER parses."
+            "description": "Certificate subject (e.g. `CN=NVIDIA GameStream Client`), if the DER parses.\n\nDo not display this as a device name. Every moonlight-common-c client self-signs with that\nsame fixed subject, so it identifies the *protocol*, not the device — a list of paired\nphones, TVs and handhelds all read identically. [`Self::label`] is the field to show."
           }
         }
       },
@@ -7946,6 +8025,20 @@
           "text": {
             "type": "string",
             "description": "Plain-language instruction. English fallback — the console overrides it by check id."
+          }
+        }
+      },
+      "RenameClient": {
+        "type": "object",
+        "description": "Body of `PATCH /clients/{fingerprint}` — the device's display name.",
+        "properties": {
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The name to show for this device. `null` (or an empty/whitespace-only string) clears it and\nthe device goes back to being listed by fingerprint alone.\n\nScrubbed before storage by the same sanitizer the native plane runs on device names:\ncontrol characters and Unicode bidi overrides are stripped (they could make one paired\ndevice impersonate another in this very list), whitespace collapsed, and the result capped\nat 64 characters.",
+            "example": "Living Room TV"
           }
         }
       },

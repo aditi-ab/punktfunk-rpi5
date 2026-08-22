@@ -25,7 +25,8 @@ const nativeRows: PairedRow[] = nativeClients.map((c) => ({
 const moonlightRows: PairedRow[] = pairedClients.map((c) => ({
 	protocol: "moonlight" as const,
 	fingerprint: c.fingerprint,
-	name: c.subject ?? "",
+	name: c.label ?? c.subject ?? "",
+	label: c.label,
 }));
 
 // Per-client access states, separate from Pages/Pairing: these stories render single components
@@ -106,6 +107,7 @@ export const AccessColumn: Story = {
 			refetch={noop}
 			nowUnix={accessNowUnix}
 			onEditAccess={noop}
+			onRename={noop}
 			onUnpair={noop}
 			onUnpairAll={noop}
 			pendingFingerprint={null}
