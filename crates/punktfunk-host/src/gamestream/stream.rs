@@ -1111,6 +1111,21 @@ fn spawn_sender(
 
 use crate::send_pacing::percentile;
 
+/// How long to ignore further keyframe requests after emitting one.
+///
+/// The window bounds IDR emission in TIME, so it needs an absolute floor rather than a frame
+/// count: it has to outlast the round trip in which the client receives and decodes the IDR it
+/// already asked for. The original `frame_interval * 2` closes long before that at high refresh —
+/// 16.7 ms at 120 fps, while a Moonlight client under loss re-asks every ~30 ms — so every request
+/// passed the gate and the stream became ~32 full IDRs/s, whose bulk causes the very loss that
+/// prompts the next request. That storm sustains itself and reads as stutter at a flat latency
+/// (field log, AMD RX 7800 XT / Bazzite 44 HEVC, 2026-08-22: 1118 requests, 1115 honoured, 3
+/// coalesced). 100 ms matches the encoder-reset backoff below and is about one IDR's service time
+/// on a saturated link.
+fn keyframe_coalesce_window(frame_interval: Duration) -> Duration {
+    (frame_interval * 2).max(Duration::from_millis(100))
+}
+
 /// The encode → packetize loop, over a borrowed capturer. Sending runs on a dedicated thread
 /// (see [`spawn_sender`]) so a send spike can never stall capture/encode.
 #[allow(clippy::too_many_arguments)]
@@ -1278,9 +1293,9 @@ fn stream_body(
     // RFI (VAAPI/AMD — `supports_rfi=false`) each one becomes a full IDR, so an un-coalesced request
     // stream turns EVERY frame into a 4K IDR, saturates the send path, and collapses the session
     // instead of recovering. One fresh IDR already resolves all pending loss, so after emitting one
-    // we ignore further keyframe requests for a short in-flight window (~2 frames). NVENC
-    // ref-invalidation (cheap, no IDR spike) is never rate-limited — only full keyframes are.
-    let keyframe_coalesce = frame_interval * 2;
+    // we ignore further keyframe requests for the in-flight window below. NVENC ref-invalidation
+    // (cheap, no IDR spike) is never rate-limited — only full keyframes are.
+    let keyframe_coalesce = keyframe_coalesce_window(frame_interval);
     let mut last_keyframe: Option<Instant> = None;
     // A frame dropped at the pipeline head (below) breaks the reference chain for the following
     // P-frames: the client never receives it, but the encoder advanced its references past it, and —
@@ -1796,6 +1811,27 @@ mod tests {
         // A titleless entry still shows up as something a human can read.
         let t = resolve_gs_app(Some(&entry("", Some("/opt/game/run")))).expect("tracked");
         assert_eq!(t.game.title, "/opt/game/run");
+    }
+
+    /// The coalesce window must bound forced IDRs in time, not in frames. A frame-scaled window
+    /// vanishes exactly where it matters most — at high refresh, where a client's recovery spam
+    /// arrives far slower than two frame intervals and so passes the gate every time.
+    #[test]
+    fn keyframe_coalesce_window_outlasts_a_clients_request_cadence() {
+        // The observed storm: a 120 fps session against a client re-asking every ~30 ms. The
+        // pre-floor window was 16.7 ms, so every request became a full IDR.
+        let at_120 = keyframe_coalesce_window(Duration::from_secs_f64(1.0 / 120.0));
+        assert!(
+            at_120 >= Duration::from_millis(100),
+            "120 fps window {at_120:?} does not outlast a ~30 ms request cadence"
+        );
+        // 60 fps was under the floor too (33.3 ms), which is why this is not a 120-only fix.
+        assert!(keyframe_coalesce_window(Duration::from_secs_f64(1.0 / 60.0)) >= at_120);
+        // A slow stream keeps the frame-scaled window — the floor only ever raises it.
+        assert_eq!(
+            keyframe_coalesce_window(Duration::from_millis(200)),
+            Duration::from_millis(400)
+        );
     }
 
     /// End-to-end check of the send thread: batches pushed on the channel arrive, complete and
