@@ -3682,7 +3682,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             } else {
                 bitrate_kbps
             };
-            let mut new_enc = crate::encode::open_video(
+            let opened = crate::encode::open_video(
                 plan.codec,
                 frame.format,
                 frame.width,
@@ -3701,7 +3701,33 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                      be reopened at it",
                     frame.width, frame.height, frame.format
                 )
-            })?;
+            });
+            let mut new_enc = match opened {
+                Ok(e) => e,
+                Err(e) => {
+                    // Don't spend the session on the FIRST failed open. The mode-set that triggered
+                    // this is exactly the kind of event that leaves the driver settling — the same
+                    // transient the submit path's backoff exists for ("NVENC session open failing
+                    // after a codec switch", 2026-07) — so spend the shared reset budget on it at
+                    // the same exponential pace, re-entering this guard each round. The old encoder
+                    // is still installed and still mismatched; it simply keeps failing submit until
+                    // an open succeeds or the budget runs out.
+                    encoder_resets += 1;
+                    if encoder_resets > MAX_ENCODER_RESETS {
+                        return Err(e).context("encoder reopen at the source's new mode");
+                    }
+                    let backoff = std::cmp::max(
+                        interval,
+                        std::time::Duration::from_millis(100u64 << (encoder_resets - 1).min(4)),
+                    );
+                    tracing::warn!(error = %format!("{e:#}"), reset = encoder_resets,
+                        max = MAX_ENCODER_RESETS,
+                        "reopening the encoder at the source's new mode failed — retrying");
+                    next = std::time::Instant::now() + backoff;
+                    std::thread::sleep(backoff);
+                    continue;
+                }
+            };
             if let Some(c) = plan.wire_chunk {
                 new_enc.set_wire_chunking(c);
             }
