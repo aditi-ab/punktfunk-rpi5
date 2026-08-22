@@ -50,7 +50,10 @@ on:
       - 'crates/pf-vaadec/**'
       - 'packaging/flatpak/**'
       - 'Cargo.lock'
+      # Both halves of this job's correctness, not of the bundle's content: a change to either
+      # can only be proven by a real run, and there is no other trigger that would give it one.
       - '.gitea/workflows/flatpak.yml'
+      - 'scripts/ci/flatpak-deps-present.sh'
     tags: ['v*']
   workflow_dispatch:
 
@@ -270,12 +273,13 @@ jobs:
 
       - name: Prefetch deps + sources (retried — the network phase, split off the build)
         run: |
+          set -euo pipefail
           # All of the job's heavy network I/O happens HERE, retried, so a dropped DNS lookup
           # or TCP dial costs a backoff-retry instead of the whole (long) compile:
-          #   1) --install-deps-only pulls everything the manifest declares from Flathub: the
-          #      GNOME 50 runtime/SDK + the rust-stable (//25.08, rustc 1.96) and llvm20 SDK
-          #      extensions. (No codec extension: the client links no FFmpeg — see the
-          #      manifest header.)
+          #   1) the Flathub deps the manifest declares — the GNOME 50 runtime/SDK + the
+          #      rust-stable (//25.08, rustc 1.96) and llvm20 SDK extensions — but ONLY the ones
+          #      genuinely MISSING; see the block below. (No codec extension: the client links no
+          #      FFmpeg — see the manifest header.)
           #   2) --download-only fetches every source (all crates in cargo-sources.json) into
           #      the .flatpak-builder state dir. Both are resumable/idempotent, so re-running
           #      after a partial failure is safe and cheap.
@@ -288,9 +292,40 @@ jobs:
           # for the mechanism.
           # 10 attempts (~9min budget), matching the remote-add bootstrap above — same shared,
           # load-sensitive runner, same flathub.org resolution path.
-          bash scripts/ci/retry.sh 10 flatpak-builder --user --force-clean --disable-rofiles-fuse \
-            --install-deps-from=flathub --install-deps-only \
-            "$PWD/build-dir" "$MANIFEST"
+          #
+          # WHY THIS IS NOT AN UNCONDITIONAL `--install-deps-only` ANY MORE (2026-08-22):
+          # that flag does not install what is missing, it UPDATES what is present.
+          # builder_manifest_install_dep() branches on `flatpak info --show-commit <ref>` succeeding
+          # and runs `flatpak update` for every dep already installed — with no fallback to a
+          # plain install when that update fails — and ci/flatpak-ci.Dockerfile bakes
+          # the entire runtime set, so on a healthy run it was a pure no-op that nonetheless made
+          # every build depend on Flathub being healthy at that minute. It bit on 2026-08-22:
+          #     Updating runtime/org.freedesktop.Sdk.Extension.rust-stable/x86_64/25.08
+          #     Error: Failed to update org.freedesktop.Sdk.Extension.rust-stable: While pulling …
+          #       .filez: Server returned HTTP 404
+          # dl.flathub.org served a 404 for one object of the then-current rust-stable//25.08
+          # commit, deterministically — all 10 retry.sh attempts died on the SAME object over
+          # ~9 min — and flatpak-builder SEGFAULTED on its own error path (rc=139), so retry.sh
+          # saw a crash rather than a clean "this will never work" either. The build never wanted
+          # that newer commit: the manifest pins a runtime VERSION, not a commit, and the baked
+          # one satisfies it. Updating bought nothing and imported an upstream outage.
+          #
+          # So: assert what the image already has, and reach for Flathub only on a real miss —
+          # the same "guard, don't install on top of a stale image" doctrine as the Tooling step.
+          # The check lives in scripts/ci/flatpak-deps-present.sh (run its --self-test after
+          # touching it): a bug in it that reports "satisfied" when it is not would build against
+          # whatever runtime happened to be lying around, which is worth more than an inline
+          # if-statement. It deliberately fails OPEN — anything it cannot parse takes the slow
+          # install path below.
+          if bash scripts/ci/flatpak-deps-present.sh "$MANIFEST"; then
+            echo "deps satisfied by the baked image — not touching Flathub"
+            flatpak list --user --columns=ref
+          else
+            echo "::warning::$MANIFEST declares deps punktfunk-flatpak-ci does not have — pulling from Flathub (~1.5 GB). Bump GNOME_VERSION/FREEDESKTOP_VERSION in ci/flatpak-ci.Dockerfile so this stays off the hot path."
+            bash scripts/ci/retry.sh 10 flatpak-builder --user --force-clean --disable-rofiles-fuse \
+              --install-deps-from=flathub --install-deps-only \
+              "$PWD/build-dir" "$MANIFEST"
+          fi
           bash scripts/ci/retry.sh 10 flatpak-builder --user --force-clean --disable-rofiles-fuse \
             --download-only --disable-updates \
             "$PWD/build-dir" "$MANIFEST"
@@ -298,7 +333,17 @@ jobs:
       - name: Build the flatpak (offline — deps + sources prefetched above)
         run: |
           # Everything is already local (state dir warmed by the prefetch step), so this long
-          # step needs no network; --install-deps-from stays as a no-op safety net.
+          # step needs no network.
+          #
+          # --install-deps-from=flathub USED to sit here, commented as "a no-op safety net". It
+          # was neither. builder-main.c calls builder_manifest_install_deps() whenever that flag
+          # is set — --install-deps-only only decides whether it EXITS afterwards — so this step
+          # re-ran the same `flatpak update` of the runtimes that killed the prefetch step on
+          # 2026-08-22 (Flathub HTTP 404 on a rust-stable//25.08 object; see there). A live pull
+          # of multi-GB runtimes is a strange thing to call a safety net in the step whose whole
+          # design is to be offline, and it could only ever fire if the prefetch step above had
+          # already failed the job. Dropped: the prefetch step is the one place that talks to
+          # Flathub, and it is the one place with retries.
           #
           # --disable-updates is LOAD-BEARING, not tidiness: without it this step was never
           # actually offline. flatpak-builder runs the DOWNLOAD PHASE again as part of every
@@ -326,7 +371,6 @@ jobs:
           flatpak-builder --user --force-clean --disable-rofiles-fuse \
             --default-branch="$FLATPAK_BRANCH" \
             --disable-updates \
-            --install-deps-from=flathub \
             --repo="$PWD/repo" \
             "$PWD/build-dir" "$MANIFEST"
 
