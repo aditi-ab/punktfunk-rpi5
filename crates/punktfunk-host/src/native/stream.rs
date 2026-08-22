@@ -1875,6 +1875,14 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         mut cur_display_gen,
         built_bitrate,
     ) = pipe;
+    // What `enc` was opened against. The capture source can change format/size UNDER this loop with
+    // no client `Reconfigure` at all — the IDD-push capturer re-opens its ring on a confirmed
+    // display-descriptor change (a fullscreen game mode-setting the virtual display, an HDR flip) —
+    // and every backend's `submit` then refuses the frame. Tracked so the loop can FOLLOW the
+    // source (see the guard in the submit path) instead of dying against an error no in-place
+    // encoder reset can fix. Every site below that swaps `enc` re-binds `frame` with it, so this is
+    // always `(frame.format, frame.width, frame.height)` immediately after one.
+    let mut enc_src = (frame.format, frame.width, frame.height);
     // The display exists now, so the portal has answered: settle the cursor plan against what it
     // actually negotiated rather than what this session asked for (see `settle_portal_cursor`).
     // `mut`: every capture-loss rebuild re-runs `create`, hence re-negotiates.
@@ -2613,6 +2621,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 );
                 cur_mode = new_mode;
                 next = std::time::Instant::now();
+                enc_src = (frame.format, frame.width, frame.height);
                 // H2/H3: the backend may have honored a different mode than requested — KWin caps
                 // a virtual output's refresh, or Windows pf-vdisplay rejects a resolution its
                 // running monitor doesn't advertise and the host falls back to the actual display
@@ -2695,6 +2704,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     trace.as_ref(),
                     true,
                 ) {
+                    enc_src = (frame.format, frame.width, frame.height);
                     // The owed AUs died with the old encoder — same bookkeeping as a resize.
                     inflight.clear();
                     last_au_at = std::time::Instant::now();
@@ -3388,6 +3398,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 interval = new_interval;
                 cur_node_id = new_node_id;
                 cur_display_gen = new_display_gen;
+                enc_src = (frame.format, frame.width, frame.height);
                 // The rebuild re-ran `create`, so the portal answered again — possibly a different
                 // backend's portal (the retarget above), possibly with a different verdict. Settle
                 // the cursor plan against THIS display, exactly as bring-up did: the retarget arm
@@ -3650,6 +3661,106 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // exactly that volume, so host apps already tone-mapped the content into it and the honest
         // mastering description IS the client's panel. (The IDD capturer only knows the generic
         // baseline; if the driver ever forwards per-content IDDCX_HDR10_METADATA, prefer that here.)
+        // Follow an AUTONOMOUS source change — one no client `Reconfigure` announced. The IDD-push
+        // capturer re-opens its ring on a confirmed display-descriptor change: a fullscreen game
+        // mode-setting the virtual display (2026-08-22 field report: a 4K60 HEVC session, the game
+        // switched the display to 1080p mid-play), or an HDR flip changing the frame format. The
+        // encoder is the one component that cannot follow that in place (same note as
+        // `try_inplace_resize`), so every `submit` below refuses the frame — and the submit-error
+        // path only rebuilds the encoder IN PLACE, at the SAME configured size, which cannot fix a
+        // size the source has already left. All five resets burn on it and the session ends while
+        // audio keeps running. Reopen at what the source actually delivers instead; the client
+        // learns the new mode from the `Reconfigured` below and its decoder from the opening IDR.
+        if enc_src != (frame.format, frame.width, frame.height) {
+            let actual = delivered_mode(frame.width, frame.height, interval);
+            // Same per-mode pin the client-initiated resize re-resolves: PyroWave's Automatic rate
+            // IS a function of the mode, so carrying the old one across a source-driven mode change
+            // hands it the wrong operating point. H.26x rates are mode-independent (ABR owns them),
+            // and an explicit client rate is never second-guessed.
+            let src_kbps = if bitrate_auto && plan.codec == crate::encode::Codec::PyroWave {
+                resolve_bitrate_kbps_for(plan.codec, 0, &actual, plan.chroma, plan.bit_depth)
+            } else {
+                bitrate_kbps
+            };
+            let opened = crate::encode::open_video(
+                plan.codec,
+                frame.format,
+                frame.width,
+                frame.height,
+                actual.refresh_hz,
+                src_kbps as u64 * 1000,
+                frame.is_cuda(),
+                bit_depth,
+                plan.chroma,
+                plan.cursor_blend,
+                plan.max_slices,
+            )
+            .with_context(|| {
+                format!(
+                    "the capture source changed to {}x{} {:?} mid-session and the encoder could not \
+                     be reopened at it",
+                    frame.width, frame.height, frame.format
+                )
+            });
+            let mut new_enc = match opened {
+                Ok(e) => e,
+                Err(e) => {
+                    // Don't spend the session on the FIRST failed open. The mode-set that triggered
+                    // this is exactly the kind of event that leaves the driver settling — the same
+                    // transient the submit path's backoff exists for ("NVENC session open failing
+                    // after a codec switch", 2026-07) — so spend the shared reset budget on it at
+                    // the same exponential pace, re-entering this guard each round. The old encoder
+                    // is still installed and still mismatched; it simply keeps failing submit until
+                    // an open succeeds or the budget runs out.
+                    encoder_resets += 1;
+                    if encoder_resets > MAX_ENCODER_RESETS {
+                        return Err(e).context("encoder reopen at the source's new mode");
+                    }
+                    let backoff = std::cmp::max(
+                        interval,
+                        std::time::Duration::from_millis(100u64 << (encoder_resets - 1).min(4)),
+                    );
+                    tracing::warn!(error = %format!("{e:#}"), reset = encoder_resets,
+                        max = MAX_ENCODER_RESETS,
+                        "reopening the encoder at the source's new mode failed — retrying");
+                    next = std::time::Instant::now() + backoff;
+                    std::thread::sleep(backoff);
+                    continue;
+                }
+            };
+            if let Some(c) = plan.wire_chunk {
+                new_enc.set_wire_chunking(c);
+            }
+            // A rebuilt encoder starts with the ring bound unset — re-report it, as every other
+            // rebuild site does, or an in-place backend can encode a texture the capturer has
+            // already rotated and overwritten.
+            new_enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
+            tracing::info!(
+                from = %format!("{}x{} {:?}", enc_src.1, enc_src.2, enc_src.0),
+                to = %format!("{}x{} {:?}", frame.width, frame.height, frame.format),
+                "the capture source changed mode mid-session with no client reconfigure — reopened \
+                 the encoder at the delivered size"
+            );
+            enc = new_enc;
+            enc_src = (frame.format, frame.width, frame.height);
+            adopt_built_bitrate(&mut bitrate_kbps, src_kbps, &live_bitrate, &retarget_tx);
+            // The owed AUs died with the old encoder — same bookkeeping as a resize.
+            inflight.clear();
+            last_au_at = std::time::Instant::now();
+            encoder_resets = 0;
+            // A fresh encoder opens on an IDR — anchor the cooldown.
+            last_forced_idr = Some(std::time::Instant::now());
+            // The client's mode slot still says the old size, and its stats/aspect follow it.
+            // Publish what it is really decoding now, exactly as an accepted resize does.
+            live_mode.store(
+                pack_mode(actual.width, actual.height, actual.refresh_hz),
+                Ordering::Relaxed,
+            );
+            let _ = reconfig_result_tx.send(Reconfigured {
+                accepted: true,
+                mode: actual,
+            });
+        }
         let hdr_meta = capturer.hdr_meta().map(|m| client_hdr.unwrap_or(m));
         enc.set_hdr_meta(hdr_meta);
         let mut resend_meta = hdr_meta != last_hdr_meta;
