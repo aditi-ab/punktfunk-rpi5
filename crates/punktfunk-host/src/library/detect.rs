@@ -55,7 +55,14 @@ pub struct DetectSpec {
     /// Steam appid, for titles Steam itself installed (never for non-Steam shortcuts, whose reaper
     /// appid semantics differ — those carry an [`exe`](Self::exe) instead). On Linux this is the
     /// sharpest signal available: Steam wraps every launch — native or Proton — in
-    /// `reaper SteamLaunch AppId=<appid>`, whose lifetime is exactly the game's.
+    /// `reaper SteamLaunch AppId=<appid>`.
+    ///
+    /// ⚠ That reaper is the *appid's*, not the game's. Steam wraps its **pre-launch** work for a
+    /// title in one too — shader pre-caching most visibly — so a launch is a chain of reaper trees
+    /// and only the last of them is the game. Reading the first as the game is what dropped a
+    /// stream 10 s into a Rocket League launch, mid-shader-compile (field report 2026-08-22); the
+    /// shader job is excluded by name in [`crate::procscan`], and [`crate::gamelease`] waits out a
+    /// window before believing any of them.
     pub steam_appid: Option<u32>,
     /// A launcher-stamped environment marker.
     pub env_marker: Option<EnvMarker>,

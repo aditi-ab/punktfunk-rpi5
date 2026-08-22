@@ -120,6 +120,14 @@ impl Scanner {
         Some(ProcRef { pid, start })
     }
 
+    /// This process's image file name. Diagnostics only (see [`super::names`]); `?` for a process
+    /// that has already gone or cannot be opened, which is routine.
+    pub fn name_of(&self, p: ProcRef) -> String {
+        process_start_and_image(p.pid)
+            .and_then(|(_, image)| image.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "?".into())
+    }
+
     /// Which of `procs` are still the same live processes — pid present **and** creation time
     /// unchanged, so a recycled pid is never reported alive (rule 2). Windows reuses pids briskly, so
     /// this check is what makes signalling a remembered pid safe at all.

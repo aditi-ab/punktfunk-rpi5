@@ -590,6 +590,9 @@ fn watch(
 
     // ---- Phase 1: wait for the game to show up. ----
     let start_deadline = spawned_at + START_GRACE;
+    // How long the scan has *continuously* seen something for this title — the scan-side twin of
+    // [`SHIM_WINDOW`]. See `scan_settled` below for what it is protecting against.
+    let mut seen_since: Option<Instant> = None;
     loop {
         if cancelled() {
             return;
@@ -713,12 +716,39 @@ fn watch(
             && (child.is_some() || spawned.is_some())
             && spawned_at.elapsed() >= SHIM_WINDOW;
         let live = scanner.find(&shared.spec, shared.launch_stamp);
+        // The same rule for what the *scan* finds, and for the same reason. A store's launch is a
+        // chain of process trees, and the ones that run before the game carry the signals the game
+        // carries: Steam wraps its shader pre-caching and its Proton prefix work in the very
+        // `reaper SteamLaunch AppId=<appid>` the game gets, so the first poll of a launch can match
+        // a tree that was never the game.
+        //
+        // Latching on one poll is what costs, because the two phases are patient in opposite ways.
+        // This one waits [`START_GRACE`] — five minutes — and ending it never ends the session.
+        // Phase 2 waits [`EXIT_CONFIRM`] — three seconds — and ending it *does*. A single sighting
+        // flips the lease from the first to the second, permanently; when that tree then exits with
+        // the real game not yet started, the stream drops mid-launch. On Linux that ended a Rocket
+        // League session 10 s after launch, while Steam was still compiling its shaders, and the
+        // player had to launch a second time to get one that stayed up (field report 2026-08-22).
+        //
+        // Requiring the sighting to persist buys that back for a few seconds of `GameRunning`
+        // latency and nothing else — exit detection is untouched. ⚠ It is a window, not a proof: a
+        // pre-launch tree that outlives the window still latches. Signals sharp enough to tell one
+        // from the other belong in [`crate::procscan`] (where Steam's shader job is already excluded
+        // by name); this bounds what no signal caught.
+        let scan_settled = if live.is_empty() {
+            seen_since = None;
+            false
+        } else {
+            seen_since.get_or_insert_with(Instant::now).elapsed() >= SHIM_WINDOW
+        };
         // A provider saying so is as good as seeing it — better, for a title there is nothing to
         // see: it is the launcher that started the game telling us it did. This is the only way a
         // [`LeaseKind::Reported`] lease ever leaves this phase, and for a `Matched` one it just
-        // gets there sooner than the scan would.
+        // gets there sooner than the scan would. Not gated by the window above: a report is the
+        // launcher's own statement about the game, not an inference from a process that resembles
+        // it, so there is nothing to wait out.
         let said_running = reported().is_some_and(|l| l.running);
-        if !live.is_empty() || child_alive || said_running {
+        if scan_settled || child_alive || said_running {
             known = live.clone();
             publish(&live);
             shared.was_running.store(true, Ordering::Relaxed);
@@ -731,6 +761,8 @@ fn watch(
                 title = %shared.game.title,
                 kind = kind.as_str(),
                 procs = live.len(),
+                // Which processes, not just how many: see [`crate::procscan::names`].
+                names = ?crate::procscan::names(&live),
                 "the launched game is running"
             );
             break;
@@ -2016,6 +2048,78 @@ mod tests {
             shared.state(),
             GameState::Untracked,
             "nothing is watching this title any more, and the row has to say so"
+        );
+    }
+
+    /// 🛑 The 2026-08-22 field report: a **pre-launch** process tree must not be mistaken for the
+    /// game.
+    ///
+    /// Steam wraps its shader pre-caching in the same `SteamLaunch AppId=` reaper the game itself
+    /// gets, so the first poll of a launch matches a tree that was never the game. What shipped
+    /// latched on that single sighting: the lease left the start phase immediately, and when the
+    /// compile finished and that tree exited — with Rocket League still starting — the exit watch
+    /// called it the game exiting and closed the session with `APP_EXITED`, 10 s after launch. On
+    /// the player's screen the stream dropped mid-"Processing Vulkan shaders"; their workaround was
+    /// to launch the game twice.
+    ///
+    /// The scanner now knows Steam's replayer by name ([`crate::procscan`]). This pins the bound
+    /// behind that: a matched process that does not outlive [`SHIM_WINDOW`] never arms the exit
+    /// watch, whatever it was — which is what covers the pre-launch trees nobody has named yet.
+    ///
+    /// Ignored by default: it outlives the shim window and then waits out [`EXIT_CONFIRM`], ~11 s.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "drives a real process for ~11s (shim window + exit confirmation)"]
+    fn a_pre_launch_tree_that_exits_never_ends_the_session() {
+        use std::sync::atomic::AtomicUsize;
+
+        // The stand-in has to keep the name `sleep`: coreutils is a multi-call binary that
+        // dispatches on `argv[0]`, and under any other name it exits instantly — which would pass
+        // this test for entirely the wrong reason. (Same trap as the live matcher test in
+        // [`crate::procscan`].)
+        let td = tempfile::tempdir().expect("tempdir");
+        let stand_in = td.path().join("sleep");
+        std::fs::copy("/bin/sleep", &stand_in).expect("copy a stand-in pre-launch binary");
+        let launch_stamp = launch_clock();
+
+        // Alive for less than the shim window — Steam's shader job, in miniature.
+        let mut child = std::process::Command::new(&stand_in)
+            .arg("3")
+            .spawn()
+            .expect("spawn the fake pre-launch tree");
+        // Reaped on its own thread: a zombie keeps its `/proc` entry with an unchanged start time,
+        // so the scan would call it alive forever and the exit under test never happen.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        static PRE_EXITS: AtomicUsize = AtomicUsize::new(0);
+        PRE_EXITS.store(0, Ordering::SeqCst);
+        let lease = open(
+            LeaseRequest {
+                launch_stamp,
+                // No child and no pid: the scan is the only signal, which is the field-report shape
+                // (`steam steam://rungameid/…` had already handed off and exited).
+                ..req("steam:pre-launch", DetectSpec::dir(td.path()), false)
+            },
+            Box::new(|| {
+                PRE_EXITS.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let shared = lease.shared();
+        assert!(matches!(shared.kind(), LeaseKind::Matched));
+
+        std::thread::sleep(SHIM_WINDOW + EXIT_CONFIRM + Duration::from_secs(3));
+        assert_eq!(
+            PRE_EXITS.load(Ordering::SeqCst),
+            0,
+            "a tree that ran before the game must not end the session when it exits — this is the \
+             field report"
+        );
+        assert_ne!(
+            shared.state(),
+            GameState::Exited,
+            "the game never started, so nothing of it can have exited"
         );
     }
 

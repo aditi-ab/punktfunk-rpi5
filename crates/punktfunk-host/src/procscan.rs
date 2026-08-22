@@ -87,6 +87,26 @@ pub fn resolve(pid: u32) -> Option<ProcRef> {
     }
 }
 
+/// Short names for the processes a lease adopted, in `procs` order.
+///
+/// Diagnostics only — nothing decides anything on these, and they are deliberately not part of
+/// [`ProcRef`], which is compared for equality. They exist because a launch that adopted the game
+/// and a launch that adopted a *pre-launch* tree logged identically (`procs=1`), which is what left
+/// the 2026-08-22 field report unclosable from its log: the one question worth asking of that line
+/// is which process the lease latched onto.
+pub fn names(procs: &[ProcRef]) -> Vec<String> {
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        let scanner = Scanner::system();
+        procs.iter().map(|p| scanner.name_of(*p)).collect()
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = procs;
+        Vec::new()
+    }
+}
+
 /// An out-of-band opinion on whether a spec's game is still running, independent of the process scan.
 ///
 /// Consulted **only to veto** declaring a game gone — never to declare it running, and never as the
