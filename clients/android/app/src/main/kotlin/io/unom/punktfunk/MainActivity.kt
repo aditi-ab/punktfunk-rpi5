@@ -515,8 +515,21 @@ class MainActivity : ComponentActivity() {
         else -> KeyEvent.KEYCODE_DPAD_RIGHT
     }
 
-    /** Resolve the panel's highest-refresh mode (same resolution) once, for [setConsoleHighRefreshRate]. */
+    /**
+     * Resolve the panel's highest-refresh mode (same resolution) once, for [setConsoleHighRefreshRate].
+     *
+     * NEVER on a TV, which leaves the id at `0` and makes every [setConsoleHighRefreshRate] call a
+     * no-op. The pin exists for phone refresh governors that cap third-party apps at 60 Hz; a TV has
+     * no such governor, and there it does active harm. `display.mode` is what [nativeDisplayMode]
+     * reads to resolve "Native" refresh at connect, so a menu-time pin makes the session negotiate
+     * the PINNED rate rather than the TV's real HDMI output — and [StreamScreen] then releases the
+     * pin on TV (the decoder's own mode switch governs there), dropping the panel back to 60 while
+     * the host is already serving 120. Every frame then waits out that mismatch, which is the
+     * "latency explodes unless I set the refresh by hand" field report: picking a refresh explicitly
+     * is precisely what bypasses the corrupted `nativeDisplayMode` answer.
+     */
     private fun resolveHighRefreshMode() {
+        if (isTvDevice(this)) return
         @Suppress("DEPRECATION")
         val disp = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) display else windowManager.defaultDisplay
         highRefreshModeId = disp?.supportedModes?.maxWithOrNull(
