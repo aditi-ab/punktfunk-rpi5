@@ -1194,6 +1194,11 @@ fn stream_body(
     // also fails safe when nobody tells it, but pass the REAL depth: `idd_depth` is configurable
     // and a deeper ring is free pipelining the fallback would forfeit.
     enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
+    // What `enc` was opened against. The capture source can change size/format UNDER this loop with
+    // nothing negotiating it (see the follow-the-source guard below); tracked so the loop can notice.
+    // Both sites that swap `enc` re-bind `frame` with it, so this is always
+    // `(frame.format, frame.width, frame.height)` right after one.
+    let mut enc_src = (frame.format, frame.width, frame.height);
     // FEC overhead percent (Sunshine default 20). Override with PUNKTFUNK_FEC_PCT (0 = data-only).
     let fec_pct: u8 = std::env::var("PUNKTFUNK_FEC_PCT")
         .ok()
@@ -1362,6 +1367,7 @@ fn stream_body(
                 .context("reopen encoder after rebuild")?;
                 // A rebuilt encoder starts unconfigured — same reason as the first open above.
                 enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
+                enc_src = (frame.format, frame.width, frame.height);
                 supports_rfi = enc.caps().supports_rfi;
                 enc.request_keyframe();
                 last_keyframe = Some(Instant::now());
@@ -1375,6 +1381,82 @@ fn stream_body(
             }
         }
         let t_cap = tick.elapsed();
+        // Follow an AUTONOMOUS source mode change — one nothing negotiated. The IDD-push capturer
+        // re-opens its ring on a confirmed display-descriptor change (a fullscreen game mode-setting
+        // the virtual display, or an HDR flip changing the format), and the encoder is the one
+        // component that cannot follow a resolution change in place. Every `submit` below then
+        // refuses the frame ("captured WxH != encoder AxB"), and the submit ladder only rebuilds the
+        // encoder IN PLACE — at the SAME configured size — which cannot fix a size the source has
+        // already left, so all five resets burn on it and the stream ends (native/stream.rs carried
+        // the identical gap; a 2026-08-22 field report hit it there at 4K→1080p).
+        //
+        // GameStream has no mid-stream mode-change message, so the client is NOT told: Moonlight
+        // decodes a bitstream that disagrees with the resolution it configured its decoder from.
+        // That is the same bargain the first open above already takes whenever the captured size
+        // differs from the negotiated one (the monitor-mirror case) — tolerant decoders re-init off
+        // the SPS and scale, a strict one (Media Foundation on Xbox) may stall and drop the session.
+        // Taking it here too is strictly better than the alternative, which is ending every stream
+        // the moment a game changes mode.
+        if enc_src != (frame.format, frame.width, frame.height) {
+            match encode::open_video(
+                cfg.codec,
+                frame.format,
+                frame.width,
+                frame.height,
+                cfg.fps,
+                cfg.bitrate_kbps as u64 * 1000,
+                frame.is_cuda(),
+                // Derived from the delivered format, so an HDR flip re-opens at the right depth.
+                gs_bit_depth(frame.format),
+                encode::ChromaFormat::Yuv420, // GameStream stays 4:2:0 — see the first open
+                cursor_blend,                 // same capture cursor mode — see the first open
+                cfg.slices,                   // client slicing ceiling — see the first open
+            ) {
+                Ok(e) => {
+                    tracing::info!(
+                        from = %format!("{}x{} {:?}", enc_src.1, enc_src.2, enc_src.0),
+                        to = %format!("{}x{} {:?}", frame.width, frame.height, frame.format),
+                        negotiated = ?(cfg.width, cfg.height),
+                        "gamestream: the capture source changed mode mid-stream — reopened the \
+                         encoder at the delivered size (the client is not told; a strict decoder \
+                         may not follow — see the note at this guard)"
+                    );
+                    enc = e;
+                    enc_src = (frame.format, frame.width, frame.height);
+                    // A rebuilt encoder starts unconfigured — same reasons as the first open.
+                    enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
+                    supports_rfi = enc.caps().supports_rfi;
+                    enc.request_keyframe();
+                    last_keyframe = Some(Instant::now());
+                    // The old encoder died with its in-flight submissions — their AUs will never
+                    // arrive, so the numbering prediction restarts at `au_seq` (same reasoning as
+                    // the capture rebuild above). Restart the stall clock for the fresh encoder and
+                    // give it the full reset budget.
+                    enc_inflight = 0;
+                    encoder_resets = 0;
+                    last_au_at = Instant::now();
+                }
+                Err(e) => {
+                    // Don't spend the stream on the FIRST failed open: the mode-set that triggered
+                    // this is exactly the kind of event that leaves the driver settling, which is
+                    // what the submit ladder's backoff exists for. Spend the shared reset budget at
+                    // the same exponential pace, re-entering this guard each round — the old encoder
+                    // stays installed and mismatched meanwhile, so it simply keeps failing submit.
+                    encoder_resets += 1;
+                    if encoder_resets > MAX_ENCODER_RESETS {
+                        return Err(e).context("reopen encoder at the source's new mode");
+                    }
+                    let backoff = frame_interval
+                        .max(Duration::from_millis(100u64 << (encoder_resets - 1).min(4)));
+                    tracing::warn!(error = %format!("{e:#}"), reset = encoder_resets,
+                        max = MAX_ENCODER_RESETS,
+                        "gamestream: reopening the encoder at the source's new mode failed — retrying");
+                    next_frame = Instant::now() + backoff;
+                    std::thread::sleep(backoff);
+                    continue;
+                }
+            }
+        }
         // Honor a client recovery request. Prefer reference-frame invalidation (the encoder
         // re-references an older still-valid frame — no costly IDR spike); if the encoder can't
         // invalidate (range too old, or no NVENC RFI) it returns false and we force a keyframe.
