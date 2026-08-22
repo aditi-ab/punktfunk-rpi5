@@ -50,7 +50,10 @@ on:
       - 'crates/pf-vaadec/**'
       - 'packaging/flatpak/**'
       - 'Cargo.lock'
+      # Both halves of this job's correctness, not of the bundle's content: a change to either
+      # can only be proven by a real run, and there is no other trigger that would give it one.
       - '.gitea/workflows/flatpak.yml'
+      - 'scripts/ci/flatpak-deps-present.sh'
     tags: ['v*']
   workflow_dispatch:
 
