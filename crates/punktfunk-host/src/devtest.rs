@@ -573,6 +573,29 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
     // (device_type 3, the MI_02-promoted identity) — watch Steam claim it live.
     let edge = args.iter().any(|a| a == "--edge");
     let deck = args.iter().any(|a| a == "--deck");
+    // `--idle-after N` drives normally for N seconds, then STOPS sending state frames while still
+    // pumping. That is Moonlight's cadence: moonlight-common-c sends a controller packet only on
+    // CHANGE, so an untouched pad produces no wire events at all. The native plane never sees this
+    // because punktfunk's own client re-sends every live pad's snapshot every 100 ms (the
+    // `input_task.rs` refresh tick) — which is exactly why a manager that needs a periodic re-emit
+    // can look healthy on one plane and die on the other.
+    let idle_after: u64 = args
+        .iter()
+        .skip_while(|a| *a != "--idle-after")
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // `--resume-after M` ends the silence at M seconds and drives again. That is the half that
+    // actually answers the question: enumeration surviving a silence proves nothing, because a pad
+    // can stay listed and still deliver no input. What matters is whether a report written AFTER
+    // the silence still reaches a consumer — check it with `win-input-matrix --watch` while this
+    // runs, and watch whether the timestamps start advancing again.
+    let resume_after: u64 = args
+        .iter()
+        .skip_while(|a| *a != "--resume-after")
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let extra_buttons: u32 = if edge || deck {
         punktfunk_core::input::gamepad::BTN_PADDLE1 | punktfunk_core::input::gamepad::BTN_PADDLE2
     } else {
@@ -612,6 +635,9 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
                 $label
             );
             let deadline = Instant::now() + Duration::from_secs(secs);
+            let started = Instant::now();
+            let mut announced_silence = false;
+            let mut announced_resume = false;
             let (mut i, mut last) = (0i32, Instant::now());
             while Instant::now() < deadline {
                 mgr.pump(
@@ -620,7 +646,27 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
                     ),
                     |o| println!("  hid output from game: {o:?}"),
                 );
-                if last.elapsed() >= Duration::from_millis(400) {
+                let el = started.elapsed();
+                let resumed =
+                    resume_after != 0 && el >= Duration::from_secs(resume_after.max(idle_after));
+                let silent =
+                    idle_after != 0 && el >= Duration::from_secs(idle_after) && !resumed;
+                if silent && !announced_silence {
+                    announced_silence = true;
+                    println!(
+                        "  --- going SILENT (no more state frames, still pumping) at {}s ---",
+                        idle_after
+                    );
+                }
+                if resumed && !announced_resume {
+                    announced_resume = true;
+                    println!(
+                        "  --- RESUMING state frames at {}s (after {}s of silence) ---",
+                        resume_after,
+                        resume_after.saturating_sub(idle_after)
+                    );
+                }
+                if !silent && last.elapsed() >= Duration::from_millis(400) {
                     last = Instant::now();
                     i += 1;
                     let buttons = if i % 2 == 0 {
