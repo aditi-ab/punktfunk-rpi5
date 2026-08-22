@@ -819,6 +819,54 @@ async fn status_reflects_runtime_state() {
     assert!(!body.to_string().contains("gcm"));
 }
 
+/// Point `PUNKTFUNK_CONFIG_DIR` at a throwaway tempdir for the body of a test, and put the previous
+/// value back on drop even if an assertion panics.
+///
+/// ONE of these for the whole file on purpose. Mutating the process environment is safe to call and
+/// unsound from a live multithreaded process, so `check-unsafe-hygiene.sh` (gate C) holds this file
+/// to a fixed count of such call sites — and counts plain prose mentions too, deliberately, since
+/// its grep is the contract. A second test that copy-pastes the dance trips it, which is exactly
+/// what it is for. This also bundles the serialization: the lock is a FIELD, so it cannot be
+/// forgotten, and `Drop::drop` runs before any field drops, meaning the environment is restored
+/// while this still holds the lock.
+struct ConfigDirOverride {
+    tmp: tempfile::TempDir,
+    prev: Option<std::ffi::OsString>,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ConfigDirOverride {
+    fn new() -> ConfigDirOverride {
+        let _serial = crate::identity::CONFIG_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("PUNKTFUNK_CONFIG_DIR");
+        // SAFETY: `_serial` holds CONFIG_DIR_TEST_LOCK, which serializes every test in this binary
+        // that reads or writes this variable.
+        unsafe { std::env::set_var("PUNKTFUNK_CONFIG_DIR", tmp.path()) };
+        ConfigDirOverride { tmp, prev, _serial }
+    }
+
+    /// The throwaway config dir itself — used verbatim by `pf_paths`, with no `punktfunk`
+    /// subdirectory appended.
+    fn path(&self) -> &std::path::Path {
+        self.tmp.path()
+    }
+}
+
+impl Drop for ConfigDirOverride {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            // SAFETY: `self._serial` is still alive here (fields drop after `Drop::drop`), so this
+            // runs under the same serialization as the `set_var` in `new`.
+            Some(v) => unsafe { std::env::set_var("PUNKTFUNK_CONFIG_DIR", v) },
+            // SAFETY: as above.
+            None => unsafe { std::env::remove_var("PUNKTFUNK_CONFIG_DIR") },
+        }
+    }
+}
+
 // Holding `CONFIG_DIR_TEST_LOCK` across the awaits is the POINT: the env override must cover
 // the whole test body, and `#[tokio::test]` is a single-threaded runtime — nothing else can
 // need the executor while we hold it.
@@ -828,26 +876,7 @@ async fn paired_clients_list_and_unpair() {
     // Unpair PERSISTS (save_paired → paired.json in the config dir), so point the config dir
     // at a throwaway tempdir — this test must never rewrite the dev box's real pairing store.
     // The guard restores the previous value even if an assertion below panics.
-    struct EnvGuard(Option<std::ffi::OsString>);
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                // SAFETY: dropped while this test still holds CONFIG_DIR_TEST_LOCK, which
-                // serializes every test that writes or reads this variable in the binary.
-                Some(v) => unsafe { std::env::set_var("PUNKTFUNK_CONFIG_DIR", v) },
-                // SAFETY: as above.
-                None => unsafe { std::env::remove_var("PUNKTFUNK_CONFIG_DIR") },
-            }
-        }
-    }
-    let _serial = crate::identity::CONFIG_DIR_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let tmp = tempfile::tempdir().unwrap();
-    let _env = EnvGuard(std::env::var_os("PUNKTFUNK_CONFIG_DIR"));
-    // SAFETY: `_serial` holds CONFIG_DIR_TEST_LOCK (taken above), serializing every test that
-    // writes or reads this variable in the binary.
-    unsafe { std::env::set_var("PUNKTFUNK_CONFIG_DIR", tmp.path()) };
+    let tmp = ConfigDirOverride::new();
 
     let state = test_state();
     let app = test_app(state.clone(), None);
@@ -1009,24 +1038,7 @@ async fn paired_clients_list_and_unpair() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn client_label_round_trips_scrubs_and_is_forgotten_on_unpair() {
-    struct EnvGuard(Option<std::ffi::OsString>);
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                // SAFETY: dropped while this test still holds CONFIG_DIR_TEST_LOCK.
-                Some(v) => unsafe { std::env::set_var("PUNKTFUNK_CONFIG_DIR", v) },
-                // SAFETY: as above.
-                None => unsafe { std::env::remove_var("PUNKTFUNK_CONFIG_DIR") },
-            }
-        }
-    }
-    let _serial = crate::identity::CONFIG_DIR_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let tmp = tempfile::tempdir().unwrap();
-    let _env = EnvGuard(std::env::var_os("PUNKTFUNK_CONFIG_DIR"));
-    // SAFETY: `_serial` holds CONFIG_DIR_TEST_LOCK, serializing every test touching this var.
-    unsafe { std::env::set_var("PUNKTFUNK_CONFIG_DIR", tmp.path()) };
+    let tmp = ConfigDirOverride::new();
 
     let state = test_state();
     let app = test_app(state.clone(), None);
