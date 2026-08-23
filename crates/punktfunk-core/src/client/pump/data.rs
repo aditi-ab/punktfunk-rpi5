@@ -128,18 +128,31 @@ impl DataPump {
         // becomes the climb ceiling and slow start does the rest. Old hosts decline (all-zero
         // reply) or never answer (timeout clears the state so LossReports resume) — either way
         // the ceiling stays negotiated, exactly the old behavior. PUNKTFUNK_ABR_PROBE=0 opts out.
-        // `PUNKTFUNK_ABR_PROBE_KBPS` lowers the burst target (unset/0/garbage → the 2 Gbps
-        // default): the target is deliberately far above any plausible link so the burst measures
-        // the link and not itself, but on links the burst DISTURBS that backfires — a constrained
-        // Wi-Fi link can black-hole under 2 Gbps (measured on webOS: the probe hitting the 6 s
-        // timeout delayed first video to 14 s, and a "successful" one still reported
-        // send_dropped=20211), and a 2-3 core TV client starves decoding the firehose. An
-        // embedder that caps its own speed test wants this capped to match.
+        // The burst target is DERIVED from `stream_cap_kbps`, not set "far above any plausible
+        // link". It used to be a flat 2 Gbps on that reasoning — the burst must measure the link
+        // and not itself — but the ABR already discards every bit measured above what the session
+        // could use: `set_ceiling` clamps to the stream cap set a few lines up, so everything past
+        // `stream_cap_kbps / 0.7` is thrown away the moment it lands. All that height bought was
+        // bufferbloat for a number nothing reads, and on links the burst DISTURBS it backfires — a
+        // constrained Wi-Fi link can black-hole under 2 Gbps (measured on webOS: the probe hitting
+        // the 6 s timeout delayed first video to 14 s, and a "successful" one still reported
+        // send_dropped=20211; the same shape is reported on a Fire TV Stick 4K Max), and a 2-3
+        // core TV client starves decoding the firehose.
+        //
+        // ×2 is the smallest multiplier that still PROVES the cap: the measured ceiling is
+        // `delivered × 0.7`, so reaching `stream_cap_kbps` needs `delivered ≥ cap × 1.43` and the
+        // rest is margin. Deriving it this way cannot cap anyone — a session whose mode and codec
+        // justify a high ceiling asks for a correspondingly high target by itself, and a mode we
+        // cannot size (`stream_ceiling_kbps` → `u32::MAX`) still gets the old 2 Gbps. It also
+        // fixes webOS and every other constrained client, not just the box that reported it.
+        //
+        // `PUNKTFUNK_ABR_PROBE_KBPS` overrides the target outright (unset/0/garbage → the derived
+        // one). An embedder that caps its own speed test wants this capped to match.
         let capacity_probe_kbps: u32 = std::env::var("PUNKTFUNK_ABR_PROBE_KBPS")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .filter(|&v| v > 0)
-            .unwrap_or(2_000_000);
+            .unwrap_or_else(|| probe_target_kbps(stream_cap_kbps));
         const CAPACITY_PROBE_MS: u32 = 800;
         const CAPACITY_PROBE_DELAY: Duration = Duration::from_secs(2);
         const CAPACITY_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
@@ -154,6 +167,9 @@ impl DataPump {
         // in; the embedder path had neither, so an unanswered request wedged the report tick and a
         // finished one left the ABR window anchored before the burst.
         let mut was_probing = false;
+        // `frames_completed` as the burst began, so the probe-end block below can ask "did ANY
+        // frame survive this burst" rather than only "has one ever arrived" — see there.
+        let mut frames_at_probe_start: u64 = 0;
         // The window this closes is discarded outright: no LossReport, no standing-latency close,
         // no ABR feed. Two causes, both of them "this window's signals describe something other
         // than the link, and one bogus congestion verdict here ends slow start for good":
@@ -289,6 +305,24 @@ impl DataPump {
                 last_report = Instant::now();
                 discard_abr_window = true;
                 flush_in_window = false;
+                // …and if the burst swallowed the video with it, re-anchor the decoder. This runs
+                // on EVERY probe end — a successful one, a timed-out one, an embedder "Test
+                // connection" — and the frame-count guard is what makes it a no-op the rest of the
+                // time: a burst the link couldn't hold can take the keyframe down with it, and
+                // then nothing re-requests one, so the client sits on black until some unrelated
+                // recovery path happens to fire. That is the reported Fire TV / webOS black
+                // screen. Compared against the count SNAPSHOTTED at the burst's leading edge
+                // rather than against 0: at startup the two are the same test, but this one also
+                // catches a burst that kills an already-running stream (an embedder speed test
+                // mid-session), which the cumulative counter never could. At most one request per
+                // probe, and it funnels through the control task's coalescer like the other two
+                // emitters in this file, so it cannot IDR-storm.
+                if st.frames_completed == frames_at_probe_start {
+                    let _ = ctrl_tx.try_send(CtrlRequest::Keyframe);
+                    tracing::warn!(
+                        "no frame survived the capacity probe — requested a keyframe to re-anchor"
+                    );
+                }
             }
             // Arm a watchdog on the leading edge of ANY probe, so a host that silently ignores
             // `ProbeRequest` (an old build — anticipated, see the capacity-probe timeout below)
@@ -296,6 +330,7 @@ impl DataPump {
             if !was_probing && probe_active {
                 let burst = Duration::from_millis(pump_probe.lock().unwrap().duration_ms as u64);
                 probe_watchdog = Some(Instant::now() + burst + CAPACITY_PROBE_TIMEOUT);
+                frames_at_probe_start = st.frames_completed;
             }
             if !probe_active {
                 probe_watchdog = None;
@@ -797,6 +832,18 @@ fn should_report_delivery(packets_received: u64, confirmed: &mut bool) -> bool {
     owed
 }
 
+/// The capacity probe's burst target for a session bounded at `stream_cap_kbps`, in kbps — the
+/// default `PUNKTFUNK_ABR_PROBE_KBPS` overrides. See the probe's comment in the pump for why it is
+/// derived rather than fixed: `BitrateController::set_ceiling` clamps the measurement to the
+/// stream cap, so every bit measured above `cap / 0.7` is discarded, and bursting for it only
+/// buys bufferbloat. ×2 clears that `1.43×` bar with margin.
+///
+/// `u32::MAX` in (a mode [`crate::abr::stream_ceiling_kbps`] declines to size) keeps the historic
+/// 2 Gbps, which is also the ceiling on the whole derivation: this can only ever lower the target.
+fn probe_target_kbps(stream_cap_kbps: u32) -> u32 {
+    stream_cap_kbps.saturating_mul(2).min(2_000_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,6 +881,40 @@ mod tests {
             assert!(should_report_delivery(0, &mut confirmed));
             assert!(!confirmed);
         }
+    }
+
+    /// The burst has to be big enough to PROVE the stream cap and no bigger. Anything the burst
+    /// measures above `cap / 0.7` is discarded by `BitrateController::set_ceiling` (pinned by
+    /// `abr::tests::the_stream_bound_clamps_a_learned_ceiling_only`) and paid for in bufferbloat.
+    #[test]
+    fn the_probe_target_proves_the_stream_cap_without_overshooting_it() {
+        // Real modes, from the smallest a session runs to the largest — including 1440p120, the
+        // field session that walked to 657 Mbps and taught the ABR the cap in the first place.
+        for (w, h, hz, codec, depth) in [
+            (1280, 720, 60, crate::quic::CODEC_HEVC, 8),
+            (1920, 1080, 60, crate::quic::CODEC_H264, 8),
+            (2560, 1440, 120, crate::quic::CODEC_HEVC, 8),
+            (3840, 2160, 120, crate::quic::CODEC_HEVC, 10),
+        ] {
+            let cap = crate::abr::stream_ceiling_kbps(w, h, hz, codec, depth, 0);
+            let target = probe_target_kbps(cap);
+            // Enough: a link that delivers the whole burst measures `delivered × 0.7`, and that
+            // has to reach the cap or the session can never climb to what its mode allows.
+            assert!(
+                target.saturating_mul(7) / 10 >= cap,
+                "{w}x{h}@{hz}: a {target} kbps burst cannot prove a {cap} kbps cap"
+            );
+            // …and no more: a target that overshoots what the clamp keeps is pure bufferbloat.
+            // (The old flat 2 Gbps overshot 1440p120 by 6×.)
+            assert!(
+                target <= cap.saturating_mul(2),
+                "{w}x{h}@{hz}: {target} kbps chases capacity the clamp discards"
+            );
+        }
+        // A mode `stream_ceiling_kbps` declines to size (`u32::MAX`) keeps the historic 2 Gbps,
+        // which is also the hard ceiling on the derivation — it can only ever lower the target.
+        assert_eq!(probe_target_kbps(u32::MAX), 2_000_000);
+        assert_eq!(probe_target_kbps(1_500_000), 2_000_000);
     }
 
     #[test]
