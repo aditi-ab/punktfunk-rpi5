@@ -101,6 +101,18 @@ class GamepadRouter(
          * the whole session. The capture-link pads carry the same flag on [ExternalPad].
          */
         val motionReaches: Boolean = true,
+        /**
+         * Whether [Gamepad.BTN_MISC1] means a MUTE button on this particular pad — the one bit
+         * whose physical meaning differs per controller, and the gate on the mic toggle in
+         * [slotButton].
+         *
+         * A DualSense has one; a Steam Controller 2 puts its QAM button on the same wire bit
+         * (`Sc2Device`), and QAM must not mute anyone's microphone. Asked once at open, off the
+         * fact each path actually knows: the report order for an [InputDevice] (only
+         * [Gamepad.PadButtons.GENERIC_SONY] mints this bit there), the declared pad kind for a
+         * capture link.
+         */
+        val hasMuteButton: Boolean = false,
     ) {
         /** Forwarded button bits currently held (Gamepad.BTN_*) — for release-on-close + chord detection. */
         var held = 0
@@ -160,7 +172,8 @@ class GamepadRouter(
 
     /**
      * Invoked (main thread) each time the mic-mute chord ([MIC_CHORD], Select + Y) is COMPLETED on
-     * a pad — the couch equivalent of the stream's on-screen mute button, which a gamepad user
+     * a pad, or a pad's own mute button ([Gamepad.BTN_MISC1] — a DualSense's) is pressed — the
+     * couch equivalent of the stream's on-screen mute button, which a gamepad user
      * cannot reach. `StreamScreen` wires it to the mute toggle. Unlike the exit chord this fires
      * immediately: muting is the kind of thing you want to have already happened, and the on-screen
      * indicator makes an accidental toggle self-evident. The buttons still go to the host — the
@@ -235,14 +248,39 @@ class GamepadRouter(
     }
 
     /**
+     * Is this bit's WIRE SEND kept with this device, though the bit is otherwise tracked normally?
+     *
+     * Exactly one is: a real mute button ([Slot.hasMuteButton]) under the "local" [systemForward]
+     * policy. It is tracked — the mic toggle in [slotButton] is edge-triggered off held state —
+     * but not forwarded, so every send site has to ask, including [releaseHeld]'s close-time
+     * flush, or a mute held across a disconnect would put a release on the wire for a press that
+     * never went out. Every other system button under that policy leaves [slotButton] at the top
+     * and never reaches a send at all.
+     */
+    private fun localOnly(slot: Slot, bit: Int): Boolean =
+        !systemForward && bit == Gamepad.BTN_MISC1 && slot.hasMuteButton
+
+    /**
      * One button transition on [slot] — the shared body behind [onButton] and an [ExternalPad]'s
      * transitions: forward the wire event, track held state, arm/disarm the exit chord, and fire
-     * the instant chords ([MIC_CHORD], [STATS_CHORD]).
+     * the instant chords ([MIC_CHORD], [STATS_CHORD], and the mute button's own mic toggle).
      */
     private fun slotButton(slot: Slot, bit: Int, down: Boolean, send: Boolean) {
         // Raw system buttons stay local under the "local" policy — no wire send and no held
-        // tracking, symmetric on both edges so nothing leaks into the chords either.
-        if (!systemForward && (bit == Gamepad.BTN_GUIDE || bit == Gamepad.BTN_MISC1)) return
+        // tracking, symmetric on both edges so nothing leaks into the chords either. A Steam
+        // Controller 2's QAM button is BTN_MISC1 and keeps exactly that behaviour.
+        //
+        // A real MUTE button ([Slot.hasMuteButton]) is deliberately exempt: that policy's own
+        // words are "keeps them entirely with this device", and toggling this device's microphone
+        // is precisely what a mute button does with itself. Returning here would have left the
+        // button present and silently dead under `local`, for a reason nobody would ever find. It
+        // loses its wire send instead (see [localOnly]) and keeps the held tracking the toggle's
+        // edge-trigger reads. It cannot leak into a chord — MISC1 is in none of them.
+        if (!systemForward &&
+            (bit == Gamepad.BTN_GUIDE || (bit == Gamepad.BTN_MISC1 && !slot.hasMuteButton))
+        ) {
+            return
+        }
         if (down) {
             if (guideGesture && send) {
                 // A Select pressed ALONE is held back until it resolves: a tap (delivered
@@ -258,7 +296,7 @@ class GamepadRouter(
                 }
                 flushPendingSelect(slot)
             }
-            if (send && forwarding) {
+            if (send && forwarding && !localOnly(slot, bit)) {
                 NativeBridge.nativeSendGamepadButton(handle, bit, true, slot.index)
             }
             val wasHeld = slot.held
@@ -268,11 +306,26 @@ class GamepadRouter(
             // Mic mute and the stats-tier cycle, each edge-triggered on the button that COMPLETES
             // its chord (see [completesChord]) — the two meanings this client gives Select plus a
             // face button. Both leave the press on the wire: the game still gets its buttons.
-            if (completesChord(wasHeld, bit, MIC_CHORD)) onMicChord?.invoke()
+            //
+            // A pad's own mute button is a second trigger for the SAME toggle, not a new
+            // mechanism — so it gets the same edge-trigger, expressed as the one-button chord it
+            // is. That is load-bearing rather than tidy: [onButton] deliberately still calls this
+            // with `down = true` on auto-repeat and suppresses only `send` (its repeatCount
+            // guard), so an unguarded `bit == BTN_MISC1` would flap the mic for as long as the
+            // button is held down.
+            //
+            // [Slot.hasMuteButton] is the other half, and it is not belt-and-braces: BTN_MISC1 is
+            // the wire's misc/QAM bit, and `Sc2Device` puts a Steam Controller 2's QAM button on
+            // it. Reading "any MISC1" as mute would mute the microphone on every QAM press.
+            if (completesChord(wasHeld, bit, MIC_CHORD) ||
+                (slot.hasMuteButton && completesChord(wasHeld, bit, Gamepad.BTN_MISC1))
+            ) {
+                onMicChord?.invoke()
+            }
             if (completesChord(wasHeld, bit, STATS_CHORD)) onStatsChord?.invoke()
         } else {
             val owned = guideGesture && bit == Gamepad.BTN_BACK && consumeSelectRelease(slot)
-            if (!owned && send && forwarding) {
+            if (!owned && send && forwarding && !localOnly(slot, bit)) {
                 NativeBridge.nativeSendGamepadButton(handle, bit, false, slot.index)
             }
             slot.held = slot.held and bit.inv()
@@ -543,7 +596,15 @@ class GamepadRouter(
         // time. Cheap enough to ask unconditionally; the answer holds for the pad's lifetime.
         val motionReaches = NativeBridge.nativePadMotionReaches(handle, pref)
         if (forwarding && hasGyro && !motionReaches) onMotionUnreachable?.invoke()
-        slots[syntheticId] = Slot(index, Gamepad.AxisMapper(handle, index))
+        // `DsDevice` raises BTN_MISC1 from the DualSense report's mute bit; `Sc2Device` raises the
+        // same bit from the Steam Controller 2's QAM button, which must not touch the microphone.
+        // The declared kind separates them (a DualShock 4 has no mute button either).
+        val hasMute = pref == Gamepad.PREF_DUALSENSE || pref == Gamepad.PREF_DUALSENSEEDGE
+        slots[syntheticId] = Slot(
+            index,
+            Gamepad.AxisMapper(handle, index),
+            hasMuteButton = hasMute,
+        )
         return ExternalPad(syntheticId, index, motionReaches)
     }
 
@@ -603,10 +664,15 @@ class GamepadRouter(
         // Asked here, off the kind this pad just DECLARED — not off the session's resolved backend,
         // which under Automatic answers for whichever pad happened to be active at dial time. Held
         // for the slot's life; the sensor path reads it on every sample.
+        val map = Gamepad.padMap(dev)
         val slot = Slot(
             index,
-            Gamepad.AxisMapper(handle, index, Gamepad.padMap(dev)),
+            Gamepad.AxisMapper(handle, index, map),
             NativeBridge.nativePadMotionReaches(handle, pref),
+            // The only route to BTN_MISC1 on this path is GENERIC_SONY's `0x13e` row, so the
+            // report order IS the answer — and unlike `pref` it survives the user pinning every
+            // pad to one type, which would otherwise cost a DualSense its mute button.
+            hasMuteButton = map.buttons == Gamepad.PadButtons.GENERIC_SONY,
         )
         slots[dev.id] = slot
         // After the table holds the slot, so a listener that sends on this device the moment it is
@@ -652,7 +718,9 @@ class GamepadRouter(
         var bits = slot.held
         while (bits != 0) {
             val bit = bits and -bits // lowest set bit
-            if (forwarding) NativeBridge.nativeSendGamepadButton(handle, bit, false, slot.index)
+            if (forwarding && !localOnly(slot, bit)) {
+                NativeBridge.nativeSendGamepadButton(handle, bit, false, slot.index)
+            }
             bits = bits and bit.inv()
         }
         slot.held = 0

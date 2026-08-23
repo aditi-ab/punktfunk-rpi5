@@ -282,6 +282,17 @@ object Gamepad {
      * `KEYCODE_DPAD_*` are included but must only be routed here when the event is from a gamepad
      * (a keyboard's arrow keys share these keycodes and belong to the VK path) — see MainActivity.
      * L2/R2 are forwarded as the analog trigger axes, never as buttons.
+     *
+     * [BTN_TOUCHPAD] and [BTN_MISC1] have no Android keycode at all, so
+     * [PadButtons.GENERIC_SONY] BORROWS the last two rows of `Generic.kl`'s joystick block for
+     * them ([KEYCODE_BUTTON_15][KeyEvent.KEYCODE_BUTTON_15] / `_16`, evdev `BTN_BASE5`/`BTN_BASE6`)
+     * — see there. This table is global, so a device that genuinely presses one of those two
+     * emits the bit as well. That is the cost of the borrow, and it is why the borrow is at the
+     * TOP of the block rather than at `BUTTON_1`/`BUTTON_2`: those are a flight stick's trigger
+     * and thumb button, which any joystick-usage HID device reports, whereas reaching `BUTTON_15`
+     * takes a pad that declares fifteen. The residual case — a fifteen-button HOTAS whose button
+     * 16 also toggles the client's mic — is the one this leaves on the table; narrowing it
+     * further needs per-device knowledge the router does not have (see `GamepadRouter`).
      */
     fun buttonBit(keyCode: Int): Int = when (keyCode) {
         KeyEvent.KEYCODE_BUTTON_A -> BTN_A
@@ -295,6 +306,8 @@ object Gamepad {
         KeyEvent.KEYCODE_BUTTON_START -> BTN_START
         KeyEvent.KEYCODE_BUTTON_SELECT -> BTN_BACK
         KeyEvent.KEYCODE_BUTTON_MODE -> BTN_GUIDE
+        KeyEvent.KEYCODE_BUTTON_15 -> BTN_TOUCHPAD // borrowed — see the KDoc
+        KeyEvent.KEYCODE_BUTTON_16 -> BTN_MISC1 // borrowed — see the KDoc
         KeyEvent.KEYCODE_DPAD_UP -> BTN_DPAD_UP
         KeyEvent.KEYCODE_DPAD_DOWN -> BTN_DPAD_DOWN
         KeyEvent.KEYCODE_DPAD_LEFT -> BTN_DPAD_LEFT
@@ -404,9 +417,12 @@ object Gamepad {
 
         /**
          * A Sony pad numbering straight through with no kernel driver behind it: □ ✕ ○ △ L1 R1
-         * L2 R2 Create Options L3 R3 PS, i.e. `0x130`..`0x13c` in that order. The analog trigger
-         * value rides `AXIS_RX`/`AXIS_RY` on such a pad, so the digital L2/R2 fold to keycodes
-         * [buttonBit] deliberately drops — the wire carries the axis, never both.
+         * L2 R2 Create Options L3 R3 PS touchpad mute, i.e. `0x130`..`0x13e` in that order. The
+         * analog trigger value rides `AXIS_RX`/`AXIS_RY` on such a pad, so the digital L2/R2 fold
+         * to keycodes [buttonBit] deliberately drops — the wire carries the axis, never both.
+         *
+         * This order — and ONLY this order — is where `0x13d`/`0x13e` mean the touchpad click and
+         * the mute button. Everywhere else they are L3/R3.
          */
         GENERIC_SONY,
 
@@ -453,7 +469,23 @@ object Gamepad {
                     0x13a -> KeyEvent.KEYCODE_BUTTON_THUMBL
                     0x13b -> KeyEvent.KEYCODE_BUTTON_THUMBR
                     0x13c -> KeyEvent.KEYCODE_BUTTON_MODE // PS
-                    // 0x13d touchpad click / 0x13e mute: no wire button, dropped as before.
+                    // Touchpad click and mute. The wire has bits for both ([BTN_TOUCHPAD] /
+                    // [BTN_MISC1]) and Android has no keycode for either, so these two borrow
+                    // BUTTON_15/BUTTON_16 to reach [buttonBit] — see its KDoc for the cost.
+                    //
+                    // ONLY here. `0x13d`/`0x13e` are BTN_THUMBL/BTN_THUMBR (L3/R3) in the standard
+                    // Linux mapping — [genericKeyCode] says so itself — and they mean touchpad and
+                    // mute purely because a driverless DualSense enumerates its buttons straight
+                    // through in its own report order, which is what GENERIC_SONY IS. Hoisting
+                    // this above `padMap(dev)` would put L3 on the touchpad and R3 on the mic for
+                    // every Xbox pad, Switch Pro, 8BitDo, Steam Deck and `hid-playstation`
+                    // DualSense on the couch. There is no scancode that means the same button on
+                    // all pads; that is the entire reason this enum exists.
+                    0x13d -> KeyEvent.KEYCODE_BUTTON_15 // touchpad click → BTN_TOUCHPAD
+                    0x13e -> KeyEvent.KEYCODE_BUTTON_16 // mute → BTN_MISC1
+                    // Unreachable with the guard above in force (it only lets `0x130`..`0x13e`
+                    // through, and every one of those is now named), and KEYCODE_UNKNOWN is the
+                    // safe answer if that ever changes.
                     else -> KeyEvent.KEYCODE_UNKNOWN
                 }
                 GENERIC_XBOX -> when (scan) {

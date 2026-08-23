@@ -932,6 +932,10 @@ private val TEST_BUTTONS = listOf(
     "Select" to KeyEvent.KEYCODE_BUTTON_SELECT,
     "Start" to KeyEvent.KEYCODE_BUTTON_START,
     "Guide" to KeyEvent.KEYCODE_BUTTON_MODE,
+    // The two buttons Android has no keycode for, on the keycodes [Gamepad.buttonBit] borrows for
+    // them. Only a driverless Sony pad reaches these; every other controller leaves them dark.
+    "Touch" to KeyEvent.KEYCODE_BUTTON_15,
+    "Mute" to KeyEvent.KEYCODE_BUTTON_16,
     "↑" to KeyEvent.KEYCODE_DPAD_UP,
     "↓" to KeyEvent.KEYCODE_DPAD_DOWN,
     "←" to KeyEvent.KEYCODE_DPAD_LEFT,

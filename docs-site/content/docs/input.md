@@ -44,9 +44,13 @@ from the [stats overlay](/docs/stats), so it shows even with stats off.
 
 The mute lasts for that stream only — the next session starts unmuted; nothing is written to your
 settings. With **Stream microphone** off in [client settings](/docs/client-settings#audio) the
-shortcut does nothing and no badge appears. **Linux and Windows** clients only (a Steam Deck stream
-is the Linux client, so an attached keyboard gets the chord); on Apple and Android turn **Stream
-microphone** off in settings instead.
+shortcut does nothing and no badge appears.
+
+The **keyboard** chord is **Linux and Windows** only (a Steam Deck stream is the Linux client, so an
+attached keyboard gets it). On **Android** a controller can reach the same toggle: **Select + Y**,
+and on a DualSense the pad's own **Mute** button does it too — one toggle per press, and the badge
+is the same. On **Apple** clients there is no shortcut; turn **Stream microphone** off in settings
+instead.
 
 Alt-Tabbing away releases input on its own and takes it back when you return. A release you asked
 for with the chord stays released until you opt back in. Either way, keys and buttons you were

@@ -628,7 +628,7 @@ class MainActivity : ComponentActivity() {
             // keyboard arrows and belong to the VK path below — and BACK, which is how a pad with
             // no BUTTON_SELECT scancode delivers its Select: see [Gamepad.padButtonBit], which is
             // why this asks it rather than `buttonBit`).
-            if (event.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
+            if (fromPad(event)) {
                 val bit = Gamepad.padButtonBit(Gamepad.padKeyCode(event), event.flags)
                 if (bit != 0) {
                     // The router forwards the bit on this device's own wire pad index and tracks held
@@ -710,7 +710,7 @@ class MainActivity : ComponentActivity() {
             // D-pad is not from SOURCE_GAMEPAD; a pad's face buttons / D-pad are) — and, for a real
             // pad, WHICH pad family, so the glyphs wear its lettering/shapes.
             if (event.action == KeyEvent.ACTION_DOWN && isConsoleNavKey(event.keyCode)) {
-                lastPadIsGamepad = event.isFromSource(InputDevice.SOURCE_GAMEPAD)
+                lastPadIsGamepad = fromPad(event)
                 if (lastPadIsGamepad) {
                     lastPadStyle = Gamepad.styleFor(event.device)
                     lastPadDeviceId = event.deviceId
@@ -718,7 +718,7 @@ class MainActivity : ComponentActivity() {
             }
             // The Controllers debug screen sees pad events before the navigation remap below.
             padKeyProbe?.let { if (it(event)) return true }
-            if (event.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
+            if (fromPad(event)) {
                 // Not streaming: a game controller drives the Compose UI (TV + phone). Map the face
                 // buttons to the navigation the focus system / back stack understand; D-pad *keys*
                 // already move focus on their own, so they fall through to super untouched. Read
@@ -740,6 +740,32 @@ class MainActivity : ComponentActivity() {
         }
         return super.dispatchKeyEvent(event)
     }
+
+    /**
+     * Did this key event come from a controller — the question every pad branch here actually
+     * means when it asks `isFromSource(SOURCE_GAMEPAD)`.
+     *
+     * The event's source class is the platform's per-EVENT guess, and some boxes get it wrong:
+     * Fire OS is reported to deliver a Bluetooth DualSense's Triangle, touchpad and Mode/PS with
+     * standard `KEYCODE_BUTTON_*` keycodes but a SOURCE_KEYBOARD tag, and the plain gate then
+     * drops them before anything can map them. The DEVICE's source classes are the fact, so widen
+     * to the device — but only for keycodes that cannot be anything BUT a gamepad button.
+     *
+     * That restriction is the whole safety of this. [KeyEvent.isGamepadButton] is exactly the
+     * `KEYCODE_BUTTON_*` block — no `KEYCODE_DPAD_*`, no `KEYCODE_BACK` — and both exclusions are
+     * load-bearing: a keyboard's arrow keys share the D-pad keycodes and belong to the VK path
+     * ([Gamepad.buttonBit]), and a remote's or keyboard's BACK shares `KEYCODE_BACK` and has to
+     * keep leaving the stream, which for a device with no pad on it is the documented way out
+     * ([Gamepad.padButtonBit]). Widening on the device alone — or on its vendor id, which for
+     * `0x045E`/`0x054C` covers those vendors' keyboards and mice too — routes both into the pad
+     * branch and breaks them.
+     *
+     * The RAW keycode is what is asked: routing happens before [Gamepad.padKeyCode]'s correction,
+     * and both the raw and the corrected keycode are in this block for every button concerned.
+     */
+    private fun fromPad(event: KeyEvent): Boolean =
+        event.isFromSource(InputDevice.SOURCE_GAMEPAD) ||
+            (KeyEvent.isGamepadButton(event.keyCode) && Gamepad.isPad(event.device))
 
     /**
      * `true` (back) / `false` (forward) when this key event is a MOUSE side button, null when it is
