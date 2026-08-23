@@ -155,7 +155,7 @@ fn is_abandoned_mint(instance_id: &str, hwids: &[String]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+mod abandoned_tests {
     use super::is_abandoned_mint;
 
     fn hw(s: &str) -> Vec<String> {
