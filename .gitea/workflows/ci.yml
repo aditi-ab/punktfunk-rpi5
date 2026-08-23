@@ -107,6 +107,12 @@ jobs:
       # registry/git are download caches, target/ the incremental build. The target key
       # carries the rustc version — resolved via `rustc --version` (below) rather than parsed
       # from rust-toolchain.toml, so a pin bump there invalidates stale incremental state too.
+      # `pf-console-ui` pulls skia-safe, so a target-cache miss makes this job download a prebuilt
+      # Skia from the same no-retry build-script fetch that took the android job out on
+      # 2026-08-22, over the same load-shedding runner network. Cheap insurance; see the script.
+      - name: curl with retries (skia-bindings' prebuilt fetch has none)
+        run: sh scripts/ci/install-retrying-curl.sh
+
       - name: Cache keys
         run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
       - uses: actions/cache@v4
@@ -269,6 +275,12 @@ jobs:
       # images; this heals the job while the running :latest predates the bake.
       - name: sccache (no-op once the image bakes it)
         run: sh scripts/ci/ensure-sccache.sh
+
+      # `pf-console-ui` pulls skia-safe, so a target-cache miss makes this job download a prebuilt
+      # Skia from the same no-retry build-script fetch that took the android job out on
+      # 2026-08-22, over the same load-shedding runner network. Cheap insurance; see the script.
+      - name: curl with retries (skia-bindings' prebuilt fetch has none)
+        run: sh scripts/ci/install-retrying-curl.sh
 
       - name: Cache keys
         run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
