@@ -171,6 +171,13 @@ jobs:
       - name: Rust Android targets (no-op unless the toolchain pin outran the image)
         run: rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 
+      # Must precede every cargo step below: skia-bindings' ~19 MB prebuilt download runs inside
+      # a build script with no retry, and a truncated transfer here does not surface as a network
+      # error — it silently becomes a from-source Skia build that dies in the container. See the
+      # script for the measured failure.
+      - name: curl with retries (skia-bindings' prebuilt fetch has none)
+        run: sh scripts/ci/install-retrying-curl.sh
+
       # Same key namespace as ci.yml/deb.yml ON PURPOSE: identical Cargo.lock, identical
       # CARGO_HOME layout (/usr/local/cargo), so the registry/git downloads dedupe with
       # the rest of the fleet in the central cache. target/ is deliberately NOT cached
@@ -209,9 +216,25 @@ jobs:
       # The task lints arm64-v8a AND armeabi-v7a, and reuses the build task's exact cargo-ndk
       # environment — see the long note on `registerCargoNdkClippy` in kit/build.gradle.kts for why
       # both pointer widths are load-bearing and why the environment must not be duplicated here.
+      # The `STARTING A FULL BUILD` check turns the manual rule in this workflow's `env:` block
+      # ("Every ABI's log must show DOWNLOAD AND INSTALL SUCCEEDED") into something that fails the
+      # job by itself. Without it a missed prebuilt reads as a Gradle stack trace with the real
+      # cause ~1,800 lines up — which is exactly how 2026-08-22 spent a week looking like a lint
+      # failure. This is the first cargo step in the job, so it catches the drop earliest.
+      #
+      # No pipefail: the runner is dash. Capture, then decide.
       - name: Clippy (Android target, deny warnings)
         working-directory: clients/android
-        run: ./gradlew :kit:cargoNdkClippy --stacktrace
+        run: |
+          set -e
+          rc=0
+          ./gradlew :kit:cargoNdkClippy --stacktrace > /tmp/android-clippy.log 2>&1 || rc=$?
+          cat /tmp/android-clippy.log
+          if grep -q "STARTING A FULL BUILD" /tmp/android-clippy.log; then
+            echo "::error::skia-bindings did not get its prebuilt archive and started building Skia from source — the download was dropped (see DOWNLOAD AND INSTALL FAILED above). This is a fetch failure, not a lint failure."
+            exit 1
+          fi
+          exit $rc
 
       # The kit's JVM unit tests — the pure parsers, migrations and feedback policies. They were
       # running nowhere: this workflow only assembled, and android-screenshots.yml runs the :app
