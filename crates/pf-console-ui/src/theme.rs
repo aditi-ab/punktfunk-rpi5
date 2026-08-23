@@ -7,12 +7,15 @@
 
 use anyhow::{anyhow, Result};
 use skia_safe::textlayout::{
-    FontCollection, ParagraphBuilder, ParagraphStyle, TextAlign, TextStyle, TypefaceFontProvider,
+    FontCollection, Paragraph, ParagraphBuilder, ParagraphStyle, TextAlign, TextStyle,
+    TypefaceFontProvider,
 };
 use skia_safe::{
     gradient, Canvas, Color4f, Font, FontMgr, FontStyle, MaskFilter, Paint, PathEffect, Point,
     RRect, Rect, TileMode, Typeface,
 };
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 // --- Paint ----------------------------------------------------------------------------------
 
@@ -521,7 +524,7 @@ pub(crate) const EDGE_INSET: f64 = 24.0;
 // --- Typography ---------------------------------------------------------------------------
 
 /// Geist weights the console uses (matching the Apple client's `.geist(size, weight)`).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum W {
     Regular,
     Medium,
@@ -538,6 +541,111 @@ pub(crate) struct Fonts {
     semibold: Typeface,
     bold: Typeface,
     collection: FontCollection,
+    /// Shaped paragraphs, keyed by everything that shapes one ([`ParaKey`]).
+    ///
+    /// `Paragraph::layout` runs the whole shaper — HarfBuzz, line breaking, font fallback —
+    /// and the shell re-built every paragraph on screen from scratch EVERY frame, which on a
+    /// TV box is the largest CPU cost in the frame. Position is deliberately not part of the
+    /// key (`paint` takes it), so one shaped paragraph serves a string wherever it moves to:
+    /// a scrolling shelf and a screen transition both re-use it rather than re-shaping.
+    ///
+    /// `RefCell` because every draw path here takes `&self` and the console's shell is
+    /// single-threaded by construction (one render thread owns it on all three ABIs).
+    paragraphs: RefCell<HashMap<ParaKey, Cached>>,
+    /// The frame counter [`Fonts::begin_frame`] bumps — the cache's liveness clock.
+    frame: Cell<u64>,
+}
+
+/// The three paragraph shapes the console draws. A single tag rather than a loose
+/// `(TextAlign, Option<usize>)` pair because it is half of a hash key, and because those two
+/// were never independent — every call site picks one of these three.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Para {
+    /// Centred, wrapping freely.
+    Centered,
+    /// Left-aligned, wrapping freely.
+    Leading,
+    /// Left-aligned, clamped to one ellipsized line.
+    Heading,
+}
+
+impl Para {
+    /// The paragraph style this shape asks for: alignment, and the line clamp if it has one.
+    fn style(self) -> (TextAlign, Option<usize>) {
+        match self {
+            Para::Centered => (TextAlign::Center, None),
+            Para::Leading => (TextAlign::Left, None),
+            Para::Heading => (TextAlign::Left, Some(1)),
+        }
+    }
+}
+
+/// Everything [`shape`] bakes into a laid-out `Paragraph` — change any of it and the shaped
+/// result differs, so all of it is in the key.
+///
+/// The floats ride as bits: the sizes and widths are all `k`-scaled, so they are never whole
+/// numbers, and `f64`/`f32` are not `Hash`. Bit equality is the right test anyway — the same
+/// `k` produces the same bits, and a different `k` must re-shape.
+#[derive(PartialEq, Eq, Hash)]
+struct ParaKey {
+    text: String,
+    kind: Para,
+    weight: W,
+    size: u64,
+    max_w: u32,
+    /// ARGB, as `[a, r, g, b]`.
+    color: [u8; 4],
+}
+
+/// One shaped paragraph and the frame it was last drawn on.
+struct Cached {
+    para: Paragraph,
+    used: u64,
+}
+
+/// How many shaped paragraphs stay resident before the cold ones are dropped. A screen draws
+/// well under this; the ceiling exists for the library, where paging a large catalogue walks
+/// through thousands of titles and every one of them would otherwise be kept forever.
+const PARA_CACHE_MAX: usize = 512;
+
+/// Build and lay out one paragraph — the shaping [`Fonts::draw_paragraph`]'s cache exists to
+/// do exactly once per distinct key.
+///
+/// A free function rather than a method because the cache hands it a `&ParaKey` borrowed out
+/// of the map it is inserting into, which rules out holding `&self` across the call.
+fn shape(collection: &FontCollection, key: &ParaKey) -> Paragraph {
+    let (align, clamp) = key.kind.style();
+    let mut style = ParagraphStyle::new();
+    style.set_text_align(align);
+    if let Some(lines) = clamp {
+        style.set_max_lines(lines);
+        style.set_ellipsis("\u{2026}");
+    }
+    let mut ts = TextStyle::new();
+    ts.set_font_families(&["Geist"]);
+    ts.set_font_size(f64::from_bits(key.size) as f32);
+    let [a, r, g, b] = key.color;
+    ts.set_color(skia_safe::Color::from_argb(a, r, g, b));
+    ts.set_font_style(match key.weight {
+        W::Regular => FontStyle::normal(),
+        W::Medium => FontStyle::new(
+            skia_safe::font_style::Weight::MEDIUM,
+            skia_safe::font_style::Width::NORMAL,
+            skia_safe::font_style::Slant::Upright,
+        ),
+        W::SemiBold => FontStyle::new(
+            skia_safe::font_style::Weight::SEMI_BOLD,
+            skia_safe::font_style::Width::NORMAL,
+            skia_safe::font_style::Slant::Upright,
+        ),
+        W::Bold => FontStyle::bold(),
+    });
+    style.set_text_style(&ts);
+    let mut builder = ParagraphBuilder::new(&style, collection.clone());
+    builder.add_text(&key.text);
+    let mut p = builder.build();
+    p.layout(f32::from_bits(key.max_w));
+    p
 }
 
 /// The Geist faces ride in the binary — the console must look right on a bare gamescope
@@ -574,6 +682,8 @@ pub(crate) fn build_fonts() -> Result<Fonts> {
         semibold,
         bold,
         collection,
+        paragraphs: RefCell::new(HashMap::new()),
+        frame: Cell::new(0),
     })
 }
 
@@ -641,50 +751,59 @@ impl Fonts {
         }
     }
 
-    /// `clamp` caps the paragraph at that many lines and ellipsizes what doesn't fit; `None`
-    /// wraps freely. A heading has to clamp — an over-long one used to grow DOWNWARD into the
-    /// screen's content, which is why both other clients pin theirs to one line.
+    /// Start a frame — the paragraph cache's clock. Anything not drawn on this frame or the
+    /// one before it becomes a candidate for eviction, so the live set is exactly "what the
+    /// last two frames drew". The shell calls this once per `render_in`.
+    pub(crate) fn begin_frame(&self) {
+        self.frame.set(self.frame.get().wrapping_add(1));
+    }
+
+    /// Draw a shaped paragraph, building and laying it out only the first time this exact
+    /// (text, shape, weight, size, width, colour) is asked for — see [`Fonts::paragraphs`].
+    /// `at` is the paragraph's TOP-LEFT, and is deliberately not part of the key.
     #[allow(clippy::too_many_arguments)]
-    fn paragraph(
+    fn draw_paragraph(
         &self,
+        canvas: &Canvas,
         text: &str,
+        kind: Para,
         w: W,
         size: f64,
         color: Color4f,
-        align: TextAlign,
         max_w: f64,
-        clamp: Option<usize>,
-    ) -> skia_safe::textlayout::Paragraph {
-        let mut style = ParagraphStyle::new();
-        style.set_text_align(align);
-        if let Some(lines) = clamp {
-            style.set_max_lines(lines);
-            style.set_ellipsis("\u{2026}");
-        }
-        let mut ts = TextStyle::new();
-        ts.set_font_families(&["Geist"]);
-        ts.set_font_size(size as f32);
-        ts.set_color(color.to_color());
-        ts.set_font_style(match w {
-            W::Regular => FontStyle::normal(),
-            W::Medium => FontStyle::new(
-                skia_safe::font_style::Weight::MEDIUM,
-                skia_safe::font_style::Width::NORMAL,
-                skia_safe::font_style::Slant::Upright,
-            ),
-            W::SemiBold => FontStyle::new(
-                skia_safe::font_style::Weight::SEMI_BOLD,
-                skia_safe::font_style::Width::NORMAL,
-                skia_safe::font_style::Slant::Upright,
-            ),
-            W::Bold => FontStyle::bold(),
+        at: Point,
+    ) {
+        let frame = self.frame.get();
+        // ponytail: the key owns its text, so a HIT still costs one small `String` allocation
+        // where a borrowed-key lookup would cost none. Deliberate — it is a rounding error
+        // against the shape it replaces, and the alternatives (hash-only keys, `hashbrown`'s
+        // raw entry) trade a real collision risk or a dependency for it. Revisit only if a
+        // profile ever puts this line on the board.
+        let key = ParaKey {
+            text: text.to_owned(),
+            kind,
+            weight: w,
+            size: size.to_bits(),
+            max_w: (max_w as f32).to_bits(),
+            color: {
+                // The 8-bit ARGB the paragraph actually bakes, not the `Color4f` it came
+                // from — two float colours that round to the same pixel share an entry.
+                let c = color.to_color();
+                [c.a(), c.r(), c.g(), c.b()]
+            },
+        };
+        let mut cache = self.paragraphs.borrow_mut();
+        let entry = cache.entry(key).or_insert_with_key(|k| Cached {
+            para: shape(&self.collection, k),
+            used: frame,
         });
-        style.set_text_style(&ts);
-        let mut b = ParagraphBuilder::new(&style, self.collection.clone());
-        b.add_text(text);
-        let mut p = b.build();
-        p.layout(max_w as f32);
-        p
+        entry.used = frame;
+        entry.para.paint(canvas, at);
+        // Drop what the last two frames did not draw. Every entry still on screen is
+        // re-stamped above on the frame it appears in, so this only reaps strings that left.
+        if cache.len() > PARA_CACHE_MAX {
+            cache.retain(|_, c| c.used + 1 >= frame);
+        }
     }
 
     /// Centered, wrapping paragraph with `y` as its TOP edge (shaping + CJK fallback).
@@ -700,8 +819,8 @@ impl Fonts {
         y: f64,
         max_w: f64,
     ) {
-        let p = self.paragraph(text, w, size, color, TextAlign::Center, max_w, None);
-        p.paint(canvas, Point::new((cx - max_w / 2.0) as f32, y as f32));
+        let at = Point::new((cx - max_w / 2.0) as f32, y as f32);
+        self.draw_paragraph(canvas, text, Para::Centered, w, size, color, max_w, at);
     }
 
     /// [`centered`](Self::centered)'s LEFT-ALIGNED twin: `x` is the text's left edge, `y` its
@@ -719,8 +838,8 @@ impl Fonts {
         y: f64,
         max_w: f64,
     ) {
-        let p = self.paragraph(text, w, size, color, TextAlign::Left, max_w, None);
-        p.paint(canvas, Point::new(x as f32, y as f32));
+        let at = Point::new(x as f32, y as f32);
+        self.draw_paragraph(canvas, text, Para::Leading, w, size, color, max_w, at);
     }
 
     /// A screen's heading: left-aligned at `x`, top edge at `y`, clamped to ONE ellipsized
@@ -743,8 +862,8 @@ impl Fonts {
         y: f64,
         max_w: f64,
     ) {
-        let p = self.paragraph(text, w, size, color, TextAlign::Left, max_w, Some(1));
-        p.paint(canvas, Point::new(x as f32, y as f32));
+        let at = Point::new(x as f32, y as f32);
+        self.draw_paragraph(canvas, text, Para::Heading, w, size, color, max_w, at);
     }
 
     /// A single shaped line, middle-ellipsized to `max_w`, drawn at a baseline. For
@@ -770,8 +889,12 @@ impl Fonts {
         let ell_w = font.measure_str(ell, None).0;
         let mut fitted = String::new();
         let mut used = 0.0f32;
+        // The char goes onto the stack to be measured, not into a fresh `String` per character:
+        // this runs for every over-long title on screen, every frame, and the allocation was
+        // the bulk of it. `encode_utf8` writes the same bytes `to_string` would have.
+        let mut buf = [0u8; 4];
         for ch in text.chars() {
-            let cw = font.measure_str(ch.to_string().as_str(), None).0;
+            let cw = font.measure_str(&*ch.encode_utf8(&mut buf), None).0;
             if used + cw + ell_w > max_w as f32 {
                 break;
             }

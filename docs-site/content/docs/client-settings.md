@@ -252,6 +252,16 @@ the route where there are no face buttons to press, such as an Android TV remote
 names whichever your device has; the Apple TV carries it in ordinary Settings next to **Show it**
 instead, so it's reachable from the Siri Remote.
 
+**Reduce interface resolution** — *default: off.* Android only, in the controller-optimized
+settings. Draws the menus at 1080p and lets the display scale them up, instead of drawing at the
+panel's own resolution. Text goes a little softer; the interface gets much smoother. It is for 4K
+televisions and projectors, whose graphics chips are built to decode and composite video rather
+than to draw a moving interface, and are far slower than the ones in phones — at 4K every part of
+the interface costs four times what it does at 1080p, on hardware nowhere near four times faster.
+A premium 4K box is *more* likely to want this than a cheap 1080p stick, which never had the extra
+pixels in the first place. Nothing about a stream changes: picture quality is
+[**Resolution** and **Bitrate**](#video), and this is the interface only.
+
 ## Overlay
 
 **Statistics overlay** — *default: Normal.* Four tiers — Off, Compact, Normal, Detailed — each a

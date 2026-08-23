@@ -26,6 +26,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -137,13 +138,53 @@ fun SkiaConsoleShell(
     // Phone) still read a step too small in the hand: the floor is what sets the phone scale
     // (the couch term only wins on tablets and TVs), so this is a phones-only bump.
     val tv = remember { io.unom.punktfunk.isTvDevice(context) }
-    val scale = if (tv) 0f else {
-        val dm = context.resources.displayMetrics
-        val couch = minOf(dm.widthPixels, dm.heightPixels) / 800f
-        maxOf(couch, density.density * 0.75f).coerceIn(0.75f, 3f)
+    // The SurfaceView's own laid-out size, fed back by `onSizeChanged` below — deliberately not
+    // `displayMetrics`. The reduced buffer's aspect ratio has to match the RECT it is scaled into
+    // or the compositor stretches the whole interface, and while those two normally agree,
+    // `displayMetrics` has a long history of disagreeing with a view's real size by a system bar
+    // depending on the version and on who is currently hiding what. "Normally agree" is not
+    // something to hang picture geometry on. Zero until the first layout, which is exactly what
+    // `render` wants: the surface comes up at its natural size and is re-fixed a frame later.
+    var viewW by remember { mutableStateOf(0) }
+    var viewH by remember { mutableStateOf(0) }
+    // "Reduce interface resolution" (`Settings.reduceUiResolution`): cap the console's BUFFER at
+    // 1920 on its long edge and let the compositor scale it up to the panel. 1 means "draw at the
+    // panel's own resolution" — the setting is off, or the display is already at or under 1080p
+    // and there is nothing to give back.
+    //
+    // ONE factor on both axes, so the aspect ratio survives exactly and no layout can stretch.
+    // Everything else in this function that speaks in SURFACE pixels multiplies by it — the insets
+    // and design-unit scale just below, the pointer coordinates further down — because
+    // `setFixedSize` shrinks the buffer WITHOUT shrinking the view: a mouse still reports its
+    // position in view pixels, and handing those straight to a half-size surface would land the
+    // cursor at twice its true offset.
+    val render = if (!settings.reduceUiResolution) 1f else {
+        val long = maxOf(viewW, viewH)
+        if (long > 1920) 1920f / long else 1f
     }
-    LaunchedEffect(handle, left, top, right, bottom, scale) {
-        if (handle != 0L) NativeBridge.nativeConsoleSetViewport(handle, left, top, right, bottom, scale)
+    // The pointer listeners below are installed in `factory`, which runs ONCE — capturing `render`
+    // directly would freeze them at its first-composition value (1, before the first layout has
+    // reported a size), and a mouse would keep reporting view pixels into a half-size surface for
+    // the rest of the session. Same reason `platformUp` is held this way.
+    val currentRender by rememberUpdatedState(render)
+    val dm = context.resources.displayMetrics
+    val scale = if (tv) 0f else {
+        val couch = minOf(dm.widthPixels, dm.heightPixels) / 800f
+        // `render` too: the design-unit scale is in SURFACE pixels, so shrinking the buffer without
+        // shrinking this would draw the type larger on screen than the same phone draws it today.
+        maxOf(couch, density.density * 0.75f).coerceIn(0.75f, 3f) * render
+    }
+    LaunchedEffect(handle, left, top, right, bottom, scale, render) {
+        if (handle != 0L) {
+            NativeBridge.nativeConsoleSetViewport(
+                handle,
+                left * render,
+                top * render,
+                right * render,
+                bottom * render,
+                scale,
+            )
+        }
     }
 
     // The pad, raw, before MainActivity's B→Back and stick→D-pad synthesis: face buttons and the
@@ -272,7 +313,9 @@ fun SkiaConsoleShell(
 
     Box(Modifier.fillMaxSize()) {
         AndroidView(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxSize()
+                .onSizeChanged { viewW = it.width; viewH = it.height },
             factory = { ctx ->
                 SurfaceView(ctx).apply {
                     // The console draws opaque, edge to edge; Compose overlays sit above it.
@@ -305,7 +348,8 @@ fun SkiaConsoleShell(
                             MotionEvent.ACTION_CANCEL -> 5
                             else -> return@setOnTouchListener false
                         }
-                        NativeBridge.nativeConsolePointer(handle, kind, ev.x, ev.y, 0f)
+                        // View pixels → SURFACE pixels (see `render` above).
+                        NativeBridge.nativeConsolePointer(handle, kind, ev.x * currentRender, ev.y * currentRender, 0f)
                         if (ev.actionMasked == MotionEvent.ACTION_UP) v.performClick()
                         true
                     }
@@ -313,11 +357,25 @@ fun SkiaConsoleShell(
                         if (handle != 0L && ev.actionMasked == MotionEvent.ACTION_SCROLL &&
                             ev.isFromSource(InputDevice.SOURCE_CLASS_POINTER)
                         ) {
-                            NativeBridge.nativeConsolePointer(handle, 4, ev.x, ev.y, ev.getAxisValue(MotionEvent.AXIS_VSCROLL))
+                            NativeBridge.nativeConsolePointer(handle, 4, ev.x * currentRender, ev.y * currentRender, ev.getAxisValue(MotionEvent.AXIS_VSCROLL))
                             true
                         } else false
                     }
                     importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                }
+            },
+            // Applied here rather than in `factory` so flipping the setting takes effect without
+            // leaving the console: `setFixedSize` re-creates the buffer and the render thread
+            // re-wraps it through the ordinary surfaceChanged path. `setSizeFromLayout` is the
+            // documented way back to "the view's own size" when the setting goes off again.
+            update = { view ->
+                if (render < 1f) {
+                    view.holder.setFixedSize(
+                        (viewW * render).roundToInt().coerceAtLeast(1),
+                        (viewH * render).roundToInt().coerceAtLeast(1),
+                    )
+                } else {
+                    view.holder.setSizeFromLayout()
                 }
             },
         )
