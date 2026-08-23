@@ -80,6 +80,12 @@ enum RowId {
     /// beside the palette row for the same reason it does: both are presentation, and the
     /// effect of stepping this one is visible on the backdrop behind it.
     ReduceMotion,
+    /// Draw the console at 1080p and let the display scale it up, instead of at the panel's
+    /// own resolution. Android-only, and beside [`RowId::ReduceMotion`] on purpose: both are
+    /// "give up some fidelity for a smoother console", and this is the one that matters on a
+    /// 4K TV or projector, where every pass the shell draws costs four times what it does at
+    /// 1080p on a GPU that is not four times faster.
+    ReduceUiResolution,
     /// How the game library arranges its titles — see `library::LibraryView`. The library
     /// changes it in place now, from the bar over its own field, which is where an
     /// arrangement you want to SEE the effect of belongs; this row stays because both
@@ -128,6 +134,7 @@ mod android_keys {
     pub const DS_CAPTURE: &str = "android.ds_capture";
     pub const GAMEPAD_UI_MODE: &str = "android.gamepad_ui_mode";
     pub const GAMEPAD_UI: &str = "android.gamepad_ui_enabled";
+    pub const REDUCE_UI_RES: &str = "android.reduce_ui_resolution";
 }
 
 /// The Android console-UI mode's stored values (`GamepadUi.kt`).
@@ -247,6 +254,7 @@ const TABS: [(&str, &[RowId]); 7] = [
         &[
             RowId::Palette,
             RowId::ReduceMotion,
+            RowId::ReduceUiResolution,
             RowId::LibraryView,
             RowId::LibraryCollections,
             RowId::Stats,
@@ -685,6 +693,7 @@ fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
             | RowId::DsCapture
             | RowId::GamepadUi
             | RowId::GamepadUiMode
+            | RowId::ReduceUiResolution
             | RowId::Controllers
             | RowId::Licenses
     );
@@ -936,6 +945,11 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
         // Phrased as the thing that is ON, not as the suppression, so "On" means the
         // reduction is in effect — the same way every other toggle on this screen reads.
         RowId::ReduceMotion => (None, "Reduce motion", on_off(s.reduce_motion).into()),
+        RowId::ReduceUiResolution => (
+            None,
+            "Reduce interface resolution",
+            on_off(extra_bool(s, android_keys::REDUCE_UI_RES, false)).into(),
+        ),
         RowId::LibraryView => (
             None,
             "Library view",
@@ -1130,6 +1144,12 @@ fn detail(id: RowId, platform: crate::platform::Platform) -> &'static str {
             "Freezes the backdrop and replaces the console's slides and pops with plain \
              fades. Also the gentler choice on an OLED, where a still field can sit for \
              hours."
+        }
+        RowId::ReduceUiResolution => {
+            "Draws the menus at 1080p and lets the display scale them up. Text goes a \
+             little softer; the console gets much smoother on a 4K TV or projector, whose \
+             graphics chip is far slower than the panel in front of it. Nothing about a \
+             stream changes — this is the interface only."
         }
         RowId::LibraryView => {
             "Shelf shows one cover at a time, big. Grid shows about eighteen at once — \
@@ -1396,6 +1416,9 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             step_option(cur, all.len(), delta, wrap).map(|i| s.ui_palette = all[i].id.to_string())
         }
         RowId::ReduceMotion => toggle(&mut s.reduce_motion, delta, wrap),
+        RowId::ReduceUiResolution => {
+            toggle_extra(s, android_keys::REDUCE_UI_RES, false, delta, wrap)
+        }
         RowId::LibraryView => {
             let all = &crate::library::LibraryView::ALL;
             let cur = crate::library::LibraryView::parse(&s.library_view);
@@ -2250,11 +2273,12 @@ pub(super) mod tests {
         // 2026-08 sweep found them bridged but unreachable) later passes added, minus the
         // game-library toggle: this screen never read it, and the library is offered on any
         // paired host now.
-        // 35 desktop rows + the nine Android-only ones (design android-skia-console-port.md
-        // D3): seven `extra`-backed settings and two platform-screen action rows.
-        assert_eq!(seen.len(), 44, "{seen:?}");
+        // 35 desktop rows + the ten Android-only ones (design android-skia-console-port.md
+        // D3): eight `extra`-backed settings and two platform-screen action rows.
+        assert_eq!(seen.len(), 45, "{seen:?}");
         assert!(seen.contains(&RowId::Palette));
         assert!(seen.contains(&RowId::ReduceMotion));
+        assert!(seen.contains(&RowId::ReduceUiResolution));
         assert!(seen.contains(&RowId::AudioFormat));
         // The catalog rows belong to the trailing tab, which builds them at render time.
         assert!(TABS[PROFILES_TAB].1.is_empty());

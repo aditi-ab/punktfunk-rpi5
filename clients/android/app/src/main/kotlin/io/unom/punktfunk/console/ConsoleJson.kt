@@ -328,6 +328,7 @@ internal object ConsoleJson {
         j.put("android.ds_capture", s.dsCapture)
         j.put("android.gamepad_ui_mode", s.gamepadUiMode)
         j.put("android.gamepad_ui_enabled", s.gamepadUiEnabled)
+        j.put("android.reduce_ui_resolution", s.reduceUiResolution)
         // A store written by the nesting build carries the stale wrapper; drop it rather than
         // round-trip a copy of these keys that nothing reads for the life of the install.
         j.remove("extra")
@@ -386,6 +387,7 @@ internal object ConsoleJson {
             gamepadUiMode = j.optString("android.gamepad_ui_mode", s.gamepadUiMode)
                 .ifEmpty { s.gamepadUiMode },
             gamepadUiEnabled = j.optBoolean("android.gamepad_ui_enabled", s.gamepadUiEnabled),
+            reduceUiResolution = j.optBoolean("android.reduce_ui_resolution", s.reduceUiResolution),
         )
     }
 }

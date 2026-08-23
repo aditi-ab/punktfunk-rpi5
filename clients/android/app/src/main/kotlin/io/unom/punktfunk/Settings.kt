@@ -115,6 +115,22 @@ data class Settings(
      */
     val gamepadUiEnabled: Boolean = true,
     /**
+     * Draw the console UI at 1080p and let the display scale it up, instead of at the panel's own
+     * resolution. Off by default — this is a deliberate sharpness-for-smoothness trade, not
+     * something to impose on a device that does not need it.
+     *
+     * It exists for 4K TVs and projectors. Their graphics chips are chosen to decode and composite
+     * video, not to shade a UI, and are far slower than a phone's; at 4K every pass the console
+     * draws — the mesh backdrop above all — costs four times what it does at 1080p on hardware
+     * that is nowhere near four times faster. A "premium" 4K box is MORE likely to want this than
+     * a cheap 1080p stick, which never had the extra pixels to begin with.
+     *
+     * Read by [io.unom.punktfunk.console.SkiaConsoleShell], which applies it with
+     * `SurfaceHolder.setFixedSize` — the compositor then scales the smaller buffer up for free.
+     * The stream is untouched; that has its own `renderScale`.
+     */
+    val reduceUiResolution: Boolean = false,
+    /**
      * When [gamepadUiEnabled] actually takes over — the cross-client `gamepad_ui_mode` pair,
      * mirroring the Apple client's `gamepadUIMode`: `"connected"` (default, and what the switch
      * has always meant) waits for a controller; `"always"` keeps the console UI with no pad in
@@ -329,6 +345,7 @@ class SettingsStore(context: Context) {
             // Migration: the pre-enum Boolean "trackpad_mode" (true = trackpad, false = direct).
             ?: if (prefs.getBoolean(K_TRACKPAD, true)) TouchMode.TRACKPAD else TouchMode.POINTER,
         gamepadUiEnabled = prefs.getBoolean(K_GAMEPAD_UI, true),
+        reduceUiResolution = prefs.getBoolean(K_REDUCE_UI_RES, false),
         gamepadUiMode = prefs.getString(K_GAMEPAD_UI_MODE, GAMEPAD_UI_WHEN_CONNECTED)
             ?: GAMEPAD_UI_WHEN_CONNECTED,
         libraryEnabled = prefs.getBoolean(K_LIBRARY, true),
@@ -373,6 +390,7 @@ class SettingsStore(context: Context) {
             .putString(K_STATS_VERBOSITY, s.statsVerbosity.name)
             .putString(K_TOUCH_MODE, s.touchMode.name)
             .putBoolean(K_GAMEPAD_UI, s.gamepadUiEnabled)
+            .putBoolean(K_REDUCE_UI_RES, s.reduceUiResolution)
             .putString(K_GAMEPAD_UI_MODE, s.gamepadUiMode)
             .putBoolean(K_LIBRARY, s.libraryEnabled)
             .putString(K_UI_PALETTE, s.uiPalette)
@@ -415,6 +433,7 @@ class SettingsStore(context: Context) {
         const val K_HUD = "stats_hud_enabled"
         const val K_TOUCH_MODE = "touch_mode"
         const val K_GAMEPAD_UI = "gamepad_ui_enabled"
+        const val K_REDUCE_UI_RES = "reduce_ui_resolution"
         const val K_GAMEPAD_UI_MODE = "gamepad_ui_mode"
         const val K_LIBRARY = "library_enabled"
         const val K_UI_PALETTE = "ui_palette"
