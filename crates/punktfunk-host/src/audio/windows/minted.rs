@@ -275,13 +275,22 @@ fn ensure_role(role: Role) -> Result<(String, String, Option<String>)> {
     let (hwid, inf) = discover_driver(role.needle(), role.inf_name())?;
     let devnode = match find_role_devnode(role)? {
         Some(inst) => inst,
-        None => {
-            let inst = pe::create_media_devnode(role.desc(), &hwid, |set, did| {
-                pe::write_devparam_dword(set, did, ROLE_MARKER, role.value())
-            })?;
-            tracing::info!(role = role.label(), devnode = %inst, "minted an audio devnode");
-            inst
-        }
+        // Before minting a SECOND devnode, reclaim an abandoned one. Minting is two PnP steps
+        // (register, then mark), and a host that dies between them — the 0.30.0 teardown abort
+        // did exactly this, five times on one box — leaves a registered, driver-bound, endpoint-
+        // serving devnode that carries no marker. Nothing then resolves it: the next pass mints
+        // a fresh one and the orphan lingers as a duplicate "Punktfunk Speakers"/"Punktfunk
+        // Microphone" in the Sound zoo, invisible to the marker-matched uninstall sweep.
+        None => match adopt_orphan_devnode(role, &hwid)? {
+            Some(inst) => inst,
+            None => {
+                let inst = pe::create_media_devnode(role.desc(), &hwid, |set, did| {
+                    pe::write_devparam_dword(set, did, ROLE_MARKER, role.value())
+                })?;
+                tracing::info!(role = role.label(), devnode = %inst, "minted an audio devnode");
+                inst
+            }
+        },
     };
     pe::bind_driver(&hwid, &inf)?;
 
@@ -527,6 +536,61 @@ fn find_role_devnode(role: Role) -> Result<Option<String>> {
                 return Ok(Some(inst));
             }
         }
+    }
+    Ok(None)
+}
+
+/// Reclaim an ABANDONED punktfunk devnode for `role`, re-marking it so it resolves normally from
+/// here on; `None` when there is nothing to adopt (the ordinary first-mint path).
+///
+/// The shape adopted is `ROOT\MEDIA\NNNN` + the role's Steam hardware id + NO owner marker.
+/// That triple can only be ours: `ROOT\MEDIA\NNNN` is what
+/// `SetupDiCreateDeviceInfoW(… DICD_GENERATE_ID)` on the MEDIA class yields, and STEAM'S OWN
+/// devnodes are enumerated under `ROOT\SteamStreamingSpeakers\*` /
+/// `ROOT\SteamStreamingMicrophone\*` — they carry the same hardware id but never that instance
+/// prefix, which is precisely what keeps this from adopting (and later sweeping) Steam's devices.
+/// A marker of ANY family is left alone: it is a live devnode, ours but spoken for.
+///
+/// Which family the orphan came from does not matter. Every one is a plain instance of the same
+/// Valve driver; roles are ours to assign, and re-marking it here is what makes the assignment
+/// stick across restarts.
+fn adopt_orphan_devnode(role: Role, hwid: &str) -> Result<Option<String>> {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        SetupDiEnumDeviceInfo, SPDRP_HARDWAREID,
+    };
+    let set = pe::media_class_devs()?;
+    for i in 0.. {
+        let mut did = pe::devinfo_data();
+        // SAFETY: live set; `did` is a live out-param with cbSize set.
+        if unsafe { SetupDiEnumDeviceInfo(set.0, i, &mut did) }.is_err() {
+            break; // ERROR_NO_MORE_ITEMS
+        }
+        let Some(inst) = pe::instance_id(&set, &did) else {
+            continue;
+        };
+        if !inst.to_ascii_uppercase().starts_with("ROOT\\MEDIA\\") {
+            continue;
+        }
+        if !pe::devnode_multi_sz_prop(&set, &did, SPDRP_HARDWAREID)
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(hwid))
+        {
+            continue;
+        }
+        if super::devnode_cleanup::OWNER_MARKERS
+            .iter()
+            .any(|m| pe::read_devparam_dword(&set, &did, m).is_some())
+        {
+            continue;
+        }
+        pe::write_devparam_dword(&set, &mut did, ROLE_MARKER, role.value())?;
+        tracing::warn!(
+            role = role.label(),
+            devnode = %inst,
+            "adopted an abandoned audio devnode — one of ours whose owner marker never landed \
+             (a host that died mid-mint). Re-marked and reused instead of minting a duplicate"
+        );
+        return Ok(Some(inst));
     }
     Ok(None)
 }

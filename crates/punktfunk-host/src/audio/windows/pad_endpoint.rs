@@ -1192,6 +1192,17 @@ fn grant_system_full_control(subkey_path: &str) -> Result<()> {
     result
 }
 
+/// The MMDevices hive an endpoint's record lives in, chosen by the direction its id encodes
+/// (`{0.0.1.…}` = capture, anything else = render). Render is the safe default: it is what every
+/// non-capture id resolves to, and the pad program only ever has render endpoints.
+fn mmdev_path_for(endpoint_id: &str) -> &'static str {
+    if endpoint_id.starts_with(CAPTURE_ENDPOINT_ID_PREFIX) {
+        MMDEV_CAPTURE_PATH
+    } else {
+        MMDEV_RENDER_PATH
+    }
+}
+
 /// The raw-registry stamp route: repair the Properties key ACL, then write the serialized
 /// values (see [`reg_registry_value`]). Values written here are STORED but possibly not
 /// SERVED until an AudioEndpointBuilder restart — the caller's read-back decides.
@@ -1199,7 +1210,14 @@ fn registry_stamp(endpoint_id: &str, stamps: &[&Stamp]) -> Result<()> {
     use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
     let guid = endpoint_guid_part(endpoint_id)?;
-    let path = format!(r"{MMDEV_RENDER_PATH}\{guid}\Properties");
+    // The hive follows the endpoint's DIRECTION. This was hardcoded to Render, which is
+    // invisible for the pad program (its endpoints are render-only) but wrong for the minted
+    // provider, which stamps the virtual microphone's CAPTURE endpoint through the same
+    // writer: the fallback then reached for `…\Render\{capture-guid}\Properties`, a key that
+    // cannot exist, so every registry-route stamp of a capture endpoint failed on a box where
+    // the property store was denied — silently, since the caller degrades to "keeps the
+    // driver's default name".
+    let path = format!(r"{}\{guid}\Properties", mmdev_path_for(endpoint_id));
     grant_system_full_control(&path)
         .with_context(|| format!("make {path} writable (registry stamp route)"))?;
     let key = RegKey::predef(HKEY_LOCAL_MACHINE)
@@ -2108,6 +2126,23 @@ fn pad_capture_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The registry stamp route must reach for the hive matching the endpoint's DIRECTION —
+    /// it was hardcoded to Render, so a capture endpoint's fallback stamp could never land.
+    #[test]
+    fn registry_stamp_hive_follows_the_endpoint_direction() {
+        assert_eq!(
+            mmdev_path_for("{0.0.1.00000000}.{2753f927-2093-4ab4-aa90-9d880e959128}"),
+            MMDEV_CAPTURE_PATH,
+            "the minted microphone's capture endpoint records under Capture"
+        );
+        assert_eq!(
+            mmdev_path_for("{0.0.0.00000000}.{5da9b5c9-8a10-4b54-8cf6-ce02b8354f16}"),
+            MMDEV_RENDER_PATH,
+        );
+        // Anything unrecognised keeps the old behaviour rather than inventing a hive.
+        assert_eq!(mmdev_path_for("nonsense"), MMDEV_RENDER_PATH);
+    }
 
     /// The serialized container blob for pad 0 must be byte-for-byte the on-glass-measured
     /// value, and byte 23 must be the pad index.
