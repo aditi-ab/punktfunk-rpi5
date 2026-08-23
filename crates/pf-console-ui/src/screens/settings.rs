@@ -2178,6 +2178,9 @@ pub(super) mod tests {
                 RowId::Sc2Passthrough,
                 RowId::DsCapture,
                 RowId::Controllers,
+                // Between the Input tab's rows and the rest of Interface: this one sits under
+                // Reduce motion, which is earlier in that tab than the console-UI switch.
+                RowId::ReduceUiResolution,
                 RowId::GamepadUi,
                 RowId::GamepadUiMode,
                 RowId::Licenses,
