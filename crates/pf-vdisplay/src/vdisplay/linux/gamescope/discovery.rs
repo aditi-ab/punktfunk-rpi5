@@ -483,7 +483,12 @@ fn gamescope_patch_level() -> u32 {
                  cursor composited into the capture stream"
             );
         } else {
-            tracing::debug!(
+            // INFO, not DEBUG: this is the whole reason a box streams SDR, and the branch above
+            // announces the good news at INFO. A field report ("HDR stopped working after the
+            // update") cost a deep dive because the handshake's `capture_supports_hdr=false` was
+            // visible at INFO while the ONE line saying why sat a level below it. Fires once per
+            // process — the answer is cached in `LEVEL`.
+            tracing::info!(
                 bin = %gamescope_bin(),
                 "gamescope has no {PFHDR_MARKER} marker — sessions on this backend stay 8-bit SDR \
                  with a host-composited cursor (install punktfunk-gamescope for HDR)"

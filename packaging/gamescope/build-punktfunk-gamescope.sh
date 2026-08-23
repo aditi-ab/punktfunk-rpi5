@@ -109,6 +109,16 @@ echo "==> configuring"
 # (gamescope's own meson.build hard-errors if libliftoff/vkroots are missing from this list, so
 # all three go together.)
 #
+# **libdisplay-info is in the list for exactly the wlroots reason**, learned the hard way on the
+# SteamOS VM 2026-08-23: it is a vendored submodule too, so a build box that merely HAS
+# libdisplay-info-dev makes meson link it SHARED, and the binary then dies on SteamOS with
+# `libdisplay-info.so.2: cannot open shared object file` — it builds, it installs, it prints its
+# +pfhdr banner in the box, and build-gamescope.sh's on-glass check is the only thing between that
+# and a host promising HDR it cannot deliver. Debian trixie has the -dev package, Fedora and Arch
+# have it too, and any of them can pull it in transitively, so "don't install it" is not a fix
+# that holds. Pinning the fallback makes the outcome the same everywhere, which is the whole
+# point of this list.
+#
 # The C++ runtime goes STATIC for the same reason wlroots does: this binary is built on a ROLLING
 # distro and has to start on a FROZEN one. Arch's gcc (16.1.1 when this was written) makes the
 # compositor require `GLIBCXX_3.4.35`, and SteamOS 3.8.16 ships libstdc++ 3.4.34 — so the published
@@ -124,7 +134,7 @@ export LDFLAGS="${LDFLAGS:-} -static-libstdc++ -static-libgcc"
 meson setup "$BUILD" "$SRCDIR" \
   --prefix="$PREFIX" \
   --buildtype=release \
-  -Dforce_fallback_for="libliftoff,vkroots,wlroots${EXTRA_FALLBACK:+,$EXTRA_FALLBACK}" \
+  -Dforce_fallback_for="libliftoff,vkroots,wlroots,libdisplay-info${EXTRA_FALLBACK:+,$EXTRA_FALLBACK}" \
   -Dpipewire=enabled \
   -Denable_tests=false \
   -Denable_openvr_support=false \
