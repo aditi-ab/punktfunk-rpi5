@@ -68,6 +68,16 @@ log "Building punktfunk-gamescope (HDR 10-bit capture; ~5-10 min, best-effort)"
 # the two lists in step). Provisioned here, not in install.sh's main pass, so a dep problem can
 # only ever cost this feature. glm/stb come in as meson wraps; wlroots/libliftoff/vkroots/
 # libdisplay-info are vendored submodules — none of those need packages.
+#
+# ⚠ The last three names are the WSI LAYER's, and their absence is why this leg failed on every
+# Deck from 2026-08-13 (3ac4548c turned `-Denable_gamescope_wsi_layer=true` on) until it was
+# noticed as "HDR stopped working after an update". x11-xcb does NOT fail the compositor build —
+# it fails layer/meson.build, and build-punktfunk-gamescope.sh treats a missing layer as a hard
+# error, so the whole build exits non-zero. ci/gamescope-trixie.Dockerfile walked into the
+# identical trap one release later (1b28a7f7, v0.28.1) and now asserts x11-xcb at image build;
+# this list never got the same fix. MEASURED on debian:trixie against the names above: x11-xcb,
+# xkbcommon-x11 and libdisplay-info are ABSENT — gbm/egl/xfixes/xi do arrive transitively.
+# ci/gamescope-trixie.Dockerfile is the canonical list; diff against it when this build breaks.
 if ! distrobox enter "$BOX" -- bash -lc '
 set -e
 export DEBIAN_FRONTEND=noninteractive
@@ -85,7 +95,8 @@ sudo apt-get install -y -qq --no-install-recommends \
     libvulkan-dev libglm-dev libpixman-1-dev libeis-dev \
     libavif-dev libdecor-0-dev hwdata libluajit-5.1-dev \
     libpipewire-0.3-dev libspa-0.2-dev libsdl2-dev \
-    xwayland liblcms2-dev >/dev/null
+    xwayland liblcms2-dev \
+    libx11-xcb-dev libxkbcommon-x11-dev libdisplay-info-dev >/dev/null
 ' ; then
     warn "could not provision gamescope build deps in '$BOX' — sessions stay SDR (re-run update.sh to retry)"
     exit 0
@@ -94,8 +105,20 @@ if ! distrobox enter "$BOX" -- bash -lc "
 set -e
 bash '$PKGDIR/build-punktfunk-gamescope.sh' --prefix \"\$HOME/.local\" --no-setcap
 "; then
-    warn "punktfunk-gamescope failed to build — sessions stay SDR (re-run update.sh to retry)"
-    unwire
+    # A failed build REPLACED NOTHING — the previously installed binary is untouched on disk. If it
+    # still passes the on-glass check it is the very binary that was streaming HDR before this run,
+    # so keep it wired and say it is stale. Unwiring here took HDR away from boxes whose compositor
+    # still worked, on an update that changed nothing about it (field report: HDR "lost" going to
+    # 0.31.2, host.env silently missing PUNKTFUNK_GAMESCOPE_BIN afterwards). `unwire` belongs only
+    # where the binary itself fails `verifies` — the else branch at the bottom, which also removes
+    # it. `wire` re-arms a box a previous run of this bug already unwired.
+    if verifies; then
+        warn "punktfunk-gamescope failed to build — keeping the installed $("$GS_BIN" --version 2>&1 | head -1) (stale; re-run update.sh to retry)"
+        wire
+    else
+        warn "punktfunk-gamescope failed to build and none is installed — sessions stay SDR (re-run update.sh to retry)"
+        unwire
+    fi
     exit 0
 fi
 
