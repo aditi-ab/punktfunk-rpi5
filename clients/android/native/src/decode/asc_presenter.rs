@@ -21,6 +21,25 @@
 //! handle early at worst reuses a buffer a touch soon (a visible tear), never a use-after-free. The
 //! fences are the correctness of *timing*, not of memory — which is what lets this ship behind an
 //! auto-fallback with the residual risk being visual, not a crash.
+//!
+//! **The acquire fence must come from `acquireNextImageAsync`, never `acquireLatestImageAsync`.**
+//! `AImageReader::acquireLatestImage` (`NdkImageReader.cpp`, unfixed as of AOSP main) drains with
+//! one `int*` out-param it overwrites per image, then releases each dropped image with whatever the
+//! out-param currently holds — the *successor's* fence:
+//!
+//! ```text
+//! acquireImageLocked(&prev, fd)  → *fd = F1        (prev = img1)
+//! acquireImageLocked(&next, fd)  → *fd = F2        (next = img2; F1 overwritten and leaked)
+//! prev->close(*fd)               → reader adopts F2 as img1's release fence, then closes it
+//! acquireImageLocked(&next, fd)  → no buffer; leaves *fd alone
+//! returns img2 with *fd = F2     ← already given away and closed
+//! ```
+//!
+//! So the moment a burst gives it two images to collapse, the caller is handed a stale fd plus one
+//! leaked fd per extra drop. Passing that stale fd to `setBuffer` transfers it to SurfaceFlinger,
+//! which closes it again — an `fdsan` `SIGABRT` on the decode thread, either at `Fence::Fence(int)`
+//! inside `setBuffer` (the number was already re-owned) or at the end of `Transaction::apply` when
+//! the layer state is torn down. `AscBackend::drain_reader` therefore does newest-wins itself.
 
 use ndk::hardware_buffer::HardwareBuffer;
 use ndk::media::image_reader::{AcquireResult, Image, ImageFormat, ImageReader};
@@ -376,19 +395,24 @@ impl AscBackend {
         true
     }
 
-    /// Acquire newly rendered images out of the reader: latency keeps only the newest (older are
-    /// dropped back to the pool by `acquireLatest`); smooth keeps order up to capacity.
+    /// Acquire newly rendered images out of the reader: latency keeps only the newest (older ones
+    /// drop back to the pool as they are superseded); smooth keeps order up to capacity.
+    ///
+    /// Both modes drain with `acquireNextImageAsync`, one image at a time. `acquireLatestImageAsync`
+    /// is the obvious newest-wins call and is NOT usable — see the acquire-fence note at the top of
+    /// this module.
     fn drain_reader(&mut self) {
         if self.fifo_capacity == 0 {
-            // Newest-wins: one acquire-latest collapses the whole burst to the freshest buffer.
-            if let Some(acq) = self.acquire(true) {
+            // Newest-wins: collapse the burst to the freshest buffer ourselves. Each superseded
+            // candidate drops here — its image returns to the pool, its own acquire fence closes.
+            while let Some(acq) = self.acquire() {
                 if self.candidate.replace(acq).is_some() {
                     self.skipped += 1; // an un-presented candidate was superseded
                 }
             }
         } else {
             // Smooth: pull every ready image in order into the FIFO, evicting the oldest past cap.
-            while let Some(acq) = self.acquire(false) {
+            while let Some(acq) = self.acquire() {
                 self.fifo.push_back(acq);
                 while self.fifo.len() > self.fifo_capacity {
                     self.fifo.pop_front();
@@ -398,19 +422,13 @@ impl AscBackend {
         }
     }
 
-    /// Acquire one image (`latest` drops older, else FIFO) and pair its decode stamps + cadence due.
-    /// `None` when the reader is empty or a transient acquire error occurs.
-    fn acquire(&mut self, latest: bool) -> Option<Acquired> {
+    /// Acquire the next image and pair its decode stamps + cadence due. `None` when the reader is
+    /// empty or a transient acquire error occurs.
+    fn acquire(&mut self) -> Option<Acquired> {
         // SAFETY: we never touch the image's pixels — the acquire fence is handed straight to
         // SurfaceFlinger via `setBuffer`, which is exactly the "await before access" the async
         // acquire requires.
-        let res = unsafe {
-            if latest {
-                self.reader.acquire_latest_image_async()
-            } else {
-                self.reader.acquire_next_image_async()
-            }
-        };
+        let res = unsafe { self.reader.acquire_next_image_async() };
         let (image, fence) = match res {
             Ok(AcquireResult::Image(pair)) => pair,
             Ok(_) => return None, // no buffer available / max acquired

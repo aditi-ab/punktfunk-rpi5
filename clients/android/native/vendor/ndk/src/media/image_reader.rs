@@ -317,6 +317,12 @@ impl ImageReader {
     /// If the returned file descriptor is not [`None`], it must be awaited before attempting to
     /// access the [`Image`] returned.
     ///
+    /// **The returned fence is unsound whenever the platform actually drops an older image.**
+    /// `AImageReader::acquireLatestImage` reuses one out-param across the drain and releases each
+    /// dropped image with the *successor's* fence fd, so the fd handed back has already been given
+    /// to the reader (and closed by it) — adopting it here yields a double close and an `fdsan`
+    /// abort. Drain with [`ImageReader::acquire_next_image_async()`] and pick the newest yourself.
+    ///
     /// <https://developer.android.com/ndk/reference/group/media#aimagereader_acquirelatestimageasync>
     #[cfg(feature = "api-level-26")]
     #[doc(alias = "AImageReader_acquireLatestImageAsync")]
