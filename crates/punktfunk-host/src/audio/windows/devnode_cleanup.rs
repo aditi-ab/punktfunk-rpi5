@@ -26,15 +26,24 @@
 
 use super::{audio_control, audio_probe, minted, pad_endpoint as pe};
 use anyhow::Result;
-use windows::Win32::Devices::DeviceAndDriverInstallation::SetupDiEnumDeviceInfo;
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    SetupDiEnumDeviceInfo, SPDRP_HARDWAREID,
+};
 
 /// The `Device Parameters` REG_DWORD each punktfunk-minted devnode family stamps on itself. The
 /// VALUE is what differs per family; presence of the NAME is "this one is ours", which is all a
 /// sweep needs.
-const OWNER_MARKERS: [&str; 3] = [
+pub(crate) const OWNER_MARKERS: [&str; 3] = [
     pe::PAD_INDEX_VALUE,
     minted::ROLE_MARKER,
     audio_probe::PROBE_MARKER,
+];
+
+/// The Steam streaming hardware ids every audio devnode this product mints is created with —
+/// the second half of the ABANDONED-devnode test in [`owned_devnodes`].
+const MINTED_HWIDS: [&str; 2] = [
+    "ROOT\\SteamStreamingSpeakers",
+    "ROOT\\SteamStreamingMicrophone",
 ];
 
 /// What one sweep removed. `endpoint_records` is counted separately from `devnodes` because the
@@ -117,9 +126,84 @@ fn owned_devnodes() -> Result<Vec<String>> {
             .any(|m| pe::read_devparam_dword(&set, &did, m).is_some())
         {
             out.push(inst);
+            continue;
+        }
+        // ABANDONED: `ROOT\MEDIA\NNNN` carrying one of our minting hardware ids but no marker at
+        // all — a devnode registered by a host that died before the marker write landed. It is
+        // still bound and still serving endpoints, so leaving it behind is the "uninstalling
+        // punktfunk left Sound settings full of Punktfunk devices forever" report all over again.
+        //
+        // The instance prefix is what makes this safe, and it is NOT redundant with
+        // [`is_removable_instance`]: Steam's own devnodes carry these very hardware ids and are
+        // ROOT-enumerated too, but live under `ROOT\SteamStreamingSpeakers\*` /
+        // `ROOT\SteamStreamingMicrophone\*`. Only `ROOT\MEDIA\*` can have come from our
+        // `SetupDiCreateDeviceInfoW(… DICD_GENERATE_ID)`.
+        if is_abandoned_mint(&inst, &pe::devnode_multi_sz_prop(&set, &did, SPDRP_HARDWAREID)) {
+            out.push(inst);
         }
     }
     Ok(out)
+}
+
+/// The ABANDONED-devnode test, split out from the PnP enumeration so the rule that keeps this
+/// sweep off VALVE'S OWN devices is checkable without a live devinfo set. See [`owned_devnodes`].
+fn is_abandoned_mint(instance_id: &str, hwids: &[String]) -> bool {
+    instance_id.to_ascii_uppercase().starts_with("ROOT\\MEDIA\\")
+        && MINTED_HWIDS
+            .iter()
+            .any(|want| hwids.iter().any(|h| h.eq_ignore_ascii_case(want)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_abandoned_mint;
+
+    fn hw(s: &str) -> Vec<String> {
+        vec![s.to_string()]
+    }
+
+    #[test]
+    fn adopts_our_own_unmarked_devnodes() {
+        // What a host that died mid-mint leaves behind, either role.
+        assert!(is_abandoned_mint(
+            r"ROOT\MEDIA\0004",
+            &hw(r"ROOT\SteamStreamingMicrophone")
+        ));
+        assert!(is_abandoned_mint(
+            r"ROOT\MEDIA\0002",
+            &hw(r"ROOT\SteamStreamingSpeakers")
+        ));
+        // PnP casing is not guaranteed on either half.
+        assert!(is_abandoned_mint(
+            r"root\media\0009",
+            &hw(r"root\steamstreamingspeakers")
+        ));
+    }
+
+    #[test]
+    fn never_matches_valves_own_devices() {
+        // THE safety rule: Steam's devnodes carry the very same hardware ids and are ROOT-
+        // enumerated too — only the instance prefix separates them from ours.
+        assert!(!is_abandoned_mint(
+            r"ROOT\STEAMSTREAMINGMICROPHONE\0000",
+            &hw(r"ROOT\SteamStreamingMicrophone")
+        ));
+        assert!(!is_abandoned_mint(
+            r"ROOT\STEAMSTREAMINGSPEAKERS\0000",
+            &hw(r"ROOT\SteamStreamingSpeakers")
+        ));
+    }
+
+    #[test]
+    fn never_matches_other_vendors_or_real_hardware() {
+        // VB-Cable mints ROOT\MEDIA devnodes too — a different hardware id is all that saves it.
+        assert!(!is_abandoned_mint(r"ROOT\MEDIA\0000", &hw("VBAudioVACWDM")));
+        assert!(!is_abandoned_mint(
+            r"HDAUDIO\FUNC_01&VEN_10EC&DEV_0897",
+            &hw(r"ROOT\SteamStreamingSpeakers")
+        ));
+        assert!(!is_abandoned_mint(r"ROOT\MEDIA\0001", &[]));
+    }
 }
 
 /// A devnode this sweep is allowed to remove: ROOT-enumerated, i.e. software-created.
