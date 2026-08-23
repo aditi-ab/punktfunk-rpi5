@@ -163,8 +163,19 @@ impl Shell {
             let bw = lead + tw + pad_x;
             let bx = (w - bw) / 2.0;
             let by = h - BOTTOM_BAND * k - bh - 8.0 * k + (1.0 - slide) * 12.0 * k;
-            canvas.save_layer_alpha_f(None, alpha);
             let rect = Rect::from_xywh(bx as f32, by as f32, bw as f32, bh as f32);
+            // BOUNDED to the pill. Unbounded, `save_layer` allocates an offscreen the size of
+            // the whole SURFACE and composites it back — on a 4K TV that is a 33 MB render
+            // target raised and torn down every frame, for four seconds, to fade a 34 dp pill
+            // (and on a box whose whole Skia budget is 64 MB, it evicts real work to do it).
+            //
+            // Everything drawn inside is inside `rect`: the pill fill, `theme::panel`'s
+            // hairline ON that rect, the kind mark centred in it, and text that ends a `pad_x`
+            // short of its right edge. There is no blur to reach further, so the outset is
+            // slack for the stroke rather than a computed reach — `screens::home` needs 36 k
+            // for the same layer only because it wraps a σ = 10 k halo.
+            let bounds = rect.with_outset((12.0 * k as f32, 12.0 * k as f32));
+            canvas.save_layer_alpha_f(Some(bounds), alpha);
             canvas.draw_rrect(
                 skia_safe::RRect::new_rect_xy(rect, (bh / 2.0) as f32, (bh / 2.0) as f32),
                 &fill(crate::theme::shade(0.6)),

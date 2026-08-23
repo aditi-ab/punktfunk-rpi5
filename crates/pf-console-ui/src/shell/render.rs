@@ -67,6 +67,8 @@ impl Shell {
             }
             None => dt,
         };
+        // The shaped-paragraph cache's clock, before anything asks it to draw.
+        fonts.begin_frame();
         self.sync();
         // Publish the palette's ink before ANYTHING draws — every widget, glyph and panel in
         // the crate reads it (see `theme::set_ink`), so a frame that skipped this would paint
@@ -80,10 +82,14 @@ impl Shell {
         crate::theme::set_reduce_motion(reduce);
         self.pads = pads.to_vec();
         self.glyphs = GlyphStyle::from_pref(pad_pref);
-        self.chip = Some(pad.map_or_else(
-            || "No controller — keyboard works too".to_string(),
-            str::to_owned,
-        ));
+        // Compared before it is rebuilt: this string changes when someone plugs a controller
+        // in, and was being re-allocated 60 times a second to say so. (`pads` above is left
+        // alone — it is at most a handful of small structs, and `PadInfo` would have to grow a
+        // `PartialEq` in another crate to be worth the same treatment.)
+        let chip = pad.unwrap_or("No controller — keyboard works too");
+        if self.chip.as_deref() != Some(chip) {
+            self.chip = Some(chip.to_owned());
+        }
 
         let (full_w, full_h) = (f64::from(viewport.width), f64::from(viewport.height));
         let ins = viewport.insets;
@@ -353,7 +359,26 @@ impl LayerEnv<'_> {
         scale: f64,
     ) -> Vec<(crate::glyphs::HintKey, Rect)> {
         let canvas = self.canvas;
-        canvas.save_layer_alpha_f(None, alpha.clamp(0.0, 1.0) as f32);
+        // Only RAISE the layer when it carries something. A settled screen is painted at full
+        // alpha, unscaled and unslid, and an unbounded `save_layer` allocates an offscreen the
+        // size of the whole SURFACE and composites it back — so the console was paying for one
+        // full-screen offscreen on every frame it sat still, to apply an alpha of 1. Skia does
+        // not elide it either: `SkCanvas::saveLayerAlphaf` forwards alpha ≥ 1 straight to
+        // `saveLayer(bounds, nullptr)`, whose only early-out is an empty clip.
+        //
+        // Dropping the layer is pixel-identical rather than merely close: nothing in this crate
+        // draws with a blend mode other than `SrcOver`, and `SrcOver` is associative, so
+        // compositing the draws into a transparent layer and then over the backdrop lands on
+        // exactly the value drawing them straight onto the backdrop does. (It is also why the
+        // text stays grayscale-AA — no LCD subpixel text to gain or lose an isolation.) Same
+        // reasoning `screens::home` already bounds its per-tile layer by.
+        let layered = alpha < 0.999 || (scale - 1.0).abs() > 0.001 || dy.abs() > 0.001;
+        if layered {
+            canvas.save_layer_alpha_f(None, alpha.clamp(0.0, 1.0) as f32);
+        } else {
+            // Still a save: the transform below is undone by the same `restore`.
+            canvas.save();
+        }
         canvas.translate((0.0, dy as f32));
         let (cx, cy) = ((self.w / 2.0) as f32, (self.h / 2.0) as f32);
         canvas.translate((cx, cy));

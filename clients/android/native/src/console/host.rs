@@ -223,6 +223,7 @@ impl ConsoleHost {
         let thread = std::thread::Builder::new()
             .name("pf-console".into())
             .spawn(move || {
+                boost_thread_priority();
                 let run = || -> Result<()> {
                     let console = Console::new(opts, entry, &thread_handles)?;
                     render_loop(console, thread_shared.clone(), thread_store)
@@ -248,6 +249,34 @@ impl ConsoleHost {
         }
     }
 }
+
+/// Best-effort: lift the console's render thread off the default nice band, the same way
+/// `decode::setup::boost_thread_priority` lifts the decode thread. This thread IS the console's
+/// frame loop — every menu press waits on it — and at default priority a TV box's scheduler is
+/// free to park it on a little core behind whatever else the system is doing, which reads as a
+/// UI that lags the remote. `-8` rather than the decode path's `-10`: a stream's frames are the
+/// harder deadline, and the two should not compete when the console is up during a session.
+///
+/// Non-fatal if the platform refuses (the exact floor a foreground app may set is policy).
+fn boost_thread_priority() {
+    // SAFETY: `gettid`/`setpriority` on the calling thread are always-safe syscalls; PRIO_PROCESS
+    // with a TID targets that one task on Linux — the idiom `Process.setThreadPriority` uses.
+    unsafe {
+        let tid = libc::gettid();
+        if libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -8) != 0 {
+            log::debug!(
+                "console: setpriority(-8) failed (non-fatal): {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// How often the render loop reports what a frame is costing it. Nothing in a bug report from a
+/// TV said whether the console was drawing at 4K or at 60 Hz, so "it feels sluggish" could not be
+/// triaged from a log bundle at all — this is that missing line. One line a minute is cheap
+/// enough to leave on for everyone, and the answer is only useful from the box that is slow.
+const FRAME_REPORT: Duration = Duration::from_secs(60);
 
 /// No input for this long = the console is being looked at, not used — halve the redraw
 /// rate (`IDLE_FRAME_STEP` slept between swaps). 60 s keeps every interaction and its
@@ -283,6 +312,9 @@ fn render_loop(mut console: Console, shared: Arc<Shared>, store: Arc<SnapshotSto
     // SurfaceView forever. Dying raises `Dead`, and Kotlin answers with the touch UI.
     let mut gl_failures = 0u32;
     const GL_FAILURE_LIMIT: u32 = 3;
+    // What a frame is costing, reported once a `FRAME_REPORT` window (see there).
+    let (mut frames, mut frame_time, mut frame_peak) = (0u32, Duration::ZERO, Duration::ZERO);
+    let mut report_at = Instant::now();
 
     loop {
         // Take everything queued. With no surface up, block until something arrives.
@@ -446,8 +478,17 @@ fn render_loop(mut console: Console, shared: Arc<Shared>, store: Arc<SnapshotSto
                 skia = None;
                 match g.wrap_window(&egl, w, h) {
                     Ok(surf) => {
+                        // The console's real render resolution — the one number a bug report
+                        // from a TV never carried. A 4K panel is 4× the fragment work of 1080p
+                        // for every pass the shell draws.
+                        log::info!("console: drawing at {w}×{h}");
                         skia = Some((surf, w, h));
                         gl_failures = 0;
+                        // Start the frame window here, not at loop entry: the console parks
+                        // with no surface while a stream is up, and a window that had been
+                        // open across that would report its first frame as "1 frame in 20 min".
+                        (frames, frame_time, frame_peak, report_at) =
+                            (0, Duration::ZERO, Duration::ZERO, Instant::now());
                     }
                     Err(e) => {
                         log::error!("console: {e:#}");
@@ -462,6 +503,11 @@ fn render_loop(mut console: Console, shared: Arc<Shared>, store: Arc<SnapshotSto
                     insets,
                     scale,
                 };
+                // Around the DRAW only, not the swap: `eglSwapBuffers` blocks on vsync, so
+                // wall-clock per iteration is always ~the panel period and says nothing. What
+                // matters is how much of that period the shell spends building the frame —
+                // once that passes the period, the console is missing vsyncs.
+                let drew = Instant::now();
                 console.frame(
                     surf.canvas(),
                     &viewport,
@@ -470,6 +516,20 @@ fn render_loop(mut console: Console, shared: Arc<Shared>, store: Arc<SnapshotSto
                     &pads,
                 );
                 g.context.flush_and_submit();
+                let cost = drew.elapsed();
+                frame_time += cost;
+                frame_peak = frame_peak.max(cost);
+                frames += 1;
+                if report_at.elapsed() >= FRAME_REPORT {
+                    log::info!(
+                        "console: {w}×{h}, {frames} frames in {:?} — {:.1} ms/frame mean, {:.1} ms peak",
+                        report_at.elapsed(),
+                        frame_time.as_secs_f64() * 1000.0 / f64::from(frames),
+                        frame_peak.as_secs_f64() * 1000.0,
+                    );
+                    (frames, frame_time, frame_peak, report_at) =
+                        (0, Duration::ZERO, Duration::ZERO, Instant::now());
+                }
                 if let Err(e) = s.swap() {
                     // The window went away under us; wait for the next surface.
                     log::warn!("console: {e:#} — dropping the surface");
