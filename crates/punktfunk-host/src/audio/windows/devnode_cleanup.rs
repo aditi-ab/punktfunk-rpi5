@@ -138,7 +138,10 @@ fn owned_devnodes() -> Result<Vec<String>> {
         // ROOT-enumerated too, but live under `ROOT\SteamStreamingSpeakers\*` /
         // `ROOT\SteamStreamingMicrophone\*`. Only `ROOT\MEDIA\*` can have come from our
         // `SetupDiCreateDeviceInfoW(… DICD_GENERATE_ID)`.
-        if is_abandoned_mint(&inst, &pe::devnode_multi_sz_prop(&set, &did, SPDRP_HARDWAREID)) {
+        if is_abandoned_mint(
+            &inst,
+            &pe::devnode_multi_sz_prop(&set, &did, SPDRP_HARDWAREID),
+        ) {
             out.push(inst);
         }
     }
@@ -148,7 +151,9 @@ fn owned_devnodes() -> Result<Vec<String>> {
 /// The ABANDONED-devnode test, split out from the PnP enumeration so the rule that keeps this
 /// sweep off VALVE'S OWN devices is checkable without a live devinfo set. See [`owned_devnodes`].
 fn is_abandoned_mint(instance_id: &str, hwids: &[String]) -> bool {
-    instance_id.to_ascii_uppercase().starts_with("ROOT\\MEDIA\\")
+    instance_id
+        .to_ascii_uppercase()
+        .starts_with("ROOT\\MEDIA\\")
         && MINTED_HWIDS
             .iter()
             .any(|want| hwids.iter().any(|h| h.eq_ignore_ascii_case(want)))
