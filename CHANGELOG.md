@@ -23,7 +23,9 @@ host event schema. `pf-driver-proto` shows no diff. No `#[repr(C)]` struct moves
 changes signature, so an embedder takes this release without recompiling anything.
 `api/openapi.json` gains **one route and one field** (`PATCH /clients/{fingerprint}`, the
 `RenameClient` schema, and `PairedClient.label`); nothing existing changes shape, so a consumer that
-ignores both is unaffected. One dependency moves, lockfile-only, for a security advisory.
+ignores both is unaffected. **`@punktfunk/host` is re-cut to 0.1.6** so a plugin can actually reach
+the generated types for that route; `@punktfunk/plugin-kit` stays at 0.4.4. One dependency moves,
+lockfile-only, for a security advisory.
 
 The cycle is fix-shaped and the faults share a family resemblance: **a session degrading or ending
 against something ordinary that nothing was checking**. The host mistaking Steam's pre-launch trees
@@ -52,7 +54,7 @@ per-frame cost and its new resolution switch (#384, #385), one feature (#374), a
 | Host event schema | 1 | **1** | unchanged (`punktfunk-host/src/events.rs`) |
 | `api/openapi.json` | 0.31.2 | **0.31.3** | **additive**: one route (`PATCH /clients/{fingerprint}`), one schema (`RenameClient`), one response field (`PairedClient.label`), plus the `info.version` stamp. Regenerated in #374 on a runner where `openapi_document_is_complete_and_checked_in` executes; **re-stamped** here, not regenerated — `punktfunk-host` does not build on macOS. `api/` and `docs-site/public/` are byte-identical to each other |
 | gamescope patch level (`+pfhdrN`) | 8 | **8** | unchanged; no new patch files, `packaging/gamescope/PKGBUILD` still declares `pfhdr8`. #382 fixes the Deck **source** build, not the patch set |
-| `@punktfunk/host` (SDK) | 0.1.5 | **0.1.5** | **not re-cut**, but `sdk/src/gen/punktfunk.ts` did change — see the drift note at the end. The registry's 0.1.5 therefore has no types for the new route |
+| `@punktfunk/host` (SDK) | 0.1.5 | **0.1.6** | **cut**, for the generated client `sdk/src/gen/punktfunk.ts` — it carries `PATCH /clients/{fingerprint}`, `RenameClient` and `PairedClient.label`, and a plugin resolves `@punktfunk/host` from the registry, so those types reach nobody until a version ships them. `SDK_VERSION` moves with `package.json`; see the drift note at the end |
 | `@punktfunk/plugin-kit` | 0.4.4 | **0.4.4** | unchanged; nothing under `plugin-kit/` moved. 0.4.4 remains the registry's `latest` |
 
 ### ⚠ Breaking changes
@@ -544,8 +546,17 @@ pinned generator, and nothing in CI regenerates or verifies it (unlike `api/open
 `include/punktfunk_core.h`, which are both gated). #374 lands the clean regeneration rather than
 hand-patching generated code.
 
-`@punktfunk/host` is **not** re-cut for it, so the registry's 0.1.5 has no types for
-`PATCH /clients/{fingerprint}`. Cut `sdk-v0.1.6` if anything outside this repo needs them.
+**`@punktfunk/host` 0.1.6 is cut for it** (`sdk-v0.1.6`, published by `sdk-publish.yml`), because a
+plugin resolves the SDK from the registry: the types for `PATCH /clients/{fingerprint}` could not
+reach one while they sat in `sdk/` unpublished. That single regenerated file is the whole diff since
+`sdk-v0.1.5`.
+
+`SDK_VERSION` in `sdk/src/version.ts` moves with `package.json`. It is a hand-maintained constant —
+`tsconfig.build.json` sets `rootDir: "src"` so it cannot import `package.json`, and the runner ships
+as one bundled `runner-cli.js` with no manifest beside it — and the runner compares it against the
+SDK installed in the plugins tree to decide whether to reinstall. Shipping 0.1.6 with the constant
+still reading 0.1.5 would publish the types and then never deliver them; `version.test.ts` exists for
+exactly that and gates it.
 
 ---
 
