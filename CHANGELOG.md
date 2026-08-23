@@ -12,6 +12,554 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ---
 
+## v0.31.3
+
+41 commits since v0.31.2 (26 non-merge), counted at the tip this was cut from.
+
+**One versioned surface moves, and additively: the management API.** `WIRE_VERSION` stays **2**, the
+C ABI stays **25** — `include/punktfunk_core.h` is **byte-identical to the v0.31.2 tag**, as it was
+to v0.31.1 — and so do the driver protocol, the gamepad channel, the plugin index schema and the
+host event schema. `pf-driver-proto` shows no diff. No `#[repr(C)]` struct moves and no C function
+changes signature, so an embedder takes this release without recompiling anything.
+`api/openapi.json` gains **one route and one field** (`PATCH /clients/{fingerprint}`, the
+`RenameClient` schema, and `PairedClient.label`); nothing existing changes shape, so a consumer that
+ignores both is unaffected. **`@punktfunk/host` is re-cut to 0.1.6** so a plugin can actually reach
+the generated types for that route; `@punktfunk/plugin-kit` stays at 0.4.4. One dependency moves,
+lockfile-only, for a security advisory.
+
+The cycle is fix-shaped and the faults share a family resemblance: **a session degrading or ending
+against something ordinary that nothing was checking**. The host mistaking Steam's pre-launch trees
+for the game and then reading their exit as the game's (#372); a fullscreen game mode-setting the
+virtual display under both stream loops, which no in-place encoder rebuild can converge on (#373);
+the forced-keyframe coalesce window measured in frames rather than time (#377); an Android TV
+negotiating the refresh its own console pin had installed rather than what the panel outputs
+(#378); a startup capacity probe large enough to black-hole the link it was measuring (#379); a
+hand-back that never verified the panel came back (#375); a half-minted audio devnode that nothing
+afterwards recognised (#381); and a failed compositor build that unlinked the working one it never
+replaced (#382). Alongside: two Android input/present fixes (#376, #380), the console's
+per-frame cost and its new resolution switch (#384, #385), one feature (#374), and CI (#370, #383).
+
+### Versions
+
+| | v0.31.2 | v0.31.3 | Notes |
+|---|---|---|---|
+| Wire protocol | 2 | **2** | unchanged. No message added, removed or re-shaped |
+| C ABI | 25 | **25** | unchanged. `include/punktfunk_core.h` has **no diff at all** against the v0.31.2 tag — the second release running |
+| Rust edition | 2024 | **2024** | unchanged |
+| MSRV (`rust-version`) | 1.85 | **1.85** | unchanged |
+| Workspace crate dirs | 27 | **27** | unchanged (39 `[workspace] members`, also unchanged) |
+| Virtual-display driver protocol | 6 | **6** | unchanged (minimum accepted still 3); `pf-driver-proto` shows no diff against the v0.31.2 tag |
+| Windows virtual-gamepad channel | 3 | **3** | unchanged. #374 exercises the UMDF HID pad through `devtest` but changes no backend |
+| Plugin index schema | 1 | **1** | unchanged |
+| Host event schema | 1 | **1** | unchanged (`punktfunk-host/src/events.rs`) |
+| `api/openapi.json` | 0.31.2 | **0.31.3** | **additive**: one route (`PATCH /clients/{fingerprint}`), one schema (`RenameClient`), one response field (`PairedClient.label`), plus the `info.version` stamp. Regenerated in #374 on a runner where `openapi_document_is_complete_and_checked_in` executes; **re-stamped** here, not regenerated — `punktfunk-host` does not build on macOS. `api/` and `docs-site/public/` are byte-identical to each other |
+| gamescope patch level (`+pfhdrN`) | 8 | **8** | unchanged; no new patch files, `packaging/gamescope/PKGBUILD` still declares `pfhdr8`. #382 fixes the Deck **source** build, not the patch set |
+| `@punktfunk/host` (SDK) | 0.1.5 | **0.1.6** | **cut**, for the generated client `sdk/src/gen/punktfunk.ts` — it carries `PATCH /clients/{fingerprint}`, `RenameClient` and `PairedClient.label`, and a plugin resolves `@punktfunk/host` from the registry, so those types reach nobody until a version ships them. `SDK_VERSION` moves with `package.json`; see the drift note at the end |
+| `@punktfunk/plugin-kit` | 0.4.4 | **0.4.4** | unchanged; nothing under `plugin-kit/` moved. 0.4.4 remains the registry's `latest` |
+
+### ⚠ Breaking changes
+
+**None.** No wire change, no ABI change, no driver-protocol change, no plugin-contract change, and
+the one API change is additive. Every 0.31.x host, client, driver and plugin keeps interoperating in
+both directions with no re-pairing and no rebuild.
+
+Five **behaviour** changes that break no build but change what a machine does:
+
+- **`GameRunning` is reported up to `SHIM_WINDOW` (5 s) later than before** for a lease matched by
+  process scan. A scan match must now be seen *continuously* for that window before it latches out
+  of the start phase. A provider plugin's runstate report still latches immediately — that is the
+  launcher's own statement, not an inference — and exit detection is untouched.
+- **The GameStream stream loop now re-opens the encoder at a source-driven mode**, and does not tell
+  the client. GameStream has no mid-stream mode-change message, so Moonlight decodes a bitstream
+  that disagrees with the resolution it configured its decoder from. Tolerant decoders re-init off
+  the SPS; a strict one (Media Foundation on Xbox) may stall. This is the same bargain the first
+  open in that function already takes for the monitor-mirror case (§7.3), and the alternative it
+  replaces is ending the session outright.
+- **`GET /api/v1/clients` grows `label`**, and `PairedClient.subject` is now documented as *not* a
+  device name. A console or integration that displayed `subject` should prefer `label` and fall back
+  to `subject` only when it is unset.
+- **The startup capacity probe no longer bursts at a flat 2 Gbps.** Its target is derived from
+  `stream_cap_kbps × 2`, still capped at 2 Gbps. `PUNKTFUNK_ABR_PROBE_KBPS` and its `> 0` filter are
+  unchanged, so an embedder that pins the probe explicitly sees no difference.
+- **Android no longer pins the panel to its highest refresh mode on a TV.** `highRefreshModeId`
+  stays 0 there, which `setConsoleHighRefreshRate` already treats as a no-op. Phones and tablets are
+  unaffected — the pin exists for their refresh governors.
+
+### `PATCH /clients/{fingerprint}`: an operator label for a paired client
+
+Every moonlight-common-c client self-signs with the same fixed subject (`CN=NVIDIA GameStream
+Client`), so the certificate carries no device identity at all: five paired devices are five
+identical rows, distinguishable only by fingerprint prefix — most sharply when choosing which to
+unpair. Reported from the field as a rename request.
+
+The label is operator-supplied and stored host-side, keyed by fingerprint:
+
+- **`client-labels.json`, a SIDECAR to `paired.json`, not a field inside it.** `paired.json` is a
+  bare `Vec<Vec<u8>>` of DERs; giving it a shape would be a migration on the one file that decides
+  who may connect, and a label is not part of that trust decision — a corrupt or missing label file
+  must never be able to lock anybody out. Every read failure degrades to "no names". Writes take the
+  same atomic temp-file + rename as `save_paired`, serialized by `LABELS_LOCK` so two concurrent
+  renames cannot lose one of the two names in a whole-file rewrite. Fingerprints are normalized to
+  lowercase hex.
+- **Route semantics.** A whitespace-only body **clears** rather than storing a blank name; only an
+  already-paired fingerprint may be named (a label for an unknown one would be invisible and never
+  cleaned up); unpairing forgets the label, so the file cannot grow without bound and re-pairing the
+  same certificate starts unnamed.
+- **Scrubbing reuses `native_pairing::sanitize_device_name`** rather than growing a second one — it
+  already strips C0/C1 controls and Unicode bidi overrides and caps at 64. That is not cosmetic
+  here: the label is the *only* thing distinguishing two paired devices in the console, so an
+  unscrubbed one could dress a stranger's device up as the operator's TV and be spared an unpair on
+  that basis.
+- **Lanes.** The new route takes the plugin/cert lanes of the `DELETE` beside it — neither may reach
+  it — not the roster `GET`'s read permission.
+  `every_route_is_classified_for_the_plugin_and_cert_lanes` pins that.
+- **Console.** A pencil on Moonlight rows opens the existing `promptText` dialog seeded with the
+  current label, not the `CN=…` fallback (or every rename would start by deleting boilerplate).
+  Native rows keep their pairing-supplied name and get no pencil.
+
+Test: `client_label_round_trips_scrubs_and_is_forgotten_on_unpair` — name it, see it in the list,
+watch a bidi override and collapsed whitespace get scrubbed, clear it two ways, reject a malformed
+and an unpaired fingerprint, and assert the unpair forgot it on disk.
+
+### The encoder follows an autonomous source mode or format change
+
+A fullscreen game can mode-set the virtual display mid-session with no client `Reconfigure`. The
+IDD-push capturer already handles that — it re-opens its ring at the new mode on a confirmed
+descriptor change — but nothing re-opened the **encoder**, which is the one component that cannot
+follow a resolution change in place. Every submit then failed with `captured frame 1920x1080 !=
+encoder 3840x2160`, and the submit-error path only rebuilds the encoder IN PLACE, at the SAME
+configured size, which cannot converge on a size the source has already left. All five resets burned
+on it and the video session ended ~3 s later with audio still running.
+
+Field report 2026-08-22 (host 0.31.2, RX 6800 XT, AMF/HEVC 4K60):
+
+```
+IDD push: display descriptor changed — recreating the ring at the new mode
+  target_id=259 from=3840x2160 hdr=true to=1920x1080 hdr=true
+encoder submit failed — encoder rebuilt in place, forcing an IDR
+  error=captured frame 1920x1080 != encoder 3840x2160 reset=1 max=5
+... reset=5 max=5
+encoder did not recover after repeated in-place rebuilds — ending the video session ... resets=6
+```
+
+Both stream loops now track what the encoder was opened against `(format, width, height)` and, when
+the source delivers something else, re-open through the same `open_video` path a client-initiated
+resize uses:
+
+- **Native (`native/stream.rs`)** publishes the new mode to the client exactly as an accepted resize
+  does, so its mode slot, stats and aspect follow. PyroWave's `Automatic` rate is re-resolved for
+  the new mode — it is a per-mode bpp pin, so carrying the old one across hands the encoder the
+  wrong operating point; H.26x rates stay with ABR, and an explicit client rate is never
+  second-guessed.
+- **GameStream (`gamestream/stream.rs`)** does the same bookkeeping the capture-loss rebuild in that
+  loop already does (ring depth, RFI caps, forced IDR, in-flight numbering restart), and derives
+  `gs_bit_depth(frame.format)` per open so an HDR flip that recreates the ring at P010 re-opens at
+  the right depth. It cannot notify the client; see the behaviour note above.
+
+A failed re-open does **not** end the session on the first try: the mode-set is exactly the kind of
+event that leaves the driver settling, which is the transient the submit path's backoff exists for
+("NVENC session open failing after a codec switch", 2026-07). It spends the shared `encoder_resets`
+budget at the existing exponential pace (100 ms → 1.6 s), re-entering the follow-the-source guard
+each round — the same ~3 s ceiling as before, but every round is now a real attempt at the new mode
+rather than an in-place re-init that cannot converge. The exhausted path is tagged accurately as an
+encoder **reopen** failure, not a submit failure.
+
+This also covers a mid-session frame-format change (an HDR flip re-creating the ring at a new
+format), which failed identically.
+
+### The forced-keyframe coalesce window gets an absolute floor
+
+`keyframe_coalesce` was `frame_interval * 2`. The window bounds IDR emission in **time** — it has to
+outlast the round trip in which the client receives and decodes the IDR it already asked for — so a
+frame count is the wrong unit, and it collapses exactly where it matters: 16.7 ms at 120 fps, while
+a Moonlight client that has lost decode sync re-asks roughly every 30 ms. The gate never closed
+between requests, so effectively every request became a full keyframe, whose bulk saturates the send
+path, which causes the loss that prompts the next request. The storm sustains itself and reads as
+stutter at a flat latency, because frames are being lost rather than queued.
+
+Field log (AMD RX 7800 XT, Bazzite 44, 1080p120 HEVC over the GameStream plane): **1118 IDR requests
+in one 91 s session, 1115 honoured, 3 coalesced** — about one full IDR every tenth frame at a
+100 Mbps target. The same session's H.264 leg (libav VAAPI, same bitrate) took 2 requests and was
+clean, which is what made it read as an HEVC fault.
+
+`keyframe_coalesce_window(frame_interval)` is now `(frame_interval * 2).max(100 ms)`. 100 ms matches
+the encoder-reset backoff in the same loop and is about one IDR's service time on a saturated link.
+Note this is **not a 120-only fix**: 60 fps sat at 33.3 ms, also under the floor. A slow stream keeps
+the frame-scaled window — the floor only ever raises it. NVENC ref-invalidation (cheap, no IDR
+spike) is still never rate-limited. `keyframe_coalesce_window_outlasts_a_clients_request_cadence`
+pins all three cases.
+
+### The game lease stops latching on Steam's pre-launch trees
+
+`reaper SteamLaunch AppId=<appid>` is the **appid's** wrapper, not the game's, and Steam wraps its
+pre-launch work for a title in one too — so a launch is a chain of appid-tagged trees and only the
+last is the game. The lease matched the first tree two seconds in, and that single sighting latched
+it out of `START_GRACE` (300 s, ending nothing) into `EXIT_CONFIRM` (3 s, ending the session). When
+that tree exited with the game still starting, the watch called it the game exiting and closed the
+connection with `APP_EXITED`. Reported as having to launch Rocket League twice: the first launch
+streamed the "Processing Vulkan shaders" dialog and dropped ten seconds in.
+
+Linux has nothing else to catch it — `procscan::running_hint` is Windows-only and no provider
+reports runstate for Steam, so an appid scan with three seconds of slack is the whole signal.
+(Steam's `registry.vdf` is not an option: `RunningAppID` is no longer set on modern Steam Linux, and
+the per-app `Running` key is unreliable.)
+
+Two layers, because only one of them can be certain:
+
+- The matcher **rejects** a `SteamLaunch AppId=` reaper whose payload is `fossilize_replay` —
+  Steam's shader replayer, never a game. `program_name` handles the full-path form.
+- A scan match must be seen **continuously for `SHIM_WINDOW`** before it latches. This is the rule
+  already applied to a spawned child ("a launcher about to hand off looks exactly like the game for
+  its first few seconds"); the scan side never had it. It bounds the pre-launch trees nobody has
+  named yet, at the cost of the `GameRunning` latency in the behaviour note above.
+
+Exit detection is untouched, and a provider report still latches immediately. Diagnostics: the log
+said `procs=1` and never *which* process, which is what made this unclosable from a log alone —
+`procscan::names` puts the short names on the line.
+
+### The startup capacity probe is sized from the session, not from a flat ceiling
+
+The probe burst at a flat 2 Gbps on the reasoning that it must measure the link and not itself. That
+reasoning is obsolete: the ABR already clamps the measured ceiling to `stream_cap_kbps` (what this
+session's mode + codec could plausibly use), so **every bit measured above `cap / 0.7` is discarded
+the moment it lands**. The height bought a number nothing reads and paid bufferbloat for it — a
+constrained link can black-hole under it. Measured on webOS: a 6 s probe timeout delaying first
+video to **14 s**, and a "successful" probe still reporting `send_dropped=20211`; the same shape is
+now reported on a Fire TV Stick 4K Max.
+
+The target is `stream_cap_kbps × 2`, capped at the old 2 Gbps. **×2 is the smallest multiplier that
+can still prove the cap** — the ceiling is `delivered × 0.7`, so proving `cap` needs
+`delivered ≥ cap × 1.43` — so this can never cap anyone: a session whose mode justifies a high
+ceiling asks for a high target by itself, and a mode `stream_ceiling_kbps` declines to size still
+gets 2 Gbps. Deliberately **not** a platform `cfg!`: the constraint is the session's, not Android's,
+and webOS has the same bug.
+
+Second half of the black screen: if the burst takes the first keyframe down with it, nothing
+re-requested one and the client sat on black until an unrelated recovery path happened to fire. A
+keyframe is now requested at probe end when no frame completed across the burst — compared against
+the count snapshotted at the burst's **leading edge** rather than against 0, so it also covers a
+mid-session embedder speed test that kills a running stream. One request per probe, through the
+control task's coalescer, so it cannot IDR-storm.
+
+### Android: the console's high-refresh pin is not applied on a TV
+
+Field report: on Android TV / Fire Stick, latency explodes whenever the client's refresh differs
+from the host's, and setting the refresh by hand is the only workaround. The client was
+manufacturing that mismatch itself, in three steps:
+
+1. `MainActivity.onCreate` pins the panel to its highest-refresh mode for the console UI
+   (`setConsoleHighRefreshRate(true)`) — unconditionally, TVs included. That pin exists for phone
+   refresh governors (Nothing OS's LTPO logic among them) which cap third-party apps at 60 Hz. No TV
+   has one.
+2. At connect, `nativeDisplayMode` resolves "Native" refresh from `display.mode` — which now reports
+   the mode the pin installed, not the TV's real HDMI output. So the session negotiates (say) 120.
+3. `StreamScreen` releases the pin again on TV, by design: there the decoder's own
+   `setFrameRate(CHANGE_FRAME_RATE_ALWAYS)` governs the HDMI mode. The panel falls back to 60 while
+   the host is already serving 120.
+
+A 120 fps stream on a 60 Hz output, by construction, on exactly the two form factors in the report.
+Picking a refresh explicitly is precisely what bypasses step 2, which is why that is the workaround
+people found. The mode comparator sorts refresh before area, so the same pin could also drop a 4K TV
+to 1080p120 and negotiate the stream at that.
+
+Fixed at the choke point: `resolveHighRefreshMode` returns early on a TV, leaving `highRefreshModeId`
+at 0, which `setConsoleHighRefreshRate` already treats as a no-op — so all three of its callers are
+covered by the one guard.
+
+Also in the same chain: `nativeDisplayMode` **truncated** the panel rate, so a TV reporting the
+fractional NTSC rates over HDMI (59.94, 29.97, 23.976) asked the host for 59 / 29 / 23 — rates no
+display mode has, which the host serves by clamping down to the highest it advertises at or below.
+Rounded now, which also makes it agree with `MainActivity.streamPanelFps`; the two describe the same
+panel and must not disagree.
+
+### Android: `acquireLatestImageAsync` hands back a fence it already gave away
+
+Every `pf-decode` SIGABRT on the Shield is fdsan catching a double-close of the acquire fence the ASC
+presenter passes to `ASurfaceTransaction_setBuffer`, in three shapes: inside `Fence::Fence(int)`
+under `setBuffer` when the number had already been re-owned (`fd N is owned by unique_fd, was
+expected to be unowned`), at the end of `Transaction::apply` when the layer state is torn down, and
+in `Parcel::freeDataNoInit` once the number churns.
+
+The fence is not ours to give. `AImageReader::acquireLatestImage` drains with a **single `int*`
+out-param it overwrites per image**, then releases each dropped image with whatever that out-param
+currently holds — the successor's fence — and returns the last value written. So as soon as a burst
+gives it two images to collapse, the caller receives an fd the reader has already adopted and
+closed, plus one leaked fd per extra drop. **This is unfixed as of AOSP main**, so the newest-wins
+collapse has to happen on our side.
+
+Both present intents now drain with `acquireNextImageAsync`, whose fence is always a fresh dup we
+exclusively own, and latency picks the newest itself — the loop the smoothing FIFO already ran.
+Superseded candidates drop as before (image back to the pool, its own acquire fence closed). Reader
+drops now show up in `skipped` instead of vanishing inside the reader lock.
+
+### Android: a DualSense's buttons, touchpad click and Mute
+
+Three defects reported against a Bluetooth DualSense on a Fire TV Stick 4K Max, **re-implemented
+from #371's diagnosis**. #371 itself is not merged: all three problems are real and correctly
+identified, but each fix as sent lands somewhere that breaks more hardware than it repairs.
+
+1. **Some buttons never reach the stream.** Fire OS tags certain DualSense buttons `SOURCE_KEYBOARD`
+   even though the keycodes are standard `BUTTON_*`, and `MainActivity`'s
+   `event.isFromSource(SOURCE_GAMEPAD)` gate then drops them. The event's source class is the
+   platform's per-event guess; the DEVICE's is the fact. New `MainActivity.fromPad` widens to the
+   device — but ONLY for `KeyEvent.isGamepadButton` keycodes. That exclusion is the whole safety of
+   it: DPAD keycodes are a keyboard's arrow keys and BACK is a remote's way out of the stream, and
+   both share their keycodes with a pad. `Gamepad.isPad` is untouched (source-class only), and no
+   vendor-id or device-name matching is added anywhere — the field report records both pads being
+   IDENTIFIED correctly; only their button positions were wrong.
+2. **Touchpad click and Mute were dropped.** Both have wire bits (`BTN_TOUCHPAD`, `BTN_MISC1`) and no
+   Android keycode, so `GENERIC_SONY`'s `0x13d`/`0x13e` rows borrow `BUTTON_15`/`BUTTON_16` to carry
+   them into `buttonBit`. Inside `GENERIC_SONY` and nowhere else: `0x13d`/`0x13e` are
+   `BTN_THUMBL`/`BTN_THUMBR` — L3 and R3 — in the standard Linux mapping, and they mean touchpad and
+   mute only inside the straight-through report order a driverless pad uses. A row in `SONY_MODERN`,
+   or an override above `padMap(dev)`, would cost every Xbox pad, Switch Pro, 8BitDo, Steam Deck and
+   hid-playstation DualSense both stick clicks. `correct()`'s `genericKeyCode` guard is unchanged.
+3. **Mute toggles the mic** — once per press, and only on a pad that has one. Edge-triggered through
+   the existing `completesChord` as the one-button chord it is: `onButton` still calls
+   `slotButton(down = true)` on auto-repeat, so an unguarded check would flap the mic for as long as
+   the button is held. Gated on a new `Slot.hasMuteButton`.
+
+### The console's per-frame cost, and a resolution switch for 4K boxes
+
+A field report of a sluggish console UI on a Fire TV Stick 4K Max and a Valerion projector. The Skia
+shell is faster than the Compose one it replaced per unit of work; it was doing far more work than
+anyone had counted, on every frame whether or not anything had changed. Four costs, **none of which
+change a pixel**:
+
+- `Fonts::paragraph` built a `ParagraphBuilder`, added its text and called `layout()` on every call —
+  the whole shaper, HarfBuzz, line breaking and font fallback, for every string on screen, sixty
+  times a second. Now built once per distinct `(text, shape, weight, size, width, colour)` and kept.
+  Position is deliberately **not** in the key, so a shelf that scrolls and a screen that slides both
+  re-use what they already shaped. Cold entries are dropped past a ceiling by the two frames that
+  last drew them, so the live set is what is on screen and paging a large library cannot grow it
+  forever.
+- `LayerEnv::paint` raised an unbounded `save_layer` **unconditionally** — including on the settled
+  path, where alpha is 1, scale is 1 and slide is 0. That allocates an offscreen the size of the
+  whole SURFACE and composites it back, to apply an alpha of one, on every frame the console sat
+  still. Skia does not elide it: `SkCanvas::saveLayerAlphaf` forwards alpha ≥ 1 straight to
+  `saveLayer(bounds, nullptr)`, whose only early-out is an empty clip. On a 4K panel that is a
+  **33 MB render target per frame against a 64 MB budget** on a 2 GB box — evicting real work to do
+  nothing. Dropping it is pixel-identical rather than close: nothing in this crate draws with a
+  blend mode other than `SrcOver`, `SrcOver` is associative, and there is no LCD subpixel text to
+  gain or lose an isolation.
+- The toast's layer was unbounded too, for a 34 dp pill; it takes the pill's rect now.
+- `draw_clipped` measured its ellipsis fit by allocating a `String` **per character**, for every
+  over-long title on screen, every frame. It measures out of a stack buffer now.
+
+On the Android host the render thread takes the same priority lift the decode thread has always had
+(`-8`, a band below the stream's `-10`, so the two do not compete when the console is up
+mid-session). And the console logged its GLES version and cache budget but never its render
+resolution or frame cost, so "it feels sluggish" could not be triaged from a log bundle at all — it
+now names the surface size and reports mean and peak draw time once a minute, timed around the
+**draw** and not the swap (`eglSwapBuffers` blocks on vsync, so wall-clock per iteration is always
+the panel period and says nothing).
+
+**`Reduce interface resolution`** (#384) is the lever that commit deliberately left out: an
+off-by-default Android switch, under Reduce motion, capping the buffer's long edge at 1920 via
+`SurfaceHolder.setFixedSize` and letting the compositor scale up. Two things it had to get right:
+`setFixedSize` shrinks the BUFFER and not the VIEW, so everything speaking in surface pixels is
+scaled to match — safe-area insets, the design-unit scale, and pointer coordinates, which a mouse
+still reports in view pixels and which would otherwise land the cursor at twice its true offset (one
+factor on both axes, so aspect survives exactly). And the buffer is sized from the `SurfaceView`'s
+laid-out size via `onSizeChanged`, **not** `displayMetrics`, which has a long history of disagreeing
+with a view's real size by a system bar. The factor reaches the pointer listeners through
+`rememberUpdatedState` — `AndroidView`'s `factory` runs once, so a captured value would freeze at 1.
+
+⚠ This is the INTERFACE only and shares nothing with the stream: picture size is `effectiveMode` off
+`Display.mode.physicalWidth`, and picture scaling is the separate `renderScale`.
+
+`platform_row_split_hides_only_the_other_platforms_concepts` pins the exact ordered set of rows the
+desktop does not show; the new switch is Android-only by design, so #385 grows that expected list by
+one between the Controllers action row and the console-UI switch. The row-COUNT assertion beside it
+was already updated and passed, which is why only the ordered-set one went red.
+
+### gamescope: the hand-back verifies the panel came back
+
+Field reports on 0.31.x, Bazzite and Nobara: after disconnecting, the box's own physical screen stays
+black. **It could not be reproduced** — #375 carries the full negative write-up, five scenarios
+across both distro families on real VMs, all recovering cleanly, and the mechanism first proposed
+disproved on glass. So this does not guess at the trigger; it closes the gap that lets ANY trigger
+end as a dark panel.
+
+`do_restore_tv_session` issued a lifecycle verb and logged what systemd said about the **job**. "The
+job succeeded" and "the box shows a picture" are different questions, and nothing in that file had
+ever asked the second — the restore walked away the moment the verb returned, so every way of ending
+dark looked identical to success in the log.
+
+It now measures. After the hand-back a detached watcher polls `detect_active_session()`, whose `None`
+means no compositor of our uid is running at all — exactly the symptom. Still dark 25 s later, it
+climbs a ladder of remedies, each measured on both images (Bazzite 44.20260818, Nobara f44,
+2026-08-22):
+
+1. **STOP** the autologin unit. Its login session's script is parked on `systemctl --user --wait
+   start <unit>` on both images, so a stop releases that wait, the session exits, and `Relogin=true`
+   logs back in — starting the unit inside a session with a seat. `stop`, not `restart`: a restart
+   does **not** release the parked waiter (measured), which is why it cannot rescue a box the
+   ordinary restart already failed to bring back.
+2. Restart the display manager — what the pre-0.31.0 takeover did on every disconnect, and proven on
+   the Bazzite VM to return the box to game mode.
+3. `PUNKTFUNK_RECOVER_SESSION_CMD`, then an ERROR naming the command a human has to run.
+
+### Windows audio: an abandoned devnode is adopted, and capture endpoints stamp the right hive
+
+Minting an audio devnode is two PnP steps: `SetupDiRegisterDeviceInfo` makes it real and bindable,
+then the owner marker goes into Device Parameters. A host that dies between them — the 0.30.0
+TLS-destructor abort did exactly this, five times on one field box — leaves a registered,
+driver-bound, endpoint-serving devnode carrying **no marker**.
+
+Nothing resolved it afterwards. `find_role_devnode` matches on the marker, so the next pass minted a
+SECOND devnode and the orphan stayed: a duplicate `Punktfunk Speakers` / `Punktfunk Microphone` in
+the Sound zoo that no uninstall removed, because `devnode_cleanup` is marker-matched too. A field box
+showed exactly this shape — `Punktfunk Speakers (3- Punktfunk)` beside an unstamped `Punktfunk
+Speakers (4- Steam Streaming Speakers)`. Reproduced on .173 against the shipping 0.31.2 binary by
+clearing the marker: `ROOT\MEDIA\0005` was minted and `0004` abandoned, still active and still
+serving two live microphone endpoints.
+
+- `minted.rs` **adopts before it mints**: an unmarked `ROOT\MEDIA\NNNN` devnode carrying the role's
+  Steam hardware id is re-marked and reused, so the endpoint GUID survives and no device-change
+  broadcast is paid.
+- `devnode_cleanup` sweeps the same shape, so orphans already on a box go at uninstall instead of
+  outliving the product.
+- The instance prefix is what keeps both off Valve's own devices: Steam's devnodes carry these
+  hardware ids and are ROOT-enumerated too, but live under `ROOT\SteamStreamingSpeakers\*` /
+  `ROOT\SteamStreamingMicrophone\*`. Only `ROOT\MEDIA\*` can come from our
+  `SetupDiCreateDeviceInfoW(DICD_GENERATE_ID)`. `is_abandoned_mint` carries that rule with unit
+  tests.
+
+Separately, `write_stamps` falls back to a raw-registry write when the property store denies it, and
+that fallback built its path from `MMDEV_RENDER_PATH` **unconditionally** — so stamping the minted
+microphone's CAPTURE endpoint reached for `…\MMDevices\Audio\Render\{capture-guid}\Properties`, a key
+that cannot exist. `RegOpenKeyExW` failed, `write_stamps` returned the error, and `stamp_identity`
+degraded to "keeps the driver's default name". Invisible to the pad program (render-only endpoints)
+and on any box where the property store route succeeds — it only bites where the property store is
+denied, exactly the boxes the ACL repair exists for. The hive now follows the direction the endpoint
+id encodes, with render as the default for anything unrecognised. Unit-tested.
+
+### Steam Deck: a failed gamescope rebuild took HDR from boxes whose compositor still worked
+
+ROOT CAUSE of "HDR stopped working after updating to 0.31.2" on a Deck **source** install. Two
+defects, one symptom.
+
+1. `scripts/steamdeck/build-gamescope.sh` has been **unbuildable since 2026-08-13**, when `3ac4548c`
+   turned `-Denable_gamescope_wsi_layer=true` on. The layer needs `x11-xcb`, which Debian splits into
+   its own `libx11-xcb-dev`; the distrobox apt list — last touched 2026-07-31 — never got it.
+   Measured on `debian:trixie` against that list verbatim, gamescope at the pinned `5fb8dce4`:
+   `Run-time dependency x11-xcb found: NO` → `src/layer/meson.build:3:14: ERROR: Dependency
+   "x11-xcb" not found`. `meson setup` exits 1 with the list as it was and 0 with `libx11-xcb-dev`
+   added, and `build-punktfunk-gamescope.sh` treats a missing layer as a hard error, so the whole
+   build fails. `ci/gamescope-trixie.Dockerfile` walked into the identical trap one release later
+   (`1b28a7f7`, v0.28.1) and asserts x11-xcb at image build; this list never got the same fix.
+   Debian-family only — Arch's libx11 and Fedora's libX11-devel carry `x11-xcb.pc`. `xkbcommon-x11`
+   and `libdisplay-info` measured absent too and are added with it.
+2. The build-failure branch then called `unwire`, deleting `PUNKTFUNK_GAMESCOPE_BIN` from `host.env`.
+   **A failed build REPLACED NOTHING** — the previously installed binary is still on disk and still
+   passes `verifies`. So a rebuild that never landed took HDR away from a box that had been streaming
+   it minutes earlier: the script warns into a log nobody reads and exits 0, the update reports
+   success, and the host then resolves the distro's stock `/usr/bin/gamescope` at patch level 0 and
+   fixes the session at 8-bit SDR in the Welcome — which the `punktfunk/1` handshake cannot take
+   back.
+
+`libdisplay-info` is also pinned to the vendored subproject, like wlroots, so a system copy cannot
+change what the build links.
+
+### Measured and dropped: the UMDF pad input-silence theory
+
+`devtest` grows `--idle-after N` / `--resume-after M`, which stop and restart the state frames while
+still pumping, to test what a Moonlight client actually does. The hypothesis:
+`UhidManager::heartbeat` documents that a UMDF pad "treats a multi-second input silence as an
+unplugged controller", the native plane calls it every tick and `SessionPads::pump_rumble` does not
+— and the two planes differ in exactly the way that would expose it, since punktfunk's own client
+re-sends every live pad's snapshot every 100 ms (`input_task.rs` refresh tick) while
+moonlight-common-c sends a controller packet only on **change**.
+
+**Measured on .173 (Win11 26200) and it does NOT reproduce**: with `--xboxhid --idle-after 12
+--seconds 75` the pad sat through 58 s of total input silence with `SWD\PUNKTFUNK\PF_XBOX_0` at
+Status=OK and its promoted `HID\PUNKTFUNK&IG_00` child present throughout. The one-line "add a
+heartbeat to the GameStream arm" fix this was going to justify is therefore **not** warranted, and
+was not made.
+
+Two things the same run did establish, and they are real:
+
+- **Two live processes wanting pad index 0 collide** exactly as
+  `PadCreateFault::IndexOwnedElsewhere` describes (`Global\pfds-boot-0`, ACCESS_DENIED because the
+  mailbox DACL is SYSTEM+LocalService). `dfcffcdd` (v0.31.1) put **both** input planes on that one
+  name — before it, GameStream used `Global\pfxusb-boot-0` and the two could never collide — so the
+  hazard is new even though it is not what the reporter hit. A clean release-then-retake does not
+  collide (0 s, 1 s and 3 s gaps all created their pad), so an ordinary client reconnect is not the
+  trigger.
+- **`PUNKTFUNK_HOST_CMD=serve` on .173 means GameStream is switched off there**, so that box has
+  never exercised the plane `dfcffcdd` changed — which is how a compile-only fix reached users
+  unexercised.
+
+### Dependencies
+
+- **`h2` 0.4.15 → 0.4.18, for RUSTSEC-2026-0258** (unbounded empty DATA frames, disclosed
+  2026-08-17; fixed in 0.4.16). Lockfile-only and transitive — no manifest declares `h2`, and
+  `cargo metadata --locked` accepts the two-line change with no other package moving, so the
+  resolver needed nothing else. This was the only finding across all five Rust lockfiles; the two
+  remaining `cargo audit` lines (`audiopus_sys`, `paste`) are the pre-existing *unmaintained*
+  warnings already allowed in `.cargo/audit.toml`.
+  ⚠ `THIRD-PARTY-NOTICES.txt` still records `h2 0.4.15` and is **not** regenerated here: the
+  generator walks the dependency closure of the machine it runs on, and on macOS that drops the
+  `rusqlite` / `libsqlite3-sys` / `fallible-iterator` cluster (575 → 566 crates) — removing
+  attributions a Linux or Windows build genuinely links. Regenerate it on Linux. Nothing gates the
+  checked-in copy, and every packaging script regenerates it on its own platform, so this is
+  cosmetic drift rather than a shipped inaccuracy.
+
+### CI
+
+- **The flatpak build stopped updating runtimes it already has.** Every attempt died on
+  `dl.flathub.org` serving a 404 for one object of the then-current `rust-stable//25.08` commit;
+  `retry.sh` burned all 10 attempts (~9 min) on it and `flatpak-builder` segfaulted on its own error
+  path (rc=139), so the wrapper could not tell a dead end from a load blip. Root cause is ours:
+  `--install-deps-only` does not install what is missing, it **updates** what is present, and
+  `ci/flatpak-ci.Dockerfile` bakes the entire runtime set — so that update was a pure no-op on a
+  healthy run while making every build depend on Flathub's health at that minute. Nothing wanted the
+  newer commit; the manifest pins a runtime **version**, not a commit.
+  `scripts/ci/flatpak-deps-present.sh` now asks first and reaches for Flathub only on a real miss;
+  it fails **open** (anything it cannot parse takes the full install path) and has a `--self-test`
+  that stubs `flatpak` over baked / cold / each dep missing / wrong version / unreadable manifest.
+  `--install-deps-from=flathub` is dropped from the build step: `builder_manifest_install_deps()`
+  runs whenever that flag is set, so the step billed as offline was re-running the same update.
+  `packaging/flatpak/build-flatpak.sh` keeps it — a dev box has no baked image. `flatpak.yml` now
+  also triggers on the deps-check script itself, so a change to that decision cannot ship untested.
+- **A dropped Skia download read as a lint failure.** `scripts/ci/retry.sh` wraps every single-shot
+  network call in CI, but one of the largest fetches was never wrappable that way: `skia-bindings`
+  pulls ~19 MB of prebuilt Skia per target from INSIDE its build script, with a bare `curl -sS -f -L`
+  and no retry. Measured on main 2026-08-22, android job: `curl: (18) end of response with 17054400
+  bytes missing` — 2 MB of 19,057,024 arrived before the connection closed. `skia-bindings` then
+  swallowed it, falling through to starting a full from-source Skia build the CI containers carry no
+  deps for, so the job surfaced as something else entirely.
+- **`mgmt/tests.rs` has one `ConfigDirOverride`, not one copy per test.** The unsafe-hygiene gate
+  failed at 6 process-global-API mentions against a baseline of 3: the new rename test had
+  copy-pasted the existing `EnvGuard` + lock + tempdir dance, which is exactly the duplication gate
+  C exists to catch. The single guard also makes the pairing harder to get wrong — the lock is a
+  **field** rather than a separate `_serial` binding a test could forget, and `Drop::drop` runs
+  before any field drops, so the environment is restored while the guard still holds the lock. Back
+  to 3.
+
+### `sdk/src/gen/punktfunk.ts` had drifted from its own generator
+
+The generated client in #374 is bigger than the feature. Regenerating it from the **unchanged**
+committed spec already produced a ~700-line diff — the checked-in copy had drifted from its own
+pinned generator, and nothing in CI regenerates or verifies it (unlike `api/openapi.json` and
+`include/punktfunk_core.h`, which are both gated). #374 lands the clean regeneration rather than
+hand-patching generated code.
+
+**`@punktfunk/host` 0.1.6 is cut for it** (`sdk-v0.1.6`, published by `sdk-publish.yml`), because a
+plugin resolves the SDK from the registry: the types for `PATCH /clients/{fingerprint}` could not
+reach one while they sat in `sdk/` unpublished. That single regenerated file is the whole diff since
+`sdk-v0.1.5`.
+
+`SDK_VERSION` in `sdk/src/version.ts` moves with `package.json`. It is a hand-maintained constant —
+`tsconfig.build.json` sets `rootDir: "src"` so it cannot import `package.json`, and the runner ships
+as one bundled `runner-cli.js` with no manifest beside it — and the runner compares it against the
+SDK installed in the plugins tree to decide whether to reinstall. Shipping 0.1.6 with the constant
+still reading 0.1.5 would publish the types and then never deliver them; `version.test.ts` exists for
+exactly that and gates it.
+
+---
+
 ## v0.31.2
 
 10 commits since v0.31.1 (6 non-merge), counted at the tip this was cut from.

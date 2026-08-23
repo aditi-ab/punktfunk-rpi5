@@ -52,6 +52,12 @@ The console lists every paired device with its access (and a live countdown for 
 From there you can change the level, extend or cut the expiry, or **remove** the device — removing
 revokes it immediately, even mid-session. Re-pairing a removed device is just the PIN ceremony again.
 
+**Naming a Moonlight device.** Every Moonlight-compatible client identifies itself with the same
+built-in name, so several of them look identical in the list. Use the pencil on the row to give it
+one of your own ("Living room TV") — the name is stored on the host, so every browser sees it, and
+removing the device forgets it. Devices paired with Punktfunk's own apps send a real name already
+and have no pencil.
+
 Can't pair at all? [Troubleshooting → Pairing is rejected](/docs/troubleshooting#pairing-is-rejected--the-client-cant-connect).
 
 ## How it works, briefly
