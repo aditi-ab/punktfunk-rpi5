@@ -1,0 +1,4 @@
+• Fixes the big latency jump on Android TV and Fire Stick — the app was asking your host for a frame rate your TV doesn't actually output. Setting the refresh by hand is no longer needed.
+• A DualSense on Fire TV: buttons that never reached your game now do, and Mute mutes your mic.
+• Fixes an app crash while streaming, most often on NVIDIA Shield.
+• Smoother interface on 4K TVs and projectors, plus a new Reduce interface resolution switch.
