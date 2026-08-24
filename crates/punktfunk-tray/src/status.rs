@@ -220,9 +220,11 @@ fn poll_loop(
     // cert would have hit it just as squarely, so the coupling goes rather than the symptom.
     //
     // Nothing is lost by dropping the pin: this probe sends no credentials, reads no body, and
-    // decides only a menu LABEL. A local port-squatter could make that label read "up" — but the
-    // entry is always present and always opens the same URL regardless of the probe, so it gains
-    // nothing it did not already have.
+    // decides only presentation — the menu entry's label, plus whether a tray-icon click opens
+    // the console or the menu (win.rs). A port-squatter could flip that, but the entry itself is
+    // unconditional and opens the same URL either way, and no browser ever pinned this cert. On
+    // Windows the probe was never pinned to begin with: `punktfunk_config_dir` returns None there,
+    // so `load_pin` was already None.
     let console_agent = agent(None);
     let mut last: Option<(TrayStatus, bool)> = None;
     // When the summary became unreachable while the service was running (grace anchor).

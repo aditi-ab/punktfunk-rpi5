@@ -370,9 +370,11 @@ jobs:
         run: bun run build
       - name: Typecheck
         run: bun run lint
-      # Scoped to server/: the console's browser code has no test runner, but the gate that keeps a
-      # plugin's origin apart from the console's does — and its failure mode is a well-formed header
-      # that only a browser rejects, which nothing else here would catch.
+      # Scoped to server/ and nitro-entry/: the console's browser code has no test runner, but two
+      # gates here do — the one keeping a plugin's origin apart from the console's, whose failure
+      # mode is a well-formed header that only a browser rejects, and the one picking which of the
+      # host's two identities the console serves, whose failure mode is a cert no browser accepts.
+      # Neither would be caught anywhere else.
       - name: Test
         run: bun run test
 

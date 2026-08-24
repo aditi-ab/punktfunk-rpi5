@@ -431,13 +431,16 @@ pub fn serve(
     //
     // Resolved BEFORE the legacy GameStream identity below, and that order is load-bearing twice
     // over. (1) The web console gates its start on `cert.pem` existing and then serves the native
-    // pair sitting next to it (web/nitro-entry/tls-paths.mjs); minting the legacy pair first leaves
-    // a first-run window where the console starts, finds no native pair, and serves the SAN-less
-    // RSA cert no browser accepts — for the rest of that boot. This way `cert.pem` existing implies
-    // the native pair does too. (2) In the degenerate case (native clients paired, but the cert
-    // they pinned is gone from disk) the old order let `load_or_create` mint a BRAND-NEW cert.pem
-    // that `load_or_adopt` then adopted while logging that it was preserving their pins — stranding
-    // them silently. Reading the dir first means that case reaches the branch written for it.
+    // pair sitting next to it (web/nitro-entry/tls-paths.mjs); minting the legacy pair first
+    // leaves a first-run window where the console starts, finds no native pair, and serves the
+    // SAN-less RSA cert no browser accepts — for the rest of that boot. Running first closes that
+    // window: whenever this call WRITES a native pair, it has done so before `cert.pem` appears.
+    // (It does not write one on an upgraded host whose native clients pinned the legacy cert —
+    // there the console correctly falls back to that same legacy pair.) (2) In the degenerate case
+    // (native clients paired, but the cert they pinned is gone from disk) the old order let
+    // `load_or_create` mint a BRAND-NEW cert.pem that `load_or_adopt` then adopted while logging
+    // that it was preserving their pins — stranding them silently. Reading the dir first means
+    // that case reaches the branch written for it.
     let native_ident = crate::identity::load_or_adopt(&np).context("native host identity")?;
     #[cfg(feature = "gamestream")]
     let state = {

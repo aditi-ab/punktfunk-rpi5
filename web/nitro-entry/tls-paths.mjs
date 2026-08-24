@@ -28,11 +28,48 @@
 // build key.pem is the Moonlight PAIRING SIGNING key, native-key.pem is only a TLS key.
 //
 // Swapped as a PAIR or not at all — a native cert with the legacy key is a server that cannot
-// complete a handshake with anyone. A host that never took the split (upgraded, native clients
-// still pinning the RSA cert, so `load_or_adopt` keeps serving it) has no native pair on disk and
-// falls through unchanged, as does a cert an operator supplied under any other name.
-import { existsSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+// complete a handshake with anyone, so both halves must be present AND must come from the same
+// directory. A host that never took the split (upgraded, native clients still pinning the RSA cert,
+// so `load_or_adopt` keeps serving it) has no native pair on disk and falls through unchanged, as
+// does a cert an operator supplied under any other name.
+import { statSync } from "node:fs";
+
+/**
+ * The directory prefix (separator included) of a path ending in `base`, or null if it does not.
+ *
+ * Deliberately NOT `node:path`: that resolves per-RUNTIME, so a POSIX build reads
+ * `C:\ProgramData\punktfunk\cert.pem` as one long filename — and Windows, where the service
+ * supervisor hands us exactly that (windows/service.rs), is the platform CI can never exercise.
+ * A suffix test gives the same answer everywhere. It also leaves the prefix VERBATIM, where
+ * `join(dirname(p), …)` would normalise `/a/b/../cert.pem` to a different directory than the one
+ * the operator named — which matters the moment `b` is a symlink.
+ *
+ * @param {string} p
+ * @param {string} base
+ * @returns {string | null}
+ */
+function dirPrefix(p, base) {
+	if (p === base) return ""; // bare relative name
+	if (!p.endsWith(base)) return null;
+	const sep = p[p.length - base.length - 1];
+	return sep === "/" || sep === "\\" ? p.slice(0, -base.length) : null;
+}
+
+/**
+ * A readable, NON-EMPTY file. Emptiness matters: `pf_paths::write_secret_file` is
+ * create+truncate+write rather than temp+rename, so a console starting mid-write could otherwise
+ * adopt a 0-byte cert and leave `Bun.serve` throwing on every restart — and not every launcher
+ * retries forever (the Steam Deck unit is `Restart=on-failure` under the default rate limit).
+ *
+ * @param {string} p
+ */
+function usable(p) {
+	try {
+		return statSync(p).size > 0;
+	} catch {
+		return false;
+	}
+}
 
 /**
  * @param {string | undefined} cert  PUNKTFUNK_UI_TLS_CERT, verbatim.
@@ -40,15 +77,15 @@ import { basename, dirname, join } from "node:path";
  * @param {(p: string) => boolean} [exists]  injected by the test; defaults to a real stat.
  * @returns {{cert: string | undefined, key: string | undefined}}
  */
-export function resolveUiTlsPaths(cert, key, exists = existsSync) {
+export function resolveUiTlsPaths(cert, key, exists = usable) {
 	// Half-configured TLS is the caller's error to report (it refuses to start); don't mask it by
 	// resolving one half of a pair that isn't there.
 	if (!cert || !key) return { cert, key };
-	if (basename(cert) !== "cert.pem" || basename(key) !== "key.pem") {
-		return { cert, key };
-	}
-	const nativeCert = join(dirname(cert), "native-cert.pem");
-	const nativeKey = join(dirname(key), "native-key.pem");
+	const dir = dirPrefix(cert, "cert.pem");
+	// Same directory, or we are not looking at a pair — see the PAIR note above.
+	if (dir === null || dir !== dirPrefix(key, "key.pem")) return { cert, key };
+	const nativeCert = `${dir}native-cert.pem`;
+	const nativeKey = `${dir}native-key.pem`;
 	return exists(nativeCert) && exists(nativeKey)
 		? { cert: nativeCert, key: nativeKey }
 		: { cert, key };
