@@ -821,6 +821,7 @@ fn on_receive(
     // session without the GAMEPAD grant never creates a uinput node or a pad-audio streamer,
     // because the creating event never arrives.
     if let Some(gp) = super::gamepad::decode(&pt) {
+        crate::sleep_inhibit::note_input();
         if permitted(grants, GrantClass::Gamepad, drops) {
             pads.handle(&gp);
         }
@@ -831,6 +832,7 @@ fn on_receive(
     // pen drives this session's virtual tablet; touch forwards as ordinary wire touches.
     // Pointer-class by construction (the plane tag decides, like the native pen plane).
     if let Some(p) = super::input::decode_pointer(&pt) {
+        crate::sleep_inhibit::note_input();
         if permitted(grants, GrantClass::Pointer, drops) {
             pointer.apply(&p, |ev| {
                 let _ = inj_tx.send(ev);
@@ -862,6 +864,10 @@ fn on_receive(
     if events.is_empty() {
         return; // keepalive / QoS / unhandled input kind
     }
+    // A Moonlight guest is driving the box — drop any standing suspend veto so their own "Sleep"
+    // reaches logind (see `sleep_inhibit`). Past the `is_empty` gate on purpose: a keepalive is
+    // the one thing a passive viewer DOES send, and it must not read as someone being there.
+    crate::sleep_inhibit::note_input();
 
     // Forward to the dedicated injector thread (it opens the backend on the first event and
     // coalesces redundant motion) — each event past one mask test against the exhaustive

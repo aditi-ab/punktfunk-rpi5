@@ -962,7 +962,15 @@ pub(super) fn input_thread(
         } else {
             pads.feedback_poll_interval()
         };
-        match rx.recv_timeout(poll) {
+        let arrived = rx.recv_timeout(poll);
+        // Every plane's input funnels through here, so this is where the box learns someone is
+        // driving it: any arrival drops a standing suspend veto, so the next press being "Sleep"
+        // in Steam's power menu reaches logind instead of being refused (see `sleep_inhibit`).
+        // Stamped before the grant tests below — a denied event still means a person is there.
+        if arrived.is_ok() {
+            crate::sleep_inhibit::note_input();
+        }
+        match arrived {
             // Rich input (touchpad / motion) is applied the moment it arrives; the single channel
             // wakes for gyro samples instead of making them wait out the feedback poll interval.
             // Guarded on the pad grant like every gamepad arm below — see the `grants` parameter.
