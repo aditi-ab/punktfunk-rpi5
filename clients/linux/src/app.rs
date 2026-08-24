@@ -148,6 +148,11 @@ pub enum AppMsg {
         ended: Option<String>,
         tofu: bool,
     },
+    /// Hand over to the gamepad console (`punktfunk-session --browse`) — the couch UI's
+    /// door from the desktop shell.
+    OpenConsole,
+    /// The console child exited; `Some` carries why it ended badly.
+    ConsoleExited(Option<String>),
     /// Request-access Cancel: the child was killed; release busy quietly.
     CancelPending,
     /// The speed-test dialog resolved (either way) — release `busy`.
@@ -518,6 +523,51 @@ impl SimpleComponent for AppModel {
                         "Stream session failed (punktfunk-session exit {code})"
                     ))),
                 }
+            }
+            AppMsg::OpenConsole => {
+                if std::mem::replace(&mut self.busy, true) {
+                    return;
+                }
+                // The console owns the screen and the pads while it runs, so it takes `busy`
+                // like a stream does. `gio::Subprocess` is the GLib-native child: its
+                // `wait_check_async` lands the exit on this very main loop — no thread, no
+                // channel — and reports a non-zero exit as an error. That is also how a
+                // build without the session's `ui` feature (Nix) surfaces: the child prints
+                // "--browse needs the console UI" and exits non-zero, and we banner it.
+                let mut argv = vec![
+                    std::ffi::OsString::from(crate::spawn::session_binary()),
+                    "--browse".into(),
+                ];
+                // Same knob a stream uses — the session also fullscreens itself on the Deck
+                // and under gamescope regardless.
+                if self.settings.borrow().fullscreen_on_stream {
+                    argv.push("--fullscreen".into());
+                }
+                let argv: Vec<&std::ffi::OsStr> =
+                    argv.iter().map(std::ffi::OsString::as_os_str).collect();
+                match gio::Subprocess::newv(&argv, gio::SubprocessFlags::NONE) {
+                    Ok(child) => {
+                        let sender = sender.clone();
+                        child.wait_check_async(gio::Cancellable::NONE, move |res| {
+                            sender.input(AppMsg::ConsoleExited(res.err().map(|e| e.to_string())));
+                        });
+                    }
+                    Err(e) => {
+                        self.busy = false;
+                        self.hosts.emit(HostsMsg::ShowError(format!(
+                            "Couldn't start the console UI — {e}"
+                        )));
+                    }
+                }
+            }
+            AppMsg::ConsoleExited(err) => {
+                self.busy = false;
+                // Quitting the console (B at its root) exits 0 and returns here silently.
+                if let Some(e) = err {
+                    self.hosts
+                        .emit(HostsMsg::ShowError(format!("Console UI ended — {e}")));
+                }
+                self.hosts.emit(HostsMsg::Refresh);
             }
             AppMsg::CancelPending => {
                 self.close_waiting();
@@ -1007,6 +1057,7 @@ fn install_actions(window: &adw::ApplicationWindow, sender: &ComponentSender<App
     window.add_action(&add("shortcuts", || AppMsg::ShowShortcuts));
     window.add_action(&add("about", || AppMsg::ShowAbout));
     window.add_action(&add("add-host", || AppMsg::ShowAddHost));
+    window.add_action(&add("console", || AppMsg::OpenConsole));
 }
 
 /// The Keyboard Shortcuts window — the SESSION window's keys (the shell itself has

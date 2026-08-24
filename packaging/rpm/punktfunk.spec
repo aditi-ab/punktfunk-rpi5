@@ -423,6 +423,9 @@ install -Dm0755 target/release/punktfunk-session %{buildroot}%{_bindir}/punktfun
 install -Dm0755 target/release/punktfunk %{buildroot}%{_bindir}/punktfunk
 install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
                 %{buildroot}%{_datadir}/applications/io.unom.Punktfunk.desktop
+# Second launcher, straight into the gamepad console (`--browse`) — the couch entry point.
+install -Dm0644 packaging/linux/io.unom.Punktfunk.Console.desktop \
+                %{buildroot}%{_datadir}/applications/io.unom.Punktfunk.Console.desktop
 # The app icon the desktop entry (and the About dialog) name. Without it the launcher falls
 # back to a generic monitor glyph, which is what shipped until now.
 install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg \
@@ -640,6 +643,7 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %{_bindir}/punktfunk-session
 %{_bindir}/punktfunk
 %{_datadir}/applications/io.unom.Punktfunk.desktop
+%{_datadir}/applications/io.unom.Punktfunk.Console.desktop
 %{_datadir}/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg
 %{_udevrulesdir}/70-punktfunk-client.rules
 %{_prefix}/lib/sysctl.d/99-punktfunk-client-net.conf

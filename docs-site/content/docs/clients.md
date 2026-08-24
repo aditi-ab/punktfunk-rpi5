@@ -79,6 +79,15 @@ punktfunk launch <host-ref>              # start a session, waking the host firs
 punktfunk-client --connect <host>:9777   # the older flag — still supported for existing scripts
 ```
 
+**Couch mode.** The same client also has a **gamepad console UI**: a full-screen, controller-driven
+front end with the host list, PIN pairing, settings, Wake-on-LAN and the game library, streaming in
+its own window. Three ways in — the **gamepad button** in the shell's header bar (also *Main menu →
+Console UI*), the separate **Punktfunk Console** launcher the packages install alongside the app, or:
+
+```sh
+punktfunk-client --browse --fullscreen
+```
+
 The client also updates itself (`punktfunk-client --check-update` / `--apply-update`) — see
 [Keeping a client up to date](/docs/install-client#keeping-a-client-up-to-date).
 

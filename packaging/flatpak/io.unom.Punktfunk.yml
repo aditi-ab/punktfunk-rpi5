@@ -350,6 +350,11 @@ modules:
       # Desktop entry (renamed to the app id; Exec is the in-sandbox binary).
       - install -Dm0644 packaging/flatpak/io.unom.Punktfunk.desktop
           ${FLATPAK_DEST}/share/applications/io.unom.Punktfunk.desktop
+      # Second launcher, straight into the gamepad console (`--browse`) — the couch entry
+      # point. Shared with the deb/rpm/arch (there is nothing sandbox-specific about it);
+      # flatpak's export rewrites Exec into `flatpak run --command=punktfunk-client …`.
+      - install -Dm0644 packaging/linux/io.unom.Punktfunk.Console.desktop
+          ${FLATPAK_DEST}/share/applications/io.unom.Punktfunk.Console.desktop
       # AppStream metainfo (required for a well-formed flatpak / Software listings).
       - install -Dm0644 packaging/flatpak/io.unom.Punktfunk.metainfo.xml
           ${FLATPAK_DEST}/share/metainfo/io.unom.Punktfunk.metainfo.xml
