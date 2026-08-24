@@ -62,6 +62,10 @@ desktop session, so Steam's own "Switch to Desktop" hung until a reboot.
 > sudo usermod -aG punktfunk "$USER"   # then log out and back in
 > ```
 >
+> It also keeps the box's own power menu working: on a takeover flavour that *stops* the display
+> manager, the box has no active local session for the length of the stream, and Shut Down /
+> Restart / Sleep are refused unless you are in this group.
+>
 > Your package created the group at install time and put **nobody** in it, on purpose: it also
 > gates the usbip nodes the virtual Steam Deck pad attaches through, and writing those can present
 > arbitrary emulated USB hardware — so joining stays a deliberate act, on a machine you trust.
@@ -144,15 +148,17 @@ Whether the panel then goes *dark* is the **Topology** setting's job, not the mo
 
 - **Managed** and **bare spawn** — the box's own gaming session is moved out of the way so it
   stops driving the panel, and then the panel is actually turned **off** for the stream and
-  restored at teardown. On a KDE desktop that goes through KWin's DPMS; on a box already in Game
-  Mode there is no KWin to ask, so the host turns the CRTCs off over DRM itself. Neither needs
-  root — the DRM path rides the same seat access every local compositor gets.
+  restored at teardown. The host asks whichever desktop is running: KDE goes through KWin's DPMS,
+  sway and Hyprland through their own; a box already in Game Mode has no desktop to ask, so the
+  host turns the CRTCs off over DRM itself. None of these needs root — the DRM path rides the same
+  seat access every local compositor gets.
 - **Attach** — nothing is darkened, and cannot be: this model streams the panel the box is
   driving, so turning it off would turn off the picture.
 
 Under `extend` or `primary` none of this happens and your screens are left alone. If `exclusive`
-asked for a dark screen and the host could not deliver one — a box already in Game Mode has no
-KDE desktop to ask for DPMS — it says so in the log rather than leaving you guessing at a lit
+asked for a dark screen and the host could not deliver one — **GNOME** is the case that cannot be
+served, because Mutter offers apps no way to turn a screen off and holds the graphics card itself
+so the DRM route is refused — it says so in the log rather than leaving you guessing at a lit
 screen.
 
 Only the one head the session drives is listed — a nested or headless gamescope (including the
