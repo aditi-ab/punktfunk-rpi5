@@ -1005,8 +1005,20 @@ impl Shell {
     pub(crate) fn key(&mut self, key: crate::input::Key, shift: bool, repeat: bool) -> bool {
         use crate::input::Key as S;
         if self.editing() {
+            let mut ctx = Ctx {
+                hosts: &self.hosts,
+                library: &self.library,
+                settings: &mut self.settings,
+                store: &*self.store,
+                platform: self.platform,
+                pads: &self.pads,
+                deck: self.deck,
+                fallback_ui: self.fallback_ui,
+                device_name: &self.device_name,
+                t: self.t0.elapsed().as_secs_f64(),
+            };
             if let Some(top) = self.stack.last_mut() {
-                if top.edit_key(key) {
+                if top.edit_key(key, &mut ctx) {
                     return true;
                 }
             }

@@ -1250,7 +1250,9 @@ pub fn show_scoped(
         "Above 1× supersamples for sharpness; below is lighter on the host",
         &scale_names.iter().map(String::as_str).collect::<Vec<_>>(),
     );
-    let bitrate_row = adw::SpinRow::with_range(0.0, 3000.0, 5.0);
+    // 1 Mbit/s per step: the rungs that matter on a thin link are 3, 4, 6 — a 5-wide step
+    // could not name any of them, and typing was the only way to reach one.
+    let bitrate_row = adw::SpinRow::with_range(0.0, 3000.0, 1.0);
     bitrate_row.set_title("Bitrate");
     bitrate_row
         .set_subtitle("Mbit/s · 0 = host default · a host card's menu has a network speed test");
