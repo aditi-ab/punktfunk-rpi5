@@ -16,7 +16,9 @@ use crate::glyphs::{Hint, HintKey};
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox, Screen};
 use crate::theme::{fg, Fonts, W};
-use crate::widgets::{ListMsg, MenuList, RowSpec, TabStrip, TAB_STRIP_H};
+use crate::widgets::{
+    permits, Charset, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec, TabStrip, TAB_STRIP_H,
+};
 use pf_client_core::audio_format::{AUDIO_FORMATS, AUDIO_FORMAT_OPUS};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use pf_client_core::trust::{MouseMode, StatsVerbosity, TouchMode};
@@ -288,7 +290,18 @@ const RESOLUTIONS: [(u32, u32); 6] = [
 const REFRESH: [u32; 5] = [0, 30, 60, 90, 120];
 /// Mirrors [`punktfunk_core::render_scale::PRESETS`] (and the desktop pickers).
 const RENDER_SCALES: [f64; 9] = [0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
-const BITRATES: [u32; 7] = [0, 5_000, 10_000, 20_000, 30_000, 50_000, 80_000];
+/// The rungs left/right steps through, in kbps. Tight at the bottom, where one rung is the
+/// difference between watchable and a slideshow on a thin link, and coarse at the top, where
+/// a rung is noise; the ceiling is 2 Gbps. The list is deliberately long — a ladder no thumb
+/// can walk to the value it wants is what the Y field is for.
+const BITRATES: [u32; 30] = [
+    0, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 8_000, 10_000, 12_000, 15_000, 20_000, 25_000,
+    30_000, 40_000, 50_000, 60_000, 80_000, 100_000, 125_000, 150_000, 200_000, 250_000, 300_000,
+    400_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000,
+];
+/// What the typed field accepts, in Mbps: the ladder's own ceiling. The host clamps to its
+/// range anyway (500 kbps – 8 Gbps), so this is about what a client should let you ask for.
+const CUSTOM_MAX_MBPS: u32 = 2_000;
 const COMPOSITORS: [(&str, &str); 5] = [
     ("auto", "Automatic"),
     ("kwin", "KWin"),
@@ -371,6 +384,14 @@ pub(crate) struct SettingsScreen {
     /// can't create profiles (design §5.4: the desktop app does), so the list is stable
     /// for the screen's lifetime.
     profiles: Vec<(String, String)>,
+    /// The Bitrate row's typed rate in Mbps while Y has the field open — `None` the rest of
+    /// the time. Every other row on this screen is a list of options, and a ladder is the
+    /// right shape for a list; a bitrate is a NUMBER, and the one a link actually carries is
+    /// rarely a round rung. Y rather than A so the A-cycles-forward grammar holds everywhere.
+    custom_bitrate: Option<String>,
+    /// The tray keyboard the field types through, where the platform has no keyboard of its
+    /// own (on a Deck, Steam's keyboard types and ours never draws — same rule as add-host).
+    keyboard: Keyboard,
 }
 
 impl SettingsScreen {
@@ -388,6 +409,112 @@ impl SettingsScreen {
             tab: 0,
             tab_cursors: [0; TABS.len()],
             profiles,
+            custom_bitrate: None,
+            keyboard: Keyboard::new(),
+        }
+    }
+
+    /// A text field is open — the run loop keeps SDL text input started, so a hardware
+    /// keyboard (and Steam's, on a Deck) types straight into it.
+    pub(crate) fn editing(&self) -> bool {
+        self.custom_bitrate.is_some()
+    }
+
+    /// Committed text from SDL. Digits only, four of them: 2000 Mbps is the ceiling.
+    pub(crate) fn text_input(&mut self, text: &str) {
+        for ch in text.chars() {
+            self.type_char(ch);
+        }
+    }
+
+    fn type_char(&mut self, ch: char) -> bool {
+        let Some(buf) = self.custom_bitrate.as_mut() else {
+            return false;
+        };
+        if !permits(Charset::Digits, ch) || buf.chars().count() >= 4 {
+            return false;
+        }
+        buf.push(ch);
+        true
+    }
+
+    fn backspace(&mut self) -> bool {
+        self.custom_bitrate.as_mut().and_then(String::pop).is_some()
+    }
+
+    /// Raw key edits while the field is open (Backspace repeats, Return/Escape are done).
+    pub(crate) fn edit_key(&mut self, key: crate::input::Key, ctx: &mut Ctx) -> bool {
+        use crate::input::Key as K;
+        if self.custom_bitrate.is_none() {
+            return false;
+        }
+        match key {
+            K::Backspace => {
+                self.backspace();
+                true
+            }
+            K::Return | K::Escape => {
+                self.commit_custom(ctx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Close the field, storing what was typed. An empty field (or a typed `0`) leaves the
+    /// rate alone: a cleared field is an abandoned edit, and "let the host decide" is the
+    /// ladder's own first rung, not something to reach by deleting four digits.
+    fn commit_custom(&mut self, ctx: &mut Ctx) {
+        let Some(text) = self.custom_bitrate.take() else {
+            return;
+        };
+        let Ok(mbps) = text.parse::<u32>() else {
+            return;
+        };
+        if mbps == 0 {
+            return;
+        }
+        // The same rebase-then-save every other write here does: another writer may have
+        // stored the file while the keyboard was up.
+        *ctx.settings = ctx.store.load();
+        ctx.settings.bitrate_kbps = mbps.min(CUSTOM_MAX_MBPS) * 1000;
+        ctx.store.save(ctx.settings);
+    }
+
+    /// The field is modal while it is up: the tray takes the events, and closing commits.
+    fn custom_menu(&mut self, ev: MenuEvent, ctx: &mut Ctx) -> Option<MenuPulse> {
+        if ctx.deck {
+            // Steam's keyboard is doing the typing (text arrives through `text_input`); the
+            // pad is only here to say when it's done.
+            return match ev {
+                MenuEvent::Back | MenuEvent::Confirm => {
+                    self.commit_custom(ctx);
+                    Some(MenuPulse::Confirm)
+                }
+                _ => None,
+            };
+        }
+        let (msg, pulse) = self.keyboard.menu(ev);
+        match msg {
+            KeyMsg::Type(c) => {
+                if self.type_char(c) {
+                    Some(MenuPulse::Move)
+                } else {
+                    Some(MenuPulse::Boundary)
+                }
+            }
+            KeyMsg::Backspace => {
+                if self.backspace() {
+                    Some(MenuPulse::Move)
+                } else {
+                    Some(MenuPulse::Boundary)
+                }
+            }
+            KeyMsg::Done => {
+                self.commit_custom(ctx);
+                Some(MenuPulse::Confirm)
+            }
+            KeyMsg::None => pulse,
         }
     }
 
@@ -457,6 +584,27 @@ impl SettingsScreen {
     /// Mouse/touch. The strip is checked first — its pills sit above the list and a press
     /// there is never meant for a row.
     pub(crate) fn pointer(&mut self, p: Pointer, ctx: &mut Ctx, fx: &mut Outbox) -> bool {
+        if self.custom_bitrate.is_some() && !ctx.deck {
+            if !self.keyboard.covers(p) {
+                if p.press() {
+                    self.commit_custom(ctx);
+                    return true;
+                }
+                return false;
+            }
+            let (msg, _) = self.keyboard.pointer(p);
+            match msg {
+                KeyMsg::Type(c) => {
+                    self.type_char(c);
+                }
+                KeyMsg::Backspace => {
+                    self.backspace();
+                }
+                KeyMsg::Done => self.commit_custom(ctx),
+                KeyMsg::None => {}
+            }
+            return true;
+        }
         if let Some(tab) = self.strip.pointer(p) {
             self.show_tab(tab, ctx);
             return true;
@@ -477,6 +625,9 @@ impl SettingsScreen {
         ctx: &mut Ctx,
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
+        if self.custom_bitrate.is_some() {
+            return self.custom_menu(ev, ctx);
+        }
         match ev {
             MenuEvent::Back => {
                 fx.pop();
@@ -488,6 +639,16 @@ impl SettingsScreen {
         }
         let ids = self.row_ids(ctx);
         self.clamp_cursor(ids.len());
+        // Y on the Bitrate row opens the typed rate; on every other row it means nothing,
+        // and the hint bar only offers it where it does.
+        if ev == MenuEvent::Secondary {
+            return if ids.get(self.list.cursor) == Some(&RowId::Bitrate) {
+                self.custom_bitrate = Some(String::new());
+                Some(MenuPulse::Confirm)
+            } else {
+                None
+            };
+        }
         let (msg, pulse) = self.list.menu(ev, ids.len());
         self.apply_row(msg, pulse, &ids, ctx, fx)
     }
@@ -590,6 +751,20 @@ impl SettingsScreen {
     }
 
     pub(crate) fn hints(&self, ctx: &Ctx) -> Vec<Hint> {
+        if self.custom_bitrate.is_some() {
+            if ctx.deck {
+                return vec![
+                    Hint::new(HintKey::Key("STEAM + X"), "Keyboard"),
+                    Hint::new(HintKey::Confirm, "Done"),
+                    Hint::new(HintKey::Back, "Done"),
+                ];
+            }
+            return vec![
+                Hint::new(HintKey::Confirm, "Type"),
+                Hint::new(HintKey::Tertiary, "Delete"),
+                Hint::new(HintKey::Back, "Done"),
+            ];
+        }
         let ids = self.row_ids(ctx);
         // The shoulders always change section, so that hint leads on every row.
         let mut hints = vec![Hint::new(HintKey::Shoulders, "Section")];
@@ -601,6 +776,12 @@ impl SettingsScreen {
             Some(RowId::NoProfiles) | None => vec![Hint::new(HintKey::Back, "Done")],
             Some(RowId::Controllers | RowId::Licenses) => vec![
                 Hint::new(HintKey::Confirm, "Open"),
+                Hint::new(HintKey::Back, "Done"),
+            ],
+            // The one row with a value the ladder cannot name every version of.
+            Some(RowId::Bitrate) => vec![
+                Hint::new(HintKey::Adjust, "Adjust"),
+                Hint::new(HintKey::Secondary, "Type a rate"),
                 Hint::new(HintKey::Back, "Done"),
             ],
             Some(_) => vec![
@@ -635,20 +816,49 @@ impl SettingsScreen {
             k,
             dt,
         );
+        let seat = self
+            .keyboard
+            .seat(self.custom_bitrate.is_some() && !ctx.deck, dt);
+        let tray_h = if seat > 0.0 {
+            (Keyboard::tray_height() + 12.0) * k * seat
+        } else {
+            0.0
+        };
         let list_rect = Rect::from_ltrb(
             rect.left,
             rect.top + strip_h as f32,
             rect.right,
-            rect.bottom - detail_h as f32,
+            rect.bottom - detail_h as f32 - tray_h as f32,
         );
         let ids = self.row_ids(ctx);
         self.clamp_cursor(ids.len());
-        let rows: Vec<RowSpec> = ids
+        let mut rows: Vec<RowSpec> = ids
             .iter()
             .map(|id| row_spec(*id, ctx, &self.profiles))
             .collect();
-        self.list
-            .render(canvas, list_rect, &rows, fonts, k, dt, true);
+        // While the field is open the Bitrate row IS the field: it shows the digits typed so
+        // far and carries the caret, so the value being edited is where the value lives.
+        if let (Some(text), Some(i)) = (
+            self.custom_bitrate.as_ref(),
+            ids.iter().position(|id| *id == RowId::Bitrate),
+        ) {
+            rows[i].value = Some(if text.is_empty() {
+                "Mbps".into()
+            } else {
+                format!("{text} Mbps")
+            });
+            rows[i].value_dim = text.is_empty();
+            rows[i].caret = true;
+        }
+        self.list.render(
+            canvas,
+            list_rect,
+            &rows,
+            fonts,
+            k,
+            dt,
+            self.custom_bitrate.is_none(),
+        );
         let detail = ids
             .get(self.list.cursor)
             .copied()
@@ -660,9 +870,19 @@ impl SettingsScreen {
             13.0 * k,
             fg(0.55),
             f64::from(rect.left) + f64::from(rect.width()) / 2.0,
-            f64::from(rect.bottom) - detail_h + 6.0 * k,
+            f64::from(rect.bottom) - detail_h - tray_h + 6.0 * k,
             f64::from(rect.width()) * 0.8,
         );
+        if seat > 0.0 {
+            self.keyboard.render(
+                canvas,
+                fonts,
+                f64::from(rect.width()),
+                f64::from(rect.bottom),
+                seat,
+                k,
+            );
+        }
     }
 }
 
@@ -837,7 +1057,7 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             if s.bitrate_kbps == 0 {
                 "Automatic".into()
             } else {
-                format!("{} Mbps", s.bitrate_kbps / 1000)
+                bitrate_label(s.bitrate_kbps)
             },
         ),
         RowId::Compositor => (
@@ -1045,7 +1265,9 @@ fn detail(id: RowId, platform: crate::platform::Platform) -> &'static str {
             "The host renders larger or smaller than the stream mode and this window \
              resamples — above 1× supersamples, below saves bandwidth."
         }
-        RowId::Bitrate => "Automatic uses the host's default (20 Mbps).",
+        RowId::Bitrate => {
+            "Automatic uses the host's default (20 Mbps). Y types an exact rate, up to 2 Gbps."
+        }
         RowId::Compositor => {
             "Which compositor drives the virtual output — honored only if available on the host."
         }
@@ -1219,6 +1441,26 @@ fn detail(id: RowId, platform: crate::platform::Platform) -> &'static str {
     }
 }
 
+/// A rate as the row says it: Mbps to a gigabit, Gbps above it, and a decimal only where
+/// dropping one would print two different rates the same way (12.5 Mbps, 1.5 Gbps). Rates
+/// off the ladder are real — the field below types them, and the desktop shells' free-form
+/// spinner has always been able to store one.
+fn bitrate_label(kbps: u32) -> String {
+    let unit = |v: f64, suffix: &str| {
+        if (v - v.round()).abs() < 0.05 {
+            format!("{} {suffix}", v.round())
+        } else {
+            format!("{v:.1} {suffix}")
+        }
+    };
+    let mbps = f64::from(kbps) / 1000.0;
+    if kbps >= 1_000_000 {
+        unit(mbps / 1000.0, "Gbps")
+    } else {
+        unit(mbps, "Mbps")
+    }
+}
+
 fn on_off(v: bool) -> &'static str {
     if v {
         "On"
@@ -1283,8 +1525,21 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
                 .map(|i| s.render_scale = RENDER_SCALES[i])
         }
         RowId::Bitrate => {
-            let cur = BITRATES.iter().position(|b| *b == s.bitrate_kbps);
-            step_option(cur, BITRATES.len(), delta, wrap).map(|i| s.bitrate_kbps = BITRATES[i])
+            // A typed rate (or one a desktop shell's spinner stored) sits BETWEEN rungs, and
+            // the generic step snaps a value it cannot find to the first option — which here
+            // is Automatic, i.e. one nudge throws the custom rate away. Step to the rung the
+            // thumb is heading for instead.
+            let stepped = match BITRATES.iter().position(|b| *b == s.bitrate_kbps) {
+                Some(i) => step_option(Some(i), BITRATES.len(), delta, wrap),
+                None if delta < 0 => BITRATES.iter().rposition(|b| *b < s.bitrate_kbps),
+                // Above the top rung there is nothing higher to step to; A (which wraps) still
+                // comes back round to Automatic.
+                None => BITRATES
+                    .iter()
+                    .position(|b| *b > s.bitrate_kbps)
+                    .or(if wrap { Some(0) } else { None }),
+            };
+            stepped.map(|i| s.bitrate_kbps = BITRATES[i])
         }
         RowId::Compositor => step_str(&COMPOSITORS, &mut s.compositor, delta, wrap),
         RowId::Codec => step_str(&CODECS, &mut s.codec, delta, wrap),
@@ -2017,10 +2272,14 @@ pub(super) mod tests {
         assert_eq!(ctx.settings.mouse_mode, "capture");
     }
 
+    /// A rate that is not a rung — typed on the row, or stored by a desktop shell's
+    /// free-form spinner — steps to its NEIGHBOUR. Every other picker here snaps an
+    /// unrecognised value to its first option, which on this row is Automatic: one nudge
+    /// would throw away the exact rate the user went to the trouble of typing.
     #[test]
-    fn unknown_value_snaps_to_first() {
+    fn an_off_ladder_rate_steps_to_its_neighbour() {
         let (mut settings, pads) = ctx_parts();
-        settings.bitrate_kbps = 12_345; // set via a desktop shell's free-form field
+        settings.bitrate_kbps = 12_345;
         let library = crate::library::LibraryShared::default();
         let mut ctx = Ctx {
             hosts: &[],
@@ -2035,7 +2294,81 @@ pub(super) mod tests {
             t: 0.0,
         };
         assert!(adjust(RowId::Bitrate, 1, false, &mut ctx));
-        assert_eq!(ctx.settings.bitrate_kbps, 0, "snapped to Automatic");
+        assert_eq!(ctx.settings.bitrate_kbps, 15_000, "the rung above");
+        ctx.settings.bitrate_kbps = 12_345;
+        assert!(adjust(RowId::Bitrate, -1, false, &mut ctx));
+        assert_eq!(ctx.settings.bitrate_kbps, 12_000, "the rung below");
+        // The ends still thud rather than wrap under left/right.
+        ctx.settings.bitrate_kbps = 2_000_000;
+        assert!(!adjust(RowId::Bitrate, 1, false, &mut ctx), "the ceiling");
+        // …and a rung it does know steps as it always did.
+        ctx.settings.bitrate_kbps = 5_000;
+        assert!(adjust(RowId::Bitrate, -1, false, &mut ctx));
+        assert_eq!(ctx.settings.bitrate_kbps, 4_000);
+    }
+
+    /// The typed rate: Y opens the field on the Bitrate row (and nowhere else), digits land
+    /// in it, and closing stores what was typed — clamped to the ceiling, because four
+    /// digits can ask for 9999 Mbps and no client should send that.
+    #[test]
+    fn a_typed_bitrate_is_stored_and_clamped() {
+        let (mut settings, pads) = ctx_parts();
+        let library = crate::library::LibraryShared::default();
+        // A snapshot store, not the file one: this test SAVES, and a unit test must not
+        // rewrite the machine's real settings file to prove it.
+        let store = crate::store::SnapshotStore::new(settings.clone(), Vec::new());
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            store: &store,
+            platform: crate::platform::Platform::Desktop,
+            pads: &pads,
+            deck: false,
+            fallback_ui: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        let mut s = SettingsScreen::with_profiles(Vec::new());
+        let mut fx = Outbox::default();
+        let ids = s.row_ids(&ctx);
+        s.list.cursor = ids
+            .iter()
+            .position(|id| *id == RowId::Bitrate)
+            .expect("the bitrate row");
+        s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
+        assert!(s.editing(), "Y opens the field");
+        s.text_input("13x7"); // digits only: the 'x' is refused, not typed
+        assert!(s.edit_key(crate::input::Key::Return, &mut ctx));
+        assert!(!s.editing(), "Return closes it");
+        assert_eq!(ctx.settings.bitrate_kbps, 137_000);
+
+        s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
+        s.text_input("99999"); // four digits fit; the fifth is refused
+        assert!(s.edit_key(crate::input::Key::Return, &mut ctx));
+        assert_eq!(
+            ctx.settings.bitrate_kbps, 2_000_000,
+            "clamped to the ceiling"
+        );
+
+        // An emptied field is an abandoned edit, not a request for Automatic.
+        s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
+        assert!(s.edit_key(crate::input::Key::Return, &mut ctx));
+        assert_eq!(ctx.settings.bitrate_kbps, 2_000_000, "left alone");
+
+        // Y is the bitrate row's alone — on a neighbour it does nothing at all.
+        s.list.cursor = 0;
+        s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
+        assert!(!s.editing());
+    }
+
+    #[test]
+    fn rates_read_in_the_biggest_round_unit() {
+        assert_eq!(bitrate_label(20_000), "20 Mbps");
+        assert_eq!(bitrate_label(12_500), "12.5 Mbps");
+        assert_eq!(bitrate_label(1_000_000), "1 Gbps");
+        assert_eq!(bitrate_label(1_500_000), "1.5 Gbps");
+        assert_eq!(bitrate_label(2_000_000), "2 Gbps");
     }
 
     /// The Profiles section trails the settings rows: one row per catalog profile whose

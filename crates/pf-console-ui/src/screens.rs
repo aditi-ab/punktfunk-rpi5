@@ -246,16 +246,22 @@ impl Screen {
         match self {
             Screen::AddHost(s) => s.text_input(text),
             Screen::Pair(s) => s.text_input(text),
+            Screen::Settings(s) => s.text_input(text),
             _ => {}
         }
     }
 
     /// Raw key edits while a field is editing (Backspace repeats, Return = done).
     /// Returns true when consumed.
-    pub(crate) fn edit_key(&mut self, key: crate::input::Key) -> bool {
+    ///
+    /// Takes the context because a field can commit into the settings store on close —
+    /// the settings screen's typed bitrate does, where add-host and pair only hold text a
+    /// later action row reads.
+    pub(crate) fn edit_key(&mut self, key: crate::input::Key, ctx: &mut Ctx) -> bool {
         match self {
             Screen::AddHost(s) => s.edit_key(key),
             Screen::Pair(s) => s.edit_key(key),
+            Screen::Settings(s) => s.edit_key(key, ctx),
             _ => false,
         }
     }
@@ -265,6 +271,7 @@ impl Screen {
         match self {
             Screen::AddHost(s) => s.editing(),
             Screen::Pair(s) => s.editing(),
+            Screen::Settings(s) => s.editing(),
             _ => false,
         }
     }
