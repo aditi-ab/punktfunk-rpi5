@@ -1,23 +1,54 @@
-//! DPMS control of the box's live KDE desktop (`org_kde_kwin_dpms`) — how a bare-spawn gamescope
-//! session honors [`Topology::Exclusive`](crate::policy::Topology::Exclusive).
+//! Turning the box's OWN physical panels off — how a gamescope session honors
+//! [`Topology::Exclusive`](crate::policy::Topology::Exclusive).
 //!
-//! A bare spawn is its OWN headless compositor: nothing on that route touches the desktop the box
-//! is showing, so on a KDE machine the physical panel keeps displaying the (idle) desktop for the
-//! whole stream — while the same `exclusive` policy on the KWin route turns the physicals off
-//! outright. The KWin route's mechanism is closed to us here: KWin refuses an output configuration
-//! with ZERO enabled outputs, and a gamescope session has no KWin output of its own to leave
-//! enabled. DPMS is the honest translation of `exclusive` for this route — the desktop stays
-//! exactly where it is (no topology churn, no window re-homing), the panels go dark, and any
-//! LOCAL input wakes them, which is the right answer for a desktop someone can walk up to.
-//! Stream input never wakes them: it is injected into the nested gamescope's own EIS socket and
-//! does not pass through KWin.
+//! A gamescope session is its own compositor: nothing on either owning route (bare spawn, managed
+//! takeover) touches the desktop the box is showing, so the physical panel keeps displaying the
+//! (idle) desktop for the whole stream — while the same `exclusive` policy on a *desktop* backend
+//! turns the physicals off outright. That backend's mechanism is closed to us here: a compositor
+//! refuses an output configuration with ZERO enabled outputs, and a gamescope session has no
+//! output of its own on that desktop to leave enabled.
 //!
-//! Driven in-process over the compositor's own Wayland (`Connection::connect_to_env`, the same
-//! stack as [`crate::kwin_output_mgmt`] and for the same reason: `kscreen-doctor` rides a separate
-//! libkscreen/KDED layer that can be wedged while KWin itself answers fine), with a
-//! `kscreen-doctor --dpms` shell-out fallback. Best-effort everywhere — a box with no Wayland
-//! session, or a non-KDE desktop, declines quietly and the stream proceeds with the panel lit,
-//! exactly as before this module existed.
+//! DPMS is the honest translation. The desk stays exactly where it is — no topology churn, no
+//! workspace moves, no window re-homing — the panels just go dark, and any LOCAL input wakes them,
+//! which is the right answer for a desktop someone can walk up to. Stream input never wakes them:
+//! it is injected into the nested gamescope's own EIS socket and never reaches the desktop.
+//!
+//! **There is no cross-compositor DPMS protocol**, so this module is a dispatcher. In order, each
+//! arm self-gating so a box only pays for the one that answers:
+//!
+//! | desktop | mechanism |
+//! |---|---|
+//! | KDE / KWin | in-process `org_kde_kwin_dpms`, then a `kscreen-doctor --dpms` shell-out |
+//! | sway (wlroots) | `swaymsg output <name> dpms off` ([`crate::wlroots::dpms_other_heads`]) |
+//! | Hyprland | its dpms dispatcher, read-modify-verify ([`crate::hyprland::dpms_other_heads`]) |
+//! | none at all | [`crate::drm_dpms`] — the CRTCs off over DRM, no compositor needed |
+//! | GNOME / Mutter | **cannot be served** — see below |
+//!
+//! KDE is driven in-process over the compositor's own Wayland (`Connection::connect_to_env`, the
+//! same stack as [`crate::kwin_output_mgmt`] and for the same reason: `kscreen-doctor` rides a
+//! separate libkscreen/KDED layer that can be wedged while KWin itself answers fine). sway and
+//! Hyprland are driven through their own native IPC, which is how [`crate::wlroots`] and
+//! [`crate::hyprland`] already drive them — no second layer to be wedged, so no in-process twin
+//! is warranted.
+//!
+//! Neither of those two is as simple as "send the off command", and the Hyprland one especially
+//! is not: its dpms dispatcher is a **toggle** that ignores the state word (measured on 0.55.4 —
+//! asking for `on` turned a lit head OFF), and the classic argv does not even parse under its Lua
+//! config manager. [`crate::hyprland::dpms_other_heads`] carries the full account; the contract
+//! this module depends on is only that each arm returns **the heads it actually changed**, so the
+//! re-light moves exactly those and never a head it did not darken.
+//!
+//! The DRM arm is not an afterthought: a box sitting in Game Mode runs gamescope and NO desktop
+//! compositor, and it is *exactly* the deployment whose TV the operator wants dark.
+//!
+//! ⚠ **GNOME is the one gap, and it is structural.** Mutter exposes no DPMS to clients at all, and
+//! its `exclusive` mechanism (an `ApplyMonitorsConfig` that omits the physicals) needs a virtual
+//! output of its own to keep enabled — which a gamescope session, being its own compositor, does
+//! not have. The DRM floor cannot cover it either: Mutter holds DRM master, so `SET_MASTER` is
+//! refused. [`darken`] says so at `warn!` rather than failing silently.
+//!
+//! This module owns the refcount and the hold for every arm — see [`Darkened`] for how each is
+//! undone.
 //!
 //! **The hold is refcounted here, NOT floated through the registry's per-group restore.** Every
 //! gamescope spawn is its own display group (`registry::group_key` — deliberately, they are
@@ -433,6 +464,16 @@ enum Darkened {
     /// The `kscreen-doctor --dpms off` fallback ran (it takes no per-output address, so the
     /// re-light is the symmetric `--dpms on`).
     Kscreen,
+    /// sway (wlroots) turned these outputs off — `swaymsg output <name> dpms off`. Addressed by
+    /// connector name, so the re-light undoes exactly the heads we changed and never a sibling's.
+    Sway(Vec<String>),
+    /// Hyprland turned these monitors off — `hyprctl dispatch dpms off <name>`. Same per-name
+    /// discipline as [`Darkened::Sway`], and the same reason.
+    Hyprland(Vec<String>),
+    /// No desktop to ask, so [`crate::drm_dpms`] turned the CRTCs off over DRM directly. The
+    /// re-light is a `drop` — the hold IS a set of open `/dev/dri/cardN` fds, and the kernel
+    /// re-lights on last close. Nothing to replay, and crash-safe for the same reason.
+    Drm(crate::drm_dpms::DrmDarken),
 }
 
 /// The host-wide darken hold — refcounted like `sleep_inhibit`: the 0→1 edge darkens, the 1→0
@@ -505,9 +546,42 @@ pub fn release_stream_darken() {
     }
 }
 
+/// The non-KDE desktops we can ask, in preference order. Each self-gates on its own IPC being
+/// reachable — `wlroots::dpms_other_heads` shells out to `swaymsg`, which needs `SWAYSOCK`;
+/// Hyprland's needs `HYPRLAND_INSTANCE_SIGNATURE` — so a box only ever pays for the one that
+/// answers, and a box running neither falls straight through.
+///
+/// Both address heads BY NAME and report back the ones they actually changed, so the re-light
+/// undoes exactly those and never a concurrent session's headless output.
+///
+/// **GNOME is absent on purpose.** Mutter exposes no DPMS to clients at all, and its `exclusive`
+/// mechanism (`ApplyMonitorsConfig` omitting the physicals) needs a virtual output of its own to
+/// keep enabled — which a gamescope spawn, being its own compositor, does not have. There is
+/// nothing to call; the `warn!` at the end of [`darken`] names it rather than failing silently.
+fn non_kde_desktop_darken() -> Option<Darkened> {
+    let sway = crate::wlroots::dpms_other_heads(false);
+    if !sway.is_empty() {
+        tracing::info!(
+            outputs = ?sway,
+            "sway: desktop outputs off for the exclusive gamescope stream"
+        );
+        return Some(Darkened::Sway(sway));
+    }
+    let hypr = crate::hyprland::dpms_other_heads(false);
+    if !hypr.is_empty() {
+        tracing::info!(
+            outputs = ?hypr,
+            "hyprland: desktop monitors off for the exclusive gamescope stream"
+        );
+        return Some(Darkened::Hyprland(hypr));
+    }
+    None
+}
+
 /// The 0→1 darken: in-process over `org_kde_kwin_dpms` first, `kscreen-doctor --dpms off` as the
-/// wedged-compositor fallback. `None` = nothing was darkened (no desktop, not KDE, panels already
-/// off, or every arm declined) — and therefore nothing to restore.
+/// wedged-compositor fallback, then the other desktops, then DRM. `None` = nothing was darkened
+/// (no desktop that answers, panels already off, or every arm declined) — and therefore nothing to
+/// restore.
 fn darken() -> Option<Darkened> {
     match Session::open("darken") {
         Ok(mut s) => {
@@ -526,8 +600,49 @@ fn darken() -> Option<Darkened> {
             }
         }
         // Definitive "not KDE" / "no desktop": no fallback can do better (kscreen-doctor drives
-        // the same KDE-only machinery), so decline quietly — already logged by `open`.
-        Err(OpenFailure::NoDpmsGlobal) | Err(OpenFailure::Connect(_)) => None,
+        // the same KDE-only machinery). Declining is still right — but NOT quietly. [`darken`] is
+        // only ever reached because the operator selected `Topology::Exclusive`, so every decline
+        // here is "you asked for your screens off and they stayed on", which is a verdict and not
+        // a routine state. It sat at `debug!` in `open`, and that silence is what made the Nobara
+        // field report (2026-08-24) undiagnosable: no line anywhere named the panel. Same
+        // discipline as [`relight`], which has always said so when it gave up — a lit panel under
+        // `exclusive` deserves the honesty a dark one already got.
+        Err(e @ (OpenFailure::NoDpmsGlobal | OpenFailure::Connect(_))) => {
+            // Not KDE. Try the other desktops we drive, then the compositor-independent floor.
+            // Each arm self-gates on its own IPC being reachable, so the order is just preference
+            // and a box only ever pays for the ones that answer.
+            if let Some(d) = non_kde_desktop_darken() {
+                return Some(d);
+            }
+            match crate::drm_dpms::darken() {
+                Some(d) => {
+                    tracing::info!(
+                        cards = ?d.darkened,
+                        "DRM: the box's own CRTCs are off for the exclusive gamescope stream (no \
+                         desktop compositor to ask — a session in Game Mode has none)"
+                    );
+                    Some(Darkened::Drm(d))
+                }
+                // Nothing on this box was ours to darken: no desktop that answers, and then no
+                // `/dev/dri` card that was ours either — every one already mastered by someone
+                // else (a live compositor, including the gamescope an Attach route is mirroring,
+                // which must NOT be darkened), or nothing lit. Say so: `darken` is only ever
+                // reached because the operator selected `Topology::Exclusive`, so this is "you
+                // asked for your screens off and they stayed on" — a verdict, not a routine
+                // state. It sat at `debug!` in `open`, and that silence is what made the Nobara
+                // field report (2026-08-24) undiagnosable: no line anywhere named the panel.
+                None => {
+                    tracing::warn!(
+                        %e,
+                        "exclusive topology asked for the box's own screens to go dark: no \
+                         desktop compositor on this box could be asked (GNOME/Mutter exposes no \
+                         DPMS to clients), and no DRM card was ours to turn off either — the \
+                         panel stays as it is for this stream"
+                    );
+                    None
+                }
+            }
+        }
         // A live session that stopped answering: the standalone tool rides a different stack
         // (libkscreen/KDED) and may still get through — the same rationale as `kwin.rs`'s
         // kscreen fallbacks, honest-verdict discipline included.
@@ -593,6 +708,41 @@ fn relight(d: Darkened) {
                      local input wakes it"
                 );
             }
+        }
+        // Per-name, so exactly the heads we darkened come back and a sibling's headless output is
+        // never switched on by us. A head the operator unplugged meanwhile just fails its one
+        // command and says so — the others still re-light.
+        Darkened::Sway(outputs) => {
+            let back = crate::wlroots::dpms_other_heads(true);
+            if back.is_empty() {
+                tracing::error!(
+                    ?outputs,
+                    "sway: could NOT re-light the desktop outputs — they stay dark until local \
+                     input or `swaymsg output '*' dpms on`"
+                );
+            } else {
+                tracing::info!(outputs = ?back, "sway: desktop outputs back on");
+            }
+        }
+        Darkened::Hyprland(outputs) => {
+            let back = crate::hyprland::dpms_other_heads(true);
+            if back.is_empty() {
+                tracing::error!(
+                    ?outputs,
+                    "hyprland: could NOT re-light the desktop monitors — they stay dark until \
+                     local input or `hyprctl dispatch dpms on`"
+                );
+            } else {
+                tracing::info!(outputs = ?back, "hyprland: desktop monitors back on");
+            }
+        }
+        // The one arm that cannot fail: the hold IS the open fds, so dropping it closes them and
+        // the kernel's last-close restores the console. No ioctl to be refused, no saved mode to
+        // replay — which is why this path needs no "could NOT re-light" line of its own.
+        Darkened::Drm(d) => {
+            let cards = d.darkened.clone();
+            drop(d);
+            tracing::info!(?cards, "DRM: the box's own CRTCs released — panel back on");
         }
     }
 }

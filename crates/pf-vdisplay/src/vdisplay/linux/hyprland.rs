@@ -539,6 +539,123 @@ fn heads_to_disable(heads: &[crate::monitors::PhysicalMonitor], ours: &str) -> V
         .collect()
 }
 
+/// DPMS every head that is not ours and not a sibling's off (or back on), for a **gamescope**
+/// session honoring `Topology::Exclusive` — see [`crate::panel_dpms`].
+///
+/// Distinct from [`disable_other_heads`], which is what the *Hyprland backend's own* exclusive
+/// topology does, and deliberately so on this compositor above all: disabling a Hyprland head is
+/// the operation whose only known undo is re-reading the operator's whole config
+/// ([`restore_heads`]), dropping every runtime override they set by hand. DPMS is a separate axis
+/// — this module's own notes record `dispatch dpms on <name>` failing to re-enable a *disabled*
+/// head for exactly that reason — so off/on round-trips cleanly and touches nothing else.
+///
+/// A gamescope spawn owns no Hyprland output, hence the empty `ours`; a concurrent session's
+/// `HEADLESS-*` is still spared by [`heads_to_disable`]'s `managed` filter.
+///
+/// Returns the heads actually changed, so the re-light undoes exactly those.
+pub(crate) fn dpms_other_heads(on: bool) -> Vec<String> {
+    let Ok(heads) = list_monitors() else {
+        return Vec::new();
+    };
+    let mut changed = Vec::new();
+    for name in heads_to_disable(&heads, "") {
+        match dpms_one(&name, on) {
+            // Only a head THIS call moved is recorded: one already in the wanted state was left
+            // alone (the dispatcher toggles, so "fixing" it would break it), and reporting it as
+            // changed would have the re-light toggle a head we never darkened.
+            Ok(true) => changed.push(name),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                output = %name, error = %format!("{e:#}"),
+                "hyprland: could not DPMS this monitor for `topology: exclusive`"
+            ),
+        }
+    }
+    changed
+}
+
+/// The DPMS state Hyprland reports for `name` right now — `hyprctl -j monitors all`'s
+/// `dpmsStatus`. `None` when the monitor is not listed or the field is missing.
+///
+/// Measured on 0.55.4: this tracks the hardware exactly (`dpmsStatus:true` ⇔ the connector's sysfs
+/// `dpms=On`), in both states, and a DPMS-off monitor stays listed. It is the readback
+/// [`dpms_one`] is built around.
+fn monitor_dpms(name: &str) -> Option<bool> {
+    let raw = hyprctl(&["-j", "monitors", "all"]).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    parsed
+        .as_array()?
+        .iter()
+        .find(|m| m.get("name").and_then(|v| v.as_str()) == Some(name))?
+        .get("dpmsStatus")?
+        .as_bool()
+}
+
+/// Put ONE monitor into `want_on`, reporting whether this call actually changed it.
+///
+/// ⚠ **The dispatcher is a TOGGLE, not a set** — measured on 0.55.4 (Lua) 2026-08-24, and the
+/// single most important fact in this function. It ignores the state word entirely:
+///
+/// ```text
+/// On  ==[ hl.dsp.dpms("on",  "HDMI-A-1") ]==>  Off      <- asked for ON, got OFF
+/// Off ==[ hl.dsp.dpms("on",  "HDMI-A-1") ]==>  On
+/// Off ==[ hl.dsp.dpms{state="off", ...}  ]==>  On       <- asked for OFF, got ON
+/// ```
+///
+/// So a blind "off" LIGHTS an already-dark head, and a blind "on" at teardown DARKENS a lit one —
+/// the operator's screen left off after the stream, which is the failure this whole policy exists
+/// to avoid. Hence read → act only if it differs → verify. That shape is also correct on a
+/// config manager where the call really is a set, so it is not conditional on detecting which.
+///
+/// The SPELLING differs too. The classic `hyprctl dispatch dpms off <name>` does not work on the
+/// Lua manager at all: `dispatch` is shorthand for `hl.dispatch(...)`, so the bare words parse as
+/// a Lua expression and it dies with `')' expected near 'off'`. A hyprlang box (0.56.2 was probed
+/// as one) wants the classic form. There is no stable probe for which manager is loaded, and
+/// [`hyprctl_dispatch`] already catches the exit-0 rejections both produce — so try classic, then
+/// Lua, and report both failures if neither lands.
+///
+/// ⚠ **Never omit the monitor name.** `hl.dsp.dpms("on")` answers `ok` and toggles *something*;
+/// with a name it is at least addressed at the head we mean.
+fn dpms_one(name: &str, want_on: bool) -> Result<bool> {
+    if monitor_dpms(name) == Some(want_on) {
+        return Ok(false); // already where we want it — toggling would break it
+    }
+    let classic =
+        match hyprctl_dispatch(&["dispatch", "dpms", if want_on { "on" } else { "off" }, name]) {
+            Ok(()) => None,
+            Err(e) => {
+                let lua = lua_dpms_expr(name, want_on);
+                match hyprctl_dispatch(&["dispatch", &lua]) {
+                    Ok(()) => None,
+                    Err(lua_err) => Some(format!("hyprlang: {e:#}; lua: {lua_err:#}")),
+                }
+            }
+        };
+    if let Some(why) = classic {
+        bail!("neither dispatch form was accepted for {name} — {why}");
+    }
+    // Verify, because a toggle that fired against a state we misread is worse than one that did
+    // not fire at all.
+    match monitor_dpms(name) {
+        Some(now) if now == want_on => Ok(true),
+        Some(now) => bail!(
+            "hyprland accepted the dpms dispatch for {name} but it is now dpmsStatus={now}, \
+             wanted {want_on} (the dispatcher toggles — the readback disagreed with reality)"
+        ),
+        None => bail!("hyprland stopped listing {name} after its dpms dispatch"),
+    }
+}
+
+/// The Lua-config-manager spelling of a per-monitor DPMS. Pure, so a test pins the shape — the
+/// quoting is the whole trick, and an unquoted argument is exactly what the classic form gets
+/// wrong on that manager.
+fn lua_dpms_expr(name: &str, on: bool) -> String {
+    format!(
+        "hl.dsp.dpms(\"{}\", \"{name}\")",
+        if on { "on" } else { "off" }
+    )
+}
+
 /// Disable every non-managed head for an `exclusive` session, returning the ones actually disabled
 /// (the input to [`restore_heads`]). Best-effort per head: one that refuses costs exclusivity on
 /// that screen, not the session.
@@ -1387,6 +1504,22 @@ fn portal_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Lua config manager parses a `dispatch` argument as a Lua expression, so the monitor
+    /// name and the state must both be QUOTED — an unquoted `dpms off HDMI-A-1` is what dies with
+    /// `')' expected near 'off'` on 0.55.4. Pinning the shape here because the quoting is the
+    /// entire difference between working and silently doing nothing.
+    #[test]
+    fn the_lua_dpms_expression_quotes_both_arguments() {
+        assert_eq!(
+            lua_dpms_expr("HDMI-A-1", false),
+            r#"hl.dsp.dpms("off", "HDMI-A-1")"#
+        );
+        assert_eq!(lua_dpms_expr("DP-2", true), r#"hl.dsp.dpms("on", "DP-2")"#);
+        // The monitor name is never omitted: the no-name form answers `ok` and TOGGLES on 0.55.4,
+        // which would flip a just-restored head back off.
+        assert!(lua_dpms_expr("DP-2", true).contains("\"DP-2\""));
+    }
 
     #[test]
     fn version_tag_parses_release_and_dev_builds() {

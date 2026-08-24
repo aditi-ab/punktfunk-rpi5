@@ -136,7 +136,24 @@ PUNKTFUNK_CAPTURE_MONITOR=HDMI-A-1
 
 The host then attaches to the session's own composited output: nothing is stopped, nothing is
 relaunched, no mode is imposed, and what you see is exactly what is on the TV. That is the
-difference from **managed**, which deliberately takes the session over and blanks the panel.
+difference from **managed**, which deliberately takes the session over and relaunches it headless,
+so the box's own session stops driving that panel.
+
+Whether the panel then goes *dark* is the **Topology** setting's job, not the model's — see
+[Virtual displays](/docs/virtual-displays#topology). What `exclusive` can do differs by model:
+
+- **Managed** and **bare spawn** — the box's own gaming session is moved out of the way so it
+  stops driving the panel, and then the panel is actually turned **off** for the stream and
+  restored at teardown. On a KDE desktop that goes through KWin's DPMS; on a box already in Game
+  Mode there is no KWin to ask, so the host turns the CRTCs off over DRM itself. Neither needs
+  root — the DRM path rides the same seat access every local compositor gets.
+- **Attach** — nothing is darkened, and cannot be: this model streams the panel the box is
+  driving, so turning it off would turn off the picture.
+
+Under `extend` or `primary` none of this happens and your screens are left alone. If `exclusive`
+asked for a dark screen and the host could not deliver one — a box already in Game Mode has no
+KDE desktop to ask for DPMS — it says so in the log rather than leaving you guessing at a lit
+screen.
 
 Only the one head the session drives is listed — a nested or headless gamescope (including the
 per-session ones the host spawns itself) has none of its own, so the picker is empty there. Full

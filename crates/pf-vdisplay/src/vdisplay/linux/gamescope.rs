@@ -71,7 +71,7 @@ pub struct GamescopeDisplay {
     /// ran `apply_input_env`); `create` then falls through to the bare spawn, the safe default.
     route: Option<crate::GamescopeRoute>,
     /// The topology-restore action the bare-spawn `create` prepared under `Topology::Exclusive` —
-    /// the release of this display's [`crate::kwin_dpms`] darken hold — pending pickup by the
+    /// the release of this display's [`crate::panel_dpms`] darken hold — pending pickup by the
     /// registry via [`VirtualDisplay::take_topology_restore`], so it runs at the display's
     /// teardown (§6.1) and never before.
     pending_restore: Option<Box<dyn FnOnce() + Send>>,
@@ -175,6 +175,63 @@ const SWITCH_HONOR_GRACE: Duration = Duration::from_secs(120);
 /// Whether [`install_idle_dropin`] has one outstanding. Process memory only — the sweep in
 /// [`restore_takeover_on_startup`] is what covers a host that died holding one.
 static IDLE_DROPIN_ARMED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// Whether the MANAGED route currently holds a [`crate::panel_dpms`] darken hold for
+/// `Topology::Exclusive`.
+///
+/// The managed route cannot register its release the way a bare spawn does. A spawn reports
+/// `DisplayOwnership::Owned`, so `registry::acquire` picks its `take_topology_restore()` up and
+/// runs it at teardown; managed reports `SessionManaged`, and that function returns for anything
+/// not `Owned` **above** the pickup — deliberately, because this module owns the managed
+/// lifecycle instead. So this module owns the release too: [`do_restore_tv_session`], the one
+/// teardown every managed path funnels through.
+///
+/// A plain bool rather than a count because the managed SESSION is what is darkened, not each
+/// connect: it survives client disconnects (that is the whole point of [`MANAGED_SESSION`]), and a
+/// same-mode reconnect reuses it warm without a relaunch. Acquiring per connect would ratchet
+/// `panel_dpms`'s refcount up with no matching releases and pin the panel dark for the host's life.
+static MANAGED_DARKEN_HELD: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// The 0→1 edge: should this call actually take a `panel_dpms` hold? Pure, and split from
+/// [`managed_darken_acquire`] so the balance rule is testable without a live compositor — the same
+/// shape as `panel_dpms::Holds::acquire_edge`, and for the same reason.
+fn managed_darken_acquire_edge(held: &mut bool, exclusive: bool) -> bool {
+    if !exclusive || *held {
+        return false;
+    }
+    *held = true;
+    true
+}
+
+/// The 1→0 edge: should this call actually release one?
+fn managed_darken_release_edge(held: &mut bool) -> bool {
+    if !*held {
+        return false;
+    }
+    *held = false;
+    true
+}
+
+/// Take the managed route's darken hold, once, if `exclusive` and we don't already hold one.
+fn managed_darken_acquire(exclusive: bool) {
+    let mut held = MANAGED_DARKEN_HELD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if managed_darken_acquire_edge(&mut held, exclusive) {
+        crate::panel_dpms::acquire_stream_darken();
+    }
+}
+
+/// Drop it, if held. Idempotent, because it is called unconditionally from the restore — which is
+/// exactly what makes it safe to put above every early return there.
+fn managed_darken_release() {
+    let mut held = MANAGED_DARKEN_HELD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if managed_darken_release_edge(&mut held) {
+        crate::panel_dpms::release_stream_darken();
+    }
+}
 
 /// A pending debounced TV-session restore: the instant [`do_restore_tv_session`] should fire after
 /// the last client disconnect. A reconnect inside the window clears it (and reuses the still-warm
@@ -537,7 +594,7 @@ impl VirtualDisplay for GamescopeDisplay {
         // The DPMS darken-hold release the bare-spawn `create` registered (Exclusive topology
         // only). The registry stores it on this display's entry and runs it at teardown — which,
         // for gamescope, is the display's OWN teardown: every spawn is its own group, and the
-        // cross-session ordering lives in `kwin_dpms`'s refcount, not in the group float.
+        // cross-session ordering lives in `panel_dpms`'s refcount, not in the group float.
         self.pending_restore.take()
     }
 
@@ -583,8 +640,32 @@ impl VirtualDisplay for GamescopeDisplay {
             // also what the ladder's own default arm picks.
             None => (None, None),
         };
+        // `Topology::Exclusive` means the operator asked for the box's own screens to go dark for
+        // the stream. Resolved ONCE, above every route's return, so the managed hold below and the
+        // "free the box's session" decision and the bare spawn's darken at the end of this
+        // function can never disagree within a single create.
+        let exclusive = crate::effective_topology() == crate::policy::Topology::Exclusive;
         if let Some(client) = session_env {
-            return create_managed_session(&client, mode, self.hdr);
+            let out = create_managed_session(&client, mode, self.hdr)?;
+            // Managed is the route that matters most here: it is the recommended one, it gives the
+            // best experience, and it is the ONLY way to serve a client its own virtual output at
+            // its own mode. So `exclusive` has to mean something on it.
+            //
+            // Its takeover idles the box's autologin session, which stops that session DRIVING the
+            // panel — but measured on the Nobara VM (2026-08-24), that alone leaves the connector
+            // at `enabled=enabled dpms=On` indefinitely: with no DRM master the kernel just keeps
+            // the CRTC configured. Turning it off is [`crate::panel_dpms`]'s job, and on a Game Mode
+            // box (no KWin) that lands in its DRM arm — which needs no compositor and no privilege.
+            //
+            // The hold canNOT ride `self.pending_restore` the way the bare spawn's does: this
+            // route reports `DisplayOwnership::SessionManaged`, and `registry::acquire` returns for
+            // anything not `Owned` ABOVE its `take_topology_restore()` pickup, so that hold would
+            // never be released — and a panel dark after every stream is worse than one left lit.
+            // Hence [`managed_darken_acquire`] / [`managed_darken_release`], balanced against
+            // [`do_restore_tv_session`] instead: the one teardown every managed path funnels
+            // through, and the same place the drop-in sweep lives for the same reason.
+            managed_darken_acquire(exclusive);
+            return Ok(out);
         }
         // Attach to an already-running gamescope (a foreign / externally-launched session) instead
         // of spawning our own: capture its node AND inject into its EIS socket.
@@ -601,6 +682,10 @@ impl VirtualDisplay for GamescopeDisplay {
                     .context("PUNKTFUNK_GAMESCOPE_NODE must be a node id or 'auto'")?
             };
             point_injector_at_eis();
+            // ⚠ NO darken hold here either, and this one is policy: attach MIRRORS a gamescope
+            // that may itself be lighting the physical panel, so honoring `exclusive` by
+            // darkening it would darken the very picture being streamed. `exclusive` cannot be
+            // served on this route; the operator's lever is to pick a model that owns a display.
             tracing::info!(node_id, "gamescope: attaching to existing PipeWire node");
             // ATTACH = mirror a foreign gamescope we don't own → External (no keep-alive/reuse).
             return Ok(VirtualOutput {
@@ -631,7 +716,8 @@ impl VirtualDisplay for GamescopeDisplay {
         // NO instance free — and then collided with the box's own autologin/desktop Steam, which
         // is precisely the collision this block exists to prevent.
         let app = resolved_spawn_app(self.cmd.as_deref());
-        if app.as_deref().is_some_and(is_steam_launch) {
+        let steam = app.as_deref().is_some_and(is_steam_launch);
+        if steam {
             // A dedicated launch NEEDS Steam's single instance — no attach degrade exists here, so
             // a mask-fragile-DM box without takeover privilege fails with the actionable error.
             stop_autologin_sessions()
@@ -639,6 +725,24 @@ impl VirtualDisplay for GamescopeDisplay {
             // B1b: a Steam running in a plain DESKTOP session (GNOME/KDE) holds the instance just
             // the same, and the autologin stop above can't see it — free it too, or fail loudly.
             free_desktop_steam()?;
+        } else if free_box_session_for_exclusive(steam, exclusive) {
+            // B1c: a NON-Steam launch has no single instance to free, and used to leave the box's
+            // gaming session completely untouched. On a Game Mode box that session IS the DRM
+            // master of the TV (`gamescope/heads.rs`), so under Exclusive it went on lighting the
+            // panel with live Game Mode for the whole stream — the loudest half of the Nobara field
+            // report, and never a 0.31.0 regression: this path has always been Steam-gated.
+            //
+            // Best-effort, unlike the Steam arm above: freeing the session is what MAKES the panel
+            // dark here, not what makes the launch possible, so a box that refuses costs the
+            // operator their dark screen and not their game. The restore is the same machinery
+            // either way (`STOPPED_AUTOLOGIN` → `schedule_restore_tv_session`).
+            if let Err(why) = stop_autologin_sessions() {
+                tracing::warn!(
+                    %why,
+                    "exclusive topology: could not free the box's gaming session, so its own \
+                     display keeps whatever it is showing for this stream"
+                );
+            }
         }
         // A5: a per-spawn instance id addresses this spawn's log + node discovery, so two coexisting
         // bare-spawns (a kept lingering one + a fresh one) never parse each other's node id from a
@@ -685,16 +789,19 @@ impl VirtualDisplay for GamescopeDisplay {
         // the physicals outright, but that door is closed here (KWin refuses zero enabled outputs,
         // and no output on that desktop is ours to leave enabled) — so the desktop's panels go to
         // DPMS-off instead, best-effort and self-gating (a box with no KDE desktop declines
-        // quietly inside `kwin_dpms`). Placed AFTER the spawn succeeded, so a failed create never
-        // blanks the user's screen. The hold is refcounted in `kwin_dpms` rather than floated
+        // quietly inside `panel_dpms`). Placed AFTER the spawn succeeded, so a failed create never
+        // blanks the user's screen. The hold is refcounted in `panel_dpms` rather than floated
         // through the registry's group restore, because every gamescope spawn is its own group
         // (`registry::group_key`) — the float alone would re-light the panel when the FIRST of two
-        // concurrent spawns ends, under the second's still-live stream. Skipped for Managed (its
-        // takeover already stopped the desktop) and Attach (it mirrors a gamescope that may itself
-        // be driving the physical panel) — both returned earlier in this function.
-        if crate::effective_topology() == crate::policy::Topology::Exclusive {
-            crate::kwin_dpms::acquire_stream_darken();
-            self.pending_restore = Some(Box::new(crate::kwin_dpms::release_stream_darken));
+        // concurrent spawns ends, under the second's still-live stream. Managed takes the same
+        // hold at its own return above, through [`managed_darken_acquire`] rather than this field
+        // (its display is not registry-owned, so there is no `take_topology_restore` pickup to
+        // ride). Only Attach still skips, and for a reason that survives: it mirrors a gamescope
+        // that may itself be driving the physical panel, so darkening it would darken the very
+        // picture being streamed.
+        if exclusive {
+            crate::panel_dpms::acquire_stream_darken();
+            self.pending_restore = Some(Box::new(crate::panel_dpms::release_stream_darken));
         }
         // Bare SPAWN: we own the nested gamescope process → registry-poolable (keep-alive-able).
         Ok(VirtualOutput::owned(
@@ -3728,6 +3835,17 @@ fn handback_watch(units: &[String]) {
 /// [`start_restore_worker`] once the debounce deadline passes; takes the stopped-unit list so a
 /// cancelled+reconnected window keeps the list for a later real restore.
 fn do_restore_tv_session(verify: bool) {
+    // Give the box its screens back FIRST, above every early return below — including the SteamOS
+    // ones, which is why this sits at the very top rather than beside the drop-in sweep that
+    // follows the same "must not leak past a return" rule. The managed route's `exclusive` darken
+    // has no registry restore to ride (`DisplayOwnership::SessionManaged` returns above
+    // `take_topology_restore`), so this call is its ONLY release — leaking it would leave the
+    // operator's panel dark for the rest of the host's life.
+    //
+    // Safe this early: releasing re-lights, and every path below either hands the box back or
+    // deliberately keeps a headless session on a box with no connected display (nothing lit to
+    // darken there anyway). Idempotent, so the paths that reach the restore twice cost nothing.
+    managed_darken_release();
     // SteamOS: we reconfigured `gamescope-session.target` headless via a drop-in. Restore = remove
     // the drop-in + restart the target (back to the physical panel) — unless the user switched to a
     // desktop session meanwhile, in which case drop the override and leave the desktop alone.
@@ -5192,6 +5310,20 @@ fn is_steam_launch(cmd: &str) -> bool {
     cmd.split_whitespace().next() == Some("steam")
 }
 
+/// Should a bare-spawn launch free the box's own gaming session when it is NOT a Steam launch?
+///
+/// Two different requirements reach the same call. A **Steam** launch frees it because it must —
+/// the single instance is not shareable — and that arm fails the create when it can't. **Exclusive
+/// topology** frees it because the operator asked for the box's screens to go dark, and on a Game
+/// Mode box that session is the DRM master of the physical panel; that arm is best-effort.
+///
+/// Pure so the gate is testable without systemd: the bug it closes was a policy question
+/// (`is_steam_launch` standing in for "does the box's session need to get out of the way"), not a
+/// systemd one.
+fn free_box_session_for_exclusive(steam: bool, exclusive: bool) -> bool {
+    !steam && exclusive
+}
+
 /// Shape a resolved launch command for a bare-spawn gamescope session. A Steam URI launch
 /// (`steam steam://rungameid/<id>`, produced by `library::command_for`) gets `-gamepadui` inserted
 /// so the nested Steam is Big Picture — the identity gamescope's `--steam` integration is built
@@ -5564,8 +5696,9 @@ mod tests {
     use super::{
         any_output_size_is, cancel_pending_restore, cgroup_is_punktfunk_owned,
         classify_output_size, connected_connector_under, display_manager_unit_under, dm_plan,
-        game_hz, gamescope_output_size, hdr_args, idle_dropin_body, idle_dropin_path,
-        install_idle_dropin, is_steam_launch, mask_unit, missing_flags, mode_mismatch,
+        free_box_session_for_exclusive, game_hz, gamescope_output_size, hdr_args, idle_dropin_body,
+        idle_dropin_path, install_idle_dropin, is_steam_launch, managed_darken_acquire_edge,
+        managed_darken_release_edge, mask_unit, missing_flags, mode_mismatch,
         nested_wrapper_script, our_wsi_layer_dir, parse_listed_units, plan_bind,
         release_autologin_mask, remove_idle_dropin, script_hardcodes_gamescope, sentinel_advanced,
         shape_dedicated_command, switch_ends_mask_window, takeover_state_is_live, unmask_unit,
@@ -5897,6 +6030,126 @@ mod tests {
         // The remedies the old fixed guess offered — a reinstall and a polkit rule — must appear
         // ONLY where they can actually help, never on the path that ran and was refused.
         assert!(!ran.contains("reinstall"), "{ran}");
+    }
+
+    /// ON GLASS. The MANAGED route's hold, driven against the real `panel_dpms`/`drm_dpms` stack —
+    /// the wiring the pure edge test above cannot see. Run it in the takeover state (the box's
+    /// gaming session idled, so nothing holds DRM master), on a box with a connected head:
+    ///
+    /// ```sh
+    /// ./pf_vdisplay-<hash> --ignored --nocapture the_managed_hold_darkens_a_real_panel
+    /// ```
+    #[test]
+    #[ignore = "on glass: needs a connected head and no compositor holding /dev/dri/card*"]
+    fn live_the_managed_hold_darkens_a_real_panel() {
+        fn lit() -> Vec<(String, String)> {
+            let mut v = Vec::new();
+            let Ok(rd) = std::fs::read_dir("/sys/class/drm") else {
+                return v;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                let f = |n: &str| {
+                    std::fs::read_to_string(p.join(n))
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default()
+                };
+                if f("status") == "connected" {
+                    v.push((e.file_name().to_string_lossy().into_owned(), f("dpms")));
+                }
+            }
+            v.sort();
+            v
+        }
+
+        let before = lit();
+        println!("before: {before:?}");
+        assert!(
+            !before.is_empty(),
+            "needs a connected head to mean anything"
+        );
+
+        super::managed_darken_acquire(true);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let during = lit();
+        println!("during: {during:?}");
+
+        // A reconnect must not take a second hold — if it did, the release below would leave the
+        // panel dark. This is the failure the pure test models; here it is against the real
+        // refcount.
+        super::managed_darken_acquire(true);
+
+        super::managed_darken_release();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let after = lit();
+        println!("after:  {after:?}");
+
+        let went_dark: Vec<&String> = during
+            .iter()
+            .zip(&before)
+            .filter(|((_, now), (_, was))| was == "On" && now == "Off")
+            .map(|((n, _), _)| n)
+            .collect();
+        if went_dark.is_empty() {
+            println!("nothing was ours to darken (card already mastered?) — skipping");
+            return;
+        }
+        // Deliberately "at least one went dark", not "all did": a box can carry a connected head
+        // the live compositor does not manage. The Hyprland VM has a virtio `Virtual-1` beside the
+        // real `HDMI-A-1`, and only the latter is Hyprland's to darken — asserting all of them
+        // would fail on a difference that is not a defect. What must hold is that the mechanism
+        // darkened something real, and that the release put every head back exactly as found.
+        println!("went dark: {went_dark:?}");
+        assert_eq!(after, before, "the release must restore what we found");
+    }
+
+    #[test]
+    fn the_managed_darken_hold_is_taken_once_and_released_once() {
+        // The managed SESSION is what gets darkened, not each connect — it outlives client
+        // disconnects and a same-mode reconnect reuses it warm. So a reconnect must NOT take a
+        // second hold: `panel_dpms`'s refcount would ratchet up with no matching release and pin
+        // the operator's panel dark for the rest of the host's life.
+        let mut held = false;
+        assert!(managed_darken_acquire_edge(&mut held, true), "0→1 darkens");
+        assert!(!managed_darken_acquire_edge(&mut held, true), "reconnect");
+        assert!(!managed_darken_acquire_edge(&mut held, true));
+
+        // The restore calls the release unconditionally, above every early return — so it has to
+        // be idempotent, or a path that reaches the restore twice would release a hold it does
+        // not have and drop someone else's.
+        assert!(managed_darken_release_edge(&mut held), "1→0 re-lights");
+        assert!(!managed_darken_release_edge(&mut held), "already released");
+        assert!(!managed_darken_release_edge(&mut held));
+
+        // And it re-arms: a later stream on the same host lifetime darkens again.
+        assert!(managed_darken_acquire_edge(&mut held, true));
+        assert!(managed_darken_release_edge(&mut held));
+
+        // Not exclusive ⇒ never a hold, so the restore's unconditional release stays a no-op.
+        // This is what makes `extend` / `SharedDesktop` ("never blank the real monitors") mean
+        // what they say on the managed route.
+        let mut held = false;
+        assert!(!managed_darken_acquire_edge(&mut held, false));
+        assert!(!held);
+        assert!(!managed_darken_release_edge(&mut held));
+    }
+
+    #[test]
+    fn exclusive_frees_the_box_session_for_a_non_steam_launch_too() {
+        // The bug: `is_steam_launch` was standing in for "does the box's own session need to get
+        // out of the way", and those are two different questions. A non-Steam library game under
+        // `exclusive` left the box's Game Mode gamescope holding DRM master on the TV, so the
+        // operator's screen showed live Game Mode for the whole stream (Nobara, 2026-08-24).
+        assert!(free_box_session_for_exclusive(false, true));
+        // A Steam launch is already handled by the arm above this one — and that arm is the
+        // FAILING one (the single instance is not optional), so this gate must not also fire and
+        // free the session a second time.
+        assert!(!free_box_session_for_exclusive(true, true));
+        // Not exclusive: the operator did not ask for their screens to go dark, so a non-Steam
+        // launch must keep leaving the box's session strictly alone. This is what makes `extend`
+        // and the `SharedDesktop` preset ("never blank the real monitors") mean what they say.
+        assert!(!free_box_session_for_exclusive(false, false));
+        assert!(!free_box_session_for_exclusive(true, false));
     }
 
     #[test]

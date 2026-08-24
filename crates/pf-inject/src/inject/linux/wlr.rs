@@ -40,7 +40,7 @@ const SCROLL_HORIZONTAL: u32 = 1;
 /// `wl_output.name` — the connector name we match the streamed head on — arrived in v4. Nothing
 /// else we ask of an output needs more than v1, so a lower advert only costs us the names (and
 /// with them the ability to aim absolute input; see [`index_named`]). Same constant, same reason,
-/// as `pf_vdisplay`'s `kwin_dpms`.
+/// as `pf_vdisplay`'s `panel_dpms`.
 const WL_OUTPUT_MAX: u32 = 4;
 
 /// One `wl_output` the compositor has advertised.

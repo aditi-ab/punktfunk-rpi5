@@ -491,6 +491,45 @@ fn disable_argv(name: &str) -> [&str; 3] {
     ["output", name, "disable"]
 }
 
+/// The `swaymsg` argv that DPMS-es `name` off or on. Same noun-first shape as [`disable_argv`],
+/// and a different axis from it: `dpms off` leaves the output enabled and configured (its
+/// workspaces do not move, no window is re-homed) and merely stops driving the panel.
+fn dpms_argv(name: &str, on: bool) -> [&str; 4] {
+    ["output", name, "dpms", if on { "on" } else { "off" }]
+}
+
+/// DPMS every head that is not ours and not a sibling's off (or back on), for a **gamescope**
+/// session honoring `Topology::Exclusive` — see [`crate::panel_dpms`].
+///
+/// Distinct from [`disable_other_heads`], which is what the *wlroots backend's own* exclusive
+/// topology does. A gamescope spawn is its own compositor and owns no sway output, so there is
+/// nothing here to promote to "the desk" and nothing to focus — and disabling the operator's
+/// outputs would move their workspaces around for a stream that is not even on this compositor.
+/// DPMS is the honest translation: the desk stays exactly as it is, the panels just go dark.
+///
+/// Reuses [`heads_to_disable`]'s filter with an empty `ours`, so a concurrent wlroots session's
+/// `HEADLESS-*` output is spared for the same reason it is there — blanking it would black out
+/// that client's stream.
+///
+/// Returns the heads actually changed, so the re-light can undo exactly those. Best-effort per
+/// head, like its neighbour: one that refuses costs a lit screen, not the stream.
+pub(crate) fn dpms_other_heads(on: bool) -> Vec<String> {
+    let Ok(heads) = list_monitors() else {
+        return Vec::new();
+    };
+    let mut changed = Vec::new();
+    for name in heads_to_disable(&heads, "") {
+        match swaymsg(&dpms_argv(&name, on)) {
+            Ok(_) => changed.push(name),
+            Err(e) => tracing::warn!(
+                output = %name, error = %format!("{e:#}"),
+                "wlroots: could not DPMS this output for `topology: exclusive`"
+            ),
+        }
+    }
+    changed
+}
+
 /// The `swaymsg` argv that re-enables `name`. sway keeps a disabled output's configuration, so a
 /// bare `enable` restores the mode/position/scale it had — there is no need to replay the rule the
 /// way the Hyprland twin's `reload` does.
@@ -1058,6 +1097,30 @@ mod tests {
             head("DP-3", false),
         ];
         assert_eq!(heads_to_disable(&heads, ours), vec!["DP-1", "HDMI-A-1"]);
+    }
+
+    /// `dpms` is a different sway verb from `disable`, and the difference is the whole point of
+    /// the gamescope arm: `disable` moves workspaces and re-homes windows on the operator's desk,
+    /// `dpms off` leaves the desk alone and only stops driving the panel. Four tokens, not three —
+    /// sway spells it `output <name> dpms on|off`.
+    #[test]
+    fn dpms_is_a_separate_verb_from_disable() {
+        assert_eq!(dpms_argv("DP-1", false), ["output", "DP-1", "dpms", "off"]);
+        assert_eq!(dpms_argv("DP-1", true), ["output", "DP-1", "dpms", "on"]);
+        assert_eq!(disable_argv("DP-1"), ["output", "DP-1", "disable"]);
+    }
+
+    /// The gamescope DPMS arm reuses the disable filter with an EMPTY `ours`: a gamescope spawn
+    /// owns no sway output, so nothing of ours needs sparing — but a concurrent wlroots session's
+    /// `HEADLESS-*` still must be, or darkening would black out that client's stream.
+    #[test]
+    fn the_gamescope_dpms_arm_still_spares_a_sibling_headless() {
+        let heads = [
+            head("DP-1", true),
+            head("HEADLESS-1", true),
+            head("DP-3", false),
+        ];
+        assert_eq!(heads_to_disable(&heads, ""), vec!["DP-1"]);
     }
 
     /// A box with no physical output (the CI/headless posture) has nothing to disable, so no
