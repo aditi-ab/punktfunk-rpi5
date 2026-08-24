@@ -876,6 +876,14 @@ mod kwin_output_mgmt;
 #[path = "vdisplay/linux/kwin_dpms.rs"]
 mod kwin_dpms;
 
+// The compositor-independent half of the same policy: turn the CRTCs off over DRM directly, for a
+// box with no desktop to ask (Game Mode runs gamescope and no KWin, and is exactly where the
+// operator's TV is lit by the box itself). Reached from `kwin_dpms`'s "not KDE" arm, which is what
+// owns the refcount and the hold.
+#[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/drm_dpms.rs"]
+mod drm_dpms;
+
 #[cfg(target_os = "windows")]
 #[path = "vdisplay/windows/manager.rs"]
 pub mod manager;

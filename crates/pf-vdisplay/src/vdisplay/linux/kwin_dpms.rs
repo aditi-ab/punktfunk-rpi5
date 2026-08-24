@@ -15,9 +15,13 @@
 //! Driven in-process over the compositor's own Wayland (`Connection::connect_to_env`, the same
 //! stack as [`crate::kwin_output_mgmt`] and for the same reason: `kscreen-doctor` rides a separate
 //! libkscreen/KDED layer that can be wedged while KWin itself answers fine), with a
-//! `kscreen-doctor --dpms` shell-out fallback. Best-effort everywhere — a box with no Wayland
-//! session, or a non-KDE desktop, declines quietly and the stream proceeds with the panel lit,
-//! exactly as before this module existed.
+//! `kscreen-doctor --dpms` shell-out fallback. Best-effort everywhere.
+//!
+//! **A box with no KDE desktop at all falls through to [`crate::drm_dpms`]**, which turns the CRTCs
+//! off over DRM directly and needs no compositor's cooperation. That arm is not an afterthought: a
+//! box sitting in Game Mode runs gamescope and no KWin, and it is *exactly* the deployment whose TV
+//! the operator wants dark. This module still owns the refcount and the hold for both arms — see
+//! [`Darkened`] for how each is undone.
 //!
 //! **The hold is refcounted here, NOT floated through the registry's per-group restore.** Every
 //! gamescope spawn is its own display group (`registry::group_key` — deliberately, they are
@@ -433,6 +437,10 @@ enum Darkened {
     /// The `kscreen-doctor --dpms off` fallback ran (it takes no per-output address, so the
     /// re-light is the symmetric `--dpms on`).
     Kscreen,
+    /// No desktop to ask, so [`crate::drm_dpms`] turned the CRTCs off over DRM directly. The
+    /// re-light is a `drop` — the hold IS a set of open `/dev/dri/cardN` fds, and the kernel
+    /// re-lights on last close. Nothing to replay, and crash-safe for the same reason.
+    Drm(crate::drm_dpms::DrmDarken),
 }
 
 /// The host-wide darken hold — refcounted like `sleep_inhibit`: the 0→1 edge darkens, the 1→0
@@ -534,13 +542,32 @@ fn darken() -> Option<Darkened> {
         // discipline as [`relight`], which has always said so when it gave up — a lit panel under
         // `exclusive` deserves the honesty a dark one already got.
         Err(e @ (OpenFailure::NoDpmsGlobal | OpenFailure::Connect(_))) => {
-            tracing::warn!(
-                %e,
-                "exclusive topology asked for the box's own screens to go dark, and this box has \
-                 no KDE desktop to ask (a session already in Game Mode has no KWin) — the panel \
-                 stays as it is for this stream"
-            );
-            None
+            match crate::drm_dpms::darken() {
+                Some(d) => {
+                    tracing::info!(
+                        cards = ?d.darkened,
+                        "DRM: the box's own CRTCs are off for the exclusive gamescope stream (no KDE \
+                         desktop to ask — a session in Game Mode has no KWin)"
+                    );
+                    Some(Darkened::Drm(d))
+                }
+                // Nothing on this box was ours to darken: no `/dev/dri` at all, every card already
+                // mastered by someone else (a live compositor — including the gamescope an Attach
+                // route is mirroring, which must NOT be darkened), or nothing lit. Say so: `darken`
+                // is only ever reached because the operator selected `Topology::Exclusive`, so this
+                // is "you asked for your screens off and they stayed on" — a verdict, not a routine
+                // state. It sat at `debug!` in `open`, and that silence is what made the Nobara field
+                // report (2026-08-24) undiagnosable: no line anywhere named the panel.
+                None => {
+                    tracing::warn!(
+                        %e,
+                        "exclusive topology asked for the box's own screens to go dark: this box has \
+                         no KDE desktop to ask, and no DRM card was ours to turn off either — the \
+                         panel stays as it is for this stream"
+                    );
+                    None
+                }
+            }
         }
         // A live session that stopped answering: the standalone tool rides a different stack
         // (libkscreen/KDED) and may still get through — the same rationale as `kwin.rs`'s
@@ -607,6 +634,14 @@ fn relight(d: Darkened) {
                      local input wakes it"
                 );
             }
+        }
+        // The one arm that cannot fail: the hold IS the open fds, so dropping it closes them and
+        // the kernel's last-close restores the console. No ioctl to be refused, no saved mode to
+        // replay — which is why this path needs no "could NOT re-light" line of its own.
+        Darkened::Drm(d) => {
+            let cards = d.darkened.clone();
+            drop(d);
+            tracing::info!(?cards, "DRM: the box's own CRTCs released — panel back on");
         }
     }
 }
