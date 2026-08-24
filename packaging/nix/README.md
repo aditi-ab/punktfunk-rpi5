@@ -410,7 +410,10 @@ The shell exports an
   session binary's *optional* on-glass stats overlay is absent, and the **GTK shell
   (`punktfunk-client`) is skia-free and fully featured.** Re-adding it means teaching skia-bindings
   to consume a prebuilt Skia offline (a fixed-output derivation of the rust-skia tarball) or a
-  vendored from-source Skia build — a tracked follow-up.
+  vendored from-source Skia build — a tracked follow-up. For the same reason this build does **not** install
+  `io.unom.Punktfunk.Console.desktop` (the deb/rpm/arch/flatpak couch launcher): it runs
+  `--browse`, which needs that feature, so the entry would be a launcher that only prints an
+  error.
 
 - **⚠ `nix flake check` does NOT check the NixOS module — that is why `module-check.nix` exists.**
   For `nixosModules`, nix forces the value and asserts it is a lambda taking an open attribute set,

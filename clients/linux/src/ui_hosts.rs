@@ -859,7 +859,14 @@ impl SimpleComponent for HostsPage {
             rescan_btn.connect_clicked(move |_| sender.input(HostsMsg::Rescan));
         }
         header.pack_start(&rescan_btn);
+        // The couch UI's front door, beside the page's other actions (same placement the
+        // WinUI shell gives it). It was previously reachable only as `--browse` on the
+        // command line, which is no way to find a mode.
+        let console_btn = gtk::Button::from_icon_name("input-gaming-symbolic");
+        console_btn.set_tooltip_text(Some("Console UI — the controller-driven couch interface"));
+        console_btn.set_action_name(Some("win.console"));
         let menu = gio::Menu::new();
+        menu.append(Some("Console UI"), Some("win.console"));
         menu.append(Some("Preferences"), Some("win.preferences"));
         menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
         menu.append(Some("About Punktfunk"), Some("win.about"));
@@ -869,7 +876,9 @@ impl SimpleComponent for HostsPage {
             .primary(true)
             .tooltip_text("Main menu")
             .build();
+        // Packed after the menu so the hamburger stays rightmost (pack_end fills inward).
         header.pack_end(&menu_btn);
+        header.pack_end(&console_btn);
 
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&header);

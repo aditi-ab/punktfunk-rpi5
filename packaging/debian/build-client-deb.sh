@@ -75,6 +75,10 @@ install -Dm0755 "$SESSION_BIN"                           "$STAGE/usr/bin/punktfu
 install -Dm0755 "$CLI_BIN"                               "$STAGE/usr/bin/punktfunk"
 install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
                 "$STAGE/usr/share/applications/io.unom.Punktfunk.desktop"
+# Second launcher, straight into the gamepad console (`--browse`): the couch entry point a
+# TV/HTPC user picks from the app grid, and what gets added to Steam as a non-Steam game.
+install -Dm0644 packaging/linux/io.unom.Punktfunk.Console.desktop \
+                "$STAGE/usr/share/applications/io.unom.Punktfunk.Console.desktop"
 # The app icon the desktop entry (and the About dialog) name. Without it the launcher falls
 # back to a generic monitor glyph, which is what shipped until now.
 install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg \
