@@ -1,0 +1,41 @@
+// Members of the `punktfunk` group may power the box off, restart it, or put it to sleep even when
+// the box has no ACTIVE LOCAL SESSION — which is exactly the state a display-manager takeover
+// leaves it in for the length of a stream.
+//
+// Why this is needed at all: logind ships `power-off`/`reboot`/`suspend` as `allow_active: yes`,
+// and polkit decides "active" from the caller's own logind session — falling back to the user's
+// elected DISPLAY session when the caller has none, which is every `systemd --user` unit including
+// the managed gamescope session. A takeover that STOPS the display manager removes that session
+// (logind elects a display session only from `user`/`greeter` class ones, never from the user
+// manager's), the fallback then finds nothing, and all three actions become `auth_admin_keep`: an
+// interactive password prompt, asked of a non-interactive caller, on a screen that is switched off.
+// Nothing surfaces the refusal, so the symptom is a power menu that does nothing at all.
+//
+// That menu is the reason this file exists. On SteamOS-like boxes Steam does not call logind for
+// "Shut Down" — it writes `$STEAMOS_STEAM_SHUTDOWN_SENTINEL` and exits, and `gamescope-session-plus`
+// runs a plain `poweroff` once Steam is gone. During a stream that wrapper is OURS, running in the
+// session-less transient unit, so its `poweroff` is the call polkit refuses. Measured on Bazzite,
+// 2026-08-24: the identical `pkcheck --action-id org.freedesktop.login1.power-off` from a
+// `systemd --user` unit answers authorized with the display manager up, and `auth_admin_keep` with
+// it stopped.
+//
+// The group ships EMPTY and joining it is a deliberate act. It is the same group the takeover's own
+// root helper (`io.unom.punktfunk.dm-helper`) authorizes on, and a takeover that stops a display
+// manager cannot work without that helper — so this grants to exactly the population the fault
+// reaches, and to nobody else.
+//
+// Scope notes: the three actions are the three entries in Steam's power menu, so a grant that stops
+// there authorizes "use the power menu on the box you are streaming from" and nothing else. The
+// `-multiple-sessions` variants are deliberately NOT granted — a box with a second USER logged in
+// still asks before it powers off under them — and neither are the `-ignore-inhibit` ones, which
+// would let this override somebody else's block inhibitor rather than just our absent session.
+polkit.addRule(function (action, subject) {
+    if (
+        (action.id == "org.freedesktop.login1.power-off" ||
+            action.id == "org.freedesktop.login1.reboot" ||
+            action.id == "org.freedesktop.login1.suspend") &&
+        subject.isInGroup("punktfunk")
+    ) {
+        return polkit.Result.YES;
+    }
+});
