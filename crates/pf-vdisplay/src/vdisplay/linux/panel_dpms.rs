@@ -20,7 +20,7 @@
 //! |---|---|
 //! | KDE / KWin | in-process `org_kde_kwin_dpms`, then a `kscreen-doctor --dpms` shell-out |
 //! | sway (wlroots) | `swaymsg output <name> dpms off` ([`crate::wlroots::dpms_other_heads`]) |
-//! | Hyprland | `hyprctl dispatch dpms off <name>` ([`crate::hyprland::dpms_other_heads`]) |
+//! | Hyprland | its dpms dispatcher, read-modify-verify ([`crate::hyprland::dpms_other_heads`]) |
 //! | none at all | [`crate::drm_dpms`] — the CRTCs off over DRM, no compositor needed |
 //! | GNOME / Mutter | **cannot be served** — see below |
 //!
@@ -30,6 +30,13 @@
 //! Hyprland are driven through their own native IPC, which is how [`crate::wlroots`] and
 //! [`crate::hyprland`] already drive them — no second layer to be wedged, so no in-process twin
 //! is warranted.
+//!
+//! Neither of those two is as simple as "send the off command", and the Hyprland one especially
+//! is not: its dpms dispatcher is a **toggle** that ignores the state word (measured on 0.55.4 —
+//! asking for `on` turned a lit head OFF), and the classic argv does not even parse under its Lua
+//! config manager. [`crate::hyprland::dpms_other_heads`] carries the full account; the contract
+//! this module depends on is only that each arm returns **the heads it actually changed**, so the
+//! re-light moves exactly those and never a head it did not darken.
 //!
 //! The DRM arm is not an afterthought: a box sitting in Game Mode runs gamescope and NO desktop
 //! compositor, and it is *exactly* the deployment whose TV the operator wants dark.
