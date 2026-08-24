@@ -526,8 +526,22 @@ fn darken() -> Option<Darkened> {
             }
         }
         // Definitive "not KDE" / "no desktop": no fallback can do better (kscreen-doctor drives
-        // the same KDE-only machinery), so decline quietly — already logged by `open`.
-        Err(OpenFailure::NoDpmsGlobal) | Err(OpenFailure::Connect(_)) => None,
+        // the same KDE-only machinery). Declining is still right — but NOT quietly. [`darken`] is
+        // only ever reached because the operator selected `Topology::Exclusive`, so every decline
+        // here is "you asked for your screens off and they stayed on", which is a verdict and not
+        // a routine state. It sat at `debug!` in `open`, and that silence is what made the Nobara
+        // field report (2026-08-24) undiagnosable: no line anywhere named the panel. Same
+        // discipline as [`relight`], which has always said so when it gave up — a lit panel under
+        // `exclusive` deserves the honesty a dark one already got.
+        Err(e @ (OpenFailure::NoDpmsGlobal | OpenFailure::Connect(_))) => {
+            tracing::warn!(
+                %e,
+                "exclusive topology asked for the box's own screens to go dark, and this box has \
+                 no KDE desktop to ask (a session already in Game Mode has no KWin) — the panel \
+                 stays as it is for this stream"
+            );
+            None
+        }
         // A live session that stopped answering: the standalone tool rides a different stack
         // (libkscreen/KDED) and may still get through — the same rationale as `kwin.rs`'s
         // kscreen fallbacks, honest-verdict discipline included.

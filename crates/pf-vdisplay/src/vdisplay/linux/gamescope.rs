@@ -584,6 +584,20 @@ impl VirtualDisplay for GamescopeDisplay {
             None => (None, None),
         };
         if let Some(client) = session_env {
+            // ⚠ NO darken hold here, and the reason is a release path rather than a policy. This
+            // route reports `DisplayOwnership::SessionManaged`, and `registry::acquire` returns
+            // early for anything that is not `Owned` — ABOVE its `take_topology_restore()` pickup
+            // — because the gamescope module owns this display's lifecycle instead. A hold taken
+            // here would therefore never be released, and a panel left dark after every stream is
+            // a worse failure than one left lit (`kwin_dpms::relight` is written as "the last line
+            // of defence for a dark monitor" for exactly this reason).
+            //
+            // What this route DOES get is the takeover itself: it idles the box's autologin
+            // session, so that session stops driving the physical panel. Adding DPMS on top —
+            // for a box where KDE is live *beside* the managed infra — needs the release wired
+            // into `do_restore_tv_session`, which owns the managed teardown. Left undone
+            // deliberately; the dedicated-game-session path in the field report is the Spawn
+            // route below, not this one.
             return create_managed_session(&client, mode, self.hdr);
         }
         // Attach to an already-running gamescope (a foreign / externally-launched session) instead
@@ -601,6 +615,10 @@ impl VirtualDisplay for GamescopeDisplay {
                     .context("PUNKTFUNK_GAMESCOPE_NODE must be a node id or 'auto'")?
             };
             point_injector_at_eis();
+            // ⚠ NO darken hold here either, and this one is policy: attach MIRRORS a gamescope
+            // that may itself be lighting the physical panel, so honoring `exclusive` by
+            // darkening it would darken the very picture being streamed. `exclusive` cannot be
+            // served on this route; the operator's lever is to pick a model that owns a display.
             tracing::info!(node_id, "gamescope: attaching to existing PipeWire node");
             // ATTACH = mirror a foreign gamescope we don't own → External (no keep-alive/reuse).
             return Ok(VirtualOutput {
@@ -630,8 +648,14 @@ impl VirtualDisplay for GamescopeDisplay {
         // `PUNKTFUNK_GAMESCOPE_APP="steam -gamepadui"` route got gamescope's `--steam` mode with
         // NO instance free — and then collided with the box's own autologin/desktop Steam, which
         // is precisely the collision this block exists to prevent.
+        // `Topology::Exclusive` means the operator asked for the box's own screens to go dark for
+        // the stream. Resolved ONCE, here below the Managed/Attach returns that never consult it,
+        // so the "free the box's session" decision and the darken at the end of this function
+        // cannot disagree within a single create.
+        let exclusive = crate::effective_topology() == crate::policy::Topology::Exclusive;
         let app = resolved_spawn_app(self.cmd.as_deref());
-        if app.as_deref().is_some_and(is_steam_launch) {
+        let steam = app.as_deref().is_some_and(is_steam_launch);
+        if steam {
             // A dedicated launch NEEDS Steam's single instance — no attach degrade exists here, so
             // a mask-fragile-DM box without takeover privilege fails with the actionable error.
             stop_autologin_sessions()
@@ -639,6 +663,24 @@ impl VirtualDisplay for GamescopeDisplay {
             // B1b: a Steam running in a plain DESKTOP session (GNOME/KDE) holds the instance just
             // the same, and the autologin stop above can't see it — free it too, or fail loudly.
             free_desktop_steam()?;
+        } else if free_box_session_for_exclusive(steam, exclusive) {
+            // B1c: a NON-Steam launch has no single instance to free, and used to leave the box's
+            // gaming session completely untouched. On a Game Mode box that session IS the DRM
+            // master of the TV (`gamescope/heads.rs`), so under Exclusive it went on lighting the
+            // panel with live Game Mode for the whole stream — the loudest half of the Nobara field
+            // report, and never a 0.31.0 regression: this path has always been Steam-gated.
+            //
+            // Best-effort, unlike the Steam arm above: freeing the session is what MAKES the panel
+            // dark here, not what makes the launch possible, so a box that refuses costs the
+            // operator their dark screen and not their game. The restore is the same machinery
+            // either way (`STOPPED_AUTOLOGIN` → `schedule_restore_tv_session`).
+            if let Err(why) = stop_autologin_sessions() {
+                tracing::warn!(
+                    %why,
+                    "exclusive topology: could not free the box's gaming session, so its own \
+                     display keeps whatever it is showing for this stream"
+                );
+            }
         }
         // A5: a per-spawn instance id addresses this spawn's log + node discovery, so two coexisting
         // bare-spawns (a kept lingering one + a fresh one) never parse each other's node id from a
@@ -689,10 +731,13 @@ impl VirtualDisplay for GamescopeDisplay {
         // blanks the user's screen. The hold is refcounted in `kwin_dpms` rather than floated
         // through the registry's group restore, because every gamescope spawn is its own group
         // (`registry::group_key`) — the float alone would re-light the panel when the FIRST of two
-        // concurrent spawns ends, under the second's still-live stream. Skipped for Managed (its
-        // takeover already stopped the desktop) and Attach (it mirrors a gamescope that may itself
-        // be driving the physical panel) — both returned earlier in this function.
-        if crate::effective_topology() == crate::policy::Topology::Exclusive {
+        // concurrent spawns ends, under the second's still-live stream. Still skipped for Managed
+        // and Attach — but NOT for the reason the old comment gave here ("its takeover already
+        // stopped the desktop"), which outlived the display-manager stop that 0.31.0 retired and
+        // hid a lit panel behind a premise that was no longer true. The reasons that do hold are
+        // written at each of those two returns above: Managed has no release path for a hold, and
+        // Attach would darken the very panel it is streaming.
+        if exclusive {
             crate::kwin_dpms::acquire_stream_darken();
             self.pending_restore = Some(Box::new(crate::kwin_dpms::release_stream_darken));
         }
@@ -5192,6 +5237,20 @@ fn is_steam_launch(cmd: &str) -> bool {
     cmd.split_whitespace().next() == Some("steam")
 }
 
+/// Should a bare-spawn launch free the box's own gaming session when it is NOT a Steam launch?
+///
+/// Two different requirements reach the same call. A **Steam** launch frees it because it must —
+/// the single instance is not shareable — and that arm fails the create when it can't. **Exclusive
+/// topology** frees it because the operator asked for the box's screens to go dark, and on a Game
+/// Mode box that session is the DRM master of the physical panel; that arm is best-effort.
+///
+/// Pure so the gate is testable without systemd: the bug it closes was a policy question
+/// (`is_steam_launch` standing in for "does the box's session need to get out of the way"), not a
+/// systemd one.
+fn free_box_session_for_exclusive(steam: bool, exclusive: bool) -> bool {
+    !steam && exclusive
+}
+
 /// Shape a resolved launch command for a bare-spawn gamescope session. A Steam URI launch
 /// (`steam steam://rungameid/<id>`, produced by `library::command_for`) gets `-gamepadui` inserted
 /// so the nested Steam is Big Picture — the identity gamescope's `--steam` integration is built
@@ -5564,9 +5623,9 @@ mod tests {
     use super::{
         any_output_size_is, cancel_pending_restore, cgroup_is_punktfunk_owned,
         classify_output_size, connected_connector_under, display_manager_unit_under, dm_plan,
-        game_hz, gamescope_output_size, hdr_args, idle_dropin_body, idle_dropin_path,
-        install_idle_dropin, is_steam_launch, mask_unit, missing_flags, mode_mismatch,
-        nested_wrapper_script, our_wsi_layer_dir, parse_listed_units, plan_bind,
+        free_box_session_for_exclusive, game_hz, gamescope_output_size, hdr_args, idle_dropin_body,
+        idle_dropin_path, install_idle_dropin, is_steam_launch, mask_unit, missing_flags,
+        mode_mismatch, nested_wrapper_script, our_wsi_layer_dir, parse_listed_units, plan_bind,
         release_autologin_mask, remove_idle_dropin, script_hardcodes_gamescope, sentinel_advanced,
         shape_dedicated_command, switch_ends_mask_window, takeover_state_is_live, unmask_unit,
         xwayland_refusal_marker, BindOff, BindPlan, BoxOutputSize, DmHelperError, SessionBind,
@@ -5897,6 +5956,24 @@ mod tests {
         // The remedies the old fixed guess offered — a reinstall and a polkit rule — must appear
         // ONLY where they can actually help, never on the path that ran and was refused.
         assert!(!ran.contains("reinstall"), "{ran}");
+    }
+
+    #[test]
+    fn exclusive_frees_the_box_session_for_a_non_steam_launch_too() {
+        // The bug: `is_steam_launch` was standing in for "does the box's own session need to get
+        // out of the way", and those are two different questions. A non-Steam library game under
+        // `exclusive` left the box's Game Mode gamescope holding DRM master on the TV, so the
+        // operator's screen showed live Game Mode for the whole stream (Nobara, 2026-08-24).
+        assert!(free_box_session_for_exclusive(false, true));
+        // A Steam launch is already handled by the arm above this one — and that arm is the
+        // FAILING one (the single instance is not optional), so this gate must not also fire and
+        // free the session a second time.
+        assert!(!free_box_session_for_exclusive(true, true));
+        // Not exclusive: the operator did not ask for their screens to go dark, so a non-Steam
+        // launch must keep leaving the box's session strictly alone. This is what makes `extend`
+        // and the `SharedDesktop` preset ("never blank the real monitors") mean what they say.
+        assert!(!free_box_session_for_exclusive(false, false));
+        assert!(!free_box_session_for_exclusive(true, false));
     }
 
     #[test]
