@@ -71,7 +71,7 @@ pub struct GamescopeDisplay {
     /// ran `apply_input_env`); `create` then falls through to the bare spawn, the safe default.
     route: Option<crate::GamescopeRoute>,
     /// The topology-restore action the bare-spawn `create` prepared under `Topology::Exclusive` —
-    /// the release of this display's [`crate::kwin_dpms`] darken hold — pending pickup by the
+    /// the release of this display's [`crate::panel_dpms`] darken hold — pending pickup by the
     /// registry via [`VirtualDisplay::take_topology_restore`], so it runs at the display's
     /// teardown (§6.1) and never before.
     pending_restore: Option<Box<dyn FnOnce() + Send>>,
@@ -176,7 +176,7 @@ const SWITCH_HONOR_GRACE: Duration = Duration::from_secs(120);
 /// [`restore_takeover_on_startup`] is what covers a host that died holding one.
 static IDLE_DROPIN_ARMED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
-/// Whether the MANAGED route currently holds a [`crate::kwin_dpms`] darken hold for
+/// Whether the MANAGED route currently holds a [`crate::panel_dpms`] darken hold for
 /// `Topology::Exclusive`.
 ///
 /// The managed route cannot register its release the way a bare spawn does. A spawn reports
@@ -189,12 +189,12 @@ static IDLE_DROPIN_ARMED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 /// A plain bool rather than a count because the managed SESSION is what is darkened, not each
 /// connect: it survives client disconnects (that is the whole point of [`MANAGED_SESSION`]), and a
 /// same-mode reconnect reuses it warm without a relaunch. Acquiring per connect would ratchet
-/// `kwin_dpms`'s refcount up with no matching releases and pin the panel dark for the host's life.
+/// `panel_dpms`'s refcount up with no matching releases and pin the panel dark for the host's life.
 static MANAGED_DARKEN_HELD: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
-/// The 0→1 edge: should this call actually take a `kwin_dpms` hold? Pure, and split from
+/// The 0→1 edge: should this call actually take a `panel_dpms` hold? Pure, and split from
 /// [`managed_darken_acquire`] so the balance rule is testable without a live compositor — the same
-/// shape as `kwin_dpms::Holds::acquire_edge`, and for the same reason.
+/// shape as `panel_dpms::Holds::acquire_edge`, and for the same reason.
 fn managed_darken_acquire_edge(held: &mut bool, exclusive: bool) -> bool {
     if !exclusive || *held {
         return false;
@@ -218,7 +218,7 @@ fn managed_darken_acquire(exclusive: bool) {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if managed_darken_acquire_edge(&mut held, exclusive) {
-        crate::kwin_dpms::acquire_stream_darken();
+        crate::panel_dpms::acquire_stream_darken();
     }
 }
 
@@ -229,7 +229,7 @@ fn managed_darken_release() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if managed_darken_release_edge(&mut held) {
-        crate::kwin_dpms::release_stream_darken();
+        crate::panel_dpms::release_stream_darken();
     }
 }
 
@@ -594,7 +594,7 @@ impl VirtualDisplay for GamescopeDisplay {
         // The DPMS darken-hold release the bare-spawn `create` registered (Exclusive topology
         // only). The registry stores it on this display's entry and runs it at teardown — which,
         // for gamescope, is the display's OWN teardown: every spawn is its own group, and the
-        // cross-session ordering lives in `kwin_dpms`'s refcount, not in the group float.
+        // cross-session ordering lives in `panel_dpms`'s refcount, not in the group float.
         self.pending_restore.take()
     }
 
@@ -654,7 +654,7 @@ impl VirtualDisplay for GamescopeDisplay {
             // Its takeover idles the box's autologin session, which stops that session DRIVING the
             // panel — but measured on the Nobara VM (2026-08-24), that alone leaves the connector
             // at `enabled=enabled dpms=On` indefinitely: with no DRM master the kernel just keeps
-            // the CRTC configured. Turning it off is [`crate::kwin_dpms`]'s job, and on a Game Mode
+            // the CRTC configured. Turning it off is [`crate::panel_dpms`]'s job, and on a Game Mode
             // box (no KWin) that lands in its DRM arm — which needs no compositor and no privilege.
             //
             // The hold canNOT ride `self.pending_restore` the way the bare spawn's does: this
@@ -789,8 +789,8 @@ impl VirtualDisplay for GamescopeDisplay {
         // the physicals outright, but that door is closed here (KWin refuses zero enabled outputs,
         // and no output on that desktop is ours to leave enabled) — so the desktop's panels go to
         // DPMS-off instead, best-effort and self-gating (a box with no KDE desktop declines
-        // quietly inside `kwin_dpms`). Placed AFTER the spawn succeeded, so a failed create never
-        // blanks the user's screen. The hold is refcounted in `kwin_dpms` rather than floated
+        // quietly inside `panel_dpms`). Placed AFTER the spawn succeeded, so a failed create never
+        // blanks the user's screen. The hold is refcounted in `panel_dpms` rather than floated
         // through the registry's group restore, because every gamescope spawn is its own group
         // (`registry::group_key`) — the float alone would re-light the panel when the FIRST of two
         // concurrent spawns ends, under the second's still-live stream. Managed takes the same
@@ -800,8 +800,8 @@ impl VirtualDisplay for GamescopeDisplay {
         // that may itself be driving the physical panel, so darkening it would darken the very
         // picture being streamed.
         if exclusive {
-            crate::kwin_dpms::acquire_stream_darken();
-            self.pending_restore = Some(Box::new(crate::kwin_dpms::release_stream_darken));
+            crate::panel_dpms::acquire_stream_darken();
+            self.pending_restore = Some(Box::new(crate::panel_dpms::release_stream_darken));
         }
         // Bare SPAWN: we own the nested gamescope process → registry-poolable (keep-alive-able).
         Ok(VirtualOutput::owned(
@@ -6032,7 +6032,7 @@ mod tests {
         assert!(!ran.contains("reinstall"), "{ran}");
     }
 
-    /// ON GLASS. The MANAGED route's hold, driven against the real `kwin_dpms`/`drm_dpms` stack —
+    /// ON GLASS. The MANAGED route's hold, driven against the real `panel_dpms`/`drm_dpms` stack —
     /// the wiring the pure edge test above cannot see. Run it in the takeover state (the box's
     /// gaming session idled, so nothing holds DRM master), on a box with a connected head:
     ///
@@ -6101,7 +6101,7 @@ mod tests {
     fn the_managed_darken_hold_is_taken_once_and_released_once() {
         // The managed SESSION is what gets darkened, not each connect — it outlives client
         // disconnects and a same-mode reconnect reuses it warm. So a reconnect must NOT take a
-        // second hold: `kwin_dpms`'s refcount would ratchet up with no matching release and pin
+        // second hold: `panel_dpms`'s refcount would ratchet up with no matching release and pin
         // the operator's panel dark for the rest of the host's life.
         let mut held = false;
         assert!(managed_darken_acquire_edge(&mut held, true), "0→1 darkens");

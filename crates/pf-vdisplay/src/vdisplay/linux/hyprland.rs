@@ -539,6 +539,38 @@ fn heads_to_disable(heads: &[crate::monitors::PhysicalMonitor], ours: &str) -> V
         .collect()
 }
 
+/// DPMS every head that is not ours and not a sibling's off (or back on), for a **gamescope**
+/// session honoring `Topology::Exclusive` — see [`crate::panel_dpms`].
+///
+/// Distinct from [`disable_other_heads`], which is what the *Hyprland backend's own* exclusive
+/// topology does, and deliberately so on this compositor above all: disabling a Hyprland head is
+/// the operation whose only known undo is re-reading the operator's whole config
+/// ([`restore_heads`]), dropping every runtime override they set by hand. DPMS is a separate axis
+/// — this module's own notes record `dispatch dpms on <name>` failing to re-enable a *disabled*
+/// head for exactly that reason — so off/on round-trips cleanly and touches nothing else.
+///
+/// A gamescope spawn owns no Hyprland output, hence the empty `ours`; a concurrent session's
+/// `HEADLESS-*` is still spared by [`heads_to_disable`]'s `managed` filter.
+///
+/// Returns the heads actually changed, so the re-light undoes exactly those.
+pub(crate) fn dpms_other_heads(on: bool) -> Vec<String> {
+    let Ok(heads) = list_monitors() else {
+        return Vec::new();
+    };
+    let verb = if on { "on" } else { "off" };
+    let mut changed = Vec::new();
+    for name in heads_to_disable(&heads, "") {
+        match hyprctl_dispatch(&["dispatch", "dpms", verb, &name]) {
+            Ok(()) => changed.push(name),
+            Err(e) => tracing::warn!(
+                output = %name, error = %format!("{e:#}"),
+                "hyprland: could not DPMS this monitor for `topology: exclusive`"
+            ),
+        }
+    }
+    changed
+}
+
 /// Disable every non-managed head for an `exclusive` session, returning the ones actually disabled
 /// (the input to [`restore_heads`]). Best-effort per head: one that refuses costs exclusivity on
 /// that screen, not the session.

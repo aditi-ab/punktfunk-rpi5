@@ -1,7 +1,7 @@
 //! Compositor-independent panel darkening over DRM — how a box with **no desktop compositor**
 //! honors [`Topology::Exclusive`](crate::policy::Topology::Exclusive).
 //!
-//! [`crate::kwin_dpms`] asks KWin to turn the panels off, which is the right answer whenever there
+//! [`crate::panel_dpms`] asks KWin to turn the panels off, which is the right answer whenever there
 //! is a KDE desktop to ask. There often isn't. A box sitting in **Game Mode** runs gamescope and no
 //! KWin at all, so that path declines — and Game Mode is precisely the deployment where the
 //! operator's TV is lit by the box itself. Measured on the Nobara VM (2026-08-24): after the
@@ -34,7 +34,7 @@
 //! **The re-light is `close(fd)`, and that is the whole of it.** The kernel's last-close handling
 //! restores the console and the panel comes back lit (measured: `enabled=enabled dpms=On` within
 //! 2 s of the close). There is no saved mode to replay and no restore that can half-fail — which
-//! also means **crash safety comes free**, the same property [`crate::kwin_dpms`] gets from DPMS
+//! also means **crash safety comes free**, the same property [`crate::panel_dpms`] gets from DPMS
 //! being non-persistent: a host that dies holding this has its fds closed by the kernel, and the
 //! box lights up. Nothing to journal, nothing to sweep at startup. (Contrast the Windows
 //! `pnp_disable_monitors` path, which needs a recovery journal precisely because its disable

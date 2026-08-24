@@ -867,18 +867,21 @@ mod kwin;
 #[path = "vdisplay/linux/kwin_output_mgmt.rs"]
 mod kwin_output_mgmt;
 
-// DPMS control of the box's live KDE desktop (org_kde_kwin_dpms) — how a bare-spawn gamescope
-// session honors `Topology::Exclusive`: the spawn is its own headless compositor, so the desktop's
-// physical outputs can't be *disabled* (KWin refuses zero enabled outputs and no output there is
-// ours) — they are put to DPMS-off for the stream instead, refcounted across concurrent spawns.
-// Consumed by `gamescope` (best-effort, with kscreen fallback).
+// DPMS control of the box's own physical panels — how a gamescope session (which owns no output on
+// the box's desktop) honors `Topology::Exclusive`. Dispatches per desktop: KDE over
+// org_kde_kwin_dpms, sway and Hyprland over their own IPC, and `drm_dpms` for a box with no
+// desktop at all. GNOME is the one it cannot serve — Mutter exposes no DPMS to clients.
+// The desktop's outputs can't be *disabled* the way the desktop backends do it (KWin refuses zero
+// enabled outputs, and no output there is ours to keep), so DPMS-off is the honest translation:
+// the desk is untouched, the panels just go dark. Refcounted across concurrent spawns; consumed by
+// `gamescope` on both its owning routes, best-effort throughout.
 #[cfg(target_os = "linux")]
-#[path = "vdisplay/linux/kwin_dpms.rs"]
-mod kwin_dpms;
+#[path = "vdisplay/linux/panel_dpms.rs"]
+mod panel_dpms;
 
 // The compositor-independent half of the same policy: turn the CRTCs off over DRM directly, for a
 // box with no desktop to ask (Game Mode runs gamescope and no KWin, and is exactly where the
-// operator's TV is lit by the box itself). Reached from `kwin_dpms`'s "not KDE" arm, which is what
+// operator's TV is lit by the box itself). Reached from `panel_dpms`'s "not KDE" arm, which is what
 // owns the refcount and the hold.
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/drm_dpms.rs"]
