@@ -20,7 +20,8 @@
 //!   behind-cadence host acks climbs at the current rate) and short-ack cap learning
 //!   ([`BitrateController::on_ack`]), this is what stops an Automatic session from driving the
 //!   encoder off a cliff the network could carry. It is also the one signal that can fire for a
-//!   reason the rate cannot fix, so it DISARMS itself when backing off stops helping — see
+//!   reason the rate cannot fix (contention on the host's GPU), so it stands itself down when
+//!   backing off stops helping, and a later clean run re-probes it — see
 //!   [`ENCODE_NOOP_BACKOFFS_TO_DISARM`].
 //!
 //! AIMD shape: a SEVERE window (an unrecoverable frame, a flush, ≥6 % loss, or a decode-latency
@@ -160,11 +161,16 @@ const ENCODE_SEVERE_US: i64 = 12_000;
 /// demonstrably doing nothing should stand down rather than repeat forever.
 ///
 /// Two, not one: a single pair of backoffs at a similar level is also what a real knee looks like
-/// while the rate is still above it, and the knee is the case this signal was built for. Deliberately
-/// session-scoped and cleared only by [`on_mode_switch`](BitrateController::on_mode_switch) — within
-/// one mode an encoder that does not answer the rate will not start answering it. The loss, OWD,
-/// decode and keyframe signals keep their full power throughout, and the host's own climb refusal
-/// stays the backstop for a genuine knee.
+/// while the rate is still above it, and the knee is the case this signal was built for.
+///
+/// And a stand-down, never a permanent disarm. Nothing this controller learns from evidence is
+/// permanent — both caps re-probe, and the clock-flush detector was itself changed from "off for
+/// the session" to re-armable for exactly this reason. GPU contention is transient by nature (the
+/// game exits to a menu, the shader storm ends), while what it silences is the only signal that
+/// can descend when the encoder is past its knee on a link that shows nothing. So a clean run
+/// re-arms it on the [`CAP_REPROBE_WINDOWS_MIN`] ladder, doubling each time the silence is
+/// immediately re-earned. The loss, OWD, decode and keyframe signals keep their full power
+/// throughout, and the host's own climb refusal stays the backstop for a genuine knee.
 const ENCODE_NOOP_BACKOFFS_TO_DISARM: u32 = 2;
 /// Clean windows parked at a learned cap before re-probing above it, and the ceiling that
 /// interval backs off to.
@@ -375,9 +381,20 @@ pub(crate) struct BitrateController {
     /// Consecutive encode-attributed backoffs after which encode time did NOT come down (see
     /// [`ENCODE_NOOP_BACKOFFS_TO_DISARM`]).
     encode_noop_backoffs: u32,
-    /// The encode down-driver is off for this session: its rises are not answering the rate, so
-    /// they neither mark a window bad nor teach a baseline. Cleared by a mode switch.
+    /// The encode down-driver is stood down: its rises are not answering the rate, so they
+    /// neither mark a window bad nor teach a baseline. Lifted by a clean run (see
+    /// `encode_reprobe_after`) or a mode switch — never permanent, like every other piece of
+    /// evidence-learned state here.
     encode_disarmed: bool,
+    /// Clean windows since the stand-down, against `encode_reprobe_after`.
+    encode_disarm_clean_windows: u32,
+    /// Clean windows the stand-down must survive before the signal is re-armed. Doubles each
+    /// time a re-armed signal is immediately silenced again, so a standing contention settles
+    /// into a slow poll instead of thrashing ([`CAP_REPROBE_WINDOWS_MIN`]).
+    encode_reprobe_after: u32,
+    /// A stand-down has been lifted at least once, so the next one is re-silencing something the
+    /// re-probe already tried — the trigger for backing that clock off.
+    encode_rearmed: bool,
     /// The host-taught rate cap (§ABR overdrive): latched when the host acks BELOW what we
     /// asked twice consecutively at the same value — its encoder's codec-level ceiling, or a
     /// climb refusal while host encode can't hold cadence. Kept apart from `ceiling_kbps` so
@@ -480,6 +497,9 @@ impl BitrateController {
             encode_backoff_us: 0,
             encode_noop_backoffs: 0,
             encode_disarmed: false,
+            encode_disarm_clean_windows: 0,
+            encode_reprobe_after: CAP_REPROBE_WINDOWS_MIN,
+            encode_rearmed: false,
             host_cap_kbps: None,
             last_requested_kbps: None,
             short_ack_kbps: 0,
@@ -690,6 +710,9 @@ impl BitrateController {
         self.encode_disarmed = false;
         self.encode_backoff_us = 0;
         self.encode_noop_backoffs = 0;
+        self.encode_disarm_clean_windows = 0;
+        self.encode_reprobe_after = CAP_REPROBE_WINDOWS_MIN;
+        self.encode_rearmed = false;
         self.proven_kbps = 0;
     }
 
@@ -875,6 +898,42 @@ impl BitrateController {
                 }
             }
         }
+        // The encode down-driver's stand-down re-probes on the same clock, for the same reason
+        // the two caps do: it is EVIDENCE, not a spec limit. What silenced it — a game
+        // saturating the GPU, a shader-compile storm, another app on the card — is exactly the
+        // sort of thing that ENDS mid-session, and what it silences is the only signal that can
+        // descend when the encoder is genuinely past its compute knee on a link that shows
+        // nothing. Left permanent, one contended stretch would strip that protection from every
+        // later minute of the session, including the calm ones where a climb can reach a rate
+        // the ASIC cannot hold.
+        //
+        // A clean run is the cheapest moment to ask again: nothing else is unhappy, so if the
+        // rate still cannot move encode time, two more no-op backoffs stand it down again at a
+        // bounded cost — while the doubling interval keeps a genuinely standing contention from
+        // thrashing. The asymmetry decides it: a too-eager re-arm costs one ×0.7, a too-permanent
+        // silence costs the knee protection outright.
+        if self.encode_disarmed {
+            if bad {
+                self.encode_disarm_clean_windows = 0;
+            } else {
+                self.encode_disarm_clean_windows += 1;
+                if self.encode_disarm_clean_windows >= self.encode_reprobe_after {
+                    self.encode_disarmed = false;
+                    self.encode_rearmed = true;
+                    self.encode_disarm_clean_windows = 0;
+                    // Re-arm on a FRESH baseline and with no streak carried over: the level the
+                    // old backoffs fired at describes a regime that has since been clean for
+                    // seconds, so it is not the reference the next one should be judged against.
+                    self.encode_backoff_us = 0;
+                    self.encode_noop_backoffs = 0;
+                    self.encode_means.clear();
+                    tracing::debug!(
+                        after_windows = self.encode_reprobe_after,
+                        "adaptive bitrate: re-arming the encode down-driver after a clean run"
+                    );
+                }
+            }
+        }
         let cooled = self
             .last_change
             .is_none_or(|t| now.duration_since(t) >= CHANGE_COOLDOWN);
@@ -985,15 +1044,27 @@ impl BitrateController {
                     // Fired again no lower than last time: the ×0.7 in between did nothing.
                     self.encode_noop_backoffs += 1;
                     if self.encode_noop_backoffs >= ENCODE_NOOP_BACKOFFS_TO_DISARM {
+                        // Re-silencing something the re-probe had already lifted means the
+                        // contention is STANDING, not the transient the re-probe exists to ride
+                        // out — back its clock off, exactly as both learned caps do.
+                        self.encode_reprobe_after = if self.encode_rearmed {
+                            self.encode_reprobe_after
+                                .saturating_mul(2)
+                                .min(CAP_REPROBE_WINDOWS_MAX)
+                        } else {
+                            CAP_REPROBE_WINDOWS_MIN
+                        };
                         self.encode_disarmed = true;
+                        self.encode_disarm_clean_windows = 0;
                         self.encode_means.clear();
                         tracing::info!(
                             at_kbps = self.current_kbps,
                             encode_mean_us = mean,
                             noop_backoffs = self.encode_noop_backoffs,
+                            rearm_after_windows = self.encode_reprobe_after,
                             "adaptive bitrate: host encode time is not answering the rate — \
-                             disarming the encode down-driver for this session (loss, OWD, decode \
-                             and keyframe signals keep driving)"
+                             standing the encode down-driver down until a clean run re-probes it \
+                             (loss, OWD, decode and keyframe signals keep driving)"
                         );
                     }
                 } else {
@@ -2322,21 +2393,21 @@ mod tests {
         for _ in 0..BASELINE_MIN_WINDOWS {
             let at = ticks(start, *tick);
             *tick += 1;
-            assert_eq!(
-                c.on_window(
-                    at,
-                    0,
-                    0,
-                    Some(10_000),
-                    None,
-                    Some(7_000),
-                    1_000_000,
-                    false,
-                    0
-                ),
+            // Seed windows are clean by construction; ack a climb if the controller takes one, so
+            // the helper stays usable in tests that leave climb headroom below the ceiling.
+            if let Some(k) = c.on_window(
+                at,
+                0,
+                0,
+                Some(10_000),
                 None,
-                "a baseline seed window must be clean"
-            );
+                Some(7_000),
+                1_000_000,
+                false,
+                0,
+            ) {
+                c.on_ack(k);
+            }
         }
         let at = ticks(start, *tick);
         *tick += 1;
@@ -2351,6 +2422,90 @@ mod tests {
             false,
             0,
         )
+    }
+
+    /// `n` clean windows carrying no encode sample, acking any climb the controller takes.
+    fn clean_run(c: &mut BitrateController, start: Instant, tick: &mut u32, n: u32) {
+        for _ in 0..n {
+            let at = ticks(start, *tick);
+            *tick += 1;
+            if let Some(k) = c.on_window(at, 0, 0, Some(10_000), None, None, 1_000_000, false, 0) {
+                c.on_ack(k);
+            }
+        }
+    }
+
+    /// Drive the field ratchet: encode-attributed backoffs at a level the ×0.7s never move, until
+    /// the signal stands down.
+    fn disarm_encode(c: &mut BitrateController, start: Instant, tick: &mut u32) {
+        for _ in 0..=ENCODE_NOOP_BACKOFFS_TO_DISARM {
+            let verdict = encode_choke(c, start, tick, 20_000);
+            c.on_ack(verdict.expect("an unanswered encode rise must back off"));
+        }
+        assert!(c.encode_disarmed);
+    }
+
+    #[test]
+    fn a_stood_down_encode_signal_re_arms_after_a_clean_run() {
+        // The stand-down is EVIDENCE, not a spec limit, and what it answers — contention on the
+        // host's GPU — is exactly the sort of thing that ends mid-session. Left permanent, one
+        // contended stretch would strip the knee down-driver from every calm minute that follows,
+        // including the ones where a climb can reach a rate the ASIC cannot hold.
+        let mut c = BitrateController::new(20_000);
+        let start = Instant::now();
+        let mut tick = 0;
+        disarm_encode(&mut c, start, &mut tick);
+        assert_eq!(c.encode_reprobe_after, CAP_REPROBE_WINDOWS_MIN);
+
+        // A short clean spell is not enough — the re-probe is a run, not a blip.
+        clean_run(&mut c, start, &mut tick, CAP_REPROBE_WINDOWS_MIN - 1);
+        assert!(c.encode_disarmed);
+        clean_run(&mut c, start, &mut tick, 1);
+        assert!(!c.encode_disarmed);
+
+        // And it really drives again: a fresh excursion backs the rate off.
+        assert!(encode_choke(&mut c, start, &mut tick, 40_000).is_some());
+    }
+
+    #[test]
+    fn a_standing_contention_backs_the_re_arm_clock_off() {
+        // A re-armed signal silenced again means the contention is STANDING, not the transient
+        // the re-probe rides out. Same answer both caps give: poll it slowly rather than either
+        // giving up forever or thrashing every twelve seconds.
+        //
+        // Started high enough that two full ratchets stay clear of the floor — a rate pinned at
+        // `FLOOR_KBPS` stops backing off at all, which would starve the second stand-down of the
+        // backoffs it is counted from.
+        let mut c = BitrateController::new(200_000);
+        let start = Instant::now();
+        let mut tick = 0;
+        disarm_encode(&mut c, start, &mut tick);
+        clean_run(&mut c, start, &mut tick, CAP_REPROBE_WINDOWS_MIN);
+        assert!(!c.encode_disarmed);
+        // Re-armed, and the contention is still there.
+        disarm_encode(&mut c, start, &mut tick);
+        assert_eq!(c.encode_reprobe_after, CAP_REPROBE_WINDOWS_MIN * 2);
+    }
+
+    #[test]
+    fn a_bad_window_restarts_the_re_arm_run() {
+        // The re-probe wants a genuinely quiet stretch: a window the network spoiled says nothing
+        // about whether the encoder would answer the rate now, so the run starts over.
+        let mut c = BitrateController::new(20_000);
+        let start = Instant::now();
+        let mut tick = 0;
+        disarm_encode(&mut c, start, &mut tick);
+        clean_run(&mut c, start, &mut tick, CAP_REPROBE_WINDOWS_MIN - 1);
+        let at = ticks(start, tick);
+        tick += 1;
+        // A flush: severe, so it also costs a ×0.7 — and it resets the clean run behind it.
+        assert!(c
+            .on_window(at, 0, 0, Some(10_000), None, None, 1_000_000, true, 0)
+            .is_some());
+        clean_run(&mut c, start, &mut tick, CAP_REPROBE_WINDOWS_MIN - 1);
+        assert!(c.encode_disarmed, "the spoiled window must restart the run");
+        clean_run(&mut c, start, &mut tick, 1);
+        assert!(!c.encode_disarmed);
     }
 
     #[test]
@@ -2418,7 +2573,8 @@ mod tests {
         assert_eq!(c.encode_noop_backoffs, 1);
         assert!(!c.encode_disarmed);
         // Twice in a row ⇒ the rate is not the lever. This backoff still lands (the window was
-        // judged before the verdict), and it is the last one this signal ever drives.
+        // judged before the verdict), and it is the last one this signal drives until a clean run
+        // re-probes it (`a_stood_down_encode_signal_re_arms_after_a_clean_run`).
         assert_eq!(encode_choke(&mut c, start, &mut tick, 20_000), Some(6_860));
         c.on_ack(6_860);
         assert!(c.encode_disarmed);
