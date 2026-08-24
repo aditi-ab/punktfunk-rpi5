@@ -8,8 +8,9 @@
 //
 // NOTE on HTTP/2 + HTTP/3: NOT offered here, on purpose. `Bun.serve` has no HTTP/2 server, and
 // HTTP/3 (which Bun *can* do) is useless to a browser against this cert: QUIC refuses any cert error,
-// and the host identity cert is a CN-only, no-SAN, self-signed cert (correct for native fingerprint
-// PINNING, rejected by browsers). So browsers stay on HTTP/1.1 regardless — advertising h3 would just
+// and the host identity is SELF-SIGNED whichever pair we serve — the native one carries real SANs, so
+// a browser gets past the name check, but never past the untrusted issuer (and the legacy fallback is
+// CN-only with no SAN, which fails both). So browsers stay on HTTP/1.1 regardless — advertising h3 would just
 // dangle an `Alt-Svc` no browser can use. Real h2/h3 would need a browser-TRUSTED, SAN-matching cert
 // (a local CA installed per device) fronted by a server that speaks them (e.g. Caddy) — deliberately
 // out of scope for a LAN console; TLS (no cleartext login/session) is the win.
@@ -17,14 +18,16 @@
 // TWO LISTENERS, on purpose — see `PLUGIN ORIGIN` below.
 //
 // Env (set by the launchers / the systemd unit — see web.env.example):
-//   PUNKTFUNK_UI_TLS_CERT / _KEY   PEM file paths (the host's cert.pem / key.pem). BOTH set ⇒ HTTPS.
-//                                  Unset ⇒ plain HTTP (local dev only).
+//   PUNKTFUNK_UI_TLS_CERT / _KEY   PEM file paths (the host's cert.pem / key.pem — the native
+//                                  sibling pair is preferred when present, see tls-paths.mjs).
+//                                  BOTH set ⇒ HTTPS. Unset ⇒ plain HTTP (local dev only).
 //   PORT / HOST                    standard Nitro bind (3000 / 0.0.0.0).
 //   PUNKTFUNK_UI_PLUGIN_PORT       the plugin-UI origin's port (default: console port + 1).
 import "#nitro-internal-pollyfills";
 import wsAdapter from "crossws/adapters/bun";
 import { useNitroApp } from "nitropack/runtime";
 import { startScheduleRunner } from "nitropack/runtime/internal";
+import { resolveUiTlsPaths } from "./tls-paths.mjs";
 
 const nitroApp = useNitroApp();
 const ws = import.meta._websocket
@@ -75,8 +78,15 @@ const PEER_IP_HEADER = "x-pf-peer-ip";
 const LISTENER_HEADER = "x-pf-listener";
 
 // TLS from the host's identity cert (file PATHS → Bun.file, not PEM-in-env). Absent ⇒ plain HTTP.
-const certPath = process.env.PUNKTFUNK_UI_TLS_CERT;
-const keyPath = process.env.PUNKTFUNK_UI_TLS_KEY;
+//
+// The launchers all name the LEGACY cert.pem/key.pem pair and cannot express a fallback, so the
+// choice between the host's two identities is made here — see tls-paths.mjs for why the native
+// pair is the right one to serve (SANs a browser accepts; the cert the tray and native clients
+// already pin).
+const { cert: certPath, key: keyPath } = resolveUiTlsPaths(
+	process.env.PUNKTFUNK_UI_TLS_CERT,
+	process.env.PUNKTFUNK_UI_TLS_KEY,
+);
 const tls =
 	certPath && keyPath
 		? { cert: Bun.file(certPath), key: Bun.file(keyPath) }
@@ -126,7 +136,8 @@ const listenerOptions = (lane) => ({
 	// is a hooks/library JSON edit, kilobytes. 4 MiB leaves several orders of headroom and still
 	// makes the memory cost of an unauthenticated request negligible.
 	maxRequestBodySize:
-		Number.parseInt(process.env.NITRO_BUN_MAX_BODY_BYTES, 10) || 4 * 1024 * 1024,
+		Number.parseInt(process.env.NITRO_BUN_MAX_BODY_BYTES, 10) ||
+		4 * 1024 * 1024,
 	// `tls: undefined` ⇒ plain HTTP (dev); otherwise HTTPS over HTTP/1.1.
 	tls,
 	websocket: import.meta._websocket ? ws.websocket : undefined,
@@ -167,7 +178,9 @@ console.log(`punktfunk web console listening on ${server.url} (tls=${!!tls})`);
 // this exists to close, and a security boundary that disappears when a port is busy is not one. It
 // degrades to "plugin UIs unavailable": the console reads the state below and renders an
 // explanation instead of a frame, and everything else about the console keeps working.
-const pluginPort = Number(process.env.PUNKTFUNK_UI_PLUGIN_PORT || consolePort + 1);
+const pluginPort = Number(
+	process.env.PUNKTFUNK_UI_PLUGIN_PORT || consolePort + 1,
+);
 let pluginServer;
 try {
 	pluginServer = Bun.serve({ ...listenerOptions("plugin"), port: pluginPort });

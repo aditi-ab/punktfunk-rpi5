@@ -1091,7 +1091,10 @@ fn spawn_web(cfg: &WebConfig, data: &Path, job: HANDLE) -> Result<Child> {
         // The /api proxy hop to the host's loopback HTTPS mgmt API. The host's self-signed cert is
         // accepted only inside the proxy code (per-request TLS), never process-wide.
         ("PUNKTFUNK_MGMT_URL", mgmt_url),
-        // Serve HTTPS with the host's own identity cert; mark the session cookie Secure.
+        // Serve HTTPS with the host's own identity cert; mark the session cookie Secure. Names the
+        // LEGACY pair — the console prefers the native sibling when it exists
+        // (web/nitro-entry/tls-paths.mjs), which is also what the gate above ends up waiting for:
+        // `serve` resolves the native identity before minting this one.
         (
             "PUNKTFUNK_UI_TLS_CERT",
             data.join("cert.pem").to_string_lossy().into_owned(),

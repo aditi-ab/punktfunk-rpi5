@@ -208,7 +208,22 @@ fn poll_loop(
     // that proves the server is answering, and the agent below refuses redirects so the probe is
     // exactly one round trip. (A 302 still counts as up via the `Status` arm in `probe_console`.)
     let console_url = format!("https://127.0.0.1:{web_port}/login");
-    let agent = agent(load_pin());
+    // Named, not `agent`: shadowing the fn (as this did while there was only one agent) would make
+    // the second call below resolve to this binding instead.
+    let mgmt_agent = agent(load_pin());
+    // The console probe gets its OWN, UNPINNED agent. It is a different server from the mgmt API
+    // and there is no rule that it presents the same certificate: it served the legacy `cert.pem`
+    // while mgmt served the native one (the identity split), so the pinned agent refused the
+    // handshake and every identity-split host showed "Open web console (not responding)" over a
+    // perfectly healthy console — next to a tooltip reading "idle", because the same agent reached
+    // mgmt fine (field report 2026-08-24). An operator fronting the console with their own LAN-CA
+    // cert would have hit it just as squarely, so the coupling goes rather than the symptom.
+    //
+    // Nothing is lost by dropping the pin: this probe sends no credentials, reads no body, and
+    // decides only a menu LABEL. A local port-squatter could make that label read "up" — but the
+    // entry is always present and always opens the same URL regardless of the probe, so it gains
+    // nothing it did not already have.
+    let console_agent = agent(None);
     let mut last: Option<(TrayStatus, bool)> = None;
     // When the summary became unreachable while the service was running (grace anchor).
     // Runs for the process lifetime (the tray exits by process exit; nothing to unwind).
@@ -220,7 +235,7 @@ fn poll_loop(
     loop {
         let svc = probe_service();
         let summary = if svc == ServiceState::Running {
-            let s = fetch_summary(&agent, &summary_url());
+            let s = fetch_summary(&mgmt_agent, &summary_url());
             match s {
                 Some(_) => unreachable_since = None,
                 None if unreachable_since.is_none() => unreachable_since = Some(Instant::now()),
@@ -233,7 +248,7 @@ fn poll_loop(
         };
         let grace_expired = unreachable_since.is_some_and(|t| t.elapsed() >= START_GRACE);
         let status = map_status(&svc, summary, grace_expired);
-        let console_up = if probe_console(&agent, &console_url) {
+        let console_up = if probe_console(&console_agent, &console_url) {
             console_misses = 0;
             true
         } else {
