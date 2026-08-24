@@ -100,6 +100,10 @@ done
 install -Dm0755 scripts/pf-dm-helper               "$STAGE/usr/libexec/punktfunk/pf-dm-helper"
 install -Dm0644 scripts/io.unom.punktfunk.dm-helper.policy \
                                                    "$STAGE/usr/share/polkit-1/actions/io.unom.punktfunk.dm-helper.policy"
+# ...and the other half of stopping one: with the DM stopped the box has no active local session,
+# so logind's power actions fall to auth_admin_keep and Steam's power menu goes quiet mid-stream.
+install -Dm0644 packaging/linux/49-punktfunk-power.rules \
+                                                   "$STAGE/usr/share/polkit-1/rules.d/49-punktfunk-power.rules"
 # vhci-hcd autoload — usbip transport for the virtual Steam Deck pad (Steam only adopts USB pads).
 install -Dm0644 scripts/punktfunk-modules.conf     "$STAGE/usr/lib/modules-load.d/punktfunk.conf"
 # UDP socket-buffer tuning (32 MB) — without it the kernel clamps the host's SO_SNDBUF to ~416 KB

@@ -350,6 +350,10 @@ install -Dm0644 scripts/alsa-ucm2/USB-Audio/Punktfunk/DualSense-PS5-Haptic-HiFi.
 # polkit rule. The helper derives the DM unit itself — callers can't name arbitrary units.
 install -Dm0755 scripts/pf-dm-helper %{buildroot}%{_libexecdir}/punktfunk/pf-dm-helper
 install -Dm0644 scripts/io.unom.punktfunk.dm-helper.policy %{buildroot}%{_datadir}/polkit-1/actions/io.unom.punktfunk.dm-helper.policy
+# ...and the other half of stopping a display manager: with it stopped the box has no active local
+# session, so logind's own power actions fall to auth_admin_keep and Steam's power menu goes quiet
+# mid-stream. Scoped to the same (shipped-empty) punktfunk group the helper above gates on.
+install -Dm0644 packaging/linux/49-punktfunk-power.rules %{buildroot}%{_datadir}/polkit-1/rules.d/49-punktfunk-power.rules
 
 # vhci-hcd autoload — the usbip transport that makes the virtual Steam Deck controller a
 # real USB device (Steam Input only adopts those; the UHID fallback is invisible to Steam).
@@ -612,6 +616,7 @@ install -Dm0644 scripts/punktfunk-scripting.service %{buildroot}%{_userunitdir}/
 %{_libexecdir}/punktfunk/pf-update
 %{_unitdir}/punktfunk-update.service
 %{_datadir}/polkit-1/rules.d/49-punktfunk-update.rules
+%{_datadir}/polkit-1/rules.d/49-punktfunk-power.rules
 %{_datadir}/polkit-1/actions/io.unom.punktfunk.dm-helper.policy
 %{_prefix}/lib/modules-load.d/punktfunk.conf
 %{_prefix}/lib/sysctl.d/99-punktfunk-net.conf

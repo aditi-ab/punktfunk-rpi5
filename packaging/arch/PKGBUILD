@@ -235,6 +235,11 @@ package_punktfunk-host() {
     "$pkgdir/usr/share/polkit-1/actions/io.unom.punktfunk.dm-helper.policy"
   sed -i 's#/usr/libexec/punktfunk/pf-dm-helper#/usr/lib/punktfunk/pf-dm-helper#' \
     "$pkgdir/usr/share/polkit-1/actions/io.unom.punktfunk.dm-helper.policy"
+  # ...and the other half of stopping a display manager: with it stopped the box has no active
+  # local session, so logind's power actions fall to auth_admin_keep and Steam's power menu goes
+  # quiet mid-stream. No path annotation to rewrite — a .rules file names a group, not a binary.
+  install -Dm0644 "$R/packaging/linux/49-punktfunk-power.rules" \
+    "$pkgdir/usr/share/polkit-1/rules.d/49-punktfunk-power.rules"
   # Web-console-triggered updates (host-update-from-web-console.md §7): root helper + oneshot
   # unit + group-scoped polkit rule. Same no-libexec relocation as pf-dm-helper, with the
   # unit's ExecStart rewritten to match. On pacman the helper additionally requires the
