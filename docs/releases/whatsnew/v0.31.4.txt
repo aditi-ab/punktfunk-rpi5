@@ -1,0 +1,3 @@
+• Fixes a long stream sliding down to the worst picture quality on a connection that was never the problem — and staying there. One session walked from 57 Mbps to 5 over ten minutes without losing a packet.
+• Bitrate now reaches 2 Gbps instead of stopping at 80 Mbps, and steps finely at the low end where one step decides whether a thin connection is watchable.
+• Press Y on the Bitrate row to type an exact rate. A rate that isn't a preset step no longer snaps back to Automatic.

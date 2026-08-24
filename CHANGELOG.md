@@ -12,6 +12,416 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ---
 
+## v0.31.4
+
+21 commits since v0.31.3 (14 non-merge), counted at the tip this was cut from.
+
+**Nothing versioned moves.** `WIRE_VERSION` stays **2**, the C ABI stays **25** —
+`include/punktfunk_core.h` is **byte-identical to the v0.31.3 tag, and to v0.31.2 and v0.31.1
+before it**, the third release running with no diff at all — and so do the driver protocol, the
+gamepad channel, the plugin index schema, the host event schema and the gamescope patch level.
+`pf-driver-proto` shows no diff. `api/openapi.json` is **content-identical**: only `info.version` is
+re-stamped, so this is the first release since v0.31.0 where the management API grows nothing.
+`@punktfunk/host` stays **0.1.6** and `@punktfunk/plugin-kit` stays **0.4.4**; nothing under `sdk/`
+or `plugin-kit/` moved. No dependency moves in any of the five Rust lockfiles.
+
+The cycle is **Linux-host shaped**, and the faults share a premise: *a policy that was written
+against one desktop and silently did nothing on the others.* `Topology::Exclusive` on a gamescope
+session was implemented as `org_kde_kwin_dpms` and reached only a live KDE desktop, so a Game Mode
+box — the deployment whose TV the operator most wants dark — got nothing (#389, five commits:
+a DRM floor for a box with no desktop at all, sway and Hyprland arms, the managed route's own
+hold, and the box-session free that was gated on Steam). The `sleep:idle` block inhibitor refused
+every `Suspend()` for the length of a stream, including the operator's own from Steam's power menu,
+and on a display-manager-stopping takeover polkit's `allow_active` fallback found no session to
+elect and dropped all three power actions to `auth_admin_keep` (#391). The web console served the
+**legacy** identity because every launcher names that pair and none of them *can* choose, so
+browsers rejected it outright and the tray's mgmt-pinned probe refused the handshake and labelled a
+healthy console dead (#393). Alongside: the client's encode down-driver, whose thresholds were
+absolute durations calibrated at 120 Hz and whose stand-down was permanent (#392); an
+`installTap` format snapshot that could reach the Objective-C terminate handler (#387); the
+console's bitrate row (#388); and a GTK entry point for the console UI (#390).
+
+### Versions
+
+| | v0.31.3 | v0.31.4 | Notes |
+|---|---|---|---|
+| Wire protocol | 2 | **2** | unchanged. No message added, removed or re-shaped |
+| C ABI | 25 | **25** | unchanged. `include/punktfunk_core.h` has **no diff at all** against the v0.31.3 tag — nor against v0.31.2 or v0.31.1. Third release running |
+| Rust edition | 2024 | **2024** | unchanged |
+| MSRV (`rust-version`) | 1.85 | **1.85** | unchanged |
+| Workspace crate dirs | 27 | **27** | unchanged (39 `[workspace] members`, also unchanged). `drm_dpms.rs` is a new **module** inside `pf-vdisplay`, not a new crate |
+| Virtual-display driver protocol | 6 | **6** | unchanged (minimum accepted still 3); `pf-driver-proto` shows no diff against the v0.31.3 tag |
+| Windows virtual-gamepad channel | 3 | **3** | unchanged. Nothing under the Windows gamepad backends moved |
+| Plugin index schema | 1 | **1** | unchanged |
+| Host event schema | 1 | **1** | unchanged (`punktfunk-host/src/events.rs` shows no diff) |
+| `api/openapi.json` | 0.31.3 | **0.31.4** | **content-identical** — the `info.version` stamp is the whole diff. No route, schema or field added, removed or re-shaped. Re-stamped, not regenerated (`punktfunk-host` does not build on macOS); `api/` and `docs-site/public/` are byte-identical to each other |
+| gamescope patch level (`+pfhdrN`) | 8 | **8** | unchanged; no new patch files, `packaging/gamescope/PKGBUILD` still declares `pfhdr8` |
+| `@punktfunk/host` (SDK) | 0.1.6 | **0.1.6** | unchanged; nothing under `sdk/` moved, and the API it wraps did not either |
+| `@punktfunk/plugin-kit` | 0.4.4 | **0.4.4** | unchanged; nothing under `plugin-kit/` moved. 0.4.4 remains the registry's `latest` |
+
+### ⚠ Breaking changes
+
+**None.** No wire change, no ABI change, no driver-protocol change, no plugin-contract change, and
+this time not even an additive API change. Every 0.31.x host, client, driver and plugin keeps
+interoperating in both directions with no re-pairing and no rebuild.
+
+One **source-level rename**, internal to `pf-vdisplay` and visible to nobody outside it:
+`kwin_dpms` → `panel_dpms`. It is no longer a KWin module. `org_kde_kwin_dpms` itself — the
+vendored protocol's interface name, which is not ours to rename — is untouched.
+
+Five **behaviour** changes that break no build but change what a machine does:
+
+- **The `sleep:idle` inhibitor is no longer held for the whole stream.** It is held only while the
+  stream is quiet, dropped synchronously on any client input on either plane, and re-taken after
+  `QUIET_BEFORE_VETO` (30 s) of silence. A host that previously vetoed every `Suspend()` for a
+  session's length now vetoes only the ones that arrive during genuine inactivity.
+- **`Topology::Exclusive` now darkens panels on sway, Hyprland and a desktop-less box**, where it
+  previously did nothing. If you run a gamescope session on one of those and had selected
+  `exclusive` expecting the old no-op, you now get dark panels. `extend`, `primary` and the
+  `SharedDesktop` preset are unchanged and still take no hold at all.
+- **`stop_autologin_sessions` is now reached for a non-Steam library launch** when the topology is
+  exclusive. Previously only `is_steam_launch` reached it. Best-effort: it warns and continues,
+  unlike the Steam arm above it, because there the cost is a dark screen rather than the game.
+- **The encode-attributed backoff re-arms after standing down**, on a doubling interval, rather
+  than being disarmed for the rest of the session. Its SEVERE/MILD thresholds are now sized from
+  the negotiated refresh (a fraction of the session's frame budget) instead of the absolute
+  durations calibrated at 120 Hz, so a 60 Hz session no longer takes an immediate ×0.7 on an
+  ordinary one-frame hiccup.
+- **The web console prefers the native identity pair.** When `PUNKTFUNK_UI_TLS_CERT` names
+  `cert.pem` and `native-cert.pem`/`native-key.pem` both exist beside it, the console serves the
+  native pair. A host with no native pair on disk, or an operator-supplied cert under any other
+  name, falls through unchanged. `serve` now resolves the native identity **before** minting the
+  legacy one.
+
+### `Topology::Exclusive` becomes a per-desktop dispatcher
+
+`kwin_dpms` asked KWin for DPMS-off, which is the right answer whenever there is a KDE desktop to
+ask. A gamescope session owns no output on the box's own desktop, so the desktop backends' `disable`
+route is wrong here — disabling would move the operator's workspaces and re-home their windows for a
+stream that is not even on their compositor, and on Hyprland a disabled head has no clean undo (the
+only known restore is `hyprctl reload`, which drops every runtime override). DPMS is a separate axis
+and round-trips cleanly. The module is renamed `panel_dpms` and becomes a dispatcher, each arm
+self-gating on its own IPC so a box only pays for the one that answers:
+
+| desktop | mechanism |
+|---|---|
+| KDE / KWin | in-process `org_kde_kwin_dpms`, then `kscreen-doctor` |
+| sway (wlroots) | `swaymsg output <name> dpms off` |
+| Hyprland | `hyprctl dispatch dpms off <name>`, then the Lua `hl.dsp.dpms(...)` spelling |
+| none at all | `drm_dpms` — the CRTCs off over DRM |
+| GNOME / Mutter | **cannot be served** |
+
+Both compositor arms reuse their backend's existing `heads_to_disable` filter with an **empty**
+`ours` — a gamescope session owns nothing to spare, but a concurrent wlroots session's `HEADLESS-*`
+still must be spared or darkening blacks out that client's stream. They address heads by name and
+report which ones actually changed, so the re-light undoes exactly those.
+
+**GNOME is a structural gap, not an omission.** Mutter exposes no DPMS to clients; its own
+`exclusive` mechanism (`ApplyMonitorsConfig` omitting the physicals) needs a virtual output of its
+own to keep enabled, which a gamescope session does not have; and the DRM floor is refused because
+Mutter holds master. The decline was at `debug!` and is now a `warn!` naming the reason — every one
+of these means "you asked for your screens off and they stayed on".
+
+**Not verified on glass: the sway arm.** The lab has Bazzite, Nobara and SteamOS — no sway box. Its
+argv shape and the sibling-sparing filter are unit-tested and it compiles clean, but the command has
+not been run against a live sway session. Hyprland, KDE and DRM were all measured on real machines.
+
+### `drm_dpms`: the CRTCs off over DRM, for a box with no desktop to ask
+
+Measured on the Nobara VM (123, Fedora 44) before any of it was written, because the cheaper answers
+all fail on real hardware: getting the box's session out of the way is **not** enough (with no
+client holding DRM master the kernel keeps the CRTC configured — `enabled=enabled dpms=On`
+indefinitely); `setterm --blank force` is unreachable (`/dev/tty1` is `crw------- root:tty`); the
+connector's `dpms` sysfs attribute is read-only even as root; and `/sys/class/graphics/fb0/blank`
+works but needs root, which the takeover deliberately stopped needing in 0.31.0.
+
+What works unprivileged: `/dev/dri/cardN` carries a logind uaccess ACL for whoever holds the active
+seat (`crw-rw----+`), and `SET_MASTER` succeeds while nobody else is master — exactly the state the
+takeover has just produced. Walk `GETRESOURCES`, `GETCRTC` each id, `SETCRTC` with `fb_id=0,
+mode_valid=0, count_connectors=0` on the ones actually driving something. The connector reaches
+`enabled=disabled dpms=Off`, the same end state `kscreen-doctor --dpms off` reaches through KWin.
+
+Two measured properties shrank the code. The darkness **survives `DROP_MASTER`**, so mastership is
+handed straight back — a host still holding it would starve the box's own gamescope when the restore
+relaunches its session. And the re-light is **`close(fd)`**: the kernel's last-close restores the
+console, so there is no saved mode to replay, no restore that can half-fail, and crash safety is
+free. Nothing to journal, nothing to sweep at startup. `SET_MASTER` failing is also the natural
+guard for the Attach route — a card already mastered by a live compositor is not ours, and darkening
+it would darken the very picture being streamed.
+
+Four ioctls, three `#[repr(C)]` structs, one `unsafe` block. The ioctl numbers encode their payload
+size (`0x40`, `0x68`), so the layouts are pinned by `const _: () = assert!(...)` at compile time,
+plus a test that restates it greppably and pins the two field offsets the count/data-pass dance
+depends on.
+
+### The managed gamescope route takes the hold too
+
+Managed reports `DisplayOwnership::SessionManaged`, and `registry::acquire` returns for anything not
+`Owned` **above** its `take_topology_restore()` pickup — so a hold registered the way the bare spawn
+does would never be released, and a panel dark after every stream is worse than one left lit. That
+is an argument for putting the release somewhere else, not for skipping the feature on the route
+that matters most (it is the recommended one, and the only way to serve a client its own virtual
+output at its own mode).
+
+Somewhere else is `do_restore_tv_session`, the one teardown every managed path funnels through, at
+the very **top** of it because the SteamOS branch returns above the existing drop-in sweep.
+
+The hold is a **bool, not a count**, and that is load-bearing: the managed *session* is what gets
+darkened, not each connect. It outlives client disconnects and a same-mode reconnect reuses it warm,
+so acquiring per connect would ratchet the refcount up with no matching releases and pin the
+operator's panel dark for the rest of the host's life. The edges are split into pure
+`managed_darken_{acquire,release}_edge` so the balance rule is unit-tested without a live
+compositor: reconnect takes no second hold, the unconditional release is idempotent, a full cycle
+re-arms, and `extend` / `SharedDesktop` still take no hold at all.
+
+### The box's own session is freed for `exclusive`, not just for Steam
+
+`stop_autologin_sessions` was reached only via `is_steam_launch`
+(`cmd.split_whitespace().next() == Some("steam")`), because freeing Steam's single instance was the
+only requirement anyone had for it. But on a Game Mode box that same session is the DRM master of
+the TV, so a **non-Steam** library game left it running and the panel showed live Game Mode for the
+whole stream — the 2026-08-24 Nobara field report. `exclusive` is now stated as a second,
+independent reason: `free_box_session_for_exclusive` is pure and unit-tested over all four
+Steam × Exclusive combinations, including that `extend` and the `SharedDesktop` preset must still
+leave the box strictly alone.
+
+A related comment had rotted: the one authorising the DPMS skip on this file's other routes ("its
+takeover already stopped the desktop") outlived the stop it named by three commits — `c2f5e91b`
+replaced the managed takeover's display-manager STOP with an idle drop-in — so the gap read as
+intentional. It is replaced by the two reasons that actually hold, written at the returns they
+belong to.
+
+### Hyprland: the dpms dispatcher is a toggle, and the classic argv does not parse under Lua
+
+Verified on the NixOS VM (125, Hyprland 0.55.4), and both halves of the arm as first shipped were
+wrong — which is why it went on glass.
+
+`hyprctl dispatch dpms off <name>` **dies on the Lua config manager**: `dispatch` is shorthand for
+`hl.dispatch(...)`, so the bare words are parsed as a Lua expression —
+
+    error: [string "return hl.dispatch(dpms off HDMI-A-1)"]:1:
+           ')' expected near 'off'
+
+The Lua spelling is `hl.dsp.dpms("off", "<name>")`. A hyprlang box wants the classic form, there is
+no stable probe for which manager is loaded, and `hyprctl_dispatch` already catches the exit-0
+rejections both produce — so: try classic, then Lua, and report both failures if neither lands.
+
+And the dispatcher is a **toggle that ignores the state word**. Measured, both spellings, positional
+and table:
+
+    On  ==[ hl.dsp.dpms("on",  "HDMI-A-1") ]==>  Off   <- asked ON, got OFF
+    Off ==[ hl.dsp.dpms("on",  "HDMI-A-1") ]==>  On
+    Off ==[ hl.dsp.dpms{state="off", ...}  ]==>  On    <- asked OFF, got ON
+
+So a blind "send off, later send on" would **light** an already-dark head at stream start and
+**darken** a lit one at teardown — the operator's screen left off after the stream, precisely the
+failure this policy exists to prevent. `dpms_one` is therefore read → act only if the state differs
+→ verify, via `hyprctl -j monitors all`'s `dpmsStatus` (measured to track the connector's sysfs
+`dpms` exactly in both states; a dark monitor stays listed). That shape is also correct where the
+call really is a set, so it is not conditional on detecting the manager. It returns whether it
+**changed** anything, and `dpms_other_heads` records only those.
+
+### The sleep inhibitor is held only while the stream is quiet
+
+Since `b7a00137` the host held a logind `sleep:idle` inhibitor in **BLOCK** mode for the whole
+length of a stream, so a passive video-only viewer could not have the box suspend out from under
+them. A block lock on `sleep` refuses **every** suspend, though: "Sleep" in Steam's Big Picture
+power menu reaches logind as the same `Suspend()` call and comes back as
+
+    Operation inhibited by "Punktfunk" (PID …), reason is "a client is streaming".
+
+Nothing in that UI surfaces a D-Bus error, so the entry simply did nothing for as long as anyone was
+connected. Reproduced on a Bazzite host, 2026-08-24, by taking the same lock by hand.
+
+The veto is now held only while the stream is quiet. Any client input on either plane drops it
+**synchronously** — releasing is a `close(2)` on the inhibitor fd, no round trip, so a Sleep press
+cannot race it — and it is re-taken after 30 s of silence. That is the line the original
+justification already drew: a person choosing Sleep is by definition sending input, and a passive
+viewer never does. Both planes stamp the clock at their single input entry point: the native input
+thread's channel `recv` (**before** the grant tests — a denied event still means a person is there)
+and the GameStream control plane's three decode arms, **past** the keepalive gate, because a
+keepalive is the one thing a passive viewer does send.
+
+### polkit: three power actions for a session-less takeover
+
+The other half of "the power menu does nothing during a stream", and an independent fault. logind
+ships `power-off`/`reboot`/`suspend` as `allow_active: yes`. polkit decides "active" from the
+caller's own logind session and, for a caller that has none — every `systemd --user` unit, which is
+exactly what the managed gamescope session is — falls back to the user's elected DISPLAY session.
+logind elects that only from `user`/`greeter` class sessions, never from the user manager's own, so
+a takeover that **stops** the display manager removes the last candidate and all three actions drop
+to `auth_admin_keep`: an interactive password prompt, put to a non-interactive caller, on a screen
+that is switched off.
+
+On SteamOS-like boxes that is the call being refused. Steam does not ask logind for "Shut Down" at
+all — it writes `$STEAMOS_STEAM_SHUTDOWN_SENTINEL` and exits, and `gamescope-session-plus` runs a
+plain `poweroff` once Steam is gone. During a stream that wrapper is ours, in the session-less
+transient unit.
+
+Measured on Bazzite, 2026-08-24: the identical
+`pkcheck --action-id org.freedesktop.login1.power-off` from a `systemd --user` unit answers
+authorized with sddm up, `auth_admin_keep` with sddm stopped, and authorized again in that same
+stopped state with this rule installed.
+
+`packaging/linux/49-punktfunk-power.rules`, installed by the deb, rpm and arch packagings, scoped to
+the (shipped-empty) `punktfunk` group — the same group the takeover's own root helper
+(`io.unom.punktfunk.dm-helper`) authorizes on, so it grants to exactly the population the fault
+reaches. The `-multiple-sessions` and `-ignore-inhibit` variants are deliberately **not** granted.
+
+### The encode down-driver: frame-budget thresholds and a re-armable stand-down
+
+A 1440p60 Lutris session ratcheted **57 → 5 Mbps over ten minutes** on a link that never dropped a
+packet — no keyframe asks, no flushes, a flat decoder, and the host granting every rate it was
+asked for. Two causes, both client-side.
+
+**The thresholds were absolute durations calibrated at 120 Hz** ("~half a frame budget",
+"≈1.5 × a frame budget"). At 60 Hz one frame is 16.7 ms, so an ordinary one-frame encode hiccup
+cleared the SEVERE tier and took the immediate ×0.7, where the same hiccup at 120 Hz (8.3 ms) never
+reached it — the exact asymmetry the field log shows against 1440p120 sessions on the same host and
+client. They are now sized in the session's own frame budget, plumbed from the negotiated refresh
+and re-read on a mode switch.
+
+**And the signal fired for a cause the rate cannot fix.** It exists to find the encoder's compute
+knee, where cutting the rate cuts the work; when encode time is held up by a game saturating the
+GPU that premise is false, the backoff changes nothing, and `on_ack`'s baseline re-seed erases the
+evidence that nothing improved. Each encode-attributed backoff now remembers the level it fired at:
+two in a row that fire no lower mean the rate is not the lever, and the signal stands down. Same
+shape as `NOOP_CLOCK_FLUSHES_TO_DISARM`. Loss, OWD, decode and keyframe signals keep their full
+power throughout, and the host's own climb refusal stays the backstop for a genuine knee.
+
+**The stand-down re-probes rather than lasting the session.** Nothing else this controller learns
+from evidence is permanent — both learned caps re-probe on the `CAP_REPROBE_WINDOWS_MIN` ladder, and
+the clock-flush detector was itself changed from "off for the rest of the session" to re-armable for
+exactly this reason. What the stand-down answers is transient by nature (contention ends when the
+game exits to a menu, when the shader storm finishes, when the second app on the card closes), and
+what it silences is the only signal that can descend when the encoder is genuinely past its knee on
+a link that shows nothing else. A clean run re-arms it, and the interval doubles each time the
+silence is immediately re-earned, so standing contention settles into a slow poll rather than
+thrashing. The asymmetry is the argument: a too-eager re-arm costs one ×0.7 and stands down again; a
+too-permanent silence costs the protection outright.
+
+### The web console serves the native identity; the tray's probe drops its pin
+
+The host has kept two identities since the identity split (`crate::identity`): `native-cert.pem` /
+`native-key.pem` (P-256, real SANs — what the native QUIC plane, the mgmt API and every native
+client pin) and the legacy `cert.pem` / `key.pem` (RSA, `CN=punktfunk`, **no SAN**, kept byte-stable
+for Moonlight). The web console never followed the split. Every launcher — the systemd unit, the
+NixOS module, the Windows service supervisor, `web-run.cmd`, the Steam Deck installer — names the
+**legacy** pair, and none of them *can* choose: `Environment=` has no "this file, else that one". So
+the console served a certificate with no SAN at all, which costs twice over: browsers reject a
+CN-only cert outright (`ERR_CERT_COMMON_NAME_INVALID`), and the tray's loopback liveness probe
+reused the agent **pinned** to the mgmt identity, so rustls refused the handshake and a healthy
+console was labelled "not responding" — next to a tooltip reading "idle", which is the proof, since
+the same agent reached mgmt fine on the very same tick.
+
+The entry (`web/nitro-entry/tls-paths.mjs`) is the one place every launcher routes through, so the
+choice is made there: prefer the native sibling pair when both files exist, **as a pair or not at
+all** (a native cert with the legacy key completes no handshake with anyone). It is a **suffix
+test**, not `node:path`: `node:path` resolves per-runtime, so a POSIX CI runner reads
+`C:\ProgramData\punktfunk\cert.pem` as one long filename and never swaps — and Windows, where
+`windows/service.rs` hands us exactly that, is the platform the CI job can never exercise. The
+suffix test gives the same answer everywhere, leaves the prefix **verbatim** (where
+`join(dirname(p), …)` normalised `/a/b/../cert.pem` into a different directory the moment `b` was a
+symlink), and cannot hand back a mismatched pair. Existence is not enough:
+`pf_paths::write_secret_file` is create+truncate+write rather than temp+rename, so a console
+starting mid-write could adopt a 0-byte cert and leave `Bun.serve` throwing on every restart (the
+Steam Deck unit is `Restart=on-failure` under the default rate limit, i.e. permanently dead) — the
+check is a **non-empty** stat, mirroring the host's own `!c.trim().is_empty()`.
+
+`serve` now resolves the native identity **before** minting the legacy one. That closes a first-run
+window where the console (which waits on `cert.pem`) could start between the two writes and serve
+the SAN-less cert for the rest of the boot, and a second latent fault: with `cert.pem` missing but
+native clients paired, the old order let `load_or_create` mint a brand-new `cert.pem` that
+`load_or_adopt` then adopted while logging that it was preserving their pins.
+
+The tray's console probe **loses** its pin rather than gaining a second one. It is a different
+server and there is no rule that it presents the mgmt certificate — an operator fronting the console
+with their own LAN-CA cert would have hit this just as squarely. The probe sends no credentials,
+reads no body, and decides only a menu label (plus whether a tray-icon single click opens the
+console, which `win.rs` gates on `console_up`). On Windows it was never pinned to begin with:
+`punktfunk_config_dir` is `None` off Linux, so `load_pin` already returned `None`.
+
+`web/`'s test scope grows from `server/` to `server/ nitro-entry/`; 18 tests, including a win32
+case.
+
+### Apple: the mic tap installs with `format: nil` and follows the device
+
+`installTap(onBus:bufferSize:format:)` validates a non-nil format against the bus and raises an
+Objective-C exception on **any** mismatch. Swift cannot catch that, so it reached the terminate
+handler and aborted the process — SIGABRT in `AVAudioEngineGraph::InstallTapOnNode`, crashing macOS
+0.31.0 at **session start**, not at launch.
+
+The format handed to the tap is necessarily read a moment earlier
+(`input.outputFormat(forBus: 0)`), and on macOS the input can move underneath it in that window: a
+device switch, a clock/rate change, or the `kAudioOutputUnitProperty_CurrentDevice` swap
+`startCapture` itself performs two lines before. The existing guard only rejected the
+0 Hz / 0-channel case, which is a different failure — a device that is absent, not one that changed.
+
+Installing with `format: nil` is the documented "use the bus's own format" and makes the mismatch
+unrepresentable rather than merely unlikely. The tap then has to follow the real format, so the
+rate-dependent pieces (mono bus, resampler, both scratch buffers) move into a `MicChain` the tap
+rebuilds when `buffer.format.sampleRate` differs — a chain pinned to a stale rate would resample by
+the wrong ratio and pitch-shift the mic. That rebuild subsumes the old grow-on-larger-quantum
+branch; the steady state still allocates nothing. Tests cover the sizing arithmetic, including that
+`staging` fits the **upward** ratio, which silently truncates every packet on any device below
+48 kHz if it is sized for the input rate instead.
+
+### The console's bitrate row: 30 rungs, a typed rate, and neighbour stepping
+
+The gamepad shell's Bitrate picker had been seven rungs ending at **80 Mbps** since the console
+shipped — a ceiling a user ran into — while the GTK dialog beside it has always gone to
+3000 Mbit/s, so the two surfaces disagreed about what the machine may ask for and the console was
+the smaller. Three changes, one row:
+
+- **30 rungs, 1 Mbps to 2 Gbps.** Tight at the bottom (1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25 …)
+  where one rung decides whether a thin link is watchable, coarse at the top where a rung is noise.
+  Rates at or above a gigabit read as Gbps.
+- **Y opens a typed rate on that row** — four digits, through the tray keyboard (or SDL text input,
+  and Steam's own keyboard on a Deck) exactly like the add-host and pair fields. **A** goes on
+  cycling the ladder everywhere, so the console's grammar is unchanged.
+- **A rate that is not a rung steps to its neighbour.** The generic picker snaps an unrecognised
+  value to its first option, which on this row is Automatic: one nudge threw away a rate typed here
+  or set by the desktop spinner.
+
+`Screen::edit_key` now takes the context, because this is the first field that commits into the
+settings store when it closes rather than holding text for a later action row. The desktop dialog
+gets the same complaint's other half: its spinner steps 1 Mbit/s instead of 5, so 3, 4 and 6 are
+reachable without typing.
+
+### Linux client: a front door to the console UI
+
+The gamepad console has shipped since the arch split, but on Linux the only way in was
+`punktfunk-session --browse` (or `punktfunk-client --browse`, which execs it) on a command line. The
+WinUI shell has had both doors for a while; this is the GTK half. Three entry points, one
+destination: a gamepad button in the hosts header (`input-gaming-symbolic`, left of the hamburger —
+the placement WinUI gives it); a "Console UI" main-menu entry so the mode has a searchable name;
+and `io.unom.Punktfunk.Console.desktop`, a second launcher shipped by the deb, rpm, arch and flatpak
+packagings, which is what an app-grid search finds and what gets added to Steam as a non-Steam game.
+Its `Exec=punktfunk-client --browse --fullscreen` deliberately goes through the shell binary — that
+argv already execs the session, and it is the command flatpak's `Exec` rewrite expects.
+
+The in-shell launch is a `gio::Subprocess`: `wait_check_async` lands the child's exit on the GTK
+main loop with no thread and no channel, releases `busy`, refreshes the host list (the console can
+pair hosts), and banners a non-zero exit — which is also how a session built without its `ui`
+feature surfaces ("--browse needs the console UI", exit non-zero).
+
+**The Nix build does not install the new desktop entry**: it compiles the session
+`--no-default-features`, so that launcher could only ever print an error. Noted in
+`packaging/nix/README.md` next to the existing Skia caveat.
+
+### Dependencies
+
+**None.** No lockfile in the repo moves — not the workspace `Cargo.lock`, not the four under
+`tools/` and `packaging/windows/`, and no `package.json` under `web/`, `sdk/` or `plugin-kit/`.
+
+### CI
+
+`ci.yml`'s web test step widens from `bun test server/` to `bun test server/ nitro-entry/`, so the
+identity-selection gate runs where the origin-isolation gate already did. Both have the same
+property: a failure mode only a browser would catch.
+
+---
+
 ## v0.31.3
 
 41 commits since v0.31.2 (26 non-merge), counted at the tip this was cut from.
