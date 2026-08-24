@@ -1479,39 +1479,28 @@ public final class SessionAudio {
             "mic capture: \(Int(inFormat.sampleRate)) Hz, \(inChannels) ch, \(channelPlan)")
         #endif
 
-        // Encode a single mono bus (folded from `inFormat` in the tap): the resampler goes
+        // Encode a single mono bus (folded from the tap's own buffer format): the resampler goes
         // mono@inputSR → the encoder's 48 kHz mono, so it handles the rate change and the
         // wrong-channel downmix never happens. Mono end to end — the host's decoder upmixes,
         // so the old duplicate-into-stereo step only cost bits and cycles.
         //
-        // `mono`/`staging` are the per-callback scratch buffers, preallocated HERE (grown only
-        // if a larger-than-expected device quantum ever arrives) — the steady-state tap path
-        // allocates nothing.
+        // `chain` carries the rate-dependent pieces INCLUDING the per-callback scratch buffers,
+        // preallocated HERE for the rate the input currently reports — the steady-state tap path
+        // allocates nothing. The tap rebuilds it if the device's real rate or quantum differ,
+        // which is the price of installing the tap with the bus's own format (see below).
         let scratchFrames: AVAudioFrameCount = 8192
-        let stagingCapacity = { (frames: AVAudioFrameCount) -> AVAudioFrameCount in
-            AVAudioFrameCount(
-                (Double(frames) * 48_000 / inFormat.sampleRate).rounded(.up)) + 64
-        }
-        guard let monoFormat = AVAudioFormat(
-                  commonFormat: .pcmFormatFloat32, sampleRate: inFormat.sampleRate,
-                  channels: 1, interleaved: false),
-              let encoder = try? OpusEncoder(),
-              let resampler = AVAudioConverter(from: monoFormat, to: encoder.pcmFormat),
+        guard let encoder = try? OpusEncoder(),
+              var chain = Self.micChain(
+                  rate: inFormat.sampleRate, frames: scratchFrames, to: encoder.pcmFormat),
               let chunk = AVAudioPCMBuffer(
-                  pcmFormat: encoder.pcmFormat, frameCapacity: encoder.framesPerPacket),
-              let monoScratch = AVAudioPCMBuffer(
-                  pcmFormat: monoFormat, frameCapacity: scratchFrames),
-              let stagingScratch = AVAudioPCMBuffer(
-                  pcmFormat: encoder.pcmFormat, frameCapacity: stagingCapacity(scratchFrames))
+                  pcmFormat: encoder.pcmFormat, frameCapacity: encoder.framesPerPacket)
         else {
             log.error("Opus encoder unavailable — mic uplink disabled")
             return false
         }
 
-        // Tap-thread-confined state: fold into `mono`, resample into `staging`, accumulate in
-        // `fifo`, slice `framesPerPacket` (10 ms) chunks for the encoder.
-        var mono = monoScratch
-        var staging = stagingScratch
+        // Tap-thread-confined state: fold into `chain.mono`, resample into `chain.staging`,
+        // accumulate in `fifo`, slice `framesPerPacket` (10 ms) chunks for the encoder.
         var fifo: [Float] = []
         fifo.reserveCapacity(48_000)
         var seq: UInt32 = 0
@@ -1533,22 +1522,32 @@ public final class SessionAudio {
         // 480 frames = 10 ms, matching the packet duration. Advisory — CoreAudio delivers the
         // device quantum whatever we ask (the old 2048 request came back as 42.7 ms bursts, most
         // of the uplink's latency) — but where the system honors it, the tap fires per-packet.
-        input.installTap(onBus: 0, bufferSize: 480, format: inFormat) { buffer, _ in
+        // `format: nil` — NOT the format read above. `installTap` validates a non-nil format
+        // against the bus and raises an Objective-C exception on any mismatch; Swift cannot catch
+        // that, so it aborts the process (SIGABRT in `AVAudioEngineGraph::InstallTapOnNode`). The
+        // format was necessarily read a moment EARLIER, and on macOS the input can move underneath
+        // it — a device switch, a clock/rate change, or the `setDevice` swap `startCapture` itself
+        // performs two lines before this. `nil` means "whatever the bus emits", which is what the
+        // chain wants anyway, and the mismatch cannot arise by construction. The tap then follows
+        // the real format below.
+        input.installTap(onBus: 0, bufferSize: 480, format: nil) { buffer, _ in
             if flag.isStopped { return }
             let frames = Int(buffer.frameLength)
             guard frames > 0, let src = buffer.floatChannelData else { return }
-            if frames > Int(mono.frameCapacity) {
-                // A quantum larger than the scratch (bufferSize is advisory both ways) — regrow
-                // once to the new high-water mark; the steady state stays allocation-free.
-                guard let biggerMono = AVAudioPCMBuffer(
-                          pcmFormat: monoFormat, frameCapacity: buffer.frameLength),
-                      let biggerStaging = AVAudioPCMBuffer(
-                          pcmFormat: encoder.pcmFormat,
-                          frameCapacity: stagingCapacity(buffer.frameLength))
+            // Rebuild the rate-dependent chain when the device changes rate under a live tap
+            // (resampling by the old ratio would pitch-shift the mic), and when a quantum larger
+            // than the scratch arrives (`bufferSize` is advisory both ways) — regrown once to the
+            // new high-water mark, so the steady state stays allocation-free.
+            if buffer.format.sampleRate != chain.monoFormat.sampleRate
+                || buffer.frameLength > chain.mono.frameCapacity {
+                guard let rebuilt = Self.micChain(
+                          rate: buffer.format.sampleRate,
+                          frames: max(buffer.frameLength, scratchFrames),
+                          to: encoder.pcmFormat)
                 else { return }
-                mono = biggerMono
-                staging = biggerStaging
+                chain = rebuilt
             }
+            let mono = chain.mono, staging = chain.staging, resampler = chain.resampler
             guard let dst = mono.floatChannelData?[0] else { return }
             mono.frameLength = buffer.frameLength
 
@@ -1618,6 +1617,41 @@ public final class SessionAudio {
             if head > 0 { fifo.removeFirst(head) } // keeps capacity — no realloc
         }
         return true
+    }
+
+    /// The rate-dependent half of the mic chain: a mono bus at `rate`, the resampler from it onto
+    /// the encoder's 48 kHz mono, and the two scratch buffers sized for `frames`. Grouped so the
+    /// tap can swap all four together — they are only ever valid as a set.
+    struct MicChain {
+        let monoFormat: AVAudioFormat
+        let resampler: AVAudioConverter
+        let mono: AVAudioPCMBuffer
+        let staging: AVAudioPCMBuffer
+    }
+
+    /// Build a `MicChain` for `rate`, or nil if the rate is unusable or an allocation fails.
+    /// Built once up front for the format the input reports, and again from the tap whenever the
+    /// device's real rate differs — a macOS input can change rate under a live tap, and a chain
+    /// pinned to the old rate resamples by the wrong ratio (a pitch-shifted mic).
+    /// `internal` for unit testing: it needs no engine, device or permission.
+    static func micChain(
+        rate: Double, frames: AVAudioFrameCount, to pcmFormat: AVAudioFormat
+    ) -> MicChain? {
+        // `staging` holds the resampled 48 kHz mono, so it must fit the UPWARD ratio from `rate`
+        // (a 44.1 kHz quantum grows by ~1.088); +64 covers the converter's own slack.
+        guard rate > 0, frames > 0,
+              let monoFormat = AVAudioFormat(
+                  commonFormat: .pcmFormatFloat32, sampleRate: rate, channels: 1,
+                  interleaved: false),
+              let resampler = AVAudioConverter(from: monoFormat, to: pcmFormat),
+              let mono = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: frames),
+              let staging = AVAudioPCMBuffer(
+                  pcmFormat: pcmFormat,
+                  frameCapacity: AVAudioFrameCount(
+                      (Double(frames) * 48_000 / rate).rounded(.up)) + 64)
+        else { return nil }
+        return MicChain(
+            monoFormat: monoFormat, resampler: resampler, mono: mono, staging: staging)
     }
 
     /// Fold `channels` of input (`floatChannelData` layout: `interleaved` → one buffer strided by
