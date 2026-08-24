@@ -193,7 +193,7 @@ export default defineConfig({
 			// stock self-listening entry for ours (`nitro-entry/bun-https.mjs`), which calls
 			// `Bun.serve({ tls })` so the console is served over HTTPS (HTTP/1.1 over TLS) with the
 			// host's own identity cert. (No HTTP/2 — Bun.serve has no h2 server — and no HTTP/3, which a
-			// browser won't speak against this self-signed, no-SAN host cert.) Bun is the runtime
+			// browser won't speak against a self-signed host cert.) Bun is the runtime
 			// everywhere now — the Windows installer already bundles it, and the punktfunk-web .deb
 			// vendors it (it can't be `node`: `Bun.serve` is a bun API). (dev `vite dev` is unaffected.)
 			preset: "bun",

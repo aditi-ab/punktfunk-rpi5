@@ -667,6 +667,11 @@ in
           HOST = "0.0.0.0";
           # Serve HTTPS with the host's own identity cert (the anchor native clients already pin) and
           # mark the session cookie Secure. The host's `serve` writes these PEMs.
+          #
+          # These name the LEGACY pair; the server prefers the native sibling
+          # (native-cert.pem/native-key.pem) when it exists, because a generated unit cannot express
+          # "this file, else that one" any more than the hand-written one can. The choice is made in
+          # web/nitro-entry/tls-paths.mjs — keep this in step with scripts/punktfunk-web.service.
           PUNKTFUNK_UI_TLS_CERT = "%h/.config/punktfunk/cert.pem";
           PUNKTFUNK_UI_TLS_KEY = "%h/.config/punktfunk/key.pem";
           PUNKTFUNK_UI_SECURE = "1";

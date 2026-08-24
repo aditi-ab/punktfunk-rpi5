@@ -51,6 +51,9 @@ if exist "%ENDPOINTFILE%" for /f "usebackq tokens=1* delims==" %%A in ("%ENDPOIN
 rem No NODE_TLS_REJECT_UNAUTHORIZED: the host's self-signed cert is accepted only for the loopback
 rem proxy hop, scoped inside the proxy code (Bun per-request TLS), not process-wide.
 rem Serve HTTPS (HTTP/1.1 over TLS) with the host's identity cert; mark the session cookie Secure.
+rem These name the LEGACY pair; the server prefers native-cert.pem/native-key.pem beside them when
+rem both exist (the identity split - web\nitro-entry\tls-paths.mjs). Don't "fix" them to the native
+rem names: a host that never took the split has no native pair, and the fallback lives in there.
 set "PUNKTFUNK_UI_TLS_CERT=%CERTFILE%"
 set "PUNKTFUNK_UI_TLS_KEY=%KEYFILE%"
 set "PUNKTFUNK_UI_SECURE=1"

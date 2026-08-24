@@ -58,6 +58,8 @@ PORT=47992 HOST=0.0.0.0 \
   PUNKTFUNK_UI_TLS_KEY=~/.config/punktfunk/key.pem PUNKTFUNK_UI_SECURE=1 \
   bun run start           # = bun run .output/server/index.mjs
 # PUNKTFUNK_UI_TLS_* unset ⇒ plain HTTP (local dev); both set ⇒ HTTPS (HTTP/1.1 over TLS).
+# Naming cert.pem/key.pem serves native-cert.pem/native-key.pem instead when both sit beside them
+# (the identity split — nitro-entry/tls-paths.mjs); the legacy pair is the fallback, not the target.
 # The host's self-signed mgmt cert is accepted only for the proxy's loopback hop, scoped in code
 # (Bun per-request TLS: server/routes/api/[...].ts) — no process-wide NODE_TLS_REJECT_UNAUTHORIZED.
 # See .env.example.

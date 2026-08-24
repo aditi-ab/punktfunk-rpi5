@@ -419,6 +419,29 @@ pub fn serve(
     // The shared streaming-stats recorder: one handle for the mgmt API, the GameStream encode loop
     // (via `AppState`), and the native punktfunk/1 loops (passed to `native::serve`).
     let stats = crate::stats_recorder::StatsRecorder::new(crate::stats_recorder::default_dir());
+    // The native plane always runs, so the shared native-pairing handle (linking the QUIC ceremony
+    // and the management API) always exists.
+    let np = Arc::new(
+        crate::native_pairing::NativePairing::load_with(None, None, false)
+            .context("native pairing store")?,
+    );
+    // The identity the native QUIC plane and the mgmt API present (the identity split): P-256 on
+    // hosts no native client ever pinned, the legacy RSA cert otherwise — resolved ONCE here so
+    // the two planes cannot race the first-run adoption. See `crate::identity`.
+    //
+    // Resolved BEFORE the legacy GameStream identity below, and that order is load-bearing twice
+    // over. (1) The web console gates its start on `cert.pem` existing and then serves the native
+    // pair sitting next to it (web/nitro-entry/tls-paths.mjs); minting the legacy pair first
+    // leaves a first-run window where the console starts, finds no native pair, and serves the
+    // SAN-less RSA cert no browser accepts — for the rest of that boot. Running first closes that
+    // window: whenever this call WRITES a native pair, it has done so before `cert.pem` appears.
+    // (It does not write one on an upgraded host whose native clients pinned the legacy cert —
+    // there the console correctly falls back to that same legacy pair.) (2) In the degenerate case
+    // (native clients paired, but the cert they pinned is gone from disk) the old order let
+    // `load_or_create` mint a BRAND-NEW cert.pem that `load_or_adopt` then adopted while logging
+    // that it was preserving their pins — stranding them silently. Reading the dir first means
+    // that case reaches the branch written for it.
+    let native_ident = crate::identity::load_or_adopt(&np).context("native host identity")?;
     #[cfg(feature = "gamestream")]
     let state = {
         let identity = cert::ServerIdentity::load_or_create().context("host certificate")?;
@@ -426,20 +449,10 @@ pub fn serve(
     };
     #[cfg(not(feature = "gamestream"))]
     let state = Arc::new(AppState::new(host, stats.clone()));
-    // The native plane always runs, so the shared native-pairing handle (linking the QUIC ceremony
-    // and the management API) always exists.
-    let np = Arc::new(
-        crate::native_pairing::NativePairing::load_with(None, None, false)
-            .context("native pairing store")?,
-    );
     // WP13: hand the GameStream planes the grants registry — the nvhttp launch surface and the
     // ENet control thread resolve a Moonlight fingerprint's mask against the same registry the
     // native plane enforces (design §8: it keys on fingerprint hex and serves both stores).
     let _ = state.access.set(np.clone());
-    // The identity the native QUIC plane and the mgmt API present (the identity split): P-256 on
-    // hosts no native client ever pinned, the legacy RSA cert otherwise — resolved ONCE here so
-    // the two planes cannot race the first-run adoption. See `crate::identity`.
-    let native_ident = crate::identity::load_or_adopt(&np).context("native host identity")?;
     tracing::info!(
         hostname = %state.host.hostname,
         uniqueid = %state.host.uniqueid,
