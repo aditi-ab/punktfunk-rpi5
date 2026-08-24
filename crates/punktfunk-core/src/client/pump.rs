@@ -97,6 +97,12 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         negotiated.bit_depth,
         negotiated.chroma_format,
     );
+    // This session's frame budget, the unit the ABR's host-encode thresholds are expressed in
+    // (see [`crate::abr::BitrateController::encode_thresholds`]). The NEGOTIATED refresh, not the
+    // requested one — `mode_slot` still holds the request until the connect handshake seeds it,
+    // and a host that answered 60 to a 120 ask is exactly the session that must not be scored
+    // against a 120 Hz budget.
+    let refresh_hz = negotiated.mode.refresh_hz;
     // Seed the live offset with the connect-time estimate BEFORE the embedder can observe the
     // client (ready_tx): clock_offset_now_ns() never reads a pre-handshake 0 on a skewed pair.
     clock_offset.store(negotiated.clock_offset_ns, Ordering::Relaxed);
@@ -179,6 +185,9 @@ pub(super) async fn run_pump(args: WorkerArgs) {
 
     // Control task (see [`control_task`]): the handshake stream stays open for mid-stream
     // renegotiation, speed tests, clock re-sync, and clipboard metadata.
+    // The data pump re-reads the accepted mode when `mode_gen` moves, to re-size the ABR's
+    // frame-budget-scaled encode thresholds for the new refresh.
+    let mode_slot_pump = mode_slot.clone();
     tokio::spawn(
         control_task::ControlTask {
             ctrl_rx,
@@ -271,6 +280,8 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         resolved_bitrate_kbps,
         negotiated_codec,
         stream_cap_kbps,
+        refresh_hz,
+        mode_slot: mode_slot_pump,
     };
     let _ = tokio::task::spawn_blocking(move || pump.run()).await;
 

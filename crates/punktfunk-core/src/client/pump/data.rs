@@ -44,6 +44,12 @@ pub(super) struct DataPump {
     /// [`crate::abr::stream_ceiling_kbps`]) — the bound the probe-measured link ceiling is held
     /// to. Computed where the negotiated geometry lives, so this module stays codec-agnostic.
     pub(super) stream_cap_kbps: u32,
+    /// The negotiated refresh, which sets the frame budget the ABR sizes its host-encode
+    /// thresholds against (see [`crate::abr::BitrateController::set_frame_budget`]).
+    pub(super) refresh_hz: u32,
+    /// The accepted mode, written by the control task on a mode switch — read when `mode_gen`
+    /// moves so the frame budget follows the new refresh.
+    pub(super) mode_slot: Arc<Mutex<crate::config::Mode>>,
 }
 
 impl DataPump {
@@ -69,6 +75,8 @@ impl DataPump {
             resolved_bitrate_kbps,
             negotiated_codec,
             stream_cap_kbps,
+            refresh_hz,
+            mode_slot: pump_mode_slot,
         } = self;
         pin_thread_user_interactive(); // feeds the frame channel → the user-interactive video pump
         register_hot_tid(&pump_hot_tids); // this thread does UDP receive + FEC reassembly — hint it
@@ -121,6 +129,10 @@ impl DataPump {
         // no inter-coded stream benefits from — the field session walked to 657 Mbps for 1440p120
         // and drove the client's decode latency from 0.8 ms to 10 ms getting there.
         abr.set_stream_cap(stream_cap_kbps);
+        // Size the host-encode thresholds in this session's frame budgets rather than the 120 Hz
+        // durations they were calibrated at — a 60 Hz session otherwise takes the SEVERE
+        // one-window ×0.7 on an ordinary one-frame encode hiccup.
+        abr.set_frame_budget(refresh_hz);
         // Startup link-capacity probe (Automatic sessions): the controller's ceiling is the
         // negotiated start rate — the conservative 20 Mbps default, historically a box Automatic
         // could NEVER climb out of. One speed-test burst shortly after the stream settles
@@ -538,6 +550,10 @@ impl DataPump {
                 if mg != seen_mode_gen {
                     seen_mode_gen = mg;
                     abr.on_mode_switch();
+                    // The frame budget is a property of the MODE: a switch that changes the
+                    // refresh changes what one frame of encode time costs, and the encode
+                    // thresholds are sized in those.
+                    abr.set_frame_budget(pump_mode_slot.lock().unwrap().refresh_hz);
                 }
                 if let Some(acked) = bitrate_ack.lock().unwrap().take() {
                     abr.on_ack(acked);
@@ -1055,6 +1071,12 @@ mod tests {
             resolved_bitrate_kbps: 20_000,
             negotiated_codec: crate::quic::CODEC_HEVC,
             stream_cap_kbps: 100_000,
+            refresh_hz: 60,
+            mode_slot: Arc::new(Mutex::new(crate::config::Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            })),
         };
         let started = Instant::now();
         let pump_thread = std::thread::spawn(move || pump.run());
