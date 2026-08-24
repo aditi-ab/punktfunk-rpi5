@@ -19,7 +19,9 @@
 //!   fat LAN never surfaces as loss/OWD/decode. Paired with the host's own climb refusal (a
 //!   behind-cadence host acks climbs at the current rate) and short-ack cap learning
 //!   ([`BitrateController::on_ack`]), this is what stops an Automatic session from driving the
-//!   encoder off a cliff the network could carry.
+//!   encoder off a cliff the network could carry. It is also the one signal that can fire for a
+//!   reason the rate cannot fix, so it DISARMS itself when backing off stops helping — see
+//!   [`ENCODE_NOOP_BACKOFFS_TO_DISARM`].
 //!
 //! AIMD shape: a SEVERE window (an unrecoverable frame, a flush, ≥6 % loss, or a decode-latency
 //! excursion far past baseline) backs off ×0.7 immediately; ordinary congestion
@@ -126,10 +128,44 @@ const PROVEN_HEADROOM_DEN: u32 = 2;
 /// encode_us inflated by its retrieve-queue depth (~a frame), so an absolute budget threshold
 /// would read permanently-red and drive the rate to the floor; a rise above the session's own
 /// baseline survives that offset. ~half a 120 Hz frame budget of standing rise is real.
+///
+/// A FRAME BUDGET, not a fixed duration — the two constants here are the 120 Hz values, used
+/// only until [`set_frame_budget`](BitrateController::set_frame_budget) supplies the session's
+/// own (see [`BitrateController::encode_thresholds`]). Left absolute they encode a 120 Hz
+/// assumption into every session: at 60 Hz one frame is 16.7 ms, so an ordinary one-frame encode
+/// hiccup clears the SEVERE tier and takes the immediate ×0.7 where the same hiccup at 120 Hz
+/// (8.3 ms) does not even reach it. That asymmetry is a field report — a 1440p60 session ratcheted
+/// to the floor while 1440p120 sessions on the same host and client climbed to their shape ceiling.
 const ENCODE_RISE_US: i64 = 4_000;
 /// Host-encode latency this far above baseline (≈1.5 × a 120 Hz budget) is SEVERE — the encode
-/// queue is growing past the knee; skip the two-window confirmation.
+/// queue is growing past the knee; skip the two-window confirmation. Frame-budget-scaled like
+/// [`ENCODE_RISE_US`].
 const ENCODE_SEVERE_US: i64 = 12_000;
+/// Consecutive encode-attributed backoffs that did NOT bring host encode time down before the
+/// encode down-driver is disarmed for the session.
+///
+/// The signal's whole premise is that encode time is a function of the rate the controller can
+/// actuate: it exists to find the encoder's compute knee, where cutting the rate cuts the work.
+/// When the rise comes from something else on the GPU — a game saturating the card, which is
+/// exactly when the host is also behind cadence — the premise is false. The backoff changes
+/// nothing, the signal fires again, and [`on_ack`](BitrateController::on_ack)'s baseline re-seed
+/// erases the evidence that nothing improved, so the controller ratchets to the floor pulling the
+/// one lever that cannot work (the field case: 57 → 5 Mbps over ten minutes with zero packet loss,
+/// zero keyframe asks and a flat decoder).
+///
+/// So: remember the level each encode-attributed backoff fired at, and when the next one fires no
+/// lower, count it. Two in a row means the rate is not what is driving encode time here — stop
+/// letting it drive. Same shape as the clock-flush detector's
+/// [`crate::client::frame_channel::NOOP_CLOCK_FLUSHES_TO_DISARM`]: a signal whose remedy is
+/// demonstrably doing nothing should stand down rather than repeat forever.
+///
+/// Two, not one: a single pair of backoffs at a similar level is also what a real knee looks like
+/// while the rate is still above it, and the knee is the case this signal was built for. Deliberately
+/// session-scoped and cleared only by [`on_mode_switch`](BitrateController::on_mode_switch) — within
+/// one mode an encoder that does not answer the rate will not start answering it. The loss, OWD,
+/// decode and keyframe signals keep their full power throughout, and the host's own climb refusal
+/// stays the backstop for a genuine knee.
+const ENCODE_NOOP_BACKOFFS_TO_DISARM: u32 = 2;
 /// Clean windows parked at a learned cap before re-probing above it, and the ceiling that
 /// interval backs off to.
 ///
@@ -329,6 +365,19 @@ pub(crate) struct BitrateController {
     /// baseline like the decode signal. Cleared whenever OUR OWN rate decrease changes the
     /// encode regime (see [`on_ack`](Self::on_ack)) and on a mode switch.
     encode_means: VecDeque<i64>,
+    /// This session's frame budget in µs (one refresh interval), the unit the encode thresholds
+    /// are expressed in — see [`encode_thresholds`](Self::encode_thresholds). `None` = the mode
+    /// was never plumbed in, and the 120 Hz constants stand exactly as before.
+    frame_budget_us: Option<i64>,
+    /// The window mean host-encode latency (µs) that drove the last encode-attributed backoff;
+    /// `0` = none yet, or the streak was broken by a backoff something else drove.
+    encode_backoff_us: i64,
+    /// Consecutive encode-attributed backoffs after which encode time did NOT come down (see
+    /// [`ENCODE_NOOP_BACKOFFS_TO_DISARM`]).
+    encode_noop_backoffs: u32,
+    /// The encode down-driver is off for this session: its rises are not answering the rate, so
+    /// they neither mark a window bad nor teach a baseline. Cleared by a mode switch.
+    encode_disarmed: bool,
     /// The host-taught rate cap (§ABR overdrive): latched when the host acks BELOW what we
     /// asked twice consecutively at the same value — its encoder's codec-level ceiling, or a
     /// climb refusal while host encode can't hold cadence. Kept apart from `ceiling_kbps` so
@@ -427,6 +476,10 @@ impl BitrateController {
             owd_means: VecDeque::with_capacity(BASELINE_WINDOWS),
             decode_means: VecDeque::with_capacity(BASELINE_WINDOWS),
             encode_means: VecDeque::with_capacity(BASELINE_WINDOWS),
+            frame_budget_us: None,
+            encode_backoff_us: 0,
+            encode_noop_backoffs: 0,
+            encode_disarmed: false,
             host_cap_kbps: None,
             last_requested_kbps: None,
             short_ack_kbps: 0,
@@ -483,6 +536,33 @@ impl BitrateController {
     /// operator's env cap.
     pub(crate) fn set_stream_cap(&mut self, kbps: u32) {
         self.stream_cap_kbps = Some(kbps);
+    }
+
+    /// Teach the controller this session's refresh rate, so the encode thresholds can be sized in
+    /// FRAME BUDGETS rather than the 120 Hz durations they were calibrated at (see
+    /// [`ENCODE_RISE_US`]). Ignored for a nonsense rate — the defaults are the old behavior, which
+    /// is the right answer when the mode is not known.
+    pub(crate) fn set_frame_budget(&mut self, refresh_hz: u32) {
+        if refresh_hz > 0 {
+            self.frame_budget_us = Some(1_000_000 / refresh_hz as i64);
+        }
+    }
+
+    /// `(rise, severe)` for the host-encode signal: half a frame budget and one and a half of
+    /// them, the shape [`ENCODE_RISE_US`] documents, against this session's actual budget.
+    ///
+    /// Scales with the SESSION REFRESH, not with the rate the source actually delivers. A game
+    /// rendering below refresh stretches the real budget further still (the host stretches its own
+    /// cadence deadline by exactly that, `cadence_budget`), so a sub-refresh source can still
+    /// present a one-frame hiccup above the severe tier — that residue is what
+    /// [`ENCODE_NOOP_BACKOFFS_TO_DISARM`] is for. Deliberately not chased here: the client would
+    /// have to infer the source period from arrival cadence, which is the same jitter the signal
+    /// is trying to read through.
+    fn encode_thresholds(&self) -> (i64, i64) {
+        match self.frame_budget_us {
+            Some(budget) => (budget / 2, budget * 3 / 2),
+            None => (ENCODE_RISE_US, ENCODE_SEVERE_US),
+        }
     }
 
     /// The host's [`crate::quic::BitrateChanged`] ack: its clamp is authoritative for what the
@@ -603,6 +683,13 @@ impl BitrateController {
         self.owd_means.clear();
         self.decode_means.clear();
         self.encode_means.clear();
+        // The encode down-driver's disarm is mode-scoped like everything else here: the new mode
+        // is a different amount of encode work per frame, so a rate that could not move encode
+        // time under the old one says nothing about this one. Re-arm and let it prove itself
+        // again. (The caller re-sizes the frame budget for the new refresh alongside this.)
+        self.encode_disarmed = false;
+        self.encode_backoff_us = 0;
+        self.encode_noop_backoffs = 0;
         self.proven_kbps = 0;
     }
 
@@ -684,11 +771,17 @@ impl BitrateController {
         // frame describe what reached the CLIENT, and they mean the same thing however little
         // flowed — the periodic-capture-stall case (see [`STARVED_DELIVERY_DIV`]) still backs off
         // on one window, as its tests require.
+        //
+        // Withheld the same way once the signal has DISARMED itself (see
+        // [`ENCODE_NOOP_BACKOFFS_TO_DISARM`]): a rise the rate has twice failed to answer is not
+        // evidence about the rate, so it must neither mark a window bad nor teach a baseline.
+        let (encode_rise_us, encode_severe_us) = self.encode_thresholds();
+        let encode_usable = !starved && !self.encode_disarmed;
         let (encode_bad, encode_severe) = score_baseline(
             &mut self.encode_means,
-            encode_mean_us.filter(|_| !starved),
-            ENCODE_RISE_US,
-            ENCODE_SEVERE_US,
+            encode_mean_us.filter(|_| encode_usable),
+            encode_rise_us,
+            encode_severe_us,
         );
         // SEVERE = the user already saw damage (an unrecoverable frame, a jump-to-live flush, a
         // deep decode-latency excursion, a window spent begging for keyframes) or loss far past
@@ -874,6 +967,44 @@ impl BitrateController {
                 self.decode_backoff_kbps = rate;
             } else {
                 self.decode_backoff_kbps = 0;
+            }
+            // Encode attribution (see [`ENCODE_NOOP_BACKOFFS_TO_DISARM`]): did the LAST
+            // encode-driven backoff buy anything? Judged from the level this one fires at, not
+            // from the baseline — `on_ack` re-seeded that after the last decrease, so the firing
+            // level is the only surviving record of what encode time did in between. Network
+            // distress disqualifies the attribution: loss, a flush or a dropped frame explain the
+            // backoff without the encoder, and cutting the rate genuinely is the remedy for those.
+            let encode_attributed = (encode_severe || encode_bad)
+                && dropped == 0
+                && !flushed
+                && loss_ppm < HEAVY_LOSS_PPM;
+            if let Some(mean) = encode_mean_us.filter(|_| encode_attributed) {
+                if self.encode_backoff_us > 0
+                    && mean >= self.encode_backoff_us.saturating_sub(encode_rise_us)
+                {
+                    // Fired again no lower than last time: the ×0.7 in between did nothing.
+                    self.encode_noop_backoffs += 1;
+                    if self.encode_noop_backoffs >= ENCODE_NOOP_BACKOFFS_TO_DISARM {
+                        self.encode_disarmed = true;
+                        self.encode_means.clear();
+                        tracing::info!(
+                            at_kbps = self.current_kbps,
+                            encode_mean_us = mean,
+                            noop_backoffs = self.encode_noop_backoffs,
+                            "adaptive bitrate: host encode time is not answering the rate — \
+                             disarming the encode down-driver for this session (loss, OWD, decode \
+                             and keyframe signals keep driving)"
+                        );
+                    }
+                } else {
+                    self.encode_noop_backoffs = 0;
+                }
+                self.encode_backoff_us = mean;
+            } else {
+                // Something else drove this one: the encode streak is broken, and the level the
+                // next encode-driven backoff would have to beat no longer means anything.
+                self.encode_backoff_us = 0;
+                self.encode_noop_backoffs = 0;
             }
             self.climb_since_backoff = false;
             let next = ((self.current_kbps as u64 * 7 / 10) as u32).max(self.floor_kbps);
@@ -2176,6 +2307,198 @@ mod tests {
                 None
             );
         }
+    }
+
+    /// One encode-attributed choke: re-seed the baseline `on_ack` cleared, then present `level`
+    /// again — the shape of an encoder held up by something the last ×0.7 did nothing about.
+    /// Four seed windows is under [`CLEAN_WINDOWS_TO_INCREASE`], so no cycle can climb its way
+    /// out from under the test.
+    fn encode_choke(
+        c: &mut BitrateController,
+        start: Instant,
+        tick: &mut u32,
+        level: i64,
+    ) -> Option<u32> {
+        for _ in 0..BASELINE_MIN_WINDOWS {
+            let at = ticks(start, *tick);
+            *tick += 1;
+            assert_eq!(
+                c.on_window(
+                    at,
+                    0,
+                    0,
+                    Some(10_000),
+                    None,
+                    Some(7_000),
+                    1_000_000,
+                    false,
+                    0
+                ),
+                None,
+                "a baseline seed window must be clean"
+            );
+        }
+        let at = ticks(start, *tick);
+        *tick += 1;
+        c.on_window(
+            at,
+            0,
+            0,
+            Some(10_000),
+            None,
+            Some(level),
+            1_000_000,
+            false,
+            0,
+        )
+    }
+
+    #[test]
+    fn the_encode_thresholds_follow_the_session_frame_budget() {
+        // The 1440p60-vs-1440p120 field asymmetry. One frame of encode delay is 8.3 ms at 120 Hz
+        // and 16.7 ms at 60 Hz, so against FIXED thresholds the 60 Hz session takes the immediate
+        // ×0.7 for the same physical hiccup the 120 Hz one shrugs off. Sized in frame budgets,
+        // both treat it the same way: ordinary, and confirmed by a second window.
+        let excursion = 23_700; // 7 ms baseline + ~one 60 Hz frame
+        let mut hz120 = BitrateController::new(20_000);
+        hz120.set_frame_budget(120);
+        let mut tick = 0;
+        let start = Instant::now();
+        assert_eq!(
+            encode_choke(&mut hz120, start, &mut tick, excursion),
+            Some(14_000),
+            "at 120 Hz that is ~2.8 frame budgets over baseline — severe, one window"
+        );
+
+        let mut hz60 = BitrateController::new(20_000);
+        hz60.set_frame_budget(60);
+        let mut tick = 0;
+        assert_eq!(
+            encode_choke(&mut hz60, start, &mut tick, excursion),
+            None,
+            "the same excursion is ~1 frame budget at 60 Hz — bad, but not severe"
+        );
+        // Confirmed by a second window, it still backs off — the signal is not weakened, only
+        // re-scaled.
+        let at = ticks(start, tick + 1);
+        assert_eq!(
+            hz60.on_window(
+                at,
+                0,
+                0,
+                Some(10_000),
+                None,
+                Some(excursion),
+                1_000_000,
+                false,
+                0
+            ),
+            Some(14_000)
+        );
+    }
+
+    #[test]
+    fn unactuatable_encode_rises_disarm_the_down_driver() {
+        // The field ratchet (2026-08-22): a game saturating the GPU holds host encode time up,
+        // the client reads it as the compute knee, and every ×0.7 changes nothing — 57 Mbps to
+        // the floor over ten minutes with zero loss, zero keyframe asks and a flat decoder.
+        // `on_ack` re-seeds the encode baseline after each decrease, so nothing in the signal
+        // itself ever notices that the backoffs are not working. The firing LEVEL does.
+        let mut c = BitrateController::new(20_000);
+        let start = Instant::now();
+        let mut tick = 0;
+
+        // First one is a legitimate knee sample — nothing has been learned yet.
+        assert_eq!(encode_choke(&mut c, start, &mut tick, 20_000), Some(14_000));
+        c.on_ack(14_000);
+        // Fires again no lower: the first ×0.7 bought nothing. One no-op is not a verdict — a
+        // real knee still above the current rate looks exactly like this.
+        assert_eq!(encode_choke(&mut c, start, &mut tick, 20_000), Some(9_800));
+        c.on_ack(9_800);
+        assert_eq!(c.encode_noop_backoffs, 1);
+        assert!(!c.encode_disarmed);
+        // Twice in a row ⇒ the rate is not the lever. This backoff still lands (the window was
+        // judged before the verdict), and it is the last one this signal ever drives.
+        assert_eq!(encode_choke(&mut c, start, &mut tick, 20_000), Some(6_860));
+        c.on_ack(6_860);
+        assert!(c.encode_disarmed);
+
+        // The ratchet stops: the same excursion no longer moves the rate…
+        assert_eq!(encode_choke(&mut c, start, &mut tick, 20_000), None);
+        // …and the session climbs back out instead of parking at the floor.
+        c.set_ceiling(200_000);
+        assert!(
+            run_clean(&mut c, start, tick, 8).is_some_and(|k| k > 6_860),
+            "a disarmed encode signal must not keep the session pinned"
+        );
+    }
+
+    #[test]
+    fn an_encode_backoff_that_helps_keeps_the_down_driver_armed() {
+        // The knee this signal was built for: the ×0.7 lands nearer it and encode time genuinely
+        // comes down, so the next excursion is a fresh event rather than evidence that the rate
+        // is the wrong lever. Nothing here may disarm.
+        let mut c = BitrateController::new(20_000);
+        let start = Instant::now();
+        let mut tick = 0;
+        assert_eq!(encode_choke(&mut c, start, &mut tick, 40_000), Some(14_000));
+        c.on_ack(14_000);
+        assert_eq!(encode_choke(&mut c, start, &mut tick, 22_000), Some(9_800));
+        c.on_ack(9_800);
+        assert_eq!(c.encode_noop_backoffs, 0);
+        assert!(!c.encode_disarmed);
+    }
+
+    #[test]
+    fn a_network_driven_backoff_breaks_the_encode_streak() {
+        // Loss, a flush or a dropped frame explain a backoff without the encoder — and cutting
+        // the rate genuinely IS the remedy for those. Such a window must not count toward the
+        // disarm, even when encode time happens to be elevated in it too.
+        let mut c = BitrateController::new(20_000);
+        let start = Instant::now();
+        let mut tick = 0;
+        assert_eq!(encode_choke(&mut c, start, &mut tick, 20_000), Some(14_000));
+        c.on_ack(14_000);
+        assert_eq!(c.encode_backoff_us, 20_000);
+        // Re-seed so the encode signal is live again…
+        for _ in 0..BASELINE_MIN_WINDOWS {
+            let at = ticks(start, tick);
+            tick += 1;
+            assert_eq!(
+                c.on_window(
+                    at,
+                    0,
+                    0,
+                    Some(10_000),
+                    None,
+                    Some(7_000),
+                    1_000_000,
+                    false,
+                    0
+                ),
+                None
+            );
+        }
+        // …then a window carrying BOTH an encode excursion and a jump-to-live flush. The flush is
+        // the explanation, so the encode streak resets rather than advancing toward a disarm.
+        let at = ticks(start, tick);
+        assert_eq!(
+            c.on_window(
+                at,
+                0,
+                0,
+                Some(10_000),
+                None,
+                Some(20_000),
+                1_000_000,
+                true,
+                0
+            ),
+            Some(9_800)
+        );
+        assert_eq!(c.encode_backoff_us, 0);
+        assert_eq!(c.encode_noop_backoffs, 0);
+        assert!(!c.encode_disarmed);
     }
 
     #[test]
