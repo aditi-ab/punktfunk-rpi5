@@ -1762,8 +1762,8 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                  instead of building twice"
             );
             mode = m;
-            // Mirror the loop's rebuild: PyroWave's Automatic bitrate is a per-mode ~1.6 bpp pin, so
-            // a resolution change moves the operating point. Explicit client rates stay put.
+            // Mirror the loop's rebuild: PyroWave's bitrate is a per-mode ~1.6 bpp pin, so a
+            // resolution change moves the operating point (PyroWave is always Automatic — RFC §5.2).
             if bitrate_auto && plan.codec == crate::encode::Codec::PyroWave {
                 bitrate_kbps =
                     resolve_bitrate_kbps_for(plan.codec, 0, &mode, plan.chroma, plan.bit_depth);
@@ -2512,10 +2512,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             // new-mode frame — `build_pipeline` waits for it). Total lands in the shared
             // `resize_ms` slot (→ `session_status`); a failed rebuild abandons it silently.
             let resize_trace = crate::bringup::Trace::start("resize", resize_ms.clone());
-            // PyroWave's Automatic bitrate is a per-mode ~1.6 bpp pin (resolve_bitrate_kbps_for) —
-            // a resolution change moves the operating point (1080p→4K quadruples the pixel rate),
-            // so re-resolve it for the new mode. Explicit client rates stay put (the operator knows
-            // the link), and the H.26x codecs keep their mode-independent rate (ABR owns it).
+            // PyroWave's bitrate is a per-mode ~1.6 bpp pin (resolve_bitrate_kbps_for) — a
+            // resolution change moves the operating point (1080p→4K quadruples the pixel rate),
+            // so re-resolve it for the new mode (PyroWave is always Automatic — RFC §5.2). The
+            // H.26x codecs keep their mode-independent rate (ABR owns it).
             let mode_bitrate = if bitrate_auto && plan.codec == crate::encode::Codec::PyroWave {
                 resolve_bitrate_kbps_for(plan.codec, 0, &new_mode, plan.chroma, plan.bit_depth)
             } else {

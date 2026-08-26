@@ -399,7 +399,7 @@ final class SessionModel: ObservableObject {
         let hz = UInt32(clamping: effective.refreshHz)
         let compositor = PunktfunkConnection.Compositor(
             rawValue: UInt32(clamping: effective.compositor)) ?? .auto
-        let bitrateKbps = UInt32(clamping: effective.bitrateKbps)
+        var bitrateKbps = UInt32(clamping: effective.bitrateKbps)
         let audioChannels = UInt8(clamping: effective.audioChannels)
         // The audio format this session ASKS for — the user's choice, at every channel count.
         //
@@ -419,6 +419,15 @@ final class SessionModel: ObservableObject {
         let (audioRateHz, audioBits) = audioFormat.wire
         let hdrEnabled = effective.hdrEnabled
         let preferredCodec = PunktfunkConnection.codecByte(effective.codec)
+        // PyroWave is always Automatic bitrate (ABR overhaul RFC §5.2): a fixed kbps is
+        // ill-defined for the all-intra codec (bpp is the operating point) and used to bypass
+        // the host's operator ceiling — send 0 and let the host pin its per-mode rate. Gated
+        // like the advertisement below: a device that failed the Metal probe never offers the
+        // codec, falls back to H.26x, and the user's rate must survive there. The stored
+        // setting is untouched, so switching codecs back restores it.
+        if preferredCodec == PunktfunkConnection.codecPyroWave, MetalWaveletDecoder.supported {
+            bitrateKbps = 0
+        }
         let pin = host.pinnedSHA256
         // Capability gate (main-actor — screen APIs): only advertise HDR when this display can
         // actually present it, so the host sends a proper SDR stream to an SDR display rather than

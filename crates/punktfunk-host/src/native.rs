@@ -931,7 +931,13 @@ fn resolve_bitrate_kbps(requested: u32) -> u32 {
 /// an Automatic client (`0`) gets the codec's ~1.6 bpp operating point for the negotiated
 /// mode instead of the 20 Mbps H.26x default. The rate is then PINNED for the session:
 /// the client's ABR controller stays off for this codec and the host refuses mid-stream
-/// retargets. An explicit client rate is honored unchanged (the operator knows the link).
+/// retargets.
+///
+/// PyroWave ignores an explicit client rate too (ABR overhaul RFC §5.2): a fixed rate is
+/// ill-defined for an all-intra codec (bpp is the operating point, not kbps) and it used to
+/// bypass the `PUNKTFUNK_PYROWAVE_MAX_MBPS` operator ceiling. Clients grey the control out;
+/// this arm is the belt-and-braces for embedders that never update their UI. H.26x/AV1
+/// explicit rates are honored unchanged (the operator knows the link).
 fn resolve_bitrate_kbps_for(
     codec: crate::encode::Codec,
     requested: u32,
@@ -939,7 +945,14 @@ fn resolve_bitrate_kbps_for(
     chroma: crate::encode::ChromaFormat,
     bit_depth: u8,
 ) -> u32 {
-    if requested == 0 && codec == crate::encode::Codec::PyroWave {
+    if codec == crate::encode::Codec::PyroWave {
+        if requested != 0 {
+            tracing::warn!(
+                requested_kbps = requested,
+                "an explicit bitrate is ill-defined under PyroWave (all-intra bpp semantics) — \
+                 treating it as Automatic and resolving the per-mode pin"
+            );
+        }
         // ~1.6 bpp for 4:2:0. 4:4:4 doubles the samples per pixel (3 vs 1.5) but chroma
         // compresses better than luma → ×1.625 ≈ 2.6 bpp; 16-bit planes add ~15 % (both
         // factors measured against the Phase-0 fixture matrix, design/pyrowave-444-hdr.md).
@@ -976,7 +989,8 @@ fn resolve_bitrate_kbps_for(
 
 /// Operator ceiling for PyroWave's open-loop Automatic bitrate pin: `PUNKTFUNK_PYROWAVE_MAX_MBPS`
 /// (megabits/s) → kbps, or `None` when unset/zero/invalid (no cap — the raw bpp pin stands).
-/// Only consulted for `requested == 0` PyroWave sessions; an explicit client bitrate bypasses it.
+/// Consulted for every PyroWave session — an explicit client bitrate resolves through the
+/// pin too (RFC §5.2), so nothing bypasses the ceiling.
 fn pyrowave_auto_pin_ceiling_kbps() -> Option<u32> {
     std::env::var("PUNKTFUNK_PYROWAVE_MAX_MBPS")
         .ok()
@@ -2035,8 +2049,9 @@ async fn serve_session(
     });
     let bitrate_kbps = welcome.bitrate_kbps; // resolved encoder bitrate (Hello clamped, or default)
                                              // "Automatic" request: the resolved rate is a host default — for PyroWave a per-mode
-                                             // bpp pin the data plane re-resolves on a mid-stream mode switch.
-    let bitrate_auto = hello.bitrate_kbps == 0;
+                                             // bpp pin the data plane re-resolves on a mid-stream mode switch. PyroWave is Automatic
+                                             // unconditionally (`resolve_bitrate_kbps_for` overrode any explicit rate — RFC §5.2).
+    let bitrate_auto = hello.bitrate_kbps == 0 || codec == crate::encode::Codec::PyroWave;
     let bit_depth = welcome.bit_depth; // resolved encode bit depth (8, or 10 when negotiated)
                                        // Resolved chroma — derive the typed value back from the wire byte the Welcome carried (so the
                                        // session uses exactly what the client was told). `Yuv444` only when the handshake gate passed.
@@ -2501,7 +2516,8 @@ mod tests {
             ),
             (1920u64 * 1080 * 60 * 26 / 10 * 115 / 100 / 1000) as u32
         );
-        // An explicit client rate is honored (clamped like any other codec)...
+        // An explicit client rate is overridden to the same pin — a fixed kbps is ill-defined
+        // for the all-intra codec, and it used to skip the operator ceiling (RFC §5.2)...
         assert_eq!(
             resolve_bitrate_kbps_for(
                 crate::encode::Codec::PyroWave,
@@ -2510,7 +2526,7 @@ mod tests {
                 ChromaFormat::Yuv420,
                 8
             ),
-            130_000
+            1920 * 1080 * 60 * 16 / 10 / 1000
         );
         // ...and the H.26x codecs keep the legacy default.
         assert_eq!(
@@ -2559,10 +2575,11 @@ mod tests {
             resolve_bitrate_kbps_for(Codec::PyroWave, 0, &small, ChromaFormat::Yuv420, 8),
             1920 * 1080 * 60 * 16 / 10 / 1000
         );
-        // ...and an explicit client rate bypasses the ceiling entirely.
+        // ...and an explicit client rate no longer bypasses it: PyroWave resolves through the
+        // pin + ceiling whatever the Hello carried (RFC §5.2 — this bypass was the bug).
         assert_eq!(
             resolve_bitrate_kbps_for(Codec::PyroWave, 6_000_000, &mode, ChromaFormat::Yuv444, 10),
-            6_000_000
+            4_500_000
         );
         // SAFETY: as the set above — single writer, and the readers run on this thread.
         unsafe { std::env::remove_var("PUNKTFUNK_PYROWAVE_MAX_MBPS") };

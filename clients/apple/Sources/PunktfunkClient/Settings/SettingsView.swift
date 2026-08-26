@@ -450,15 +450,24 @@ struct SettingsView: View {
                     title: "Render scale",
                     options: RenderScale.presets.map { (label: RenderScale.label($0), tag: $0) },
                     selection: $renderScale)
-                TVSelectionRow(
-                    title: "Bitrate",
-                    options: SettingsOptions.bitrateOptions(current: bitrateKbps),
-                    selection: $bitrateKbps)
-                if bitrateKbps > 1_000_000 {
-                    Label(Self.gigabitWarning, systemImage: "exclamationmark.triangle.fill")
-                        .font(.geist(20, relativeTo: .caption)) // TV-legible caption size
-                        .foregroundStyle(.orange)
-                        .multilineTextAlignment(.center)
+                // PyroWave is always Automatic (ABR overhaul RFC §5.2): the session sends 0
+                // and the host pins a per-mode rate. tvOS has no codec picker, so this only
+                // fires on a codec synced from another device — but the row must not offer a
+                // rate the session ignores. The stored value is kept.
+                if codec == "pyrowave", MetalWaveletDecoder.supported {
+                    tvCaption("PyroWave sets its own rate from the stream mode — the bitrate "
+                        + "setting doesn't apply.")
+                } else {
+                    TVSelectionRow(
+                        title: "Bitrate",
+                        options: SettingsOptions.bitrateOptions(current: bitrateKbps),
+                        selection: $bitrateKbps)
+                    if bitrateKbps > 1_000_000 {
+                        Label(Self.gigabitWarning, systemImage: "exclamationmark.triangle.fill")
+                            .font(.geist(20, relativeTo: .caption)) // TV-legible caption size
+                            .foregroundStyle(.orange)
+                            .multilineTextAlignment(.center)
+                    }
                 }
                 TVSelectionRow(
                     title: "10-bit HDR",
