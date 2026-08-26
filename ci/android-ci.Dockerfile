@@ -46,7 +46,10 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --no-modify-path --profile minimal \
     && rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android \
-    && cargo install cargo-ndk --locked \
+    # Version-pinned like every other tool baked in here: unpinned, a rebuild months apart
+    # silently bakes a different cargo-ndk, and this one drives the shipped Android .so builds.
+    # crates.io is append-only with a checksummed index, so the version IS the pin. Bump freely.
+    && cargo install cargo-ndk@4.1.2 --locked \
     && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git" \
     && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME" \
     && rustc --version && cargo ndk --version
