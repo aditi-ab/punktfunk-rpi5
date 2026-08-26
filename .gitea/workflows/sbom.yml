@@ -34,7 +34,7 @@ jobs:
     steps:
       # fetch-depth 0: the dispatch path derives the canary base from the tag history
       # (scripts/ci/pf-version.sh), which a shallow clone cannot see.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       # Pinned syft (keep in sync with the version validated against this repo; bump deliberately).

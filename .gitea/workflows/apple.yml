@@ -156,7 +156,7 @@ jobs:
       gitea.event.pull_request.head.repo.fork != true
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Rust toolchain (self-healing on a fresh runner)
         run: |
@@ -220,7 +220,7 @@ jobs:
       TEAM_ID: F4H37KF6WC
       PROJECT: clients/apple/Punktfunk.xcodeproj
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Select release Xcode
         run: |
@@ -690,7 +690,7 @@ jobs:
     runs-on: macos-arm64
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Rust toolchain + iOS Simulator targets (+ nightly for the tvOS slices)
         run: |

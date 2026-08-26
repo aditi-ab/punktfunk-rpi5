@@ -27,7 +27,7 @@ jobs:
     runs-on: [self-hosted, gpu]
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Tier-3 GPU stream benchmark
         # Through the environment, not interpolated into the command line: a `${{ }}` expansion is
         # substituted before the shell parses the line, so an input carrying shell syntax would run

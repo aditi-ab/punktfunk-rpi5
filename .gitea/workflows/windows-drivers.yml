@@ -52,7 +52,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Probe driver toolchain (informational — never fails the job)
         continue-on-error: true
@@ -142,7 +142,7 @@ jobs:
       # (the shipping pack proves it). A 0.71-era layout-test overflow once needed LLVM 21; the 0.72 bump
       # retired that — see design/windows-build-and-packaging.md.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Ensure Windows toolchain (WDK, FFmpeg, Inno Setup, ARM64 target)
         # Shared self-provision step (also used by windows-client.yml/windows-host.yml) so
         # driver-build is self-sufficient on any windows-amd64 runner and never races a manually

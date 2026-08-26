@@ -78,9 +78,9 @@ jobs:
       image: 192.168.1.58:5010/punktfunk-rust-ci:latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Cache /usr/local/cargo so the cargo-audit binary (and the advisory DB clone) persist.
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             /usr/local/cargo/bin
@@ -119,7 +119,7 @@ jobs:
       - name: Install git + CA certs
         working-directory: /
         run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # `bun audit` queries the registry advisory DB for the versions pinned in the tree's
       # bun.lock. No install/build needed — it reads the manifest + lockfile. Fails the job on any
       # advisory, the same fail-on-vulnerability stance as cargo-audit above; triage a finding by
@@ -163,7 +163,7 @@ jobs:
       - name: Install git + CA certs
         working-directory: /
         run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: bun audit (non-blocking)
         run: bun audit || echo "::warning::docs-site has known advisories (CMS/UI + nitropack chains) — tracked in punktfunk-planning design/cra-readiness.md"
 
@@ -176,7 +176,7 @@ jobs:
       run:
         working-directory: clients/decky
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # decky is pnpm-managed (pnpm-lock.yaml lockfileVersion 9.0 → pnpm 10 reads it). Like
       # bun audit, `pnpm audit` needs no install/build — lockfile + registry advisory DB only.
       # --prod: rollup bundles only the prod deps into the shipped plugin; devDependencies are
@@ -197,8 +197,8 @@ jobs:
       image: 192.168.1.58:5010/punktfunk-rust-ci:latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             /usr/local/cargo/bin
@@ -291,21 +291,21 @@ jobs:
       #   sites; do not blanket-disable the check.
       MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-symbolic-alignment-check
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Two caches, split on purpose so a Cargo.lock change does not re-download a ~400 MB
       # toolchain. Both use their OWN `miri-` key prefix — never a shared one.
       # The Miri sysroot is per-toolchain and per-target (two are built here: host + MSVC), so it
       # belongs with the toolchain, not with the lockfile.
       - name: cache the nightly toolchain + Miri sysroots
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             /usr/local/rustup/toolchains/${{ env.MIRI_TOOLCHAIN }}-x86_64-unknown-linux-gnu
             ~/.cache/miri
           key: miri-toolchain-v1-${{ env.MIRI_TOOLCHAIN }}
       - name: cache the cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /usr/local/cargo/registry
           key: miri-registry-v1-${{ hashFiles('Cargo.lock') }}
@@ -412,17 +412,17 @@ jobs:
       # use it anyway. Keeps a future workflow-level sccache from becoming a puzzle.
       RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Own `san-` key prefixes — never shared with the miri caches, per the cache-poisoning
       # note there (and so an incomplete save from one job can never starve the other).
       - name: cache the nightly toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /usr/local/rustup/toolchains/${{ env.SAN_TOOLCHAIN }}-x86_64-unknown-linux-gnu
           key: san-toolchain-v1-${{ env.SAN_TOOLCHAIN }}
       - name: cache the cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /usr/local/cargo/registry
           key: san-registry-v1-${{ hashFiles('Cargo.lock') }}

@@ -48,7 +48,7 @@ jobs:
       image: 192.168.1.58:5010/punktfunk-rust-ci:latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
       # images; this heals the job while the running :latest predates the bake.
@@ -72,14 +72,14 @@ jobs:
       # it is profile-independent.
       - name: Cache keys
         run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             /usr/local/cargo/registry
             /usr/local/cargo/git
           key: cargo-home-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-home-
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           # This job builds RELEASE (see the build step) in the same image and target layout as

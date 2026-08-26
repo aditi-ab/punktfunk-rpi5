@@ -50,7 +50,7 @@ jobs:
     steps:
       - name: Prepare the container (${{ matrix.family }})
         run: ${{ matrix.prep }}
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # No tty → the script runs as --yes; --no-start because there is no user systemd here.
       # Root without sudo → the script's sudo shim, another path under test.
       - name: Run the installer unattended
