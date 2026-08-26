@@ -708,6 +708,10 @@ impl TabStrip {
     /// Draw the pills along the leading edge of `rect`'s top band, at the same
     /// [`EDGE_INSET`] the heading above them uses. Returns nothing — the caller already
     /// knows the band is [`TAB_STRIP_H`] tall.
+    ///
+    /// `focused` = the strip itself holds the D-pad focus (a remote with no shoulder
+    /// buttons steps onto it from the list's top row): the highlight brightens and grows
+    /// ‹ › chevrons, the same affordance a focused value row shows for left/right.
     #[allow(clippy::too_many_arguments)] // the crate's render signature, same as MenuList's
     pub(crate) fn render(
         &mut self,
@@ -715,6 +719,7 @@ impl TabStrip {
         rect: Rect,
         labels: &[&str],
         selected: usize,
+        focused: bool,
         fonts: &Fonts,
         k: f64,
         dt: f64,
@@ -770,10 +775,16 @@ impl TabStrip {
             canvas,
             Rect::from_xywh(ix as f32, top as f32, iw as f32, pill_h as f32),
             (pill_h / 2.0 / k) as f32,
-            Some(accent(0.85)),
-            PanelStroke::Plain(0.22),
+            Some(accent(if focused { 1.0 } else { 0.85 })),
+            PanelStroke::Plain(if focused { 0.5 } else { 0.22 }),
             k as f32,
         );
+        if focused {
+            // The focused value row's ‹ › affordance, on the strip: left/right travel here.
+            let cy = top + pill_h / 2.0;
+            chevron(canvas, ix - 9.0 * k, cy, 4.0 * k, true, 0.9);
+            chevron(canvas, ix + iw + 9.0 * k, cy, 4.0 * k, false, 0.9);
+        }
 
         let baseline = top + pill_h / 2.0 + size * 0.36;
         self.pills.clear();
@@ -1277,18 +1288,18 @@ mod tests {
         let dt = 1.0 / 60.0;
         // Seat on the first tab, then a 5-step burst at one press per frame — far faster
         // than the spring can settle, which is the whole point.
-        strip.render(surface.canvas(), rect, &TABS, 0, &fonts, 1.0, dt);
+        strip.render(surface.canvas(), rect, &TABS, 0, false, &fonts, 1.0, dt);
         let mut worst_left = f64::MAX;
         let mut worst_right = f64::MIN;
         for sel in 1..=5 {
-            strip.render(surface.canvas(), rect, &TABS, sel, &fonts, 1.0, dt);
+            strip.render(surface.canvas(), rect, &TABS, sel, false, &fonts, 1.0, dt);
             let (ix, iw) = strip.indicator.map(|(x, w)| (x.pos, w.pos)).unwrap();
             worst_left = worst_left.min(ix);
             worst_right = worst_right.max(ix + iw);
         }
         // Then let it land.
         for _ in 0..240 {
-            strip.render(surface.canvas(), rect, &TABS, 5, &fonts, 1.0, dt);
+            strip.render(surface.canvas(), rect, &TABS, 5, false, &fonts, 1.0, dt);
             let (ix, iw) = strip.indicator.map(|(x, w)| (x.pos, w.pos)).unwrap();
             worst_left = worst_left.min(ix);
             worst_right = worst_right.max(ix + iw);
@@ -1324,7 +1335,7 @@ mod tests {
         let mut run = |w: f32, k: f64| {
             let rect = Rect::from_xywh(0.0, 0.0, w, (TAB_STRIP_H * k) as f32);
             let mut strip = TabStrip::new();
-            strip.render(surface.canvas(), rect, &TABS, 0, &fonts, k, dt);
+            strip.render(surface.canvas(), rect, &TABS, 0, false, &fonts, k, dt);
             let first = strip.pill(0).expect("the first section was drawn");
             let last = strip
                 .pill(TABS.len() - 1)
