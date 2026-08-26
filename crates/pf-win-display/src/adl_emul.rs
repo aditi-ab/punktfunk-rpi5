@@ -406,6 +406,30 @@ pub fn run(action: EmulAction, connector_filter: Option<i32>) -> RunOutcome {
         return RunOutcome::InitFailed(recs);
     }
 
+    // What the filter below will see, one record per distinct (bus, vendor, present) — a probe
+    // that walks nothing must SAY why (first .173 run: 15 adapters enumerated, zero walked,
+    // zero explanation; "silence is not success" applies to the probe itself).
+    let mut seen_shapes: Vec<(i32, i32, i32)> = Vec::new();
+    for info in &infos {
+        let shape = (info.iBusNumber, info.iVendorID, info.iPresent);
+        if seen_shapes.contains(&shape) {
+            continue;
+        }
+        seen_shapes.push(shape);
+        rec(
+            "adl-adapter-seen",
+            &format!("bus{}", info.iBusNumber),
+            0,
+            ADL_OK,
+            format!(
+                "vendor_id={} present={} name={}",
+                info.iVendorID,
+                info.iPresent,
+                c_str(&info.strAdapterName).trim()
+            ),
+        );
+    }
+
     // One GPU surfaces as many logical adapters — probe each bus once, AMD-present only.
     let mut seen_buses: Vec<i32> = Vec::new();
     for info in &infos {
