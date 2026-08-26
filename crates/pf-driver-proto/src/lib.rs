@@ -822,6 +822,10 @@ pub mod gamepad {
     /// exclusively, so extra buttons declared here may be invisible to every consumer anyway.
     /// That needs measuring before it is built.
     pub const DEVTYPE_XBOX_ELITE: u8 = 6;
+    /// Steam Controller 2 ("Triton", 2026): wired identity `28DE:1302`. Raw-passthrough pad —
+    /// the host feeds the client's captured reports verbatim and the driver answers Steam's
+    /// feature query-dance in-driver (see the `triton` module).
+    pub const DEVTYPE_TRITON: u8 = 7;
 
     /// The value a gamepad driver writes into its section's `driver_proto` field once it attaches —
     /// the host's positive "driver is alive on this section" signal (health check + version audit).
@@ -1369,6 +1373,241 @@ pub mod gamepad {
         assert!(offset_of!(PadBootstrap, handle_pid) == 24);
         assert!(offset_of!(PadBootstrap, handle_seq) == 28);
     };
+}
+
+/// Steam Controller 2 (Triton) wire tables shared by the UMDF driver (answers Steam
+/// synchronously) and the host/inject side (Linux usbip leg + tests). Everything here is
+/// pure byte-packing so it tests on any host.
+pub mod triton {
+    /// Feature-1 command bytes of the Valve query dance.
+    pub const ID_GET_ATTRIBUTES_VALUES: u8 = 0x83;
+    pub const ID_GET_STRING_ATTRIBUTE: u8 = 0xAE;
+    pub const ID_GET_FIRMWARE_INFO: u8 = 0xF2;
+    /// Output report id Steam rumbles with (`80 | type | intensity16 | Lspeed16 Lgain | Rspeed16 Rgain`).
+    pub const ID_OUT_REPORT_HAPTIC_RUMBLE: u8 = 0x80;
+
+    /// The wired Steam Controller 2 identity (`28DE:1302`) — the Triton half of
+    /// [`crate::gamepad::DEVTYPE_TRITON`]'s `0x83` attributes reply.
+    const WIRED_PRODUCT: u32 = 0x1302;
+
+    /// Firmware build time (unix epoch) served as attribute tag `4`
+    /// (`ATTRIB_FIRMWARE_BUILD_TIME`, per SDL's `controller_constants.h` — the same tag map the
+    /// Phase-0 bench responder used) in the `0x83` attributes reply, and mirrored at bytes 4..8
+    /// of the `0xF2` firmware-info reply (the two carried the same value before this constant
+    /// existed and must keep doing so).
+    ///
+    /// BENCH FINDING (2026-08-21, the first Windows Steam claim): the previous synthetic value
+    /// (`unit_id ^ 0x0296_DAF9` ≈ Feb 2016) read as decade-old firmware and Steam offered to
+    /// "update" the virtual pad — a flow whose SET_REPORTs would be forwarded toward a REAL
+    /// controller on the client path, which nobody wants. The synthetic attributes are this
+    /// pad's permanent identity (the in-driver query dance answers Steam itself; a captured
+    /// physical pad's firmware version never reaches Steam), so the value is ours to pin.
+    /// `0x6A6D_3700` = 2026-08-01T00:00:00Z. Bump it when Steam learns a newer shipping
+    /// firmware and starts prompting again.
+    pub const FW_BUILD_TIME: u32 = 0x6A6D_3700;
+
+    /// Bit 31 of an out-ring slot's `len` marks the frame as a FEATURE set (vs interrupt/output).
+    /// Only the Triton devtype's producer (driver) and consumer (triton_windows drain) interpret
+    /// it; every other devtype writes plain lengths, so the bit is additive.
+    pub const OUT_FEATURE_BIT: u32 = 0x8000_0000;
+    #[inline]
+    pub const fn out_len(raw: u32) -> u32 {
+        raw & !OUT_FEATURE_BIT
+    }
+    #[inline]
+    pub const fn out_is_feature(raw: u32) -> bool {
+        raw & OUT_FEATURE_BIT != 0
+    }
+
+    /// Wire length (id byte included) of each input report the wired descriptor declares.
+    /// hidclass sizes its read buffer from the largest (0x42 → 54) and refuses over-long
+    /// completions, so the driver trims every served report to this. `None` = undeclared id,
+    /// drop it (0x47 is the BLE timestamp report — BLE-only, not in the 372-byte descriptor).
+    pub const fn input_len(report_id: u8) -> Option<usize> {
+        match report_id {
+            0x42 => Some(54),
+            0x45 => Some(46),
+            0x43 => Some(15),
+            0x44 => Some(6),
+            0x79 => Some(2),
+            0x7B => Some(13),
+            _ => None,
+        }
+    }
+
+    /// Declared wire length (id byte INCLUDED) of each OUTPUT report the wired descriptor
+    /// declares. The mirror of [`input_len`] for the write direction: hidclass pads every output
+    /// write to `OutputReportByteLength` (64) before the driver rings it, so the HOST trims each
+    /// drained OUTPUT frame to this before forwarding — the client replays the bare declared
+    /// payload over GATT, matching the Linux leg's native-length forwarding (a 0x80 rumble is
+    /// 10 bytes there, not 64). An unknown id returns 64 — no trim, never guess a length.
+    /// Provenance: the captured 372-byte descriptor ([`RDESC`]) plus the per-id output
+    /// characteristic map, verified per-actuator against real hardware (bench 2026-06-09).
+    pub const fn out_report_len(id: u8) -> usize {
+        match id {
+            0x80 => 10,
+            0x81 => 8,
+            0x82 => 4,
+            0x83 => 10,
+            0x84 => 9,
+            0x85 => 4,
+            0x86 => 4,
+            // 0x87/0x88/0x89 are declared full-length (63-byte payload) blobs.
+            _ => 64,
+        }
+    }
+
+    /// Per-pad unit id ("TRI\0" | index — same value the Linux leg uses).
+    pub const fn unit_id(index: u8) -> u32 {
+        0x5452_4900 | index as u32
+    }
+
+    /// ASCII serial `FVPF1302<idx:02>D03` — "FVPF" because Steam rejects a "PF"-leading
+    /// serial, and the FVPF prefix is what the host's physical-conflict gate excludes.
+    pub fn serial(index: u8, out: &mut [u8; 13]) {
+        const D: &[u8; 10] = b"0123456789";
+        out.copy_from_slice(b"FVPF130200D03");
+        out[8] = D[(index / 10 % 10) as usize];
+        out[9] = D[(index % 10) as usize];
+    }
+
+    /// The wired Triton's captured 372-byte report descriptor — MOVED VERBATIM from
+    /// crates/pf-inject/src/inject/proto/triton_proto.rs:52-85 (`TRITON_RDESC`), including its
+    /// comment block. Byte-identical to the Phase-0 sysfs capture (programmatically diffed).
+    #[rustfmt::skip]
+    pub static RDESC: [u8; 372] = [
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x40, 0x09, 0x01, 0xA1, 0x00,
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x02, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01,
+        0x95, 0x02, 0x81, 0x02, 0x75, 0x06, 0x95, 0x01, 0x81, 0x01, 0x05, 0x01,
+        0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x02,
+        0x81, 0x06, 0x95, 0x01, 0x09, 0x38, 0x81, 0x06, 0x05, 0x0C, 0x0A, 0x38,
+        0x02, 0x95, 0x01, 0x81, 0x06, 0xC0, 0xC0, 0x05, 0x01, 0x09, 0x06, 0xA1,
+        0x01, 0x85, 0x41, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25,
+        0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x81, 0x01, 0x19, 0x00, 0x29,
+        0x65, 0x15, 0x00, 0x25, 0x65, 0x75, 0x08, 0x95, 0x06, 0x81, 0x00, 0xC0,
+        0x06, 0x00, 0xFF, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x42, 0x15, 0x00, 0x26,
+        0xFF, 0x00, 0x75, 0x08, 0x95, 0x35, 0x09, 0x42, 0x81, 0x02, 0x85, 0x44,
+        0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x05, 0x09, 0x44, 0x81,
+        0x02, 0x85, 0x79, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x01,
+        0x09, 0x79, 0x81, 0x02, 0x85, 0x43, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75,
+        0x08, 0x95, 0x0E, 0x09, 0x43, 0x81, 0x02, 0x85, 0x7B, 0x15, 0x00, 0x26,
+        0xFF, 0x00, 0x75, 0x08, 0x95, 0x0C, 0x09, 0x7B, 0x81, 0x02, 0x85, 0x45,
+        0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x2D, 0x09, 0x45, 0x81,
+        0x02, 0x85, 0x80, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x09,
+        0x09, 0x80, 0x91, 0x02, 0x85, 0x81, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75,
+        0x08, 0x95, 0x07, 0x09, 0x81, 0x91, 0x02, 0x85, 0x82, 0x15, 0x00, 0x26,
+        0xFF, 0x00, 0x75, 0x08, 0x95, 0x03, 0x09, 0x82, 0x91, 0x02, 0x85, 0x83,
+        0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x09, 0x09, 0x83, 0x91,
+        0x02, 0x85, 0x84, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x08,
+        0x09, 0x84, 0x91, 0x02, 0x85, 0x85, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75,
+        0x08, 0x95, 0x03, 0x09, 0x85, 0x91, 0x02, 0x85, 0x86, 0x15, 0x00, 0x26,
+        0xFF, 0x00, 0x75, 0x08, 0x95, 0x03, 0x09, 0x86, 0x91, 0x02, 0x85, 0x87,
+        0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x3F, 0x09, 0x87, 0x91,
+        0x02, 0x85, 0x89, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x3F,
+        0x09, 0x89, 0x91, 0x02, 0x85, 0x88, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75,
+        0x08, 0x95, 0x3F, 0x09, 0x88, 0x91, 0x02, 0x85, 0x01, 0x95, 0x3F, 0x09,
+        0x01, 0xB1, 0x02, 0x85, 0x02, 0x95, 0x3F, 0x09, 0x01, 0xB1, 0x02, 0xC0,
+    ];
+
+    /// Build the reply to a feature GET_REPORT — the answer half of the Valve query dance. Steam's
+    /// `GetControllerInfo` SETs a query (`0x83` attributes / `0xAE` string) and then GETs the answer;
+    /// **the reply's command byte must echo the LAST SET's command** or Steam treats the pad as
+    /// broken and never adopts it (confirmed on-glass 2026-07-15: answering every GET with a serial
+    /// blob left the virtual pad unpicked). The frame rides feature report id **1**
+    /// (`[0x01][cmd][len][payload…]`, matching SDL's send framing for this device), and the `0x83`
+    /// blob carries the Triton's product id. The attribute VALUES beyond the product id mirror the
+    /// Deck's hidraw capture (same firmware family conventions) — replace them with a capture from
+    /// a physical pad if Steam still balks.
+    ///
+    /// `last_set` is the id-first SET payload (`[0x01, cmd, …]`); a stack that already stripped the
+    /// id byte (`[cmd, …]`, cmd ≥ 0x80) is handled too.
+    ///
+    /// MOVED VERBATIM from `crates/pf-inject/src/inject/proto/triton_proto.rs:290-365`
+    /// (fn `triton_feature_reply`) — do not re-derive it. Two mechanical fixups the move needed:
+    ///   (1) the body referenced the module const `TRITON_WIRED_PRODUCT` (triton_proto.rs:31) —
+    ///       repointed to this module's [`WIRED_PRODUCT`];
+    ///   (2) `ATTRIB_STR_UNIT_SERIAL` and the `ID_*` consts were declared INSIDE the fn body —
+    ///       the `ID_*` consts now come from this module (shadow-free); `ATTRIB_STR_UNIT_SERIAL`
+    ///       stays fn-local, since it isn't part of this module's public surface.
+    pub fn feature_reply(last_set: &[u8], serial: &str, unit_id: u32) -> [u8; 64] {
+        const ATTRIB_STR_UNIT_SERIAL: u8 = 0x01;
+
+        let body = match last_set {
+            [0x01, rest @ ..] => rest,
+            d => d,
+        };
+        let cmd = body.first().copied().unwrap_or(ID_GET_STRING_ATTRIBUTE);
+
+        let mut r = [0u8; 64];
+        r[0] = 0x01;
+        match cmd {
+            ID_GET_ATTRIBUTES_VALUES => {
+                // Captured controller response: 25-byte payload containing five id/u32 attributes.
+                r[1] = ID_GET_ATTRIBUTES_VALUES;
+                r[2] = 0x19;
+                let attrs = [
+                    (0x01, WIRED_PRODUCT),
+                    (0x02, 0),
+                    (0x0A, unit_id),
+                    // Tag 4 = ATTRIB_FIRMWARE_BUILD_TIME. Was `unit_id ^ 0x0296_DAF9` (≈ Feb
+                    // 2016 as an epoch) — Steam read it as ancient firmware and prompted to
+                    // update the virtual pad. See [`FW_BUILD_TIME`].
+                    (0x04, FW_BUILD_TIME),
+                    (0x09, 0x49),
+                ];
+                let mut o = 3;
+                for (id, val) in attrs {
+                    r[o] = id;
+                    r[o + 1..o + 5].copy_from_slice(&val.to_le_bytes());
+                    o += 5;
+                }
+            }
+            ID_GET_STRING_ATTRIBUTE => {
+                // Captured replies always declare 20 bytes: attribute id plus a 19-byte padded string.
+                let attr = body.get(2).copied().unwrap_or(ATTRIB_STR_UNIT_SERIAL);
+                let b = serial.as_bytes();
+                let len = b.len().min(19);
+                r[..4].copy_from_slice(&[0x01, ID_GET_STRING_ATTRIBUTE, 0x14, attr]);
+                r[4..4 + len].copy_from_slice(&b[..len]);
+            }
+            ID_GET_FIRMWARE_INFO => {
+                let index = body.get(2).copied().unwrap_or(0);
+                r[1] = ID_GET_FIRMWARE_INFO;
+                r[3] = index;
+                match index {
+                    0 => {
+                        r[2] = 0x29;
+                        // Mirrors the 0x83 reply's tag-4 attribute — the two build-time fields
+                        // carried the same value before [`FW_BUILD_TIME`] existed and must keep
+                        // agreeing (Steam may cross-check them).
+                        r[4..8].copy_from_slice(&FW_BUILD_TIME.to_le_bytes());
+                        r[8] = 0x49;
+                        r[12..24].copy_from_slice(b"603f69218a85");
+                        let b = serial.as_bytes();
+                        let len = b.len().min(16);
+                        r[28..28 + len].copy_from_slice(&b[..len]);
+                    }
+                    1 => {
+                        r[2] = 0x22;
+                        r[4..37].copy_from_slice(&[
+                            0x00, 0x57, 0xD0, 0x18, 0x6A, 0x37, 0x30, 0x35, 0x34, 0x32, 0x35, 0x37,
+                            0x64, 0x32, 0x64, 0x61, 0x37, 0x00, 0x00, 0x00, 0x00, 0x23, 0x00, 0x00,
+                            0x00, 0x00, 0x00, 0x00, 0x00, 0x33, 0x6D, 0x02, 0x00,
+                        ]);
+                    }
+                    _ => {
+                        r[2] = 0x09;
+                        r[4..12].copy_from_slice(&[0x7C, 0x4F, 0x01, 0x00, 0x01, 0, 0, 0]);
+                    }
+                }
+            }
+            _ => {
+                let n = body.len().min(63);
+                r[1..1 + n].copy_from_slice(&body[..n]);
+            }
+        }
+        r
+    }
 }
 
 /// Virtual-pointer shared-memory layout (host ↔ the UMDF HID-mouse minidriver `pf_mouse`).
@@ -2047,5 +2286,98 @@ mod tests {
         assert_eq!(DECK_PROOF_CMD.len(), 2);
         assert!(!DECK_PROOF_CMD.starts_with(&[0x83]) && !DECK_PROOF_CMD.starts_with(&[0xAE]));
         assert!(!DECK_PROOF_CMD.starts_with(&[0xEB]) && !DECK_PROOF_CMD.starts_with(&[0x8F]));
+    }
+
+    #[test]
+    fn triton_devtype_is_the_next_free_slot() {
+        assert_eq!(gamepad::DEVTYPE_TRITON, 7);
+    }
+
+    /// The GET reply echoes the LAST SET's command — the Valve query dance Steam's
+    /// GetControllerInfo runs; a mismatched command type makes Steam drop the pad
+    /// (on-glass 2026-07-15, and the Phase-0 static-zeros run looped forever).
+    #[test]
+    fn triton_feature_reply_echoes_the_queried_command() {
+        // Settings write (lizard-off) reads back as a mirror.
+        let set = [0x01, 0x87, 0x03, 0x09, 0x00, 0x00];
+        let r = triton::feature_reply(&set, "FVPF130200D03", 0x5452_4900);
+        assert_eq!(r[0], 0x01);
+        assert_eq!(&r[1..6], &[0x87, 0x03, 0x09, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn triton_feature_reply_synthesizes_attributes_for_0x83() {
+        let set = [0x01, 0x83, 0x00];
+        let r = triton::feature_reply(&set, "FVPF130200D03", 0x5452_4900);
+        assert_eq!(&r[..3], &[0x01, 0x83, 0x19]); // 25-byte TLV payload
+        assert_eq!(r[3], 0x01); // first attribute id: product id
+                                // Tag-4 TLV (ATTRIB_FIRMWARE_BUILD_TIME) carries FW_BUILD_TIME — the Bench-1 regression
+                                // pin: a stale epoch here makes Steam prompt to "update" the virtual pad's firmware.
+        assert_eq!(r[18], 0x04);
+        assert_eq!(r[19..23], triton::FW_BUILD_TIME.to_le_bytes());
+    }
+
+    #[test]
+    fn triton_firmware_info_build_time_agrees_with_the_attributes_reply() {
+        let set = [0x01, 0xF2, 0x00, 0x00];
+        let r = triton::feature_reply(&set, "FVPF130200D03", 0x5452_4900);
+        assert_eq!(&r[..4], &[0x01, 0xF2, 0x29, 0x00]);
+        // Bytes 4..8 mirror the 0x83 reply's tag-4 build time — Steam may cross-check the two.
+        assert_eq!(r[4..8], triton::FW_BUILD_TIME.to_le_bytes());
+    }
+
+    #[test]
+    fn triton_input_len_matches_the_descriptor() {
+        assert_eq!(triton::input_len(0x42), Some(54));
+        assert_eq!(triton::input_len(0x45), Some(46));
+        assert_eq!(triton::input_len(0x43), Some(15));
+        assert_eq!(triton::input_len(0x44), Some(6));
+        assert_eq!(triton::input_len(0x79), Some(2));
+        assert_eq!(triton::input_len(0x7B), Some(13));
+        assert_eq!(triton::input_len(0x47), None); // BLE-only id, not in the wired descriptor
+        assert_eq!(triton::input_len(0x01), None);
+    }
+
+    #[test]
+    fn triton_out_report_len_matches_the_descriptor_and_bench_table() {
+        assert_eq!(triton::out_report_len(0x80), 10);
+        assert_eq!(triton::out_report_len(0x81), 8);
+        assert_eq!(triton::out_report_len(0x82), 4);
+        assert_eq!(triton::out_report_len(0x83), 10);
+        assert_eq!(triton::out_report_len(0x84), 9);
+        assert_eq!(triton::out_report_len(0x85), 4);
+        assert_eq!(triton::out_report_len(0x86), 4);
+        assert_eq!(triton::out_report_len(0x87), 64);
+        assert_eq!(triton::out_report_len(0x88), 64);
+        assert_eq!(triton::out_report_len(0x89), 64);
+        // Undeclared ids stay whole (64 = no trim) — never guess a length.
+        assert_eq!(triton::out_report_len(0x00), 64);
+        assert_eq!(triton::out_report_len(0x8A), 64);
+    }
+
+    #[test]
+    fn triton_serial_shape_dodges_the_pf_prefix_rejection() {
+        let mut s = [0u8; 13];
+        triton::serial(3, &mut s);
+        assert_eq!(&s, b"FVPF130203D03");
+    }
+
+    #[test]
+    fn triton_rdesc_is_the_372_byte_capture() {
+        assert_eq!(triton::RDESC.len(), 372);
+        // Mouse TLC opens it: Usage Page Generic Desktop, Usage Mouse, Collection App, Report ID 0x40.
+        assert_eq!(
+            &triton::RDESC[..8],
+            &[0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x40]
+        );
+    }
+
+    #[test]
+    fn out_feature_bit_round_trips() {
+        let tagged = 64u32 | triton::OUT_FEATURE_BIT;
+        assert_eq!(triton::out_len(tagged), 64);
+        assert!(triton::out_is_feature(tagged));
+        assert!(!triton::out_is_feature(64));
+        assert_eq!(triton::out_len(64), 64);
     }
 }
