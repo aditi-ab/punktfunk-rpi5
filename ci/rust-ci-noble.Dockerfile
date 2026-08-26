@@ -47,7 +47,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # BSD-2 openh264 crate, NOT FFmpeg libx264) are all LGPL-compatible.
 # Sourced from the official FFmpeg GitHub mirror by release tag, NOT ffmpeg.org: the CI build network
 # can't reach ffmpeg.org (curl times out) but reaches github.com fine. The `nX.Y` tag pins the version
-# (n8.0 -> libavcodec 62); bump it to move FFmpeg. Immutable-tag clone, so no separate checksum needed.
+# (n8.0 -> libavcodec 62); bump it to move FFmpeg — together with the commit SHA it is pinned to below.
 #
 # STAYING ON 8.0 THROUGH THE 2026-08-08 FFmpeg-9 BUMP IS DELIBERATE. `ffmpeg-next` moved to 9, but a
 # crate major is a CEILING (ffmpeg-sys-next 9 spans libavcodec 56..63), so an 8.0 tree still compiles
@@ -57,16 +57,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # re-qualify the encode stack for every Ubuntu user and buy none of them anything, so it is its own
 # change — and it drags NVHDR_TAG and the soname assertion below along with it.
 ARG FFMPEG_TAG=n8.0
+# The COMMIT that tag points at. A git tag is MUTABLE — upstream can move one, and unlike a branch
+# nobody would notice — and these .so's are BUNDLED into the host .deb every Ubuntu user installs.
+# The clone below asserts HEAD against this, so a moved tag fails the build loudly instead of
+# shipping. Same shape as the bun/sccache sha256 pins: a mismatch stops the build, it does not
+# silently "fix" itself. Bump alongside FFMPEG_TAG:
+#   git ls-remote --tags https://github.com/FFmpeg/FFmpeg.git 'refs/tags/<new-tag>^{}'
+# Take the `^{}` line: these are ANNOTATED tags, so the bare ref is the tag OBJECT and the peeled
+# `^{}` is the commit — the commit is what a clone leaves at HEAD, and what this compares against.
+ARG FFMPEG_SHA=140fd653aed8cad774f991ba083e2d01e86420c7
 # nv-codec-headers must MATCH the FFmpeg version: its `master` is NVENC SDK 13, which renamed
 # NV_ENC_CLOCK_TIMESTAMP_SET.countingType -> countingTypeLSB and won't compile against FFmpeg 8.0's
 # nvenc.c. Pin the last SDK-12 tag (has the field FFmpeg 8.0 expects). Bump alongside FFMPEG_TAG.
 ARG NVHDR_TAG=n12.2.72.0
+# Commit for NVHDR_TAG, asserted after checkout — see FFMPEG_SHA above for why and how to bump:
+#   git ls-remote --tags https://github.com/FFmpeg/nv-codec-headers.git 'refs/tags/<new-tag>^{}'
+ARG NVHDR_SHA=c69278340ab1d5559c7d7bf0edf615dc33ddbba7
 RUN set -eux; \
     # nv-codec-headers: the NVENC/NVDEC headers FFmpeg's --enable-nvenc needs (headers only, no lib —
     # the driver is dlopen'd at runtime). Installs ffnvcodec.pc under /usr/local/lib/pkgconfig.
     git clone --depth 1 --branch "$NVHDR_TAG" https://github.com/FFmpeg/nv-codec-headers.git /tmp/nvhdr; \
+    test "$(git -C /tmp/nvhdr rev-parse HEAD)" = "$NVHDR_SHA" \
+      || { echo "error: nv-codec-headers $NVHDR_TAG is not $NVHDR_SHA — tag moved upstream" >&2; exit 1; }; \
     make -C /tmp/nvhdr install PREFIX=/usr/local; \
     git clone --depth 1 --branch "$FFMPEG_TAG" https://github.com/FFmpeg/FFmpeg.git /tmp/ffmpeg; \
+    test "$(git -C /tmp/ffmpeg rev-parse HEAD)" = "$FFMPEG_SHA" \
+      || { echo "error: FFmpeg $FFMPEG_TAG is not $FFMPEG_SHA — tag moved upstream" >&2; exit 1; }; \
     cd /tmp/ffmpeg; \
     PKG_CONFIG_PATH=/usr/local/lib/pkgconfig ./configure \
       --prefix=/opt/ffmpeg \
