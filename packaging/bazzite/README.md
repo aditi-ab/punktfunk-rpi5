@@ -41,6 +41,15 @@ that's the walkthrough to hand a user. Packager-side facts:
   OpenPGP signature from `packages@unom.io` (`AF245C506F4E4763`, the RPM signing key). The public
   key is baked into `punktfunk-sysext.sh`; the script refuses a feed it can't verify
   (`PUNKTFUNK_SYSEXT_ALLOW_UNSIGNED=1` is the documented escape hatch for pre-signing feeds).
+- `SHA256SUMS` opens with `# FEED <name>` and `# SERIAL <unix-ts>` **inside the signed bytes**, so
+  the signature says which feed and which publish it covers — a write:package token without the
+  signing key can otherwise copy a canary manifest into the stable path, or put last month's back,
+  and every box verifies it happily. `punktfunk-sysext` refuses a manifest that is unbound, is
+  bound to a different feed, or whose serial is below the highest it has accepted (persisted per
+  feed in `/var/lib/extensions/.punktfunk.serial-floor`, which survives `remove` on purpose).
+  `publish-sysext-feed.sh` stamps both on every publish; a feed published before binding existed
+  is bound by its next publish, or now with
+  `TOKEN=… bash packaging/bazzite/publish-sysext-feed.sh --seal f<ver>[-canary]`.
 - The image embeds `ID=fedora` + `VERSION_ID` (matched through Bazzite's `ID_LIKE`), so after a
   major rebase the old image is refused instead of merging soname-broken binaries; feeds exist
   per Fedora major, from the same CI matrix as the RPM groups.

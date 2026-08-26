@@ -68,6 +68,7 @@ pub enum ClipCoordCmd {
     /// clipboard; when disabled, it drops any selection it owns and stops forwarding host copies.
     SetEnabled(bool),
     /// The client copied: install its offered wire MIMEs as a lazy host selection (empty = clear).
+    /// Ignored while sync is off, so a revoked device's content never reaches the host clipboard.
     RemoteOffer { seq: u32, mimes: Vec<String> },
 }
 

@@ -50,7 +50,7 @@ mod cli {
 punktfunk — the Punktfunk client, headless
 
   punktfunk discover [--json] [--timeout SECS]
-  punktfunk pair <host[:port]> [--pin N] [--name LABEL]
+  punktfunk pair <host[:port]> [--pin N|-] [--name LABEL]
   punktfunk hosts list [--probe] [--json]
   punktfunk hosts add <host[:port]> [--name LABEL] [--fp HEX]
   punktfunk hosts forget <host-ref>
@@ -58,7 +58,7 @@ punktfunk — the Punktfunk client, headless
   punktfunk library <host-ref> [--json]
   punktfunk launch <host-ref> [--game ID] [--profile REF] [--request-access]
                               [--exec] [--fullscreen]
-  punktfunk open <punktfunk://…>
+  punktfunk open <punktfunk://…> [--yes]
   punktfunk reachable <host-ref>
   punktfunk speed-test <host-ref>
   punktfunk profiles list [--json]
@@ -98,7 +98,10 @@ address with `punktfunk hosts add` and it shows in `hosts list --probe`."
 punktfunk pair <host[:port]> — enrol this device with a host (PIN ceremony)
 
   --pin N       the PIN the host is showing; without it the command asks, and
-                refuses (exit 6) when there is no terminal to ask on
+                refuses (exit 6) when there is no terminal to ask on. The value
+                sits on argv, which every local user can read (/proc/*/cmdline)
+  --pin -       read the PIN from stdin instead (one line) — what a script or
+                another program should use, so the secret never hits argv
   --name LABEL  the label the host files this device under
                 (default: this machine's name)
 
@@ -187,7 +190,12 @@ Same parser and same refusal rules as clicking the link in a shell: a
 contradicted fingerprint refuses and says so, an ambiguous name refuses
 rather than guessing, and an unknown host is never trusted from a URL —
 that is a decision for a person, at a surface that can show the fingerprint
-(exit 6 points at `punktfunk pair`). --exec as in launch."
+(exit 6 points at `punktfunk pair`). --exec as in launch.
+
+A link that names its host by the stable record id opens straight away. One
+that names it by label or address is a guess anything could make, so it asks
+first; --yes answers for a script, and without a terminal it refuses (exit 6)
+rather than opening unasked."
             }
             "reachable" => {
                 "\
@@ -272,6 +280,11 @@ from the config directory for a true factory reset."
     /// Resolve a host reference the way every other surface does: stable id, then a unique
     /// name, then `addr[:port]` (design/client-deep-links.md §2). Sharing `resolve_host` is
     /// what keeps `punktfunk launch desk` and `punktfunk://connect/desk` from disagreeing.
+    ///
+    /// [`HostResolution::Confirm`] — a guessable reference — is accepted WITHOUT a prompt here,
+    /// and only here: this reference is an argument the user typed in their own terminal, so
+    /// there is nobody else to confirm it with. The guessable-reference rule exists for URLs
+    /// handed to us by someone else; that path is `open`, which does ask.
     fn resolve(reference: &str) -> Result<(KnownHosts, usize), u8> {
         let known = KnownHosts::load();
         let link = DeepLink {
@@ -279,7 +292,7 @@ from the config directory for a true factory reset."
             ..Default::default()
         };
         match deeplink::resolve_host(&link, &known) {
-            HostResolution::Known(i) => Ok((known, i)),
+            HostResolution::Known(i) | HostResolution::Confirm(i) => Ok((known, i)),
             HostResolution::Ambiguous => {
                 eprintln!(
                     "more than one saved host is called \"{reference}\" — use its address or id"
@@ -459,30 +472,33 @@ from the config directory for a true factory reset."
             })
     }
 
-    /// `pair <host[:port]> [--pin N]` — the SPAKE2 ceremony. Without `--pin` it prompts, which
+    /// `pair <host[:port]> [--pin N|-]` — the SPAKE2 ceremony. Without `--pin` it prompts, which
     /// is the interactive shape; with one it is scriptable. Refuses rather than prompting when
     /// stdin isn't a terminal and no PIN was given: a pairing that silently blocks a CI job
     /// forever is worse than an exit code.
+    ///
+    /// `--pin -` reads the PIN from stdin instead. A value on argv is readable by every local
+    /// user (`/proc/*/cmdline` is world-readable on every distro we target) and the PIN is the
+    /// only secret binding the ceremony to the operator's intent, so programmatic callers — the
+    /// Decky backend among them — pipe it in rather than spelling it on the command line.
     fn pair(args: &[String]) -> u8 {
         let Some(target) = positional(args, 0) else {
-            eprintln!("usage: punktfunk pair <host[:port]> [--pin N]");
+            eprintln!("usage: punktfunk pair <host[:port]> [--pin N|-]");
             return UNRESOLVED;
         };
         let (addr, port) = split_host_port(&target);
-        let pin = match value(args, "--pin") {
-            Some(p) => p,
+        let pin = match value(args, "--pin").as_deref() {
+            Some("-") => read_pin(None),
+            Some(p) => Some(p.to_string()),
+            None if is_tty() => read_pin(Some(&addr)),
             None => {
-                if !is_tty() {
-                    eprintln!("no --pin and no terminal to ask on");
-                    return NEEDS_INTERACTION;
-                }
-                eprint!("PIN shown on {addr}: ");
-                let mut line = String::new();
-                if std::io::stdin().read_line(&mut line).is_err() {
-                    return NEEDS_INTERACTION;
-                }
-                line.trim().to_string()
+                eprintln!("no --pin and no terminal to ask on");
+                return NEEDS_INTERACTION;
             }
+        };
+        let Some(pin) = pin else {
+            eprintln!("no PIN on stdin");
+            return NEEDS_INTERACTION;
         };
         let identity = match trust::load_or_create_identity() {
             Ok(i) => i,
@@ -898,6 +914,31 @@ from the config directory for a true factory reset."
         );
         match outcome {
             Ok(PlanOutcome::Connect(plan)) => run_plan(*plan, has(args, "--exec"), false),
+            // The link named the host by something GUESSABLE — its label, its address — rather
+            // than by its record id. A URL handed to us by someone else may not dial on a guess,
+            // so a person says yes first. `--yes` is the scripted escape (and the only way in
+            // without a terminal to ask on).
+            Ok(PlanOutcome::ConfirmConnect(plan)) => {
+                if !has(args, "--yes") {
+                    if !is_tty() {
+                        eprintln!(
+                            "that link names {} by label or address, not by its id — re-run with \
+                             --yes to open it",
+                            plan.host.name
+                        );
+                        return NEEDS_INTERACTION;
+                    }
+                    eprint!("Connect to {} ({})? [y/N] ", plan.host.name, plan.host.addr);
+                    let mut line = String::new();
+                    if std::io::stdin().read_line(&mut line).is_err()
+                        || !line.trim().eq_ignore_ascii_case("y")
+                    {
+                        eprintln!("cancelled");
+                        return OK;
+                    }
+                }
+                run_plan(*plan, has(args, "--exec"), false)
+            }
             // A URL may never pair or trust on its own — that is a decision for a person, at a
             // surface that can show them the fingerprint.
             Ok(PlanOutcome::ConfirmUnknown(u)) => {
@@ -1049,7 +1090,11 @@ from the config directory for a true factory reset."
             ..Default::default()
         };
         let (addr, port) = match deeplink::resolve_host(&link, &known) {
-            HostResolution::Known(i) => (known.hosts[i].addr.clone(), known.hosts[i].port),
+            // Nothing is dialled and no title is launched, so a guessable reference needs no
+            // confirmation — it only picks which address to send one probe packet to.
+            HostResolution::Known(i) | HostResolution::Confirm(i) => {
+                (known.hosts[i].addr.clone(), known.hosts[i].port)
+            }
             _ => split_host_port(&reference),
         };
         if punktfunk_core::client::NativeClient::probe(&addr, port, PROBE_TIMEOUT) {
@@ -1220,6 +1265,19 @@ from the config directory for a true factory reset."
         std::io::IsTerminal::is_terminal(&std::io::stdin())
     }
 
+    /// One line of PIN from stdin — prompted when we're asking a person, silent for `--pin -`
+    /// (a pipe from another program). `None` on a read error or an empty line (EOF), which the
+    /// caller turns into [`NEEDS_INTERACTION`] rather than sending an empty PIN to the host.
+    fn read_pin(prompt_for: Option<&str>) -> Option<String> {
+        if let Some(addr) = prompt_for {
+            eprint!("PIN shown on {addr}: ");
+        }
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok()?;
+        let pin = line.trim();
+        (!pin.is_empty()).then(|| pin.to_string())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1250,6 +1308,16 @@ from the config directory for a true factory reset."
                 Some("10.0.0.1".into())
             );
             assert_eq!(positional(&argv(&["--json"]), 0), None);
+            // `--pin -` (the PIN comes down stdin, never argv): the lone dash is that flag's
+            // VALUE, not the host to pair with.
+            assert_eq!(
+                positional(&argv(&["--pin", "-", "desk"]), 0),
+                Some("desk".into())
+            );
+            assert_eq!(
+                value(&argv(&["desk", "--pin", "-"]), "--pin"),
+                Some("-".into())
+            );
         }
 
         #[test]

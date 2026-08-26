@@ -751,7 +751,9 @@ themselves within a minute. The service commands need an **elevated** PowerShell
 3. **The console page never loads.** The service restarts the console on any failure, so give it a
    minute first. If it stays down, the console's own log says why — check
    `%ProgramData%\punktfunk\logs\web.log` (and `service.log` next to it, which records every console
-   start and exit), then restart the service:
+   start and exit). Those files are readable only by Administrators and SYSTEM, so open them from an
+   **elevated** PowerShell — `Get-Content -Tail 50 $env:ProgramData\punktfunk\logs\web.log` — then
+   restart the service:
 
    ```powershell
    punktfunk-host service restart
@@ -800,7 +802,10 @@ The same output also lands outside the console — on Linux in the journal
 (`journalctl --user -u punktfunk-host`), on Windows in `%ProgramData%\punktfunk\logs\host.log` (plus
 `service.log` for the service that supervises it). Those *do* follow the log level: raise it with
 `RUST_LOG=debug` in [`host.env`](/docs/configuration) and restart the host. `RUST_LOG=info` is
-already the default, so setting it changes nothing.
+already the default, so setting it changes nothing. The Windows files are readable only by
+Administrators and SYSTEM — a normal editor is refused even on an admin account, because Windows
+hands it a filtered token — so open them from an **elevated** PowerShell, or stay on the **Logs**
+page above, which needs no elevation.
 
 None of that covers the **client** side. If the picture, the decoder or the presenter is what
 failed, the Windows client keeps its own log at `%LOCALAPPDATA%\punktfunk\logs\client.log` (rotated

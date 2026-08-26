@@ -15,15 +15,31 @@
 //! the owning plugin at the moment of an actual launch. What that buys over letting the plugin write
 //! `kind = "command"` straight into the library:
 //!
-//! * **A stolen plugin token is no longer command execution.** Planting an entry is not enough — the
-//!   host asks the *live registered plugin* what to run, authenticated with the per-boot secret only
-//!   that process knows. A plugin asked about an entry it never published answers 404 (this is why
-//!   the ask names the entry rather than trusting the payload), so a forged entry launches nothing.
+//! * **An entry planted under someone ELSE'S provider launches nothing.** The provider is stamped by
+//!   the host from the reconcile URL, so the plugin asked is the entry's owner, and a plugin asked
+//!   about an entry it never published answers 404 (this is why the ask names the entry rather than
+//!   trusting the payload).
 //! * **Nothing executable is ever persisted or served.** No command lands in `library.json`, and
 //!   `GET /library` has none to redact for a paired client.
 //! * **No stale recipes.** The same reasoning as the `xbox` kind resolving its AUMID at launch time:
 //!   an emulator that moved, or a config the operator has since edited, is picked up on the next
 //!   launch instead of leaving an unlaunchable tile behind.
+//!
+//! What it does **not** buy — and this doc claimed it did until the 2026-08-25 review (H-1) — is a
+//! barrier against a stolen plugin token. That one credential also reaches `PUT /api/v1/plugins/{id}`
+//! for *any* id, and a registration names the loopback port and the per-boot secret the host will
+//! dial: a holder stands up its own listener, registers a provider around it, reconciles a `plugin`
+//! entry under that provider, and answers the ask with whatever it likes. The per-boot secret proves
+//! the host reached whoever registered that id, not that they were entitled to it.
+//!
+//! There is no per-plugin credential to bind it to, either: the runner hosts every plugin as a fiber
+//! in ONE bun process (`sdk/src/runner.ts` `import()`s each unit), reading one shared `plugin-token`,
+//! so no token can name a single plugin. Nor would one help — this kind exists so that a plugin MAY
+//! choose a command the host runs, so an id proven beyond doubt buys the same primitive. What is
+//! load-bearing is the principal gap: on Windows the runner is LocalService and the host is SYSTEM,
+//! so whatever can read the LocalService-readable `plugin-token` escalates through here. Closing it
+//! means running the answer as the runner's principal (which gives up the session placement below)
+//! or a process per plugin — a runner redesign, not a change to this transport.
 //!
 //! The host still *runs* the command, because only the host can put the process where the stream can
 //! see it: on Linux the line is either gamescope's own argv (a bare-spawn session nests it) or a
@@ -319,8 +335,8 @@ mod tests {
 
     #[test]
     fn a_404_means_the_plugin_disowns_the_entry() {
-        // The forged-entry case: planting a library row is not enough, because the plugin that would
-        // have to answer for it never published one.
+        // The cross-provider case: a row planted under someone else's provider launches nothing,
+        // because that provider's plugin is the one asked and it never published the key.
         let (port, server) = stub_plugin(404, r#"{"error":"no launchable entry \"forged\""}"#);
         crate::mgmt::register_ui_for_test("stub-disowner", port, "s");
 

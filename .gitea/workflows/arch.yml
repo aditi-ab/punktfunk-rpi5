@@ -115,10 +115,12 @@ jobs:
             git nodejs rust clang cmake ninja nasm pkgconf python vulkan-headers \
             gtk4 libadwaita sdl3 ffmpeg pipewire wayland libxkbcommon opus libei \
             mesa libglvnd unzip libarchive || echo "::warning::pacman guard failed (stale image db?) — proceeding with baked packages"
-          command -v bun >/dev/null || {
-            curl -fsSL https://bun.sh/install | bash
-            install -m0755 "$HOME/.bun/bin/bun" /usr/local/bin/bun
-          }
+          # Arch ships bun in [extra], so the bootstrap takes the pacman-signed package instead of
+          # piping bun.sh's installer into root's shell — this job builds and publishes the package,
+          # and the installer would be upstream code choosing bytes we then ship. Kept behind the
+          # `command -v` guard rather than folded into the list above: the image's baked bun is not
+          # in pacman's db, so `--needed` cannot see it and would re-download bun on every run.
+          command -v bun >/dev/null || pacman -S --noconfirm --needed bun
           bun --version
 
       # THE BUILDER'S FFmpeg IS PART OF THE PACKAGE CONTRACT, not merely a build detail.

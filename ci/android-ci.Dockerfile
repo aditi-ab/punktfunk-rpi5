@@ -46,16 +46,26 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --no-modify-path --profile minimal \
     && rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android \
-    && cargo install cargo-ndk --locked \
+    # Version-pinned like every other tool baked in here: unpinned, a rebuild months apart
+    # silently bakes a different cargo-ndk, and this one drives the shipped Android .so builds.
+    # crates.io is append-only with a checksummed index, so the version IS the pin. Bump freely.
+    && cargo install cargo-ndk@4.1.2 --locked \
     && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git" \
     && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME" \
     && rustc --version && cargo ndk --version
 
 # Shared compile cache: jobs set RUSTC_WRAPPER=sccache (backend = RustFS S3 on the LAN,
 # see .gitea/workflows — the env lives there so dev use of this image stays uncached).
+# Checked by SHA-256, like the bun pin: sccache is RUSTC_WRAPPER, so it sits in front of every
+# rustc invocation that produces a SHIPPED binary. Bump SCCACHE_VERSION and SCCACHE_SHA together —
+# upstream publishes the sum as <asset>.tar.gz.sha256 next to the release asset.
 ARG SCCACHE_VERSION=0.10.0
-RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-    | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache' \
+ARG SCCACHE_SHA=1fbb35e135660d04a2d5e42b59c7874d39b3deb17de56330b25b713ec59f849b
+RUN curl -fsSL -o /tmp/sccache.tar.gz \
+      "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    && echo "${SCCACHE_SHA}  /tmp/sccache.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/sccache.tar.gz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache' \
+    && rm -f /tmp/sccache.tar.gz \
     && sccache --version
 
 # actions/checkout (and every other JS action: cache, upload-artifact) execs `node` INSIDE

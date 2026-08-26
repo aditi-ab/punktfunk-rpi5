@@ -4,6 +4,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.ui.graphics.vector.ImageVector
+import io.unom.punktfunk.kit.security.KnownHost
 
 /** Bottom-bar destinations (the immersive stream view is shown full-screen, outside the bar). */
 enum class Tab(val label: String, val icon: ImageVector) {
@@ -36,6 +37,22 @@ data class PendingTrust(
 ) {
     enum class Kind { TRUST_NEW, FP_CHANGED, PAIR, REQUEST_ACCESS }
 }
+
+/**
+ * A `punktfunk://` link that named a saved host by something GUESSABLE — its display name or its
+ * address — instead of by its stable record id, waiting for the user's OK before it dials.
+ *
+ * MainActivity is exported with a BROWSABLE `punktfunk://` filter, so any app or web page can emit
+ * `punktfunk://connect/Gaming%20PC?launch=steam:570`; guessing a label must not be enough to start
+ * a stream and boot a game. A link that names the record id (the shortcuts this app emits) still
+ * connects on its own. [profile] and [launch] are the link's, carried across the detour exactly as
+ * [PendingTrust] carries them.
+ */
+data class PendingLinkConnect(
+    val host: KnownHost,
+    val profile: String? = null,
+    val launch: String? = null,
+)
 
 /**
  * A stream session that just opened, and the state the stream screen needs about it.

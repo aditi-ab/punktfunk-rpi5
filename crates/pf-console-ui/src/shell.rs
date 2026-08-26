@@ -1310,10 +1310,8 @@ impl Shell {
             self.mesh_scrim[2],
             self.mesh_scrim[3],
         ];
-        // SAFETY: `uniforms` is a local `[f32; 12]` — exactly 48 bytes — and `f32` has no padding
-        // or invalid bit patterns, so reading it as bytes is sound; the slice is copied by
-        // `Data::new_copy` before `uniforms` goes out of scope.
-        let bytes = unsafe { std::slice::from_raw_parts(uniforms.as_ptr().cast::<u8>(), 48) };
+        let words = uniforms.map(f32::to_ne_bytes);
+        let bytes = words.as_flattened();
         match self.mesh.make_shader(Data::new_copy(bytes), &[], None) {
             Some(shader) => {
                 let mut paint = crate::theme::shaded();

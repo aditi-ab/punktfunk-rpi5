@@ -327,16 +327,22 @@ public struct DeepLink: Equatable, Sendable {
     }
 
     /// Resolve this link's host reference against the local store, in the documented order:
-    /// stable record id → unique case-insensitive name → `addr[:port]` literal. The `host=`
-    /// parameter is the recovery path — a self-emitted shortcut that outlived the record it was
-    /// written from still lands on the right box (degraded to the confirmation sheet).
+    /// stable record id → unique case-insensitive name → `addr[:port]` literal, then the `host=`
+    /// recovery path — a self-emitted shortcut that outlived the record it was written from still
+    /// lands on the right box.
+    ///
+    /// Only the record id is UNGUESSABLE, so only the record id resolves to `.known`, the silent
+    /// one-click contract. A display name is an mDNS instance name or a user label ("Gaming PC")
+    /// and an address is a LAN address: anything that can open a URL can guess those, and a guess
+    /// must not be able to start a stream (or launch a title). They resolve to `.confirm` — the
+    /// same host, behind the user's OK.
     public func resolveHost(in hosts: [StoredHost]) -> HostResolution {
         let reference = hostRef.lowercased()
         if let match = hosts.first(where: { $0.id.uuidString.lowercased() == reference }) {
             return .known(match)
         }
         let byName = hosts.filter { !$0.name.isEmpty && $0.name.lowercased() == reference }
-        if byName.count == 1 { return .known(byName[0]) }
+        if byName.count == 1 { return .confirm(byName[0]) }
         if byName.count > 1 { return .ambiguous }
         // `addr[:port]` literal, then the `host=` recovery parameter — both matched the way every
         // other per-host lookup in the client matches. The literal is only considered when the
@@ -347,7 +353,7 @@ public struct DeepLink: Equatable, Sendable {
             if let match = hosts.first(where: {
                 $0.address == candidate.address && $0.port == candidate.port
             }) {
-                return .known(match)
+                return .confirm(match)
             }
         }
         guard let target = literal ?? host else { return .unresolvable }
@@ -356,8 +362,13 @@ public struct DeepLink: Equatable, Sendable {
 
     /// What the local host store made of a link's references.
     public enum HostResolution: Equatable, Sendable {
-        /// A record we already have (subject to `pinConflict`).
+        /// A record we already have, named by its stable (unguessable) id: the one-click contract
+        /// (subject to `pinConflict`).
         case known(StoredHost)
+        /// The same record, named by something GUESSABLE — its display name, its address, or the
+        /// `host=` recovery parameter. A link may not act on a guess, so this one waits for the
+        /// user's confirmation; past that it is the `.known` path exactly.
+        case confirm(StoredHost)
         /// No record, but the link says where to dial: the confirmation sheet's input, from which
         /// the normal pairing flow proceeds under the user's eyes. Never an auto-connect.
         case unknown(address: String, port: UInt16, name: String?, fp: String?)

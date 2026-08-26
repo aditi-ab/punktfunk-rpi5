@@ -50,15 +50,23 @@ pub(super) async fn pair_ceremony(
     let (pake, spake_b) = pake::start(false, pin, &client_fp, host_fp);
     let confirms = pake.finish(&req.spake_a)?; // Err only on a malformed peer message
 
-    io::write_msg(
-        &mut send,
-        &PairChallenge {
-            spake_b,
-            confirm: confirms.host,
-        }
-        .encode(),
+    // Bounded: this write completes only when the CLIENT grants flow-control credit, so a client
+    // that advertises a tiny `stream_receive_window` could otherwise park the ceremony here for as
+    // long as it liked — on a host that serves pairings one at a time, and past the armed window's
+    // TTL (2026-08-25 review).
+    tokio::time::timeout(
+        PAIRING_TIMEOUT,
+        io::write_msg(
+            &mut send,
+            &PairChallenge {
+                spake_b,
+                confirm: confirms.host,
+            }
+            .encode(),
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| anyhow!("pairing timed out sending the challenge"))??;
 
     // SINGLE-USE PIN: we've now sent the host key-confirmation, which lets the client TEST this one
     // guess (a right PIN → its proof will match; a wrong PIN → the client detects the mismatch and
@@ -71,9 +79,9 @@ pub(super) async fn pair_ceremony(
     // signal to scope this to failures only (the client just disconnects).
     //
     // The armed window carries the operator's access choice for whoever completes this ceremony
-    // (design §5.7) — read it BEFORE the consume below wipes it with the rest of the window.
-    let access = np.armed_access();
-    np.disarm();
+    // (design §5.7) — read it BEFORE the consume wipes it with the rest of the window, and refuse
+    // outright if the window lapsed while we were writing.
+    let access = consume_window(np, pin)?;
 
     let proof = tokio::time::timeout(PAIRING_TIMEOUT, io::read_msg(&mut recv))
         .await
@@ -92,7 +100,13 @@ pub(super) async fn pair_ceremony(
     } else {
         tracing::warn!(name = %name, "pairing rejected (wrong PIN) — fingerprint not stored");
     }
-    io::write_msg(&mut send, &PairResult { ok }.encode()).await?;
+    // Bounded for the same reason as the challenge write above.
+    tokio::time::timeout(
+        PAIRING_TIMEOUT,
+        io::write_msg(&mut send, &PairResult { ok }.encode()),
+    )
+    .await
+    .map_err(|_| anyhow!("pairing timed out sending the result"))??;
     let _ = send.finish();
     // Wait for the client to acknowledge by closing, so the PairResult isn't dropped by our
     // close on a slow link (bounded so a vanished client can't wedge the sequential host).
@@ -100,4 +114,90 @@ pub(super) async fn pair_ceremony(
     conn.close(0u32.into(), b"pairing done");
     anyhow::ensure!(ok, "pairing rejected (wrong PIN)");
     Ok(())
+}
+
+/// Consume the armed window this ceremony is running against: its access choice, plus the proof
+/// that the window is STILL the one whose PIN we started with. `Err` ⇒ it lapsed while the ceremony
+/// was in flight (expired, disarmed, or the operator re-armed) — mint nothing, and leave whatever
+/// window is armed *now* untouched, so a stalling client can't wipe the operator's next one.
+///
+/// The order is the security property: the access choice is read BEFORE the PIN is re-checked, so
+/// an expiry landing between the two reads fails CLOSED (no choice AND no PIN ⇒ refused). Reading
+/// them the other way round would fail OPEN — [`NativePairing::add_with_access`] reads an absent
+/// choice as the full/permanent default, which is exactly what an expired "controller only, 4
+/// hours" window must never become.
+fn consume_window(np: &NativePairing, pin: &str) -> Result<Option<crate::native_pairing::Access>> {
+    let access = np.armed_access();
+    anyhow::ensure!(
+        np.current_pin().as_deref() == Some(pin),
+        "the pairing window lapsed while the ceremony was running"
+    );
+    np.disarm();
+    Ok(access)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_pairing::Access;
+    use std::time::Duration;
+
+    fn temp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "pf-native-ceremony-{tag}-{}.json",
+            std::process::id()
+        ))
+    }
+
+    fn controller_4h() -> Access {
+        Access {
+            grants: punktfunk_core::quic::GRANT_PRESET_CONTROLLER_ONLY,
+            expires_unix: Some(4 * 3600),
+        }
+    }
+
+    /// A window that lapses mid-ceremony mints NOTHING. Without the re-check the ceremony read an
+    /// expired window as "no access choice", and `add_with_access(.., None)` turns that into full,
+    /// permanent control for a new fingerprint — the operator's "controller only, 4 h" silently
+    /// upgraded by a client that stalled the host's write past the TTL (2026-08-25 review).
+    #[test]
+    fn expired_window_mints_no_grant() {
+        let p = temp("expired");
+        let _ = std::fs::remove_file(&p);
+        let np = NativePairing::load_with(Some(p.clone()), None, false).unwrap();
+
+        // Live window: the operator's choice comes through, and the window is consumed.
+        let pin = np.arm_for(Duration::from_secs(60), None, Some(controller_4h()));
+        assert_eq!(consume_window(&np, &pin).unwrap(), Some(controller_4h()));
+        assert!(np.current_pin().is_none(), "single-use: window consumed");
+
+        // Lapsed window (a zero TTL is already past by the time it is read): refuse, rather than
+        // fall through to the full/permanent default.
+        let pin = np.arm_for(Duration::ZERO, None, Some(controller_4h()));
+        assert!(consume_window(&np, &pin).is_err());
+
+        // A window the operator re-armed while the ceremony ran is somebody else's: refuse, and
+        // do NOT disarm it — otherwise a stalling client wipes every window that follows.
+        let stale = np.arm_for(Duration::ZERO, None, Some(controller_4h()));
+        // The PIN is random, so re-arm until it actually differs (1-in-10 000 otherwise).
+        let mut fresh = np.arm_for(Duration::from_secs(60), None, Some(controller_4h()));
+        while fresh == stale {
+            fresh = np.arm_for(Duration::from_secs(60), None, Some(controller_4h()));
+        }
+        assert!(consume_window(&np, &stale).is_err());
+        assert_eq!(np.current_pin().as_deref(), Some(fresh.as_str()));
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The CLI `--allow-pairing` window carries no access choice and no expiry: `None` there is the
+    /// legitimate full/permanent default, not an expired window, and must still pair.
+    #[test]
+    fn choiceless_window_still_pairs() {
+        let p = temp("choiceless");
+        let _ = std::fs::remove_file(&p);
+        let np = NativePairing::load_with(Some(p.clone()), Some("4321".into()), true).unwrap();
+        assert_eq!(consume_window(&np, "4321").unwrap(), None);
+        let _ = std::fs::remove_file(&p);
+    }
 }

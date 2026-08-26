@@ -70,7 +70,9 @@ class DeepLinkVectorTest {
  * Resolution and emission — the half the vector file can't cover, because it depends on what is in
  * THIS device's host store. The rules are the one-click contract in resolution form: an id beats a
  * name beats an address, an ambiguous name refuses rather than guesses, and a link whose record is
- * gone still lands on the confirmation sheet via `host=`+`fp=` instead of dying.
+ * gone still lands on the confirmation sheet via `host=`+`fp=` instead of dying. Only the id — the
+ * one reference nothing can guess — dials on its own; a name or an address resolves to the same
+ * host behind a confirmation.
  */
 class DeepLinkResolutionTest {
     private val fp = "a".repeat(64)
@@ -86,12 +88,39 @@ class DeepLinkResolutionTest {
 
     @Test
     fun idBeatsNameBeatsAddress() {
-        assertEquals(desk, (resolve("punktfunk://connect/${desk.id}") as HostResolution.Known).host)
-        assertEquals(desk, (resolve("punktfunk://connect/desk") as HostResolution.Known).host)
-        assertEquals(desk, (resolve("punktfunk://connect/192.168.1.50") as HostResolution.Known).host)
-        assertEquals(desk, (resolve("punktfunk://connect/192.168.1.50:9777") as HostResolution.Known).host)
+        assertEquals(desk, (resolve("punktfunk://connect/${desk.id}") as HostResolution.Record).host)
+        assertEquals(desk, (resolve("punktfunk://connect/desk") as HostResolution.Record).host)
+        assertEquals(desk, (resolve("punktfunk://connect/192.168.1.50") as HostResolution.Record).host)
+        assertEquals(
+            desk,
+            (resolve("punktfunk://connect/192.168.1.50:9777") as HostResolution.Record).host,
+        )
         // Two hosts answer to "Couch" — refuse with a notice, never pick one.
         assertEquals(HostResolution.Ambiguous, resolve("punktfunk://connect/couch"))
+    }
+
+    /**
+     * The record id is a UUID nothing can guess; a display name ("Gaming PC") and a LAN address are
+     * guesses any web page can make. So the id — and only the id — is the silent one-click dial;
+     * everything else that finds a saved host stops at [HostResolution.Confirm].
+     */
+    @Test
+    fun onlyTheRecordIdDialsWithoutAsking() {
+        assertEquals(HostResolution.Known(desk), resolve("punktfunk://connect/${desk.id}"))
+        assertEquals(HostResolution.Confirm(desk), resolve("punktfunk://connect/desk"))
+        assertEquals(HostResolution.Confirm(desk), resolve("punktfunk://connect/DESK"))
+        assertEquals(HostResolution.Confirm(desk), resolve("punktfunk://connect/192.168.1.50"))
+        assertEquals(HostResolution.Confirm(desk), resolve("punktfunk://connect/192.168.1.50:9777"))
+        // …including the `host=` recovery path, exactly as its own doc always claimed.
+        assertEquals(
+            HostResolution.Confirm(desk),
+            resolve("punktfunk://connect/00000000-0000-4000-8000-000000000000?host=192.168.1.50"),
+        )
+        // A launch id doesn't buy a name any authority it didn't have.
+        assertEquals(
+            HostResolution.Confirm(desk),
+            resolve("punktfunk://connect/desk?launch=steam:570"),
+        )
     }
 
     @Test
@@ -99,7 +128,7 @@ class DeepLinkResolutionTest {
         val stale = "00000000-0000-4000-8000-000000000000"
         assertEquals(
             desk,
-            (resolve("punktfunk://connect/$stale?host=192.168.1.50") as HostResolution.Known).host,
+            (resolve("punktfunk://connect/$stale?host=192.168.1.50") as HostResolution.Record).host,
         )
         // …but a stale id is NOT a hostname: dialing "00000000-…" would be a confusing dead end
         // rather than the recovery the grammar specifies.

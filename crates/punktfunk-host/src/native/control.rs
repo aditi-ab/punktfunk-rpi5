@@ -63,7 +63,8 @@ pub(super) async fn run(
     clip: pf_clipboard::ClipCoord,
     // Per-client access (design/per-client-access.md §5): the session's LIVE grant mask — the
     // same atomic the datagram filter reads; the deadline/watch task folds console edits into
-    // it, so a `ClipControl` arriving after a mid-session revoke resolves against the new mask.
+    // it, so a `ClipControl` or `ClipOffer` arriving after a mid-session revoke resolves against
+    // the new mask.
     session_grants: Arc<AtomicU32>,
     // `AccessUpdate`s from the session's deadline/watch task (expiry warnings + mid-session
     // grant edits) — this task is the control stream's sole writer, so they cross here.
@@ -77,6 +78,10 @@ pub(super) async fn run(
     // Set once `clip_offer_rx` closes (coordinator gone / inert handle) so its `select!` branch
     // stops firing on a perpetually-ready `None`.
     let mut clip_offer_closed = false;
+    // Per-client-access enforcement drops for the messages this task gates (design §5.5): counted
+    // per class with one `warn!` on the first, so a client spamming a revoked plane can't turn the
+    // log into the DoS.
+    let denied = GrantDrops::new();
     // Same discipline for the wire-MTU watcher's channel — its bounded lifetime ends mid-session
     // on every healthy path.
     let mut shard_change_closed = false;
@@ -363,16 +368,27 @@ pub(super) async fn run(
                 } else if let Ok(offer) = ClipOffer::decode(&msg) {
                     // The client copied: hand its lazy format list to the coordinator, which
                     // installs a host-side source that fetches from the client on host paste.
-                    tracing::debug!(
-                        seq = offer.seq,
-                        kinds = offer.kinds.len(),
-                        "clipboard offer from client"
-                    );
-                    let mimes = offer.kinds.iter().map(|k| k.mime.clone()).collect();
-                    let _ = clip_cmd_tx.send(ClipCoordCmd::RemoteOffer {
-                        seq: offer.seq,
-                        mimes,
-                    });
+                    // Gated like the `ClipControl` above, against the LIVE mask: this is the
+                    // WRITE half of the same permission — it puts a client-owned selection on the
+                    // host's real desktop clipboard — so an offer arriving after a mid-session
+                    // revoke is dropped, not installed.
+                    if clip_offer_permitted(
+                        session_grants.load(Ordering::Relaxed),
+                        clip_enabled.load(Ordering::SeqCst),
+                    ) {
+                        tracing::debug!(
+                            seq = offer.seq,
+                            kinds = offer.kinds.len(),
+                            "clipboard offer from client"
+                        );
+                        let mimes = offer.kinds.iter().map(|k| k.mime.clone()).collect();
+                        let _ = clip_cmd_tx.send(ClipCoordCmd::RemoteOffer {
+                            seq: offer.seq,
+                            mimes,
+                        });
+                    } else {
+                        denied.note(GrantClass::Clipboard);
+                    }
                 } else {
                     tracing::warn!("unknown control message — ignoring");
                 }
@@ -413,6 +429,13 @@ pub(super) async fn run(
                 // branch, the `clip_offer_closed` pattern.
                 match update {
                     Some(u) => {
+                        // An edit that took CLIPBOARD away leaves the session up, so tell the
+                        // coordinator too: the lifecycle task clearing `clip_enabled` only stops
+                        // the host→client direction, while the selection it installed for this
+                        // device stays on the host clipboard until `SetEnabled(false)` drops it.
+                        if u.grants & punktfunk_core::quic::GRANT_CLIPBOARD == 0 {
+                            let _ = clip_cmd_tx.send(ClipCoordCmd::SetEnabled(false));
+                        }
                         if io::write_msg(&mut ctrl_send, &u.encode()).await.is_err() {
                             break;
                         }
@@ -525,13 +548,21 @@ fn resolve_clip_control(
     }
 }
 
+/// Whether a client's [`ClipOffer`] may be installed on the host's real desktop clipboard: the
+/// device's LIVE `CLIPBOARD` grant, ANDed with the sync state its last [`ClipControl`] resolved
+/// (which already folded in the operator policy and backend availability). Both are read when the
+/// offer arrives, so a revoke mid-session closes this direction as it closes the other one.
+fn clip_offer_permitted(grants: u32, clip_enabled: bool) -> bool {
+    grants & punktfunk_core::quic::GRANT_CLIPBOARD != 0 && clip_enabled
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use punktfunk_core::quic::{
         CLIP_FLAG_FILES, CLIP_POLICY_FILES, CLIP_POLICY_TEXT, CLIP_REASON_BACKEND_UNAVAILABLE,
         CLIP_REASON_NOT_PERMITTED, CLIP_REASON_NO_FILES, CLIP_REASON_OK,
-        CLIP_REASON_POLICY_DISABLED,
+        CLIP_REASON_POLICY_DISABLED, GRANT_ALL, GRANT_CLIPBOARD,
     };
 
     const ON: ClipControl = ClipControl {
@@ -587,5 +618,24 @@ mod tests {
             resolve_clip_control(Some(both), true, true, ON),
             (true, both, CLIP_REASON_OK)
         );
+    }
+
+    /// The client→host direction is gated by the same grant as the host→client one: an offer from
+    /// a device that never had CLIPBOARD is dropped, and so is one that arrives after a
+    /// mid-session revoke — the console edit lands in the live mask (and clears the enable flag
+    /// with it), and the very next offer resolves against the new one.
+    #[test]
+    fn clip_offer_needs_the_live_grant() {
+        // The normal case: granted and sync on.
+        assert!(clip_offer_permitted(GRANT_ALL, true));
+
+        // Never granted — nothing to install, whatever the client claims about sync.
+        assert!(!clip_offer_permitted(GRANT_ALL & !GRANT_CLIPBOARD, true));
+        assert!(!clip_offer_permitted(0, true));
+
+        // Revoked mid-session: the lifecycle task stored the edited mask and cleared the enable
+        // flag; both halves of that state refuse the offer on their own.
+        assert!(!clip_offer_permitted(GRANT_ALL & !GRANT_CLIPBOARD, false));
+        assert!(!clip_offer_permitted(GRANT_ALL, false));
     }
 }

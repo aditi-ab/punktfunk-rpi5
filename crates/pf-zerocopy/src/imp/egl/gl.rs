@@ -7,7 +7,7 @@
 #![allow(non_upper_case_globals)]
 
 use anyhow::{bail, ensure, Result};
-use std::os::raw::{c_int, c_void};
+use std::os::raw::{c_char, c_int, c_void};
 
 pub(crate) const GL_TEXTURE_2D: u32 = 0x0DE1;
 pub(crate) const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
@@ -70,7 +70,7 @@ unsafe extern "C" {
     pub(crate) fn glShaderSource(
         shader: u32,
         count: c_int,
-        string: *const *const i8,
+        string: *const *const c_char,
         length: *const c_int,
     );
     pub(crate) fn glCompileShader(shader: u32);
@@ -80,7 +80,7 @@ unsafe extern "C" {
     pub(crate) fn glAttachShader(program: u32, shader: u32);
     pub(crate) fn glLinkProgram(program: u32);
     pub(crate) fn glGetProgramiv(program: u32, pname: u32, params: *mut c_int);
-    pub(crate) fn glGetUniformLocation(program: u32, name: *const i8) -> c_int;
+    pub(crate) fn glGetUniformLocation(program: u32, name: *const c_char) -> c_int;
     pub(crate) fn glUniform1i(location: c_int, v0: c_int);
     pub(crate) fn glDeleteProgram(program: u32);
     pub(crate) fn glTexSubImage2D(
@@ -152,7 +152,7 @@ pub(crate) unsafe fn compile_shader(kind: u32, src: &[u8]) -> Result<u32> {
     unsafe {
         let sh = glCreateShader(kind);
         ensure!(sh != 0, "glCreateShader failed");
-        let ptr = src.as_ptr() as *const i8;
+        let ptr = src.as_ptr() as *const c_char;
         let len = src.len() as c_int;
         glShaderSource(sh, 1, &ptr, &len);
         glCompileShader(sh);

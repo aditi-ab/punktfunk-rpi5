@@ -2361,6 +2361,10 @@ impl Parser {
             let mut i = 0;
 
             while start_sb < sb_cols {
+                if i >= MAX_TILE_COLS {
+                    return Err(format!("Invalid tile_cols {}", i + 1));
+                }
+
                 self.mi_col_starts[i] = start_sb << sb_shift;
 
                 let max_width = std::cmp::min(sb_cols - start_sb, max_tile_width_sb);
@@ -2387,6 +2391,10 @@ impl Parser {
             let mut start_sb = 0;
             let mut i = 0;
             while start_sb < sb_rows {
+                if i >= MAX_TILE_ROWS {
+                    return Err(format!("Invalid tile_rows {}", i + 1));
+                }
+
                 self.mi_row_starts[i] = start_sb << sb_shift;
                 let max_height = std::cmp::min(sb_rows - start_sb, max_tile_height_sb);
                 ti.height_in_sbs_minus_1[i] = r.read_ns(max_height.try_into().unwrap())?;
@@ -4290,5 +4298,40 @@ mod tests {
                 consumed += data_len;
             }
         }
+    }
+
+    /// punktfunk deviation 12: the non-uniform tile loops are bounded by the frame's
+    /// superblock count, not by the 64-entry `width_in_sbs_minus_1` /
+    /// `height_in_sbs_minus_1` they fill, so a frame made of one-superblock tiles
+    /// walked off both. MAX_TILE_COLS / MAX_TILE_ROWS are the spec's own ceiling.
+    #[test]
+    fn more_non_uniform_tiles_than_the_spec_allows_is_a_parse_error_not_a_panic() {
+        use crate::codec::av1::parser::{SequenceHeaderObu, TileInfo};
+        use crate::codec::av1::reader::Reader;
+        use std::rc::Rc;
+
+        // All zeroes: uniform_tile_spacing_flag = 0, then every ns() read decodes to
+        // a one-superblock tile.
+        let data = [0u8; 128];
+
+        // 4096 mi columns is 256 superblocks, so the column loop runs 256 times.
+        let mut parser = Parser::default();
+        parser.sequence_header = Some(Rc::new(SequenceHeaderObu::default()));
+        parser.mi_cols = 4096;
+        parser.mi_rows = 4096;
+        let err = parser
+            .parse_tile_info(&mut Reader::new(&data), &mut TileInfo::default())
+            .unwrap_err();
+        assert!(err.starts_with("Invalid tile_cols"), "{err}");
+
+        // Four superblocks wide: the column loop finishes, the row loop overruns.
+        let mut parser = Parser::default();
+        parser.sequence_header = Some(Rc::new(SequenceHeaderObu::default()));
+        parser.mi_cols = 64;
+        parser.mi_rows = 4096;
+        let err = parser
+            .parse_tile_info(&mut Reader::new(&data), &mut TileInfo::default())
+            .unwrap_err();
+        assert!(err.starts_with("Invalid tile_rows"), "{err}");
     }
 }

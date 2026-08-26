@@ -16,10 +16,11 @@
 //!    unplug since sway 1.8). See [`StopGuard`] — and the long root-cause note on `hyprland.rs`'s
 //!    copy, which is where this was measured.
 //!
-//! Requirements: the host runs inside the sway session's environment (`SWAYSOCK` for swaymsg,
-//! and the portal activation env — `WAYLAND_DISPLAY`/`XDG_CURRENT_DESKTOP=sway` imported into
-//! `systemctl --user`, see `scripts/headless/prepare-session.sh`), with the ScreenCast
-//! interface routed to xdpw (`scripts/headless/portals.conf`).
+//! Requirements: the host can reach the sway session — `SWAYSOCK` for swaymsg, inherited or
+//! discovered and set on each child ([`swaymsg_command`]), plus the portal activation env
+//! (`WAYLAND_DISPLAY`/`XDG_CURRENT_DESKTOP=sway` imported into `systemctl --user`, see
+//! `scripts/headless/prepare-session.sh`), with the ScreenCast interface routed to xdpw
+//! (`scripts/headless/portals.conf`).
 
 use super::{DisplayOwnership, Mode, VirtualDisplay, VirtualOutput};
 use anyhow::{anyhow, bail, Context, Result};
@@ -125,14 +126,19 @@ impl WlrootsDisplay {
     }
 }
 
-/// wlroots/Sway is usable when the host runs inside a Sway session — signalled by `SWAYSOCK`
-/// (the IPC socket `swaymsg create_output` needs). Cheap env check for the enumeration path.
+/// wlroots/Sway is usable when the host runs inside a Sway session — signalled by an INHERITED
+/// `SWAYSOCK` (the IPC socket `swaymsg create_output` needs). Cheap env check for the enumeration
+/// path.
 ///
-/// Under [`crate::with_env_lock`]: this runs on a management worker (`/host/compositors` →
-/// [`crate::available`]) concurrently with another connect's `apply_session_env`, which `set_var`s
-/// — and, when no sway session is live, `remove_var`s — this very key. A glibc `getenv` racing a
-/// `setenv` is the `environ` realloc data race ENV_LOCK exists for, and it is UB whichever key each
-/// side names. No caller holds the lock (the mutex is not reentrant).
+/// Inherited is now all it can be: `apply_session_env` no longer exports this key (the value goes
+/// to the `swaymsg` children instead — see [`swaymsg_command`]), so this can only ever report what
+/// the host was launched with, never what we ourselves wrote. That is the honest half: a
+/// `systemd --user` host inherits nothing, and [`crate::available`] covers it by asking the `/proc`
+/// scan whether a wlroots session is live BEFORE it consults this probe.
+///
+/// Still under [`crate::with_env_lock`]: it orders the read against this crate's remaining env
+/// writers (`apply_session_env`'s four survivors), which is all that lock has ever been able to do.
+/// No caller holds it — the mutex is not reentrant.
 pub fn is_available() -> bool {
     crate::with_env_lock(|| std::env::var_os("SWAYSOCK")).is_some()
 }
@@ -632,13 +638,30 @@ const SWAYMSG_BUDGET: Duration = Duration::from_secs(5);
 /// settle, so it is the slowest helper on this path — and its result is already ignored.
 const PORTAL_RESTART_BUDGET: Duration = Duration::from_secs(10);
 
+/// A bare `swaymsg`, with the live sway IPC socket threaded onto the child.
+///
+/// `SWAYSOCK` used to ride the process env: `apply_session_env` `set_var`'d it per connect (and
+/// `remove_var`'d it when nothing sway-shaped was live) so these children inherited it. Nothing
+/// outside pf-vdisplay ever read it, so that bought a per-connect `setenv` — a data race with any
+/// `getenv` on any other thread of a live streaming host — for a value two children need.
+/// `Command::env` gives it to exactly those children, the way `set_launch_command` carries the
+/// launch. `sock` is `None` when there is no sway IPC we can find: leave the child's env alone
+/// then, so an inherited one (host started inside the session) still wins.
+fn swaymsg_command(sock: Option<String>) -> Command {
+    let mut cmd = Command::new("swaymsg");
+    if let Some(sock) = sock {
+        cmd.env("SWAYSOCK", sock);
+    }
+    cmd
+}
+
 /// Run `swaymsg -- <args>`, returning stdout (`--` so command tokens like `--custom` reach
 /// sway instead of swaymsg's own getopt). swaymsg exits non-zero (with the error on stderr/
 /// stdout) when the command fails, so checking the status covers `{"success": false}` too.
 fn swaymsg(args: &[&str]) -> Result<String> {
-    let out =
-        crate::proc::output_within(Command::new("swaymsg").arg("--").args(args), SWAYMSG_BUDGET)
-            .context("run swaymsg (is sway installed?)")?;
+    let mut cmd = swaymsg_command(crate::session::sway_socket());
+    let out = crate::proc::output_within(cmd.arg("--").args(args), SWAYMSG_BUDGET)
+        .context("run swaymsg (is sway installed?)")?;
     if !out.status.success() {
         bail!(
             "swaymsg {:?} failed: {}{}",
@@ -656,11 +679,9 @@ fn swaymsg(args: &[&str]) -> Result<String> {
 /// *command*, which is right for `create_output` and wrong for a query — `-t` after `--` comes back
 /// as `Unknown/invalid command '-t'` (caught on-glass writing the monitor enumeration).
 fn swaymsg_query(kind: &str) -> Result<serde_json::Value> {
-    let out = crate::proc::output_within(
-        Command::new("swaymsg").args(["-t", kind, "--raw"]),
-        SWAYMSG_BUDGET,
-    )
-    .context("run swaymsg (is sway installed?)")?;
+    let mut cmd = swaymsg_command(crate::session::sway_socket());
+    let out = crate::proc::output_within(cmd.args(["-t", kind, "--raw"]), SWAYMSG_BUDGET)
+        .context("run swaymsg (is sway installed?)")?;
     if !out.status.success() {
         bail!(
             "swaymsg -t {kind} failed: {}",
@@ -1059,6 +1080,33 @@ mod tests {
     fn disable_and_enable_name_the_output_before_the_verb() {
         assert_eq!(disable_argv("DP-1"), ["output", "DP-1", "disable"]);
         assert_eq!(enable_argv("DP-1"), ["output", "DP-1", "enable"]);
+    }
+
+    /// `SWAYSOCK` reaches `swaymsg` as a per-CHILD override, never as a `set_var` on the host's own
+    /// environment — that write was a `getenv` data race with every other thread of a live session
+    /// (security-review 2026-08-25). Pinning both arms: a known socket is set on the child, and an
+    /// unknown one leaves the child's env untouched so an inherited `SWAYSOCK` still reaches sway.
+    #[test]
+    fn the_sway_socket_travels_on_the_child_not_the_process_env() {
+        let overrides = |sock: Option<String>| -> Vec<(String, Option<String>)> {
+            swaymsg_command(sock)
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            overrides(Some("/run/user/1000/sway-ipc.1000.42.sock".to_string())),
+            [(
+                "SWAYSOCK".to_string(),
+                Some("/run/user/1000/sway-ipc.1000.42.sock".to_string())
+            )]
+        );
+        assert!(overrides(None).is_empty());
     }
 
     fn head(connector: &str, enabled: bool) -> crate::monitors::PhysicalMonitor {

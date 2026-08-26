@@ -587,6 +587,18 @@ impl Config {
                 "shard_payload too large to fit a datagram (header + crypto overhead)",
             ));
         }
+        // The floor the clamp helpers already bottom out at, enforced for the CLIENT: its value
+        // comes off the wire from the peer (`Welcome::shard_payload`) and sets the reassembler's
+        // per-frame shard floor ([`ReassemblerLimits::min_shard_bytes`]), so without this a
+        // hostile Welcome drops that floor to two bytes and we accept confetti-sized shards for
+        // the whole session. A host's value is always locally derived (every `shard_payload_for_*`
+        // helper clamps here, and a client's ACK only ever confirms a size the host proposed), so
+        // a hand-configured host below the floor stays legal.
+        if self.role == Role::Client && self.shard_payload < MIN_SHARD_PAYLOAD {
+            return Err(PunktfunkError::InvalidArg(
+                "negotiated shard_payload below MIN_SHARD_PAYLOAD",
+            ));
+        }
         if self.fec.max_data_per_block == 0 {
             return Err(PunktfunkError::InvalidArg("max_data_per_block must be > 0"));
         }
@@ -656,6 +668,26 @@ mod tests {
         assert!(c.validate().is_err());
         c.key = SessionKey::ChaCha20Poly1305([1u8; 32]);
         assert!(c.validate().is_ok());
+    }
+
+    /// The client's `shard_payload` is whatever the host's `Welcome` says, and the reassembler
+    /// takes its per-frame shard floor from it — so a sub-floor negotiated value must be refused
+    /// outright instead of quietly lowering that floor (a 2-byte shard is not a path this
+    /// protocol runs on: it can't carry the QUIC control plane either).
+    #[test]
+    fn rejects_negotiated_shard_payload_below_the_floor() {
+        let mut c = Config::p1_defaults(Role::Client);
+        c.shard_payload = 2;
+        assert!(c.validate().is_err());
+        c.shard_payload = MIN_SHARD_PAYLOAD - 2;
+        assert!(c.validate().is_err());
+        c.shard_payload = MIN_SHARD_PAYLOAD;
+        assert!(c.validate().is_ok());
+        // The reassembler's floor can no longer be dragged below the production one by a peer.
+        assert_eq!(
+            crate::packet::ReassemblerLimits::from_config(&c).min_shard_bytes,
+            MIN_SHARD_PAYLOAD
+        );
     }
 
     #[test]

@@ -1921,19 +1921,15 @@ mod tests {
         }
     }
 
-    fn synth_sps(o: &SpsOpts) -> Vec<u8> {
-        let mut s = BitSink::new();
-        s.bits(4, 0); // sps_video_parameter_set_id
-        s.bits(3, 0); // sps_max_sub_layers_minus1
-        s.bit(1); // sps_temporal_id_nesting_flag
-
-        // profile_tier_level(1, 0): general_profile_space u(2), tier u(1),
-        // profile_idc u(5), 32 compatibility flags, progressive/interlaced/
-        // non-packed/frame-only, 43 constraint/reserved bits (all zero for every
-        // profile branch the parser takes), inbld/reserved bit, level u(8).
+    /// profile_tier_level()'s general block: general_profile_space u(2), tier u(1),
+    /// profile_idc u(5), 32 compatibility flags, progressive/interlaced/non-packed/
+    /// frame-only, 43 constraint/reserved bits (all zero for every profile branch the
+    /// parser takes), inbld/reserved bit, level u(8). The per-sub-layer tail follows
+    /// only when max_sub_layers_minus1 > 0.
+    fn ptl_general(s: &mut BitSink, profile_idc: u8, level_idc: u32) {
         s.bits(2, 0);
         s.bit(0);
-        s.bits(5, u32::from(o.profile_idc));
+        s.bits(5, u32::from(profile_idc));
         s.bits(32, 0);
         s.bit(1); // general_progressive_source_flag
         s.bit(0); // general_interlaced_source_flag
@@ -1942,7 +1938,15 @@ mod tests {
         s.bits(31, 0);
         s.bits(12, 0); // 43 zero bits total
         s.bit(0); // general_inbld_flag / reserved
-        s.bits(8, o.level_idc); // general_level_idc
+        s.bits(8, level_idc); // general_level_idc
+    }
+
+    fn synth_sps(o: &SpsOpts) -> Vec<u8> {
+        let mut s = BitSink::new();
+        s.bits(4, 0); // sps_video_parameter_set_id
+        s.bits(3, 0); // sps_max_sub_layers_minus1
+        s.bit(1); // sps_temporal_id_nesting_flag
+        ptl_general(&mut s, o.profile_idc, o.level_idc);
 
         s.ue(0); // sps_seq_parameter_set_id
         s.ue(o.chroma_format_idc);
@@ -3578,5 +3582,163 @@ mod tests {
         let plan = planner.plan_au(&idr_slice()).unwrap();
         assert!(plan.picture.is_idr);
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    // ------- vendored-parser bounds regressions (deviations 9-11) -------
+
+    const VPS_NUT: u8 = 32;
+    const SPS_NUT: u8 = 33;
+    const PPS_NUT: u8 = 34;
+
+    /// Trailing bits, so the parser keeps reading past the guarded field instead of
+    /// stopping short — a truncated NALU would be an error for the wrong reason.
+    fn padded(mut s: BitSink) -> Vec<u8> {
+        for _ in 0..64 {
+            s.bits(8, 0xff);
+        }
+        s.finish()
+    }
+
+    /// Deviation 9: `{vps,sps}_max_sub_layers_minus1` is u(3), so 7 is representable,
+    /// but 7.4.3.1/7.4.3.2 stop at 6 — and the sub-layer arrays the parser then walks
+    /// are six and seven deep. Both param sets are now a parse error, not a panic.
+    /// This is also what keeps the planner's own
+    /// `max_num_reorder_pics[max_sub_layers_minus1]` reads in bounds.
+    #[test]
+    fn a_param_set_claiming_eight_sub_layers_is_a_parse_error_not_a_panic() {
+        let mut s = BitSink::new();
+        s.bits(4, 0); // vps_video_parameter_set_id
+        s.bit(1); // vps_base_layer_internal_flag
+        s.bit(1); // vps_base_layer_available_flag
+        s.bits(6, 0); // vps_max_layers_minus1
+        s.bits(3, 7); // vps_max_sub_layers_minus1 — one past the spec's 6
+        s.bit(1); // vps_temporal_id_nesting_flag
+        s.bits(16, 0xffff); // vps_reserved_0xffff_16bits
+        ptl_general(&mut s, 1, 120);
+        let vps = h265_nalu(VPS_NUT, &padded(s));
+        assert!(matches!(
+            H265Planner::new().plan_au(&vps),
+            Err(PlanError::Parse(_))
+        ));
+
+        let mut s = BitSink::new();
+        s.bits(4, 0); // sps_video_parameter_set_id
+        s.bits(3, 7); // sps_max_sub_layers_minus1
+        s.bit(1); // sps_temporal_id_nesting_flag
+        ptl_general(&mut s, 1, 120);
+        let sps = h265_nalu(SPS_NUT, &padded(s));
+        assert!(matches!(
+            H265Planner::new().plan_au(&sps),
+            Err(PlanError::Parse(_))
+        ));
+    }
+
+    /// The PPS fields ahead of the two this section attacks, all zero.
+    fn pps_prefix() -> BitSink {
+        let mut s = BitSink::new();
+        s.ue(0); // pps_pic_parameter_set_id
+        s.ue(0); // pps_seq_parameter_set_id
+        s.bits(2, 0); // dependent_slice_segments_enabled / output_flag_present
+        s.bits(3, 0); // num_extra_slice_header_bits
+        s.bits(2, 0); // sign_data_hiding_enabled / cabac_init_present
+        s.ue(0); // num_ref_idx_l0_default_active_minus1
+        s.ue(0); // num_ref_idx_l1_default_active_minus1
+        s.se(0); // init_qp_minus26
+        s.bits(3, 0); // constrained_intra_pred / transform_skip / cu_qp_delta_enabled
+        s.se(0); // pps_cb_qp_offset
+        s.se(0); // pps_cr_qp_offset
+        s.bits(4, 0); // chroma_qp_offsets / weighted_pred / weighted_bipred / bypass
+        s
+    }
+
+    /// The PPS fields after the tile block, all zero, plus rbsp_trailing_bits().
+    fn pps_tail(mut s: BitSink) -> Vec<u8> {
+        s.bits(2, 0); // loop_filter_across_slices / deblocking_filter_control_present
+        s.bits(2, 0); // pps_scaling_list_data_present / lists_modification_present
+        s.ue(0); // log2_parallel_merge_level_minus2
+        s.bits(2, 0); // slice_segment_header_extension / pps_extension_present
+        s.finish()
+    }
+
+    /// Deviation 10: equation 7-42 subtracts `scaling_list_pred_matrix_id_delta` from
+    /// matrixId in u32. Unbounded, it underflows into an out-of-bounds read of the
+    /// six-entry scaling lists; 7.4.5 caps it at matrixId / (sizeId == 3 ? 3 : 1).
+    #[test]
+    fn a_scaling_list_predicting_from_a_negative_matrix_is_a_parse_error_not_a_panic() {
+        let mut s = pps_prefix();
+        s.bits(2, 0); // tiles_enabled / entropy_coding_sync_enabled
+        s.bits(2, 0); // loop_filter_across_slices / deblocking_filter_control_present
+        s.bit(1); // pps_scaling_list_data_present_flag
+        s.bit(0); // scaling_list_pred_mode_flag[0][0]
+        s.ue(1); // scaling_list_pred_matrix_id_delta[0][0] — refMatrixId = 0 - 1
+        let mut au = synth_sps(&SpsOpts::default());
+        au.extend(h265_nalu(PPS_NUT, &padded(s)));
+        assert!(matches!(
+            H265Planner::new().plan_au(&au),
+            Err(PlanError::Parse(_))
+        ));
+    }
+
+    /// Deviation 11: the tile counts were bounded by the picture's CTB size only, so a
+    /// wide-enough SPS let them run past the width and height arrays. Table A.8 caps
+    /// them at 20 columns and 22 rows for every level.
+    #[test]
+    fn a_pps_with_more_tiles_than_any_level_allows_is_a_parse_error_not_a_panic() {
+        // 2048x2048 luma with 64x64 CTBs: 32 CTBs each way, so the picture bound
+        // alone would admit 31 tile columns and rows.
+        let sps = SpsOpts {
+            width: 2048,
+            height: 2048,
+            ..Default::default()
+        };
+        for (columns, rows) in [(25, 0), (0, 25)] {
+            let mut s = pps_prefix();
+            s.bit(1); // tiles_enabled_flag
+            s.bit(0); // entropy_coding_sync_enabled_flag
+            s.ue(columns); // num_tile_columns_minus1
+            s.ue(rows); // num_tile_rows_minus1
+            s.bit(1); // uniform_spacing_flag
+            let mut au = synth_sps(&sps);
+            au.extend(h265_nalu(PPS_NUT, &padded(s)));
+            assert!(
+                matches!(H265Planner::new().plan_au(&au), Err(PlanError::Parse(_))),
+                "{columns} columns / {rows} rows must be refused"
+            );
+        }
+    }
+
+    /// The tile ceiling's two downstream sites, both reached from one slice header:
+    /// the entry-point maximum multiplied the two tile counts in u8 (20 x 22 overflows
+    /// it), and `entry_point_offset_minus1` is 32 deep however large that maximum is.
+    #[test]
+    fn a_slice_claiming_more_entry_points_than_the_header_holds_is_a_parse_error_not_a_panic() {
+        let sps = SpsOpts {
+            width: 2048,
+            height: 2048,
+            ..Default::default()
+        };
+        let mut s = pps_prefix();
+        s.bit(1); // tiles_enabled_flag
+        s.bit(0); // entropy_coding_sync_enabled_flag
+        s.ue(19); // num_tile_columns_minus1 — Table A.8's ceiling, and legal here
+        s.ue(21); // num_tile_rows_minus1
+        s.bit(1); // uniform_spacing_flag
+        s.bit(0); // loop_filter_across_tiles_enabled_flag
+        let mut au = synth_sps(&sps);
+        au.extend(h265_nalu(PPS_NUT, &pps_tail(s)));
+
+        let mut s = BitSink::new();
+        s.bit(1); // first_slice_segment_in_pic_flag
+        s.bit(0); // no_output_of_prior_pics_flag
+        s.ue(0); // slice_pic_parameter_set_id
+        s.ue(2); // slice_type: I
+        s.se(0); // slice_qp_delta
+        s.ue(35); // num_entry_point_offsets — 440 tiles would allow it, 32 slots do not
+        au.extend(h265_nalu(IDR_W_RADL, &padded(s)));
+
+        assert!(matches!(
+            H265Planner::new().plan_au(&au),
+            Err(PlanError::Parse(_))
+        ));
     }
 }

@@ -27,6 +27,13 @@
 # images they describe, so anything able to replace an image could replace its checksum too. The
 # public key is baked in below rather than fetched, because a key fetched from the thing you are
 # authenticating authenticates nothing.
+#   A signature alone still only says "we signed these bytes, once" — not which feed they were
+# signed for, nor whether they are the current ones. So the manifest also carries a `# FEED` and a
+# `# SERIAL` header INSIDE the signed bytes, and fetch_manifest refuses one whose FEED is not the
+# feed it fetched, or whose SERIAL is below the highest this box has accepted. Without both, anyone
+# who can write the registry WITHOUT the key (a leaked write:package token) copies the canary
+# manifest + images into the stable path, or puts last month's back, and every box verifies it
+# happily. Same two rules the Rust updater enforces (crates/pf-update-check/src/manifest.rs).
 set -euo pipefail
 
 REGISTRY="${PUNKTFUNK_SYSEXT_REGISTRY:-https://git.unom.io/api/packages/unom/generic/punktfunk-sysext}"
@@ -34,6 +41,7 @@ CONF=/etc/punktfunk-sysext.conf
 EXT_DIR=/var/lib/extensions
 IMG="$EXT_DIR/punktfunk.raw"
 SIDECAR="$EXT_DIR/.punktfunk.version"
+FLOOR_FILE="$EXT_DIR/.punktfunk.serial-floor"
 MARKER=/usr/lib/extension-release.d/extension-release.punktfunk
 ETC_SRC=/usr/share/punktfunk/etc
 PF_TMP="$(mktemp -d)"; trap 'rm -rf "$PF_TMP"' EXIT
@@ -65,10 +73,33 @@ need_root() { [ "$(id -u)" = 0 ] || { echo "run as root (sudo)" >&2; exit 1; }; 
 os_version_id() { . /etc/os-release; echo "${VERSION_ID%%.*}"; }
 channel() { # shellcheck disable=SC1090
   [ -f "$CONF" ] && . "$CONF"; echo "${CHANNEL:-stable}"; }
-feed_url() {
+# feed_name -> the feed this box reads: f43, f43-canary, … (Fedora major x channel). The publisher
+# stamps this same name into the signed manifest, which is what makes the two comparable.
+feed_name() {
   local suffix=""
   [ "$(channel)" = canary ] && suffix="-canary"
-  echo "$REGISTRY/f$(os_version_id)$suffix"
+  echo "f$(os_version_id)$suffix"
+}
+feed_url() { echo "$REGISTRY/$(feed_name)"; }
+
+# The highest manifest serial ever accepted for a feed — the anti-rollback floor, persisted the way
+# the Rust updater persists its own per-channel `serial_floor` (crates/punktfunk-host/src/update.rs).
+# Per FEED, never global: serials are publish timestamps, so a canary publish would otherwise raise
+# the floor above the next stable manifest and lock the stable channel out.
+serial_floor() {
+  local v
+  v="$(sed -n "s/^$(feed_name) //p" "$FLOOR_FILE" 2>/dev/null | head -n1)"
+  case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac
+}
+# Raise it (never lower — the caller compares first). Best-effort and quiet on purpose: `status`
+# runs unprivileged, and before the extensions dir exists at all, so it must report the feed rather
+# than die — or nag — over not being able to record it. `2>/dev/null` comes BEFORE the redirect it
+# is there to silence: redirections are set up left to right, so the other order still prints the
+# shell's own "No such file or directory" to the terminal.
+raise_serial_floor() {
+  local f; f="$(feed_name)"
+  { grep -v "^$f " "$FLOOR_FILE" 2>/dev/null || :; echo "$f $1"; } 2>/dev/null > "$FLOOR_FILE.new" \
+    && mv -f "$FLOOR_FILE.new" "$FLOOR_FILE" 2>/dev/null || :
 }
 
 # verify_manifest SUMS SIG -> 0 iff SIG is a good detached signature over SUMS by FEED_KEY.
@@ -91,7 +122,7 @@ verify_manifest() {
 #   Returns non-zero (having said why) rather than exiting, so `status` can report a bad feed
 #   instead of dying on it; install/update turn that into a hard stop.
 fetch_manifest() {
-  local feed sums sig
+  local feed sums sig want got serial floor
   feed="$(feed_url)"
   sums="$PF_TMP/SHA256SUMS"; sig="$PF_TMP/SHA256SUMS.asc"
   curl -fsSL -o "$sums" "$feed/SHA256SUMS" || { echo "cannot reach the feed $feed" >&2; return 1; }
@@ -117,6 +148,31 @@ fetch_manifest() {
     echo "!! older than the rotation. Do not install; re-download punktfunk-sysext.sh and retry." >&2
     return 1
   fi
+  # Signed — by us, at some point, for something. The two facts a signature cannot carry on its own
+  # are stamped inside the document (see the Trust note at the top) and checked here.
+  want="$(feed_name)"
+  got="$(sed -n 's/^# FEED //p' "$sums" | head -n1)"
+  serial="$(sed -n 's/^# SERIAL //p' "$sums" | head -n1)"
+  case "$serial" in ''|*[!0-9]*) serial="" ;; esac
+  if [ -z "$got" ] || [ -z "$serial" ]; then
+    echo "!! the feed $feed is signed but UNBOUND: its manifest carries no '# FEED'/'# SERIAL'" >&2
+    echo "!! header, so the signature says nothing about which feed or which publish it covers." >&2
+    echo "!! (a feed published before binding existed; it is bound on the next publish, or now with" >&2
+    echo "!!  TOKEN=… bash packaging/bazzite/publish-sysext-feed.sh --seal $want)" >&2
+    return 1
+  fi
+  if [ "$got" != "$want" ]; then
+    echo "!! this manifest was signed for the feed '$got', but it is being served as '$want' —" >&2
+    echo "!! another channel's (or another OS release's) feed is being replayed here. Refusing." >&2
+    return 1
+  fi
+  floor="$(serial_floor)"
+  if [ "$serial" -lt "$floor" ]; then
+    echo "!! manifest serial $serial is older than the last accepted $floor — refusing rollback." >&2
+    echo "!! An old but validly-signed manifest is being replayed at $feed." >&2
+    return 1
+  fi
+  if [ "$serial" -gt "$floor" ]; then raise_serial_floor "$serial"; fi
   return 0
 }
 
@@ -312,6 +368,21 @@ cmd_update() {
     post_merge
     return
   fi
+  # Even a correctly bound, in-date manifest can offer only OLDER images (a mistaken republish, an
+  # over-eager prune). `latest` reports the newest the feed HAS, not the newest that ever shipped,
+  # so without this the box walks backwards onto a superseded — possibly known-vulnerable —
+  # release, silently. Rolling back stays possible; it just has to be asked for.
+  case "$cur" in
+    [0-9]*)
+      if [ "$ver" != "$cur" ] \
+         && [ "$(printf '%s\n%s\n' "$ver" "$cur" | sort -V | tail -n1)" = "$cur" ] \
+         && [ "${PUNKTFUNK_SYSEXT_ALLOW_DOWNGRADE:-0}" != 1 ]; then
+        echo "!! the feed's newest image ($ver) is OLDER than the installed $cur — refusing to" >&2
+        echo "!! downgrade. For a deliberate rollback:" >&2
+        echo "!!     sudo PUNKTFUNK_SYSEXT_ALLOW_DOWNGRADE=1 punktfunk-sysext update" >&2
+        exit 1
+      fi ;;
+  esac
   echo "updating: ${cur:-<none>} -> $ver"
   # shellcheck disable=SC2086
   do_install $l
@@ -347,6 +418,8 @@ cmd_remove() {
     fi
   fi
   rm -f /etc/xdg/autostart/io.unom.Punktfunk.Tray.desktop
+  # $FLOOR_FILE deliberately survives: it is anti-rollback state, not installation state, and a
+  # remove/re-install cycle is the obvious way to hand a box a replayed manifest it already refused.
   rm -f "$IMG" "$SIDECAR" "$CONF"
   systemd-sysext refresh 2>/dev/null || :
   echo "punktfunk sysext removed (user config in ~/.config/punktfunk is untouched)."

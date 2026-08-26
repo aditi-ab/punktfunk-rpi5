@@ -105,5 +105,108 @@ in the future."
    AV1 has its own `read_su`, and the H.26x `se(v)` callers all pass positive widths — so
    it is left to upstream rather than widened into this deviation.
 
+9. `src/codec/h265/parser.rs` — `parse_vps` and `parse_sps`: reject
+   `{vps,sps}_max_sub_layers_minus1 > 6` immediately after the read. The element is
+   `u(3)`, so 7 is representable, but 7.4.3.1 and 7.4.3.2 both bound it at 6 — and
+   every array the parser then walks with it is sized for the spec, not for the field:
+   `profile_tier_level()`'s `sub_layer_*` flags are `[_; 6]` and the sub-layer ordering
+   arrays are `[_; 7]`. A ~20-byte VPS NALU with the field set to 7 panicked inside
+   `parse_profile_tier_level` with an index-out-of-bounds before any picture was
+   decoded, on every reconnect. Bound at the spec's 6, not at the arrays' 5/6, because
+   the two agree there — a conformant stream is never refused. This is also what keeps
+   punktfunk's own `sps.max_num_reorder_pics[max_sub_layers_minus1]` and
+   `sps.max_dec_pic_buffering_minus1[max_sub_layers_minus1]` reads in bounds
+   (`pf-bitstream` h265.rs, and the `pf-vaadec` / `pf-dxvadec` / `pf-vkdecode` picture
+   builders downstream of it) — they all take their `Sps` from this parser, so the
+   parse-time check is the single choke point and none of them needs its own guard.
+   Regression-tested in `pf-bitstream`
+   (`a_param_set_claiming_eight_sub_layers_is_a_parse_error_not_a_panic`).
+   **Report upstream — not yet filed.**
+
+10. `src/codec/h265/parser.rs` — `parse_scaling_list_data`: read
+    `scaling_list_pred_matrix_id_delta` with `read_ue_max(matrixId / factor)` instead of
+    an unbounded `read_ue`, which is exactly the range 7.4.5 permits (`0` to
+    `matrixId / ( sizeId == 3 ? 3 : 1 )`). Equation 7-42 subtracts
+    `delta * factor` from `matrixId` in `u32`: unbounded it underflows — a debug panic
+    on the subtraction, and in release a `~4e9` index into the six-entry
+    `scaling_list_{4x4,8x8,16x16,32x32}`. Reachable from a PPS with
+    `pps_scaling_list_data_present_flag` set, or the equivalent SPS flag. `factor` moved
+    a few lines up so the bound and equation 7-42 share one definition; the same bound
+    also makes `delta * factor` unable to overflow. Regression-tested in `pf-bitstream`
+    (`a_scaling_list_predicting_from_a_negative_matrix_is_a_parse_error_not_a_panic`).
+    **Report upstream — not yet filed.**
+
+11. `src/codec/h265/parser.rs` — the tile syntax, three edits, all one defect. `parse_pps`
+    bounded `num_tile_{columns,rows}_minus1` by the picture only
+    (`pic_{width,height}_in_ctbs_y - 1`, which reaches 2110 on a legal SPS) while using
+    them to index `column_width_minus1` / `row_height_minus1`. A PPS on a 2048x2048 SPS
+    asking for 26 tile columns panicked. Annex A is the real bound: A.4.1 requires
+    `num_tile_columns_minus1 < MaxTileCols` and `num_tile_rows_minus1 < MaxTileRows`,
+    and Table A.8 peaks at 20 and 22 (levels 6, 6.1, 6.2). So:
+
+    - new `MAX_TILE_COLUMNS` / `MAX_TILE_ROWS` consts (20, 22), and the counts are read
+      with `min(picture bound, const - 1)`;
+    - the arrays grew from `[u32; 19]` / `[u32; 21]` to those consts. Upstream sized them
+      one short of Table A.8 — the code stores the running remainder in
+      `column_width_minus1[num_tile_columns_minus1]`, so the last tile needs a slot —
+      which means bounding at the arrays would have refused a conformant 20-column
+      stream. Growing by one entry each costs nothing and lets the guard be the spec's
+      number rather than an implementation artefact. The upstream test asserting
+      `[0; 19]` / `[0; 21]` follows the consts now.
+
+    Raising the ceiling to the spec's exposed two further panics downstream, in
+    `parse_slice_header`'s entry-point block (both reachable before this change too, at
+    the arrays' old 19x21 ceiling):
+
+    - the `num_entry_point_offsets` maximum computed
+      `(num_tile_columns_minus1 + 1) * (num_tile_rows_minus1 + 1) - 1` in `u8`, which
+      overflows above 256 tiles — 20x22 is 440. Widened to `u32`, matching the sibling
+      branch two lines down;
+    - `num_entry_point_offsets` was then bounded by that maximum while
+      `entry_point_offset_minus1` is `[u32; 32]`, so a slice claiming 35 entry points
+      indexed past it. Clamped to the array, the same way deviation 7 handles the
+      long-term arrays. 7.4.7.1 puts no 32-entry cap on the element, so this refuses a
+      conformant stream with more than 32 entry points — notably 4K wavefront
+      (`entropy_coding_sync_enabled_flag`) streams, which carry one offset per CTB row.
+      An error beats a panic, but the real fix is upstream sizing that array from the
+      stream.
+
+    Regression-tested in `pf-bitstream`
+    (`a_pps_with_more_tiles_than_any_level_allows_is_a_parse_error_not_a_panic`,
+    `a_slice_claiming_more_entry_points_than_the_header_holds_is_a_parse_error_not_a_panic`).
+    **Report upstream — not yet filed.**
+
+12. `src/codec/av1/parser.rs` — `parse_tile_info`: the two non-uniform tile loops
+    (`uniform_tile_spacing_flag == 0`) run until `start_sb` reaches `sb_cols` / `sb_rows`
+    while filling `width_in_sbs_minus_1` / `height_in_sbs_minus_1`, which are
+    `MAX_TILE_COLS` / `MAX_TILE_ROWS` (64) deep. Each iteration advances `start_sb` by at
+    least one superblock, so a frame wide or tall enough — 4096 mi columns is 256
+    superblocks — walks 256 entries into a 64-entry array. The uniform branch already
+    checks `tile_cols > MAX_TILE_COLS` after the fact and is genuinely bounded before it
+    (`tile_cols_log2 <= max_log2_tile_cols <= 6`); the non-uniform branch had neither.
+    Guarded at the top of each loop body, returning the same
+    `"Invalid tile_{cols,rows} {n}"` the uniform branch does. 64 is the spec's own
+    ceiling (`MAX_TILE_COLS` / `MAX_TILE_ROWS` in 3, and a conformance requirement on
+    `TileCols` / `TileRows` in 5.11.1), so it is both the array bound and the legal one.
+    Regression-tested in the file's own test module
+    (`more_non_uniform_tiles_than_the_spec_allows_is_a_parse_error_not_a_panic`).
+    **Report upstream — not yet filed.**
+
+13. `src/codec/h264/parser.rs` — `parse_sps`: reject a picture whose macroblock count
+    overflows `u32`, with the `checked_mul` idiom the frame-crop validation a few lines
+    below already uses. `max_dpb_frames()` computes
+    `max_dpb_mbs / (width_mb * height_mb)` (A.3.1); both dimensions are `ue(v)` read into
+    `u16`, so each reaches 65536 macroblocks and their product reaches 2^33. In debug
+    that is a multiply-overflow panic, in release it wraps — 65536 x 65536 wraps to
+    exactly zero — and the division that follows panics on a zero divisor. `max_dpb_frames()`
+    returns `usize`, not `Result`, and the DPB and `max_num_order_frames()` both call it,
+    so the check belongs at the parse boundary where an `Err` is available. Bounded at
+    the arithmetic limit rather than Table A-1's `MaxFS`: the level tables are the only
+    range H.264 gives these elements, this parser enforces no other level conformance at
+    parse time, and hardware decoders routinely accept a stream whose level_idc
+    understates its resolution. Regression-tested in the file's own test module
+    (`a_picture_whose_macroblock_count_overflows_is_a_parse_error_not_a_panic`).
+    **Report upstream — not yet filed.**
+
 Re-sync procedure: fetch the AOSP tree, re-apply this trim, diff `codec/` +
 `bitstream_utils.rs` (expect near-zero conflicts), update the commit pin above.

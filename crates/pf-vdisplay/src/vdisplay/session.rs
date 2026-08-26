@@ -202,8 +202,10 @@ pub enum ActiveKind {
 /// The session environment that points a backend at the [detected](detect_active_session) active
 /// session: the Wayland socket (for the Wayland-protocol backends), the runtime dir + session bus
 /// (for PipeWire capture + D-Bus / portal input), and the desktop name (for portal routing). The
-/// host serves one session at a time, so [`apply_session_env`] writes these into the process env
-/// per connect and every backend that reads them then opens against the live session.
+/// host serves one session at a time, so [`apply_session_env`] writes the first four into the
+/// process env per connect and every backend that reads them then opens against the live session.
+/// The last two are a *description* of the session, not something exported — their readers are
+/// `hyprctl` and `swaymsg`, which get them per spawn (see [`hypr_signature`] / [`sway_socket`]).
 #[derive(Clone, Debug, Default)]
 pub struct SessionEnv {
     /// `WAYLAND_DISPLAY` of the live compositor (`None` for Gaming-attach / Mutter, which are
@@ -217,16 +219,16 @@ pub struct SessionEnv {
     /// routing (xdph keys its Hyprland-specific behavior off `Hyprland`).
     pub xdg_current_desktop: Option<String>,
     /// `HYPRLAND_INSTANCE_SIGNATURE` of the live Hyprland instance (`Some` only for
-    /// [`ActiveKind::DesktopHyprland`]). `hyprctl` needs it to reach the right instance socket;
-    /// [`apply_session_env`] exports it so the systemd-`--user` host works without inheriting the
-    /// session env. `None` for every other compositor.
+    /// [`ActiveKind::DesktopHyprland`]). `hyprctl` needs it to reach the right instance socket, and
+    /// it is handed to that child directly ([`hypr_signature`]) so the systemd-`--user` host works
+    /// without inheriting the session env. `None` for every other compositor.
     pub hyprland_signature: Option<String>,
     /// `SWAYSOCK` of the live sway instance (`Some` only for a sway [`ActiveKind::DesktopWlroots`]).
     /// `swaymsg` needs it, and it was the LAST session variable the host could not derive: a
     /// `systemd --user` host that never inherited the login shell's environment had no sway IPC at
     /// all, so output enumeration and the chooser both failed. Derived from the detected compositor
-    /// PID like the Hyprland signature above. `None` on river (wlroots, but no sway IPC) and every
-    /// other compositor.
+    /// PID like the Hyprland signature above, and likewise handed straight to the child
+    /// ([`sway_socket`]). `None` on river (wlroots, but no sway IPC) and every other compositor.
     pub sway_socket: Option<String>,
 }
 
@@ -536,6 +538,35 @@ fn find_sway_socket(env: &EnvProbe, runtime: &str, uid: u32, pid: Option<u32>) -
     cands.into_iter().next().map(|(_, p)| p)
 }
 
+/// The `HYPRLAND_INSTANCE_SIGNATURE` to hand a `hyprctl` child, resolved at spawn time.
+///
+/// [`apply_session_env`] used to export this so `hyprctl` inherited it — a `setenv` on the connect
+/// path for a variable nothing outside this crate reads, i.e. a `getenv` race with every other
+/// thread bought for nothing. The reader takes it by argument now (`Command::env`), the way
+/// `set_launch_command` took the launch off the env before it. Resolving per spawn is also the more
+/// truthful answer: a Hyprland↔sway switch cannot leave a stale export pointing `hyprctl` at a dead
+/// instance, because there is no export.
+#[cfg(target_os = "linux")]
+pub(crate) fn hypr_signature() -> Option<String> {
+    let probe = EnvProbe::sample();
+    let runtime = default_runtime_dir(&probe);
+    find_hypr_signature(&probe, &runtime, crate::proc::current_uid())
+}
+
+/// The `SWAYSOCK` to hand a `swaymsg` child, resolved at spawn time — the sway counterpart of
+/// [`hypr_signature`], off the process env for the same reason.
+///
+/// No compositor PID to match against here (detection's `/proc` scan is far too expensive to repeat
+/// per `swaymsg`), so this takes [`find_sway_socket`]'s other two arms: a valid inherited value, else
+/// the newest sway IPC socket we own. `None` on river (wlroots, no sway IPC) and when nothing
+/// sway-shaped is listening — which is what keeps `swaymsg` from being aimed at a dead socket.
+#[cfg(target_os = "linux")]
+pub(crate) fn sway_socket() -> Option<String> {
+    let probe = EnvProbe::sample();
+    let runtime = default_runtime_dir(&probe);
+    find_sway_socket(&probe, &runtime, crate::proc::current_uid(), None)
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn detect_active_session() -> ActiveSession {
     ActiveSession::none()
@@ -578,16 +609,30 @@ fn find_wayland_socket(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String
 
 /// Write a detected session's [`SessionEnv`] into the process env so every backend (video capture
 /// and input alike) that reads `WAYLAND_DISPLAY` / `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` /
-/// `XDG_CURRENT_DESKTOP` at open time targets the live session. Serialized via [`ENV_LOCK`] so
-/// concurrent session handshakes can't race the `set_var`s; the next connect re-detects and
+/// `XDG_CURRENT_DESKTOP` at open time targets the live session; the next connect re-detects and
 /// re-applies.
+///
+/// Those four are what remains because their readers can only take them from the process env:
+/// wayland-client's `connect_to_env`, zbus's address lookup, libpipewire and the Mesa loader — plus
+/// [`settle_desktop_portal`], which imports them into the systemd / D-Bus activation environment BY
+/// NAME out of ours. Everything whose reader is code we own travels as a value instead: `hyprctl`'s
+/// instance signature and `swaymsg`'s socket are handed to those children with `Command::env`
+/// ([`hypr_signature`] / [`sway_socket`]), the launch command rides `set_launch_command`, and the
+/// gamescope sub-mode rides `set_gamescope_route`.
+///
+/// [`ENV_LOCK`] orders these writes against this crate's own env readers. It does **not** make them
+/// sound — see its doc — so shortening this list is the only thing that moves the needle.
 #[cfg(target_os = "linux")]
 pub fn apply_session_env(active: &ActiveSession) {
     let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let e = &active.env;
-    // SAFETY: `_env_guard` holds [`ENV_LOCK`] — the crate-wide discipline (see its doc in lib.rs)
-    // that serializes every process-env writer on the session-setup path; steady-state streaming
-    // threads read cached config, not the environment (security-review 2026-06-28 #7).
+    // SAFETY: PARTIAL, and deliberately not a proof. `_env_guard` holds [`ENV_LOCK`], which orders
+    // this against every env reader and writer *inside pf-vdisplay*, and steady-state streaming
+    // threads read cached config rather than the environment. Nothing else in the process takes
+    // that lock — not glibc, not zbus, not wayland-client, not the Mesa ICD loader — so each write
+    // below is still a race with a concurrent `getenv` elsewhere, as `setenv(3)` always is. These
+    // four survive only because their readers cannot be handed a value; every variable whose
+    // readers are ours has been moved off (security-review 2026-06-28 #7, 2026-08-25).
     unsafe {
         std::env::set_var("XDG_RUNTIME_DIR", &e.xdg_runtime_dir);
         std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &e.dbus_session_bus_address);
@@ -597,25 +642,11 @@ pub fn apply_session_env(active: &ActiveSession) {
         if let Some(d) = &e.xdg_current_desktop {
             std::env::set_var("XDG_CURRENT_DESKTOP", d);
         }
-        // Hyprland: export the discovered instance signature so `hyprctl` reaches the live
-        // compositor (fixes G4 for the systemd `--user` host, which never inherited it). Only set
-        // when detection found a Hyprland session; a stale value from a previous connect is
-        // cleared otherwise so a Hyprland→sway switch can't leave `hyprctl` pointed at a dead
-        // instance.
-        match &e.hyprland_signature {
-            Some(sig) => std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", sig),
-            None => std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"),
-        }
-        // sway: same treatment, and for the same reason — `swaymsg` (output enumeration, the
-        // capture chooser) is unreachable without it, so a systemd `--user` host that never
-        // inherited the login environment had no sway backend at all. Cleared when nothing
-        // sway-shaped is live, so a sway→Hyprland switch can't leave `swaymsg` aimed at a dead
-        // socket. `wlroots::is_available()` keys off this variable, so setting it here is also
-        // what makes the backend visible at all.
-        match &e.sway_socket {
-            Some(sock) => std::env::set_var("SWAYSOCK", sock),
-            None => std::env::remove_var("SWAYSOCK"),
-        }
+        // `HYPRLAND_INSTANCE_SIGNATURE` and `SWAYSOCK` were exported here too. Their only readers
+        // are `hyprctl` and `swaymsg`, both spawned by this crate, so they travel to those children
+        // as `Command::env` values now ([`hypr_signature`] / [`sway_socket`]): two fewer
+        // `setenv`/`unsetenv` calls per connect, and nothing left to go stale across a Hyprland↔sway
+        // switch — a child that is not spawned inherits no signature to be wrong about.
         // NOTHING live ⇒ every session-scoped var still in the env is a leftover from a previous
         // connect's retarget, and the availability probes read them: after a gnome-shell crash
         // (observed 2026-07-10: SIGSEGV → GDM greeter) a stale `XDG_CURRENT_DESKTOP=GNOME` kept
@@ -908,8 +939,8 @@ mod tests {
     }
 
     /// river is the other wlroots desktop and ships no sway IPC. Reporting `None` is what keeps
-    /// `apply_session_env` from exporting a `SWAYSOCK` that points at nothing — an exported lie
-    /// would make `wlroots::is_available()` claim a backend that cannot answer.
+    /// [`sway_socket`] from handing `swaymsg` a `SWAYSOCK` that points at nothing — a made-up
+    /// socket would turn "no sway IPC here" into a connect that hangs or fails obscurely.
     #[test]
     fn no_sway_ipc_socket_reports_none() {
         let rt = FakeRuntime::new("none", &[]);

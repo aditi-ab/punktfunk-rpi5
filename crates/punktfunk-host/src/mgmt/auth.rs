@@ -113,8 +113,15 @@ pub(crate) async fn require_auth(
     // sessions, or edit the library). Everything outside the allowlist requires the operator's bearer
     // token. The fingerprint is attached by `serve_https` from the verified peer cert.
     if let Some(PeerCertFingerprint(Some(fp))) = req.extensions().get::<PeerCertFingerprint>() {
+        // `effective`, not `is_paired`: the expiry-blind verb answers "is this device LISTED", which
+        // is the device roster's question, not an admission gate's (see the `native_pairing` module
+        // header's two-verbs contract). Authorizing on the listing would leave a guest whose access
+        // lapsed hours ago holding this lane for as long as the record sits in the store.
         if cert_may_access(req.method(), req.uri().path())
-            && st.native.as_ref().is_some_and(|n| n.is_paired(fp))
+            && st
+                .native
+                .as_ref()
+                .is_some_and(|n| n.effective(fp, unix_now()).is_some())
         {
             return forward(req, next, AuthLane::Cert).await;
         }
@@ -190,6 +197,12 @@ pub(crate) async fn require_auth(
 /// What stays *out* of the list, and why:
 /// - **hooks** — `hooks.json` runs operator commands on lifecycle events; writing it is arbitrary
 ///   command execution as the host user, and reading it can expose webhook credentials.
+/// - **the host's log ring** (`GET /logs`) — it serves the host's own tracing at DEBUG and above,
+///   unredacted, which is the *same* webhook credentials (for Slack, Discord, ntfy, Teams, Zapier
+///   and Home Assistant the URL IS the bearer token) plus every command line the hook runner has
+///   spawned. Withholding `/hooks` while handing the ring over left the carve-out above decorative
+///   (2026-08-25 review H-2). A plugin still WRITES its own output — `POST /plugins/logs` below —
+///   which is the direction it actually needs.
 /// - **pairing administration** — arming/approving/denying/unpairing (and PIN visibility) decide
 ///   *which devices may stream*; a plugin defect must not be able to admit an attacker's device
 ///   or eject the operator's.
@@ -205,6 +218,14 @@ pub(crate) async fn require_auth(
 /// its own entries — but the two operator-privileged FIELDS inside those payloads (`prep`, and
 /// `launch.kind == "command"`) are refused to this lane in the handlers, via [`AuthLane`]. Route
 /// reachability and field authority are separate questions and this gate only answers the first.
+///
+/// That field refusal is **not** a command-execution boundary today, and this doc used to read as
+/// though it were: `PUT /plugins/{}` below lets this lane register *any* plugin id together with the
+/// loopback port and per-boot secret the host will dial, and a `launch.kind == "plugin"` entry under
+/// that id makes the host run whatever that listener answers
+/// ([`crate::library::ask_plugin_launch`], 2026-08-25 review H-1). No narrowing here can fix that:
+/// the runner hosts every plugin in ONE process on ONE shared token, so this gate cannot tell which
+/// plugin is calling, and a plugin that proved its id would still be entitled to that primitive.
 pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
     // (method, path) pairs, `{}` matching exactly one path segment. Grouped as the route table is.
     const ALLOWED: &[(&Method, &str)] = &[
@@ -215,7 +236,6 @@ pub(crate) fn plugin_may_access(method: &Method, path: &str) -> bool {
         (&Method::GET, "/api/v1/local/summary"),
         (&Method::GET, "/api/v1/compositors"),
         (&Method::GET, "/api/v1/events"),
-        (&Method::GET, "/api/v1/logs"),
         // The paired-device rosters: read-only. (DELETE is pairing administration — not listed.)
         (&Method::GET, "/api/v1/clients"),
         (&Method::GET, "/api/v1/native/clients"),
@@ -322,4 +342,28 @@ pub(crate) fn cert_may_access(method: &Method, path: &str) -> bool {
 /// secret without pulling in a ct-eq dependency.
 pub(crate) fn token_eq(presented: &str, expected: &str) -> bool {
     Sha256::digest(presented.as_bytes()) == Sha256::digest(expected.as_bytes())
+}
+
+/// Host wall clock, unix seconds — the clock every stored access deadline is expressed in, sampled
+/// at each check (per-client-access design §4), same as `mgmt::native`'s copy.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The log ring is the `/hooks` carve-out's back door: it carries the hook runner's webhook URLs
+    /// (which ARE the bearer credential for Slack/Discord/ntfy/Teams/Zapier/Home Assistant) and the
+    /// command lines it spawned, unredacted, to anyone who can `GET /logs`. A plugin only ever needs
+    /// the other direction — pin both halves so neither drifts back (2026-08-25 review H-2).
+    #[test]
+    fn the_plugin_lane_writes_logs_but_never_reads_them() {
+        assert!(!plugin_may_access(&Method::GET, "/api/v1/logs"));
+        assert!(plugin_may_access(&Method::POST, "/api/v1/plugins/logs"));
+    }
 }

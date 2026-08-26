@@ -24,9 +24,9 @@
 //!    what made every stream after the first one fail on Hyprland — see [`StopGuard`].
 //!
 //! Requirements: the host runs inside (or can reach) the Hyprland session — either
-//! `HYPRLAND_INSTANCE_SIGNATURE` is inherited, or [`is_available`] discovers it from
-//! `$XDG_RUNTIME_DIR/hypr/` and [`super::super::apply_session_env`] exports it for `hyprctl` — with
-//! the ScreenCast interface routed to xdph (`scripts/headless/portals.conf`).
+//! `HYPRLAND_INSTANCE_SIGNATURE` is inherited, or it is discovered from `$XDG_RUNTIME_DIR/hypr/`
+//! and handed to each `hyprctl` child ([`hyprctl_command`]) — with the ScreenCast interface routed
+//! to xdph (`scripts/headless/portals.conf`).
 //!
 //! The focus contract [`focus_output`] rests on is verified on **Hyprland 0.56.2** (2026-08-17,
 //! headless probe against a real instance): `output create headless` leaves the new head
@@ -195,18 +195,19 @@ impl HyprlandDisplay {
     }
 }
 
-/// Hyprland is usable when a live Hyprland instance for our uid is reachable — signalled by
-/// `HYPRLAND_INSTANCE_SIGNATURE` (inherited from the session) **or** a discoverable instance socket
-/// under `$XDG_RUNTIME_DIR/hypr/*/.socket.sock` (so the systemd `--user` host works without env
-/// import, unlike sway's `SWAYSOCK`; the signature is then exported by `apply_session_env`). Cheap,
-/// side-effect-free — safe on the enumeration path.
+/// Hyprland is usable when a live Hyprland instance for our uid is reachable — signalled by an
+/// INHERITED `HYPRLAND_INSTANCE_SIGNATURE` **or** a discoverable instance socket under
+/// `$XDG_RUNTIME_DIR/hypr/*/.socket.sock` (so the systemd `--user` host works without env import,
+/// unlike sway's `SWAYSOCK`). Cheap, side-effect-free — safe on the enumeration path.
+///
+/// Inherited is now all the signature can be: `apply_session_env` no longer exports it (the value
+/// goes to the `hyprctl` children instead — see [`hyprctl_command`]), so this reads only what the
+/// host was launched with. The socket scan below is the arm that matters, and it always was.
 ///
 /// Both env reads take [`crate::with_env_lock`] — in ONE scope, so the pair is sampled from a single
-/// consistent view. This runs on a management worker (`/host/compositors` → [`crate::available`])
-/// concurrently with another connect's `apply_session_env`, which `set_var`s the signature for a
-/// live Hyprland session and `remove_var`s it for anything else; a glibc `getenv` racing that
-/// `setenv`/`unsetenv` is the `environ` realloc data race ENV_LOCK exists for. No caller holds the
-/// lock (it is not reentrant), and the `read_dir` below deliberately runs outside it.
+/// consistent view — which orders them against this crate's remaining env writers
+/// (`apply_session_env`'s four survivors) and nothing else. No caller holds the lock (it is not
+/// reentrant), and the `read_dir` below deliberately runs outside it.
 pub fn is_available() -> bool {
     let (sig, runtime) = crate::with_env_lock(|| {
         (
@@ -887,12 +888,13 @@ const HYPRCTL_BUDGET: Duration = Duration::from_secs(5);
 /// job to settle, so it is the slowest helper on this path — and its result is already ignored.
 const PORTAL_RESTART_BUDGET: Duration = Duration::from_secs(10);
 
-/// Run `hyprctl <args>`, returning stdout. `hyprctl` reads `HYPRLAND_INSTANCE_SIGNATURE` from the
-/// env (exported by `apply_session_env`) to reach the right instance socket. It exits non-zero on a
-/// hard failure, but for dispatch commands it can print an error with status 0 — see
-/// [`hyprctl_dispatch`].
+/// Run `hyprctl <args>`, returning stdout. `hyprctl` needs `HYPRLAND_INSTANCE_SIGNATURE` to reach
+/// the right instance socket; it is set on THIS CHILD ([`hyprctl_command`]) rather than exported
+/// into the host's own environment. It exits non-zero on a hard failure, but for dispatch commands
+/// it can print an error with status 0 — see [`hyprctl_dispatch`].
 fn hyprctl(args: &[&str]) -> Result<String> {
-    let out = crate::proc::output_within(Command::new("hyprctl").args(args), HYPRCTL_BUDGET)
+    let mut cmd = hyprctl_command(args, crate::session::hypr_signature());
+    let out = crate::proc::output_within(&mut cmd, HYPRCTL_BUDGET)
         .context("run hyprctl (is Hyprland installed?)")?;
     if !out.status.success() {
         bail!(
@@ -903,6 +905,24 @@ fn hyprctl(args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The `hyprctl` invocation, with the live instance signature threaded onto the child.
+///
+/// It used to ride the process env: `apply_session_env` `set_var`'d it per connect (and
+/// `remove_var`'d it for a non-Hyprland session) so this child inherited it. Nothing outside
+/// pf-vdisplay ever read it, so that bought a per-connect `setenv` — a data race with any `getenv`
+/// on any other thread of a live streaming host — for a value one child needs. `Command::env` gives
+/// it to exactly that child, the way `set_launch_command` carries the launch. `sig` is `None` when
+/// there is no live Hyprland instance we can find: leave the child's env alone then, so an
+/// inherited one (host started inside the session) still wins.
+fn hyprctl_command(args: &[&str], sig: Option<String>) -> Command {
+    let mut cmd = Command::new("hyprctl");
+    cmd.args(args);
+    if let Some(sig) = sig {
+        cmd.env("HYPRLAND_INSTANCE_SIGNATURE", sig);
+    }
+    cmd
 }
 
 /// Serializes **write-the-selection → complete-the-handshake**, process-wide — see the wlroots
@@ -1542,6 +1562,34 @@ mod tests {
             focus_argv("PF-1234-1"),
             ["dispatch", "focusmonitor", "PF-1234-1"]
         );
+    }
+
+    /// `HYPRLAND_INSTANCE_SIGNATURE` reaches `hyprctl` as a per-CHILD override, never as a `set_var`
+    /// on the host's own environment — that write was a `getenv` data race with every other thread
+    /// of a live session (security-review 2026-08-25). Pinning both arms: a discovered signature is
+    /// set on the child, and an undiscoverable one leaves the child's env untouched so an inherited
+    /// signature still reaches the compositor.
+    #[test]
+    fn the_instance_signature_travels_on_the_child_not_the_process_env() {
+        let overrides = |sig: Option<String>| -> Vec<(String, Option<String>)> {
+            hyprctl_command(&["-j", "version"], sig)
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            overrides(Some("abc123".to_string())),
+            [(
+                "HYPRLAND_INSTANCE_SIGNATURE".to_string(),
+                Some("abc123".to_string())
+            )]
+        );
+        assert!(overrides(None).is_empty());
     }
 
     #[test]

@@ -1515,7 +1515,9 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("GET", "/api/v1/local/summary", true, false), // loopback-only, handled before the gates
         ("GET", "/api/v1/compositors", true, true),
         ("GET", "/api/v1/events", true, false),
-        ("GET", "/api/v1/logs", true, false),
+        // The ring is unredacted host tracing — webhook URLs and hook command lines. Serving it to
+        // the plugin lane made the `/hooks` carve-out decorative (2026-08-25 review H-2).
+        ("GET", "/api/v1/logs", false, false),
         // ---- diagnostics: OPERATOR ONLY, both lanes denied. The verdicts name the host's user,
         // its group layout and the state of its device nodes — a paired streaming client has no
         // business enumerating any of that, and a plugin that wanted to would be asking for a map

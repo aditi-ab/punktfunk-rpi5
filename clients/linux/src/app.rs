@@ -612,10 +612,10 @@ impl AppModel {
     }
 
     /// Route a `punktfunk://` URL (design/client-deep-links.md §4.1). Parsing, host/profile
-    /// resolution and every refusal rule live in the shared brain (`plan_from_link`); this is
-    /// only the GTK end of it — turn the outcome into the same messages a card click raises,
-    /// so a link gets the identical wake, trust and error surfaces and NOT a second connect
-    /// path of its own.
+    /// resolution and every refusal rule — including "only a stable record id may dial
+    /// unattended" — live in the shared brain (`plan_from_link`); this is only the GTK end of
+    /// it: turn the outcome into the same messages a card click raises, so a link gets the
+    /// identical wake, trust and error surfaces and NOT a second connect path of its own.
     fn open_deep_link(&mut self, url: &str, sender: &ComponentSender<AppModel>) {
         use pf_client_core::deeplink;
         use pf_client_core::orchestrate::{plan_from_link, PlanOutcome};
@@ -659,6 +659,51 @@ impl AppModel {
                 } else {
                     AppMsg::Connect(req)
                 });
+            }
+            Ok(PlanOutcome::ConfirmConnect(plan)) => {
+                // The link named this (saved, pinned) host by its LABEL or its ADDRESS rather
+                // than by its record id. `x-scheme-handler/punktfunk` is registered by our
+                // .desktop, so any web page can hand us such a URL and both of those are
+                // guessable — the dial waits for a person. Deliberately not the PIN ceremony
+                // below: this host is already pinned, and re-pairing it would throw that away.
+                if self.busy {
+                    return self.toast("A session is already running — end it first.");
+                }
+                let req = ConnectRequest {
+                    name: plan.host.name.clone(),
+                    addr: plan.host.addr.clone(),
+                    port: plan.host.port,
+                    fp_hex: plan.host.fp_hex.clone(),
+                    pair_optional: false,
+                    launch: plan.launch.clone().map(|id| (id.clone(), id)),
+                    mac: plan.host.mac.clone(),
+                    profile: plan.profile_override.clone(),
+                };
+                let mut body = format!("A link asks to connect to {} ({}).", req.name, req.addr);
+                if let Some((id, _)) = &req.launch {
+                    body.push_str(&format!("\n\nIt also asks the host to launch “{id}”."));
+                }
+                body.push_str(
+                    "\n\nIt names the host by its label or address, which anything that can \
+                     open a link could guess. A link that names the host's id connects without \
+                     asking.",
+                );
+                let dialog = adw::AlertDialog::new(Some("Open this link?"), Some(&body));
+                dialog.add_responses(&[("cancel", "Cancel"), ("connect", "Connect")]);
+                dialog.set_response_appearance("connect", adw::ResponseAppearance::Suggested);
+                dialog.set_close_response("cancel");
+                let sender = sender.clone();
+                let wake = plan.wake;
+                dialog.connect_response(Some("connect"), move |_, _| {
+                    // The same two messages the `Connect` arm raises, so the confirmed link
+                    // gets the identical wake / trust / error surfaces a card click gets.
+                    sender.input(if wake {
+                        AppMsg::WakeConnect(req.clone())
+                    } else {
+                        AppMsg::Connect(req.clone())
+                    });
+                });
+                dialog.present(Some(&self.window));
             }
             Ok(PlanOutcome::ConfirmUnknown(unknown)) => {
                 // Known-but-unpinned, or not known at all: the link may not pair and may not

@@ -1,15 +1,16 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { UserPlus, X } from "lucide-react";
 import { type FC, useState } from "react";
+import { ApiError } from "@/api/fetcher";
 import type { ApprovePending } from "@/api/gen/model/approvePending";
 import type { PendingDevice } from "@/api/gen/model/pendingDevice";
 import {
 	getListNativeClientsQueryKey,
 	getListPendingDevicesQueryKey,
-	useApprovePendingDevice,
 	useDenyPendingDevice,
 	useListPendingDevices,
 } from "@/api/gen/native/native";
+import { useApprovePendingDevice } from "@/api/pairing";
 import { QueryState } from "@/components/query-state";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -34,21 +35,31 @@ export const PendingDevicesSection: FC = () => {
 	const deny = useDenyPendingDevice();
 	// The row whose Approve dialog is open — a snapshot, so the 10 s poll can't reset the form.
 	const [approving, setApproving] = useState<PendingDevice | null>(null);
+	const [wrongPassword, setWrongPassword] = useState(false);
 
 	const refresh = () => {
 		qc.invalidateQueries({ queryKey: getListPendingDevicesQueryKey() });
 		qc.invalidateQueries({ queryKey: getListNativeClientsQueryKey() });
 	};
-	const onApprove = (id: number, body: ApprovePending) =>
+	const openApprove = (device: PendingDevice | null) => {
+		setWrongPassword(false);
+		setApproving(device);
+	};
+	const onApprove = (id: number, body: ApprovePending, password: string) => {
+		setWrongPassword(false);
 		approve.mutate(
-			{ id, data: body },
+			{ id, data: body, password },
 			{
 				onSuccess: () => {
 					setApproving(null);
 					refresh();
 				},
+				onError: (e) => {
+					if (e instanceof ApiError && e.status === 401) setWrongPassword(true);
+				},
 			},
 		);
+	};
 	const onDeny = (id: number) => deny.mutate({ id }, { onSuccess: refresh });
 
 	// The id of the row whose approve/deny is in flight — only that row's buttons disable.
@@ -61,15 +72,16 @@ export const PendingDevicesSection: FC = () => {
 		<>
 			<PendingDevices
 				pending={pending}
-				onApprove={setApproving}
+				onApprove={openApprove}
 				onDeny={onDeny}
 				pendingId={pendingId}
 			/>
 			<ApproveDialog
 				device={approving}
-				onCancel={() => setApproving(null)}
+				onCancel={() => openApprove(null)}
 				onApprove={onApprove}
 				isPending={approve.isPending}
+				wrongPassword={wrongPassword}
 			/>
 		</>
 	);

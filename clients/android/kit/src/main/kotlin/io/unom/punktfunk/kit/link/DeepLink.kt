@@ -154,15 +154,22 @@ object DeepLinks {
 
     /**
      * Resolve a link's host reference against the local store, in the documented order: stable
-     * record id → unique case-insensitive name → `addr[:port]` literal. The `host=` parameter is
-     * the recovery path — a self-emitted shortcut that outlived the record it was written from
-     * still lands on the right box (degraded to the confirmation sheet).
+     * record id → unique case-insensitive name → `addr[:port]` literal, then the `host=` recovery
+     * parameter — a self-emitted shortcut that outlived the record it was written from still lands
+     * on the right box.
+     *
+     * Only the record id is UNGUESSABLE, so only the record id resolves to [HostResolution.Known],
+     * the silent one-click contract. A display name comes from an mDNS instance name or a user
+     * label ("Gaming PC"), and an address is a LAN address: any zero-permission app or web page can
+     * emit `punktfunk://connect/Gaming%20PC` and would otherwise start a stream (and launch a
+     * title) on a guess. Those all resolve to [HostResolution.Confirm] — the same host, behind the
+     * user's OK.
      */
     fun resolveHost(link: DeepLink, hosts: List<KnownHost>): HostResolution {
         hosts.firstOrNull { it.id == link.hostRef }?.let { return HostResolution.Known(it) }
         val byName = hosts.filter { it.name.equals(link.hostRef, ignoreCase = true) }
         when (byName.size) {
-            1 -> return HostResolution.Known(byName[0])
+            1 -> return HostResolution.Confirm(byName[0])
             0 -> Unit
             else -> return HostResolution.Ambiguous
         }
@@ -173,7 +180,7 @@ object DeepLinks {
         val literal = if (looksLikeAddress(link.hostRef)) parseAddrPort(link.hostRef) else null
         for ((addr, port) in listOfNotNull(literal, link.host)) {
             hosts.firstOrNull { it.address == addr && it.port == port }
-                ?.let { return HostResolution.Known(it) }
+                ?.let { return HostResolution.Confirm(it) }
         }
         val fallback = literal ?: link.host ?: return HostResolution.Unresolvable
         return HostResolution.Unknown(fallback.first, fallback.second, link.name, link.fp)
@@ -429,8 +436,23 @@ sealed interface DeepLinkResult {
 
 /** What the local host store made of a link's references. */
 sealed interface HostResolution {
-    /** A record we already trust (subject to [DeepLink.pinConflict]). */
-    data class Known(val host: KnownHost) : HostResolution
+    /** A saved record — [Known] may act on its own, [Confirm] only once the user says so. */
+    sealed interface Record : HostResolution {
+        val host: KnownHost
+    }
+
+    /**
+     * A record we already trust, named by its stable (unguessable) id: the one-click contract,
+     * subject to [DeepLink.pinConflict].
+     */
+    data class Known(override val host: KnownHost) : Record
+
+    /**
+     * The same record, but named by something GUESSABLE — its display name, its address, or the
+     * `host=` recovery parameter. A link may not start a stream on a guess, so this one goes to
+     * the confirmation the front-end shows: same dial, one tap later.
+     */
+    data class Confirm(override val host: KnownHost) : Record
 
     /**
      * No record, but the link says where to dial: the confirmation sheet's input, from which the

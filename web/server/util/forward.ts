@@ -11,12 +11,13 @@ import {
 } from "h3";
 import { isLoopbackUrl, mgmtToken, mgmtUrl } from "./auth";
 
-/** Forward a JSON body to `path` on the management API and relay the upstream response verbatim. */
+/** Forward a JSON body to `path` on the management API and relay the upstream response verbatim.
+ * Omit `body` for a bodiless method (GET) — a read whose RESPONSE we rewrite. */
 export async function forwardJson(
 	event: H3Event,
 	path: string,
 	method: string,
-	body: unknown,
+	body?: unknown,
 ): Promise<string> {
 	const token = mgmtToken();
 	if (!token) {
@@ -29,9 +30,9 @@ export async function forwardJson(
 		method,
 		headers: {
 			authorization: `Bearer ${token}`,
-			"content-type": "application/json",
+			...(body === undefined ? {} : { "content-type": "application/json" }),
 		},
-		body: JSON.stringify(body),
+		body: body === undefined ? undefined : JSON.stringify(body),
 	};
 	if (isLoopbackUrl(base)) {
 		// Bun.fetch extension — scoped per request, never process-wide (see routes/api/[...].ts).

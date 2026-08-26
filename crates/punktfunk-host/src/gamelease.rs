@@ -1018,6 +1018,10 @@ fn terminate_blocking(shared: &LeaseShared) {
 /// nothing — the exact failure a spawned pid was folded into the Windows ladder to fix. Resolved at
 /// the moment of use rather than stored on the lease, so a report that has since gone stale, or a
 /// pid the kernel has since recycled, contributes nothing.
+///
+/// And held to procscan's rule 1 like every other adopted process, because this is the one pid that
+/// arrives from *outside* the host: a plugin names it, so nothing but the start-time floor stands
+/// between `POST /game/end` and any process on the box — as SYSTEM, on Windows.
 #[cfg(any(target_os = "linux", windows))]
 fn reported_proc(shared: &LeaseShared) -> Option<crate::procscan::ProcRef> {
     let pid = shared
@@ -1027,7 +1031,41 @@ fn reported_proc(shared: &LeaseShared) -> Option<crate::procscan::ProcRef> {
         .and_then(crate::runstate::opinion)
         .filter(|l| l.running)?
         .pid?;
-    crate::procscan::resolve(pid)
+    let proc = crate::procscan::resolve(pid)?;
+    if let Some(min) = shared.launch_stamp {
+        let started = start_secs(proc);
+        if started + crate::procscan::START_SLACK_SECS < min {
+            return None; // predates this launch — never ours (rule 1)
+        }
+    }
+    Some(proc)
+}
+
+/// A resolved process's start time in seconds on the platform's process-start timeline — the scale
+/// [`LeaseShared::launch_stamp`] is on, so the two can be compared.
+///
+/// [`crate::procscan::ProcRef::start`] is otherwise opaque and its units are per-platform, and the
+/// matcher converts it inside each platform module rather than exposing it. Repeated here for the
+/// one pid the matcher never sees; `a_reported_pid_that_predates_the_launch_is_never_a_target`
+/// drives it against a real process, so the two cannot drift apart silently.
+#[cfg(any(target_os = "linux", windows))]
+fn start_secs(p: crate::procscan::ProcRef) -> f64 {
+    #[cfg(target_os = "linux")]
+    let per_sec = {
+        // SAFETY: `sysconf` reads a static system limit by name; no memory of ours is involved, and
+        // a non-positive answer (which is handled here) is its documented failure signal.
+        let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        // The same fallback the matcher takes: a non-positive answer would poison the comparison.
+        if ticks > 0 {
+            ticks as f64
+        } else {
+            100.0
+        }
+    };
+    // 100-nanosecond `FILETIME` ticks: the unit a Windows creation time is reported in.
+    #[cfg(windows)]
+    let per_sec = 10_000_000.0;
+    p.start as f64 / per_sec
 }
 
 /// SIGTERM everything that belongs to the game, wait, then SIGKILL whatever ignored it.
@@ -1744,6 +1782,69 @@ mod tests {
             Box::new(|| {}),
         );
         assert!(matches!(l.shared().kind(), LeaseKind::Untracked));
+    }
+
+    /// 🛑 The pid a provider reports takes the same start-time floor every other adopted process
+    /// takes. It is the only pid that reaches the termination ladder from *outside* the host, so
+    /// that floor is the whole of what stands between a plugin and any process on the box.
+    ///
+    /// Without it, a plugin that has a lease open reports the pid of anything it likes — security
+    /// tooling, sshd, the operator's editor — and `POST /game/end` walks the ladder over it: on
+    /// Windows the host is SYSTEM, so that reaches everything on the machine. The Playnite case is
+    /// untouched, because it reports a pid it just started; the second half is that case.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reported_pid_that_predates_the_launch_is_never_a_target() {
+        const ID: &str = "playnite:reported-pid";
+        const PROVIDER: &str = "playnite-reported-pid";
+
+        // Stands in for whatever a plugin decides to name: it exists before either stamp below.
+        let mut victim = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn the process a plugin would point at");
+        crate::runstate::report(
+            PROVIDER,
+            [ID.to_string()].into_iter().collect(),
+            [(ID.to_string(), Some(victim.id()))].into_iter().collect(),
+        );
+
+        // A launch that happened a minute after that process started — so the report names
+        // something this session never launched.
+        let l = open(
+            LeaseRequest {
+                launch_stamp: launch_clock().map(|s| s + 60.0),
+                ..req(ID, DetectSpec::default(), false)
+            },
+            Box::new(|| {}),
+        );
+        assert!(matches!(l.shared().kind(), LeaseKind::Reported));
+        assert!(
+            reported_proc(&l.shared()).is_none(),
+            "a reported pid that predates the launch must not be signallable"
+        );
+        drop(l);
+
+        // The Playnite case, unchanged: the pid the provider started for this launch. The stamp is
+        // taken *after* the process exists, which also pins the slack — an exact comparison would
+        // reject the real game (`crate::procscan::START_SLACK_SECS`).
+        let l = open(
+            LeaseRequest {
+                launch_stamp: launch_clock(),
+                ..req(ID, DetectSpec::default(), false)
+            },
+            Box::new(|| {}),
+        );
+        assert_eq!(
+            reported_proc(&l.shared()).map(|p| p.pid),
+            Some(victim.id()),
+            "the pid a provider started for this launch is still what `End` aims at"
+        );
+        drop(l);
+
+        crate::runstate::forget(PROVIDER);
+        let _ = victim.kill();
+        let _ = victim.wait();
     }
 
     #[test]

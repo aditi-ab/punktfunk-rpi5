@@ -8,7 +8,7 @@
 use anyhow::{bail, Context as _, Result};
 use ash::vk;
 use pf_client_core::video::{DmabufFrame, DrmFrameGuard};
-use std::os::fd::{BorrowedFd, IntoRawFd as _};
+use std::os::fd::{AsRawFd as _, BorrowedFd, IntoRawFd as _};
 
 /// `fourcc('N','V','1','2')` — 8-bit 4:2:0 VAAPI output.
 const DRM_FORMAT_NV12: u32 = 0x3231_564e;
@@ -297,14 +297,15 @@ fn plane_image(
             .context("no importable memory type for dmabuf")?;
 
         // Vulkan owns the fd it imports — dup so the decoder guard keeps the original.
-        // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
-        // type and live for the call, and every builder struct is a local that outlives it.
+        // SAFETY: `fd` is open for the whole borrow — it is a plane fd of the caller's
+        // `DmabufFrame`, whose `DrmFrameGuard` (the thing that closes those fds) lives until
+        // `import` hands it to the `HwFrame`. The borrow ends at `try_clone_to_owned`, which dups.
         let owned = unsafe { BorrowedFd::borrow_raw(fd) }
             .try_clone_to_owned()
             .context("dup dmabuf fd")?;
         let mut import_info = vk::ImportMemoryFdInfoKHR::default()
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-            .fd(owned.into_raw_fd());
+            .fd(owned.as_raw_fd());
         let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
         // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
         // type and live for the call, and every builder struct is a local that outlives it.
@@ -319,7 +320,9 @@ fn plane_image(
             )
         }
         .context("import dmabuf memory")?;
-        // (On allocate_memory failure Vulkan still closed the dup'd fd — nothing leaks.)
+        // Vulkan takes the fd only on a SUCCESSFUL import, so release `owned` here and let it close
+        // the dup on every failure path above (`?` drops it) instead of leaking one fd per frame.
+        let _ = owned.into_raw_fd();
         // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
         // type and live for the call, and every builder struct is a local that outlives it.
         if let Err(e) = unsafe { device.bind_image_memory(image, memory, 0) } {

@@ -411,6 +411,7 @@ fn session_url_xml(st: &AppState, tag: &str) -> String {
 
 async fn h_pair(
     State(st): State<Arc<AppState>>,
+    peer: Option<Extension<PeerCertFingerprint>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let uniqueid = q.get("uniqueid").cloned().unwrap_or_default();
@@ -440,9 +441,17 @@ async fn h_pair(
             _ => Ok(pair_error_xml()),
         }
     } else if phrase == Some("pairchallenge") {
-        // Reached only over the TLS port with the pinned host cert; the handshake is the
-        // proof, so acknowledge success.
-        Ok(paired_ok_xml())
+        // The ceremony's last step, which Moonlight makes over the TLS port with the cert phase 4
+        // has just pinned — so the pinned handshake is the proof, and only a pinned caller is told
+        // it is paired. Anyone else (the plain-HTTP listener, or an HTTPS peer presenting a cert
+        // that is not in the allow-list) gets the same answer an unpaired host gives, so this
+        // endpoint asserts no pairing the caller does not hold (security-review 2026-08-25).
+        if peer_is_paired(&peer, &st) {
+            Ok(paired_ok_xml())
+        } else {
+            tracing::warn!("pairchallenge rejected — client is not paired");
+            Ok(pair_error_xml())
+        }
     } else if let Some(v) = q.get("clientchallenge") {
         st.pairing.clientchallenge(&st.identity, &uniqueid, v)
     } else if let Some(v) = q.get("serverchallengeresp") {
@@ -535,6 +544,45 @@ mod tests {
             !peer_is_paired(&other, &st),
             "a non-pinned cert stays rejected"
         );
+    }
+
+    /// `pairchallenge` is the ceremony's last step and Moonlight makes it over the TLS port with
+    /// the cert phase 4 just pinned, so only a pinned caller is told it is paired. A plain-HTTP
+    /// scanner (no client cert at all) and an HTTPS peer with an unpinned cert both get the
+    /// unpaired answer — the endpoint must not assert a pairing the caller does not hold.
+    #[tokio::test]
+    async fn pairchallenge_answers_only_a_pinned_client() {
+        async fn challenge(
+            st: &Arc<AppState>,
+            peer: Option<Extension<PeerCertFingerprint>>,
+        ) -> String {
+            let q = HashMap::from([("phrase".to_string(), "pairchallenge".to_string())]);
+            let resp = h_pair(State(st.clone()), peer, Query(q))
+                .await
+                .into_response();
+            let b = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            String::from_utf8(b.to_vec()).unwrap()
+        }
+
+        let st = test_state();
+        let der = b"pairchallenge-client-der".to_vec();
+        let peer = Some(Extension(PeerCertFingerprint(Some(fp_of(&der)))));
+
+        // Plain HTTP (no cert) and an unpinned HTTPS cert both answer as an unpaired host.
+        let plain = challenge(&st, None).await;
+        assert!(plain.contains("<paired>0</paired>"), "plain HTTP: {plain}");
+        let unpinned = challenge(&st, peer.clone()).await;
+        assert!(
+            unpinned.contains("<paired>0</paired>"),
+            "unpinned cert: {unpinned}"
+        );
+
+        // Once phase 4 has pinned the cert, the real client's last step still succeeds.
+        st.paired.lock().unwrap().push(der);
+        let pinned = challenge(&st, peer).await;
+        assert!(pinned.contains("<paired>1</paired>"), "pinned: {pinned}");
     }
 
     #[test]

@@ -68,11 +68,22 @@ elif [ -f packaging/flatpak/cargo-sources.json ] && [ "${FORCE_GEN:-0}" != "1" ]
   echo "==> reusing existing packaging/flatpak/cargo-sources.json (FORCE_GEN=1 to regenerate)"
 else
   echo "==> generating offline cargo-sources.json from Cargo.lock"
+  # PINNED to a commit and checked by SHA-256 — same ref+sum as .gitea/workflows/flatpak.yml, so
+  # the local build path and CI vendor crate sources with the identical script. `master` is a
+  # mutable ref, and this is third-party python that chooses which crate sources the build (a
+  # SIGNED one, in CI) vendors. Bump both together, here and in the workflow:
+  #   curl -fsSL .../<new-sha>/cargo/flatpak-cargo-generator.py | sha256sum
+  GEN_REF=f03a673abe6ce189cea1c2857e2b44af2dd79d1f
+  GEN_SHA=b373c8ab1a05378ec5d8ed0645c7b127bcec7d2f7a1798694fbc627d570d856c
   GEN=/tmp/flatpak-cargo-generator.py
   if [ ! -f "$GEN" ]; then
     curl -fsSL -o "$GEN" \
-      https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+      "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/$GEN_REF/cargo/flatpak-cargo-generator.py"
   fi
+  # Verified on EVERY run, not just after a download: the branch above reuses whatever is already
+  # at that /tmp path — which on a shared box is a file this script did not write.
+  echo "$GEN_SHA  $GEN" | sha256sum -c - \
+    || { echo "error: $GEN does not match the pin for $GEN_REF — rm it and re-run" >&2; exit 1; }
   # Needs python3 + aiohttp + tomlkit. On a host that lacks them (e.g. the Deck), generate on the
   # Mac / a dev box instead and rsync the result next to the manifest (reused by the branch above).
   # Prune the microsoft/windows-rs git crates first (punktfunk-client-windows only) — otherwise
