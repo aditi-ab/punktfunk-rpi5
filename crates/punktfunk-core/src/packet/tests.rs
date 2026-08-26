@@ -1186,6 +1186,56 @@ fn slice_streamed_lying_final_kills_frame() {
     assert_eq!(stats.snapshot().frames_dropped, 1);
 }
 
+/// Completion tiling check: a sentinel base that lies WITHIN every bounds check (in range,
+/// below the final block) but breaks the tiling — a gap at the honest base, an overlap at
+/// the claimed one — must NOT be delivered as a `complete` frame (the black-band corruption
+/// shape: wrong-offset bytes with zeros in the gap and no loss counter moving). The frame
+/// is counted lost instead, which is what fires the client's recovery request.
+#[test]
+fn slice_streamed_lying_base_within_bounds_kills_frame() {
+    let (pkts, _) = slice_streamed_packets();
+    let hdr_of = |p: &Vec<u8>| PacketHeader::read_from_bytes(&p[..HEADER_LEN]).unwrap();
+
+    // Shift block 1's base from shard 19 (304 B) to shard 20 (320 B) on EVERY packet of the
+    // block (the base is pinned by the block's first packet, so all must agree). Still
+    // shard-aligned, still 20 + 26 = 46 ≤ 63 (the final block's base) — every pre-fix
+    // check passes, and the frame would have completed with a one-shard zero gap at 19
+    // and block 1's last shard overwriting block 2's first.
+    let delivery: Vec<Vec<u8>> = pkts
+        .iter()
+        .map(|p| {
+            let mut h = hdr_of(p);
+            if h.block_count == 0 && h.block_index == 1 {
+                let mut p = p.clone();
+                h.frame_bytes = 320;
+                p[..HEADER_LEN].copy_from_slice(h.as_bytes());
+                p
+            } else {
+                p.clone()
+            }
+        })
+        .collect();
+
+    let cfg = slice_config();
+    let mut r = Reassembler::new(ReassemblerLimits::from_config(&cfg));
+    let coder = coder_for(FecScheme::Gf16);
+    let stats = StatsCounters::default();
+    assert!(
+        push_all(&mut r, coder.as_ref(), &stats, &delivery).is_none(),
+        "a mis-tiled frame must never be delivered"
+    );
+    assert_eq!(
+        stats.snapshot().frames_dropped,
+        1,
+        "the mis-tiled frame must be counted lost"
+    );
+    assert_eq!(r.in_flight(), 0, "the killed frame must release its budget");
+
+    // Its packets are stragglers for a terminated index now — no resurrection, no recount.
+    assert!(push_all(&mut r, coder.as_ref(), &stats, &delivery).is_none());
+    assert_eq!(stats.snapshot().frames_dropped, 1);
+}
+
 /// One slice bigger than a whole FEC block must cut MULTIPLE blocks from a single push (the
 /// flush loop) — the final block can never be left oversized.
 #[test]

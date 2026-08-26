@@ -643,9 +643,11 @@ impl Reassembler {
                 // Slice frames have no uniform shape to demand — the invariant is positional:
                 // every sentinel block must sit strictly below the final block's base
                 // (`total_data − data_shards`; the firewall already proved the subtraction
-                // safe) and be a non-final index. Sentinel-vs-sentinel overlap is not policed —
-                // the sender is AEAD-authenticated, so a lying base can only corrupt this
-                // frame's own pixels, never memory (placement stays in-bounds by these checks).
+                // safe) and be a non-final index. Sentinel-vs-sentinel overlap is not policed
+                // HERE — placement stays in-bounds by these checks, so a lying base can only
+                // corrupt this frame's own bytes, never memory — but the completion tiling
+                // check below refuses to deliver such a frame (black-band corruption from a
+                // buggy, AEAD-authenticated sender would otherwise ship as `complete`).
                 let final_base = total_data - data_shards;
                 frame.blocks.iter().any(|(&bi, b)| {
                     let bi = bi as usize;
@@ -881,6 +883,31 @@ impl Reassembler {
                 reconstructed_shards(&done.blocks, lim.max_data_shards),
             );
             *in_flight_bytes -= frame_cost(&done); // buffer + block state, before the truncate below
+                                                   // Slice-streamed frames: every base was bounds-checked on arrival (in range,
+                                                   // below the final block) but nothing yet proved the blocks TILE the AU. A base
+                                                   // that lies WITHIN bounds leaves a zero gap and an overlap — wrong bytes in a
+                                                   // frame stamped `complete`, which the decoder paints as garbage rectangles and
+                                                   // no loss counter ever moves. Refuse to deliver: the index is already in
+                                                   // `completed` (stragglers can't resurrect it), so just count the loss — the
+                                                   // `frames_dropped` climb is what fires the client's recovery request.
+            if done.user_flags & crate::packet::USER_FLAG_SLICE_STREAM != 0 {
+                let total_data = done.frame_bytes.div_ceil(done.shard_bytes).max(1);
+                let mut next = 0usize;
+                let tiled = (0..block_count).all(|bi| match done.blocks.get(&(bi as u16)) {
+                    Some(b) if b.base_shard == next => {
+                        next += b.data_shards;
+                        true
+                    }
+                    _ => false,
+                }) && next == total_data;
+                if !tiled {
+                    if !is_probe {
+                        StatsCounters::add(&stats.frames_dropped, 1);
+                    }
+                    drop(stats);
+                    return Ok(None);
+                }
+            }
             done.buf.truncate(done.frame_bytes); // trim trailing-shard zero padding
                                                  // Slice-progressive consumers already hold the delivered prefix — the completing
                                                  // packet hands up only the SUFFIX (with `last`), or the degenerate whole-AU part
@@ -923,6 +950,12 @@ impl Reassembler {
                     break;
                 }
                 if block_count != 0 && (*next_part_block as usize) + 1 >= block_count {
+                    break;
+                }
+                // A prefix is only a prefix if this block starts where the last one ended —
+                // a slice block whose wire base lies within bounds must not extend it (the
+                // frame then dies at the completion tiling check above).
+                if b.base_shard != *delivered_shards {
                     break;
                 }
                 *delivered_shards = b.base_shard + b.data_shards;
