@@ -87,6 +87,13 @@ public final class GamepadManager: ObservableObject {
     /// `lowest_free_index`). Recomputed by `assignPadIndices` whenever `forwarded` changes.
     private var padIndexByController: [ObjectIdentifier: UInt8] = [:]
 
+    /// Wire pad indices reserved by EXTERNAL (non-GameController) captures — today the Steam
+    /// Controller 2 BLE passthrough (`Sc2Capture`), whose device GameController never surfaces
+    /// and so can never appear in the identity-keyed table above. Sharing ONE allocator
+    /// (`takenIndices` feeds both `assignPadIndices` and `reserveExternalPadIndex`) is what
+    /// makes a GC pad and an external capture unable to collide on an index.
+    private var externalIndices: Set<UInt8> = []
+
     /// The kind of the last controller that was actually attached — persisted under
     /// `DefaultsKey.lastGamepadKind` and deliberately NEVER cleared on disconnect. The gamepad
     /// UI's legends read it (through `GamepadGlyphs`) whenever `active` is nil, so a DualSense
@@ -258,9 +265,30 @@ public final class GamepadManager: ObservableObject {
         for dc in next {
             let key = ObjectIdentifier(dc.controller)
             guard padIndexByController[key] == nil,
-                  let free = Self.lowestFreeIndex(Set(padIndexByController.values)) else { continue }
+                  let free = Self.lowestFreeIndex(takenIndices()) else { continue }
             padIndexByController[key] = free
         }
+    }
+
+    /// Every index currently in use — the GC table's plus the external reservations. The one
+    /// set both allocation paths consult.
+    private func takenIndices() -> Set<UInt8> {
+        Set(padIndexByController.values).union(externalIndices)
+    }
+
+    /// Reserve the lowest free wire pad index for an external (non-GameController) capture —
+    /// `Sc2Capture` claims through here on its first state report. Held until
+    /// `releaseExternalPadIndex(_:)`; nil when all `GamepadWire.maxPads` indices are taken (the
+    /// caller drops reports until one frees).
+    public func reserveExternalPadIndex() -> UInt8? {
+        guard let free = Self.lowestFreeIndex(takenIndices()) else { return nil }
+        externalIndices.insert(free)
+        return free
+    }
+
+    /// Hand an external reservation back (link drop / capture stop). Idempotent.
+    public func releaseExternalPadIndex(_ index: UInt8) {
+        externalIndices.remove(index)
     }
 
     /// The lowest wire pad index not already taken, or nil when all `GamepadWire.maxPads` are in

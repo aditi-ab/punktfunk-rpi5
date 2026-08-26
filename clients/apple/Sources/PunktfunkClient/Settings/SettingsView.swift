@@ -105,6 +105,10 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.touchMode) var touchMode = TouchInputMode.trackpad.rawValue
     @AppStorage(DefaultsKey.rumbleOnDevice) var rumbleOnDevice = false
     @AppStorage(DefaultsKey.gyroFromDevice) var gyroFromDevice = false
+    /// Steam Controller 2 passthrough (device tier — the controllers section's row; the row
+    /// itself is #if os(iOS)||os(macOS), the storage is harmlessly unconditional like its
+    /// gamepad neighbors above).
+    @AppStorage(DefaultsKey.sc2Capture) var sc2Capture = false
     // The sidebar selection drives the detail pane on iPad and the pushed sub-page on iPhone.
     // Width class decides the initial value: nil on iPhone (show the category list first),
     // General on iPad (a two-column layout should never open with an empty detail).
