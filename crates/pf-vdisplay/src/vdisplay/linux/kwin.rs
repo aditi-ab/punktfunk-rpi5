@@ -137,11 +137,22 @@ impl KwinDisplay {
     /// absent. Records the output's UUID (in-process) or kscreen address (fallback) for
     /// [`apply_position`](VirtualDisplay::apply_position), and returns the disabled outputs (each
     /// `(name, "WxH@Hz")`) for the group teardown restore. `Extend`/`Auto` disable nothing.
+    ///
+    /// `pre_enabled` is the non-managed outputs that were enabled BEFORE the virtual output was
+    /// created ([`enabled_physicals`], captured in `create`). It exists because KWin reacts to our
+    /// output appearing by applying its stored setup for the NEW monitor set
+    /// (`kwinoutputconfig.json`), and a set that ever ran `exclusive` has "physicals disabled"
+    /// stored — so the physicals can be OFF by the time any post-create enumeration runs. A field
+    /// report (Bazzite, triple-monitor) showed exactly that: `also_disabled=[]` on an exclusive
+    /// apply, so teardown restored nothing and the desk stayed dark. The snapshot is the only read
+    /// KWin's reaction cannot have polluted: under `Exclusive` it joins the restore list, under
+    /// every other topology [`reenable_stranded`] puts the stored-config casualties back on.
     fn apply_topology(
         &mut self,
         name: &str,
         our_prefix: &str,
         dims: (u32, u32),
+        pre_enabled: &[(String, String)],
     ) -> Vec<(String, String)> {
         use crate::kwin_output_mgmt::TopologyKind;
         use crate::policy::Topology;
@@ -155,6 +166,10 @@ impl KwinDisplay {
                 // (stable) output name for whatever monitor set it was saved under. Applies only if
                 // it really is mirroring; nothing else about the user's arrangement is touched.
                 crate::kwin_output_mgmt::clear_replication_source(our_prefix, dims.0, dims.1);
+                // ...and the same goes for the stored ENABLED state: these topologies promise the
+                // user's screens stay untouched, so KWin switching them off in reaction to our
+                // output appearing is undone, not honored.
+                reenable_stranded(pre_enabled.to_vec());
                 return Vec::new();
             }
         };
@@ -162,7 +177,13 @@ impl KwinDisplay {
         let outcome = crate::kwin_output_mgmt::apply_topology(our_prefix, dims.0, dims.1, kind);
         if outcome.handled {
             self.our_uuid = outcome.our_uuid;
-            return outcome.disabled;
+            if kind == TopologyKind::Primary {
+                // `Primary` keeps the physicals enabled by contract — undo KWin's stored-config
+                // disable exactly as the Extend arm does. Nothing to restore at teardown.
+                reenable_stranded(pre_enabled.to_vec());
+                return outcome.disabled;
+            }
+            return union_restore(outcome.disabled, pre_enabled);
         }
         // Fallback: kscreen-doctor — resolve our address the old way, then shell out the topology.
         tracing::info!(
@@ -171,9 +192,10 @@ impl KwinDisplay {
         let addr = resolve_kscreen_addr(name, dims.0, dims.1);
         self.last_name = Some(addr.clone());
         match topology {
-            Topology::Exclusive => apply_virtual_primary(&addr),
+            Topology::Exclusive => union_restore(apply_virtual_primary(&addr), pre_enabled),
             Topology::Primary => {
                 apply_virtual_primary_only(&addr);
+                reenable_stranded(pre_enabled.to_vec());
                 Vec::new()
             }
             Topology::Extend | Topology::Auto => Vec::new(),
@@ -324,6 +346,10 @@ impl VirtualDisplay for KwinDisplay {
         // install — the output is born at the real size and 60 Hz is the offer anyway.
         let want_high = mode.refresh_hz > 60;
         let birth_h = if want_high { height + 16 } else { height };
+        // Snapshot the enabled physicals BEFORE the virtual output exists: creating it changes the
+        // monitor set, and KWin may apply a stored setup for the new set that disables them (see
+        // `apply_topology`). Everything read after this point can already be polluted by that.
+        let pre_enabled = enabled_physicals();
         let (mut node_id, mut stop) = spawn_vout(width, birth_h)?;
         // `requested_*`, NOT `width`/`height`: `spawn_vout` hands back a node id, never a size, so
         // every number on this line is what we ASKED for. Logged as `width=… height=…` it read like
@@ -534,7 +560,7 @@ impl VirtualDisplay for KwinDisplay {
         // bootstrap output. Applied over kde_output_management_v2 in-process (immune to a wedged
         // kscreen-doctor backend; see `apply_topology`), with a kscreen-doctor fallback. `disabled`
         // is the physical/bootstrap outputs, each `(name, "WxH@Hz")`, to restore on teardown.
-        let disabled = self.apply_topology(&name, &our_prefix, final_dims);
+        let disabled = self.apply_topology(&name, &our_prefix, final_dims, &pre_enabled);
         // `last_name` is already the best address we have: `Virtual-<name>` from the top of this
         // function, upgraded in place to the RESOLVED numeric kscreen id by whichever of the
         // `want_high` fallback or `apply_topology`'s fallback actually ran a resolve. Nothing to
@@ -561,6 +587,21 @@ impl VirtualDisplay for KwinDisplay {
                 if !crate::kwin_output_mgmt::reenable_outputs(&disabled) {
                     reenable_outputs_kscreen(&disabled);
                 }
+                // This ran BEFORE our output is reclaimed (§6.1 ordering, so KWin never sees zero
+                // outputs) — which means it applied under the WITH-us monitor set. Reclaiming the
+                // output then flips KWin to the without-us set, whose stored setup can put the
+                // physicals straight back to disabled (how the field report's desk ended up dark
+                // after every stream). One delayed re-assert lands after the reclaim, under THAT
+                // set — and being a user-applied config, KWin persists it there, healing the
+                // stored setup instead of re-fighting it next session. One shot, never a loop.
+                let verify = disabled.clone();
+                std::thread::Builder::new()
+                    .name("punktfunk-kwin-restore-verify".into())
+                    .spawn(move || {
+                        std::thread::sleep(STRAND_RECHECK_DELAY);
+                        reenable_pass(&verify, "post-teardown", true);
+                    })
+                    .ok();
             }) as Box<dyn FnOnce() + Send>
         });
         // Layout position (§6.2) is applied by the registry via `apply_position` right after create
@@ -573,6 +614,95 @@ impl VirtualDisplay for KwinDisplay {
         out.expect_exact_dims = expect_exact_dims;
         Ok(out)
     }
+}
+
+/// How long after a create/teardown to re-check for outputs KWin's stored setup switched off.
+/// KWin applies the stored setup for a changed monitor set promptly, but not synchronously with
+/// our reads — the immediate pass catches the common case, this delayed one the late apply.
+const STRAND_RECHECK_DELAY: Duration = Duration::from_millis(2000);
+
+/// The non-managed outputs currently enabled, each `(name, "WxH@Hz")` — the same spec shape the
+/// restore path stores, so the two lists interchange. Empty when output management is unavailable
+/// (the callers then simply keep today's behavior).
+fn enabled_physicals() -> Vec<(String, String)> {
+    crate::kwin_output_mgmt::list_monitors()
+        .map(|ms| {
+            ms.into_iter()
+                .filter(|m| m.enabled && !m.managed && m.width > 0 && m.height > 0)
+                .map(|m| {
+                    let hz = ((m.refresh_mhz as f64) / 1000.0).round() as u32;
+                    (m.connector, format!("{}x{}@{hz}", m.width, m.height))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Undo KWin's stored-config reaction to our output appearing: any output in `pre_enabled` (lit
+/// BEFORE the virtual output was created) that is disabled now was switched off by KWin's persisted
+/// setup for the new monitor set — the enabled-state sibling of the stored `replicationSource`
+/// that [`crate::kwin_output_mgmt::clear_replication_source`] clears. Two passes: one now, one
+/// after [`STRAND_RECHECK_DELAY`] (KWin can apply the stored setup after our first read). Each is
+/// one shot, so a user's own later disable stays honored.
+fn reenable_stranded(pre_enabled: Vec<(String, String)>) {
+    if pre_enabled.is_empty() {
+        return;
+    }
+    reenable_pass(&pre_enabled, "immediate", false);
+    std::thread::Builder::new()
+        .name("punktfunk-kwin-reenable".into())
+        .spawn(move || {
+            std::thread::sleep(STRAND_RECHECK_DELAY);
+            reenable_pass(&pre_enabled, "delayed", false);
+        })
+        .ok();
+}
+
+/// One re-enable pass: re-read the outputs, re-enable `expected ∩ now-disabled`. `abort_if_managed`
+/// is the post-teardown guard: a managed output present by then means a NEW session already owns
+/// the topology (a quick reconnect), and lighting the physicals under its `exclusive` would undo
+/// it — that session's own restore covers them instead.
+fn reenable_pass(expected: &[(String, String)], wave: &'static str, abort_if_managed: bool) {
+    let Ok(now) = crate::kwin_output_mgmt::list_monitors() else {
+        return;
+    };
+    if abort_if_managed && now.iter().any(|m| m.managed) {
+        return;
+    }
+    let dark: Vec<(String, String)> = expected
+        .iter()
+        .filter(|(name, _)| now.iter().any(|m| &m.connector == name && !m.enabled))
+        .cloned()
+        .collect();
+    if dark.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        outputs = ?dark,
+        wave,
+        "KWin's stored output setup (kwinoutputconfig.json) left physical output(s) disabled that \
+         the current topology says stay enabled — re-enabling them"
+    );
+    if !crate::kwin_output_mgmt::reenable_outputs(&dark) {
+        reenable_outputs_kscreen(&dark);
+    }
+}
+
+/// The `exclusive` restore list: what this apply disabled, plus every `pre_enabled` output not
+/// already in it — an output KWin's stored setup disabled in the create window was invisible to
+/// the apply's own enumeration, and dropping it from the list is how a teardown restored nothing
+/// on a triple-monitor box (`also_disabled=[]`). Re-enabling an output that was never actually
+/// disabled is a documented no-op, so the union errs on the side of the desk lighting up.
+fn union_restore(
+    mut disabled: Vec<(String, String)>,
+    pre_enabled: &[(String, String)],
+) -> Vec<(String, String)> {
+    for (name, spec) in pre_enabled {
+        if !disabled.iter().any(|(n, _)| n == name) {
+            disabled.push((name.clone(), spec.clone()));
+        }
+    }
+    disabled
 }
 
 /// Re-enable the outputs an `exclusive` topology disabled (bootstrap / physical) via `kscreen-doctor`
@@ -2044,9 +2174,33 @@ fn await_created(
 #[cfg(test)]
 mod tests {
     use super::{
-        mode_satisfies, modes_from_json, monitors_from_kscreen_json, pick_custom_mode, KModeRow,
-        MANAGED_PREFIX,
+        mode_satisfies, modes_from_json, monitors_from_kscreen_json, pick_custom_mode, union_restore,
+        KModeRow, MANAGED_PREFIX,
     };
+
+    /// The field failure the union guards: KWin's stored setup for the with-us monitor set
+    /// disabled the physicals in the window between our output's creation and the exclusive
+    /// apply's enumeration, so the apply saw nothing enabled (`also_disabled=[]`) and teardown
+    /// restored nothing — a triple-monitor desk stranded dark. The pre-create snapshot must
+    /// reach the restore list; what the apply itself disabled keeps its (fresher) entry.
+    #[test]
+    fn the_restore_list_covers_outputs_kwin_disabled_before_the_apply_saw_them() {
+        let pre = vec![
+            ("DP-1".to_string(), "2560x1440@144".to_string()),
+            ("DP-2".to_string(), "2560x1440@60".to_string()),
+            ("DP-3".to_string(), "1920x1080@60".to_string()),
+        ];
+        // The log's case: the apply enumerated nothing enabled.
+        assert_eq!(union_restore(Vec::new(), &pre), pre);
+        // The healthy case: the apply's own capture wins for the outputs it saw (its spec is
+        // the fresher read), and the snapshot only fills the gaps.
+        let seen = vec![("DP-1".to_string(), "2560x1440@120".to_string())];
+        let merged = union_restore(seen, &pre);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0], ("DP-1".to_string(), "2560x1440@120".to_string()));
+        assert!(merged.contains(&("DP-2".to_string(), "2560x1440@60".to_string())));
+        assert!(merged.contains(&("DP-3".to_string(), "1920x1080@60".to_string())));
+    }
 
     /// The field failure this predicate now guards, in the shape the log reported it: a client
     /// negotiated 3840x2160, KWin restored a stored 1920x1080 for the output name, and nothing
