@@ -715,10 +715,12 @@ struct ChunkState {
     slices_out: u32,
     /// The AU-opening chunk (`AuChunk::first`) has been handed out.
     opened: bool,
-    /// Debug-build shadow of every emitted byte, cross-checked against the finishing blocking
-    /// lock's full AU — a mis-cut chunk fails loudly in the on-hw tests instead of silently
-    /// corrupting the wire. Compiled out of release builds.
-    #[cfg(debug_assertions)]
+    /// Shadow of every emitted byte, cross-checked against the finishing blocking lock's
+    /// full AU. Release-mode since the Strix-Halo field report (black bands "like an
+    /// equalizer"): a driver branch whose doNotWait `bitstreamSizeInBytes` runs ahead of the
+    /// flushed slice bytes ships not-yet-written buffer content, and only this comparison
+    /// can see it — the wire stays self-consistent, so no client counter ever moves. Costs
+    /// one AU-sized copy + compare per frame, noise next to the encode itself.
     shadow: Vec<u8>,
 }
 
@@ -728,7 +730,6 @@ impl ChunkState {
             emitted: 0,
             slices_out: 0,
             opened: false,
-            #[cfg(debug_assertions)]
             shadow: Vec::new(),
         }
     }
@@ -871,6 +872,12 @@ pub struct NvencCudaEncoder {
     /// Sub-frame chunked poll armed for the live session (§7 LN1 Phase 1): multi-slice +
     /// sub-frame readback configured AND sync retrieve at init. See [`Encoder::poll_chunk`].
     subframe_chunks: bool,
+    /// This driver's sub-frame readback was caught publishing bytes the finished AU disowns
+    /// (the `poll_chunk` finish-lock prefix check) — every later `query_caps` resolve on this
+    /// encoder turns sub-frame OFF, so the stall-recovery rebuild the divergence bails into
+    /// heals permanently instead of re-arming the same broken path (which would loop rebuilds
+    /// into `MAX_ENCODER_RESETS` and end the session). Never cleared: a fresh encoder retests.
+    subframe_broken: bool,
     /// `NV_ENC_CAPS_NUM_ENCODER_ENGINES` — how many NVENC engines this GPU has, probed in
     /// [`query_caps`]. `0` = not probed / unreadable. The split-encode ceiling: the driver accepts
     /// a split wider than the hardware and silently encodes narrower, so this is the only honest
@@ -978,6 +985,7 @@ impl NvencCudaEncoder {
             subframe_on: false,
             subframe_forced: false,
             subframe_chunks: false,
+            subframe_broken: false,
             encoder_engines: 0,
             last_submit_at: None,
             send_spread_us: 0,
@@ -1191,7 +1199,11 @@ impl NvencCudaEncoder {
         // regression). PUNKTFUNK_NVENC_SLICES / PUNKTFUNK_NVENC_SUBFRAME stay the explicit
         // operator overrides in both directions.
         self.slices = resolve_slices(self.codec, 4.min(self.max_slices));
-        self.subframe_on = resolve_subframe(self.subframe_cap);
+        // `subframe_broken` wins over everything, the operator force included: it is only
+        // ever set after this session PROVED the driver's sub-frame accounting corrupt
+        // (the finish-lock prefix check), and re-arming would corrupt again. Per-encoder,
+        // so a fresh session retests the driver.
+        self.subframe_on = resolve_subframe(self.subframe_cap) && !self.subframe_broken;
         self.subframe_forced = subframe_env_forced();
         tracing::info!(
             rfi = self.rfi_supported,
@@ -2571,7 +2583,6 @@ impl Encoder for NvencCudaEncoder {
                             .nv_ok()
                             .map_err(|e| nvenc_status::call_err("unlock_bitstream (chunk)", e))?;
                         let cs = self.chunk.get_or_insert_with(ChunkState::new);
-                        #[cfg(debug_assertions)]
                         cs.shadow.extend_from_slice(&data);
                         let first = !cs.opened;
                         cs.opened = true;
@@ -2621,19 +2632,34 @@ impl Encoder for NvencCudaEncoder {
             let total = lock.bitstreamSizeInBytes as usize;
             let full = std::slice::from_raw_parts(lock.bitstreamBufferPtr as *const u8, total);
             let cs = self.chunk.take().unwrap_or_else(ChunkState::new);
-            if cs.emitted > total {
+            // The completion authority judges the sampler: bytes the doNotWait locks published
+            // must be a byte-exact prefix of the finished AU, or the wire already carries
+            // corruption no client can detect (self-consistent tiling, wrong content — the
+            // black-band field report). On divergence, latch sub-frame off for every later
+            // session open and bail into the encode-stall recovery: it rebuilds in place
+            // (now WITHOUT sub-frame, so once per session at most) and forces an IDR — the
+            // client ages out the partial AU and re-anchors. Short-circuit order matters:
+            // `emitted > total` makes the prefix slice below ill-formed.
+            let diverged = cs.emitted > total || cs.shadow.as_slice() != &full[..cs.emitted];
+            if diverged {
                 let _ = (api().unlock_bitstream)(self.encoder, bs);
+                if !map.is_null() {
+                    let _ = (api().unmap_input_resource)(self.encoder, map);
+                }
+                self.subframe_broken = true;
+                tracing::warn!(
+                    emitted = cs.emitted,
+                    total,
+                    "NVENC sub-frame readback diverged from the finished AU — this driver's \
+                     early slice publishes cannot be trusted; disarming sub-frame for every \
+                     later session open and rebuilding the encoder"
+                );
                 bail!(
-                    "NVENC chunked poll: {} bytes already emitted but the finished AU is only \
-                     {} — sub-frame readback reported bytes the final lock disowns",
+                    "NVENC chunked poll: sub-frame readback diverged from the finished AU \
+                     ({} bytes emitted, {} total) — sub-frame disarmed, rebuild required",
                     cs.emitted,
                     total
                 );
-            }
-            #[cfg(debug_assertions)]
-            if cs.shadow.as_slice() != &full[..cs.emitted] {
-                let _ = (api().unlock_bitstream)(self.encoder, bs);
-                bail!("NVENC chunked poll: emitted chunks diverge from the finished AU prefix");
             }
             let data = full[cs.emitted..].to_vec();
             let keyframe = matches!(
