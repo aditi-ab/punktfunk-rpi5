@@ -522,12 +522,18 @@ fn chroma_offsets(
 /// `column_width_minus1` is `u32` in the parser and `u16` in libva; a value past
 /// 65535 columns is impossible for any real picture, so saturating is honest here
 /// and a wrap would not be.
-fn narrow_19(src: &[u32; 19]) -> [u16; 19] {
-    std::array::from_fn(|i| u16::try_from(src[i]).unwrap_or(u16::MAX))
+///
+/// Takes a slice, not a fixed-size array: libva's 19/21 are a frozen ABI (see the
+/// `offset_of!` asserts in `va_h265`), while the parser's arrays carry one extra
+/// slot for the running remainder it stores at `[num_tile_*_minus1]`. Copying the
+/// first 19/21 is what libva wants anyway — it derives the last tile itself — and
+/// a slice means growing the parser side again cannot break this pair.
+fn narrow_19(src: &[u32]) -> [u16; 19] {
+    std::array::from_fn(|i| u16::try_from(src.get(i).copied().unwrap_or(0)).unwrap_or(u16::MAX))
 }
 
-fn narrow_21(src: &[u32; 21]) -> [u16; 21] {
-    std::array::from_fn(|i| u16::try_from(src[i]).unwrap_or(u16::MAX))
+fn narrow_21(src: &[u32]) -> [u16; 21] {
+    std::array::from_fn(|i| u16::try_from(src.get(i).copied().unwrap_or(0)).unwrap_or(u16::MAX))
 }
 
 #[cfg(test)]

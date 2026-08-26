@@ -562,6 +562,51 @@ mod tests {
         );
     }
 
+    /// Adopting a punch does more than pick a destination: `connect`ing to the *observed source*
+    /// binds the data plane's full 5-tuple, so from that moment the kernel drops everything that
+    /// isn't the punched peer. That is what stops a second source on the same authenticated IP (a
+    /// co-NAT peer, another local process) from re-steering the video plane with a later punch or
+    /// feeding the session's reassembler — the punch race is only ever open until the first
+    /// accepted datagram fixes the tuple.
+    #[test]
+    fn a_punched_transport_only_accepts_the_punched_five_tuple() {
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let reported = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        let host_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let host_addr = host_sock.local_addr().unwrap();
+        peer.send_to(PUNCH_MAGIC, host_addr).unwrap();
+
+        let (transport, punched) = UdpTransport::from_socket_punch(
+            host_sock,
+            &reported.local_addr().unwrap().to_string(),
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(punched, "the peer's punch must be adopted");
+
+        // Same authenticated IP, different port: a punch AND a payload, both after the tuple is
+        // fixed. Neither may be seen; the punched peer's datagram still must be.
+        let stray = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        stray.send_to(PUNCH_MAGIC, host_addr).unwrap();
+        stray.send_to(b"stray", host_addr).unwrap();
+        peer.send_to(b"real", host_addr).unwrap();
+
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..20 {
+            match transport.recv().unwrap() {
+                Some(p) => got.push(p),
+                None => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        assert_eq!(
+            got,
+            vec![b"real".to_vec()],
+            "only the punched 5-tuple may reach the session"
+        );
+    }
+
     /// A punch from any source other than the QUIC-authenticated peer must be ignored: `PUNCH_MAGIC`
     /// is a fixed public constant with no key or session id, so honouring an off-peer punch lets
     /// anyone who lands an 8-byte datagram on the ephemeral data port steal (or redirect) the video

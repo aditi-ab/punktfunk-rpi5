@@ -49,6 +49,7 @@ export const ApproveDevice: Story = {
 			onCancel={noop}
 			onApprove={noop}
 			isPending={false}
+			wrongPassword={false}
 		/>
 	),
 };
@@ -62,6 +63,7 @@ export const ApproveReknock: Story = {
 			onCancel={noop}
 			onApprove={noop}
 			isPending={false}
+			wrongPassword={false}
 		/>
 	),
 };

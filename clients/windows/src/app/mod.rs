@@ -438,6 +438,21 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                         (None, false) => connect::initiate(&ctx, target, &set_screen, &set_status),
                     }
                 }
+                // The link named a saved, pinned host by its LABEL or its ADDRESS rather than
+                // by its record id. This app registers the `punktfunk` scheme (AppxManifest's
+                // windows.protocol / the installer's URL Protocol key), so any web page can
+                // hand us such a URL, and both of those references are guessable — it may not
+                // dial on its own.
+                //
+                // ⚠ DEGRADED, not the designed behaviour: the GTK shell and the touch clients
+                // put a "Open this link?" confirmation here and connect on the user's OK. This
+                // shell has no prompt surface to ask through yet, so it explains instead. Give
+                // it the dialog and this arm becomes the `Connect` arm behind it.
+                Ok(PlanOutcome::ConfirmConnect(p)) => refuse(format!(
+                    "Open \u{201c}{}\u{201d} from the host list \u{2014} a link can only dial a \
+                     host by its id.",
+                    p.host.name
+                )),
                 // Known but never pinned, or not known at all: a link may not pair and may not
                 // trust on its own, so it opens the ordinary PIN ceremony seeded with what the
                 // link CLAIMED — name shown as claimed, the fingerprint pre-filling the pin so

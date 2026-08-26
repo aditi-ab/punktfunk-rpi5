@@ -144,7 +144,7 @@ fun App(forceGamepadUi: Boolean = false) {
         activity.pendingDeepLink = null
         val parsed = DeepLinks.parse(url) as? DeepLinkResult.Parsed ?: return@LaunchedEffect
         val target = DeepLinks.resolveHost(parsed.link, KnownHostStore(context).all())
-        val sameHost = target is HostResolution.Known && target.host.id == live.hostId
+        val sameHost = target is HostResolution.Record && target.host.id == live.hostId
         if (!sameHost) {
             Toast.makeText(
                 context,

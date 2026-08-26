@@ -48,6 +48,8 @@ export default defineEventHandler(async (event) => {
 
 	// One proxied attempt; `null` means the plugin is unreachable (unregistered, or its port died).
 	const attempt = async (bustCache: boolean): Promise<Response | null> => {
+		// `null` also covers a port we refuse to dial — the plugin declared it when it registered, so
+		// it is not ours to trust (see isDialablePort in util/pluginProxy.ts).
 		const cred = await fetchUiCredential(id, { bustCache });
 		if (!cred) return null;
 		const target = `http://127.0.0.1:${cred.port}${rest}${search}`;

@@ -17,6 +17,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
+import io.unom.punktfunk.models.PendingLinkConnect
 import io.unom.punktfunk.models.PendingTrust
 
 // The touch UI's prompts, each described once — a title, a list of [DialogAction]s (primary
@@ -161,6 +162,36 @@ fun RequestAccessPrompt(
         PromptText(
             "Request access and approve this device in the host's console (or web UI) — no PIN " +
                 "needed. Or pair with the 4-digit PIN the host displays.",
+        )
+    }
+}
+
+/**
+ * A `punktfunk://` link that named a saved host by its label or its address rather than by its
+ * stable id: both are guessable, and the activity is exported, so the dial happens on the user's
+ * tap instead of on the link's say-so. A link that names the id — every shortcut Punktfunk itself
+ * emits — never reaches this prompt.
+ */
+@Composable
+fun LinkConnectPrompt(
+    target: PendingLinkConnect,
+    onConnect: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    PunktfunkDialog(
+        title = "Open this link?",
+        onDismiss = onDismiss,
+        actions = listOf(
+            DialogAction("Connect", primary = true, onClick = onConnect),
+            DialogAction("Cancel", onClick = onDismiss),
+        ),
+    ) {
+        PromptText("A link asks to connect to ${target.host.name} (${target.host.address}).")
+        target.launch?.let { PromptText("It also asks the host to launch “$it”.") }
+        PromptText(
+            "It names the host by its label or address, which anything that can open a link " +
+                "could guess. Shortcuts made in Punktfunk name the host's id and connect " +
+                "without asking.",
         )
     }
 }

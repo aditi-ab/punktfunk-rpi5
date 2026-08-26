@@ -102,7 +102,9 @@ punktfunk://connect/<host-ref>[?fp=<64-hex>][&host=<addr[:port]>][&launch=<id>][
 ```
 
 `<host-ref>` is a saved host's stable record id, its name (unique, ignoring case), or `addr[:port]`,
-resolved in that order; a name matching two saved hosts is refused rather than guessed.
+resolved in that order; a name matching two saved hosts is refused rather than guessed. Only the
+record id opens without asking — a name or an address is something any web page could guess, so a
+link built on one confirms first.
 
 | Parameter | Means |
 |---|---|
@@ -132,6 +134,9 @@ punktfunk://connect/Living%20Room%20PC?launch=steam:570
 punktfunk://connect/Living%20Room%20PC?profile=Work
 ```
 
+All three name the host by label, so they ask before connecting. Put the record id in place of the
+name — which is what **Copy link** writes — for a link that opens in one click.
+
 ## What a link can and can't do
 
 The rule the grammar keeps: **a link may only do what clicking a card you already have could do,
@@ -141,6 +146,12 @@ minus every trust decision.**
   page cannot shape your session beyond choosing among your own configurations.
 - There is no `pair` route and never will be. `punktfunk://pair/...` is refused outright;
   [pairing](/docs/pairing) stays something you do with the fingerprint on screen.
+- Only the **stable record id** connects unattended. A link naming the host by its label or its
+  address — including through `host=` — reaches the same host, but behind an *Open this link?*
+  confirmation naming the host and anything it asks to launch: "Gaming PC" and a LAN address are
+  guesses anything that can open a URL could make. (The Windows app has no prompt surface for this
+  yet, so it points you at the host list instead.) **Copy link** always writes the id, so a shortcut
+  you made keeps opening in one click.
 - A link naming a host you don't know is never connected. When it carries an address — as
   `<host-ref>` or `host=` — Linux and Android open the app's normal trust prompt, pre-filled with
   that address and any `fp` the link carried, so the first connect is verified rather than blind.
@@ -183,8 +194,11 @@ box, use the `punktfunk` CLI:
 
 ```bash
 punktfunk profiles list                          # ids, names, how many settings each overrides
-punktfunk open 'punktfunk://connect/Desk?profile=Work'
+punktfunk open --yes 'punktfunk://connect/Desk?profile=Work'
 ```
+
+`--yes` answers the confirmation a label- or address-referenced link raises; a link carrying the
+record id needs no flag. Without a terminal to ask on and without `--yes`, `open` refuses (exit 6).
 
 It ships in the Linux client packages and the Windows MSIX. The Flatpak has it too, inside the
 sandbox — `flatpak run --command=punktfunk io.unom.Punktfunk`. See [Clients](/docs/clients) for the

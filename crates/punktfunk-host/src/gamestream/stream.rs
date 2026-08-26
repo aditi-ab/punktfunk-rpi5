@@ -289,7 +289,7 @@ fn run(
         )];
         let _prep = (!prep_cmds.is_empty()).then(|| crate::hooks::run_prep(&prep_cmds, &prep_env));
         // Open the virtual-display source: pick the live compositor, normalize the session env
-        // (apply_session_env/apply_input_env — gamescope ATTACH/resize + KWin/Mutter retargeting,
+        // (apply_session_env + input/gamescope routing — ATTACH/resize + KWin/Mutter retargeting,
         // exactly like the native plane), create a virtual output at the client mode, and capture it.
         // Re-runnable: the encode loop calls it again on a mid-stream capture loss to FOLLOW a
         // Desktop<->Game switch.
@@ -657,9 +657,9 @@ fn open_gs_mirror_source(
         .map(Ok)
         .unwrap_or_else(crate::vdisplay::detect)
         .context("detect compositor")?;
-    // A mirror streams an existing head — no gamescope sub-mode applies, so the resolved route is
-    // deliberately dropped here rather than carried.
-    let _ = crate::vdisplay::apply_input_env(compositor, false);
+    // Point input at the same backend the video landed on. A mirror streams an existing head, so no
+    // gamescope sub-mode applies and no route is resolved here at all.
+    crate::inject::set_backend_id(crate::vdisplay::input_backend_id(compositor));
     let mut vd = crate::vdisplay::open_mirror(compositor, connector)?;
     // Cursor mode is the session's negotiated one: metadata where this encode path composites
     // `frame.cursor`, otherwise let the compositor embed it (§7.5 — one resolver, per-backend
@@ -748,7 +748,7 @@ fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<GsApp> {
 }
 
 /// Open the virtual-display video source for a GameStream session: pick the LIVE compositor + normalize
-/// the session env (apply_session_env/apply_input_env — gamescope ATTACH/resize, KWin/Mutter
+/// the session env (apply_session_env + input/gamescope routing — ATTACH/resize, KWin/Mutter
 /// retargeting) exactly like the native plane (native.rs resolve_compositor), create a virtual
 /// output at the client's mode, and capture it. Returns the capturer (it owns the output's keepalive;
 /// the stateless VirtualDisplay factory is dropped here) plus the resolved compositor. An apps.json
@@ -817,16 +817,16 @@ fn open_gs_virtual_source(
             // the resolved command so an unresolvable entry falls back to auto routing (review #9).
             let has_launch = launch.and_then(|t| t.command.as_deref()).is_some();
             if crate::vdisplay::wants_dedicated_game_session(has_launch) {
-                let r =
-                    crate::vdisplay::apply_input_env(crate::vdisplay::Compositor::Gamescope, true);
-                (crate::vdisplay::Compositor::Gamescope, r)
+                let c = crate::vdisplay::Compositor::Gamescope;
+                crate::inject::set_backend_id(crate::vdisplay::input_backend_id(c));
+                (c, crate::vdisplay::resolve_gamescope_route(c, true))
             } else {
                 let c = crate::vdisplay::compositor_for_kind(active.kind)
                     .map(Ok)
                     .unwrap_or_else(crate::vdisplay::detect)
                     .context("detect compositor")?;
-                let r = crate::vdisplay::apply_input_env(c, false);
-                (c, r)
+                crate::inject::set_backend_id(crate::vdisplay::input_backend_id(c));
+                (c, crate::vdisplay::resolve_gamescope_route(c, false))
             }
         }
     };
@@ -849,7 +849,7 @@ fn open_gs_virtual_source(
     // interactive-session spawner launches it by id instead.
     vd.set_launch_command(launch.and_then(|t| t.command.clone()));
     // This plane's resolved gamescope sub-mode, on the instance for the same reason as the launch
-    // command above — the GameStream and native planes both call `apply_input_env`, so publishing
+    // command above — the GameStream and native planes both resolve a route, so publishing
     // through the process env let either retarget the other's `create`.
     vd.set_gamescope_route(gamescope_route.clone());
     // Serialize with the punktfunk/1 plane's IDD-push setup dance (Goal-1 §2.5). A GameStream

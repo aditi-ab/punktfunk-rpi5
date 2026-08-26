@@ -1,5 +1,5 @@
 //! Gamescope-session routing (plan §W3 — carved out of [`super`]): mode selection
-//! ([`pick_gamescope_mode`]), input-env routing ([`apply_input_env`]), dedicated-game-session
+//! ([`pick_gamescope_mode`]), injector-backend selection ([`input_backend_id`]), dedicated-game-session
 //! decisions/launch ([`wants_dedicated_game_session`], [`launch_into_gamescope_session`]), and the
 //! managed-session restore workers.
 
@@ -8,9 +8,9 @@ use super::*;
 /// The RESOLVED gamescope sub-mode for one session, with the payload `GamescopeDisplay::create`
 /// needs.
 ///
-/// This is what [`apply_input_env`] hands back, and it is carried on the backend INSTANCE
+/// This is what [`resolve_gamescope_route`] hands back, and it is carried on the backend INSTANCE
 /// (`VirtualDisplay::set_gamescope_route`) exactly as `set_launch_command` carries the launch — not
-/// through process env. The env knobs used to BE the channel: `apply_input_env` wrote
+/// through process env. The env knobs used to BE the channel: `resolve_gamescope_route` wrote
 /// `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION` and `create` read them back, but the lock was released in
 /// between, and the whole GameStream plane plus the mid-session switch watcher re-run the writer —
 /// so session B's decision could overwrite session A's before A's `create` ever read it. They
@@ -79,7 +79,7 @@ fn pick_gamescope_mode(
 
 /// The operator's gamescope overrides, sampled ONCE — at first use, and never written back.
 ///
-/// `apply_input_env` used to both WRITE `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION` (to publish the
+/// `resolve_gamescope_route` used to both WRITE `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION` (to publish the
 /// sub-mode it chose) and READ them as operator overrides. Reading them live therefore fed the
 /// ladder its own previous output: the Attach arm set `_NODE=auto`, and `node_env` sits at rung 2 of
 /// [`pick_gamescope_mode`] — ABOVE `dedicated_launch` at rung 3 — so one Attach decision latched
@@ -102,7 +102,7 @@ struct OperatorGamescope {
     managed: bool,
     attach: bool,
     /// The operator's `PUNKTFUNK_GAMESCOPE_NODE` VALUE, if set — the ladder needs its presence and
-    /// `apply_input_env` needs its content to build the route.
+    /// `resolve_gamescope_route` needs its content to build the route.
     node: Option<String>,
     /// Likewise `PUNKTFUNK_GAMESCOPE_SESSION` — the managed session flavour.
     session: Option<String>,
@@ -137,26 +137,22 @@ fn operator_gamescope() -> &'static OperatorGamescope {
     })
 }
 
-/// Route input to match the chosen video backend (they must not diverge), via the highest-priority
-/// `PUNKTFUNK_INPUT_BACKEND` knob the injector honors.
+/// The injector backend that matches a video backend — the two must not diverge, so this is the one
+/// place that decides. `pf_inject::set_backend_id` takes the answer; the caller publishes it
+/// alongside [`resolve_gamescope_route`] whenever it routes a session.
 ///
-/// For gamescope the sub-mode ladder ([`pick_gamescope_mode`]) selects **managed** (a host-managed
-/// session at the client's mode — tears the TV's autologin down on connect, restored on a debounced
-/// idle; only where session-plus/SteamOS actually exists), **attach** (mirror a running gamescope at
-/// its own mode; explicit via `PUNKTFUNK_GAMESCOPE_ATTACH`/`PUNKTFUNK_GAMESCOPE_NODE`, or the
-/// fallback for a foreign gamescope on an infra-less box), or **bare spawn** (a per-session headless
-/// gamescope nesting the session's launch command — the plain-distro default).
-/// `PUNKTFUNK_GAMESCOPE_MANAGED` forces managed over all of it.
+/// A `&'static str` because pf-vdisplay never depends on pf-inject (see the crate manifest's note),
+/// and these four ids are already the `PUNKTFUNK_INPUT_BACKEND` vocabulary the injector parses.
 ///
-/// Returns the resolved [`GamescopeRoute`] when `chosen` is gamescope — the caller must carry it to
-/// the backend instance via `VirtualDisplay::set_gamescope_route`. It is a RETURN VALUE and no
-/// longer an env write precisely because two sessions connecting at once would otherwise clobber
-/// each other's decision through the process env.
-#[cfg(target_os = "linux")]
-#[must_use = "the resolved gamescope route must reach the backend instance (set_gamescope_route)"]
-pub fn apply_input_env(chosen: Compositor, dedicated_launch: bool) -> Option<GamescopeRoute> {
-    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let backend = match chosen {
+/// This used to be an `unsafe { std::env::set_var("PUNKTFUNK_INPUT_BACKEND", ..) }` inside
+/// `apply_input_env`, read back by `pf_inject::default_backend` — which runs once per input batch on
+/// the injector service thread. A `getenv` on that hot path racing this per-session `setenv` is the
+/// `environ` data race, on a live streaming host, reachable by nothing more exotic than a client
+/// reconnect (security-review 2026-08-25). Handing back a value removes the write entirely; the
+/// operator's own `PUNKTFUNK_INPUT_BACKEND` is still READ by the injector, and is no longer
+/// overwritten by us.
+pub fn input_backend_id(chosen: Compositor) -> &'static str {
+    match chosen {
         Compositor::Gamescope => "gamescope",
         // KWin: org_kde_kwin_fake_input — direct injection, no RemoteDesktop portal / approval
         // dialog (headless, the krdpserver path), authorized by the host's shipped .desktop.
@@ -166,20 +162,26 @@ pub fn apply_input_env(chosen: Compositor, dedicated_launch: bool) -> Option<Gam
         // Hyprland kept `zwlr_virtual_pointer_v1` + `zwp_virtual_keyboard_v1` (D4) — same wlr
         // injector as sway/river, no code change.
         Compositor::Wlroots | Compositor::Hyprland => "wlr",
-    };
-    // SAFETY: `_env_guard` holds [`ENV_LOCK`] — the crate-wide discipline (lib.rs) serializing
-    // every process-env writer on the session-setup path; steady-state threads read cached
-    // config, not the environment.
-    unsafe { std::env::set_var("PUNKTFUNK_INPUT_BACKEND", backend) };
-    drop(_env_guard);
-    resolve_gamescope_route(chosen, dedicated_launch)
+    }
 }
 
-/// The gamescope sub-mode ladder ALONE — no input-backend env write.
+/// The gamescope sub-mode ladder: **managed** (a host-managed session at the client's mode — tears
+/// the TV's autologin down on connect, restored on a debounced idle; only where session-plus/SteamOS
+/// actually exists), **attach** (mirror a running gamescope at its own mode; explicit via
+/// `PUNKTFUNK_GAMESCOPE_ATTACH`/`PUNKTFUNK_GAMESCOPE_NODE`, or the fallback for a foreign gamescope
+/// on an infra-less box), or **bare spawn** (a per-session headless gamescope nesting the session's
+/// launch command — the plain-distro default). `PUNKTFUNK_GAMESCOPE_MANAGED` forces managed over all
+/// of it.
 ///
-/// Split out for the operator-pinned path (`PUNKTFUNK_COMPOSITOR` set), which deliberately leaves
-/// `PUNKTFUNK_INPUT_BACKEND` alone but still needs a route: without one, `create` would fall
-/// through to a bare spawn on a box the operator pinned to the managed session.
+/// Returns the resolved [`GamescopeRoute`] when `chosen` is gamescope — the caller must carry it to
+/// the backend instance via `VirtualDisplay::set_gamescope_route`. It is a RETURN VALUE and not an
+/// env write precisely because two sessions connecting at once would otherwise clobber each other's
+/// decision through the process env.
+///
+/// Nothing here touches the injector: a caller routing a session pairs this with
+/// [`input_backend_id`], while the operator-pinned (`PUNKTFUNK_COMPOSITOR`) path calls this ALONE —
+/// it deliberately leaves input routing to the operator's own knob, but still needs a route, or
+/// `create` would fall through to a bare spawn on a box pinned to the managed session.
 #[cfg(target_os = "linux")]
 #[must_use = "the resolved gamescope route must reach the backend instance (set_gamescope_route)"]
 pub fn resolve_gamescope_route(
@@ -190,8 +192,8 @@ pub fn resolve_gamescope_route(
         return None;
     }
     {
-        // Sampled inside — `operator_gamescope` takes ENV_LOCK itself, and `apply_input_env` has
-        // already dropped its guard before calling us (the mutex is not reentrant).
+        // Sampled inside — `operator_gamescope` takes ENV_LOCK itself, and no caller holds it (the
+        // mutex is not reentrant). Nothing on this path writes the env at all any more.
         let ov = operator_gamescope();
         let mode = pick_gamescope_mode(
             dedicated_launch,
@@ -220,11 +222,6 @@ pub fn resolve_gamescope_route(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn apply_input_env(_chosen: Compositor, _dedicated_launch: bool) -> Option<GamescopeRoute> {
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
 pub fn resolve_gamescope_route(
     _chosen: Compositor,
     _dedicated_launch: bool,
@@ -235,7 +232,7 @@ pub fn resolve_gamescope_route(
 /// Should a game-launching session get a **dedicated** headless gamescope (`game_session=dedicated`
 /// policy, `design/gamemode-and-dedicated-sessions.md` B0)? True only when the session carries a
 /// launch, the policy selects `dedicated`, AND gamescope is actually available (else it degrades to
-/// `auto` honestly). Computed at the handshake and threaded into [`apply_input_env`] /
+/// `auto` honestly). Computed at the handshake and threaded into [`resolve_gamescope_route`] /
 /// [`resolve_compositor`] as a value (no new env knob — the `ENV_LOCK` discipline).
 pub fn wants_dedicated_game_session(has_launch: bool) -> bool {
     use policy::GameSession;
@@ -262,7 +259,7 @@ pub fn wants_dedicated_game_session(has_launch: bool) -> bool {
 /// Will `vd.create` on this backend NEST the session's launch command itself (gamescope's bare
 /// spawn runs it inside the new gamescope)? When true the session must NOT also spawn the command
 /// into the session — it would start twice. Takes the session's own resolved
-/// [`GamescopeRoute`] (from [`apply_input_env`]) rather than re-reading process env, so a
+/// [`GamescopeRoute`] (from [`resolve_gamescope_route`]) rather than re-reading process env, so a
 /// concurrent session's routing decision cannot change this session's answer.
 #[cfg(target_os = "linux")]
 pub fn launch_is_nested(compositor: Compositor, route: Option<&GamescopeRoute>) -> bool {
@@ -562,7 +559,23 @@ mod tests {
         assert_eq!(pick(true, false, false, true, false, false, false), Attach);
     }
 
-    /// The ladder must not be able to read back its own output. `apply_input_env`'s Attach arm used
+    /// The injector backend is a RETURN VALUE the caller hands to `pf_inject::set_backend_id`, never
+    /// a `set_var` of `PUNKTFUNK_INPUT_BACKEND` — that write raced `pf_inject::default_backend`'s
+    /// `getenv`, which runs once per input batch on the injector service thread
+    /// (security-review 2026-08-25). Pinning the whole table because pf-vdisplay cannot depend on
+    /// pf-inject: these four ids are one half of a cross-crate contract, and `pf-inject`'s
+    /// `every_id_the_video_side_emits_maps_to_a_backend` pins the other.
+    #[test]
+    fn every_compositor_names_the_injector_backend_that_matches_it() {
+        assert_eq!(input_backend_id(Compositor::Gamescope), "gamescope");
+        assert_eq!(input_backend_id(Compositor::Kwin), "kwin");
+        assert_eq!(input_backend_id(Compositor::Mutter), "libei");
+        // Hyprland shares sway's wlr virtual-input protocols (D4) — same injector, on purpose.
+        assert_eq!(input_backend_id(Compositor::Wlroots), "wlr");
+        assert_eq!(input_backend_id(Compositor::Hyprland), "wlr");
+    }
+
+    /// The ladder must not be able to read back its own output. `resolve_gamescope_route`'s Attach arm used
     /// to write `PUNKTFUNK_GAMESCOPE_NODE=auto`, and `node_env` outranks `dedicated_launch` — so
     /// while the override was read live, one Attach latched Attach for the host's lifetime and
     /// silently overrode `game_session=dedicated`. Sampling once is what breaks the loop, and it is

@@ -1047,13 +1047,13 @@ mod tests {
             num_tile_rows_minus1: 2,
             uniform_spacing_flag: false,
             column_width_minus1: {
-                let mut w = [0u32; 19];
+                let mut w = [0u32; 20];
                 w[0] = 17;
                 w[1] = 12;
                 w
             },
             row_height_minus1: {
-                let mut h = [0u32; 21];
+                let mut h = [0u32; 22];
                 h[0] = 9;
                 h[1] = 8;
                 h[2] = 16;

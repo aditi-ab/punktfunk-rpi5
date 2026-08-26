@@ -268,7 +268,14 @@ impl Drop for ServerThread {
     }
 }
 
-/// Accept loop: serve each USB/IP connection with the vendored `usbip_sim::handler` until stopped.
+/// Serve the ONE USB/IP connection an attachment is for — the kernel's single `vhci_hcd` attach
+/// (our own in-process import, or the `usbip` CLI's) — with the vendored `usbip_sim::handler`,
+/// then stop. The listener is dropped the moment that connection is accepted: it speaks
+/// unauthenticated USB/IP on loopback, so keeping it open for the session lets ANY local user
+/// import the device — reading the streaming client's live controller reports and issuing HID
+/// SET_REPORT transfers at it. Nothing legitimate needs a second accept: every re-attach (kernel
+/// module reload, pad re-plug, the in-process→CLI fallback) goes through [`attach_device`] again
+/// and brings its own listener with it.
 async fn run_server(
     listener: std::net::TcpListener,
     server: Arc<UsbIpServer>,
@@ -282,60 +289,62 @@ async fn run_server(
             return;
         }
     };
-    loop {
-        tokio::select! {
-            _ = stop.notified() => break,
-            r = listener.accept() => match r {
-                Ok((mut sock, _)) => {
-                    // URB replies are small and interleave with the kernel's next SUBMITs; without
-                    // TCP_NODELAY the multi-interface request/response pattern collapses into
-                    // ~40 ms Nagle/delayed-ACK stalls (observed as ~22 reports/s on the Puck's
-                    // active hidraw against a 266 Hz source).
-                    sock.set_nodelay(true).ok();
-                    let server = server.clone();
-                    let trace = super::usbip_trace::trace_prefix(&label);
-                    let label = label.clone();
-                    tokio::spawn(async move {
-                        // The handler's Err arm used to be discarded. It is the *only* signal that
-                        // we tore the connection down rather than the kernel — and the kernel's
-                        // side of that (`recv xbuf`, `sendmsg failed`) reads identically either
-                        // way, so throwing it away cost days of mis-attributed diagnosis.
-                        let sink = trace.and_then(|prefix| {
-                            match super::usbip_trace::open_trace(&prefix) {
-                                Ok(s) => {
-                                    tracing::info!(prefix, "usbip byte trace armed");
-                                    Some(s)
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "usbip trace files unopenable — running untraced");
-                                    None
-                                }
-                            }
-                        });
-                        let res = match sink {
-                            Some(s) => {
-                                let mut traced = super::usbip_trace::TracedIo::wrap(sock, s);
-                                usbip_sim::handler(&mut traced, server).await
-                            }
-                            None => usbip_sim::handler(&mut sock, server).await,
-                        };
-                        match res {
-                            Ok(()) => tracing::debug!(label, "usbip connection closed by the kernel"),
-                            Err(e) => tracing::warn!(
-                                label,
-                                error = %e,
-                                "usbip server dropped the connection — the kernel will report this as a \
-                                 transfer error on whatever URB was in flight"
-                            ),
-                        }
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "usbip accept error");
-                    break;
-                }
+    let (mut sock, _) = tokio::select! {
+        _ = stop.notified() => return,
+        r = listener.accept() => match r {
+            Ok(peer) => peer,
+            Err(e) => {
+                tracing::warn!(error = %e, "usbip accept error");
+                return;
             }
         }
+    };
+    // The kernel has its socket; the port has no further legitimate caller. Closing it here is
+    // what keeps the device from being a local privilege boundary for the rest of the session.
+    drop(listener);
+    // URB replies are small and interleave with the kernel's next SUBMITs; without
+    // TCP_NODELAY the multi-interface request/response pattern collapses into
+    // ~40 ms Nagle/delayed-ACK stalls (observed as ~22 reports/s on the Puck's
+    // active hidraw against a 266 Hz source).
+    sock.set_nodelay(true).ok();
+    let trace = super::usbip_trace::trace_prefix(&label);
+    let conn = tokio::spawn(async move {
+        // The handler's Err arm used to be discarded. It is the *only* signal that
+        // we tore the connection down rather than the kernel — and the kernel's
+        // side of that (`recv xbuf`, `sendmsg failed`) reads identically either
+        // way, so throwing it away cost days of mis-attributed diagnosis.
+        let sink = trace.and_then(|prefix| match super::usbip_trace::open_trace(&prefix) {
+            Ok(s) => {
+                tracing::info!(prefix, "usbip byte trace armed");
+                Some(s)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "usbip trace files unopenable — running untraced");
+                None
+            }
+        });
+        let res = match sink {
+            Some(s) => {
+                let mut traced = super::usbip_trace::TracedIo::wrap(sock, s);
+                usbip_sim::handler(&mut traced, server).await
+            }
+            None => usbip_sim::handler(&mut sock, server).await,
+        };
+        match res {
+            Ok(()) => tracing::debug!(label, "usbip connection closed by the kernel"),
+            Err(e) => tracing::warn!(
+                label,
+                error = %e,
+                "usbip server dropped the connection — the kernel will report this as a \
+                 transfer error on whatever URB was in flight"
+            ),
+        }
+    });
+    // Stay until the kernel closes the connection (or the attachment is dropped) — the runtime
+    // lives on this thread, so returning early would kill the task serving the device.
+    tokio::select! {
+        _ = stop.notified() => {}
+        _ = conn => {}
     }
 }
 
@@ -753,6 +762,45 @@ mod tests {
             .map(|(p, _, _)| p);
         assert_eq!(hs, Some(1));
         assert_eq!(ss, Some(8));
+    }
+
+    /// The emulation server serves exactly ONE USB/IP connection — the kernel's single `vhci_hcd`
+    /// attach — and the loopback port closes with it. Anything that can still reach that port
+    /// afterwards can import the device: read the streaming client's live controller reports and
+    /// write HID SET_REPORTs at it, with no authentication anywhere in USB/IP to stop it. Needs
+    /// neither root nor `vhci_hcd` — only the listener side is under test.
+    #[test]
+    fn usbip_server_serves_one_connection_then_closes_the_port() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let report = Arc::new(Mutex::new(neutral_deck_report()));
+        let feedback = Arc::new(Mutex::new(SteamFeedback::default()));
+        let server =
+            ServerThread::spawn(listener, build_device(0, &report, &feedback), "test deck")
+                .expect("spawn the emulation server");
+
+        // The one legitimate importer (what `attach_in_process` does before handing the fd to
+        // `vhci_hcd`), held open for the rest of the test exactly as the kernel holds it.
+        let _kernel = connect_loopback(port).expect("the attach connects");
+
+        // Poll: the accept races the connect above (the connection sits in the listen backlog
+        // until the server thread picks it up), and the port closes only once it has.
+        let mut refused = false;
+        for _ in 0..100 {
+            match TcpStream::connect(("127.0.0.1", port)) {
+                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => {
+                    refused = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            refused,
+            "a second USB/IP importer must find the port closed"
+        );
+        drop(server);
     }
 
     /// On-box smoke test (needs root + `vhci_hcd`): attach a virtual Deck, confirm `hid-steam` binds

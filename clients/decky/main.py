@@ -407,10 +407,16 @@ def _cli_argv() -> list[str] | None:
     return [str(sibling)] if sibling.exists() else None
 
 
-async def _run_cli(args: list[str], timeout: float = 20.0) -> tuple[int, str, str]:
+async def _run_cli(
+    args: list[str], timeout: float = 20.0, stdin_text: str | None = None
+) -> tuple[int, str, str]:
     """Run the headless CLI, returning ``(returncode, stdout, stderr)``. SEPARATE pipes: stdout
     is the machine interface (JSON/TSV) and stderr carries the log lines, and merging them would
     corrupt every payload. ``(-1, "", "")`` when no client is installed or the call times out.
+
+    ``stdin_text`` is written to the child and the pipe closed — the way a secret reaches the CLI,
+    because argv does not qualify: ``/proc/*/cmdline`` is world-readable, so every process on the
+    Deck can read a flag's value. See :meth:`Plugin.pair`.
 
     The same ``_flatpak_env`` repair the client runs needed applies here unchanged — Decky's
     PyInstaller ``LD_LIBRARY_PATH`` leak breaks the flatpak's libcurl whatever binary inside the
@@ -422,10 +428,12 @@ async def _run_cli(args: list[str], timeout: float = 20.0) -> tuple[int, str, st
     try:
         proc = await asyncio.create_subprocess_exec(
             *prefix, *args,
+            stdin=asyncio.subprocess.PIPE if stdin_text is not None else None,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             env=_flatpak_env(),
         )
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        payload = stdin_text.encode() if stdin_text is not None else None
+        out, err = await asyncio.wait_for(proc.communicate(payload), timeout=timeout)
         rc = proc.returncode if proc.returncode is not None else -1
         return (
             rc,
@@ -761,21 +769,27 @@ class Plugin:
         return await _cli_json(["hosts", "list", "--probe", "--json"], timeout=30.0)
 
     async def pair(self, addr: str, port: int, pin: str, name: str = "Steam Deck") -> dict:
-        """The PIN ceremony (``punktfunk pair <addr:port> --pin N --name LABEL``).
+        """The PIN ceremony (``punktfunk pair <addr:port> --pin - --name LABEL``).
 
         The operator arms pairing on the host, which shows a 4-digit PIN; entering it here
         verifies the host end to end and pins its fingerprint, so every later connect is silent.
         ``{ok: True}``, or ``{ok: False, error}`` where ``refused`` is a wrong PIN or a host
         that isn't armed, and ``unreachable`` is a host that never answered.
 
+        The PIN goes down the child's STDIN (``--pin -``), never on argv: it is the only secret
+        binding the ceremony to the operator's intent, and a value on the command line is readable
+        by every local process for as long as the call runs (~100 s here) — long enough for anyone
+        on the Deck to complete the pairing with their own keypair instead.
+
         The budget is generous because the ceremony waits on a person at the other end."""
         rc, out, err = await _run_cli(
             [
                 "pair", f"{addr}:{int(port)}",
-                "--pin", str(pin).strip(),
+                "--pin", "-",
                 "--name", name,
             ],
             timeout=100.0,
+            stdin_text=f"{str(pin).strip()}\n",
         )
         if rc == 0:
             fp = ""

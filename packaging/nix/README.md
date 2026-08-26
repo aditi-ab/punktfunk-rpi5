@@ -466,8 +466,8 @@ server; there is no cache daemon to run.
 
 **One-time setup — in this order.** The publish step ends by fetching `nix.unom.io` to prove the
 cache really answers (and answers **404**, not 403, for a path it does not hold), so stand the
-service up *before* you set the secret that switches publishing on. The secret is the last step for
-exactly that reason: until it exists the publish no-ops with a warning and `main` stays green,
+service up *before* you set the secrets that switch publishing on. They are the last steps for
+exactly that reason: until they exist the publish no-ops with a warning and `main` stays green,
 the same way flatpak.yml's repo deploy does.
 
 1. **Ingress — both halves live in `unom/infra`, and they must move together.** Neither the DNS
@@ -518,7 +518,14 @@ the same way flatpak.yml's repo deploy does.
    docker run --rm nixos/nix nix --extra-experimental-features nix-command \
      key generate-secret --key-name punktfunk-cache-1            # or anywhere with docker
    ```
-4. Push to `main` touching the flake. The publish step also writes the public key to
+4. **Deploy host key.** `DEPLOY_KNOWN_HOSTS` is a repo Actions secret holding unom-1's SSH host
+   key — `ssh-keyscan -p "$DEPLOY_PORT" "$DEPLOY_HOST"` — and the publish `ssh`es with
+   `StrictHostKeyChecking=yes` against it. Every run starts with an empty `known_hosts`, so
+   `accept-new` would make *every* run a first contact, handing `DEPLOY_SSH_KEY` and the signed
+   publish to whatever won the race for the address. It gates the step alongside
+   `NIX_CACHE_SIGNING_KEY`/`DEPLOY_HOST`: until it is set the publish skips with a warning.
+   Re-keyscan and re-set it if unom-1's host key ever changes, or the deploy fails closed.
+5. Push to `main` touching the flake. The publish step also writes the public key to
    `https://nix.unom.io/punktfunk-cache.pub`, so users can always check the docs against the cache.
 
 `scripts/setup-nix-cache.sh` walks through it interactively, and each stage detects work already

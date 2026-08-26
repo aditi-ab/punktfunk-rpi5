@@ -46,12 +46,13 @@ pub struct SendInputInjector {
     touch_failed: bool,
 }
 
-// SAFETY: `SendInputInjector` holds only an `Option<HDESK>` (a desktop handle). The host creates
-// and drives it from a single dedicated injector thread; the handle is opened, rebound, and closed
-// on whichever thread owns the value, and the type is not `Sync`, so there is never concurrent
-// access. A desktop `HDESK` is not thread-affine for ownership (`CloseDesktop` works from any
-// thread; `SetThreadDesktop` rebinds the current thread), so transferring ownership via `Send` is
-// sound.
+// SAFETY: the only field that is not already `Send` is the `Option<HDESK>` (`touch_failed` is a
+// `bool`, and `SyntheticTouch` is `Send` on its own — `Arc<Mutex<..>>` + `JoinHandle`, with the
+// device handle carrying its own proof). The host creates and drives the injector from a single
+// dedicated thread; the desktop handle is opened, rebound, and closed on whichever thread owns the
+// value, and the type is not `Sync`, so there is never concurrent access. A desktop `HDESK` is not
+// thread-affine for ownership (`CloseDesktop` works from any thread; `SetThreadDesktop` rebinds the
+// current thread), so transferring ownership via `Send` is sound.
 unsafe impl Send for SendInputInjector {}
 
 impl SendInputInjector {

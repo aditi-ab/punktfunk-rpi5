@@ -238,10 +238,23 @@ pub(crate) fn source_id_for(e: &CustomEntry) -> Option<&str> {
 /// The stored entry a full **library id** refers to, or `None`. The art proxy resolves *any* id this
 /// way before falling back to the legacy per-store branches (WP1.2), which is what lets a plugin's
 /// entries be served regardless of what their ids look like.
+///
+/// Gated on what the library actually collects ([`super::collect_games`]), so a source the operator
+/// switched OFF resolves to nothing here either. It used to resolve straight out of the catalog,
+/// which let `GET /library/art/<id>/<kind>` — on the paired-cert allowlist — serve covers for
+/// entries `GET /library` had already filtered away (security review 2026-08-25).
+///
+/// The per-entry **hide** is deliberately not applied: the console draws a hidden title's (dimmed)
+/// cover so the operator can bring it back, and this resolver cannot see the caller's lane. Keeping
+/// a hidden title's art off the paired-cert lane is a check for the route, which can.
 pub fn entry_for_library_id(library_id: &str) -> Option<CustomEntry> {
-    load_custom()
+    let entry = load_custom()
         .into_iter()
-        .find(|e| library_id_for(e) == library_id)
+        .find(|e| library_id_for(e) == library_id)?;
+    super::collect_games()
+        .iter()
+        .any(|g| g.id == library_id)
+        .then_some(entry)
 }
 
 /// Serve a stored entry's **local** art file for one [`ArtKind`] — the `library.json` branch of the
@@ -374,8 +387,9 @@ pub fn delete_custom(id: &str) -> Result<MutateOutcome<()>> {
 
 // ------------------------------------------------------------------ providers (RFC §8)
 
-/// The **operator-privileged field** set in a library payload, if the payload carries one — the
-/// fields whose contents the host later executes as the host user.
+/// The **operator-privileged field** in a library payload, if the payload carries one: `prep`, or a
+/// launch kind that is not on [`UNPRIVILEGED_LAUNCH_KINDS`] — the fields whose contents the host
+/// could later execute as the host user.
 ///
 /// `prep` is run by [`crate::hooks::run_prep`] through `/bin/sh -c`, and a `command` launch is run
 /// through `/bin/sh -c` (Linux) or `cmd.exe /c` (Windows). Both are documented at their execution
@@ -386,10 +400,8 @@ pub fn delete_custom(id: &str) -> Result<MutateOutcome<()>> {
 /// copies of the very primitive the `/hooks` carve-out exists to withhold.
 ///
 /// Returns the field name for the error message, so a plugin author sees exactly what was refused.
-/// The other launch kinds (`steam_appid`, `steam_ui`, `launcher_ui`, `epic`, `gog`, `aumid`, `playnite`,
-/// `lutris_id`, `heroic`) are all
-/// host-resolved from a validated id and stay open to every lane — a provider plugin can still
-/// publish its whole catalogue, it just cannot hand the host a shell command to run.
+/// Every launch kind on [`UNPRIVILEGED_LAUNCH_KINDS`] stays open to every lane — a provider plugin
+/// can still publish its whole catalogue, it just cannot hand the host a program to run.
 pub fn privileged_field(
     launch: Option<&LaunchSpec>,
     prep: &[crate::hooks::PrepCmd],
@@ -397,11 +409,38 @@ pub fn privileged_field(
     if !prep.is_empty() {
         return Some("prep");
     }
-    if launch.is_some_and(|l| l.kind == "command") {
-        return Some("launch.kind = \"command\"");
+    if launch.is_some_and(|l| !UNPRIVILEGED_LAUNCH_KINDS.contains(&l.kind.as_str())) {
+        return Some("launch.kind");
     }
     None
 }
+
+/// The launch kinds any lane may publish: the host owns the whole command line and builds it from a
+/// value it validates per kind (`launch.rs`), so the entry NAMES a title rather than carrying a
+/// program to run. `plugin` is here for a different reason — its command is never stored at all: the
+/// host asks the live plugin for one at launch time ([`crate::library::ask_plugin_launch`]), so the
+/// stored entry on its own executes nothing.
+///
+/// An **allowlist**, deliberately, and the reason [`privileged_field`] reads the way round it does:
+/// a kind added to `launch.rs` and forgotten here is operator-only until someone lists it on
+/// purpose, which is the safe way to be wrong. It used to be a two-entry blocklist, and `gog` — an
+/// exe plus arguments — sat outside it as a standing exec primitive for the plugin lane (security
+/// review 2026-08-25). `gog` is listed now because `launch::gog_spawn` confines its exe to a GOG
+/// install the host enumerates itself; `command` never is, because `cmd.exe /c` / `sh -c` is the
+/// primitive this whole gate exists to withhold.
+const UNPRIVILEGED_LAUNCH_KINDS: &[&str] = &[
+    "steam_appid",
+    "steam_ui",
+    "launcher_ui",
+    "lutris_id",
+    "heroic",
+    "epic",
+    "gog",
+    "aumid",
+    "xbox",
+    "playnite",
+    "plugin",
+];
 
 /// Provider ids are path segments, event sources, and console labels: keep them tame.
 /// `manual` is reserved (it is the no-provider sentinel in `library.changed`).
@@ -1120,9 +1159,9 @@ mod tests {
         );
     }
 
-    /// The field-authority rule behind the 2026-08-05 review's H-1: exactly the two fields the host
-    /// later hands to a shell are operator-only. Everything else — including every host-resolved
-    /// launch kind — stays open, so a provider plugin can publish its whole catalogue.
+    /// The field-authority rule behind the 2026-08-05 review's H-1: the fields the host later hands
+    /// to a shell are operator-only. Every host-resolved launch kind stays open, so a provider
+    /// plugin can publish its whole catalogue.
     #[test]
     fn privileged_field_is_command_execution_only() {
         let cmd = LaunchSpec {
@@ -1138,15 +1177,56 @@ mod tests {
             undo: None,
         }];
 
-        assert_eq!(
-            privileged_field(Some(&cmd), &[]),
-            Some("launch.kind = \"command\"")
-        );
+        assert_eq!(privileged_field(Some(&cmd), &[]), Some("launch.kind"));
         assert_eq!(privileged_field(None, &prep), Some("prep"));
         assert_eq!(privileged_field(Some(&steam), &prep), Some("prep"));
         // The ordinary provider catalogue: nothing privileged, so no lane is refused.
         assert_eq!(privileged_field(Some(&steam), &[]), None);
         assert_eq!(privileged_field(None, &[]), None);
+    }
+
+    /// The gate is an ALLOWLIST, and this is the test that keeps it one: a launch kind nobody listed
+    /// is operator-privileged, so a kind added to `launch.rs` and forgotten in
+    /// `UNPRIVILEGED_LAUNCH_KINDS` fails closed instead of shipping as an open primitive. `gog` was
+    /// exactly that miss — an exe plus arguments that the two-entry blocklist never named (security
+    /// review 2026-08-25).
+    ///
+    /// The listed set is pinned as well as the rule, so WIDENING it is a deliberate edit to this
+    /// test rather than a line that slips through in someone's diff.
+    #[test]
+    fn an_unlisted_launch_kind_is_operator_privileged() {
+        let kind = |k: &str| {
+            let spec = LaunchSpec {
+                kind: k.into(),
+                value: "x".into(),
+            };
+            privileged_field(Some(&spec), &[])
+        };
+        assert_eq!(
+            UNPRIVILEGED_LAUNCH_KINDS,
+            &[
+                "steam_appid",
+                "steam_ui",
+                "launcher_ui",
+                "lutris_id",
+                "heroic",
+                "epic",
+                "gog",
+                "aumid",
+                "xbox",
+                "playnite",
+                "plugin",
+            ],
+            "widening this set hands the plugin lane a new launch kind — do it on purpose"
+        );
+        for k in UNPRIVILEGED_LAUNCH_KINDS {
+            assert_eq!(kind(k), None, "`{k}` is on the allowlist");
+        }
+        // A kind this host has never heard of — a newer host's vocabulary, or a plugin's invention.
+        assert_eq!(kind("brand_new_store"), Some("launch.kind"));
+        assert_eq!(kind(""), Some("launch.kind"));
+        // Casing is not a way in: the launch resolvers match the exact string.
+        assert_eq!(kind("GOG"), Some("launch.kind"));
     }
 
     #[test]

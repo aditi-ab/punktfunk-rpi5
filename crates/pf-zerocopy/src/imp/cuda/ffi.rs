@@ -266,15 +266,9 @@ pub(crate) struct CudaApi {
     cuIpcOpenMemHandle: unsafe extern "C" fn(*mut CUdeviceptr, CUipcMemHandle, c_uint) -> CUresult,
     cuIpcCloseMemHandle: unsafe extern "C" fn(CUdeviceptr) -> CUresult,
 }
-// SAFETY: every field is a bare `extern "C" fn` address into the leaked, process-lifetime
-// `libcuda` mapping (`cuda_api` `forget`s the `Library`, so it is never unloaded) — an immutable
-// value with no interior mutability and no thread affinity. Moving the table to another thread
-// cannot dangle (the code it points at stays mapped) or race (the fields are read-only).
-unsafe impl Send for CudaApi {}
-// SAFETY: as above — the table is a set of immutable fn-pointer addresses with no interior
-// mutability, so concurrent shared reads from multiple threads cannot race; the driver entry
-// points they address are themselves thread-safe.
-unsafe impl Sync for CudaApi {}
+// `Send`/`Sync` need no `unsafe impl`: every field is a bare fn pointer, which is already both.
+// The addresses stay valid because `cuda_api` `forget`s the `Library`, so `libcuda` is never
+// unloaded.
 
 /// `CUresult` returned by the wrappers when `libcuda` isn't loaded (no NVIDIA driver). Non-zero so
 /// the existing `ck()`/`!= 0` checks treat it as an ordinary driver error; distinct from any real

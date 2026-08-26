@@ -331,10 +331,11 @@ object SkiaConsole {
     }
 
     /**
-     * A `punktfunk://` link while the console is up. Known-and-pinned is the one-click contract
-     * (the same dial the console's own Launch takes); anything that would need a trust decision
-     * is a notice here — a link may never establish trust, and the console's Pair screen is
-     * reached from the host's tile, not from a URL.
+     * A `punktfunk://` link while the console is up. Named-by-id and pinned is the one-click
+     * contract (the same dial the console's own Launch takes); anything that would need a trust
+     * decision — or that named the host by a guessable label or address — is a notice here. A link
+     * may never establish trust, the console's Pair screen is reached from the host's tile rather
+     * than from a URL, and the console draws no prompt this shell could ask a question through.
      */
     fun handleDeepLink(url: String) {
         if (handle == 0L) return
@@ -357,7 +358,7 @@ object SkiaConsole {
             }
         }
         when (val resolved = io.unom.punktfunk.kit.link.DeepLinks.resolveHost(link, knownHostStore.all())) {
-            is io.unom.punktfunk.kit.link.HostResolution.Known -> {
+            is io.unom.punktfunk.kit.link.HostResolution.Record -> {
                 val kh = resolved.host
                 if (link.pinConflict(kh)) {
                     notice("That link's fingerprint doesn't match the one pinned for ${kh.name}.")
@@ -365,6 +366,10 @@ object SkiaConsole {
                 }
                 if (kh.fpHex.isEmpty() || !kh.paired) {
                     notice("Pair with ${kh.name} first — a link can't establish trust.")
+                    return
+                }
+                if (resolved is io.unom.punktfunk.kit.link.HostResolution.Confirm) {
+                    notice("A link can only dial ${kh.name} by its id — open it from the list.")
                     return
                 }
                 launch(

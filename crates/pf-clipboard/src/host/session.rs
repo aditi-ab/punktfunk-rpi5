@@ -102,14 +102,21 @@ async fn run(
                         }
                     }
                     ClipCoordCmd::RemoteOffer { seq, mimes } => {
-                        client_seq = seq;
-                        let res = if mimes.is_empty() {
-                            backend.clear_offer()
-                        } else {
-                            backend.set_offer(&mimes)
-                        };
-                        if let Err(e) = res {
-                            tracing::debug!(error = %e, "clipboard apply remote offer failed");
+                        // Only while the client has sync on — with it off the device's grant was
+                        // revoked (or it never enabled sync at all), and its content must not go
+                        // on the host's real clipboard. Re-read HERE and not only at the sender:
+                        // the access lifecycle task clears the flag from another task, which can
+                        // land between the offer being queued and this arm running.
+                        if clip_enabled.load(Ordering::SeqCst) {
+                            client_seq = seq;
+                            let res = if mimes.is_empty() {
+                                backend.clear_offer()
+                            } else {
+                                backend.set_offer(&mimes)
+                            };
+                            if let Err(e) = res {
+                                tracing::debug!(error = %e, "clipboard apply remote offer failed");
+                            }
                         }
                     }
                 }
@@ -127,8 +134,16 @@ async fn run(
                     ClipEvent::Paste { mime, responder } => {
                         // A host app is pasting the client's offered content: pull that format from
                         // the client and hand it to the backend's responder. Off-task so the loop
-                        // keeps serving.
-                        tokio::spawn(fetch_into_pipe(conn.clone(), client_seq, mime, responder));
+                        // keeps serving. The enable snapshot rides along like `serve_fetch`'s: a
+                        // paste that raced a revoke must not fetch from the client, even though
+                        // the selection it owned is being dropped in the same breath.
+                        tokio::spawn(fetch_into_pipe(
+                            conn.clone(),
+                            client_seq,
+                            mime,
+                            responder,
+                            clip_enabled.load(Ordering::SeqCst),
+                        ));
                     }
                     ClipEvent::Closed => break,
                 }
@@ -221,14 +236,20 @@ async fn serve_fetch(
 }
 
 /// Pull `mime` of the client's current offer (`seq`) over an outbound fetch stream and hand the bytes
-/// to the backend's paste `responder`. Any failure (timeout, decline, I/O) responds with empty bytes
-/// so the pasting host app gets an empty paste instead of hanging.
+/// to the backend's paste `responder`. Any failure (timeout, decline, I/O) — or `enabled` being false,
+/// the client having lost the clipboard since the paste started — responds with empty bytes so the
+/// pasting host app gets an empty paste instead of hanging.
 async fn fetch_into_pipe(
     conn: quinn::Connection,
     seq: u32,
     mime: String,
     responder: PasteResponder,
+    enabled: bool,
 ) {
+    if !enabled {
+        responder.respond(Vec::new()).await;
+        return;
+    }
     let req = ClipFetch {
         seq,
         file_index: CLIP_FILE_INDEX_NONE,

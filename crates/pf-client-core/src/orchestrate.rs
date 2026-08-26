@@ -251,6 +251,13 @@ impl ConnectPlan {
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlanOutcome {
     Connect(Box<ConnectPlan>),
+    /// The same plan, for a link that named the host by something GUESSABLE — its display name,
+    /// its address, or the `host=` recovery parameter — rather than by its stable record id.
+    /// `x-scheme-handler/punktfunk` means any web page can emit such a link, so the front-end
+    /// asks first and then runs it exactly as [`PlanOutcome::Connect`]. NOT
+    /// [`PlanOutcome::ConfirmUnknown`]: this host is saved and pinned, and routing it through
+    /// the pairing ceremony would drop the pin it already has.
+    ConfirmConnect(Box<ConnectPlan>),
     /// The link resolved to no local record. The front-end shows the confirmation sheet with
     /// exactly this, and the normal pairing/TOFU flow proceeds under the user's eyes (§3.1).
     ConfirmUnknown(Box<UnknownHost>),
@@ -316,7 +323,9 @@ impl PlanError {
 
 /// Build a plan from a `punktfunk://` link against this device's stores — the shared half of
 /// every platform's URL router (§4). The security rules of §3 live here, not in the shells:
-/// no pairing, no silent trust, references resolved or refused.
+/// no pairing, no silent trust, no dial on a GUESSABLE reference (only the stable record id
+/// yields [`PlanOutcome::Connect`]; a name or an address yields
+/// [`PlanOutcome::ConfirmConnect`]), references resolved or refused.
 ///
 /// Preempting a live session is the one rule that stays with the caller: only the front-end
 /// knows whether a session is running, and the answer ("focus it" / "end that one first")
@@ -341,8 +350,12 @@ pub fn plan_from_link(
             _ => return Err(PlanError::UnknownProfile(reference.clone())),
         }
     }
-    match crate::deeplink::resolve_host(link, known) {
-        HostResolution::Known(i) => {
+    let resolution = crate::deeplink::resolve_host(link, known);
+    // A guessable reference (name / address / `host=`) reaches the same plan, but the front-end
+    // must put a person in front of it — see `PlanOutcome::ConfirmConnect`.
+    let confirm = matches!(resolution, HostResolution::Confirm(_));
+    match resolution {
+        HostResolution::Known(i) | HostResolution::Confirm(i) => {
             let host = &known.hosts[i];
             if link.pin_conflict(host) {
                 return Err(PlanError::PinConflict {
@@ -376,7 +389,11 @@ pub fn plan_from_link(
                 // window title (it names nothing that is trusted).
                 plan.host.name = link.name.clone().unwrap_or_else(|| plan.host.addr.clone());
             }
-            Ok(PlanOutcome::Connect(Box::new(plan)))
+            Ok(if confirm {
+                PlanOutcome::ConfirmConnect(Box::new(plan))
+            } else {
+                PlanOutcome::Connect(Box::new(plan))
+            })
         }
         HostResolution::Unknown {
             addr,
@@ -910,8 +927,8 @@ mod tests {
         let plan =
             |url: &str| plan_from_link(&deeplink::parse(url).unwrap(), &known, &catalog, &base);
 
-        // A known, pinned host with a matching (or absent) fp: a plain connect.
-        let out = plan("punktfunk://connect/Desk").unwrap();
+        // A known, pinned host named by its (unguessable) record id: a plain connect.
+        let out = plan("punktfunk://connect/11111111-2222-4333-8444-555555555555").unwrap();
         match out {
             PlanOutcome::Connect(p) => {
                 assert_eq!(p.host.addr, "192.168.1.50");
@@ -919,6 +936,23 @@ mod tests {
                 assert!(p.host.fp_hex.is_some());
             }
             other => panic!("expected a connect, got {other:?}"),
+        }
+
+        // The SAME host named by its label — which any web page could guess, and
+        // `x-scheme-handler/punktfunk` lets one hand us: the same plan, but the shell must ask
+        // first. Deliberately not `ConfirmUnknown`: that would re-run the pairing ceremony on a
+        // host that is already pinned.
+        match plan("punktfunk://connect/Desk").unwrap() {
+            PlanOutcome::ConfirmConnect(p) => {
+                assert_eq!(p.host.addr, "192.168.1.50");
+                assert!(p.host.fp_hex.is_some());
+            }
+            other => panic!("expected a confirm-connect, got {other:?}"),
+        }
+        // …and by its address, launch id and all.
+        match plan("punktfunk://connect/192.168.1.50?launch=steam:570").unwrap() {
+            PlanOutcome::ConfirmConnect(p) => assert_eq!(p.launch.as_deref(), Some("steam:570")),
+            other => panic!("expected a confirm-connect, got {other:?}"),
         }
 
         // A lying/stale fingerprint never connects, and says which host it was about.

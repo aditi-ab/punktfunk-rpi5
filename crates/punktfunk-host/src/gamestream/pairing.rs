@@ -16,7 +16,7 @@ use rsa::sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 /// Out-of-band PIN delivery. Moonlight generates + displays a PIN; the operator submits it
@@ -28,7 +28,9 @@ use tokio::sync::Notify;
 const MAX_PARKED_WAITERS: usize = 4;
 
 pub struct PinGate {
-    pin: Mutex<Option<String>>,
+    /// The submitted PIN and when it was submitted — a PIN no handshake consumed within the
+    /// pairing window is discarded rather than held for the next one ([`PinGate::take`]).
+    pin: Mutex<Option<(String, Instant)>>,
     notify: Notify,
     /// Handshakes currently parked in [`take`](Self::take) — drives the management API's
     /// `pin_pending` so a control pane knows when to prompt for the PIN.
@@ -62,7 +64,7 @@ impl PinGate {
             );
             return false;
         }
-        *self.pin.lock().unwrap() = Some(pin);
+        *self.pin.lock().unwrap() = Some((pin, Instant::now()));
         self.notify.notify_waiters();
         true
     }
@@ -98,8 +100,18 @@ impl PinGate {
 
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if let Some(p) = self.pin.lock().unwrap().take() {
-                return Some(p);
+            // A PIN must not outlive the handshake it was typed for: the slot is global and
+            // unbound, so a PIN submitted with no handshake left to consume it (the submitter's
+            // waiter died between the management API's `awaiting_pin` check and the submit) used
+            // to sit here indefinitely and authenticate whoever knocked next — a PIN typed for
+            // one device pairing another (security-review 2026-08-25). Its shelf life is the same
+            // pairing window a handshake parks for, and a real client is ALREADY parked when the
+            // operator submits, so it takes the PIN within microseconds — never near this bound.
+            if let Some((p, at)) = self.pin.lock().unwrap().take() {
+                if at.elapsed() < timeout {
+                    return Some(p);
+                }
+                tracing::warn!("pairing: discarding a PIN no handshake consumed in time");
             }
             if tokio::time::timeout_at(deadline, self.notify.notified())
                 .await
@@ -374,6 +386,20 @@ mod tests {
         // Timeout path also clears the flag.
         assert_eq!(pairing.pin.take(Duration::from_millis(10)).await, None);
         assert!(!pairing.pin.awaiting_pin());
+    }
+
+    /// A PIN nobody consumed must NOT authenticate the next handshake to arrive: the slot is
+    /// global and unbound, so a PIN typed for a device that gave up would otherwise pair whoever
+    /// knocked afterwards (security-review 2026-08-25).
+    #[tokio::test]
+    async fn unconsumed_pin_is_discarded() {
+        let pairing = Pairing::new();
+        pairing.pin.submit("1234".into()); // nothing parked — nobody takes it
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Older than the window this handshake parks for: discarded, not handed over…
+        assert_eq!(pairing.pin.take(Duration::from_millis(5)).await, None);
+        // …and gone for good, so the handshake after it doesn't inherit it either.
+        assert_eq!(pairing.pin.take(Duration::from_millis(5)).await, None);
     }
 
     /// A pre-auth peer flood can park at most `MAX_PARKED_WAITERS` pairing handshakes; the next

@@ -15,8 +15,8 @@ use axum::Extension;
 ///
 /// Both checks belong here rather than in the route gate: `PUT /library/provider/{p}` is a route a
 /// provider plugin must be able to call — reconciling its own entry set is the whole point of a
-/// scanner plugin — while `prep` / `launch.kind = "command"` inside that payload are the operator's
-/// authority alone. Route reachability and field authority are separate questions.
+/// scanner plugin — while `prep` / a `launch.kind` outside the host-resolved set inside that payload
+/// are the operator's authority alone. Route reachability and field authority are separate questions.
 ///
 /// `Some((reason, response))` is the refusal to return; `None` means the payload may proceed.
 /// Deliberately not `Result<(), Response>`: the "error" here IS the response the handler sends, so
@@ -60,11 +60,10 @@ fn check_privileged_fields(
                 api_error(
                     StatusCode::FORBIDDEN,
                     &format!(
-                        "`{field}` is executed as the host user and may only be set with the \
-                         operator's admin token — a plugin may publish entries with any host-resolved \
-                         launch kind (steam_appid, steam_ui, launcher_ui, epic, gog, aumid, xbox, lutris_id, \
-                         heroic, playnite) \
-                         instead"
+                        "`{field}` can become a command the host runs as the host user, so it may \
+                         only be set with the operator's admin token — a plugin may publish entries \
+                         with any host-resolved launch kind (steam_appid, steam_ui, launcher_ui, \
+                         epic, gog, aumid, xbox, lutris_id, heroic, playnite) or `plugin` instead"
                     ),
                 ),
             ));

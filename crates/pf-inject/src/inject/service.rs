@@ -64,10 +64,14 @@ fn injector_service_thread(rx: std::sync::mpsc::Receiver<InputEvent>) {
             batch.push(ev);
         }
 
-        // The resolved input backend (PUNKTFUNK_INPUT_BACKEND, set per connect / mid-stream session
-        // switch) may have changed since we opened. Reopen against it so input FOLLOWS the active
-        // session instead of injecting into a stale, still-warm backend (e.g. the managed gamescope's
-        // EIS socket after the user switched to the KDE desktop).
+        // The resolved input backend (published by the host per connect / mid-stream session switch
+        // — `set_backend_id`) may have changed since we opened. Reopen against it so input FOLLOWS
+        // the active session instead of injecting into a stale, still-warm backend (e.g. the managed
+        // gamescope's EIS socket after the user switched to the KDE desktop).
+        //
+        // This runs once per BATCH, which is why the published value is a `RwLock` read and not a
+        // `getenv`: the old `PUNKTFUNK_INPUT_BACKEND` round-trip made this hot path a data race
+        // against the connect path's `setenv` (security-review 2026-08-25).
         let want = default_backend();
         if injector.is_some() && open_backend != Some(want) {
             tracing::info!(

@@ -38,6 +38,7 @@ import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.kit.security.obtainIdentity
 import io.unom.punktfunk.models.ActiveSession
+import io.unom.punktfunk.models.PendingLinkConnect
 import io.unom.punktfunk.models.PendingTrust
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
@@ -284,6 +285,8 @@ fun ConnectScreen(
     // A trust decision awaiting the user (first-connect TOFU / fp changed / PIN pairing / the
     // request-access-or-PIN choice).
     var pendingTrust by remember { mutableStateOf<PendingTrust?>(null) }
+    // A `punktfunk://` link that named a saved host by a guessable reference, awaiting the OK.
+    var pendingLinkConnect by remember { mutableStateOf<PendingLinkConnect?>(null) }
     // A no-PIN "request access" connect in flight (the cancelable "Waiting for approval…" dialog).
     var awaiting by remember { mutableStateOf<RequestAccessState?>(null) }
     // A saved host being edited (name / address / port / MAC).
@@ -673,8 +676,10 @@ fun ConnectScreen(
             }
         }
         when (val resolved = DeepLinks.resolveHost(link, savedHosts)) {
-            // Known AND pinned is the one-click contract: do exactly what tapping its card does.
-            is HostResolution.Known -> {
+            // A saved record. Pinned AND named by its (unguessable) id is the one-click contract:
+            // do exactly what tapping its card does. Named by anything a web page could guess —
+            // its label, its address — the same dial waits for a tap on the confirmation.
+            is HostResolution.Record -> {
                 // A pin that contradicts the stored one is the link being stale or lying. Hard
                 // refusal: this is the one case where doing what the card does would be wrong.
                 if (link.pinConflict(resolved.host)) {
@@ -689,6 +694,10 @@ fun ConnectScreen(
                         resolved.host.address, resolved.host.port, resolved.host.name,
                         link.fp, PendingTrust.Kind.REQUEST_ACCESS, profileRef, link.launch,
                     )
+                    return@LaunchedEffect
+                }
+                if (resolved is HostResolution.Confirm) {
+                    pendingLinkConnect = PendingLinkConnect(resolved.host, profileRef, link.launch)
                     return@LaunchedEffect
                 }
                 connect(
@@ -821,6 +830,15 @@ fun ConnectScreen(
             doConnect(pt.host, pt.port, pt.name, fp, pt.profile, pt.launch)
         },
         onRequestAccess = { pt -> pendingTrust = null; requestAccess(pt) },
+        pendingLinkConnect = pendingLinkConnect,
+        onConfirmLinkConnect = { plc ->
+            pendingLinkConnect = null
+            connect(
+                plc.host.address, plc.host.port,
+                oneOffProfile = plc.profile, launch = plc.launch,
+            )
+        },
+        onDismissLinkConnect = { pendingLinkConnect = null },
         awaitingHostName = awaiting?.target?.name,
         onCancelApproval = {
             awaiting?.cancelled?.set(true)

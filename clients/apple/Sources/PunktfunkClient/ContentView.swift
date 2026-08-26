@@ -24,8 +24,9 @@ struct ContentView: View {
     /// connect to resolve the session's `EffectiveSettings`, and edited by the settings surface.
     @ObservedObject private var profiles = ProfileStore.shared
     @StateObject private var discovery = HostDiscovery()
-    // The dev auto-connect hook writes these three, so they stay observed here; every OTHER
-    // stream setting reaches a session through `EffectiveSettings`, resolved once per connect.
+    // The dev auto-connect hook (DEBUG-only — see `autoConnectIfAsked`) writes these three, so
+    // they stay observed here; every OTHER stream setting reaches a session through
+    // `EffectiveSettings`, resolved once per connect.
     @AppStorage(DefaultsKey.streamWidth) private var width = 1920
     @AppStorage(DefaultsKey.streamHeight) private var height = 1080
     @AppStorage(DefaultsKey.streamHz) private var hz = 60
@@ -52,6 +53,29 @@ struct ContentView: View {
     /// a live session is already up. Surfaced as an informational alert (distinct from the
     /// "Connection failed" one, which is for actual connect errors).
     @State private var deepLinkNotice: String?
+    /// A `punktfunk://` deep link that named a saved host by something GUESSABLE — its display
+    /// name, its address, or the `host=` recovery parameter — instead of by its stable record id.
+    /// Anything that can open a URL can guess "Gaming PC", so the link's action waits for this
+    /// confirmation; a link that names the id (every shortcut this app emits) still runs on its own.
+    private struct DeepLinkConfirm {
+        let host: StoredHost
+        let launch: String?
+        let profile: ProfileSelection
+        /// A `browse` link: open the host's library instead of dialing it.
+        let browse: Bool
+
+        var actionTitle: String { browse ? "Open Library" : "Connect" }
+        var message: String {
+            let asked = browse
+                ? "open \(host.displayName)'s game library"
+                : "connect to \(host.displayName)"
+                    + (launch.map { " and launch \u{201C}\($0)\u{201D}" } ?? "")
+            return "A link asked to \(asked). It names the host by its label or address, which "
+                + "anything that can open a link could guess — a shortcut made in Punktfunk names "
+                + "the host's id and opens without asking."
+        }
+    }
+    @State private var deepLinkConfirm: DeepLinkConfirm?
     #if os(iOS)
     /// Owns the Live Activity for the running session (Lock Screen / Dynamic Island). Driven from
     /// the session model's published state below; iPhone/iPad only.
@@ -193,6 +217,29 @@ struct ContentView: View {
             } message: {
                 Text(deepLinkNotice ?? "")
             }
+            // A link that named a saved host by a guessable reference: the dial (or the library)
+            // happens on the user's word rather than on the link's.
+            .alert(
+                "Open this link?",
+                isPresented: deepLinkConfirmPresented,
+                presenting: deepLinkConfirm
+            ) { confirm in
+                Button(confirm.actionTitle) { runDeepLinkConfirm(confirm) }
+                Button("Cancel", role: .cancel) {}
+            } message: { confirm in
+                Text(confirm.message)
+            }
+    }
+
+    /// The confirmed link's action: exactly what a `.known` (id-referenced) link would have done,
+    /// one tap later.
+    private func runDeepLinkConfirm(_ confirm: DeepLinkConfirm) {
+        deepLinkConfirm = nil
+        if confirm.browse {
+            libraryTarget = LibraryTarget(host: confirm.host, profile: confirm.profile)
+        } else {
+            connect(confirm.host, launchID: confirm.launch, profile: confirm.profile)
+        }
     }
 
     private var driven: some View {
@@ -482,6 +529,12 @@ struct ContentView: View {
             set: { if !$0 { deepLinkNotice = nil } })
     }
 
+    private var deepLinkConfirmPresented: Binding<Bool> {
+        Binding(
+            get: { deepLinkConfirm != nil && !consolePromptShowing },
+            set: { if !$0 { deepLinkConfirm = nil } })
+    }
+
     /// True while the console prompt owns the modal state (see `consolePrompt`). Always false on
     /// tvOS, whose alerts the focus engine drives natively.
     private var consolePromptShowing: Bool {
@@ -555,6 +608,20 @@ struct ContentView: View {
                 actions: [
                     GamepadPromptAction(id: "ok", title: "OK", isCancel: true) {
                         model.errorMessage = nil
+                    },
+                ])
+        }
+        if let confirm = deepLinkConfirm {
+            return GamepadPrompt(
+                id: "link-confirm",
+                title: "Open this link?",
+                message: confirm.message,
+                actions: [
+                    GamepadPromptAction(id: "go", title: confirm.actionTitle, isPrimary: true) {
+                        runDeepLinkConfirm(confirm)
+                    },
+                    GamepadPromptAction(id: "cancel", title: "Cancel", isCancel: true) {
+                        deepLinkConfirm = nil
                     },
                 ])
         }
@@ -654,11 +721,13 @@ struct ContentView: View {
     /// (design/client-deep-links.md): a stable id, a unique host name or an `addr[:port]`, with
     /// `fp`/`host` recovery parameters and a one-off `profile`.
     ///
-    /// The security posture is the parser's plus three rules that live here, and none of them
+    /// The security posture is the parser's plus four rules that live here, and none of them
     /// bends: a URL never pairs and never trusts on its own (an unknown host becomes a
-    /// confirmation, not a connect), never preempts a live session (same host → focus, different
-    /// host → say so; NEVER tear one down on a background tap), and carries only references — a
-    /// profile it can't honor refuses with a notice rather than streaming with the wrong settings.
+    /// confirmation, not a connect), never dials on a GUESSABLE reference (only the stable record
+    /// id connects unattended — a label or an address becomes a confirmation), never preempts a
+    /// live session (same host → focus, different host → say so; NEVER tear one down on a
+    /// background tap), and carries only references — a profile it can't honor refuses with a
+    /// notice rather than streaming with the wrong settings.
     private func handleDeepLink(_ url: URL) {
         let link: DeepLink
         do {
@@ -703,8 +772,12 @@ struct ContentView: View {
                 return
             }
         }
-        switch link.resolveHost(in: store.hosts) {
-        case .known(let host):
+        let resolution = link.resolveHost(in: store.hosts)
+        switch resolution {
+        // A saved record. `.known` (named by its unguessable id) dials straight away; `.confirm`
+        // (named by its label or its address, which anything that can open a URL could guess)
+        // takes the same dial one tap later.
+        case .known(let host), .confirm(let host):
             guard !link.pinConflict(with: host) else {
                 deepLinkNotice = "That link's fingerprint doesn't match the identity saved for "
                     + "\(host.displayName). It's out of date, or it isn't pointing where it says."
@@ -717,6 +790,11 @@ struct ContentView: View {
                     return
                 }
                 return // deep-linked to the host we're already on — nothing to do
+            }
+            if case .confirm = resolution {
+                deepLinkConfirm = DeepLinkConfirm(
+                    host: host, launch: link.launch, profile: selection, browse: false)
+                return
             }
             connect(host, launchID: link.launch, profile: selection)
         case .unknown(let address, let port, let name, let fp):
@@ -765,8 +843,10 @@ struct ContentView: View {
                 return
             }
         }
-        switch link.resolveHost(in: store.hosts) {
-        case .known(let host):
+        let resolution = link.resolveHost(in: store.hosts)
+        switch resolution {
+        // Same rule as a connect link: only the record id opens on the link's own say-so.
+        case .known(let host), .confirm(let host):
             guard !link.pinConflict(with: host) else {
                 deepLinkNotice = "That link's fingerprint doesn't match the identity saved for "
                     + "\(host.displayName). It's out of date, or it isn't pointing where it says."
@@ -779,6 +859,11 @@ struct ContentView: View {
                     return
                 }
                 return // browsing the host we're already streaming — nothing to do
+            }
+            if case .confirm = resolution {
+                deepLinkConfirm = DeepLinkConfirm(
+                    host: host, launch: nil, profile: selection, browse: true)
+                return
             }
             libraryTarget = LibraryTarget(host: host, profile: selection)
         case .unknown(let address, _, let name, _):
@@ -1425,7 +1510,12 @@ struct ContentView: View {
     /// touching the saved host list. PUNKTFUNK_COMPOSITOR=kwin|gamescope|… overrides the
     /// compositor preference and PUNKTFUNK_REMOTE_GAMEPAD=xbox360|dualsense the virtual
     /// pad type (same names as the host env knobs). (IPv4/hostname only.)
+    ///
+    /// DEBUG-ONLY, and compiled out of a release build: it streams to whatever host an
+    /// environment variable names with the trust prompt auto-confirmed, which is a dev lever
+    /// (`swift run`, the shot harness), never something a shipped app should answer to.
     private func autoConnectIfAsked() {
+        #if DEBUG
         guard let target = ProcessInfo.processInfo.environment["PUNKTFUNK_AUTOCONNECT"],
               !target.isEmpty, model.phase == .idle
         else { return }
@@ -1460,5 +1550,6 @@ struct ContentView: View {
             effective.bitrateKbps = v
         }
         model.connect(to: host, effective: effective, gamepad: pad, autoTrust: true)
+        #endif
     }
 }

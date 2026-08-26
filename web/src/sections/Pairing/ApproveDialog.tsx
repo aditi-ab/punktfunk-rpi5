@@ -40,10 +40,15 @@ export const ApproveDialog: FC<{
 	/** The device being approved, or null when the dialog is closed. */
 	device: PendingDevice | null;
 	onCancel: () => void;
-	onApprove: (id: number, body: ApprovePending) => void;
+	/** Approve, with the console password the BFF re-verifies — approving pairs a device outright,
+	 * with no PIN ceremony, so a session cookie on its own must not be able to do it. */
+	onApprove: (id: number, body: ApprovePending, password: string) => void;
 	isPending: boolean;
-}> = ({ device, onCancel, onApprove, isPending }) => {
+	/** The last approve was refused: the password was wrong. */
+	wrongPassword: boolean;
+}> = ({ device, onCancel, onApprove, isPending, wrongPassword }) => {
 	const [name, setName] = useState("");
+	const [password, setPassword] = useState("");
 	const [draft, setDraft] = useState<AccessDraft>(() =>
 		draftFromStored(null, null, null),
 	);
@@ -61,6 +66,7 @@ export const ApproveDialog: FC<{
 	useEffect(() => {
 		if (!device) return;
 		setName(device.name);
+		setPassword("");
 		setDraft(
 			draftFromStored(device.grants, device.expires_unix, device.granted_unix),
 		);
@@ -80,16 +86,20 @@ export const ApproveDialog: FC<{
 			body.grants = draft.grants;
 			if (secs != null) body.expires_in_secs = secs;
 		}
-		onApprove(device.id, body);
+		onApprove(device.id, body, password);
 	};
 
 	const approveAsGuest = () => {
 		if (!device) return;
-		onApprove(device.id, {
-			name: trimmedName(),
-			grants: PRESET_CONTROLLER,
-			expires_in_secs: GUEST_EXPIRES_SECS,
-		});
+		onApprove(
+			device.id,
+			{
+				name: trimmedName(),
+				grants: PRESET_CONTROLLER,
+				expires_in_secs: GUEST_EXPIRES_SECS,
+			},
+			password,
+		);
 	};
 
 	return (
@@ -132,6 +142,28 @@ export const ApproveDialog: FC<{
 
 					<AccessControls value={draft} onChange={setDraft} idPrefix="approve" />
 
+					{/* Approving pairs the device outright — no PIN — so it re-confirms the console
+					    password, which the BFF verifies and strips (util/confirm.ts). Both approve
+					    paths below carry it, the guest fast path included. */}
+					<div className="space-y-2">
+						<Label htmlFor="approve-password">{m.store_spec_password()}</Label>
+						<Input
+							id="approve-password"
+							type="password"
+							autoComplete="current-password"
+							value={password}
+							onChange={(e) => setPassword(e.target.value)}
+						/>
+						<p className="text-xs text-muted-foreground">
+							{m.pairing_password_help()}
+						</p>
+						{wrongPassword && (
+							<p role="alert" className="text-xs text-destructive">
+								{m.update_apply_wrong_password()}
+							</p>
+						)}
+					</div>
+
 					{/* The guest fast path — visually its own thing, deliberately not one of the footer
 					    buttons: one click grants Controller only for 4 hours, no dialog fiddling. */}
 					<div className="flex items-center justify-between gap-3 rounded-md border p-3">
@@ -142,7 +174,7 @@ export const ApproveDialog: FC<{
 							variant="secondary"
 							size="sm"
 							className="shrink-0"
-							disabled={isPending}
+							disabled={isPending || password.length === 0}
 							onClick={approveAsGuest}
 						>
 							<Timer className="size-4" />
@@ -154,7 +186,10 @@ export const ApproveDialog: FC<{
 						<Button variant="outline" onClick={onCancel} disabled={isPending}>
 							{m.common_cancel()}
 						</Button>
-						<Button disabled={isPending} onClick={submit}>
+						<Button
+							disabled={isPending || password.length === 0}
+							onClick={submit}
+						>
 							{m.pairing_pending_approve()}
 						</Button>
 					</DialogFooter>

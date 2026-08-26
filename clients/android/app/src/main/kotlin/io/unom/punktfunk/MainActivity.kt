@@ -874,7 +874,7 @@ class MainActivity : ComponentActivity() {
         val url = deepLinkFrom(intent) ?: return false
         val parsed = DeepLinks.parse(url) as? DeepLinkResult.Parsed ?: return false
         val target = DeepLinks.resolveHost(parsed.link, KnownHostStore(this).all())
-        return target is HostResolution.Known && target.host.id == live.hostId
+        return target is HostResolution.Record && target.host.id == live.hostId
     }
 
     /** The host a live stream is on — see [liveStream]. */

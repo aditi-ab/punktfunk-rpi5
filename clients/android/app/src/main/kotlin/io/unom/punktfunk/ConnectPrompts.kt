@@ -3,12 +3,14 @@ package io.unom.punktfunk
 import androidx.compose.runtime.Composable
 import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.KnownHost
+import io.unom.punktfunk.models.PendingLinkConnect
 import io.unom.punktfunk.models.PendingTrust
 
 /**
  * Everything `ConnectScreen` puts ON TOP of whichever home it drew — the trust and pairing
- * ceremony, the parked "Waiting for approval…", the console's host options, the speed test, the
- * edit form, the local-network rationale, and finally the connect takeover.
+ * ceremony, a link's connect confirmation, the parked "Waiting for approval…", the console's host
+ * options, the speed test, the edit form, the local-network rationale, and finally the connect
+ * takeover.
  *
  * They live together because their ORDER is the contract: this is a stack of siblings in one tree,
  * so the last one drawn is the one on top, and [ConnectOverlay] is last on purpose — a dial can
@@ -33,6 +35,11 @@ internal fun ConnectPrompts(
     /** The PIN ceremony completed with this host fingerprint — save as paired, then dial. */
     onPaired: (PendingTrust, String) -> Unit,
     onRequestAccess: (PendingTrust) -> Unit,
+    // ---- a link that named a saved host by a guessable reference ----------------------------
+    /** Non-null while such a link waits for the OK that turns it into a plain dial. */
+    pendingLinkConnect: PendingLinkConnect?,
+    onConfirmLinkConnect: (PendingLinkConnect) -> Unit,
+    onDismissLinkConnect: () -> Unit,
     // ---- the parked no-PIN request ----------------------------------------------------------
     /** Non-null while a "request access" connect sits parked on the host awaiting approval. */
     awaitingHostName: String?,
@@ -87,6 +94,14 @@ internal fun ConnectPrompts(
                 PairPinDialog(pt, identity, onSavePaired) { onPendingTrustChange(null) }
             }
         }
+    }
+
+    pendingLinkConnect?.let { plc ->
+        LinkConnectPrompt(
+            target = plc,
+            onConnect = { onConfirmLinkConnect(plc) },
+            onDismiss = onDismissLinkConnect,
+        )
     }
 
     awaitingHostName?.let { hostLabel ->

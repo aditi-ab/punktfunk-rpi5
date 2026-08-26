@@ -162,7 +162,7 @@ if you have a desktop client you already have it:
 
 ```sh
 punktfunk hosts list --probe                  # saved hosts, each with a live reachability check
-punktfunk pair <host>[:port] --pin 1234       # enrol this device with a host
+punktfunk pair <host>[:port] --pin -          # enrol this device with a host (PIN on stdin)
 punktfunk library <host-ref> --json           # the host's games, machine-readable
 punktfunk launch <host-ref> --game <id>       # stream, waking the host first if it's asleep
 punktfunk open 'punktfunk://connect/<host-ref>'
@@ -173,6 +173,14 @@ A `<host-ref>` is a saved host's id, its name, or an address — the same refere
 link takes. There is also `hosts add` / `hosts forget`,
 [`wake`](/docs/wake-on-lan#from-the-command-line), `reachable`, `profiles list` and `reset`; run
 `punktfunk help <command>` for a verb's flags.
+
+`--pin -` reads the PIN from stdin (`echo 1234 | punktfunk pair …`), which is the form to script.
+`--pin 1234` still works, but the value sits on the command line, where every local user can read it
+(`/proc/*/cmdline`); with neither flag, an interactive run asks for it.
+
+`punktfunk open` connects on its own only when the link names its host by the stable record id. A
+link naming it by label or address is a guess anything could make, so it asks first — and with no
+terminal to ask on it refuses (exit 6) unless you pass `--yes`.
 
 Exit codes are stable, so a script can branch without parsing prose: **0** ok, **2** connect failed,
 **3** trust rejected (re-pair), **4** the renderer couldn't start, **5** nothing matched what you

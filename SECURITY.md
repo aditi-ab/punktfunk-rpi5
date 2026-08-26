@@ -82,7 +82,10 @@ us beyond the download itself.
   checks every package for you. `rpmkeys --checksig` on a downloaded RPM verifies it by hand.
 - **The Bazzite sysext feed** carries a detached signature over its `SHA256SUMS`, from that same
   key. `punktfunk-sysext` verifies it before installing and refuses a feed it cannot verify — the
-  public key is baked into the script rather than fetched from the feed.
+  public key is baked into the script rather than fetched from the feed. The manifest also names
+  the feed it was signed for and carries a monotonic publish serial, both inside the signed bytes,
+  so a genuinely-signed manifest replayed from another channel — or an older one put back — is
+  refused too.
 - **Windows installers and MSIX packages** are Authenticode-signed; a release build that cannot
   reach its code-signing certificate fails to build rather than falling back to a self-signed one.
   Check with `Get-AuthenticodeSignature punktfunk-host-setup-1.2.3.exe`.

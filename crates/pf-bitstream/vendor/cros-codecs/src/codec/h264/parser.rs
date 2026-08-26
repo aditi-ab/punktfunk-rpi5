@@ -2102,6 +2102,13 @@ impl Parser {
         sps.pic_height_in_map_units_minus1 = r.read_ue()?;
         sps.frame_mbs_only_flag = r.read_bit()?;
 
+        // max_dpb_frames() divides MaxDpbMbs by the frame's macroblock count (A.3.1).
+        // ue(v) admits 65536 macroblocks in each direction, and the u32 product of the
+        // two wraps to zero long before that.
+        let _ = (sps.width() / 16)
+            .checked_mul(sps.height() / 16)
+            .ok_or::<String>("Invalid picture size in macroblocks".into())?;
+
         if !sps.frame_mbs_only_flag {
             sps.mb_adaptive_frame_field_flag = r.read_bit()?;
         }
@@ -3058,5 +3065,44 @@ mod tests {
         assert!(MaxLongTermFrameIdx::Idx(0) < 1);
         assert_eq!(MaxLongTermFrameIdx::Idx(24), 24);
         assert!(MaxLongTermFrameIdx::Idx(24) < 25);
+    }
+
+    /// punktfunk deviation 13: `max_dpb_frames()` divides MaxDpbMbs by the frame's
+    /// macroblock count (A.3.1), a u32 product that wraps to zero at the widest
+    /// picture `ue(v)` admits — 65536 x 65536 macroblocks is exactly 2^32. The SPS is
+    /// refused at parse time now, so the division always has a divisor.
+    #[test]
+    fn a_picture_whose_macroblock_count_overflows_is_a_parse_error_not_a_panic() {
+        use crate::codec::h264::nalu_writer::NaluWriter;
+
+        let mut buf = Vec::<u8>::new();
+        {
+            let mut w = NaluWriter::new(&mut buf, true);
+            w.write_header(3, 7).unwrap(); // nal_ref_idc = 3, SPS
+            w.write_u(8, 66u32).unwrap(); // profile_idc: Baseline, so no chroma block
+            w.write_u(8, 0u32).unwrap(); // constraint flags + reserved_zero_2bits
+            w.write_u(8, 51u32).unwrap(); // level_idc: 5.1
+            w.write_ue(0u32).unwrap(); // seq_parameter_set_id
+            w.write_ue(0u32).unwrap(); // log2_max_frame_num_minus4
+            w.write_ue(2u32).unwrap(); // pic_order_cnt_type: 2, nothing follows
+            w.write_ue(1u32).unwrap(); // max_num_ref_frames
+            w.write_f(1, 0u32).unwrap(); // gaps_in_frame_num_value_allowed_flag
+            w.write_ue(65535u32).unwrap(); // pic_width_in_mbs_minus1
+            w.write_ue(65535u32).unwrap(); // pic_height_in_map_units_minus1
+            w.write_f(1, 1u32).unwrap(); // frame_mbs_only_flag
+            w.write_f(1, 1u32).unwrap(); // direct_8x8_inference_flag
+            w.write_f(1, 0u32).unwrap(); // frame_cropping_flag
+            w.write_f(1, 0u32).unwrap(); // vui_parameters_present_flag
+            w.write_f(1, 1u32).unwrap(); // rbsp_stop_one_bit
+            while !w.aligned() {
+                w.write_f(1, 0u32).unwrap();
+            }
+        }
+
+        let mut cursor = Cursor::new(buf.as_slice());
+        let nalu = Nalu::next(&mut cursor).unwrap();
+        assert!(matches!(nalu.header.type_, NaluType::Sps));
+        let err = Parser::default().parse_sps(&nalu).unwrap_err();
+        assert!(err.starts_with("Invalid picture size"), "{err}");
     }
 }

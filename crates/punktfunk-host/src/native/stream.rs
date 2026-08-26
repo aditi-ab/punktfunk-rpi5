@@ -2402,8 +2402,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             if sw.compositor != compositor {
                 tracing::info!(from = compositor.id(), to = sw.compositor.id(), kind = ?sw.kind,
                     "session switch — rebuilding backend in place");
-                // Retarget the process env at the new session BEFORE opening the new backend (this
-                // thread is the only env writer; the watcher only snapshots).
+                // Retarget the process env at the new session BEFORE opening the new backend. Being
+                // the only WRITER is not safety: `setenv` races every concurrent `getenv` in the
+                // process — glibc's own internals, zbus, wayland-client, the Mesa loader — and none
+                // of them takes pf-vdisplay's `ENV_LOCK`. The four variables this still writes are
+                // the ones whose readers can only take them from the environment; see that lock's
+                // doc for what it does and does not buy (security-review 2026-08-25).
                 crate::vdisplay::apply_session_env(&crate::vdisplay::ActiveSession {
                     kind: sw.kind,
                     env: sw.env,
@@ -2411,7 +2415,8 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 });
                 // A mid-stream Game↔Desktop switch is not a fresh dedicated launch — route input at the
                 // switched-to backend's normal sub-mode.
-                let switched_route = crate::vdisplay::apply_input_env(sw.compositor, false);
+                crate::inject::set_backend_id(crate::vdisplay::input_backend_id(sw.compositor));
+                let switched_route = crate::vdisplay::resolve_gamescope_route(sw.compositor, false);
                 // Switching INTO a desktop mid-stream: the xdg portal / systemd-user env may still
                 // point at the old session, so input would silently not land until a reconnect.
                 // Settle it (env push + KWin portal restart) before the injector reopens against it.
@@ -3290,7 +3295,8 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         if let Some(c) = crate::vdisplay::compositor_for_kind(active.kind) {
                             crate::vdisplay::apply_session_env(&active);
                             // Capture-loss rebuild follows the live box session, not a fresh dedicated launch.
-                            let rebuilt_route = crate::vdisplay::apply_input_env(c, false);
+                            crate::inject::set_backend_id(crate::vdisplay::input_backend_id(c));
+                            let rebuilt_route = crate::vdisplay::resolve_gamescope_route(c, false);
                             if c != compositor {
                                 if matches!(
                                     c,

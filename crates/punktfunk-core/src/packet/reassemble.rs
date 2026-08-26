@@ -155,7 +155,9 @@ impl ReassemblerLimits {
             (max_data + (max_data * 90).div_ceil(100)).min(c.fec.scheme.max_total_shards());
         ReassemblerLimits {
             // `.min(c.shard_payload)`: never reject the session's own negotiated value — a
-            // hand-configured session below the production floor still reassembles itself.
+            // hand-configured session below the production floor still reassembles itself. It
+            // can't be a NEGOTIATED one: `Config::validate` refuses a sub-floor value on the
+            // client, which is the only side that takes it from the peer's `Welcome`.
             min_shard_bytes: crate::config::MIN_SHARD_PAYLOAD.min(c.shard_payload),
             max_shard_bytes: crate::config::max_shard_payload(),
             max_data_shards: max_data,
@@ -381,9 +383,11 @@ impl Reassembler {
         // final block first.
         let slice_stream = hdr.user_flags & crate::packet::USER_FLAG_SLICE_STREAM != 0;
         let block_idx = hdr.block_index as usize;
-        // For a sentinel-opened frame the buffer must hold ANY final geometry the totals may
-        // later pin — the maximum the negotiated limits allow (the design's "allocate at
-        // max_frame_bytes"; the existing in-flight budget bounds the amplification).
+        // The most data shards any frame can carry under THIS packet's shard size: the ceiling the
+        // per-frame block caps below derive from, and the clamp on a frame's buffer extent. NOT
+        // what a frame is allocated at — that is only ever the extent its packets have PROVEN
+        // (see `need_shards`), which is what keeps one small datagram from committing the whole
+        // negotiated frame ceiling; the in-flight budget bounds the rest.
         let total_data_max = lim.max_frame_bytes.div_ceil(shard_bytes).max(1);
         // The per-frame FEC-block ceiling under THIS packet's shard size (geometry is
         // per-frame: a shrunk shard needs more blocks for the same bytes, so a session-level

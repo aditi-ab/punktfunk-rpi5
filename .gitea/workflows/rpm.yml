@@ -119,10 +119,24 @@ jobs:
           dnf -y install gamescope || true
           # bun builds the punktfunk-web console (--with web). Baked into the image; install it
           # here too so the job stays green against the PREVIOUS image (docker.yml bootstrap note).
+          #
+          # A PINNED release asset, checked by SHA-256 — never `curl https://bun.sh/install | bash`.
+          # This job holds RPM_GPG_PRIVATE_KEY, and the spec VENDORS this very binary into
+          # punktfunk-web, so an install script piped into root's shell is upstream code running in
+          # front of the signing key AND choosing bytes we then sign. Same discipline as
+          # windows-host.yml's bun pin. Bump BUN_VER and BUN_SHA together (the sums are published in
+          # the release's SHASUMS256.txt). `-baseline` on purpose: it needs no AVX2, so the bun we
+          # ship starts on every x86-64 box — something the auto-detecting installer never promised,
+          # since it reads the BUILDER's CPU, not the user's.
           command -v bun >/dev/null || {
             dnf -y install unzip
-            curl -fsSL https://bun.sh/install | bash
-            install -m0755 "$HOME/.bun/bin/bun" /usr/local/bin/bun
+            BUN_VER=bun-v1.3.14
+            BUN_SHA=a063908ae08b7852ca10939bbdc6ceed3ddabce8fb9402dce83d65d73b36e6c7
+            curl -fsSL -o /tmp/bun.zip \
+              "https://github.com/oven-sh/bun/releases/download/$BUN_VER/bun-linux-x64-baseline.zip"
+            echo "$BUN_SHA  /tmp/bun.zip" | sha256sum -c -
+            unzip -q -o -j /tmp/bun.zip '*/bun' -d /tmp
+            install -m0755 /tmp/bun /usr/local/bin/bun
           }
           bun --version
       - uses: actions/cache@v4

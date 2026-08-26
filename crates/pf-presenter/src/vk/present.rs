@@ -850,13 +850,14 @@ impl Presenter {
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(4.9); // ≈1000 nits over the 203-nit reference
             let mut pc = [0f32; 16];
-            pc[..12].copy_from_slice(bytemuck_rows(&rows));
+            pc[..12].copy_from_slice(rows.as_flattened());
             pc[12] = mode;
             pc[13] = peak;
             // Crop: 1.0 unless the source image is a decode pool bigger than the picture.
             pc[14] = uv_scale[0];
             pc[15] = uv_scale[1];
-            let bytes = std::slice::from_raw_parts(pc.as_ptr().cast::<u8>(), 64);
+            let words = pc.map(f32::to_ne_bytes);
+            let bytes = words.as_flattened();
             self.device.cmd_push_constants(
                 self.cmd_buf,
                 self.csc.pipeline_layout,
@@ -946,10 +947,11 @@ impl Presenter {
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(4.9); // ≈1000 nits over the 203-nit reference
             let mut pc = [0f32; 16];
-            pc[..12].copy_from_slice(bytemuck_rows(&rows));
+            pc[..12].copy_from_slice(rows.as_flattened());
             pc[12] = mode;
             pc[13] = peak;
-            let bytes = std::slice::from_raw_parts(pc.as_ptr().cast::<u8>(), 64);
+            let words = pc.map(f32::to_ne_bytes);
+            let bytes = words.as_flattened();
             self.device.cmd_push_constants(
                 self.cmd_buf,
                 planar.pipeline_layout,
@@ -1022,12 +1024,6 @@ fn csc_depth_packing_or_8bit(raw: RawVkFormat) -> (u8, bool) {
         }
         (8, false)
     })
-}
-
-/// Flatten the 3×vec4 rows for the push-constant block.
-fn bytemuck_rows(rows: &[[f32; 4]; 3]) -> &[f32] {
-    // SAFETY: [[f32;4];3] is 12 contiguous f32s.
-    unsafe { std::slice::from_raw_parts(rows.as_ptr().cast::<f32>(), 12) }
 }
 
 #[cfg(test)]

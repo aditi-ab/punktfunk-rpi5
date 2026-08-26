@@ -102,17 +102,17 @@ pub use session::{session_epoch, try_recover_session};
 /// Gamescope-session routing (plan §W3).
 #[path = "vdisplay/routing.rs"]
 pub(crate) mod routing;
-pub use routing::{
-    apply_input_env, managed_session_available, preflight_takeover_privilege,
-    release_autologin_mask, resolve_gamescope_route, restore_managed_session, restore_takeover_now,
-    restore_takeover_on_startup, start_restore_worker, takeover_privilege_verdict,
-    wants_dedicated_game_session, GamescopeRoute, TakeoverInapplicable, TakeoverVerdict,
-};
 #[cfg(target_os = "linux")]
 pub use routing::{
     cancel_pending_tv_restore, dedicated_game_exited, focus_streamed_output,
     gamescope_xwayland_cursor_targets, launch_into_gamescope_session, launch_is_nested,
     steam_appid_from_launch, watch_steam_game_exit,
+};
+pub use routing::{
+    input_backend_id, managed_session_available, preflight_takeover_privilege,
+    release_autologin_mask, resolve_gamescope_route, restore_managed_session, restore_takeover_now,
+    restore_takeover_on_startup, start_restore_worker, takeover_privilege_verdict,
+    wants_dedicated_game_session, GamescopeRoute, TakeoverInapplicable, TakeoverVerdict,
 };
 
 /// Compositors punktfunk knows how to drive (plan §6).
@@ -229,8 +229,9 @@ impl Compositor {
 ///
 /// The **live session is the primary signal**, ahead of each backend's own probe. Those probes read
 /// the process env (`XDG_CURRENT_DESKTOP` for Mutter, `WAYLAND_DISPLAY` for KWin's registry
-/// handshake, `SWAYSOCK` for sway) — env a host started *outside* the session (a `systemd --user`
-/// unit, a TTY, ssh) never inherited. It is only retargeted at the live session on the connect path
+/// handshake, `SWAYSOCK` for sway — that last one *only* as inherited, since nothing exports it any
+/// more) — env a host started *outside* the session (a `systemd --user` unit, a TTY, ssh) never
+/// inherited. It is only retargeted at the live session on the connect path
 /// ([`apply_session_env`]), so enumerating before the first client connect reported "unavailable"
 /// for the very desktop the operator was sitting in — while [`detect`], which scans `/proc`, marked
 /// that same backend the default. The management API showed both badges on one row, and the answer
@@ -287,15 +288,47 @@ fn compositor_from_pin(v: &str) -> Option<Compositor> {
     })
 }
 
-/// Serializes ALL process-global env mutation on the per-session setup path. `std::env::set_var`
-/// concurrent with another thread's `set_var` (glibc `environ` realloc) is a data race = UB. With
-/// the default concurrent native sessions each running `resolve_compositor` in its own
-/// `spawn_blocking`, the per-session env retargeting would otherwise race and could crash the host
-/// (security-review 2026-06-28 #7). Every env write on the setup path takes this lock; steady-state
-/// streaming reads cached config, not env. This removes the memory-unsafety; the launch command is
-/// additionally threaded per-session (`SessionContext.launch` → `set_launch_command`) so it never
-/// rides the process env at all — the remaining knobs here (session retarget, gamescope sub-mode)
-/// still carry a cross-session *value* confusion window inherent to a process-global env.
+/// Serializes **pf-vdisplay's own** process-env readers and writers on the per-session setup path,
+/// so two concurrent native sessions (each running `resolve_compositor` in its own
+/// `spawn_blocking`) can't interleave the retarget with each other's reads
+/// (security-review 2026-06-28 #7).
+///
+/// ## What it does NOT do
+///
+/// It does not make `set_var`/`remove_var` sound, and an earlier revision of this doc claimed it
+/// did. `setenv(3)` grows and replaces the `environ` array and swaps value pointers under it;
+/// `unsetenv(3)` shifts it. Any concurrent `getenv` anywhere in the process is a data race on that
+/// array — and by the time this path runs the host is a live streaming session with tokio, QUIC,
+/// mDNS, the HTTP API, capture threads and zbus tasks all up. None of glibc's own internals (`tzset`
+/// for log timestamps, `getaddrinfo`, gettext), zbus, wayland-client or the Mesa ICD loader takes
+/// this lock, and they cannot be made to. A client reconnect or a mid-stream Desktop↔Game switch is
+/// enough to hit it: best case a torn value, worst case a use-after-free mid-session
+/// (security-review 2026-08-25).
+///
+/// ## What actually fixes it
+///
+/// Not a wider lock — a shorter list. **Punktfunk no longer uses the process env as a channel to
+/// itself.** Every value one part of the host computes for another travels as a value: the launch
+/// command per session (`SessionContext.launch` → `set_launch_command`), the gamescope sub-mode
+/// ([`resolve_gamescope_route`]'s return → `set_gamescope_route`), the injector backend
+/// ([`input_backend_id`]'s return → `pf_inject::set_backend_id`, which retired the last
+/// `PUNKTFUNK_INPUT_BACKEND` write — its reader `getenv`s once per input BATCH, so that one was the
+/// sharpest edge of all), and `hyprctl`'s / `swaymsg`'s session handles, handed to those children
+/// with `Command::env`.
+///
+/// What is left is [`apply_session_env`]'s four — `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`,
+/// `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`. These are the DESKTOP's variables, not ours: their
+/// readers are wayland-client, zbus, libpipewire and the Mesa loader, which take them from the
+/// process env and nowhere else, plus [`settle_desktop_portal`], which imports them into the
+/// activation environment BY NAME out of ours. (Punktfunk sniffs `XDG_CURRENT_DESKTOP` too —
+/// `mutter::is_available`, `detect`, `pf_inject::default_backend`'s last rung — but as a reader of
+/// the desktop's value, not as a channel of its own.) Threading them means connecting
+/// Wayland/D-Bus/PipeWire explicitly (`Connection::connect_to_socket`,
+/// `zbus::conn::Builder::address`); "set them once before threads exist" does not apply, because
+/// the values change per session — that is what this path is for.
+///
+/// The lock stays because ordering our own readers is still worth having, and because the writes
+/// that remain must not also race each other. Read it as "the discipline", never as "the proof".
 pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Run `f` with [`ENV_LOCK`] held. Use around any `set_var`/`remove_var` on the session-setup path.
@@ -726,7 +759,7 @@ pub fn gamescope_composites_cursor() -> bool {
 /// `GAMESCOPE_BIN` wrapper (or PATH shim), so the flags are ours.
 ///
 /// **Ask the resolved ROUTE, never the env.** This used to test the spawn-vs-attach term by reading
-/// `PUNKTFUNK_GAMESCOPE_NODE`, which worked only while `apply_input_env` PUBLISHED its decision into
+/// `PUNKTFUNK_GAMESCOPE_NODE`, which worked only while the routing PUBLISHED its decision into
 /// that key. Phase 2.3 deleted the publication (routing.rs: "Nothing is written back to the two
 /// knobs") and left the key as an operator override — rung 2 of a 6-rung ladder — so the session
 /// that reaches [`GamescopeRoute::Attach`] at the ladder's rung 5 instead (a foreign gamescope on an
