@@ -113,9 +113,11 @@ A [plugin](/docs/plugins) can own a slice of the library and keep it in sync —
 Manager and Playnite plugins get your collection into the grid, box art and all.
 
 A library plugin can also publish a **launcher tile** — an entry that opens Steam Big Picture,
-Heroic, Lutris or Playnite itself rather than a game, so you can install or fix something from the
-couch. Clients group those into their own row above your titles, each drawing its launcher's logo.
-A launcher tile you don't want is a switch in that plugin's settings.
+Heroic's console mode, Lutris or Playnite Fullscreen itself rather than a game, so you can install
+or fix something from the couch. Where a launcher has both a couch UI and an ordinary window, they
+are separate tiles: Steam Big Picture beside the Steam client, Heroic Console Mode beside the Heroic
+window. Clients group them all into their own row above your titles, each drawing its launcher's
+logo. A launcher tile you don't want is a switch in that plugin's settings.
 
 Entries a plugin owns are read-only to you. The host refuses a hand edit or delete of one, because
 the next sync would overwrite it anyway — change the title at its source and let the plugin sync
