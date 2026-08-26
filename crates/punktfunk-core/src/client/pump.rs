@@ -170,7 +170,12 @@ pub(super) async fn run_pump(args: WorkerArgs) {
 
     // Adaptive bitrate ack slot: the control task parks the latest BitrateChanged here; the
     // pump's controller drains it on its report tick (`take()` — an ack is consumed once).
-    let bitrate_ack: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    // A QUEUE, not a latest-wins slot: a full resolve ack and a corrective short retarget can
+    // land in the same 750 ms report window, and host-cap learning needs to see BOTH in order
+    // (two consecutive short acks teach the cap — 08-22 ABR review §2.4; the collapsed slot
+    // could reintroduce the overdrive sawtooth the encoder-ceiling path exists to stop).
+    let bitrate_ack: Arc<Mutex<std::collections::VecDeque<u32>>> =
+        Arc::new(Mutex::new(std::collections::VecDeque::new()));
     // Decode-recovery keyframe asks (the ABR recovery signal): the control task counts every
     // outbound `CtrlRequest::Keyframe` — the one choke point all emitters funnel through — and
     // the pump drains the count per report window.

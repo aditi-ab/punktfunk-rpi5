@@ -27,7 +27,7 @@ pub(super) struct DataPump {
     pub(super) mode_gen: Arc<AtomicU32>,
     pub(super) frames_dropped: Arc<std::sync::atomic::AtomicU64>,
     pub(super) fec_recovered: Arc<std::sync::atomic::AtomicU64>,
-    pub(super) bitrate_ack: Arc<Mutex<Option<u32>>>,
+    pub(super) bitrate_ack: Arc<Mutex<std::collections::VecDeque<u32>>>,
     /// Outbound decode-recovery keyframe asks, counted by the control task at its send choke
     /// point; drained per report window as the ABR's recovery signal.
     pub(super) recovery_kf: Arc<AtomicU32>,
@@ -575,8 +575,14 @@ impl DataPump {
                         negotiated_chroma,
                     ));
                 }
-                if let Some(acked) = bitrate_ack.lock().unwrap().take() {
-                    abr.on_ack(acked);
+                // Drain ALL acks in arrival order — host-cap learning counts consecutive short
+                // acks, so a full resolve plus its corrective retarget in one window must both
+                // land (§2.4; the old latest-wins slot collapsed them to one).
+                {
+                    let drained: Vec<u32> = bitrate_ack.lock().unwrap().drain(..).collect();
+                    for acked in drained {
+                        abr.on_ack(acked);
+                    }
                 }
                 let owd_mean_us =
                     (owd_frames > 0).then(|| (owd_sum_ns / owd_frames as i128 / 1000) as i64);
@@ -1048,7 +1054,7 @@ mod tests {
                     refresh_hz: 60,
                 })),
                 probe: Arc::new(Mutex::new(ProbeState::default())),
-                bitrate_ack: Arc::new(Mutex::new(None)),
+                bitrate_ack: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 live_bitrate: Arc::new(AtomicU32::new(0)),
                 recovery_kf: Arc::new(AtomicU32::new(0)),
                 pipeline_gap: pipeline_gap.clone(),
@@ -1084,7 +1090,7 @@ mod tests {
             mode_gen: Arc::new(AtomicU32::new(0)),
             frames_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fec_recovered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            bitrate_ack: Arc::new(Mutex::new(None)),
+            bitrate_ack: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             recovery_kf: Arc::new(AtomicU32::new(0)),
             pipeline_gap: pipeline_gap.clone(),
             bitrate_kbps: 20_000,
