@@ -1106,7 +1106,9 @@ pub(super) async fn negotiate(
             // "Automatic" — `bitrate_kbps` above is the host's own answer for `mode`, so the build
             // may re-resolve it if the source turns out to deliver a different size. Sampled here
             // rather than in the thread body so the closure doesn't have to capture `hello`.
-            let bitrate_auto = hello.bitrate_kbps == 0;
+            // PyroWave is Automatic unconditionally (`resolve_bitrate_kbps_for` overrode any
+            // explicit rate — RFC §5.2).
+            let bitrate_auto = hello.bitrate_kbps == 0 || codec == crate::encode::Codec::PyroWave;
             let trace = bringup.clone();
             std::thread::Builder::new()
                 .name("punktfunk1-stream".into())

@@ -50,8 +50,10 @@ probe about two seconds in that lets the rate climb past 20 Mbps. An explicit ra
 session, clamped to **500 kbps – 8 Gbps**. A host card's menu has **Test network speed…** to suggest
 a value.
 
-PyroWave has no useful low-rate regime: its Automatic is a fixed per-pixel budget for the negotiated
-mode (hundreds of Mbps), with adaptive bitrate and the probe off for the whole session.
+PyroWave is **always Automatic**: the rate is a fixed per-pixel budget for the negotiated mode
+(hundreds of Mbps), with adaptive bitrate and the probe off for the whole session. A fixed kbps
+is meaningless for the all-intra codec, so the bitrate setting is disabled while PyroWave is
+selected — your stored value is kept, and picking another codec restores it.
 
 **Render scale** — *default: Native (1×).* The host renders and encodes at your mode times this;
 your device resamples to its window. Above 1× supersamples at more bandwidth and decode work; below
@@ -298,7 +300,7 @@ exactly [what a profile can't change](/docs/profiles-and-links#what-a-profile-ca
 | You ask for | What the host does |
 |---|---|
 | Resolution and refresh | Builds a display at exactly that mode. A host pinned to a real monitor keeps that monitor's resolution and you scale locally. A size the encoder can't take — odd, or past the codec's per-axis limit — fails the connect rather than being quietly changed. |
-| A bitrate | Clamps it to 500 kbps – 8 Gbps, or uses its 20 Mbps default for Automatic (a per-pixel budget for Automatic PyroWave). |
+| A bitrate | Clamps it to 500 kbps – 8 Gbps, or uses its 20 Mbps default for Automatic. PyroWave ignores the number entirely — every PyroWave session gets the per-pixel budget. |
 | A codec | Honors it when it can encode it, else the best shared codec in the order HEVC → AV1 → H.264. |
 | 10-bit HDR | Upgrades only for HDR content on an encoder that can do 10-bit; otherwise 8-bit SDR. |
 | 4:4:4 chroma | Sends it only when every gate passes; otherwise 4:2:0. |
