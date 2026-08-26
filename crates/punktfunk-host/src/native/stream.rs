@@ -906,7 +906,10 @@ fn send_loop(
             }
             if let Some(s) = want_shard {
                 match session.set_shard_payload(s) {
-                    Ok(()) => tracing::info!(shard_payload = s, "wire shard payload re-keyed"),
+                    Ok(()) => {
+                        wire_rekeys += 1;
+                        tracing::info!(shard_payload = s, "wire shard payload re-keyed");
+                    }
                     // Can't fire for a watcher-driven value (it validates the same bounds) —
                     // belt-and-suspenders for a future driver.
                     Err(e) => tracing::warn!(shard_payload = s, error = ?e,
@@ -2319,6 +2322,13 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // Self-diagnosis for the periodic-stutter class: warns when the served recovery IDRs settle
     // into a stable multi-second rhythm (see [`pf_frame::metronome::Metronome`]).
     let mut recovery_cadence = pf_frame::metronome::Metronome::new();
+    // Wire-MTU re-keys applied this session — the metronomic-recovery attribution reads it: a
+    // path that needed one was black-holing full-size video (VPN/overlay hop), and a client
+    // re-asking through that is periodic by construction. The 2026-08-26 lab sessions produced
+    // the "display disturbance" warn on exactly such a path, at a period (1.7 s) the client
+    // cooldown bands narrowly miss — period alone cannot make this call, the transport context
+    // can.
+    let mut wire_rekeys: u32 = 0;
     // Position within the current intra-refresh wave (frames since the last IDR/wave start). Only
     // meaningful on a `caps().intra_refresh_recovery` encoder; the pump tags every wave-boundary AU
     // with `USER_FLAG_RECOVERY_POINT` so the client can lift its post-loss freeze on a clean
@@ -3092,6 +3102,23 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                                  a host display disturbance"
                             );
                         }
+                    } else if wire_rekeys > 0 {
+                        // A deterministic NETWORK pathology, not a display one: this session's
+                        // path dropped full-size video until the wire-MTU watcher re-keyed the
+                        // shards, and a client re-asking through a black-holing hop is periodic
+                        // by construction (its retry cadence, skewed by the path — 2026-08-26
+                        // lab data landed at 1.7 s, just outside the cooldown bands). Name the
+                        // path before anyone chases display hardware.
+                        tracing::warn!(
+                            period_s = format!("{:.1}", period.as_secs_f64()),
+                            wire_rekeys,
+                            "client keyframe recoveries are METRONOMIC on a session whose wire \
+                             MTU had to be re-keyed mid-stream — a constrained path (VPN/overlay \
+                             adapter, lowered NIC MTU) black-holing full-size video is the prime \
+                             suspect, NOT a host/display disturbance; see the 'wire MTU' lines \
+                             above, and pin PUNKTFUNK_WIRE_MTU to skip the lossy discovery window \
+                             on this path"
+                        );
                     } else {
                         tracing::warn!(
                             period_s = format!("{:.1}", period.as_secs_f64()),
