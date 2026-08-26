@@ -152,9 +152,30 @@ fn accept(
     }
 }
 
+/// Parse a SET→GET command reply into a validated pid. The driver answers with the payload
+/// `[DECK_PROOF_CMD, ChannelProof, zeros…]`; Windows hands it back either as served (offset 0) or
+/// one byte in, behind the report-id slot (the unnumbered-report marshalling). Accept either
+/// placement rather than pinning a marshalling detail that differs between the descriptors this
+/// one driver serves.
+fn proof_from_reply(reply: &[u8], expect: u32, rejected: &mut Option<&'static str>) -> Option<u32> {
+    for off in [0usize, 1] {
+        let Some(body) = reply.get(off..) else {
+            continue;
+        };
+        if let Some(tail) = body.strip_prefix(&DECK_PROOF_CMD[..])
+            && let Some(pid) = accept(ChannelProof::from_bytes(tail), expect, rejected)
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
 /// The PS identities answer on the declared-but-unserved report `0x85`; the Deck answers its
-/// unnumbered report after a private SET_FEATURE command. Both are tried — one driver binary serves
-/// four identities and the host does not know which one this devnode became until the DATA section
+/// unnumbered report after a private SET_FEATURE command; the Triton answers that SAME command on
+/// its declared feature id `0x01` — a numbered-report collection, where hidclass refuses the other
+/// two frames outright (see the third leg below). All are tried — one driver binary serves every
+/// pad identity and the host does not know which one this devnode became until the DATA section
 /// is attached, which is precisely what we are trying to earn the right to do.
 ///
 /// So neither answer can be trusted on shape alone: a Deck serves its ONE unnumbered feature report
@@ -189,21 +210,38 @@ fn ask_feature(h: HANDLE, expect_pad_index: u32) -> Result<u32> {
     if set_ok {
         let mut reply = vec![0u8; buf_len];
         // SAFETY: as above.
-        if unsafe { HidD_GetFeature(h, reply.as_mut_ptr().cast(), buf_len as u32) } {
-            // The driver answers with the payload; on an unnumbered report Windows hands it back
-            // one byte in, behind the report-id slot. Accept either placement rather than pinning a
-            // marshalling detail that differs between the two descriptors this one driver serves.
-            for off in [0usize, 1] {
-                let Some(body) = reply.get(off..) else {
-                    continue;
-                };
-                if let Some(tail) = body.strip_prefix(&DECK_PROOF_CMD[..]) {
-                    let p = ChannelProof::from_bytes(tail);
-                    if let Some(pid) = accept(p, expect_pad_index, &mut rejected) {
-                        return Ok(pid);
-                    }
-                }
-            }
+        if unsafe { HidD_GetFeature(h, reply.as_mut_ptr().cast(), buf_len as u32) }
+            && let Some(pid) = proof_from_reply(&reply, expect_pad_index, &mut rejected)
+        {
+            return Ok(pid);
+        }
+    }
+
+    // Numbered-report collections (Triton): the SAME SET→GET command contract, framed id-first.
+    // hidclass rejects a `HidD_SetFeature`/`HidD_GetFeature` buffer whose byte 0 is not a declared
+    // NONZERO feature report id (the gating the driver's XBOX_RDESC feature-report note records:
+    // built without a declared feature id the pad "enumerates perfectly and then delivers
+    // NOTHING"), and the Triton descriptor declares feature ids 0x01/0x02 while `0x85` is one of
+    // its OUTPUT reports — so on that collection BOTH legs above die at hidclass before the driver
+    // ever sees them. Ride the proof on declared id 0x01 instead: the driver strips a leading
+    // 0x00 OR 0x01 before matching the command (`triton_proof_requested`), so this frame lands on
+    // the same proof machine, and its `[DECK_PROOF_CMD, proof…]` answer parses through the same
+    // offset-0/offset-1 logic as the Deck's. Defensive-in-depth, like the whole function: the legs
+    // run in order and whichever one the transport accepts wins.
+    let mut cmd = vec![0u8; buf_len];
+    cmd[0] = 0x01;
+    cmd[1..1 + DECK_PROOF_CMD.len()].copy_from_slice(&DECK_PROOF_CMD);
+    // SAFETY: `h` is live; `cmd` is a valid `buf_len`-sized buffer.
+    let set_ok_numbered = unsafe { HidD_SetFeature(h, cmd.as_mut_ptr().cast(), buf_len as u32) };
+    if set_ok_numbered {
+        let mut reply = vec![0u8; buf_len];
+        // The GET buffer must name a declared feature id too — the same hidclass gate.
+        reply[0] = 0x01;
+        // SAFETY: as above.
+        if unsafe { HidD_GetFeature(h, reply.as_mut_ptr().cast(), buf_len as u32) }
+            && let Some(pid) = proof_from_reply(&reply, expect_pad_index, &mut rejected)
+        {
+            return Ok(pid);
         }
     }
     // A well-formed answer that failed validation is a different fault from no answer at all, and
@@ -212,10 +250,16 @@ fn ask_feature(h: HANDLE, expect_pad_index: u32) -> Result<u32> {
         bail!("{why}");
     }
     bail!(
-        "this HID collection carries no channel proof (feature 0x{:02x}: no; Deck command: {}) — \
-         the driver predates the proof (reinstall: punktfunk-host.exe driver install --gamepad)",
+        "this HID collection carries no channel proof (feature 0x{:02x}: no; Deck command: {}; \
+         numbered command: {}) — the driver predates the proof (reinstall: punktfunk-host.exe \
+         driver install --gamepad)",
         HID_FEATURE_REPORT_CHANNEL_PROOF,
         if set_ok {
+            "no matching reply"
+        } else {
+            "SET_FEATURE failed"
+        },
+        if set_ok_numbered {
             "no matching reply"
         } else {
             "SET_FEATURE failed"
