@@ -194,6 +194,12 @@ One-time setup (mirrors any new unom DMZ service — see the deploy-infra notes)
 
 1. **Secret** `FLATPAK_GPG_PRIVATE_KEY` on this repo = base64 of the armored private key
    (`gpg --armor --export-secret-keys <fpr> | base64 -w0`). `DEPLOY_*` + `REGISTRY_TOKEN` already exist.
+   Also **`DEPLOY_KNOWN_HOSTS`** — unom-1's SSH host key, `ssh-keyscan -p "$DEPLOY_PORT"
+   "$DEPLOY_HOST"` — which the deploy `ssh`es against with `StrictHostKeyChecking=yes`. Every run
+   starts with an empty `known_hosts`, so `accept-new` made *every* run a first contact, handing the
+   deploy key and the GPG-signed repo to whatever won the race for the address. It gates the step
+   like the others: until it is set the deploy skips with a warning. Same secret and same host as
+   the Nix cache publish (see `packaging/nix/README.md`), so configuring either satisfies both.
 2. **Edge Caddy** on home-reverse-proxy-1 (`/home/caddy/caddy/Caddyfile`, apply by hand + `./reload.sh`):
    `flatpak.unom.io { reverse_proxy 192.168.50.50:3230 }`
 3. **Port allowlist:** add `3230` to `caddy_target_ports` in `unom/infra` (proxmox/unom-1) + terraform apply.
