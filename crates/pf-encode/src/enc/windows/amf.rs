@@ -689,7 +689,10 @@ unsafe fn set_prop(
             result_name(r)
         ))
     } else {
-        tracing::debug!(
+        // INFO, not debug: which optional properties a VCN generation/driver rejects is exactly
+        // the per-box capability matrix no lab hardware covers (design: windows-amd-host-program
+        // §3.3) — field logs at default level must carry it.
+        tracing::info!(
             property = %name,
             result = result_name(r),
             amf_code = r,
@@ -697,6 +700,18 @@ unsafe fn set_prop(
         );
         Ok(false)
     }
+}
+
+/// Read one INT64 component property back (`GetProperty`, prefix vtable) — the encoder-side truth
+/// after any internal clamp. `None` when the runtime declines the read or hands back a non-INT64
+/// variant: callers treat that as "no readback", never as zero.
+unsafe fn get_prop_i64(comp: *mut sys::AmfComponent, name: PCWSTR) -> Option<i64> {
+    let mut v = AmfVariant::zeroed();
+    let r = ((*(*comp).vtbl).get_property)(comp, name.0, &mut v);
+    if r != sys::AMF_OK {
+        return None;
+    }
+    v.as_i64()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1266,6 +1281,10 @@ impl AmfEncoder {
                 height = self.height,
                 fps = self.fps,
                 ring = if self.ten_bit { "P010" } else { "NV12" },
+                // The two driver-answered capabilities (design: windows-amd-host-program §3.3);
+                // the rejected optional properties behind a `false` have their own INFO lines.
+                ltr = ltr_active,
+                intra_refresh = ir_active,
                 runtime = %format_args!(
                     "{}.{}.{}",
                     (lib.version >> 48) & 0xffff,
@@ -2196,6 +2215,22 @@ impl Encoder for AmfEncoder {
             self.bound_device = 0;
         }
         true
+    }
+
+    /// The rate the component actually runs at: `TargetBitrate` read back via `GetProperty`.
+    /// Without this the session adopted the *requested* rate on AMD, `encoder_ceiling_kbps` was
+    /// never learned, and the ABR overdrive guard was structurally inert on the one backend with
+    /// no other rate feedback (design: windows-amd-host-program §3.3). `None` before the lazy
+    /// open or when the runtime declines the read — the caller keeps the requested rate, exactly
+    /// the pre-readback behavior.
+    fn applied_bitrate_bps(&self) -> Option<u64> {
+        let inner = self.inner.as_ref()?;
+        // SAFETY: `inner.comp.0` is the live component, only ever used on the session thread
+        // with no AMF call in flight (the loop is synchronous); `get_prop_i64` is a read-only
+        // prefix-vtable call whose out-param is a local this frame owns.
+        unsafe { get_prop_i64(inner.comp.0, self.props.target_bitrate) }
+            .filter(|&b| b > 0)
+            .map(|b| b as u64)
     }
 
     fn reconfigure_bitrate(&mut self, bps: u64) -> bool {

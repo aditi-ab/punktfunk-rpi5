@@ -90,8 +90,9 @@ fn budget_for(bitrate_bps: u64, fps: u32) -> usize {
 // GPU-saturated workload PyroWave cares about most.
 //
 // The old `PUNKTFUNK_GPU_PRIORITY` knob went with it; `PUNKTFUNK_GPU_PRIORITY_CLASS`
-// (`off|normal|high|realtime|auto`, default `auto`) is the one that survives and it is strictly
-// more capable — the removed knob could not express the auto gate at all.
+// (`off|normal|high|realtime|auto`, default `high` — `auto` is opt-in since the 2026-08-12 AMD
+// field A/B convicted its REALTIME upgrade, see `pf-frame/src/dxgi.rs`) is the one that survives
+// and it is strictly more capable — the removed knob could not express the auto gate at all.
 
 pub struct PyroWaveEncoder {
     // pyrowave owns the whole Vulkan device (create_device_by_compat) — no ash on this side.

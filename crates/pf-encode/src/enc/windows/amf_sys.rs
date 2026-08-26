@@ -305,7 +305,8 @@ pub struct AmfComponentVtbl {
     // AMFPropertyStorage
     pub set_property:
         unsafe extern "system" fn(*mut AmfComponent, *const u16, AmfVariant) -> AmfResult,
-    pub get_property: Slot,
+    pub get_property:
+        unsafe extern "system" fn(*mut AmfComponent, *const u16, *mut AmfVariant) -> AmfResult,
     pub has_property: Slot,
     pub get_property_count: Slot,
     pub get_property_at: Slot,

@@ -2305,6 +2305,37 @@ mod tests {
         );
     }
 
+    /// The repeated-stall (non-metronomic) WARN's window arithmetic: fires at the third reported
+    /// stall inside 60 s, stays quiet through the 300 s re-warn spacing, and re-arms on a fresh
+    /// burst after old entries age out.
+    #[test]
+    fn stall_rate_warn_window_and_rewarn() {
+        let base = Instant::now();
+        let at = |s: u64| base + Duration::from_secs(s);
+        let mut w = StallWatch::new();
+        assert_eq!(w.note_for_rate_warn(at(0)), None);
+        assert_eq!(w.note_for_rate_warn(at(10)), None);
+        assert_eq!(
+            w.note_for_rate_warn(at(20)),
+            Some(3),
+            "third stall in 60 s warns"
+        );
+        assert_eq!(
+            w.note_for_rate_warn(at(30)),
+            None,
+            "inside the re-warn spacing the arm stays quiet"
+        );
+        // A fresh burst well past the spacing: the old entries have aged out of the window,
+        // so it takes a full RATE_MIN_STALLS again — and then warns again.
+        assert_eq!(w.note_for_rate_warn(at(400)), None);
+        assert_eq!(w.note_for_rate_warn(at(401)), None);
+        assert_eq!(
+            w.note_for_rate_warn(at(402)),
+            Some(3),
+            "re-warns after the spacing"
+        );
+    }
+
     /// [`stall::attribute`]'s verdict table — the Branch-1/Branch-2 fork, per evidence shape.
     #[test]
     fn stall_attribution_verdicts() {

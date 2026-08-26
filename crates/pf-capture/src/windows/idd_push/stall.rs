@@ -129,9 +129,13 @@ pub(super) enum StallClass {
     CompositorBlocked,
     /// Engines alive, DWM's clock ticking, driver drained E_PENDING, and the ETW present witness
     /// saw (essentially) NO swapchain presents from ANY process across the hole: the content
-    /// stopped presenting — no damage, DWM correctly composed nothing (a game hitch, a loading
-    /// screen, a menu). Benign for the display path; the content side is where to look if the
-    /// user FELT it.
+    /// stopped presenting — no damage, DWM correctly composed nothing. A ONE-OFF here is benign
+    /// (a game hitch, a loading screen, a menu). But this class is also what a frozen *presenter*
+    /// looks like (disturbance-immunity Flavor 3: the display stack — win32k CCD lock, UMD
+    /// serialization against display events, vblank-wait limiters — stops the content's present
+    /// loop), and every probe we run sits at the host's elevated GPU priority, so normal-band
+    /// starvation reads healthy. REPEATED holes under active load do NOT exonerate the display
+    /// path — the repeated-stall / metronomic WARNs carry that triage.
     ContentSilence,
     /// Engines alive, DWM ticking, driver drained E_PENDING — and the ETW present witness saw
     /// presents FLOWING through the hole while the virtual display's kernel queue
@@ -155,13 +159,48 @@ impl std::fmt::Display for StallClass {
                 "CLASS-2 compositor blocked (engines alive, DWM tick frozen — vendor lock / DDC)"
             }
             Self::ContentSilence => {
-                "CONTENT-SILENCE (no swapchain presents from any process across the hole — the content stopped presenting; not the display path)"
+                "CONTENT-SILENCE (no swapchain presents from any process across the hole — the content stopped presenting; a one-off is a game hitch/menu, but REPEATED holes under load can equally be the display stack freezing the presenter)"
             }
             Self::FrameGeneration => {
                 "FRAME-GENERATION (presents FLOWED while the virtual display's kernel queue starved — the OS display path dropped composed frames)"
             }
             Self::Unattributed => "UNATTRIBUTED (insufficient telemetry)",
         })
+    }
+}
+
+/// The vdisplay driver's GPU-priority lever (`PFVD_RT_GPU` / legacy opt-out `PFVD_NO_RT_GPU`) as
+/// configured in THIS process's environment (machine env; the WUDFHost driver process resolves
+/// the pair the same way, so this read mirrors what the driver decided — modulo a machine env
+/// edited after either process started, which a restart heals). The RX 9070 XT field A/B
+/// (2026-08-12) convicted EXACTLY this lever's REALTIME rung of the metronomic stall signature,
+/// so every stall-triage line must say whether it is engaged before anyone chases display
+/// hardware.
+pub(super) fn rt_gpu_driver_posture() -> &'static str {
+    if std::env::var_os("PFVD_NO_RT_GPU").is_some() {
+        "off (PFVD_NO_RT_GPU)"
+    } else {
+        match std::env::var_os("PFVD_RT_GPU") {
+            None => "off (default)",
+            Some(v) if v.eq_ignore_ascii_case("thread") => "gpu-thread (+7)",
+            Some(_) => "REALTIME (PFVD_RT_GPU)",
+        }
+    }
+}
+
+/// The host's own GPU scheduling-priority policy (`PUNKTFUNK_GPU_PRIORITY_CLASS`) as prose —
+/// [`rt_gpu_driver_posture`]'s twin for the second convicted REALTIME lever (the `auto` gate's
+/// HIGH→REALTIME upgrade, ~3.6 s beat in the same A/B).
+pub(super) fn rt_gpu_host_posture() -> &'static str {
+    match std::env::var("PUNKTFUNK_GPU_PRIORITY_CLASS")
+        .ok()
+        .as_deref()
+    {
+        Some("off") => "off",
+        Some("normal") => "normal",
+        Some("realtime") => "REALTIME (pinned)",
+        Some("auto") => "auto (gated REALTIME upgrade)",
+        _ => "high (default)",
     }
 }
 
@@ -308,6 +347,13 @@ pub(super) struct StallWatch {
     episode: Option<Episode>,
     /// A closed episode's summary, parked for the caller ([`Self::take_recovery`]).
     pending_recovery: Option<Recovery>,
+    /// Instants of REPORTED stalls inside the last [`Self::RATE_WINDOW`] — the repeated-stall
+    /// (non-metronomic) WARN's evidence. The metronome needs a stable period; the 2026-08-26
+    /// 7700 XT field case showed 6 stall-sized holes in 8 s with none, and its log carried zero
+    /// triage guidance as a result.
+    rate_window: std::collections::VecDeque<Instant>,
+    /// When the repeated-stall WARN last fired (spacing: [`Self::RATE_REWARN`]).
+    last_rate_warn: Option<Instant>,
 }
 
 impl StallWatch {
@@ -327,6 +373,14 @@ impl StallWatch {
     /// Episodes with fewer holes than this dissolve silently — the single stall's own report
     /// line already covers them.
     const EPISODE_MIN_HOLES: u32 = 2;
+    /// Rolling window for the repeated-stall (non-metronomic) WARN.
+    const RATE_WINDOW: Duration = Duration::from_secs(60);
+    /// Reported stalls inside [`Self::RATE_WINDOW`] that make the session WARN-worthy — well
+    /// above the ~1-per-minute a busy desktop legitimately produces, well under a degraded
+    /// session's dozens.
+    const RATE_MIN_STALLS: usize = 3;
+    /// Re-WARN spacing for the rate arm (the metronomic arms pace themselves via the metronome).
+    const RATE_REWARN: Duration = Duration::from_secs(300);
 
     pub(super) fn new() -> Self {
         Self {
@@ -338,7 +392,57 @@ impl StallWatch {
             classes: [0; 7],
             episode: None,
             pending_recovery: None,
+            rate_window: std::collections::VecDeque::new(),
+            last_rate_warn: None,
         }
+    }
+
+    /// Feed one REPORTED stall at `now` into the rate window; `Some(count)` exactly when the
+    /// repeated-stall WARN is due (≥ [`Self::RATE_MIN_STALLS`] inside [`Self::RATE_WINDOW`],
+    /// spaced by [`Self::RATE_REWARN`]). Pure — unit-tested beside the verdict tests.
+    pub(super) fn note_for_rate_warn(&mut self, now: Instant) -> Option<usize> {
+        self.rate_window.push_back(now);
+        while let Some(front) = self.rate_window.front() {
+            if now.duration_since(*front) > Self::RATE_WINDOW {
+                self.rate_window.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.rate_window.len() < Self::RATE_MIN_STALLS {
+            return None;
+        }
+        if self
+            .last_rate_warn
+            .is_some_and(|t| now.duration_since(t) < Self::RATE_REWARN)
+        {
+            return None;
+        }
+        self.last_rate_warn = Some(now);
+        Some(self.rate_window.len())
+    }
+
+    /// The session's per-verdict tally as one log token ([`StallVerdict`] order).
+    fn verdict_tally(&self) -> String {
+        format!(
+            "worker-stalled {}, compose-silence {}, delivery-leg {}, no-telemetry {}",
+            self.verdicts[1], self.verdicts[2], self.verdicts[3], self.verdicts[0]
+        )
+    }
+
+    /// The session's per-class tally as one log token ([`StallClass`] order).
+    fn class_tally(&self) -> String {
+        format!(
+            "ours-worker {}, ours-delivery {}, adapter-freeze {}, compositor-blocked {}, \
+             content-silence {}, frame-generation {}, unattributed {}",
+            self.classes[0],
+            self.classes[1],
+            self.classes[2],
+            self.classes[3],
+            self.classes[4],
+            self.classes[5],
+            self.classes[6]
+        )
     }
 
     /// Forget the flow history (a ring recreate's gap is self-inflicted, not a DWM stall — without
@@ -488,6 +592,37 @@ impl StallWatch {
             "IDD-push capture stall — the desktop was composing at speed, then the ring \
              delivered no frame for the gap; the class names the leg that lost them"
         );
+        // The repeated-stall arm: the metronome needs a stable period, but a session losing
+        // frames to 150+ ms holes every few seconds without one (the 2026-08-26 7700 XT case)
+        // deserves the same triage payload — otherwise the log's only guidance is per-stall
+        // DEBUG lines nobody is told to read. Skipped when THIS stall completed a metronomic
+        // cycle: the arms below carry strictly richer prose.
+        if stall.metronomic.is_none() {
+            if let Some(stalls_in_window) = self.note_for_rate_warn(now) {
+                let suspects = pf_win_display::display_events::connected_inactive_physicals();
+                let suspects = if suspects.is_empty() {
+                    "none".to_string()
+                } else {
+                    suspects.join(", ")
+                };
+                tracing::warn!(
+                    stalls_in_window = stalls_in_window as u64,
+                    os_correlated = format!("{}/{}", self.with_os_events, self.seen),
+                    connected_inactive = %suspects,
+                    rt_gpu_driver = rt_gpu_driver_posture(),
+                    rt_gpu_host = rt_gpu_host_posture(),
+                    verdicts = %self.verdict_tally(),
+                    classes = %self.class_tally(),
+                    "capture stalls are REPEATING without a stable period — same triage as the \
+                     metronomic class: if rt_gpu_driver or rt_gpu_host shows a REALTIME opt-in, \
+                     clear it first (unset PFVD_RT_GPU / set PUNKTFUNK_GPU_PRIORITY_CLASS=high); \
+                     then a connected-but-inactive display's standby servicing (see \
+                     connected_inactive), then display-poller software (the SteelSeries GG / \
+                     SignalRGB class). A content-silence class tally does NOT exonerate the \
+                     display stack — a frozen presenter reads identically (Flavor 3)"
+                );
+            }
+        }
         if let Some(period) = stall.metronomic {
             let suspects = pf_win_display::display_events::connected_inactive_physicals();
             let suspects = if suspects.is_empty() {
@@ -497,21 +632,8 @@ impl StallWatch {
             };
             let correlated = format!("{}/{}", self.with_os_events, self.seen);
             // The session's attribution in one token: which leg the evidence convicted, per stall.
-            let verdict_tally = format!(
-                "worker-stalled {}, compose-silence {}, delivery-leg {}, no-telemetry {}",
-                self.verdicts[1], self.verdicts[2], self.verdicts[3], self.verdicts[0]
-            );
-            let class_tally = format!(
-                "ours-worker {}, ours-delivery {}, adapter-freeze {}, compositor-blocked {}, \
-                 content-silence {}, frame-generation {}, unattributed {}",
-                self.classes[0],
-                self.classes[1],
-                self.classes[2],
-                self.classes[3],
-                self.classes[4],
-                self.classes[5],
-                self.classes[6]
-            );
+            let verdict_tally = self.verdict_tally();
+            let class_tally = self.class_tally();
             // Half-or-more of the stalls carrying a coinciding OS event = the reaction
             // cascade is OS-visible; otherwise the disturbance never surfaces above the
             // driver. Different classes, different cures — say which one this box has.
@@ -533,33 +655,11 @@ impl StallWatch {
                      suspects)"
                 );
             } else {
-                // The two REALTIME GPU-priority opt-ins, as configured in THIS process's
-                // environment (machine env; the WUDFHost driver process resolves the PFVD pair
-                // the same way, so this read mirrors what the driver decided — modulo a machine
-                // env edited after either process started, which a restart heals). The RX 9070
-                // XT field A/B (2026-08-12) convicted EXACTLY this warning's signature twice
-                // over: the driver's swap-chain REALTIME raise beat at ~1.8 s, the host
-                // auto-gate's REALTIME upgrade at ~3.6 s — so a log carrying this warning must
-                // say whether either lever is engaged before anyone chases display hardware.
-                let rt_gpu_driver = if std::env::var_os("PFVD_NO_RT_GPU").is_some() {
-                    "off (PFVD_NO_RT_GPU)"
-                } else {
-                    match std::env::var_os("PFVD_RT_GPU") {
-                        None => "off (default)",
-                        Some(v) if v.eq_ignore_ascii_case("thread") => "gpu-thread (+7)",
-                        Some(_) => "REALTIME (PFVD_RT_GPU)",
-                    }
-                };
-                let rt_gpu_host = match std::env::var("PUNKTFUNK_GPU_PRIORITY_CLASS")
-                    .ok()
-                    .as_deref()
-                {
-                    Some("off") => "off",
-                    Some("normal") => "normal",
-                    Some("realtime") => "REALTIME (pinned)",
-                    Some("auto") => "auto (gated REALTIME upgrade)",
-                    _ => "high (default)",
-                };
+                // The two REALTIME GPU-priority opt-ins (see the posture helpers' docs for the
+                // 2026-08-12 A/B that convicted both) — a log carrying this warning must say
+                // whether either lever is engaged before anyone chases display hardware.
+                let rt_gpu_driver = rt_gpu_driver_posture();
+                let rt_gpu_host = rt_gpu_host_posture();
                 tracing::warn!(
                     period_s = format!("{:.2}", period.as_secs_f64()),
                     os_correlated = correlated,
