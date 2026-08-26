@@ -81,12 +81,16 @@ impl Shell {
         let reduce = self.settings.reduce_motion;
         crate::theme::set_reduce_motion(reduce);
         self.pads = pads.to_vec();
-        self.glyphs = GlyphStyle::from_pref(pad_pref);
+        self.glyphs = glyph_style(self.input_source, pad_pref, self.platform);
         // Compared before it is rebuilt: this string changes when someone plugs a controller
         // in, and was being re-allocated 60 times a second to say so. (`pads` above is left
         // alone — it is at most a handful of small structs, and `PadInfo` would have to grow a
         // `PartialEq` in another crate to be worth the same treatment.)
-        let chip = pad.unwrap_or("No controller — keyboard works too");
+        let chip = pad.unwrap_or(if self.glyphs == GlyphStyle::Remote {
+            "TV remote — a controller works too"
+        } else {
+            "No controller — keyboard works too"
+        });
         if self.chip.as_deref() != Some(chip) {
             self.chip = Some(chip.to_owned());
         }
@@ -425,5 +429,88 @@ impl LayerEnv<'_> {
         };
         canvas.restore();
         rects
+    }
+}
+
+/// The glyph style for this frame: the last input source rules — keys speak the
+/// platform's key device (a TV remote on Android, a keyboard on the desktop), a pad
+/// speaks its own family ([`GlyphStyle::from_pref`]). Before anything has driven, the
+/// connected pad's family shows if there is one (a pad in hand is what a fresh console
+/// will most likely be driven by), else the platform's key device.
+fn glyph_style(
+    source: Option<crate::console::InputSource>,
+    pad_pref: Option<punktfunk_core::config::GamepadPref>,
+    platform: crate::platform::Platform,
+) -> GlyphStyle {
+    let keys = || match platform {
+        crate::platform::Platform::Android => GlyphStyle::Remote,
+        crate::platform::Platform::Desktop => GlyphStyle::Keyboard,
+    };
+    match (source, pad_pref) {
+        (Some(crate::console::InputSource::Keys), _) => keys(),
+        (_, Some(p)) => GlyphStyle::from_pref(Some(p)),
+        (_, None) => keys(),
+    }
+}
+
+#[cfg(test)]
+mod glyph_style_tests {
+    use super::*;
+    use crate::console::InputSource;
+    use crate::platform::Platform;
+    use punktfunk_core::config::GamepadPref;
+
+    /// The matrix the field report walked: a Chromecast (Android, no pad) used to show
+    /// keyboard keycaps — Enter/Esc/Tab, none of which its remote has. Keys on Android
+    /// now read as the remote, keys on the desktop as the keyboard, a driving pad as its
+    /// own family — and a pad that vanishes mid-session falls back to the platform's key
+    /// device rather than freezing on the departed pad's letters.
+    #[test]
+    fn the_legend_follows_what_drives() {
+        let xbox = Some(GamepadPref::Xbox360);
+        // Untouched console: the connected pad's family, else the platform's key device.
+        assert_eq!(
+            glyph_style(None, xbox, Platform::Android),
+            GlyphStyle::Letters
+        );
+        assert_eq!(
+            glyph_style(None, None, Platform::Android),
+            GlyphStyle::Remote
+        );
+        assert_eq!(
+            glyph_style(None, None, Platform::Desktop),
+            GlyphStyle::Keyboard
+        );
+        // Keys drove last: the key device, even with a pad still connected.
+        assert_eq!(
+            glyph_style(Some(InputSource::Keys), xbox, Platform::Android),
+            GlyphStyle::Remote
+        );
+        assert_eq!(
+            glyph_style(Some(InputSource::Keys), xbox, Platform::Desktop),
+            GlyphStyle::Keyboard
+        );
+        // A pad drove last: its family — and Nintendo reads Nintendo.
+        assert_eq!(
+            glyph_style(
+                Some(InputSource::Pad),
+                Some(GamepadPref::SwitchPro),
+                Platform::Desktop
+            ),
+            GlyphStyle::Nintendo
+        );
+        assert_eq!(
+            glyph_style(
+                Some(InputSource::Pad),
+                Some(GamepadPref::DualSense),
+                Platform::Android
+            ),
+            GlyphStyle::Shapes
+        );
+        // The pad drove, then unplugged: back to the platform's key device.
+        assert_eq!(
+            glyph_style(Some(InputSource::Pad), None, Platform::Android),
+            GlyphStyle::Remote
+        );
     }
 }

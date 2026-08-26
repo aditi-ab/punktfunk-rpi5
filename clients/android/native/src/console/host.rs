@@ -16,7 +16,8 @@ use ndk::native_window::NativeWindow;
 use pf_client_core::console::{OverlayAction, PointerInput, SessionPhase};
 use pf_client_core::menu_nav::{MenuEvent, MenuNav, MenuPulse, MenuSample, PadInfo};
 use pf_console_ui::{
-    Console, ConsoleEntry, ConsoleHandles, ConsoleOptions, Insets, Key, SnapshotStore, Viewport,
+    Console, ConsoleEntry, ConsoleHandles, ConsoleOptions, InputSource, Insets, Key, SnapshotStore,
+    Viewport,
 };
 use punktfunk_core::config::GamepadPref;
 use std::collections::VecDeque;
@@ -346,7 +347,11 @@ fn render_loop(mut console: Console, shared: Arc<Shared>, store: Arc<SnapshotSto
                 }
                 Cmd::Menu(ev) => {
                     last_input = Instant::now();
-                    if let Some(p) = console.menu(ev) {
+                    // Discrete events are the remote/keyboard path (Kotlin routes pad
+                    // buttons through PadSample) — with one wrinkle: a pad's SELECT also
+                    // arrives here (SkiaConsoleShell's ▲-on-Home shortcut), briefly
+                    // reading as keys. The next real pad press corrects the legend.
+                    if let Some(p) = console.menu(ev, InputSource::Keys) {
                         shared.emit(HostEvent::Pulse(p));
                     }
                 }
@@ -454,7 +459,7 @@ fn render_loop(mut console: Console, shared: Arc<Shared>, store: Arc<SnapshotSto
             menu_out.clear();
             nav.poll(&sample, Instant::now(), &mut menu_out);
             for ev in menu_out.drain(..) {
-                if let Some(p) = console.menu(ev) {
+                if let Some(p) = console.menu(ev, InputSource::Pad) {
                     shared.emit(HostEvent::Pulse(p));
                 }
             }

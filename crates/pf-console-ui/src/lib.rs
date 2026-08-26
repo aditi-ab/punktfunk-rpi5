@@ -57,7 +57,7 @@ mod theme;
 mod widgets;
 
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
-pub use console::{Console, ConsoleEntry, ConsoleHandles, Insets, Viewport};
+pub use console::{Console, ConsoleEntry, ConsoleHandles, InputSource, Insets, Viewport};
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub use input::Key;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
