@@ -798,8 +798,12 @@ struct ContentView: View {
             }
             connect(host, launchID: link.launch, profile: selection)
         case .unknown(let address, let port, let name, let fp):
-            // Never a silent connect: hand the address, claimed name and pin to the add sheet so
-            // the user makes the trust decision with their eyes on it.
+            // Never a silent connect — an unsaved host is a trust decision, and a link is not
+            // where it gets made. This only NAMES what the link pointed at; adding the host is a
+            // deliberate trip to the + button, where the fingerprint is on screen. (Linux, Android
+            // and Windows instead pre-fill their trust prompt from the link; the outcome is the
+            // same — nothing connects until a person looks at it — but the sheet is not seeded
+            // here, so don't read this as doing that.)
             guard model.phase == .idle else {
                 deepLinkNotice = "Already streaming. End that session first."
                 return

@@ -326,6 +326,13 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     // later instance over WM_COPYDATA) and this poll pulls them onto the UI thread. Thread-fed
     // state must be root state, like the pad count below.
     let (deep_link, set_deep_link) = cx.use_async_state(Option::<String>::None);
+    // A link that named its host by something GUESSABLE (its label, its address, the `host=`
+    // recovery parameter) rather than by the stable record id: `Some(plan)` arms the "Open this
+    // link?" confirmation built at the bottom of this function. The plan is byte-for-byte the one
+    // an id-referenced link carries, so confirming runs the identical dial one click later. Root
+    // state like every other dialog flag in this shell.
+    let (link_confirm, set_link_confirm) =
+        cx.use_async_state(Option::<Box<pf_client_core::orchestrate::ConnectPlan>>::None);
     cx.use_effect((), {
         let set_deep_link = set_deep_link.clone();
         move || {
@@ -363,16 +370,18 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     let (library, set_library) = cx.use_async_state(library::LibraryState::default());
 
     // Continuous LAN discovery (spawned once).
-    // Route an arriving link. Parsing, host and profile resolution and every refusal rule live
-    // in the shared brain (`plan_from_link`); this is only the WinUI end — turn the outcome into
-    // the same call a tile click makes, so a link gets the identical wake, trust and error
-    // surfaces rather than a second connect path of its own.
+    // Route an arriving link. Parsing, host and profile resolution and every refusal rule —
+    // including "only a stable record id may dial unattended" — live in the shared brain
+    // (`plan_from_link`); this is only the WinUI end — turn the outcome into the same call a tile
+    // click makes, so a link gets the identical wake, trust and error surfaces rather than a
+    // second connect path of its own.
     cx.use_effect(deep_link.clone(), {
-        let (ctx, set_screen, set_status, set_deep_link) = (
+        let (ctx, set_screen, set_status, set_deep_link, set_link_confirm) = (
             ctx.clone(),
             set_screen.clone(),
             set_status.clone(),
             set_deep_link.clone(),
+            set_link_confirm.clone(),
         );
         let screen_now = screen.clone();
         move || {
@@ -403,56 +412,16 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
             );
             use pf_client_core::orchestrate::PlanOutcome;
             match plan {
-                Ok(PlanOutcome::Connect(p)) => {
-                    let target = Target {
-                        name: p.host.name.clone(),
-                        addr: p.host.addr.clone(),
-                        port: p.host.port,
-                        fp_hex: p.host.fp_hex.clone(),
-                        pair_optional: false,
-                        mac: p.host.mac.clone(),
-                        mgmt_port: p.host.mgmt_port,
-                        profile: p.profile_override.clone(),
-                        launch: None, // routed explicitly below (initiate_launch*)
-                    };
-                    // With a MAC it takes the dial first wake path, so a sleeping host wakes
-                    // instead of erroring — exactly what clicking its tile would do. The
-                    // link's `launch=` id must reach the session (`--launch`) — this arm used
-                    // to drop it, so a game link opened a plain desktop session.
-                    match (p.launch.clone(), p.wake && !target.mac.is_empty()) {
-                        (Some(id), true) => {
-                            connect::initiate_launch_waking(
-                                &ctx,
-                                target,
-                                id,
-                                &set_screen,
-                                &set_status,
-                            );
-                        }
-                        (Some(id), false) => {
-                            connect::initiate_launch(&ctx, target, id, &set_screen, &set_status);
-                        }
-                        (None, true) => {
-                            connect::initiate_waking(&ctx, target, &set_screen, &set_status)
-                        }
-                        (None, false) => connect::initiate(&ctx, target, &set_screen, &set_status),
-                    }
-                }
+                Ok(PlanOutcome::Connect(p)) => dial_link(&ctx, &p, &set_screen, &set_status),
                 // The link named a saved, pinned host by its LABEL or its ADDRESS rather than
                 // by its record id. This app registers the `punktfunk` scheme (AppxManifest's
                 // windows.protocol / the installer's URL Protocol key), so any web page can
                 // hand us such a URL, and both of those references are guessable — it may not
-                // dial on its own.
-                //
-                // ⚠ DEGRADED, not the designed behaviour: the GTK shell and the touch clients
-                // put a "Open this link?" confirmation here and connect on the user's OK. This
-                // shell has no prompt surface to ask through yet, so it explains instead. Give
-                // it the dialog and this arm becomes the `Connect` arm behind it.
-                Ok(PlanOutcome::ConfirmConnect(p)) => refuse(format!(
-                    "Open \u{201c}{}\u{201d} from the host list \u{2014} a link can only dial a \
-                     host by its id.",
-                    p.host.name
-                )),
+                // dial on its own. Arm the confirmation instead; OK runs `dial_link` on the
+                // very same plan, so the confirmed link and an id-referenced one are one code
+                // path. Deliberately NOT the PIN ceremony below: this host is already pinned,
+                // and re-pairing it would throw that pin away.
+                Ok(PlanOutcome::ConfirmConnect(p)) => set_link_confirm.call(Some(p)),
                 // Known but never pinned, or not known at all: a link may not pair and may not
                 // trust on its own, so it opens the ordinary PIN ceremony seeded with what the
                 // link CLAIMED — name shown as claimed, the fingerprint pre-filling the pin so
@@ -744,19 +713,110 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         Screen::Stream => stream::session_page(ctx, &hud),
     };
 
+    // The "Open this link?" confirmation for a guessable-reference link (see `link_confirm`).
+    // It lives at ROOT, not on a page: a link can arrive over WM_COPYDATA while any screen is
+    // up, and a WinUI ContentDialog is a popup rather than a visual child, so it rides above
+    // whatever is showing. Same discipline as the shell's other dialogs — ALWAYS MOUNTED, with
+    // `is_open` doing the arming, in a stable trailing slot (unmounting a ContentDialog trips
+    // the reactor backend's phantom-child bookkeeping; see hosts.rs's forget confirmation).
+    let link_dialog: Element = {
+        let pending = link_confirm;
+        // Name the host AND the game, because that is the whole point of asking: it's what
+        // lets someone tell their own shortcut from a link a web page just handed them.
+        let content = pending
+            .as_ref()
+            .map(|p| {
+                let mut s = format!(
+                    "A link asks to connect to {} ({}).",
+                    p.host.name, p.host.addr
+                );
+                if let Some(id) = &p.launch {
+                    s.push_str(&format!(
+                        "\n\nIt also asks the host to launch \u{201c}{id}\u{201d}."
+                    ));
+                }
+                s.push_str(
+                    "\n\nIt names the host by its label or address, which anything that can open \
+                     a link could guess. Shortcuts made in Punktfunk name the host's id and \
+                     connect without asking.",
+                );
+                s
+            })
+            .unwrap_or_default();
+        let (ctx2, ss, st, sc) = (
+            ctx.clone(),
+            set_screen.clone(),
+            set_status.clone(),
+            set_link_confirm.clone(),
+        );
+        ContentDialog::new("Open this link?")
+            .content(content)
+            .primary_button_text("Connect")
+            .close_button_text("Cancel")
+            .is_open(pending.is_some())
+            .on_closed(move |r: ContentDialogResult| {
+                sc.call(None);
+                // Cancel (and Escape, which WinUI also reports as `None`) does nothing at all.
+                if r == ContentDialogResult::Primary
+                    && let Some(plan) = &pending
+                {
+                    dial_link(&ctx2, plan, &ss, &st);
+                }
+            })
+            .into()
+    };
+
     // The Stream screen is a plain status card (the session child owns the real stream window);
     // it's shown without the navigation entrance tween. Everything else slides + fades in.
-    if matches!(screen, Screen::Stream) {
-        return body;
+    let page: Element = if matches!(screen, Screen::Stream) {
+        body
+    } else {
+        let offset = (1.0 - progress) * 22.0;
+        border(body)
+            .opacity(progress)
+            .margin(Thickness {
+                left: 0.0,
+                top: offset,
+                right: 0.0,
+                bottom: 0.0,
+            })
+            .into()
+    };
+    grid(vec![page, link_dialog]).into()
+}
+
+/// Run a resolved link plan: the same four calls a host tile's click makes, so a link gets the
+/// identical wake, trust and error surfaces rather than a second connect path of its own. Shared
+/// by the two outcomes that dial — `PlanOutcome::Connect` (the link named the stable record id)
+/// and a confirmed `PlanOutcome::ConfirmConnect` — so the confirmation is one click in front of
+/// this, never a second implementation of it.
+fn dial_link(
+    ctx: &Arc<AppCtx>,
+    plan: &pf_client_core::orchestrate::ConnectPlan,
+    set_screen: &AsyncSetState<Screen>,
+    set_status: &AsyncSetState<String>,
+) {
+    let target = Target {
+        name: plan.host.name.clone(),
+        addr: plan.host.addr.clone(),
+        port: plan.host.port,
+        fp_hex: plan.host.fp_hex.clone(),
+        pair_optional: false,
+        mac: plan.host.mac.clone(),
+        mgmt_port: plan.host.mgmt_port,
+        profile: plan.profile_override.clone(),
+        launch: None, // routed explicitly below (initiate_launch*)
+    };
+    // With a MAC it takes the dial first wake path, so a sleeping host wakes instead of
+    // erroring — exactly what clicking its tile would do. The link's `launch=` id must reach
+    // the session (`--launch`) — this used to drop it, so a game link opened a plain desktop
+    // session.
+    match (plan.launch.clone(), plan.wake && !target.mac.is_empty()) {
+        (Some(id), true) => {
+            connect::initiate_launch_waking(ctx, target, id, set_screen, set_status);
+        }
+        (Some(id), false) => connect::initiate_launch(ctx, target, id, set_screen, set_status),
+        (None, true) => connect::initiate_waking(ctx, target, set_screen, set_status),
+        (None, false) => connect::initiate(ctx, target, set_screen, set_status),
     }
-    let offset = (1.0 - progress) * 22.0;
-    border(body)
-        .opacity(progress)
-        .margin(Thickness {
-            left: 0.0,
-            top: offset,
-            right: 0.0,
-            bottom: 0.0,
-        })
-        .into()
 }

@@ -215,8 +215,17 @@ jobs:
         # device" (see packaging/flatpak/prune-windows-lock.py). The committed Cargo.lock is
         # untouched; cargo --offline only needs sources for the crates it compiles.
         run: |
+          # PINNED to a commit and checked by SHA-256. `master` is a mutable ref, and this is
+          # third-party python executed in the SAME job that holds FLATPAK_GPG_PRIVATE_KEY — it
+          # chooses which crate sources the signed build vendors, so an upstream push (or a bad
+          # day at raw.githubusercontent) would be picking bytes we then sign. Bump both together:
+          #   curl -fsSL .../<new-sha>/cargo/flatpak-cargo-generator.py | sha256sum
+          GEN_REF=f03a673abe6ce189cea1c2857e2b44af2dd79d1f
+          GEN_SHA=b373c8ab1a05378ec5d8ed0645c7b127bcec7d2f7a1798694fbc627d570d856c
           curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/flatpak-cargo-generator.py \
-            https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+            "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/$GEN_REF/cargo/flatpak-cargo-generator.py"
+          echo "$GEN_SHA  /tmp/flatpak-cargo-generator.py" | sha256sum -c - \
+            || { echo "::error::flatpak-cargo-generator.py sha256 mismatch at $GEN_REF"; exit 1; }
           python3 packaging/flatpak/prune-windows-lock.py Cargo.lock /tmp/Cargo.flatpak.lock
           python3 /tmp/flatpak-cargo-generator.py /tmp/Cargo.flatpak.lock \
             -o packaging/flatpak/cargo-sources.json
@@ -413,10 +422,14 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          # unom-1's SSH host key, `ssh-keyscan -p "$DEPLOY_PORT" "$DEPLOY_HOST"` — the same repo
+          # secret nix.yml publishes with (packaging/nix/README.md). Gated with the rest below: no
+          # pinned host key, no deploy, never a first-contact-trusts-anything push.
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
-          if [ -z "${FLATPAK_GPG_PRIVATE_KEY:-}" ] || [ -z "${DEPLOY_HOST:-}" ]; then
-            echo "::warning::FLATPAK_GPG_PRIVATE_KEY/DEPLOY_* not set — skipping repo deploy (bundle still published)."
+          if [ -z "${FLATPAK_GPG_PRIVATE_KEY:-}" ] || [ -z "${DEPLOY_HOST:-}" ] || [ -z "${DEPLOY_KNOWN_HOSTS:-}" ]; then
+            echo "::warning::FLATPAK_GPG_PRIVATE_KEY/DEPLOY_*/DEPLOY_KNOWN_HOSTS not set — skipping repo deploy (bundle still published). See packaging/nix/README.md for the host key."
             exit 0
           fi
           # 1) Import the signing key into a throwaway keyring; sign the repo.
@@ -481,7 +494,13 @@ jobs:
           #    objects so clients mid-update aren't broken; the fresh signed summary advertises latest.
           install -d -m700 ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy; chmod 600 ~/.ssh/deploy
-          SSH="ssh -i $HOME/.ssh/deploy -p ${DEPLOY_PORT:-22} -o StrictHostKeyChecking=accept-new"
+          # Pin unom-1's host key instead of trusting whoever answers first. This step is holding
+          # FLATPAK_GPG_PRIVATE_KEY and ships the signed OSTree repo, so `accept-new` — which trusts
+          # the first key it ever sees, and every run starts with an empty known_hosts, so EVERY run
+          # is a first contact — would hand the deploy key and the publish to anything that won the
+          # race for the address. The guard above skips the deploy when the secret is unset.
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts; chmod 600 ~/.ssh/known_hosts
+          SSH="ssh -i $HOME/.ssh/deploy -p ${DEPLOY_PORT:-22} -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
           DEST="${DEPLOY_USER}@${DEPLOY_HOST}"
           # All idempotent — retried because the runner's link to unom-1 drops TCP dials under
           # load (the same flake that hits docker.yml's deploy-docs with "dial tcp: i/o timeout").

@@ -149,15 +149,14 @@ minus every trust decision.**
 - Only the **stable record id** connects unattended. A link naming the host by its label or its
   address — including through `host=` — reaches the same host, but behind an *Open this link?*
   confirmation naming the host and anything it asks to launch: "Gaming PC" and a LAN address are
-  guesses anything that can open a URL could make. (The Windows app has no prompt surface for this
-  yet, so it points you at the host list instead.) **Copy link** always writes the id, so a shortcut
+  guesses anything that can open a URL could make. **Copy link** always writes the id, so a shortcut
   you made keeps opening in one click.
 - A link naming a host you don't know is never connected. When it carries an address — as
-  `<host-ref>` or `host=` — Linux and Android open the app's normal trust prompt, pre-filled with
-  that address and any `fp` the link carried, so the first connect is verified rather than blind.
-  Windows and the Apple apps show a notice naming the host, and you pair from the host list
-  yourself. A link with no address to fall back on — a bare name or a stale record id — is refused
-  with a notice.
+  `<host-ref>` or `host=` — Linux, Android and Windows open the app's normal trust prompt, pre-filled
+  with that address and any `fp` the link carried, so the first connect is verified rather than
+  blind. The Apple apps show a notice naming the host, and you add it from the host list yourself.
+  A link with no address to fall back on — a bare name or a stale record id — is refused with a
+  notice.
 - An `fp` that contradicts the fingerprint already pinned for that host is a hard refusal with a
   notice. Nothing connects.
 - A `profile=` that names nothing on this device, or two profiles at once, refuses **before**
