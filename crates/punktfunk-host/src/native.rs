@@ -1036,6 +1036,81 @@ fn adapt_fec(loss_ppm: u32) -> u8 {
     target.clamp(FEC_MIN as u32, FEC_MAX as u32) as u8
 }
 
+/// The decay floor once a session has seen real loss ("burned", ABR overhaul RFC §2.4).
+const FEC_BURNED_MIN: u8 = 5;
+/// Clean 750 ms report windows (~2 min) a burned session must string together before the
+/// floor steps back to [`FEC_MIN`].
+const FEC_REEARN_WINDOWS: u32 = 160;
+/// Ceiling on the doubled re-earn requirement (~16 min) — a periodic-burst link converges to
+/// "armored for the session" without the counter running away.
+const FEC_REEARN_MAX: u32 = 1280;
+
+/// Adaptive-FEC decay floor with a memory of real loss (ABR overhaul RFC §2.4; pure —
+/// unit-tested).
+///
+/// The plain 1 pt/window decay converges on [`FEC_MIN`] (1 %) over any clean stretch — on a
+/// lossy link that is precisely backwards: static content strips the armor, then the first
+/// motion frame arrives essentially unprotected and dies (the 2026-08-26 motion-onset field
+/// chain, step 2). Once a window reports ANY shard loss (`loss_ppm > 0` — loss is discrete,
+/// so nonzero means real lost shards, not noise), the floor rises to [`FEC_BURNED_MIN`].
+///
+/// Not session-permanent — the controller's house rule (the encode stand-down, `7246f0fe`)
+/// is that nothing learned from evidence is forever: [`FEC_REEARN_WINDOWS`] clean windows
+/// re-earn the 1 % floor, a link that re-burns before the step-down has proven itself
+/// doubles the next requirement (to [`FEC_REEARN_MAX`]), and a step-down that survives its
+/// own horizon resets the requirement to base.
+#[derive(Debug)]
+struct FecFloor {
+    floor: u8,
+    clean_windows: u32,
+    reearn: u32,
+    /// Clean windows since the floor last stepped down; `None` = no step-down on probation.
+    since_stepdown: Option<u32>,
+}
+
+impl Default for FecFloor {
+    fn default() -> Self {
+        Self {
+            floor: FEC_MIN,
+            clean_windows: 0,
+            reearn: FEC_REEARN_WINDOWS,
+            since_stepdown: None,
+        }
+    }
+}
+
+impl FecFloor {
+    /// Feed one report window; returns the floor the adaptive target must not decay below.
+    fn on_report(&mut self, loss_ppm: u32) -> u8 {
+        if loss_ppm > 0 {
+            if let Some(w) = self.since_stepdown.take() {
+                if w < self.reearn {
+                    // The clean run that earned the step-down was luck — demand double.
+                    self.reearn = (self.reearn * 2).min(FEC_REEARN_MAX);
+                }
+            }
+            self.clean_windows = 0;
+            self.floor = FEC_BURNED_MIN;
+        } else {
+            self.clean_windows = self.clean_windows.saturating_add(1);
+            if let Some(w) = self.since_stepdown.as_mut() {
+                *w = w.saturating_add(1);
+                if *w >= self.reearn {
+                    // The step-down outlived its probation — the link really recovered.
+                    self.reearn = FEC_REEARN_WINDOWS;
+                    self.since_stepdown = None;
+                }
+            }
+            if self.floor > FEC_MIN && self.clean_windows >= self.reearn {
+                self.floor = FEC_MIN;
+                self.clean_windows = 0;
+                self.since_stepdown = Some(0);
+            }
+        }
+        self.floor
+    }
+}
+
 /// Apply the latest adaptive-FEC target to the session if it changed (cheap relaxed load + compare),
 /// called once per frame on the data-plane send path.
 fn apply_fec_target(session: &mut Session, fec_target: &AtomicU8) {
@@ -2597,6 +2672,57 @@ mod tests {
                                             // Heavy loss saturates at the ceiling, never beyond.
         assert_eq!(adapt_fec(1_000_000), FEC_MAX); // 100% → clamped
         assert!(adapt_fec(u32::MAX) <= FEC_MAX);
+    }
+
+    /// [`FecFloor`] (RFC §2.4): real loss raises the decay floor to 5 % so a static stretch
+    /// can't strip the armor before motion; a long clean run re-earns 1 %; a link that
+    /// re-burns before the step-down has proven itself doubles the next requirement; a
+    /// step-down that survives resets it.
+    #[test]
+    fn fec_floor_burns_reearns_and_doubles_on_early_reburn() {
+        let mut f = FecFloor::default();
+        // Untouched sessions decay to the 1 % floor as ever.
+        assert_eq!(f.on_report(0), FEC_MIN);
+        // One lost shard anywhere = burned: the floor is 5 % and clean windows hold it there.
+        assert_eq!(f.on_report(2_270), FEC_BURNED_MIN); // one packet at 5 Mbps
+        for _ in 0..FEC_REEARN_WINDOWS - 1 {
+            assert_eq!(f.on_report(0), FEC_BURNED_MIN);
+        }
+        // The 160th clean window re-earns the 1 % floor.
+        assert_eq!(f.on_report(0), FEC_MIN);
+        // A re-burn INSIDE the step-down's probation doubles the next requirement…
+        assert_eq!(f.on_report(500), FEC_BURNED_MIN);
+        for _ in 0..2 * FEC_REEARN_WINDOWS - 1 {
+            assert_eq!(f.on_report(0), FEC_BURNED_MIN);
+        }
+        assert_eq!(f.on_report(0), FEC_MIN);
+        // …and the ceiling bounds the doubling ladder.
+        let mut g = FecFloor {
+            reearn: FEC_REEARN_MAX,
+            since_stepdown: Some(0),
+            ..FecFloor::default()
+        };
+        g.on_report(1);
+        assert_eq!(g.reearn, FEC_REEARN_MAX);
+        // A step-down that survives its probation resets the requirement to base.
+        let mut h = FecFloor::default();
+        h.on_report(1);
+        for _ in 0..FEC_REEARN_WINDOWS {
+            h.on_report(0);
+        }
+        assert_eq!(h.floor, FEC_MIN);
+        for _ in 0..FEC_REEARN_WINDOWS {
+            h.on_report(0);
+        }
+        assert_eq!(h.reearn, FEC_REEARN_WINDOWS);
+        assert!(
+            h.since_stepdown.is_none(),
+            "probation over — durable recovery"
+        );
+        // A burn AFTER a durable recovery is a fresh burn, not a double.
+        h.on_report(1);
+        assert_eq!(h.reearn, FEC_REEARN_WINDOWS);
+        assert_eq!(h.floor, FEC_BURNED_MIN);
     }
 
     #[test]
