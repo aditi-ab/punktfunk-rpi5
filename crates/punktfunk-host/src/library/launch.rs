@@ -165,6 +165,21 @@ fn command_for(spec: &LaunchSpec) -> Option<String> {
             // The same resolution the `heroic` game launches use (native binary, else Flatpak), just
             // without `--no-gui` and without a URI: that opens Heroic's window, which IS the tile.
             "heroic" => heroic_launch_prefix(),
+            // Heroic's console mode — its couch front end, the Big Picture of this launcher.
+            //
+            // It takes TWO flags, which is not obvious and is why this is the host's business and
+            // not a plugin's: `--console` only routes the UI to that front end, and `--fullscreen`
+            // is what actually fills the screen (Heroic reads them separately —
+            // `isCLIConsoleMode` / `isCLIFullscreen`). Neither is a URI: `heroic://` speaks only
+            // `ping` and `launch`, so a protocol hand-off cannot reach console mode at all — the
+            // same reason Playnite's fullscreen tile spawns its exe directly.
+            //
+            // Console mode arrived in Heroic 2.21.0. An older Heroic ignores the unknown
+            // `--console` and honours `--fullscreen`, so the tile degrades to a fullscreen desktop
+            // UI rather than to nothing.
+            "heroic-console" => {
+                heroic_launch_prefix().map(|p| format!("{p} --console --fullscreen"))
+            }
             // Bare `lutris` opens the Lutris window; with a `lutris:rungameid/…` URI it launches a
             // game instead (the `lutris_id` kind above).
             "lutris" => Some("lutris".into()),
@@ -532,9 +547,16 @@ pub(crate) fn valid_playnite_id(value: &str) -> bool {
 
 /// The launcher UIs **this host** can open, as `launcher_ui` values (D4).
 ///
-/// One kind for every launcher but Steam, rather than one kind each: they all have exactly a single
-/// UI to open, so the value is just which launcher. Steam keeps its own [`valid_steam_ui`] kind
-/// because it has two (Big Picture and the desktop client), which is a genuinely different choice.
+/// One kind for every launcher but Steam, rather than one kind each. A value names a launcher *UI*,
+/// which for most of them is the same thing as naming the launcher — and where it is not, the value
+/// says which one: `heroic` opens Heroic's window, `heroic-console` its couch front end, and on
+/// Windows `playnite` has always meant Playnite's **Fullscreen** app rather than its desktop one.
+/// Steam keeps its own [`valid_steam_ui`] kind because it was the first launcher with two UIs worth
+/// opening, and because both of its values are the same length of word — splitting Heroic's two out
+/// into a `heroic_ui` kind today would buy symmetry and cost every N-1 host: an unknown *kind*
+/// degrades to an unlaunchable tile, but an unknown *value* is a hard 400 that refuses the whole
+/// reconcile, so a new value is the shape that has to be gated on `minHost` in the plugin index
+/// either way.
 ///
 /// Platform-gated, because a value naming a launcher this OS cannot run is not a tile that merely
 /// looks odd — it is one that fails at launch. Validated inbound too, so a plugin gets a 400 it can
@@ -548,7 +570,7 @@ pub(crate) fn valid_playnite_id(value: &str) -> bool {
 fn launcher_ui_stores() -> &'static [&'static str] {
     #[cfg(target_os = "linux")]
     {
-        &["heroic", "lutris"]
+        &["heroic", "heroic-console", "lutris"]
     }
     // Playnite's activation is verified (2026-08-06, on the .173 box); Epic, GOG Galaxy and the
     // Xbox app are still unwired — each needs its own verified activation, and an unverified guess
@@ -593,6 +615,14 @@ pub(crate) fn resolvable_launcher_ui(value: &str) -> bool {
     #[cfg(windows)]
     if value == "playnite" {
         return playnite_fullscreen_exe().is_some();
+    }
+    // Same question for both Heroic tiles, and the same answer: they resolve to whatever
+    // `heroic_launch_prefix` finds, so when that finds nothing the tile is dead and must not be
+    // published. Keeping `~/.config/heroic` around after uninstalling Heroic is enough to reach
+    // this — the plugin's `detect` only looks for that directory.
+    #[cfg(target_os = "linux")]
+    if matches!(value, "heroic" | "heroic-console") {
+        return heroic_launch_prefix().is_some();
     }
     true
 }
@@ -1123,10 +1153,21 @@ mod tests {
         #[cfg(target_os = "linux")]
         {
             assert!(known_launcher_ui("heroic"));
+            assert!(known_launcher_ui("heroic-console"));
             assert!(known_launcher_ui("lutris"));
             // Not wired on this OS — outside the vocabulary, so it is refused inbound rather than
             // becoming a tile that does nothing.
             assert!(!known_launcher_ui("gog"));
+            // Both Heroic tiles resolve through the same probe, so a box without Heroic drops both
+            // rather than publishing one dead tile beside the other.
+            assert_eq!(
+                resolvable_launcher_ui("heroic"),
+                heroic_launch_prefix().is_some()
+            );
+            assert_eq!(
+                resolvable_launcher_ui("heroic-console"),
+                heroic_launch_prefix().is_some()
+            );
         }
         #[cfg(windows)]
         {
@@ -1253,6 +1294,21 @@ mod tests {
         if let Some(cmd) = ui("heroic") {
             assert!(!cmd.contains("--no-gui"), "the GUI is the point: {cmd:?}");
             assert!(!cmd.contains("heroic://"), "no game URI: {cmd:?}");
+            assert!(
+                !cmd.contains("--console"),
+                "that is the other tile: {cmd:?}"
+            );
+        }
+        // Console mode needs BOTH flags — `--console` alone routes the UI without filling the
+        // screen, which from a couch is the bug this tile exists to avoid. Same prefix as the
+        // window tile, so it is `None` on the same boxes.
+        assert_eq!(ui("heroic-console").is_some(), ui("heroic").is_some());
+        if let Some(cmd) = ui("heroic-console") {
+            assert!(cmd.contains("--console"), "{cmd:?}");
+            assert!(cmd.contains("--fullscreen"), "{cmd:?}");
+            assert!(!cmd.contains("--no-gui"), "the GUI is the point: {cmd:?}");
+            // Gamescope spawns by `split_whitespace`, so every token has to stand alone.
+            assert!(cmd.split_whitespace().any(|t| t == "--console"), "{cmd:?}");
         }
         assert_eq!(ui("nonsense"), None);
         assert_eq!(ui(""), None);

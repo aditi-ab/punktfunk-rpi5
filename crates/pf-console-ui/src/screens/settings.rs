@@ -677,9 +677,12 @@ impl SettingsScreen {
         let ids = self.row_ids(ctx);
         self.clamp_cursor(ids.len());
         // Y on the Bitrate row opens the typed rate; on every other row it means nothing,
-        // and the hint bar only offers it where it does.
+        // and the hint bar only offers it where it does. Not under PyroWave — the row is
+        // dimmed (see `row_spec`) and a typed rate would be as inert as the ladder.
         if ev == MenuEvent::Secondary {
-            return if ids.get(self.list.cursor) == Some(&RowId::Bitrate) {
+            return if ids.get(self.list.cursor) == Some(&RowId::Bitrate)
+                && ctx.settings.codec != "pyrowave"
+            {
                 self.custom_bitrate = Some(String::new());
                 Some(MenuPulse::Confirm)
             } else {
@@ -824,6 +827,11 @@ impl SettingsScreen {
                 Hint::new(HintKey::Confirm, "Open"),
                 Hint::new(HintKey::Back, "Done"),
             ],
+            // Dimmed under PyroWave (row_spec): offering "Adjust" on an inert row would
+            // teach a control that answers with a thud.
+            Some(RowId::Bitrate) if ctx.settings.codec == "pyrowave" => {
+                vec![Hint::new(HintKey::Back, "Done")]
+            }
             // The one row with a value the ladder cannot name every version of.
             Some(RowId::Bitrate) => vec![
                 Hint::new(HintKey::Adjust, "Adjust"),
@@ -910,7 +918,7 @@ impl SettingsScreen {
         let detail = ids
             .get(self.list.cursor)
             .copied()
-            .map_or("", |id| detail(id, ctx.platform));
+            .map_or("", |id| detail(id, ctx));
         fonts.centered(
             canvas,
             detail,
@@ -1042,6 +1050,11 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
     // that one is different.
     let enabled = match id {
         RowId::EchoCancel => s.mic_enabled,
+        // PyroWave is always Automatic bitrate (ABR overhaul RFC §5.2): the session sends 0
+        // whatever this row stores and the host pins a per-mode bpp rate. Dimmed, not live —
+        // a control that changes nothing must say so. The stored rate is kept: switching the
+        // codec back restores it.
+        RowId::Bitrate => s.codec != "pyrowave",
         // ⚠ Lossless follows the channel count for a reason that has MOVED, and the old reason
         // is still written down in several places that are now wrong (`hi-res-audio.md` §4.2's
         // blanket "surround does not fit a datagram", and `trust::Settings::audio_format`'s doc
@@ -1301,8 +1314,9 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
 /// The focused row's one-line explainer. Takes the platform because two desktop rows
 /// advertise desktop-only live chords (Ctrl+Alt+Shift+…) that no Android build has — a
 /// shortcut the device cannot press must not be taught.
-fn detail(id: RowId, platform: crate::platform::Platform) -> &'static str {
+fn detail(id: RowId, ctx: &Ctx) -> &'static str {
     use crate::platform::Platform;
+    let platform = ctx.platform;
     match id {
         RowId::Resolution => {
             "The host creates a virtual display at exactly this size — no scaling. \
@@ -1312,6 +1326,10 @@ fn detail(id: RowId, platform: crate::platform::Platform) -> &'static str {
         RowId::RenderScale => {
             "The host renders larger or smaller than the stream mode and this window \
              resamples — above 1× supersamples, below saves bandwidth."
+        }
+        RowId::Bitrate if ctx.settings.codec == "pyrowave" => {
+            "PyroWave sets its own rate from the stream mode (all-intra) — a fixed bitrate \
+             doesn't apply. Pick another codec to use this setting."
         }
         RowId::Bitrate => {
             "Automatic uses the host's default (20 Mbps). Y types an exact rate, up to 2 Gbps."
@@ -1573,6 +1591,11 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
                 .map(|i| s.render_scale = RENDER_SCALES[i])
         }
         RowId::Bitrate => {
+            // Inert under PyroWave — a boundary thud, matching what the dimmed row shows
+            // (the host pins the rate; see `row_spec`).
+            if s.codec == "pyrowave" {
+                return false;
+            }
             // A typed rate (or one a desktop shell's spinner stored) sits BETWEEN rungs, and
             // the generic step snaps a value it cannot find to the first option — which here
             // is Automatic, i.e. one nudge throws the custom rate away. Step to the rung the
@@ -2143,6 +2166,40 @@ pub(super) mod tests {
         assert!(!ctx.settings.echo_cancel);
         assert!(adjust(RowId::EchoCancel, 1, true, &mut ctx));
         assert!(ctx.settings.echo_cancel);
+    }
+
+    /// Bitrate follows the codec: dimmed and inert under PyroWave (the host pins a per-mode
+    /// rate and the session sends 0 — ABR overhaul RFC §5.2), live for every other codec,
+    /// and the stored rate survives the dim so switching back restores it.
+    #[test]
+    fn bitrate_dims_under_pyrowave() {
+        let (mut settings, pads) = ctx_parts();
+        settings.codec = "pyrowave".into();
+        settings.bitrate_kbps = 80_000;
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
+            pads: &pads,
+            deck: false,
+            fallback_ui: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        assert!(!row_spec(RowId::Bitrate, &ctx, &[]).enabled);
+        assert!(
+            !adjust(RowId::Bitrate, 1, false, &mut ctx),
+            "pyrowave = thud"
+        );
+        assert!(!adjust(RowId::Bitrate, 1, true, &mut ctx), "A too");
+        assert_eq!(ctx.settings.bitrate_kbps, 80_000, "the stored rate is kept");
+
+        ctx.settings.codec = "hevc".into();
+        assert!(row_spec(RowId::Bitrate, &ctx, &[]).enabled);
+        assert!(adjust(RowId::Bitrate, 1, false, &mut ctx));
     }
 
     /// The smoothness buffer is OFFERED only under Smoothness — under Lowest latency it names

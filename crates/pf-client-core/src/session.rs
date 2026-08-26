@@ -795,6 +795,25 @@ fn pump(
         // rung at all, so advertising HEVC would promise what this build cannot keep.
         &params.decoder,
     ) & !params.exclude_codecs;
+    // PyroWave is always Automatic bitrate (ABR overhaul RFC §5.2): a fixed kbps is
+    // ill-defined for the all-intra codec (bpp is the operating point) and used to bypass
+    // the host's `PUNKTFUNK_PYROWAVE_MAX_MBPS` ceiling. Send 0 and let the host pin; the
+    // stored profile value is untouched, so switching codecs back restores it. Gated on the
+    // codec actually being ADVERTISED: a pyrowave preference on a device that failed the
+    // decode probe falls back to H.26x, where the user's explicit rate must survive.
+    let bitrate_kbps = if preferred == punktfunk_core::quic::CODEC_PYROWAVE
+        && advertised_codecs & punktfunk_core::quic::CODEC_PYROWAVE != 0
+    {
+        if params.bitrate_kbps != 0 {
+            tracing::info!(
+                stored_kbps = params.bitrate_kbps,
+                "PyroWave forces Automatic bitrate — asking the host for its per-mode pin"
+            );
+        }
+        0
+    } else {
+        params.bitrate_kbps
+    };
     if params.exclude_codecs != 0 {
         tracing::info!(
             excluded = params.exclude_codecs,
@@ -840,7 +859,7 @@ fn pump(
         params.mode,
         params.compositor,
         params.gamepad,
-        params.bitrate_kbps,
+        bitrate_kbps,
         params.video_caps,
         params.audio_channels,
         audio_rate_hz,

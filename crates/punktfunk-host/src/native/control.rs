@@ -102,6 +102,9 @@ pub(super) async fn run(
     // result / reconfigure / clip offer, so the read future is dropped routinely. `io::read_msg`
     // would lose the partial frame and misalign the stream for the rest of the session.
     let mut ctrl_reader = io::MsgReader::new(ctrl_recv);
+    // Burned decay floor for adaptive FEC (RFC §2.4): once this session has reported real
+    // loss, the decay below stops at 5 % instead of 1 % — see `FecFloor`.
+    let mut fec_floor = FecFloor::default();
     loop {
         tokio::select! {
             msg = ctrl_reader.read_msg() => {
@@ -191,7 +194,14 @@ pub(super) async fn run(
                         // the stream covered across the gap while still converging to FEC_MIN
                         // on a genuinely clean link.
                         let prev = fec_target_ctl.load(Ordering::Relaxed);
-                        let target = adapt_fec(rep.loss_ppm).max(prev.saturating_sub(1));
+                        // The burned floor (RFC §2.4) binds the decay, not the attack: real
+                        // loss raises it to 5 % for as long as the link keeps proving lossy,
+                        // so a static stretch can no longer strip the armor the first motion
+                        // frame needs. ~2 clean minutes re-earn the 1 % floor.
+                        let floor = fec_floor.on_report(rep.loss_ppm);
+                        let target = adapt_fec(rep.loss_ppm)
+                            .max(prev.saturating_sub(1))
+                            .max(floor);
                         fec_target_ctl.store(target, Ordering::Relaxed);
                         if prev != target {
                             tracing::debug!(
