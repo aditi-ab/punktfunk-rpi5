@@ -1348,6 +1348,17 @@ fn dump_console_screens() {
     s.set_connecting(None);
     s.session_failed("Connection timed out");
     dump(&mut s, 10, 8, "10-toast", true);
+
+    // The TV-remote legend (Android platform, keys driving): the OK and ↩ badges, the
+    // ▲ section pointer, the hidden Y/X hints, and the remote chip mark — Home and the
+    // hint-dense Settings. The platform flip is legends-only for these two frames; the
+    // stack was built desktop, so only the glyphs and the Android row set differ.
+    dump(&mut s, 30, 8, "_remote-settle", true);
+    s.platform = crate::platform::Platform::Android;
+    s.note_input_source(crate::console::InputSource::Keys);
+    dump(&mut s, 40, 8, "11-home-remote", false);
+    s.handle_menu(MenuEvent::Tertiary);
+    dump(&mut s, 40, 8, "11b-settings-remote", false);
 }
 
 /// A 2:3 poster, PNG-encoded, in a colour derived from `seed`.

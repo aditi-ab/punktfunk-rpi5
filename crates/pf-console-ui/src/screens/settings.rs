@@ -20,7 +20,7 @@ use crate::widgets::{
     permits, Charset, KeyMsg, Keyboard, ListMsg, MenuList, RowSpec, TabStrip, TAB_STRIP_H,
 };
 use pf_client_core::audio_format::{AUDIO_FORMATS, AUDIO_FORMAT_OPUS};
-use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
+use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use pf_client_core::trust::{MouseMode, StatsVerbosity, TouchMode};
 use skia_safe::{Canvas, Rect};
 
@@ -384,6 +384,11 @@ pub(crate) struct SettingsScreen {
     /// can't create profiles (design §5.4: the desktop app does), so the list is stable
     /// for the screen's lifetime.
     profiles: Vec<(String, String)>,
+    /// The tab strip holds the D-pad focus (Up from the list's top row steps onto it;
+    /// Down/A step back off). This is how a device with ONLY a D-pad — a Chromecast/Google
+    /// TV remote — switches tabs at all: the shoulder ring (L1/R1) and the Tab/PgUp/PgDn
+    /// keys don't exist there, and a field report lost every tab but the first to that.
+    strip_focus: bool,
     /// The Bitrate row's typed rate in Mbps while Y has the field open — `None` the rest of
     /// the time. Every other row on this screen is a list of options, and a ladder is the
     /// right shape for a list; a bitrate is a NUMBER, and the one a link actually carries is
@@ -409,6 +414,7 @@ impl SettingsScreen {
             tab: 0,
             tab_cursors: [0; TABS.len()],
             profiles,
+            strip_focus: false,
             custom_bitrate: None,
             keyboard: Keyboard::new(),
         }
@@ -609,6 +615,11 @@ impl SettingsScreen {
             self.show_tab(tab, ctx);
             return true;
         }
+        // A pointer press on the rows takes the focus back from the strip — direct
+        // manipulation names its own target.
+        if p.press() {
+            self.strip_focus = false;
+        }
         let ids = self.row_ids(ctx);
         self.clamp_cursor(ids.len());
         let (msg, pulse) = self.list.pointer(p, ids.len());
@@ -628,6 +639,26 @@ impl SettingsScreen {
         if self.custom_bitrate.is_some() {
             return self.custom_menu(ev, ctx);
         }
+        if self.strip_focus {
+            // The strip holds the D-pad focus: left/right travel the ring, down/A drop back
+            // to the rows, B still leaves the screen. This is the only tab path a device
+            // with no shoulders and no Tab key has (a TV remote).
+            return match ev {
+                MenuEvent::Back => {
+                    fx.pop();
+                    None
+                }
+                MenuEvent::Move(MenuDir::Left) | MenuEvent::JumpBack => self.switch_tab(-1, ctx),
+                MenuEvent::Move(MenuDir::Right) | MenuEvent::JumpForward => self.switch_tab(1, ctx),
+                MenuEvent::Move(MenuDir::Down) | MenuEvent::Confirm => {
+                    self.strip_focus = false;
+                    Some(MenuPulse::Move)
+                }
+                // The top of the screen — the same recoil the list's ends answer with.
+                MenuEvent::Move(MenuDir::Up) => Some(MenuPulse::Boundary),
+                _ => None,
+            };
+        }
         match ev {
             MenuEvent::Back => {
                 fx.pop();
@@ -635,6 +666,12 @@ impl SettingsScreen {
             }
             MenuEvent::JumpBack => return self.switch_tab(-1, ctx),
             MenuEvent::JumpForward => return self.switch_tab(1, ctx),
+            // Up from the top row steps onto the tab strip instead of recoiling — the
+            // D-pad-only path to the other tabs.
+            MenuEvent::Move(MenuDir::Up) if self.list.cursor == 0 => {
+                self.strip_focus = true;
+                return Some(MenuPulse::Move);
+            }
             _ => {}
         }
         let ids = self.row_ids(ctx);
@@ -765,6 +802,15 @@ impl SettingsScreen {
                 Hint::new(HintKey::Back, "Done"),
             ];
         }
+        // The strip has the focus (a D-pad-only remote's tab path): say what the D-pad does
+        // up here, not what the rows would do.
+        if self.strip_focus {
+            return vec![
+                Hint::new(HintKey::Adjust, "Section"),
+                Hint::new(HintKey::Confirm, "Rows"),
+                Hint::new(HintKey::Back, "Done"),
+            ];
+        }
         let ids = self.row_ids(ctx);
         // The shoulders always change section, so that hint leads on every row.
         let mut hints = vec![Hint::new(HintKey::Shoulders, "Section")];
@@ -812,6 +858,7 @@ impl SettingsScreen {
             Rect::from_ltrb(rect.left, rect.top, rect.right, rect.top + strip_h as f32),
             &labels,
             self.tab,
+            self.strip_focus,
             fonts,
             k,
             dt,
@@ -857,7 +904,8 @@ impl SettingsScreen {
             fonts,
             k,
             dt,
-            self.custom_bitrate.is_none(),
+            // The rows rest their focus ring while the keyboard tray or the strip holds it.
+            self.custom_bitrate.is_none() && !self.strip_focus,
         );
         let detail = ids
             .get(self.list.cursor)
@@ -2715,6 +2763,50 @@ pub(super) mod tests {
         s.menu(MenuEvent::JumpForward, &mut ctx, &mut fx);
         assert_eq!(s.tab, 0);
         // Switching sections is navigation, never a settings write.
+        assert!(fx.nav.is_none() && fx.cmds.is_empty());
+    }
+
+    /// A D-pad alone reaches every tab: Up from the top row steps onto the strip,
+    /// left/right travel it, Down drops back into the rows. This is the only tab path a
+    /// Chromecast/Google TV remote has — no shoulders, no Tab key — and it regressed to
+    /// "first tab only" when the rows were split across tabs.
+    #[test]
+    fn dpad_alone_reaches_every_tab() {
+        let (mut settings, pads) = ctx_parts();
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
+            pads: &pads,
+            deck: false,
+            fallback_ui: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        let mut s = SettingsScreen::with_profiles(Vec::new());
+        let mut fx = Outbox::default();
+        // Up from the top row focuses the strip instead of recoiling…
+        assert_eq!(s.list.cursor, 0);
+        s.menu(MenuEvent::Move(MenuDir::Up), &mut ctx, &mut fx);
+        assert!(s.strip_focus, "Up from the top row lands on the strip");
+        // …right travels the ring…
+        s.menu(MenuEvent::Move(MenuDir::Right), &mut ctx, &mut fx);
+        assert_eq!(s.tab, 1);
+        assert!(s.strip_focus, "switching keeps the strip focused");
+        s.menu(MenuEvent::Move(MenuDir::Left), &mut ctx, &mut fx);
+        s.menu(MenuEvent::Move(MenuDir::Left), &mut ctx, &mut fx);
+        assert_eq!(s.tab, PROFILES_TAB, "the strip wraps like the shoulders do");
+        // …and Down returns to the rows of the tab that's showing.
+        s.menu(MenuEvent::Move(MenuDir::Down), &mut ctx, &mut fx);
+        assert!(!s.strip_focus, "Down drops back into the list");
+        // While the list has focus, Left/Right still adjust rows — only the top row's Up
+        // reaches the strip, so a value row's chevrons keep meaning what they say.
+        s.menu(MenuEvent::Move(MenuDir::Down), &mut ctx, &mut fx);
+        assert!(!s.strip_focus);
+        // Focusing the strip is navigation, never a settings write.
         assert!(fx.nav.is_none() && fx.cmds.is_empty());
     }
 

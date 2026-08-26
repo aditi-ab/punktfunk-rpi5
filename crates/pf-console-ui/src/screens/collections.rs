@@ -388,6 +388,7 @@ impl CollectionsScreen {
             Rect::from_ltrb(pills as f32, strip.top, strip.right, strip.bottom),
             &labels,
             selected,
+            false,
             fonts,
             k,
             dt,

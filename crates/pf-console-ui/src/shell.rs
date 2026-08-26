@@ -289,6 +289,12 @@ pub(crate) struct Shell {
     /// (or out of) calm alongside the screen transition.
     bg_mix: f64,
     glyphs: GlyphStyle,
+    /// What drove the console LAST — a pad or keys — noted at the input seams
+    /// ([`Shell::note_input_source`], [`Shell::key`]) and read by the per-frame glyph
+    /// resolution, so the legend speaks the language of the device actually in use.
+    /// `None` until anything drives: the style then follows the connected pad, or the
+    /// platform's key device where there is none.
+    input_source: Option<crate::console::InputSource>,
     chip: Option<String>,
     pads: Vec<PadInfo>,
     /// The settled top screen's hint-bar hit boxes, republished every frame by
@@ -373,6 +379,7 @@ impl Shell {
             ink,
             bg_mix,
             glyphs: GlyphStyle::Keyboard,
+            input_source: None,
             chip: None,
             pads: Vec::new(),
             hint_rects: Vec::new(),
@@ -997,6 +1004,13 @@ impl Shell {
         consumed
     }
 
+    /// Note what produced the menu events now arriving — the hint legend follows it.
+    /// Called by [`crate::console::Console::menu`] (which is told by its host) and the
+    /// overlay's pad path; the keyboard path notes itself in [`Shell::key`].
+    pub(crate) fn note_input_source(&mut self, source: crate::console::InputSource) {
+        self.input_source = Some(source);
+    }
+
     /// The keyboard fallback — the console is fully drivable with no pad. Arrows and
     /// Enter/Esc map onto menu events; Y/X mirror the pad's Secondary/Tertiary
     /// (suppressed while editing, where letters are text).
@@ -1004,6 +1018,7 @@ impl Shell {
     /// `shift` only matters for Tab, whose two directions are one key.
     pub(crate) fn key(&mut self, key: crate::input::Key, shift: bool, repeat: bool) -> bool {
         use crate::input::Key as S;
+        self.input_source = Some(crate::console::InputSource::Keys);
         if self.editing() {
             let mut ctx = Ctx {
                 hosts: &self.hosts,

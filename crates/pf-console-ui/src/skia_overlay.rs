@@ -301,7 +301,12 @@ impl Overlay for SkiaOverlay {
 
     fn handle_menu(&mut self, event: MenuEvent) -> Option<MenuPulse> {
         if self.console_visible() {
-            self.shell.as_mut().and_then(|s| s.handle_menu(event))
+            self.shell.as_mut().and_then(|s| {
+                // The presenter's menu_rx carries pad events only (its keyboard goes
+                // through `key`), so this seam IS the pad source note.
+                s.note_input_source(crate::console::InputSource::Pad);
+                s.handle_menu(event)
+            })
         } else {
             None
         }

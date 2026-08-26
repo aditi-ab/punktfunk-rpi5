@@ -17,6 +17,17 @@ use skia_safe::Canvas;
 
 pub use crate::input::Key;
 
+/// What produced a menu event — the device family the hint legend should speak in.
+/// Pointer input carries no source on purpose: a tap says nothing about which buttons
+/// the user's OTHER hand holds, so it leaves the legend as it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputSource {
+    /// A gamepad (the glyphs follow the active pad's family).
+    Pad,
+    /// Keys: a TV remote's D-pad on Android, a keyboard on the desktop.
+    Keys,
+}
+
 /// Where the console starts.
 pub enum ConsoleEntry {
     /// The host list (the session binary's bare `--browse`; the Android console's Home).
@@ -122,8 +133,12 @@ impl Console {
             .render_in(canvas, viewport, &self.fonts, pad, pad_pref, pads);
     }
 
-    /// A controller menu event. The pulse, if any, is what the pad should feel.
-    pub fn menu(&mut self, event: MenuEvent) -> Option<MenuPulse> {
+    /// A menu event, with WHERE it came from — a controller, or keys (a TV remote's
+    /// D-pad, a keyboard). The source is what keeps the hint legend speaking the language
+    /// of the device actually in the user's hand; the pulse, if any, is what a pad should
+    /// feel.
+    pub fn menu(&mut self, event: MenuEvent, source: InputSource) -> Option<MenuPulse> {
+        self.shell.note_input_source(source);
         self.shell.handle_menu(event)
     }
 
