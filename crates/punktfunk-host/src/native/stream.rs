@@ -831,6 +831,10 @@ fn send_loop(
     // costs on HEVC (sub-frame readback, and with it the send/encode overlap) — a number the
     // encoder cannot observe. Written here because this is the only thread that sees a send.
     send_spread_us: Arc<AtomicU32>,
+    // Wire-MTU re-keys applied here, published for the encode loop's metronomic-recovery
+    // attribution (a re-keyed path was black-holing full-size video — name it before the
+    // display suspects).
+    wire_rekeys: Arc<AtomicU32>,
     // Streamed AUs go out as slice-granularity blocks ([`USER_FLAG_SLICE_STREAM`]'s contract)
     // instead of the legacy full-FEC-block shape.
     slice_wire: bool,
@@ -907,7 +911,7 @@ fn send_loop(
             if let Some(s) = want_shard {
                 match session.set_shard_payload(s) {
                     Ok(()) => {
-                        wire_rekeys += 1;
+                        wire_rekeys.fetch_add(1, Ordering::Relaxed);
                         tracing::info!(shard_payload = s, "wire shard payload re-keyed");
                     }
                     // Can't fire for a watcher-driven value (it validates the same bounds) —
@@ -2147,6 +2151,13 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // loop is the only place the encoder can be touched.
     let send_spread_us = Arc::new(AtomicU32::new(0));
     let send_spread_send = Arc::clone(&send_spread_us);
+    // Wire-MTU re-keys applied this session, published by the send thread (it owns the
+    // packetizer) for the encode loop's metronomic-recovery attribution: a path that needed a
+    // re-key was black-holing full-size video, and a client re-asking through that is periodic
+    // by construction — the 2026-08-26 lab sessions drew the "display disturbance" warn on
+    // exactly such a path, at a period (1.7 s) the client cooldown bands narrowly miss.
+    let wire_rekeys = Arc::new(AtomicU32::new(0));
+    let wire_rekeys_send = Arc::clone(&wire_rekeys);
     let send_stats = SendStats {
         rec: stats.clone(),
         mode: live_mode.clone(),
@@ -2169,6 +2180,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     stop,
                     perf,
                     send_spread_send,
+                    wire_rekeys_send,
                     slice_wire,
                     burst_cap,
                     fec_target,
@@ -2322,13 +2334,6 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // Self-diagnosis for the periodic-stutter class: warns when the served recovery IDRs settle
     // into a stable multi-second rhythm (see [`pf_frame::metronome::Metronome`]).
     let mut recovery_cadence = pf_frame::metronome::Metronome::new();
-    // Wire-MTU re-keys applied this session — the metronomic-recovery attribution reads it: a
-    // path that needed one was black-holing full-size video (VPN/overlay hop), and a client
-    // re-asking through that is periodic by construction. The 2026-08-26 lab sessions produced
-    // the "display disturbance" warn on exactly such a path, at a period (1.7 s) the client
-    // cooldown bands narrowly miss — period alone cannot make this call, the transport context
-    // can.
-    let mut wire_rekeys: u32 = 0;
     // Position within the current intra-refresh wave (frames since the last IDR/wave start). Only
     // meaningful on a `caps().intra_refresh_recovery` encoder; the pump tags every wave-boundary AU
     // with `USER_FLAG_RECOVERY_POINT` so the client can lift its post-loss freeze on a clean
@@ -2808,6 +2813,11 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 // `interval` was built as 1/effective_hz, so the round-trip recovers the integer
                 // rate.
                 let hz = interval_hz(interval);
+                // Time the rebuild: its few hundred ms of nothing straddles a client report
+                // window and reads as a collapsed link (§announce_pipeline_gap — the mode-switch
+                // and eviction rebuilds already announce; this one was the 08-22 ABR review's
+                // §2.2 hole).
+                let t_rebuild = std::time::Instant::now();
                 match crate::encode::open_video(
                     plan.codec,
                     frame.format,
@@ -2863,10 +2873,17 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         behind_score = 0;
                         depth_frames = 0;
                         ahead_run = 0;
+                        // The client must not score the rebuild's dead air as congestion.
+                        announce_pipeline_gap(&gap_tx, t_rebuild.elapsed().as_millis() as u32);
                     }
                     Err(e) => {
                         tracing::warn!(error = %format!("{e:#}"), to_kbps = new_kbps,
                             "bitrate-change encoder rebuild failed — keeping the current rate");
+                        // The control task already acked `new_kbps`; the encoder still runs the
+                        // old rate. Without this correction the client's controller, HUD and
+                        // climb base all track a rate that never existed (08-22 ABR review
+                        // §2.3 — the phantom-rate hole).
+                        let _ = retarget_tx.send(bitrate_kbps);
                     }
                 }
             }
@@ -3102,7 +3119,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                                  a host display disturbance"
                             );
                         }
-                    } else if wire_rekeys > 0 {
+                    } else if wire_rekeys.load(Ordering::Relaxed) > 0 {
                         // A deterministic NETWORK pathology, not a display one: this session's
                         // path dropped full-size video until the wire-MTU watcher re-keyed the
                         // shards, and a client re-asking through a black-holing hop is periodic
@@ -3111,7 +3128,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         // path before anyone chases display hardware.
                         tracing::warn!(
                             period_s = format!("{:.1}", period.as_secs_f64()),
-                            wire_rekeys,
+                            wire_rekeys = wire_rekeys.load(Ordering::Relaxed),
                             "client keyframe recoveries are METRONOMIC on a session whose wire \
                              MTU had to be re-keyed mid-stream — a constrained path (VPN/overlay \
                              adapter, lowered NIC MTU) black-holing full-size video is the prime \
