@@ -15,7 +15,7 @@ pub(super) struct ControlTask {
     pub(super) mode_slot: Arc<Mutex<Mode>>,
     pub(super) probe: Arc<Mutex<ProbeState>>,
     /// The latest host `BitrateChanged` ack, drained by the pump's ABR on its report tick.
-    pub(super) bitrate_ack: Arc<Mutex<Option<u32>>>,
+    pub(super) bitrate_ack: Arc<Mutex<std::collections::VecDeque<u32>>>,
     /// The live encoder-target mirror ([`NativeClient::current_bitrate_kbps`]): unlike the
     /// drain-once ack slot above, this one always holds the latest acked rate for stats HUDs.
     pub(super) live_bitrate: Arc<AtomicU32>,
@@ -200,7 +200,7 @@ impl ControlTask {
                         if ack.bitrate_kbps > 0 {
                             live_bitrate.store(ack.bitrate_kbps, Ordering::Relaxed);
                         }
-                        *bitrate_ack.lock().unwrap() = Some(ack.bitrate_kbps);
+                        bitrate_ack.lock().unwrap().push_back(ack.bitrate_kbps);
                     } else if let Ok(gap) = crate::quic::PipelineGap::decode(&msg) {
                         // The host rebuilt its capture ring + encoder in place and nothing flowed
                         // while it did. Park it for the pump, which discards the report window in

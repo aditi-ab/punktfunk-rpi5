@@ -86,6 +86,10 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     let clock_rtt_ns = negotiated.clock_rtt_ns;
     let resolved_bitrate_kbps = negotiated.bitrate_kbps;
     let negotiated_codec = negotiated.codec;
+    // Session constants a mode switch does not change — the pump recomputes the stream-shape
+    // cap from them for the switched geometry (review §2.1).
+    let bit_depth = negotiated.bit_depth;
+    let chroma_format = negotiated.chroma_format;
     // What this session's mode + codec could plausibly use — the bound the ABR holds its
     // probe-measured link ceiling to. Computed here because this is where the Welcome-resolved
     // geometry lives; the data pump stays codec-agnostic.
@@ -164,9 +168,14 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         }
     });
 
-    // Adaptive bitrate ack slot: the control task parks the latest BitrateChanged here; the
-    // pump's controller drains it on its report tick (`take()` — an ack is consumed once).
-    let bitrate_ack: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    // Adaptive bitrate ack queue: the control task pushes every BitrateChanged; the pump's
+    // controller drains them in arrival order on its report tick. A QUEUE, not a latest-wins
+    // slot (review §2.4): a full resolve ack plus a corrective short retarget in the same
+    // 750 ms window used to collapse to whichever arrived last, and host-cap learning needs
+    // two CONSECUTIVE short acks — losing one delayed or prevented the cap and could
+    // reintroduce the encoder-overdrive sawtooth.
+    let bitrate_ack: Arc<Mutex<std::collections::VecDeque<u32>>> =
+        Arc::new(Mutex::new(std::collections::VecDeque::new()));
     // Decode-recovery keyframe asks (the ABR recovery signal): the control task counts every
     // outbound `CtrlRequest::Keyframe` — the one choke point all emitters funnel through — and
     // the pump drains the count per report window.
@@ -279,6 +288,8 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         bitrate_kbps,
         resolved_bitrate_kbps,
         negotiated_codec,
+        bit_depth,
+        chroma_format,
         stream_cap_kbps,
         refresh_hz,
         mode_slot: mode_slot_pump,
