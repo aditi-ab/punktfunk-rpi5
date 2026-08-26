@@ -2798,6 +2798,11 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 // `interval` was built as 1/effective_hz, so the round-trip recovers the integer
                 // rate.
                 let hz = interval_hz(interval);
+                // Timed for the `PipelineGap` below: the rebuild stalls capture for ~0.6 s,
+                // and a client that isn't told discards its starved windows as congestion
+                // (the 401 ms field case: slow start killed, minutes at ~15 Mbps on a clean
+                // link — review §2.2). The mode-switch and topology rebuilds already announce.
+                let rebuild_t0 = std::time::Instant::now();
                 match crate::encode::open_video(
                     plan.codec,
                     frame.format,
@@ -2853,10 +2858,24 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         behind_score = 0;
                         depth_frames = 0;
                         ahead_run = 0;
+                        // …and it must not feed the CLIENT's controller either: announce the
+                        // host-local gap so the starved window is discarded, exactly as a
+                        // mode-switch rebuild does (review §2.2 — this arm was the one rebuild
+                        // that never told the client).
+                        announce_pipeline_gap(
+                            &gap_tx,
+                            rebuild_t0.elapsed().as_millis().min(u32::MAX as u128) as u32,
+                        );
                     }
                     Err(e) => {
                         tracing::warn!(error = %format!("{e:#}"), to_kbps = new_kbps,
                             "bitrate-change encoder rebuild failed — keeping the current rate");
+                        // The control task acked the resolved rate BEFORE this apply — with
+                        // the rebuild failed, the client's controller now tracks a rate the
+                        // encoder never ran: its climb base, utilization and proven math all
+                        // drift from a phantom number (review §2.3). Snap it back, same
+                        // channel as the short-apply correction above.
+                        let _ = retarget_tx.send(bitrate_kbps);
                     }
                 }
             }
