@@ -525,13 +525,14 @@ fn idd_adaptive_enabled() -> bool {
 /// ADAPTIVE chunks — 16 packets at today's rates, coarsening to at most 64 (the GSO-segment
 /// cap) once the rate would otherwise skip every sub-floor sleep, so ≥1 Gbps frames still pace
 /// instead of collapsing into an unpaced blast (plan Phase 1.2). `burst_cap` `None` = auto:
-/// `max(128 KB, this AU's wire bytes / 4)`, so the burst stays a bounded fraction of a
-/// high-rate frame instead of swallowing it whole (plan Phase 1.3); `Some` =
-/// PUNKTFUNK_PACE_BURST_KB pinned an absolute cap. So a normal-bitrate frame (≤ cap) leaves in
-/// one immediate burst at ~0 added latency, while a genuine IDR / sustained-high-bitrate frame
-/// (≫ cap) still spreads — keeping the freeze fix exactly where it's needed (an unpaced
-/// line-rate burst overruns the kernel tx buffer → EAGAIN drop → under infinite GOP, a freeze
-/// until the next keyframe).
+/// 10 ms at the pace rate, clamped to [16 KiB, 256 KiB]
+/// ([`crate::send_pacing::auto_burst_bytes`], ABR overhaul RFC §2.1) — time-based so Wi-Fi
+/// bitrates get a burst their link can drain instead of the old gigabit-sized 128 KiB floor
+/// that swallowed every sub-LAN frame whole; `Some` = PUNKTFUNK_PACE_BURST_KB pinned an
+/// absolute cap. So a normal-bitrate frame (≤ cap) leaves in one immediate burst at ~0 added
+/// latency, while a genuine IDR / sustained-high-bitrate frame (≫ cap) still spreads —
+/// keeping the freeze fix exactly where it's needed (an unpaced line-rate burst overruns the
+/// kernel tx buffer → EAGAIN drop → under infinite GOP, a freeze until the next keyframe).
 ///
 /// `pace_rate_bps` (latency plan T1.2; resume-safe form, stall program T2): the caller passes
 /// ~3× the live encoder bitrate — a rate the link is proven to carry sustained — and the
@@ -552,11 +553,19 @@ fn paced_submit(
     deadline: std::time::Instant,
     burst_cap: Option<usize>,
     pace_rate_bps: u64,
+    max_spread: std::time::Duration,
 ) -> Result<PaceStat> {
     let wires = session
         .seal_frame_at(data, pts_ns, flags, frame_index)
         .map_err(|e| anyhow!("seal_frame: {e:?}"))?;
-    pace_sealed(session, wires, deadline, burst_cap, pace_rate_bps)
+    pace_sealed(
+        session,
+        wires,
+        deadline,
+        burst_cap,
+        pace_rate_bps,
+        max_spread,
+    )
 }
 
 /// The pace-and-send half of [`paced_submit`], for wires that are ALREADY sealed — shared with
@@ -568,12 +577,14 @@ fn pace_sealed(
     deadline: std::time::Instant,
     burst_cap: Option<usize>,
     pace_rate_bps: u64,
+    max_spread: std::time::Duration,
 ) -> Result<PaceStat> {
     let mut refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
     // FEC/recovery test knob (PUNKTFUNK_VIDEO_DROP) — same knob the GameStream plane honors.
     crate::send_pacing::inject_video_drop(&mut refs);
     let wire_bytes: usize = refs.iter().map(|p| p.len()).sum();
-    let burst_bytes = burst_cap.unwrap_or_else(|| (wire_bytes / 4).max(128 * 1024));
+    let burst_bytes = burst_cap
+        .unwrap_or_else(|| crate::send_pacing::auto_burst_bytes(pace_rate_bps, wire_bytes));
     let cfg = crate::send_pacing::PaceCfg {
         burst_bytes: Some(burst_bytes),
         chunk: crate::send_pacing::ChunkPolicy::Adaptive { base: 16, max: 64 },
@@ -583,9 +594,12 @@ fn pace_sealed(
     // `pace_rate_bps` IS the budget — the deadline no longer under-cuts it, so an oversized
     // frame (a stall-resume scene delta, a cold IDR) paces at the proven 3× rate instead of
     // collapsing into a line-rate blast that overruns the socket buffer and loses the very
-    // frame that ends a freeze. See `send_pacing::native_budget` for the full argument.
+    // frame that ends a freeze — bounded by `max_spread` (~2 frame intervals, RFC §2.2) so
+    // the spread can't back the encode|send channel up into `cadence_degraded`. See
+    // `send_pacing::native_budget` for the full argument.
     let overflow_bytes = wire_bytes.saturating_sub(burst_bytes) as u64;
-    let budget = crate::send_pacing::native_budget(deadline, pace_rate_bps, overflow_bytes);
+    let budget =
+        crate::send_pacing::native_budget(deadline, pace_rate_bps, overflow_bytes, max_spread);
     // Time the socket handoff per chunk and fold it into the session's SealPerf split — the
     // sleeps between chunks stay excluded, so sock_ns is pure send_gso/sendmmsg time.
     let mut sock_ns = 0u64;
@@ -682,6 +696,12 @@ struct StreamedOpen {
     au: punktfunk_core::packet::StreamedAu,
     spread_us: u32,
     paced: bool,
+    /// The AU's remaining unpaced allowance (ABR overhaul RFC §2.3): ONE microburst budget
+    /// per AU, consumed across its block flushes. The old shape passed the auto rule per
+    /// flush, granting every block its own fresh 128 KiB — a streamed AU's burst multiplied
+    /// by its block count. `None` = legacy per-flush behavior (PUNKTFUNK_PACE_FACTOR=0 with
+    /// no PUNKTFUNK_PACE_BURST_KB pin — pacing off).
+    burst_left: Option<usize>,
 }
 
 /// Feed one [`ChunkMsg`] through the streamed sealer: open at `first`, seal + pace every FEC
@@ -695,6 +715,7 @@ fn handle_chunk(
     slice_wire: bool,
     burst_cap: Option<usize>,
     pace_rate_bps: u64,
+    max_spread: std::time::Duration,
 ) -> Result<Option<(FrameMsg, PaceStat)>> {
     if c.first {
         if open.take().is_some() {
@@ -721,6 +742,16 @@ fn handle_chunk(
                 .map_err(|e| anyhow!("begin_streamed_frame: {e:?}"))?,
             spread_us: 0,
             paced: false,
+            // The AU's whole-life burst budget (RFC §2.3). The AU's total size is unknown at
+            // open, but the auto rule is time-at-pace-rate and doesn't need it.
+            burst_left: if pace_rate_bps == 0 && burst_cap.is_none() {
+                None
+            } else {
+                Some(
+                    burst_cap
+                        .unwrap_or_else(|| crate::send_pacing::auto_burst_bytes(pace_rate_bps, 0)),
+                )
+            },
         });
     }
     let Some(s) = open.as_mut() else {
@@ -735,7 +766,22 @@ fn handle_chunk(
         .seal_streamed_chunk(&mut s.au, &c.data, true)
         .map_err(|e| anyhow!("seal_streamed_chunk: {e:?}"))?;
     if !wires.is_empty() {
-        let stat = pace_sealed(session, wires, c.deadline, burst_cap, pace_rate_bps)?;
+        // Consume the AU budget by the flush's full wire size — even the part that was paced,
+        // not burst. Over-counting only makes LATER blocks pace sooner, which is the safe
+        // direction, and it keeps the accounting a subtraction instead of a round trip
+        // through the pacer's burst/overflow split.
+        let flush_bytes: usize = wires.iter().map(|w| w.len()).sum();
+        let stat = pace_sealed(
+            session,
+            wires,
+            c.deadline,
+            s.burst_left.or(burst_cap),
+            pace_rate_bps,
+            max_spread,
+        )?;
+        if let Some(left) = s.burst_left.as_mut() {
+            *left = left.saturating_sub(flush_bytes);
+        }
         s.spread_us = s.spread_us.saturating_add(stat.spread_us);
         s.paced |= stat.paced;
     }
@@ -746,7 +792,14 @@ fn handle_chunk(
     let tail = session
         .seal_streamed_finish(s.au)
         .map_err(|e| anyhow!("seal_streamed_finish: {e:?}"))?;
-    let stat = pace_sealed(session, tail, c.deadline, burst_cap, pace_rate_bps)?;
+    let stat = pace_sealed(
+        session,
+        tail,
+        c.deadline,
+        s.burst_left.or(burst_cap),
+        pace_rate_bps,
+        max_spread,
+    )?;
     Ok(Some((
         FrameMsg {
             data: Vec::new(), // already on the wire — accounting only
@@ -921,6 +974,16 @@ fn send_loop(
                 let pace_rate = (stats.bitrate_kbps.load(Ordering::Relaxed) as f64
                     * 1000.0
                     * pace_factor) as u64;
+                // RFC §2.2: one frame's paced spread is bounded to ~2 frame intervals so a
+                // big IDR can't back the encode|send channel up into `cadence_degraded`
+                // (which refuses every climb). The live refresh rides `stats.mode` (reconfigs
+                // republish it); 0 (not yet known) = the absolute ceiling alone.
+                let (_, _, hz) = unpack_mode(stats.mode.load(Ordering::Relaxed));
+                let max_spread = if hz > 0 {
+                    std::time::Duration::from_secs_f64(2.0 / hz as f64)
+                } else {
+                    crate::send_pacing::MAX_PACE_SPREAD
+                };
                 // `Ok(Some(..))` = an AU fully left the socket (a whole frame, or a streamed
                 // AU's last chunk) — run the per-AU accounting; `Ok(None)` = mid-AU chunk.
                 let outcome = match send_msg {
@@ -933,6 +996,7 @@ fn send_loop(
                         msg.deadline,
                         burst_cap,
                         pace_rate,
+                        max_spread,
                     )
                     .map(|stat| Some((msg, stat))),
                     SendMsg::Chunk(c) => handle_chunk(
@@ -942,6 +1006,7 @@ fn send_loop(
                         slice_wire,
                         burst_cap,
                         pace_rate,
+                        max_spread,
                     ),
                 };
                 match outcome {
@@ -2096,9 +2161,10 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
 
     let perf = pf_host_config::config().perf;
     // Microburst cap (applied in send_loop/paced_submit): a frame ≤ the cap bursts out
-    // immediately; only a bigger frame's overflow is spread. `None` = auto — max(128 KB, the
-    // AU's wire bytes / 4), so the burst stays a bounded fraction of high-rate frames instead
-    // of swallowing them whole (plan Phase 1.3). PUNKTFUNK_PACE_BURST_KB pins an absolute cap.
+    // immediately; only a bigger frame's overflow is spread. `None` = auto — 10 ms at the
+    // pace rate, clamped to [16 KiB, 256 KiB] (`send_pacing::auto_burst_bytes`, RFC §2.1) so
+    // Wi-Fi links get a burst they can drain instead of the old gigabit-sized 128 KiB floor.
+    // PUNKTFUNK_PACE_BURST_KB pins an absolute cap.
     let burst_cap: Option<usize> = std::env::var("PUNKTFUNK_PACE_BURST_KB")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
