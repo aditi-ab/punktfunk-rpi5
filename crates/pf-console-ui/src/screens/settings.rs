@@ -649,9 +649,7 @@ impl SettingsScreen {
                     None
                 }
                 MenuEvent::Move(MenuDir::Left) | MenuEvent::JumpBack => self.switch_tab(-1, ctx),
-                MenuEvent::Move(MenuDir::Right) | MenuEvent::JumpForward => {
-                    self.switch_tab(1, ctx)
-                }
+                MenuEvent::Move(MenuDir::Right) | MenuEvent::JumpForward => self.switch_tab(1, ctx),
                 MenuEvent::Move(MenuDir::Down) | MenuEvent::Confirm => {
                     self.strip_focus = false;
                     Some(MenuPulse::Move)

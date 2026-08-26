@@ -2174,8 +2174,8 @@ fn await_created(
 #[cfg(test)]
 mod tests {
     use super::{
-        mode_satisfies, modes_from_json, monitors_from_kscreen_json, pick_custom_mode, union_restore,
-        KModeRow, MANAGED_PREFIX,
+        mode_satisfies, modes_from_json, monitors_from_kscreen_json, pick_custom_mode,
+        union_restore, KModeRow, MANAGED_PREFIX,
     };
 
     /// The field failure the union guards: KWin's stored setup for the with-us monitor set
