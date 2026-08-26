@@ -180,7 +180,7 @@ pub fn absolute_anchor() -> Option<AbsoluteAnchor> {
 /// A `RwLock` rather than an env var, for the reason [`ABSOLUTE_ANCHOR`] already gives: the injector
 /// is host-lifetime and lives behind a channel, so a *session* can only reach it through process
 /// state — and typed, lock-guarded process state beats `set_var`. This slot IS the backend-select
-/// that doc pointed at as the last holdout. It was a `std::env::set_var` in
+/// that doc pointed at as the last holdout. It was a process-environment write in
 /// `pf_vdisplay::apply_input_env` read back here by `getenv`, and [`default_backend`] runs once per
 /// input batch on the injector service thread: a `getenv` on a hot path racing a per-session
 /// `setenv` is the `environ` data race, on a live streaming host, with no attacker needed
