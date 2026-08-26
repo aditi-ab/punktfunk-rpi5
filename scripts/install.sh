@@ -283,7 +283,7 @@ REPO
 CMD
 )"
             [ "$group" = fedora-44 ] || run "sudo sed -i 's|/rpm/fedora-44|/rpm/$group|' /etc/yum.repos.d/punktfunk.repo"
-            run 'sudo dnf install punktfunk'
+            run 'sudo dnf install punktfunk punktfunk-web punktfunk-scripting'
             ;;
         sysext)
             install_line='sudo bash punktfunk-sysext.sh install'

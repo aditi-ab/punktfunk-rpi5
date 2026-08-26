@@ -187,6 +187,24 @@ ffmpeg -hide_banner -encoders | grep nvenc   # expect hevc_nvenc / av1_nvenc / h
 
 The same applies on a layered Bazzite / Fedora Atomic install; the sysext image carries its own.
 
+## `systemctl --user status punktfunk-web`: unit not found
+
+The web console is its own package, and the `punktfunk` RPM only *recommends* it
+(`Recommends: punktfunk-web`) — a box with `install_weak_deps=False` in `/etc/dnf/dnf.conf`, a
+`--setopt=install_weak_deps=0` install, or an `rpm-ostree` layering that drops weak deps gets the
+host with no console and no unit to enable. Install it by name:
+
+```sh
+rpm -q punktfunk-web || sudo dnf install punktfunk-web punktfunk-scripting
+systemctl --user enable --now punktfunk-web
+journalctl --user -u punktfunk-web-init | sed -n 's/.*password generated: //p'
+```
+
+`No match for argument` instead means the repo you're on has no console: **COPR** builds host and
+client only (its mock chroot has no `bun`). Use the RPM registry —
+[Fedora](/docs/fedora#2-install-the-host), step 2. The same weak-dep miss happens on Debian/Ubuntu
+after an `apt install --no-install-recommends`; the fix is `sudo apt install punktfunk-web`.
+
 ## pacman: error: could not register 'punktfunk' database (database already registered)
 
 The repo block got appended to `/etc/pacman.conf` twice — the add line is an append, so running it

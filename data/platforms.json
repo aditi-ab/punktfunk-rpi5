@@ -117,7 +117,7 @@
         "gpgkey=https://git.unom.io/api/packages/unom/rpm/repository.key",
         "       https://git.unom.io/api/packages/unom/generic/punktfunk-keys/1/RPM-GPG-KEY-punktfunk",
         "REPO",
-        "sudo dnf install punktfunk"
+        "sudo dnf install punktfunk punktfunk-web punktfunk-scripting"
       ]
     },
     {
