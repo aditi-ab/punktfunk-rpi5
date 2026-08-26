@@ -194,7 +194,29 @@
 // only in the struct from here on — appended behind its `struct_size` guard, zero meaning
 // unspecified/auto — so they stop being ABI events at all. Client-local; [`WIRE_VERSION`] is
 // unchanged.
-#define PUNKTFUNK_ABI_VERSION 26
+//
+// **v27** closes the two C-ABI gaps of the as-is Steam Controller 2 passthrough
+// (`PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2`), whose Rust internals both directions already carried:
+// `punktfunk_connection_send_hid_report` sends one raw captured report up as
+// `RichInput::HidReport` (`[0xCC][0x04]`, the clamp rules shared verbatim with the Android JNI
+// shim), and `punktfunk_connection_next_hidout` now SURFACES `HidOutput::HidRaw` (`[0xCD][0x05]`
+// — Steam's hidraw write to the host's virtual SC2) instead of skipping it as NoFrame: a new
+// `PUNKTFUNK_HIDOUT_HID_RAW` kind with the report in a `hid_kind`/`raw_len`/`raw[64]` tail
+// appended to `PunktfunkHidOutput`.
+//
+// ⚠ WIDENED, not just added — the first deliberate widening this surface has made, and the
+// v18/v24 rule ("growing one in place breaks every out-of-tree embedder at once") is why it is
+// spelled out here rather than slipped in. `PunktfunkHidOutput` grows 19 → 85 bytes (the
+// pre-v27 prefix layout is byte-identical; the tail is appended), so a binary built against a
+// v26 header passes a 19-byte out-slot that a v27 core would overrun. The version equality check IS the
+// guard: `punktfunk_abi_version()` mismatch has always meant "incompatible core", and every
+// in-tree embedder (the Apple xcframework, whose header and dylib build together) recompiles
+// against the regenerated header. A second struct + second pull symbol was considered and
+// rejected: the hidout plane has ONE puller by contract, and forking its drain loop across two
+// symbols so one of them could stay 19 bytes would push the fork into every embedder forever,
+// for a struct only poll-written by the core into caller memory. No wire change — both datagram
+// forms shipped with the passthrough itself — so [`WIRE_VERSION`] is unchanged.
+#define PUNKTFUNK_ABI_VERSION 27
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -225,6 +247,16 @@
 // (headphone/speaker/mic volumes + routing) with `effect_len = 6`. Forwarded change-only.
 #define PUNKTFUNK_HIDOUT_AUDIO_CTL 5
 
+// `PunktfunkHidOutput::kind` — a raw report the host's hidraw consumer (Steam) wrote to an
+// as-is passthrough pad (`HidOutput::HidRaw`, the reverse of
+// [`punktfunk_connection_send_hid_report`]): `hid_kind` (`PUNKTFUNK_HID_RAW_OUTPUT` /
+// `PUNKTFUNK_HID_RAW_FEATURE`) + `raw`/`raw_len` valid. Replay it verbatim on the physical
+// device — an OUTPUT report on the interrupt-OUT endpoint / per-report GATT characteristic
+// (Triton rumble `0x80`, haptic pulse `0x81`, …), a FEATURE report as `SET_REPORT` / a GATT
+// feature write (lizard mode, IMU enable). Only an as-is passthrough session
+// (`PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2`) emits these; clients without such a capture drop them.
+#define PUNKTFUNK_HIDOUT_HID_RAW 6
+
 // Capacity of `PunktfunkHidOutput::effect` (the DualSense trigger parameter block).
 #define PUNKTFUNK_HID_EFFECT_MAX 11
 
@@ -239,6 +271,13 @@
 // it today; *sending* it from a C client needs the size-prefixed `PunktfunkRichInputEx` +
 // `punktfunk_connection_send_rich_input2` (added with client capture).
 #define PUNKTFUNK_RICH_TOUCHPAD_EX 3
+
+// `RichInput::HidReport` kind on the wire (`[0xCC][0x04][pad][len][data…]`) — one raw HID input
+// report from a client-captured controller, forwarded verbatim for the host's as-is virtual pad
+// (the Steam Controller 2 passthrough, `PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2`). A C client sends it
+// through [`punktfunk_connection_send_hid_report`], never by building the datagram itself; the
+// constant exists so client-side tests can pin the wire byte against this header.
+#define PUNKTFUNK_RICH_HID_REPORT 4
 
 // [`PunktfunkPenSample::state`] bit: the pen hovers in range (implied by `TOUCHING`).
 #define PUNKTFUNK_PEN_IN_RANGE 1
@@ -2402,10 +2441,12 @@ typedef struct {
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// One DualSense HID-output feedback event a game wrote to the host's virtual pad
+// One HID-output feedback event a game wrote to the host's virtual pad
 // ([`punktfunk_connection_next_hidout`]). `kind` selects which fields are meaningful — replay it
-// on a real DualSense (lightbar color, player LEDs, or an adaptive-trigger effect via the
-// platform's `GCDualSenseAdaptiveTrigger`-style API).
+// on the real controller: DualSense feedback (lightbar color, player LEDs, an adaptive-trigger
+// effect via the platform's `GCDualSenseAdaptiveTrigger`-style API), or — on an as-is Steam
+// Controller 2 passthrough session — a raw report to forward verbatim
+// (`PUNKTFUNK_HIDOUT_HID_RAW`).
 typedef struct {
     // One of `PUNKTFUNK_HIDOUT_*`.
     uint8_t kind;
@@ -2428,6 +2469,17 @@ typedef struct {
     // exported precisely so embedders can size their own buffers against it, and it declaring one
     // number while the struct it describes hardcoded another was the whole hazard.
     uint8_t effect[PUNKTFUNK_HID_EFFECT_MAX];
+    // HidRaw: `PUNKTFUNK_HID_RAW_OUTPUT` (an OUTPUT report — a hidraw `write()`) or
+    // `PUNKTFUNK_HID_RAW_FEATURE` (a FEATURE report — `SET_REPORT`). Distinct from `kind`,
+    // which says this event IS a raw report; this says which device channel replays it.
+    uint8_t hid_kind;
+    // HidRaw: number of valid bytes in `raw` (≤ `PUNKTFUNK_HID_REPORT_MAX`).
+    uint8_t raw_len;
+    // HidRaw: the full report, id byte first — exactly what the host's hidraw consumer wrote
+    // (Steam writes feature frames whole, so trailing zero-padding is normal; OUTPUT frames
+    // arrive host-trimmed to the declared report length on current hosts). Sized off
+    // [`HID_REPORT_MAX`](crate::quic::HID_REPORT_MAX), the wire bound for the same bytes.
+    uint8_t raw[PUNKTFUNK_HID_REPORT_MAX];
 } PunktfunkHidOutput;
 #endif
 
@@ -3714,11 +3766,12 @@ PunktfunkStatus punktfunk_connection_set_rumble_quirks(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Pull the next DualSense HID-output feedback event (lightbar / player LEDs / adaptive trigger)
-// the host's virtual pad received from a game, into `*out`. [`PunktfunkStatus::NoFrame`] on
-// timeout, [`PunktfunkStatus::Closed`] once the session ended. Only the DualSense host backend
-// emits these. Same threading rules as [`punktfunk_connection_next_rumble`] (one puller, may run
-// alongside the other planes).
+// Pull the next HID-output feedback event the host's virtual pad received from a game
+// (DualSense lightbar / player LEDs / adaptive trigger — or, on an as-is Steam Controller 2
+// passthrough session, a raw `PUNKTFUNK_HIDOUT_HID_RAW` report to replay verbatim), into
+// `*out`. [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once the session
+// ended. Only the DualSense and SC2 host backends emit these. Same threading rules as
+// [`punktfunk_connection_next_rumble`] (one puller, may run alongside the other planes).
 //
 // # Safety
 // `c` is a valid connection handle; `out` is writable for one `PunktfunkHidOutput`.
@@ -3902,6 +3955,25 @@ PunktfunkStatus punktfunk_connection_send_rich_input(PunktfunkConnection *c,
 // `struct_size` bytes.
 PunktfunkStatus punktfunk_connection_send_rich_input2(PunktfunkConnection *c,
                                                       const PunktfunkRichInputEx *rich);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Send one raw HID input report from a client-captured controller — the as-is Steam Controller 2
+// passthrough's up direction (`[0xCC][0x04]` on the wire, [`RichInput::HidReport`](crate::quic::RichInput))
+// — as a QUIC datagram (non-blocking enqueue). `data[..len]` is the report exactly as the device
+// produced it on its interrupt endpoint / GATT notify, id byte first (`0x42`/`0x45`/`0x47` state,
+// `0x43` battery, …); `len` is clamped to `PUNKTFUNK_HID_REPORT_MAX` and `pad` masked into the
+// 16-pad wire space. Best-effort/lossy by design — state reports are idempotent snapshots at the
+// device's own rate, so a lost datagram self-heals on the next one. A no-op unless the pad
+// declared `PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2` and the host runs the as-is backend.
+// [`PunktfunkStatus::InvalidArg`] on an empty report.
+//
+// # Safety
+// `c` is a valid connection handle; `data` points to `len` readable bytes.
+PunktfunkStatus punktfunk_connection_send_hid_report(PunktfunkConnection *c,
+                                                     uint8_t pad,
+                                                     const uint8_t *data,
+                                                     uintptr_t len);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

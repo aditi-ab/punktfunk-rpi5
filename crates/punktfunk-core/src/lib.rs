@@ -265,7 +265,29 @@ pub use stats::Stats;
 /// only in the struct from here on — appended behind its `struct_size` guard, zero meaning
 /// unspecified/auto — so they stop being ABI events at all. Client-local; [`WIRE_VERSION`] is
 /// unchanged.
-pub const ABI_VERSION: u32 = 26;
+///
+/// **v27** closes the two C-ABI gaps of the as-is Steam Controller 2 passthrough
+/// (`PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2`), whose Rust internals both directions already carried:
+/// `punktfunk_connection_send_hid_report` sends one raw captured report up as
+/// `RichInput::HidReport` (`[0xCC][0x04]`, the clamp rules shared verbatim with the Android JNI
+/// shim), and `punktfunk_connection_next_hidout` now SURFACES `HidOutput::HidRaw` (`[0xCD][0x05]`
+/// — Steam's hidraw write to the host's virtual SC2) instead of skipping it as NoFrame: a new
+/// `PUNKTFUNK_HIDOUT_HID_RAW` kind with the report in a `hid_kind`/`raw_len`/`raw[64]` tail
+/// appended to `PunktfunkHidOutput`.
+///
+/// ⚠ WIDENED, not just added — the first deliberate widening this surface has made, and the
+/// v18/v24 rule ("growing one in place breaks every out-of-tree embedder at once") is why it is
+/// spelled out here rather than slipped in. `PunktfunkHidOutput` grows 19 → 85 bytes (the
+/// pre-v27 prefix layout is byte-identical; the tail is appended), so a binary built against a
+/// v26 header passes a 19-byte out-slot that a v27 core would overrun. The version equality check IS the
+/// guard: `punktfunk_abi_version()` mismatch has always meant "incompatible core", and every
+/// in-tree embedder (the Apple xcframework, whose header and dylib build together) recompiles
+/// against the regenerated header. A second struct + second pull symbol was considered and
+/// rejected: the hidout plane has ONE puller by contract, and forking its drain loop across two
+/// symbols so one of them could stay 19 bytes would push the fork into every embedder forever,
+/// for a struct only poll-written by the core into caller memory. No wire change — both datagram
+/// forms shipped with the passthrough itself — so [`WIRE_VERSION`] is unchanged.
+pub const ABI_VERSION: u32 = 27;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

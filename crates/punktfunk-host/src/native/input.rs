@@ -75,6 +75,14 @@ impl PadState {
 /// manager caps actual pad creation at its own MAX_PADS.
 const MAX_WIRE_PADS: usize = punktfunk_core::input::MAX_PADS;
 
+/// The Steam Controller 2 (Triton) backend for the running OS: the Linux UHID/usbip passthrough,
+/// or the Windows UMDF minidriver over the `pf_gamepad` shm channel (device-type 7). One alias so
+/// the SC2 sites below share a single spelling instead of a per-OS manager path at each.
+#[cfg(target_os = "linux")]
+type Sc2Manager = pf_inject::steam_controller2::Triton2Manager;
+#[cfg(target_os = "windows")]
+type Sc2Manager = pf_inject::triton_windows::TritonWindowsManager;
+
 /// Per-pad virtual-gamepad router: each pad index is served by a backend of that pad's declared
 /// kind ([`InputKind::GamepadArrival`](punktfunk_core::input::InputKind::GamepadArrival)), so ONE
 /// session can MIX controller types — pad 0 a DualSense, pad 1 an Xbox pad. A pad the client never
@@ -129,8 +137,8 @@ struct Pads {
     switchpro: Option<crate::inject::switch_pro::SwitchProManager>,
     #[cfg(target_os = "linux")]
     steamctrl: Option<crate::inject::steam_controller::SteamCtrlManager>,
-    #[cfg(target_os = "linux")]
-    steamctrl2: Option<crate::inject::steam_controller2::Triton2Manager>,
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    steamctrl2: Option<Sc2Manager>,
     #[cfg(target_os = "linux")]
     steamctrl2_puck: Option<crate::inject::steam_controller2::Triton2Manager>,
     #[cfg(target_os = "windows")]
@@ -187,7 +195,7 @@ impl Pads {
             switchpro: None,
             #[cfg(target_os = "linux")]
             steamctrl: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             steamctrl2: None,
             #[cfg(target_os = "linux")]
             steamctrl2_puck: None,
@@ -344,10 +352,10 @@ impl Pads {
                 .steamctrl
                 .get_or_insert_with(crate::inject::steam_controller::SteamCtrlManager::new)
                 .handle(ev),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             GamepadPref::SteamController2 => self
                 .steamctrl2
-                .get_or_insert_with(crate::inject::steam_controller2::Triton2Manager::new)
+                .get_or_insert_with(Sc2Manager::new)
                 .handle(ev),
             #[cfg(target_os = "linux")]
             GamepadPref::SteamController2Puck => self
@@ -488,7 +496,7 @@ impl Pads {
                     m.apply_rich(rich)
                 }
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             GamepadPref::SteamController2 => {
                 if let Some(m) = &mut self.steamctrl2 {
                     m.apply_rich(rich)
@@ -532,8 +540,12 @@ impl Pads {
     /// cadence so PC-generated trackpad pulses do not sit for up to 4 ms and then arrive at the
     /// client in bursts. Other backends keep the lower-frequency poll to avoid idle churn.
     fn feedback_poll_interval(&self) -> std::time::Duration {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        let sc2_active = self.steamctrl2.is_some();
         #[cfg(target_os = "linux")]
-        if self.steamctrl2.is_some() || self.steamctrl2_puck.is_some() {
+        let sc2_active = sc2_active || self.steamctrl2_puck.is_some();
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if sc2_active {
             return std::time::Duration::from_millis(1);
         }
         std::time::Duration::from_millis(4)
@@ -602,12 +614,15 @@ impl Pads {
             if let Some(m) = &mut self.steamctrl {
                 m.pump(&mut rumble, &mut hidout);
             }
-            if let Some(m) = &mut self.steamctrl2 {
-                m.pump(&mut rumble, &mut hidout);
-            }
             if let Some(m) = &mut self.steamctrl2_puck {
                 m.pump(&mut rumble, &mut hidout);
             }
+        }
+        // SC2 (Triton) exists on both OSes (see `Sc2Manager`), so its pump sits outside the
+        // per-OS blocks — one call serves the Linux UHID/usbip leg and the Windows UMDF leg.
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if let Some(m) = &mut self.steamctrl2 {
+            m.pump(&mut rumble, &mut hidout);
         }
         #[cfg(target_os = "windows")]
         {
@@ -665,9 +680,12 @@ impl Pads {
             if let Some(m) = &mut self.steamctrl {
                 m.heartbeat(gap);
             }
-            if let Some(m) = &mut self.steamctrl2 {
-                m.heartbeat(gap);
-            }
+        }
+        // SC2 (Triton) exists on both OSes (see `Sc2Manager`), so its heartbeat sits outside
+        // the per-OS blocks — same 8 ms gap the blocks use.
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if let Some(m) = &mut self.steamctrl2 {
+            m.heartbeat(std::time::Duration::from_millis(8));
         }
         #[cfg(target_os = "windows")]
         {
