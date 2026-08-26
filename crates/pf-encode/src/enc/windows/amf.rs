@@ -2687,6 +2687,72 @@ mod tests {
         }
     }
 
+    /// Live `applied_bitrate_bps` readback (windows-amd-host-program §3.3): the typed
+    /// `GetProperty` vtable slot must return the rate the component actually accepted — before
+    /// the lazy open it is `None`, after the first submit it reads the open rate, and after a
+    /// dynamic retarget it reads the NEW rate. This is the whole ABR-ceiling feedback path on
+    /// AMD, and the vtable typing is the concentrated FFI risk — so prove it on real hardware.
+    /// Skips cleanly without the AMD runtime/GPU.
+    #[test]
+    fn amf_applied_bitrate_readback_live() {
+        if let Err(e) = try_factory() {
+            eprintln!("skipping: AMF runtime unavailable ({e})");
+            return;
+        }
+        let Some(device) = amd_d3d11_device() else {
+            eprintln!("skipping: no AMD adapter on this box");
+            return;
+        };
+        let (w, h, fps) = (640u32, 480u32, 60u32);
+        let tex = nv12_texture(&device, w, h);
+        let mut enc = AmfEncoder::open(
+            Codec::H265,
+            PixelFormat::Nv12,
+            w,
+            h,
+            fps,
+            2_000_000,
+            8,
+            ChromaFormat::Yuv420,
+        )
+        .expect("native AMF open");
+        assert_eq!(
+            enc.applied_bitrate_bps(),
+            None,
+            "no readback before the lazy open — the caller must keep the requested rate"
+        );
+        let frame = CapturedFrame {
+            width: w,
+            height: h,
+            pts_ns: 1,
+            format: PixelFormat::Nv12,
+            payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
+                texture: tex.clone(),
+                device: device.clone(),
+                pyro: None,
+            }),
+            cursor: None,
+        };
+        enc.submit(&frame).expect("submit");
+        let opened = enc.applied_bitrate_bps();
+        assert_eq!(
+            opened,
+            Some(2_000_000),
+            "post-open readback must be the accepted open rate"
+        );
+        assert!(
+            enc.reconfigure_bitrate(8_000_000),
+            "dynamic retarget declined on live hardware"
+        );
+        let retargeted = enc.applied_bitrate_bps();
+        assert_eq!(
+            retargeted,
+            Some(8_000_000),
+            "post-retarget readback must be the accepted NEW rate"
+        );
+        eprintln!("live AMF applied-bitrate readback: open {opened:?} -> retarget {retargeted:?}");
+    }
+
     /// Live native codec probe (design §4): on a box with the AMD runtime, AVC and HEVC must
     /// probe true (every VCN generation encodes both); AV1's answer is hardware truth (RDNA3+).
     #[test]
