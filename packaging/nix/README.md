@@ -525,6 +525,20 @@ the same way flatpak.yml's repo deploy does.
    publish to whatever won the race for the address. It gates the step alongside
    `NIX_CACHE_SIGNING_KEY`/`DEPLOY_HOST`: until it is set the publish skips with a warning.
    Re-keyscan and re-set it if unom-1's host key ever changes, or the deploy fails closed.
+
+   Key it **port-agnostically**, because `ssh` looks a host key up by the exact string it dialled
+   and `DEPLOY_PORT` is a secret nobody re-reads when re-keying — a plain entry silently fails to
+   match once the port is not 22, and the failure looks like a host-key error rather than a
+   formatting one. One line covers both forms:
+
+   ```
+   <DEPLOY_HOST>,[<DEPLOY_HOST>]:* ssh-ed25519 AAAA…
+   ```
+
+   Pin **ed25519 only**. Pinning every type `ssh-keyscan` prints lets a host offering just RSA
+   satisfy the check on an RSA line, so the weakest pinned key is the one that decides; one modern
+   key is both stronger and shorter. `DEPLOY_HOST` is unom-1's public IP (Hetzner, since the
+   2026-07-12 cutover off proxmox), so scan that address — not a private one from an SSH config.
 5. Push to `main` touching the flake. The publish step also writes the public key to
    `https://nix.unom.io/punktfunk-cache.pub`, so users can always check the docs against the cache.
 
