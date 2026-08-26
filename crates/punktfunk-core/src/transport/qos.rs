@@ -6,10 +6,13 @@
 //!
 //! [`set_media_qos`] DSCP-tags the latency-sensitive video/audio traffic (+ Linux `SO_PRIORITY`) so a
 //! QoS-aware path (Wi-Fi WMM access categories, a managed switch, a shaped uplink) can prioritize it
-//! over bulk flows. Mirrors what Apollo/Sunshine tag — DSCP **CS5** for video, **CS6** for audio. It
-//! is **opt-in** (`PUNKTFUNK_DSCP=1`, or [`set_dscp_default`] from an embedder — the Android client
-//! ties it to its experimental low-latency mode): DSCP can interact badly with some consumer
-//! ISPs/routers. On Windows a plain `IP_TOS` is silently stripped from the wire, so the marking
+//! over bulk flows. Mirrors what Apollo/Sunshine tag — DSCP **CS5** for video, **CS6** for audio.
+//! Default: **on toward private-network peers** (RFC1918 / ULA / link-local / loopback — ABR
+//! overhaul RFC §2.5), where the AP-side WMM mapping is a real airtime-priority win and the
+//! documented bleach/reject risk (some consumer ISPs/routers on the WAN path) cannot apply; off
+//! toward anything routable. `PUNKTFUNK_DSCP=1` forces it on everywhere, `=0` is the kill switch,
+//! and [`set_dscp_default`] (the Android low-latency tie-in) still forces it on regardless of the
+//! peer. On Windows a plain `IP_TOS` is silently stripped from the wire, so the marking
 //! goes through qWAVE flows instead (see [`super::qos_windows`]) — the caller holds the returned
 //! [`QosFlow`] guard for as long as the socket sends media.
 
@@ -69,27 +72,58 @@ impl MediaClass {
     }
 }
 
-/// Runtime default for DSCP marking when `PUNKTFUNK_DSCP` is unset (see [`set_dscp_default`]).
-/// Off unless an embedder opts in — on Wi-Fi, access points commonly map DSCP to WMM access
-/// categories (a real airtime-priority win), but wired paths rarely honour it and some bleach or
-/// reject marked packets, so it never turns on by itself.
+/// Embedder force-on for DSCP marking when `PUNKTFUNK_DSCP` is unset (see [`set_dscp_default`]).
+/// `false` (the default) is AUTO — marking toward private-network peers only, the RFC §2.5
+/// default; `true` marks toward every peer (the caller has judged its path, e.g. the Android
+/// low-latency mode over a VPN the address math can't recognize as local).
 static DSCP_DEFAULT: AtomicBool = AtomicBool::new(false);
 
-/// Opt in to (or back out of) DSCP marking for sockets created from now on. Must be called BEFORE
-/// connecting — the tag is applied at socket creation. The Android client ties this to its
-/// experimental low-latency mode; `PUNKTFUNK_DSCP` still overrides in either direction.
+/// Force DSCP marking on for sockets created from now on (or back to the private-peer AUTO
+/// default with `false`). Must be called BEFORE connecting — the tag is applied at socket
+/// creation. The Android client ties this to its experimental low-latency mode;
+/// `PUNKTFUNK_DSCP` still overrides in either direction.
 pub fn set_dscp_default(enabled: bool) {
     DSCP_DEFAULT.store(enabled, Ordering::Relaxed);
 }
 
-/// Whether DSCP/QoS marking is enabled: `PUNKTFUNK_DSCP` when set (`1`/`true`/`on` forces it on,
-/// `0`/`false`/`off` forces it off — e.g. to rule QoS out while debugging a flaky AP), else the
-/// [`set_dscp_default`] runtime default.
-pub(crate) fn dscp_enabled() -> bool {
-    match std::env::var("PUNKTFUNK_DSCP").as_deref() {
-        Ok("1") | Ok("true") | Ok("on") => true,
-        Ok("0") | Ok("false") | Ok("off") => false,
-        _ => DSCP_DEFAULT.load(Ordering::Relaxed),
+/// The DSCP decision (pure — unit-tested): the env override wins in either direction
+/// (`1`/`true`/`on` forces on everywhere, `0`/`false`/`off` is the kill switch — e.g. to rule
+/// QoS out while debugging a flaky AP); else the embedder's force-on; else AUTO — mark exactly
+/// when the peer is a private-network address.
+fn dscp_decision(env: Option<&str>, embedder_on: bool, peer_private: bool) -> bool {
+    match env {
+        Some("1") | Some("true") | Some("on") => true,
+        Some("0") | Some("false") | Some("off") => false,
+        _ => embedder_on || peer_private,
+    }
+}
+
+/// [`dscp_decision`] against the process env, the embedder default, and the socket's connected
+/// peer.
+pub(crate) fn dscp_enabled_for(peer: Option<std::net::SocketAddr>) -> bool {
+    dscp_decision(
+        std::env::var("PUNKTFUNK_DSCP").ok().as_deref(),
+        DSCP_DEFAULT.load(Ordering::Relaxed),
+        peer.is_some_and(|p| is_private_peer(&p)),
+    )
+}
+
+/// A peer address the local network owns: RFC1918 / link-local / loopback IPv4, and
+/// loopback / ULA (`fc00::/7`) / link-local (`fe80::/10`) IPv6, including v4-mapped forms.
+/// The DSCP bleach/reject risk lives on ISP paths — none of these ever cross one.
+fn is_private_peer(addr: &std::net::SocketAddr) -> bool {
+    fn v4(ip: std::net::Ipv4Addr) -> bool {
+        ip.is_private() || ip.is_loopback() || ip.is_link_local()
+    }
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => v4(ip),
+        std::net::IpAddr::V6(ip) => {
+            let seg0 = ip.segments()[0];
+            ip.is_loopback()
+                || (seg0 & 0xfe00) == 0xfc00
+                || (seg0 & 0xffc0) == 0xfe80
+                || ip.to_ipv4_mapped().is_some_and(v4)
+        }
     }
 }
 
@@ -104,16 +138,18 @@ pub struct QosFlow {
     _never: std::convert::Infallible,
 }
 
-/// Best-effort: tag `socket`'s outgoing packets for prioritized delivery of its media class. A no-op
-/// unless `PUNKTFUNK_DSCP=1`. Every step is best-effort (failures logged at debug, never fatal) — QoS
-/// is a nicety, not required for correctness.
+/// Best-effort: tag `socket`'s outgoing packets for prioritized delivery of its media class. A
+/// no-op toward a non-private peer unless forced (see [`dscp_decision`]). Every step is
+/// best-effort (failures logged at debug, never fatal) — QoS is a nicety, not required for
+/// correctness.
 ///
 /// The socket must already be `connect`ed (Windows derives the qWAVE flow from the connected
-/// 5-tuple). IPv4 only (all current media sockets bind `0.0.0.0`); a v6 socket simply isn't
-/// tagged. Returns the [`QosFlow`] guard on Windows — keep it alive with the socket; `None`
-/// elsewhere (the marking is a plain socket option) and whenever a step refused.
+/// 5-tuple; the private-peer default reads the same connected address). IPv4 only (all current
+/// media sockets bind `0.0.0.0`); a v6 socket simply isn't tagged. Returns the [`QosFlow`]
+/// guard on Windows — keep it alive with the socket; `None` elsewhere (the marking is a plain
+/// socket option) and whenever a step refused.
 pub fn set_media_qos(socket: &UdpSocket, class: MediaClass) -> Option<QosFlow> {
-    if !dscp_enabled() {
+    if !dscp_enabled_for(socket.peer_addr().ok()) {
         return None;
     }
     #[cfg(windows)]
@@ -166,10 +202,79 @@ mod tests {
     #[test]
     fn qos_and_buffer_growth_are_best_effort_and_never_panic() {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        // No PUNKTFUNK_DSCP in the test env → early return; must not panic regardless.
+        // Unconnected socket: no peer → no locality → the AUTO default stays off (and no
+        // PUNKTFUNK_DSCP in the test env); must not panic regardless.
         assert!(set_media_qos(&sock, MediaClass::Video).is_none());
         assert!(set_media_qos(&sock, MediaClass::Audio).is_none());
         grow_socket_buffers(&sock);
+    }
+
+    /// RFC §2.5: the default marks exactly the peers the local network owns — the env still
+    /// wins in either direction and the embedder hook still forces on (a VPN path the address
+    /// math can't recognize).
+    #[test]
+    fn dscp_defaults_on_for_private_peers_only() {
+        // The pure decision.
+        assert!(dscp_decision(Some("1"), false, false));
+        assert!(
+            !dscp_decision(Some("0"), true, true),
+            "the kill switch beats everything"
+        );
+        assert!(dscp_decision(None, true, false), "embedder force-on");
+        assert!(
+            dscp_decision(None, false, true),
+            "AUTO: a private peer marks"
+        );
+        assert!(
+            !dscp_decision(None, false, false),
+            "AUTO: a routable peer does not"
+        );
+
+        // The address classifier.
+        use std::net::SocketAddr;
+        for a in [
+            "192.168.1.20:47999",
+            "10.0.0.7:1",
+            "172.16.3.4:5",
+            "169.254.10.1:2",
+            "127.0.0.1:9",
+            "[fe80::1]:1",
+            "[fd12:3456::1]:1",
+            "[::1]:1",
+            "[::ffff:192.168.1.2]:1",
+        ] {
+            assert!(
+                is_private_peer(&a.parse::<SocketAddr>().unwrap()),
+                "{a} is local"
+            );
+        }
+        for a in [
+            "1.1.1.1:53",
+            "84.23.10.9:47999",
+            "172.32.0.1:1", // one past RFC1918's 172.16/12
+            "[2001:db8::1]:1",
+            "[::ffff:8.8.8.8]:1",
+        ] {
+            assert!(
+                !is_private_peer(&a.parse::<SocketAddr>().unwrap()),
+                "{a} is routable"
+            );
+        }
+    }
+
+    /// The AUTO path end to end: a CONNECTED loopback socket has a private peer, so the
+    /// default now marks it (the unconnected socket above stays unmarked — no peer).
+    #[test]
+    fn a_connected_loopback_socket_marks_by_default() {
+        let target = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.connect(target.local_addr().unwrap()).unwrap();
+        let _ = set_media_qos(&sock, MediaClass::Video);
+        #[cfg(target_os = "linux")]
+        {
+            let s = socket2::SockRef::from(&sock);
+            assert_eq!(s.tos_v4().unwrap(), 0xA0, "AUTO marked the private peer");
+        }
     }
 
     #[test]
