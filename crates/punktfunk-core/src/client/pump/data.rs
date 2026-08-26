@@ -40,6 +40,10 @@ pub(super) struct DataPump {
     /// The rate the host actually configured (echoed in Welcome).
     pub(super) resolved_bitrate_kbps: u32,
     pub(super) negotiated_codec: u8,
+    /// Session-negotiated depth/chroma (a mode switch changes geometry, not these) — inputs to
+    /// the stream-cap re-size when the accepted mode changes.
+    pub(super) negotiated_bit_depth: u8,
+    pub(super) negotiated_chroma: u8,
     /// What this session's mode + codec could plausibly use (see
     /// [`crate::abr::stream_ceiling_kbps`]) — the bound the probe-measured link ceiling is held
     /// to. Computed where the negotiated geometry lives, so this module stays codec-agnostic.
@@ -74,6 +78,8 @@ impl DataPump {
             bitrate_kbps,
             resolved_bitrate_kbps,
             negotiated_codec,
+            negotiated_bit_depth,
+            negotiated_chroma,
             stream_cap_kbps,
             refresh_hz,
             mode_slot: pump_mode_slot,
@@ -550,10 +556,24 @@ impl DataPump {
                 if mg != seen_mode_gen {
                     seen_mode_gen = mg;
                     abr.on_mode_switch();
-                    // The frame budget is a property of the MODE: a switch that changes the
-                    // refresh changes what one frame of encode time costs, and the encode
-                    // thresholds are sized in those.
-                    abr.set_frame_budget(pump_mode_slot.lock().unwrap().refresh_hz);
+                    // The frame budget and the stream-shape cap are properties of the MODE: a
+                    // switch that changes the refresh changes what one frame of encode time
+                    // costs, and a switch that changes the geometry changes what the stream
+                    // could plausibly use — without the rebind a 4K→720p switch kept a 4K-sized
+                    // climb ceiling for the rest of the session (08-22 ABR review §2.1).
+                    let (w, h, hz) = {
+                        let m = pump_mode_slot.lock().unwrap();
+                        (m.width, m.height, m.refresh_hz)
+                    };
+                    abr.set_frame_budget(hz);
+                    abr.rebind_stream_cap(crate::abr::stream_ceiling_kbps(
+                        w,
+                        h,
+                        hz,
+                        negotiated_codec,
+                        negotiated_bit_depth,
+                        negotiated_chroma,
+                    ));
                 }
                 if let Some(acked) = bitrate_ack.lock().unwrap().take() {
                     abr.on_ack(acked);
@@ -1070,6 +1090,8 @@ mod tests {
             bitrate_kbps: 20_000,
             resolved_bitrate_kbps: 20_000,
             negotiated_codec: crate::quic::CODEC_HEVC,
+            negotiated_bit_depth: 8,
+            negotiated_chroma: 0,
             stream_cap_kbps: 100_000,
             refresh_hz: 60,
             mode_slot: Arc::new(Mutex::new(crate::config::Mode {

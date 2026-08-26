@@ -558,6 +558,29 @@ impl BitrateController {
         self.stream_cap_kbps = Some(kbps);
     }
 
+    /// A MODE SWITCH re-teaches the stream cap — and unlike [`set_stream_cap`] at session
+    /// start, it also CLAMPS an already-learned ceiling down to the new shape: `set_ceiling` is
+    /// deliberately monotonic, so without this a 4K→720p switch keeps authorizing 4K-sized
+    /// climbs and only the reactive loss/decode signals rein them in (08-22 ABR review §2.1).
+    /// The current rate is untouched — descent stays the congestion signals' job — and an
+    /// up-switch only lifts the cap for FUTURE learning (the trimmed ceiling has no untrimmed
+    /// measurement to restore from; the §3.3 re-probe item owns that half).
+    pub(crate) fn rebind_stream_cap(&mut self, kbps: u32) {
+        self.stream_cap_kbps = Some(kbps);
+        if !self.enabled {
+            return;
+        }
+        let bound = kbps.min(self.ceiling_cap_kbps.unwrap_or(u32::MAX));
+        if self.ceiling_kbps > bound {
+            tracing::info!(
+                ceiling_kbps = self.ceiling_kbps,
+                bound_kbps = bound,
+                "adaptive bitrate: mode switch shrank the stream shape — climb ceiling clamped"
+            );
+            self.ceiling_kbps = bound;
+        }
+    }
+
     /// Teach the controller this session's refresh rate, so the encode thresholds can be sized in
     /// FRAME BUDGETS rather than the 120 Hz durations they were calibrated at (see
     /// [`ENCODE_RISE_US`]). Ignored for a nonsense rate — the defaults are the old behavior, which
@@ -1467,6 +1490,34 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         c.set_ceiling(10_000); // below the negotiated start → ignored
         assert_eq!(c.ceiling_kbps, 20_000);
+    }
+
+    /// A mode switch that shrinks the stream shape must also shrink an already-learned climb
+    /// ceiling — `set_ceiling` is monotonic, so before `rebind_stream_cap` a 4K→720p switch
+    /// kept authorizing 4K-sized climbs for the session (08-22 ABR review §2.1). An up-switch
+    /// lifts only the cap: with no untrimmed measurement stored, a higher ceiling would be
+    /// evidence-free (the §3.3 re-probe item owns that half). The negotiated-start ceiling
+    /// (nothing learned yet) stays clampable — the shape is real evidence, unlike the
+    /// below-start `set_ceiling` case the monotonic test pins.
+    #[test]
+    fn a_mode_switch_rebind_clamps_the_learned_ceiling_but_never_raises_it() {
+        let mut c = BitrateController::new(20_000);
+        c.set_stream_cap(400_000);
+        c.set_ceiling(300_000); // probe-learned, inside the 4K-ish shape
+        assert_eq!(c.ceiling_kbps, 300_000);
+        // Switch down: the 720p-ish shape must bind the learned ceiling immediately.
+        c.rebind_stream_cap(60_000);
+        assert_eq!(c.ceiling_kbps, 60_000, "down-switch clamps the ceiling");
+        // Switch back up: the cap lifts, but the ceiling holds — no measurement authorizes more.
+        c.rebind_stream_cap(400_000);
+        assert_eq!(c.ceiling_kbps, 60_000, "up-switch alone raises nothing");
+        // …until the next learned ceiling passes through the (now wider) funnel.
+        c.set_ceiling(300_000);
+        assert_eq!(c.ceiling_kbps, 300_000, "future learning uses the new cap");
+        // Disabled controller: the rebind records the cap and touches nothing else.
+        let mut d = BitrateController::new(0);
+        d.rebind_stream_cap(1);
+        assert_eq!(d.ceiling_kbps, 0);
     }
 
     /// The stream bound must cut the field runaway and must NOT touch a session anyone

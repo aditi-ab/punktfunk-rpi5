@@ -86,6 +86,10 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     let clock_rtt_ns = negotiated.clock_rtt_ns;
     let resolved_bitrate_kbps = negotiated.bitrate_kbps;
     let negotiated_codec = negotiated.codec;
+    // Depth/chroma are session-negotiated (a mode switch changes geometry, not these) — copied
+    // so the data pump can re-size the stream cap when the accepted mode changes (§2.1).
+    let negotiated_bit_depth = negotiated.bit_depth;
+    let negotiated_chroma = negotiated.chroma_format;
     // What this session's mode + codec could plausibly use — the bound the ABR holds its
     // probe-measured link ceiling to. Computed here because this is where the Welcome-resolved
     // geometry lives; the data pump stays codec-agnostic.
@@ -279,6 +283,8 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         bitrate_kbps,
         resolved_bitrate_kbps,
         negotiated_codec,
+        negotiated_bit_depth,
+        negotiated_chroma,
         stream_cap_kbps,
         refresh_hz,
         mode_slot: mode_slot_pump,
