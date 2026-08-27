@@ -74,6 +74,90 @@ pub(super) enum DecodeEvent {
     Error { fatal: bool },
 }
 
+/// The decoder bring-up rungs, in order, as `(present backend, aggressive low-latency keys)`.
+/// The backend is `Some(overlay)` for ASC with that reader-usage profile (see
+/// [`AscBackend::create`]'s `overlay` doc), `None` for the SurfaceView presenter. See the ladder's
+/// comment in [`run_async`] for why these axes, and why in this order.
+///
+/// Consecutive duplicates are collapsed: the `present_backend` sysprop and the low-latency toggle
+/// may each already have shed what a rung was going to shed, and re-running a configuration the
+/// codec just refused buys nothing but another failed `start`. The first rung is always exactly
+/// what the session asked for, so a device that works is never charged for this ladder.
+fn bring_up_rungs(asc_wanted: bool, low_latency: bool) -> Vec<(Option<bool>, bool)> {
+    let mut rungs = vec![
+        (asc_wanted.then_some(true), low_latency),
+        (asc_wanted.then_some(false), low_latency),
+        (None, low_latency),
+        (None, false),
+    ];
+    rungs.dedup();
+    rungs
+}
+
+/// Human label for a rung's present backend, for the retry / decoder-started log lines — the
+/// string a field log bundle is grepped for, so it names the reader profile, not just "ASC".
+fn backend_label(backend: Option<bool>) -> &'static str {
+    match backend {
+        Some(true) => "ASurfaceControl (overlay reader)",
+        Some(false) => "ASurfaceControl (GPU-composited reader)",
+        None => "SurfaceView",
+    }
+}
+
+/// Put `codec` into async-notify mode, forwarding every codec callback onto `ev_tx`.
+///
+/// Must run BEFORE `configure()`/`start()` so we're async from the first buffer, and once per
+/// bring-up rung — a codec that failed `start` is discarded, and its replacement needs its own
+/// registration. Each closure only *pushes an event*: no `AMediaCodec` call happens on the codec's
+/// looper thread, which is what keeps every buffer op on the decode thread that owns the codec.
+///
+/// `false` ⇒ the platform refused async mode; that is not something a simpler format or a
+/// different output surface can fix, so the caller gives up rather than trying the next rung.
+fn install_async_callbacks(codec: &mut MediaCodec, ev_tx: &mpsc::Sender<DecodeEvent>) -> bool {
+    let out_tx = ev_tx.clone();
+    let in_tx = ev_tx.clone();
+    let fmt_tx = ev_tx.clone();
+    let err_tx = ev_tx.clone();
+    let cb = AsyncNotifyCallback {
+        on_input_available: Some(Box::new(move |idx| {
+            let _ = in_tx.send(DecodeEvent::InputAvailable(idx));
+        })),
+        on_output_available: Some(Box::new(move |idx, info| {
+            let _ = out_tx.send(DecodeEvent::OutputAvailable {
+                index: idx,
+                pts_us: info.presentation_time_us().max(0) as u64,
+                // The `decoded` HUD point: stamp HERE, on the codec's looper thread, so the
+                // decode stage ends when the frame actually became available — not after the
+                // channel hop + whatever work the loop coalesces in front of presenting it.
+                decoded_ns: now_realtime_ns(),
+                // Its monotonic twin, from the same instant. The stats are REALTIME (they
+                // fold the host's clock offset in), while the cadence loop and
+                // `releaseOutputBufferAtTime` are both CLOCK_MONOTONIC — and the loop is fed
+                // and read in one domain, never converted (`punktfunk_core::phase`: a
+                // constant offset between domains is what its offset estimator absorbs).
+                decoded_mono_ns: now_monotonic_ns(),
+            });
+        })),
+        on_format_changed: Some(Box::new(move |_fmt| {
+            let _ = fmt_tx.send(DecodeEvent::FormatChanged);
+        })),
+        on_error: Some(Box::new(move |e, code, _detail| {
+            let fatal = !code.is_recoverable() && !code.is_transient();
+            if fatal {
+                log::error!("decode: fatal codec error — stream will stop: {e:?}");
+            } else {
+                log::warn!("decode: codec error {e:?} (recoverable)");
+            }
+            let _ = err_tx.send(DecodeEvent::Error { fatal });
+        })),
+    };
+    if let Err(e) = codec.set_async_notify_callback(Some(cb)) {
+        log::error!("decode: set_async_notify_callback failed: {e}");
+        return false;
+    }
+    true
+}
+
 /// The event-driven async decode loop (default; see [`run`]/[`USE_ASYNC_DECODE`]). The codec drives
 /// us: an async-notify callback fires the instant an input buffer frees or a frame finishes
 /// decoding, so a decoded frame is presented immediately instead of waiting out a poll interval (the
@@ -101,132 +185,177 @@ pub(super) fn run_async(
     boost_thread_priority();
     let mode = client.mode();
     let mime = codec_mime(client.codec);
-    let mut codec = match create_codec(mime, decoder_name.as_deref()) {
-        Some(c) => c,
-        None => {
-            log::error!("decode: no {mime} decoder on this device");
-            return;
+    // HDR static metadata (ST.2086 mastering + content light level): fetched ONCE, ahead of the
+    // bring-up ladder, so a retry rung never pays the wait again. MediaCodec wants it BEFORE
+    // configure(), and the host sends a 0xCE right after the handshake, so it's typically already
+    // queued; wait briefly otherwise. The Surface DataSpace (applied on FormatChanged below)
+    // carries transfer/primaries regardless — this adds the luminance the tone-mapper needs.
+    let hdr_static = if client.color.is_hdr() {
+        match client.next_hdr_meta(Duration::from_millis(250)) {
+            Ok(meta) => {
+                log::info!("decode: HDR static metadata applied (KEY_HDR_STATIC_INFO)");
+                Some(android_hdr_static_info(&meta))
+            }
+            Err(_) => {
+                log::info!("decode: HDR session but no mastering metadata yet — DataSpace only");
+                None
+            }
         }
+    } else {
+        None
     };
-    let codec_name = codec.name().unwrap_or_default();
-    stats.set_decoder(&codec_name, ll_feature);
-    log::info!(
-        "decode: codec mime = {mime}, decoder = {codec_name} (async, low-latency feature: {ll_feature})"
-    );
-
+    // Resolve the present intent once (shared by both backends).
+    let priority = PresentPriority::resolve(present_priority, smooth_buffer);
     // The event channel: the callbacks + feeder push, this loop pulls. `Sender` is `Send`, so the
     // callback closures (each capturing a clone) satisfy the async-notify `Send` bound.
     let (ev_tx, ev_rx) = mpsc::channel::<DecodeEvent>();
-    // Install the callbacks BEFORE configure()/start() so we're in async mode from the first buffer.
-    // Each just forwards an index/flag — no codec access here (the codec owns these closures).
-    {
-        let out_tx = ev_tx.clone();
-        let in_tx = ev_tx.clone();
-        let fmt_tx = ev_tx.clone();
-        let err_tx = ev_tx.clone();
-        let cb = AsyncNotifyCallback {
-            on_input_available: Some(Box::new(move |idx| {
-                let _ = in_tx.send(DecodeEvent::InputAvailable(idx));
-            })),
-            on_output_available: Some(Box::new(move |idx, info| {
-                let _ = out_tx.send(DecodeEvent::OutputAvailable {
-                    index: idx,
-                    pts_us: info.presentation_time_us().max(0) as u64,
-                    // The `decoded` HUD point: stamp HERE, on the codec's looper thread, so the
-                    // decode stage ends when the frame actually became available — not after the
-                    // channel hop + whatever work the loop coalesces in front of presenting it.
-                    decoded_ns: now_realtime_ns(),
-                    // Its monotonic twin, from the same instant. The stats are REALTIME (they
-                    // fold the host's clock offset in), while the cadence loop and
-                    // `releaseOutputBufferAtTime` are both CLOCK_MONOTONIC — and the loop is fed
-                    // and read in one domain, never converted (`punktfunk_core::phase`: a
-                    // constant offset between domains is what its offset estimator absorbs).
-                    decoded_mono_ns: now_monotonic_ns(),
-                });
-            })),
-            on_format_changed: Some(Box::new(move |_fmt| {
-                let _ = fmt_tx.send(DecodeEvent::FormatChanged);
-            })),
-            on_error: Some(Box::new(move |e, code, _detail| {
-                let fatal = !code.is_recoverable() && !code.is_transient();
-                if fatal {
-                    log::error!("decode: fatal codec error — stream will stop: {e:?}");
-                } else {
-                    log::warn!("decode: codec error {e:?} (recoverable)");
-                }
-                let _ = err_tx.send(DecodeEvent::Error { fatal });
-            })),
-        };
-        if let Err(e) = codec.set_async_notify_callback(Some(cb)) {
-            log::error!("decode: set_async_notify_callback failed: {e}");
-            return;
-        }
-    }
 
-    // Build the low-latency format (identical keys to the sync path).
-    let mut format = MediaFormat::new();
-    format.set_str("mime", mime);
-    format.set_i32("width", mode.width as i32);
-    format.set_i32("height", mode.height as i32);
-    format.set_i32(
-        "max-input-size",
-        (mode.width * mode.height).max(2_000_000) as i32,
-    );
-    configure_low_latency(&mut format, &codec_name, low_latency_mode);
-    if client.color.is_hdr() {
-        match client.next_hdr_meta(Duration::from_millis(250)) {
-            Ok(meta) => {
-                format.set_buffer("hdr-static-info", &android_hdr_static_info(&meta));
-                log::info!("decode: HDR static metadata applied (KEY_HDR_STATIC_INFO)");
-            }
-            Err(_) => {
-                log::info!("decode: HDR session but no mastering metadata yet — DataSpace only")
-            }
-        }
-    }
-    // Resolve the present intent once (shared by both backends).
-    let priority = PresentPriority::resolve(present_priority, smooth_buffer);
-    // The present backend. ASurfaceControl (default) drives its own `AImageReader` output surface +
-    // compositor layer, scheduling against the panel's real present clock; the SurfaceView presenter
-    // below is the fallback for API < 29, an ASC init failure, or the `present_backend=surfaceview`
-    // sysprop. A non-null `asc` means the codec renders into the reader, not the SurfaceView window.
-    let mut asc = if asc_backend_selected() {
-        // The negotiated colour is authoritative (PQ vs HLG, range) — not a guess the codec's
-        // output format later corrects; many decoders never echo `color-transfer` at all.
-        let initial_ds = color_dataspace(&client.color);
-        AscBackend::create(
-            &window,
-            mode.width as i32,
-            mode.height as i32,
-            surface_size,
-            panel_hz,
-            initial_ds,
-            mode.refresh_hz,
-            priority,
-        )
-    } else {
+    // ── Decoder bring-up ladder ──────────────────────────────────────────────────────────────
+    // `configure()` can succeed and `start()` still fail: start is where the codec negotiates
+    // buffers with its output consumer and allocates them, so a decoder that accepted the format
+    // can still refuse the surface it has to render into. Observed on a Xiaomi Mi TV Stick
+    // (2026-08-27; Android 11, armeabi-v7a, `OMX.amlogic.hevc.decoder.awesome2`): EVERY session
+    // logged `start failed: ErrorUnknown` and returned, so this thread died before feeding a single
+    // AU while the pump kept receiving video — the frame queue filled, the pump jumped to live once
+    // per `FLUSH_COOLDOWN`, and the host read that perfect 2 s keyframe cadence as a client too
+    // slow to keep up. Audio, input and the library all kept working, so it presented to the user
+    // as a permanent black screen with sound, and to us as a decoder that was never even running.
+    //
+    // A codec that failed `start` is in an error state and cannot be reconfigured, so each rung
+    // builds a fresh one. The rungs shed what a start can choke on, most-suspect first:
+    //
+    //   1. The ASC reader's `COMPOSER_OVERLAY` usage. Start dequeues every codec output buffer
+    //      from the reader's window with OUR consumer usage OR'd into the decoder's own producer
+    //      bits, and overlay + GPU-sampled + vendor-vdec in one allocation is exactly what an old
+    //      OMX-era gralloc can refuse (see [`AscBackend::create`]'s `overlay` doc). The retry
+    //      keeps the whole ASC backend — real latches, real fences — and asks only for the
+    //      SurfaceTexture-shaped `GPU_SAMPLED_IMAGE` allocation every video path exercises;
+    //      SurfaceFlinger GPU-composites the layer instead of scanning it out. Usage is the ONLY
+    //      reader axis worth a rung: `READER_MAX_IMAGES` is not a start-time factor (consumer-side
+    //      images allocate lazily during streaming).
+    //   2. The `AImageReader` entirely — an app-side BufferQueue consumer at all is the residual
+    //      suspect (a vendor OMX component keying on queues-to-composer).
+    //   3. The aggressive low-latency key set.
+    //
+    // Every downstream branch here already keys off `asc.is_some()`, so a fallen-back session just
+    // runs the SurfaceView presenter that has always been the API < 29 / ASC-init-failure
+    // fallback — nothing below this block needs to know.
+    //
+    // The rung that wins is logged: on a device that needs one, that line names the real culprit,
+    // which no amount of host-side log reading could.
+    //
+    // ponytail: no ASC + plain-keys rung. If a field case ever shows the low-latency keys alone
+    // were at fault, that rung belongs between 2 and 3 — the ASC presenter is the better one and
+    // is worth keeping whenever it can start.
+    let asc_wanted = asc_backend_selected();
+    if !asc_wanted {
         log::info!("decode: present backend = SurfaceView (present_backend sysprop)");
-        None
+    }
+    let rungs = bring_up_rungs(asc_wanted, low_latency_mode);
+
+    let mut brought_up: Option<(MediaCodec, Option<AscBackend>)> = None;
+    for (rung, &(backend, aggressive)) in rungs.iter().enumerate() {
+        if rung > 0 {
+            log::warn!(
+                "decode: decoder refused that configuration — retrying through {} with aggressive \
+                 low-latency keys {}",
+                backend_label(backend),
+                if aggressive { "ON" } else { "OFF" }
+            );
+        }
+        let mut codec = match create_codec(mime, decoder_name.as_deref()) {
+            Some(c) => c,
+            None => {
+                log::error!("decode: no {mime} decoder on this device");
+                return;
+            }
+        };
+        // The decoder's *actual* resolved name (Kotlin's pick, or the platform default when it
+        // fell back) drives both the HUD label and which vendor low-latency keys apply.
+        let codec_name = codec.name().unwrap_or_default();
+        if rung == 0 {
+            stats.set_decoder(&codec_name, ll_feature);
+            log::info!(
+                "decode: codec mime = {mime}, decoder = {codec_name} (async, low-latency feature: {ll_feature})"
+            );
+        }
+        if !install_async_callbacks(&mut codec, &ev_tx) {
+            return; // the platform refused async mode outright — no rung changes that
+        }
+        // Build the low-latency format (identical keys to the sync path).
+        let mut format = MediaFormat::new();
+        format.set_str("mime", mime);
+        format.set_i32("width", mode.width as i32);
+        format.set_i32("height", mode.height as i32);
+        format.set_i32(
+            "max-input-size",
+            (mode.width * mode.height).max(2_000_000) as i32,
+        );
+        configure_low_latency(&mut format, &codec_name, aggressive);
+        if let Some(info) = hdr_static.as_ref() {
+            format.set_buffer("hdr-static-info", info);
+        }
+        // The present backend. ASurfaceControl (default) drives its own `AImageReader` output
+        // surface + compositor layer, scheduling against the panel's real present clock; the
+        // SurfaceView presenter below is the fallback for API < 29, an ASC init failure, the
+        // `present_backend=surfaceview` sysprop, or a rung that dropped it. A non-null `asc` means
+        // the codec renders into the reader, not the SurfaceView window.
+        let asc = if let Some(overlay) = backend {
+            // The negotiated colour is authoritative (PQ vs HLG, range) — not a guess the codec's
+            // output format later corrects; many decoders never echo `color-transfer` at all.
+            AscBackend::create(
+                &window,
+                mode.width as i32,
+                mode.height as i32,
+                surface_size.clone(),
+                panel_hz,
+                color_dataspace(&client.color),
+                mode.refresh_hz,
+                priority,
+                overlay,
+            )
+        } else {
+            None
+        };
+        // The decoder's output surface: the reader's window when ASC is active, else the SurfaceView.
+        let configure_window: &NativeWindow = asc.as_ref().map_or(&window, |a| a.reader_window());
+        if let Err(e) = codec.configure(
+            &format,
+            Some(configure_window),
+            MediaCodecDirection::Decoder,
+        ) {
+            log::error!("decode: configure failed: {e}");
+            continue;
+        }
+        if let Err(e) = codec.start() {
+            log::error!("decode: start failed: {e}");
+            continue;
+        }
+        log::info!(
+            "decode: decoder started (async) at {}x{} through {}",
+            mode.width,
+            mode.height,
+            // `asc.as_ref().and(backend)`, not `backend`: an ASC rung whose backend failed to
+            // CREATE fell back to the SurfaceView within the rung, and this line must report what
+            // actually runs.
+            backend_label(asc.as_ref().and(backend))
+        );
+        brought_up = Some((codec, asc));
+        break;
+    }
+    let Some((codec, mut asc)) = brought_up else {
+        // Every rung refused. Say so loudly and in the shape the next reporter can act on: the
+        // session stays up (audio/input/library all still work), so without this line the only
+        // symptom is a black screen and a keyframe request every 2 s that blames the network.
+        log::error!(
+            "decode: the {mime} decoder refused EVERY configuration — this session has no video. \
+             Audio and input keep working, so the stream will look alive while the screen stays \
+             black, and the host will see a keyframe recovery request every 2 s that is this, not \
+             a slow link. See the `configure failed` / `start failed` lines above for the reason \
+             each rung gave"
+        );
+        return;
     };
-    // The decoder's output surface: the reader's window when ASC is active, else the SurfaceView.
-    let configure_window: &NativeWindow = asc.as_ref().map_or(&window, |a| a.reader_window());
-    if let Err(e) = codec.configure(
-        &format,
-        Some(configure_window),
-        MediaCodecDirection::Decoder,
-    ) {
-        log::error!("decode: configure failed: {e}");
-        return;
-    }
-    if let Err(e) = codec.start() {
-        log::error!("decode: start failed: {e}");
-        return;
-    }
-    log::info!(
-        "decode: decoder started (async) at {}x{}",
-        mode.width,
-        mode.height
-    );
     // The forced TV mode switch (`is_tv` ⇒ ALWAYS strategy) is part of the experimental stack;
     // off, every form factor gets the original soft seamless hint. ASC votes the rate on its own
     // layer instead (the SurfaceView window shows nothing under the ASC path).
@@ -1258,4 +1387,53 @@ fn asc_present_ready(
         );
     }
     stats.note_skipped(withheld); // gate-withheld frames (the reader-drop skips ride `asc.flush`)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bring_up_rungs;
+
+    /// The ladder that turns a decoder which refuses to start from a permanent black screen into
+    /// a retry or two away from a picture (the 2026-08-27 Mi TV Stick case). Order and
+    /// de-duplication are the whole of its logic — everything else in the loop is MediaCodec I/O.
+    #[test]
+    fn rungs_shed_the_overlay_then_asc_then_the_aggressive_keys_and_never_repeat_one() {
+        // The default: shed the reader's COMPOSER_OVERLAY usage first (keeping ASC — the whole
+        // point of the middle rung), then the `AImageReader` entirely, then the aggressive keys.
+        assert_eq!(
+            bring_up_rungs(true, true),
+            [
+                (Some(true), true),
+                (Some(false), true),
+                (None, true),
+                (None, false)
+            ]
+        );
+        // `present_backend=surfaceview` already shed ASC — both ASC rungs collapse away.
+        assert_eq!(bring_up_rungs(false, true), [(None, true), (None, false)]);
+        // Low-latency mode off ⇒ the keys are already the plain set; the backend is the only axis.
+        assert_eq!(
+            bring_up_rungs(true, false),
+            [(Some(true), false), (Some(false), false), (None, false)]
+        );
+        // Nothing left to shed: one attempt, and no pointless second `start` of the same thing.
+        assert_eq!(bring_up_rungs(false, false), [(None, false)]);
+
+        for asc in [true, false] {
+            for ll in [true, false] {
+                let rungs = bring_up_rungs(asc, ll);
+                // A device that works must pay nothing for this ladder: rung 0 is always exactly
+                // what the session asked for.
+                assert_eq!(rungs[0], (asc.then_some(true), ll));
+                // Every ladder ends at the most conservative configuration there is.
+                assert_eq!(*rungs.last().unwrap(), (None, false));
+                // Monotonic: a rung only ever sheds, never re-enables what an earlier one dropped
+                // (`Option<bool>`'s Ord: `None < Some(false) < Some(true)`), so the ladder always
+                // descends towards the conservative end.
+                assert!(rungs
+                    .windows(2)
+                    .all(|w| w[1].0 <= w[0].0 && w[1].1 <= w[0].1));
+            }
+        }
+    }
 }
