@@ -12,6 +12,442 @@ with the version table of the release you are moving to, then read **Breaking ch
 
 ---
 
+## v0.32.0
+
+90 commits since v0.31.4 (63 non-merge), counted at the tip this was cut from.
+
+**The C ABI steps 25 → 26, and nothing else versioned moves.** `punktfunk_connect_opts` closes the
+`punktfunk_connect_ex*` ladder: eleven generations each added a field by minting a new exported
+symbol plus a 20-something-parameter forwarding shim, and the replacement takes every option in ONE
+size-prefixed `PunktfunkConnectOpts`. **Every `ex` keeps its symbol and its behaviour**, so this is
+an added surface rather than a changed one. `WIRE_VERSION` stays **2**: every wire addition this
+cycle is additive (two capability bits, one AU user flag, one trailing `Welcome` field), the same
+append discipline every field since `compositor` has followed. The driver protocol, the Windows
+gamepad channel, the plugin index schema, the host event schema and the gamescope patch level are
+all untouched; `pf-driver-proto` and `punktfunk-host/src/events.rs` show no diff; `api/openapi.json`
+is content-identical to v0.31.4, the `info.version` stamp being the whole diff.
+
+**Read `Breaking changes` regardless.** The auto-bitrate overhaul lands here in four phases, and
+Phase 4 redefines what the bitrate number *means* on the control plane — deliberately without a
+capability handshake. Alongside it: the 2026-08-25 security review (58 confirmed findings, one of
+them a console session cookie reaching code execution), a second GameStream security pass (media-port
+endpoint proof, control-stream nonce separation), and the GameStream competitive program, which turns
+**both** video and control encryption on by default.
+
+### Versions
+
+| | v0.31.4 | v0.32.0 | Notes |
+|---|---|---|---|
+| Wire protocol | 2 | **2** | unchanged. Three additions, each ignorable by an older peer: `USER_FLAG_REPEAT` (`0x0100`) on the AU header, `CLIENT_CAP_KEEP_HOST_AUDIO` (`0x20`) in `Hello::client_caps`, and `Welcome::host_caps2` — a trailing field, absent → `0`, carrying `HOST_CAP2_REPEAT_MARK` (`0x01`) |
+| C ABI | 25 | **26** | **MOVES.** `punktfunk_connect_opts` + `PunktfunkConnectOpts` replace the `connect_ex*` ladder; layout is locked padding-free on both pointer widths (96/68 B) by const asserts and by the C harness compiling the same sizes, so an appended field can never land in bytes an older `sizeof` already covered. An older, shorter caller gets its tail defaulted to unspecified/auto rather than misread. Also additive: `USER_FLAG_REPEAT`, `CLIENT_CAP_KEEP_HOST_AUDIO`, `HOST_CAP2_REPEAT_MARK`, plus corrected `VIDEO_CAP_10BIT` / `VIDEO_CAP_HDR` prose |
+| Rust edition | 2024 | **2024** | unchanged |
+| MSRV (`rust-version`) | 1.85 | **1.85** | unchanged |
+| Workspace crate dirs | 27 | **27** | unchanged (39 `[workspace] members`, also unchanged) |
+| Virtual-display driver protocol | 6 | **6** | unchanged (minimum accepted still 3); `pf-driver-proto` shows no diff against the v0.31.4 tag |
+| Windows virtual-gamepad channel | 3 | **3** | unchanged; nothing under the Windows gamepad backends moved |
+| Plugin index schema | 1 | **1** | unchanged — but `launcher_ui` accepts a new **value**, `heroic-console`, and a plugin publishing it must gate on `minHost` (below) |
+| Host event schema | 1 | **1** | unchanged (`punktfunk-host/src/events.rs` shows no diff) |
+| `api/openapi.json` | 0.31.4 | **0.32.0** | **content-identical** — the `info.version` stamp is the whole diff. Re-stamped, not regenerated (`punktfunk-host` does not build on macOS); `api/` and `docs-site/public/` are byte-identical to each other |
+| gamescope patch level (`+pfhdrN`) | 8 | **8** | unchanged; no new patch files, `packaging/gamescope/PKGBUILD` still declares `pfhdr8` |
+| `@punktfunk/host` (SDK) | 0.1.6 | **0.1.6** | unchanged; nothing under `sdk/` moved |
+| `@punktfunk/plugin-kit` | 0.4.4 | **0.4.4** | unchanged **on purpose**. `plugin-kit/src/wire.ts` changes exactly one line and it is a doc comment in the `launch.kind` table — `launcher_ui` is a bare string validated host-side, so no type, schema or runtime behaviour moved. 0.4.4 remains the registry's `latest` |
+
+### Breaking changes
+
+**1. The bitrate is the total wire budget** (ABR RFC §5.1). Every number on the control plane —
+`Hello` resolve, `SetBitrate`, acks, `live_bitrate`, the console — is now the **total wire budget**,
+not the encoder rate. FEC parity (1–50 %), packet framing (~4.5 %) and the audio plane used to ride
+on **top** of it, so a "20 Mbps" session put 22–30+ Mbps on the wire; on the constrained links where
+the setting matters most, that overshoot *was* the failure. Encoder opens and reconfigures convert
+through `EncDerive` (budget − audio, over framing + FEC) snapshotted at the live FEC percent, and
+read-backs convert back, so a short apply reports budget truth. A FEC step re-derives the encoder
+rate in place, so parity reallocates **within** the budget instead of inflating the wire. The audio
+reservation comes from the resolved plane (exact PCM cost, or the shared Opus budget ladder).
+
+**No capability handshake, by design** (RFC §5.1, amended 2026-08-27): new-client → old-host is
+byte-for-byte today's behaviour, and old-client → new-host shifts conservative by the overhead
+share. **PyroWave is the identity** (its pin is an encoder operating point), and **the GameStream
+plane keeps its historical semantics untouched.** Client-side, the controller's `actual` becomes the
+wire measure — received bytes with headers, seals and parity, minus probe filler, plus the mirrored
+audio reservation — so utilization and the proven mark compare like with like against budget
+targets. The derivation is pure and unit-tested: round-trips never inflate the budget, reallocation
+is monotone in FEC, and a budget too small for its own audio floors honestly.
+
+*If you embed and you read `live_bitrate` as an encoder rate, it is not one any more.*
+
+**2. `FLOOR_KBPS` drops 5000 → 2000** (RFC §7 Q4), with a one-shot log warning on the first descent
+below the old fence.
+
+**3. DSCP marking defaults to AUTO**, where it was opt-in. The host marks toward RFC1918 / ULA /
+link-local / loopback peers and stays off toward anything routable: the bleaching risk (consumer
+ISPs and routers that reject or strip DSCP) lives on WAN paths, while the win — APs mapping DSCP to
+WMM airtime priority — lives on local ones. `PUNKTFUNK_DSCP=1` still forces it on everywhere, `=0`
+is still the kill switch.
+
+**4. GameStream video AND control encryption are on by default.** `PUNKTFUNK_GS_ENCRYPT` now
+defaults to *supported* carrying **both** bits (offered, never required). The values are `0` (back to
+the plaintext wire), **`video`** (new — keeps video encryption, drops only the control offer), and
+`require` (forces the negotiation).
+
+Video graduated first, verified 2026-08-27 against a Win11 / RTX 4090 host from Moonlight on macOS,
+four legs: off streams unchanged; *supported* had the client **opt in by itself on a LAN,
+unprompted** — which is why the default moved, since an offer nobody takes is a no-op; *require*
+negotiated and decoded in hardware; and *require* + 5 % injected wire loss ran 27 s and 8 keyframes
+with **zero IDR re-requests**, which is the FEC-then-encrypt ordering proven on hardware rather than
+in a unit test. Note that the client negotiates `packet_size` 1360 where the plaintext leg used
+1392 — it subtracts `sizeof(ENC_VIDEO_HEADER)` exactly as the reference says — so the on-wire
+datagram is 1408 either way and still fits the MTU it sized for.
+
+`SS_ENC_CONTROL_V2` graduated the same way, on the same box at 2560x1440@240 HEVC Main10 HDR. It
+shipped dark for one commit, then the client turned it on **by itself** when merely offered. The
+host's own scheme detector is what settles it, because it reports what it locked onto rather than
+what was negotiated: `nonce: V2 { seq_be: false, marker: [67, 67] }`, where `[67, 67]` is `b"CC"` —
+the client→host V2 marker. The host then sealed its HDR-mode cue under the flipped `b"HC"` and the
+client acted on it, so both directions ran on distinct nonces, on hardware.
+
+**5. PyroWave sessions force Automatic bitrate** (RFC §5.2). An explicit client rate under PyroWave
+was ill-defined — the operating point is bits per pixel, not kbps — and bypassed the
+`PUNKTFUNK_PYROWAVE_MAX_MBPS` operator ceiling entirely. `resolve_bitrate_kbps_for` now ignores the
+requested rate under PyroWave (warning when it overrides) so every such session goes through the
+per-mode bpp pin and the ceiling, and `bitrate_auto` treats PyroWave sessions as Automatic so a mode
+switch re-resolves the pin whatever the `Hello` carried.
+
+**6. Console pairing routes move behind the console password** (security review). Arming, approving
+and PIN submission rode the generic catch-all with the operator's admin bearer attached — a console
+session cookie alone reached code execution. They now sit behind the console password like the other
+trust-root routes, and the armed PIN is returned **once** in that gated response instead of riding a
+1 s status poll. *A script driving the pairing routes with only a session cookie is now refused.*
+
+**7. Deep links auto-dial by stable record id only.** A display name or an address gets a
+confirmation on every client.
+
+### The auto-bitrate overhaul (four phases)
+
+Against `punktfunk-planning` `design/abr-stack-overhaul.md`; the field chains are the 2026-08-26 and
+2026-08-27 reports.
+
+**Phase 1 — the transmission plane stops decaying to a blast** (§2.1–2.4). The unpaced microburst
+allowance was an absolute `max(128 KiB, wire/4)`, sized for gigabit LAN, so at Wi-Fi bitrates every
+frame went out back-to-back; it is now **time at the pace rate** (10 ms, clamped). Adaptive FEC no
+longer decays to 1 %, so the first big motion frame after a static stretch is not shipped
+unprotected. §2.5 is the DSCP default above.
+
+**Phase 2 — the control loop stops believing its own bookkeeping** (§2.2–2.3). A failed
+bitrate-change encoder rebuild now snaps the client back (`retarget_tx`): the control task acks
+*before* the apply, so the client's climb base, utilization and proven math had been tracking a rate
+the encoder never ran until some later event happened to correct them. The ABR rebuild announces
+`PipelineGap` on success. Bitrate acks queue in arrival order instead of a latest-wins slot, and a
+mode switch re-sizes the ABR stream cap and clamps the learned ceiling with it.
+
+**Phase 3 — the controller learns stillness from the host** (§4.1–4.3, §7 Q4). The host marks
+idle-keepalive re-encodes on the wire (`USER_FLAG_REPEAT`, whole-frame and streamed paths) and
+advertises that it does so via `HOST_CAP2_REPEAT_MARK` in the new trailing `host_caps2` byte. The
+capability is what makes the flag's *absence* meaningful: against an advertising host an unflagged
+AU is genuinely new content, while against an older host the client must treat activity as unknown
+and keep the legacy window arithmetic. Idle windows (every AU a repeat) are **neutral** — they train
+no OWD / decode / encode baseline, accrue no climb credit or re-probe authority, and never authorize
+a climb; loss, flush and drop keep their full power. Utilization is measured per frame at the
+source's own rate, so a 35 fps menu on a 90 Hz config can climb when its frames run full, and the
+proven-headroom cap prorates with it (bounding the next target's projected **wire** rate at ×1.5
+over what was delivered) or the two gates would deadlock exactly where the fix is needed. Recovery
+is bounded and multiplicative: the proven mark is a two-bucket windowed max (~30–60 s) rather than
+all-session, and the first active window after ≥3 s of stillness re-arms slow start with the
+cooldown cleared — the ~103 s additive crawl from the floor becomes seconds, never past ×1.5 over
+recently-proven delivery.
+
+**Phase 4 — the budget redefinition**, above.
+
+**Also here:** frames that died of *lateness* stop ratcheting the bitrate. `window_loss_ppm`'s
+`frames_dropped` bump fired even when `lost == 0 && late > 0` — every presumed-lost shard had in
+fact arrived, and the frames died of delay, which neither lever this number drives can touch (FEC
+repairs loss, not delay; a bitrate backoff cannot shorten a hole). In the 2026-08-27 field log that
+read `loss_ppm=50000` exactly and cut ×0.7 three times, to 6.86 Mbps in 4 s, on a wire with zero
+measured loss.
+
+### Security review 2026-08-25
+
+58 confirmed findings across host, console, clients and supply chain. Nearly every serious one is a
+documented boundary whose code had stopped enforcing what its comment promised — so where the two
+disagreed the comment won and the code was made to match, and where it could not be, the comment was
+corrected instead.
+
+**Critical:** the console pairing routes, above. **High:** the plugin lane no longer reads the
+unredacted log ring (which carried the webhook credentials the `/hooks` carve-out exists to
+withhold), and hook lines log an origin and a short id rather than a URL or a command line; a
+plugin-reported pid is held to `procscan`'s start-time floor before the SYSTEM host will signal it;
+`ClipOffer` is gated on the live grant mask, so a revoked guest loses the host clipboard in both
+directions; ENet refuses connects with no live launch instead of letting LAN peers squat all four
+slots; Windows secrets are born with their DACL applied rather than world-readable; the sysext feed
+binds FEED and a monotonic SERIAL inside the signed bytes; `privileged_field` allowlists the
+host-resolved launch kinds, so a new kind is privileged by default; and five parser panics reachable
+from one malformed NALU are range-checked. The Apple identity key moves to `ThisDeviceOnly` so it
+stops riding encrypted backups. `pf-vdisplay` stops routing session identity through the process
+environment — the injector backend threads a typed slot, so per-batch `getenv` no longer races a
+per-session `setenv`.
+
+### The GameStream (Moonlight-compatible) plane
+
+The competitive program's WP0–WP3, WP5, WP6.1 and WP7.
+
+**Transport.** Arrival-driven capture, microburst pacing and a pooled packetizer (the per-AU copy is
+gone); ENet wakes on packet rather than on a poll tick; the encoder budget derives *under* the client
+number; `frame_processing_latency` is stamped instead of hardcoded to 0, so Moonlight's own overlay
+finally shows real host latency.
+
+**Loss adaptation** (`PUNKTFUNK_GS_ADAPT=0` pins it off). The plane decodes the client's `0x0201`
+loss reports and runs a 1 Hz state machine over them: FEC steps up on lossy windows and down on
+clean ones, the budget backs off from the second consecutive lossy window and recovers per clean
+window, and every step re-derives the encoder rate and reconfigures in place. A refusal turns
+adaptation off for the session rather than leaving the two halves disagreeing.
+
+**Session truth.** `serverinfo`'s `state` / `currentgame` are real now, but **owner-scoped only** and
+failing closed on unknown fps — showing a non-owner the truth would route same-app taps into an
+owner-only `/resume` and lose reject / join / steal via `/launch`. `/resume` parses and **re-keys**
+`rikey`/`rikeyid` (stale keys made post-resume control undecryptable), re-binds `peer_ip`, and
+restarts media by stop-then-wait on a new `media_exited` counter each media thread bumps as its last
+act — a sequential handoff with no capturer race, bounded at 2 s.
+
+**Wake-on-LAN.** `serverinfo`'s `<mac>` was the literal fake `01:02:03:04:05:06`, which made every
+Moonlight WoL a silent no-op. It is now the real routed-NIC MAC, cached on first **success** only so
+the boot race retries.
+
+**Media.** The capture format comes from the shared `SessionPlan` (`gs_session_plan`) instead of a
+hand-hardcoded `OutputFormat::resolve` — one resolver for both planes, and the visible win is that a
+gamescope GameStream session resolves `nv12_native`, so the producer's NV12 feeds Vulkan Video
+directly and the per-frame RGB→NV12 CSC the native plane already skips is skipped here too. The
+encoder gets the source's real HDR grade every frame (`set_hdr_meta` from the capturer), which an
+HDR backend embeds as in-band mastering/CLL SEI on keyframes — this plane had never called it, so an
+HDR GameStream session shipped **no grade at all**. RS(4,2) audio FEC now covers every layout,
+stereo included; the old `channels > 2` gate was bring-up caution that left the most common
+configuration with zero audio loss protection.
+
+**Still blocked:** 4:4:4 and `encoderCscMode` — the 4:4:4 SCM extension bit values are not in the
+sanctioned wire reference, and CscMode honour is an encoder-wide colorspace plumb.
+
+### GameStream security pass
+
+**The media ports learn their endpoint from the client that can prove it.** Both media planes took
+the first UDP datagram arriving from the launch owner's address and never looked inside it. The ping
+payload the protocol exists to carry — handed to the client in the SETUP response and echoed back as
+its first datagram — was the fixed constant `0011223344556677` for **every session on every host**,
+and nothing ever compared it against what arrived. Source-IP binding was the whole guard, so anything
+that could send from (or spoof) that address won the endpoint by being first, and was handed the
+stream. The payload is now a per-session secret: eight random bytes minted at `/launch`, re-minted at
+`/resume`, advertised hex-encoded in SETUP, and checked before an endpoint is adopted. Both planes go
+through one `learn_client_endpoint`, because they had drifted into two byte-identical loops.
+
+**Minting alone would have proved nothing.** `SETUP` was **unauthenticated** while its siblings
+`ANNOUNCE` and `PLAY` were not, so any peer that could reach 48010 could ask for the payload the
+media planes were about to verify, and walk the check. `SETUP` is now gated on `authorized_launch`
+like the other two.
+
+**The control stream stops sharing one nonce space with the client.** Each direction now has its own.
+
+**`serverinfo` stops advertising HEVC capacity it may not have.** `MaxLumaPixelsHEVC` was the
+constant `1869449984` in every document, including ones whose `ServerCodecModeSupport` had just
+dropped HEVC — a GPU-less host encodes H.264 and nothing else, and said so in the mask while quoting
+a 4K60 HEVC ceiling two lines above. It now follows the mask, with `0` when HEVC is not offered.
+
+**Four security questions get answers instead of follow-up notes.** None change behaviour. The TLS
+verifier's accept-any-client-certificate comment called pinning "a hardening follow-up"; it is not
+one, because a TLS handshake completes before the request line is parsed, so per-route pinning cannot
+be expressed there at all. The `CertificateVerify` signature **is** checked, and `peer_is_paired`
+pins the SHA-256 of that same certificate before any state-changing work, on every route but
+`/serverinfo`. The PIN's 4-digit space is likewise not the exposure, because submission is the
+bearer-authenticated management API and nowhere else.
+
+### Wire additions
+
+`USER_FLAG_REPEAT` (`0x0100`) marks a host-side re-encode of a held frame — the idle keepalive — so
+it carries no new content. Purely informational, set unconditionally; a receiver that predates it
+ignores the bit, and a client only trusts its *absence* as "active frame" when the host advertised
+`HOST_CAP2_REPEAT_MARK`.
+
+`CLIENT_CAP_KEEP_HOST_AUDIO` (`0x20`) asks the host to leave its own audio devices alone — capture
+whatever the operator's default playback device already is, instead of re-routing the desktop mix
+onto a silent endpoint. Request-only, with no `HOST_CAP` echo: an older host ignores the bit and
+re-routes as it always did, which degrades to "audio still works, host went quiet". Best-effort and
+host-global across concurrent sessions — any live session that asked wins for all of them until it
+ends. `0x40` and `0x80` remain free.
+
+`Welcome::host_caps2` is the second capability byte the `0x80` wall predicted, delivered as a
+trailing field (absent → `0`). `HOST_CAP2_REPEAT_MARK` is its bit `0x01`.
+
+### 10-bit SDR, independent of HDR
+
+`VIDEO_CAP_10BIT` and `VIDEO_CAP_HDR` were always separate wire bits, but everything above the wire
+welded them: the client advertised both from one "HDR" switch, the handshake required an HDR capture
+source for any 10-bit depth, `SessionPlan` derived `hdr` from `bit_depth`, and the encoder stamped
+BT.2020 PQ on every 10-bit format. A client setting now advertises the depth bit **alone**, and the
+handshake resolves `bit_depth = 10` without the HDR gates where the SDR-10 chain exists (Windows
+IDD-push + direct NVENC + HEVC); everywhere else the session stays 8-bit and says so honestly in the
+`Welcome`. The Welcome's colour label, the virtual display's HDR bring-up and the capturer's
+want-HDR flag all follow the new session-HDR verdict instead of the depth. Capture grows
+`PixelFormat::Rgb10a2Sdr` (the BGRA slot expanded 8→10 by a trivial full-res pass,
+`HdrRgb10Converter::new_sdr_expand`), which NVENC ingests as ABGR10 and encodes Main10 under the
+ordinary BT.709 SDR VUI, both 4:2:0 and 4:4:4. **Every pre-0.32 client sets the two bits together**,
+so nothing changes for them.
+
+### New environment variables
+
+| Variable | Plane | Meaning |
+|---|---|---|
+| `PUNKTFUNK_GS_ENCRYPT` | GameStream | `0` = plaintext wire, `video` = video encryption only (drops the control offer), unset = both offered (the new default), `require` = force the negotiation |
+| `PUNKTFUNK_GS_ADAPT` | GameStream | `0` pins loss adaptation off (FEC percent and budget stay at the configured values) |
+| `PF_STREAM_WIDTH` / `_HEIGHT` / `_REFRESH` / `_HDR` | both | the negotiated mode, exported into per-app prep/undo commands (the marker file's vocabulary, via `hooks::prep_mode_env`) — so an RTSS-style per-mode frame cap is one step instead of one hard-coded entry per device, on Windows hosts too |
+
+`PUNKTFUNK_DSCP` is not new, but its default changed (above).
+
+### `launcher_ui` grows a second Heroic value, for its console mode
+
+**Plugin-facing.** `launcher_ui` accepts **`heroic-console`** on Linux, alongside `heroic` and
+`lutris`. It resolves to the same prefix `heroic` does — the native binary if on `PATH`, else the
+Flatpak — plus `--console --fullscreen`.
+
+Heroic 2.21 added a fullscreen gamepad UI, and it takes **two** flags: `--console` only routes the
+UI to that front end (`isCLIConsoleMode`), and `--fullscreen` is what fills the screen
+(`isCLIFullscreen`). Neither is reachable by URI — `heroic://` speaks only `ping` and `launch` — so
+this is the same shape as Playnite's fullscreen tile on Windows, where the registered protocol
+handler can only open the desktop app.
+
+That makes `launcher_ui`'s value a launcher **UI** rather than a launcher, which it already was on
+Windows (`playnite` has always meant `Playnite.FullscreenApp.exe`). A `heroic_ui` kind mirroring
+`steam_ui` would have been tidier and was rejected: an unknown *kind* degrades to an unlaunchable
+tile on an N-1 host, but an unknown *value* is a hard 400 that refuses the whole reconcile — so
+either shape has to be gated on `minHost` in the plugin index, and the value is the smaller change.
+**A plugin publishing `heroic-console` must set `minHost` to this release.**
+
+Also here: `resolvable_launcher_ui` now probes `heroic_launch_prefix()` for both Heroic values, the
+way it already did for Playnite. Both tiles are dropped from a reconcile on a box where Heroic
+cannot be resolved, instead of being published as tiles that do nothing — reachable by keeping
+`~/.config/heroic` after uninstalling Heroic, since the plugin's `detect` only looks for that
+directory.
+
+### Capture, encode and display
+
+**A slice block's lying base can no longer ship as a complete frame.** A slice-streamed sentinel's
+wire base was bounds-checked (in range, below the final block) but never validated to *tile* the AU:
+a base that lied within bounds left a zero gap and an overlap, and the reassembler still stamped the
+frame `complete`. The decoder then painted the wrong-offset bytes as garbage rectangles while no
+loss counter moved, so the recovery machinery never fired and the corruption marched on
+indefinitely — the field report of black bars "moving like an equalizer", identical across Vulkan,
+DXVA and CPU decoders, with Android immune because it never negotiates the path.
+
+**A stall learns whether anything was dirty.** `try_consume` samples `GetCursorPos` (rate-limited,
+`user32` only) and accumulates motion per gap, with the stall-ending frame's own move held back one
+call so it never counts into the gap it ended: `Some(0)` means nothing was dirty anywhere, and
+`Some(n > 0)` through a present-free hole means damage existed and the display stack composed none
+of it — a positive conviction `CONTENT-SILENCE` could never make. `window_report` attributes the
+pre-hole flow (`flow_dwm_only`), so a game's holes are never demoted. The new **DAMAGE-IDLE** class
+is excluded from the metronome, from both repeated-stall WARNs and from the `connected_inactive`
+blame. This reattributes the 2026-08-27 NVIDIA-laptop case (36 stalls / 27 s) from the dark laptop
+panel to damage starvation, and the below-OS METRONOMIC warn stops prescribing panel A/Bs for holes
+the witness can already explain.
+
+**AMF** reports its applied bitrate (live readback proof on real VCN hardware), pins AV1 B-pictures
+off and asserts no reordering on the bitstream. **NVENC** sub-frame readback is verified in release
+builds rather than trusted. The AMD field log self-describes. `pf-win-display`'s adl-emul probe walks
+headless AMD adapters and says which it skipped, and why. A wire-MTU-re-keyed session stops blaming
+its metronomic recoveries on the display (`wire_rekeys` is published from the send thread, which owns
+the packetizer).
+
+**KWin's stored setup** darkened the desk and the restore never saw it: the snapshot now happens
+before create, and is re-asserted after teardown.
+
+**An over-declared AV1 OBU is a parse error, not a decode-thread panic.** `obu_size` is a leb128 read
+straight out of the stream, bounded only by `u32::MAX` and tied to nothing about how many bytes are
+actually present. `read_obu` then built the OBU with an unchecked
+`&data[start_offset..start_offset + obu_size]`, so any access unit whose last OBU declared more
+payload than remained panicked with `range end index .. out of range`. That is a bounds check rather
+than arithmetic, so it panicked in release too, and aborted whichever thread was decoding. It reaches
+every native AV1 rung — `pf-vkdecode`, `pf-dxvadec` and `pf-vaadec` are all re-exports of
+`pf_bitstream::av1::Av1Planner`. `PUNKTFUNK_AU_FAULT=truncate` produces the shape, and so does any AU
+delivered short over the wire.
+
+### A pad's OS identity is host-wide, not the client's wire index
+
+Every OS-level name a virtual pad needs derived from a pad index and nothing else: the
+`Global\pfxusb-boot-<i>` / `Global\pfds-boot-<i>` bootstrap mailboxes, the `SwDeviceCreate` instance
+ids (`pf_xusb_<i>`, `pf_pad_<i>`, `pf_ds4_<i>`, `pf_xbox_<i>`), and on Linux the DualSense pairing
+MAC, the Deck serial and the Switch MAC — the last three documented as needing to be unique per pad,
+because `hid-playstation` adopts the MAC as the HID `uniq` and SDL/Steam dedup by that serial.
+
+The host serves up to `DEFAULT_MAX_CONCURRENT` sessions of the same desktop, each with its own input
+thread and router, and **every client numbers its first controller wire pad 0**. So two paired
+clients each holding a controller collided on all of them. On Windows the second session's
+`Shm::create_named` saw `ERROR_ALREADY_EXISTS` on all five retries and never got a pad for the whole
+session — and the create-failure hint told the operator to restart the service, which would have
+killed both sessions, when no other process was involved. On Linux nothing errored: both minted the
+same DualSense MAC and SDL merged the two pads into one controller. New `pf_inject::pad_pool` makes
+the OS slot host-wide, claimed on a pad's first present.
+
+### Maintainability sweep
+
+Five places where one fact lived twice now state it once: the control task's 31 positional arguments
+become a named-field `Task`; bring-up and the compositor retarget derive the cursor-composite pair
+once; the house DRM-node knob is parsed once, in the crate that owns GPU choice; and three
+hand-copies of the encoder IR/LTR policy env knob parse once. No behaviour changes.
+
+### Clients and console UI
+
+**Android: a decoder that refused to start took the picture with it.** `configure()` succeeding says
+nothing about `start()` — start is where the codec negotiates buffers with its output consumer and
+allocates them, so a decoder that accepted the format can still refuse the surface it must render
+into. On a Xiaomi Mi TV Stick (Android 11, armeabi-v7a,
+`OMX.amlogic.hevc.decoder.awesome2`) every session logged `start failed: ErrorUnknown` and the decode
+thread returned, so not one access unit was ever fed while the pump kept receiving video. The frame
+queue filled, the pump jumped to live once per `FLUSH_COOLDOWN`, and **the host read that perfect 2 s
+keyframe cadence as a client too slow to sustain the stream** — see
+`punktfunk-metronomic-keyframe-warn`. Audio, input and the library all kept working, so it presented
+as a permanent black screen with sound.
+
+The async loop now gets a bring-up ladder instead of one attempt. A codec that failed start is in an
+error state and cannot be reconfigured, so each rung builds a fresh one and sheds what a start can
+choke on, most-suspect first: the `AImageReader` the ASC presenter renders into
+(`READER_MAX_IMAGES` full-resolution PRIVATE `COMPOSER_OVERLAY` buffers, which the SurfaceView path
+does not allocate at all), then the aggressive low-latency key set. Every downstream branch already
+keys off `asc.is_some()`, so a fallen-back session runs the SurfaceView presenter that has always
+been the API < 29 fallback. **Rung 0 is always exactly what the session asked for**, so a working
+device pays nothing, and the winning rung is logged. The sync loop gets no ladder because both axes
+are already shed there; it gets the diagnosis in its error line instead. Android also stops reporting
+a stored log bundle's `201` as a failed upload.
+
+"Send logs to host" reaches the GTK, WinUI and Android touch shells, carrying the session's trail,
+and a console that cannot start says so. The console UI's hint legend resolves from **what drove
+last** at every input seam: a pad speaks its own family (PlayStation shapes, Nintendo's own letters
+with both pairs swapped the way the pad is engraved, ABXY otherwise), keys on Android are treated as
+a TV remote (an OK badge, the ↩ return arrow, the section hint pointing at the D-pad path, and the
+Y/X hints hidden outright because a remote has neither), and keys on the desktop stay keyboard
+keycaps. The settings tab strip answered only to shoulder buttons; Up from the top row now reaches
+it, which is what a TV remote's D-pad has. Windows couch tiles stop minting a console window.
+"Capture system shortcuts" now works in Desktop mouse mode — it was wired end to end and then
+discarded by one `!desktop` term in the presenter's grab condition. The forwarded cursor folds
+`SDL_GetWindowDisplayScale` into its resample factor, so it is no longer half-size on a 200 % client.
+
+### Dependencies
+
+**One move, in the workspace `Cargo.lock` only:** `h2` 0.4.18 → **0.4.19**, closing
+**RUSTSEC-2026-0258** (unbounded empty DATA frames), which was left open deliberately at v0.31.1 and
+lands here on its own rather than folded into a version bump. The four lockfiles under `tools/` and
+`packaging/windows/` do not move, and no `package.json` under `web/`, `sdk/` or `plugin-kit/` moves.
+
+### CI and supply chain
+
+Every `checkout` and cache action is pinned to a **commit**, not a tag — a tag is a pointer, not a
+version — and the stale `v4` majors are gone. The tools the builder images bake in are pinned too,
+not just the ones the jobs fetch: `cargo-ndk` (it builds the shipped Android `.so` files), and the
+FFmpeg **commits** we actually build rather than the git tag that names them. Release-signing jobs
+pin `bun`, `sccache` and actions by checksum/SHA. Two new wire constants are baselined as protocol
+internals rather than knobs, and the two new exported constants carry the `PUNKTFUNK_` prefix in the
+C header (R21).
+
+Two fixes to the C harness itself, both of which had been hiding failures on a developer machine: it
+now links on an Apple Silicon box (`-L/opt/homebrew/lib` was missing), and it always builds the
+staticlib **with** `quic`, because a featureless `.a` left by an earlier plain build was being
+silently reused.
+
+---
+
 ## v0.31.4
 
 21 commits since v0.31.3 (14 non-merge), counted at the tip this was cut from.
@@ -419,31 +855,6 @@ feature surfaces ("--browse needs the console UI", exit non-zero).
 `ci.yml`'s web test step widens from `bun test server/` to `bun test server/ nitro-entry/`, so the
 identity-selection gate runs where the origin-isolation gate already did. Both have the same
 property: a failure mode only a browser would catch.
-
-### `launcher_ui` grows a second Heroic value, for its console mode
-
-**Plugin-facing.** `launcher_ui` accepts **`heroic-console`** on Linux, alongside `heroic` and
-`lutris`. It resolves to the same prefix `heroic` does — the native binary if on `PATH`, else the
-Flatpak — plus `--console --fullscreen`.
-
-Heroic 2.21 added a fullscreen gamepad UI, and it takes **two** flags: `--console` only routes the
-UI to that front end (`isCLIConsoleMode`), and `--fullscreen` is what fills the screen
-(`isCLIFullscreen`). Neither is reachable by URI — `heroic://` speaks only `ping` and `launch` — so
-this is the same shape as Playnite's fullscreen tile on Windows, where the registered protocol
-handler can only open the desktop app.
-
-That makes `launcher_ui`'s value a launcher **UI** rather than a launcher, which it already was on
-Windows (`playnite` has always meant `Playnite.FullscreenApp.exe`). A `heroic_ui` kind mirroring
-`steam_ui` would have been tidier and was rejected: an unknown *kind* degrades to an unlaunchable
-tile on an N-1 host, but an unknown *value* is a hard 400 that refuses the whole reconcile — so
-either shape has to be gated on `minHost` in the plugin index, and the value is the smaller change.
-**A plugin publishing `heroic-console` must set `minHost` to this release.**
-
-Also here: `resolvable_launcher_ui` now probes `heroic_launch_prefix()` for both Heroic values, the
-way it already did for Playnite. Both tiles are dropped from a reconcile on a box where Heroic
-cannot be resolved, instead of being published as tiles that do nothing — reachable by keeping
-`~/.config/heroic` after uninstalling Heroic, since the plugin's `detect` only looks for that
-directory.
 
 ---
 
