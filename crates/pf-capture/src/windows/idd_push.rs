@@ -2525,7 +2525,7 @@ mod tests {
             p: Option<&ProbeWindow>,
             c: Option<&EtwWindowCounts>,
         ) -> StallClass {
-            super::super::stall::classify(gap, verdict, p, c, None)
+            super::stall::classify(gap, verdict, p, c, None)
         }
         // The driver's own verdicts win outright — probes can't overrule "we lost the frames".
         assert_eq!(
