@@ -42,9 +42,8 @@ the secure native-only host):
 
 (Bare `serve` is the secure native-only default and stock Moonlight clients can't connect to it; the
 native plane is always on, and `--gamestream` adds the Moonlight-compat surface.) Video, audio and
-input are all encrypted on this path, but GameStream still *pairs* over plain HTTP and its control
-channel uses the older GameStream scheme rather than the native protocol's, so enable it on a
-**trusted LAN**. See [Running as a Service](/docs/running-as-a-service) for the bundled
+input are all encrypted on this path, but GameStream still *pairs* over plain HTTP, so enable it on
+a **trusted LAN**. See [Running as a Service](/docs/running-as-a-service) for the bundled
 unit. The host advertises itself on the network, so Moonlight usually finds it on its own.
 
 ## 2. Add the host in Moonlight
@@ -120,7 +119,9 @@ That **Desktop** entry is the operator base list. An `apps.json` in the host's c
   configure — and it is why a marginal Wi-Fi link degrades rather than stuttering.
 - **Your video is encrypted.** The host offers per-packet video encryption and Moonlight turns it
   on by itself, so the stream is encrypted end to end — audio and the control channel always were.
-  Nothing to configure.
+  The host also offers the GameStream protocol's newer control-encryption scheme, which Moonlight
+  likewise turns on by itself; it gives each direction of the control channel its own nonce, which
+  the older scheme does not. Nothing to configure.
 - Moonlight uses the GameStream protocol, so it doesn't get Punktfunk's native-protocol
   extensions — no client-side speed test, no jumbo frames. Error correction and encryption are
   *not* on that list any more: both are in every stream. On a good link the two protocols feel the

@@ -6,9 +6,9 @@
 //!
 //! Runs on its own native thread (control-plane setup, not the per-frame hot path), one
 //! thread per connection. DESCRIBE offers `SS_ENC_VIDEO` (per-shard AES-128-GCM video, WP7 —
-//! on by default, never REQUIRED, `PUNKTFUNK_GS_ENCRYPT=0` opts out) and, under
-//! `PUNKTFUNK_GS_ENCRYPT=control`, `SS_ENC_CONTROL_V2` — which gives the ENet control stream a
-//! per-direction nonce and lets the client seal RTSP itself. Audio is AES-CBC regardless and
+//! on by default, never REQUIRED, `PUNKTFUNK_GS_ENCRYPT=0` opts out) and `SS_ENC_CONTROL_V2`
+//! — which gives the ENet control stream a per-direction nonce and lets the client seal RTSP
+//! itself (`PUNKTFUNK_GS_ENCRYPT=video` drops just this one). Audio is AES-CBC regardless and
 //! `SS_ENC_AUDIO` is still not offered (its layout is absent from the wire reference). See
 //! [`EncOffer`].
 //!
@@ -436,17 +436,17 @@ enum EncOffer {
     /// `0` — advertise nothing, the plaintext wire this plane sent before WP7. The escape
     /// hatch for a client that turns out to mis-negotiate, and for measuring the seal's cost.
     Off,
-    /// **The default.** Advertise as SUPPORTED and let the client decide — what a
-    /// Sunshine-class host does. Verified on glass 2026-08-27 (.173 → Moonlight 6.x on macOS,
-    /// RTX 4090, 2560x1440@240 HEVC Main10): the client opts in of its own accord even on a
-    /// LAN, and decodes the sealed stream in hardware with zero errors.
+    /// **The default.** Advertise `SS_ENC_VIDEO` and `SS_ENC_CONTROL_V2` as SUPPORTED and let
+    /// the client decide — what a Sunshine-class host does. Both verified on glass 2026-08-27
+    /// (.173 → Moonlight on macOS, RTX 4090, 2560x1440@240 HEVC Main10 HDR): the client opts into
+    /// both of its own accord even on a LAN, decodes the sealed video in hardware, and the host
+    /// logs the control scheme it settled on as `V2 { marker: "CC" }` — per-direction nonces, so
+    /// the legacy scheme's (key, nonce) reuse is retired for that session.
     Supported,
-    /// `control` — additionally offer `SS_ENC_CONTROL_V2`, which closes the legacy control
-    /// scheme's (key, nonce) reuse. Its own tier rather than part of the default because it is
-    /// the newer wire and has not yet met a real client here: the same posture WP7 shipped video
-    /// encryption in (dark, then default after glass confirmed it). Flip the default once an
-    /// on-glass run negotiates it and the session survives.
-    Control,
+    /// `video` — video encryption only, dropping `SS_ENC_CONTROL_V2` back to the legacy control
+    /// scheme. The granular way out: `Off` would also throw away video encryption, and this plane
+    /// serves a spread of client builds of which exactly one has been tested against the V2 offer.
+    VideoOnly,
     /// `require` — additionally list everything offered as REQUESTED, which forces any client
     /// that supports it to enable it. **The on-glass test lever**: with `Supported` alone a LAN
     /// session may negotiate plaintext and never exercise a single sealed packet, so a green test
@@ -455,13 +455,15 @@ enum EncOffer {
     Required,
 }
 
-/// Whether — and how hard — this host offers video encryption (WP7). **On by default** since
-/// the 2026-08-27 on-glass pass: a stock Moonlight client negotiates `SS_ENC_VIDEO` by itself
-/// (even on a LAN, where it was not obvious it would) and decodes the sealed stream in
-/// hardware, and FEC still recovers through the seal at 5 % injected wire loss — 27 s with
-/// zero keyframe re-requests. `PUNKTFUNK_GS_ENCRYPT=0` is the escape hatch back to the
-/// plaintext wire; `require` additionally REQUESTS it (the test lever that forces the
-/// negotiation when a client would otherwise decline).
+/// Whether — and how hard — this host offers encryption. **On by default** since the
+/// 2026-08-27 on-glass pass: a stock Moonlight client negotiates `SS_ENC_VIDEO` by itself (even
+/// on a LAN, where it was not obvious it would) and decodes the sealed stream in hardware, and
+/// FEC still recovers through the seal at 5 % injected wire loss — 27 s with zero keyframe
+/// re-requests. `SS_ENC_CONTROL_V2` joined the default the same way, in a second on-glass pass
+/// later that day. `PUNKTFUNK_GS_ENCRYPT=0` is the escape hatch back to the plaintext wire,
+/// `video` keeps video encryption but drops the control offer, and `require` additionally
+/// REQUESTS both (the test lever that forces the negotiation when a client would otherwise
+/// decline).
 fn gs_video_encryption_offer() -> EncOffer {
     static ON: std::sync::OnceLock<EncOffer> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -470,7 +472,7 @@ fn gs_video_encryption_offer() -> EncOffer {
             .map(str::trim)
         {
             Ok("0") | Ok("off") | Ok("false") | Ok("no") => EncOffer::Off,
-            Ok("control") | Ok("control-v2") => EncOffer::Control,
+            Ok("video") | Ok("video-only") => EncOffer::VideoOnly,
             Ok("require") | Ok("required") => EncOffer::Required,
             // Unset, `1`, `supported`, or anything unrecognized: the default offer.
             _ => EncOffer::Supported,
@@ -485,8 +487,8 @@ fn enc_flags(offer: EncOffer) -> (u32, u32) {
     // refuse every client that cannot do it.
     match offer {
         EncOffer::Off => (0, 0),
-        EncOffer::Supported => (SS_ENC_VIDEO, 0),
-        EncOffer::Control => (SS_ENC_VIDEO | SS_ENC_CONTROL_V2, 0),
+        EncOffer::VideoOnly => (SS_ENC_VIDEO, 0),
+        EncOffer::Supported => (SS_ENC_VIDEO | SS_ENC_CONTROL_V2, 0),
         EncOffer::Required => (
             SS_ENC_VIDEO | SS_ENC_CONTROL_V2,
             SS_ENC_VIDEO | SS_ENC_CONTROL_V2,
@@ -1125,18 +1127,22 @@ mod tests {
     }
 
     /// The advertisement ladder: `Off` offers nothing (the plaintext wire this plane shipped
-    /// before WP7); `Supported` — the default — offers video encryption; `control` adds
+    /// before WP7); `video` offers video encryption alone; `Supported` — the default — adds
     /// `SS_ENC_CONTROL_V2`; and only the `require` test lever ever sets REQUESTED, which is the
     /// whole reason it exists (a client that is merely *allowed* to encrypt may decline on a LAN,
     /// and then an on-glass test proves nothing).
     #[test]
     fn encryption_is_offered_but_never_required_in_shipping_modes() {
         assert_eq!(enc_flags(EncOffer::Off), (0, 0));
-        assert_eq!(enc_flags(EncOffer::Supported), (SS_ENC_VIDEO, 0));
         assert_eq!(
-            enc_flags(EncOffer::Control),
+            enc_flags(EncOffer::VideoOnly),
+            (SS_ENC_VIDEO, 0),
+            "the granular way out keeps video encryption"
+        );
+        assert_eq!(
+            enc_flags(EncOffer::Supported),
             (SS_ENC_VIDEO | SS_ENC_CONTROL_V2, 0),
-            "the control tier adds V2 without requiring it"
+            "the default offers both, and requires neither"
         );
         assert_eq!(
             enc_flags(EncOffer::Required),
@@ -1151,19 +1157,21 @@ mod tests {
         let servable = SS_ENC_VIDEO | SS_ENC_CONTROL_V2;
         for offer in [
             EncOffer::Off,
+            EncOffer::VideoOnly,
             EncOffer::Supported,
-            EncOffer::Control,
             EncOffer::Required,
         ] {
             let (sup, req) = enc_flags(offer);
             assert_eq!(sup & !servable, 0, "no unimplemented bits offered");
             assert_eq!(req & !sup, 0, "never request what isn't supported");
         }
-        // The default stays video-only until an on-glass run confirms V2 against a real client.
-        assert_eq!(
+        // The default carries the control offer — that is what retires the legacy nonce reuse
+        // for a stock client, and a default that quietly lost the bit would be a silent
+        // regression rather than a visible one.
+        assert_ne!(
             enc_flags(EncOffer::Supported).0 & SS_ENC_CONTROL_V2,
             0,
-            "control-v2 must stay opt-in until glass confirms it"
+            "the default must offer control-v2"
         );
     }
 
@@ -1258,12 +1266,14 @@ mod tests {
     #[test]
     fn describe_advertises_codecs_and_surround() {
         let sdp = describe_sdp();
-        // The default build OFFERS video encryption (verified on glass) but never requires it,
-        // so a client that wants plaintext still gets exactly the wire it always got.
-        assert!(sdp.contains(&format!(
-            "a=x-ss-general.encryptionSupported:{SS_ENC_VIDEO}"
-        )));
-        assert!(sdp.contains("a=x-ss-general.encryptionRequested:0"));
+        // The default build OFFERS video encryption AND control-v2 (both verified on glass) but
+        // requires neither, so a client that wants the plaintext wire still gets exactly the wire
+        // it always got. Asserted against `enc_flags` rather than a literal so this tracks the
+        // default instead of restating it — the env can still steer it (`PUNKTFUNK_GS_ENCRYPT`),
+        // which is why this reads the offer rather than assuming one.
+        let (supported, requested) = enc_flags(gs_video_encryption_offer());
+        assert!(sdp.contains(&format!("a=x-ss-general.encryptionSupported:{supported}")));
+        assert!(sdp.contains(&format!("a=x-ss-general.encryptionRequested:{requested}")));
         assert!(
             sdp.contains("sprop-parameter-sets=AAAAAU"),
             "HEVC indicator"

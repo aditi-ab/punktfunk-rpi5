@@ -14,10 +14,10 @@
 //!
 //! The GCM nonce depends on what Moonlight negotiated (`encryptControlMessage` in
 //! moonlight-common-c). For `SS_ENC_CONTROL_V2` it is a 12-byte nonce with `seq` (LE) in bytes
-//! [0..4] and `b"CC"` (client→host) at [10..12]. For the legacy path — which we hit unless the
-//! client negotiated `SS_ENC_CONTROL_V2` (offered by `PUNKTFUNK_GS_ENCRYPT=control`; we have
-//! advertised `SS_ENC_VIDEO` since WP7, which does not affect this stream) — it is a 16-byte
-//! nonce with only `iv[0] = seq & 0xff` and the rest
+//! [0..4] and `b"CC"` (client→host) at [10..12]. That is the path a stock client takes now that
+//! `SS_ENC_CONTROL_V2` is offered by default. The legacy path — a client that declines it, or a
+//! host set to `PUNKTFUNK_GS_ENCRYPT=video`/`0` — is a 16-byte nonce with only
+//! `iv[0] = seq & 0xff` and the rest
 //! zero. The tag is prepended to the ciphertext; there is no AAD; the key is the forward
 //! `hex::decode(rikey)`. We auto-detect the exact scheme via [`decrypt_control`] on the first
 //! packet that authenticates, since GCM gives no partial credit.
