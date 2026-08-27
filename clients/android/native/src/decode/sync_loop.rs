@@ -108,7 +108,16 @@ pub(super) fn run_sync(
         return;
     }
     if let Err(e) = codec.start() {
-        log::error!("decode: start failed: {e}");
+        // No bring-up ladder here, unlike the async loop: this path only runs with low-latency
+        // mode OFF, which is already the conservative key set, and it renders straight into the
+        // SurfaceView rather than an `AImageReader` — the two things that ladder sheds are both
+        // already shed. Name the symptom instead, because the session stays up around this
+        // failure (audio, input and the library all keep working) and the host sees only a
+        // keyframe request every 2 s that reads as a slow link.
+        log::error!(
+            "decode: start failed: {e} — this session has no video. Audio and input keep working, \
+             so the stream will look alive while the screen stays black"
+        );
         return;
     }
     log::info!(
