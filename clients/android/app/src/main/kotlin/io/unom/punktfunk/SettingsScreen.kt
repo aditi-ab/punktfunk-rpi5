@@ -589,7 +589,10 @@ private fun GeneralSettings(s: Settings, update: (Settings) -> Unit) {
                 onCheckedChange = { on -> update(s.copy(libraryEnabled = on)) },
             )
         }
-        SettingsGroup("Interface") {
+        // The footer is null on every device where the console works, so it costs nothing there —
+        // and on the ones where it doesn't, it is the only place the app admits that this switch
+        // is being overruled. See `SkiaConsole.unavailable`.
+        SettingsGroup("Interface", footer = io.unom.punktfunk.console.SkiaConsole.unavailable()) {
             ToggleRow(
                 title = "Controller-optimized UI",
                 subtitle = "Swap the touch home for the console home — the host carousel and " +

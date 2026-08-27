@@ -80,6 +80,8 @@ internal fun ConnectGrid(
     onEdit: (KnownHost) -> Unit,
     onWake: (KnownHost) -> Unit,
     onSpeedTest: (KnownHost) -> Unit,
+    /** Upload this device's recent log to the host — see the menu row's gate below. */
+    onSendLogs: (KnownHost) -> Unit,
     onCopyLink: (KnownHost, StreamProfile?) -> Unit,
     onTogglePin: (KnownHost, StreamProfile) -> Unit,
     /** The experimental game-library toggle — off hides "Browse library…" everywhere. */
@@ -107,6 +109,14 @@ internal fun ConnectGrid(
         }
         if (pin == null) {
             add(HostMenuItem("Network speed test") { onSpeedTest(kh) })
+        }
+        // "Send logs to host" — the same row the console's host menu carries
+        // (`pf-console-ui`'s `options.rs`), on the same gate: the upload authenticates with the
+        // streaming cert, so it needs a paired identity and a host that is answering. It belongs
+        // HERE too and not only in the console: a device whose console never comes up is exactly
+        // the one whose logs somebody needs, and the touch home was its only shell.
+        if (pin == null && kh.paired && kh.isOnline(discovered, reachable)) {
+            add(HostMenuItem("Send logs to host") { onSendLogs(kh) })
         }
         add(HostMenuItem("Copy link") { onCopyLink(kh, pin) })
         if (profiles.isEmpty()) return@buildList

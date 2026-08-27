@@ -37,10 +37,8 @@ import io.unom.punktfunk.models.ActiveSession
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -130,6 +128,26 @@ object SkiaConsole {
         val available = runCatching { NativeBridge.nativeConsoleAvailable() }.getOrDefault(false)
         if (!available) return false
         return backendProp() != "none"
+    }
+
+    /**
+     * Why the console cannot front the gamepad UI here, or null when it can — for the settings
+     * screen to print under the switch that asks for it.
+     *
+     * `App` gates the console on `wanted() && healthy` on top of the user's own setting, and those
+     * two terms are the ONLY ones that can veto "Always": the mode, the attached pad, the TV check
+     * and the dev flag are ORed together, so a device where the console never comes up ignores
+     * every one of them. Until this existed that produced a switch the app silently disobeyed —
+     * indistinguishable, from the outside, from the switch itself being broken, and it is what a
+     * report of "the gamepad UI just doesn't activate, even on Always, even with a controller"
+     * looks like. Reads [healthy] as Compose state, so the note clears itself if it ever recovers.
+     */
+    fun unavailable(): String? = when {
+        !wanted() -> "This device has no console UI in this build, so the touch layout stays up."
+        !healthy -> "The console UI couldn't start on this device, so the touch layout is " +
+            "standing in. Restart the app to try again — and if it keeps happening, send this " +
+            "host your logs from a saved host's ⋮ menu."
+        else -> null
     }
 
     private fun backendProp(): String = runCatching {
@@ -628,11 +646,8 @@ object SkiaConsole {
     }
 
     /**
-     * `ConsoleCmd::SendLogs` — the native log ring (`nativeRenderLogs`) posted to this
-     * paired host's `POST /api/v1/client-logs` over the same mTLS client the library fetch
-     * uses; the result comes back as a notice, in the desktop console's wording. The header
-     * mirrors the desktop's identity line (`punktfunk-session <ver> (<os> <arch>) — client
-     * log bundle`).
+     * `ConsoleCmd::SendLogs` — [io.unom.punktfunk.SendLogs], the same upload the touch home's
+     * card menu runs; the result comes back here as a notice.
      */
     private fun sendLogs(c: JSONObject) {
         val addr = c.optString("addr"); val mgmt = c.optInt("mgmt"); val fp = c.optString("fp_hex")
@@ -642,34 +657,10 @@ object SkiaConsole {
             notice("Identity not ready yet — try again in a moment")
             return
         }
-        val version = appContext?.let { app ->
-            runCatching { app.packageManager.getPackageInfo(app.packageName, 0).versionName }.getOrNull()
-        } ?: "?"
-        val header = "punktfunk-android $version (android ${android.os.Build.VERSION.RELEASE}; " +
-            "${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"}) — client log bundle"
+        val app = appContext ?: return
         ioPool.execute {
-            val err = runCatching {
-                val body = NativeBridge.nativeRenderLogs(header)
-                val client = io.unom.punktfunk.kit.library.mtlsHttpClient(
-                    id.certPem, id.privateKeyPem, addr, fp,
-                )
-                val req = Request.Builder()
-                    .url("https://$addr:$mgmt/api/v1/client-logs")
-                    .post(body.toRequestBody("text/plain; charset=utf-8".toMediaType()))
-                    .build()
-                client.newCall(req).execute().use { resp ->
-                    if (resp.code == 200) "" else "host answered HTTP ${resp.code}"
-                }
-            }.getOrElse { it.message ?: "upload failed" }
-            main.post {
-                notice(
-                    if (err.isEmpty()) {
-                        "Logs sent to $hostName — download them from its web console's Logs page"
-                    } else {
-                        "Couldn't send logs — $err"
-                    },
-                )
-            }
+            val message = io.unom.punktfunk.SendLogs.toHost(app, id, addr, mgmt, fp, hostName)
+            main.post { notice(message) }
         }
     }
 

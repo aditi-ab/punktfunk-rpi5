@@ -635,6 +635,22 @@ fun ConnectScreen(
         if (copied) notice = message else status = message
     }
 
+    // "Send logs to host" — [SendLogs], the same upload the console's host menu runs. The outcome
+    // is a notice either way (success and failure both name the host), because the row's whole job
+    // is to tell a reporter whether the bundle actually landed.
+    fun sendLogs(kh: KnownHost) {
+        val id = identity ?: run {
+            status = "Identity not ready yet — try again in a moment"
+            return
+        }
+        notice = "Sending logs to ${kh.name.ifBlank { kh.address }}…"
+        status = null
+        scope.launch {
+            val message = withContext(Dispatchers.IO) { SendLogs.toHost(context, id, kh) }
+            notice = message
+        }
+    }
+
     // ---- punktfunk:// routing (design/client-deep-links.md §3) --------------------------------
     //
     // The invariant: a URL may only ever do what a click on an existing card could do, MINUS trust
@@ -776,6 +792,7 @@ fun ConnectScreen(
         onEdit = { kh -> editTarget = kh },
         onWake = { kh -> wakeHost(kh) },
         onSpeedTest = { kh -> startSpeedTest(HostCardEntry(kh, null)) },
+        onSendLogs = { kh -> sendLogs(kh) },
         onCopyLink = { kh, pin -> copyLink(kh, pin) },
         onTogglePin = { kh, p -> togglePin(kh, p) },
         libraryEnabled = settings.libraryEnabled,
