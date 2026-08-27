@@ -422,8 +422,12 @@ fn audio_body(
     let mut seq: u16 = 0;
     let mut timestamp: u32 = 0;
     let mut sent: u64 = 0;
-    // Surround sessions carry RS(4,2) FEC; the stereo wire stays exactly as validated.
-    let fec = layout.channels > 2;
+    // RS(4,2) FEC on EVERY layout (WP5.5) — stereo included. The parity math is
+    // layout-agnostic (shards are opaque encrypted packets), and a stock client's audio
+    // depacketizer runs the same fixed RS(4,2) recovery regardless of channel count; the old
+    // `channels > 2` gate was bring-up caution, and it left the MOST COMMON configuration with
+    // zero audio loss protection — one lost packet was an audible dropout no parity could heal.
+    let fec = true;
     let mut fec_block: Vec<Vec<u8>> = Vec::with_capacity(FEC_DATA_SHARDS);
     let (mut fec_base_seq, mut fec_base_ts) = (0u16, 0u32);
     let mut fec_skipped = false;

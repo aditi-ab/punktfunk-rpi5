@@ -692,10 +692,10 @@ fn open_gs_mirror_source(
         .context("start mirroring the pinned monitor")?;
     crate::capture::capture_virtual_output(
         vout,
-        // Same `gpu` predicate as the virtual source below: whether the RESOLVED encoder backend
-        // takes GPU frames. `zerocopy::enabled()` (the old argument here) is only the env knob —
-        // with a CPU encoder resolved it would ask capture for GPU frames nothing can consume.
-        pf_frame::OutputFormat::resolve(cfg.hdr, crate::encode::resolved_backend_is_gpu()),
+        // The capture format comes from the shared SessionPlan (WP5.1) — the same resolver the
+        // native plane uses, so the `gpu` predicate, HDR-ness and the producer-native-NV12 CSC
+        // skip can't drift between the planes. See `gs_session_plan`.
+        gs_session_plan(&cfg, metadata_cursor).output_format(),
         crate::session_plan::CaptureBackend::resolve(),
         compositor == crate::vdisplay::Compositor::Kwin,
     )
@@ -914,13 +914,42 @@ fn open_gs_virtual_source(
     // source — the Linux HDR path is the portal monitor mirror (`video_source=portal`).
     let mut capturer = capture::capture_virtual_output(
         vout,
-        capture::OutputFormat::resolve(cfg.hdr, crate::encode::resolved_backend_is_gpu()),
+        // Capture format from the shared SessionPlan (WP5.1) — one resolver for both planes.
+        // The visible upgrade over the old hardcoded `OutputFormat::resolve(hdr, gpu)`: a
+        // gamescope session (cursor blend off — see `set_hw_cursor` above) now gets
+        // `nv12_native`, so the producer's NV12 feeds Vulkan Video directly and the per-frame
+        // RGB→NV12 CSC the native plane already skips is skipped here too.
+        gs_session_plan(
+            &cfg,
+            compositor != crate::vdisplay::Compositor::Gamescope
+                && blend_capable_metadata_cursor(&cfg),
+        )
+        .output_format(),
         crate::session_plan::CaptureBackend::resolve(),
         compositor == crate::vdisplay::Compositor::Kwin,
     )
     .context("capture virtual output")?;
     capturer.set_active(true);
     Ok((capturer, compositor, gamescope_route))
+}
+
+/// The GameStream session's [`SessionPlan`](crate::session_plan::SessionPlan) (WP5.1): the same
+/// shared resolver the native plane uses, at this plane's negotiated shape — 4:2:0 (stock
+/// Moonlight; 4:4:4 is the Sunshine-extension follow-up this unlocks), depth 10 only with HDR
+/// (Moonlight's HDR toggle is the only 10-bit negotiation the protocol has), and NO
+/// cursor-forward (GameStream has no client cursor channel). Only `output_format()` is consumed
+/// today — the capture format stops being hand-hardcoded and picks up `nv12_native` where the
+/// plan resolves it.
+fn gs_session_plan(cfg: &StreamConfig, cursor_blend: bool) -> crate::session_plan::SessionPlan {
+    crate::session_plan::SessionPlan::resolve(
+        if cfg.hdr { 10 } else { 8 },
+        cfg.hdr,
+        encode::ChromaFormat::Yuv420,
+        cfg.codec,
+        cursor_blend,
+        false, // no cursor-forward on this plane
+        cfg.slices > 1,
+    )
 }
 
 /// The encoder bit depth implied by the captured frame's pixel format: a 10-bit (HDR) source — the
@@ -1649,6 +1678,13 @@ fn stream_body(
                 tracing::debug!("video: keyframe request coalesced (IDR still in flight)");
             }
         }
+        // The source's REAL HDR grade to the encoder (WP5.4) — an HDR backend embeds it as
+        // in-band mastering/CLL SEI on keyframes, which is the channel a STOCK Moonlight
+        // decoder tone-maps from. This plane never called it: an HDR GameStream session shipped
+        // no grade at all (the 0x010e control cue only flips the display mode and carries the
+        // generic fallback metadata). Cheap per frame by the trait's contract; `None` (SDR /
+        // no-metadata capturer) is the no-op it always was.
+        enc.set_hdr_meta(capturer.hdr_meta());
         if let Err(e) = enc.submit_indexed(&frame, au_seq.wrapping_add(enc_inflight)) {
             // The input half of an encode stall (see native/stream.rs): rebuild the encoder in
             // place instead of ending the stream. A backend without an in-place rebuild
