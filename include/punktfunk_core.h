@@ -730,6 +730,18 @@
 // know this contract.
 #define PUNKTFUNK_USER_FLAG_SLICE_STREAM 128
 
+// `user_flags` bit: this AU is a host-side **repeat** — the encode loop re-encoded a held
+// frame because the source produced nothing new (the idle keepalive), so it carries no new
+// content. The client's ABR uses it to tell an idle window from an active one (ABR overhaul
+// RFC §4.1): repeat-heavy windows must neither train the latency baselines nor read as "the
+// target wasn't utilized" — that is how a static stretch used to poison the controller
+// against the first moment of motion. Purely informational (no wire-shape change), so it is
+// set unconditionally; receivers that predate it ignore the bit, and a client only TRUSTS
+// its absence as "active frame" when the host advertised
+// [`HOST_CAP2_REPEAT_MARK`](crate::quic::HOST_CAP2_REPEAT_MARK) — against an older host,
+// zero repeat flags means "unknown", not "all active".
+#define USER_FLAG_REPEAT 256
+
 // Widest lost-frame range (frames, wrapping `last - first`) a reference-frame-invalidation
 // recovery may be asked to repair; anything wider goes straight to the keyframe path on BOTH
 // ends. RFI can only re-reference history the encoder still holds — NVENC keeps a 5-frame DPB,
@@ -1080,6 +1092,20 @@
 // [`HOST_CAP_PEN`], `0x08` is [`HOST_CAP_CURSOR`], `0x04` is [`HOST_CAP_TEXT_INPUT`],
 // `0x01`/`0x02` are gamepad-state / clipboard.
 #define PUNKTFUNK_HOST_CAP_AUDIO_HIRES 128
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2) bit — the second capability byte
+// the `0x80` wall above predicted, delivered as a trailing Welcome field (absent → `0`, the
+// same append discipline as every field since `compositor`; no ABI bump needed).
+//
+// The host marks its idle-keepalive re-encodes with
+// [`USER_FLAG_REPEAT`](crate::packet::USER_FLAG_REPEAT), so the client's ABR can tell an
+// idle window from an active one (ABR overhaul RFC §4.1). The bit is what makes the flag's
+// ABSENCE meaningful: against a host that advertises it, an unflagged AU is genuinely new
+// content; against an older host the client must treat activity as unknown and keep the
+// legacy window arithmetic.
+#define HOST_CAP2_REPEAT_MARK 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

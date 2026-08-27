@@ -58,9 +58,32 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// Never ask for less than this — below it the stream is unusable anyway and the floor keeps a
-/// mis-measured window from cratering the session.
-const FLOOR_KBPS: u32 = 5_000;
+/// Never ask for less than this — the floor keeps a mis-measured window from cratering the
+/// session. 2 Mbps (down from the long-standing 5 000 — ABR overhaul RFC §7 Q4): with paced
+/// sends, the burned FEC floor and the fps-normalized climb gate, a truly thin link is better
+/// served soft than lossy — and the first descent below [`LOW_RATE_WARN_KBPS`] says so once
+/// in the log rather than leaving "why is it blurry" undiagnosable.
+const FLOOR_KBPS: u32 = 2_000;
+/// The rate below which the one-shot quality warning fires (the OLD floor — sessions never
+/// used to go below it, so riding under it is exactly the new territory worth flagging).
+const LOW_RATE_WARN_KBPS: u32 = 5_000;
+/// Fully-idle report windows (the host marked every AU a repeat) before the next ACTIVE window
+/// re-arms slow start (RFC §4.3): ~3 s of stillness means the scene changed regime, and the
+/// re-climb from whatever the idle stretch decayed to should be multiplicative — bounded, as
+/// every slow-start step is, by ×1.5 over the windowed proven mark.
+const IDLE_WINDOWS_TO_REARM: u32 = 4;
+/// Fewest active frames a window needs before the fps-normalized utilization gate (RFC §4.2)
+/// may authorize a climb — a couple of stray frames prorate the target to almost nothing and
+/// would make any dribble read as "fully utilized".
+const MIN_ACTIVE_FRAMES_TO_CLIMB: u32 = 4;
+/// One report window, in µs — the pump's `ADAPT_REPORT_INTERVAL` cadence this controller is
+/// documented against throughout (the 750 ms in every window comment).
+const WINDOW_US: i64 = 750_000;
+/// Report windows per proven-throughput bucket (~30 s). The proven mark is the max over the
+/// current and previous buckets (≤ ~60 s, ≥ ~30 s) instead of the whole session: a high-water
+/// mark from minutes ago describes a link/scene regime that may be gone, and re-armed slow
+/// start doubling toward a stale all-session mark is the overshoot RFC §4.3 bounds.
+const PROVEN_BUCKET_WINDOWS: u32 = 40;
 /// Consecutive bad windows before an ORDINARY decrease — one window can be a scheduler blip or a
 /// single Wi-Fi scan; two in a row (1.5 s) is a condition. A SEVERE window skips the wait.
 const BAD_WINDOWS_TO_DECREASE: u32 = 2;
@@ -453,8 +476,18 @@ pub(crate) struct BitrateController {
     /// decode latency — the known-good high-water mark climbs are bounded against. Never decays;
     /// shrinking capacity (thermals, a heavier scene) is the reactive decode signal's job. On
     /// embedders without a decode signal this is just the delivered high-water mark — weaker
-    /// evidence, but the same bound.
-    proven_kbps: u32,
+    /// evidence, but the same bound. WINDOWED (RFC §4.3): the mark is the max over the current
+    /// and previous [`PROVEN_BUCKET_WINDOWS`] buckets, read via [`Self::proven`], so authority
+    /// from a regime minutes gone decays instead of licensing a doubling into it.
+    proven_cur_kbps: u32,
+    proven_prev_kbps: u32,
+    /// Windows into the current proven bucket — rotates at [`PROVEN_BUCKET_WINDOWS`].
+    proven_bucket_windows: u32,
+    /// Consecutive fully-idle windows (every AU host-flagged a repeat — RFC §4.1); the first
+    /// active window after ≥ [`IDLE_WINDOWS_TO_REARM`] of them re-arms slow start.
+    idle_windows: u32,
+    /// The one-shot low-rate quality warning fired (see [`LOW_RATE_WARN_KBPS`]).
+    low_rate_warned: bool,
     bad_windows: u32,
     clean_windows: u32,
     last_change: Option<Instant>,
@@ -514,7 +547,11 @@ impl BitrateController {
             climb_since_backoff: true,
             decode_cap_probe_windows: 0,
             decode_cap_reprobe_after: CAP_REPROBE_WINDOWS_MIN,
-            proven_kbps: 0,
+            proven_cur_kbps: 0,
+            proven_prev_kbps: 0,
+            proven_bucket_windows: 0,
+            idle_windows: 0,
+            low_rate_warned: false,
             bad_windows: 0,
             clean_windows: 0,
             last_change: None,
@@ -730,7 +767,16 @@ impl BitrateController {
         self.encode_disarm_clean_windows = 0;
         self.encode_reprobe_after = CAP_REPROBE_WINDOWS_MIN;
         self.encode_rearmed = false;
-        self.proven_kbps = 0;
+        self.proven_cur_kbps = 0;
+        self.proven_prev_kbps = 0;
+        self.proven_bucket_windows = 0;
+        self.idle_windows = 0;
+    }
+
+    /// The proven-throughput mark climbs are bounded against — the max over the current and
+    /// previous bucket (RFC §4.3), i.e. the highest clean delivered rate of the last ~30–60 s.
+    fn proven(&self) -> u32 {
+        self.proven_cur_kbps.max(self.proven_prev_kbps)
     }
 
     /// Feed one report window; returns the rate to request now, if any. `dropped` = frames that
@@ -744,7 +790,9 @@ impl BitrateController {
     /// carried, as opposed to the target it was allowed; feeds the utilization climb gate and
     /// the proven-throughput high-water mark), `flushed` = the pump's jump-to-live fired in the
     /// window, `recovery_kf` = decode-recovery keyframe asks the client sent in the window (see
-    /// [`RECOVERY_KF_BAD`]).
+    /// [`RECOVERY_KF_BAD`]), and `active_frames` = AUs the host did NOT flag as idle-keepalive
+    /// repeats (RFC §4.1; `None` from an older host that doesn't mark — the legacy window
+    /// arithmetic then applies throughout).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_window(
         &mut self,
@@ -757,6 +805,7 @@ impl BitrateController {
         actual_kbps: u32,
         flushed: bool,
         recovery_kf: u32,
+        active_frames: Option<u32>,
     ) -> Option<u32> {
         if !self.enabled {
             return None;
@@ -768,6 +817,47 @@ impl BitrateController {
             tracing::info!("adaptive bitrate off — host never acked a SetBitrate (older host)");
             return None;
         }
+        // Idle windows (RFC §4.1): the host flagged EVERY AU a repeat — the source produced
+        // nothing, so the window measures stillness, not this rate. It must neither train the
+        // latency baselines below, nor accrue climb credit or re-probe authority, nor feed the
+        // encode signal; loss/flush/drop keep their full power (damage is damage, however
+        // little flowed). `None` (an older, non-marking host) is never idle: the legacy
+        // arithmetic applies unchanged.
+        let idle = active_frames == Some(0);
+        if idle {
+            self.idle_windows = self.idle_windows.saturating_add(1);
+        } else {
+            // Motion onset (RFC §4.3): the first active window after a real idle stretch is a
+            // regime change — what the stretch decayed to says nothing about what the scene
+            // now needs. Re-arm slow start (its doubling stays bounded by ×1.5 over the
+            // WINDOWED proven mark and every cap/ceiling) and clear the change cooldown so
+            // the climb may fire off this very window's evidence.
+            if self.idle_windows >= IDLE_WINDOWS_TO_REARM && !self.probing {
+                self.probing = true;
+                self.last_change = None;
+                tracing::debug!(
+                    idle_windows = self.idle_windows,
+                    proven_kbps = self.proven(),
+                    "adaptive bitrate: motion onset after an idle stretch — slow start re-armed"
+                );
+            }
+            self.idle_windows = 0;
+        }
+        // The proven mark's bucket clock (RFC §4.3) ticks on every window — idle ones too:
+        // decay is about TIME, and a mark from a minute ago is stale however the minute was
+        // spent.
+        self.proven_bucket_windows += 1;
+        if self.proven_bucket_windows >= PROVEN_BUCKET_WINDOWS {
+            self.proven_bucket_windows = 0;
+            self.proven_prev_kbps = self.proven_cur_kbps;
+            self.proven_cur_kbps = 0;
+        }
+        // Baseline neutrality for idle windows: a repeat-only window's OWD/decode means
+        // describe the keepalive dribble, not the link under load — feeding them would train
+        // the rolling MINIMUM on the quietest possible traffic, exactly the poisoning that
+        // made the first motion window read as congestion (the 2026-08-26 field chain, step 5).
+        let owd_mean_us = owd_mean_us.filter(|_| !idle);
+        let decode_mean_us = decode_mean_us.filter(|_| !idle);
         // OWD: compare against the rolling-min baseline of PRIOR windows (so a rising window
         // doesn't drag its own baseline up), then record it. No severe tier — a standing queue is
         // congestion evidence, not visible damage, so it always takes the two-window path.
@@ -816,7 +906,7 @@ impl BitrateController {
         // [`ENCODE_NOOP_BACKOFFS_TO_DISARM`]): a rise the rate has twice failed to answer is not
         // evidence about the rate, so it must neither mark a window bad nor teach a baseline.
         let (encode_rise_us, encode_severe_us) = self.encode_thresholds();
-        let encode_usable = !starved && !self.encode_disarmed;
+        let encode_usable = !starved && !self.encode_disarmed && !idle;
         let (encode_bad, encode_severe) = score_baseline(
             &mut self.encode_means,
             encode_mean_us.filter(|_| encode_usable),
@@ -848,8 +938,8 @@ impl BitrateController {
         // backlog draining in a single window, a flush's queue, the FEC surge that answers a loss
         // burst). "Loss doesn't disqualify, the bytes still arrived" was true about the bytes and
         // wrong about the conclusion drawn from them.
-        if !bad && actual_kbps > self.proven_kbps {
-            self.proven_kbps = actual_kbps;
+        if !bad && actual_kbps > self.proven_cur_kbps {
+            self.proven_cur_kbps = actual_kbps;
         }
         if bad {
             self.bad_windows += 1;
@@ -861,8 +951,13 @@ impl BitrateController {
                 self.streak_decode_windows += 1;
             }
             self.clean_windows = 0;
-            // Any congestion signal ends slow start for good — from here on, climbs are additive.
+            // Any congestion signal ends slow start for good — from here on, climbs are
+            // additive (until a motion onset after a real idle stretch re-arms it, above).
             self.probing = false;
+        } else if idle {
+            // Neutral (RFC §4.1): a repeat-only window is not credit toward a climb, and it
+            // must not zero the bad streak either — stillness proves nothing in either
+            // direction.
         } else {
             self.clean_windows += 1;
             self.bad_windows = 0;
@@ -875,7 +970,9 @@ impl BitrateController {
         if let Some(cap) = self.host_cap_kbps {
             if bad {
                 self.cap_probe_windows = 0;
-            } else if self.current_kbps >= cap.saturating_sub(cap / 16) {
+            // `!idle`: re-probe authority accrues from clean LOADED windows, not stillness
+            // (RFC §4.1) — an idle stretch neither resets nor advances the clock.
+            } else if !idle && self.current_kbps >= cap.saturating_sub(cap / 16) {
                 self.cap_probe_windows += 1;
                 if self.cap_probe_windows >= self.cap_reprobe_after {
                     self.cap_probe_windows = 0;
@@ -899,7 +996,8 @@ impl BitrateController {
         if let Some(cap) = self.decode_cap_kbps {
             if bad {
                 self.decode_cap_probe_windows = 0;
-            } else if self.current_kbps >= cap.saturating_sub(cap / 16) {
+            // Same `!idle` rule as the host cap's clock above.
+            } else if !idle && self.current_kbps >= cap.saturating_sub(cap / 16) {
                 self.decode_cap_probe_windows += 1;
                 if self.decode_cap_probe_windows >= self.decode_cap_reprobe_after {
                     self.decode_cap_probe_windows = 0;
@@ -932,7 +1030,9 @@ impl BitrateController {
         if self.encode_disarmed {
             if bad {
                 self.encode_disarm_clean_windows = 0;
-            } else {
+            // Same `!idle` rule as the cap clocks: an encoder that was quiet because nothing
+            // needed encoding has proven nothing about its knee.
+            } else if !idle {
                 self.encode_disarm_clean_windows += 1;
                 if self.encode_disarm_clean_windows >= self.encode_reprobe_after {
                     self.encode_disarmed = false;
@@ -1096,17 +1196,59 @@ impl BitrateController {
             }
             self.climb_since_backoff = false;
             let next = ((self.current_kbps as u64 * 7 / 10) as u32).max(self.floor_kbps);
+            // Descending into territory the old 5 Mbps floor used to fence off: say so once,
+            // so "why is it blurry" has a log line instead of a mystery. The rate is the
+            // link's fault, not a bug — this floor trades soft for lossy on purpose (RFC §7).
+            if next < LOW_RATE_WARN_KBPS && !self.low_rate_warned {
+                self.low_rate_warned = true;
+                tracing::warn!(
+                    at_kbps = next,
+                    "adaptive bitrate: the link sustains only a very low rate — expect \
+                     visibly soft video until it recovers (floor: 2 Mbps)"
+                );
+            }
             self.bad_windows = 0;
             self.streak_decode_windows = 0;
             return self.request(next, now);
         }
-        // Climbs only fire off a UTILIZED clean window (actual delivered ≥ ¾ of the target — the
-        // target was genuinely tested, not idling under calm content) and step at most ×1.5 past
-        // the proven high-water mark. Calm windows still count as clean (clean_windows keeps
-        // accumulating — the network is healthy), they just can't authorize a climb; the first
-        // utilized window after a long-enough clean run climbs immediately.
-        let utilized =
+        // Climbs only fire off a UTILIZED clean window (the target was genuinely tested, not
+        // idling under calm content) and step at most ×1.5 past the proven high-water mark.
+        //
+        // Utilization is measured per FRAME at the rate the source actually runs (RFC §4.2)
+        // when the host marks repeats: a frame-driven source at 35 fps on a 90 Hz config can
+        // never reach ¾ of the WALL-CLOCK target at any rate — the documented dead band — yet
+        // its frames may be running at the encoder's full per-frame budget, which is exactly
+        // "the target was tested". So the target is prorated by active_frames/expected before
+        // the ¾ gate, floored at [`MIN_ACTIVE_FRAMES_TO_CLIMB`] active frames so a dribble
+        // can't prorate the bar to nothing; a fully-idle window never authorizes (the
+        // `unloaded_clean_windows_never_authorize_a_climb` intent, extended). An older host
+        // (`None`) and an unknown refresh keep the legacy wall-clock arithmetic.
+        let legacy_utilized =
             actual_kbps as u64 * UTILIZATION_DEN >= self.current_kbps as u64 * UTILIZATION_NUM;
+        // `proration = Some((active, expected))` when the source runs meaningfully below the
+        // session refresh — it prorates the utilization bar here AND the proven-headroom cap
+        // below (the two must move together or they deadlock: a 35 fps source's wall-clock
+        // wire rate can never exceed ~39 % of its target, so an unprorated proven mark would
+        // cap every climb under the current target no matter how full the frames ran).
+        let proration = match (active_frames, self.frame_budget_us) {
+            (Some(n), Some(budget_us))
+                if budget_us > 0 && n > 0 && (n as i64) < WINDOW_US / budget_us =>
+            {
+                Some((n as u64, ((WINDOW_US / budget_us).max(1)) as u64))
+            }
+            _ => None,
+        };
+        let utilized = match (active_frames, proration) {
+            (Some(0), _) => false,
+            (_, Some((n, expected))) => {
+                n >= MIN_ACTIVE_FRAMES_TO_CLIMB as u64
+                    && actual_kbps as u64 * UTILIZATION_DEN * expected
+                        >= self.current_kbps as u64 * UTILIZATION_NUM * n
+            }
+            // A full-rate source, an older host, or an unknown refresh: the exact legacy
+            // wall-clock arithmetic (and its rounding).
+            _ => legacy_utilized,
+        };
         // The effective ceiling folds in both learned caps: the probe measured the LINK, the
         // host's short acks measured the ENCODER, and the decode cap measured the CLIENT
         // DECODER — whichever binds first is the limit.
@@ -1131,8 +1273,21 @@ impl BitrateController {
             self.ceiling_ask_kbps = ceiling_target;
             return self.request(ceiling_target, now);
         }
-        let cap = eff_ceiling
-            .min(self.proven_kbps.saturating_mul(PROVEN_HEADROOM_NUM) / PROVEN_HEADROOM_DEN);
+        // The proven mark bounds the next target's PROJECTED WIRE RATE at ×1.5 over what the
+        // pipeline demonstrably carried. For a full-rate source that IS the target; for a
+        // frame-driven source the target's wire rate is `target × active/expected`, so the
+        // bound on the target scales by the inverse — the same proration as the utilization
+        // gate, which is what keeps the documented no-deadlock invariant (a prorated-utilized
+        // window guarantees ≥ ~12 % of climbing room, exactly as the wall-clock pair did).
+        let proven_wire_cap =
+            self.proven().saturating_mul(PROVEN_HEADROOM_NUM) / PROVEN_HEADROOM_DEN;
+        let proven_target_cap = match proration {
+            Some((n, expected)) => {
+                u32::try_from(proven_wire_cap as u64 * expected / n).unwrap_or(u32::MAX)
+            }
+            None => proven_wire_cap,
+        };
+        let cap = eff_ceiling.min(proven_target_cap);
         if self.current_kbps < eff_ceiling && utilized && cap > self.current_kbps {
             // Slow start: double on every cooled clean window until the first congestion signal
             // (this is how an Automatic session reaches a probe-measured ceiling in seconds).
@@ -1199,6 +1354,7 @@ mod tests {
                 1_000_000,
                 false,
                 0,
+                None,
             );
             if out.is_some() {
                 return out;
@@ -1222,7 +1378,8 @@ mod tests {
                 None,
                 1_000_000,
                 true,
-                0
+                0,
+                None,
             ),
             None
         );
@@ -1243,7 +1400,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             None
         );
@@ -1258,7 +1416,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(14_000)
         );
@@ -1274,7 +1433,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             None
         ); // bad #1 again
@@ -1288,7 +1448,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(9_800)
         );
@@ -1300,13 +1461,35 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false, 0),
+            c.on_window(
+                ticks(start, 0),
+                1,
+                0,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0,
+                None
+            ),
             Some(14_000)
         );
         // …and so does a jump-to-live flush.
         let mut c = BitrateController::new(20_000);
         assert_eq!(
-            c.on_window(ticks(start, 0), 0, 0, None, None, None, 1_000_000, true, 0),
+            c.on_window(
+                ticks(start, 0),
+                0,
+                0,
+                None,
+                None,
+                None,
+                1_000_000,
+                true,
+                0,
+                None
+            ),
             Some(14_000)
         );
         // …and ≥6 % window loss.
@@ -1321,7 +1504,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(14_000)
         );
@@ -1332,39 +1516,107 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false, 0),
+            c.on_window(
+                ticks(start, 0),
+                1,
+                0,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0,
+                None
+            ),
             Some(14_000)
         );
         c.on_ack(14_000);
         // A severe window INSIDE the 1.5 s cooldown (tick 1 = 750 ms) → held; at the cooldown
         // boundary (tick 2 = 1.5 s) it fires.
         assert_eq!(
-            c.on_window(ticks(start, 1), 1, 0, None, None, None, 1_000_000, false, 0),
+            c.on_window(
+                ticks(start, 1),
+                1,
+                0,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0,
+                None
+            ),
             None
         );
         assert_eq!(
-            c.on_window(ticks(start, 2), 1, 0, None, None, None, 1_000_000, false, 0),
+            c.on_window(
+                ticks(start, 2),
+                1,
+                0,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0,
+                None
+            ),
             Some(9_800)
         );
     }
 
     #[test]
     fn floor_is_never_crossed() {
-        let mut c = BitrateController::new(6_000);
+        // The floor is 2 Mbps now (RFC §7 Q4) — the old 5 000 fence, with pacing + the burned
+        // FEC floor in place, traded "lossy" for "soft" and moved down.
+        let mut c = BitrateController::new(2_500);
         let start = Instant::now();
-        // ×0.7 of 6000 = 4200 < floor → clamped to 5000.
+        // ×0.7 of 2500 = 1750 < floor → clamped to 2000.
         assert_eq!(
-            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false, 0),
-            Some(5_000)
+            c.on_window(
+                ticks(start, 0),
+                1,
+                0,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0,
+                None
+            ),
+            Some(2_000)
         );
-        c.on_ack(5_000);
+        c.on_ack(2_000);
         // At the floor, further bad windows request nothing.
         assert_eq!(
-            c.on_window(ticks(start, 6), 1, 0, None, None, None, 1_000_000, false, 0),
+            c.on_window(
+                ticks(start, 6),
+                1,
+                0,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0,
+                None
+            ),
             None
         );
         assert_eq!(
-            c.on_window(ticks(start, 7), 1, 0, None, None, None, 1_000_000, false, 0),
+            c.on_window(
+                ticks(start, 7),
+                1,
+                0,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0,
+                None
+            ),
             None
         );
     }
@@ -1374,7 +1626,18 @@ mod tests {
         let mut c = BitrateController::new(20_000);
         let start = Instant::now();
         assert_eq!(
-            c.on_window(ticks(start, 0), 1, 0, None, None, None, 1_000_000, false, 0),
+            c.on_window(
+                ticks(start, 0),
+                1,
+                0,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0,
+                None
+            ),
             Some(14_000)
         );
         c.on_ack(14_000);
@@ -1407,6 +1670,7 @@ mod tests {
                 1_000_000,
                 false,
                 0,
+                None,
             ) {
                 c.on_ack(k);
                 got.push(k);
@@ -1430,7 +1694,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(40_000)
         );
@@ -1446,7 +1711,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(28_000)
         );
@@ -1464,6 +1730,7 @@ mod tests {
                 1_000_000,
                 false,
                 0,
+                None,
             );
             if next.is_some() {
                 assert!(i >= 8, "additive climb must wait for the clean run");
@@ -1478,7 +1745,18 @@ mod tests {
         let mut c = BitrateController::new(0);
         c.set_ceiling(1_000_000);
         assert_eq!(
-            c.on_window(Instant::now(), 0, 0, None, None, None, 1_000_000, false, 0),
+            c.on_window(
+                Instant::now(),
+                0,
+                0,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0,
+                None
+            ),
             None
         );
         let mut c = BitrateController::new(20_000);
@@ -1626,7 +1904,8 @@ mod tests {
                     None,
                     1_000_000,
                     false,
-                    0
+                    0,
+                    None,
                 ),
                 None
             );
@@ -1642,7 +1921,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             None
         );
@@ -1656,7 +1936,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(14_000)
         );
@@ -1680,7 +1961,8 @@ mod tests {
                     None,
                     1_000_000,
                     false,
-                    0
+                    0,
+                    None,
                 ),
                 None
             );
@@ -1697,7 +1979,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             None
         );
@@ -1711,7 +1994,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(14_000)
         );
@@ -1734,7 +2018,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                2
+                2,
+                None,
             ),
             None
         );
@@ -1748,7 +2033,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                2
+                2,
+                None,
             ),
             Some(14_000)
         );
@@ -1770,7 +2056,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                4
+                4,
+                None,
             ),
             Some(14_000)
         );
@@ -1793,7 +2080,8 @@ mod tests {
                     None,
                     1_000_000,
                     false,
-                    1
+                    1,
+                    None,
                 ),
                 None
             );
@@ -1820,6 +2108,7 @@ mod tests {
                 1_000_000,
                 false,
                 0,
+                None,
             ) {
                 last = k;
                 c.on_ack(k);
@@ -1838,7 +2127,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             None
         );
@@ -1854,7 +2144,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(210_000)
         );
@@ -1883,7 +2174,8 @@ mod tests {
                     Some(mean),
                     1_000_000,
                     false,
-                    0
+                    0,
+                    None,
                 ),
                 None,
                 "window {i} fired off a baseline of fewer than {BASELINE_MIN_WINDOWS} samples"
@@ -1901,7 +2193,8 @@ mod tests {
                 Some(20_000),
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(70_000)
         );
@@ -1926,7 +2219,8 @@ mod tests {
                     None,
                     2_000,
                     false,
-                    0
+                    0,
+                    None,
                 ),
                 None
             );
@@ -1944,10 +2238,390 @@ mod tests {
                 None,
                 18_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(27_000)
         );
+        // Extended (RFC §4.2): a window with NO active frames — the host flagged every AU an
+        // idle-keepalive repeat — never authorizes a climb either, whatever its delivered
+        // figure claims. Stillness is not evidence about the rate.
+        let mut c = BitrateController::new(20_000);
+        c.set_ceiling(300_000);
+        c.set_frame_budget(60);
+        for i in 0..12 {
+            assert_eq!(
+                c.on_window(
+                    ticks(start, i),
+                    0,
+                    0,
+                    Some(10_000),
+                    Some(8_000),
+                    None,
+                    18_000,
+                    false,
+                    0,
+                    Some(0),
+                ),
+                None,
+                "an idle window must never climb"
+            );
+        }
+    }
+
+    /// RFC §4.2 — the floor dead band's general form: a frame-driven source (a menu at 35 fps
+    /// on a 90 Hz config) can never reach ¾ of the WALL-CLOCK target at any rate, so the old
+    /// gate structurally refused every climb. Utilization measured per frame at the source's
+    /// own rate climbs when the frames run full — and the proven-headroom cap prorates with
+    /// it, or the two gates would deadlock exactly where the fix is needed.
+    #[test]
+    fn a_frame_driven_source_climbs_at_its_own_fps() {
+        let mut c = BitrateController::new(20_000);
+        c.set_stream_cap(100_000);
+        c.set_ceiling(60_000);
+        c.set_frame_budget(90); // budget 11 111 µs → 67 expected frames per 750 ms window
+        let start = Instant::now();
+        // 26 active frames of the 67 expected, at full per-frame size: 8 000 kbps delivered
+        // against a 20 000×26/67 ≈ 7 761 prorated target — utilized (the legacy gate would
+        // have demanded 15 000 and refused forever). Slow start doubles, bounded by the
+        // PRORATED proven headroom: 8 000×1.5×67/26 = 30 923, not the wall-clock 12 000 that
+        // would have deadlocked under the current target.
+        assert_eq!(
+            c.on_window(
+                ticks(start, 0),
+                0,
+                0,
+                Some(10_000),
+                None,
+                None,
+                8_000,
+                false,
+                0,
+                Some(26),
+            ),
+            Some(30_923)
+        );
+        // A dribble (under MIN_ACTIVE_FRAMES_TO_CLIMB) prorates the bar to almost nothing —
+        // it must not read as utilized.
+        let mut d = BitrateController::new(20_000);
+        d.set_stream_cap(100_000);
+        d.set_ceiling(60_000);
+        d.set_frame_budget(90);
+        assert_eq!(
+            d.on_window(
+                ticks(start, 0),
+                0,
+                0,
+                Some(10_000),
+                None,
+                None,
+                900,
+                false,
+                0,
+                Some(3),
+            ),
+            None,
+            "three stray frames are not a utilized window"
+        );
+    }
+
+    /// RFC §4.1 — the calm-baseline poisoning, head to head: the same wire history (quiet
+    /// keepalive-only stretch, then motion) BACKS OFF against a non-marking host — the idle
+    /// stretch trained the OWD baseline's rolling min on keepalive dribble, so motion's
+    /// ordinary latency reads as a rise — and CLIMBS against a marking host, whose idle
+    /// windows train nothing.
+    #[test]
+    fn idle_windows_train_no_baselines() {
+        let start = Instant::now();
+        let run = |marking: bool| -> Option<u32> {
+            let mut c = BitrateController::new(20_000);
+            c.set_ceiling(300_000);
+            c.set_frame_budget(60);
+            let mut decision = None;
+            // Warm the OWD baseline under load: four active full-rate windows at 30 ms.
+            for i in 0..4 {
+                let r = c.on_window(
+                    ticks(start, i),
+                    0,
+                    0,
+                    Some(30_000),
+                    None,
+                    None,
+                    2_000,
+                    false,
+                    0,
+                    marking.then_some(45),
+                );
+                assert_eq!(r, None);
+            }
+            // The quiet stretch: keepalive dribble at 1 ms OWD. A marking host flags it idle
+            // (trains nothing); a legacy host's windows look like ordinary calm content and
+            // train the rolling MIN down to 1 ms.
+            for i in 4..10 {
+                let r = c.on_window(
+                    ticks(start, i),
+                    0,
+                    0,
+                    Some(1_000),
+                    None,
+                    None,
+                    200,
+                    false,
+                    0,
+                    marking.then_some(0),
+                );
+                assert_eq!(r, None);
+            }
+            // Motion: two windows at the same 30 ms OWD the warmup ran at, delivering well.
+            // The FIRST decision is the verdict (a request starts the change cooldown, so the
+            // second window is silent either way).
+            for i in 10..12 {
+                let r = c.on_window(
+                    ticks(start, i),
+                    0,
+                    0,
+                    Some(30_000),
+                    None,
+                    None,
+                    18_000,
+                    false,
+                    0,
+                    marking.then_some(45),
+                );
+                decision = decision.or(r);
+            }
+            decision
+        };
+        // Legacy host: 30 ms against a 1 ms-trained baseline is an OWD rise — two windows
+        // → a ×0.7 backoff. Motion itself read as congestion (the field chain, step 5).
+        assert_eq!(run(false), Some(14_000));
+        // Marking host: the baseline still says 30 ms is normal — motion is clean, and the
+        // banked slow start climbs off the first utilized window instead (×1.5 over the
+        // 18 000 just proven).
+        assert_eq!(run(true), Some(27_000));
+    }
+
+    /// RFC §4.3 — motion onset after a real idle stretch re-arms slow start: the re-climb is
+    /// multiplicative (not the +6 % crawl that took ~103 s from the floor), and each step
+    /// stays bounded by ×1.5 over the WINDOWED proven mark.
+    #[test]
+    fn motion_onset_rearms_slow_start_bounded_by_the_windowed_proven() {
+        let mut c = BitrateController::new(20_000);
+        c.set_stream_cap(100_000);
+        c.set_ceiling(60_000);
+        c.set_frame_budget(60);
+        let start = Instant::now();
+        // A severe window ends slow start for good (the pre-§4.3 rule)…
+        assert_eq!(
+            c.on_window(
+                ticks(start, 0),
+                1,
+                0,
+                None,
+                None,
+                None,
+                18_000,
+                false,
+                0,
+                Some(45)
+            ),
+            Some(14_000)
+        );
+        c.on_ack(14_000);
+        // …one clean active window proves 14 000 delivered…
+        assert_eq!(
+            c.on_window(
+                ticks(start, 1),
+                0,
+                0,
+                None,
+                None,
+                None,
+                14_000,
+                false,
+                0,
+                Some(45),
+            ),
+            None
+        );
+        // …then ≥ IDLE_WINDOWS_TO_REARM fully-idle windows: the scene went still.
+        for i in 2..6 {
+            assert_eq!(
+                c.on_window(
+                    ticks(start, i),
+                    0,
+                    0,
+                    None,
+                    None,
+                    None,
+                    200,
+                    false,
+                    0,
+                    Some(0)
+                ),
+                None
+            );
+        }
+        // Motion onset: the first active window re-arms slow start — a multiplicative step,
+        // bounded by the windowed proven ×1.5 (21 000), where the additive crawl would have
+        // offered 14 876.
+        assert_eq!(
+            c.on_window(
+                ticks(start, 6),
+                0,
+                0,
+                None,
+                None,
+                None,
+                14_000,
+                false,
+                0,
+                Some(45),
+            ),
+            Some(21_000)
+        );
+    }
+
+    /// RFC §4.3 — the proven mark is windowed: a high-water from a regime minutes gone must
+    /// not size the onset step. Same shape as the re-arm test, but the idle stretch outlives
+    /// both proven buckets — the onset doubles over what the onset itself just delivered, not
+    /// over the stale pre-idle mark.
+    #[test]
+    fn the_proven_mark_decays_with_its_buckets() {
+        let mut c = BitrateController::new(20_000);
+        c.set_stream_cap(100_000);
+        c.set_ceiling(60_000);
+        c.set_frame_budget(60);
+        let start = Instant::now();
+        // Prove 20 000 delivered — a fully-utilized first window, so slow start immediately
+        // asks for the bounded double (never acked here; the mark is what matters)…
+        assert_eq!(
+            c.on_window(
+                ticks(start, 0),
+                0,
+                0,
+                None,
+                None,
+                None,
+                20_000,
+                false,
+                0,
+                Some(45),
+            ),
+            Some(30_000)
+        );
+        // …then kill slow start with severe windows: the first is inside the change cooldown
+        // (it scores, but decides nothing), the second backs off. The 20 000 mark survives.
+        assert_eq!(
+            c.on_window(
+                ticks(start, 1),
+                1,
+                0,
+                None,
+                None,
+                None,
+                20_000,
+                false,
+                0,
+                Some(45)
+            ),
+            None
+        );
+        assert_eq!(
+            c.on_window(
+                ticks(start, 2),
+                1,
+                0,
+                None,
+                None,
+                None,
+                20_000,
+                false,
+                0,
+                Some(45)
+            ),
+            Some(14_000)
+        );
+        c.on_ack(14_000);
+        // Idle long enough to rotate BOTH proven buckets away (2 × PROVEN_BUCKET_WINDOWS).
+        for i in 3..3 + 2 * PROVEN_BUCKET_WINDOWS {
+            assert_eq!(
+                c.on_window(
+                    ticks(start, i),
+                    0,
+                    0,
+                    None,
+                    None,
+                    None,
+                    200,
+                    false,
+                    0,
+                    Some(0)
+                ),
+                None
+            );
+        }
+        // Onset delivers 14 000: the re-armed doubling is bounded by ×1.5 over THAT
+        // (21 000) — under the stale all-session rule the 20 000 mark would have licensed
+        // 28 000, a doubling into a regime nothing recent has proven.
+        assert_eq!(
+            c.on_window(
+                ticks(start, 3 + 2 * PROVEN_BUCKET_WINDOWS),
+                0,
+                0,
+                None,
+                None,
+                None,
+                14_000,
+                false,
+                0,
+                Some(45),
+            ),
+            Some(21_000)
+        );
+    }
+
+    /// The 2 Mbps floor's one-shot quality warning (RFC §7 Q4): fires on the first descent
+    /// below the old 5 000 fence, once.
+    #[test]
+    fn the_low_rate_warning_fires_once_below_the_old_floor() {
+        let mut c = BitrateController::new(6_000);
+        let start = Instant::now();
+        assert!(!c.low_rate_warned);
+        // 6000 × 0.7 = 4200 — under the old floor, over the new one.
+        assert_eq!(
+            c.on_window(
+                ticks(start, 0),
+                1,
+                0,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0,
+                None
+            ),
+            Some(4_200)
+        );
+        assert!(c.low_rate_warned, "the descent below 5 000 warns");
+        c.on_ack(4_200);
+        assert_eq!(
+            c.on_window(
+                ticks(start, 6),
+                1,
+                0,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0,
+                None
+            ),
+            Some(2_940)
+        );
+        assert!(c.low_rate_warned, "…exactly once");
     }
 
     #[test]
@@ -1969,7 +2643,8 @@ mod tests {
                 None,
                 20_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(30_000)
         );
@@ -1985,7 +2660,8 @@ mod tests {
                 None,
                 30_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(45_000)
         );
@@ -2009,7 +2685,8 @@ mod tests {
                 None,
                 20_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(30_000)
         );
@@ -2026,7 +2703,8 @@ mod tests {
                     None,
                     600,
                     false,
-                    0
+                    0,
+                    None,
                 ),
                 None
             );
@@ -2050,7 +2728,8 @@ mod tests {
                     None,
                     1_000_000,
                     false,
-                    0
+                    0,
+                    None,
                 ),
                 None
             );
@@ -2067,7 +2746,8 @@ mod tests {
                 None,
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(14_000)
         );
@@ -2153,6 +2833,7 @@ mod tests {
                 1_000_000,
                 false,
                 0,
+                None,
             );
         }
         assert_eq!(c.host_cap_kbps, Some(794_000 + 794_000 / 8));
@@ -2193,6 +2874,7 @@ mod tests {
                 1_000_000,
                 false,
                 0,
+                None,
             ) {
                 c.on_ack(k);
             }
@@ -2266,6 +2948,7 @@ mod tests {
                     1_000_000,
                     false,
                     0,
+                    None,
                 );
                 tick += 1;
             }
@@ -2300,7 +2983,8 @@ mod tests {
                     Some(7_000),
                     1_000_000,
                     false,
-                    0
+                    0,
+                    None,
                 ),
                 None
             );
@@ -2315,7 +2999,8 @@ mod tests {
                 Some(11_500),
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             None
         );
@@ -2329,7 +3014,8 @@ mod tests {
                 Some(12_000),
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(14_000)
         );
@@ -2352,7 +3038,8 @@ mod tests {
                     Some(7_000),
                     1_000_000,
                     false,
-                    0
+                    0,
+                    None,
                 ),
                 None
             );
@@ -2367,7 +3054,8 @@ mod tests {
                 Some(20_000),
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(14_000)
         );
@@ -2391,6 +3079,7 @@ mod tests {
                 1_000_000,
                 false,
                 0,
+                None,
             );
         }
         let _ = c.on_window(
@@ -2403,6 +3092,7 @@ mod tests {
             1_000_000,
             false,
             0,
+            None,
         );
         assert_eq!(
             c.on_window(
@@ -2414,7 +3104,8 @@ mod tests {
                 Some(12_500),
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(14_000)
         );
@@ -2432,7 +3123,8 @@ mod tests {
                     Some(15_000),
                     1_000_000,
                     false,
-                    0
+                    0,
+                    None,
                 ),
                 None
             );
@@ -2464,6 +3156,7 @@ mod tests {
                 1_000_000,
                 false,
                 0,
+                None,
             ) {
                 c.on_ack(k);
             }
@@ -2480,6 +3173,7 @@ mod tests {
             1_000_000,
             false,
             0,
+            None,
         )
     }
 
@@ -2488,7 +3182,18 @@ mod tests {
         for _ in 0..n {
             let at = ticks(start, *tick);
             *tick += 1;
-            if let Some(k) = c.on_window(at, 0, 0, Some(10_000), None, None, 1_000_000, false, 0) {
+            if let Some(k) = c.on_window(
+                at,
+                0,
+                0,
+                Some(10_000),
+                None,
+                None,
+                1_000_000,
+                false,
+                0,
+                None,
+            ) {
                 c.on_ack(k);
             }
         }
@@ -2559,7 +3264,7 @@ mod tests {
         tick += 1;
         // A flush: severe, so it also costs a ×0.7 — and it resets the clean run behind it.
         assert!(c
-            .on_window(at, 0, 0, Some(10_000), None, None, 1_000_000, true, 0)
+            .on_window(at, 0, 0, Some(10_000), None, None, 1_000_000, true, 0, None)
             .is_some());
         clean_run(&mut c, start, &mut tick, CAP_REPROBE_WINDOWS_MIN - 1);
         assert!(c.encode_disarmed, "the spoiled window must restart the run");
@@ -2605,7 +3310,8 @@ mod tests {
                 Some(excursion),
                 1_000_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(14_000)
         );
@@ -2689,7 +3395,8 @@ mod tests {
                     Some(7_000),
                     1_000_000,
                     false,
-                    0
+                    0,
+                    None,
                 ),
                 None
             );
@@ -2707,7 +3414,8 @@ mod tests {
                 Some(20_000),
                 1_000_000,
                 true,
-                0
+                0,
+                None,
             ),
             Some(9_800)
         );
@@ -2763,7 +3471,18 @@ mod tests {
         // One calm, unutilized window (2 Mb/s actual): seeds the latency baselines without
         // authorizing climbs, and must decide nothing.
         assert_eq!(
-            c.on_window(at, 0, 0, Some(10_000), Some(8_000), None, 2_000, false, 0),
+            c.on_window(
+                at,
+                0,
+                0,
+                Some(10_000),
+                Some(8_000),
+                None,
+                2_000,
+                false,
+                0,
+                None
+            ),
             None
         );
     }
@@ -2786,6 +3505,7 @@ mod tests {
                 1_000_000,
                 false,
                 0,
+                None,
             ) {
                 c.on_ack(k);
             }
@@ -2811,6 +3531,7 @@ mod tests {
             c.current_kbps,
             false,
             0,
+            None,
         );
         *tick += 1;
         r
@@ -2853,6 +3574,7 @@ mod tests {
             c.current_kbps / 10,
             true,
             RECOVERY_KF_SEVERE,
+            None,
         );
         *tick += 1;
         r
@@ -2960,7 +3682,8 @@ mod tests {
                     Some(2_800),
                     10_000,
                     false,
-                    0
+                    0,
+                    None,
                 ),
                 None
             );
@@ -2981,6 +3704,7 @@ mod tests {
             390,
             false,
             0,
+            None,
         );
         t += 1;
         assert_eq!(
@@ -3006,6 +3730,7 @@ mod tests {
             20_000,
             false,
             0,
+            None,
         );
         assert!(
             verdict.is_some_and(|k| k < 20_000),
@@ -3037,6 +3762,7 @@ mod tests {
                 1_000_000,
                 false,
                 0,
+                None,
             ) {
                 // Never past the cap in force when the decision was made. (A long clean run
                 // legitimately re-probes that cap upward — `decode_cap_reprobes_after_a_
@@ -3069,7 +3795,18 @@ mod tests {
         let start = Instant::now();
         let mut t = 0;
         let r1 = c
-            .on_window(ticks(start, t), 0, 0, None, None, None, 490_000, true, 0)
+            .on_window(
+                ticks(start, t),
+                0,
+                0,
+                None,
+                None,
+                None,
+                490_000,
+                true,
+                0,
+                None,
+            )
             .expect("flush must back off");
         assert_eq!(r1, 350_000);
         assert!(c.decode_cap_kbps.is_none());
@@ -3089,6 +3826,7 @@ mod tests {
                 c.current_kbps,
                 false,
                 0,
+                None,
             )
             .expect("loss must back off");
         t += 1;
@@ -3112,6 +3850,7 @@ mod tests {
                 c.current_kbps,
                 true,
                 0,
+                None,
             )
             .expect("flush must back off");
         t += 1;
@@ -3133,6 +3872,7 @@ mod tests {
                 c.current_kbps,
                 true,
                 0,
+                None,
             )
             .expect("flush must back off");
         assert!(c.decode_cap_kbps.is_none());
@@ -3163,6 +3903,7 @@ mod tests {
                 490_000,
                 false,
                 0,
+                None,
             );
             t += 1;
         }
@@ -3210,6 +3951,7 @@ mod tests {
             15_000,
             false,
             0,
+            None,
         );
         t += 1;
         // Choke #1 (00:35:56Z): flush + 40 ms decode at ~417 Mbps — evidence, first sample.
@@ -3227,6 +3969,7 @@ mod tests {
                 first,
                 true,
                 1,
+                None,
             )
             .expect("flush choke must back off");
         t += 1;
@@ -3249,7 +3992,8 @@ mod tests {
                 None,
                 second,
                 false,
-                0
+                0,
+                None,
             ),
             None,
             "the first bad window must not decide"
@@ -3265,7 +4009,8 @@ mod tests {
                 None,
                 second,
                 false,
-                0
+                0,
+                None,
             ),
             Some(((second as u64 * 7 / 10) as u32).max(FLOOR_KBPS))
         );
@@ -3307,6 +4052,7 @@ mod tests {
                 r1,
                 true,
                 1,
+                None,
             )
             .expect("drain flush must back off");
         t += 1;
@@ -3351,6 +4097,7 @@ mod tests {
                 300_000,
                 false,
                 RECOVERY_KF_SEVERE,
+                None,
             )
             .expect("keyframe storm must back off");
         t += 1;
@@ -3370,6 +4117,7 @@ mod tests {
                 rate,
                 false,
                 RECOVERY_KF_SEVERE,
+                None,
             )
             .expect("second storm must back off");
         assert_eq!(c.decode_cap_kbps, Some(rate - rate / 16));
@@ -3400,6 +4148,7 @@ mod tests {
                 300_000,
                 false,
                 RECOVERY_KF_SEVERE,
+                None,
             )
             .expect("clean storm must back off");
         t += 1;
@@ -3418,6 +4167,7 @@ mod tests {
                 c.current_kbps,
                 false,
                 RECOVERY_KF_SEVERE,
+                None,
             )
             .expect("lossy storm must back off");
         assert!(c.decode_cap_kbps.is_none());
@@ -3450,7 +4200,8 @@ mod tests {
                 None,
                 490_000,
                 false,
-                0
+                0,
+                None,
             ),
             None,
             "one OWD-bad window must not decide"
@@ -3466,7 +4217,8 @@ mod tests {
                 None,
                 490_000,
                 false,
-                0
+                0,
+                None,
             ),
             Some(350_000)
         );
@@ -3485,8 +4237,19 @@ mod tests {
         let mut i = 0;
         // Keep every window bad and never ack: exactly MAX_UNACKED requests, then silence.
         while i < 60 {
-            if c.on_window(ticks(start, i), 1, 0, None, None, None, 1_000_000, false, 0)
-                .is_some()
+            if c.on_window(
+                ticks(start, i),
+                1,
+                0,
+                None,
+                None,
+                None,
+                1_000_000,
+                false,
+                0,
+                None,
+            )
+            .is_some()
             {
                 sent += 1;
             }

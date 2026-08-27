@@ -1073,6 +1073,10 @@ pub(super) async fn negotiate(
         audio_rate_hz: audio_plane.rate_hz,
         audio_bits: audio_plane.bits,
         audio_frame_us: audio_plane.frame_us,
+        // This host marks its idle-keepalive re-encodes with USER_FLAG_REPEAT (ABR overhaul
+        // RFC §4.1) — the bit is what lets the client's ABR trust an unflagged AU as new
+        // content.
+        host_caps2: punktfunk_core::quic::HOST_CAP2_REPEAT_MARK,
     };
     io::write_msg(send, &welcome.encode()).await?;
     bringup.mark("welcome");

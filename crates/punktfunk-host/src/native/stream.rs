@@ -735,6 +735,12 @@ fn handle_chunk(
                 punktfunk_core::packet::USER_FLAG_SLICE_STREAM
             } else {
                 0
+            }
+            // Same repeat marking as the whole-frame path (RFC §4.1).
+            | if c.repeat {
+                punktfunk_core::packet::USER_FLAG_REPEAT
+            } else {
+                0
             };
         *open = Some(StreamedOpen {
             au: session
@@ -991,7 +997,16 @@ fn send_loop(
                         &mut session,
                         &msg.data,
                         msg.capture_ns,
-                        msg.flags,
+                        // Repeats are marked on the wire (USER_FLAG_REPEAT, RFC §4.1) so the
+                        // client's ABR can tell an idle window from an active one — the
+                        // Welcome advertised HOST_CAP2_REPEAT_MARK, which is what makes the
+                        // bit's absence mean "new content".
+                        msg.flags
+                            | if msg.repeat {
+                                punktfunk_core::packet::USER_FLAG_REPEAT
+                            } else {
+                                0
+                            },
                         msg.frame_index,
                         msg.deadline,
                         burst_cap,

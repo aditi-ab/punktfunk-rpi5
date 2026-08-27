@@ -48,6 +48,11 @@ pub(super) struct DataPump {
     /// (review §2.1).
     pub(super) bit_depth: u8,
     pub(super) chroma_format: u8,
+    /// The host marks idle-keepalive repeats with `USER_FLAG_REPEAT`
+    /// ([`crate::quic::HOST_CAP2_REPEAT_MARK`] in the Welcome — RFC §4.1). Only then do the
+    /// per-window active/repeat counts below mean anything; against an older host the ABR is
+    /// handed `None` and keeps its legacy window arithmetic.
+    pub(super) marks_repeats: bool,
     /// What this session's mode + codec could plausibly use (see
     /// [`crate::abr::stream_ceiling_kbps`]) — the bound the probe-measured link ceiling is held
     /// to. Computed where the negotiated geometry lives; recomputed here on an accepted mode
@@ -85,6 +90,7 @@ impl DataPump {
             negotiated_codec,
             bit_depth,
             chroma_format,
+            marks_repeats,
             stream_cap_kbps,
             refresh_hz,
             mode_slot: pump_mode_slot,
@@ -212,6 +218,9 @@ impl DataPump {
         let mut discard_abr_window = false;
         let mut probe_watchdog: Option<Instant> = None;
         let (mut owd_sum_ns, mut owd_frames) = (0i128, 0u32);
+        // Per-window AU activity split (RFC §4.1): total completed video AUs and how many the
+        // host flagged as idle-keepalive repeats. Meaningful only on a `marks_repeats` host.
+        let (mut au_frames, mut au_repeats) = (0u32, 0u32);
         let mut flush_in_window = false;
         // Jump-to-live state (see the guard in the loop below): when the clock-based over-bound
         // run began (`stale_since`, armed only when the skew handshake succeeded so the clocks
@@ -586,6 +595,15 @@ impl DataPump {
                 let owd_mean_us =
                     (owd_frames > 0).then(|| (owd_sum_ns / owd_frames as i128 / 1000) as i64);
                 (owd_sum_ns, owd_frames) = (0, 0);
+                // Active = new content the source actually produced this window. `None` toward
+                // an older host that doesn't mark repeats — the ABR then keeps its legacy
+                // window arithmetic rather than misreading "no flags" as "all active".
+                let active_frames = if marks_repeats {
+                    Some(au_frames.saturating_sub(au_repeats))
+                } else {
+                    None
+                };
+                (au_frames, au_repeats) = (0, 0);
                 // Drain the embedder's decode-latency window (always, so it stays bounded even when
                 // the controller is disabled) → the mean feeds the decode signal; `None` when the
                 // embedder reported nothing this window (old embedder / no decoded frames).
@@ -635,6 +653,7 @@ impl DataPump {
                         actual_kbps,
                         flush_in_window,
                         recovery_kf_reqs,
+                        active_frames,
                     )
                 };
                 if let Some(kbps) = verdict {
@@ -713,6 +732,14 @@ impl DataPump {
                     // signals, so only the delivery that completes an AU feeds them (parts
                     // would bias OWD low and constantly reset the staleness run).
                     let is_au = frame.complete;
+                    if is_au {
+                        // The window's activity split (RFC §4.1) — repeats are the host's
+                        // idle keepalive, not new content.
+                        au_frames = au_frames.saturating_add(1);
+                        if frame.flags & crate::packet::USER_FLAG_REPEAT != 0 {
+                            au_repeats = au_repeats.saturating_add(1);
+                        }
+                    }
                     if pump_perf_on && is_au {
                         let now = Instant::now();
                         if let Some(prev) = last_arrival.replace(now) {
@@ -1097,6 +1124,7 @@ mod tests {
             negotiated_codec: crate::quic::CODEC_HEVC,
             bit_depth: 8,
             chroma_format: 0,
+            marks_repeats: false,
             stream_cap_kbps: 100_000,
             refresh_hz: 60,
             mode_slot: Arc::new(Mutex::new(crate::config::Mode {

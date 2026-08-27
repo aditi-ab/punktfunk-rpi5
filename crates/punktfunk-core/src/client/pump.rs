@@ -86,6 +86,10 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     let clock_rtt_ns = negotiated.clock_rtt_ns;
     let resolved_bitrate_kbps = negotiated.bitrate_kbps;
     let negotiated_codec = negotiated.codec;
+    // Whether the host marks its idle-keepalive repeats (USER_FLAG_REPEAT — RFC §4.1). Only
+    // then can the ABR trust an unflagged AU as new content; an older host leaves the window
+    // arithmetic in its legacy form.
+    let marks_repeats = negotiated.host_caps2 & crate::quic::HOST_CAP2_REPEAT_MARK != 0;
     // Session constants a mode switch does not change — the pump recomputes the stream-shape
     // cap from them for the switched geometry (review §2.1).
     let bit_depth = negotiated.bit_depth;
@@ -290,6 +294,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         negotiated_codec,
         bit_depth,
         chroma_format,
+        marks_repeats,
         stream_cap_kbps,
         refresh_hz,
         mode_slot: mode_slot_pump,
