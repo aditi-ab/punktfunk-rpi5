@@ -94,6 +94,8 @@ pub enum CardOutput {
     Pair(ConnectRequest),
     SpeedTest(ConnectRequest),
     Library(ConnectRequest),
+    /// Upload this device's recent log ring to the host (`logring::send_to_host`).
+    SendLogs(ConnectRequest),
     /// Open the host edit sheet (name, profile binding, pinned cards, clipboard).
     Edit {
         fp_hex: String,
@@ -334,6 +336,13 @@ impl relm4::factory::FactoryComponent for HostCard {
                     );
                 }
                 {
+                    let req = req.clone();
+                    add(
+                        "send-logs",
+                        Box::new(move || CardOutput::SendLogs(req.clone())),
+                    );
+                }
+                {
                     let (fp, name) = (k.fp_hex.clone(), k.name.clone());
                     add(
                         "rename",
@@ -520,6 +529,13 @@ impl relm4::factory::FactoryComponent for HostCard {
                         look.append(Some("Browse library\u{2026}"), Some("card.library"));
                     }
                     look.append(Some("Test network speed\u{2026}"), Some("card.speed"));
+                    // The same row the console's host menu carries, on the same gate: the
+                    // upload authenticates with the paired identity, and an offline host
+                    // could only ever toast an error. The bundle lands on the host's web
+                    // console (Logs page) beside the host's own log.
+                    if k.paired && *online {
+                        look.append(Some("Send logs to host"), Some("card.send-logs"));
+                    }
                     // An explicit wake only when offline and a MAC is known.
                     if !online && !k.mac.is_empty() {
                         look.append(Some("Wake host"), Some("card.wake"));
@@ -729,6 +745,8 @@ pub enum HostsOutput {
     SpeedTest(ConnectRequest),
     /// With the advertised mgmt port when a live advert carries one.
     Library(ConnectRequest, Option<u16>),
+    /// With the mgmt port resolved the same way as [`HostsOutput::Library`]'s.
+    SendLogs(ConnectRequest, Option<u16>),
 }
 
 impl SimpleComponent for HostsPage {
@@ -1019,6 +1037,10 @@ impl SimpleComponent for HostsPage {
                 CardOutput::Library(req) => {
                     let mgmt = self.mgmt_port_for(&req);
                     let _ = sender.output(HostsOutput::Library(req, mgmt));
+                }
+                CardOutput::SendLogs(req) => {
+                    let mgmt = self.mgmt_port_for(&req);
+                    let _ = sender.output(HostsOutput::SendLogs(req, mgmt));
                 }
                 CardOutput::Edit { fp_hex, name } => self.edit_host_dialog(&sender, &fp_hex, &name),
                 CardOutput::Forget { fp_hex, name } => self.forget_dialog(&sender, &fp_hex, &name),

@@ -39,11 +39,6 @@ punktfunk-core = { path = "../../crates/punktfunk-core", features = ["quic"] }
 serde_json = { version = "1", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# The log ring normalizes `log`-crate events off the bridge's "log" shim target
-# (`ring_layer.rs`) so the vendored decoder's per-frame DEBUG chatter can be gated by its real
-# module path; both are already in the graph through tracing-subscriber's default features.
-tracing-log = "0.2"
-log = "0.4"
 
 # This crate carries NO toolkit, deliberately: it is the renderer the shells spawn, and the
 # `--no-default-features` build is what a minimal/embedded image installs. GTK4/libadwaita/relm4
