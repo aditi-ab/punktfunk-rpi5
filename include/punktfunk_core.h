@@ -740,7 +740,7 @@
 // its absence as "active frame" when the host advertised
 // [`HOST_CAP2_REPEAT_MARK`](crate::quic::HOST_CAP2_REPEAT_MARK) — against an older host,
 // zero repeat flags means "unknown", not "all active".
-#define USER_FLAG_REPEAT 256
+#define PUNKTFUNK_USER_FLAG_REPEAT 256
 
 // Widest lost-frame range (frames, wrapping `last - first`) a reference-frame-invalidation
 // recovery may be asked to repair; anything wider goes straight to the keyframe path on BOTH
@@ -1105,7 +1105,7 @@
 // ABSENCE meaningful: against a host that advertises it, an unflagged AU is genuinely new
 // content; against an older host the client must treat activity as unknown and keep the
 // legacy window arithmetic.
-#define HOST_CAP2_REPEAT_MARK 1
+#define PUNKTFUNK_HOST_CAP2_REPEAT_MARK 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
