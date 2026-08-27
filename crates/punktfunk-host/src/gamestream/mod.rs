@@ -250,6 +250,12 @@ pub struct AppState {
     pub quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// True while the audio stream thread is running (also its keep-running flag).
     pub audio_streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Bumped by each media thread (video, audio) as the LAST thing it does on exit — after its
+    /// teardown (capturer re-pool, lease guard, events) has fully run. `/resume` restarts the
+    /// media planes by clearing the run flags and then WAITING on this counter (WP3): the old
+    /// threads' teardown must complete before the resumed connection's threads start, or the
+    /// two race over the pooled capturer and the late exit path stomps the successor's state.
+    pub media_exited: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Set by the control stream when the client requests an IDR / invalidates reference
     /// frames (recovery after loss); the video thread forces a keyframe and clears it.
     pub force_idr: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -363,6 +369,7 @@ impl AppState {
             force_idr: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rfi_range: std::sync::Arc::new(std::sync::Mutex::new(None)),
             loss_stats: std::sync::Arc::new(GsLossStats::default()),
+            media_exited: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             video_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
             audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
             stats,
@@ -385,6 +392,7 @@ impl AppState {
             force_idr: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rfi_range: std::sync::Arc::new(std::sync::Mutex::new(None)),
             loss_stats: std::sync::Arc::new(GsLossStats::default()),
+            media_exited: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
             stats,
             access: std::sync::OnceLock::new(),

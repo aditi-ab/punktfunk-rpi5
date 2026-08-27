@@ -89,6 +89,9 @@ pub fn start(
     video_cap: CapturerSlot,
     stats: Arc<crate::stats_recorder::StatsRecorder>,
     on_lost: super::OnSessionLost,
+    // Bumped as the LAST act of this thread — the full-teardown-complete signal `/resume`'s
+    // media restart waits on (see `AppState::media_exited`).
+    media_exited: Arc<std::sync::atomic::AtomicU64>,
     life: GameLifetime,
 ) {
     let _ = std::thread::Builder::new()
@@ -163,6 +166,9 @@ pub fn start(
                 reason,
             });
             tracing::info!("video stream stopped");
+            // LAST: everything above (capturer re-pool, lease guard, marker, events) has run,
+            // so a `/resume` waiting on this counter can safely start the successor threads.
+            media_exited.fetch_add(1, Ordering::SeqCst);
         });
 }
 

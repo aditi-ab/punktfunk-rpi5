@@ -132,7 +132,31 @@ async fn h_serverinfo(
     // PairStatus=1 only when the HTTPS peer presented a *pinned* client cert; an unpaired client
     // (or plain HTTP) sees 0 and is steered into the pairing flow.
     let paired = https && peer_is_paired(&peer, &st);
-    xml(serverinfo::serverinfo_xml(&st.host, https, paired))
+    // The running app id, visible to the session OWNER only (WP3 — see `owner_current_game` /
+    // the rationale on `serverinfo_xml`). This is what makes Moonlight show Resume/Quit.
+    let current_game = if paired {
+        owner_current_game(&st.launch.lock().unwrap(), peer_fp(&peer))
+    } else {
+        0
+    };
+    xml(serverinfo::serverinfo_xml(
+        &st.host,
+        https,
+        paired,
+        current_game,
+    ))
+}
+
+/// The `currentgame` a given caller may see: the live session's appid iff the caller IS the
+/// session owner (fingerprints known on both sides and equal), else 0. Pure — unit-tested.
+/// Stricter than [`peer_may_control_session`] on purpose: that gate fails OPEN when a
+/// fingerprint is unknown (so a same-client control action can't be locked out), but an
+/// ADVERTISEMENT fails closed — an unknown owner is nobody's business to see.
+fn owner_current_game(launch: &Option<LaunchSession>, caller: Option<[u8; 32]>) -> u32 {
+    match (launch, caller) {
+        (Some(s), Some(fp)) if s.owner_fp == Some(fp) => s.appid,
+        _ => 0,
+    }
 }
 
 async fn h_applist(
@@ -264,6 +288,8 @@ async fn h_launch(
 async fn h_resume(
     State(st): State<Arc<AppState>>,
     peer: Option<Extension<PeerCertFingerprint>>,
+    addr: Option<Extension<PeerAddr>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     if !peer_is_paired(&peer, &st) {
         tracing::warn!("resume rejected — client is not paired");
@@ -286,11 +312,73 @@ async fn h_resume(
         tracing::warn!("resume rejected — caller does not own the session");
         return xml(error_xml());
     }
-    if st.launch.lock().unwrap().is_some() {
-        xml(session_url_xml(&st, "resume"))
-    } else {
-        xml(error_xml())
+    // RESTART the media planes for this connection (WP3). Moonlight resumes with a fresh RTSP
+    // handshake, but a PLAY that finds `streaming` still true takes its "already running"
+    // branch — the old threads keep streaming at the VANISHED endpoint and the resumed client
+    // gets no media. Clear the run flags and WAIT (bounded) for the old threads' full exit:
+    // their teardown must complete before the successor's threads start, or the two race over
+    // the pooled capturer and the old exit path stomps the new session's flags. A timeout
+    // proceeds anyway — worst case is exactly the old (media-less) behavior.
+    let before = st.media_exited.load(std::sync::atomic::Ordering::SeqCst);
+    let expected = u64::from(
+        st.streaming
+            .swap(false, std::sync::atomic::Ordering::SeqCst),
+    ) + u64::from(
+        st.audio_streaming
+            .swap(false, std::sync::atomic::Ordering::SeqCst),
+    );
+    if expected > 0 {
+        tracing::info!(
+            threads = expected,
+            "resume — stopping the previous connection's media threads"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while st.media_exited.load(std::sync::atomic::Ordering::SeqCst) < before + expected {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!("resume — old media threads still exiting after 2 s; proceeding");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
+    // RE-KEY the session with the fresh rikey/rikeyid this resume carries (WP3 — the handler
+    // used to read no query params at all). A resuming Moonlight mints NEW session keys and
+    // derives its control-GCM and audio-CBC state from them; keeping the original launch's
+    // keys meant every post-resume control packet failed decrypt and audio decoded to noise.
+    // Keys present → they replace the session's; malformed → refuse the resume (streaming
+    // against keys the client doesn't hold is a worse failure than a clean error); absent →
+    // keep the current keys (nothing claimed otherwise). `surroundAudioInfo` needs no reading
+    // here: the RTSP ANNOUNCE that follows re-negotiates audio for the new connection anyway.
+    // The launch may have been cleared by the old threads' client-unreachable teardown while
+    // we waited — then there is nothing to resume, and the client falls back to `/launch`.
+    {
+        let mut launch = st.launch.lock().unwrap();
+        let Some(session) = launch.as_mut() else {
+            return xml(error_xml());
+        };
+        if q.contains_key("rikey") {
+            match parse_rikey(&q) {
+                Ok((gcm_key, rikeyid)) => {
+                    session.gcm_key = gcm_key;
+                    session.rikeyid = rikeyid;
+                    tracing::info!(
+                        rikeyid,
+                        "resume — session re-keyed with the client's fresh rikey"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "resume rejected — malformed rikey");
+                    return xml(error_xml());
+                }
+            }
+        }
+        // Re-bind the media/RTSP source-IP filters to where the client resumes FROM — a device
+        // that moved networks (Wi-Fi → ethernet) resumes instead of being filtered out.
+        if let Some(Extension(PeerAddr(a))) = addr {
+            session.peer_ip = Some(a.ip());
+        }
+    }
+    xml(session_url_xml(&st, "resume"))
 }
 
 async fn h_cancel(
@@ -323,8 +411,10 @@ async fn h_cancel(
     xml("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<root status_code=\"200\"><cancel>1</cancel></root>\n".to_string())
 }
 
-/// Parse the `/launch` query (rikey/rikeyid/mode) into a [`LaunchSession`].
-fn launch(_st: &AppState, q: &HashMap<String, String>) -> Result<LaunchSession> {
+/// Parse the `rikey`/`rikeyid` pair out of a `/launch` or `/resume` query: the 16-byte AES
+/// session key (hex) every media/control crypto derives from, and the signed 32-bit key id
+/// (negative values wrap to a big-endian u32 IV later).
+fn parse_rikey(q: &HashMap<String, String>) -> Result<([u8; 16], i32)> {
     let rikey = q.get("rikey").ok_or_else(|| anyhow!("missing rikey"))?;
     let key_bytes = hex::decode(rikey).context("rikey hex")?;
     if key_bytes.len() < 16 {
@@ -332,8 +422,13 @@ fn launch(_st: &AppState, q: &HashMap<String, String>) -> Result<LaunchSession> 
     }
     let mut gcm_key = [0u8; 16];
     gcm_key.copy_from_slice(&key_bytes[..16]);
-    // rikeyid is a signed 32-bit int (negative values wrap to a big-endian u32 IV later).
     let rikeyid: i32 = q.get("rikeyid").and_then(|s| s.parse().ok()).unwrap_or(0);
+    Ok((gcm_key, rikeyid))
+}
+
+/// Parse the `/launch` query (rikey/rikeyid/mode) into a [`LaunchSession`].
+fn launch(_st: &AppState, q: &HashMap<String, String>) -> Result<LaunchSession> {
+    let (gcm_key, rikeyid) = parse_rikey(q)?;
     let (width, height, fps) = q
         .get("mode")
         .and_then(|m| parse_mode(m))
@@ -732,7 +827,7 @@ mod tests {
 
         // No grants record: a stock Moonlight pairing resumes exactly as today.
         let ok = body_of(
-            h_resume(State(st.clone()), peer.clone())
+            h_resume(State(st.clone()), peer.clone(), None, Query(HashMap::new()))
                 .await
                 .into_response(),
         )
@@ -751,7 +846,7 @@ mod tests {
         )
         .unwrap();
         let no = body_of(
-            h_resume(State(st.clone()), peer.clone())
+            h_resume(State(st.clone()), peer.clone(), None, Query(HashMap::new()))
                 .await
                 .into_response(),
         )
@@ -768,7 +863,7 @@ mod tests {
         )
         .unwrap();
         let no = body_of(
-            h_resume(State(st.clone()), peer.clone())
+            h_resume(State(st.clone()), peer.clone(), None, Query(HashMap::new()))
                 .await
                 .into_response(),
         )
@@ -805,5 +900,107 @@ mod tests {
         assert!(ok.contains("<cancel>1</cancel>"), "owner cancel: {ok}");
         assert!(st.launch.lock().unwrap().is_none(), "cancel tears down");
         let _ = std::fs::remove_file(&store);
+    }
+
+    /// WP3: `currentgame` is advertised to the session OWNER only. A non-owner (or an unknown
+    /// fingerprint on either side) keeps seeing free/0 — which is what keeps it on the `/launch`
+    /// path and the reject/join/steal admission, instead of routing into owner-only `/resume`.
+    #[test]
+    fn current_game_is_owner_scoped() {
+        let owner = [7u8; 32];
+        let other = [9u8; 32];
+        let session = |owner_fp: Option<[u8; 32]>| {
+            Some(LaunchSession {
+                gcm_key: [0; 16],
+                rikeyid: 0,
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                appid: 4242,
+                peer_ip: None,
+                owner_fp,
+            })
+        };
+        // The owner sees the running app.
+        assert_eq!(owner_current_game(&session(Some(owner)), Some(owner)), 4242);
+        // A different paired client sees a free host.
+        assert_eq!(owner_current_game(&session(Some(owner)), Some(other)), 0);
+        // Unknown fingerprints — either side — fail CLOSED (unlike the control gate).
+        assert_eq!(owner_current_game(&session(None), Some(owner)), 0);
+        assert_eq!(owner_current_game(&session(Some(owner)), None), 0);
+        // No session: free.
+        assert_eq!(owner_current_game(&None, Some(owner)), 0);
+    }
+
+    /// WP3: a resume carrying a fresh `rikey`/`rikeyid` RE-KEYS the live session (control GCM +
+    /// audio CBC derive from it — stale keys made every post-resume packet undecryptable); a
+    /// malformed rikey refuses the resume; a keyless resume keeps the current keys.
+    #[tokio::test]
+    async fn resume_rekeys_the_session() {
+        async fn body_of(resp: Response) -> String {
+            let b = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            String::from_utf8(b.to_vec()).unwrap()
+        }
+        let st = test_state();
+        let der = b"resume-rekey-client".to_vec();
+        let fp_hex = fp_of(&der);
+        let owner_fp = punktfunk_core::quic::endpoint::cert_fingerprint(&der);
+        st.paired.lock().unwrap().push(der);
+        let peer = Some(Extension(PeerCertFingerprint(Some(fp_hex))));
+        *st.launch.lock().unwrap() = Some(LaunchSession {
+            gcm_key: [0x11; 16],
+            rikeyid: 1,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            appid: 1,
+            peer_ip: None,
+            owner_fp: Some(owner_fp),
+        });
+
+        // Fresh keys on the query → the session now carries them.
+        let mut q = HashMap::new();
+        q.insert("rikey".to_string(), "22".repeat(16));
+        q.insert("rikeyid".to_string(), "-5".to_string());
+        let ok = body_of(
+            h_resume(State(st.clone()), peer.clone(), None, Query(q))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(ok.contains("<resume>1</resume>"), "re-keyed resume: {ok}");
+        {
+            let launch = st.launch.lock().unwrap();
+            let s = launch.as_ref().unwrap();
+            assert_eq!(s.gcm_key, [0x22; 16]);
+            assert_eq!(s.rikeyid, -5);
+        }
+
+        // Malformed rikey → refused, and the session's keys stay what they were.
+        let mut bad = HashMap::new();
+        bad.insert("rikey".to_string(), "zz".to_string());
+        let no = body_of(
+            h_resume(State(st.clone()), peer.clone(), None, Query(bad))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(!no.contains("<resume>1</resume>"), "malformed rikey: {no}");
+        assert_eq!(
+            st.launch.lock().unwrap().as_ref().unwrap().gcm_key,
+            [0x22; 16]
+        );
+
+        // No rikey at all → resume succeeds on the current keys (nothing claimed otherwise).
+        let ok = body_of(
+            h_resume(State(st.clone()), peer.clone(), None, Query(HashMap::new()))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert!(ok.contains("<resume>1</resume>"), "keyless resume: {ok}");
+        assert_eq!(st.launch.lock().unwrap().as_ref().unwrap().rikeyid, -5);
     }
 }

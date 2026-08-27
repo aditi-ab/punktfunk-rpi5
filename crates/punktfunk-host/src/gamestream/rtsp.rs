@@ -295,6 +295,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                         state.video_cap.clone(),
                         state.stats.clone(),
                         on_lost.clone(),
+                        state.media_exited.clone(),
                         // The launched game's lifetime wiring. A game *exiting* is a deliberate end
                         // (the player finished) — the same distinction the native plane draws with
                         // its close code, and what the end-game-on-session-end policy keys off at
@@ -330,6 +331,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                     // Same owner-IP bind as the video plane: only the launching peer's pings are
                     // honored at the audio endpoint. security-review 2026-08-15 finding 1.
                     ls.peer_ip,
+                    state.media_exited.clone(),
                 );
             }
             response(&req.cseq, &[("Session", "DEADBEEFCAFE;timeout = 90")], None)
