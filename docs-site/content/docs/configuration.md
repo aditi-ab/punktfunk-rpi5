@@ -129,7 +129,7 @@ See your desktop page ([KDE](/docs/kde), [GNOME](/docs/gnome)) for when to set t
 
 | Setting | Values | Meaning |
 |---|---|---|
-| `PUNKTFUNK_FEC_PCT` | `0`–`90` (percent) | **Pins** forward-error-correction redundancy and turns adaptive FEC **off**. Leave it unset on the native protocol: the host normally sizes recovery to the loss the client reports (a 1–50 % band, starting at 10 %; once a session has seen real loss the quiet-time floor is 5 % rather than 1 %, and a couple of clean minutes earn 1 % back), so pinning a number can leave a lossy link *worse* off than letting it adapt. Set it only when a fixed, known overhead matters — a measurement or a speed test; `0` disables FEC entirely. On the GameStream/Moonlight plane it is a plain override of that plane's fixed 20 %. |
+| `PUNKTFUNK_FEC_PCT` | `0`–`90` (percent) | **Pins** forward-error-correction redundancy and turns adaptive FEC **off**. Leave it unset on the native protocol: the host normally sizes recovery to the loss the client reports (a 1–50 % band, starting at 10 %; once a session has seen real loss the quiet-time floor is 5 % rather than 1 %, and a couple of clean minutes earn 1 % back), so pinning a number can leave a lossy link *worse* off than letting it adapt. Set it only when a fixed, known overhead matters — a measurement or a speed test; `0` disables FEC entirely. Under the wire-budget bitrate (see [Bitrate](#bitrate)) the pinned percent is still carved out of the budget, it just never moves. On the GameStream/Moonlight plane it is a plain override of that plane's fixed 20 %. |
 | `PUNKTFUNK_10BIT` | `1` · `0` *(default on)* | Allow 10-bit (HEVC Main10 / AV1 10-bit) sessions at all; `0` forces every session to 8-bit SDR. Which hosts can actually deliver it, and the client half of the switch, are on [HDR](/docs/hdr). |
 | `PUNKTFUNK_444` | `1` · `0` *(default on)* | Host **policy gate** for full chroma 4:4:4 — sharper text and thin lines, no chroma loss. **On by default**; `0` forces every session to 4:2:0. It only ever *allows*: the client's own 4:4:4 setting (default off) is the real per-session switch, and the codec, capture-path and GPU gates behind it are on [Client settings → Full chroma](/docs/client-settings#video). Which GPUs and which clients can actually do it is in the [support matrix](/docs/support-matrix#encoders); how it interacts with HDR is on [HDR](/docs/hdr). **punktfunk/1 native only** — Moonlight stays 4:2:0. |
 | `PUNKTFUNK_CHACHA20` | `1` · `0` *(default on)* | ChaCha20-Poly1305 session encryption for clients without hardware AES (old ARM TVs, e.g. webOS), lifting their ~100 Mbps software-AES decrypt ceiling. **On by default** on the host; a session uses it only when the client requests it — everyone else stays on AES-GCM. Purely a performance choice (both ciphers are full-strength); set `0` to force AES-GCM for all sessions. |
@@ -288,8 +288,12 @@ table, where client and host read the *same* variable name for their own half of
 
 ## Bitrate
 
-The client requests a bitrate; the host encodes to it. There's no host-side bitrate knob. To find a
-good value:
+The client requests a bitrate; there's no host-side bitrate knob. On the native `punktfunk/1`
+plane the number is a **total wire budget**: what actually leaves the host — video, error-correction
+parity, packet framing, and the audio plane's share — fits inside it, and when adaptive FEC adds
+parity in answer to loss, the video rate comes down so the wire doesn't go up. (Older pairs, and
+the GameStream/Moonlight plane, keep the historical meaning: the number programs the encoder, and
+overheads ride on top.) To find a good value:
 
 - **Native clients (Apple, Linux, Windows, Android):** use the built-in **speed test** (from a
   host's menu). It measures your link, suggests a bitrate, and applies it.

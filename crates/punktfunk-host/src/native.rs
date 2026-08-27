@@ -987,6 +987,134 @@ fn resolve_bitrate_kbps_for(
     resolve_bitrate_kbps(requested)
 }
 
+/// One shard's wire overhead: the 40-byte punktfunk header + the 24-byte crypto seal that ride
+/// INSIDE the UDP payload next to every `shard_payload` bytes of media (~4.5 % at 1408).
+const SHARD_WIRE_OVERHEAD: u64 =
+    (punktfunk_core::packet::HEADER_LEN + punktfunk_core::packet::CRYPTO_OVERHEAD) as u64;
+
+/// The wire-budget → encoder-rate derivation (ABR overhaul RFC §5.1, amended 2026-08-27: no
+/// capability handshake — on current builds the client's bitrate number IS a total session
+/// wire budget, full stop).
+///
+/// What rides on the wire for `video` kbps of encoder output: FEC parity (`fec_percent` more
+/// shards), packet framing ([`SHARD_WIRE_OVERHEAD`] per shard), and the audio plane's
+/// reservation off the top. So:
+///
+/// ```text
+/// wire  = video × (payload+64)/payload × (100+fec)/100 + audio
+/// video = (wire − audio) × payload/(payload+64) × 100/(100+fec)
+/// ```
+///
+/// "20 Mbps" used to mean 22–30+ Mbps on the wire — and on the constrained links where the
+/// setting matters most, the overshoot WAS the failure. Adaptive FEC now reallocates *within*
+/// the budget: the encode loop re-derives this on every FEC step, so more parity means a
+/// lower encoder rate, never a fatter wire. Floored at [`MIN_BITRATE_KBPS`] — a budget too
+/// small for its own audio still streams, it just overshoots honestly (the resolve gates keep
+/// audio ≤ ~25 % of the number, so this is corrupt-input territory).
+///
+/// PyroWave sessions bypass this entirely (callers pass their rate through): the pin is an
+/// all-intra ENCODER operating point (bpp), and the controller is off for that codec anyway.
+fn encoder_kbps_for_budget(
+    budget_kbps: u32,
+    audio_kbps: u32,
+    fec_percent: u8,
+    shard_payload: u16,
+) -> u32 {
+    let payload = shard_payload.max(1) as u64;
+    let video_wire = budget_kbps.saturating_sub(audio_kbps) as u64;
+    let video =
+        video_wire * payload * 100 / ((payload + SHARD_WIRE_OVERHEAD) * (100 + fec_percent as u64));
+    u32::try_from(video)
+        .unwrap_or(u32::MAX)
+        .max(MIN_BITRATE_KBPS)
+}
+
+/// [`encoder_kbps_for_budget`]'s inverse: the wire budget an encoder rate actually spends —
+/// what a short apply (the encoder clamped below the ask) must report BACK to the client, so
+/// its controller's climb base tracks wire truth. Rounds up where the derivation rounds down,
+/// so `budget_kbps_for_encoder(encoder_kbps_for_budget(b)) ≤ b` always holds: a roundtrip
+/// never inflates the budget the client believes.
+fn budget_kbps_for_encoder(
+    encoder_kbps: u32,
+    audio_kbps: u32,
+    fec_percent: u8,
+    shard_payload: u16,
+) -> u32 {
+    let payload = shard_payload.max(1) as u64;
+    let wire = encoder_kbps as u64 * (payload + SHARD_WIRE_OVERHEAD) * (100 + fec_percent as u64)
+        / (payload * 100);
+    u32::try_from(wire.saturating_add(audio_kbps as u64)).unwrap_or(u32::MAX)
+}
+
+/// The budget↔encoder conversion at one moment in time (RFC §5.1): the session constants
+/// plus a SNAPSHOT of the adaptive FEC percent, taken by the caller at each encoder touch —
+/// the FEC-step watcher in the stream loop re-derives when the live percent moves on. `Copy`,
+/// so it threads next to the `Copy` [`SessionPlan`](crate::session_plan::SessionPlan) through
+/// the build chain without ceremony.
+#[derive(Clone, Copy, Debug)]
+struct EncDerive {
+    audio_kbps: u32,
+    shard_payload: u16,
+    fec_percent: u8,
+    /// PyroWave: the pin IS an encoder rate — both directions are the identity.
+    identity: bool,
+}
+
+impl EncDerive {
+    /// The encoder video rate a wire budget affords right now.
+    fn enc_kbps(&self, budget_kbps: u32) -> u32 {
+        if self.identity {
+            budget_kbps
+        } else {
+            encoder_kbps_for_budget(
+                budget_kbps,
+                self.audio_kbps,
+                self.fec_percent,
+                self.shard_payload,
+            )
+        }
+    }
+
+    /// The wire budget an encoder rate actually spends — for read-backs (a short apply must
+    /// report budget truth to the client).
+    fn budget_kbps(&self, encoder_kbps: u32) -> u32 {
+        if self.identity {
+            encoder_kbps
+        } else {
+            budget_kbps_for_encoder(
+                encoder_kbps,
+                self.audio_kbps,
+                self.fec_percent,
+                self.shard_payload,
+            )
+        }
+    }
+}
+
+/// The audio plane's wire reservation for the budget derivation, from the RESOLVED Welcome:
+/// the exact PCM cost on the lossless plane, else the Opus ladder's planned cost — the same
+/// shared [`plan_audio_budget`](punktfunk_core::audio::plan_audio_budget) rung the audio
+/// thread runs, with redundancy exactly when the session GRANTED it (`HOST_CAP_AUDIO_RED`).
+/// The client mirrors this from the same Welcome fields; an operator-pinned non-default tier
+/// skews its mirror by a few hundred kbps, well inside the utilization gate's ¾ tolerance.
+fn audio_reserved_kbps(welcome: &punktfunk_core::quic::Welcome) -> u32 {
+    if welcome.audio_codec == punktfunk_core::quic::AUDIO_CODEC_PCM {
+        punktfunk_core::audio::pcm::bitrate_kbps(
+            welcome.audio_rate_hz,
+            welcome.audio_bits,
+            welcome.audio_channels,
+        )
+    } else {
+        punktfunk_core::audio::plan_audio_budget(
+            welcome.bitrate_kbps,
+            welcome.audio_channels,
+            punktfunk_core::audio::AudioTier::default(),
+            welcome.host_caps & punktfunk_core::quic::HOST_CAP_AUDIO_RED != 0,
+        )
+        .kbps
+    }
+}
+
 /// Operator ceiling for PyroWave's open-loop Automatic bitrate pin: `PUNKTFUNK_PYROWAVE_MAX_MBPS`
 /// (megabits/s) → kbps, or `None` when unset/zero/invalid (no cap — the raw bpp pin stands).
 /// Consulted for every PyroWave session — an explicit client bitrate resolves through the
@@ -2122,10 +2250,16 @@ async fn serve_session(
         (!cmds.is_empty())
             .then(|| tokio::task::block_in_place(|| crate::hooks::run_prep(&cmds, &env)))
     });
-    let bitrate_kbps = welcome.bitrate_kbps; // resolved encoder bitrate (Hello clamped, or default)
-                                             // "Automatic" request: the resolved rate is a host default — for PyroWave a per-mode
-                                             // bpp pin the data plane re-resolves on a mid-stream mode switch. PyroWave is Automatic
-                                             // unconditionally (`resolve_bitrate_kbps_for` overrode any explicit rate — RFC §5.2).
+    // The resolved number is the session's TOTAL WIRE budget (RFC §5.1): the Welcome, every
+    // ack, the HUD and this whole control plane speak budget — only the encoder opens are
+    // handed the derived video rate (`EncDerive` in the stream loop: budget minus the audio
+    // reservation, over framing + FEC overhead). PyroWave is the exception (its pin is an
+    // all-intra encoder operating point): budget == encoder rate there.
+    let bitrate_kbps = welcome.bitrate_kbps;
+    let audio_reserved_kbps = audio_reserved_kbps(&welcome);
+    // "Automatic" request: the resolved rate is a host default — for PyroWave a per-mode
+    // bpp pin the data plane re-resolves on a mid-stream mode switch. PyroWave is Automatic
+    // unconditionally (`resolve_bitrate_kbps_for` overrode any explicit rate — RFC §5.2).
     let bitrate_auto = hello.bitrate_kbps == 0 || codec == crate::encode::Codec::PyroWave;
     let bit_depth = welcome.bit_depth; // resolved encode bit depth (8, or 10 when negotiated)
                                        // Resolved chroma — derive the typed value back from the wire byte the Welcome carried (so the
@@ -2312,6 +2446,8 @@ async fn serve_session(
                         compositor,
                         gamescope_route,
                         bitrate_kbps,
+                        audio_reserved_kbps,
+                        shard_payload: welcome.shard_payload,
                         live_bitrate,
                         encoder_ceiling_kbps,
                         cadence_degraded,
@@ -2678,6 +2814,50 @@ mod tests {
     /// can't strip the armor before motion; a long clean run re-earns 1 %; a link that
     /// re-burns before the step-down has proven itself doubles the next requirement; a
     /// step-down that survives resets it.
+    #[test]
+    fn wire_budget_derivation_never_overshoots() {
+        // RFC §5.1 worked example: 20 Mbps budget, a 300 kbps Opus reservation, 10 % FEC,
+        // 1408-byte shards → video = (20000−300) × 1408×100 / (1472×110) = 17 130 kbps.
+        assert_eq!(encoder_kbps_for_budget(20_000, 300, 10, 1408), 17_130);
+        // …whose wire spend rounds back UNDER the budget, never over.
+        assert_eq!(budget_kbps_for_encoder(17_130, 300, 10, 1408), 19_999);
+
+        // The invariant across the operating range: any non-floored derivation's roundtrip
+        // spends within the budget — a short-ack conversion can never report a budget the
+        // wire would exceed.
+        for budget in [2_000u32, 5_000, 20_000, 100_000, 1_000_000] {
+            for fec in [1u8, 5, 10, 25, 50] {
+                for audio in [0u32, 256, 512, 8_500] {
+                    for payload in [1388u16, 1408, 8896] {
+                        let e = encoder_kbps_for_budget(budget, audio, fec, payload);
+                        if e > MIN_BITRATE_KBPS {
+                            let back = budget_kbps_for_encoder(e, audio, fec, payload);
+                            assert!(
+                                back <= budget,
+                                "budget {budget} fec {fec} audio {audio} payload {payload}: \
+                                 derived {e} spends {back}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // A budget too small for its own audio floors at the encoder minimum and overshoots
+        // HONESTLY — the resolve gates keep audio ≤ ~25 % of the number, so this is
+        // corrupt-input armor, not an operating point.
+        assert_eq!(
+            encoder_kbps_for_budget(500, 8_500, 50, 1408),
+            MIN_BITRATE_KBPS
+        );
+
+        // FEC reallocation is monotone: more parity ⇒ a lower video rate, same budget.
+        let calm = encoder_kbps_for_budget(20_000, 300, 1, 1408);
+        let burned = encoder_kbps_for_budget(20_000, 300, 5, 1408);
+        let stormy = encoder_kbps_for_budget(20_000, 300, 50, 1408);
+        assert!(calm > burned && burned > stormy);
+    }
+
     #[test]
     fn fec_floor_burns_reearns_and_doubles_on_early_reburn() {
         let mut f = FecFloor::default();

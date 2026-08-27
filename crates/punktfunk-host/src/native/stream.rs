@@ -1378,8 +1378,18 @@ pub(super) struct SessionContext {
     /// (and on to the backend instance) rather than through `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION`:
     /// two sessions connecting at once used to overwrite each other's decision in the process env.
     pub(super) gamescope_route: Option<crate::vdisplay::GamescopeRoute>,
-    /// Negotiated encoder bitrate (kbps).
+    /// The session's TOTAL WIRE budget (kbps, RFC §5.1) — what the client asked for and what
+    /// every ack, adopt and `live_bitrate` store echoes: video plus FEC parity, packet
+    /// framing and the audio reservation. Encoder opens/reconfigures convert at the live FEC
+    /// percent through [`super::EncDerive`]; PyroWave is the identity (its pin IS an encoder
+    /// rate).
     pub(super) bitrate_kbps: u32,
+    /// The audio plane's reservation off the top of the budget (see
+    /// `native::audio_reserved_kbps`).
+    pub(super) audio_reserved_kbps: u32,
+    /// The negotiated shard payload — the framing-overhead denominator in the budget
+    /// derivation.
+    pub(super) shard_payload: u16,
     /// The encoder's live APPLIED rate (kbps) — shared with the send pacer, the web console, the
     /// mgmt registry AND the control task (which acks climbs against it). The encode loop stores
     /// `Encoder::applied_bitrate_bps` here after every apply, so everything downstream tracks
@@ -1682,6 +1692,8 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         compositor,
         gamescope_route,
         mut bitrate_kbps,
+        audio_reserved_kbps,
+        shard_payload,
         live_bitrate,
         encoder_ceiling_kbps,
         cadence_degraded,
@@ -1753,6 +1765,18 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // Streamed-AU wire mode: the client's cap AND the host escape hatch (`PUNKTFUNK_STREAMED_AU=0`
     // reverts to whole-AU sends without touching the encoder's slicing knobs). The third gate —
     // whether the ENCODER actually chunks — is dynamic (`supports_chunked_poll`, per AU).
+    // RFC §5.1: `bitrate_kbps` — and every number that reaches the client (acks, adopts,
+    // `live_bitrate`, the console) — is the session's TOTAL WIRE BUDGET. Only the encoder
+    // opens/reconfigures below convert, through an [`super::EncDerive`] snapshotted at the
+    // live adaptive-FEC percent; the FEC-step watcher in the loop re-derives when it moves,
+    // so parity reallocates WITHIN the budget instead of inflating the wire.
+    let budget_identity = plan.codec == crate::encode::Codec::PyroWave;
+    let enc_derive = move |fec: u8| super::EncDerive {
+        audio_kbps: audio_reserved_kbps,
+        shard_payload,
+        fec_percent: fec,
+        identity: budget_identity,
+    };
     let streamed_wire = streamed_au && std::env::var("PUNKTFUNK_STREAMED_AU").as_deref() != Ok("0");
     // Slice-granularity streamed blocks (P2): needs the streamed wire AND the client's
     // multi-slice tolerance (the slices only exist when the encoder splits the frame, which
@@ -1935,6 +1959,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 bitrate_kbps,
                 bitrate_auto,
                 bit_depth,
+                enc_derive(fec_target.load(Ordering::Relaxed)),
                 plan,
                 &quit,
                 &stop,
@@ -2238,6 +2263,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         .spawn({
             let stop = stop.clone();
             let phase_send = phase.clone();
+            // The encode loop keeps its own handle: the RFC §5.1 FEC-step watcher
+            // re-derives the encoder rate off the same target the send loop applies.
+            let fec_target_send = fec_target.clone();
             move || {
                 send_loop(
                     session,
@@ -2249,7 +2277,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     send_spread_send,
                     slice_wire,
                     burst_cap,
-                    fec_target,
+                    fec_target_send,
                     shard_rx,
                     send_stats,
                     timing_conn,
@@ -2422,6 +2450,9 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // `depth_frames` skips the startup warmup so first-frame bring-up cost can't false-escalate.
     let mut cur_depth: usize = 1;
     let mut behind_score: u32 = 0;
+    // The FEC percent the encoder's video rate was last derived at (RFC §5.1) — the FEC-step
+    // watcher in the loop re-derives when the live target moves off this.
+    let mut last_fec = fec_target.load(Ordering::Relaxed);
     let mut depth_frames: u64 = 0;
     // Observed source-delivery period (EMA over REAL frames' arrival spacing, ns) — the budget
     // the behind test scores encode work against. The negotiated refresh alone is the wrong
@@ -2522,6 +2553,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                             bitrate_kbps,
                             bitrate_auto,
                             bit_depth,
+                            enc_derive(fec_target.load(Ordering::Relaxed)),
                             plan,
                             &quit,
                             &stop,
@@ -2622,6 +2654,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     new_mode,
                     mode_bitrate,
                     bit_depth,
+                    enc_derive(fec_target.load(Ordering::Relaxed)),
                     plan,
                     &quit,
                     resize_trace.as_ref(),
@@ -2645,6 +2678,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     mode_bitrate,
                     bitrate_auto,
                     bit_depth,
+                    enc_derive(fec_target.load(Ordering::Relaxed)),
                     plan,
                     &quit,
                     // The display this rebuild supersedes (retired below once the new pipeline is
@@ -2785,6 +2819,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     cur_mode,
                     bitrate_kbps,
                     bit_depth,
+                    enc_derive(fec_target.load(Ordering::Relaxed)),
                     plan,
                     &quit,
                     trace.as_ref(),
@@ -2823,6 +2858,27 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         // with (the same resync discipline as a mode switch, minus the pipeline churn) and owns
         // the bitrate clamping. Rates arrive pre-clamped by the control task
         // (`resolve_bitrate_kbps`).
+        // RFC §5.1: adaptive FEC reallocates WITHIN the wire budget — when the target percent
+        // moves, the encoder's video rate re-derives so parity never inflates the wire. In
+        // place only (a FEC step is not worth a rebuild stall); a backend without in-place
+        // retarget catches up at the next real bitrate change. Runs BEFORE the drain so a
+        // request landing this iteration supersedes it. PyroWave: identity — nothing to do.
+        if !budget_identity {
+            let fec_now = fec_target.load(Ordering::Relaxed);
+            if fec_now != last_fec {
+                let prev = enc_derive(last_fec).enc_kbps(bitrate_kbps);
+                let want = enc_derive(fec_now).enc_kbps(bitrate_kbps);
+                last_fec = fec_now;
+                if want != prev && enc.reconfigure_bitrate(want as u64 * 1000) {
+                    tracing::debug!(
+                        fec_pct = fec_now,
+                        encoder_kbps = want,
+                        budget_kbps = bitrate_kbps,
+                        "adaptive FEC moved — encoder rate re-derived within the wire budget"
+                    );
+                }
+            }
+        }
         let mut want_kbps = None;
         while let Ok(k) = bitrate_rx.try_recv() {
             want_kbps = Some(k);
@@ -2848,7 +2904,11 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             }
         }
         if let Some(new_kbps) = want_kbps.filter(|&k| k != bitrate_kbps) {
-            if enc.reconfigure_bitrate(new_kbps as u64 * 1000) {
+            // The request (and everything reported back) is a WIRE BUDGET; the encoder is
+            // handed the derived video rate, and its applied read-back converts BACK to
+            // budget so acks, the ceiling and the console keep speaking the user's unit.
+            let ed = enc_derive(fec_target.load(Ordering::Relaxed));
+            if enc.reconfigure_bitrate(ed.enc_kbps(new_kbps) as u64 * 1000) {
                 // Adopt the encoder's post-clamp truth, not the request: it feeds the send
                 // pacer, the console/mgmt view and the control task's acks, and a short apply
                 // teaches the ceiling used above.
@@ -2856,6 +2916,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     .applied_bitrate_bps()
                     .map(|b| (b / 1000) as u32)
                     .filter(|&k| k > 0)
+                    .map(|k| ed.budget_kbps(k))
                     .unwrap_or(new_kbps);
                 tracing::info!(
                     from_kbps = bitrate_kbps,
@@ -2895,7 +2956,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     frame.width,
                     frame.height,
                     hz,
-                    new_kbps as u64 * 1000,
+                    ed.enc_kbps(new_kbps) as u64 * 1000,
                     frame.is_cuda(),
                     bit_depth,
                     plan.chroma,
@@ -2909,6 +2970,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                             .applied_bitrate_bps()
                             .map(|b| (b / 1000) as u32)
                             .filter(|&k| k > 0)
+                            .map(|k| ed.budget_kbps(k))
                             .unwrap_or(new_kbps);
                         tracing::info!(
                             from_kbps = bitrate_kbps,
@@ -3462,6 +3524,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                         bitrate_kbps,
                         bitrate_auto,
                         bit_depth,
+                        enc_derive(fec_target.load(Ordering::Relaxed)),
                         plan,
                         &quit,
                         &stop,
@@ -4534,8 +4597,10 @@ fn try_inplace_resize(
     frame: &mut crate::capture::CapturedFrame,
     interval: &mut std::time::Duration,
     new_mode: punktfunk_core::Mode,
+    // The session's wire budget (kbps) — the fresh encoder below opens at the DERIVED rate.
     bitrate_kbps: u32,
     bit_depth: u8,
+    enc_of: super::EncDerive,
     plan: crate::session_plan::SessionPlan,
     quit: &Arc<AtomicBool>,
     trace: &crate::bringup::Trace,
@@ -4650,7 +4715,7 @@ fn try_inplace_resize(
         new_frame.width,
         new_frame.height,
         effective_hz,
-        bitrate_kbps as u64 * 1000,
+        enc_of.enc_kbps(bitrate_kbps) as u64 * 1000,
         new_frame.is_cuda(),
         bit_depth,
         plan.chroma,
@@ -4718,6 +4783,9 @@ pub(super) fn prepare_display(
     // Passed through to [`build_pipeline`] — see its parameter of the same name.
     bitrate_auto: bool,
     bit_depth: u8,
+    // The budget→encoder conversion for the prep build (Welcome-time FEC snapshot — the
+    // session loop's FEC watcher takes over once streaming).
+    enc_of: super::EncDerive,
     chroma: crate::encode::ChromaFormat,
     codec: crate::encode::Codec,
     shard_payload: u16,
@@ -4769,6 +4837,7 @@ pub(super) fn prepare_display(
         bitrate_kbps,
         bitrate_auto,
         bit_depth,
+        enc_of,
         plan,
         quit,
         stop,
@@ -4796,6 +4865,8 @@ fn build_pipeline_with_retry(
     // Passed through to [`build_pipeline`] — see its parameter of the same name.
     bitrate_auto: bool,
     bit_depth: u8,
+    // Passed through to [`build_pipeline`] — the budget→encoder conversion for its open.
+    enc_of: super::EncDerive,
     plan: crate::session_plan::SessionPlan,
     quit: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
@@ -4863,6 +4934,7 @@ fn build_pipeline_with_retry(
             bitrate_kbps,
             bitrate_auto,
             bit_depth,
+            enc_of,
             plan,
             quit,
             None, // fresh bring-up — no display superseded
@@ -5125,12 +5197,16 @@ fn reset_stalled_encoder(
 fn build_pipeline(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
     mode: punktfunk_core::Mode,
+    // The session's WIRE BUDGET (kbps, RFC §5.1) — the number returned in the Pipeline and
+    // adopted by the caller stays budget-domain; only the `open_video` below converts (`enc`).
     bitrate_kbps: u32,
     // The client asked for "Automatic", so `bitrate_kbps` is the host's own codec-aware answer for
     // `mode` — and may be re-resolved below when the source delivers a different size than `mode`.
     // An explicit client rate is left exactly as given.
     bitrate_auto: bool,
     bit_depth: u8,
+    // The budget→encoder conversion at this build's moment (live FEC snapshotted by the caller).
+    enc_of: super::EncDerive,
     plan: crate::session_plan::SessionPlan,
     quit: &Arc<AtomicBool>,
     // The pool gen of the display this build REPLACES (`Some` only on the mode-switch full
@@ -5306,7 +5382,7 @@ fn build_pipeline(
         frame.width,
         frame.height,
         effective_hz,
-        bitrate_kbps as u64 * 1000,
+        enc_of.enc_kbps(bitrate_kbps) as u64 * 1000,
         frame.is_cuda(),
         bit_depth,
         plan.chroma,

@@ -1113,6 +1113,16 @@ pub(super) async fn negotiate(
             // PyroWave is Automatic unconditionally (`resolve_bitrate_kbps_for` overrode any
             // explicit rate — RFC §5.2).
             let bitrate_auto = hello.bitrate_kbps == 0 || codec == crate::encode::Codec::PyroWave;
+            // The budget→encoder conversion for the prep build (RFC §5.1): `bitrate_kbps` is
+            // the session's WIRE BUDGET; the prep's encoder opens at the derived video rate,
+            // snapshotted at the Welcome's initial FEC percent. The stream loop's FEC watcher
+            // re-derives from there.
+            let enc_of = super::EncDerive {
+                audio_kbps: super::audio_reserved_kbps(&welcome),
+                shard_payload: welcome.shard_payload,
+                fec_percent: welcome.fec.fec_percent,
+                identity: codec == crate::encode::Codec::PyroWave,
+            };
             let trace = bringup.clone();
             std::thread::Builder::new()
                 .name("punktfunk1-stream".into())
@@ -1126,6 +1136,7 @@ pub(super) async fn negotiate(
                         multi_slice,
                         bitrate_kbps,
                         bitrate_auto,
+                        enc_of,
                         bit_depth,
                         chroma,
                         codec,
