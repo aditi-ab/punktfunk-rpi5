@@ -1,0 +1,4 @@
+• Fixes a black screen with working sound on some TV devices. The decoder could fail to start, so no picture arrived — your device now falls back to a simpler setup.
+• Streaming quality holds up far better, because a still menu no longer looks like a bad connection.
+• Button hints match your device: a TV remote gets OK and Back, a Nintendo pad its own letters.
+• Send logs to the host from the touch interface.
