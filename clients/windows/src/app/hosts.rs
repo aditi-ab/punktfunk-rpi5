@@ -15,6 +15,11 @@ use windows_reactor::*;
 const MENU_CONNECT: &str = "Connect";
 const MENU_LIBRARY: &str = "Browse library\u{2026}";
 const MENU_SPEED: &str = "Test network speed\u{2026}";
+/// Upload this device's recent log ring to the host (`logring::send_to_host`), where the web
+/// console's Logs page lists it beside the host's own log. Paired + online only — the same
+/// gate as the console UI's row, because the upload authenticates with the paired identity
+/// and an offline host could only ever report an error.
+const MENU_SEND_LOGS: &str = "Send logs to host";
 const MENU_WAKE: &str = "Wake host";
 /// One entry for every per-host property (name, address, MAC, clipboard sharing) — the
 /// Apple client's add/edit sheet. A menu item per field read as clutter and buried the ones
@@ -758,6 +763,10 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                             items.push(menu_item(MENU_LIBRARY));
                         }
                         items.push(menu_item(MENU_SPEED));
+                        // See [`MENU_SEND_LOGS`] for the gate.
+                        if k.paired && online {
+                            items.push(menu_item(MENU_SEND_LOGS));
+                        }
                         // An explicit wake only when the host is offline and we have a MAC.
                         if can_wake {
                             items.push(menu_item(MENU_WAKE));
@@ -848,6 +857,54 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                             svc.set_screen.call(Screen::Library);
                         }
                         MENU_WAKE => crate::wol::wake(&target.mac, target.addr.parse().ok()),
+                        MENU_SEND_LOGS => {
+                            // Blocking network (the library agent's 5 s connect / 10 s global
+                            // budgets) — a worker thread, with the outcome routed to the
+                            // status line. Wording is the console's verbatim, so a quoted
+                            // message means the same thing everywhere.
+                            let identity = svc.ctx.identity.clone();
+                            let target = target.clone();
+                            let set_status = svc.set_status.clone();
+                            set_status.call(format!("Sending logs to {}…", target.name));
+                            let _ = std::thread::Builder::new()
+                                .name("punktfunk-sendlogs".into())
+                                .spawn(move || {
+                                    let header = format!(
+                                        "punktfunk-client {} ({} {}) — client log bundle",
+                                        env!("CARGO_PKG_VERSION"),
+                                        std::env::consts::OS,
+                                        std::env::consts::ARCH,
+                                    );
+                                    let pin = target
+                                        .fp_hex
+                                        .as_deref()
+                                        .and_then(crate::trust::parse_hex32);
+                                    let mgmt = target
+                                        .mgmt_port
+                                        .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
+                                    let msg = match pf_client_core::logring::send_to_host(
+                                        &target.addr,
+                                        mgmt,
+                                        &identity,
+                                        pin,
+                                        &header,
+                                    ) {
+                                        Ok(id) => {
+                                            tracing::info!(host = %target.name, id, "client logs uploaded");
+                                            format!(
+                                                "Logs sent to {} — download them from its web \
+                                                 console's Logs page",
+                                                target.name
+                                            )
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(host = %target.name, error = %e, "client log upload failed");
+                                            format!("Couldn't send logs — {e}")
+                                        }
+                                    };
+                                    set_status.call(msg);
+                                });
+                        }
                         MENU_SPEED => {
                             *svc.ctx.shared.target.lock().unwrap() = target.clone();
                             // New run: invalidate any still-in-flight probe, reset the screen.

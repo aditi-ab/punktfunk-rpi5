@@ -23,7 +23,6 @@
 
 #[cfg(all(any(target_os = "linux", windows), feature = "ui"))]
 mod console;
-mod ring_layer;
 
 /// The session control socket: a line-per-connection unix socket other same-user
 /// processes use to poke the RUNNING stream — today two verbs, `guide` and `qam`, which
@@ -642,7 +641,7 @@ mod session_main {
                         ),
                 )
                 .with(
-                    crate::ring_layer::RingLayer
+                    pf_client_core::logring::RingLayer
                         .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
                 )
                 .init();

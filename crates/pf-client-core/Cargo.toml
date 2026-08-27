@@ -136,6 +136,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
+# `logring::RingLayer` — the ONE tracing layer feeding the ring, shared by the session binary
+# and both desktop shells (it lived in clients/session, which left the GTK and WinUI shells
+# with no ring and so no "Send logs to host"). Minimal features: the layer only needs the
+# `Layer` trait; the bins bring their own full-featured tracing-subscriber, and cargo's
+# feature union means this adds nothing they didn't already compile. `tracing-log` is the
+# bridge-normalization half (see the layer's docs) and rides tracing-subscriber's default
+# `tracing-log` feature in every bin anyway. Android/Apple builds are untouched — this is
+# the desktop target block.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry"] }
+tracing-log = "0.2"
 # Stable ids for profiles and host records (profiles.rs) — the OS RNG only, same version the
 # workspace already resolves for punktfunk-core. No uuid crate: the v4 layout is four lines.
 rand = "0.9"
@@ -224,6 +234,11 @@ windows = { git = "https://github.com/microsoft/windows-rs", rev = "acb5a1a74410
 # `video_vaapi_native::parity`. A DEV dependency, so no shipped binary gains anything —
 # which is also part of why the VAAPI readback cannot reach the production video path.
 sha2 = "0.11"
+# `logring`'s bridged-decoder test plants `log`-crate records through the tracing-log
+# bridge and installs a registry subscriber — the full-featured halves the shipping layer
+# deliberately doesn't need.
+log = "0.4"
+tracing-subscriber = { version = "0.3" }
 
 [features]
 # PyroWave client decode ships in every default build (flatpak included; pyrowave-sys is a

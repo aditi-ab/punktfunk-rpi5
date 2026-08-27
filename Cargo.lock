@@ -3003,6 +3003,7 @@ dependencies = [
  "async-channel",
  "libc",
  "libloading 0.9.0",
+ "log",
  "mdns-sd",
  "openh264",
  "opus",
@@ -3022,6 +3023,8 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tracing",
+ "tracing-log",
+ "tracing-subscriber",
  "ureq",
  "wasapi",
  "windows 0.62.2 (git+https://github.com/microsoft/windows-rs?rev=acb5a1a7441033d9312b16842af02eb0c2b403dc)",
@@ -3540,14 +3543,12 @@ dependencies = [
 name = "punktfunk-client-session"
 version = "0.31.4"
 dependencies = [
- "log",
  "pf-client-core",
  "pf-console-ui",
  "pf-presenter",
  "punktfunk-core",
  "serde_json",
  "tracing",
- "tracing-log",
  "tracing-subscriber",
  "winresource",
 ]

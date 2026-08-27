@@ -706,10 +706,18 @@ pub fn spawn_session(
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit()); // the session's logs interleave with the front-end's
+        // Piped through the ring forwarder, not inherited: a dev terminal still gets the
+        // session's logs interleaved with the front-end's (the forwarder writes them straight
+        // back to our stderr), and the shell's "Send logs to host" bundle now carries the
+        // session's whole receive/decode/present trail — without it, the one surface a
+        // GUI-only user can export held everything EXCEPT the stream it was exported about.
+        .stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("couldn't start {}: {e}", SESSION_BIN))?;
+    if let Some(stderr) = child.stderr.take() {
+        crate::logring::forward_child_stderr(stderr);
+    }
     tracing::info!(
         host = %plan.host.addr, port = plan.host.port,
         profile = plan.profile.as_ref().map(|p| p.name.as_str()).unwrap_or("-"),

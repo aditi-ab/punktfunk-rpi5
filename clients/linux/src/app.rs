@@ -155,6 +155,10 @@ pub enum AppMsg {
     ConsoleExited(Option<String>),
     /// Request-access Cancel: the child was killed; release busy quietly.
     CancelPending,
+    /// Upload the client log ring to this paired host (`logring::send_to_host`); the
+    /// outcome lands as a Toast either way. The mgmt port rides along, resolved like
+    /// OpenLibrary's.
+    SendLogs(ConnectRequest, Option<u16>),
     /// The speed-test dialog resolved (either way) — release `busy`.
     SpeedTestDone,
     ShowPreferences,
@@ -266,6 +270,7 @@ impl SimpleComponent for AppModel {
                     HostsOutput::Pair(req) => AppMsg::Pair(req),
                     HostsOutput::SpeedTest(req) => AppMsg::SpeedTest(req),
                     HostsOutput::Library(req, mgmt) => AppMsg::OpenLibrary(req, mgmt),
+                    HostsOutput::SendLogs(req, mgmt) => AppMsg::SendLogs(req, mgmt),
                     HostsOutput::Toast(msg) => AppMsg::Toast(msg),
                 });
 
@@ -423,6 +428,44 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::SpeedTest(req) => self.speed_test(req, &sender),
+            AppMsg::SendLogs(req, mgmt_port) => {
+                // Blocking network (the library agent's 5 s connect / 10 s global budgets) —
+                // a worker thread, with the outcome routed back as a Toast. Wording is the
+                // console's verbatim, so a quoted message means the same thing everywhere.
+                let identity = self.identity.clone();
+                let pin = req.fp_hex.as_deref().and_then(trust::parse_hex32);
+                let mgmt = mgmt_port.unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
+                self.toast(&format!("Sending logs to {}…", req.name));
+                let out = sender.input_sender().clone();
+                std::thread::Builder::new()
+                    .name("punktfunk-sendlogs".into())
+                    .spawn(move || {
+                        let header = format!(
+                            "punktfunk-client {} ({} {}) — client log bundle",
+                            env!("CARGO_PKG_VERSION"),
+                            std::env::consts::OS,
+                            std::env::consts::ARCH,
+                        );
+                        let msg = match pf_client_core::logring::send_to_host(
+                            &req.addr, mgmt, &identity, pin, &header,
+                        ) {
+                            Ok(id) => {
+                                tracing::info!(host = %req.name, id, "client logs uploaded");
+                                format!(
+                                    "Logs sent to {} — download them from its web console's \
+                                     Logs page",
+                                    req.name
+                                )
+                            }
+                            Err(e) => {
+                                tracing::warn!(host = %req.name, error = %e, "client log upload failed");
+                                format!("Couldn't send logs — {e}")
+                            }
+                        };
+                        let _ = out.send(AppMsg::Toast(msg));
+                    })
+                    .ok();
+            }
             AppMsg::SpeedTestDone => self.busy = false,
             AppMsg::OpenLibrary(req, mgmt_port) => {
                 crate::ui_library::open(self, &sender, req, mgmt_port);
@@ -990,11 +1033,30 @@ fn clear_steam_sdl_device_filter() {
 }
 
 pub fn run() -> glib::ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    // The fmt layer as before, plus the in-process ring (`pf_client_core::logring`, DEBUG+ regardless
+    // of RUST_LOG) that "Send logs to host" uploads — the env filter scopes the stderr layer
+    // only, because the ring exists precisely for the diagnostics nobody enabled before the
+    // bug happened. The spawned session's own stderr joins the ring too (`orchestrate` pipes
+    // it through `logring::forward_child_stderr`), so a bundle from this shell carries the
+    // stream's trail, not just the launcher's.
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::Layer;
+        tracing_subscriber::registry()
+            .with(
+                // The default (stdout) writer, exactly as `fmt().init()` had it.
+                tracing_subscriber::fmt::layer().with_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "info".into()),
+                ),
+            )
+            .with(
+                pf_client_core::logring::RingLayer
+                    .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
+            )
+            .init();
+    }
     // Steam launches its shortcuts with SDL_GAMECONTROLLER_IGNORE_DEVICES naming every
     // physical pad Steam Input has virtualized; the Settings controller list needs the
     // real devices (same rationale as the session binary).
