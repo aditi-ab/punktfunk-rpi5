@@ -2584,7 +2584,192 @@ fn clamp_device_name(s: &str) -> String {
     s[..end].to_string()
 }
 
-/// Shared body of [`punktfunk_connect_ex7`] / [`punktfunk_connect_ex8`]: `status_out`
+/// Every connect option in one **growable** struct — the terminal form of the
+/// [`punktfunk_connect`] … [`punktfunk_connect_ex11`] chain, consumed by
+/// [`punktfunk_connect_opts`]. Eleven generations each minted a new exported symbol to add a
+/// field or two (`ex11` over `ex10`: exactly `audio_rate_hz` + `audio_bits`, for a 24-parameter
+/// signature and a full forwarding shim). This struct ends that: a new option is a new field
+/// appended HERE, guarded by `struct_size` exactly like [`PunktfunkConfig`].
+///
+/// Usage: zero-initialize the whole struct, set `struct_size = sizeof(PunktfunkConnectOpts)`,
+/// then set the fields you mean. Every zero field keeps the auto/legacy behaviour of the `ex`
+/// chain (null pointer = absent, `0` = auto/unspecified) — `audio_rate_hz = 0` is `ex10`'s
+/// UNSPECIFIED audio format, an explicit pair is `ex11`'s hi-res request, so the load-bearing
+/// `ex11`-vs-`ex10` symbol choice becomes a field value.
+///
+/// Growth discipline (for this crate): append only — never reorder, never widen an existing
+/// field; a new field's zero value must mean "unspecified/auto"; keep the struct free of TAIL
+/// padding on both pointer widths (the const asserts below lock 96/68 bytes), so an appended
+/// field can never land inside bytes an older caller's `sizeof` already covered; bump
+/// [`crate::ABI_VERSION`].
+#[cfg(feature = "quic")]
+#[repr(C)]
+pub struct PunktfunkConnectOpts {
+    /// `sizeof(PunktfunkConnectOpts)` as THIS caller was compiled — the skew guard
+    /// ([`punktfunk_connect_opts`] rejects smaller than the v26 introduction size, and when the
+    /// struct grows, an older caller's shorter size defaults the tail instead of misreading it).
+    pub struct_size: u32,
+    /// Required: NUL-terminated UTF-8 IP or hostname (the one non-nullable pointer here).
+    pub host: *const std::os::raw::c_char,
+    /// Library id to auto-launch, or null ([`punktfunk_connect_ex4`]).
+    pub launch_id: *const std::os::raw::c_char,
+    /// Null (trust on first use) or the host certificate's expected 32-byte SHA-256
+    /// ([`punktfunk_connect`]'s trust contract).
+    pub pin_sha256: *const u8,
+    /// TLS client identity: both null (anonymous) or both NUL-terminated PEM
+    /// ([`punktfunk_generate_identity`]).
+    pub client_cert_pem: *const std::os::raw::c_char,
+    /// See `client_cert_pem`.
+    pub client_key_pem: *const std::os::raw::c_char,
+    /// The label this device knocks with, or null for the OS default
+    /// ([`punktfunk_connect_ex10`]).
+    pub device_name: *const std::os::raw::c_char,
+    /// Requested mode ([`punktfunk_connect`]).
+    pub width: u32,
+    /// See `width`.
+    pub height: u32,
+    /// See `width`.
+    pub refresh_hz: u32,
+    /// `PUNKTFUNK_COMPOSITOR_*`; `0`/unrecognized = auto ([`punktfunk_connect_ex`]).
+    pub compositor: u32,
+    /// `PUNKTFUNK_GAMEPAD_*`; `0`/unrecognized = auto ([`punktfunk_connect_ex2`]).
+    pub gamepad: u32,
+    /// Session wire budget in kbps; `0` = the host default ([`punktfunk_connect_ex3`]).
+    pub bitrate_kbps: u32,
+    /// Audio format ask; `0`/`0` = UNSPECIFIED (the legacy Opus path), an explicit pair is a
+    /// hi-res request that derives `PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES`
+    /// ([`punktfunk_connect_ex11`] — including why explicit 48000/16 is a genuine lossless ask).
+    pub audio_rate_hz: u32,
+    /// Connect timeout in milliseconds.
+    pub timeout_ms: u32,
+    /// Required: the host's UDP port.
+    pub port: u16,
+    /// `PUNKTFUNK_VIDEO_CAP_*` bits ([`punktfunk_connect_ex5`]).
+    pub video_caps: u8,
+    /// Channel ask: 2 / 6 / 8; `0` = stereo ([`punktfunk_connect_ex6`]).
+    pub audio_channels: u8,
+    /// See `audio_rate_hz`.
+    pub audio_bits: u8,
+    /// `PUNKTFUNK_CODEC_*` bits the client can decode ([`punktfunk_connect_ex7`]).
+    pub video_codecs: u8,
+    /// The one `PUNKTFUNK_CODEC_*` bit to prefer; `0` = host's choice
+    /// ([`punktfunk_connect_ex7`]).
+    pub preferred_codec: u8,
+    /// `PUNKTFUNK_CLIENT_CAP_*` bits ([`punktfunk_connect_ex8`]).
+    pub client_caps: u8,
+}
+
+// The no-tail-padding lock the growth contract rests on (see the struct doc): if either width's
+// size moves under an edit that meant to change nothing, fields were reordered/widened or tail
+// padding appeared — all append-contract breaks. On APPENDING a field: keep
+// `CONNECT_OPTS_MIN_SIZE` frozen at these v26 values and update these literals to the new
+// (still padding-free) sizes.
+#[cfg(feature = "quic")]
+const _: () = {
+    #[cfg(target_pointer_width = "64")]
+    assert!(core::mem::size_of::<PunktfunkConnectOpts>() == 96);
+    #[cfg(target_pointer_width = "32")]
+    assert!(core::mem::size_of::<PunktfunkConnectOpts>() == 68);
+};
+
+/// The v26 introduction size of [`PunktfunkConnectOpts`] — the MINIMUM `struct_size`
+/// [`punktfunk_connect_opts`] ever accepts. FROZEN: when the struct grows, this stays put so
+/// v26-built callers keep connecting; only the const asserts above move.
+#[cfg(all(feature = "quic", target_pointer_width = "64"))]
+const CONNECT_OPTS_MIN_SIZE: usize = 96;
+#[cfg(all(feature = "quic", target_pointer_width = "32"))]
+const CONNECT_OPTS_MIN_SIZE: usize = 68;
+
+/// Connect with every option in one growable [`PunktfunkConnectOpts`] (ABI v26) — semantics are
+/// exactly [`punktfunk_connect_ex11`]'s, field for field. The `ex` chain stays supported and
+/// byte-identical forever, but it is CLOSED: new options land only in the struct.
+///
+/// `status_out` (nullable) is written on every path, like the whole connect family;
+/// `observed_sha256_out` (null or 32 bytes) receives the host certificate's fingerprint on
+/// success, per [`punktfunk_connect`]'s trust contract.
+///
+/// # Safety
+/// `opts` is null or points to at least `opts->struct_size` readable bytes laid out as its
+/// declared version of [`PunktfunkConnectOpts`]; its pointer fields follow
+/// [`punktfunk_connect_ex11`]'s contract; `observed_sha256_out` is null or valid for 32 bytes.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connect_opts(
+    opts: *const PunktfunkConnectOpts,
+    observed_sha256_out: *mut u8,
+    status_out: *mut i32,
+) -> *mut PunktfunkConnection {
+    let set_status = |s: crate::error::PunktfunkStatus| {
+        if !status_out.is_null() {
+            // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this path,
+            // written once by value.
+            unsafe { *status_out = s as i32 };
+        }
+    };
+    if opts.is_null() {
+        set_status(crate::error::PunktfunkStatus::NullPointer);
+        return std::ptr::null_mut();
+    }
+    // Read only the 4-byte size prefix first to bound the subsequent read — `config_from_ptr`'s
+    // guard, with the growth direction added: older (shorter, but never shorter than v26)
+    // callers get their missing tail defaulted instead of misread.
+    // SAFETY: `addr_of!` forms a raw pointer WITHOUT creating a reference, which is the point:
+    // the caller's struct may be a different size than ours, so the field is read by offset
+    // rather than through a `&`.
+    let declared = unsafe { std::ptr::addr_of!((*opts).struct_size).read_unaligned() } as usize;
+    if declared < CONNECT_OPTS_MIN_SIZE {
+        set_status(crate::error::PunktfunkStatus::InvalidArg);
+        return std::ptr::null_mut();
+    }
+    // Copy the known prefix over an all-zero struct: today that is the whole struct; once the
+    // struct has grown past a caller's vintage, the copy stops at THEIR `struct_size` and the
+    // appended fields stay zero = unspecified (zeroed raw pointers are null). A NEWER caller's
+    // extra tail is ignored the same way.
+    // SAFETY: all-zero is a valid `PunktfunkConnectOpts` — null pointers and zero scalars.
+    let mut o: PunktfunkConnectOpts = unsafe { std::mem::zeroed() };
+    let take = declared.min(std::mem::size_of::<PunktfunkConnectOpts>());
+    // SAFETY: per the ABI contract `opts` is readable for `declared >= take` bytes; `o` is a
+    // local of at least `take` bytes; a local cannot overlap a caller-owned region.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            opts.cast::<u8>(),
+            std::ptr::addr_of_mut!(o).cast::<u8>(),
+            take,
+        );
+    }
+    // SAFETY: the pointer fields are forwarded UNCHANGED to the shared body, which applies the
+    // same ABI contract to them; the copy above dereferenced nothing they point at.
+    unsafe {
+        connect_ex_impl(
+            o.host,
+            o.port,
+            o.client_caps,
+            o.width,
+            o.height,
+            o.refresh_hz,
+            o.compositor,
+            o.gamepad,
+            o.bitrate_kbps,
+            o.video_caps,
+            o.audio_channels,
+            o.video_codecs,
+            o.preferred_codec,
+            o.launch_id,
+            o.pin_sha256,
+            observed_sha256_out,
+            o.client_cert_pem,
+            o.client_key_pem,
+            o.device_name,
+            o.audio_rate_hz,
+            o.audio_bits,
+            o.timeout_ms,
+            status_out,
+        )
+    }
+}
+
+/// Shared body of the whole connect family — [`punktfunk_connect`] through
+/// [`punktfunk_connect_ex11`] and [`punktfunk_connect_opts`]: `status_out`
 /// (nullable) is written on EVERY path — `Ok`, the mapped [`PunktfunkError`],
 /// `InvalidArg` for bad arguments, `Panic` if the connect panicked. `device_name` (nullable,
 /// [`punktfunk_connect_ex10`]) is the label this device knocks with; null = the OS default.
@@ -6043,6 +6228,36 @@ mod log_sink_tests {
 #[cfg(all(test, feature = "quic"))]
 mod tests {
     use super::*;
+
+    /// The [`PunktfunkConnectOpts`] size-prefix guard: null and undersized structs come back as
+    /// status codes, not reads — and a well-sized struct takes the copy path all the way into
+    /// the shared body (null `host` = `InvalidArg`, before any dialing). The growth half of the
+    /// contract (an older, shorter caller gets its tail defaulted) cannot be exercised until the
+    /// struct actually grows; what CAN regress today is this guard and the no-tail-padding
+    /// layout the const asserts beside the struct lock.
+    #[test]
+    fn connect_opts_guards_size_prefix() {
+        let mut status = 0i32;
+        // SAFETY: null `opts` is the documented reported-not-UB case.
+        let c =
+            unsafe { punktfunk_connect_opts(std::ptr::null(), std::ptr::null_mut(), &mut status) };
+        assert!(c.is_null());
+        assert_eq!(status, PunktfunkStatus::NullPointer as i32);
+
+        // SAFETY: an all-zero struct is a valid value (null pointers, zero scalars).
+        let mut o: PunktfunkConnectOpts = unsafe { std::mem::zeroed() };
+        o.struct_size = 4; // an impossible, pre-v26 size
+                           // SAFETY: `o` outlives the call; out-params are null or a live local.
+        let c = unsafe { punktfunk_connect_opts(&o, std::ptr::null_mut(), &mut status) };
+        assert!(c.is_null());
+        assert_eq!(status, PunktfunkStatus::InvalidArg as i32);
+
+        o.struct_size = std::mem::size_of::<PunktfunkConnectOpts>() as u32;
+        // SAFETY: as above; the null `host` field is the documented InvalidArg path.
+        let c = unsafe { punktfunk_connect_opts(&o, std::ptr::null_mut(), &mut status) };
+        assert!(c.is_null());
+        assert_eq!(status, PunktfunkStatus::InvalidArg as i32);
+    }
 
     /// The `ex10` device name is cut to the Hello's BYTE budget on a CHARACTER boundary — the
     /// naive `s[..HELLO_NAME_MAX]` panics on any multi-byte name that straddles it, and an

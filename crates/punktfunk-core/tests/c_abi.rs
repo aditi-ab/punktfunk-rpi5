@@ -43,14 +43,16 @@ fn native_libs() -> &'static [&'static str] {
 
 fn ensure_staticlib(profile_dir: &Path) -> PathBuf {
     let staticlib = profile_dir.join("libpunktfunk_core.a");
-    if !staticlib.exists() {
-        // `cargo test` doesn't always emit the standalone staticlib; build it. The
-        // outer cargo's build lock is released during test execution, so this is safe.
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let _ = Command::new(cargo)
-            .args(["build", "-p", "punktfunk-core"])
-            .status();
-    }
+    // `cargo test` doesn't always emit the standalone staticlib; build it — WITH `quic`, the
+    // surface the harness declares (`-DPUNKTFUNK_FEATURE_QUIC`) and this test's link line
+    // already pays for (`-lopus`, Security). Unconditional, because a featureless `.a` left by
+    // an earlier plain `cargo build` would otherwise be reused and fail the link on the quic
+    // symbols; when the artifact is already right this is an incremental no-op. The outer
+    // cargo's build lock is released during test execution, so this is safe.
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let _ = Command::new(cargo)
+        .args(["build", "-p", "punktfunk-core", "--features", "quic"])
+        .status();
     staticlib
 }
 
@@ -84,8 +86,24 @@ fn c_abi_harness_round_trips() {
 
     let mut compile = Command::new(&cc);
     compile
-        .args(["-std=c11", "-Wall", "-Wextra", "-O2", "-I"])
-        .arg(&include)
+        // The staticlib is built with workspace-unified features, quic included (that's what the
+        // -lopus / Security link line below pays for) — so expose the header's quic surface and
+        // let the harness exercise it (the `PunktfunkConnectOpts` layout check).
+        .args([
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-O2",
+            "-DPUNKTFUNK_FEATURE_QUIC",
+            "-I",
+        ])
+        .arg(&include);
+    // Apple Silicon: `cc` does not search homebrew's prefix on its own, and `-lopus` lives
+    // there — without this the harness never linked on a Mac dev box at all.
+    if cfg!(target_os = "macos") && Path::new("/opt/homebrew/lib").is_dir() {
+        compile.arg("-L/opt/homebrew/lib");
+    }
+    compile
         .arg(&harness)
         .arg(&staticlib)
         .args(native_libs())

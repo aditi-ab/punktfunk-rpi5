@@ -185,7 +185,16 @@
 // never sees it and [`WIRE_VERSION`] is unchanged. It relies on tracing's `log` feature, now
 // declared explicitly by this crate (it was on transitively through quinn's defaults, which is
 // not a thing an ABI promise should rest on).
-#define PUNKTFUNK_ABI_VERSION 25
+// **v26** adds [`abi::punktfunk_connect_opts`] + [`abi::PunktfunkConnectOpts`] — the whole
+// connect surface in ONE size-prefixed, growable struct, closing the eleven-generation
+// `punktfunk_connect_ex*` chain (each new option used to mint a new exported symbol plus a
+// 20-something-parameter forwarding shim; `ex11` over `ex10` was two fields). ADDED, not
+// widened: every `ex` variant keeps its symbol, signature and byte-identical behaviour, and an
+// embedder that never calls the new form behaves exactly as on v25. New connect options land
+// only in the struct from here on — appended behind its `struct_size` guard, zero meaning
+// unspecified/auto — so they stop being ABI events at all. Client-local; [`WIRE_VERSION`] is
+// unchanged.
+#define PUNKTFUNK_ABI_VERSION 26
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -2259,6 +2268,81 @@ typedef struct {
 } PunktfunkStats;
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Every connect option in one **growable** struct — the terminal form of the
+// [`punktfunk_connect`] … [`punktfunk_connect_ex11`] chain, consumed by
+// [`punktfunk_connect_opts`]. Eleven generations each minted a new exported symbol to add a
+// field or two (`ex11` over `ex10`: exactly `audio_rate_hz` + `audio_bits`, for a 24-parameter
+// signature and a full forwarding shim). This struct ends that: a new option is a new field
+// appended HERE, guarded by `struct_size` exactly like [`PunktfunkConfig`].
+//
+// Usage: zero-initialize the whole struct, set `struct_size = sizeof(PunktfunkConnectOpts)`,
+// then set the fields you mean. Every zero field keeps the auto/legacy behaviour of the `ex`
+// chain (null pointer = absent, `0` = auto/unspecified) — `audio_rate_hz = 0` is `ex10`'s
+// UNSPECIFIED audio format, an explicit pair is `ex11`'s hi-res request, so the load-bearing
+// `ex11`-vs-`ex10` symbol choice becomes a field value.
+//
+// Growth discipline (for this crate): append only — never reorder, never widen an existing
+// field; a new field's zero value must mean "unspecified/auto"; keep the struct free of TAIL
+// padding on both pointer widths (the const asserts below lock 96/68 bytes), so an appended
+// field can never land inside bytes an older caller's `sizeof` already covered; bump
+// [`crate::ABI_VERSION`].
+typedef struct {
+    // `sizeof(PunktfunkConnectOpts)` as THIS caller was compiled — the skew guard
+    // ([`punktfunk_connect_opts`] rejects smaller than the v26 introduction size, and when the
+    // struct grows, an older caller's shorter size defaults the tail instead of misreading it).
+    uint32_t struct_size;
+    // Required: NUL-terminated UTF-8 IP or hostname (the one non-nullable pointer here).
+    const char *host;
+    // Library id to auto-launch, or null ([`punktfunk_connect_ex4`]).
+    const char *launch_id;
+    // Null (trust on first use) or the host certificate's expected 32-byte SHA-256
+    // ([`punktfunk_connect`]'s trust contract).
+    const uint8_t *pin_sha256;
+    // TLS client identity: both null (anonymous) or both NUL-terminated PEM
+    // ([`punktfunk_generate_identity`]).
+    const char *client_cert_pem;
+    // See `client_cert_pem`.
+    const char *client_key_pem;
+    // The label this device knocks with, or null for the OS default
+    // ([`punktfunk_connect_ex10`]).
+    const char *device_name;
+    // Requested mode ([`punktfunk_connect`]).
+    uint32_t width;
+    // See `width`.
+    uint32_t height;
+    // See `width`.
+    uint32_t refresh_hz;
+    // `PUNKTFUNK_COMPOSITOR_*`; `0`/unrecognized = auto ([`punktfunk_connect_ex`]).
+    uint32_t compositor;
+    // `PUNKTFUNK_GAMEPAD_*`; `0`/unrecognized = auto ([`punktfunk_connect_ex2`]).
+    uint32_t gamepad;
+    // Session wire budget in kbps; `0` = the host default ([`punktfunk_connect_ex3`]).
+    uint32_t bitrate_kbps;
+    // Audio format ask; `0`/`0` = UNSPECIFIED (the legacy Opus path), an explicit pair is a
+    // hi-res request that derives `PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES`
+    // ([`punktfunk_connect_ex11`] — including why explicit 48000/16 is a genuine lossless ask).
+    uint32_t audio_rate_hz;
+    // Connect timeout in milliseconds.
+    uint32_t timeout_ms;
+    // Required: the host's UDP port.
+    uint16_t port;
+    // `PUNKTFUNK_VIDEO_CAP_*` bits ([`punktfunk_connect_ex5`]).
+    uint8_t video_caps;
+    // Channel ask: 2 / 6 / 8; `0` = stereo ([`punktfunk_connect_ex6`]).
+    uint8_t audio_channels;
+    // See `audio_rate_hz`.
+    uint8_t audio_bits;
+    // `PUNKTFUNK_CODEC_*` bits the client can decode ([`punktfunk_connect_ex7`]).
+    uint8_t video_codecs;
+    // The one `PUNKTFUNK_CODEC_*` bit to prefer; `0` = host's choice
+    // ([`punktfunk_connect_ex7`]).
+    uint8_t preferred_codec;
+    // `PUNKTFUNK_CLIENT_CAP_*` bits ([`punktfunk_connect_ex8`]).
+    uint8_t client_caps;
+} PunktfunkConnectOpts;
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // One audio packet pulled off a `punktfunk/1` connection — an Opus frame (48 kHz, 5 ms) on
 // every ordinary session, or one lossless PCM frame on a session that resolved the `0xD3` plane.
 // `data` borrows connection memory until the next `punktfunk_connection_next_audio` call.
@@ -3142,6 +3226,24 @@ PunktfunkConnection *punktfunk_connect_ex11(const char *host,
                                             const char *client_key_pem,
                                             const char *device_name,
                                             uint32_t timeout_ms,
+                                            int32_t *status_out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Connect with every option in one growable [`PunktfunkConnectOpts`] (ABI v26) — semantics are
+// exactly [`punktfunk_connect_ex11`]'s, field for field. The `ex` chain stays supported and
+// byte-identical forever, but it is CLOSED: new options land only in the struct.
+//
+// `status_out` (nullable) is written on every path, like the whole connect family;
+// `observed_sha256_out` (null or 32 bytes) receives the host certificate's fingerprint on
+// success, per [`punktfunk_connect`]'s trust contract.
+//
+// # Safety
+// `opts` is null or points to at least `opts->struct_size` readable bytes laid out as its
+// declared version of [`PunktfunkConnectOpts`]; its pointer fields follow
+// [`punktfunk_connect_ex11`]'s contract; `observed_sha256_out` is null or valid for 32 bytes.
+PunktfunkConnection *punktfunk_connect_opts(const PunktfunkConnectOpts *opts,
+                                            uint8_t *observed_sha256_out,
                                             int32_t *status_out);
 #endif
 
