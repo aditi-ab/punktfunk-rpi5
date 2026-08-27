@@ -9,67 +9,109 @@ use super::*;
 use pf_clipboard::ClipCoordCmd;
 use punktfunk_core::quic::{ClipControl, ClipOffer, ClipState};
 
-/// Run the control task for one live session. Owns the control streams (`serve_session` hands them
-/// off after negotiation) plus every channel end that bridges to the data-plane thread, and the
-/// [`pf_clipboard::ClipCoord`] handle bridging to the clipboard coordinator. Returns when the
-/// control stream closes or a data-plane channel drops.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run(
-    mut ctrl_send: quinn::SendStream,
-    ctrl_recv: quinn::RecvStream,
-    initial_mode: punktfunk_core::Mode,
-    codec: crate::encode::Codec,
-    live_reconfig_ok: bool,
-    adaptive_fec: bool,
-    session_bitrate_kbps: u32,
-    // Encoder-truth bridge (data plane → here, §ABR overdrive): the encoder's live applied rate,
-    // its discovered codec-level ceiling (0 = unknown), and the "encode can't hold cadence"
-    // flag. Read at `SetBitrate`-resolve time so the ack — the base the client's controller
-    // climbs from — never promises a rate the encoder won't run at.
-    live_bitrate: Arc<AtomicU32>,
-    encoder_ceiling_kbps: Arc<AtomicU32>,
-    cadence_degraded: Arc<AtomicBool>,
-    cadence_behind_score: Arc<AtomicU32>,
-    // Delivery truth, published from every `DeliveryReport` for the data plane's stall diagnosis:
-    // the packets the client says it has received all session (`u32::MAX` = a client too old to
-    // send one, the pre-seeded value).
-    client_packets_received: Arc<AtomicU32>,
-    fec_target_ctl: Arc<AtomicU8>,
-    // Phase-locked capture bridge: client PhaseReports land here latest-wins; the encode loop's
-    // controller drains at its own ~1 Hz cadence (design/phase-locked-capture.md).
-    phase_ctl: Arc<super::stream::PhaseCtl>,
-    reconfig_tx: std::sync::mpsc::Sender<punktfunk_core::Mode>,
-    keyframe_tx: std::sync::mpsc::Sender<()>,
-    rfi_tx: std::sync::mpsc::Sender<(u32, u32)>,
-    bitrate_tx: std::sync::mpsc::Sender<u32>,
-    probe_tx: std::sync::mpsc::Sender<ProbeRequest>,
-    mut probe_result_rx: tokio::sync::mpsc::UnboundedReceiver<ProbeResult>,
-    mut reconfig_result_rx: tokio::sync::mpsc::UnboundedReceiver<Reconfigured>,
-    // Host-initiated bitrate re-target (a rebuild re-resolved an Automatic rate): forwarded to
-    // the client as a `BitrateChanged` so its controller's climb base tracks the real encoder.
-    mut retarget_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
-    // Pipeline-gap announcements (see `gap_tx`): a rebuild that kept the session up stopped the
-    // stream for this many ms, forwarded to the client as a `PipelineGap` so its bitrate
-    // controller discards the report window that straddled our own stall.
-    mut gap_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
-    // Mid-session shard renegotiation (design/shard-payload-reneg.md): the wire-MTU watcher
-    // asks for a `ShardPayloadChanged` here (this task is the control stream's sole writer),
-    // and the client's `ShardPayloadAck`s flow back on `shard_ack_tx` — the grow gate.
-    mut shard_change_rx: tokio::sync::mpsc::UnboundedReceiver<u16>,
-    shard_ack_tx: tokio::sync::mpsc::UnboundedSender<u16>,
-    mut cursor_shape_rx: tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::CursorShape>,
-    cursor_client_draws: Arc<AtomicBool>,
-    clip_enabled: Arc<AtomicBool>,
-    clip: pf_clipboard::ClipCoord,
-    // Per-client access (design/per-client-access.md §5): the session's LIVE grant mask — the
-    // same atomic the datagram filter reads; the deadline/watch task folds console edits into
-    // it, so a `ClipControl` or `ClipOffer` arriving after a mid-session revoke resolves against
-    // the new mask.
-    session_grants: Arc<AtomicU32>,
-    // `AccessUpdate`s from the session's deadline/watch task (expiry warnings + mid-session
-    // grant edits) — this task is the control stream's sole writer, so they cross here.
-    mut access_rx: tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::AccessUpdate>,
-) {
+/// Everything [`run`] owns for one live session — the control streams (`serve_session` hands
+/// them off after negotiation), every channel end that bridges to the data-plane thread, and the
+/// [`pf_clipboard::ClipCoord`] handle bridging to the clipboard coordinator. A named-field
+/// struct rather than the parameter list it grew from: at ~30 positionals the spawn site had
+/// stopped saying anything, and its same-typed neighbours (`retarget_rx` / `gap_rx` both carry
+/// bare `u32`s) were one silent transposition away from a runtime puzzle.
+pub(super) struct Task {
+    pub(super) ctrl_send: quinn::SendStream,
+    pub(super) ctrl_recv: quinn::RecvStream,
+    pub(super) initial_mode: punktfunk_core::Mode,
+    pub(super) codec: crate::encode::Codec,
+    pub(super) live_reconfig_ok: bool,
+    pub(super) adaptive_fec: bool,
+    pub(super) session_bitrate_kbps: u32,
+    /// Encoder-truth bridge (data plane → here, §ABR overdrive): the encoder's live applied
+    /// rate, its discovered codec-level ceiling (0 = unknown), and the "encode can't hold
+    /// cadence" flag. Read at `SetBitrate`-resolve time so the ack — the base the client's
+    /// controller climbs from — never promises a rate the encoder won't run at.
+    pub(super) live_bitrate: Arc<AtomicU32>,
+    /// See [`Self::live_bitrate`].
+    pub(super) encoder_ceiling_kbps: Arc<AtomicU32>,
+    /// See [`Self::live_bitrate`].
+    pub(super) cadence_degraded: Arc<AtomicBool>,
+    /// See [`Self::live_bitrate`].
+    pub(super) cadence_behind_score: Arc<AtomicU32>,
+    /// Delivery truth, published from every `DeliveryReport` for the data plane's stall
+    /// diagnosis: the packets the client says it has received all session (`u32::MAX` = a
+    /// client too old to send one, the pre-seeded value).
+    pub(super) client_packets_received: Arc<AtomicU32>,
+    pub(super) fec_target_ctl: Arc<AtomicU8>,
+    /// Phase-locked capture bridge: client PhaseReports land here latest-wins; the encode
+    /// loop's controller drains at its own ~1 Hz cadence (design/phase-locked-capture.md).
+    pub(super) phase_ctl: Arc<super::stream::PhaseCtl>,
+    pub(super) reconfig_tx: std::sync::mpsc::Sender<punktfunk_core::Mode>,
+    pub(super) keyframe_tx: std::sync::mpsc::Sender<()>,
+    pub(super) rfi_tx: std::sync::mpsc::Sender<(u32, u32)>,
+    pub(super) bitrate_tx: std::sync::mpsc::Sender<u32>,
+    pub(super) probe_tx: std::sync::mpsc::Sender<ProbeRequest>,
+    pub(super) probe_result_rx: tokio::sync::mpsc::UnboundedReceiver<ProbeResult>,
+    pub(super) reconfig_result_rx: tokio::sync::mpsc::UnboundedReceiver<Reconfigured>,
+    /// Host-initiated bitrate re-target (a rebuild re-resolved an Automatic rate): forwarded to
+    /// the client as a `BitrateChanged` so its controller's climb base tracks the real encoder.
+    pub(super) retarget_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
+    /// Pipeline-gap announcements (see `gap_tx`): a rebuild that kept the session up stopped
+    /// the stream for this many ms, forwarded to the client as a `PipelineGap` so its bitrate
+    /// controller discards the report window that straddled our own stall.
+    pub(super) gap_rx: tokio::sync::mpsc::UnboundedReceiver<u32>,
+    /// Mid-session shard renegotiation (design/shard-payload-reneg.md): the wire-MTU watcher
+    /// asks for a `ShardPayloadChanged` here (this task is the control stream's sole writer),
+    /// and the client's `ShardPayloadAck`s flow back on `shard_ack_tx` — the grow gate.
+    pub(super) shard_change_rx: tokio::sync::mpsc::UnboundedReceiver<u16>,
+    pub(super) shard_ack_tx: tokio::sync::mpsc::UnboundedSender<u16>,
+    pub(super) cursor_shape_rx:
+        tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::CursorShape>,
+    pub(super) cursor_client_draws: Arc<AtomicBool>,
+    pub(super) clip_enabled: Arc<AtomicBool>,
+    pub(super) clip: pf_clipboard::ClipCoord,
+    /// Per-client access (design/per-client-access.md §5): the session's LIVE grant mask — the
+    /// same atomic the datagram filter reads; the deadline/watch task folds console edits into
+    /// it, so a `ClipControl` or `ClipOffer` arriving after a mid-session revoke resolves
+    /// against the new mask.
+    pub(super) session_grants: Arc<AtomicU32>,
+    /// `AccessUpdate`s from the session's deadline/watch task (expiry warnings + mid-session
+    /// grant edits) — this task is the control stream's sole writer, so they cross here.
+    pub(super) access_rx: tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::AccessUpdate>,
+}
+
+/// Run the control task for one live session (owning everything in its [`Task`]). Returns when
+/// the control stream closes or a data-plane channel drops.
+pub(super) async fn run(task: Task) {
+    let Task {
+        mut ctrl_send,
+        ctrl_recv,
+        initial_mode,
+        codec,
+        live_reconfig_ok,
+        adaptive_fec,
+        session_bitrate_kbps,
+        live_bitrate,
+        encoder_ceiling_kbps,
+        cadence_degraded,
+        cadence_behind_score,
+        client_packets_received,
+        fec_target_ctl,
+        phase_ctl,
+        reconfig_tx,
+        keyframe_tx,
+        rfi_tx,
+        bitrate_tx,
+        probe_tx,
+        mut probe_result_rx,
+        mut reconfig_result_rx,
+        mut retarget_rx,
+        mut gap_rx,
+        mut shard_change_rx,
+        shard_ack_tx,
+        mut cursor_shape_rx,
+        cursor_client_draws,
+        clip_enabled,
+        clip,
+        session_grants,
+        mut access_rx,
+    } = task;
     let pf_clipboard::ClipCoord {
         available: clip_available,
         cmd_tx: clip_cmd_tx,
