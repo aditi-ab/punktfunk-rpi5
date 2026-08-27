@@ -1850,10 +1850,25 @@ impl Parser {
         assert!(reader.0.position() % 8 == 0);
         let start_offset: usize = (reader.0.position() / 8).try_into().unwrap();
 
+        // `obu_size` was read off the wire as a leb128 and is bounded only by `u32::MAX`; nothing
+        // ties it to how many bytes are actually present. Bound it against the buffer BEFORE it is
+        // used to slice, or a truncated (or simply over-declared) OBU panics with `range end index
+        // .. out of range` — an abort of whatever thread is decoding. See PROVENANCE.md deviation 14.
+        let obu_end = start_offset
+            .checked_add(obu_size)
+            .ok_or::<String>("obu_size overflows the access unit offset".into())?;
+        if obu_end > data.len() {
+            return Err(format!(
+                "obu_size {} overruns the access unit: {} bytes present after the OBU header",
+                obu_size,
+                data.len().saturating_sub(start_offset)
+            ));
+        }
+
         log::debug!(
             "Identified OBU type {:?}, data size: {}, obu_size: {}",
             header.obu_type,
-            start_offset + obu_size,
+            obu_end,
             obu_size
         );
 
@@ -1872,8 +1887,8 @@ impl Parser {
 
         Ok(ObuAction::Process(Obu {
             header,
-            data: Cow::from(&data[start_offset..start_offset + obu_size]),
-            bytes_used: start_offset + obu_size,
+            data: Cow::from(&data[start_offset..obu_end]),
+            bytes_used: obu_end,
         }))
     }
 
@@ -4333,5 +4348,46 @@ mod tests {
             .parse_tile_info(&mut Reader::new(&data), &mut TileInfo::default())
             .unwrap_err();
         assert!(err.starts_with("Invalid tile_rows"), "{err}");
+    }
+
+    /// An OBU whose declared `obu_size` runs past the bytes present is a parse error,
+    /// not a panic (PROVENANCE.md deviation 14).
+    ///
+    /// `obu_size` is a leb128 read straight out of the stream and bounded only by
+    /// `u32::MAX`; nothing ties it to the length of the buffer handed in. Cutting a real
+    /// access unit mid-OBU therefore leaves a final OBU declaring more payload than
+    /// remains, and the unchecked slice used to abort the calling thread with
+    /// `range end index .. out of range for slice of length ..`.
+    #[test]
+    fn an_obu_declaring_more_bytes_than_are_present_is_a_parse_error_not_a_panic() {
+        let mut overruns = 0usize;
+
+        for packet in IvfIterator::new(STREAM_TEST_25_FPS).take(8) {
+            // Three cuts per unit so the walk is guaranteed to land inside an OBU
+            // rather than exactly on a boundary.
+            for denom in [2usize, 3, 4] {
+                let cut = packet.len() - packet.len() / denom;
+                let mut parser = Parser::default();
+                let mut consumed = 0usize;
+
+                while consumed < cut {
+                    match parser.read_obu(&packet[..cut][consumed..]) {
+                        Ok(ObuAction::Process(obu)) => consumed += obu.bytes_used,
+                        Ok(ObuAction::Drop(n)) => consumed += usize::try_from(n).unwrap(),
+                        Err(e) => {
+                            if e.contains("overruns the access unit") {
+                                overruns += 1;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            overruns > 0,
+            "no cut reached the obu_size bound - the test proves nothing"
+        );
     }
 }

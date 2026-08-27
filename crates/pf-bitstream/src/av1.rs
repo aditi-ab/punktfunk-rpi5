@@ -1187,4 +1187,56 @@ mod tests {
             Some(PlanError::NoFrame)
         );
     }
+
+    /// A truncated access unit never panics the decode thread.
+    ///
+    /// `plan_au` degrades every malformation it knows about to [`PlanWarning::TruncatedAu`]
+    /// or [`PlanError`], and `pf-vkdecode` re-validates OBU ranges on top — but the AV1
+    /// `obu_size` bound lives in the vendored parser, and until PROVENANCE.md deviation 14
+    /// it was missing: an AU cut mid-OBU leaves a final OBU declaring more payload than
+    /// remains, and the unchecked slice aborted the calling thread. That reaches all three
+    /// native rungs, which re-export this planner, and is exactly the shape
+    /// `PUNKTFUNK_AU_FAULT=truncate` injects.
+    ///
+    /// The contract asserted here is the crate's stated posture, not a specific verdict:
+    /// a short AU is a plan error or a warning, and whatever plans do come back stay
+    /// inside the bytes handed in.
+    #[test]
+    fn a_truncated_access_unit_is_a_plan_error_not_a_panic() {
+        let mut planned = 0usize;
+        let mut rejected = 0usize;
+
+        for packet in IvfIterator::new(AV1_25FPS).take(12) {
+            for denom in [2usize, 3, 4, 8] {
+                let cut = packet.len() - packet.len() / denom;
+                // A fresh planner per cut: the claim is that a short unit fails cleanly on
+                // its own terms, not that a planner carries state across one.
+                let mut planner = Av1Planner::new();
+                match planner.plan_au(&packet[..cut]) {
+                    Ok(plans) => {
+                        planned += 1;
+                        for plan in &plans {
+                            for tile in &plan.tiles {
+                                assert!(
+                                    tile.data.start <= tile.data.end && tile.data.end <= cut,
+                                    "tile range {:?} escapes a {cut}-byte truncated unit",
+                                    tile.data
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => rejected += 1,
+                }
+            }
+        }
+
+        assert!(
+            planned + rejected == 48,
+            "every cut must reach a verdict; got {planned} planned + {rejected} rejected"
+        );
+        assert!(
+            rejected > 0,
+            "no truncated unit was rejected - the test proves nothing"
+        );
+    }
 }
