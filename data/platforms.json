@@ -81,7 +81,7 @@
         "curl -fsSL https://git.unom.io/api/packages/unom/debian/repository.key | sudo tee /etc/apt/keyrings/punktfunk.asc >/dev/null",
         "echo \"deb [signed-by=/etc/apt/keyrings/punktfunk.asc] https://git.unom.io/api/packages/unom/debian stable main\" | sudo tee /etc/apt/sources.list.d/punktfunk.list",
         "sudo apt update",
-        "sudo apt install punktfunk-host"
+        "sudo apt install punktfunk-host punktfunk-web punktfunk-scripting"
       ]
     },
     {
@@ -95,7 +95,7 @@
         "curl -fsS https://git.unom.io/api/packages/unom/arch/repository.key | sudo pacman-key --add -",
         "sudo pacman-key --lsign-key E0CA04465C99C936E0B0C6510A317015A34DDD69",
         "grep -q '^\\[punktfunk\\]' /etc/pacman.conf || printf '\\n[punktfunk]\\nServer = https://git.unom.io/api/packages/unom/arch/$repo/$arch\\n' | sudo tee -a /etc/pacman.conf >/dev/null",
-        "sudo pacman -Syu punktfunk-host"
+        "sudo pacman -Syu punktfunk-host punktfunk-web punktfunk-scripting"
       ]
     },
     {

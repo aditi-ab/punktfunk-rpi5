@@ -22,9 +22,9 @@ the partial upgrade that breaks Arch boxes:
 
 <Install platform="arch" />
 
-The browser console is **optional** on Arch, so name it yourself — same line, full upgrade:
-`sudo pacman -Syu punktfunk-web`. (Also in the repo: `punktfunk-gamescope` for HDR off gamescope,
-`punktfunk-scripting` for [plugins](/docs/plugins), `punktfunk-client` if this box is also a client.)
+The browser console and the plugin runner are *optional* packages on Arch — pacman never installs
+an optional dependency, so the line names them. (Also in the repo: `punktfunk-gamescope` for HDR off
+gamescope, `punktfunk-client` if this box is also a client.)
 
 From then on a normal `sudo pacman -Syu` moves every Punktfunk package; restart the host afterwards
 (`systemctl --user restart punktfunk-host`) — or let the [console do it](/docs/updating).

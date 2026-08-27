@@ -28,7 +28,10 @@ package needs 2.39) — [build from source](/docs/build-from-source) there, or u
 ## 2. Install the host
 
 The repo is public and signed — the `debian` in the URL is the package format, it's the same repo
-Ubuntu uses. The browser console, `punktfunk-web`, comes along automatically:
+Ubuntu uses. The line names the browser console (`punktfunk-web`) and the plugin runner
+(`punktfunk-scripting`) explicitly rather than leaning on apt to pull them in: they are only
+*recommended* by `punktfunk-host`, and a box with `APT::Install-Recommends "0"` would end up with
+a host you cannot pair with.
 
 <Install platform="debian" />
 

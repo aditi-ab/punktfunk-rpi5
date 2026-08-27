@@ -9,10 +9,10 @@ The **host** is the program on the PC you stream *from*. It installs from Punktf
 repositories on Linux and from a signed installer on Windows — pick your system:
 
 <Cards>
-  <Card title="Ubuntu 26.04+" href="/docs/ubuntu" description="apt — one repo line, then sudo apt install punktfunk-host." />
+  <Card title="Ubuntu 26.04+" href="/docs/ubuntu" description="apt — one repo line, then one apt install for host, console and plugin runner." />
   <Card title="Debian 13+ (and LMDE)" href="/docs/debian" description="The same apt repo as Ubuntu." />
-  <Card title="Fedora 43+" href="/docs/fedora" description="dnf — add the RPM repo, then sudo dnf install punktfunk." />
-  <Card title="Arch / CachyOS" href="/docs/arch" description="pacman — a signed binary repo, then pacman -Syu punktfunk-host." />
+  <Card title="Fedora 43+" href="/docs/fedora" description="dnf — add the RPM repo, then one dnf install for host, console and plugin runner." />
+  <Card title="Arch / CachyOS" href="/docs/arch" description="pacman — a signed binary repo, then one full -Syu for all three packages." />
   <Card title="Bazzite / Fedora Atomic" href="/docs/bazzite" description="A systemd sysext — no layering, no reboot." />
   <Card title="SteamOS (Steam Deck as host)" href="/docs/steamos-host" description="One script, built on-device." />
   <Card title="NixOS" href="/docs/nixos" description="A flake input and a NixOS module, with a binary cache." />
@@ -51,10 +51,13 @@ they show (CI fails if the two drift apart). Re-running is safe.
 - **Already running Sunshine, Apollo or Vibeshine?** They can coexist, with one port moved — see
   [Switching from Sunshine](/docs/switching-from-sunshine) before you install.
 - **What gets installed.** `punktfunk-host` is the host; `punktfunk-web` is the browser console
-  (pairing, status, library — apt and RPM pull it in automatically, on Arch you name it yourself,
-  the Bazzite image contains it); `punktfunk-scripting` is the plugin runner that brings your
-  game launchers into the [library](/docs/game-library) (started for you everywhere except Arch and
-  source builds — `systemctl --user enable --now punktfunk-scripting` there).
+  (pairing, status, library); `punktfunk-scripting` is the plugin runner that brings your game
+  launchers into the [library](/docs/game-library) (started for you everywhere except Arch and
+  source builds — `systemctl --user enable --now punktfunk-scripting` there). Every install line
+  on these pages names all three. The host package only *recommends* the console, and a package
+  manager set to skip weak deps (`install_weak_deps=False`, `APT::Install-Recommends "0"`) would
+  otherwise leave you with a host and no way to pair with it. The Bazzite image contains all
+  three already.
 - **Stable by default.** Every guide points at the **stable** channel, which moves on `vX.Y.Z`
   releases. The latest `main` build is the **canary** channel — [Release Channels](/docs/channels).
 - **Updating and removing** are one page each: [Updating the Host](/docs/updating) (the console

@@ -236,10 +236,23 @@ fi
 # ---------------------------------------------------------------------------- 1. install
 # The snippets below are data/platforms.json's install lines, verbatim (stable channel); canary
 # and the Fedora group are edited in. check-docs-drift.sh gate 6 keeps them identical.
-if command -v punktfunk-host >/dev/null 2>&1; then
-    say "punktfunk-host is already installed ($(punktfunk-host --version 2>/dev/null | head -1)) — skipping the install, continuing with setup"
+#
+# The host, the console and the plugin runner are three separate packages on every family, so "is
+# the host there?" is the wrong question to skip the install on. A box that has the host but no
+# console — installed by hand, from an older docs line, or by a package manager told to drop weak
+# deps (dnf `install_weak_deps=False`, APT::Install-Recommends "0") — would never get one however
+# often this ran, and the console is where you pair, approve a device and change every setting.
+# Ask per binary instead: each family's line below names all three, and installing one that is
+# already there is a no-op.
+have() { command -v "$1" >/dev/null 2>&1; }
+MISSING=
+have punktfunk-host       || MISSING="$MISSING host"
+have punktfunk-web-server || MISSING="$MISSING web-console"
+have punktfunk-scripting  || MISSING="$MISSING plugin-runner"
+if [ -z "$MISSING" ]; then
+    say "host, web console and plugin runner are already installed ($(punktfunk-host --version 2>/dev/null | head -1)) — skipping the install, continuing with setup"
 else
-    say "Installing the host ($CHANNEL channel)"
+    say "Installing:$MISSING ($CHANNEL channel)"
     case "$FAMILY" in
         apt)
             repo_line='echo "deb [signed-by=/etc/apt/keyrings/punktfunk.asc] https://git.unom.io/api/packages/unom/debian stable main" | sudo tee /etc/apt/sources.list.d/punktfunk.list'
@@ -248,7 +261,7 @@ else
             run 'curl -fsSL https://git.unom.io/api/packages/unom/debian/repository.key | sudo tee /etc/apt/keyrings/punktfunk.asc >/dev/null'
             run "$repo_line"
             run 'sudo apt update'
-            run 'sudo apt install punktfunk-host'
+            run 'sudo apt install punktfunk-host punktfunk-web punktfunk-scripting'
             ;;
         pacman)
             repo_line=$(cat <<'LINE'
@@ -260,10 +273,7 @@ LINE
             run 'curl -fsS https://git.unom.io/api/packages/unom/arch/repository.key | sudo pacman-key --add -'
             run 'sudo pacman-key --lsign-key E0CA04465C99C936E0B0C6510A317015A34DDD69'
             run "$repo_line"
-            run 'sudo pacman -Syu punktfunk-host'
-            if ask "Install the web console and the plugin runner too (punktfunk-web, punktfunk-scripting — optional on Arch, recommended)?" y; then
-                run 'sudo pacman -Syu punktfunk-web punktfunk-scripting'
-            fi
+            run 'sudo pacman -Syu punktfunk-host punktfunk-web punktfunk-scripting'
             ;;
         dnf)
             group=$RPM_GROUP
@@ -294,8 +304,12 @@ CMD
     esac
     hash -r 2>/dev/null || true
     if [ "$DRY" != 1 ]; then
-        command -v punktfunk-host >/dev/null 2>&1 || die "the install finished but punktfunk-host isn't on PATH — open a new terminal and re-run, or see $DOCS_PAGE"
+        have punktfunk-host || die "the install finished but punktfunk-host isn't on PATH — open a new terminal and re-run, or see $DOCS_PAGE"
         ok "punktfunk-host $(punktfunk-host --version 2>/dev/null | head -1) installed"
+        # Not fatal — the host still streams — but say it out loud here rather than let step 7
+        # hand out a console URL for something that is not on the box.
+        if have punktfunk-web-server; then ok "the web console (punktfunk-web) is installed"
+        else warn "the web console (punktfunk-web) did NOT get installed — pairing, approving a device and every setting live there. Install it by hand: $DOCS_PAGE"; fi
     fi
 fi
 
@@ -384,7 +398,11 @@ if [ "$START" = 1 ]; then
     else
         systemctl --user daemon-reload 2>/dev/null
         units="punktfunk-host"
-        systemctl --user list-unit-files punktfunk-web.service 2>/dev/null | grep -q '^punktfunk-web.service' && units="$units punktfunk-web"
+        if systemctl --user list-unit-files punktfunk-web.service 2>/dev/null | grep -q '^punktfunk-web.service'; then
+            units="$units punktfunk-web"
+        else
+            warn "no punktfunk-web.service on this box — the console is not installed, so nothing will answer on 47992 ($DOCS_PAGE)"
+        fi
         # The plugin runner fills the game library; apt/dnf/sysext start it themselves, Arch doesn't.
         if systemctl --user list-unit-files punktfunk-scripting.service 2>/dev/null | grep -q disabled; then units="$units punktfunk-scripting"; fi
         run "systemctl --user enable --now $units"
@@ -421,11 +439,20 @@ if grep -qs 0x10de /sys/bus/pci/devices/*/vendor 2>/dev/null; then
 fi
 ip=$(hostname -I 2>/dev/null | awk '{print $1}')
 [ -n "$ip" ] || ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')
+# Step 1 is the console, so it must not be printed as fact when the console isn't installed —
+# that is what sent a Fedora user looking for a page nothing was serving. (--dry-run installs
+# nothing by definition, so it shows the normal text.)
+if have punktfunk-web-server || [ "$DRY" = 1 ]; then
+    step1="1. Open the web console:  https://${ip:-<host-ip>}:47992  (the certificate is the host's own — continue past the warning)
+     password:  sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password"
+else
+    step1="1. Install the web console — it is NOT on this box, and pairing, approving a device and
+     every setting live there. The install line for your distro is on $DOCS_PAGE"
+fi
 cat <<EOF
 
   Done. Next:
-  1. Open the web console:  https://${ip:-<host-ip>}:47992  (the certificate is the host's own — continue past the warning)
-     password:  sed -n 's/^PUNKTFUNK_UI_PASSWORD=//p' ~/.config/punktfunk/web-password
+  $step1
   2. Install a client on the device you stream to ($DOCS/install-client), connect, and click
      Approve in the console — or Pair a device for a PIN ($DOCS/pairing).
   3. Stream. Ctrl+Alt+Shift+Q hands mouse and keyboard back on desktop clients.

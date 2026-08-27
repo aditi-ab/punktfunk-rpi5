@@ -140,13 +140,13 @@ installer_case() {   # name os-release-body expected-substring [extra args...]
         fail=1 ;;
     esac
 }
-installer_case debian   'ID=debian\nVERSION_ID=13\n'                    'sudo apt install -y punktfunk-host'
-installer_case ubuntu   'ID=ubuntu\nID_LIKE=debian\nVERSION_ID=26.04\n'  'sudo apt install -y punktfunk-host'
+installer_case debian   'ID=debian\nVERSION_ID=13\n'                    'sudo apt install -y punktfunk-host punktfunk-web punktfunk-scripting'
+installer_case ubuntu   'ID=ubuntu\nID_LIKE=debian\nVERSION_ID=26.04\n'  'sudo apt install -y punktfunk-host punktfunk-web punktfunk-scripting'
 installer_case mint22   'ID=linuxmint\nID_LIKE="ubuntu debian"\nVERSION_ID=22.1\n' 'cannot host'
-installer_case fedora   'ID=fedora\nVERSION_ID=44\n'                    'sudo dnf install -y punktfunk'
+installer_case fedora   'ID=fedora\nVERSION_ID=44\n'                    'sudo dnf install -y punktfunk punktfunk-web punktfunk-scripting'
 installer_case fedora43 'ID=fedora\nVERSION_ID=43\n'                    '/rpm/bazzite'
-installer_case arch     'ID=arch\n'                                    'sudo pacman -Syu --noconfirm punktfunk-host'
-installer_case cachyos  'ID=cachyos\nID_LIKE="arch"\n'                  'sudo pacman -Syu --noconfirm punktfunk-host'
+installer_case arch     'ID=arch\n'                                    'sudo pacman -Syu --noconfirm punktfunk-host punktfunk-web punktfunk-scripting'
+installer_case cachyos  'ID=cachyos\nID_LIKE="arch"\n'                  'sudo pacman -Syu --noconfirm punktfunk-host punktfunk-web punktfunk-scripting'
 installer_case bazzite  'ID=bazzite\nID_LIKE="fedora"\nVERSION_ID=43\n' 'punktfunk-sysext.sh install'
 installer_case nixos    'ID=nixos\n'                                   'docs/nixos'
 installer_case steamos  'ID=steamos\nID_LIKE=arch\n'                    'docs/steamos-host'
