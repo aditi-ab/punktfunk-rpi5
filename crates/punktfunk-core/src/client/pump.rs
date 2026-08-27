@@ -90,6 +90,27 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     // then can the ABR trust an unflagged AU as new content; an older host leaves the window
     // arithmetic in its legacy form.
     let marks_repeats = negotiated.host_caps2 & crate::quic::HOST_CAP2_REPEAT_MARK != 0;
+    // RFC §5.1: the bitrate numbers are WIRE BUDGETS, so the controller's `actual` measures
+    // wire bytes plus this reservation for the audio plane — which rides the control
+    // connection and is spent whether or not video flows. Exact for PCM (the negotiated
+    // plane names its rate); the Opus mirror runs the host's own shared budget ladder at the
+    // default tier — an operator-pinned tier skews it by a few hundred kbps, well inside the
+    // utilization gate's ¾ tolerance.
+    let audio_reserved_kbps = if negotiated.audio_codec == crate::quic::AUDIO_CODEC_PCM {
+        crate::audio::pcm::bitrate_kbps(
+            negotiated.audio_rate_hz,
+            negotiated.audio_bits,
+            negotiated.audio_channels,
+        )
+    } else {
+        crate::audio::plan_audio_budget(
+            negotiated.bitrate_kbps,
+            negotiated.audio_channels,
+            crate::audio::AudioTier::default(),
+            host_caps & crate::quic::HOST_CAP_AUDIO_RED != 0,
+        )
+        .kbps
+    };
     // Session constants a mode switch does not change — the pump recomputes the stream-shape
     // cap from them for the switched geometry (review §2.1).
     let bit_depth = negotiated.bit_depth;
@@ -295,6 +316,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         bit_depth,
         chroma_format,
         marks_repeats,
+        audio_reserved_kbps,
         stream_cap_kbps,
         refresh_hz,
         mode_slot: mode_slot_pump,

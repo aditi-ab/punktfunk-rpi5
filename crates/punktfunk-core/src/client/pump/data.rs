@@ -53,6 +53,9 @@ pub(super) struct DataPump {
     /// per-window active/repeat counts below mean anything; against an older host the ABR is
     /// handed `None` and keeps its legacy window arithmetic.
     pub(super) marks_repeats: bool,
+    /// The audio plane's wire reservation (RFC §5.1) — added to the window's wire-byte
+    /// `actual` so the controller's domain matches the budget its targets are in.
+    pub(super) audio_reserved_kbps: u32,
     /// What this session's mode + codec could plausibly use (see
     /// [`crate::abr::stream_ceiling_kbps`]) — the bound the probe-measured link ceiling is held
     /// to. Computed where the negotiated geometry lives; recomputed here on an accepted mode
@@ -91,6 +94,7 @@ impl DataPump {
             bit_depth,
             chroma_format,
             marks_repeats,
+            audio_reserved_kbps,
             stream_cap_kbps,
             refresh_hz,
             mode_slot: pump_mode_slot,
@@ -333,7 +337,7 @@ impl DataPump {
                 last_late = st.fec_late_shards;
                 last_received = st.packets_received;
                 last_dropped = st.frames_dropped;
-                last_bytes = st.media_bytes_received;
+                last_bytes = wire_bytes(&st);
                 last_report = Instant::now();
                 discard_abr_window = true;
                 flush_in_window = false;
@@ -437,12 +441,12 @@ impl DataPump {
                             "adaptive bitrate: capacity probe declined — keeping negotiated ceiling"
                         );
                     }
-                    // Rebase the ABR window's byte anchor past the burst. (Probe filler is
-                    // routed out of `media_bytes_received` at the reassembler, so it can no
-                    // longer read as the burst rate on its own — but the anchor still has to
-                    // skip the video that landed around the burst under a suppressed report
-                    // tick, which would otherwise divide a long span's bytes by one window.)
-                    last_bytes = st.media_bytes_received;
+                    // Rebase the ABR window's byte anchor past the burst. (The wire measure
+                    // nets the probe filler out by construction — see `wire_bytes` — but the
+                    // anchor still has to skip the video that landed around the burst under a
+                    // suppressed report tick, which would otherwise divide a long span's
+                    // bytes by one window.)
+                    last_bytes = wire_bytes(&st);
                 } else if Instant::now() >= deadline {
                     // The host never answered (a build that ignores ProbeRequest): clear the
                     // stuck-active state so LossReports resume, keep the negotiated ceiling.
@@ -626,18 +630,17 @@ impl DataPump {
                 // the next one.
                 let recovery_kf_reqs = pump_recovery_kf.swap(0, Ordering::Relaxed);
                 // The window's ACTUAL delivered throughput — what the pipeline really carried, vs
-                // the target it was allowed. MEDIA bytes (data-shard payload: no headers, no FEC
-                // parity, no probe filler, no audio), because both consumers compare it against
-                // the ENCODER's target: the utilization gate asks "was the target genuinely
-                // tested?" and the proven mark bounds every later climb. Wire bytes answered a
-                // different question — they rise with the redundancy the host adds in answer to
-                // loss, so the gate read ~25 % high precisely on the links it exists for.
+                // the target it was allowed. WIRE bytes (RFC §5.1): the targets are wire
+                // BUDGETS now, so `actual` measures what the budget actually buys — headers,
+                // seals and FEC parity included (the redundancy the host adds in answer to loss
+                // SPENDS the budget; under the old encoder-domain targets that read ~25 % high,
+                // which is why this used to be media bytes), minus the speed-test filler (the
+                // probe's spend, not the stream's), plus the audio plane's reservation — audio
+                // rides the control connection and is spent whether or not video flows.
                 let window_ms = last_report.elapsed().as_millis().max(1) as u64;
-                let actual_kbps = (st
-                    .media_bytes_received
-                    .wrapping_sub(last_bytes)
-                    .saturating_mul(8)
-                    / window_ms) as u32;
+                let actual_kbps = ((wire_bytes(&st).wrapping_sub(last_bytes).saturating_mul(8)
+                    / window_ms) as u32)
+                    .saturating_add(audio_reserved_kbps);
                 // A discard window feeds the controller NOTHING — its signals are probe-tail
                 // residue, and one "congestion" verdict here ends slow start for good.
                 let verdict = if discard {
@@ -687,7 +690,7 @@ impl DataPump {
                 last_late = st.fec_late_shards;
                 last_received = st.packets_received;
                 last_dropped = st.frames_dropped;
-                last_bytes = st.media_bytes_received;
+                last_bytes = wire_bytes(&st);
                 if pump_perf_on {
                     if let Some(p) = session.take_pump_perf() {
                         let per_pkt_ns = |ns: u64| ns.checked_div(p.packets).unwrap_or(0);
@@ -912,6 +915,13 @@ fn probe_target_kbps(stream_cap_kbps: u32) -> u32 {
     stream_cap_kbps.saturating_mul(2).min(2_000_000)
 }
 
+/// The controller's WIRE measure (RFC §5.1): every received media-plane byte — headers, seals
+/// and FEC parity included, because they spend the budget the targets are denominated in —
+/// minus the speed-test filler (the probe's spend, not the stream's).
+fn wire_bytes(st: &crate::stats::Stats) -> u64 {
+    st.bytes_received.wrapping_sub(st.probe_bytes_received)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1125,6 +1135,7 @@ mod tests {
             bit_depth: 8,
             chroma_format: 0,
             marks_repeats: false,
+            audio_reserved_kbps: 256,
             stream_cap_kbps: 100_000,
             refresh_hz: 60,
             mode_slot: Arc::new(Mutex::new(crate::config::Mode {
