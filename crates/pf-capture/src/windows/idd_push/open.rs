@@ -672,6 +672,15 @@ impl IddPushCapturer {
                 // it back to the caller to retire or reuse the display (audit §5.1).
                 _keepalive: Box::new(()),
             };
+            // The two REALTIME GPU-priority opt-ins, stamped once per capture session so EVERY
+            // field log self-describes its posture — the stall WARNs repeat them, but only when
+            // they fire, and the 7700 XT case (2026-08-26) showed a stalling log where they
+            // never did (design: windows-amd-host-program §3.1 Gap B).
+            tracing::info!(
+                rt_gpu_driver = super::stall::rt_gpu_driver_posture(),
+                rt_gpu_host = super::stall::rt_gpu_host_posture(),
+                "GPU-priority posture for this capture session"
+            );
             // The HDR SDR-white reference for the composited cursor, queried ONCE here rather than
             // from the blend (which holds the ring slot's keyed mutex — see
             // `refresh_sdr_white_scale`). No-op on an SDR composition.

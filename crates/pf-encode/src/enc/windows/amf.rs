@@ -689,7 +689,10 @@ unsafe fn set_prop(
             result_name(r)
         ))
     } else {
-        tracing::debug!(
+        // INFO, not debug: which optional properties a VCN generation/driver rejects is exactly
+        // the per-box capability matrix no lab hardware covers (design: windows-amd-host-program
+        // §3.3) — field logs at default level must carry it.
+        tracing::info!(
             property = %name,
             result = result_name(r),
             amf_code = r,
@@ -697,6 +700,18 @@ unsafe fn set_prop(
         );
         Ok(false)
     }
+}
+
+/// Read one INT64 component property back (`GetProperty`, prefix vtable) — the encoder-side truth
+/// after any internal clamp. `None` when the runtime declines the read or hands back a non-INT64
+/// variant: callers treat that as "no readback", never as zero.
+unsafe fn get_prop_i64(comp: *mut sys::AmfComponent, name: PCWSTR) -> Option<i64> {
+    let mut v = AmfVariant::zeroed();
+    let r = ((*(*comp).vtbl).get_property)(comp, name.0, &mut v);
+    if r != sys::AMF_OK {
+        return None;
+    }
+    v.as_i64()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1084,6 +1099,33 @@ impl AmfEncoder {
                 }
             }
             Codec::Av1 => {
+                // Never B-frames — the same insurance as H.264's `BPicturesPattern=0`, for the
+                // generation that can grow them: the three AV1 B-picture properties are VCN5
+                // features (header-verified 2026-08-26; defaults 0/false TODAY, but "defaults
+                // flip on newer hardware" is exactly how H.264 grew RDNA3+ B-frames). A B-frame
+                // would add a frame period of latency and break the FIFO wire contract on the
+                // one codec whose loss recovery is already full-IDR (no LTR, no IR). Optional:
+                // pre-VCN5 drivers reject the names, which is the correct no-op. (HEVC needs no
+                // twin — AMF defines NO B-frame property for it at all, and the 2026-08-26 VCN3
+                // capture measured 3 I + 52 P + 0 B.)
+                set_prop(
+                    comp,
+                    w!("Av1BPicturesPattern"),
+                    AmfVariant::from_i64(0),
+                    false,
+                )?;
+                set_prop(
+                    comp,
+                    w!("Av1MaxConsecutiveBPictures"),
+                    AmfVariant::from_i64(0),
+                    false,
+                )?;
+                set_prop(
+                    comp,
+                    w!("Av1AdaptiveMiniGop"),
+                    AmfVariant::from_bool(false),
+                    false,
+                )?;
                 // Sequence header OBU on every key frame — the AV1 twin of the HEVC IDR-aligned
                 // header insertion (self-contained join points on the wire).
                 set_prop(
@@ -1266,6 +1308,10 @@ impl AmfEncoder {
                 height = self.height,
                 fps = self.fps,
                 ring = if self.ten_bit { "P010" } else { "NV12" },
+                // The two driver-answered capabilities (design: windows-amd-host-program §3.3);
+                // the rejected optional properties behind a `false` have their own INFO lines.
+                ltr = ltr_active,
+                intra_refresh = ir_active,
                 runtime = %format_args!(
                     "{}.{}.{}",
                     (lib.version >> 48) & 0xffff,
@@ -2198,6 +2244,22 @@ impl Encoder for AmfEncoder {
         true
     }
 
+    /// The rate the component actually runs at: `TargetBitrate` read back via `GetProperty`.
+    /// Without this the session adopted the *requested* rate on AMD, `encoder_ceiling_kbps` was
+    /// never learned, and the ABR overdrive guard was structurally inert on the one backend with
+    /// no other rate feedback (design: windows-amd-host-program §3.3). `None` before the lazy
+    /// open or when the runtime declines the read — the caller keeps the requested rate, exactly
+    /// the pre-readback behavior.
+    fn applied_bitrate_bps(&self) -> Option<u64> {
+        let inner = self.inner.as_ref()?;
+        // SAFETY: `inner.comp.0` is the live component, only ever used on the session thread
+        // with no AMF call in flight (the loop is synchronous); `get_prop_i64` is a read-only
+        // prefix-vtable call whose out-param is a local this frame owns.
+        unsafe { get_prop_i64(inner.comp.0, self.props.target_bitrate) }
+            .filter(|&b| b > 0)
+            .map(|b| b as u64)
+    }
+
     fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
         let bps_i = bps.min(i64::MAX as u64) as i64;
         let vbv = self.vbv_bits(bps);
@@ -2642,6 +2704,22 @@ mod tests {
                 }
             }
             assert_eq!(first_run[0].pts_ns, 1, "FIFO pts pairing");
+            // No reordering, ON THE BITSTREAM: every AU must come out in submit order. A
+            // B-frame (H.264 pre-`BPicturesPattern=0`, or AV1 on a VCN5 whose defaults grew
+            // them) reorders output, which both adds a frame period of latency and breaks the
+            // `Encoder` trait's FIFO contract — this asserts the property pins actually took,
+            // instead of trusting a `set_prop` that a driver may silently decline.
+            for run in [&first_run, &second_run] {
+                for pair in run.windows(2) {
+                    assert!(
+                        pair[1].pts_ns > pair[0].pts_ns,
+                        "{codec:?}: AUs must leave in submit order (reordering ⇒ B-frames), \
+                         got {} then {}",
+                        pair[0].pts_ns,
+                        pair[1].pts_ns
+                    );
+                }
+            }
             assert_eq!(second_run[0].pts_ns, 100, "post-reset FIFO pts pairing");
             eprintln!(
                 "live AMF {codec:?} encode: {} + {} AUs across a native reset, first IDR {} bytes",
@@ -2650,6 +2728,72 @@ mod tests {
                 first_run[0].data.len()
             );
         }
+    }
+
+    /// Live `applied_bitrate_bps` readback (windows-amd-host-program §3.3): the typed
+    /// `GetProperty` vtable slot must return the rate the component actually accepted — before
+    /// the lazy open it is `None`, after the first submit it reads the open rate, and after a
+    /// dynamic retarget it reads the NEW rate. This is the whole ABR-ceiling feedback path on
+    /// AMD, and the vtable typing is the concentrated FFI risk — so prove it on real hardware.
+    /// Skips cleanly without the AMD runtime/GPU.
+    #[test]
+    fn amf_applied_bitrate_readback_live() {
+        if let Err(e) = try_factory() {
+            eprintln!("skipping: AMF runtime unavailable ({e})");
+            return;
+        }
+        let Some(device) = amd_d3d11_device() else {
+            eprintln!("skipping: no AMD adapter on this box");
+            return;
+        };
+        let (w, h, fps) = (640u32, 480u32, 60u32);
+        let tex = nv12_texture(&device, w, h);
+        let mut enc = AmfEncoder::open(
+            Codec::H265,
+            PixelFormat::Nv12,
+            w,
+            h,
+            fps,
+            2_000_000,
+            8,
+            ChromaFormat::Yuv420,
+        )
+        .expect("native AMF open");
+        assert_eq!(
+            enc.applied_bitrate_bps(),
+            None,
+            "no readback before the lazy open — the caller must keep the requested rate"
+        );
+        let frame = CapturedFrame {
+            width: w,
+            height: h,
+            pts_ns: 1,
+            format: PixelFormat::Nv12,
+            payload: FramePayload::D3d11(pf_frame::dxgi::D3d11Frame {
+                texture: tex.clone(),
+                device: device.clone(),
+                pyro: None,
+            }),
+            cursor: None,
+        };
+        enc.submit(&frame).expect("submit");
+        let opened = enc.applied_bitrate_bps();
+        assert_eq!(
+            opened,
+            Some(2_000_000),
+            "post-open readback must be the accepted open rate"
+        );
+        assert!(
+            enc.reconfigure_bitrate(8_000_000),
+            "dynamic retarget declined on live hardware"
+        );
+        let retargeted = enc.applied_bitrate_bps();
+        assert_eq!(
+            retargeted,
+            Some(8_000_000),
+            "post-retarget readback must be the accepted NEW rate"
+        );
+        eprintln!("live AMF applied-bitrate readback: open {opened:?} -> retarget {retargeted:?}");
     }
 
     /// Live native codec probe (design §4): on a box with the AMD runtime, AVC and HEVC must

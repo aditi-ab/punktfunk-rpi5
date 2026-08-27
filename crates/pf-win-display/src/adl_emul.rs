@@ -406,13 +406,41 @@ pub fn run(action: EmulAction, connector_filter: Option<i32>) -> RunOutcome {
         return RunOutcome::InitFailed(recs);
     }
 
-    // One GPU surfaces as many logical adapters — probe each bus once, AMD-present only.
+    // What the filter below will see, one record per distinct (bus, vendor, present) — a probe
+    // that walks nothing must SAY why (first .173 run: 15 adapters enumerated, zero walked,
+    // zero explanation; "silence is not success" applies to the probe itself).
+    let mut seen_shapes: Vec<(i32, i32, i32)> = Vec::new();
+    for info in &infos {
+        let shape = (info.iBusNumber, info.iVendorID, info.iPresent);
+        if seen_shapes.contains(&shape) {
+            continue;
+        }
+        seen_shapes.push(shape);
+        rec(
+            "adl-adapter-seen",
+            &format!("bus{}", info.iBusNumber),
+            0,
+            ADL_OK,
+            format!(
+                "vendor_id={} present={} name={}",
+                info.iVendorID,
+                info.iPresent,
+                c_str(&info.strAdapterName).trim()
+            ),
+        );
+    }
+
+    // One GPU surfaces as many logical adapters — probe each bus once, AMD only. The read-only
+    // Probe walks NON-present adapters too (real buses only): a headless iGPU reports
+    // `iPresent=0` yet its driver still answers `EDIDManagement_Caps`, and that headless iGPU
+    // is precisely the lab rung of the edid_lock ladder (.173, 2026-08-26 — the old
+    // present-only gate walked nothing there). Lock/Unlock keep the present requirement: a
+    // connector pin on an adapter without displays is a different experiment.
     let mut seen_buses: Vec<i32> = Vec::new();
     for info in &infos {
-        if info.iPresent == 0
-            || info.iVendorID != AMD_VENDOR_ID
-            || seen_buses.contains(&info.iBusNumber)
-        {
+        let present_ok =
+            info.iPresent != 0 || (matches!(action, EmulAction::Probe) && info.iBusNumber >= 0);
+        if !present_ok || info.iVendorID != AMD_VENDOR_ID || seen_buses.contains(&info.iBusNumber) {
             continue;
         }
         seen_buses.push(info.iBusNumber);

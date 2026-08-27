@@ -580,11 +580,20 @@ Open the web console's **Logs** page and search for `METRONOMIC`. You'll get one
   dummy plug, or simply keep the display active while you stream. The console's **Virtual displays**
   page also has a *Disable monitor devices while streaming (PnP)* toggle that suppresses the
   Windows-side reaction; the log line's `connected_inactive` field names the displays it suspects.
-- **…with NO coinciding OS display event** — the disturbance is below Windows: a connected but
-  sleeping screen being serviced by the GPU driver, display-poller software (the SteelSeries GG /
-  SignalRGB class), or the desktop present clock — try a different refresh rate. On a laptop panel
-  that the host deactivated, keeping it active with the **primary** topology usually settles it —
-  see [Virtual displays → Topology](/docs/virtual-displays#topology).
+- **…with NO coinciding OS display event** — the disturbance is below Windows. **Check the
+  line's `rt_gpu_driver` / `rt_gpu_host` fields first**: if either shows a REALTIME opt-in,
+  clear it (unset `PFVD_RT_GPU` / set `PUNKTFUNK_GPU_PRIORITY_CLASS=high`) — a punktfunk process
+  holding REALTIME GPU priority is the field-proven amplifier of exactly this pattern on AMD.
+  Otherwise: a connected but sleeping screen being serviced by the GPU driver, display-poller
+  software (the SteelSeries GG / SignalRGB class), or the desktop present clock — try a different
+  refresh rate. On a laptop panel that the host deactivated, keeping it active with the
+  **primary** topology usually settles it — see
+  [Virtual displays → Topology](/docs/virtual-displays#topology).
+
+Freezes that repeat *without* a steady rhythm are caught too: search the log for
+`REPEATING without a stable period` — that warning carries the same fields and the same cure
+list. Every session also stamps one `GPU-priority posture for this capture session` line near
+its start, so a log shows the levers even before any stall fires.
 
 ## Stutter, drops, or high latency
 

@@ -884,6 +884,10 @@ fn send_loop(
     // costs on HEVC (sub-frame readback, and with it the send/encode overlap) — a number the
     // encoder cannot observe. Written here because this is the only thread that sees a send.
     send_spread_us: Arc<AtomicU32>,
+    // Wire-MTU re-keys applied here, published for the encode loop's metronomic-recovery
+    // attribution (a re-keyed path was black-holing full-size video — name it before the
+    // display suspects).
+    wire_rekeys: Arc<AtomicU32>,
     // Streamed AUs go out as slice-granularity blocks ([`USER_FLAG_SLICE_STREAM`]'s contract)
     // instead of the legacy full-FEC-block shape.
     slice_wire: bool,
@@ -959,7 +963,10 @@ fn send_loop(
             }
             if let Some(s) = want_shard {
                 match session.set_shard_payload(s) {
-                    Ok(()) => tracing::info!(shard_payload = s, "wire shard payload re-keyed"),
+                    Ok(()) => {
+                        wire_rekeys.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(shard_payload = s, "wire shard payload re-keyed");
+                    }
                     // Can't fire for a watcher-driven value (it validates the same bounds) —
                     // belt-and-suspenders for a future driver.
                     Err(e) => tracing::warn!(shard_payload = s, error = ?e,
@@ -2210,6 +2217,13 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // loop is the only place the encoder can be touched.
     let send_spread_us = Arc::new(AtomicU32::new(0));
     let send_spread_send = Arc::clone(&send_spread_us);
+    // Wire-MTU re-keys applied this session, published by the send thread (it owns the
+    // packetizer) for the encode loop's metronomic-recovery attribution: a path that needed a
+    // re-key was black-holing full-size video, and a client re-asking through that is periodic
+    // by construction — the 2026-08-26 lab sessions drew the "display disturbance" warn on
+    // exactly such a path, at a period (1.7 s) the client cooldown bands narrowly miss.
+    let wire_rekeys = Arc::new(AtomicU32::new(0));
+    let wire_rekeys_send = Arc::clone(&wire_rekeys);
     let send_stats = SendStats {
         rec: stats.clone(),
         mode: live_mode.clone(),
@@ -2232,6 +2246,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                     stop,
                     perf,
                     send_spread_send,
+                    wire_rekeys_send,
                     slice_wire,
                     burst_cap,
                     fec_target,
@@ -3182,6 +3197,23 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                                  a host display disturbance"
                             );
                         }
+                    } else if wire_rekeys.load(Ordering::Relaxed) > 0 {
+                        // A deterministic NETWORK pathology, not a display one: this session's
+                        // path dropped full-size video until the wire-MTU watcher re-keyed the
+                        // shards, and a client re-asking through a black-holing hop is periodic
+                        // by construction (its retry cadence, skewed by the path — 2026-08-26
+                        // lab data landed at 1.7 s, just outside the cooldown bands). Name the
+                        // path before anyone chases display hardware.
+                        tracing::warn!(
+                            period_s = format!("{:.1}", period.as_secs_f64()),
+                            wire_rekeys = wire_rekeys.load(Ordering::Relaxed),
+                            "client keyframe recoveries are METRONOMIC on a session whose wire \
+                             MTU had to be re-keyed mid-stream — a constrained path (VPN/overlay \
+                             adapter, lowered NIC MTU) black-holing full-size video is the prime \
+                             suspect, NOT a host/display disturbance; see the 'wire MTU' lines \
+                             above, and pin PUNKTFUNK_WIRE_MTU to skip the lossy discovery window \
+                             on this path"
+                        );
                     } else {
                         tracing::warn!(
                             period_s = format!("{:.1}", period.as_secs_f64()),
