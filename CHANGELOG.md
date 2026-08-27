@@ -441,10 +441,21 @@ pin `bun`, `sccache` and actions by checksum/SHA. Two new wire constants are bas
 internals rather than knobs, and the two new exported constants carry the `PUNKTFUNK_` prefix in the
 C header (R21).
 
-Two fixes to the C harness itself, both of which had been hiding failures on a developer machine: it
-now links on an Apple Silicon box (`-L/opt/homebrew/lib` was missing), and it always builds the
+Three fixes to the C harness itself. Two had been hiding failures on a developer machine: it now
+links on an Apple Silicon box (`-L/opt/homebrew/lib` was missing), and it always builds the
 staticlib **with** `quic`, because a featureless `.a` left by an earlier plain build was being
 silently reused.
+
+The third had been breaking CI. `tests/c_abi.rs` shells out to a nested `cargo build -p
+punktfunk-core --features quic` while the outer `cargo test --workspace` is mid-run. Resolving
+features for one package is not the workspace union the outer run resolved, so cargo rebuilt that
+subgraph under different metadata **into the shared target directory**, and the outer run's pending
+units — which name `target/<profile>/deps/*.rlib` by explicit `--extern` path — were left pointing
+at artifacts that had been replaced. Doctests run last, so they are what fell over:
+`Doc-tests pf_capture` died with `E0463: can't find crate for pf_frame`, a crate nothing in the diff
+had touched, after a green Build and two green Clippy legs. The nested build now uses
+`target/c-abi-harness/` and cannot perturb the outer one. The old comment claimed the released build
+lock made it safe; the released lock is why it *runs*.
 
 ---
 
