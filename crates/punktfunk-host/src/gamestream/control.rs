@@ -861,6 +861,30 @@ fn on_receive(
             );
             return;
         }
+        // Client loss telemetry (0x0201, the Gen7 loss-stats report — WP2.2). Body after the
+        // 4-byte [type][len] header: LE i32s, stats[0] = loss count, stats[1] = window ms,
+        // stats[3] = last-good frame (the IDX_LOSS_STATS reading, apollo-comparison #94 ✓V;
+        // wire ref: design/research/gamestream-protocol-research.json). Folded into cumulative
+        // counters; the video thread's 1 Hz adaptation step reads them as window deltas and
+        // drives FEC percent + bitrate de-rating off them. This used to fall through to the
+        // input decoder and be silently dropped — the host was blind to client-observed loss.
+        if inner == 0x0201 && pt.len() >= 20 {
+            let lost = i32::from_le_bytes(pt[4..8].try_into().expect("len checked")).max(0);
+            let window_ms = i32::from_le_bytes(pt[8..12].try_into().expect("len checked"));
+            let last_good = i32::from_le_bytes(pt[16..20].try_into().expect("len checked"));
+            state
+                .loss_stats
+                .lost
+                .fetch_add(lost as u64, std::sync::atomic::Ordering::Relaxed);
+            state
+                .loss_stats
+                .reports
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if lost > 0 {
+                tracing::debug!(lost, window_ms, last_good, "control: client loss report");
+            }
+            return;
+        }
     }
 
     // Controller events go to the uinput virtual pads (created on demand per the mask) —

@@ -108,7 +108,10 @@ fn decode_input_packet(p: &[u8]) -> Option<InputEvent> {
                 modifiers | crate::inject::KEY_FLAG_SEMANTIC_VK,
             )
         }
-        // Gamepad, pen, touch, haptics — not yet injected. (UTF-8 text is handled in `decode`.)
+        // Not a pointer/keyboard magic. Gamepad, pen and touch are decoded by the SIBLING
+        // decoders (`gamepad::decode`, `pen`/`SS_PEN`/`SS_TOUCH` in the control dispatch), not
+        // here; anything genuinely unknown falls through to the control loop's drop.
+        // (UTF-8 text is handled in `decode`.)
         _ => return None,
     })
 }

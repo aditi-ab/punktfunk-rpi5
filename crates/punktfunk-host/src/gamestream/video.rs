@@ -95,6 +95,14 @@ impl VideoPacketizer {
         }
     }
 
+    /// Retarget the FEC overhead percent mid-stream (adaptive FEC, WP2.3). Safe per frame: the
+    /// block geometry is derived from `fec_percentage` fresh on every `packetize_into` call, and
+    /// the client derives each block's parity count from the per-packet `fecInfo` wire percent —
+    /// nothing on either side caches a session-wide percentage.
+    pub fn set_fec_percent(&mut self, pct: u8) {
+        self.fec_percentage = pct as usize;
+    }
+
     /// Return a spent batch's datagram buffers to the pool (drains `spent`; buffers beyond
     /// [`POOL_MAX`] are dropped). The paced sender feeds this through the recycle channel after
     /// each frame leaves the wire — see `spawn_sender`/`spawn_packetizer`.

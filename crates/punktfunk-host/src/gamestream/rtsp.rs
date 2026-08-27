@@ -291,6 +291,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                         state.streaming.clone(),
                         state.force_idr.clone(),
                         state.rfi_range.clone(),
+                        state.loss_stats.clone(),
                         state.video_cap.clone(),
                         state.stats.clone(),
                         on_lost.clone(),
