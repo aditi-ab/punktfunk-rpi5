@@ -1,10 +1,10 @@
 //! GameStream (P1) control plane — what a stock Moonlight/Artemis client talks to around
 //! the media streams: mDNS discovery, the nvhttp serverinfo + pairing HTTP(S) API, RTSP,
 //! and the ENet control stream. `tokio`/`axum` live here (control plane, I/O-bound — never
-//! the per-frame hot path; that is `punktfunk_core`'s P1 wire codec). See `design/gamestream-host-plan.md`.
-//!
-//! Status: P1.1 — mDNS `_nvstream._tcp` advertisement + `/serverinfo`. Pairing, RTSP, and
-//! the media streams follow (see the GameStream host task list / plan).
+//! the per-frame hot path; that is `stream`/`video`/`audio` on their own threads). Shipped
+//! end-to-end against stock Moonlight since June 2026 — `design/gamestream-host-plan.md` is
+//! the original bring-up rationale, `design/gamestream-competitive-program.md` (planning
+//! repo) the current investigation + roadmap.
 
 // The Moonlight-protocol modules exist only behind the `gamestream` cargo feature (rust-safety
 // WP19): a native-only build (`--no-default-features --features pyrowave`) contains none of this
@@ -133,6 +133,18 @@ pub fn host_hdr_capable() -> bool {
     }
 }
 
+/// Cumulative client-loss telemetry from the control stream's periodic `0x0201` loss-stats
+/// message (GS competitive program WP2.2 — the plane's only in-stream quality signal). Pure
+/// monotonic counters: the control thread adds, the video thread's 1 Hz adaptation step reads
+/// deltas — no locking, no reset races.
+#[derive(Default)]
+pub struct GsLossStats {
+    /// Sum of the client's reported loss counts.
+    pub lost: std::sync::atomic::AtomicU64,
+    /// How many loss-stats reports arrived (a report with `lost == 0` is a healthy heartbeat).
+    pub reports: std::sync::atomic::AtomicU64,
+}
+
 /// Stable host identity + advertised capabilities, shared across control-plane handlers.
 pub struct Host {
     pub hostname: String,
@@ -238,6 +250,12 @@ pub struct AppState {
     pub quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// True while the audio stream thread is running (also its keep-running flag).
     pub audio_streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Bumped by each media thread (video, audio) as the LAST thing it does on exit — after its
+    /// teardown (capturer re-pool, lease guard, events) has fully run. `/resume` restarts the
+    /// media planes by clearing the run flags and then WAITING on this counter (WP3): the old
+    /// threads' teardown must complete before the resumed connection's threads start, or the
+    /// two race over the pooled capturer and the late exit path stomps the successor's state.
+    pub media_exited: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Set by the control stream when the client requests an IDR / invalidates reference
     /// frames (recovery after loss); the video thread forces a keyframe and clears it.
     pub force_idr: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -245,6 +263,11 @@ pub struct AppState {
     /// video thread drains it and calls `Encoder::invalidate_ref_frames`, falling back to a full
     /// IDR when the encoder can't invalidate (range too old / no NVENC RFI). `None` = nothing pending.
     pub rfi_range: std::sync::Arc<std::sync::Mutex<Option<(i64, i64)>>>,
+    /// Client-reported loss telemetry from the periodic control loss-stats message (`0x0201`,
+    /// decoded in [`control`]) — the plane's only in-stream quality signal. Cumulative counters;
+    /// the video thread's 1 Hz adaptation step reads them as window deltas (GS competitive
+    /// program WP2.2).
+    pub loss_stats: std::sync::Arc<GsLossStats>,
     /// Persistent screen capturer, reused across streams so reconnects don't spawn a second
     /// (conflicting) screencast session. The video thread borrows it for the stream's duration
     /// and returns it; `set_active` gates its cost while idle. The slot's `bool` records whether
@@ -345,6 +368,8 @@ impl AppState {
             audio_streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             force_idr: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rfi_range: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            loss_stats: std::sync::Arc::new(GsLossStats::default()),
+            media_exited: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             video_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
             audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
             stats,
@@ -366,6 +391,8 @@ impl AppState {
             audio_streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             force_idr: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rfi_range: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            loss_stats: std::sync::Arc::new(GsLossStats::default()),
+            media_exited: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
             stats,
             access: std::sync::OnceLock::new(),
@@ -1005,6 +1032,7 @@ mod session_tests {
                 min_fec: 0,
                 hdr: false,
                 slices: 1, // the no-request default — hardware decoders get single-slice AUs
+                encrypt_video: false,
             });
         }
 

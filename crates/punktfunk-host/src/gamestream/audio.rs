@@ -211,6 +211,7 @@ pub type AudioCapSlot =
 /// `gcm_key`/`rikeyid` come from `/launch` and key the AES-CBC payload encryption;
 /// `params` is the negotiated [`AudioParams`] from the RTSP ANNOUNCE.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+#[allow(clippy::too_many_arguments)] // one construction site (RTSP PLAY)
 pub fn start(
     running: Arc<AtomicBool>,
     gcm_key: [u8; 16],
@@ -219,6 +220,9 @@ pub fn start(
     audio_cap: AudioCapSlot,
     on_lost: super::OnSessionLost,
     owner_ip: Option<std::net::IpAddr>,
+    // Bumped as this thread's LAST act — the teardown-complete signal `/resume`'s media
+    // restart waits on (see `AppState::media_exited`).
+    media_exited: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let _ = std::thread::Builder::new()
         .name("punktfunk-audio".into())
@@ -231,6 +235,7 @@ pub fn start(
             }
             running.store(false, Ordering::SeqCst);
             tracing::info!("audio stream stopped");
+            media_exited.fetch_add(1, Ordering::SeqCst);
         });
 }
 
@@ -239,6 +244,7 @@ pub fn start(
 /// "the crate compiles everywhere"). Reports failure the same way the real stream thread
 /// does: clears `running`.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[allow(clippy::too_many_arguments)] // signature parity with the real implementation
 pub fn start(
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     _gcm_key: [u8; 16],
@@ -247,9 +253,11 @@ pub fn start(
     _audio_cap: AudioCapSlot,
     _on_lost: super::OnSessionLost,
     _owner_ip: Option<std::net::IpAddr>,
+    media_exited: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     tracing::error!("GameStream audio requires Linux (PipeWire) or Windows (WASAPI) + libopus");
     running.store(false, std::sync::atomic::Ordering::SeqCst);
+    media_exited.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -414,8 +422,12 @@ fn audio_body(
     let mut seq: u16 = 0;
     let mut timestamp: u32 = 0;
     let mut sent: u64 = 0;
-    // Surround sessions carry RS(4,2) FEC; the stereo wire stays exactly as validated.
-    let fec = layout.channels > 2;
+    // RS(4,2) FEC on EVERY layout (WP5.5) — stereo included. The parity math is
+    // layout-agnostic (shards are opaque encrypted packets), and a stock client's audio
+    // depacketizer runs the same fixed RS(4,2) recovery regardless of channel count; the old
+    // `channels > 2` gate was bring-up caution, and it left the MOST COMMON configuration with
+    // zero audio loss protection — one lost packet was an audible dropout no parity could heal.
+    let fec = true;
     let mut fec_block: Vec<Vec<u8>> = Vec::with_capacity(FEC_DATA_SHARDS);
     let (mut fec_base_seq, mut fec_base_ts) = (0u16, 0u32);
     let mut fec_skipped = false;

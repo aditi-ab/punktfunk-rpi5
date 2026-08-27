@@ -6,8 +6,7 @@
 //! (different sockets, framing, and error contracts) — this module shares the schedule, not the
 //! plumbing.
 //!
-//! The two planes keep their historical parameterizations exactly (pinned by the
-//! deterministic-schedule tests below):
+//! The two planes' parameterizations (pinned by the deterministic-schedule tests below):
 //!
 //! * **native** — the first `burst_bytes` leave immediately (one absorbed microburst), only the
 //!   overflow is paced across `min(90 % of the time left to the frame deadline, the time the
@@ -18,10 +17,12 @@
 //!   rate cap (latency plan T1.2) front-loads the spread: the link demonstrably carries 1× the
 //!   stream rate sustained, so a bounded 3× excursion is safe and a large frame's tail stops
 //!   waiting out the whole interval;
-//! * **GameStream** — no burst stage; the whole frame spreads across a fixed ¾-frame-interval
-//!   budget in a BOUNDED number of steps (≤ 12, chunk ≥ 16), because on that non-RT send thread
-//!   every step ends in a `thread::sleep` whose overshoot must stay independent of bitrate
-//!   (Moonlight clients are tested against this timing).
+//! * **GameStream** — the same burst + rate-derived budget as native since the GS competitive
+//!   program's WP1.2 (the original shape — no burst, every frame spread across a fixed
+//!   ¾-interval budget — cost every P-frame an up-to-¾-interval tail for congestion protection
+//!   only oversized frames need). The chunking stays BOUNDED (≤ 12 steps, chunk ≥ 16), because
+//!   on that non-RT send thread every step ends in a `thread::sleep` whose overshoot must stay
+//!   independent of bitrate (Moonlight clients are tested against this timing).
 //!
 //! `PUNKTFUNK_VIDEO_DROP` (the FEC-recovery test knob both planes honor) and the stats
 //! `percentile` helper live here too — they were duplicated alongside the pacing.
@@ -291,6 +292,65 @@ pub(crate) fn pace_frame<T: AsRef<[u8]>, E>(
     })
 }
 
+/// T1.1 frame-driven encode trigger (latency plan): `PUNKTFUNK_FRAME_DRIVEN=0` restores the
+/// legacy fixed-cadence tick everywhere (backends without an arrival wait keep it regardless —
+/// see [`pf_capture::Capturer::supports_arrival_wait`]). Shared by both video planes: the
+/// native loop and the GameStream loop key their arrival-driven capture on the same knob.
+pub(crate) fn frame_driven_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PUNKTFUNK_FRAME_DRIVEN").as_deref() != Ok("0"))
+}
+
+/// Wire-rate credit bucket for the frame-driven (arrival-wait) capture trigger, shared by both
+/// video planes (moved here from the native stream loop when the GameStream loop adopted T1.1).
+///
+/// The floor alone (0.9 × interval between grabs) lets a source that ALWAYS has a frame pending
+/// — a display overdriven by `PUNKTFUNK_VDISPLAY_HZ_MULT`, uncapped content, a mirrored panel
+/// running faster than the negotiated rate — settle at 0.9-interval spacing: 1.11× the
+/// negotiated rate on the wire (field report: 132 fps on a 120 fps session, frames the client's
+/// 120 Hz panel can only drop). Credit accrues at one frame per interval of real elapsed time
+/// (capped at [`Self::CAP`]) and every submitted frame spends one; a grab may run early only
+/// against banked credit, so per-gap jitter still passes while the average cannot exceed the
+/// pacing rate. A source at or below the pacing rate banks credit faster than it spends and is
+/// never delayed.
+pub(crate) struct CaptureCredit {
+    /// Banked frames, in `[-1.0, CAP]`. Transiently dips below 0 when a grab spent credit it had
+    /// only partly banked; the owed fraction is repaid before the next grab.
+    credit: f32,
+    /// When credit last accrued (the previous [`Self::earliest`] call).
+    last: Instant,
+}
+
+impl CaptureCredit {
+    /// Burst allowance: at most this many frames may follow a stall back-to-back before the
+    /// bucket re-gates. One frame of instant catch-up plus the floor's own headroom.
+    pub(crate) const CAP: f32 = 1.25;
+
+    pub(crate) fn new(now: Instant) -> CaptureCredit {
+        CaptureCredit {
+            credit: Self::CAP,
+            last: now,
+        }
+    }
+
+    /// Accrue the elapsed credit and return the earliest instant the next grab may run: `now`
+    /// once a full frame is banked, else the missing fraction of an interval out.
+    pub(crate) fn earliest(&mut self, now: Instant, interval: Duration) -> Instant {
+        let secs = interval.as_secs_f32();
+        if secs > 0.0 {
+            let accrued = now.duration_since(self.last).as_secs_f32() / secs;
+            self.credit = (self.credit + accrued).min(Self::CAP);
+        }
+        self.last = now;
+        now + interval.mul_f32((1.0 - self.credit).max(0.0))
+    }
+
+    /// One frame submitted — spend its credit.
+    pub(crate) fn charge(&mut self) {
+        self.credit -= 1.0;
+    }
+}
+
 /// Parsed-once `PUNKTFUNK_VIDEO_DROP` percentage (1..=90, anything else = off): discard N % of
 /// the sealed wire packets before send — controlled loss injection with no netem/root, honored
 /// by BOTH video planes. Warned once on activation.
@@ -350,10 +410,11 @@ mod tests {
         }
     }
 
-    /// The GameStream plane's canonical parameters (mirrors `gamestream::stream::spawn_sender`).
-    fn gs_cfg() -> PaceCfg {
+    /// The GameStream plane's canonical parameters (mirrors `gamestream::stream::spawn_sender`,
+    /// post-WP1.2): an auto-sized microburst plus BOUNDED overflow chunking.
+    fn gs_cfg(burst_cap: usize) -> PaceCfg {
         PaceCfg {
-            burst_bytes: None,
+            burst_bytes: Some(burst_cap),
             chunk: ChunkPolicy::Bounded {
                 min_chunk: 16,
                 max_steps: 12,
@@ -407,35 +468,47 @@ mod tests {
         }
     }
 
-    /// Deterministic-schedule pin, GameStream plane: no burst stage, and the chunk/step layout
-    /// must reproduce the legacy `pace_layout` exactly (chunk = max(16, ceil(n/12)), ≤ 12
-    /// steps) — including the historical bounds its old unit test asserted.
+    /// Deterministic-schedule pin, GameStream plane (post-WP1.2): the burst split follows the
+    /// native rule (the packet crossing the cap still bursts; a frame under the cap bursts
+    /// whole — the ~0-latency fast path for normal frames), and the OVERFLOW keeps the bounded
+    /// legacy layout (chunk = max(16, ceil(overflow/12)), ≤ 12 steps).
     #[test]
-    fn gamestream_schedule_matches_legacy_pace_layout() {
-        let legacy_pace_layout = |n: usize| -> (usize, usize) {
-            let chunk_sz = 16usize.max(n.div_ceil(12));
-            (chunk_sz, n.div_ceil(chunk_sz))
-        };
-        for &n in &[1usize, 16, 17, 146, 192, 193, 610, 1024, 5000, 50_000] {
-            let pkts = packets(n, 1024);
-            let (chunk, steps) = legacy_pace_layout(n);
-            // Two very different budgets: Bounded schedules must not read the budget at all.
-            for budget in [Duration::ZERO, Duration::from_millis(7)] {
-                let s = schedule(&pkts, &gs_cfg(), budget);
-                assert_eq!(s.burst_len, 0, "n={n}: GameStream has no burst stage");
-                assert_eq!(s.chunk, chunk, "n={n}: chunk size");
-                assert_eq!(s.steps, steps, "n={n}: step count");
-                assert!(s.steps <= 12, "n={n}: step count bounded");
-                assert!(s.chunk >= 16, "n={n}: chunk floor");
-                assert!(s.chunk * s.steps >= n, "n={n}: layout covers all packets");
-            }
+    fn gamestream_schedule_bursts_then_bounds_the_overflow() {
+        // The canonical stream: 20 Mbps × 3 pace → auto burst 75 000 B (10 ms at the rate).
+        let cap = auto_burst_bytes(60_000_000, 0);
+        assert_eq!(cap, 75_000);
+        // A steady-state 60 fps frame at 20 Mbps (~42 KB, ~35 packets): entirely under the
+        // burst cap → the whole frame leaves immediately, nothing is paced.
+        let pkts = packets(35, 1200);
+        for budget in [Duration::ZERO, Duration::from_millis(7)] {
+            let s = schedule(&pkts, &gs_cfg(cap), budget);
+            assert_eq!(s.burst_len, 35, "steady-state frame bursts whole");
         }
-        // The legacy test's exact anchors.
-        let s = schedule(&packets(1, 1024), &gs_cfg(), Duration::ZERO);
-        assert_eq!((s.chunk, s.steps), (16, 1));
-        let s = schedule(&packets(16, 1024), &gs_cfg(), Duration::ZERO);
-        assert_eq!((s.chunk, s.steps), (16, 1));
-        assert!(schedule(&packets(610, 1024), &gs_cfg(), Duration::ZERO).steps <= 12);
+        // An IDR (~600 KB, 500 packets): 63 packets burst (cum crosses 75 000 at #63), the
+        // 437-packet overflow spreads in the bounded layout.
+        let pkts = packets(500, 1200);
+        for budget in [Duration::ZERO, Duration::from_millis(7)] {
+            let s = schedule(&pkts, &gs_cfg(cap), budget);
+            assert_eq!(s.burst_len, 63, "burst split at the cap crossing");
+            let overflow: usize = 500 - 63;
+            let chunk = 16usize.max(overflow.div_ceil(12));
+            assert_eq!(s.chunk, chunk, "overflow keeps the bounded chunking");
+            assert_eq!(s.steps, overflow.div_ceil(chunk));
+            assert!(s.steps <= 12, "step count stays bounded");
+            assert!(s.chunk >= 16, "chunk floor");
+        }
+        // The bounded layout invariants across sizes (the old test's historical bounds).
+        for &n in &[64usize, 146, 610, 5000, 50_000] {
+            let pkts = packets(n, 1200);
+            let s = schedule(&pkts, &gs_cfg(cap), Duration::ZERO);
+            let overflow = n - s.burst_len;
+            assert!(s.steps <= 12, "n={n}: step count bounded");
+            assert!(s.chunk >= 16, "n={n}: chunk floor");
+            assert!(
+                s.chunk * s.steps >= overflow,
+                "n={n}: layout covers the overflow"
+            );
+        }
     }
 
     /// The native plane's Phase-1.2 policy (plan `throughput-beyond-1gbps.md`): 16-packet
@@ -526,13 +599,15 @@ mod tests {
         assert_eq!(seen, vec![10, 64, 64, 64, 8]);
         assert!(stat.paced);
 
-        // GameStream, 146 packets: chunk = max(16, ceil(146/12)=13) = 16 → 10 paced chunks.
+        // GameStream, 146 × 1 KB with a 16 KB burst cap: packets 0..=15 burst (cum hits 16 KB
+        // at #16, sent as one 16-packet chunk), then 130 overflow → bounded chunks of
+        // max(16, ceil(130/12)=11) = 16: 9 chunks (8 × 16 + 2).
         let pkts = packets(146, 1024);
         let mut seen: Vec<usize> = Vec::new();
         pace_frame(
             &pkts,
             PaceBudget::Fixed(Duration::ZERO),
-            &gs_cfg(),
+            &gs_cfg(16 * 1024),
             |chunk| {
                 seen.push(chunk.len());
                 Ok::<(), std::io::Error>(())
@@ -550,7 +625,7 @@ mod tests {
         let r = pace_frame(
             &pkts,
             PaceBudget::Fixed(Duration::ZERO),
-            &gs_cfg(),
+            &gs_cfg(16 * 1024),
             |_chunk| {
                 calls += 1;
                 if calls == 2 {
@@ -757,6 +832,105 @@ mod tests {
         let mut pkts = packets(100, 64);
         assert_eq!(inject_video_drop(&mut pkts), 0);
         assert_eq!(pkts.len(), 100);
+    }
+
+    /// Drive [`CaptureCredit`] against a source that ALWAYS has a frame pending (the overdriven
+    /// display + uncapped content case): each cycle grabs the instant the gate opens, the next
+    /// `earliest` call runs right after (encode folded into the wait, like the loop). Returns the
+    /// grab instants.
+    fn grab_saturated(
+        b: &mut CaptureCredit,
+        start: Instant,
+        interval: Duration,
+        n: usize,
+    ) -> Vec<Instant> {
+        let mut now = start;
+        let mut grabs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let gate = b.earliest(now, interval);
+            let grab = gate.max(now);
+            b.charge();
+            grabs.push(grab);
+            now = grab;
+        }
+        grabs
+    }
+
+    #[test]
+    fn capture_credit_pins_a_saturated_source_at_the_interval() {
+        let interval = Duration::from_millis(10);
+        let t0 = Instant::now();
+        let mut b = CaptureCredit::new(t0);
+        let grabs = grab_saturated(&mut b, t0, interval, 120);
+        // Whatever the initial credit bought, the total may exceed the on-rate schedule by at
+        // most the burst cap — 120 grabs span no less than (120 - 1 - CAP) intervals.
+        let span = grabs[119].duration_since(grabs[0]);
+        assert!(
+            span >= interval.mul_f32(120.0 - 1.0 - CaptureCredit::CAP),
+            "span {span:?} admits more than CAP frames of overshoot"
+        );
+        // And the steady state is EXACTLY the interval: past the warmup, consecutive grabs are
+        // one interval apart (not 0.9 — the 132-fps bug).
+        for w in grabs[20..].windows(2) {
+            let gap = w[1].duration_since(w[0]);
+            assert!(
+                gap >= interval.mul_f32(0.999) && gap <= interval.mul_f32(1.001),
+                "steady-state gap {gap:?} != interval {interval:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_credit_never_delays_an_on_rate_or_slow_source() {
+        let interval = Duration::from_millis(10);
+        let t0 = Instant::now();
+        let mut b = CaptureCredit::new(t0);
+        // A source at half the pacing rate (a 60 fps game on a 120 fps session): every arrival
+        // banks two frames of credit and spends one — the gate is always already open.
+        let mut now = t0;
+        for _ in 0..50 {
+            now += interval * 2;
+            assert_eq!(
+                b.earliest(now, interval),
+                now,
+                "slow source must not be gated"
+            );
+            b.charge();
+        }
+        // Exactly on-rate: still never gated (credit hovers at the cap, never below 1).
+        let mut b = CaptureCredit::new(t0);
+        let mut now = t0;
+        for _ in 0..50 {
+            now += interval;
+            assert_eq!(
+                b.earliest(now, interval),
+                now,
+                "on-rate source must not be gated"
+            );
+            b.charge();
+        }
+    }
+
+    #[test]
+    fn capture_credit_burst_after_a_stall_is_capped() {
+        let interval = Duration::from_millis(10);
+        let t0 = Instant::now();
+        let mut b = CaptureCredit::new(t0);
+        // Settle into the gated steady state, then stall the source for 10 intervals.
+        let grabs = grab_saturated(&mut b, t0, interval, 20);
+        let stall_end = grabs[19] + interval * 10;
+        // However long the stall, the recovery may run ahead of the on-rate schedule by at most
+        // CAP frames: the second post-stall grab is already re-gated.
+        let after = grab_saturated(&mut b, stall_end, interval, 3);
+        assert_eq!(after[0], stall_end, "first post-stall grab is immediate");
+        assert!(
+            after[1].duration_since(after[0]) >= interval.mul_f32(2.0 - CaptureCredit::CAP),
+            "second post-stall grab spent more than the burst cap"
+        );
+        assert!(
+            after[2].duration_since(after[1]) >= interval.mul_f32(0.999),
+            "third post-stall grab must be back on the interval grid"
+        );
     }
 
     #[test]

@@ -34,6 +34,10 @@ pub struct StreamConfig {
     /// (Amlogic — Chromecast with Google TV) wedge the whole device on multi-slice AUs they
     /// never asked for (the 0.17.0 4-slice-default field regression). Absent ⇒ 1.
     pub slices: u32,
+    /// The client echoed `SS_ENC_VIDEO` in its ANNOUNCE `x-ss-general.encryptionEnabled`, so
+    /// every video shard is AES-128-GCM-sealed under the `/launch` rikey (WP7). Only ever true
+    /// when the host advertised the bit in the first place — see `gs_video_encryption_offered`.
+    pub encrypt_video: bool,
 }
 
 /// A pooled capturer plus the three properties reuse must match on — its HDR-ness, its
@@ -85,9 +89,17 @@ pub fn start(
     running: Arc<AtomicBool>,
     force_idr: Arc<AtomicBool>,
     rfi_range: RfiSlot,
+    loss: Arc<super::GsLossStats>,
+    // The session rikey, ONLY when `cfg.encrypt_video` (WP7). Deliberately its own parameter
+    // rather than a `StreamConfig` field: that struct is `Debug`-logged at stream start, and a
+    // session key has no business in the log.
+    gcm_key: Option<[u8; 16]>,
     video_cap: CapturerSlot,
     stats: Arc<crate::stats_recorder::StatsRecorder>,
     on_lost: super::OnSessionLost,
+    // Bumped as the LAST act of this thread — the full-teardown-complete signal `/resume`'s
+    // media restart waits on (see `AppState::media_exited`).
+    media_exited: Arc<std::sync::atomic::AtomicU64>,
     life: GameLifetime,
 ) {
     let _ = std::thread::Builder::new()
@@ -137,6 +149,8 @@ pub fn start(
                 &running,
                 &force_idr,
                 &rfi_range,
+                &loss,
+                gcm_key,
                 &video_cap,
                 &stats,
                 &on_lost,
@@ -161,6 +175,9 @@ pub fn start(
                 reason,
             });
             tracing::info!("video stream stopped");
+            // LAST: everything above (capturer re-pool, lease guard, marker, events) has run,
+            // so a `/resume` waiting on this counter can safely start the successor threads.
+            media_exited.fetch_add(1, Ordering::SeqCst);
         });
 }
 
@@ -171,6 +188,9 @@ fn run(
     running: &Arc<AtomicBool>,
     force_idr: &AtomicBool,
     rfi_range: &std::sync::Mutex<Option<(i64, i64)>>,
+    loss: &super::GsLossStats,
+    // The session rikey when SS_ENC_VIDEO was negotiated — see `start`.
+    gcm_key: Option<[u8; 16]>,
     video_cap: &std::sync::Mutex<Option<PooledCapturer>>,
     // Shared stats recorder for the web-console capture/graph. Threaded into `stream_body` (the
     // encode loop); per-frame sample emission is wired by a later pass.
@@ -521,6 +541,8 @@ fn run(
             running,
             force_idr,
             rfi_range,
+            loss,
+            gcm_key,
             stats,
             &client_label,
             on_lost,
@@ -612,6 +634,8 @@ fn run(
         running,
         force_idr,
         rfi_range,
+        loss,
+        gcm_key,
         stats,
         &client_label,
         on_lost,
@@ -681,7 +705,10 @@ fn open_gs_mirror_source(
         .context("start mirroring the pinned monitor")?;
     crate::capture::capture_virtual_output(
         vout,
-        pf_frame::OutputFormat::resolve(cfg.hdr, crate::zerocopy::enabled()),
+        // The capture format comes from the shared SessionPlan (WP5.1) — the same resolver the
+        // native plane uses, so the `gpu` predicate, HDR-ness and the producer-native-NV12 CSC
+        // skip can't drift between the planes. See `gs_session_plan`.
+        gs_session_plan(&cfg, metadata_cursor).output_format(),
         crate::session_plan::CaptureBackend::resolve(),
         compositor == crate::vdisplay::Compositor::Kwin,
     )
@@ -900,13 +927,42 @@ fn open_gs_virtual_source(
     // source — the Linux HDR path is the portal monitor mirror (`video_source=portal`).
     let mut capturer = capture::capture_virtual_output(
         vout,
-        capture::OutputFormat::resolve(cfg.hdr, crate::encode::resolved_backend_is_gpu()),
+        // Capture format from the shared SessionPlan (WP5.1) — one resolver for both planes.
+        // The visible upgrade over the old hardcoded `OutputFormat::resolve(hdr, gpu)`: a
+        // gamescope session (cursor blend off — see `set_hw_cursor` above) now gets
+        // `nv12_native`, so the producer's NV12 feeds Vulkan Video directly and the per-frame
+        // RGB→NV12 CSC the native plane already skips is skipped here too.
+        gs_session_plan(
+            &cfg,
+            compositor != crate::vdisplay::Compositor::Gamescope
+                && blend_capable_metadata_cursor(&cfg),
+        )
+        .output_format(),
         crate::session_plan::CaptureBackend::resolve(),
         compositor == crate::vdisplay::Compositor::Kwin,
     )
     .context("capture virtual output")?;
     capturer.set_active(true);
     Ok((capturer, compositor, gamescope_route))
+}
+
+/// The GameStream session's [`SessionPlan`](crate::session_plan::SessionPlan) (WP5.1): the same
+/// shared resolver the native plane uses, at this plane's negotiated shape — 4:2:0 (stock
+/// Moonlight; 4:4:4 is the Sunshine-extension follow-up this unlocks), depth 10 only with HDR
+/// (Moonlight's HDR toggle is the only 10-bit negotiation the protocol has), and NO
+/// cursor-forward (GameStream has no client cursor channel). Only `output_format()` is consumed
+/// today — the capture format stops being hand-hardcoded and picks up `nv12_native` where the
+/// plan resolves it.
+fn gs_session_plan(cfg: &StreamConfig, cursor_blend: bool) -> crate::session_plan::SessionPlan {
+    crate::session_plan::SessionPlan::resolve(
+        if cfg.hdr { 10 } else { 8 },
+        cfg.hdr,
+        encode::ChromaFormat::Yuv420,
+        cfg.codec,
+        cursor_blend,
+        false, // no cursor-forward on this plane
+        cfg.slices > 1,
+    )
 }
 
 /// The encoder bit depth implied by the captured frame's pixel format: a 10-bit (HDR) source — the
@@ -1013,6 +1069,10 @@ struct RawFrame {
     /// Moonlight sees across mid-stream encoder rebuilds.
     aus: Vec<(Vec<u8>, FrameType, u32)>,
     ts: u32,
+    /// When this frame's capture was sampled (the encode-loop tick) — the packetizer stamps
+    /// `now - cap_at` into the wire's `frame_processing_latency` field (1/10 ms), which is what
+    /// Moonlight's performance overlay shows as "Host processing latency".
+    cap_at: Instant,
 }
 
 /// Packetizer thread: turns each [`RawFrame`]'s access units into wire datagrams (data + Reed–Solomon
@@ -1025,7 +1085,14 @@ struct RawFrame {
 fn spawn_packetizer(
     rx: std::sync::mpsc::Receiver<RawFrame>,
     tx: std::sync::mpsc::SyncSender<PacketBatch>,
+    // Spent batches coming back from the paced sender (WP1.3): their datagram buffers refill
+    // the packetizer's pool and the batch shells are reused, so a steady-state frame allocates
+    // nothing. `try_recv` only — an empty return channel just means allocating fresh.
+    pool_rx: std::sync::mpsc::Receiver<PacketBatch>,
     mut pk: VideoPacketizer,
+    // Live FEC percent from the 1 Hz adaptation step (WP2.3) — applied between frames, never
+    // mid-AU (per-frame block geometry + per-packet wire percent keep the client in step).
+    fec_pct_live: Arc<std::sync::atomic::AtomicU8>,
     goodput: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
     std::thread::Builder::new()
@@ -1033,10 +1100,25 @@ fn spawn_packetizer(
         .spawn(move || {
             // Above-normal, like the send thread — this stage is on the per-frame critical path.
             crate::native::boost_thread_priority(false);
+            let mut shells: Vec<PacketBatch> = Vec::new();
+            let mut cur_pct = fec_pct_live.load(std::sync::atomic::Ordering::Relaxed);
             while let Ok(frame) = rx.recv() {
-                let mut batch: PacketBatch = Vec::new();
+                let pct = fec_pct_live.load(std::sync::atomic::Ordering::Relaxed);
+                if pct != cur_pct {
+                    pk.set_fec_percent(pct);
+                    cur_pct = pct;
+                }
+                while let Ok(mut spent) = pool_rx.try_recv() {
+                    pk.recycle(&mut spent);
+                    shells.push(spent);
+                }
+                let mut batch = shells.pop().unwrap_or_default();
+                // Host processing latency for the wire header (Sunshine extension, 1/10 ms,
+                // saturating — a stalled pipeline reports the max rather than wrapping).
+                let processing_100us =
+                    u16::try_from(frame.cap_at.elapsed().as_micros() / 100).unwrap_or(u16::MAX);
                 for (au, ft, idx) in frame.aus {
-                    batch.extend(pk.packetize(&au, ft, frame.ts, Some(idx)));
+                    pk.packetize_into(&mut batch, &au, ft, frame.ts, Some(idx), processing_100us);
                 }
                 if batch.is_empty() {
                     continue;
@@ -1054,17 +1136,33 @@ fn spawn_packetizer(
 }
 
 /// Dedicated send thread: one [`PacketBatch`] per frame arrives on `rx`; its packets go out in
-/// `sendmmsg` chunks, paced so the frame's data spreads over ~3/4 of the frame interval — the
-/// shared [`send_pacing`](crate::send_pacing) policy at the GameStream parameterization: no
-/// microburst stage, a BOUNDED step count (≤ 12, chunk ≥ 16, see the policy's docs for the
-/// "send queue full" history that bound guards), each step ending in a sleep toward its slice
-/// of the fixed budget. On send failure (client gone) it ends the whole session via `on_lost` —
-/// not just this thread: audio would otherwise keep streaming at the dead endpoint and the stale
-/// launch state would wedge the next connect (see `AppState::end_session`).
+/// `sendmmsg` chunks under the shared [`send_pacing`](crate::send_pacing) policy, now at the
+/// native plane's parameterization (GS competitive program WP1.2): an
+/// [`auto_burst_bytes`](crate::send_pacing::auto_burst_bytes) microburst leaves immediately —
+/// a normal-size frame therefore goes out whole, unpaced, ~0 added latency — and only the
+/// overflow of an oversized frame (an IDR, a scene-change delta) spreads, across the time it
+/// actually needs at ~3× the stream rate ([`native_budget`](crate::send_pacing::native_budget)),
+/// bounded to ~2 frame intervals. The old shape (`burst_bytes: None`, fixed ¾-interval budget)
+/// spread EVERY frame — a 3-packet P-frame paid the same ~11 ms tail as a 4K keyframe. The
+/// chunking stays BOUNDED (≤ 12 steps, chunk ≥ 16): on this non-RT send thread every paced step
+/// ends in a `thread::sleep` whose overshoot must stay independent of bitrate.
+///
+/// Spent batches go back to the packetizer through `pool_tx` (buffer recycling, WP1.3); each
+/// frame's wire spread is pushed to `spread_us` for the encode loop's 1 s stats window. On send
+/// failure (client gone) it ends the whole session via `on_lost` — not just this thread: audio
+/// would otherwise keep streaming at the dead endpoint and the stale launch state would wedge
+/// the next connect (see `AppState::end_session`).
+#[allow(clippy::too_many_arguments)] // one construction site; a params struct would only rename the list
 fn spawn_sender(
     sock: UdpSocket,
     rx: std::sync::mpsc::Receiver<PacketBatch>,
     frame_interval: Duration,
+    // ~3× the derived encoder rate, LIVE (the 1 Hz adaptation step retargets it with the
+    // encoder): the proven-safe drain rate for the paced overflow, and the burst sizing rate.
+    // `0` = `PUNKTFUNK_PACE_FACTOR=0`, the legacy deadline-fraction spread.
+    pace_rate_bps: Arc<std::sync::atomic::AtomicU64>,
+    pool_tx: std::sync::mpsc::SyncSender<PacketBatch>,
+    spread_us: Arc<std::sync::Mutex<Vec<u32>>>,
     running: Arc<AtomicBool>,
     on_lost: super::OnSessionLost,
 ) -> Result<()> {
@@ -1074,15 +1172,6 @@ fn spawn_sender(
             // Transmit thread: above-normal, matching the native path's send thread (includes the
             // Windows session tuning/MMCSS this used to call directly; adds the Linux nice -5).
             crate::native::boost_thread_priority(false);
-            let budget = frame_interval.mul_f32(0.75);
-            let cfg = crate::send_pacing::PaceCfg {
-                burst_bytes: None, // no microburst stage — the whole frame spreads
-                chunk: crate::send_pacing::ChunkPolicy::Bounded {
-                    min_chunk: 16,
-                    max_steps: 12,
-                },
-                sleep_floor: Duration::from_micros(500),
-            };
             let mut sent: u64 = 0;
             let mut dropped: u64 = 0;
             while let Ok(mut batch) = rx.recv() {
@@ -1091,22 +1180,47 @@ fn spawn_sender(
                 if batch.is_empty() {
                     continue;
                 }
-                let r = crate::send_pacing::pace_frame(
-                    &batch,
-                    crate::send_pacing::PaceBudget::Fixed(budget),
-                    &cfg,
-                    |chunk| {
-                        sendmmsg_all(&sock, chunk)?;
-                        sent += chunk.len() as u64;
-                        Ok::<(), std::io::Error>(())
+                let wire_bytes: usize = batch.iter().map(|p| p.len()).sum();
+                let pace_rate = pace_rate_bps.load(Ordering::Relaxed);
+                let burst_bytes = crate::send_pacing::auto_burst_bytes(pace_rate, wire_bytes);
+                let cfg = crate::send_pacing::PaceCfg {
+                    burst_bytes: Some(burst_bytes),
+                    chunk: crate::send_pacing::ChunkPolicy::Bounded {
+                        min_chunk: 16,
+                        max_steps: 12,
                     },
+                    sleep_floor: Duration::from_micros(500),
+                };
+                let overflow_bytes = wire_bytes.saturating_sub(burst_bytes) as u64;
+                let budget = crate::send_pacing::native_budget(
+                    Instant::now() + frame_interval,
+                    pace_rate,
+                    overflow_bytes,
+                    frame_interval * 2,
                 );
-                if let Err(e) = r {
-                    tracing::info!(error = %e, sent, "video: client unreachable — ending session");
-                    running.store(false, Ordering::SeqCst);
-                    on_lost();
-                    return;
+                let r = crate::send_pacing::pace_frame(&batch, budget, &cfg, |chunk| {
+                    sendmmsg_all(&sock, chunk)?;
+                    sent += chunk.len() as u64;
+                    Ok::<(), std::io::Error>(())
+                });
+                match r {
+                    Ok(stat) => {
+                        // Bounded stats push (a stalled reader must not grow this unbounded).
+                        let mut v = spread_us.lock().unwrap_or_else(|p| p.into_inner());
+                        if v.len() < 1024 {
+                            v.push(stat.spread_us);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::info!(error = %e, sent, "video: client unreachable — ending session");
+                        running.store(false, Ordering::SeqCst);
+                        on_lost();
+                        return;
+                    }
                 }
+                // Recycle the spent batch (best-effort: a full/closed return channel just drops
+                // it, and the packetizer allocates fresh).
+                let _ = pool_tx.try_send(batch);
             }
             tracing::debug!(sent, dropped, "video sender exiting");
         })
@@ -1149,6 +1263,11 @@ fn stream_body(
     running: &Arc<AtomicBool>,
     force_idr: &AtomicBool,
     rfi_range: &std::sync::Mutex<Option<(i64, i64)>>,
+    // Client-reported loss counters (control 0x0201) — read as deltas by the 1 Hz adaptation
+    // step below (WP2.2-2.4: adaptive FEC percent + bitrate de-rating under the wire budget).
+    loss: &super::GsLossStats,
+    // The session rikey when SS_ENC_VIDEO was negotiated (WP7) — see `start`.
+    gcm_key: Option<[u8; 16]>,
     // Shared stats recorder. The encode loop reads `stats.is_armed()` per frame to decide whether
     // to accumulate the per-stage split, then emits a `StatsSample` at its 1 s aggregation boundary.
     stats: &Arc<crate::stats_recorder::StatsRecorder>,
@@ -1187,13 +1306,37 @@ fn stream_body(
              otherwise — see the vdisplay lines above)"
         );
     }
+    // FEC overhead percent (Sunshine default 20). Override with PUNKTFUNK_FEC_PCT (0 = data-only).
+    // Read before the encoder opens: the encoder rate is derived UNDER the parity it will carry.
+    let fec_pct: u8 = std::env::var("PUNKTFUNK_FEC_PCT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    // WP2.1 (GS competitive program): the client's configured bitrate is a WIRE budget, so the
+    // encoder rate is derived under it — parity + per-shard framing fit INSIDE the number the
+    // client asked for. The old shape handed the encoder the full negotiated rate and stacked
+    // 20 % FEC plus framing on top: every session carried ≈1.23× what the client configured,
+    // and on the constrained links where the setting matters the overshoot WAS the failure
+    // (the native plane made the same correction in ABR overhaul Phase 4).
+    // `mut`: the 1 Hz adaptation step below re-derives it when client-reported loss moves the
+    // FEC percent or de-rates the budget (WP2.2-2.4) — mid-stream encoder rebuilds then reopen
+    // at the LIVE rate, not the session-start one.
+    let mut enc_bps = gs_encoder_bps(cfg.bitrate_kbps, fec_pct, cfg.packet_size);
+    // Loss-driven adaptation state (WP2.2-2.4): FEC percent within [configured..50] and the
+    // wire budget within [floor..negotiated], stepped once per stats window from the client's
+    // 0x0201 loss reports. `PUNKTFUNK_GS_ADAPT=0` pins both at the configured values.
+    let mut adapt = GsAdapt::new(fec_pct, cfg.bitrate_kbps);
+    let mut adapt_lost_seen: u64 = 0;
+    // `false` once the encoder refuses an in-place retarget (software paths): adaptation would
+    // otherwise raise FEC without room under the budget, re-creating the WP2.1 overshoot.
+    let mut adapt_supported = true;
     let mut enc = encode::open_video(
         cfg.codec,
         frame.format,
         frame.width,
         frame.height,
         cfg.fps,
-        cfg.bitrate_kbps as u64 * 1000,
+        enc_bps,
         frame.is_cuda(),
         // 8-bit SDR, or 10-bit when the captured frame is HDR (P010) — see `gs_bit_depth`.
         gs_bit_depth(frame.format),
@@ -1219,12 +1362,17 @@ fn stream_body(
     // Both sites that swap `enc` re-bind `frame` with it, so this is always
     // `(frame.format, frame.width, frame.height)` right after one.
     let mut enc_src = (frame.format, frame.width, frame.height);
-    // FEC overhead percent (Sunshine default 20). Override with PUNKTFUNK_FEC_PCT (0 = data-only).
-    let fec_pct: u8 = std::env::var("PUNKTFUNK_FEC_PCT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20);
-    let pk = VideoPacketizer::new(cfg.packet_size, fec_pct, cfg.min_fec);
+    let mut pk = VideoPacketizer::new(cfg.packet_size, fec_pct, cfg.min_fec);
+    // SS_ENC_VIDEO (WP7): seal every shard under the session's rikey when the client
+    // negotiated it. `cfg.encrypt_video` is already gated on the host having OFFERED the bit.
+    if cfg.encrypt_video {
+        match gcm_key {
+            Some(key) => pk.set_encryption_key(key),
+            // Can't happen (a session exists by RTSP PLAY), and streaming PLAINTEXT to a client
+            // expecting ciphertext is a black screen — refuse instead.
+            None => anyhow::bail!("SS_ENC_VIDEO negotiated but the session key is gone"),
+        }
+    }
 
     // Pace at the client's negotiated frame rate, re-encoding the last captured frame when the
     // compositor produced no new one. Compositors only emit frames on damage, so a static or
@@ -1249,15 +1397,45 @@ fn stream_body(
     // the encode loop's 1 s stats boundary (the old inline batch-byte sum moved with packetization).
     let goodput = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (batch_tx, batch_rx) = std::sync::mpsc::sync_channel::<PacketBatch>(2);
+    // Sender → packetizer buffer-recycle channel (WP1.3). Depth 4 > the two depth-2 pipeline
+    // queues combined, so a batch always has a slot on the way back in steady state.
+    let (pool_tx, pool_rx) = std::sync::mpsc::sync_channel::<PacketBatch>(4);
+    // Per-frame wire spread (µs) from the paced sender, drained at the 1 s stats boundary.
+    let spread_us = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+    // Pace rate for the send thread's microburst + overflow budget: `factor ×` the derived
+    // encoder rate, the same 3×-default lever as the native plane (the link demonstrably
+    // carries 1× sustained, so a bounded 3× excursion is safe; `PUNKTFUNK_PACE_FACTOR=0`
+    // restores the legacy deadline-fraction spread).
+    let pace_factor: f64 = std::env::var("PUNKTFUNK_PACE_FACTOR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|f: &f64| f.is_finite() && *f >= 0.0)
+        .unwrap_or(3.0);
+    // Live cross-thread knobs the 1 Hz adaptation step retargets (WP2.3/2.4): the sender's
+    // pace rate follows the encoder rate; the packetizer's FEC percent follows the loss state.
+    let pace_rate_bps = Arc::new(std::sync::atomic::AtomicU64::new(
+        (enc_bps as f64 * pace_factor) as u64,
+    ));
+    let fec_pct_live = Arc::new(std::sync::atomic::AtomicU8::new(fec_pct));
     spawn_sender(
         sock.try_clone().context("clone video socket")?,
         batch_rx,
         Duration::from_secs_f64(1.0 / target_fps as f64),
+        pace_rate_bps.clone(),
+        pool_tx,
+        spread_us.clone(),
         running.clone(),
         on_lost.clone(),
     )?;
     let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<RawFrame>(2);
-    spawn_packetizer(raw_rx, batch_tx, pk, goodput.clone())?;
+    spawn_packetizer(
+        raw_rx,
+        batch_tx,
+        pool_rx,
+        pk,
+        fec_pct_live.clone(),
+        goodput.clone(),
+    )?;
 
     // Per-stage timing (PUNKTFUNK_PERF=1): max µs/stage per second + unique vs re-encoded frames,
     // to pinpoint stalls. `unique` counts genuinely-new captured frames (vs re-encoded holds).
@@ -1274,6 +1452,9 @@ fn stream_body(
     let mut last_dropped_batches: u64 = 0;
     // Absolute next-frame deadline — the single pacing clock for the loop.
     let mut next_frame = Instant::now();
+    // Frame-driven wire-rate cap (see `send_pacing::CaptureCredit`): a loop local so it
+    // survives every in-loop rebuild path — a mid-stream rebuild can't reopen the overshoot.
+    let mut cap_credit = crate::send_pacing::CaptureCredit::new(Instant::now());
     // RFI capability is fixed for the session (probed at encoder open). Query it once so the
     // recovery path skips the always-`false` invalidate call on encoders without NVENC RFI and
     // forces a keyframe directly instead.
@@ -1377,7 +1558,7 @@ fn stream_body(
                     frame.width,
                     frame.height,
                     cfg.fps,
-                    cfg.bitrate_kbps as u64 * 1000,
+                    enc_bps, // wire-budget-derived — see the first open above (WP2.1)
                     frame.is_cuda(),
                     gs_bit_depth(frame.format),
                     encode::ChromaFormat::Yuv420, // GameStream stays 4:2:0
@@ -1424,7 +1605,7 @@ fn stream_body(
                 frame.width,
                 frame.height,
                 cfg.fps,
-                cfg.bitrate_kbps as u64 * 1000,
+                enc_bps, // wire-budget-derived — see the first open above (WP2.1)
                 frame.is_cuda(),
                 // Derived from the delivered format, so an HDR flip re-opens at the right depth.
                 gs_bit_depth(frame.format),
@@ -1522,6 +1703,13 @@ fn stream_body(
                 tracing::debug!("video: keyframe request coalesced (IDR still in flight)");
             }
         }
+        // The source's REAL HDR grade to the encoder (WP5.4) — an HDR backend embeds it as
+        // in-band mastering/CLL SEI on keyframes, which is the channel a STOCK Moonlight
+        // decoder tone-maps from. This plane never called it: an HDR GameStream session shipped
+        // no grade at all (the 0x010e control cue only flips the display mode and carries the
+        // generic fallback metadata). Cheap per frame by the trait's contract; `None` (SDR /
+        // no-metadata capturer) is the no-op it always was.
+        enc.set_hdr_meta(capturer.hdr_meta());
         if let Err(e) = enc.submit_indexed(&frame, au_seq.wrapping_add(enc_inflight)) {
             // The input half of an encode stall (see native/stream.rs): rebuild the encoder in
             // place instead of ending the stream. A backend without an in-place rebuild
@@ -1597,7 +1785,11 @@ fn stream_body(
         // client) and keep encoding, so a downstream stall can never cap the encode rate.
         if !aus.is_empty() {
             let batch_len = aus.len() as u32;
-            match raw_tx.try_send(RawFrame { aus, ts }) {
+            match raw_tx.try_send(RawFrame {
+                aus,
+                ts,
+                cap_at: tick,
+            }) {
                 Ok(()) => {
                     sent_batches += 1;
                     au_seq = au_seq.wrapping_add(batch_len);
@@ -1673,6 +1865,10 @@ fn stream_body(
             let secs = fps_t.elapsed().as_secs_f64();
             // Bytes handed to the wire this window, tallied by the packetizer thread (goodput).
             let win_bytes = goodput.swap(0, std::sync::atomic::Ordering::Relaxed);
+            // The sender's per-frame wire-spread samples for this window — drained EVERY window
+            // (not just when armed) so its bounded push buffer stays fresh.
+            let mut v_spread =
+                std::mem::take(&mut *spread_us.lock().unwrap_or_else(|p| p.into_inner()));
             if perf {
                 // Max µs/stage this second on the ENCODE loop: cap=drain channel, enc=submit
                 // (zero-copy device copy + NVENC), pkt=poll (AU drain), send=enqueue to the pipeline.
@@ -1734,17 +1930,63 @@ fn stream_body(
                             p50_us: percentile(&mut v_send, 0.50) as f32,
                             p99_us: percentile(&mut v_send, 0.99) as f32,
                         },
+                        // The paced sender's per-frame wire spread (burst + paced overflow),
+                        // measured on ITS thread — the number WP1.2's microburst change moves.
+                        crate::stats_recorder::StageTiming {
+                            name: "send_spread".into(),
+                            p50_us: percentile(&mut v_spread, 0.50) as f32,
+                            p99_us: percentile(&mut v_spread, 0.99) as f32,
+                        },
                     ],
                     fps: (uniq as f64 / secs) as f32,
                     repeat_fps: (fps_count.saturating_sub(uniq) as f64 / secs) as f32,
                     mbps: (win_bytes as f64 * 8.0 / secs / 1_000_000.0) as f32,
-                    bitrate_kbps: cfg.bitrate_kbps,
+                    // The LIVE wire budget (de-rated under loss, decayed back on clean windows)
+                    // — the console shows what the host actually targets, not the ask.
+                    bitrate_kbps: adapt.budget_kbps,
                     frames_dropped: dropped_batches.saturating_sub(last_dropped_batches) as u32,
                     packets_dropped: 0,
                     send_dropped: 0,
                     fec_recovered: 0,
                 };
                 stats.push_sample(session_id, sample);
+            }
+            // 1 Hz loss adaptation (WP2.2-2.4): fold the window's client-reported loss into the
+            // FEC percent + wire budget, then retarget the encoder IN PLACE under the (possibly
+            // de-rated) budget with the new parity carved out — the wire never exceeds what the
+            // adaptation decided, which is the WP2.1 invariant kept live. The packetizer and the
+            // send pacer follow through their atomics. An encoder that refuses the in-place
+            // retarget (software paths) disables adaptation for the session: raising FEC with a
+            // frozen encoder rate would push the wire back over the budget.
+            if adapt_supported && gs_adapt_enabled() {
+                let lost_total = loss.lost.load(std::sync::atomic::Ordering::Relaxed);
+                let lost_delta = lost_total.saturating_sub(adapt_lost_seen);
+                adapt_lost_seen = lost_total;
+                if adapt.step(lost_delta) {
+                    let new_enc = gs_encoder_bps(adapt.budget_kbps, adapt.fec_pct, cfg.packet_size);
+                    if enc.reconfigure_bitrate(new_enc) {
+                        enc_bps = new_enc;
+                        fec_pct_live.store(adapt.fec_pct, std::sync::atomic::Ordering::Relaxed);
+                        pace_rate_bps.store(
+                            (new_enc as f64 * pace_factor) as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        tracing::info!(
+                            lost = lost_delta,
+                            fec_pct = adapt.fec_pct,
+                            budget_kbps = adapt.budget_kbps,
+                            enc_bps = new_enc,
+                            "gamestream: adapted FEC/bitrate to client-reported loss"
+                        );
+                    } else {
+                        adapt = GsAdapt::new(fec_pct, cfg.bitrate_kbps);
+                        adapt_supported = false;
+                        tracing::info!(
+                            "gamestream: encoder can't retarget in place — loss adaptation off \
+                             for this session (FEC/bitrate stay at the configured values)"
+                        );
+                    }
+                }
             }
             mx_cap = 0;
             mx_enc = 0;
@@ -1763,12 +2005,131 @@ fn stream_body(
         // clock. No double-sleep. If a slow frame put us behind, resync to now rather than
         // bursting to catch up.
         next_frame += frame_interval;
-        match next_frame.checked_duration_since(Instant::now()) {
-            Some(d) => std::thread::sleep(d),
-            None => next_frame = Instant::now(),
+        if crate::send_pacing::frame_driven_enabled() && capturer.supports_arrival_wait() {
+            // T1.1 frame-driven trigger (GS competitive program WP1.1, ported from the native
+            // loop): instead of sleeping out the whole tick and then SAMPLING — which holds a
+            // frame that arrived just after the previous sample for up to a full interval,
+            // ~half on average — sleep only to the rate floor and wake on the capture's actual
+            // arrival. The 0.9×interval floor (anchored to THIS tick's sample) leaves per-gap
+            // jitter headroom; the credit bucket pins the long-run AVERAGE at the negotiated
+            // rate, so a mirrored panel running faster than the session (§7.3 — a mirror keeps
+            // the panel's own mode) cannot overdrive the wire. The +0.5×interval deadline keeps
+            // a static desktop re-encoding (client liveness, bitrate shape) at ~1.5×interval
+            // cadence, exactly the legacy repeat-frame behavior.
+            cap_credit.charge();
+            let earliest = std::cmp::max(
+                tick + frame_interval.mul_f32(0.9),
+                cap_credit.earliest(Instant::now(), frame_interval),
+            );
+            if let Some(d) = earliest.checked_duration_since(Instant::now()) {
+                std::thread::sleep(d);
+            }
+            capturer.wait_arrival(tick + frame_interval.mul_f32(1.5));
+            // Arrivals are the clock now: re-anchor the absolute tick so the legacy resync math
+            // stays sane if a mid-stream rebuild flips this loop back to the fixed cadence.
+            next_frame = Instant::now() + frame_interval;
+        } else {
+            match next_frame.checked_duration_since(Instant::now()) {
+                Some(d) => std::thread::sleep(d),
+                None => next_frame = Instant::now(),
+            }
         }
     }
     Ok(())
+}
+
+/// The encoder video rate the client's configured bitrate affords once GameStream wire framing
+/// (RTP + reserved + NV header: 32 B per `packetSize + 16 − 32` payload bytes) and the session's
+/// FEC parity are carved out — the compat-plane twin of the native plane's
+/// `encoder_kbps_for_budget` (ABR overhaul Phase 4): the number a Moonlight user sets is a WIRE
+/// budget, not an encoder rate with ~23 % stacked on top. Moonlight's bitrate setting governs
+/// video alone (audio is negotiated separately, as on Sunshine-class hosts), so no audio
+/// reservation is subtracted. Floored at 500 kbps: a degenerate ask still streams, it just
+/// overshoots honestly.
+fn gs_encoder_bps(bitrate_kbps: u32, fec_pct: u8, packet_size: usize) -> u64 {
+    let pps = (packet_size + 16).saturating_sub(32).max(1) as u64; // = VideoPacketizer's payload
+    let blocksize = pps + 32;
+    let video = bitrate_kbps as u64 * 1000 * pps * 100 / (blocksize * (100 + fec_pct as u64));
+    video.max(500_000)
+}
+
+/// `PUNKTFUNK_GS_ADAPT=0` pins the GameStream plane's loss adaptation off — FEC percent and
+/// wire budget stay at their configured values for the whole session (the A/B lever).
+fn gs_adapt_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PUNKTFUNK_GS_ADAPT").as_deref() != Ok("0"))
+}
+
+/// Loss-driven adaptation state for one GameStream session (WP2.2-2.4), stepped once per
+/// stats window (~1 s) from the client's `0x0201` loss reports. Two levers, one invariant:
+///
+/// * **FEC percent** climbs fast under loss (each lossy window: `+max(5, pct/2)`, capped at
+///   [`Self::FEC_MAX`]) and decays slowly on clean windows (−5 per 8 clean, floored at the
+///   configured base) — random/burst loss is answered with parity first, the cheap lever.
+/// * **Wire budget** de-rates only under SUSTAINED loss (from the 2nd consecutive lossy
+///   window: ×0.85, floored at max(¼ of the negotiated rate, 5 Mbps)) and climbs back at
+///   1/20 of the negotiated rate per 4 clean windows — persistent congestion is answered
+///   with fewer bits, the native controller's division of labour.
+///
+/// The invariant: whoever applies a step re-derives the ENCODER rate under
+/// (budget, percent) — see the apply site — so the wire never exceeds the live budget.
+/// Constants are deliberately conservative first values (the WP0.3 netem matrix tunes them);
+/// no Sunshine-class host adapts at all, so conservative is already ahead.
+#[derive(Clone, Copy, Debug)]
+struct GsAdapt {
+    /// The session's configured FEC percent — the decay floor.
+    base_pct: u8,
+    /// The client's negotiated bitrate (kbps) — the recovery ceiling.
+    cap_kbps: u32,
+    fec_pct: u8,
+    budget_kbps: u32,
+    clean: u32,
+    lossy: u32,
+}
+
+impl GsAdapt {
+    const FEC_MAX: u8 = 50;
+
+    fn new(base_pct: u8, cap_kbps: u32) -> GsAdapt {
+        GsAdapt {
+            base_pct,
+            cap_kbps,
+            fec_pct: base_pct,
+            budget_kbps: cap_kbps,
+            clean: 0,
+            lossy: 0,
+        }
+    }
+
+    /// Fold one window's client-reported loss in. Returns whether either lever moved.
+    fn step(&mut self, lost_delta: u64) -> bool {
+        let before = (self.fec_pct, self.budget_kbps);
+        if lost_delta > 0 {
+            self.clean = 0;
+            self.lossy += 1;
+            self.fec_pct = self
+                .fec_pct
+                .saturating_add((self.fec_pct / 2).max(5))
+                .min(Self::FEC_MAX);
+            if self.lossy >= 2 {
+                let floor = (self.cap_kbps / 4).max(5_000).min(self.cap_kbps);
+                self.budget_kbps = ((self.budget_kbps as u64 * 85 / 100) as u32).max(floor);
+            }
+        } else {
+            self.lossy = 0;
+            self.clean += 1;
+            if self.clean % 8 == 0 && self.fec_pct > self.base_pct {
+                self.fec_pct = self.fec_pct.saturating_sub(5).max(self.base_pct);
+            }
+            if self.clean % 4 == 0 && self.budget_kbps < self.cap_kbps {
+                self.budget_kbps = self
+                    .budget_kbps
+                    .saturating_add((self.cap_kbps / 20).max(500))
+                    .min(self.cap_kbps);
+            }
+        }
+        (self.fec_pct, self.budget_kbps) != before
+    }
 }
 
 #[cfg(test)]
@@ -1854,10 +2215,16 @@ mod tests {
 
         let running = Arc::new(AtomicBool::new(true));
         let (tx, rx) = std::sync::mpsc::sync_channel::<PacketBatch>(2);
+        let (pool_tx, pool_rx) = std::sync::mpsc::sync_channel::<PacketBatch>(4);
+        let spread = Arc::new(std::sync::Mutex::new(Vec::new()));
         spawn_sender(
             tx_sock,
             rx,
             Duration::from_millis(8), // ~120fps frame interval
+            // 3× a 20 Mbps stream — the canonical pace rate.
+            Arc::new(std::sync::atomic::AtomicU64::new(3 * 20_000_000)),
+            pool_tx,
+            spread.clone(),
             running.clone(),
             Arc::new(|| {}),
         )
@@ -1895,5 +2262,97 @@ mod tests {
         }
         assert_eq!(got, 3 * PER_FRAME);
         assert!(running.load(Ordering::SeqCst), "no spurious client-gone");
+        // Spent batches came back for recycling, and each frame recorded a wire spread.
+        let mut recycled = 0;
+        while pool_rx.try_recv().is_ok() {
+            recycled += 1;
+        }
+        assert!(
+            recycled >= 1,
+            "sender must return spent batches to the pool"
+        );
+        assert!(
+            spread.lock().unwrap().len() >= 3,
+            "per-frame spread recorded"
+        );
+    }
+
+    /// WP2.1: the encoder rate is derived UNDER the client's configured wire budget — framing
+    /// (32 B per 1376 B payload at the default packetSize) and FEC parity fit inside it. The old
+    /// shape (encoder = the full configured rate) overshot the wire by ≈1.23× at 20 % FEC.
+    #[test]
+    fn encoder_rate_fits_inside_the_wire_budget() {
+        // 20 Mbps configured, 20 % FEC, packetSize 1392: enc = 20e6 × 1376/1408 × 100/120.
+        let enc = gs_encoder_bps(20_000, 20, 1392);
+        assert_eq!(enc, 16_287_878);
+        // Re-derive the wire this rate spends: it must not exceed the configured budget.
+        let wire = enc * 1408 / 1376 * 120 / 100;
+        assert!(wire <= 20_000_000, "wire {wire} exceeds the 20 Mbps budget");
+        assert!(
+            wire >= 19_800_000,
+            "wire {wire} leaves more than 1 % of the budget unused"
+        );
+        // FEC off: only framing is carved out.
+        assert_eq!(gs_encoder_bps(20_000, 0, 1392), 20_000_000 * 1376 / 1408);
+        // Degenerate ask: floored, never zero.
+        assert_eq!(gs_encoder_bps(0, 20, 1392), 500_000);
+    }
+
+    /// WP2.2-2.4: the loss-adaptation state machine — FEC climbs fast and decays slow, the
+    /// budget de-rates only under SUSTAINED loss and recovers gradually, and both stay inside
+    /// their bounds whatever the input sequence.
+    #[test]
+    fn loss_adaptation_steps_and_bounds() {
+        let mut a = GsAdapt::new(20, 20_000);
+        // A clean session never moves either lever.
+        for _ in 0..100 {
+            assert!(!a.step(0), "clean windows must not change anything at rest");
+        }
+        assert_eq!((a.fec_pct, a.budget_kbps), (20, 20_000));
+
+        // First lossy window: FEC climbs (+max(5, 20/2) = +10), budget HOLDS (one bad window
+        // is a blip, not congestion).
+        assert!(a.step(7));
+        assert_eq!((a.fec_pct, a.budget_kbps), (30, 20_000));
+        // Second consecutive lossy window: FEC keeps climbing, budget de-rates ×0.85.
+        assert!(a.step(3));
+        assert_eq!((a.fec_pct, a.budget_kbps), (45, 17_000));
+        // Sustained loss saturates FEC at the cap and walks the budget to its floor (¼ cap).
+        for _ in 0..30 {
+            a.step(1);
+        }
+        assert_eq!(a.fec_pct, GsAdapt::FEC_MAX);
+        assert_eq!(a.budget_kbps, 5_000, "floor = max(cap/4, 5 Mbps)");
+
+        // Recovery: budget climbs cap/20 per 4 clean windows, FEC decays 5 per 8 clean —
+        // both settle exactly at their configured values, never above.
+        let mut changes = 0;
+        for _ in 0..400 {
+            if a.step(0) {
+                changes += 1;
+            }
+            assert!(a.fec_pct >= 20 && a.fec_pct <= GsAdapt::FEC_MAX);
+            assert!(a.budget_kbps >= 5_000 && a.budget_kbps <= 20_000);
+        }
+        assert_eq!((a.fec_pct, a.budget_kbps), (20, 20_000));
+        assert!(changes > 0, "recovery must actually step");
+        // A relapse mid-recovery resets the clean streak: the next single lossy window
+        // climbs FEC but does NOT de-rate the budget again.
+        let budget_before_relapse = a.budget_kbps;
+        a.step(2);
+        assert_eq!(a.budget_kbps, budget_before_relapse);
+        assert!(a.fec_pct > 20);
+    }
+
+    /// The tiny-cap edge: the budget floor can never exceed the cap, and a 5 Mbps session
+    /// simply never de-rates.
+    #[test]
+    fn loss_adaptation_tiny_session_never_derates_below_itself() {
+        let mut a = GsAdapt::new(20, 4_000); // below the 5 Mbps absolute floor
+        for _ in 0..10 {
+            a.step(9);
+        }
+        assert_eq!(a.budget_kbps, 4_000, "floor clamps to the cap");
+        assert_eq!(a.fec_pct, GsAdapt::FEC_MAX);
     }
 }

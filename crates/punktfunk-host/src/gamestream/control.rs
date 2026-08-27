@@ -354,7 +354,16 @@ impl rusty_enet::Socket for OwnerFilteredSocket {
     type Error = std::io::Error;
 
     fn init(&mut self, opts: rusty_enet::SocketOptions) -> Result<(), std::io::Error> {
-        rusty_enet::Socket::init(&mut self.inner, opts)
+        rusty_enet::Socket::init(&mut self.inner, opts)?;
+        // Wake-on-packet service tick (GS competitive program WP1.5): a BLOCKING socket with a
+        // 2 ms read timeout, re-asserted after the inner init (which may have set nonblocking).
+        // The service loop's idle "tick" is then the empty receive itself — same ~2 ms cadence
+        // and CPU as the old `sleep(2 ms)`, but an arriving input/IDR-request datagram wakes it
+        // IMMEDIATELY instead of waiting out the rest of the tick (≤2 ms shaved off every
+        // client input event). `receive` below maps the timeout back to the non-blocking
+        // contract rusty_enet expects.
+        self.inner.set_nonblocking(false)?;
+        self.inner.set_read_timeout(Some(Duration::from_millis(2)))
     }
 
     fn send(&mut self, address: Self::Address, buffer: &[u8]) -> Result<usize, std::io::Error> {
@@ -366,17 +375,28 @@ impl rusty_enet::Socket for OwnerFilteredSocket {
         buffer: &mut [u8; rusty_enet::MTU_MAX],
     ) -> Result<Option<(Self::Address, rusty_enet::PacketReceived)>, std::io::Error> {
         // Loop so a dropped non-owner datagram doesn't starve a following owner datagram in the
-        // same drain; the inner socket is non-blocking, so this returns `Ok(None)` on WouldBlock.
+        // same drain. The inner socket BLOCKS up to its 2 ms read timeout (see `init`) — the
+        // timeout (Unix reports it as `WouldBlock`, Windows as `TimedOut`) maps back to the
+        // `Ok(None)` rusty_enet's non-blocking contract expects.
         loop {
-            match rusty_enet::Socket::receive(&mut self.inner, buffer)? {
-                Some((addr, received)) => {
+            match rusty_enet::Socket::receive(&mut self.inner, buffer) {
+                Ok(Some((addr, received))) => {
                     let owner = self.state.launch.lock().unwrap().and_then(|s| s.peer_ip);
                     if owner.is_some_and(|ip| ip != addr.ip()) {
                         continue;
                     }
                     return Ok(Some((addr, received)));
                 }
-                None => return Ok(None),
+                Ok(None) => return Ok(None),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(None)
+                }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -402,9 +422,8 @@ fn accept_connect(launch: Option<LaunchSession>, from: Option<IpAddr>) -> bool {
 /// Bind the ENet control host on 47999 and service it on a dedicated thread until `stop`.
 fn spawn(state: Arc<AppState>) -> Result<Running> {
     let socket = UdpSocket::bind(("0.0.0.0", CONTROL_PORT)).context("bind control UDP")?;
-    socket
-        .set_nonblocking(true)
-        .context("control socket nonblocking")?;
+    // Blocking-with-timeout, not nonblocking: the wrapper's `init` (called by `Host::new`)
+    // installs the 2 ms read timeout that makes the service loop wake on packet arrival.
     let mut host = Host::new(
         OwnerFilteredSocket {
             inner: socket,
@@ -476,10 +495,11 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                         }
                         host.peer_mut(pid).disconnect_later(0);
                         // Bounded flush: enough ticks for ENet to emit the termination and
-                        // the disconnect handshake; we are exiting either way.
+                        // the disconnect handshake; we are exiting either way. Each drain's
+                        // empty receive already blocks the socket's 2 ms timeout, so the old
+                        // explicit sleep would double the tick.
                         for _ in 0..50 {
                             while matches!(host.service(), Ok(Some(_))) {}
-                            std::thread::sleep(Duration::from_millis(2));
                         }
                     }
                     drops.end_of_session();
@@ -741,8 +761,10 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                     // No client/scheme yet: still answer FF uploads so games don't block.
                     pads.pump_rumble(|_, _, _, _, _| {});
                 }
-                // ENet needs frequent servicing for handshake/keepalive/retransmit.
-                std::thread::sleep(Duration::from_millis(2));
+                // ENet needs frequent servicing for handshake/keepalive/retransmit — and the
+                // pacing IS the socket's 2 ms read timeout inside the service drain above: an
+                // idle pass blocked there already (an arriving packet wakes it early), so no
+                // explicit sleep on top. See `OwnerFilteredSocket::init`.
             }
         })
         .context("spawn control thread")?;
@@ -837,6 +859,30 @@ fn on_receive(
                 ty = %format_args!("{inner:#06x}"),
                 "control: IDR request → keyframe"
             );
+            return;
+        }
+        // Client loss telemetry (0x0201, the Gen7 loss-stats report — WP2.2). Body after the
+        // 4-byte [type][len] header: LE i32s, stats[0] = loss count, stats[1] = window ms,
+        // stats[3] = last-good frame (the IDX_LOSS_STATS reading, apollo-comparison #94 ✓V;
+        // wire ref: design/research/gamestream-protocol-research.json). Folded into cumulative
+        // counters; the video thread's 1 Hz adaptation step reads them as window deltas and
+        // drives FEC percent + bitrate de-rating off them. This used to fall through to the
+        // input decoder and be silently dropped — the host was blind to client-observed loss.
+        if inner == 0x0201 && pt.len() >= 20 {
+            let lost = i32::from_le_bytes(pt[4..8].try_into().expect("len checked")).max(0);
+            let window_ms = i32::from_le_bytes(pt[8..12].try_into().expect("len checked"));
+            let last_good = i32::from_le_bytes(pt[16..20].try_into().expect("len checked"));
+            state
+                .loss_stats
+                .lost
+                .fetch_add(lost as u64, std::sync::atomic::Ordering::Relaxed);
+            state
+                .loss_stats
+                .reports
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if lost > 0 {
+                tracing::debug!(lost, window_ms, last_good, "control: client loss report");
+            }
             return;
         }
     }

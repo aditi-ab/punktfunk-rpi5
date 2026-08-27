@@ -6,16 +6,31 @@ use super::{Host, APP_VERSION, GFE_VERSION, SERVER_CODEC_MODE_SUPPORT};
 /// paired-HTTPS variant (real MAC); `paired` is whether the HTTPS peer presented a client cert
 /// that is in the paired allow-list (drives `PairStatus`). Element names are case-sensitive and
 /// match what moonlight-common-c parses.
-pub fn serverinfo_xml(host: &Host, https: bool, paired: bool) -> String {
-    // MAC is hidden over plain HTTP (no per-client identity there).
-    let mac = if https {
-        "01:02:03:04:05:06"
-    } else {
-        "00:00:00:00:00:00"
-    };
+///
+/// `current_game` is the running app id **as this caller may see it** (0 = none): the nvhttp
+/// handler passes the live session's appid only to the session OWNER's pinned cert (GS
+/// competitive program WP3). Moonlight keys real UX on these two fields — `currentgame != 0`
+/// is what makes it show Resume/Quit and route a tap through `/resume` instead of `/launch` —
+/// and both were hard-coded free/0 before, so no stock client ever resumed or quit from its
+/// UI. Owner-only on purpose: a non-owner shown the truth would route same-app taps into the
+/// owner-only `/resume`/`/cancel` and break the reject/join/steal admission it gets via
+/// `/launch` today (and a busy signal over plain HTTP would leak what's running to the LAN).
+pub fn serverinfo_xml(host: &Host, https: bool, paired: bool, current_game: u32) -> String {
+    // MAC is hidden over plain HTTP (no per-client identity there). Over HTTPS it is the REAL
+    // routed-NIC MAC (WP6.1): Moonlight persists this field for its Wake-on-LAN, so the fake
+    // constant this replaces made every client-side wake a silent no-op against this host.
+    let real_mac = if https { host_mac() } else { None };
+    let mac = real_mac.as_deref().unwrap_or("00:00:00:00:00:00");
     // PairStatus reflects the real allow-list: 1 only when the HTTPS peer's client-cert
     // fingerprint is pinned (the nvhttp handler computes `paired`); 0 otherwise (incl. plain HTTP).
     let pair_status = u8::from(paired);
+    // Moonlight matches the `_SERVER_BUSY` suffix, and pairs it with `currentgame` to decide
+    // the Resume/Quit affordance — the two must move together.
+    let state = if current_game != 0 {
+        "SUNSHINE_SERVER_BUSY"
+    } else {
+        "SUNSHINE_SERVER_FREE"
+    };
     let codec_mode_support = codec_mode_support();
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
@@ -31,8 +46,8 @@ pub fn serverinfo_xml(host: &Host, https: bool, paired: bool) -> String {
 <LocalIP>{local_ip}</LocalIP>
 <ServerCodecModeSupport>{codec_mode_support}</ServerCodecModeSupport>
 <PairStatus>{pair_status}</PairStatus>
-<currentgame>0</currentgame>
-<state>SUNSHINE_SERVER_FREE</state>
+<currentgame>{current_game}</currentgame>
+<state>{state}</state>
 </root>
 "#,
         hostname = host.hostname,
@@ -41,6 +56,23 @@ pub fn serverinfo_xml(host: &Host, https: bool, paired: bool) -> String {
         http_port = host.http_port,
         local_ip = host.local_ip(),
     )
+}
+
+/// The host's primary wake-capable MAC (`crate::wol::wake_macs`, routed NIC first) — cached on
+/// first SUCCESS only, because `/serverinfo` is polled and NIC enumeration per poll is waste,
+/// while a cold-booted host may have no routable address yet (the #366 boot-race lesson: a
+/// latched failure would advertise zeros forever). `None` until a read succeeds.
+fn host_mac() -> Option<String> {
+    static MAC: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let mut cached = MAC.lock().unwrap_or_else(|p| p.into_inner());
+    if cached.is_none() {
+        *cached = super::primary_local_ip()
+            .map(crate::wol::wake_macs)
+            .unwrap_or_default()
+            .into_iter()
+            .next();
+    }
+    cached.clone()
 }
 
 /// The `<ServerCodecModeSupport>` mask to advertise: the SDR baseline ([`base_codec_mode_support`])
@@ -210,7 +242,7 @@ mod tests {
             os_chain: "linux".into(),
             os_name: "Linux".into(),
         };
-        let xml = serverinfo_xml(&host, false, false);
+        let xml = serverinfo_xml(&host, false, false, 0);
         // The mask is the GPU-aware value (NVENC/no-GPU → the static 65793; a VAAPI host →
         // whatever it probes). Assert the XML embeds exactly what `codec_mode_support()` returns,
         // so the test is deterministic regardless of the build host's GPU.
@@ -219,5 +251,46 @@ mod tests {
         assert!(xml.contains(&format!(
             "<ServerCodecModeSupport>{mask}</ServerCodecModeSupport>"
         )));
+    }
+
+    /// WP6.1: plain HTTP never reveals a MAC; HTTPS carries the real routed-NIC MAC (or the
+    /// zeros fallback when none is readable — this CI host may have neither), and NEVER the
+    /// old fake `01:02:03:04:05:06` that made every Moonlight Wake-on-LAN a silent no-op.
+    #[test]
+    fn mac_is_real_or_hidden_never_fake() {
+        let host = Host {
+            hostname: "test".into(),
+            uniqueid: "uid".into(),
+            http_port: 47989,
+            https_port: 47984,
+            os_chain: "linux".into(),
+            os_name: "Linux".into(),
+        };
+        let http = serverinfo_xml(&host, false, false, 0);
+        assert!(http.contains("<mac>00:00:00:00:00:00</mac>"));
+        let https = serverinfo_xml(&host, true, true, 0);
+        assert!(!https.contains("01:02:03:04:05:06"), "the fake MAC is gone");
+        assert!(https.contains("<mac>"), "a mac element is always present");
+    }
+
+    /// WP3: `currentgame` + `state` move together — a caller shown a running app id gets
+    /// `_SERVER_BUSY` (what Moonlight's Resume/Quit affordance keys on), everyone else keeps
+    /// the free/0 pair the plane always sent.
+    #[test]
+    fn serverinfo_busy_state_tracks_current_game() {
+        let host = Host {
+            hostname: "test".into(),
+            uniqueid: "uid".into(),
+            http_port: 47989,
+            https_port: 47984,
+            os_chain: "linux".into(),
+            os_name: "Linux".into(),
+        };
+        let free = serverinfo_xml(&host, true, true, 0);
+        assert!(free.contains("<currentgame>0</currentgame>"));
+        assert!(free.contains("<state>SUNSHINE_SERVER_FREE</state>"));
+        let busy = serverinfo_xml(&host, true, true, 881_448_767);
+        assert!(busy.contains("<currentgame>881448767</currentgame>"));
+        assert!(busy.contains("<state>SUNSHINE_SERVER_BUSY</state>"));
     }
 }
