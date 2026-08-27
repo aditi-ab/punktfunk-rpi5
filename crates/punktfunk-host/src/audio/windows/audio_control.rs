@@ -197,9 +197,12 @@ pub(crate) fn host_audio_requested() -> bool {
 }
 
 /// The operator's default playback/recording devices must not be touched at all — the
-/// `follow_default` mode, formerly `PUNKTFUNK_KEEP_DEFAULT`.
+/// `follow_default` mode (formerly `PUNKTFUNK_KEEP_DEFAULT`), or a live session's
+/// `CLIENT_CAP_KEEP_HOST_AUDIO` ask (the client's "keep playing on the host" setting,
+/// held per-session by [`crate::audio::capture_policy::keep_host_audio_guard`]).
 pub(crate) fn keep_default_devices() -> bool {
     pf_host_config::config().audio_output_mode.keeps_default()
+        || crate::audio::capture_policy::session_keeps_default()
 }
 
 /// One wiring pass plus the inputs the desktop-audio capture loop's failure handling needs:
@@ -354,7 +357,9 @@ pub(crate) fn wire_now_full(park_defaults: bool) -> WiredPlan {
         if changed {
             tracing::info!(
                 mode = %pf_host_config::config().audio_output_mode.as_str(),
-                "audio output mode is follow_default — leaving the audio default devices untouched"
+                session_asked = crate::audio::capture_policy::session_keeps_default(),
+                "leaving the audio default devices untouched (follow_default mode, or a \
+                 session's keep-host-audio ask)"
             );
         }
         return done(wiring);

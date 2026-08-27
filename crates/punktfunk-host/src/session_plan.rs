@@ -88,9 +88,11 @@ pub struct SessionPlan {
     pub capture: CaptureBackend,
     pub topology: SessionTopology,
     pub encoder: EncoderBackend,
-    /// Handshake-negotiated encode bit depth (8, or 10 = HEVC Main10).
+    /// Handshake-negotiated encode bit depth (8, or 10 = HEVC Main10 / 10-bit AV1). Since the
+    /// 10-bit SDR path, 10 does NOT imply HDR — `hdr` below carries that separately.
     pub bit_depth: u8,
-    /// The want-HDR flag handed to the capturer (`bit_depth >= 10`): on Windows the IDD-push
+    /// The want-HDR flag handed to the capturer (the handshake's HDR verdict — the Welcome's
+    /// colour label, no longer derived from the depth): on Windows the IDD-push
     /// capturer proactively enables advanced colour on the virtual display; on Linux it runs the
     /// 10-bit PQ/BT.2020 PipeWire offer. It is only ever set where the handshake's source-aware
     /// gate said yes (`capture::capturer_supports_hdr_for`) — on Linux that means a gamescope
@@ -145,9 +147,13 @@ pub struct SessionPlan {
 
 impl SessionPlan {
     /// Resolve the whole plan once from [`config`](crate::config) + the negotiated `bit_depth`,
-    /// `chroma`, and `codec`.
+    /// `hdr`, `chroma`, and `codec`. `hdr` is passed IN (the handshake's verdict — the Welcome's
+    /// colour label) rather than derived from the depth: since 10-bit SDR exists, `bit_depth ==
+    /// 10` no longer implies BT.2020 PQ, and deriving it here re-welded the two.
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve(
         bit_depth: u8,
+        hdr: bool,
         chroma: crate::encode::ChromaFormat,
         codec: crate::encode::Codec,
         cursor_blend: bool,
@@ -159,7 +165,7 @@ impl SessionPlan {
             topology: resolve_topology(),
             encoder: resolve_encoder(),
             bit_depth,
-            hdr: bit_depth >= 10,
+            hdr,
             chroma,
             codec,
             wire_chunk: None,
@@ -228,6 +234,10 @@ impl SessionPlan {
         crate::capture::OutputFormat {
             gpu,
             hdr: self.hdr,
+            // 10-bit depth WITHOUT the HDR label = the 10-bit SDR session: the Windows
+            // capturer expands BGRA 8→10 (`Rgb10a2Sdr`) and the display's colour state is
+            // never touched.
+            ten_bit_sdr: self.bit_depth == 10 && !self.hdr,
             hw_cursor: self.cursor_forward,
             // 4:4:4 needs a full-chroma source: on Windows this keeps the capturer on RGB (not the
             // default NV12/P010 video-engine output) so NVENC can CSC to 4:4:4.

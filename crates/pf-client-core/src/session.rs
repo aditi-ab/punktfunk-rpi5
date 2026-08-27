@@ -83,6 +83,11 @@ pub struct SessionParams {
     /// Share the clipboard with this host (the per-host `KnownHost::clipboard_sync`). The
     /// bridge additionally needs the host to advertise `HOST_CAP_CLIPBOARD`.
     pub clipboard: bool,
+    /// Advertise `quic::CLIENT_CAP_KEEP_HOST_AUDIO`: ask the host to capture its default
+    /// playback device as-is instead of re-routing audio onto a silent endpoint, so the
+    /// host keeps playing while it streams ([`crate::trust::Settings::keep_host_audio`]).
+    /// Request-only — an older host ignores it.
+    pub keep_host_audio: bool,
     /// Advertise `quic::CLIENT_CAP_CURSOR`: this embedder renders the host cursor locally
     /// (the presenter's cursor channel, design/remote-desktop-sweep.md M2), so the host may
     /// stop compositing the pointer into the video. Only set when the embedder actually
@@ -889,6 +894,12 @@ fn pump(
             // PAD_AUDIO: the embedder can render per-pad DualSense haptics/speaker (see above).
         }) | (if pad_audio_on {
             punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO
+        } else {
+            0
+            // KEEP_HOST_AUDIO: the user's per-host "keep playing on the host" ask rides the
+            // Hello so the host's wiring pass can honour it before audio capture opens.
+        }) | (if params.keep_host_audio {
+            punktfunk_core::quic::CLIENT_CAP_KEEP_HOST_AUDIO
         } else {
             0
         }),

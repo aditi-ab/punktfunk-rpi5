@@ -44,7 +44,11 @@ fn sws_src_pixel(format: PixelFormat) -> Result<Pixel> {
         // swscale source for the X2RGB10→P010 conversion.
         PixelFormat::X2Rgb10 => Pixel::X2RGB10LE,
         PixelFormat::X2Bgr10 => Pixel::X2BGR10LE,
-        PixelFormat::Nv12 | PixelFormat::P010 | PixelFormat::Rgb10a2 | PixelFormat::Yuv444 => {
+        PixelFormat::Nv12
+        | PixelFormat::P010
+        | PixelFormat::Rgb10a2
+        | PixelFormat::Rgb10a2Sdr
+        | PixelFormat::Yuv444 => {
             bail!("NVENC CPU-input conversion supports packed RGB/BGR only; got {format:?}")
         }
     })
@@ -164,10 +168,10 @@ fn nvenc_input(format: PixelFormat) -> (Pixel, bool) {
         // Planar YUV444 from the zero-copy worker's GPU convert (a 4:4:4 session) — native
         // full-chroma YUV in, `hevc_nvenc` emits Range-Extensions 4:4:4.
         PixelFormat::Yuv444 => (Pixel::YUV444P, false),
-        // Rgb10a2 (HDR) and P010 (the Windows 10-bit video-processor output) are produced only by
-        // the Windows paths; the Linux capturer never emits them. Map to BGRA so the match is
-        // exhaustive — unreachable here.
-        PixelFormat::Rgb10a2 | PixelFormat::P010 => (Pixel::BGRA, false),
+        // Rgb10a2/Rgb10a2Sdr (the Windows packed-10 outputs) and P010 (the Windows 10-bit
+        // video-processor output) are produced only by the Windows paths; the Linux capturer
+        // never emits them. Map to BGRA so the match is exhaustive — unreachable here.
+        PixelFormat::Rgb10a2 | PixelFormat::Rgb10a2Sdr | PixelFormat::P010 => (Pixel::BGRA, false),
         // The Linux HDR capture formats never take the RGB-passthrough input: `open` intercepts
         // them onto the X2RGB10→P010 swscale path before consulting this mapping (like 4:4:4).
         PixelFormat::X2Rgb10 | PixelFormat::X2Bgr10 => (Pixel::BGRA, false),

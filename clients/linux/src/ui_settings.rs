@@ -640,6 +640,9 @@ fn commit_profile(active: &StreamProfile, touched: &Touched, values: &Settings) 
     if touched.has("enable_444") {
         o.enable_444 = Some(values.enable_444);
     }
+    if touched.has("ten_bit_sdr") {
+        o.ten_bit_sdr = Some(values.ten_bit_sdr);
+    }
     if touched.has("compositor") {
         o.compositor = Some(values.compositor.clone());
     }
@@ -648,6 +651,9 @@ fn commit_profile(active: &StreamProfile, touched: &Touched, values: &Settings) 
     }
     if touched.has("audio_format") {
         o.audio_format = Some(values.audio_format.clone());
+    }
+    if touched.has("keep_host_audio") {
+        o.keep_host_audio = Some(values.keep_host_audio);
     }
     if touched.has("mic_enabled") {
         o.mic_enabled = Some(values.mic_enabled);
@@ -1281,6 +1287,13 @@ pub fn show_scoped(
              only, and only where the host can encode it.",
         )
         .build();
+    let ten_bit_sdr_row = adw::SwitchRow::builder()
+        .title("10-bit SDR")
+        .subtitle(
+            "Smoother gradients without HDR \u{2014} 10-bit encoding precision. Needs an \
+             NVIDIA host; HDR takes over when it engages.",
+        )
+        .build();
     let decoder_row = ChoiceRow::new(
         &dialog,
         inline,
@@ -1466,6 +1479,10 @@ pub fn show_scoped(
         w.set_sensitive(surround_row.selected() == 0);
         surround_row.connect_changed(move |i| w.set_sensitive(i == 0));
     }
+    let keep_host_audio_row = adw::SwitchRow::builder()
+        .title("Keep host audio playing")
+        .subtitle("The host's speakers or headphones keep playing while you stream — needs a host on 0.32+")
+        .build();
     let mic_row = adw::SwitchRow::builder()
         .title("Stream microphone")
         .subtitle("Sends your microphone to the host's virtual mic — Ctrl+Alt+Shift+V mutes it mid-stream")
@@ -1711,10 +1728,12 @@ pub fn show_scoped(
         wake_row.set_active(s.auto_wake);
         inhibit_row.set_active(s.inhibit_shortcuts);
         invert_row.set_active(s.invert_scroll);
+        keep_host_audio_row.set_active(s.keep_host_audio);
         mic_row.set_active(s.mic_enabled);
         echo_row.set_active(s.echo_cancel);
         hdr_row.set_active(s.hdr_enabled);
         chroma_row.set_active(s.enable_444);
+        ten_bit_sdr_row.set_active(s.ten_bit_sdr);
         surround_row.set_selected(index::surround(s));
         audio_format_row.set_selected(index::audio_format(s));
         // `set_selected` never fires the changed hook, so mirror the stereo gate here — the same
@@ -1971,6 +1990,12 @@ pub fn show_scoped(
         toggle!(hdr_row, "hdr_enabled", o.hdr_enabled.is_some(), hdr_enabled);
         toggle!(chroma_row, "enable_444", o.enable_444.is_some(), enable_444);
         toggle!(
+            ten_bit_sdr_row,
+            "ten_bit_sdr",
+            o.ten_bit_sdr.is_some(),
+            ten_bit_sdr
+        );
+        toggle!(
             fullscreen_row,
             "fullscreen_on_stream",
             o.fullscreen_on_stream.is_some(),
@@ -1987,6 +2012,12 @@ pub fn show_scoped(
             "invert_scroll",
             o.invert_scroll.is_some(),
             invert_scroll
+        );
+        toggle!(
+            keep_host_audio_row,
+            "keep_host_audio",
+            o.keep_host_audio.is_some(),
+            keep_host_audio
         );
         toggle!(mic_row, "mic_enabled", o.mic_enabled.is_some(), mic_enabled);
         toggle!(
@@ -2059,6 +2090,7 @@ pub fn show_scoped(
     quality_group.add(codec_row.widget());
     quality_group.add(&hdr_row);
     quality_group.add(&chroma_row);
+    quality_group.add(&ten_bit_sdr_row);
     // Decoder and GPU are facts about THIS device's hardware — never per profile (tier G).
     if !profile_mode {
         quality_group.add(decoder_row.widget());
@@ -2097,6 +2129,7 @@ pub fn show_scoped(
     let audio_group = group("", "Applies from the next session.");
     audio_group.add(surround_row.widget());
     audio_group.add(audio_format_row.widget());
+    audio_group.add(&keep_host_audio_row);
     // The speaker/mic endpoint pickers below are this device's audio routing (tier G) — they
     // render only in the defaults scope; the surround/format + mic-uplink rows above are
     // profileable.
@@ -2242,10 +2275,12 @@ pub fn show_scoped(
             if want_speaker != pf_client_core::pad_audio::speaker_active(&s.pad_speaker) {
                 s.pad_speaker = if want_speaker { "pad" } else { "off" }.to_string();
             }
+            s.keep_host_audio = keep_host_audio_row.is_active();
             s.mic_enabled = mic_row.is_active();
             s.echo_cancel = echo_row.is_active();
             s.hdr_enabled = hdr_row.is_active();
             s.enable_444 = chroma_row.is_active();
+            s.ten_bit_sdr = ten_bit_sdr_row.is_active();
             s.audio_channels = match surround_row.selected() {
                 1 => 6,
                 2 => 8,

@@ -1689,6 +1689,14 @@ impl Encoder for NvencD3d11Encoder {
                     self.bit_depth = 10;
                     nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR10
                 }
+                PixelFormat::Rgb10a2Sdr => {
+                    // The 10-bit SDR capture: same packed layout as Rgb10a2, but plain sRGB
+                    // values — `hdr` above is false, so the session opens Main10 with the
+                    // ordinary BT.709 SDR VUI (the encoder's CSC follows it, the SDR 4:4:4
+                    // precedent one bit-depth up).
+                    self.bit_depth = 10;
+                    nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR10
+                }
                 PixelFormat::Nv12 => {
                     // NV12 is 8-bit 4:2:0. Force 8-bit so a transition from a prior P010 (10-bit) session
                     // — or a 10-bit-negotiated client on an SDR display — re-inits at the matching depth.

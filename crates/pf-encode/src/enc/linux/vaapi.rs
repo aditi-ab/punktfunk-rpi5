@@ -60,7 +60,11 @@ fn vaapi_sws_src(format: PixelFormat) -> Result<Pixel> {
         // swscale source for the X2RGB10→P010 conversion.
         PixelFormat::X2Rgb10 => Pixel::X2RGB10LE,
         PixelFormat::X2Bgr10 => Pixel::X2BGR10LE,
-        PixelFormat::Nv12 | PixelFormat::P010 | PixelFormat::Rgb10a2 | PixelFormat::Yuv444 => {
+        PixelFormat::Nv12
+        | PixelFormat::P010
+        | PixelFormat::Rgb10a2
+        | PixelFormat::Rgb10a2Sdr
+        | PixelFormat::Yuv444 => {
             bail!("VAAPI CPU-input path supports packed RGB/BGR only; got {format:?}")
         }
     })

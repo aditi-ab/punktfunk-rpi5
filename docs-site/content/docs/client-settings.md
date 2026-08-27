@@ -80,6 +80,14 @@ HEVC or PyroWave, the host's 4:4:4 policy on, a capture path that delivers full 
 that can encode it; if any gate fails the host says 4:2:0 before your decoder is built. Apple
 (hardware decode probe required), Linux, Windows and the console home; not Android.
 
+**10-bit SDR** — *default: off.* The picture is encoded at 10-bit precision without turning
+anything HDR: gradients that band under an 8-bit encode — skies, fog, dark scenes — come through
+smooth, and the displays at both ends keep their colour settings untouched. This is about the
+*encoder's* precision, not a 10-bit capture: the desktop stays 8-bit, the win is that compression
+stops adding banding of its own. Needs a Windows host on an NVIDIA GPU and HEVC; anywhere else the
+session stays 8-bit, and the host says so in the handshake. When HDR engages it takes over (HDR is
+already 10-bit). Linux, Windows and the desktop console.
+
 **Prioritize** — *default: Lowest latency.* **Lowest latency** shows every frame the moment the
 display can take it — a network hiccup becomes an occasional repeated or skipped frame.
 **Smoothness** holds a small buffer that evens hiccups out, at that buffer's worth of added delay.
@@ -112,6 +120,17 @@ stereo. The count the host will really send comes back in the handshake and your
 from *that*. A **Linux** host claims a sink with exactly that many channels (real surround); a
 **Windows** host loopback-captures the current output endpoint and lets Windows convert — 5.1 from
 a stereo endpoint is an upmix. Offered everywhere.
+
+**Keep host audio playing** — *default: off.* Normally a session parks the host's playback on a
+silent endpoint so sound comes out of the client only, and the host PC goes quiet. On, the session
+asks the host to capture whatever its default playback device already is instead — the speakers or
+headphones plugged into the host keep playing, and both ends hear the same audio (Moonlight's
+"Mute host PC speakers" box, unchecked). Per profile, so a laptop-in-the-house profile can keep the
+host's headphones live while the TV profile mutes them. Best-effort: it needs a host on 0.32 or
+newer, and with several clients streaming at once, any one asking wins for all of them. The
+host-wide equivalent is
+[`PUNKTFUNK_AUDIO_OUTPUT_MODE=follow_default`](/docs/configuration). Linux, Windows and the
+desktop console.
 
 **Microphone** — *default: off on Linux, Windows, Android and the console home; on in the Apple
 app.* Sends this device's microphone to the host's virtual mic. Spelled *Stream microphone* on
@@ -195,9 +214,10 @@ and puts it back afterwards — see
 (Alt+Tab, Win, …)*), macOS and the console home; on a Deck it matters only for an attached keyboard
 (gamescope holds nothing back). On, Alt+Tab and the Windows/Super key reach the host while input is
 captured; off, they act locally. Either way the chords return when you release capture with
-**Ctrl+Alt+Shift+Q**, the window loses focus, or the stream ends —
-[Desktop mouse mode](/docs/input#mouse-modes) never takes them at all. Leaving it on means
-**Ctrl+Alt+Shift+Q is your way out**, since Alt+Tab no longer is.
+**Ctrl+Alt+Shift+Q**, the window loses focus, or the stream ends. It applies in
+[both mouse modes](/docs/input#mouse-modes) — in Desktop mode the unlocked pointer can always
+click another window to hand them back. Leaving it on means **Ctrl+Alt+Shift+Q is your way out**
+of a captured stream, since Alt+Tab no longer is.
 
 On macOS the chords in question are the **⌘** ones — on, ⌘Q, ⌘W, ⌘H and the rest go to the host
 while input is captured (⌘Q arrives as Super+Q); off, they act on the Mac, which means ⌘Q quits

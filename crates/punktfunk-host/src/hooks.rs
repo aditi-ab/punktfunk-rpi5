@@ -1010,6 +1010,21 @@ pub struct PrepCmd {
     pub undo: Option<String>,
 }
 
+/// The negotiated stream mode as env for prep `do`/`undo` commands — the same `PF_STREAM_*`
+/// vocabulary as the [`crate::stream_marker`] file (and the same rule: keys only ever get
+/// added), so a script written against either sees one spelling. Exists because prep commands
+/// are how operators do per-mode setup (an RTSS/driver FPS cap wants the refresh rate), and
+/// until now their whole environment was the app identity — every mode value had to be
+/// hard-coded per device. One definition, used by BOTH serving planes, so they can't drift.
+pub fn prep_mode_env(width: u32, height: u32, refresh_hz: u32, hdr: bool) -> [(String, String); 4] {
+    [
+        ("PF_STREAM_WIDTH".to_string(), width.to_string()),
+        ("PF_STREAM_HEIGHT".to_string(), height.to_string()),
+        ("PF_STREAM_REFRESH".to_string(), refresh_hz.to_string()),
+        ("PF_STREAM_HDR".to_string(), u8::from(hdr).to_string()),
+    ]
+}
+
 /// Holds the armed `undo` commands for one session's prep steps; dropping it (session end,
 /// error return, panic-unwind) runs them in reverse order on a detached thread — teardown
 /// never blocks on operator code.
@@ -1287,6 +1302,19 @@ mod tests {
             .map(|(_, v)| v.clone())
             .unwrap();
         assert_eq!(v, "evilname");
+    }
+
+    #[test]
+    fn prep_mode_env_speaks_the_marker_vocabulary() {
+        // The names are the stream-marker file's — a script written against either sees one
+        // spelling — and HDR is 1/0 like the marker, not true/false like PF_EVENT_*.
+        let env = prep_mode_env(2560, 1440, 120, true);
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("PF_STREAM_WIDTH"), Some("2560"));
+        assert_eq!(get("PF_STREAM_HEIGHT"), Some("1440"));
+        assert_eq!(get("PF_STREAM_REFRESH"), Some("120"));
+        assert_eq!(get("PF_STREAM_HDR"), Some("1"));
+        assert_eq!(prep_mode_env(1, 1, 1, false)[3].1, "0");
     }
 
     #[cfg(unix)]

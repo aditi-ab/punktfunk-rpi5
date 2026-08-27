@@ -283,10 +283,15 @@ fn run(
         if let Some(lib_id) = app.and_then(|a| a.library_id.as_deref()) {
             prep_cmds.extend(crate::library::prep_for(lib_id));
         }
-        let prep_env = [(
+        let mut prep_env = vec![(
             "PF_APP_TITLE".to_string(),
             app.map(|a| a.title.clone()).unwrap_or_default(),
         )];
+        // The negotiated mode, same `PF_STREAM_*` names as the native plane's prep env and the
+        // marker file — one vocabulary for a script whichever client connected.
+        prep_env.extend(crate::hooks::prep_mode_env(
+            cfg.width, cfg.height, cfg.fps, cfg.hdr,
+        ));
         let _prep = (!prep_cmds.is_empty()).then(|| crate::hooks::run_prep(&prep_cmds, &prep_env));
         // Open the virtual-display source: pick the live compositor, normalize the session env
         // (apply_session_env + input/gamescope routing — ATTACH/resize + KWin/Mutter retargeting,

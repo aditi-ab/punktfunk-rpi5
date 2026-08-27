@@ -1163,10 +1163,10 @@ pub struct Settings {
     #[serde(default = "default_mouse_mode")]
     pub mouse_mode: String,
     /// Send system chords (Alt+Tab, Super / the Windows key) to the host while input is
-    /// captured under the `capture` mouse model; off leaves them with the local shell.
-    /// Read at connect into the presenter's session opts, which turns it into an SDL
-    /// keyboard grab (a low-level hook on Windows, shortcuts-inhibit or `XGrabKeyboard`
-    /// on Linux). The `desktop` mouse model never grabs, whatever this says.
+    /// captured; off leaves them with the local shell. Read at connect into the presenter's
+    /// session opts, which turns it into an SDL keyboard grab (a low-level hook on Windows,
+    /// shortcuts-inhibit or `XGrabKeyboard` on Linux). Applies in BOTH mouse models — the
+    /// `desktop` model's unlocked pointer clicking another window is its way back.
     pub inhibit_shortcuts: bool,
     /// Stream the default microphone to the host's virtual mic source.
     pub mic_enabled: bool,
@@ -1210,6 +1210,14 @@ pub struct Settings {
     /// ending a session over a dropdown. `default` so pre-existing stores load on the Opus plane.
     #[serde(default = "default_audio_format")]
     pub audio_format: String,
+    /// Ask the host to leave its own audio devices alone for this session
+    /// (`CLIENT_CAP_KEEP_HOST_AUDIO`): the host captures whatever its default playback device
+    /// already is, so audio keeps playing there — the headphones plugged into the host PC stay
+    /// live — as well as here. Off (the default), the host parks playback on a silent endpoint
+    /// and the host goes quiet while streaming. Best-effort: an older host ignores the ask and
+    /// re-routes as it always did. `default` so pre-existing stores load with today's behavior.
+    #[serde(default)]
+    pub keep_host_audio: bool,
     /// Preferred video codec: `"auto"` (host decides), `"hevc"`, `"h264"`, or `"av1"`. A soft
     /// preference — the host honors it when it can emit it, else falls back to the best shared codec.
     #[serde(default = "default_codec")]
@@ -1243,10 +1251,17 @@ pub struct Settings {
     pub enable_444: bool,
     /// Advertise 10-bit + HDR10 so the host upgrades HDR content to a Main10/PQ stream.
     /// The presenter handles the display side dynamically either way (HDR10 swapchain
-    /// where offered, tonemap where not) — off means "never send me 10-bit".
+    /// where offered, tonemap where not) — off means "never send me HDR".
     /// `default = true`: the Linux stores never carried this and always advertised.
     #[serde(default = "default_true")]
     pub hdr_enabled: bool,
+    /// Advertise 10-bit WITHOUT HDR (`VIDEO_CAP_10BIT` alone): the host encodes the SDR
+    /// desktop at Main10 precision — less encode banding on gradients, the display's colour
+    /// state untouched at both ends. Subsumed by `hdr_enabled`; the host additionally gates
+    /// (today: a Windows host on direct NVENC, HEVC), so elsewhere the session stays 8-bit.
+    /// `default` so pre-existing stores load with today's behavior.
+    #[serde(default)]
+    pub ten_bit_sdr: bool,
     /// Presentation intent: `"latency"` (default) or `"smooth"` — the Apple/Android
     /// clients' shared `present_priority` profile key, resolved with
     /// [`PresentPriority::resolve`] (via [`Settings::present_priority`]). Anything
@@ -1523,11 +1538,13 @@ impl Default for Settings {
             echo_cancel: true,
             audio_channels: 2,
             audio_format: default_audio_format(),
+            keep_host_audio: false,
             codec: "auto".into(),
             decoder: "auto".into(),
             adapter: String::new(),
             enable_444: false,
             hdr_enabled: true,
+            ten_bit_sdr: false,
             present_priority: "latency".into(),
             smooth_buffer: 0,
             vsync: true,

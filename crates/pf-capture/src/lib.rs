@@ -667,7 +667,8 @@ pub fn open_virtual_output(
 pub fn open_idd_push(
     target: pf_frame::dxgi::WinCaptureTarget,
     preferred: Option<(u32, u32, u32)>,
-    client_10bit: bool,
+    want_hdr: bool,
+    ten_bit_sdr: bool,
     want_444: bool,
     pyrowave: bool,
     keepalive: Box<dyn Send>,
@@ -678,7 +679,8 @@ pub fn open_idd_push(
     idd_push::IddPushCapturer::open(
         target,
         preferred,
-        client_10bit,
+        want_hdr,
+        ten_bit_sdr,
         want_444,
         pyrowave,
         keepalive,

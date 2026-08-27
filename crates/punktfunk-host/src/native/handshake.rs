@@ -618,6 +618,11 @@ pub(super) async fn negotiate(
     // label that matches the stream.
     let host_wants_10bit = pf_host_config::config().ten_bit;
     let client_supports_10bit = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_10BIT != 0;
+    // The two bits split (0.32): `VIDEO_CAP_HDR` is the client's HDR (BT.2020 PQ) ask;
+    // `VIDEO_CAP_10BIT` alone is the 10-bit **SDR** ask — Main10 coding precision (less encode
+    // banding on gradients) without touching the display's colour state. Every pre-0.32 client
+    // sets both together, so the split changes nothing for them.
+    let client_wants_hdr = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_HDR != 0;
     // The capture side must be able to deliver a 10-bit HDR source for the NATIVE plane's
     // virtual-output capture — the honest-downgrade gate, mirroring `capturer_supports_444`.
     // SOURCE-AWARE, because on Linux the answer depends on which compositor we just resolved:
@@ -632,26 +637,43 @@ pub(super) async fn negotiate(
     // path makes separately in rtsp.rs has no twin here: that latch is per-source, and this gate
     // already consulted the one belonging to the source this session will drive.
     let capture_supports_hdr = crate::capture::capturer_supports_hdr_for(compositor);
+    // The 10-bit SDR chain: the Windows IDD-push capturer expands its BGRA slot 8→10 bit
+    // (`Rgb10a2Sdr`), and only the direct-NVENC backend ingests that packed RGB — the same
+    // ingest fact the 4:4:4 gate keys on below (`resolved_backend_ingests_rgb_444` is `false`
+    // off Windows, which is also the whole Linux story: no SDR-10 capture chain exists there
+    // yet, so an SDR-10 ask resolves 8-bit — the honest downgrade, told in the Welcome before
+    // the client builds its decoder). HEVC only for now: NVENC's packed-RGB → 10-bit AV1
+    // ingest is unverified on glass — widen once measured. PyroWave is excluded by the same
+    // term (its capture composition is pinned to the display's HDR state, not this path).
+    let sdr10_chain_ok =
+        codec == crate::encode::Codec::H265 && crate::encode::resolved_backend_ingests_rgb_444();
+    // 10-bit is reachable through EITHER path: the HDR one (client asked HDR + the capturer
+    // can deliver a 10-bit HDR source) or the SDR-10 one above.
+    let depth_reachable = (client_wants_hdr && capture_supports_hdr) || sdr10_chain_ok;
     // The GPU probe may open a tiny encoder on first use, so run it off the reactor like the
     // 4:4:4 probe below (blocking probes → spawn_blocking), short-circuited behind the cheap
     // gates. The result is cached process-wide per (GPU, codec).
-    let gpu_can_10bit = if host_wants_10bit
-        && client_supports_10bit
-        && codec.supports_10bit()
-        && capture_supports_hdr
-    {
-        tokio::task::spawn_blocking(move || crate::encode::can_encode_10bit(codec))
-            .await
-            .context("10-bit capability probe task")?
-    } else {
-        false
-    };
+    let gpu_can_10bit =
+        if host_wants_10bit && client_supports_10bit && codec.supports_10bit() && depth_reachable {
+            tokio::task::spawn_blocking(move || crate::encode::can_encode_10bit(codec))
+                .await
+                .context("10-bit capability probe task")?
+        } else {
+            false
+        };
     let bit_depth: u8 = if gpu_can_10bit { 10 } else { 8 };
+    // The session's HDR verdict — the Welcome's colour label, the capturer's advanced-colour
+    // mandate, and the virtual display's HDR bring-up all read THIS, never `bit_depth >= 10`:
+    // a 10-bit session without it is the 10-bit SDR session (BT.709 VUI, display untouched).
+    let session_hdr = gpu_can_10bit && client_wants_hdr && capture_supports_hdr;
     tracing::info!(
         bit_depth,
+        session_hdr,
         host_wants_10bit,
         client_supports_10bit,
+        client_wants_hdr,
         capture_supports_hdr,
+        sdr10_chain_ok,
         codec = ?codec,
         gpu_can_10bit,
         client_video_caps = hello.video_caps,
@@ -764,6 +786,9 @@ pub(super) async fn negotiate(
     } else {
         bit_depth
     };
+    // The HDR verdict follows any depth clamp (the Linux 4:4:4 one above): an 8-bit stream is
+    // never labelled HDR. A no-op wherever the depth survived.
+    let session_hdr = session_hdr && bit_depth == 10;
 
     // Resolve the encoder bitrate (client request clamped to a sane range, or a codec-aware
     // host default). Resolved AFTER depth + chroma: PyroWave's Automatic rate is a ~bpp pin
@@ -942,12 +967,13 @@ pub(super) async fn negotiate(
         gamepad,
         bitrate_kbps,
         bit_depth,
-        // Colour signalling the client configures its decoder/presenter from. A negotiated
-        // 10-bit session is our HDR path (BT.2020 PQ — what the NVENC HEVC VUI emits from a
-        // 10-bit capture format); 8-bit stays BT.709 SDR. The mastering metadata (ST.2086 +
-        // CLL) rides the 0xCE datagram below. (A future step can refine this to the capturer's
-        // actual monitor HDR state and announce a mid-stream flip.)
-        color: if bit_depth >= 10 {
+        // Colour signalling the client configures its decoder/presenter from — the session's
+        // HDR verdict, NOT the bit depth: a 10-bit SDR session (VIDEO_CAP_10BIT without
+        // VIDEO_CAP_HDR) encodes Main10 under a BT.709 SDR VUI and must say SDR here. The
+        // mastering metadata (ST.2086 + CLL) rides the 0xCE datagram below. (A future step can
+        // refine this to the capturer's actual monitor HDR state and announce a mid-stream
+        // flip.)
+        color: if session_hdr {
             ColorInfo::HDR10_BT2020_PQ
         } else {
             ColorInfo::SDR_BT709
@@ -1136,8 +1162,13 @@ pub(super) async fn negotiate(
                         multi_slice,
                         bitrate_kbps,
                         bitrate_auto,
-                        enc_of,
                         bit_depth,
+                        session_hdr,
+                        // ⚠ order: `enc_of` comes AFTER the depth pair — #408 (`bbc01cdd`)
+                        // landed it before `bit_depth`, which cannot compile on Windows and
+                        // sat unnoticed because Linux CI never builds this cfg(windows) block
+                        // and windows-host.yml only runs on dispatch/release.
+                        enc_of,
                         chroma,
                         codec,
                         shard_payload,

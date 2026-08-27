@@ -149,13 +149,16 @@ There are two, and they are a per-client setting called **Mouse input**:
 
 - **Capture (games)** — the pointer locks to the stream and only relative movement is sent. The only
   cursor you see is the host's. This is what mouse-look in a game needs. The session window also
-  grabs the keyboard here, so Alt+Tab and the Windows key (Super on Linux) reach the host rather than
+  grabs the keyboard, so Alt+Tab and the Windows key (Super on Linux) reach the host rather than
   your own desktop — on macOS that is the ⌘ chords, ⌘Q included, with ⌘⎋ kept back as the way out.
   Turn **Capture system shortcuts** off in [client settings](/docs/client-settings#input) to keep
   them local.
 - **Desktop (absolute)** — the pointer is not locked. It moves in and out of the stream freely and
   its position is sent as an absolute point — what you want for remote desktop work. Your local
-  cursor is hidden over the stream; the one you see there is the host's.
+  cursor is hidden over the stream; the one you see there is the host's. On Linux and Windows,
+  Alt+Tab and the Windows/Super key go to the host here too while **Capture system shortcuts** is
+  on — the host's Start menu is part of the desktop you're driving — and clicking any other local
+  window takes them back. (On a Mac the ⌘ chords stay local in this mode.)
 
 **Capture is the default** on the Linux, Windows and macOS clients. **Android defaults to Desktop**.
 

@@ -157,6 +157,13 @@ session end in **reverse order**, best-effort, even if the session crashed:
 
 A `do` that fails logs, keeps going, and its own `undo` is skipped (it never took effect).
 
+Every prep command (and its `undo`) runs with the session's negotiated mode in its environment:
+`PF_STREAM_WIDTH`, `PF_STREAM_HEIGHT`, `PF_STREAM_REFRESH` and `PF_STREAM_HDR` (`1`/`0`), plus the
+app identity — `PF_APP_ID` for a native client's launch, `PF_APP_TITLE` for a Moonlight one. So a
+per-mode frame cap is one step for every device —
+`{ "do": "rtss-cli property:set Global FramerateLimit $PF_STREAM_REFRESH" }` — instead of one
+hard-coded entry per client.
+
 ## Reacting to a game, not a stream
 
 `stream.stopped` tells you the *stream* ended; `game.exited` tells you the *game* did. Often the

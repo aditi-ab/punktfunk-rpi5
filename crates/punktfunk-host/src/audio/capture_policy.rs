@@ -8,7 +8,36 @@
 //! * [`CaptureStats`] — the audio plane's vitals, so a log can tell a quiet host from a broken
 //!   endpoint from one we are damaging ourselves.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+/// Live sessions that asked the host to leave its audio devices alone
+/// (`CLIENT_CAP_KEEP_HOST_AUDIO` — the client's "keep playing on the host" setting). A count,
+/// not a flag, because sessions overlap; host-global because the wiring is: with several
+/// concurrent sessions any live asker wins for all of them until it ends (best-effort, as the
+/// cap documents). Windows reads it in `audio_control::keep_default_devices`; Linux in the
+/// capturer's topology pick (Monitor — tap the operator's default sink instead of claiming it).
+static KEEP_HOST_AUDIO_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII for one session's `CLIENT_CAP_KEEP_HOST_AUDIO` ask — hold it for exactly the session's
+/// lifetime (every exit path decrements, panic-unwind included).
+pub(crate) struct KeepHostAudioGuard(());
+
+pub(crate) fn keep_host_audio_guard() -> KeepHostAudioGuard {
+    KEEP_HOST_AUDIO_SESSIONS.fetch_add(1, Ordering::Relaxed);
+    KeepHostAudioGuard(())
+}
+
+impl Drop for KeepHostAudioGuard {
+    fn drop(&mut self) {
+        KEEP_HOST_AUDIO_SESSIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether any live session asked for the operator's audio devices to be left alone.
+pub(crate) fn session_keeps_default() -> bool {
+    KEEP_HOST_AUDIO_SESSIONS.load(Ordering::Relaxed) > 0
+}
 
 /// Default-playback re-assertions inside [`FIGHT_WINDOW`] before we stop fighting.
 pub(crate) const FIGHT_LIMIT: u32 = 4;
@@ -1073,5 +1102,23 @@ mod tests {
             "every one of these was silence we invented"
         );
         assert_eq!(s.late, 0);
+    }
+
+    /// The per-session keep-host-audio ask is a COUNT (sessions overlap), and every guard
+    /// drop hands the devices back — the RAII contract the wiring pass depends on. This test
+    /// is the static's only toucher, so it owns the counter for its run.
+    #[test]
+    fn keep_host_audio_guard_counts_overlapping_sessions() {
+        assert!(!session_keeps_default());
+        let a = keep_host_audio_guard();
+        assert!(session_keeps_default());
+        let b = keep_host_audio_guard();
+        drop(a);
+        assert!(
+            session_keeps_default(),
+            "the second session still holds the ask"
+        );
+        drop(b);
+        assert!(!session_keeps_default());
     }
 }

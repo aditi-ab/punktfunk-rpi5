@@ -42,6 +42,9 @@ enum RowId {
     Decoder,
     Hdr,
     Chroma444,
+    /// The 10-bit SDR opt-in (`VIDEO_CAP_10BIT` without HDR). Desktop-only, like
+    /// [`RowId::Chroma444`]: the Android session derives its depth bits from the panel.
+    TenBitSdr,
     PresentPriority,
     SmoothBuffer,
     Vsync,
@@ -51,6 +54,9 @@ enum RowId {
     /// tied to the channel count above it for a reason that is NOT the one the design doc gives;
     /// see the `enabled` note in [`row_spec`].
     AudioFormat,
+    /// The per-session `CLIENT_CAP_KEEP_HOST_AUDIO` ask — the host keeps playing on its own
+    /// output while it streams. Desktop-only until the Android session advertises the bit.
+    KeepHostAudio,
     Mic,
     EchoCancel,
     PadForward,
@@ -210,6 +216,7 @@ const TABS: [(&str, &[RowId]); 7] = [
             RowId::LowLatency,
             RowId::Hdr,
             RowId::Chroma444,
+            RowId::TenBitSdr,
             RowId::PresentPriority,
             RowId::SmoothBuffer,
             RowId::Vsync,
@@ -221,6 +228,7 @@ const TABS: [(&str, &[RowId]); 7] = [
         &[
             RowId::Audio,
             RowId::AudioFormat,
+            RowId::KeepHostAudio,
             RowId::Mic,
             RowId::EchoCancel,
         ],
@@ -977,10 +985,14 @@ fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         id,
         RowId::Decoder
             | RowId::Chroma444
+            | RowId::TenBitSdr
             | RowId::Vsync
             | RowId::AllowVrr
             | RowId::Fullscreen
             | RowId::Shortcuts
+            // Desktop-only until the Android session advertises CLIENT_CAP_KEEP_HOST_AUDIO —
+            // a row whose bit never goes out would be a dead toggle.
+            | RowId::KeepHostAudio
     );
     match platform {
         Platform::Desktop => !android_only,
@@ -1140,6 +1152,7 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
         ),
         RowId::Hdr => (None, "10-bit HDR", on_off(s.hdr_enabled).into()),
         RowId::Chroma444 => (None, "Full chroma (4:4:4)", on_off(s.enable_444).into()),
+        RowId::TenBitSdr => (None, "10-bit SDR", on_off(s.ten_bit_sdr).into()),
         RowId::PresentPriority => (
             Some("Presentation"),
             "Prioritize",
@@ -1169,6 +1182,11 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             None,
             "Audio quality",
             audio_format_label(&s.audio_format).into(),
+        ),
+        RowId::KeepHostAudio => (
+            None,
+            "Keep host audio playing",
+            on_off(s.keep_host_audio).into(),
         ),
         RowId::Mic => (None, "Microphone", on_off(s.mic_enabled).into()),
         RowId::EchoCancel => (None, "Echo cancellation", on_off(s.echo_cancel).into()),
@@ -1347,6 +1365,10 @@ fn detail(id: RowId, ctx: &Ctx) -> &'static str {
              Needs an NVIDIA host (NVENC) or the PyroWave codec — other encoders \
              stream 4:2:0 and the session falls back silently."
         }
+        RowId::TenBitSdr => {
+            "Smoother gradients without HDR — the picture is encoded at 10-bit \
+             precision. Needs an NVIDIA host; HDR takes over when it engages."
+        }
         RowId::PresentPriority => {
             "Lowest latency shows each frame the moment the display can take it — a \
              network hiccup becomes an occasional repeated or skipped frame. Smoothness \
@@ -1370,6 +1392,10 @@ fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             "Bit-exact PCM instead of Opus — 2.3 Mb/s at 48 kHz, 4.6 at 96, off the top of the \
              link. The host has its own switch and stays on Opus if it can't deliver the rate; \
              the stats overlay names what the session got. Stereo only."
+        }
+        RowId::KeepHostAudio => {
+            "The host's own speakers or headphones keep playing while you stream. \
+             Both ends hear the same audio; needs a host on 0.32 or newer."
         }
         RowId::Mic => {
             "Send this device's microphone to the host's virtual mic. \
@@ -1623,6 +1649,7 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         }
         RowId::Hdr => toggle(&mut s.hdr_enabled, delta, wrap),
         RowId::Chroma444 => toggle(&mut s.enable_444, delta, wrap),
+        RowId::TenBitSdr => toggle(&mut s.ten_bit_sdr, delta, wrap),
         RowId::PresentPriority => {
             let cur = PRESENT_PRIORITIES
                 .iter()
@@ -1661,6 +1688,7 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
                 None
             }
         }
+        RowId::KeepHostAudio => toggle(&mut s.keep_host_audio, delta, wrap),
         RowId::Mic => toggle(&mut s.mic_enabled, delta, wrap),
         // Inert while the mic is off — a boundary thud, matching what the dimmed row shows.
         RowId::EchoCancel => {
@@ -2634,8 +2662,10 @@ pub(super) mod tests {
             vec![
                 RowId::Decoder,
                 RowId::Chroma444,
+                RowId::TenBitSdr,
                 RowId::Vsync,
                 RowId::AllowVrr,
+                RowId::KeepHostAudio,
                 RowId::Shortcuts,
                 RowId::Fullscreen,
             ]
@@ -2714,9 +2744,10 @@ pub(super) mod tests {
         // 2026-08 sweep found them bridged but unreachable) later passes added, minus the
         // game-library toggle: this screen never read it, and the library is offered on any
         // paired host now.
-        // 35 desktop rows + the ten Android-only ones (design android-skia-console-port.md
-        // D3): eight `extra`-backed settings and two platform-screen action rows.
-        assert_eq!(seen.len(), 45, "{seen:?}");
+        // 37 desktop rows (the daily-driver batch added 10-bit SDR and Keep host audio) +
+        // the ten Android-only ones (design android-skia-console-port.md D3): eight
+        // `extra`-backed settings and two platform-screen action rows.
+        assert_eq!(seen.len(), 47, "{seen:?}");
         assert!(seen.contains(&RowId::Palette));
         assert!(seen.contains(&RowId::ReduceMotion));
         assert!(seen.contains(&RowId::ReduceUiResolution));
