@@ -6,9 +6,13 @@
 //!
 //! Runs on its own native thread (control-plane setup, not the per-frame hot path), one
 //! thread per connection. DESCRIBE offers `SS_ENC_VIDEO` (per-shard AES-128-GCM video, WP7 —
-//! on by default, never REQUIRED, `PUNKTFUNK_GS_ENCRYPT=0` opts out); audio is AES-CBC and the
-//! ENet control stream AES-GCM regardless, and `SS_ENC_CONTROL_V2`/`SS_ENC_AUDIO` are not
-//! offered (see [`EncOffer`]).
+//! on by default, never REQUIRED, `PUNKTFUNK_GS_ENCRYPT=0` opts out) and, under
+//! `PUNKTFUNK_GS_ENCRYPT=control`, `SS_ENC_CONTROL_V2` — which gives the ENet control stream a
+//! per-direction nonce and lets the client seal RTSP itself. Audio is AES-CBC regardless and
+//! `SS_ENC_AUDIO` is still not offered (its layout is absent from the wire reference). See
+//! [`EncOffer`].
+//!
+//! A sealed connection is recognised, not negotiated: see [`ENCRYPTED_MESSAGE_TYPE_BIT`].
 
 use super::audio;
 use super::stream::{self, StreamConfig};
@@ -18,7 +22,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -100,19 +104,46 @@ fn handle_conn(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
     let _ = stream.set_read_timeout(Some(RTSP_READ_TIMEOUT));
     let deadline = Instant::now() + RTSP_REQUEST_DEADLINE;
     let mut buf: Vec<u8> = Vec::new();
+    // Which framing this connection speaks is the client's choice, and the first byte settles it:
+    // a sealed message opens with `typeAndLength`, whose MSB is [`ENCRYPTED_MESSAGE_TYPE_BIT`],
+    // while a plaintext one opens with an ASCII method name. We answer in kind, so there is no
+    // negotiation to get wrong and no state to keep.
+    if !fill_at_least(&mut stream, &mut buf, 1, deadline)? {
+        return Ok(()); // peer closed without sending anything
+    }
+    let sealed = buf[0] & 0x80 != 0;
+    // Sealed RTSP is keyed by the same `/launch` rikey as everything else, so it cannot precede a
+    // launch. Refusing here (rather than mis-parsing) keeps the failure legible.
+    let key = state.launch.lock().unwrap().map(|s| s.gcm_key);
+    let key = match (sealed, key) {
+        (false, _) => None,
+        (true, Some(k)) => Some(k),
+        (true, None) => {
+            anyhow::bail!("sealed RTSP message arrived with no launch session to key it")
+        }
+    };
     // GameStream RTSP is one request per TCP connection: moonlight-common-c reads the
     // response until EOF, so we answer one message and close the connection (which signals
     // the end of the response). Session state lives in `AppState`, not the connection.
-    if let Some(req) = read_message(&mut stream, &mut buf, deadline)? {
+    let req = match key {
+        Some(k) => read_sealed_message(&mut stream, &mut buf, deadline, &k)?,
+        None => read_message(&mut stream, &mut buf, deadline)?,
+    };
+    if let Some(req) = req {
         tracing::debug!(
             method = %req.method,
             cseq = %req.cseq,
+            sealed,
             headers = %req.head.replace("\r\n", " | "),
             body = %req.body.replace("\r\n", " | "),
             "RTSP request"
         );
         let resp = handle_request(&req, &state, peer);
-        stream.write_all(resp.as_bytes()).context("RTSP write")?;
+        let out = match key {
+            Some(k) => seal_response(&k, resp.as_bytes()),
+            None => resp.into_bytes(),
+        };
+        stream.write_all(&out).context("RTSP write")?;
         stream.flush().ok();
         // Close (FIN after the flushed response) so the client detects end-of-response.
         let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -386,10 +417,18 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
 const SS_FF_PEN_TOUCH_EVENTS: u32 = 0x01;
 
 /// `SS_ENC_VIDEO` — the per-shard AES-128-GCM video mode (moonlight-common-c
-/// `Limelight-internal.h`; the siblings are `SS_ENC_CONTROL_V2` 0x01 and `SS_ENC_AUDIO` 0x04,
-/// neither of which this host offers yet: control-v2 also re-frames RTSP itself, and the
-/// audio-GCM layout is not in the sanctioned wire reference).
+/// `Limelight-internal.h`). `SS_ENC_AUDIO` 0x04 is still not offered: the audio-GCM layout is
+/// not in the sanctioned wire reference.
 const SS_ENC_VIDEO: u32 = 0x02;
+
+/// `SS_ENC_CONTROL_V2` — the V2 control-encryption scheme. What it buys is a **direction byte**
+/// in the GCM nonce: `[10..12]` = `b"CC"` client→host, `b"HC"` host→client. The legacy scheme has
+/// no such separation — its nonce is just the sender's own `seq` — so host messages and client
+/// input share one (key, nonce) space and collide whenever their independent counters cross.
+/// That is the single catastrophic AES-GCM failure, and this flag is its documented fix.
+///
+/// Enabling it also lets the client seal RTSP itself; see [`read_sealed_message`].
+const SS_ENC_CONTROL_V2: u32 = 0x01;
 
 /// How this host offers video encryption (WP7), from `PUNKTFUNK_GS_ENCRYPT`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -402,11 +441,17 @@ enum EncOffer {
     /// RTX 4090, 2560x1440@240 HEVC Main10): the client opts in of its own accord even on a
     /// LAN, and decodes the sealed stream in hardware with zero errors.
     Supported,
-    /// `require` — additionally list it as REQUESTED, which forces any client that supports
-    /// it to enable it. **The on-glass test lever**: with `Supported` alone a LAN session may
-    /// negotiate plaintext and never exercise a single sealed packet, so a green test would
-    /// prove nothing about the path it was meant to validate. Not a shipping mode — a client
-    /// that cannot do video encryption has nowhere to go from here.
+    /// `control` — additionally offer `SS_ENC_CONTROL_V2`, which closes the legacy control
+    /// scheme's (key, nonce) reuse. Its own tier rather than part of the default because it is
+    /// the newer wire and has not yet met a real client here: the same posture WP7 shipped video
+    /// encryption in (dark, then default after glass confirmed it). Flip the default once an
+    /// on-glass run negotiates it and the session survives.
+    Control,
+    /// `require` — additionally list everything offered as REQUESTED, which forces any client
+    /// that supports it to enable it. **The on-glass test lever**: with `Supported` alone a LAN
+    /// session may negotiate plaintext and never exercise a single sealed packet, so a green test
+    /// would prove nothing about the path it was meant to validate. Not a shipping mode — a
+    /// client that cannot do the offered encryption has nowhere to go from here.
     Required,
 }
 
@@ -425,6 +470,7 @@ fn gs_video_encryption_offer() -> EncOffer {
             .map(str::trim)
         {
             Ok("0") | Ok("off") | Ok("false") | Ok("no") => EncOffer::Off,
+            Ok("control") | Ok("control-v2") => EncOffer::Control,
             Ok("require") | Ok("required") => EncOffer::Required,
             // Unset, `1`, `supported`, or anything unrecognized: the default offer.
             _ => EncOffer::Supported,
@@ -435,11 +481,146 @@ fn gs_video_encryption_offer() -> EncOffer {
 /// The `(encryptionSupported, encryptionRequested)` masks an offer advertises — pure, so the
 /// advertisement is unit-testable without touching the process-global env.
 fn enc_flags(offer: EncOffer) -> (u32, u32) {
+    // REQUESTED is only ever non-zero for the `require` test lever: requiring encryption would
+    // refuse every client that cannot do it.
     match offer {
         EncOffer::Off => (0, 0),
         EncOffer::Supported => (SS_ENC_VIDEO, 0),
-        EncOffer::Required => (SS_ENC_VIDEO, SS_ENC_VIDEO),
+        EncOffer::Control => (SS_ENC_VIDEO | SS_ENC_CONTROL_V2, 0),
+        EncOffer::Required => (
+            SS_ENC_VIDEO | SS_ENC_CONTROL_V2,
+            SS_ENC_VIDEO | SS_ENC_CONTROL_V2,
+        ),
     }
+}
+
+/// `ENCRYPTED_MESSAGE_TYPE_BIT` — the MSB of `typeAndLength`, set on every sealed RTSP message.
+///
+/// It is also what makes the two framings **self-distinguishing**, which is why this host needs
+/// no negotiation state for them: a plaintext RTSP message opens with an ASCII method name
+/// (`OPTIONS`, `DESCRIBE`, `PLAY`), whose first byte is always below 0x80. So the client picks the
+/// framing per connection and we answer in whatever we were asked in — no `corever` threshold to
+/// guess (the sanctioned reference names that field but not its value), and no way for the two
+/// sides to disagree.
+const ENCRYPTED_MESSAGE_TYPE_BIT: u32 = 0x8000_0000;
+
+/// `encrypted_rtsp_header_t`: `u32 typeAndLength | u32 sequenceNumber | u8 tag[16]`, big-endian,
+/// followed by `length` bytes of ciphertext.
+const ENC_RTSP_HEADER: usize = 24;
+
+/// Host→client RTSP sequence numbers. PROCESS-global and monotonic, never reset — the same rule
+/// WP7 established for the video counter, and for a sharper reason here: GameStream RTSP is one
+/// message per TCP connection, so a per-connection counter would restart at 0 for every one of a
+/// session's seven messages and reuse (key, nonce) six times over.
+static RTSP_HOST_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// The 12-byte GCM nonce for a sealed RTSP message (NIST SP800-38D 8.2.1): `sequenceNumber`
+/// big-endian in `[0..4]`, `[10]` the originating direction (`b'C'` client, `b'H'` host), `[11]`
+/// the channel (`b'R'` for RTSP). The direction byte is the entire point — it is what keeps each
+/// side's counter in its own nonce space.
+fn rtsp_nonce(seq: u32, direction: u8) -> [u8; 12] {
+    let mut iv = [0u8; 12];
+    iv[0..4].copy_from_slice(&seq.to_be_bytes());
+    iv[10] = direction;
+    iv[11] = b'R';
+    iv
+}
+
+/// Build one sealed frame: `encrypted_rtsp_header_t` followed by the ciphertext. Pure, and
+/// direction-parameterised so a test can build the client's side of the wire too.
+fn seal_frame(key: &[u8; 16], seq: u32, direction: u8, pt: &[u8]) -> Vec<u8> {
+    let ct_tag = super::control::gcm_seal(key, &rtsp_nonce(seq, direction), pt, &[]);
+    let (ct, tag) = ct_tag.split_at(ct_tag.len() - 16);
+    let mut wire = Vec::with_capacity(ENC_RTSP_HEADER + ct.len());
+    wire.extend_from_slice(&(ENCRYPTED_MESSAGE_TYPE_BIT | ct.len() as u32).to_be_bytes());
+    wire.extend_from_slice(&seq.to_be_bytes());
+    wire.extend_from_slice(tag);
+    wire.extend_from_slice(ct);
+    wire
+}
+
+/// Frame + seal one RTSP response for a client that sealed its request.
+fn seal_response(key: &[u8; 16], pt: &[u8]) -> Vec<u8> {
+    seal_frame(key, RTSP_HOST_SEQ.fetch_add(1, Ordering::Relaxed), b'H', pt)
+}
+
+/// Open one COMPLETE sealed frame and parse the RTSP message inside it. Split out of
+/// [`read_sealed_message`] so the half that can be wrong about the wire is reachable without a
+/// socket. `frame` must be exactly the header plus its declared payload.
+fn open_sealed_frame(key: &[u8; 16], frame: &[u8]) -> Result<Request> {
+    anyhow::ensure!(
+        frame.len() >= ENC_RTSP_HEADER,
+        "sealed RTSP frame too short"
+    );
+    let seq = u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]);
+    // Wire order is tag-first; `aes-gcm` wants `ciphertext || tag`.
+    let mut ct_tag = frame[ENC_RTSP_HEADER..].to_vec();
+    ct_tag.extend_from_slice(&frame[8..ENC_RTSP_HEADER]);
+    let pt = super::control::gcm_open(key, &rtsp_nonce(seq, b'C'), &ct_tag, &[])
+        .context("sealed RTSP message failed to authenticate")?;
+    // Inside the seal is an ordinary RTSP message. Its end is already known from the frame
+    // length, so unlike the plaintext path there is no Content-Length to trust.
+    let Some(end) = find_subslice(&pt, b"\r\n\r\n") else {
+        anyhow::bail!("sealed RTSP message has no header terminator");
+    };
+    if end > MAX_RTSP_HEADER {
+        anyhow::bail!("RTSP headers exceed limit");
+    }
+    let head = std::str::from_utf8(&pt[..end]).context("RTSP header utf8")?;
+    let body = String::from_utf8_lossy(&pt[end + 4..]).into_owned();
+    Ok(parse_request(head, body))
+}
+
+/// Read until `buf` holds at least `want` bytes. `Ok(false)` = the peer closed first.
+fn fill_at_least(
+    stream: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    want: usize,
+    deadline: Instant,
+) -> Result<bool> {
+    while buf.len() < want {
+        if Instant::now() >= deadline {
+            anyhow::bail!("RTSP request deadline exceeded");
+        }
+        let mut tmp = [0u8; 8192];
+        let n = stream.read(&mut tmp).context("RTSP read")?;
+        if n == 0 {
+            return Ok(false);
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > MAX_RTSP_MSG {
+            anyhow::bail!("RTSP message exceeds limit");
+        }
+    }
+    Ok(true)
+}
+
+/// Read one **sealed** RTSP message and return the request inside it. Decrypt input is
+/// `tag || ciphertext` on the wire, which is reassembled into the `ciphertext || tag` order
+/// `aes-gcm` expects.
+fn read_sealed_message(
+    stream: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    deadline: Instant,
+    key: &[u8; 16],
+) -> Result<Option<Request>> {
+    if !fill_at_least(stream, buf, ENC_RTSP_HEADER, deadline)? {
+        return Ok(None);
+    }
+    let type_and_length = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let len = (type_and_length & !ENCRYPTED_MESSAGE_TYPE_BIT) as usize;
+    // This length is attacker-controlled and reaches us before a single byte has authenticated,
+    // so it is bounded by the same budget the plaintext path uses rather than trusted enough to
+    // reserve against. (`fill_at_least` also caps, but refusing here avoids the read entirely.)
+    if len > MAX_RTSP_MSG {
+        anyhow::bail!("sealed RTSP payload of {len} bytes exceeds limit");
+    }
+    if !fill_at_least(stream, buf, ENC_RTSP_HEADER + len, deadline)? {
+        anyhow::bail!("sealed RTSP message truncated");
+    }
+    let req = open_sealed_frame(key, &buf[..ENC_RTSP_HEADER + len])?;
+    buf.drain(..ENC_RTSP_HEADER + len);
+    Ok(Some(req))
 }
 
 /// Host capability SDP returned by DESCRIBE. Advertises HEVC + AV1, the surround configs, and
@@ -673,12 +854,24 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         .filter(|n| (1..=32).contains(n))
         .unwrap_or(1);
     // The encryption bitmask the client CHOSE, echoed back from what DESCRIBE advertised
-    // (WP7). Honor only the VIDEO bit, and only when we offered it — a client cannot turn on
-    // a mode the host never advertised, whatever it echoes.
-    let encrypt_video = gs_video_encryption_offer() != EncOffer::Off
-        && parse_u("x-ss-general.encryptionEnabled").unwrap_or(0) & SS_ENC_VIDEO != 0;
+    // (WP7). Honor a bit only when we actually offered it — a client cannot turn on a mode the
+    // host never advertised, whatever it echoes — so the echo is masked by the offer rather than
+    // merely checked against `Off`.
+    let (offered, _) = enc_flags(gs_video_encryption_offer());
+    let enabled = parse_u("x-ss-general.encryptionEnabled").unwrap_or(0) & offered;
+    let encrypt_video = enabled & SS_ENC_VIDEO != 0;
     if encrypt_video {
         tracing::info!("RTSP ANNOUNCE: client enabled SS_ENC_VIDEO — sealing every video shard");
+    }
+    // Nothing to store for the control bit: both planes it governs recognise the sealed form
+    // from the wire itself — the ENet stream detects the V2 nonce on the first packet that
+    // authenticates, and RTSP detects the sealed framing from its leading MSB. Worth saying out
+    // loud all the same, because it is what retires the legacy scheme's (key, nonce) reuse for
+    // this session.
+    if enabled & SS_ENC_CONTROL_V2 != 0 {
+        tracing::info!(
+            "RTSP ANNOUNCE: client enabled SS_ENC_CONTROL_V2 — control nonces are per-direction"
+        );
     }
     Some(StreamConfig {
         width,
@@ -931,26 +1124,132 @@ mod tests {
         assert_eq!(ap.channels, 2);
     }
 
-    /// WP7 advertisement: OFF advertises nothing (the shipping default, so a stock client
-    /// negotiates the plaintext wire exactly as it always has); `Supported` offers video
-    /// encryption without ever REQUIRING it; only the `require` test lever sets requested —
-    /// which is the whole reason it exists (a client that is merely *allowed* to encrypt may
-    /// decline on a LAN, and then an on-glass test proves nothing).
+    /// The advertisement ladder: `Off` offers nothing (the plaintext wire this plane shipped
+    /// before WP7); `Supported` — the default — offers video encryption; `control` adds
+    /// `SS_ENC_CONTROL_V2`; and only the `require` test lever ever sets REQUESTED, which is the
+    /// whole reason it exists (a client that is merely *allowed* to encrypt may decline on a LAN,
+    /// and then an on-glass test proves nothing).
     #[test]
     fn encryption_is_offered_but_never_required_in_shipping_modes() {
         assert_eq!(enc_flags(EncOffer::Off), (0, 0));
         assert_eq!(enc_flags(EncOffer::Supported), (SS_ENC_VIDEO, 0));
         assert_eq!(
+            enc_flags(EncOffer::Control),
+            (SS_ENC_VIDEO | SS_ENC_CONTROL_V2, 0),
+            "the control tier adds V2 without requiring it"
+        );
+        assert_eq!(
             enc_flags(EncOffer::Required),
-            (SS_ENC_VIDEO, SS_ENC_VIDEO),
+            (
+                SS_ENC_VIDEO | SS_ENC_CONTROL_V2,
+                SS_ENC_VIDEO | SS_ENC_CONTROL_V2
+            ),
             "the test lever must also REQUEST it, or a client may decline"
         );
-        // Whatever the mode, the host never advertises a bit it cannot serve.
-        for offer in [EncOffer::Off, EncOffer::Supported, EncOffer::Required] {
+        // Whatever the mode, the host never advertises a bit it cannot serve — `SS_ENC_AUDIO`
+        // (0x04) most of all, whose layout is not in the sanctioned reference.
+        let servable = SS_ENC_VIDEO | SS_ENC_CONTROL_V2;
+        for offer in [
+            EncOffer::Off,
+            EncOffer::Supported,
+            EncOffer::Control,
+            EncOffer::Required,
+        ] {
             let (sup, req) = enc_flags(offer);
-            assert_eq!(sup & !SS_ENC_VIDEO, 0, "no unimplemented bits offered");
+            assert_eq!(sup & !servable, 0, "no unimplemented bits offered");
             assert_eq!(req & !sup, 0, "never request what isn't supported");
         }
+        // The default stays video-only until an on-glass run confirms V2 against a real client.
+        assert_eq!(
+            enc_flags(EncOffer::Supported).0 & SS_ENC_CONTROL_V2,
+            0,
+            "control-v2 must stay opt-in until glass confirms it"
+        );
+    }
+
+    /// The sealed-RTSP round trip, and the property the whole framing rests on: a sealed message
+    /// is recognisable from its first byte, and a plaintext one is never mistaken for it.
+    #[test]
+    fn sealed_rtsp_round_trips_and_is_self_distinguishing() {
+        let key = [0x5Au8; 16];
+        let msg = b"OPTIONS rtsp://x RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+        let wire = seal_response(&key, msg);
+        assert!(wire.len() > ENC_RTSP_HEADER);
+        // A sealed frame announces itself in the MSB; RTSP methods are ASCII and never do.
+        assert!(wire[0] & 0x80 != 0, "sealed frames set the type bit");
+        for method in [
+            "OPTIONS", "DESCRIBE", "SETUP", "ANNOUNCE", "PLAY", "TEARDOWN",
+        ] {
+            assert!(
+                method.as_bytes()[0] & 0x80 == 0,
+                "{method} must not look sealed"
+            );
+        }
+        let type_and_length = u32::from_be_bytes([wire[0], wire[1], wire[2], wire[3]]);
+        let len = (type_and_length & !ENCRYPTED_MESSAGE_TYPE_BIT) as usize;
+        assert_eq!(
+            len,
+            wire.len() - ENC_RTSP_HEADER,
+            "length covers the payload"
+        );
+        let seq = u32::from_be_bytes([wire[4], wire[5], wire[6], wire[7]]);
+        // Decrypt the way a client does: wire order is tag-first, `aes-gcm` wants tag last.
+        let mut ct_tag = wire[ENC_RTSP_HEADER..].to_vec();
+        ct_tag.extend_from_slice(&wire[8..ENC_RTSP_HEADER]);
+        let pt = super::super::control::gcm_open(&key, &rtsp_nonce(seq, b'H'), &ct_tag, &[])
+            .expect("host-sealed RTSP must open under the H/R nonce");
+        assert_eq!(pt, msg);
+        // The direction byte is the point: the client's nonce must NOT open a host message.
+        assert!(
+            super::super::control::gcm_open(&key, &rtsp_nonce(seq, b'C'), &ct_tag, &[]).is_none(),
+            "a host message must not authenticate under the client direction"
+        );
+    }
+
+    /// The receive path, end to end: a frame sealed the way a client seals one is opened and
+    /// parsed back into the request it carried — headers, CSeq and body intact. This is the half
+    /// that decides whether a sealed session works at all.
+    #[test]
+    fn sealed_rtsp_request_is_opened_and_parsed() {
+        let key = [0xC3u8; 16];
+        let msg = b"ANNOUNCE rtsp://x RTSP/1.0\r\nCSeq: 6\r\nContent-length: 7\r\n\r\nv=0\r\na=b";
+        let frame = seal_frame(&key, 42, b'C', msg);
+        let req = open_sealed_frame(&key, &frame).expect("a client-sealed frame must open");
+        assert_eq!(req.method, "ANNOUNCE");
+        assert_eq!(req.cseq, "6");
+        assert_eq!(req.body, "v=0\r\na=b");
+
+        // A frame sealed in the HOST direction must not open as a client request — the direction
+        // byte is what separates the two nonce spaces.
+        let host_framed = seal_frame(&key, 42, b'H', msg);
+        assert!(
+            open_sealed_frame(&key, &host_framed).is_err(),
+            "host-direction frame must not authenticate as a client request"
+        );
+        // Neither may a tampered one: GCM is what makes this different from the CBC audio path.
+        let mut flipped = frame.clone();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 0x01;
+        assert!(
+            open_sealed_frame(&key, &flipped).is_err(),
+            "a flipped ciphertext byte must be rejected, not decrypted"
+        );
+        // …and a wrong key must not open it either.
+        assert!(open_sealed_frame(&[0u8; 16], &frame).is_err(), "wrong key");
+    }
+
+    /// Every sealed host message must use a fresh sequence number. RTSP is one message per TCP
+    /// connection, so a counter that reset per connection would repeat (key, nonce) across a
+    /// session's seven messages — the one catastrophic AES-GCM failure.
+    #[test]
+    fn host_rtsp_sequence_never_repeats() {
+        let key = [1u8; 16];
+        let seq_of = |w: &[u8]| u32::from_be_bytes([w[4], w[5], w[6], w[7]]);
+        let a = seq_of(&seal_response(&key, b"a\r\n\r\n"));
+        let b = seal_response(&key, b"b\r\n\r\n");
+        let c = seal_response(&key, b"c\r\n\r\n");
+        assert!(seq_of(&b) > a, "sequence must advance");
+        assert!(seq_of(&c) > seq_of(&b), "sequence must advance");
     }
 
     /// The DESCRIBE SDP carries the codec indicators and all six Opus configs, normal
