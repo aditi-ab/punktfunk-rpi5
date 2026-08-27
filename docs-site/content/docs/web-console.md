@@ -36,23 +36,26 @@ In practice:
 
 ## Enable the console
 
-- **Linux packages (apt / RPM / Bazzite):** the host package (`punktfunk-host` on Ubuntu,
-  `punktfunk` on Fedora/Bazzite) *recommends* `punktfunk-web`, so your package manager pulls the
-  console in with the host (the Bazzite sysext image already contains it). Enable it as your
-  desktop user:
+- **Linux packages (apt / RPM / Arch / Bazzite):** `punktfunk-web` is its own package, and the
+  install line on every distro page names it (the Bazzite sysext image already contains it).
+  Enable it as your desktop user:
 
   ```sh
   systemctl --user enable --now punktfunk-web
   # then browse to https://<host-ip>:47992
   ```
 
-- **Arch / CachyOS (pacman):** the console is an *optional* package and pacman never installs
-  optional dependencies — install it from the same repo the host came from (see
-  [Arch Linux](/docs/arch)), then enable it as above. Use a full `-Syu`, never a bare `pacman -S`,
-  to avoid a partial upgrade:
+  **No console on a box that has the host?** That is the one way this goes wrong: the host package
+  only *recommends* the console on apt and RPM, and lists it as an *optional* dependency on Arch
+  (pacman never installs those). So a host put on by hand, or by a package manager configured to
+  skip weak dependencies (`install_weak_deps=False` in `/etc/dnf/dnf.conf`,
+  `APT::Install-Recommends "0"`), has no console. Install it from the same repo the host came
+  from — on Arch as a full `-Syu`, never a bare `pacman -S`, to avoid a partial upgrade:
 
   ```sh
-  sudo pacman -Syu punktfunk-web
+  sudo dnf install punktfunk-web        # Fedora
+  sudo apt install punktfunk-web        # Debian / Ubuntu
+  sudo pacman -Syu punktfunk-web        # Arch / CachyOS
   systemctl --user enable --now punktfunk-web
   ```
 

@@ -39,12 +39,15 @@ jobs:
           - family: debian-13
             image: debian:trixie
             prep: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl git nodejs
+            rmweb: apt-get purge -y punktfunk-web
           - family: fedora-44
             image: fedora:44
             prep: dnf install -y -q curl git nodejs
+            rmweb: dnf remove -y punktfunk-web
           - family: arch
             image: archlinux:base
             prep: pacman -Sy --noconfirm --needed curl git nodejs && (pacman-key --init >/dev/null 2>&1 || true)
+            rmweb: pacman -Rns --noconfirm punktfunk-web
     container:
       image: ${{ matrix.image }}
     steps:
@@ -59,8 +62,25 @@ jobs:
         run: |
           punktfunk-host --version
           punktfunk-host detect-conflicts
+      # The console is the whole management surface — pairing, approving a device, every setting.
+      # A host without it can be installed and still be useless, so assert it by name: the binary
+      # the package puts on PATH and the user unit step 6 enables.
+      - name: The web console is installed too
+        run: |
+          command -v punktfunk-web-server
+          test -f /usr/lib/systemd/user/punktfunk-web.service
       - name: Re-running is a no-op install
         run: sh scripts/install.sh --yes --no-start | grep -q 'already installed'
+      # The reported Fedora failure, as a test: a box that has the host but lost (or never got)
+      # the console must get one back from a re-run. Before the per-package check, the installer
+      # saw punktfunk-host on PATH, declared itself done, and left the box without a console
+      # while still printing the console's URL.
+      - name: A host without a console gets one back on re-run
+        run: |
+          ${{ matrix.rmweb }}
+          ! command -v punktfunk-web-server
+          sh scripts/install.sh --yes --no-start
+          command -v punktfunk-web-server
       - name: --uninstall takes the packages and the repo off again
         run: |
           sh scripts/install.sh --yes --uninstall

@@ -26,8 +26,10 @@ For **Ubuntu 26.04 or newer**, Desktop or Server, GNOME or KDE.
 
 ## 2. Install the host
 
-The repo is public and signed; this adds it and installs the host (the browser console,
-`punktfunk-web`, comes along automatically):
+The repo is public and signed; this adds it and installs the host together with the browser
+console (`punktfunk-web`) and the plugin runner (`punktfunk-scripting`). They are named in the
+line rather than left to apt: `punktfunk-host` only *recommends* them, so a box with
+`APT::Install-Recommends "0"` would end up with a host you cannot pair with.
 
 <Install platform="debian" />
 
