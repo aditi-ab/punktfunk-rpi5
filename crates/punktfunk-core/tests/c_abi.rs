@@ -42,18 +42,31 @@ fn native_libs() -> &'static [&'static str] {
 }
 
 fn ensure_staticlib(profile_dir: &Path) -> PathBuf {
-    let staticlib = profile_dir.join("libpunktfunk_core.a");
     // `cargo test` doesn't always emit the standalone staticlib; build it — WITH `quic`, the
     // surface the harness declares (`-DPUNKTFUNK_FEATURE_QUIC`) and this test's link line
     // already pays for (`-lopus`, Security). Unconditional, because a featureless `.a` left by
     // an earlier plain `cargo build` would otherwise be reused and fail the link on the quic
-    // symbols; when the artifact is already right this is an incremental no-op. The outer
-    // cargo's build lock is released during test execution, so this is safe.
+    // symbols.
+    //
+    // ⚠ INTO A TARGET DIR OF ITS OWN, and that is the whole point. This runs while the OUTER
+    // `cargo test` is mid-flight, and that run's pending units — the doctests especially —
+    // name `target/<profile>/deps/*.rlib` by explicit `--extern` path. Resolving features for
+    // `-p punktfunk-core` alone is not the workspace union the outer run resolved, so a shared
+    // directory gets that subgraph rebuilt under different metadata and the outer run's paths
+    // stop existing underneath it. That is what made `Doc-tests pf_capture` die with
+    // `E0463: can't find crate for pf_frame` after a green build, green clippy and green tests
+    // — a dependency nothing in the diff had touched. The outer build lock being released
+    // during test execution is why this RUNS; it was never why it is safe.
+    let nested = profile_dir
+        .parent()
+        .expect("target dir")
+        .join("c-abi-harness");
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let _ = Command::new(cargo)
         .args(["build", "-p", "punktfunk-core", "--features", "quic"])
+        .env("CARGO_TARGET_DIR", &nested)
         .status();
-    staticlib
+    nested.join("debug").join("libpunktfunk_core.a")
 }
 
 #[test]
@@ -86,9 +99,9 @@ fn c_abi_harness_round_trips() {
 
     let mut compile = Command::new(&cc);
     compile
-        // The staticlib is built with workspace-unified features, quic included (that's what the
-        // -lopus / Security link line below pays for) — so expose the header's quic surface and
-        // let the harness exercise it (the `PunktfunkConnectOpts` layout check).
+        // `ensure_staticlib` builds it with `quic` (that's what the -lopus / Security link line
+        // below pays for) — so expose the header's quic surface and let the harness exercise it
+        // (the `PunktfunkConnectOpts` layout check).
         .args([
             "-std=c11",
             "-Wall",
