@@ -292,6 +292,9 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                         state.force_idr.clone(),
                         state.rfi_range.clone(),
                         state.loss_stats.clone(),
+                        // The rikey reaches the video plane only when SS_ENC_VIDEO was
+                        // negotiated (WP7) — no reason for it to travel otherwise.
+                        cfg.encrypt_video.then_some(ls.gcm_key),
                         state.video_cap.clone(),
                         state.stats.clone(),
                         on_lost.clone(),
@@ -363,8 +366,25 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
 /// of synthesizing mouse input client-side.
 const SS_FF_PEN_TOUCH_EVENTS: u32 = 0x01;
 
-/// Host capability SDP returned by DESCRIBE. Advertises HEVC + AV1 and no encryption
-/// (plaintext streams for now; P1.5 adds the negotiated AES paths).
+/// `SS_ENC_VIDEO` — the per-shard AES-128-GCM video mode (moonlight-common-c
+/// `Limelight-internal.h`; the siblings are `SS_ENC_CONTROL_V2` 0x01 and `SS_ENC_AUDIO` 0x04,
+/// neither of which this host offers yet: control-v2 also re-frames RTSP itself, and the
+/// audio-GCM layout is not in the sanctioned wire reference).
+const SS_ENC_VIDEO: u32 = 0x02;
+
+/// Whether this host OFFERS video encryption (WP7). **Opt-in** (`PUNKTFUNK_GS_ENCRYPT=1`)
+/// until the on-glass pass confirms a stock client negotiates and decodes it: the sealed path
+/// is the compat plane's video hot path, and a wire mistake there is a total black screen for
+/// any client that opts in — where the cost of shipping it dark is only that nobody gets the
+/// benefit yet. Flip the default once WP0.3 has run it against real Moonlight.
+fn gs_video_encryption_offered() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PUNKTFUNK_GS_ENCRYPT").as_deref() == Ok("1"))
+}
+
+/// Host capability SDP returned by DESCRIBE. Advertises HEVC + AV1, the surround configs, and
+/// — when offered — `SS_ENC_VIDEO` as SUPPORTED but never REQUESTED: a stock client that
+/// wants plaintext (or predates the negotiation) must keep working exactly as before.
 fn describe_sdp() -> String {
     // Pen/touch events are advertised only where we can actually inject them (Linux with
     // uinput — the same gate as HOST_CAP_PEN; design/pen-tablet-input.md §4). Elsewhere the
@@ -376,9 +396,15 @@ fn describe_sdp() -> String {
         0
     };
     // Line-oriented a=key:value, matching what moonlight-common-c scans for.
+    let supported = if gs_video_encryption_offered() {
+        SS_ENC_VIDEO
+    } else {
+        0
+    };
     let mut lines: Vec<String> = vec![
         format!("a=x-ss-general.featureFlags:{feature_flags}"),
-        "a=x-ss-general.encryptionSupported:0".into(),
+        format!("a=x-ss-general.encryptionSupported:{supported}"),
+        // Never REQUESTED: requiring encryption would refuse every client that doesn't do it.
         "a=x-ss-general.encryptionRequested:0".into(),
         "sprop-parameter-sets=AAAAAU".into(), // HEVC capability indicator
         "a=rtpmap:98 AV1/90000".into(),       // AV1 capability indicator
@@ -589,6 +615,14 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
     let slices = parse_u("x-nv-video[0].videoEncoderSlicesPerFrame")
         .filter(|n| (1..=32).contains(n))
         .unwrap_or(1);
+    // The encryption bitmask the client CHOSE, echoed back from what DESCRIBE advertised
+    // (WP7). Honor only the VIDEO bit, and only when we offered it — a client cannot turn on
+    // a mode the host never advertised, whatever it echoes.
+    let encrypt_video = gs_video_encryption_offered()
+        && parse_u("x-ss-general.encryptionEnabled").unwrap_or(0) & SS_ENC_VIDEO != 0;
+    if encrypt_video {
+        tracing::info!("RTSP ANNOUNCE: client enabled SS_ENC_VIDEO — sealing every video shard");
+    }
     Some(StreamConfig {
         width,
         height,
@@ -599,6 +633,7 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         min_fec,
         hdr,
         slices,
+        encrypt_video,
     })
 }
 

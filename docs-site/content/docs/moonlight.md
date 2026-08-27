@@ -88,7 +88,8 @@ The device then appears under **Paired devices**, and Moonlight remembers the ho
 
 Moonlight lists **Desktop** plus the games the host found installed (Steam, Epic, GOG, Xbox), with
 cover art — the same [library](/docs/game-library) the native clients show. Pick one and start
-streaming. The host creates a virtual display at the resolution and frame rate Moonlight requests
+streaming. While a session of yours is running, Moonlight offers **Resume** and **Quit** for it —
+resuming re-attaches to the session you left (only the device that started it sees this). The host creates a virtual display at the resolution and frame rate Moonlight requests
 (set these in Moonlight's settings), encodes it on the GPU, and streams it. Mouse, keyboard, and
 controllers flow back to the host — and a Moonlight client that sends pen events, an iPad's Apple
 Pencil included, drives the same host-side tablet a native client would, with pressure and tilt
@@ -107,10 +108,19 @@ That **Desktop** entry is the operator base list. An `apps.json` in the host's c
   10-bit BT.2020 PQ. If the toggle is there, turn it on and pick HEVC or AV1 — H.264 stays SDR.
   Setting `PUNKTFUNK_10BIT=0` in [`host.env`](/docs/configuration) withdraws the offer entirely; it
   is on by default.
-- **Bitrate:** start moderate and raise it. For very high bitrates, the [native
-  clients](/docs/clients) have a built-in speed test; with Moonlight, set the bitrate manually.
-- Moonlight uses the GameStream protocol, not Punktfunk's native FEC/encryption extensions. On a
-  solid LAN this is fine; on a lossy link a [native client](/docs/clients) holds up better.
+- **Bitrate:** the number you set is a **wire budget**, not an encoder setting — the host fits the
+  video *plus* its error-correction inside it, so "20 Mbps" means about 20 Mbps on the wire. Start
+  moderate and raise it. For very high bitrates, the [native clients](/docs/clients) have a
+  built-in speed test; with Moonlight, set the bitrate manually.
+- **The host adapts to your link.** Moonlight reports packet loss back to the host, and Punktfunk
+  acts on it: error correction is added when loss appears and wound back down when the link is
+  clean, and sustained loss also eases the bitrate off (recovering as things settle). Nothing to
+  configure — and it is why a marginal Wi-Fi link degrades rather than stuttering.
+- Moonlight uses the GameStream protocol, so it doesn't get Punktfunk's native-protocol
+  extensions — no client-side speed test, no jumbo frames, and its control channel uses the older
+  GameStream encryption. Video error correction is *not* on that list: Moonlight-compatible FEC is
+  in every stream. On a good link the two protocols feel the same; a [native
+  client](/docs/clients) still has more headroom on a bad one.
 - Comparing Moonlight's performance overlay with a Punktfunk client's stats HUD? The numbers
   measure different slices of the pipeline — see [Understanding the Stats Overlay](/docs/stats)
   for a line-by-line comparison matrix before drawing conclusions.

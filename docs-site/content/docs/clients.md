@@ -39,8 +39,9 @@ Open the app, pick your host, [pair](/docs/pairing) once, and stream. It builds 
 Punktfunk also speaks the **GameStream** protocol, so any [Moonlight](https://moonlight-stream.org/)
 client — a browser, a smart TV, an old phone, a games console — connects with no punktfunk-specific
 software; it's the catch-all where no native Punktfunk app exists. See
-[Connect with Moonlight](/docs/moonlight). It doesn't use the native protocol's FEC/encryption
-extensions, but on a healthy LAN that rarely matters.
+[Connect with Moonlight](/docs/moonlight). It gets error correction and host-side adaptation to a
+lossy link like the native clients do; what it doesn't get are the native protocol's extensions
+(client-side speed test, jumbo frames, the newer control encryption).
 
 ## Linux desktop client (GTK4)
 

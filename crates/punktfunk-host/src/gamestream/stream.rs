@@ -34,6 +34,10 @@ pub struct StreamConfig {
     /// (Amlogic — Chromecast with Google TV) wedge the whole device on multi-slice AUs they
     /// never asked for (the 0.17.0 4-slice-default field regression). Absent ⇒ 1.
     pub slices: u32,
+    /// The client echoed `SS_ENC_VIDEO` in its ANNOUNCE `x-ss-general.encryptionEnabled`, so
+    /// every video shard is AES-128-GCM-sealed under the `/launch` rikey (WP7). Only ever true
+    /// when the host advertised the bit in the first place — see `gs_video_encryption_offered`.
+    pub encrypt_video: bool,
 }
 
 /// A pooled capturer plus the three properties reuse must match on — its HDR-ness, its
@@ -86,6 +90,10 @@ pub fn start(
     force_idr: Arc<AtomicBool>,
     rfi_range: RfiSlot,
     loss: Arc<super::GsLossStats>,
+    // The session rikey, ONLY when `cfg.encrypt_video` (WP7). Deliberately its own parameter
+    // rather than a `StreamConfig` field: that struct is `Debug`-logged at stream start, and a
+    // session key has no business in the log.
+    gcm_key: Option<[u8; 16]>,
     video_cap: CapturerSlot,
     stats: Arc<crate::stats_recorder::StatsRecorder>,
     on_lost: super::OnSessionLost,
@@ -142,6 +150,7 @@ pub fn start(
                 &force_idr,
                 &rfi_range,
                 &loss,
+                gcm_key,
                 &video_cap,
                 &stats,
                 &on_lost,
@@ -180,6 +189,8 @@ fn run(
     force_idr: &AtomicBool,
     rfi_range: &std::sync::Mutex<Option<(i64, i64)>>,
     loss: &super::GsLossStats,
+    // The session rikey when SS_ENC_VIDEO was negotiated — see `start`.
+    gcm_key: Option<[u8; 16]>,
     video_cap: &std::sync::Mutex<Option<PooledCapturer>>,
     // Shared stats recorder for the web-console capture/graph. Threaded into `stream_body` (the
     // encode loop); per-frame sample emission is wired by a later pass.
@@ -531,6 +542,7 @@ fn run(
             force_idr,
             rfi_range,
             loss,
+            gcm_key,
             stats,
             &client_label,
             on_lost,
@@ -623,6 +635,7 @@ fn run(
         force_idr,
         rfi_range,
         loss,
+        gcm_key,
         stats,
         &client_label,
         on_lost,
@@ -1253,6 +1266,8 @@ fn stream_body(
     // Client-reported loss counters (control 0x0201) — read as deltas by the 1 Hz adaptation
     // step below (WP2.2-2.4: adaptive FEC percent + bitrate de-rating under the wire budget).
     loss: &super::GsLossStats,
+    // The session rikey when SS_ENC_VIDEO was negotiated (WP7) — see `start`.
+    gcm_key: Option<[u8; 16]>,
     // Shared stats recorder. The encode loop reads `stats.is_armed()` per frame to decide whether
     // to accumulate the per-stage split, then emits a `StatsSample` at its 1 s aggregation boundary.
     stats: &Arc<crate::stats_recorder::StatsRecorder>,
@@ -1347,7 +1362,17 @@ fn stream_body(
     // Both sites that swap `enc` re-bind `frame` with it, so this is always
     // `(frame.format, frame.width, frame.height)` right after one.
     let mut enc_src = (frame.format, frame.width, frame.height);
-    let pk = VideoPacketizer::new(cfg.packet_size, fec_pct, cfg.min_fec);
+    let mut pk = VideoPacketizer::new(cfg.packet_size, fec_pct, cfg.min_fec);
+    // SS_ENC_VIDEO (WP7): seal every shard under the session's rikey when the client
+    // negotiated it. `cfg.encrypt_video` is already gated on the host having OFFERED the bit.
+    if cfg.encrypt_video {
+        match gcm_key {
+            Some(key) => pk.set_encryption_key(key),
+            // Can't happen (a session exists by RTSP PLAY), and streaming PLAINTEXT to a client
+            // expecting ciphertext is a black screen — refuse instead.
+            None => anyhow::bail!("SS_ENC_VIDEO negotiated but the session key is gone"),
+        }
+    }
 
     // Pace at the client's negotiated frame rate, re-encoding the last captured frame when the
     // compositor produced no new one. Compositors only emit frames on damage, so a static or

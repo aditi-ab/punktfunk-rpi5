@@ -12,8 +12,13 @@
 //! `flags` byte isn't valid — so the NV header fields RS must reproduce (streamPacketIndex,
 //! frameIndex, flags, multiFec*) are written into the data shards **before** encoding, and only
 //! the transport fields (RTP header/seq/timestamp + fecInfo) are stamped **after**, matching
-//! Sunshine `stream.cpp`. `pct = 0` falls back to data-shards-only. Plaintext (AES-GCM video
-//! encryption is negotiated off for now).
+//! Sunshine `stream.cpp`. `pct = 0` falls back to data-shards-only.
+//!
+//! ENCRYPTION (`SS_ENC_VIDEO`, WP7 — negotiated per session, see `rtsp::describe_sdp`): when the
+//! client enables it, each finished datagram is AES-128-GCM-sealed under the `/launch` rikey and
+//! shipped as `[iv 12][frameNumber u32 LE][tag 16] || ciphertext(blocksize)`. The order is
+//! **FEC first, then encrypt per shard** — the client decrypts each shard it received and runs RS
+//! recovery over those plaintexts, so parity over ciphertext would recover nothing.
 //!
 //! Buffers are POOLED (GS competitive program WP1.3): every datagram the paced sender finishes
 //! with comes back through [`VideoPacketizer::recycle`], so a steady-state frame allocates
@@ -25,6 +30,13 @@ use punktfunk_core::fec::{ErasureCoder, Gf8Coder};
 
 /// RTP `header` byte: version 2 (0x80) | extension (0x10) — Moonlight keys on the extension.
 const RTP_HEADER_BYTE: u8 = 0x80 | 0x10;
+/// `ENC_VIDEO_HEADER` / `video_packet_enc_prefix_t` — the 32-byte WIRE PREFIX in front of an
+/// encrypted shard (`SS_ENC_VIDEO`, WP7): `[iv 12][frameNumber u32 LE][tag 16]`. Sixteen-byte
+/// multiple by design, so the FEC blocksize behind it stays 16-aligned. It sits OUTSIDE the
+/// FEC blocksize: the on-wire datagram is `prefix || ciphertext(blocksize)`, and the client
+/// subtracted `sizeof(ENC_VIDEO_HEADER)` from the `packetSize` it negotiated, so the datagram
+/// still fits the MTU it sized for.
+const ENC_PREFIX: usize = 32;
 const FLAG_PIC: u8 = 0x1;
 const FLAG_EOF: u8 = 0x2;
 const FLAG_SOF: u8 = 0x4;
@@ -64,6 +76,9 @@ pub struct VideoPacketizer {
     /// Persistent GF(2⁸) coder so its `(k, m)` Cauchy-matrix cache survives across frames
     /// (plan Phase 1.4) — a stream's block shape only moves with frame size.
     coder: Gf8Coder,
+    /// `SS_ENC_VIDEO` session key (the `/launch` rikey) when the client negotiated video
+    /// encryption, else `None` (the plaintext wire this plane has always sent). WP7.
+    enc_key: Option<[u8; 16]>,
     /// Spent datagram buffers handed back by the sender ([`recycle`](Self::recycle)); capped at
     /// [`POOL_MAX`]. `pop` + zero-fill replaces the per-shard allocation of the old shape.
     pool: Vec<Vec<u8>>,
@@ -72,6 +87,23 @@ pub struct VideoPacketizer {
     data_scratch: Vec<Vec<u8>>,
     /// Parity target buffers for [`ErasureCoder::encode_into`] — pooled the same way.
     parity_scratch: Vec<Vec<u8>>,
+}
+
+/// The `SS_ENC_VIDEO` nonce counter (WP7): PROCESS-global and monotonic, never reset. The
+/// nonce is `counter_le[8] || 0,0,0 || 'V'`, and (key, nonce) reuse is the one catastrophic
+/// GCM failure — a session-scoped counter would repeat the moment a KEYLESS `/resume`
+/// (WP3: keeps the current keys) started a fresh packetizer on the same rikey. A u64 at
+/// 120k packets/s outlives the hardware by millions of years, so monotonic-forever is both
+/// the simplest and the only structurally safe choice.
+static IV_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The next `ENC_VIDEO_HEADER` nonce: `counter_le[8] || 0,0,0 || 'V'` (0x56).
+fn next_iv() -> [u8; 12] {
+    let n = IV_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut iv = [0u8; 12];
+    iv[..8].copy_from_slice(&n.to_le_bytes());
+    iv[11] = b'V';
+    iv
 }
 
 impl VideoPacketizer {
@@ -89,10 +121,17 @@ impl VideoPacketizer {
             frame_index: 0,
             seq: 0,
             coder: Gf8Coder::default(),
+            enc_key: None,
             pool: Vec::new(),
             data_scratch: Vec::new(),
             parity_scratch: Vec::new(),
         }
+    }
+
+    /// Turn on `SS_ENC_VIDEO` per-shard encryption with the session's rikey (WP7). Called once,
+    /// before the first frame, when the client's ANNOUNCE echoed the VIDEO bit.
+    pub fn set_encryption_key(&mut self, key: [u8; 16]) {
+        self.enc_key = Some(key);
     }
 
     /// Retarget the FEC overhead percent mid-stream (adaptive FEC, WP2.3). Safe per frame: the
@@ -161,6 +200,14 @@ impl VideoPacketizer {
         let pps = self.payload_per_shard;
         let blocksize = SHARD_HEADER + pps; // = packet_size + 16
         let pct = self.fec_percentage;
+        // With SS_ENC_VIDEO the datagram carries a 32-byte prefix in front of the shard, so
+        // every buffer reserves it and the shard itself is written at `off`. `off = 0` is the
+        // plaintext wire, byte-for-byte what this plane always sent.
+        let off = if self.enc_key.is_some() {
+            ENC_PREFIX
+        } else {
+            0
+        };
 
         // frame payload = 8-byte short frame header + the AU bitstream. The header is built
         // once; each payload byte is copied exactly once, straight into its datagram below —
@@ -202,7 +249,10 @@ impl VideoPacketizer {
             for i in 0..k {
                 let global = first + i;
                 let seq = block_seq_base + i as u32;
-                let mut buf = self.take_buf(blocksize);
+                let mut buf = self.take_buf(off + blocksize);
+                // The shard proper: every offset below is relative to it, so the layout reads
+                // identically whether or not an encryption prefix precedes it.
+                let shard = &mut buf[off..];
                 let mut flags = FLAG_PIC;
                 if global == 0 {
                     flags |= FLAG_SOF;
@@ -210,11 +260,11 @@ impl VideoPacketizer {
                 if global == total_data - 1 {
                     flags |= FLAG_EOF;
                 }
-                buf[16..20].copy_from_slice(&(seq << 8).to_le_bytes()); // streamPacketIndex
-                buf[20..24].copy_from_slice(&frame_index.to_le_bytes()); // frameIndex
-                buf[24] = flags;
-                buf[26] = MULTI_FEC_FLAGS;
-                buf[27] = multi_fec_blocks;
+                shard[16..20].copy_from_slice(&(seq << 8).to_le_bytes()); // streamPacketIndex
+                shard[20..24].copy_from_slice(&frame_index.to_le_bytes()); // frameIndex
+                shard[24] = flags;
+                shard[26] = MULTI_FEC_FLAGS;
+                shard[27] = multi_fec_blocks;
                 // This shard covers frame-payload bytes [ps, pe): the 8-byte header first, then
                 // the AU. Only shard 0 can straddle the header/AU boundary (FRAME_HEADER < pps).
                 let ps = global * pps;
@@ -222,13 +272,13 @@ impl VideoPacketizer {
                 let mut w = SHARD_HEADER;
                 if ps < FRAME_HEADER {
                     let h_end = pe.min(FRAME_HEADER);
-                    buf[w..w + (h_end - ps)].copy_from_slice(&header[ps..h_end]);
+                    shard[w..w + (h_end - ps)].copy_from_slice(&header[ps..h_end]);
                     w += h_end - ps;
                 }
                 if pe > FRAME_HEADER {
                     let a_start = ps.max(FRAME_HEADER) - FRAME_HEADER;
                     let a_end = pe - FRAME_HEADER;
-                    buf[w..w + (a_end - a_start)].copy_from_slice(&au[a_start..a_end]);
+                    shard[w..w + (a_end - a_start)].copy_from_slice(&au[a_start..a_end]);
                 }
                 self.data_scratch.push(buf);
             }
@@ -248,7 +298,11 @@ impl VideoPacketizer {
                     let b = self.pool.pop().unwrap_or_default();
                     self.parity_scratch.push(b);
                 }
-                let refs: Vec<&[u8]> = self.data_scratch.iter().map(|s| s.as_slice()).collect();
+                // Parity covers the PLAINTEXT shards (`[off..]`), which is the whole reason the
+                // order is FEC-then-encrypt: the client decrypts each shard it received and
+                // runs RS recovery over those plaintexts, so parity computed over ciphertext
+                // would recover nothing.
+                let refs: Vec<&[u8]> = self.data_scratch.iter().map(|s| &s[off..]).collect();
                 if self
                     .coder
                     .encode_into(&refs, m, &mut self.parity_scratch)
@@ -264,33 +318,92 @@ impl VideoPacketizer {
             //    flags/streamPacketIndex bytes, so a recovered data shard's RS-reconstructed
             //    NV header stays valid.
             self.seq = block_seq_base + k as u32;
+            let key = self.enc_key;
             for (i, mut buf) in self.data_scratch.drain(..).enumerate() {
                 let seq = block_seq_base + i as u32;
                 finalize(
-                    &mut buf,
+                    &mut buf[off..],
                     seq,
                     timestamp_90k,
                     frame_index,
                     multi_fec_blocks,
                     fec_info(k, i, wire_pct),
                 );
+                seal_shard(&mut buf, key, frame_index);
                 out.push(buf);
             }
-            for (j, mut buf) in self.parity_scratch.drain(..).enumerate() {
+            // Moved out for the loop's `self.take_buf`/`self.pool` use, then restored so the
+            // scratch Vec keeps its allocation across frames.
+            let mut parity = std::mem::take(&mut self.parity_scratch);
+            for (j, mut par) in parity.drain(..).enumerate() {
                 let seq = self.seq;
                 self.seq = self.seq.wrapping_add(1);
                 finalize(
-                    &mut buf,
+                    &mut par,
                     seq,
                     timestamp_90k,
                     frame_index,
                     multi_fec_blocks,
                     fec_info(k, k + j, wire_pct),
                 );
+                // `encode_into` sizes parity to the shard length exactly, so an encrypted
+                // session moves it into a prefixed buffer (one memcpy on the ~20 % of packets
+                // that are parity) and returns the scratch buffer to the pool.
+                let mut buf = if off == 0 {
+                    par
+                } else {
+                    let mut b = self.take_buf(off + blocksize);
+                    b[off..].copy_from_slice(&par);
+                    self.pool.push(par);
+                    b
+                };
+                seal_shard(&mut buf, key, frame_index);
                 out.push(buf);
             }
+            self.parity_scratch = parity;
         }
     }
+}
+
+/// Seal one finished datagram for `SS_ENC_VIDEO` (WP7): AES-128-GCM over the WHOLE plaintext
+/// shard at `[ENC_PREFIX..]`, in place (GCM is a stream cipher — ciphertext length equals
+/// plaintext length), then the `[iv 12][frameNumber u32 LE][tag 16]` prefix in front of it.
+/// **No AAD** — the prefix is not authenticated, matching the format a stock Moonlight client
+/// decrypts. `key = None` is the plaintext wire and returns the buffer untouched.
+///
+/// A GCM failure can only mean a mis-sized buffer (a programming error, not input-driven), so
+/// it is logged once-per-occurrence and the shard is dropped rather than sent as readable
+/// plaintext under an encrypted negotiation — the client discards a shard it can't
+/// authenticate, and FEC covers the gap.
+fn seal_shard(buf: &mut Vec<u8>, key: Option<[u8; 16]>, frame_index: u32) {
+    use aes_gcm::aead::consts::U12;
+    use aes_gcm::aead::{AeadInOut, KeyInit};
+    use aes_gcm::{aes::Aes128, AesGcm};
+
+    let Some(key) = key else { return };
+    let iv = next_iv();
+    let cipher = match AesGcm::<Aes128, U12>::new_from_slice(&key) {
+        Ok(c) => c,
+        Err(_) => {
+            buf.clear();
+            return;
+        }
+    };
+    let tag = match cipher.encrypt_inout_detached(
+        (&iv).into(),
+        &[],
+        aes_gcm::aead::inout::InOutBuf::from(&mut buf[ENC_PREFIX..]),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = ?e, "gamestream: video shard seal failed — dropping it");
+            buf.clear();
+            return;
+        }
+    };
+    buf[..12].copy_from_slice(&iv);
+    buf[12..16].copy_from_slice(&frame_index.to_le_bytes());
+    buf[16..ENC_PREFIX].copy_from_slice(&tag);
 }
 
 /// `fecInfo` (u32, little-endian): `dataShards<<22 | fecIndex<<12 | fecPercentage<<4`.
@@ -591,6 +704,98 @@ mod tests {
             *slot = None; // 7 losses > 6 parity
         }
         assert_eq!(recover_au(&lossy), None);
+    }
+
+    /// Decrypt one `SS_ENC_VIDEO` datagram the way a client does: AES-128-GCM over
+    /// `[ENC_PREFIX..]` with the literal IV from the prefix, no AAD, tag at `[16..32]`.
+    /// `None` = the tag did not authenticate.
+    fn client_open(key: &[u8; 16], dg: &[u8]) -> Option<Vec<u8>> {
+        use aes_gcm::aead::consts::U12;
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::{aes::Aes128, AesGcm};
+        let iv: [u8; 12] = dg[..12].try_into().ok()?;
+        // aes-gcm's `decrypt` wants `ciphertext || tag`, which the wire deliberately does not
+        // carry adjacently — so re-join them exactly as a client's own decrypt call does.
+        let mut ct_tag = dg[ENC_PREFIX..].to_vec();
+        ct_tag.extend_from_slice(&dg[16..ENC_PREFIX]);
+        AesGcm::<Aes128, U12>::new_from_slice(key)
+            .ok()?
+            .decrypt(
+                (&iv).into(),
+                Payload {
+                    msg: &ct_tag,
+                    aad: &[],
+                },
+            )
+            .ok()
+    }
+
+    /// WP7 round trip: an encrypted session's datagrams carry the 32-byte prefix, decrypt under
+    /// the session key to EXACTLY the plaintext the unencrypted path would have sent, and carry
+    /// the frame index in the prefix. The IV is never repeated.
+    #[test]
+    fn encrypted_shards_decrypt_to_the_plaintext_wire() {
+        let key = [0xA5u8; 16];
+        let au = synthetic_au(9_000, 0x1234);
+        let mut plain = VideoPacketizer::new(1392, 20, 2);
+        let mut enc = VideoPacketizer::new(1392, 20, 2);
+        enc.set_encryption_key(key);
+        let want = plain.packetize(&au, FrameType::Idr, 7777, Some(3));
+        let got = enc.packetize(&au, FrameType::Idr, 7777, Some(3));
+        assert_eq!(got.len(), want.len(), "same shard count either way");
+
+        let mut ivs = std::collections::HashSet::new();
+        for (sealed, expect) in got.iter().zip(&want) {
+            assert_eq!(
+                sealed.len(),
+                ENC_PREFIX + expect.len(),
+                "prefix sits OUTSIDE the FEC blocksize"
+            );
+            // frameNumber rides the prefix in the clear.
+            assert_eq!(
+                u32::from_le_bytes(sealed[12..16].try_into().unwrap()),
+                3,
+                "prefix frameNumber"
+            );
+            assert!(ivs.insert(sealed[..12].to_vec()), "an IV was REUSED");
+            assert_eq!(sealed[11], b'V', "IV marker byte");
+            let opened = client_open(&key, sealed).expect("tag authenticates");
+            assert_eq!(&opened, expect, "decrypts to the plaintext wire image");
+        }
+        // A tampered byte must not authenticate (it IS a GCM seal, not obfuscation).
+        let mut tampered = got[0].clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+        assert!(client_open(&key, &tampered).is_none(), "tamper detected");
+        // The wrong key does not open it either.
+        assert!(client_open(&[0x00; 16], &got[0]).is_none(), "wrong key");
+    }
+
+    /// The load-bearing property of the FEC-then-encrypt ORDER: a client that decrypts what it
+    /// received can RS-recover a shard it never got. Parity computed over ciphertext would
+    /// recover nothing here.
+    #[test]
+    fn encrypted_stream_still_recovers_a_lost_shard() {
+        let key = [0x3Cu8; 16];
+        let au = synthetic_au(4_000, 0xFEED);
+        let mut pk = VideoPacketizer::new(1392, 50, 1);
+        pk.set_encryption_key(key);
+        let sealed = pk.packetize(&au, FrameType::Idr, 0, Some(0));
+        // Decrypt everything the "client" received — dropping data shard 1 in flight.
+        let mut received: Vec<Option<Vec<u8>>> = sealed
+            .iter()
+            .map(|dg| client_open(&key, dg))
+            .collect::<Option<Vec<_>>>()
+            .expect("all tags authenticate")
+            .into_iter()
+            .map(Some)
+            .collect();
+        received[1] = None;
+        assert_eq!(
+            recover_au(&received).as_deref(),
+            Some(&au[..]),
+            "RS recovery over the DECRYPTED shards restores the AU"
+        );
     }
 
     /// The pooled path is BYTE-IDENTICAL to a fresh packetizer: recycled buffers (stale bytes

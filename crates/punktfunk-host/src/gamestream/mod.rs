@@ -1032,6 +1032,7 @@ mod session_tests {
                 min_fec: 0,
                 hdr: false,
                 slices: 1, // the no-request default — hardware decoders get single-slice AUs
+                encrypt_video: false,
             });
         }
 
