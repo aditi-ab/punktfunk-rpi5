@@ -14,6 +14,12 @@
 //! the transport fields (RTP header/seq/timestamp + fecInfo) are stamped **after**, matching
 //! Sunshine `stream.cpp`. `pct = 0` falls back to data-shards-only. Plaintext (AES-GCM video
 //! encryption is negotiated off for now).
+//!
+//! Buffers are POOLED (GS competitive program WP1.3): every datagram the paced sender finishes
+//! with comes back through [`VideoPacketizer::recycle`], so a steady-state frame allocates
+//! nothing — the old shape allocated one `Vec` per shard (~3300 for a 4 MB IDR) plus a full
+//! copy of the AU per frame. The AU copy is gone too: each payload byte is copied exactly once,
+//! straight from the encoder's buffer into its datagram.
 
 use punktfunk_core::fec::{ErasureCoder, Gf8Coder};
 
@@ -27,6 +33,12 @@ const MAX_DATA_SHARDS_PER_BLOCK: usize = 255;
 const MAX_FEC_BLOCKS: usize = 4;
 /// Per-shard header: RTP(12) + reserved(4) + NV_VIDEO_PACKET(16).
 const SHARD_HEADER: usize = 32;
+/// The 8-byte `video_short_frame_header_t` prefixed to every frame's bitstream.
+const FRAME_HEADER: usize = 8;
+/// Recycled-buffer ceiling: bounds the pool at ~6 MiB of 1.4 KiB datagrams — enough to turn a
+/// 4K IDR's worth of in-flight buffers over without touching the allocator, small enough that
+/// an idle session isn't sitting on tens of MiB. Beyond it, returned buffers just drop.
+const POOL_MAX: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameType {
@@ -52,6 +64,14 @@ pub struct VideoPacketizer {
     /// Persistent GF(2⁸) coder so its `(k, m)` Cauchy-matrix cache survives across frames
     /// (plan Phase 1.4) — a stream's block shape only moves with frame size.
     coder: Gf8Coder,
+    /// Spent datagram buffers handed back by the sender ([`recycle`](Self::recycle)); capped at
+    /// [`POOL_MAX`]. `pop` + zero-fill replaces the per-shard allocation of the old shape.
+    pool: Vec<Vec<u8>>,
+    /// One block's data shards while its parity is computed (the parity encode borrows them);
+    /// drained into the output batch afterwards. Persistent so the shell allocation is one-time.
+    data_scratch: Vec<Vec<u8>>,
+    /// Parity target buffers for [`ErasureCoder::encode_into`] — pooled the same way.
+    parity_scratch: Vec<Vec<u8>>,
 }
 
 impl VideoPacketizer {
@@ -69,14 +89,32 @@ impl VideoPacketizer {
             frame_index: 0,
             seq: 0,
             coder: Gf8Coder::default(),
+            pool: Vec::new(),
+            data_scratch: Vec::new(),
+            parity_scratch: Vec::new(),
         }
     }
 
+    /// Return a spent batch's datagram buffers to the pool (drains `spent`; buffers beyond
+    /// [`POOL_MAX`] are dropped). The paced sender feeds this through the recycle channel after
+    /// each frame leaves the wire — see `spawn_sender`/`spawn_packetizer`.
+    pub fn recycle(&mut self, spent: &mut Vec<Vec<u8>>) {
+        let room = POOL_MAX.saturating_sub(self.pool.len());
+        // `drain(..).take(room)`: the first `room` buffers move to the pool; dropping the
+        // exhausted `Drain` frees the rest, leaving `spent` empty either way.
+        self.pool.extend(spent.drain(..).take(room));
+    }
+
+    /// A zeroed `blocksize` buffer — pooled when one is available, freshly allocated otherwise.
+    fn take_buf(&mut self, blocksize: usize) -> Vec<u8> {
+        let mut b = self.pool.pop().unwrap_or_default();
+        b.clear();
+        b.resize(blocksize, 0); // zero-fills from empty, whatever the buffer held before
+        b
+    }
+
     /// Packetize one encoded AU into wire datagrams (data shards + Cauchy RS parity shards).
-    ///
-    /// `frame_index`: `Some(i)` stamps the caller's index (the stream loop owns the numbering so
-    /// the encoder's RFI bookkeeping stays 1:1 with the wire across mid-stream encoder rebuilds —
-    /// see `Encoder::submit_indexed`); `None` draws from the internal counter (tests/harnesses).
+    /// Convenience wrapper over [`packetize_into`](Self::packetize_into) for tests/harnesses.
     pub fn packetize(
         &mut self,
         au: &[u8],
@@ -84,6 +122,29 @@ impl VideoPacketizer {
         timestamp_90k: u32,
         frame_index: Option<u32>,
     ) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        self.packetize_into(&mut out, au, frame_type, timestamp_90k, frame_index, 0);
+        out
+    }
+
+    /// Packetize one encoded AU, appending its wire datagrams to `out`.
+    ///
+    /// `frame_index`: `Some(i)` stamps the caller's index (the stream loop owns the numbering so
+    /// the encoder's RFI bookkeeping stays 1:1 with the wire across mid-stream encoder rebuilds —
+    /// see `Encoder::submit_indexed`); `None` draws from the internal counter (tests/harnesses).
+    ///
+    /// `processing_100us`: this frame's host processing latency (capture → packetize) in the wire
+    /// header's 1/10 ms units — the Sunshine-extension field Moonlight's overlay shows as "Host
+    /// processing latency". `0` = not measured.
+    pub fn packetize_into(
+        &mut self,
+        out: &mut Vec<Vec<u8>>,
+        au: &[u8],
+        frame_type: FrameType,
+        timestamp_90k: u32,
+        frame_index: Option<u32>,
+        processing_100us: u16,
+    ) {
         let frame_index = frame_index.unwrap_or_else(|| {
             let i = self.frame_index;
             self.frame_index = i.wrapping_add(1);
@@ -93,15 +154,16 @@ impl VideoPacketizer {
         let blocksize = SHARD_HEADER + pps; // = packet_size + 16
         let pct = self.fec_percentage;
 
-        // frame payload = 8-byte short frame header + the AU bitstream.
-        let total_len = 8 + au.len();
+        // frame payload = 8-byte short frame header + the AU bitstream. The header is built
+        // once; each payload byte is copied exactly once, straight into its datagram below —
+        // no staging copy of the AU.
+        let mut header = short_frame_header(frame_type, processing_100us);
+        let total_len = FRAME_HEADER + au.len();
         let last_payload_len = match total_len % pps {
             0 => pps,
             r => r,
         };
-        let mut fp = Vec::with_capacity(total_len);
-        fp.extend_from_slice(&short_frame_header(frame_type, last_payload_len as u16));
-        fp.extend_from_slice(au);
+        header[4..6].copy_from_slice(&(last_payload_len as u16).to_le_bytes());
 
         let total_data = total_len.div_ceil(pps).max(1);
         // With parity, cap per-block data so k + m ≤ 255 (the GF(2⁸) ceiling): parity for k
@@ -114,7 +176,7 @@ impl VideoPacketizer {
         let n_blocks = total_data.div_ceil(max_data).clamp(1, MAX_FEC_BLOCKS);
         let per_block = total_data.div_ceil(n_blocks);
 
-        let mut packets = Vec::with_capacity(total_data + total_data * pct / 100 + n_blocks);
+        out.reserve(total_data + total_data * pct / 100 + n_blocks);
         for b in 0..n_blocks {
             let first = b * per_block;
             let last = ((b + 1) * per_block).min(total_data);
@@ -128,11 +190,11 @@ impl VideoPacketizer {
             // 1. Build this block's k data-shard datagrams (full `blocksize`), writing the NV
             //    header fields RS must reproduce on recovery (streamPacketIndex, frameIndex,
             //    flags, multiFec*). The RTP header + fecInfo are left zero (stamped post-RS).
-            let mut shards: Vec<Vec<u8>> = Vec::with_capacity(k);
+            debug_assert!(self.data_scratch.is_empty());
             for i in 0..k {
                 let global = first + i;
                 let seq = block_seq_base + i as u32;
-                let mut buf = vec![0u8; blocksize];
+                let mut buf = self.take_buf(blocksize);
                 let mut flags = FLAG_PIC;
                 if global == 0 {
                     flags |= FLAG_SOF;
@@ -145,33 +207,56 @@ impl VideoPacketizer {
                 buf[24] = flags;
                 buf[26] = MULTI_FEC_FLAGS;
                 buf[27] = multi_fec_blocks;
+                // This shard covers frame-payload bytes [ps, pe): the 8-byte header first, then
+                // the AU. Only shard 0 can straddle the header/AU boundary (FRAME_HEADER < pps).
                 let ps = global * pps;
-                let pe = (ps + pps).min(fp.len());
-                buf[SHARD_HEADER..SHARD_HEADER + (pe - ps)].copy_from_slice(&fp[ps..pe]);
-                shards.push(buf);
+                let pe = (ps + pps).min(total_len);
+                let mut w = SHARD_HEADER;
+                if ps < FRAME_HEADER {
+                    let h_end = pe.min(FRAME_HEADER);
+                    buf[w..w + (h_end - ps)].copy_from_slice(&header[ps..h_end]);
+                    w += h_end - ps;
+                }
+                if pe > FRAME_HEADER {
+                    let a_start = ps.max(FRAME_HEADER) - FRAME_HEADER;
+                    let a_end = pe - FRAME_HEADER;
+                    buf[w..w + (a_end - a_start)].copy_from_slice(&au[a_start..a_end]);
+                }
+                self.data_scratch.push(buf);
             }
 
             // 2. m = ⌈k·pct/100⌉ parity shards (floored at the client's min, capped so k+m≤255)
-            //    over the full datagrams. The wire percentage is recomputed from m so the client
-            //    derives the same count.
+            //    over the full datagrams, generated into pooled buffers (`encode_into`
+            //    overwrites every parity row, so recycled bytes never survive). The wire
+            //    percentage is recomputed from m so the client derives the same count.
             let m = if pct > 0 {
                 (k * pct).div_ceil(100).max(self.min_fec).min(255 - k)
             } else {
                 0
             };
             let wire_pct = if m > 0 { (100 * m) / k } else { 0 };
-            let parity = if m > 0 {
-                let refs: Vec<&[u8]> = shards.iter().map(|s| s.as_slice()).collect();
-                self.coder.encode(&refs, m).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            if m > 0 {
+                while self.parity_scratch.len() < m {
+                    let b = self.pool.pop().unwrap_or_default();
+                    self.parity_scratch.push(b);
+                }
+                let refs: Vec<&[u8]> = self.data_scratch.iter().map(|s| s.as_slice()).collect();
+                if self
+                    .coder
+                    .encode_into(&refs, m, &mut self.parity_scratch)
+                    .is_err()
+                {
+                    // Mirrors the old `unwrap_or_default()`: an impossible shard shape sends
+                    // the block data-only rather than panicking mid-stream.
+                    self.parity_scratch.clear();
+                }
+            }
 
             // 3. Stamp transport headers (RTP + fecInfo) on every shard. We do NOT touch the
             //    flags/streamPacketIndex bytes, so a recovered data shard's RS-reconstructed
             //    NV header stays valid.
             self.seq = block_seq_base + k as u32;
-            for (i, mut buf) in shards.into_iter().enumerate() {
+            for (i, mut buf) in self.data_scratch.drain(..).enumerate() {
                 let seq = block_seq_base + i as u32;
                 finalize(
                     &mut buf,
@@ -181,9 +266,9 @@ impl VideoPacketizer {
                     multi_fec_blocks,
                     fec_info(k, i, wire_pct),
                 );
-                packets.push(buf);
+                out.push(buf);
             }
-            for (j, mut buf) in parity.into_iter().enumerate() {
+            for (j, mut buf) in self.parity_scratch.drain(..).enumerate() {
                 let seq = self.seq;
                 self.seq = self.seq.wrapping_add(1);
                 finalize(
@@ -194,10 +279,9 @@ impl VideoPacketizer {
                     multi_fec_blocks,
                     fec_info(k, k + j, wire_pct),
                 );
-                packets.push(buf);
+                out.push(buf);
             }
         }
-        packets
     }
 }
 
@@ -224,17 +308,19 @@ fn finalize(
     buf[28..32].copy_from_slice(&fec_info.to_le_bytes()); // fecInfo (LE)
 }
 
-/// 8-byte `video_short_frame_header_t` (little-endian), prefixed to the AU bitstream.
-fn short_frame_header(frame_type: FrameType, last_payload_len: u16) -> [u8; 8] {
+/// 8-byte `video_short_frame_header_t` (little-endian), prefixed to the AU bitstream. The
+/// caller stamps `lastPayloadLen` (offset 4) once it is known. `processing_100us` is the
+/// Sunshine-extension host-processing-latency field (1/10 ms units, 0 = N/A) Moonlight's
+/// performance overlay reads.
+fn short_frame_header(frame_type: FrameType, processing_100us: u16) -> [u8; 8] {
     let mut h = [0u8; 8];
     h[0] = 0x01; // headerType
-    h[1..3].copy_from_slice(&0u16.to_le_bytes()); // frame_processing_latency
+    h[1..3].copy_from_slice(&processing_100us.to_le_bytes()); // frame_processing_latency
     h[3] = match frame_type {
         FrameType::Idr => 2,
         FrameType::P => 1,
     };
-    h[4..6].copy_from_slice(&last_payload_len.to_le_bytes());
-    // h[6..8] unknown = 0
+    // h[4..6] lastPayloadLen — stamped by the caller; h[6..8] unknown = 0
     h
 }
 
@@ -340,5 +426,184 @@ mod tests {
         assert_eq!(recovered[1][24], FLAG_PIC);
         // ...and the payload region matches the original.
         assert_eq!(recovered[1][SHARD_HEADER..], pkts[1][SHARD_HEADER..]);
+    }
+
+    /// The host-processing-latency field lands at header offset 1..3 of the frame payload
+    /// (shard 0's payload starts with the 8-byte short frame header), little-endian 1/10 ms.
+    #[test]
+    fn frame_processing_latency_is_stamped() {
+        let mut pk = VideoPacketizer::new(1392, 0, 0);
+        let mut out = Vec::new();
+        pk.packetize_into(&mut out, &[0u8; 100], FrameType::P, 0, None, 47);
+        let payload = &out[0][SHARD_HEADER..];
+        assert_eq!(payload[0], 0x01); // headerType
+        assert_eq!(u16::from_le_bytes(payload[1..3].try_into().unwrap()), 47);
+        // The legacy wrapper stamps 0 (not measured).
+        let pkts = pk.packetize(&[0u8; 100], FrameType::P, 0, None);
+        let payload = &pkts[0][SHARD_HEADER..];
+        assert_eq!(u16::from_le_bytes(payload[1..3].try_into().unwrap()), 0);
+    }
+
+    // ---- GS-wire loopback harness (competitive program WP0.2) ---------------------------------
+    //
+    // A test-side reassembler that decodes the NV layout the way a stock client does: group
+    // shards by FEC block, run Cauchy RS recovery over full datagrams when data shards are
+    // missing, then reassemble the frame payload from the data shards' payload bytes. It locks
+    // the wire layout + recovery behavior against packetizer changes (the WP1.3 pooling rewrite
+    // especially) without needing a live Moonlight client.
+
+    /// Reassemble the original AU from a lossy subset of one frame's datagrams. `None` = the
+    /// frame is unrecoverable (some block lost more shards than it had parity).
+    fn recover_au(pkts: &[Option<Vec<u8>>]) -> Option<Vec<u8>> {
+        // Group by block index (byte 27: block<<4 | (count-1)<<6), keyed by fecInfo's k and
+        // fecIndex (byte 28..32) — exactly the fields a client derives shard placement from.
+        let any = pkts.iter().flatten().next()?;
+        let n_blocks = (((any[27] >> 6) & 0x3) + 1) as usize;
+        let blocksize = any.len();
+        // Per block: (k, shards[fec_index] = datagram)
+        let mut blocks: Vec<(usize, Vec<Option<Vec<u8>>>)> = Vec::new();
+        for _ in 0..n_blocks {
+            blocks.push((0, Vec::new()));
+        }
+        for p in pkts.iter().flatten() {
+            let b = ((p[27] >> 4) & 0x3) as usize;
+            let fec = u32::from_le_bytes(p[28..32].try_into().unwrap());
+            let k = (fec >> 22) as usize;
+            let idx = ((fec >> 12) & 0x3ff) as usize;
+            let entry = &mut blocks[b];
+            entry.0 = k;
+            if entry.1.len() <= idx {
+                entry.1.resize(idx + 1, None);
+            }
+            entry.1[idx] = Some(p.clone());
+        }
+        // Recover each block's data shards, then concatenate payloads in global order.
+        let mut payload = Vec::new();
+        for (k, mut shards) in blocks {
+            if k == 0 {
+                return None; // an entire block vanished — no shard even names its k
+            }
+            let have_data = shards.iter().take(k).flatten().count();
+            let data: Vec<Vec<u8>> = if have_data == k {
+                shards
+                    .into_iter()
+                    .take(k)
+                    .map(|s| s.expect("all data shards present"))
+                    .collect()
+            } else {
+                let m_present = shards.iter().skip(k).flatten().count();
+                if have_data + m_present < k {
+                    return None; // more losses than parity
+                }
+                // The client knows m from the wire percentage; the harness derives it the same
+                // way — from the highest fecIndex it can see plus the wire pct's implied count.
+                let wire_pct = ((u32::from_le_bytes(
+                    shards.iter().flatten().next()?[28..32].try_into().unwrap(),
+                ) >> 4)
+                    & 0xff) as usize;
+                let m = (k * wire_pct).div_ceil(100);
+                shards.resize(k + m, None);
+                let mut recv = shards;
+                let rec = Gf8Coder::default().reconstruct(k, m, &mut recv).ok()?;
+                rec.into_iter().take(k).collect()
+            };
+            for shard in &data {
+                assert_eq!(shard.len(), blocksize, "all shards share the block size");
+                payload.extend_from_slice(&shard[SHARD_HEADER..]);
+            }
+        }
+        // Strip the 8-byte short frame header; the true length comes from lastPayloadLen.
+        let last_payload_len = u16::from_le_bytes(payload[4..6].try_into().unwrap()) as usize;
+        let pps = blocksize - SHARD_HEADER;
+        let total_data = payload.len() / pps;
+        let total_len = (total_data - 1) * pps + last_payload_len;
+        payload.truncate(total_len);
+        Some(payload[FRAME_HEADER..].to_vec())
+    }
+
+    /// A pseudo-random but DETERMINISTIC AU (no rand dependency — CI-stable).
+    fn synthetic_au(len: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// Loss sweep: for every loss pattern within each block's parity budget the AU comes back
+    /// byte-exact; one loss past the budget and the frame is honestly unrecoverable.
+    #[test]
+    fn harness_recovers_within_parity_budget_across_shapes() {
+        // (au_len, pct, min_fec) covering: sub-shard, single-block, multi-block, high-parity.
+        for (len, pct, min_fec) in [
+            (100usize, 20u8, 0u8),
+            (4_000, 20, 2),
+            (60_000, 10, 1),
+            (600_000, 20, 0), // multi-block (>255 shards)
+        ] {
+            let mut pk = VideoPacketizer::new(1392, pct, min_fec);
+            let au = synthetic_au(len, 0xC0FFEE);
+            let pkts = pk.packetize(&au, FrameType::Idr, 1234, Some(7));
+            // Lossless first.
+            let all: Vec<Option<Vec<u8>>> = pkts.iter().map(|p| Some(p.clone())).collect();
+            assert_eq!(
+                recover_au(&all).as_deref(),
+                Some(&au[..]),
+                "lossless reassembly (len={len})"
+            );
+            // Drop exactly one data shard per block — always within budget (m >= 1 per block).
+            let mut lossy = all.clone();
+            let mut seen_blocks = std::collections::HashSet::new();
+            for (i, p) in pkts.iter().enumerate() {
+                let b = (p[27] >> 4) & 0x3;
+                let fec = u32::from_le_bytes(p[28..32].try_into().unwrap());
+                let is_data = ((fec >> 12) & 0x3ff) < (fec >> 22);
+                if is_data && seen_blocks.insert(b) {
+                    lossy[i] = None;
+                }
+            }
+            assert_eq!(
+                recover_au(&lossy).as_deref(),
+                Some(&au[..]),
+                "one data loss per block recovers (len={len} pct={pct})"
+            );
+        }
+    }
+
+    /// Past the parity budget the harness reports unrecoverable rather than fabricating data.
+    #[test]
+    fn harness_refuses_past_parity_budget() {
+        let mut pk = VideoPacketizer::new(1392, 20, 0);
+        let au = synthetic_au(40_000, 0xBEEF); // 30 data shards, m = 6
+        let pkts = pk.packetize(&au, FrameType::P, 0, None);
+        let mut lossy: Vec<Option<Vec<u8>>> = pkts.iter().map(|p| Some(p.clone())).collect();
+        for slot in lossy.iter_mut().take(7) {
+            *slot = None; // 7 losses > 6 parity
+        }
+        assert_eq!(recover_au(&lossy), None);
+    }
+
+    /// The pooled path is BYTE-IDENTICAL to a fresh packetizer: recycled buffers (stale bytes
+    /// included) must never leak into the wire image. This is the WP1.3 regression lock.
+    #[test]
+    fn recycled_buffers_produce_identical_wire_bytes() {
+        let mut fresh = VideoPacketizer::new(1392, 20, 2);
+        let mut pooled = VideoPacketizer::new(1392, 20, 2);
+        // Poison the pool with garbage-filled buffers of assorted sizes.
+        let mut junk: Vec<Vec<u8>> = (0..600).map(|i| vec![0xEEu8; 100 + (i % 1500)]).collect();
+        pooled.recycle(&mut junk);
+        assert!(junk.is_empty());
+        for (n, len) in [(0u32, 4_000usize), (1, 100), (2, 60_000), (3, 9)] {
+            let au = synthetic_au(len, n);
+            let a = fresh.packetize(&au, FrameType::P, n * 3000, Some(n));
+            let mut b = Vec::new();
+            pooled.packetize_into(&mut b, &au, FrameType::P, n * 3000, Some(n), 0);
+            assert_eq!(a, b, "frame {n}: pooled bytes must match fresh bytes");
+            // Feed the sent batch back — the steady-state cycle.
+            let mut spent = b;
+            pooled.recycle(&mut spent);
+        }
     }
 }
