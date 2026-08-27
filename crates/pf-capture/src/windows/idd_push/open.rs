@@ -647,6 +647,10 @@ impl IddPushCapturer {
                 stall_watch: StallWatch::new(),
                 offered_at_fresh: 0,
                 max_hb_age_us: 0,
+                cursor_last: None,
+                cursor_gap_px: 0,
+                cursor_pending_px: 0,
+                cursor_sampled_at: Instant::now(),
                 probes: pf_host_config::config()
                     .stall_probes
                     .then(super::probes::acquire),

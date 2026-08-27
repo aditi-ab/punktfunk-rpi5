@@ -509,6 +509,17 @@ pub struct IddPushCapturer {
     /// ever read (µs) while the host starved since then. Rolled at every fresh frame.
     offered_at_fresh: u64,
     max_hb_age_us: u64,
+    /// The damage witness feeding [`stall::StallEvidence::cursor_moved_px`]: the OS cursor's
+    /// last sampled position (`None` until `GetCursorPos` first succeeds), the px accumulated
+    /// since the last fresh frame, and one pending sample's delta held back a call so the
+    /// stall-ending frame's own cursor move never counts into the gap it ended (the fold
+    /// happens at the top of the NEXT `try_consume`, by which point this call demonstrably
+    /// did not consume a fresh frame — a fresh frame resets both). Sampled at most every
+    /// [`Self::CURSOR_WITNESS_INTERVAL`]; user32 reads, never the display-config lock.
+    cursor_last: Option<(i32, i32)>,
+    cursor_gap_px: u32,
+    cursor_pending_px: u32,
+    cursor_sampled_at: Instant,
     /// The Phase A.2 micro-probe engine (refcounted process singleton) — its window read rides
     /// every stall report so the verdict matrix can name the disturbance class. `None` when
     /// `PUNKTFUNK_STALL_PROBES=0` opted the box out (the engine costs standing threads); the
@@ -1465,11 +1476,47 @@ impl IddPushCapturer {
         }
     }
 
+    /// Damage-witness sample cadence — coarse enough to cost nothing (two user32 reads at
+    /// 125 Hz worst case), fine enough that a ≥150 ms hole gets many samples.
+    const CURSOR_WITNESS_INTERVAL: Duration = Duration::from_millis(8);
+
+    /// The damage witness (see the `cursor_*` field docs): fold the PREVIOUS call's pending
+    /// delta into the gap accumulator — if that call had consumed a fresh frame, the fresh-frame
+    /// bookkeeping would have zeroed the pending, so whatever survives belongs to the gap — then
+    /// take a fresh rate-limited `GetCursorPos` sample into the pending slot. The one-call lag is
+    /// what keeps the stall-ending frame's own cursor move out of the gap it ended.
+    ///
+    /// `GetCursorPos` is global, not per-display: a delta of 0 therefore proves the cursor sat
+    /// still EVERYWHERE (the demotion direction is strict), while a delta > 0 on a
+    /// parallel-displays host may be a sibling display's motion — that direction only ever
+    /// upholds today's CONTENT-SILENCE labeling, never worsens it.
+    // ponytail: no per-target rect filter (needs a cached CCD rect); add one if parallel-display
+    // hosts ever show false CONTENT-SILENCE convictions from sibling-cursor motion.
+    fn sample_cursor_witness(&mut self) {
+        self.cursor_gap_px = self.cursor_gap_px.saturating_add(self.cursor_pending_px);
+        self.cursor_pending_px = 0;
+        if self.cursor_sampled_at.elapsed() < Self::CURSOR_WITNESS_INTERVAL {
+            return;
+        }
+        self.cursor_sampled_at = Instant::now();
+        let mut pos = POINT::default();
+        // SAFETY: plain FFI; `pos` is a valid out-param for this synchronous call.
+        if unsafe { GetCursorPos(&mut pos) }.is_ok() {
+            if let Some((x, y)) = self.cursor_last {
+                self.cursor_pending_px = pos.x.abs_diff(x).saturating_add(pos.y.abs_diff(y));
+            }
+            self.cursor_last = Some((pos.x, pos.y));
+        }
+    }
+
     fn try_consume(&mut self) -> Result<Option<CapturedFrame>> {
         self.log_driver_status_once();
         // The secure-desktop guard first: while UAC/Winlogon is up there may be NO fresh frames
         // at all — this edge is what brings them back.
         self.poll_secure_desktop();
+        // The stall damage witness — before any early return, so gaps of every shape accumulate
+        // cursor motion (or certify its absence).
+        self.sample_cursor_witness();
         // Follow the display: a "Use HDR" flip recreates the ring at the matching format.
         self.poll_display_hdr();
         // Recover-or-drop (GB1): if a descriptor change triggered a recreate but no fresh frame has resumed
@@ -1744,6 +1791,9 @@ impl IddPushCapturer {
                     .map(|(from, p)| p.window(from, now)),
                 etw,
                 etw_counts,
+                // The gap accumulator only — this call's own pending sample (the stall-ending
+                // frame's move) is still unfolded and gets discarded by the reset below.
+                cursor_moved_px: self.cursor_last.map(|_| self.cursor_gap_px),
             };
             self.stall_watch.report(&stall, now, &evidence);
         }
@@ -1769,6 +1819,10 @@ impl IddPushCapturer {
                 self.offered_at_fresh = offered;
             }
             self.max_hb_age_us = 0;
+            // Damage witness rolls with the other per-gap trackers; the pending sample is the
+            // ending frame's own move — discarded, never folded (see `sample_cursor_witness`).
+            self.cursor_gap_px = 0;
+            self.cursor_pending_px = 0;
         }
         // Build the frame. For PyroWave the encode input is the Y plane
         // (`texture`) + the CbCr plane & fence in `pyro`; signal the shared fence
@@ -2172,13 +2226,20 @@ mod tests {
     }
 
     /// Feed a [`StallWatch`] fresh frames at the given offsets (ms from a common origin) and
-    /// return what each `note_fresh` produced.
-    fn watch_run(offsets_ms: &[u64]) -> Vec<Option<Stall>> {
+    /// return what each `note_fresh` produced, paired with the metronome's read for the stalls
+    /// (fed as non-damage-idle, the way `report` feeds every display-evidence stall).
+    fn watch_run(offsets_ms: &[u64]) -> Vec<Option<(Stall, Option<Duration>)>> {
         let base = Instant::now();
         let mut w = StallWatch::new();
         offsets_ms
             .iter()
-            .map(|ms| w.note_fresh(base + Duration::from_millis(*ms)))
+            .map(|ms| {
+                let at = base + Duration::from_millis(*ms);
+                w.note_fresh(at).map(|s| {
+                    let period = w.cycle(at, false);
+                    (s, period)
+                })
+            })
             .collect()
     }
 
@@ -2195,9 +2256,9 @@ mod tests {
         t.push(604);
         let out = watch_run(&t);
         assert!(out[..20].iter().all(Option::is_none));
-        let stall = out[20].as_ref().expect("hole after active flow is a stall");
+        let (stall, period) = out[20].as_ref().expect("hole after active flow is a stall");
         assert_eq!(stall.gap.as_millis(), 300);
-        assert!(stall.metronomic.is_none(), "one stall is not a cycle");
+        assert!(period.is_none(), "one stall is not a cycle");
     }
 
     #[test]
@@ -2307,15 +2368,42 @@ mod tests {
             flow(&mut t, cycle * 4_000, 232); // last frame at cycle*4000 + 3696
         }
         let out = watch_run(&t);
-        let stalls: Vec<&Stall> = out.iter().flatten().collect();
+        let stalls: Vec<&(Stall, Option<Duration>)> = out.iter().flatten().collect();
         assert_eq!(stalls.len(), 4, "each cycle boundary is one stall");
-        assert!(stalls[..3].iter().all(|s| s.metronomic.is_none()));
+        assert!(stalls[..3].iter().all(|(_, period)| period.is_none()));
         let period = stalls[3]
-            .metronomic
+            .1
             .expect("the 4th evenly-spaced event completes the metronome streak");
         assert!(
             (period.as_secs_f64() - 4.0).abs() < 0.3,
             "period={period:?}"
+        );
+    }
+
+    /// A damage-idle hole must not advance the metronome: the same four evenly-spaced stalls
+    /// as [`metronomic_stalls_self_diagnose`], but with one classified damage-idle — the beat
+    /// never completes, because a hand/input pause is not display-disturbance evidence.
+    #[test]
+    fn damage_idle_stalls_do_not_feed_the_metronome() {
+        let base = Instant::now();
+        let mut w = StallWatch::new();
+        let mut periods = Vec::new();
+        for cycle in 0..5u64 {
+            let mut t = Vec::new();
+            flow(&mut t, cycle * 4_000, 232);
+            for ms in t {
+                let at = base + Duration::from_millis(ms);
+                if let Some(_stall) = w.note_fresh(at) {
+                    // The 2nd stall reads damage-idle (cursor sat still on a dwm-only desktop).
+                    let damage_idle = periods.len() == 1;
+                    periods.push(w.cycle(at, damage_idle));
+                }
+            }
+        }
+        assert_eq!(periods.len(), 4);
+        assert!(
+            periods.iter().all(Option::is_none),
+            "a skipped beat must break the streak: {periods:?}"
         );
     }
 
@@ -2384,6 +2472,7 @@ mod tests {
                     probes: None,
                     etw: None,
                     etw_counts: None,
+                    cursor_moved_px: None,
                 },
             )
         };
@@ -2411,7 +2500,7 @@ mod tests {
     #[test]
     fn stall_classification_matrix() {
         use super::dxgkrnl_etw::EtwWindowCounts;
-        use super::stall::{classify, ProbeWindow, StallClass, StallVerdict};
+        use super::stall::{ProbeWindow, StallClass, StallVerdict};
         let gap = Duration::from_millis(600);
         let probes = |fence: Option<u64>, dwm: Option<u64>, flush: Option<u64>| ProbeWindow {
             fence_max_us: fence,
@@ -2424,7 +2513,20 @@ mod tests {
             queue_adds,
             present_history: true,
             queue_history: true,
+            flow_dwm_only: false,
         };
+        // Every case below predates the damage witness — `cursor_moved_px = None` keeps the
+        // pre-witness classification, which is exactly what these cases assert. The witness's
+        // own matrix (the damage-idle split) is `damage_idle_split` below. A nested fn (not a
+        // closure): each call site's temporaries need their own lifetime.
+        fn classify(
+            gap: Duration,
+            verdict: &StallVerdict,
+            p: Option<&ProbeWindow>,
+            c: Option<&EtwWindowCounts>,
+        ) -> StallClass {
+            super::super::stall::classify(gap, verdict, p, c, None)
+        }
         // The driver's own verdicts win outright — probes can't overrule "we lost the frames".
         assert_eq!(
             classify(
@@ -2574,6 +2676,60 @@ mod tests {
                 Some(&counts(1, 0))
             ),
             StallClass::ContentSilence
+        );
+    }
+
+    /// The damage witness's split of CONTENT-SILENCE (the 2026-08-27 field reattribution): a
+    /// present-free hole on a dwm-only desktop with a stationary cursor is an input/hand pause
+    /// (DAMAGE-IDLE), a moving cursor keeps it CONTENT-SILENCE (damage existed, nothing
+    /// composed — the display-stack conviction), and a game session (flow not dwm-only) is
+    /// never demoted regardless of the cursor.
+    #[test]
+    fn damage_idle_split() {
+        use super::dxgkrnl_etw::EtwWindowCounts;
+        use super::stall::{classify, ProbeWindow, StallClass, StallVerdict};
+        let gap = Duration::from_millis(600);
+        let healthy = ProbeWindow {
+            fence_max_us: Some(16_000),
+            dwm_tick_frozen_us: Some(20_000),
+            dwm_flush_max_us: Some(30_000),
+            ..ProbeWindow::default()
+        };
+        let counts = |dwm_only: bool| EtwWindowCounts {
+            presents: 0,
+            queue_adds: 0,
+            present_history: true,
+            queue_history: true,
+            flow_dwm_only: dwm_only,
+        };
+        let run = |dwm_only: bool, moved: Option<u32>| {
+            classify(
+                gap,
+                &StallVerdict::ComposeSilence,
+                Some(&healthy),
+                Some(&counts(dwm_only)),
+                moved,
+            )
+        };
+        assert_eq!(run(true, Some(0)), StallClass::DamageIdle);
+        assert_eq!(run(true, Some(312)), StallClass::ContentSilence);
+        // A game presented in the lookback: its hole is real evidence even with a still cursor.
+        assert_eq!(run(false, Some(0)), StallClass::ContentSilence);
+        // No witness (pre-witness build / GetCursorPos failing): pre-witness behavior.
+        assert_eq!(run(true, None), StallClass::ContentSilence);
+        // The witness never overrules a harder conviction: stalled fences stay ADAPTER-FREEZE.
+        assert_eq!(
+            classify(
+                gap,
+                &StallVerdict::ComposeSilence,
+                Some(&ProbeWindow {
+                    fence_max_us: Some(400_000),
+                    ..ProbeWindow::default()
+                }),
+                Some(&counts(true)),
+                Some(0),
+            ),
+            StallClass::AdapterFreeze
         );
     }
 }

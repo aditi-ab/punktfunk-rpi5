@@ -357,7 +357,18 @@ impl EtwWatch {
                 .copied()
                 .collect()
         };
-        let counts = count_window(&events, from_q, to_q, duration_qpc(LOOKBACK, freq));
+        let mut counts = count_window(&events, from_q, to_q, duration_qpc(LOOKBACK, freq));
+        // Pre-hole flow attribution (damage-idle discriminator): when every present in the
+        // lookback window came from dwm.exe, the flow the stall watch gated on was pure desktop
+        // composition — on the IDD-push desktop that means cursor/UI damage, the kind that
+        // legitimately stops the instant input stops. A game presenting anywhere in the lookback
+        // keeps this false, so a game's real holes are never demoted. Name resolution runs here
+        // (a handful of `OpenProcess` calls per stall report), off the consumer callback.
+        let lookback_pids = lookback_present_pids(&events, from_q, duration_qpc(LOOKBACK, freq));
+        counts.flow_dwm_only = !lookback_pids.is_empty()
+            && lookback_pids
+                .iter()
+                .all(|&pid| process_name(pid).is_some_and(|n| n.eq_ignore_ascii_case("dwm.exe")));
         let ms = |dq: i64| dq.max(0) * 1_000 / freq;
         let mut parts = Vec::new();
         for (start_id, stop_id, label) in [
@@ -521,6 +532,29 @@ pub(super) struct EtwWindowCounts {
     /// Queue-stream liveness inside [`LOOKBACK`] before the hole (`BltQueueAddEntry` or
     /// `BltQueueCompleteIndirectPresent` — either proves the witness works).
     pub(super) queue_history: bool,
+    /// Every present in the lookback window came from `dwm.exe` (and there was at least one):
+    /// the pre-hole flow was pure desktop composition — cursor/UI damage — not a game. Set by
+    /// [`EtwWatch::window_report`] (name resolution lives there, not in the pure tick math);
+    /// the damage-idle demotion in `stall::classify` requires it, so a game session's holes
+    /// are never demoted no matter what the cursor did.
+    pub(super) flow_dwm_only: bool,
+}
+
+/// The distinct pids that presented (DXGI 42/55) inside the lookback window `[from_q -
+/// lookback_q, from_q]` — the pre-hole flow's presenters. Pure tick math (no name resolution),
+/// factored out of [`EtwWatch::window_report`] so the windowing is unit-testable.
+fn lookback_present_pids(events: &[(i64, u16, u32)], from_q: i64, lookback_q: i64) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for &(ts, id, pid) in events {
+        if matches!(id, DXGI_PRESENT_ID | DXGI_PRESENT_MPO_ID)
+            && ts >= from_q.saturating_sub(lookback_q)
+            && ts <= from_q
+            && !pids.contains(&pid)
+        {
+            pids.push(pid);
+        }
+    }
+    pids
 }
 
 /// Enable `guid` on `session` with a kernel-side event-id allowlist. `true` on success.
@@ -645,6 +679,8 @@ mod tests {
                 queue_adds: 1,
                 present_history: true,
                 queue_history: true,
+                // Set by `window_report` (needs name resolution), never by the tick math.
+                flow_dwm_only: false,
             }
         );
 
@@ -678,5 +714,22 @@ mod tests {
         // A lookback reaching below tick 0 saturates instead of wrapping.
         let c = count_window(&[ev(0, DXGI_PRESENT_ID)], 3, to, i64::MAX);
         assert!(c.present_history);
+    }
+
+    /// [`lookback_present_pids`]'s windowing: presenters strictly from the lookback window
+    /// (dedup'd), never from inside or after the hole — an in-hole presenter is not "the flow
+    /// the stall watch gated on".
+    #[test]
+    fn lookback_presenters_come_from_before_the_hole() {
+        let (from, lb) = (1_000i64, 500i64);
+        let events = [
+            (600, DXGI_PRESENT_ID, 7u32),     // lookback, pid 7
+            (700, DXGI_PRESENT_MPO_ID, 7u32), // lookback, pid 7 again (dedup)
+            (800, DXGI_PRESENT_ID, 9u32),     // lookback, pid 9
+            (900, BLT_ADD_ID, 11u32),         // lookback, but not a present
+            (1_100, DXGI_PRESENT_ID, 13u32),  // inside the hole — excluded
+        ];
+        assert_eq!(lookback_present_pids(&events, from, lb), vec![7, 9]);
+        assert!(lookback_present_pids(&events[4..], from, lb).is_empty());
     }
 }

@@ -5,12 +5,14 @@ use super::*;
 
 /// A detected capture stall: a multi-hundred-ms hole in DWM's frame delivery that opened while the
 /// desktop was actively composing right beforehand (see [`StallWatch`]).
+///
+/// The metronome is NOT fed here — [`StallWatch::report`] feeds it after classification, so a
+/// damage-idle hole (cursor stationary on a dwm-only desktop: an input/hand pause, not a display
+/// stall — the 2026-08-27 NVIDIA-laptop field case was ~30 of these misread as a 1.87 s display
+/// metronome) never contributes to the beat that the METRONOMIC warns blame on display hardware.
 pub(super) struct Stall {
     /// How long the hole lasted (last fresh frame → the frame that ended it).
     pub(super) gap: Duration,
-    /// `Some(mean period)` when this stall completes a metronomic cycle (see
-    /// [`pf_frame::metronome::Metronome`]).
-    pub(super) metronomic: Option<Duration>,
 }
 
 /// One degraded stretch, summarized at recovery ([`StallWatch::take_recovery`]). Per-hole stall
@@ -59,6 +61,14 @@ pub(super) struct StallEvidence {
     /// display path dropped composed frames; both silent = the content stopped presenting.
     /// `None` when the ETW session is unavailable.
     pub(super) etw_counts: Option<super::dxgkrnl_etw::EtwWindowCounts>,
+    /// How far the OS cursor moved (px, |dx|+|dy| summed over samples) DURING the hole — the
+    /// damage witness. On the composited-cursor desktop the pointer is the damage source, so
+    /// `Some(0)` says the content had nothing to compose (input/hand pause: damage-idle) while
+    /// `Some(n>0)` says damage existed and DWM composed none of it — a positive display-stack
+    /// conviction. `None` = never sampled (`GetCursorPos` failing / pre-witness build); the
+    /// classifier then behaves as before this field existed. The stall-ending frame's own
+    /// cursor move is deliberately NOT counted (see the capturer's fold-on-next-call sampler).
+    pub(super) cursor_moved_px: Option<u32>,
 }
 
 /// The micro-probes' window read (Phase A.2, built by `probes::ProbeEngine::window`): per-leg
@@ -143,6 +153,13 @@ pub(super) enum StallClass {
     /// them before our swap-chain. The real display-path bug class — never yet observed in the
     /// field; a report with this label (counts attached) is the specimen we want.
     FrameGeneration,
+    /// A CONTENT-SILENCE hole whose damage witness says there was nothing to compose: the
+    /// pre-hole flow was dwm.exe-only (cursor/UI damage, no game presenting) AND the cursor sat
+    /// still through the hole. That is an input/hand pause — client-radio holes, Wi-Fi
+    /// power-save/scan cycles, or simply a resting hand — not a display disturbance. Excluded
+    /// from the metronome and both repeated-stall warns; the 2026-08-27 NVIDIA-laptop field
+    /// case was 30/30 of these blamed on the dark laptop panel.
+    DamageIdle,
     /// Not enough evidence to name a class (pre-telemetry driver and/or probes absent).
     Unattributed,
 }
@@ -163,6 +180,9 @@ impl std::fmt::Display for StallClass {
             }
             Self::FrameGeneration => {
                 "FRAME-GENERATION (presents FLOWED while the virtual display's kernel queue starved — the OS display path dropped composed frames)"
+            }
+            Self::DamageIdle => {
+                "DAMAGE-IDLE (dwm-only flow and the cursor sat still through the hole — nothing was dirty, so DWM correctly composed nothing; an input/hand pause, not a display stall)"
             }
             Self::Unattributed => "UNATTRIBUTED (insufficient telemetry)",
         })
@@ -226,6 +246,7 @@ pub(super) fn classify(
     verdict: &StallVerdict,
     probes: Option<&ProbeWindow>,
     etw_counts: Option<&super::dxgkrnl_etw::EtwWindowCounts>,
+    cursor_moved_px: Option<u32>,
 ) -> StallClass {
     match verdict {
         StallVerdict::WorkerStalled => return StallClass::OursWorker,
@@ -251,6 +272,16 @@ pub(super) fn classify(
             Some(c) if c.present_history => {
                 if c.presents >= PRESENTS_ACQUIT_CONTENT {
                     StallClass::FrameGeneration
+                } else if c.flow_dwm_only && cursor_moved_px == Some(0) {
+                    // The damage witness closes the CONTENT-SILENCE ambiguity from BOTH sides:
+                    // dwm-only flow means the damage source was the cursor, and a cursor that
+                    // sat still through the hole means DWM had nothing to compose — the hole is
+                    // an input/hand pause, not a display stall. (A cursor that MOVED through a
+                    // present-free hole stays CONTENT-SILENCE and, repeated, is the display
+                    // stack freezing the presenter — the warns say so.) Both conditions are
+                    // required: a game session (flow not dwm-only) is never demoted, and a
+                    // missing witness (`None`) keeps the pre-witness behavior.
+                    StallClass::DamageIdle
                 } else {
                     StallClass::ContentSilence
                 }
@@ -339,9 +370,9 @@ pub(super) struct StallWatch {
     /// whole session's beat, not just the stall that tripped the metronome.
     verdicts: [u32; 4],
     /// Running per-class tally ([`StallClass`] order: ours-worker, ours-delivery, adapter-freeze,
-    /// compositor-blocked, content-silence, frame-generation, unattributed) — the verdict
-    /// matrix's session summary.
-    classes: [u32; 7],
+    /// compositor-blocked, content-silence, frame-generation, damage-idle, unattributed) — the
+    /// verdict matrix's session summary.
+    classes: [u32; 8],
     /// The degraded stretch currently being accumulated, opened by a reported stall and fed by
     /// every stall-sized hole until sustained flow returns.
     episode: Option<Episode>,
@@ -389,7 +420,7 @@ impl StallWatch {
             seen: 0,
             with_os_events: 0,
             verdicts: [0; 4],
-            classes: [0; 7],
+            classes: [0; 8],
             episode: None,
             pending_recovery: None,
             rate_window: std::collections::VecDeque::new(),
@@ -434,14 +465,15 @@ impl StallWatch {
     fn class_tally(&self) -> String {
         format!(
             "ours-worker {}, ours-delivery {}, adapter-freeze {}, compositor-blocked {}, \
-             content-silence {}, frame-generation {}, unattributed {}",
+             content-silence {}, frame-generation {}, damage-idle {}, unattributed {}",
             self.classes[0],
             self.classes[1],
             self.classes[2],
             self.classes[3],
             self.classes[4],
             self.classes[5],
-            self.classes[6]
+            self.classes[6],
+            self.classes[7]
         )
     }
 
@@ -522,10 +554,21 @@ impl StallWatch {
         if !was_active || gap < Self::STALL_MIN {
             return None;
         }
-        Some(Stall {
-            gap,
-            metronomic: self.cadence.note(now),
-        })
+        // The metronome is fed in [`Self::report`], AFTER classification — a damage-idle hole
+        // must never advance the beat the METRONOMIC warns blame on display hardware.
+        Some(Stall { gap })
+    }
+
+    /// Feed one classified stall into the metronome — `Some(mean period)` when it completes a
+    /// metronomic cycle. Damage-idle stalls are NOT fed: an input/hand pause repeating on the
+    /// user's cadence must not fabricate the display-disturbance beat (the 2026-08-27 field
+    /// case fitted a "1.87 s display metronome" to what were pauses in the client's input).
+    /// Split from [`Self::report`] so the metronome integration stays unit-testable.
+    pub(super) fn cycle(&mut self, now: Instant, damage_idle: bool) -> Option<Duration> {
+        if damage_idle {
+            return None;
+        }
+        self.cadence.note(now)
     }
     /// Log a detected stall, correlate it against OS display events, and — once the cadence turns
     /// metronomic — name the class of disturbance and its cures.
@@ -562,6 +605,7 @@ impl StallWatch {
             &verdict,
             evidence.probes.as_ref(),
             evidence.etw_counts.as_ref(),
+            evidence.cursor_moved_px,
         );
         self.classes[match class {
             StallClass::OursWorker => 0,
@@ -570,8 +614,15 @@ impl StallWatch {
             StallClass::CompositorBlocked => 3,
             StallClass::ContentSilence => 4,
             StallClass::FrameGeneration => 5,
-            StallClass::Unattributed => 6,
+            StallClass::DamageIdle => 6,
+            StallClass::Unattributed => 7,
         }] += 1;
+        // Damage-idle holes are real delivery holes (the episode/recovery summaries still count
+        // them) but they are NOT display-disturbance evidence: they must not advance the
+        // metronome, trip either repeated-stall warn, or put a connected-inactive display on
+        // trial. The per-stall line below still carries their full evidence.
+        let damage_idle = class == StallClass::DamageIdle;
+        let metronomic = self.cycle(now, damage_idle);
         // debug (not warn): a single hole also happens when content legitimately pauses;
         // the reportable signal is the metronomic cycle below. Mounjay-class triage runs
         // at debug level, and the web-console debug ring captures these.
@@ -587,6 +638,11 @@ impl StallWatch {
             // inside the gap window. presents≥bar with adds≈0 = FRAME-GENERATION conviction.
             etw_presents = evidence.etw_counts.map(|c| c.presents),
             etw_queue_adds = evidence.etw_counts.map(|c| c.queue_adds),
+            // The damage witness: 0 on a dwm-only desktop = the hole had nothing to compose
+            // (input/hand pause); >0 with no presents = damage existed and the display stack
+            // composed none of it — a positive conviction the old CONTENT-SILENCE could not make.
+            cursor_moved_px_during_gap = evidence.cursor_moved_px,
+            flow_dwm_only = evidence.etw_counts.map(|c| c.flow_dwm_only),
             offered_during_gap = evidence.offered_delta,
             max_heartbeat_age_ms = evidence.max_heartbeat_age_ms,
             "IDD-push capture stall — the desktop was composing at speed, then the ring \
@@ -596,8 +652,9 @@ impl StallWatch {
         // frames to 150+ ms holes every few seconds without one (the 2026-08-26 7700 XT case)
         // deserves the same triage payload — otherwise the log's only guidance is per-stall
         // DEBUG lines nobody is told to read. Skipped when THIS stall completed a metronomic
-        // cycle: the arms below carry strictly richer prose.
-        if stall.metronomic.is_none() {
+        // cycle (the arms below carry strictly richer prose) and for damage-idle holes (an
+        // input/hand pause repeated 30 times is still not a display problem).
+        if metronomic.is_none() && !damage_idle {
             if let Some(stalls_in_window) = self.note_for_rate_warn(now) {
                 let suspects = pf_win_display::display_events::connected_inactive_physicals();
                 let suspects = if suspects.is_empty() {
@@ -623,7 +680,7 @@ impl StallWatch {
                 );
             }
         }
-        if let Some(period) = stall.metronomic {
+        if let Some(period) = metronomic {
             let suspects = pf_win_display::display_events::connected_inactive_physicals();
             let suspects = if suspects.is_empty() {
                 "none".to_string()
@@ -669,22 +726,27 @@ impl StallWatch {
                     verdicts = %verdict_tally,
                     classes = %class_tally,
                     "capture stalls are METRONOMIC with NO coinciding OS display event — \
-                     the disturbance is BELOW Windows. FIRST: if rt_gpu_driver or \
-                     rt_gpu_host shows a REALTIME opt-in, clear it (unset PFVD_RT_GPU / \
-                     set PUNKTFUNK_GPU_PRIORITY_CLASS=high) — a punktfunk process holding \
+                     the disturbance is BELOW Windows (damage-idle holes — cursor \
+                     stationary on a dwm-only desktop, i.e. input/hand pauses — are \
+                     already excluded from this beat; see cursor_moved_px_during_gap on \
+                     the per-stall lines). FIRST: if rt_gpu_driver or rt_gpu_host shows a \
+                     REALTIME opt-in, clear it (unset PFVD_RT_GPU / set \
+                     PUNKTFUNK_GPU_PRIORITY_CLASS=high) — a punktfunk process holding \
                      REALTIME GPU priority is the field-proven amplifier of exactly this \
-                     signature on AMD. Otherwise: the GPU driver servicing a \
+                     signature on AMD, and every pre-0.28 field metronome ran with it \
+                     default-on. Otherwise: the GPU driver servicing a \
                      connected-but-asleep sink (standby HPD/DDC/link probing), \
                      display-poller software (the SteelSeries-GG/SignalRGB class — \
                      correlate 'slow display-descriptor poll' lines), or the DWM present \
                      clock (try a different refresh rate). If connected_inactive lists a \
-                     display, its standby servicing is the prime suspect. For a LAPTOP \
-                     PANEL (the exclusive isolate deactivated it — the dark-but-connected \
-                     head is itself the disturbance on hybrid laptops): keep it active \
-                     with `topology: primary`, or try the `pnp_disable_monitors` axis. \
-                     For an external display: unplug it at the GPU, disable its OSD auto \
-                     input scan (TVs: instant-on/quick-start + CEC off), use an \
-                     HPD-holding adapter/dummy, or keep it active while streaming"
+                     display, its standby servicing is a suspect — cursor motion through \
+                     the holes is what convicts the display stack. For an external \
+                     display: keep it active while streaming, disable its OSD auto input \
+                     scan (TVs: instant-on/quick-start + CEC off), unplug it at the GPU, \
+                     or use an HPD-holding adapter/dummy. For a LAPTOP PANEL: keep it \
+                     active with `topology: primary` (the dark-but-connected-head \
+                     hypothesis has no confirmed post-0.28 case — verify with the cursor \
+                     witness before chasing it)"
                 );
             }
         }
