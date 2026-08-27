@@ -59,6 +59,105 @@ pub const VIDEO_PORT: u16 = 47998;
 pub const CONTROL_PORT: u16 = 47999;
 pub const AUDIO_PORT: u16 = 48000;
 
+/// Length of the per-session A/V ping payload. The SETUP response carries it hex-encoded, so
+/// these 8 bytes are the 16 characters a client echoes back.
+#[cfg(feature = "gamestream")]
+pub const AV_PING_LEN: usize = 8;
+
+/// How long [`learn_client_endpoint`] holds out for a datagram that actually carries the session's
+/// ping payload once an unverified one is already in hand.
+#[cfg(feature = "gamestream")]
+const AV_PING_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a media plane waits for its client to show up at all.
+#[cfg(feature = "gamestream")]
+const AV_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Decide whether a datagram carries this session's ping payload.
+///
+/// Accepts either encoding as a **prefix**: the SETUP header's ASCII hex, or its decoded bytes —
+/// and trailing bytes are fine, because a modern client wraps the payload in an `SS_PING`
+/// structure with a sequence number. Constant-time, so a peer can't probe the expected value a
+/// byte at a time by timing our answer.
+#[cfg(feature = "gamestream")]
+fn ping_matches(datagram: &[u8], expect: &[u8; AV_PING_LEN]) -> bool {
+    let hex = hex::encode(expect);
+    let ascii =
+        datagram.len() >= hex.len() && crypto::ct_eq(&datagram[..hex.len()], hex.as_bytes());
+    let raw = datagram.len() >= expect.len() && crypto::ct_eq(&datagram[..expect.len()], expect);
+    ascii || raw
+}
+
+/// Learn a media stream's client UDP endpoint from the first datagram that proves it belongs to
+/// this session. Two guards, weakest to strongest:
+///
+/// * **Source IP** — only the launch owner's datagrams are considered (security-review 2026-08-15
+///   finding 1). On its own this leaves the endpoint to whoever sends first from that address: a
+///   NAT neighbour sharing the owner's public IP, or an on-path peer spoofing it.
+/// * **Ping payload** — the per-session secret minted at `/launch`, handed out in the SETUP
+///   response, and echoed by the client as its first datagram. A racer who never saw it cannot
+///   produce it.
+///
+/// The payload check **prefers** rather than **requires**, and that is deliberate. The sanctioned
+/// wire reference says the client echoes the payload, and that modern clients send it inside an
+/// `SS_PING` structure *with a sequence number* — but it gives neither that structure's layout nor
+/// whether the payload crosses as the header's ASCII or as its decoded bytes. [`ping_matches`]
+/// accepts every shape those unknowns allow, yet a hard gate resting on an unverified layout would
+/// black-screen every session it guessed wrong about, and compatibility is this plane's whole
+/// reason to exist. So an unverified datagram is held as a fallback, adopted only if the grace
+/// window passes with nothing better, and logged with the bytes that did arrive — one real session
+/// settles the question, and the fallback can go.
+#[cfg(feature = "gamestream")]
+pub fn learn_client_endpoint(
+    sock: &UdpSocket,
+    label: &str,
+    owner_ip: Option<IpAddr>,
+    expect: &[u8; AV_PING_LEN],
+) -> Result<std::net::SocketAddr> {
+    let start = std::time::Instant::now();
+    let deadline = start + AV_PING_TIMEOUT;
+    let mut probe = [0u8; 256];
+    // The first owner datagram that did NOT carry the payload, kept with a copy of its opening
+    // bytes — `probe` is overwritten by every later datagram, and those bytes are the whole point
+    // of the warning below.
+    let mut fallback: Option<(std::net::SocketAddr, Vec<u8>)> = None;
+    let mut grace = deadline;
+    loop {
+        let remaining = grace.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        sock.set_read_timeout(Some(remaining))?;
+        // Any read error ends the wait and falls through to the decision below — a timeout here is
+        // the grace window expiring, not a failure, once a fallback is in hand.
+        let Ok((n, src)) = sock.recv_from(&mut probe) else {
+            break;
+        };
+        if owner_ip.is_some_and(|ip| ip != src.ip()) {
+            continue;
+        }
+        if ping_matches(&probe[..n], expect) {
+            tracing::info!(%src, "{label}: client endpoint learned (ping payload verified)");
+            return Ok(src);
+        }
+        if fallback.is_none() {
+            fallback = Some((src, probe[..n.min(32)].to_vec()));
+            grace = (std::time::Instant::now() + AV_PING_GRACE).min(deadline);
+        }
+    }
+    match fallback {
+        Some((src, head)) => {
+            tracing::warn!(
+                %src,
+                bytes = %hex::encode(&head),
+                "{label}: first datagram did not carry this session's ping payload — adopting it                  anyway (source-IP-bound only). Report these bytes: they pin the wire encoding."
+            );
+            Ok(src)
+        }
+        None => anyhow::bail!("{label}: no client ping from the launch owner within 10s"),
+    }
+}
+
 /// Advertised host version. Major ≥ 7 tells Moonlight to use SHA-256 for pairing.
 pub const APP_VERSION: &str = "7.1.431.-1";
 pub const GFE_VERSION: &str = "3.23.0.74";
@@ -230,6 +329,14 @@ pub struct AppState {
     pub(crate) control_gate: control::Gate,
     /// The active launch session (set by `/launch`, consumed by RTSP/media).
     pub launch: std::sync::Mutex<Option<LaunchSession>>,
+    /// This session's A/V ping payload ([`AV_PING_LEN`] bytes, big-endian in these 8) — minted
+    /// fresh by `/launch` and `/resume`, handed to the client in the SETUP response, and echoed
+    /// back by it as the first datagram on each media port. It is what lets the media planes tell
+    /// their client apart from anything else arriving at the port from the same address; see
+    /// [`learn_client_endpoint`]. Not in [`LaunchSession`]: the client does not supply it, we mint
+    /// it, and it re-mints on resume while that struct's keys may not.
+    #[cfg(feature = "gamestream")]
+    pub av_ping: std::sync::atomic::AtomicU64,
     /// Negotiated video config from RTSP ANNOUNCE (consumed by the stream on PLAY).
     #[cfg(feature = "gamestream")]
     pub stream: std::sync::Mutex<Option<stream::StreamConfig>>,
@@ -344,6 +451,27 @@ impl AppState {
         self.end_session(reason)
     }
 
+    /// Mint a fresh A/V ping payload for a session that is beginning (`/launch`) or re-beginning
+    /// (`/resume`), and return it. Must happen before the client's RTSP SETUP, which is what hands
+    /// it out.
+    #[cfg(feature = "gamestream")]
+    pub fn mint_av_ping(&self) -> [u8; AV_PING_LEN] {
+        let payload = crypto::random::<AV_PING_LEN>();
+        self.av_ping.store(
+            u64::from_be_bytes(payload),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        payload
+    }
+
+    /// This session's A/V ping payload — what SETUP advertises and the media planes expect back.
+    #[cfg(feature = "gamestream")]
+    pub fn av_ping_payload(&self) -> [u8; AV_PING_LEN] {
+        self.av_ping
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .to_be_bytes()
+    }
+
     /// Fresh control-plane state: no active session; the pairing allow-list is loaded from
     /// disk (pairings persist across restarts). `stats` is the shared recorder handed to both the
     /// mgmt API and the streaming loops. (The native-only build's variant is below — same state
@@ -361,6 +489,7 @@ impl AppState {
             paired: std::sync::Mutex::new(load_paired()),
             control_gate: control::Gate::new(),
             launch: std::sync::Mutex::new(None),
+            av_ping: std::sync::atomic::AtomicU64::new(0),
             stream: std::sync::Mutex::new(None),
             audio_params: std::sync::Mutex::new(audio::AudioParams::default()),
             streaming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1000,6 +1129,21 @@ mod session_tests {
         }
     }
 
+    /// Mint and read must agree on byte order — if they did not, every session would advertise
+    /// one payload in its SETUP response and expect another at the media ports, and no client
+    /// would ever be recognised. A resume must also not reuse the old value: it re-mints
+    /// precisely because the previous one may have been seen on the (plaintext) wire.
+    #[cfg(feature = "gamestream")]
+    #[test]
+    fn av_ping_mint_round_trips_and_changes() {
+        let state = test_state();
+        let first = state.mint_av_ping();
+        assert_eq!(first, state.av_ping_payload(), "advertised != expected");
+        let second = state.mint_av_ping();
+        assert_ne!(first, second, "a resume must not reuse the payload");
+        assert_eq!(second, state.av_ping_payload());
+    }
+
     /// `end_session` is THE compat-plane teardown: one call must clear the whole session — both
     /// media-thread flags, the launch, and the negotiated stream config — and be idempotent.
     /// Guards the ENet-Disconnect / client-unreachable paths that previously stopped nothing
@@ -1071,6 +1215,52 @@ mod session_tests {
         assert!(state.quit.load(Ordering::SeqCst));
         // …and it still performs the full teardown.
         assert!(!state.streaming.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(all(test, feature = "gamestream"))]
+mod av_ping_tests {
+    use super::{ping_matches, AV_PING_LEN};
+
+    const P: [u8; AV_PING_LEN] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
+
+    /// The wire reference does not say whether the client echoes the SETUP header's ASCII or its
+    /// decoded bytes, and says the modern form wraps the payload in a structure carrying a
+    /// sequence number. Every shape those unknowns allow has to be recognised, or a correct client
+    /// gets its endpoint refused.
+    #[test]
+    fn both_encodings_match_with_or_without_a_trailing_sequence() {
+        let hex = b"0011223344556677";
+        let raw = &P[..];
+        assert!(ping_matches(hex, &P), "ASCII hex, exactly");
+        assert!(ping_matches(raw, &P), "decoded bytes, exactly");
+        // …and each with an SS_PING-style sequence number appended.
+        assert!(
+            ping_matches(&[&hex[..], &[0, 0, 0, 1]].concat(), &P),
+            "hex + seq"
+        );
+        assert!(
+            ping_matches(&[raw, &[0, 0, 0, 1]].concat(), &P),
+            "raw + seq"
+        );
+    }
+
+    /// The point of the payload: a datagram that does not carry it is not this session's client.
+    #[test]
+    fn anything_else_does_not_match() {
+        assert!(!ping_matches(b"", &P), "empty");
+        assert!(!ping_matches(b"PING", &P), "the legacy fixed ping");
+        assert!(!ping_matches(b"001122334455667", &P), "one hex char short");
+        assert!(!ping_matches(&P[..7], &P), "one raw byte short");
+        assert!(
+            !ping_matches(b"0011223344556678", &P),
+            "last hex char wrong"
+        );
+        let mut near = P;
+        near[7] ^= 1;
+        assert!(!ping_matches(&near, &P), "last raw byte wrong");
+        // The old fixed constant, now that every session mints its own.
+        assert!(!ping_matches(b"0011223344556677", &[0xAB; AV_PING_LEN]));
     }
 }
 

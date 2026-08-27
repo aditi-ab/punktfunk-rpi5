@@ -22,9 +22,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Opaque per-session payload the client echoes as its first UDP datagram (port-learning).
-const PING_PAYLOAD: &str = "0011223344556677";
-
 // The RTSP listener is UNAUTHENTICATED (no TLS/pairing) and one-thread-per-connection, so bound
 // every attacker-controllable dimension to deny a pre-auth slow-loris / memory-growth DoS: a hard
 // cap on concurrent connections, a per-read timeout so a stalled peer can't pin a thread, a
@@ -223,6 +220,18 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
             Some(&describe_sdp()),
         ),
         "SETUP" => {
+            // Gated like its siblings ANNOUNCE and PLAY, and for a sharper reason since the ping
+            // payload became a secret: this response is where the payload is handed out, so an
+            // ungated SETUP would let any peer that can reach 48010 simply *ask* for the value the
+            // media planes verify — and then win the endpoint race it is meant to lose. Real
+            // clients SETUP from the same address they launched from, so this costs them nothing.
+            if authorized_launch(state, peer).is_none() {
+                tracing::warn!(
+                    ?peer,
+                    "RTSP SETUP — refused: not the paired `/launch` owner"
+                );
+                return response_status("401 Unauthorized", &req.cseq, &[], None);
+            }
             let (port, extra_key) = match stream_type(&req.uri) {
                 Some("audio") => (AUDIO_PORT, "X-SS-Ping-Payload"),
                 Some("video") => (VIDEO_PORT, "X-SS-Ping-Payload"),
@@ -230,12 +239,15 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 _ => return response_status("404 Not Found", &req.cseq, &[], None),
             };
             let transport = format!("server_port={port}");
+            // This session's payload, minted at `/launch`. The client echoes it as its first
+            // datagram on each media port, which is how those planes recognise it.
+            let payload = hex::encode(state.av_ping_payload());
             response(
                 &req.cseq,
                 &[
                     ("Session", "DEADBEEFCAFE;timeout = 90"),
                     ("Transport", &transport),
-                    (extra_key, PING_PAYLOAD),
+                    (extra_key, &payload),
                 ],
                 None,
             )
@@ -310,6 +322,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                             quit: state.quit.clone(),
                             fingerprint: ls.owner_fp.map(hex::encode),
                             owner_ip: ls.peer_ip,
+                            av_ping: state.av_ping_payload(),
                             on_game_exit: {
                                 let st = state.clone();
                                 Arc::new(move || {
@@ -337,6 +350,9 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                     // Same owner-IP bind as the video plane: only the launching peer's pings are
                     // honored at the audio endpoint. security-review 2026-08-15 finding 1.
                     ls.peer_ip,
+                    // ...and the same ping payload, which is what tells this client's first
+                    // datagram apart from anything else arriving from that address.
+                    state.av_ping_payload(),
                     state.media_exited.clone(),
                 );
             }

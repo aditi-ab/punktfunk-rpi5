@@ -220,6 +220,8 @@ pub fn start(
     audio_cap: AudioCapSlot,
     on_lost: super::OnSessionLost,
     owner_ip: Option<std::net::IpAddr>,
+    // This session's ping payload — the other half of the endpoint guard beside `owner_ip`.
+    av_ping: [u8; super::AV_PING_LEN],
     // Bumped as this thread's LAST act — the teardown-complete signal `/resume`'s media
     // restart waits on (see `AppState::media_exited`).
     media_exited: Arc<std::sync::atomic::AtomicU64>,
@@ -229,7 +231,7 @@ pub fn start(
         .spawn(move || {
             tracing::info!(?params, "audio stream starting");
             if let Err(e) = run(
-                &running, &gcm_key, rikeyid, params, &audio_cap, &on_lost, owner_ip,
+                &running, &gcm_key, rikeyid, params, &audio_cap, &on_lost, owner_ip, &av_ping,
             ) {
                 tracing::error!(error = %format!("{e:#}"), "audio stream failed");
             }
@@ -253,6 +255,7 @@ pub fn start(
     _audio_cap: AudioCapSlot,
     _on_lost: super::OnSessionLost,
     _owner_ip: Option<std::net::IpAddr>,
+    _av_ping: [u8; super::AV_PING_LEN],
     media_exited: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     tracing::error!("GameStream audio requires Linux (PipeWire) or Windows (WASAPI) + libopus");
@@ -261,6 +264,7 @@ pub fn start(
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+#[allow(clippy::too_many_arguments)] // one call site (`start`), which carries the same allow
 fn run(
     running: &AtomicBool,
     gcm_key: &[u8; 16],
@@ -269,36 +273,18 @@ fn run(
     audio_cap: &std::sync::Mutex<Option<Box<dyn AudioCapturer>>>,
     on_lost: &super::OnSessionLost,
     owner_ip: Option<std::net::IpAddr>,
+    av_ping: &[u8; super::AV_PING_LEN],
 ) -> Result<()> {
     let sock = UdpSocket::bind(("0.0.0.0", AUDIO_PORT)).context("bind audio UDP")?;
     // Grow SO_SNDBUF/RCVBUF; the opt-in DSCP/QoS tag happens after connect below (Windows
     // qWAVE derives the flow from the connected 5-tuple).
     punktfunk_core::transport::grow_socket_buffers(&sock);
     // The client pings the audio port (~every 500ms) so we learn where to send.
-    sock.set_read_timeout(Some(Duration::from_secs(10)))?;
     tracing::debug!(port = AUDIO_PORT, "audio: awaiting client ping");
-    let mut probe = [0u8; 256];
-    // Same owner-IP bind as the video plane (LaunchSession::peer_ip): only the launching peer's
-    // pings are honored, so an off-path LAN peer cannot capture the audio endpoint (a DoS here, as
-    // audio payload is AES-CBC under `rikey`). `None` keeps the pre-owner behavior.
-    // security-review 2026-08-15 finding 1.
-    let client = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                anyhow::bail!("audio: no client ping from the launch owner within 10s");
-            }
-            sock.set_read_timeout(Some(remaining))?;
-            let (_, src) = sock
-                .recv_from(&mut probe)
-                .context("audio: no client ping within 10s")?;
-            if owner_ip.is_some_and(|ip| ip != src.ip()) {
-                continue;
-            }
-            break src;
-        }
-    };
+    // Same guard as the video plane, through the same shared helper: owner IP plus this session's
+    // ping payload. Capturing the audio endpoint is a DoS rather than a disclosure (the payload is
+    // AES-CBC under `rikey`), but it is the same race and deserves the same answer.
+    let client = super::learn_client_endpoint(&sock, "audio", owner_ip, av_ping)?;
     sock.connect(client)
         .context("connect client audio endpoint")?;
     // Opt-in DSCP/QoS-tag this as the audio class (PUNKTFUNK_DSCP=1); the guard keeps the
