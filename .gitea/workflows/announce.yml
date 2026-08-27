@@ -29,7 +29,11 @@ jobs:
   announce:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      # SHA-pinned, unlike the plain `@v4` the build workflows use: this job holds
+      # UPDATE_MANIFEST_KEY — the Ed25519 key every host pins to decide whether an update is real —
+      # and a tag is mutable, so whoever can move it runs code in front of that key. Same style as
+      # the appleboy pins in deploy-services.yml; the trailing comment is the release it resolves to.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Publish the SIGNED stable update manifest — the moment every host's update check learns
       # about this release (planning: host-update-from-web-console.md §3.3). Deliberately here in

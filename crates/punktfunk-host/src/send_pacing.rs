@@ -96,16 +96,23 @@ pub(crate) const MAX_PACE_SPREAD: Duration = Duration::from_millis(100);
 ///
 /// `pace_rate_bps == 0` (PUNKTFUNK_PACE_FACTOR=0) or an overflow-free frame keeps the legacy
 /// deadline-only spread.
+///
+/// `max_spread` (ABR overhaul RFC §2.2) bounds one frame's spread to what the encode|send
+/// `sync_channel(3)` can absorb — the caller passes ~2 frame intervals. A spread past that
+/// backs the channel up into `cadence_degraded`, and the host then refuses every climb; a
+/// shorter budget over the same overflow IS the lifted effective rate the RFC asks for.
+/// Pass [`MAX_PACE_SPREAD`] when the interval is unknown.
 pub(crate) fn native_budget(
     deadline: Instant,
     pace_rate_bps: u64,
     overflow_bytes: u64,
+    max_spread: Duration,
 ) -> PaceBudget {
     if pace_rate_bps > 0 && overflow_bytes > 0 {
         let cap = Duration::from_nanos(
             (overflow_bytes * 8).saturating_mul(1_000_000_000) / pace_rate_bps,
         );
-        PaceBudget::Fixed(cap.min(MAX_PACE_SPREAD))
+        PaceBudget::Fixed(cap.min(max_spread).min(MAX_PACE_SPREAD))
     } else {
         PaceBudget::UntilDeadline {
             deadline,
@@ -113,6 +120,31 @@ pub(crate) fn native_budget(
             cap: Duration::MAX,
         }
     }
+}
+
+/// The native plane's automatic microburst allowance (pure — unit-tested): the bytes that may
+/// leave unpaced before the spread starts, sized in TIME at the pace rate (ABR overhaul RFC
+/// §2.1) — "what the link drains in ≤10 ms" — instead of the old absolute
+/// `max(128 KiB, wire/4)`, which was sized for gigabit LAN: at Wi-Fi bitrates every frame sat
+/// under it, so the whole packet train went out back-to-back and the first motion frame after
+/// a static stretch was lost to the burst (the 2026-08-26 field case; `PACE_BURST_KB=16` was
+/// its discriminator, and the 16 KiB clamp floor below is exactly that value).
+///
+/// One constant lines up both known-good ends: 5 Mbps stream (~15 Mbps pace) → ~19 KiB ≈ the
+/// field discriminator; 30 Mbps LAN (~90 Mbps pace) → ~112 KiB ≈ the old 128 KiB floor, so
+/// LAN latency does not regress; ≥205 Mbps pace clamps at 256 KiB and the rest rides the
+/// 3×-rate spread. `pace_rate_bps == 0` (PUNKTFUNK_PACE_FACTOR=0 — pacing off) keeps the
+/// legacy fraction-of-frame burst.
+pub(crate) fn auto_burst_bytes(pace_rate_bps: u64, wire_bytes: usize) -> usize {
+    const BURST_MS: u64 = 10;
+    const BURST_MIN: usize = 16 * 1024;
+    const BURST_MAX: usize = 256 * 1024;
+    if pace_rate_bps == 0 {
+        return (wire_bytes / 4).max(128 * 1024);
+    }
+    usize::try_from(pace_rate_bps * BURST_MS / 8000)
+        .unwrap_or(BURST_MAX)
+        .clamp(BURST_MIN, BURST_MAX)
 }
 
 /// Per-plane pacing parameters. See the module doc for the two canonical values.
@@ -649,21 +681,21 @@ mod tests {
         // The stall-resume case the fix exists for: a 3 MB overflow at 3×240 Mbps needs
         // ~33 ms — an IMMINENT deadline (the old min() made this a blast) must not shrink it.
         let deadline = Instant::now() + Duration::from_millis(4); // 240 fps interval
-        let b = native_budget(deadline, 720_000_000, 3_000_000);
+        let b = native_budget(deadline, 720_000_000, 3_000_000, MAX_PACE_SPREAD);
         assert_eq!(b, PaceBudget::Fixed(Duration::from_nanos(33_333_333)));
 
         // A steady-state frame: overflow 90 KB at 3×240 Mbps = 1 ms — identical to what the
         // old min(slack, cap) chose (cap was the smaller term), so nothing regresses.
-        let b = native_budget(deadline, 720_000_000, 90_000);
+        let b = native_budget(deadline, 720_000_000, 90_000, MAX_PACE_SPREAD);
         assert_eq!(b, PaceBudget::Fixed(Duration::from_micros(1_000)));
 
         // A crater-rate resume (ABR backed off to 20 Mbps, pace 60 Mbps): the raw rate math
         // says 400 ms for 3 MB — the absolute ceiling bounds the send thread's stall.
-        let b = native_budget(deadline, 60_000_000, 3_000_000);
+        let b = native_budget(deadline, 60_000_000, 3_000_000, MAX_PACE_SPREAD);
         assert_eq!(b, PaceBudget::Fixed(MAX_PACE_SPREAD));
 
         // Rate cap off (PUNKTFUNK_PACE_FACTOR=0): the legacy deadline-only spread, uncapped.
-        let b = native_budget(deadline, 0, 3_000_000);
+        let b = native_budget(deadline, 0, 3_000_000, MAX_PACE_SPREAD);
         assert!(matches!(
             b,
             PaceBudget::UntilDeadline {
@@ -674,8 +706,49 @@ mod tests {
         ));
 
         // No overflow (the whole frame bursts): budget is never consulted — legacy shape.
-        let b = native_budget(deadline, 720_000_000, 0);
+        let b = native_budget(deadline, 720_000_000, 0, MAX_PACE_SPREAD);
         assert!(matches!(b, PaceBudget::UntilDeadline { .. }));
+    }
+
+    /// [`native_budget`] with the RFC §2.2 spread cap: a paced IDR must not park the send
+    /// thread past ~2 frame intervals (encode|send `sync_channel(3)` backpressure →
+    /// `cadence_degraded` → the host refuses every climb) — the shorter budget over the same
+    /// overflow IS the lifted effective rate.
+    #[test]
+    fn native_budget_spread_capped_to_frame_intervals() {
+        let deadline = Instant::now() + Duration::from_millis(8);
+        // A 3 MB IDR at 60 Mbps pace wants 400 ms; two 120 Hz intervals (16.6 ms) win.
+        let two_intervals = Duration::from_nanos(2 * 8_333_333);
+        let b = native_budget(deadline, 60_000_000, 3_000_000, two_intervals);
+        assert_eq!(b, PaceBudget::Fixed(two_intervals));
+
+        // A steady-state frame under the cap is untouched by it.
+        let b = native_budget(deadline, 720_000_000, 90_000, two_intervals);
+        assert_eq!(b, PaceBudget::Fixed(Duration::from_micros(1_000)));
+
+        // The absolute ceiling still binds when the interval cap is the larger one
+        // (a 5 fps virtual mode must not re-license a 400 ms stall).
+        let b = native_budget(deadline, 60_000_000, 3_000_000, Duration::from_millis(400));
+        assert_eq!(b, PaceBudget::Fixed(MAX_PACE_SPREAD));
+    }
+
+    /// [`auto_burst_bytes`] (RFC §2.1): the unpaced allowance is 10 ms at the pace rate,
+    /// clamped to [16 KiB, 256 KiB] — the constants that line up the Wi-Fi field
+    /// discriminator on one end and the old LAN behavior on the other.
+    #[test]
+    fn auto_burst_is_time_at_pace_rate() {
+        // 5 Mbps stream × 3 = 15 Mbps pace → 18.75 KiB: the Wi-Fi field case, where the old
+        // 128 KiB floor swallowed every frame whole and the motion-onset burst was lost.
+        assert_eq!(auto_burst_bytes(15_000_000, 40_000), 18_750);
+        // 30 Mbps LAN × 3 = 90 Mbps → ~112 KiB ≈ the old 128 KiB floor: no LAN regression.
+        assert_eq!(auto_burst_bytes(90_000_000, 250_000), 112_500);
+        // Below ~13 Mbps pace the floor is the field-proven 16 KiB.
+        assert_eq!(auto_burst_bytes(3_000_000, 10_000), 16 * 1024);
+        // Gigabit-class pace clamps at 256 KiB — the rest rides the 3×-rate spread.
+        assert_eq!(auto_burst_bytes(3_000_000_000, 4_000_000), 256 * 1024);
+        // PUNKTFUNK_PACE_FACTOR=0 (pacing off): the legacy fraction-of-frame burst.
+        assert_eq!(auto_burst_bytes(0, 4_000_000), 1_000_000);
+        assert_eq!(auto_burst_bytes(0, 40_000), 128 * 1024);
     }
 
     /// `inject_video_drop` is a no-op when the knob is off (the default test env).

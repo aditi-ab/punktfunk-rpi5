@@ -53,21 +53,30 @@ RUN pacman -Syu --noconfirm --needed \
         # below. It does NOT affect the gamescope companion leg — that is meson + its own linker,
         # and its `-static-libstdc++` link is untouched.
         mold \
-    && pacman -Scc --noconfirm
-
-# bun builds the punktfunk-web console + the punktfunk-scripting runner AND is vendored
-# as their runtime (PF_WITH_WEB=1 / PF_WITH_SCRIPTING=1); it's AUR-only on Arch, so
-# bootstrap the official binary — once, here, instead of per run.
-RUN curl -fsSL https://bun.sh/install | bash \
-    && install -m0755 /root/.bun/bin/bun /usr/local/bin/bun \
-    && rm -rf /root/.bun \
+        # bun builds the punktfunk-web console + the punktfunk-scripting runner AND is vendored as
+        # their runtime (PF_WITH_WEB=1 / PF_WITH_SCRIPTING=1) — so these bytes end up inside the
+        # package arch.yml signs and publishes. Arch ships bun in [extra], so take the
+        # pacman-signed package (pacman verifies package signatures by default) instead of piping
+        # bun.sh's installer into root's shell, which would be upstream code choosing them. Same
+        # call as arch.yml's bootstrap guard. It rides THIS transaction rather than a later layer
+        # on purpose: -Syu refreshes the db in the same step that installs, so a cache-hit rebuild
+        # can never resolve bun against a stale snapshot the mirrors no longer carry.
+        bun \
+    && pacman -Scc --noconfirm \
     && bun --version
 
 # Shared compile cache: jobs set RUSTC_WRAPPER=sccache (backend = RustFS S3 on the LAN,
 # see .gitea/workflows — the env lives there so dev use of this image stays uncached).
+# Checked by SHA-256, like the bun pin: sccache is RUSTC_WRAPPER, so it sits in front of every
+# rustc invocation that produces a SHIPPED binary. Bump SCCACHE_VERSION and SCCACHE_SHA together —
+# upstream publishes the sum as <asset>.tar.gz.sha256 next to the release asset.
 ARG SCCACHE_VERSION=0.10.0
-RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-    | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache' \
+ARG SCCACHE_SHA=1fbb35e135660d04a2d5e42b59c7874d39b3deb17de56330b25b713ec59f849b
+RUN curl -fsSL -o /tmp/sccache.tar.gz \
+      "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    && echo "${SCCACHE_SHA}  /tmp/sccache.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/sccache.tar.gz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache' \
+    && rm -f /tmp/sccache.tar.gz \
     && sccache --version
 
 # CARGO_HOME is declared here only so this image agrees with what arch.yml already sets at job

@@ -219,7 +219,9 @@ reach *Stopped*, and starts again); `punktfunk-host service status` shows the cu
 
 The host writes to `%ProgramData%\punktfunk\logs\` — `service.log` for the service supervisor and
 `host.log` for the streaming host itself. Each is rotated to `.old` at the next start once it passes
-10 MB, one generation kept. The web console's **Logs** tab shows the same stream live. For more
+10 MB, one generation kept. Both are readable only by Administrators and SYSTEM — a normal editor
+can't open them even on an admin account — so read them from an **elevated** PowerShell, or use the
+web console's **Logs** tab, which shows the same stream live and needs no elevation. For more
 detail, set `RUST_LOG=debug` in `host.env` and restart the service.
 
 ### Updating

@@ -90,10 +90,15 @@ The document is validated as a whole, and **one bad entry disables every hook** 
   hostname — are fine, so Home Assistant on another box on your network works as written.
 - `timeout_s` must be 1–600.
 - If `hmac_secret_file` is set but unreadable, the host **skips** that POST rather than sending it
-  unsigned.
+  unsigned. It also *warns* (and still signs) when that file isn't owned by you or is readable by
+  anyone else — `chmod 600` it.
 
 So check the log after editing the file: `journalctl --user -u punktfunk-host` on Linux, or the web
-console's **Logs** page on either platform.
+console's **Logs** page on either platform. Those lines name a hook by its webhook's
+`scheme://host` or its command's program name, plus a short id — the URL path and the command's
+arguments are left out, because that's where a Slack or ntfy token and an `Authorization:` header
+live, and the **Logs** page is served over the API verbatim. The id is the same on every line about
+one hook, so two hooks sharing a program or a webhook host stay apart.
 
 A `run` command's shell one-liner vocabulary — the event flattened to env, values sanitized:
 
@@ -122,9 +127,12 @@ ok = hmac.compare_digest(request.headers["X-Punktfunk-Signature"], expected)
 **Rules of the road:** hooks are fire-and-forget and bounded — at most 8 in flight (extra firings
 are dropped with a log line, never queued), and a command that outlives its timeout is killed.
 Hook commands run as the host user, so `hooks.json` is operator-privileged config. On Linux, when a
-command starts with an **absolute path** to a script, the host checks that file is owned by you (or
-root) and not group/world-writable, and refuses to run it — loudly, in the log — if it isn't. Write
-the full path (`/home/me/.config/punktfunk/scripts/on-stream.sh`, not `~/…`) if you want that
+command names a script by **absolute path**, the host checks that file *and every directory above
+it* is owned by you (or root) and not group/world-writable, and refuses to run it — loudly, in the
+log — if it isn't: whoever can rename an entry in a directory chooses what runs out of it. (A
+world-writable directory with the sticky bit, like `/tmp`, passes — there only an entry's own owner
+can replace it.) Quoting is understood, so a path with a space in it is checked like any other.
+Write the full path (`/home/me/.config/punktfunk/scripts/on-stream.sh`, not `~/…`) if you want that
 check: the shell expands `~` and looks up PATH names like `makoctl` only afterwards, so those are
 never checked. On Windows there is no per-script check — the ACL on the config directory is the
 boundary.

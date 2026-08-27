@@ -23,8 +23,11 @@
 //! firings are dropped with a warning, never queued unboundedly), per-hook `debounce_ms`, the
 //! exec timeout + process-group kill. Trust model (RFC §9.1): `hooks.json` is
 //! operator-privileged config in the DACL'd/0700 config dir; before executing a hook whose
-//! command is a script *path*, the host verifies the file is owned by the operator (or root)
-//! and not group/world-writable — the sshd/sudoers rule — and refuses loudly otherwise.
+//! command is a script *path*, the host verifies that file — and every directory above it — is
+//! owned by the operator (or root) and not group/world-writable — the sshd/sudoers rule — and
+//! refuses loudly otherwise. Log lines name a hook by [`cmd_label`]/[`webhook_origin`], never by
+//! its raw command line or URL: the tracing ring they land in is served over `GET /api/v1/logs`,
+//! and a webhook path segment (Slack, Discord, ntfy, Teams) *is* the bearer credential.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -159,9 +162,15 @@ impl HooksConfig {
                 // Warn rather than reject (an internal-only `http://` receiver may be intentional).
                 if h.hmac_secret_file.is_some() && url.starts_with("http://") {
                     tracing::warn!(
-                        %url,
+                        url = %webhook_origin(url),
                         "webhook has an hmac_secret_file but is http:// — the signed body is sent in cleartext; prefer https://"
                     );
+                }
+            }
+            if let Some(p) = h.hmac_secret_file.as_deref() {
+                if let Some(why) = secret_file_complaint(p) {
+                    tracing::warn!(path = %p.display(),
+                        "webhook hmac_secret_file is {why} — it should be operator-owned and chmod 600");
                 }
             }
             if h.timeout_s == 0 || h.timeout_s > MAX_TIMEOUT_S {
@@ -170,6 +179,33 @@ impl HooksConfig {
         }
         Ok(())
     }
+}
+
+/// The documented `hmac_secret_file` hygiene check (see [`HookEntry::hmac_secret_file`]): the
+/// secret should be operator-owned and private. Returns the complaint to warn about, `None` when
+/// the file is fine (or absent — an unreadable secret is [`post_webhook`]'s fail-closed case, not
+/// this one's). A warning, not a refusal: the operator asked for signing, and refusing here would
+/// silently drop it.
+#[cfg(unix)]
+fn secret_file_complaint(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    // SAFETY: geteuid has no preconditions and touches no memory.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid && meta.uid() != 0 {
+        return Some(format!(
+            "owned by uid {} (host runs as uid {euid})",
+            meta.uid()
+        ));
+    }
+    (meta.mode() & 0o077 != 0)
+        .then(|| format!("group/world-accessible (mode {:o})", meta.mode() & 0o7777))
+}
+
+/// Windows: the SYSTEM/Admins-DACL'd config dir is the boundary (as for [`exec_path_check`]).
+#[cfg(not(unix))]
+fn secret_file_complaint(_path: &std::path::Path) -> Option<String> {
+    None
 }
 
 // ------------------------------------------------------------------------- store
@@ -365,25 +401,53 @@ fn dispatch(
 
 // ------------------------------------------------------------------------- exec action
 
+/// Short, stable id for one hook action (`#1a2b3c4d`) — all a log line keeps of the part that can
+/// carry a secret. The same id on every line about one firing, a different one for two hooks that
+/// share a program or a webhook host, so an operator can still tell which fired. Process-lifetime
+/// stable, like [`entry_key`]'s hash.
+fn short_id(s: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    format!("#{:08x}", hasher.finish() as u32)
+}
+
+/// What the `cmd` field of a log line carries about an operator command: the program's file name
+/// plus its [`short_id`]. The arguments are dropped — a hook command line carries API tokens
+/// (`curl -H "Authorization: …"`) as readily as a webhook URL does, and these lines land in the
+/// tracing ring `GET /api/v1/logs` serves verbatim (security review 2026-08-24). A refusal still
+/// names the offending *path*, through the [`exec_path_check`] error — that is what the operator
+/// needs in order to fix it.
+fn cmd_label(cmd: &str) -> String {
+    let prog = cmd
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(['"', '\'']);
+    let file = prog.rsplit(['/', '\\']).next().unwrap_or(prog);
+    format!("{file} {}", short_id(cmd))
+}
+
 fn fire_exec(
     cmd: String,
     ev: &crate::events::HostEvent,
     timeout_s: u32,
     sem: &std::sync::Arc<tokio::sync::Semaphore>,
 ) {
+    let label = cmd_label(&cmd);
     let Ok(permit) = sem.clone().try_acquire_owned() else {
-        tracing::warn!(cmd = %cmd, "hook dropped — too many hook executions in flight");
+        tracing::warn!(cmd = %label, "hook dropped — too many hook executions in flight");
         return;
     };
     if let Err(e) = exec_path_check(&cmd) {
-        tracing::error!(cmd = %cmd, "REFUSING hook command — {e}");
+        tracing::error!(cmd = %label, "REFUSING hook command — {e}");
         return;
     }
     let json = serde_json::to_string(ev).unwrap_or_else(|_| "{}".to_string());
     let env = flatten_env(ev);
     let kind = ev.kind.name();
     let timeout = Duration::from_secs(u64::from(timeout_s));
-    tracing::info!(cmd = %cmd, kind, "hook: running command");
+    tracing::info!(cmd = %label, kind, "hook: running command");
     // Detached execution + off-thread reap (the `try_recover_session` recipe): the streaming
     // planes never wait on operator code. The permit rides along and frees on thread exit.
     std::thread::spawn(move || {
@@ -434,7 +498,9 @@ fn flatten_env(ev: &crate::events::HostEvent) -> Vec<(String, String)> {
 
 /// The sshd/sudoers rule (RFC §9.1): refuse to run a command that references a script/binary which
 /// is group/world-writable, or owned by neither the host user nor root — a world-writable hook
-/// script is privilege-escalation bait. A bare command name (`systemctl`, `curl`) is left to PATH.
+/// script is privilege-escalation bait. The same rule covers every directory above the script: a
+/// writable parent is the same bait one level up, since whoever may rename an entry in it chooses
+/// what runs. A bare command name (`systemctl`, `curl`) is left to PATH.
 ///
 /// **This is a hygiene rule, not an authorization gate**, and the distinction matters: it
 /// constrains *who owns the file being run*, never *what the command does*. `curl … | sh` and
@@ -449,41 +515,93 @@ fn flatten_env(ev: &crate::events::HostEvent) -> Vec<(String, String)> {
 /// which is backwards: the script is the part an attacker can plant.
 #[cfg(unix)]
 fn exec_path_check(cmd: &str) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    if cmd.split_whitespace().next().is_none() {
+    let tokens = shell_tokens(cmd);
+    if tokens.is_empty() {
         return Err("empty command".into());
     }
     // SAFETY: geteuid has no preconditions and touches no memory.
     let euid = unsafe { libc::geteuid() };
-    for raw in cmd.split_whitespace() {
-        // Tolerate the quoting a hand-written command line carries — a path that is absolute only
-        // after unquoting is exactly as plantable as a bare one.
-        let token = raw.trim_matches(|c| c == '"' || c == '\'');
+    for token in &tokens {
         if !token.starts_with('/') {
             continue;
         }
-        let meta = match std::fs::metadata(token) {
-            Ok(m) => m,
-            Err(_) => continue, // not an existing file — the shell will report it
-        };
-        if !meta.is_file() {
-            continue;
+        let path = std::path::Path::new(token);
+        if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+            continue; // not an existing file — the shell will report it
         }
-        if meta.uid() != euid && meta.uid() != 0 {
-            return Err(format!(
-                "{token} is owned by uid {} (host runs as uid {euid}) — hook scripts must be \
-                 owned by the operator or root",
-                meta.uid()
-            ));
-        }
-        if meta.mode() & 0o022 != 0 {
-            return Err(format!(
-                "{token} is group/world-writable (mode {:o}) — chmod go-w it first",
-                meta.mode() & 0o7777
-            ));
+        // The script, then every directory up to `/`: an unchecked writable parent lets the
+        // attacker swap a perfectly-owned script out from under us, which is why sshd walks the
+        // whole chain rather than stat'ing the file alone.
+        for node in path.ancestors() {
+            let Ok(meta) = std::fs::metadata(node) else {
+                continue;
+            };
+            path_node_check(node, &meta, euid)?;
         }
     }
     Ok(())
+}
+
+/// The ownership/mode rule [`exec_path_check`] applies to the script and to each directory above
+/// it. A world-writable *directory* with the sticky bit set (`/tmp`) passes: there only an entry's
+/// own owner can replace it, so the swap this rule exists to block is already impossible.
+#[cfg(unix)]
+fn path_node_check(
+    path: &std::path::Path,
+    meta: &std::fs::Metadata,
+    euid: u32,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    if meta.uid() != euid && meta.uid() != 0 {
+        return Err(format!(
+            "{} is owned by uid {} (host runs as uid {euid}) — a hook script and the directories \
+             holding it must be owned by the operator or root",
+            path.display(),
+            meta.uid()
+        ));
+    }
+    let sticky_dir = meta.is_dir() && meta.mode() & 0o1000 != 0;
+    if meta.mode() & 0o022 != 0 && !sticky_dir {
+        return Err(format!(
+            "{} is group/world-writable (mode {:o}) — chmod go-w it first",
+            path.display(),
+            meta.mode() & 0o7777
+        ));
+    }
+    Ok(())
+}
+
+/// Split a command line into tokens the way `/bin/sh` would *for the purpose of finding paths*:
+/// whitespace separates, but a quoted or backslash-escaped run stays one token. Plain
+/// `split_whitespace` turned `"/opt/my hooks/run.sh"` into two nonexistent tokens, so the check
+/// above silently passed the case it most needs to catch — a script the shell really does run, at
+/// a path with a space in it (security review 2026-08-24).
+#[cfg(unix)]
+fn shell_tokens(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = cmd.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            // Inside '' a backslash is literal; inside "" and unquoted it escapes the next char.
+            Some('"') if c == '\\' => cur.extend(chars.next()),
+            Some(_) => cur.push(c),
+            None if c == '\\' => cur.extend(chars.next()),
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            None => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// Whether this process is running as `NT AUTHORITY\SYSTEM` (S-1-5-18) — i.e. as the SCM service
@@ -591,6 +709,7 @@ fn run_hook_process(
 ) -> bool {
     use std::io::Write;
     use std::os::unix::process::CommandExt;
+    let label = cmd_label(cmd);
     let mut c = std::process::Command::new("/bin/sh");
     c.arg("-c")
         .arg(cmd)
@@ -603,7 +722,7 @@ fn run_hook_process(
     let mut child = match c.spawn() {
         Ok(ch) => ch,
         Err(e) => {
-            tracing::error!(cmd = %cmd, error = %e, "hook command failed to launch");
+            tracing::error!(cmd = %label, error = %e, "hook command failed to launch");
             return false;
         }
     };
@@ -616,13 +735,13 @@ fn run_hook_process(
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
-                    tracing::warn!(cmd = %cmd, %status, "hook command exited non-zero");
+                    tracing::warn!(cmd = %label, %status, "hook command exited non-zero");
                 }
                 return status.success();
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    tracing::warn!(cmd = %cmd, timeout_s = timeout.as_secs(),
+                    tracing::warn!(cmd = %label, timeout_s = timeout.as_secs(),
                         "hook command timed out — killing its process group");
                     #[cfg(target_os = "linux")]
                     {
@@ -638,7 +757,7 @@ fn run_hook_process(
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(e) => {
-                tracing::warn!(cmd = %cmd, error = %e, "hook command wait failed");
+                tracing::warn!(cmd = %label, error = %e, "hook command wait failed");
                 return false;
             }
         }
@@ -658,6 +777,7 @@ fn run_hook_process(
     timeout: Duration,
 ) -> bool {
     use std::io::Write;
+    let label = cmd_label(cmd);
     let stamp = format!(
         "pf-hook-{}-{}.json",
         std::process::id(),
@@ -668,12 +788,12 @@ fn run_hook_process(
     );
     let json_path = std::env::temp_dir().join(stamp);
     if std::fs::write(&json_path, event_json).is_err() {
-        tracing::warn!(cmd = %cmd, "hook: could not write event JSON temp file");
+        tracing::warn!(cmd = %label, "hook: could not write event JSON temp file");
     }
     let cmdline = format!("{cmd} \"{}\"", json_path.display());
     match crate::interactive::spawn_in_active_session(&cmdline, None) {
         Ok(pid) => {
-            tracing::debug!(cmd = %cmd, pid, "hook command launched in the interactive session");
+            tracing::debug!(cmd = %label, pid, "hook command launched in the interactive session");
             // No child handle on this path — wait out the timeout, then clean the temp file.
             std::thread::sleep(timeout);
             let _ = std::fs::remove_file(&json_path);
@@ -696,7 +816,7 @@ fn run_hook_process(
             // there is no user there is nothing to run them as. A hook that must run without a
             // logged-in user belongs in a service, not here.
             tracing::warn!(
-                cmd = %cmd,
+                cmd = %label,
                 error = %format!("{e:#}"),
                 "hook SKIPPED: no interactive user session to run it in, and this host is SYSTEM — \
                  hooks run as the logged-in user by design and are never elevated to SYSTEM"
@@ -731,7 +851,7 @@ fn run_hook_process(
                                 break;
                             }
                             None if Instant::now() >= deadline => {
-                                tracing::warn!(cmd = %cmd, "hook command timed out — killing it");
+                                tracing::warn!(cmd = %label, "hook command timed out — killing it");
                                 let _ = child.kill();
                                 let _ = child.wait();
                                 break;
@@ -740,7 +860,9 @@ fn run_hook_process(
                         }
                     }
                 }
-                Err(e) => tracing::error!(cmd = %cmd, error = %e, "hook command failed to launch"),
+                Err(e) => {
+                    tracing::error!(cmd = %label, error = %e, "hook command failed to launch")
+                }
             }
             let _ = std::fs::remove_file(&json_path);
             ok
@@ -756,13 +878,14 @@ fn fire_webhook(
     ev: &crate::events::HostEvent,
     sem: &std::sync::Arc<tokio::sync::Semaphore>,
 ) {
+    let origin = webhook_origin(&url);
     let Ok(permit) = sem.clone().try_acquire_owned() else {
-        tracing::warn!(url = %url, "webhook dropped — too many hook executions in flight");
+        tracing::warn!(url = %origin, "webhook dropped — too many hook executions in flight");
         return;
     };
     let json = serde_json::to_string(ev).unwrap_or_else(|_| "{}".to_string());
     let kind = ev.kind.name();
-    tracing::info!(url = %url, kind, "hook: posting webhook");
+    tracing::info!(url = %origin, kind, "hook: posting webhook");
     std::thread::spawn(move || {
         post_webhook(&url, &json, secret_file.as_deref());
         drop(permit);
@@ -777,13 +900,7 @@ fn fire_webhook(
 /// legitimate self-hosting config. A best-effort textual + IP-literal check (no DNS resolution, so
 /// not a full anti-rebinding defense; the operator-gated config already limits the threat).
 fn webhook_host_is_internal(url: &str) -> bool {
-    // scheme://[userinfo@]host[:port]/... → the bare host.
-    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
-    let hostport = authority
-        .rsplit_once('@')
-        .map(|(_, h)| h)
-        .unwrap_or(authority);
+    let hostport = webhook_authority(url);
     let host = if let Some(rest) = hostport.strip_prefix('[') {
         rest.split(']').next().unwrap_or("") // [::1]:443 → ::1
     } else {
@@ -808,7 +925,30 @@ fn webhook_host_is_internal(url: &str) -> bool {
     }
 }
 
+/// `scheme://[userinfo@]host[:port]/...` → the bare `host[:port]`. Textual, no DNS.
+fn webhook_authority(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority)
+}
+
+/// What the `url` field of a log line carries about a webhook: `scheme://host[:port]` plus the
+/// URL's [`short_id`]. The path, query and any userinfo are dropped — for Slack, Discord, ntfy,
+/// Teams, Zapier and Home Assistant the token IS a path segment, and these lines land in the
+/// tracing ring `GET /api/v1/logs` serves verbatim (security review 2026-08-24).
+fn webhook_origin(url: &str) -> String {
+    let scheme = url
+        .split_once("://")
+        .map(|(s, _)| format!("{s}://"))
+        .unwrap_or_default();
+    format!("{scheme}{} {}", webhook_authority(url), short_id(url))
+}
+
 fn post_webhook(url: &str, json: &str, secret_file: Option<&std::path::Path>) {
+    let origin = webhook_origin(url);
     // TLS is verified (ureq's default rustls roots); redirects are never followed, so a
     // compromised receiver can't bounce the POST cross-origin (RFC §9.5).
     let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -843,11 +983,13 @@ fn post_webhook(url: &str, json: &str, secret_file: Option<&std::path::Path>) {
         }
     }
     match req.send(json) {
-        Ok(resp) => tracing::debug!(url, status = resp.status().as_u16(), "webhook delivered"),
-        Err(ureq::Error::StatusCode(code)) => {
-            tracing::warn!(url, status = code, "webhook rejected by receiver")
+        Ok(resp) => {
+            tracing::debug!(url = %origin, status = resp.status().as_u16(), "webhook delivered")
         }
-        Err(e) => tracing::warn!(url, error = %e, "webhook delivery failed"),
+        Err(ureq::Error::StatusCode(code)) => {
+            tracing::warn!(url = %origin, status = code, "webhook rejected by receiver")
+        }
+        Err(e) => tracing::warn!(url = %origin, error = %e, "webhook delivery failed"),
     }
 }
 
@@ -890,17 +1032,18 @@ pub fn run_prep(cmds: &[PrepCmd], env: &[(String, String)]) -> PrepGuard {
         if cmd.is_empty() {
             continue;
         }
+        let label = cmd_label(cmd);
         if let Err(e) = exec_path_check(cmd) {
-            tracing::error!(cmd = %cmd, "REFUSING prep command — {e}");
+            tracing::error!(cmd = %label, "REFUSING prep command — {e}");
             continue;
         }
-        tracing::info!(cmd = %cmd, "prep: running");
+        tracing::info!(cmd = %label, "prep: running");
         if run_hook_process(cmd, "{}", env, timeout) {
             if let Some(u) = c.undo.as_deref().filter(|u| !u.trim().is_empty()) {
                 undo.push(u.to_string());
             }
         } else if c.undo.is_some() {
-            tracing::warn!(cmd = %cmd, "prep step failed — its undo is skipped");
+            tracing::warn!(cmd = %label, "prep step failed — its undo is skipped");
         }
     }
     PrepGuard {
@@ -922,11 +1065,12 @@ impl Drop for PrepGuard {
         // the one thread runs them sequentially.
         std::thread::spawn(move || {
             for cmd in undo.iter().rev() {
+                let label = cmd_label(cmd);
                 if let Err(e) = exec_path_check(cmd) {
-                    tracing::error!(cmd = %cmd, "REFUSING prep undo command — {e}");
+                    tracing::error!(cmd = %label, "REFUSING prep undo command — {e}");
                     continue;
                 }
-                tracing::info!(cmd = %cmd, "prep: running undo");
+                tracing::info!(cmd = %label, "prep: running undo");
                 run_hook_process(cmd, "{}", &env, timeout);
             }
         });
@@ -1266,5 +1410,120 @@ mod tests {
         // Bare command names are left to PATH; nonexistent paths are the shell's problem.
         assert!(exec_path_check("systemctl suspend").is_ok());
         assert!(exec_path_check("/nonexistent/definitely-not-here").is_ok());
+    }
+
+    /// The two holes the check used to have: a path with a space in it (whitespace splitting made
+    /// the check a no-op for exactly the paths the shell still runs), and a writable directory
+    /// above an otherwise-fine script.
+    #[cfg(unix)]
+    #[test]
+    fn ownership_check_sees_quoted_paths_and_writable_parents() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::Permissions::from_mode;
+        let dir = std::env::temp_dir().join(format!(
+            "pf-hook-parent-{}-{:p}",
+            std::process::id(),
+            &0u8 as *const u8
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, mode(0o755)).unwrap();
+        let script = dir.join("my hook.sh");
+        std::fs::write(&script, "#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&script, mode(0o700)).unwrap();
+        let quoted = format!("\"{}\" arg", script.display());
+
+        assert!(exec_path_check(&quoted).is_ok(), "a sane quoted path runs");
+        std::fs::set_permissions(&script, mode(0o777)).unwrap();
+        assert!(
+            exec_path_check(&quoted).is_err(),
+            "world-writable script behind a quoted, space-bearing path must be refused"
+        );
+        assert!(
+            exec_path_check(&format!("'{}'", script.display())).is_err(),
+            "single quotes too"
+        );
+        assert!(
+            exec_path_check(&script.display().to_string().replace(' ', "\\ ")).is_err(),
+            "backslash-escaped spaces too"
+        );
+
+        // A writable parent defeats a perfectly-owned script — the attacker replaces the file.
+        std::fs::set_permissions(&script, mode(0o700)).unwrap();
+        std::fs::set_permissions(&dir, mode(0o777)).unwrap();
+        let err = exec_path_check(&quoted).expect_err("world-writable parent must be refused");
+        assert!(err.contains(&dir.display().to_string()), "names it: {err}");
+        std::fs::set_permissions(&dir, mode(0o755)).unwrap();
+        assert!(exec_path_check(&quoted).is_ok(), "chmod go-w fixes it");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `hmac_secret_file` warning the field doc promises.
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_permissions_are_complained_about() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "pf-hook-secret-{}-{:p}.key",
+            std::process::id(),
+            &0u8 as *const u8
+        ));
+        std::fs::write(&path, b"s3cret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(secret_file_complaint(&path).is_none(), "0600 is the ask");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let why = secret_file_complaint(&path).expect("a world-readable secret is warned about");
+        assert!(why.contains("644"), "the complaint names the mode: {why}");
+
+        // Missing/unreadable is post_webhook's fail-closed case, not a permissions complaint.
+        std::fs::remove_file(&path).unwrap();
+        assert!(secret_file_complaint(&path).is_none());
+    }
+
+    /// `GET /api/v1/logs` serves the tracing ring verbatim, so no log line may carry a webhook URL's
+    /// path (the bearer credential for Slack/Discord/ntfy) or a command's arguments — while still
+    /// saying which hook fired.
+    #[test]
+    fn log_labels_drop_the_credential_and_stay_identifiable() {
+        let slack = "https://hooks.slack.com/services/T0000/B0000/XXXXsecretXXXX";
+        let shown = webhook_origin(slack);
+        assert!(
+            shown.starts_with("https://hooks.slack.com "),
+            "origin: {shown}"
+        );
+        assert!(!shown.contains("XXXXsecretXXXX"), "token dropped: {shown}");
+        assert_ne!(
+            shown,
+            webhook_origin("https://hooks.slack.com/services/T1/B1/OTHER"),
+            "two hooks to one host stay distinguishable"
+        );
+
+        // userinfo, path and query all go; the port stays (it names the receiver, not the secret).
+        let creds = webhook_origin("https://user:pw@ha.local:8123/api/webhook/zzz?token=qqq");
+        assert!(creds.starts_with("https://ha.local:8123 "), "{creds}");
+        for secret in ["pw", "zzz", "qqq"] {
+            assert!(!creds.contains(secret), "{secret} leaked: {creds}");
+        }
+
+        // Command lines: the program's file name survives, its arguments don't.
+        let cmd = "/usr/local/bin/notify.sh --token=SEKRIT-zz 'Living Room'";
+        let label = cmd_label(cmd);
+        assert!(
+            label.starts_with("notify.sh #"),
+            "says which script ran: {label}"
+        );
+        assert!(!label.contains("SEKRIT"), "arguments dropped: {label}");
+        assert_eq!(
+            label,
+            cmd_label(cmd),
+            "stable across one firing's log lines"
+        );
+        assert_ne!(
+            label,
+            cmd_label("/usr/local/bin/notify.sh --token=SEKRIT-yy")
+        );
+        assert!(cmd_label("curl -H \"Authorization: Bearer t\" https://x/y").starts_with("curl #"));
     }
 }

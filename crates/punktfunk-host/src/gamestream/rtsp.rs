@@ -17,17 +17,22 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Opaque per-session payload the client echoes as its first UDP datagram (port-learning).
 const PING_PAYLOAD: &str = "0011223344556677";
 
 // The RTSP listener is UNAUTHENTICATED (no TLS/pairing) and one-thread-per-connection, so bound
 // every attacker-controllable dimension to deny a pre-auth slow-loris / memory-growth DoS: a hard
-// cap on concurrent connections, a per-read timeout so a stalled peer can't pin a thread, and
-// size caps on the request headers + body (real GameStream RTSP messages are a few hundred bytes).
+// cap on concurrent connections, a per-read timeout so a stalled peer can't pin a thread, a
+// whole-request deadline so a dribbling one can't either, and size caps on the request headers +
+// body (real GameStream RTSP messages are a few hundred bytes).
 const MAX_RTSP_CONNS: usize = 8;
 const RTSP_READ_TIMEOUT: Duration = Duration::from_secs(15);
+// The per-read timeout bounds ONE read, not the request: a peer sending a byte just inside it
+// resets the timeout forever and holds one of the eight slots for good. This bounds the whole
+// message instead (security-review 2026-08-25) — a real client's request arrives in one segment.
+const RTSP_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_RTSP_HEADER: usize = 16 * 1024;
 const MAX_RTSP_BODY: usize = 64 * 1024;
 const MAX_RTSP_MSG: usize = 128 * 1024;
@@ -90,13 +95,15 @@ struct Request {
 
 fn handle_conn(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
     let peer = stream.peer_addr().ok();
-    // A per-read timeout so a stalled/slow-loris peer can't pin this thread indefinitely.
+    // A per-read timeout so a stalled peer can't pin this thread, plus the whole-request
+    // deadline `read_message` enforces — a slow-loris defeats the first with the second absent.
     let _ = stream.set_read_timeout(Some(RTSP_READ_TIMEOUT));
+    let deadline = Instant::now() + RTSP_REQUEST_DEADLINE;
     let mut buf: Vec<u8> = Vec::new();
     // GameStream RTSP is one request per TCP connection: moonlight-common-c reads the
     // response until EOF, so we answer one message and close the connection (which signals
     // the end of the response). Session state lives in `AppState`, not the connection.
-    if let Some(req) = read_message(&mut stream, &mut buf)? {
+    if let Some(req) = read_message(&mut stream, &mut buf, deadline)? {
         tracing::debug!(
             method = %req.method,
             cseq = %req.cseq,
@@ -114,9 +121,17 @@ fn handle_conn(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
 }
 
 /// Read one complete RTSP message (headers + any Content-Length body) from the stream,
-/// buffering across reads and leaving any pipelined remainder in `buf`.
-fn read_message(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Result<Option<Request>> {
+/// buffering across reads and leaving any pipelined remainder in `buf`. Gives up at `deadline`
+/// (the caller's whole-request budget), which the per-read timeout alone does not bound.
+fn read_message(
+    stream: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    deadline: Instant,
+) -> Result<Option<Request>> {
     loop {
+        if Instant::now() >= deadline {
+            anyhow::bail!("RTSP request deadline exceeded");
+        }
         if let Some(end) = find_subslice(buf, b"\r\n\r\n") {
             // Cap the header section even when the terminator IS present (a single oversized header
             // block that fits a `\r\n\r\n` would otherwise skip the no-terminator cap below).
@@ -672,6 +687,29 @@ mod tests {
             body.push_str(&format!("a={k}:{v}\r\n"));
         }
         parse_announce(&body)
+    }
+
+    /// The listener is unauthenticated, so a request that never finishes must not hold one of the
+    /// eight connection slots: `read_message` gives up at the caller's deadline instead of resetting
+    /// its per-read timeout forever. An already-passed deadline is the deterministic stand-in for a
+    /// peer dribbling bytes — it bails without waiting on a socket that will never send.
+    #[test]
+    fn read_message_gives_up_at_the_request_deadline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let client = TcpStream::connect(addr).expect("connect"); // stays open, sends nothing
+        let (mut server, _) = listener.accept().expect("accept");
+        let mut buf: Vec<u8> = Vec::new();
+        // `Request` isn't `Debug`, so match rather than `expect_err`.
+        let err = match read_message(&mut server, &mut buf, Instant::now()) {
+            Err(e) => e,
+            Ok(_) => panic!("an elapsed deadline must end the request"),
+        };
+        assert!(
+            format!("{err:#}").contains("deadline"),
+            "unexpected error: {err:#}"
+        );
+        drop(client);
     }
 
     /// `x-nv-vqos[0].bitStreamFormat` → codec (0=H264, 1=HEVC, 2=AV1; missing = H264).

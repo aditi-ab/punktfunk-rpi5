@@ -256,11 +256,25 @@ extension SettingsView {
 
     /// The automatic-bitrate toggle + manual slider (and the >1 Gbps warning) rows.
     @ViewBuilder private var bitrateRows: some View {
-        described("Uses the host's default, 20 Mbps. Off to set it yourself.",
-            field: "bitrate_kbps") {
-            Toggle("Automatic bitrate", isOn: automaticBitrate)
+        // PyroWave is always Automatic (ABR overhaul RFC §5.2): the session sends 0 and the
+        // host pins a per-mode rate, so a live rate control here would change nothing. Same
+        // support gate as the codec picker offering the option; the stored rate is untouched,
+        // so switching the codec back restores it.
+        if effective.codec == "pyrowave", MetalWaveletDecoder.supported {
+            described("PyroWave sets its own rate from the stream mode — a fixed bitrate "
+                + "doesn't apply.",
+                field: "bitrate_kbps") {
+                Toggle("Automatic bitrate", isOn: .constant(true))
+                    .disabled(true)
+            }
+        } else {
+            described("Uses the host's default, 20 Mbps. Off to set it yourself.",
+                field: "bitrate_kbps") {
+                Toggle("Automatic bitrate", isOn: automaticBitrate)
+            }
         }
-        if effective.bitrateKbps != 0 {
+        if effective.codec != "pyrowave" || !MetalWaveletDecoder.supported,
+           effective.bitrateKbps != 0 {
             HStack(spacing: 12) {
                 Slider(value: bitrateSlider, in: 0...1) {
                     Text("Bitrate")

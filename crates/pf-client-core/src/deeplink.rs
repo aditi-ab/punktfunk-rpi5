@@ -314,9 +314,13 @@ impl DeepLink {
 /// What the local host store made of a link's references.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostResolution {
-    /// Index into `KnownHosts::hosts` — a record we already trust (subject to
-    /// [`DeepLink::pin_conflict`]).
+    /// Index into `KnownHosts::hosts` — a record we already trust, named by its stable
+    /// (unguessable) id: the one-click contract (subject to [`DeepLink::pin_conflict`]).
     Known(usize),
+    /// The same index, for a record named by something GUESSABLE — its display name, its
+    /// address, or the `host=` recovery parameter. A link may not act on a guess, so the
+    /// front-end confirms first; past that it is the [`HostResolution::Known`] path exactly.
+    Confirm(usize),
     /// No record, but the link says where to dial: the confirmation sheet's input, from which
     /// the normal pairing/TOFU flow proceeds under the user's eyes. Never an auto-connect.
     Unknown {
@@ -332,9 +336,16 @@ pub enum HostResolution {
 }
 
 /// Resolve a link's host reference against the local store, in the documented order: stable
-/// record id → unique case-insensitive name → `addr[:port]` literal. The `host=` parameter is
-/// the recovery path — a self-emitted shortcut that outlived the record it was written from
-/// still lands on the right box (degraded to the confirmation sheet).
+/// record id → unique case-insensitive name → `addr[:port]` literal, then the `host=` recovery
+/// path — a self-emitted shortcut that outlived the record it was written from still lands on
+/// the right box.
+///
+/// Only the record id is UNGUESSABLE, so only the record id resolves to
+/// [`HostResolution::Known`], the silent one-click contract. A display name is an mDNS instance
+/// name or a user label ("Gaming PC") and an address is a LAN address: the `.desktop` files
+/// register `x-scheme-handler/punktfunk`, so any web page can hand this resolver a guess, and a
+/// guess must not be able to start a stream (or launch a title). Those resolve to
+/// [`HostResolution::Confirm`] — the same host, behind the user's OK.
 ///
 /// Returns an index rather than a borrow so callers can keep mutating the store (rekey,
 /// touch-last-used) without fighting the borrow checker.
@@ -354,7 +365,7 @@ pub fn resolve_host(link: &DeepLink, known: &KnownHosts) -> HostResolution {
         .map(|(i, _)| i)
         .collect();
     match by_name.len() {
-        1 => return HostResolution::Known(by_name[0]),
+        1 => return HostResolution::Confirm(by_name[0]),
         0 => {}
         _ => return HostResolution::Ambiguous,
     }
@@ -367,7 +378,7 @@ pub fn resolve_host(link: &DeepLink, known: &KnownHosts) -> HostResolution {
         .flatten();
     for candidate in [literal.clone(), link.host.clone()].into_iter().flatten() {
         if let Some(i) = known.index_by_addr(&candidate.0, candidate.1) {
-            return HostResolution::Known(i);
+            return HostResolution::Confirm(i);
         }
     }
     match literal.or_else(|| link.host.clone()) {
@@ -587,7 +598,9 @@ mod tests {
 
     /// The one-click contract in resolution form: an id beats a name beats an address, an
     /// ambiguous name refuses, and a link whose record is gone still lands on the
-    /// confirmation sheet via `host=`+`fp=` instead of dying.
+    /// confirmation sheet via `host=`+`fp=` instead of dying. Only the id — the one reference
+    /// nothing can guess — dials on its own; a name or an address finds the same host behind a
+    /// confirmation.
     #[test]
     fn host_resolution_order_and_recovery() {
         let fp = "a".repeat(64);
@@ -619,20 +632,23 @@ mod tests {
             r("punktfunk://connect/11111111-2222-4333-8444-555555555555"),
             HostResolution::Known(0)
         );
-        assert_eq!(r("punktfunk://connect/desk"), HostResolution::Known(0));
+        // A display name ("Gaming PC") and a LAN address are guesses any web page can make —
+        // the same host, but only behind a confirmation. See the test below.
+        assert_eq!(r("punktfunk://connect/desk"), HostResolution::Confirm(0));
         assert_eq!(r("punktfunk://connect/couch"), HostResolution::Ambiguous);
         assert_eq!(
             r("punktfunk://connect/192.168.1.50"),
-            HostResolution::Known(0)
+            HostResolution::Confirm(0)
         );
         assert_eq!(
             r("punktfunk://connect/192.168.1.50:9777"),
-            HostResolution::Known(0)
+            HostResolution::Confirm(0)
         );
-        // A stale id with the recovery parameters: the address finds the record anyway.
+        // A stale id with the recovery parameters: the address finds the record anyway — and,
+        // being an address, behind the confirmation exactly as this function's doc always said.
         assert_eq!(
             r("punktfunk://connect/00000000-0000-4000-8000-000000000000?host=192.168.1.50"),
-            HostResolution::Known(0)
+            HostResolution::Confirm(0)
         );
         // Nothing local matches: the sheet gets the address, the claimed name and the pin —
         // which is what makes the first connect verified rather than blind TOFU.
@@ -678,6 +694,40 @@ mod tests {
             .pin_conflict(&known.hosts[0]));
         // No pin stored (an address-only record) → nothing to contradict; the trust flow runs.
         assert!(!link.pin_conflict(&known.hosts[1]));
+    }
+
+    /// The record id is a UUID nothing can guess; a display name and a LAN address are guesses
+    /// any web page can make — and `x-scheme-handler/punktfunk` hands web pages this resolver.
+    /// So the id, and only the id, is the silent one-click dial.
+    #[test]
+    fn only_the_record_id_dials_without_asking() {
+        let fp = "a".repeat(64);
+        let known = KnownHosts {
+            hosts: vec![host(
+                "Desk",
+                "192.168.1.50",
+                "11111111-2222-4333-8444-555555555555",
+                &fp,
+            )],
+        };
+        let r = |url: &str| resolve_host(&parse(url).unwrap(), &known);
+
+        assert_eq!(
+            r("punktfunk://connect/11111111-2222-4333-8444-555555555555"),
+            HostResolution::Known(0)
+        );
+        for guess in [
+            "punktfunk://connect/desk",
+            "punktfunk://connect/DESK",
+            "punktfunk://connect/192.168.1.50",
+            "punktfunk://connect/192.168.1.50:9777",
+            // A launch id doesn't buy a name any authority it didn't have.
+            "punktfunk://connect/desk?launch=steam:570",
+            // …and neither does the `host=` recovery path.
+            "punktfunk://connect/00000000-0000-4000-8000-000000000000?host=192.168.1.50",
+        ] {
+            assert_eq!(r(guess), HostResolution::Confirm(0), "{guess}");
+        }
     }
 
     /// Self-emitted links round-trip and carry all three references, so they survive both a

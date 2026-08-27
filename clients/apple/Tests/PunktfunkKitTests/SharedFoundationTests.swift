@@ -207,7 +207,8 @@ final class SharedFoundationTests: XCTestCase {
     }
 
     /// Resolution order — id beats a unique name beats an address — plus the two refusals a
-    /// front-end must surface rather than guess through.
+    /// front-end must surface rather than guess through, and the rule that keeps a guessable
+    /// reference from dialing: only the record id resolves to `.known`.
     func testDeepLinkHostResolution() throws {
         let desk = StoredHost(
             id: UUID(uuidString: "11111111-2222-4333-8444-555555555555")!,
@@ -222,14 +223,21 @@ final class SharedFoundationTests: XCTestCase {
 
         XCTAssertEqual(
             try resolve("punktfunk://connect/11111111-2222-4333-8444-555555555555"), .known(desk))
-        XCTAssertEqual(try resolve("punktfunk://connect/desk"), .known(desk))
+        // The id is a UUID nothing can guess; a display name and a LAN address are guesses any web
+        // page can make. So the id — and only the id — dials unattended; everything else that finds
+        // a saved host stops at the confirmation.
+        XCTAssertEqual(try resolve("punktfunk://connect/desk"), .confirm(desk))
+        XCTAssertEqual(try resolve("punktfunk://connect/DESK"), .confirm(desk))
         XCTAssertEqual(try resolve("punktfunk://connect/couch"), .ambiguous)
-        XCTAssertEqual(try resolve("punktfunk://connect/192.168.1.50:9777"), .known(desk))
-        // A stale id with the recovery parameter: the address finds the record anyway.
+        XCTAssertEqual(try resolve("punktfunk://connect/192.168.1.50:9777"), .confirm(desk))
+        XCTAssertEqual(
+            try resolve("punktfunk://connect/desk?launch=steam:570"), .confirm(desk))
+        // A stale id with the recovery parameter: the address finds the record anyway — and, being
+        // an address, behind the confirmation exactly as its own doc always said.
         XCTAssertEqual(
             try resolve(
                 "punktfunk://connect/00000000-0000-4000-8000-000000000000?host=192.168.1.50"),
-            .known(desk))
+            .confirm(desk))
         // Nothing local matches: the sheet gets the address, the claimed name and the pin — which
         // is what makes a first connect verified rather than blind trust-on-first-use.
         XCTAssertEqual(

@@ -60,9 +60,13 @@ export const Armed: Story = {
 		native: (
 			<NativePairingCard
 				status={{ data: nativePairArmed, ...idle }}
+				// The armed PIN reaches the card from the arm RESPONSE, never from the polled status
+				// (the BFF strips it) — so the story hands it in the same way.
+				pin={nativePairArmed.pin ?? null}
 				onArm={noop}
 				onDisarm={noop}
 				isArming={false}
+				wrongPassword={false}
 				isDisarming={false}
 			/>
 		),
@@ -71,6 +75,9 @@ export const Armed: Story = {
 				pairing={{ data: pairingIdle, ...idle }}
 				pin=""
 				onPinChange={noop}
+				password=""
+				onPasswordChange={noop}
+				wrongPassword={false}
 				onSubmit={noop}
 				isSubmitting={false}
 				isSuccess={false}

@@ -200,18 +200,7 @@ impl ControlTask {
                         if ack.bitrate_kbps > 0 {
                             live_bitrate.store(ack.bitrate_kbps, Ordering::Relaxed);
                         }
-                        {
-                            // Queued in arrival order — a full resolve ack plus a corrective
-                            // short retarget in one report window must BOTH reach the
-                            // controller (§2.4; the old latest-wins slot dropped whichever
-                            // came first). The cap is a can't-happen bound: the host sends at
-                            // most a handful per window.
-                            let mut acks = bitrate_ack.lock().unwrap();
-                            if acks.len() >= 8 {
-                                acks.pop_front();
-                            }
-                            acks.push_back(ack.bitrate_kbps);
-                        }
+                        bitrate_ack.lock().unwrap().push_back(ack.bitrate_kbps);
                     } else if let Ok(gap) = crate::quic::PipelineGap::decode(&msg) {
                         // The host rebuilt its capture ring + encoder in place and nothing flowed
                         // while it did. Park it for the pump, which discards the report window in

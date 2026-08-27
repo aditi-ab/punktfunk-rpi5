@@ -235,16 +235,19 @@ jobs:
         env:
           NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          # unom-1's SSH host key, `ssh-keyscan -p "$DEPLOY_PORT" "$DEPLOY_HOST"`. Gated here with
+          # the rest: no pinned host key, no publish — never a first-contact-trusts-anything deploy.
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         # Guard BEFORE the build, not before the upload: an unconfigured cache must not cost an
         # hour of rustc first. No-ops cleanly until the secret exists, exactly as flatpak.yml's
         # repo deploy does, so this workflow stays green through setup.
         run: |
           set -eu
-          if [ -n "${NIX_CACHE_SIGNING_KEY:-}" ] && [ -n "${DEPLOY_HOST:-}" ]; then
+          if [ -n "${NIX_CACHE_SIGNING_KEY:-}" ] && [ -n "${DEPLOY_HOST:-}" ] && [ -n "${DEPLOY_KNOWN_HOSTS:-}" ]; then
             echo "go=true" >> "$GITHUB_OUTPUT"
           else
             echo "go=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::NIX_CACHE_SIGNING_KEY/DEPLOY_HOST not set — skipping the binary cache publish (see packaging/nix/README.md)."
+            echo "::warning::NIX_CACHE_SIGNING_KEY/DEPLOY_HOST/DEPLOY_KNOWN_HOSTS not set — skipping the binary cache publish (see packaging/nix/README.md)."
           fi
 
       - name: Build the publishable packages
@@ -269,6 +272,7 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
           # `set -eu`, NOT `set -euo pipefail`: act_runner may execute a step's `run:` under dash in
           # these containers (see scripts/ci/ensure-sccache.sh), and dash dies on `-o pipefail` with
@@ -313,7 +317,13 @@ jobs:
           #    unom-1 drops TCP dials under load.
           install -d -m700 ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy; chmod 600 ~/.ssh/deploy
-          SSH="ssh -i $HOME/.ssh/deploy -p ${DEPLOY_PORT:-22} -o StrictHostKeyChecking=accept-new"
+          # Pin unom-1's host key instead of trusting whoever answers first. This step is holding
+          # NIX_CACHE_SIGNING_KEY and ships the signed cache, so `accept-new` — which trusts the
+          # first key it ever sees, and every run starts with an empty known_hosts, so EVERY run is
+          # a first contact — would hand the deploy key and the publish to anything that won the
+          # race for the address. Preflight above skips the publish when the secret is unset.
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts; chmod 600 ~/.ssh/known_hosts
+          SSH="ssh -i $HOME/.ssh/deploy -p ${DEPLOY_PORT:-22} -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
           DEST="${DEPLOY_USER}@${DEPLOY_HOST}"
           bash scripts/ci/retry.sh 5 $SSH "$DEST" "mkdir -p ~/$DEPLOY_DIR/site/nar"
           # ⚠ ORDER IS LOAD-BEARING: NARs first, narinfos second. A narinfo whose NAR has not landed

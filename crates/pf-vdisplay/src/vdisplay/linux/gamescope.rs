@@ -68,7 +68,7 @@ pub struct GamescopeDisplay {
     /// per-instance discipline as `cmd`, and for the same reason: it used to arrive through
     /// `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION`, which a concurrent connect could overwrite between
     /// the decision and this session's `create`. `None` = nothing resolved it (a caller that never
-    /// ran `apply_input_env`); `create` then falls through to the bare spawn, the safe default.
+    /// ran `resolve_gamescope_route`); `create` then falls through to the bare spawn, the safe default.
     route: Option<crate::GamescopeRoute>,
     /// The topology-restore action the bare-spawn `create` prepared under `Topology::Exclusive` —
     /// the release of this display's [`crate::panel_dpms`] darken hold — pending pickup by the
@@ -629,14 +629,14 @@ impl VirtualDisplay for GamescopeDisplay {
         // full Steam-Deck-UI session headless at the client's resolution + refresh — so games SEE
         // them (via the injected --nested-refresh + generated CVT modes, not the box's TV EDID) —
         // and relaunch it when the client's mode changes. Reuses the node + EIS discovery below.
-        // THIS session's resolved sub-mode, handed over by the host from `apply_input_env`. It
+        // THIS session's resolved sub-mode, handed over by the host from `resolve_gamescope_route`. It
         // used to be read out of the process env here, which meant a second connect could retarget
         // this one between the decision and this line.
         let (session_env, node_env) = match self.route.clone() {
             Some(crate::GamescopeRoute::Managed { client }) => (Some(client), None),
             Some(crate::GamescopeRoute::Attach { node }) => (None, Some(node)),
             Some(crate::GamescopeRoute::Spawn) => (None, None),
-            // Nobody resolved a route (no `apply_input_env` on this path): bare spawn, which is
+            // Nobody resolved a route (no `resolve_gamescope_route` on this path): bare spawn, which is
             // also what the ladder's own default arm picks.
             None => (None, None),
         };
@@ -1059,7 +1059,7 @@ fn steamos_session_present() -> bool {
 
 /// Does this box have the infrastructure the MANAGED gamescope mode drives — Bazzite's
 /// `gamescope-session-plus` or SteamOS's `gamescope-session`? The sub-mode ladder
-/// ([`crate::apply_input_env`]) only defaults to managed when this is true; a plain
+/// ([`crate::resolve_gamescope_route`]) only defaults to managed when this is true; a plain
 /// distro (neither present) falls through to the bare-spawn path instead of the old behaviour of
 /// defaulting to managed and then bailing on the missing session script.
 pub fn managed_session_available() -> bool {

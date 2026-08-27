@@ -27,13 +27,13 @@
 //! 47999 (the PIN ceremony is HTTPS on nvhttp), so [`sync`] keeps the port closed until the
 //! first pairing lands and tears it down when the last one is removed.
 
-use super::{AppState, CONTROL_PORT};
+use super::{AppState, LaunchSession, CONTROL_PORT};
 use crate::inject::gamepad::GamepadManager;
 use anyhow::{anyhow, Context, Result};
 use punktfunk_core::input::{GamepadEvent, InputEvent};
 use punktfunk_core::quic::{classify, GrantClass, HdrMeta, GRANT_ALL};
 use rusty_enet::{Event, Host, HostSettings, Packet, PeerID};
-use std::net::UdpSocket;
+use std::net::{IpAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -336,11 +336,14 @@ pub(crate) fn sync(state: &Arc<AppState>) -> Result<()> {
 /// `rusty_enet` 0.4.0 exposes no setter for `maximum_waiting_data` (the C default of 32 MiB of
 /// per-peer reassembly), so an off-path LAN peer that connects on 47999 can pin ~32 MiB × the
 /// `peer_limit` and occupy peer slots without ever authenticating — and the same unfiltered path
-/// lets an on-path attacker spoof the owner's source to feed the tracked peer. Filtering at the
-/// socket drops those datagrams BEFORE ENet allocates any per-peer state. The owner is read live
-/// from `launch` on each receive: before `/launch` (owner `None`) the filter passes everything,
-/// matching the plane's existing "trust the connect when no owner is captured" fallback used by
-/// the `Event::Connect` arm below. security-review 2026-08-15 findings 2 and 13.
+/// lets an on-path attacker spoof the owner's source to feed the tracked peer. Once the owner IS
+/// known, filtering at the socket drops those datagrams before ENet allocates any per-peer state.
+///
+/// The owner is read live from `launch` on each receive, so this covers only the window where a
+/// launch is recorded: before `/launch` (owner `None`) the filter passes everything, and what
+/// keeps an unauthenticated peer from squatting a slot through that whole idle window is
+/// [`accept_connect`] resetting the peer in the `Event::Connect` arm below.
+/// security-review 2026-08-15 findings 2 and 13; 2026-08-25 finding 1.
 struct OwnerFilteredSocket {
     inner: UdpSocket,
     state: Arc<AppState>,
@@ -376,6 +379,23 @@ impl rusty_enet::Socket for OwnerFilteredSocket {
                 None => return Ok(None),
             }
         }
+    }
+}
+
+/// Whether a fresh ENet connect may be admitted at all. A live `/launch` is the floor —
+/// Moonlight connects the control stream only after the RTSP handshake, so there is no such
+/// thing as a legitimate connect without one — and when the launching IP was captured on both
+/// sides it must match, the same source-IP bind the RTSP/media plane applies
+/// (`rtsp::authorized_launch`). Kept a free function so the gate the session actually runs is
+/// the thing the tests exercise.
+fn accept_connect(launch: Option<LaunchSession>, from: Option<IpAddr>) -> bool {
+    match (launch.map(|l| l.peer_ip), from) {
+        // No live `/launch`: nothing on this port is legitimate yet.
+        (None, _) => false,
+        // Launching IP known on both sides but mismatched → not the owner.
+        (Some(Some(want)), Some(got)) => want == got,
+        // The address couldn't be captured on one side → launch-present only.
+        _ => true,
     }
 }
 
@@ -503,23 +523,28 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                     match host.service() {
                         Ok(Some(event)) => match event {
                             Event::Connect { peer: p, .. } => {
-                                // Track this peer as THE session peer only if it comes from the
-                                // `/launch` owner's IP (when captured — `None` falls back to
-                                // trusting the connect, the pre-teardown behavior). The tracked
-                                // peer's disconnect now ENDS the session, so an unauthenticated
-                                // LAN peer that connects+disconnects on 47999 must not be able to
-                                // steal the slot and tear a live session down. Same source-IP
-                                // bind the RTSP/media plane uses (security-review #4).
-                                let owner_ip = state.launch.lock().unwrap().and_then(|s| s.peer_ip);
+                                // Admit only the launch owner ([`accept_connect`]): the tracked
+                                // peer's disconnect ENDS the session, so an unauthenticated LAN
+                                // peer that connects+disconnects on 47999 must not be able to
+                                // steal the slot and tear a live session down (security-review
+                                // #4). A refused peer is RESET, not merely left untracked — the
+                                // port is open the whole idle life of a paired host, and a peer
+                                // ENet keeps alive with its own pings would otherwise hold one of
+                                // four slots (plus its 32 MiB reassembly budget) indefinitely and
+                                // starve every later session (security-review 2026-08-25 #1).
+                                // `disconnect_now` frees the slot before the next tick and emits
+                                // no `Disconnect` event for the arm below to read as a session end.
+                                let launch = *state.launch.lock().unwrap();
                                 let from = p.address().map(|a| a.ip());
-                                if owner_ip.is_some() && from.is_some() && owner_ip != from {
-                                    tracing::warn!(
-                                        ?from,
-                                        "control: peer connected from a non-owner IP — ignoring"
-                                    );
-                                } else {
+                                if accept_connect(launch, from) {
                                     tracing::info!("control: client connected");
                                     peer = Some(p.id());
+                                } else {
+                                    tracing::warn!(
+                                        ?from,
+                                        "control: peer connected without a matching /launch — refusing"
+                                    );
+                                    p.disconnect_now(0);
                                 }
                             }
                             Event::Disconnect { peer: p, .. } => {
@@ -1192,6 +1217,40 @@ mod tests {
         v.extend_from_slice(&first.to_le_bytes());
         v.extend_from_slice(&last.to_le_bytes());
         v
+    }
+
+    /// A live `/launch` whose owner IP is `peer_ip`.
+    fn launched(peer_ip: Option<std::net::IpAddr>) -> Option<super::LaunchSession> {
+        Some(super::LaunchSession {
+            gcm_key: [0; 16],
+            rikeyid: 0,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            appid: 1,
+            peer_ip,
+            owner_fp: None,
+        })
+    }
+
+    /// The ENet connect gate: 47999 is open the whole idle life of a paired host, so a connect
+    /// with no live `/launch` behind it is refused (it would otherwise squat one of four peer
+    /// slots until every later session fails), and a launched session admits only the owner's
+    /// IP — falling back to launch-present-only when either side's address is unknown, like the
+    /// RTSP plane's `authorized_launch`.
+    #[test]
+    fn connects_are_admitted_only_behind_a_matching_launch() {
+        let owner: std::net::IpAddr = "192.168.1.20".parse().unwrap();
+        let other: std::net::IpAddr = "192.168.1.99".parse().unwrap();
+        // Idle host (no /launch): every connect is refused, address known or not.
+        assert!(!super::accept_connect(None, Some(owner)));
+        assert!(!super::accept_connect(None, None));
+        // Launched with a captured owner IP: only that IP is the session peer.
+        assert!(super::accept_connect(launched(Some(owner)), Some(owner)));
+        assert!(!super::accept_connect(launched(Some(owner)), Some(other)));
+        // Address unknown on one side → launch-present only (the pre-existing fallback).
+        assert!(super::accept_connect(launched(Some(owner)), None));
+        assert!(super::accept_connect(launched(None), Some(other)));
     }
 
     #[test]

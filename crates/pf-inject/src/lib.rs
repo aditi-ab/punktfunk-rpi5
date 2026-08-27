@@ -136,8 +136,9 @@ impl AbsoluteAnchor {
 
 /// The current absolute-coordinate anchor. A `RwLock` rather than an env var: the injector is
 /// host-lifetime and lives behind a channel, so a *session* can only reach it through process
-/// state — and process state that is typed and lock-guarded beats the `set_var` pattern the
-/// backend-select still uses (security-review 2026-06-28 #7).
+/// state — and process state that is typed and lock-guarded beats a `set_var`
+/// (security-review 2026-06-28 #7). The backend-select was the last holdout on that pattern and has
+/// since joined this one — see `SESSION_BACKEND`.
 static ABSOLUTE_ANCHOR: std::sync::RwLock<Option<AbsoluteAnchor>> = std::sync::RwLock::new(None);
 
 /// Anchor absolute coordinates at a specific output. `None` (the default) keeps the size-matched
@@ -173,6 +174,66 @@ pub fn absolute_anchor() -> Option<AbsoluteAnchor> {
         .clone()
 }
 
+/// The backend the LIVE SESSION resolved to, published by the host from
+/// `pf_vdisplay::input_backend_id` when it routes a connect or a mid-stream Desktop↔Game switch.
+///
+/// A `RwLock` rather than an env var, for the reason [`ABSOLUTE_ANCHOR`] already gives: the injector
+/// is host-lifetime and lives behind a channel, so a *session* can only reach it through process
+/// state — and typed, lock-guarded process state beats `set_var`. This slot IS the backend-select
+/// that doc pointed at as the last holdout. It was a process-environment write in
+/// `pf_vdisplay::apply_input_env` read back here by `getenv`, and [`default_backend`] runs once per
+/// input batch on the injector service thread: a `getenv` on a hot path racing a per-session
+/// `setenv` is the `environ` data race, on a live streaming host, with no attacker needed
+/// (security-review 2026-08-25).
+///
+/// Host-lifetime and last-write-wins, exactly as the env var was: the host serves one session's
+/// input at a time, and nothing clears this when a session ends (the env value persisted too).
+#[cfg(target_os = "linux")]
+static SESSION_BACKEND: std::sync::RwLock<Option<Backend>> = std::sync::RwLock::new(None);
+
+#[cfg(target_os = "linux")]
+fn session_backend() -> Option<Backend> {
+    *SESSION_BACKEND.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The [`Backend`] an id names, in every spelling the `PUNKTFUNK_INPUT_BACKEND` knob accepts.
+/// Shared by that knob and by [`set_backend_id`], so the two can never drift apart.
+#[cfg(target_os = "linux")]
+fn backend_from_id(id: &str) -> Option<Backend> {
+    Some(match id.trim().to_ascii_lowercase().as_str() {
+        "wlr" | "wlroots" | "wlrvirtual" => Backend::WlrVirtual,
+        "kwin" | "fakeinput" | "fake_input" | "kwin-fake-input" => Backend::KwinFakeInput,
+        "libei" | "ei" | "portal" => Backend::Libei,
+        "gamescope" | "gamescope-ei" => Backend::GamescopeEi,
+        _ => return None,
+    })
+}
+
+/// Point input at the backend this session's VIDEO resolved to (the two must not diverge). `id` is
+/// `pf_vdisplay::input_backend_id`'s verdict — `gamescope`/`kwin`/`libei`/`wlr`.
+///
+/// Threaded from the host rather than published through `PUNKTFUNK_INPUT_BACKEND`, the way
+/// `VirtualDisplay::set_launch_command` took the launch command off the env before it. Call it
+/// wherever a session's compositor is decided or re-decided; the operator-pinned
+/// `PUNKTFUNK_COMPOSITOR` path deliberately does not, which is what leaves the operator's own knob
+/// in charge there.
+#[cfg(target_os = "linux")]
+pub fn set_backend_id(id: &str) {
+    let Some(backend) = backend_from_id(id) else {
+        tracing::warn!(
+            value = id,
+            "unknown input backend id — leaving input routing alone"
+        );
+        return;
+    };
+    tracing::debug!(?backend, "input: session backend set");
+    *SESSION_BACKEND.write().unwrap_or_else(|e| e.into_inner()) = Some(backend);
+}
+
+/// The host routes input on every platform; only Linux has a backend to choose between.
+#[cfg(not(target_os = "linux"))]
+pub fn set_backend_id(_id: &str) {}
+
 /// Pick the injection backend for the current session. gamescope hosts its own EIS server (no
 /// portal), so a gamescope session injects directly into it. wlroots/Sway only implements the
 /// ScreenCast portal (no RemoteDesktop), so libei can't run there — use the wlr virtual-input
@@ -182,18 +243,25 @@ pub fn absolute_anchor() -> Option<AbsoluteAnchor> {
 /// Mutter's *direct* `org.gnome.Mutter.RemoteDesktop` API rather than the portal
 /// (`libei_ei_source`), so it is headless-capable too: no interactive approval to answer.
 /// `PUNKTFUNK_INPUT_BACKEND=wlr|kwin|libei|gamescope` overrides the auto-detection.
+///
+/// Resolution order, unchanged from when the session's pick arrived through the process env:
+/// **the live session's published backend** ([`set_backend_id`]) — which the host writes from
+/// `pf_vdisplay::input_backend_id`, and which used to be a `set_var` of `PUNKTFUNK_INPUT_BACKEND`
+/// that overwrote the operator's own value — then the operator's `PUNKTFUNK_INPUT_BACKEND`, then
+/// the `PUNKTFUNK_COMPOSITOR` pin, then the `XDG_CURRENT_DESKTOP` sniff. The env rungs are reached
+/// only before any session has published (and on the operator-pinned path, which deliberately
+/// publishes nothing), so this stays off `getenv` entirely once a stream is up — see
+/// [`SESSION_BACKEND`].
 #[cfg(target_os = "linux")]
 pub fn default_backend() -> Backend {
+    if let Some(b) = session_backend() {
+        return b;
+    }
     if let Ok(v) = std::env::var("PUNKTFUNK_INPUT_BACKEND") {
-        match v.trim().to_ascii_lowercase().as_str() {
-            "wlr" | "wlroots" | "wlrvirtual" => return Backend::WlrVirtual,
-            "kwin" | "fakeinput" | "fake_input" | "kwin-fake-input" => {
-                return Backend::KwinFakeInput
-            }
-            "libei" | "ei" | "portal" => return Backend::Libei,
-            "gamescope" | "gamescope-ei" => return Backend::GamescopeEi,
-            other => tracing::warn!(
-                value = other,
+        match backend_from_id(&v) {
+            Some(b) => return b,
+            None => tracing::warn!(
+                value = v.trim(),
                 "unknown PUNKTFUNK_INPUT_BACKEND — auto-detecting"
             ),
         }
@@ -715,3 +783,48 @@ mod sendinput;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/wlr.rs"]
 mod wlr;
+
+#[cfg(all(test, target_os = "linux"))]
+mod backend_select_tests {
+    use super::*;
+
+    /// The session's backend reaches the injector as a published VALUE ([`set_backend_id`]) and
+    /// outranks every env rung below it — which is exactly the precedence the old
+    /// `set_var("PUNKTFUNK_INPUT_BACKEND", ..)` had, since it OVERWROTE whatever was there. It is a
+    /// `RwLock` read now because [`default_backend`] runs once per input batch on the injector
+    /// service thread, and a `getenv` there raced the connect path's `setenv`
+    /// (security-review 2026-08-25).
+    ///
+    /// Deliberately makes no claim about the environment: the point is that nothing needs to write
+    /// it, so the test does not write one either.
+    #[test]
+    fn the_session_backend_threads_through_instead_of_the_process_env() {
+        set_backend_id("gamescope");
+        assert_eq!(default_backend(), Backend::GamescopeEi);
+        // A mid-stream Game→Desktop switch re-publishes; input follows, with no env write.
+        set_backend_id("kwin");
+        assert_eq!(default_backend(), Backend::KwinFakeInput);
+        // An id nobody recognises must leave routing where it was rather than silently retargeting
+        // input at a backend the video side did not choose.
+        set_backend_id("not-a-backend");
+        assert_eq!(default_backend(), Backend::KwinFakeInput);
+    }
+
+    /// Every id `pf_vdisplay::input_backend_id` can emit must be one this crate accepts. The two are
+    /// halves of one contract across a crate boundary that no compiler checks — pf-vdisplay must not
+    /// depend on pf-inject (its manifest says so), so it emits `&'static str` and this pins the
+    /// receiving end. Its counterpart is pf-vdisplay's
+    /// `every_compositor_names_the_injector_backend_that_matches_it`.
+    #[test]
+    fn every_id_the_video_side_emits_maps_to_a_backend() {
+        for (id, want) in [
+            ("gamescope", Backend::GamescopeEi),
+            ("kwin", Backend::KwinFakeInput),
+            ("libei", Backend::Libei),
+            ("wlr", Backend::WlrVirtual),
+        ] {
+            assert_eq!(backend_from_id(id), Some(want), "{id}");
+        }
+        assert_eq!(backend_from_id("not-a-backend"), None);
+    }
+}

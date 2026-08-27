@@ -631,9 +631,9 @@ impl VkBridge {
         let uv_off = y_pitch * height as u64;
         let dst_size = uv_off + y_pitch * height.div_ceil(2) as u64;
         // SAFETY: same structure and proofs as `import_linear` — `fd` is the caller's live dmabuf
-        // (dup'd by `import_src`), sizes are checked (`import_src` asserts the fd covers
-        // `offset + stride*height`; `ensure_dst(dst_size)` makes the exportable buffer at least
-        // the shader's whole write range, whose last word is `dst_size - 4`). The descriptor
+        // (dup'd by `import_src`), sizes are checked (every frame re-asserts that the imported src
+        // covers `offset + stride*height`; `ensure_dst(dst_size)` makes the exportable buffer at
+        // least the shader's whole write range, whose last word is `dst_size - 4`). The descriptor
         // update binds the live cached src buffer and the live dst buffer WHOLE_SIZE; every
         // `*Info`/array is a local outliving its synchronous call; `cmd`/`queue`/`fence` are this
         // bridge's own single-thread handles. The dispatch covers ⌈w/32⌉×⌈h/16⌉ groups of 8×8
@@ -645,10 +645,15 @@ impl VkBridge {
             if !self.src_cache.contains_key(&fd) {
                 let size = libc::lseek(fd, 0, libc::SEEK_END);
                 anyhow::ensure!(size > 0, "lseek(dmabuf)");
-                anyhow::ensure!(size as u64 >= span, "dmabuf smaller than frame span");
                 self.import_src(fd, size as u64)?;
             }
-            let src_buffer = self.src_cache[&fd].buffer;
+            let (src_buffer, src_size) = {
+                let s = &self.src_cache[&fd];
+                (s.buffer, s.size)
+            };
+            // As in `import_linear`: this frame's chunk metadata, not the cached import's, decides
+            // how far the shader reads.
+            anyhow::ensure!(src_size >= span, "dmabuf smaller than frame span");
             self.ensure_dst(dst_size)?;
             self.ensure_csc()?;
             let (dst_buffer, dst_cuda_ptr) = {
@@ -703,7 +708,8 @@ impl VkBridge {
                 (uv_off / 4) as u32,
                 (y_pitch / 4) as u32,
             ];
-            let push_bytes: &[u8] = std::slice::from_raw_parts(push.as_ptr().cast(), 28);
+            let push_words = push.map(u32::to_ne_bytes);
+            let push_bytes: &[u8] = push_words.as_flattened();
             self.device.cmd_push_constants(
                 self.cmd,
                 csc.playout,
@@ -794,11 +800,11 @@ impl VkBridge {
         // SAFETY: `fd` is the live dmabuf fd handed in by the caller (borrowed; `import_src` dup's it
         // internally and Vulkan owns the dup). `libc::lseek` only queries the fd's size. The unsafe
         // `import_src`/`ensure_dst` are called with a valid fd and a checked size. The bounds are
-        // proven: `import_src` asserts `size >= span` (so the cached `src_size >= span`),
-        // `copy_size = src_size.min(span)`, and `ensure_dst(copy_size)` makes `dst` at least
-        // `copy_size` — so the GPU `cmd_copy_buffer` of `copy_size` bytes reads/writes within both
-        // buffers, and the later CUDA pitched copy reading `[offset, span)` from `dst.cuda.ptr` (=
-        // `offset + stride*height = span <= copy_size`) stays inside the freshly-copied region. The
+        // proven: `src_size >= span` is re-checked below against THIS frame's `offset`/`stride`
+        // (an import cached on an earlier frame is not proof for this one), and `ensure_dst(span)`
+        // makes `dst` at least `span` — so the GPU `cmd_copy_buffer` of `span` bytes reads/writes
+        // within both buffers, and the later CUDA pitched copy reading `[offset, span)` from
+        // `dst.cuda.ptr` (= `offset + stride*height = span`) stays inside the copied region. The
         // `*Info`/`region`/`cmds`/`submit` are locals that outlive the synchronous calls reading them.
         // `cmd`/`queue`/`fence` are this bridge's own handles, used on this single thread only. The
         // host-side `wait_for_fences` fully retires the Vulkan copy BEFORE CUDA reads the shared
@@ -809,15 +815,17 @@ impl VkBridge {
             if !self.src_cache.contains_key(&fd) {
                 let size = libc::lseek(fd, 0, libc::SEEK_END);
                 anyhow::ensure!(size > 0, "lseek(dmabuf)");
-                anyhow::ensure!(size as u64 >= span, "dmabuf smaller than frame span");
                 self.import_src(fd, size as u64)?;
             }
             let (src_buffer, src_size) = {
                 let s = &self.src_cache[&fd];
                 (s.buffer, s.size)
             };
-            let copy_size = src_size.min(span);
-            self.ensure_dst(copy_size)?;
+            // Per frame, not per import: `offset`/`stride` come from this frame's PipeWire chunk
+            // metadata, so a cached import can be smaller than the span they describe. Clamping
+            // the Vulkan copy instead would leave the CUDA de-stride below reading past `dst`.
+            anyhow::ensure!(src_size >= span, "dmabuf smaller than frame span");
+            self.ensure_dst(span)?;
             let dst = self.dst.as_ref().unwrap();
 
             // Record + submit the GPU copy, wait on the fence (GPU-GPU, sub-millisecond).
@@ -828,7 +836,7 @@ impl VkBridge {
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )
                 .context("begin cmd")?;
-            let region = vk::BufferCopy::default().size(copy_size);
+            let region = vk::BufferCopy::default().size(span);
             self.device
                 .cmd_copy_buffer(self.cmd, src_buffer, dst.buffer, &[region]);
             self.device

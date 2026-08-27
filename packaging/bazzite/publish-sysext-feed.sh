@@ -65,6 +65,31 @@ read_manifest() {
   grep -E '^[0-9a-f]{64}  [^ ]+$' "$FETCHED" > "$SUMS" || :
 }
 
+# bind_manifest — stamp the feed name and a publish serial INTO the bytes about to be signed.
+#
+# A bare checksum list binds nothing: the signature proves "we signed these bytes", never "…for the
+# stable feed, this month". So anyone who can WRITE the registry without holding the key — a leaked
+# write:package token, the kind that sits in half our CI jobs — can copy this feed's manifest,
+# signature and images into another channel's path, or put an old pair back, and every box verifies
+# them happily and merges the result over /usr. punktfunk-sysext(8) refuses a manifest whose FEED is
+# not the feed it fetched and one whose SERIAL is below the highest it has accepted, which is the
+# same channel-binding + monotonic-serial pair the Rust updater enforces on its own manifest
+# (crates/pf-update-check/src/manifest.rs). Comment lines, so a `#`-skipping checksum reader and the
+# clients' image-line parsers are both unaffected by them.
+bind_manifest() {
+  local serial prev
+  serial="$(date +%s)"
+  # Monotonic per feed, and never below what the feed already claims. Clients keep the highest
+  # serial they have accepted and refuse anything lower, so one runner with a fast clock would
+  # otherwise lock every box out of this feed until wall-clock caught up.
+  prev="$(sed -n 's/^# SERIAL //p' "$FETCHED" | head -n1)"
+  case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
+  [ "$serial" -gt "$prev" ] || serial=$((prev + 1))
+  { printf '# FEED %s\n# SERIAL %s\n' "$FEED" "$serial"; cat "$SUMS"; } > "$WORK/bound"
+  mv -f "$WORK/bound" "$SUMS"
+  echo "bound manifest to feed $FEED, serial $serial"
+}
+
 # sign_manifest — detached-sign $SUMS into $SIG with RPM_GPG_PRIVATE_KEY. Prints nothing and
 # returns 1 if no key is available; the caller decides whether that is survivable.
 sign_manifest() {
@@ -119,22 +144,23 @@ if [ "$SEAL" = 1 ]; then
     echo "$BASE/SHA256SUMS lists no images — refusing to seal it (feed needs a republish)" >&2
     exit 1
   fi
+  IMAGES="$(grep -c '' <"$SUMS")"
+  cmp -s "$SUMS" "$FETCHED" \
+    || echo "normalizing $BASE/SHA256SUMS: $(grep -c '' <"$FETCHED") line(s) served, $IMAGES kept"
+  bind_manifest
   if ! sign_manifest; then
     require_signature   # non-release: warn and leave the live feed exactly as it was
     exit 0
   fi
-  # The signature must cover the bytes a client actually downloads, so a manifest that normalizing
-  # changed gets re-published with it — otherwise the .asc would describe a file the registry does
-  # not have, which is the very failure this is repairing. Manifest first, signature second, and
-  # neither when the stored copy was already clean.
-  if ! cmp -s "$SUMS" "$FETCHED"; then
-    echo "normalizing $BASE/SHA256SUMS: $(grep -c '' <"$FETCHED") line(s) served, $(grep -c '' <"$SUMS") kept"
-    curl -fsS -o /dev/null "${AUTH[@]}" -X DELETE "$BASE/SHA256SUMS" || true
-    curl -fsS -o /dev/null "${AUTH[@]}" --upload-file "$SUMS" "$BASE/SHA256SUMS"
-  fi
+  # The signature must cover the bytes a client actually downloads, and bind_manifest has just
+  # rewritten the header, so the manifest ALWAYS goes back up with its new signature — an .asc
+  # describing a file the registry does not have is the very failure this mode repairs. Manifest
+  # first, signature second: a client caught in the window sees an unsigned feed and refuses.
+  curl -fsS -o /dev/null "${AUTH[@]}" -X DELETE "$BASE/SHA256SUMS" || true
+  curl -fsS -o /dev/null "${AUTH[@]}" --upload-file "$SUMS" "$BASE/SHA256SUMS"
   curl -fsS -o /dev/null "${AUTH[@]}" -X DELETE "$BASE/SHA256SUMS.asc" || true
   curl -fsS -o /dev/null "${AUTH[@]}" --upload-file "$SIG" "$BASE/SHA256SUMS.asc"
-  echo "sealed $BASE ($(grep -c '' <"$SUMS") image(s))"
+  echo "sealed $BASE ($IMAGES image(s))"
   exit 0
 fi
 
@@ -161,8 +187,11 @@ if [ "$KEEP" -gt 0 ]; then
   done
 fi
 
+IMAGES="$(grep -c '' <"$SUMS")"
+
 # Sign the finished manifest BEFORE anything is uploaded — a signing failure on a release must
 # abort while the live feed is still whole, not halfway through being replaced.
+bind_manifest
 sign_manifest || require_signature
 
 # Upload order keeps consumers consistent: image first, then the manifest referencing it, then its
@@ -182,4 +211,4 @@ fi
 for f in "${PRUNE[@]:-}"; do
   [ -n "$f" ] && { echo "pruning $f"; curl -fsS -o /dev/null "${AUTH[@]}" -X DELETE "$BASE/$f" || true; }
 done
-echo "published $FNAME -> $BASE ($(wc -l <"$SUMS") image(s) in the feed)"
+echo "published $FNAME -> $BASE ($IMAGES image(s) in the feed)"

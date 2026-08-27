@@ -5,6 +5,7 @@
 //!
 //! - [`config_dir`] resolves the per-host config directory (XDG / `%ProgramData%`, `PUNKTFUNK_CONFIG_DIR` override).
 //! - [`create_private_dir`] makes it owner-private (0700 / restrictive DACL).
+//! - [`create_secret_dir`] the same, minus the Windows `BUILTIN\Users` read grant.
 //! - [`write_secret_file`] writes an owner-only secret (0600 / SYSTEM+Admins DACL).
 #![forbid(unsafe_code)]
 
@@ -94,9 +95,30 @@ pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     {
         let r = std::fs::create_dir_all(dir);
         #[cfg(windows)]
-        restrict_dir_to_system_admins(dir, first_hardening_of(dir));
+        restrict_dir_to_system_admins(dir, first_hardening_of(dir), true);
         r
     }
+}
+
+/// [`create_private_dir`] without the Windows `BUILTIN\Users` read grant — for a subdirectory whose
+/// *contents* are secrets rather than merely tamper-sensitive config: the host/service logs and the
+/// client log bundles paired devices upload.
+///
+/// The config dir's `Users:(OI)(CI)(RX)` is deliberate (the tray reads `mgmt-endpoint` out of it),
+/// but `(OI)` means every file born anywhere under it inherits that read — which left the logs
+/// (webhook URLs, command lines) and the uploaded bundles readable by any local user, the latter
+/// flatly contradicting the "reading them stays on the loopback-only bearer lane" split
+/// `mgmt::client_logs` documents (security-review 2026-08-25). Unix behaviour is identical to
+/// [`create_private_dir`] (0700 — the mode already excludes everyone else).
+pub fn create_secret_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let r = std::fs::create_dir_all(dir);
+        restrict_dir_to_system_admins(dir, first_hardening_of(dir), false);
+        r
+    }
+    #[cfg(not(windows))]
+    create_private_dir(dir)
 }
 
 /// Whether this is the first hardening pass of `dir` in this process — the pass that also does the
@@ -136,7 +158,9 @@ pub fn restrict_existing_secret_file(path: &std::path::Path) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    restrict_to_system_admins(path);
+    if let Err(e) = restrict_to_system_admins(path) {
+        tracing::warn!(path = %path.display(), error = %e, "icacls hardening did not succeed");
+    }
 }
 
 /// No-op off Windows: POSIX modes are set at creation by [`write_secret_file`] and a config dir a
@@ -158,12 +182,13 @@ fn icacls_path() -> String {
 /// `punktfunk` dir or plant a `host.env`/`apps.json` that the privileged SYSTEM service then trusts
 /// (LPE; security-review 2026-06-28 #3). This re-owns the dir to Administrators (defeating a
 /// pre-creation), strips inheritance, and sets an explicit DACL: SYSTEM/Administrators/OWNER full
-/// (object+container inherit so child files/dirs inherit it), and Users **read-only** (so existing
-/// reads of non-secret config keep working but a local user can no longer write/plant). Secret files
-/// are additionally locked to SYSTEM/Admins by [`write_secret_file`]. Hard-coded SIDs
+/// (object+container inherit so child files/dirs inherit it), and — when `users_read` — Users
+/// **read-only** (so existing reads of non-secret config keep working but a local user can no longer
+/// write/plant). [`create_secret_dir`] passes `false` for a dir whose contents are all secrets, and
+/// secret files are additionally locked to SYSTEM/Admins by [`write_secret_file`]. Hard-coded SIDs
 /// (locale-independent) via the absolute `%SystemRoot%` path; never fatal.
 #[cfg(windows)]
-fn restrict_dir_to_system_admins(dir: &std::path::Path, deep: bool) {
+fn restrict_dir_to_system_admins(dir: &std::path::Path, deep: bool, users_read: bool) {
     let icacls = icacls_path();
     // Reset ownership to Administrators first, so a dir a non-admin may have pre-created can't keep
     // OWNER control (an owner always retains WRITE_DAC and can put its access straight back).
@@ -183,24 +208,27 @@ fn restrict_dir_to_system_admins(dir: &std::path::Path, deep: bool) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    let status = std::process::Command::new(&icacls)
-        .arg(dir.as_os_str())
-        .args([
-            "/inheritance:r",
-            "/grant:r",
-            "*S-1-5-18:(OI)(CI)(F)", // NT AUTHORITY\SYSTEM
-            "/grant:r",
-            "*S-1-5-32-544:(OI)(CI)(F)", // BUILTIN\Administrators
-            // NO inheritable OWNER RIGHTS (`*S-1-3-4`) here, deliberately. It used to be granted
-            // `(OI)(CI)(F)`, which handed full control of every child object to whoever owned it —
-            // so a file a local user created before the hardening ran stayed writable by them even
-            // after the directory was re-owned (2026-08-05 review H-4, second half). SYSTEM and
-            // Administrators cover every account that legitimately writes here; a non-elevated
-            // manual run gets read-only config, which is the intended boundary rather than a
-            // regression — this directory drives command execution as SYSTEM.
-            "/grant:r",
-            "*S-1-5-32-545:(OI)(CI)(RX)", // BUILTIN\Users — read-only (no create/write → no plant)
-        ])
+    // NO inheritable OWNER RIGHTS (`*S-1-3-4`) in the grant below, deliberately. It used to be
+    // granted `(OI)(CI)(F)`, which handed full control of every child object to whoever owned it —
+    // so a file a local user created before the hardening ran stayed writable by them even after
+    // the directory was re-owned (2026-08-05 review H-4, second half). SYSTEM and Administrators
+    // cover every account that legitimately writes here; a non-elevated manual run gets read-only
+    // config, which is the intended boundary rather than a regression — this directory drives
+    // command execution as SYSTEM.
+    let mut acl = std::process::Command::new(&icacls);
+    acl.arg(dir.as_os_str()).args([
+        "/inheritance:r",
+        "/grant:r",
+        "*S-1-5-18:(OI)(CI)(F)", // NT AUTHORITY\SYSTEM
+        "/grant:r",
+        "*S-1-5-32-544:(OI)(CI)(F)", // BUILTIN\Administrators
+    ]);
+    if users_read {
+        // BUILTIN\Users — read-only (no create/write → no plant). `(OI)` reaches every FILE born
+        // under here as well, which is why [`create_secret_dir`] leaves this ACE off entirely.
+        acl.args(["/grant:r", "*S-1-5-32-545:(OI)(CI)(RX)"]);
+    }
+    let status = acl
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
@@ -219,18 +247,21 @@ fn restrict_dir_to_system_admins(dir: &std::path::Path, deep: bool) {
 /// for the host private key and the persisted trust stores so a local unprivileged user can neither
 /// read the key (impersonation) nor tamper with the paired allow-list (unauthorized pairing).
 ///
-/// **Windows ordering caveat** (2026-08-05 review L-17): this is create-then-`icacls`, not
-/// create-with-DACL — `std::fs::OpenOptions` cannot pass a `SECURITY_ATTRIBUTES`, and this crate is
-/// `#![forbid(unsafe_code)]` so it cannot call `CreateFileW` itself. The file therefore exists
-/// briefly under its INHERITED ACL, and a failed `icacls` is a warning rather than an error.
+/// **Windows ordering** (2026-08-05 review L-17, corrected by security-review 2026-08-25): the file
+/// cannot be BORN with the right DACL — `std::fs::OpenOptions` cannot pass a `SECURITY_ATTRIBUTES`
+/// and this crate is `#![forbid(unsafe_code)]`, so it cannot call `CreateFileW` itself. So it is
+/// created EMPTY, `icacls`'d, and only then written — `install::set_web_password`'s ordering, and
+/// the DACL step is **fatal**.
 ///
-/// What makes that acceptable is the DIRECTORY, and only the directory: every caller writes into
-/// the config dir, which [`create_private_dir`] now hardens unconditionally and BEFORE the first
-/// read of anything in it (review H-4/M-1), granting `BUILTIN\Users` read-only and no create. The
-/// inherited ACL a secret is born with is therefore already SYSTEM/Administrators-only, and the
-/// `icacls` below is defence in depth rather than the thing standing between a local user and the
-/// host key. Keep that ordering — if the directory hardening is ever moved back after a read, this
-/// window becomes real again.
+/// This used to write first and harden after, on the argument that the INHERITED ACL was already
+/// SYSTEM/Administrators-only. It never was: [`restrict_dir_to_system_admins`] deliberately grants
+/// `BUILTIN\Users` `(OI)(CI)(RX)` so non-secret config stays readable, and `(OI)` means every file
+/// born in the config dir inherits that read. Every secret was therefore world-readable for the
+/// life of the `icacls` child — long enough for a `ReadDirectoryChangesW` watcher (which the same
+/// directory ACL permits by design) to take `native-key.pem`, `key.pem` and `mgmt-token`. The
+/// `icacls` call is the ONLY control here, not defence in depth, which is also why a failure now
+/// returns an error and unlinks the still-empty file instead of filling it with a secret anyone can
+/// read. The open handle carries our own write access across the DACL change.
 pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
@@ -241,6 +272,13 @@ pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Re
         opts.mode(0o600);
     }
     let mut f = opts.open(path)?;
+    #[cfg(windows)]
+    if let Err(e) = restrict_to_system_admins(path) {
+        drop(f);
+        // Never leave a 0-byte secret behind: callers gate on "does it exist / is it non-empty".
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
     f.write_all(contents)?;
     f.flush()?;
     #[cfg(unix)]
@@ -248,19 +286,18 @@ pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Re
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
-    #[cfg(windows)]
-    restrict_to_system_admins(path);
     Ok(())
 }
 
-/// Best-effort Windows DACL lockdown of a secret file: strip inherited ACEs and grant Full only to
+/// Windows DACL lockdown of a secret file: strip inherited ACEs and grant Full only to
 /// SYSTEM, Administrators, and OWNER RIGHTS (the creating account — the SYSTEM service or a manually
 /// running user keeps access). Without this the host key under the default Users-readable
 /// `%ProgramData%` ACL is readable by ANY local user. Uses `icacls` with hard-coded SIDs
 /// (locale-independent) via the absolute `%SystemRoot%` path (a privileged service must not trust
-/// `PATH`). Never fatal — on failure the file is simply left at the inherited ACL (today's behaviour).
+/// `PATH`). Reports failure to the caller: [`write_secret_file`] treats it as fatal (it is the only
+/// control over the bytes it is about to write), [`restrict_existing_secret_file`] only warns.
 #[cfg(windows)]
-fn restrict_to_system_admins(path: &std::path::Path) {
+fn restrict_to_system_admins(path: &std::path::Path) -> std::io::Result<()> {
     let icacls = icacls_path();
     let status = std::process::Command::new(icacls)
         .arg(path.as_os_str())
@@ -275,14 +312,15 @@ fn restrict_to_system_admins(path: &std::path::Path) {
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
-    match status {
-        Ok(s) if s.success() => {}
-        _ => tracing::warn!(
-            path = %path.display(),
-            "icacls hardening did not succeed — this secret may be readable by other local users"
-        ),
+        .status()?;
+    if status.success() {
+        return Ok(());
     }
+    Err(std::io::Error::other(format!(
+        "icacls could not restrict {} to SYSTEM/Administrators ({status}) — it would be readable \
+         by other local users",
+        path.display()
+    )))
 }
 
 #[cfg(test)]
@@ -318,6 +356,37 @@ mod tests {
 
         std::fs::write(dir.join("mgmt-endpoint"), "PUNKTFUNK_MGMT_URL=\n").unwrap();
         assert_eq!(published_mgmt_port_in(&dir), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The unix half of the create-empty → harden → write ordering: a secret is never even briefly
+    /// group/world-readable, on the first write OR the truncate-and-rewrite one. (The Windows half —
+    /// the `icacls` step being fatal — can only be exercised on Windows.)
+    #[cfg(unix)]
+    #[test]
+    fn secrets_are_owner_only_on_create_and_on_rewrite() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pf-paths-secret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        create_secret_dir(&dir).unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700, "a secrets dir is owner-only");
+
+        let key = dir.join("key.pem");
+        write_secret_file(&key, b"-----BEGIN PRIVATE KEY-----\n").unwrap();
+        assert_eq!(mode(&key), 0o600);
+        write_secret_file(&key, b"rotated").unwrap();
+        assert_eq!(mode(&key), 0o600, "the rewrite path keeps 0600");
+        assert_eq!(std::fs::read(&key).unwrap(), b"rotated", "and truncates");
+
+        // A pre-existing world-readable file is tightened, not adopted.
+        let planted = dir.join("mgmt-token");
+        std::fs::write(&planted, b"old").unwrap();
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_secret_file(&planted, b"new").unwrap();
+        assert_eq!(mode(&planted), 0o600);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

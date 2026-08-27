@@ -595,62 +595,72 @@ struct PadAudioSlots {
     /// `(kinds, handle)` per running pad — `kinds` is the arrival's audio-caps mask, kept so
     /// an identical re-arrival (they are re-sent against datagram loss) is a no-op.
     slots: [Option<(u8, pad_audio::PadAudioHandle)>; MAX_WIRE_PADS],
-    /// Kind-change restarts spent per pad this session (R3). The trigger is a client-sent
-    /// arrival, so without a ceiling the client decides how many WASAPI captures the host opens.
-    restarts: [u8; MAX_WIRE_PADS],
+    /// Streamer starts spent per pad this session (R3) — the FIRST one included, because every
+    /// start is client-triggered (an arrival declares the kinds), so without a ceiling the client
+    /// decides how many WASAPI captures the host opens.
+    starts: [u8; MAX_WIRE_PADS],
 }
 
-/// R3: how many times one pad may change its declared audio kinds before the host stops
-/// obliging. A real controller declares once at open and never again; the re-sent arrivals are
-/// identical and take the no-op path above, so this is only reached by a client that keeps
-/// changing its mind.
-const MAX_PAD_AUDIO_RESTARTS: u8 = 8;
+/// R3: how many pad-audio captures one pad may open in a session before the host stops obliging.
+/// A real controller declares once at open and never again; the re-sent arrivals are identical
+/// and take the no-op path above, so this is only reached by a client that keeps cycling — by
+/// changing its declared kinds, or by alternating a declaring arrival with anything that stops
+/// the streamer (a `want == 0` re-declare, a `GamepadRemove`), which spawns and tears down just
+/// the same while never touching the kind-change arm.
+const MAX_PAD_AUDIO_STARTS: u8 = 8;
 
 impl PadAudioSlots {
     fn new() -> PadAudioSlots {
         PadAudioSlots {
             slots: std::array::from_fn(|_| None),
-            restarts: [0; MAX_WIRE_PADS],
+            starts: [0; MAX_WIRE_PADS],
         }
     }
 
     /// Idempotent spawn: same kinds → keep the running streamer; changed kinds → restart with
     /// the new mask; not running → spawn (a slot without an endpoint stays empty — bounded
-    /// retries, since arrivals are only re-sent a few times per slot open). `edge` picks the
-    /// DualSense Edge identity for the Linux sink (ignored on Windows — endpoints are
-    /// pre-stamped).
+    /// retries, since arrivals are only re-sent a few times per slot open). Every capture that
+    /// actually opens spends from [`MAX_PAD_AUDIO_STARTS`]. `edge` picks the DualSense Edge
+    /// identity for the Linux sink (ignored on Windows — endpoints are pre-stamped).
     fn ensure(&mut self, conn: &quinn::Connection, pad: u8, kinds: u8, edge: bool) {
         let idx = pad as usize;
         if idx >= MAX_WIRE_PADS {
             return;
         }
-        if let Some((have, _)) = &self.slots[idx] {
-            if *have == kinds {
-                return; // identical re-arrival — keep the running streamer
-            }
-            // R3: the restart trigger is a CLIENT-sent arrival, so the count is client-driven.
-            // Nothing bounded it: a client alternating its declared kinds could make the host
-            // tear down and re-spawn a WASAPI loopback capture indefinitely, each cycle paying a
-            // thread spawn and an endpoint activation. Cheap to bound, and a pad that has already
-            // changed its mind this many times in one session is not doing anything legitimate.
-            if self.restarts[idx] >= MAX_PAD_AUDIO_RESTARTS {
-                tracing::warn!(
-                    pad = idx,
-                    "pad-audio kinds changed again after {MAX_PAD_AUDIO_RESTARTS} restarts — \
-                     ignoring; the streamer keeps its current kinds for this session"
-                );
-                return;
-            }
-            self.restarts[idx] += 1;
+        let running = self.slots[idx].as_ref().map(|(have, _)| *have);
+        if running == Some(kinds) {
+            return; // identical re-arrival — keep the running streamer
+        }
+        // R3: the trigger is a CLIENT-sent arrival, so the count is client-driven. Nothing
+        // bounded it: a client alternating its declared kinds — or alternating a declaring
+        // arrival with a stop (`want == 0`, `GamepadRemove`) and then declaring again, which
+        // never reaches the kind-change arm at all — could make the host tear down and re-spawn a
+        // WASAPI loopback capture indefinitely, each cycle paying a thread spawn and an endpoint
+        // activation. Cheap to bound, and a pad that has opened this many captures in one session
+        // is not doing anything legitimate. Gated BEFORE the stop below, so a pad at the ceiling
+        // keeps the streamer it has rather than losing it to the last request.
+        if self.starts[idx] >= MAX_PAD_AUDIO_STARTS {
+            tracing::warn!(
+                pad = idx,
+                "pad-audio streamer already started {MAX_PAD_AUDIO_STARTS} times — ignoring; the \
+                 pad keeps whatever streamer it has for this session"
+            );
+            return;
+        }
+        if running.is_some() {
             tracing::info!(
                 pad = idx,
-                restarts = self.restarts[idx],
+                starts = self.starts[idx],
                 "pad-audio kinds changed — restarting the streamer"
             );
             self.stop(idx);
         }
         let stop = Arc::new(AtomicBool::new(false));
         if let Some(h) = pad_audio::spawn(conn.clone(), pad, kinds, edge, stop) {
+            // Charged only for a capture that actually opened: a slot with no provisioned
+            // endpoint spawns nothing, and the arrival re-sends against it must not spend the
+            // ceiling.
+            self.starts[idx] += 1;
             self.slots[idx] = Some((kinds, h));
         }
     }

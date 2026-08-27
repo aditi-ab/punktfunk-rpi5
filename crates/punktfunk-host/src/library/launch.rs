@@ -165,6 +165,21 @@ fn command_for(spec: &LaunchSpec) -> Option<String> {
             // The same resolution the `heroic` game launches use (native binary, else Flatpak), just
             // without `--no-gui` and without a URI: that opens Heroic's window, which IS the tile.
             "heroic" => heroic_launch_prefix(),
+            // Heroic's console mode — its couch front end, the Big Picture of this launcher.
+            //
+            // It takes TWO flags, which is not obvious and is why this is the host's business and
+            // not a plugin's: `--console` only routes the UI to that front end, and `--fullscreen`
+            // is what actually fills the screen (Heroic reads them separately —
+            // `isCLIConsoleMode` / `isCLIFullscreen`). Neither is a URI: `heroic://` speaks only
+            // `ping` and `launch`, so a protocol hand-off cannot reach console mode at all — the
+            // same reason Playnite's fullscreen tile spawns its exe directly.
+            //
+            // Console mode arrived in Heroic 2.21.0. An older Heroic ignores the unknown
+            // `--console` and honours `--fullscreen`, so the tile degrades to a fullscreen desktop
+            // UI rather than to nothing.
+            "heroic-console" => {
+                heroic_launch_prefix().map(|p| format!("{p} --console --fullscreen"))
+            }
             // Bare `lutris` opens the Lutris window; with a `lutris:rungameid/…` URI it launches a
             // game instead (the `lutris_id` kind above).
             "lutris" => Some("lutris".into()),
@@ -339,8 +354,9 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<WinRecipe> {
         // argv element (no shell, no cmd /c). Same pattern as the steam explorer fallback.
         "epic" => epic_launch_uri(&spec.value)
             .map(|uri| WinRecipe::handoff(format!("explorer.exe \"{uri}\""))),
-        // GOG: spawn the resolved game exe directly (host-derived from goggame-<id>.info), no Galaxy.
-        // ...and the one store recipe that is NOT a hand-off: the resolved exe is the game itself.
+        // GOG: spawn the game's own exe directly (no Galaxy) — the one store recipe that is NOT a
+        // hand-off. The triple comes from the plugin, so `gog_spawn` re-confines it to a GOG install
+        // the host finds itself.
         "gog" => gog_spawn(&spec.value).map(|(cmdline, workdir)| WinRecipe::game(cmdline, workdir)),
         // Xbox/Game Pass: activate the UWP/GDK package by its AUMID (<PFN>!<AppId>) via explorer's
         // shell:AppsFolder — which runs in the interactive user session (UWP activation fails as
@@ -532,9 +548,16 @@ pub(crate) fn valid_playnite_id(value: &str) -> bool {
 
 /// The launcher UIs **this host** can open, as `launcher_ui` values (D4).
 ///
-/// One kind for every launcher but Steam, rather than one kind each: they all have exactly a single
-/// UI to open, so the value is just which launcher. Steam keeps its own [`valid_steam_ui`] kind
-/// because it has two (Big Picture and the desktop client), which is a genuinely different choice.
+/// One kind for every launcher but Steam, rather than one kind each. A value names a launcher *UI*,
+/// which for most of them is the same thing as naming the launcher — and where it is not, the value
+/// says which one: `heroic` opens Heroic's window, `heroic-console` its couch front end, and on
+/// Windows `playnite` has always meant Playnite's **Fullscreen** app rather than its desktop one.
+/// Steam keeps its own [`valid_steam_ui`] kind because it was the first launcher with two UIs worth
+/// opening, and because both of its values are the same length of word — splitting Heroic's two out
+/// into a `heroic_ui` kind today would buy symmetry and cost every N-1 host: an unknown *kind*
+/// degrades to an unlaunchable tile, but an unknown *value* is a hard 400 that refuses the whole
+/// reconcile, so a new value is the shape that has to be gated on `minHost` in the plugin index
+/// either way.
 ///
 /// Platform-gated, because a value naming a launcher this OS cannot run is not a tile that merely
 /// looks odd — it is one that fails at launch. Validated inbound too, so a plugin gets a 400 it can
@@ -548,7 +571,7 @@ pub(crate) fn valid_playnite_id(value: &str) -> bool {
 fn launcher_ui_stores() -> &'static [&'static str] {
     #[cfg(target_os = "linux")]
     {
-        &["heroic", "lutris"]
+        &["heroic", "heroic-console", "lutris"]
     }
     // Playnite's activation is verified (2026-08-06, on the .173 box); Epic, GOG Galaxy and the
     // Xbox app are still unwired — each needs its own verified activation, and an unverified guess
@@ -593,6 +616,14 @@ pub(crate) fn resolvable_launcher_ui(value: &str) -> bool {
     #[cfg(windows)]
     if value == "playnite" {
         return playnite_fullscreen_exe().is_some();
+    }
+    // Same question for both Heroic tiles, and the same answer: they resolve to whatever
+    // `heroic_launch_prefix` finds, so when that finds nothing the tile is dead and must not be
+    // published. Keeping `~/.config/heroic` around after uninstalling Heroic is enough to reach
+    // this — the plugin's `detect` only looks for that directory.
+    #[cfg(target_os = "linux")]
+    if matches!(value, "heroic" | "heroic-console") {
+        return heroic_launch_prefix().is_some();
     }
     true
 }
@@ -893,21 +924,92 @@ pub(crate) fn epic_launch_uri(value: &str) -> Option<String> {
     ))
 }
 
-/// Map a `gog` LaunchSpec value — the tab-separated `exe \t args \t workdir` spawn triple the scanner
-/// derived from `goggame-<id>.info` — to a `(command line, working dir)`. GOG games are spawned
-/// directly (no Galaxy), so the exe is quoted and the arguments ride verbatim.
+/// Map a `gog` LaunchSpec value — the tab-separated `exe \t args \t workdir` spawn triple a GOG
+/// library plugin derives from `goggame-<id>.info` — to a `(command line, working dir)`. GOG games
+/// are spawned directly (no Galaxy), so the exe is quoted and the arguments ride verbatim.
+///
+/// The exe (and the working dir) is re-confined here to an install directory GOG's own registry
+/// lists ([`gog_install_dirs`]). The plugin already confines it while parsing the manifest
+/// (plugin-kit's `confinedJoin`, the port of the in-host scanner's `confined_join`) — but that runs
+/// outside this host's trust boundary: the triple arrives over the provider API, and unchecked this
+/// kind is an arbitrary exe-plus-arguments primitive for any lane that may publish an entry
+/// (security review 2026-08-25). `None` ⇒ no GOG install owns that exe, so the entry has no recipe
+/// and the launch fails the way any unresolvable one does.
 #[cfg(windows)]
 pub(crate) fn gog_spawn(value: &str) -> Option<(String, Option<PathBuf>)> {
+    gog_spawn_in(value, &gog_install_dirs())
+}
+
+/// The pure core of [`gog_spawn`] (unit-testable without a GOG install): `installs` is the set of
+/// directories the exe and the working dir must sit inside.
+#[cfg(windows)]
+fn gog_spawn_in(value: &str, installs: &[String]) -> Option<(String, Option<PathBuf>)> {
+    let under = |p: &str| installs.iter().any(|dir| path_under(dir, p));
     let mut parts = value.split('\t');
     let exe = parts.next().filter(|s| !s.is_empty())?;
+    if !under(exe) {
+        tracing::warn!(
+            exe,
+            "gog launch: the exe is in no GOG install — refusing it"
+        );
+        return None;
+    }
     let args = parts.next().unwrap_or("");
-    let workdir = parts.next().filter(|s| !s.is_empty()).map(PathBuf::from);
+    // An out-of-bounds working dir is dropped rather than refused: it only decides where the
+    // (confined) exe starts, and an entry that omits it already spawns without one.
+    let workdir = parts.next().filter(|s| under(s)).map(PathBuf::from);
     let cmdline = if args.trim().is_empty() {
         format!("\"{exe}\"")
     } else {
         format!("\"{exe}\" {args}")
     };
     Some((cmdline, workdir))
+}
+
+/// Windows: every directory GOG's own registry names as an installed game's root
+/// (`HKLM\SOFTWARE\WOW6432Node\GOG.com\Games\<productId>\PATH` — GOG is 32-bit, so the WOW view is
+/// where it writes). This is the host's OWN enumeration of the store, which is the whole point: it
+/// is what a `gog` launch value is checked against, and it is the same key the in-host scanner read
+/// before the store moved to a plugin. Empty when GOG isn't installed, which refuses every `gog`
+/// launch on that box.
+#[cfg(windows)]
+fn gog_install_dirs() -> Vec<String> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+
+    let Ok(games) =
+        RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(r"SOFTWARE\WOW6432Node\GOG.com\Games")
+    else {
+        return Vec::new();
+    };
+    games
+        .enum_keys()
+        .flatten()
+        .filter_map(|sub| {
+            let path: String = games.open_subkey(&sub).ok()?.get_value("PATH").ok()?;
+            let path = path.trim().to_string();
+            (!path.is_empty()).then_some(path)
+        })
+        .collect()
+}
+
+/// Whether `path` is `dir` itself or something inside it, compared the way Windows compares paths:
+/// case-insensitively, either separator, and with `..` refused outright (it would climb straight
+/// back out of the directory the prefix test just accepted — the component the in-host scanner's
+/// `confined_join` refused for the same reason). A string test rather than [`Path::starts_with`],
+/// which compares components case-SENSITIVELY: the install path a plugin sends need not be spelled
+/// the way the registry spells it.
+#[cfg(windows)]
+fn path_under(dir: &str, path: &str) -> bool {
+    let norm = |s: &str| s.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    let (dir, path) = (norm(dir), norm(path));
+    if dir.is_empty() || path.split('\\').any(|c| c == "..") {
+        return false;
+    }
+    path == dir
+        || path
+            .strip_prefix(&dir)
+            .is_some_and(|rest| rest.starts_with('\\'))
 }
 
 /// Launch a GameStream `apps.json` command (operator-typed, trusted — never client-set) into the
@@ -1123,10 +1225,21 @@ mod tests {
         #[cfg(target_os = "linux")]
         {
             assert!(known_launcher_ui("heroic"));
+            assert!(known_launcher_ui("heroic-console"));
             assert!(known_launcher_ui("lutris"));
             // Not wired on this OS — outside the vocabulary, so it is refused inbound rather than
             // becoming a tile that does nothing.
             assert!(!known_launcher_ui("gog"));
+            // Both Heroic tiles resolve through the same probe, so a box without Heroic drops both
+            // rather than publishing one dead tile beside the other.
+            assert_eq!(
+                resolvable_launcher_ui("heroic"),
+                heroic_launch_prefix().is_some()
+            );
+            assert_eq!(
+                resolvable_launcher_ui("heroic-console"),
+                heroic_launch_prefix().is_some()
+            );
         }
         #[cfg(windows)]
         {
@@ -1253,6 +1366,21 @@ mod tests {
         if let Some(cmd) = ui("heroic") {
             assert!(!cmd.contains("--no-gui"), "the GUI is the point: {cmd:?}");
             assert!(!cmd.contains("heroic://"), "no game URI: {cmd:?}");
+            assert!(
+                !cmd.contains("--console"),
+                "that is the other tile: {cmd:?}"
+            );
+        }
+        // Console mode needs BOTH flags — `--console` alone routes the UI without filling the
+        // screen, which from a couch is the bug this tile exists to avoid. Same prefix as the
+        // window tile, so it is `None` on the same boxes.
+        assert_eq!(ui("heroic-console").is_some(), ui("heroic").is_some());
+        if let Some(cmd) = ui("heroic-console") {
+            assert!(cmd.contains("--console"), "{cmd:?}");
+            assert!(cmd.contains("--fullscreen"), "{cmd:?}");
+            assert!(!cmd.contains("--no-gui"), "the GUI is the point: {cmd:?}");
+            // Gamescope spawns by `split_whitespace`, so every token has to stand alone.
+            assert!(cmd.split_whitespace().any(|t| t == "--console"), "{cmd:?}");
         }
         assert_eq!(ui("nonsense"), None);
         assert_eq!(ui(""), None);
@@ -1341,13 +1469,38 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn gog_spawn_parses_and_guards() {
-        let (cmd, wd) = gog_spawn("C:\\Games\\W3\\witcher3.exe\t--skip\tC:\\Games\\W3").unwrap();
+        let installs = ["C:\\Games\\W3".to_string(), "C:\\".to_string()];
+        let spawn = |v: &str| gog_spawn_in(v, &installs);
+        let (cmd, wd) = spawn("C:\\Games\\W3\\witcher3.exe\t--skip\tC:\\Games\\W3").unwrap();
         assert_eq!(cmd, "\"C:\\Games\\W3\\witcher3.exe\" --skip");
         assert_eq!(wd, Some(std::path::PathBuf::from("C:\\Games\\W3")));
-        let (cmd2, wd2) = gog_spawn("C:\\g.exe").unwrap();
+        let (cmd2, wd2) = spawn("C:\\g.exe").unwrap();
         assert_eq!(cmd2, "\"C:\\g.exe\"");
         assert!(wd2.is_none());
-        assert!(gog_spawn("").is_none());
+        assert!(spawn("").is_none());
+    }
+
+    /// The `gog` kind is an exe PLUS ARGUMENTS, and the triple reaches the host over the provider
+    /// API — so the exe has to be one the host itself found, not one the caller named (security
+    /// review 2026-08-25). Without this the kind is `cmd.exe /c <anything>` by another spelling.
+    #[cfg(windows)]
+    #[test]
+    fn gog_spawn_refuses_an_exe_outside_every_gog_install() {
+        let installs = ["C:\\Games\\W3".to_string()];
+        let spawn = |v: &str| gog_spawn_in(v, &installs);
+        assert!(spawn("C:\\Windows\\System32\\cmd.exe\t/c calc\tC:\\Games\\W3").is_none());
+        // A sibling whose name merely starts with the install path is not inside it.
+        assert!(spawn("C:\\Games\\W3x\\evil.exe").is_none());
+        // ...nor is anything that climbs back out of one.
+        assert!(spawn("C:\\Games\\W3\\..\\..\\Windows\\System32\\cmd.exe").is_none());
+        // No GOG install at all ⇒ nothing is launchable, rather than everything.
+        assert!(gog_spawn_in("C:\\Games\\W3\\witcher3.exe", &[]).is_none());
+        // Windows paths are case-insensitive and take either separator, so a plugin that spells the
+        // install dir differently to the registry still launches its own games.
+        assert!(spawn("c:/games/w3/bin/game.exe").is_some());
+        // An out-of-bounds working dir costs the working dir, not the launch.
+        let (_, wd) = spawn("C:\\Games\\W3\\witcher3.exe\t\tC:\\Windows\\System32").unwrap();
+        assert!(wd.is_none());
     }
 
     /// Moved here with `xbox_pfn` when the built-in scanners were removed: reducing a

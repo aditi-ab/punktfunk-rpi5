@@ -1,11 +1,12 @@
 // This client's persistent punktfunk/1 identity: a self-signed certificate + key (PEM),
-// generated once and stored in the data-protection Keychain (with a legacy file-keychain
-// fallback for unsigned builds — see `query(dataProtection:)`). The certificate's fingerprint is how
-// hosts recognize this client after PIN pairing — losing the key un-pairs this Mac from
-// every host, so the pair is presented on every connect but never regenerated once
-// stored. That invariant drives the error handling below: a Keychain that *refuses
-// access* (locked, ACL denied) is an error, not a first run — minting a replacement
-// would silently shadow the durable identity and break every existing pairing.
+// generated once and stored in the data-protection Keychain, this-device-only (with a legacy
+// file-keychain fallback for unsigned builds — see `query(dataProtection:)`). The certificate's
+// fingerprint is how hosts recognize this client after PIN pairing — losing the key un-pairs this
+// Mac from every host, so the pair is presented on every connect but never regenerated once
+// stored (and never leaves this device: see `add`). That invariant drives the error handling
+// below: a Keychain that *refuses access* (locked, ACL denied) is an error, not a first run —
+// minting a replacement would silently shadow the durable identity and break every existing
+// pairing.
 
 import Foundation
 import PunktfunkKit
@@ -115,6 +116,16 @@ final class ClientIdentityStore: @unchecked Sendable {
         if case .denied(errSecMissingEntitlement) = result {
             return read(dataProtection: false)
         }
+        // An item added before the this-device-only switch keeps the accessibility class it was
+        // added with — it would keep riding backups forever, because the identity is never
+        // regenerated. Re-stamp it on the way past (best-effort: a refusal just leaves the old
+        // class, and the identity still reads).
+        if case .found = result {
+            SecItemUpdate(
+                Self.query(dataProtection: true) as CFDictionary,
+                [kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
+                    as CFDictionary)
+        }
         return result
     }
 
@@ -141,9 +152,12 @@ final class ClientIdentityStore: @unchecked Sendable {
         else { return errSecParam }
         var add = Self.query(dataProtection: true)
         add[kSecValueData as String] = data
-        // After-first-unlock so a background reconnect can still read it; the access-group
-        // entitlement (not a per-binary ACL) gates it, so it survives rebuilds prompt-free.
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        // After-first-unlock so a background reconnect can still read it, THIS DEVICE ONLY so it
+        // never rides an encrypted backup or a device migration: this key is the whole credential
+        // a host pairs with, and a restored backup would silently re-pair the restoring device
+        // with every host. The access-group entitlement (not a per-binary ACL) gates it, so it
+        // still survives rebuilds prompt-free.
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         let status = SecItemAdd(add as CFDictionary, nil)
         guard status == errSecMissingEntitlement else { return status }
         // Ad-hoc / unsigned build: persist to the legacy file keychain instead.

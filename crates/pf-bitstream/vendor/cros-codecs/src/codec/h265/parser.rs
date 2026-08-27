@@ -42,6 +42,11 @@ const MAX_SHORT_TERM_REF_PIC_SETS: usize = 65;
 // 7.4.3.2.1:
 const MAX_LONG_TERM_REF_PIC_SETS: usize = 32;
 
+// Table A.8: MaxTileCols and MaxTileRows peak at 20 and 22 at level 6.2, and A.4.1
+// makes those a bitstream conformance requirement for every level.
+const MAX_TILE_COLUMNS: usize = 20;
+const MAX_TILE_ROWS: usize = 22;
+
 // From table 7-5.
 const DEFAULT_SCALING_LIST_0: [u8; 16] = [16; 16];
 
@@ -1239,10 +1244,10 @@ pub struct Pps {
     pub uniform_spacing_flag: bool,
     /// `column_width_minus1[ i ]` plus 1 specifies the width of the i-th tile
     /// column in units of CTBs.
-    pub column_width_minus1: [u32; 19],
+    pub column_width_minus1: [u32; MAX_TILE_COLUMNS],
     /// `row_height_minus1[ i ]` plus 1 specifies the height of the i-th tile row
     /// in units of CTBs.
-    pub row_height_minus1: [u32; 21],
+    pub row_height_minus1: [u32; MAX_TILE_ROWS],
     /// When set, specifies that in-loop filtering operations may be performed
     /// across tile boundaries in pictures referring to the PPS.  When not set,
     /// specifies that in-loop filtering operations are not performed across
@@ -2238,6 +2243,15 @@ impl Parser {
             ..Default::default()
         };
 
+        // u(3) can say 7, but 7.4.3.1 stops at 6 — and 7 walks off every sub-layer
+        // array below, starting with profile_tier_level()'s six-deep flags.
+        if vps.max_sub_layers_minus1 > 6 {
+            return Err(format!(
+                "Invalid max_sub_layers_minus1 {}",
+                vps.max_sub_layers_minus1
+            ));
+        }
+
         r.skip_bits(16)?; // vps_reserved_0xffff_16bits
 
         let ptl = &mut vps.profile_tier_level;
@@ -2606,12 +2620,16 @@ impl Parser {
                 // in Table 7-5 and Table 7-6 for i = 0..Min( 63, ( 1 << ( 4 + (
                 // sizeId << 1 ) ) ) − 1 ).
                 if !scaling_list_pred_mode_flag {
-                    let scaling_list_pred_matrix_id_delta: u32 = r.read_ue()?;
+                    // Equation 7-42's factor. 7.4.5 bounds the delta by
+                    // matrixId / factor, which is what keeps refMatrixId at or above
+                    // zero — unbounded it underflows into an out-of-bounds read.
+                    let factor: u32 = if size_id == 3 { 3 } else { 1 };
+                    let scaling_list_pred_matrix_id_delta: u32 =
+                        r.read_ue_max(matrix_id as u32 / factor)?;
                     if scaling_list_pred_matrix_id_delta == 0 {
                         Self::fill_default_scaling_list(sl, size_id, matrix_id);
                     } else {
                         // Equation 7-42
-                        let factor = if size_id == 3 { 3 } else { 1 };
                         let ref_matrix_id =
                             matrix_id as u32 - scaling_list_pred_matrix_id_delta * factor;
                         if size_id == 0 {
@@ -3104,6 +3122,14 @@ impl Parser {
             ..Default::default()
         };
 
+        // See parse_vps(): 7.4.3.2 bounds this at 6, u(3) does not.
+        if sps.max_sub_layers_minus1 > 6 {
+            return Err(format!(
+                "Invalid max_sub_layers_minus1 {}",
+                sps.max_sub_layers_minus1
+            ));
+        }
+
         Self::parse_profile_tier_level(
             &mut sps.profile_tier_level,
             &mut r,
@@ -3485,8 +3511,16 @@ impl Parser {
 
         // A mix of the rbsp data and the algorithm in 6.5.1
         if pps.tiles_enabled_flag {
-            pps.num_tile_columns_minus1 = r.read_ue_max(sps.pic_width_in_ctbs_y - 1)?;
-            pps.num_tile_rows_minus1 = r.read_ue_max(sps.pic_height_in_ctbs_y - 1)?;
+            // 7.4.3.3.1 bounds these by the picture, Table A.8 bounds them by the
+            // level — and the level cap is the one the arrays below are sized for.
+            pps.num_tile_columns_minus1 = r.read_ue_max(std::cmp::min(
+                sps.pic_width_in_ctbs_y - 1,
+                MAX_TILE_COLUMNS as u32 - 1,
+            ))?;
+            pps.num_tile_rows_minus1 = r.read_ue_max(std::cmp::min(
+                sps.pic_height_in_ctbs_y - 1,
+                MAX_TILE_ROWS as u32 - 1,
+            ))?;
             pps.uniform_spacing_flag = r.read_bit()?;
             if !pps.uniform_spacing_flag {
                 pps.column_width_minus1[usize::from(pps.num_tile_columns_minus1)] =
@@ -4122,12 +4156,21 @@ impl Parser {
             let max = if !pps.tiles_enabled_flag && pps.entropy_coding_sync_enabled_flag {
                 sps.pic_height_in_ctbs_y - 1
             } else if pps.tiles_enabled_flag && !pps.entropy_coding_sync_enabled_flag {
-                u32::from((pps.num_tile_columns_minus1 + 1) * (pps.num_tile_rows_minus1 + 1) - 1)
+                // Widened: Table A.8 permits 20 x 22 tiles, whose product does not fit
+                // the u8 the tile counts are stored in.
+                (u32::from(pps.num_tile_columns_minus1) + 1)
+                    * (u32::from(pps.num_tile_rows_minus1) + 1)
+                    - 1
             } else {
                 (u32::from(pps.num_tile_columns_minus1) + 1) * sps.pic_height_in_ctbs_y - 1
             };
 
-            hdr.num_entry_point_offsets = r.read_ue_max(max)?;
+            // 7.4.7.1 puts no 32-entry cap on num_entry_point_offsets, but
+            // entry_point_offset_minus1 is that deep, so the array is the real bound.
+            hdr.num_entry_point_offsets = r.read_ue_max(std::cmp::min(
+                max,
+                hdr.entry_point_offset_minus1.len() as u32 - 1,
+            ))?;
             if hdr.num_entry_point_offsets > 0 {
                 hdr.offset_len_minus1 = r.read_ue_max(31)?;
                 for i in 0..hdr.num_entry_point_offsets as usize {
@@ -4189,6 +4232,8 @@ mod tests {
     use crate::codec::h265::parser::NaluType;
     use crate::codec::h265::parser::Parser;
     use crate::codec::h265::parser::SliceType;
+    use crate::codec::h265::parser::MAX_TILE_COLUMNS;
+    use crate::codec::h265::parser::MAX_TILE_ROWS;
 
     const STREAM_BEAR: &[u8] = include_bytes!("test_data/bear.h265");
     const STREAM_BEAR_NUM_NALUS: usize = 35;
@@ -4718,8 +4763,8 @@ mod tests {
         assert_eq!(pps.num_tile_rows_minus1, 0);
         assert_eq!(pps.num_tile_columns_minus1, 0);
         assert!(pps.uniform_spacing_flag);
-        assert_eq!(pps.column_width_minus1, [0; 19]);
-        assert_eq!(pps.row_height_minus1, [0; 21]);
+        assert_eq!(pps.column_width_minus1, [0; MAX_TILE_COLUMNS]);
+        assert_eq!(pps.row_height_minus1, [0; MAX_TILE_ROWS]);
         assert!(pps.loop_filter_across_slices_enabled_flag);
         assert!(pps.loop_filter_across_tiles_enabled_flag);
         assert!(!pps.deblocking_filter_control_present_flag);

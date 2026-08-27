@@ -420,6 +420,31 @@ feature surfaces ("--browse needs the console UI", exit non-zero).
 identity-selection gate runs where the origin-isolation gate already did. Both have the same
 property: a failure mode only a browser would catch.
 
+### `launcher_ui` grows a second Heroic value, for its console mode
+
+**Plugin-facing.** `launcher_ui` accepts **`heroic-console`** on Linux, alongside `heroic` and
+`lutris`. It resolves to the same prefix `heroic` does — the native binary if on `PATH`, else the
+Flatpak — plus `--console --fullscreen`.
+
+Heroic 2.21 added a fullscreen gamepad UI, and it takes **two** flags: `--console` only routes the
+UI to that front end (`isCLIConsoleMode`), and `--fullscreen` is what fills the screen
+(`isCLIFullscreen`). Neither is reachable by URI — `heroic://` speaks only `ping` and `launch` — so
+this is the same shape as Playnite's fullscreen tile on Windows, where the registered protocol
+handler can only open the desktop app.
+
+That makes `launcher_ui`'s value a launcher **UI** rather than a launcher, which it already was on
+Windows (`playnite` has always meant `Playnite.FullscreenApp.exe`). A `heroic_ui` kind mirroring
+`steam_ui` would have been tidier and was rejected: an unknown *kind* degrades to an unlaunchable
+tile on an N-1 host, but an unknown *value* is a hard 400 that refuses the whole reconcile — so
+either shape has to be gated on `minHost` in the plugin index, and the value is the smaller change.
+**A plugin publishing `heroic-console` must set `minHost` to this release.**
+
+Also here: `resolvable_launcher_ui` now probes `heroic_launch_prefix()` for both Heroic values, the
+way it already did for Playnite. Both tiles are dropped from a reconcile on a box where Heroic
+cannot be resolved, instead of being published as tiles that do nothing — reachable by keeping
+`~/.config/heroic` after uninstalling Heroic, since the plugin's `detect` only looks for that
+directory.
+
 ---
 
 ## v0.31.3

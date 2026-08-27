@@ -290,6 +290,7 @@
 	"pairing_approve_known_note": "This device was paired before — its previous access is pre-filled.",
 	"pairing_approve_guest": "Approve as guest",
 	"pairing_approve_guest_hint": "Controller only, expires after 4 hours.",
+	"pairing_password_help": "A paired device can control this machine, so the password is needed again — a browser session on its own can't pair one.",
 	"access_level_label": "Access level",
 	"access_level_full": "Full control",
 	"access_level_controller": "Controller only",

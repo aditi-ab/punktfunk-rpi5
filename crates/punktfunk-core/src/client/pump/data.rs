@@ -27,6 +27,9 @@ pub(super) struct DataPump {
     pub(super) mode_gen: Arc<AtomicU32>,
     pub(super) frames_dropped: Arc<std::sync::atomic::AtomicU64>,
     pub(super) fec_recovered: Arc<std::sync::atomic::AtomicU64>,
+    /// Host `BitrateChanged` acks since the last report tick, drained in arrival order — a
+    /// queue so a corrective short retarget can't be clobbered by a full resolve ack in the
+    /// same window (review §2.4; host-cap learning needs two CONSECUTIVE short acks).
     pub(super) bitrate_ack: Arc<Mutex<std::collections::VecDeque<u32>>>,
     /// Outbound decode-recovery keyframe asks, counted by the control task at its send choke
     /// point; drained per report window as the ABR's recovery signal.
@@ -40,13 +43,15 @@ pub(super) struct DataPump {
     /// The rate the host actually configured (echoed in Welcome).
     pub(super) resolved_bitrate_kbps: u32,
     pub(super) negotiated_codec: u8,
-    /// Session-negotiated depth/chroma (a mode switch changes geometry, not these) — inputs to
-    /// the stream-cap re-size when the accepted mode changes.
-    pub(super) negotiated_bit_depth: u8,
-    pub(super) negotiated_chroma: u8,
+    /// The negotiated encode bit depth and chroma wire byte — session constants a mode switch
+    /// does NOT change, carried so the stream-shape cap can be recomputed for a new geometry
+    /// (review §2.1).
+    pub(super) bit_depth: u8,
+    pub(super) chroma_format: u8,
     /// What this session's mode + codec could plausibly use (see
     /// [`crate::abr::stream_ceiling_kbps`]) — the bound the probe-measured link ceiling is held
-    /// to. Computed where the negotiated geometry lives, so this module stays codec-agnostic.
+    /// to. Computed where the negotiated geometry lives; recomputed here on an accepted mode
+    /// switch (review §2.1).
     pub(super) stream_cap_kbps: u32,
     /// The negotiated refresh, which sets the frame budget the ABR sizes its host-encode
     /// thresholds against (see [`crate::abr::BitrateController::set_frame_budget`]).
@@ -78,8 +83,8 @@ impl DataPump {
             bitrate_kbps,
             resolved_bitrate_kbps,
             negotiated_codec,
-            negotiated_bit_depth,
-            negotiated_chroma,
+            bit_depth,
+            chroma_format,
             stream_cap_kbps,
             refresh_hz,
             mode_slot: pump_mode_slot,
@@ -556,33 +561,27 @@ impl DataPump {
                 if mg != seen_mode_gen {
                     seen_mode_gen = mg;
                     abr.on_mode_switch();
-                    // The frame budget and the stream-shape cap are properties of the MODE: a
-                    // switch that changes the refresh changes what one frame of encode time
-                    // costs, and a switch that changes the geometry changes what the stream
-                    // could plausibly use — without the rebind a 4K→720p switch kept a 4K-sized
-                    // climb ceiling for the rest of the session (08-22 ABR review §2.1).
-                    let (w, h, hz) = {
-                        let m = pump_mode_slot.lock().unwrap();
-                        (m.width, m.height, m.refresh_hz)
-                    };
-                    abr.set_frame_budget(hz);
-                    abr.rebind_stream_cap(crate::abr::stream_ceiling_kbps(
-                        w,
-                        h,
-                        hz,
+                    let m = *pump_mode_slot.lock().unwrap();
+                    // The frame budget is a property of the MODE: a switch that changes the
+                    // refresh changes what one frame of encode time costs, and the encode
+                    // thresholds are sized in those.
+                    abr.set_frame_budget(m.refresh_hz);
+                    // So is the stream-shape cap (review §2.1): computed once from the
+                    // Welcome mode, 1080p→4K kept a 1080p-sized climb ceiling (under-running
+                    // quality on a fat link) and 4K→720p left an oversized cap standing with
+                    // only the reactive loss/decode signals to bound the climb.
+                    // `set_stream_cap` also rebinds an already-learned ceiling downward.
+                    abr.set_stream_cap(crate::abr::stream_ceiling_kbps(
+                        m.width,
+                        m.height,
+                        m.refresh_hz,
                         negotiated_codec,
-                        negotiated_bit_depth,
-                        negotiated_chroma,
+                        bit_depth,
+                        chroma_format,
                     ));
                 }
-                // Drain ALL acks in arrival order — host-cap learning counts consecutive short
-                // acks, so a full resolve plus its corrective retarget in one window must both
-                // land (§2.4; the old latest-wins slot collapsed them to one).
-                {
-                    let drained: Vec<u32> = bitrate_ack.lock().unwrap().drain(..).collect();
-                    for acked in drained {
-                        abr.on_ack(acked);
-                    }
+                for acked in bitrate_ack.lock().unwrap().drain(..) {
+                    abr.on_ack(acked);
                 }
                 let owd_mean_us =
                     (owd_frames > 0).then(|| (owd_sum_ns / owd_frames as i128 / 1000) as i64);
@@ -1096,8 +1095,8 @@ mod tests {
             bitrate_kbps: 20_000,
             resolved_bitrate_kbps: 20_000,
             negotiated_codec: crate::quic::CODEC_HEVC,
-            negotiated_bit_depth: 8,
-            negotiated_chroma: 0,
+            bit_depth: 8,
+            chroma_format: 0,
             stream_cap_kbps: 100_000,
             refresh_hz: 60,
             mode_slot: Arc::new(Mutex::new(crate::config::Mode {

@@ -17,8 +17,8 @@ RUN dnf -y install \
       "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm" \
   && dnf -y install \
       # rpmbuild + source-tarball tooling; nodejs runs the Gitea Actions JS (checkout/cache) only
-      # — the punktfunk-web console builds AND runs on bun (installed below); unzip is for the bun
-      # installer.
+      # — the punktfunk-web console builds AND runs on bun (installed below); unzip extracts the
+      # pinned bun zip.
       rpm-build rpmdevtools systemd-rpm-macros git tar gzip nodejs unzip \
       # build toolchain + bindgen
       gcc gcc-c++ clang clang-devel cmake nasm pkgconf-pkg-config curl ca-certificates \
@@ -43,8 +43,22 @@ RUN dnf -y install \
 # Nitro `bun`-preset .output, served by `Bun.serve` with TLS — HTTP/1.1 over TLS). The
 # RPM vendors THIS bun binary. Not in Fedora repos; install the official standalone binary to a
 # system PATH dir so the rpmbuild `%build`/`%install` (run as any uid) find it.
-RUN curl -fsSL https://bun.sh/install | bash \
-    && install -m0755 /root/.bun/bin/bun /usr/local/bin/bun \
+#
+# A PINNED release asset, checked by SHA-256 — never `curl https://bun.sh/install | bash`. The spec
+# VENDORS this very binary into punktfunk-web, so the installer would be upstream code choosing
+# bytes rpm.yml then signs with RPM_GPG_PRIVATE_KEY. ONE bun across the repo: same version, asset
+# and sum as rpm.yml, deb.yml and rust-ci.Dockerfile — bump BUN_VERSION and BUN_SHA together (the
+# sums are in the release's SHASUMS256.txt). `-baseline` on purpose: it needs no AVX2, so the bun
+# we ship starts on every x86-64 box — something the auto-detecting installer never promised, since
+# it reads the BUILDER's CPU, not the user's.
+ARG BUN_VERSION=1.3.14
+ARG BUN_SHA=a063908ae08b7852ca10939bbdc6ceed3ddabce8fb9402dce83d65d73b36e6c7
+RUN curl -fsSL -o /tmp/bun.zip \
+      "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64-baseline.zip" \
+    && echo "${BUN_SHA}  /tmp/bun.zip" | sha256sum -c - \
+    && unzip -q -o -j /tmp/bun.zip '*/bun' -d /tmp \
+    && install -m0755 /tmp/bun /usr/local/bin/bun \
+    && rm -f /tmp/bun.zip /tmp/bun \
     && bun --version
 
 # libcuda link stub — the zerocopy path links a fixed set of cuXxx driver symbols, but CI has
@@ -78,9 +92,16 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 # Shared compile cache: jobs set RUSTC_WRAPPER=sccache (backend = RustFS S3 on the LAN,
 # see .gitea/workflows — the env lives there so dev use of this image stays uncached).
 # musl build: one static binary serves the Ubuntu and Fedora images alike.
+# Checked by SHA-256, like the bun pin: sccache is RUSTC_WRAPPER, so it sits in front of every
+# rustc invocation that produces a SHIPPED binary. Bump SCCACHE_VERSION and SCCACHE_SHA together —
+# upstream publishes the sum as <asset>.tar.gz.sha256 next to the release asset.
 ARG SCCACHE_VERSION=0.10.0
-RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-    | tar -xz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache' \
+ARG SCCACHE_SHA=1fbb35e135660d04a2d5e42b59c7874d39b3deb17de56330b25b713ec59f849b
+RUN curl -fsSL -o /tmp/sccache.tar.gz \
+      "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    && echo "${SCCACHE_SHA}  /tmp/sccache.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/sccache.tar.gz --wildcards --strip-components=1 -C /usr/local/bin '*/sccache' \
+    && rm -f /tmp/sccache.tar.gz \
     && sccache --version
 
 # Link x86_64 with mold — see cargo-config-mold.toml's header for the rustflags traps, and

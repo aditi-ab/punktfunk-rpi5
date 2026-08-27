@@ -160,7 +160,10 @@ pub(super) fn resolve_compositor(
                      to get dedicated game sessions."
                 );
             } else {
-                let route = crate::vdisplay::apply_input_env(Compositor::Gamescope, true);
+                crate::inject::set_backend_id(crate::vdisplay::input_backend_id(
+                    Compositor::Gamescope,
+                ));
+                let route = crate::vdisplay::resolve_gamescope_route(Compositor::Gamescope, true);
                 tracing::info!(
                     ?route,
                     "dedicated game session — routing to a headless gamescope spawn at the client \
@@ -200,19 +203,18 @@ pub(super) fn resolve_compositor(
                 pf_host_config::config().compositor.as_deref(),
             ));
         }
-        // Point input at the same backend and resolve the gamescope sub-mode (managed where the
-        // session infra exists, attach to a foreign gamescope, else per-session bare spawn). The
-        // route travels back to the caller as a VALUE and is carried on the backend instance — an
-        // operator pin skips the input retarget but still needs a route resolved, or `create` would
-        // fall through to a bare spawn on a box that was pinned to the managed session.
-        let route = if !overridden {
-            crate::vdisplay::apply_input_env(chosen, false)
-        } else {
-            // An operator pin deliberately leaves PUNKTFUNK_INPUT_BACKEND alone, but still needs a
-            // route resolved — otherwise `create` falls through to a bare spawn on a box pinned to
-            // the managed session.
-            crate::vdisplay::resolve_gamescope_route(chosen, false)
-        };
+        // Point input at the same backend the video landed on — as a published VALUE, not a
+        // `PUNKTFUNK_INPUT_BACKEND` `set_var`. An operator pin skips this, which is what leaves the
+        // operator's own knob in charge on a pinned box.
+        if !overridden {
+            crate::inject::set_backend_id(crate::vdisplay::input_backend_id(chosen));
+        }
+        // The gamescope sub-mode (managed where the session infra exists, attach to a foreign
+        // gamescope, else per-session bare spawn). Resolved on BOTH paths and travelling back to the
+        // caller as a value carried on the backend instance: a pin skips the input retarget above
+        // but still needs a route, or `create` falls through to a bare spawn on a box that was
+        // pinned to the managed session.
+        let route = crate::vdisplay::resolve_gamescope_route(chosen, false);
         let avail_ids: Vec<&str> = available.iter().map(|c| c.id()).collect();
         match Compositor::from_pref(pref) {
             Some(want) if want == chosen => {

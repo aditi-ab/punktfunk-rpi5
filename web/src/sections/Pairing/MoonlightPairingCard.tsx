@@ -1,13 +1,14 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { Info, KeyRound } from "lucide-react";
 import { type FC, useEffect, useRef, useState } from "react";
+import { ApiError } from "@/api/fetcher";
 import { getListPairedClientsQueryKey } from "@/api/gen/clients/clients";
 import type { PairingStatus } from "@/api/gen/model/pairingStatus";
 import {
 	getGetPairingStatusQueryKey,
 	useGetPairingStatus,
-	useSubmitPairingPin,
 } from "@/api/gen/pairing/pairing";
+import { useSubmitPairingPin } from "@/api/pairing";
 import { QueryState } from "@/components/query-state";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -20,6 +21,8 @@ import { m } from "@/paraglide/messages";
 export const MoonlightPairingSection: FC = () => {
 	const qc = useQueryClient();
 	const [pin, setPin] = useState("");
+	const [password, setPassword] = useState("");
+	const [wrongPassword, setWrongPassword] = useState(false);
 	const pairing = useGetPairingStatus({ query: { refetchInterval: 2_000 } });
 	const submit = useSubmitPairingPin();
 
@@ -36,20 +39,27 @@ export const MoonlightPairingSection: FC = () => {
 		if (pending && !wasPending.current) {
 			submit.reset();
 			setPin("");
+			setPassword("");
+			setWrongPassword(false);
 		}
 		wasPending.current = pending;
 	}, [pending, submit.reset]);
 
 	const onSubmit = () => {
+		setWrongPassword(false);
 		submit.mutate(
-			{ data: { pin } },
+			{ pin, password },
 			{
 				onSuccess: () => {
 					setPin("");
+					setPassword("");
 					qc.invalidateQueries({ queryKey: getGetPairingStatusQueryKey() });
 					// The success message tells the operator to check the paired list, so refresh it —
 					// both planes, since this card's count spans them.
 					qc.invalidateQueries({ queryKey: getListPairedClientsQueryKey() });
+				},
+				onError: (e) => {
+					if (e instanceof ApiError && e.status === 401) setWrongPassword(true);
 				},
 			},
 		);
@@ -60,6 +70,9 @@ export const MoonlightPairingSection: FC = () => {
 			pairing={pairing}
 			pin={pin}
 			onPinChange={setPin}
+			password={password}
+			onPasswordChange={setPassword}
+			wrongPassword={wrongPassword}
 			onSubmit={onSubmit}
 			isSubmitting={submit.isPending}
 			isSuccess={submit.isSuccess}
@@ -73,6 +86,10 @@ export const MoonlightPairing: FC<{
 	pairing: Loadable<PairingStatus>;
 	pin: string;
 	onPinChange: (v: string) => void;
+	/** The console password, re-confirmed because delivering the PIN completes a pairing. */
+	password: string;
+	onPasswordChange: (v: string) => void;
+	wrongPassword: boolean;
 	onSubmit: () => void;
 	isSubmitting: boolean;
 	isSuccess: boolean;
@@ -81,6 +98,9 @@ export const MoonlightPairing: FC<{
 	pairing,
 	pin,
 	onPinChange,
+	password,
+	onPasswordChange,
+	wrongPassword,
 	onSubmit,
 	isSubmitting,
 	isSuccess,
@@ -127,7 +147,34 @@ export const MoonlightPairing: FC<{
 									className="font-mono text-lg tracking-widest"
 								/>
 							</div>
-							<Button type="submit" disabled={pin.length < 4 || isSubmitting}>
+							{/* Delivering the PIN completes the handshake and pairs the client, which is the
+							    same trust decision as approving a native knock — so the same password gate
+							    (util/confirm.ts). Anyone can point their OWN Moonlight at this host and read
+							    the PIN off their own screen; the password is what they don't have. */}
+							<div className="space-y-2">
+								<Label htmlFor="pair-password">{m.store_spec_password()}</Label>
+								<Input
+									id="pair-password"
+									type="password"
+									autoComplete="current-password"
+									value={password}
+									onChange={(e) => onPasswordChange(e.target.value)}
+								/>
+								<p className="text-xs text-muted-foreground">
+									{m.pairing_password_help()}
+								</p>
+								{wrongPassword && (
+									<p role="alert" className="text-xs text-destructive">
+										{m.update_apply_wrong_password()}
+									</p>
+								)}
+							</div>
+							<Button
+								type="submit"
+								disabled={
+									pin.length < 4 || password.length === 0 || isSubmitting
+								}
+							>
 								{m.pairing_submit()}
 							</Button>
 							{/* A 204 means the PIN was DELIVERED to the waiting handshake, not that pairing

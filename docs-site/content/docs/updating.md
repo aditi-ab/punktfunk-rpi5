@@ -79,13 +79,24 @@ sudo punktfunk-sysext install --from-file ~/punktfunk-known-good.raw   # to go b
   against mismatched system libraries — run `sudo punktfunk-sysext update` once and it fetches the
   image built for the new base.
 - **If it refuses the feed.** `refusing to install from an unsigned feed` means that Fedora major's
-  feed predates signing; it gets sealed on the next publish. To install from it anyway, accepting
-  unauthenticated images, `sudo env PUNKTFUNK_SYSEXT_ALLOW_UNSIGNED=1 bash punktfunk-sysext.sh install`.
-  The other message, `the feed's SHA256SUMS is NOT signed by packages@unom.io`, is not the same
-  thing — don't install; re-download the script and try again.
+  feed predates signing; it gets sealed on the next publish. `signed but UNBOUND` is the same kind
+  of thing one step on — a feed sealed before manifests carried their `# FEED`/`# SERIAL` header —
+  and it too is fixed by the next publish. To install from either anyway, accepting unauthenticated
+  images, `sudo env PUNKTFUNK_SYSEXT_ALLOW_UNSIGNED=1 bash punktfunk-sysext.sh install`.
+  The other three messages are not the same thing — don't install; re-download the script and try
+  again: `the feed's SHA256SUMS is NOT signed by packages@unom.io`, `this manifest was signed for
+  the feed '…'` (another channel's or another Fedora major's feed served as yours), and
+  `manifest serial … is older than the last accepted …` (a real but superseded manifest replayed).
+- **If it refuses to downgrade.** `the feed's newest image (…) is OLDER than the installed …`
+  means the feed lost a build — `update` won't walk you back onto a superseded release without
+  being asked. For a deliberate rollback,
+  `sudo PUNKTFUNK_SYSEXT_ALLOW_DOWNGRADE=1 punktfunk-sysext update`, or re-install the image file
+  you kept above, which never consults the feed.
 - The feed's checksum manifest is OpenPGP-signed by packages@unom.io (key `AF245C506F4E4763`, the
   same one that signs the RPMs) and `punktfunk-sysext` verifies it against a key baked into the
-  script, so it needs `gpg` on the box.
+  script, so it needs `gpg` on the box. The manifest also names the feed it was signed for and
+  carries a publish serial, both inside the signed bytes, so a signed manifest from another
+  channel — or an older one put back — can't be replayed at yours.
 
 ### Restart after a Linux package update
 
@@ -121,8 +132,9 @@ silently — the service restarts at the end and the page reconnects by itself. 
 you're warned first: updating drops it.
 
 Every attempt leaves a result in the card (and an installer log under
-`C:\ProgramData\punktfunk\logs\update-<version>.log`) — including across the restart, so a failed
-update is never silent.
+`C:\ProgramData\punktfunk\logs\update-<version>.log` — readable only by Administrators and
+SYSTEM, so open it from an **elevated** PowerShell) — including across the restart, so a
+failed update is never silent.
 
 If the newly installed host crash-loops, the service puts the previous installer back on its own
 (the last two are kept) and says so in the card — you end up on the version you started from, not

@@ -134,7 +134,7 @@ pub trait VirtualDisplay: Send {
     /// existing session / don't spawn a nested command ignore it; only gamescope's spawn path uses it).
     fn set_launch_command(&mut self, _cmd: Option<String>) {}
     /// Set the RESOLVED gamescope sub-mode for this session (from
-    /// [`apply_input_env`](crate::apply_input_env)). Carried on the backend instance for the same
+    /// [`resolve_gamescope_route`](crate::resolve_gamescope_route)). Carried on the backend instance for the same
     /// reason as [`set_launch_command`](Self::set_launch_command) — it used to travel through
     /// `PUNKTFUNK_GAMESCOPE_NODE`/`_SESSION`, where the GameStream plane and the mid-session switch
     /// watcher could overwrite one session's decision before another session's `create` read it.

@@ -290,6 +290,7 @@
 	"pairing_approve_known_note": "Dieses Gerät war schon gekoppelt — sein bisheriger Zugriff ist vorausgefüllt.",
 	"pairing_approve_guest": "Als Gast freigeben",
 	"pairing_approve_guest_hint": "Nur Controller, läuft nach 4 Stunden ab.",
+	"pairing_password_help": "Ein gekoppeltes Gerät kann diesen Rechner steuern, deshalb wird das Passwort erneut gebraucht — eine Browser-Sitzung allein kann nichts koppeln.",
 	"access_level_label": "Zugriffsstufe",
 	"access_level_full": "Vollzugriff",
 	"access_level_controller": "Nur Controller",

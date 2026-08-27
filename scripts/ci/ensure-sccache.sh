@@ -30,6 +30,24 @@ fi
 
 BASE="https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}"
 
+# Download ONE release asset and refuse to unpack it unless its bytes match the pinned SHA-256.
+# This binary becomes RUSTC_WRAPPER — every compiler invocation in the release builds, including the
+# jobs that hold the RPM/Flatpak signing keys, runs through it — and a GitHub release asset is
+# MUTABLE at a fixed URL, so the version in the path vouches for nothing on its own.
+# Usage: fetch <arch-triple> <sha256>; leaves the verified tarball in $TARBALL.
+fetch() {
+    TARBALL="$(mktemp)"
+    curl -fsSL "$BASE/sccache-v${SCCACHE_VERSION}-$1.tar.gz" -o "$TARBALL"
+    # macOS has shasum but no sha256sum; the Linux images have both.
+    got="$(sha256sum "$TARBALL" 2>/dev/null || shasum -a 256 "$TARBALL")"
+    got="${got%% *}"
+    if [ "$got" != "$2" ]; then
+        echo "sccache $1 sha256 mismatch: got $got, pinned $2" >&2
+        echo "(bumping SCCACHE_VERSION? update the pins below it from the release's .sha256 files)" >&2
+        exit 1
+    fi
+}
+
 case "$(uname -s)" in
     Darwin)
         # The macOS runner is a LaunchAgent in the user's Aqua session, not root — install into the
@@ -38,12 +56,15 @@ case "$(uname -s)" in
         DEST="$HOME/.local/bin"
         mkdir -p "$DEST"
         case "$(uname -m)" in
-            arm64|aarch64) ARCH=aarch64-apple-darwin ;;
-            *)             ARCH=x86_64-apple-darwin ;;
+            arm64|aarch64) ARCH=aarch64-apple-darwin
+                           SHA=5aba39252e2efa26bd76144f87ac59787d60fe567ab785e27e2a8c8190892eac ;;
+            *)             ARCH=x86_64-apple-darwin
+                           SHA=6d4a77802ec83607478df7b6338be28171e65e58a38a49497ebec1fbb300fce4 ;;
         esac
+        fetch "$ARCH" "$SHA"
         # bsdtar globs by default and does not accept --wildcards.
-        curl -fsSL "$BASE/sccache-v${SCCACHE_VERSION}-${ARCH}.tar.gz" \
-            | tar -xz --strip-components=1 -C "$DEST" '*/sccache'
+        tar -xz --strip-components=1 -C "$DEST" -f "$TARBALL" '*/sccache'
+        rm -f "$TARBALL"
         chmod 0755 "$DEST/sccache"
         PATH="$DEST:$PATH"
         export PATH
@@ -56,8 +77,10 @@ case "$(uname -s)" in
         # dance is needed. The musl build is static — one binary serves the Ubuntu, Fedora and Arch
         # images alike.
         DEST=/usr/local/bin
-        curl -fsSL "$BASE/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-            | tar -xz --wildcards --strip-components=1 -C "$DEST" '*/sccache'
+        fetch x86_64-unknown-linux-musl \
+            1fbb35e135660d04a2d5e42b59c7874d39b3deb17de56330b25b713ec59f849b
+        tar -xz --wildcards --strip-components=1 -C "$DEST" -f "$TARBALL" '*/sccache'
+        rm -f "$TARBALL"
         chmod 0755 "$DEST/sccache"
         ;;
 esac

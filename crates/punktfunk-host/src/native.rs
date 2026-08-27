@@ -931,7 +931,13 @@ fn resolve_bitrate_kbps(requested: u32) -> u32 {
 /// an Automatic client (`0`) gets the codec's ~1.6 bpp operating point for the negotiated
 /// mode instead of the 20 Mbps H.26x default. The rate is then PINNED for the session:
 /// the client's ABR controller stays off for this codec and the host refuses mid-stream
-/// retargets. An explicit client rate is honored unchanged (the operator knows the link).
+/// retargets.
+///
+/// PyroWave ignores an explicit client rate too (ABR overhaul RFC §5.2): a fixed rate is
+/// ill-defined for an all-intra codec (bpp is the operating point, not kbps) and it used to
+/// bypass the `PUNKTFUNK_PYROWAVE_MAX_MBPS` operator ceiling. Clients grey the control out;
+/// this arm is the belt-and-braces for embedders that never update their UI. H.26x/AV1
+/// explicit rates are honored unchanged (the operator knows the link).
 fn resolve_bitrate_kbps_for(
     codec: crate::encode::Codec,
     requested: u32,
@@ -939,7 +945,14 @@ fn resolve_bitrate_kbps_for(
     chroma: crate::encode::ChromaFormat,
     bit_depth: u8,
 ) -> u32 {
-    if requested == 0 && codec == crate::encode::Codec::PyroWave {
+    if codec == crate::encode::Codec::PyroWave {
+        if requested != 0 {
+            tracing::warn!(
+                requested_kbps = requested,
+                "an explicit bitrate is ill-defined under PyroWave (all-intra bpp semantics) — \
+                 treating it as Automatic and resolving the per-mode pin"
+            );
+        }
         // ~1.6 bpp for 4:2:0. 4:4:4 doubles the samples per pixel (3 vs 1.5) but chroma
         // compresses better than luma → ×1.625 ≈ 2.6 bpp; 16-bit planes add ~15 % (both
         // factors measured against the Phase-0 fixture matrix, design/pyrowave-444-hdr.md).
@@ -976,7 +989,8 @@ fn resolve_bitrate_kbps_for(
 
 /// Operator ceiling for PyroWave's open-loop Automatic bitrate pin: `PUNKTFUNK_PYROWAVE_MAX_MBPS`
 /// (megabits/s) → kbps, or `None` when unset/zero/invalid (no cap — the raw bpp pin stands).
-/// Only consulted for `requested == 0` PyroWave sessions; an explicit client bitrate bypasses it.
+/// Consulted for every PyroWave session — an explicit client bitrate resolves through the
+/// pin too (RFC §5.2), so nothing bypasses the ceiling.
 fn pyrowave_auto_pin_ceiling_kbps() -> Option<u32> {
     std::env::var("PUNKTFUNK_PYROWAVE_MAX_MBPS")
         .ok()
@@ -1020,6 +1034,81 @@ fn adapt_fec(loss_ppm: u32) -> u8 {
     let loss_pct = loss_ppm as f64 / 10_000.0; // ppm → percent
     let target = (loss_pct * 1.4).ceil() as u32 + 1;
     target.clamp(FEC_MIN as u32, FEC_MAX as u32) as u8
+}
+
+/// The decay floor once a session has seen real loss ("burned", ABR overhaul RFC §2.4).
+const FEC_BURNED_MIN: u8 = 5;
+/// Clean 750 ms report windows (~2 min) a burned session must string together before the
+/// floor steps back to [`FEC_MIN`].
+const FEC_REEARN_WINDOWS: u32 = 160;
+/// Ceiling on the doubled re-earn requirement (~16 min) — a periodic-burst link converges to
+/// "armored for the session" without the counter running away.
+const FEC_REEARN_MAX: u32 = 1280;
+
+/// Adaptive-FEC decay floor with a memory of real loss (ABR overhaul RFC §2.4; pure —
+/// unit-tested).
+///
+/// The plain 1 pt/window decay converges on [`FEC_MIN`] (1 %) over any clean stretch — on a
+/// lossy link that is precisely backwards: static content strips the armor, then the first
+/// motion frame arrives essentially unprotected and dies (the 2026-08-26 motion-onset field
+/// chain, step 2). Once a window reports ANY shard loss (`loss_ppm > 0` — loss is discrete,
+/// so nonzero means real lost shards, not noise), the floor rises to [`FEC_BURNED_MIN`].
+///
+/// Not session-permanent — the controller's house rule (the encode stand-down, `7246f0fe`)
+/// is that nothing learned from evidence is forever: [`FEC_REEARN_WINDOWS`] clean windows
+/// re-earn the 1 % floor, a link that re-burns before the step-down has proven itself
+/// doubles the next requirement (to [`FEC_REEARN_MAX`]), and a step-down that survives its
+/// own horizon resets the requirement to base.
+#[derive(Debug)]
+struct FecFloor {
+    floor: u8,
+    clean_windows: u32,
+    reearn: u32,
+    /// Clean windows since the floor last stepped down; `None` = no step-down on probation.
+    since_stepdown: Option<u32>,
+}
+
+impl Default for FecFloor {
+    fn default() -> Self {
+        Self {
+            floor: FEC_MIN,
+            clean_windows: 0,
+            reearn: FEC_REEARN_WINDOWS,
+            since_stepdown: None,
+        }
+    }
+}
+
+impl FecFloor {
+    /// Feed one report window; returns the floor the adaptive target must not decay below.
+    fn on_report(&mut self, loss_ppm: u32) -> u8 {
+        if loss_ppm > 0 {
+            if let Some(w) = self.since_stepdown.take() {
+                if w < self.reearn {
+                    // The clean run that earned the step-down was luck — demand double.
+                    self.reearn = (self.reearn * 2).min(FEC_REEARN_MAX);
+                }
+            }
+            self.clean_windows = 0;
+            self.floor = FEC_BURNED_MIN;
+        } else {
+            self.clean_windows = self.clean_windows.saturating_add(1);
+            if let Some(w) = self.since_stepdown.as_mut() {
+                *w = w.saturating_add(1);
+                if *w >= self.reearn {
+                    // The step-down outlived its probation — the link really recovered.
+                    self.reearn = FEC_REEARN_WINDOWS;
+                    self.since_stepdown = None;
+                }
+            }
+            if self.floor > FEC_MIN && self.clean_windows >= self.reearn {
+                self.floor = FEC_MIN;
+                self.clean_windows = 0;
+                self.since_stepdown = Some(0);
+            }
+        }
+        self.floor
+    }
 }
 
 /// Apply the latest adaptive-FEC target to the session if it changed (cheap relaxed load + compare),
@@ -2035,8 +2124,9 @@ async fn serve_session(
     });
     let bitrate_kbps = welcome.bitrate_kbps; // resolved encoder bitrate (Hello clamped, or default)
                                              // "Automatic" request: the resolved rate is a host default — for PyroWave a per-mode
-                                             // bpp pin the data plane re-resolves on a mid-stream mode switch.
-    let bitrate_auto = hello.bitrate_kbps == 0;
+                                             // bpp pin the data plane re-resolves on a mid-stream mode switch. PyroWave is Automatic
+                                             // unconditionally (`resolve_bitrate_kbps_for` overrode any explicit rate — RFC §5.2).
+    let bitrate_auto = hello.bitrate_kbps == 0 || codec == crate::encode::Codec::PyroWave;
     let bit_depth = welcome.bit_depth; // resolved encode bit depth (8, or 10 when negotiated)
                                        // Resolved chroma — derive the typed value back from the wire byte the Welcome carried (so the
                                        // session uses exactly what the client was told). `Yuv444` only when the handshake gate passed.
@@ -2501,7 +2591,8 @@ mod tests {
             ),
             (1920u64 * 1080 * 60 * 26 / 10 * 115 / 100 / 1000) as u32
         );
-        // An explicit client rate is honored (clamped like any other codec)...
+        // An explicit client rate is overridden to the same pin — a fixed kbps is ill-defined
+        // for the all-intra codec, and it used to skip the operator ceiling (RFC §5.2)...
         assert_eq!(
             resolve_bitrate_kbps_for(
                 crate::encode::Codec::PyroWave,
@@ -2510,7 +2601,7 @@ mod tests {
                 ChromaFormat::Yuv420,
                 8
             ),
-            130_000
+            1920 * 1080 * 60 * 16 / 10 / 1000
         );
         // ...and the H.26x codecs keep the legacy default.
         assert_eq!(
@@ -2559,10 +2650,11 @@ mod tests {
             resolve_bitrate_kbps_for(Codec::PyroWave, 0, &small, ChromaFormat::Yuv420, 8),
             1920 * 1080 * 60 * 16 / 10 / 1000
         );
-        // ...and an explicit client rate bypasses the ceiling entirely.
+        // ...and an explicit client rate no longer bypasses it: PyroWave resolves through the
+        // pin + ceiling whatever the Hello carried (RFC §5.2 — this bypass was the bug).
         assert_eq!(
             resolve_bitrate_kbps_for(Codec::PyroWave, 6_000_000, &mode, ChromaFormat::Yuv444, 10),
-            6_000_000
+            4_500_000
         );
         // SAFETY: as the set above — single writer, and the readers run on this thread.
         unsafe { std::env::remove_var("PUNKTFUNK_PYROWAVE_MAX_MBPS") };
@@ -2580,6 +2672,57 @@ mod tests {
                                             // Heavy loss saturates at the ceiling, never beyond.
         assert_eq!(adapt_fec(1_000_000), FEC_MAX); // 100% → clamped
         assert!(adapt_fec(u32::MAX) <= FEC_MAX);
+    }
+
+    /// [`FecFloor`] (RFC §2.4): real loss raises the decay floor to 5 % so a static stretch
+    /// can't strip the armor before motion; a long clean run re-earns 1 %; a link that
+    /// re-burns before the step-down has proven itself doubles the next requirement; a
+    /// step-down that survives resets it.
+    #[test]
+    fn fec_floor_burns_reearns_and_doubles_on_early_reburn() {
+        let mut f = FecFloor::default();
+        // Untouched sessions decay to the 1 % floor as ever.
+        assert_eq!(f.on_report(0), FEC_MIN);
+        // One lost shard anywhere = burned: the floor is 5 % and clean windows hold it there.
+        assert_eq!(f.on_report(2_270), FEC_BURNED_MIN); // one packet at 5 Mbps
+        for _ in 0..FEC_REEARN_WINDOWS - 1 {
+            assert_eq!(f.on_report(0), FEC_BURNED_MIN);
+        }
+        // The 160th clean window re-earns the 1 % floor.
+        assert_eq!(f.on_report(0), FEC_MIN);
+        // A re-burn INSIDE the step-down's probation doubles the next requirement…
+        assert_eq!(f.on_report(500), FEC_BURNED_MIN);
+        for _ in 0..2 * FEC_REEARN_WINDOWS - 1 {
+            assert_eq!(f.on_report(0), FEC_BURNED_MIN);
+        }
+        assert_eq!(f.on_report(0), FEC_MIN);
+        // …and the ceiling bounds the doubling ladder.
+        let mut g = FecFloor {
+            reearn: FEC_REEARN_MAX,
+            since_stepdown: Some(0),
+            ..FecFloor::default()
+        };
+        g.on_report(1);
+        assert_eq!(g.reearn, FEC_REEARN_MAX);
+        // A step-down that survives its probation resets the requirement to base.
+        let mut h = FecFloor::default();
+        h.on_report(1);
+        for _ in 0..FEC_REEARN_WINDOWS {
+            h.on_report(0);
+        }
+        assert_eq!(h.floor, FEC_MIN);
+        for _ in 0..FEC_REEARN_WINDOWS {
+            h.on_report(0);
+        }
+        assert_eq!(h.reearn, FEC_REEARN_WINDOWS);
+        assert!(
+            h.since_stepdown.is_none(),
+            "probation over — durable recovery"
+        );
+        // A burn AFTER a durable recovery is a fresh burn, not a double.
+        h.on_report(1);
+        assert_eq!(h.reearn, FEC_REEARN_WINDOWS);
+        assert_eq!(h.floor, FEC_BURNED_MIN);
     }
 
     #[test]

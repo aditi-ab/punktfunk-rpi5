@@ -488,27 +488,17 @@ impl VirtualPad {
             code,
             value,
         };
-        // SAFETY: `ev` is a live local `#[repr(C)]` struct of all-integer fields with no padding bytes
-        // (timeval=16 + u16 + u16 + i32 = 24, the size asserted above), so every byte is initialized and
-        // valid to read as `u8`. The pointer is non-null and `u8`-aligned (align 1), the length is exactly
-        // `size_of::<InputEventRaw>()` so the slice spans precisely `ev`'s bytes (in bounds), and `ev`
-        // outlives `bytes` (used immediately below) with no concurrent mutation (single-threaded local).
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &ev as *const _ as *const u8,
-                std::mem::size_of::<InputEventRaw>(),
-            )
-        };
         // Best-effort: a full kernel queue drops the event; the next frame re-syncs state.
         // SAFETY: `self.fd` is the live uinput `OwnedFd` (borrowed via `as_raw_fd`, so it stays open for
-        // the call); `bytes` is the slice above backed by the still-live local `ev`. `write` only READS
-        // exactly `bytes.len()` bytes from `bytes.as_ptr()` (in bounds) and retains nothing past return,
-        // so the buffer outlives the synchronous call and the read-only access cannot race or alias.
+        // the call). `write` READS exactly `size_of::<InputEventRaw>()` bytes from the live local `ev` —
+        // a `#[repr(C)]` struct of all-integer fields with no padding (timeval=16 + u16 + u16 + i32 = 24,
+        // the size asserted above), so every byte is initialized — and retains nothing past return, so
+        // `ev` outlives the synchronous call and the read-only access cannot race or alias.
         let _ = unsafe {
             libc::write(
                 self.fd.as_raw_fd(),
-                bytes.as_ptr() as *const libc::c_void,
-                bytes.len(),
+                &ev as *const _ as *const libc::c_void,
+                std::mem::size_of::<InputEventRaw>(),
             )
         };
     }

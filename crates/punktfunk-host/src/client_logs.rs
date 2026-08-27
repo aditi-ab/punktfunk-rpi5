@@ -109,9 +109,13 @@ fn bundle_id(unix_ms: u64, fp_hex: &str, name: &str) -> String {
 }
 
 impl ClientLogStore {
-    /// Open the store, creating `dir` (owner-private, best-effort) if missing.
+    /// Open the store, creating `dir` (owner-private, best-effort) if missing. `create_secret_dir`,
+    /// not `create_private_dir`: on Windows the latter grants `BUILTIN\Users` an inheritable read,
+    /// which every stored bundle then inherited — any local user could read them straight off disk,
+    /// which is not the "reading them stays on the loopback-only bearer lane" split `mgmt::client_logs`
+    /// documents (security-review 2026-08-25).
     pub fn new(dir: PathBuf) -> std::sync::Arc<Self> {
-        if let Err(e) = pf_paths::create_private_dir(&dir) {
+        if let Err(e) = pf_paths::create_secret_dir(&dir) {
             tracing::warn!(dir = %dir.display(), error = %e, "could not create client-logs dir");
         }
         std::sync::Arc::new(ClientLogStore { dir })
@@ -121,7 +125,9 @@ impl ClientLogStore {
     /// Prunes that device's older bundles past [`KEEP_PER_DEVICE`] (best-effort).
     pub fn save(&self, fp_hex: &str, device_name: &str, body: &[u8]) -> std::io::Result<String> {
         let id = bundle_id(unix_ms_now(), fp_hex, device_name);
-        std::fs::write(self.dir.join(format!("{id}.log")), body)?;
+        // A bundle is whatever the client logged (addresses, host names) — owner-only, like the
+        // host's own secrets, so the dir ACL is not the only thing keeping it off a local user.
+        pf_paths::write_secret_file(&self.dir.join(format!("{id}.log")), body)?;
         // Prune this device's older bundles. The fp16 field is position 2 of the stem, and ids
         // sort chronologically because the timestamp leads.
         let fp16: String = fp_hex
@@ -282,6 +288,24 @@ mod tests {
             .count();
         assert_eq!(mine, KEEP_PER_DEVICE);
         assert!(listed.iter().any(|m| m.id == other), "other device pruned");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A bundle is stored owner-only — the unix half of "reading them stays on the loopback-only
+    /// bearer lane"; on Windows the same `write_secret_file` call applies the SYSTEM/Admins DACL.
+    #[cfg(unix)]
+    #[test]
+    fn stored_bundles_are_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let (s, dir) = store();
+        let id = s.save("abcdef0123456789", "Deck", b"secret log").unwrap();
+        let md = std::fs::metadata(dir.join(format!("{id}.log"))).unwrap();
+        assert_eq!(md.permissions().mode() & 0o077, 0, "bundle is owner-only");
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o077,
+            0,
+            "so is the store dir"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }
