@@ -5,7 +5,10 @@
 //! negotiated stream config; PLAY is where the media stages start (P1.3+).
 //!
 //! Runs on its own native thread (control-plane setup, not the per-frame hot path), one
-//! thread per connection. Plaintext only for now (encryption is negotiated; P1.5).
+//! thread per connection. DESCRIBE offers `SS_ENC_VIDEO` (per-shard AES-128-GCM video, WP7 —
+//! on by default, never REQUIRED, `PUNKTFUNK_GS_ENCRYPT=0` opts out); audio is AES-CBC and the
+//! ENet control stream AES-GCM regardless, and `SS_ENC_CONTROL_V2`/`SS_ENC_AUDIO` are not
+//! offered (see [`EncOffer`]).
 
 use super::audio;
 use super::stream::{self, StreamConfig};
@@ -372,14 +375,55 @@ const SS_FF_PEN_TOUCH_EVENTS: u32 = 0x01;
 /// audio-GCM layout is not in the sanctioned wire reference).
 const SS_ENC_VIDEO: u32 = 0x02;
 
-/// Whether this host OFFERS video encryption (WP7). **Opt-in** (`PUNKTFUNK_GS_ENCRYPT=1`)
-/// until the on-glass pass confirms a stock client negotiates and decodes it: the sealed path
-/// is the compat plane's video hot path, and a wire mistake there is a total black screen for
-/// any client that opts in — where the cost of shipping it dark is only that nobody gets the
-/// benefit yet. Flip the default once WP0.3 has run it against real Moonlight.
-fn gs_video_encryption_offered() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PUNKTFUNK_GS_ENCRYPT").as_deref() == Ok("1"))
+/// How this host offers video encryption (WP7), from `PUNKTFUNK_GS_ENCRYPT`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EncOffer {
+    /// `0` — advertise nothing, the plaintext wire this plane sent before WP7. The escape
+    /// hatch for a client that turns out to mis-negotiate, and for measuring the seal's cost.
+    Off,
+    /// **The default.** Advertise as SUPPORTED and let the client decide — what a
+    /// Sunshine-class host does. Verified on glass 2026-08-27 (.173 → Moonlight 6.x on macOS,
+    /// RTX 4090, 2560x1440@240 HEVC Main10): the client opts in of its own accord even on a
+    /// LAN, and decodes the sealed stream in hardware with zero errors.
+    Supported,
+    /// `require` — additionally list it as REQUESTED, which forces any client that supports
+    /// it to enable it. **The on-glass test lever**: with `Supported` alone a LAN session may
+    /// negotiate plaintext and never exercise a single sealed packet, so a green test would
+    /// prove nothing about the path it was meant to validate. Not a shipping mode — a client
+    /// that cannot do video encryption has nowhere to go from here.
+    Required,
+}
+
+/// Whether — and how hard — this host offers video encryption (WP7). **On by default** since
+/// the 2026-08-27 on-glass pass: a stock Moonlight client negotiates `SS_ENC_VIDEO` by itself
+/// (even on a LAN, where it was not obvious it would) and decodes the sealed stream in
+/// hardware, and FEC still recovers through the seal at 5 % injected wire loss — 27 s with
+/// zero keyframe re-requests. `PUNKTFUNK_GS_ENCRYPT=0` is the escape hatch back to the
+/// plaintext wire; `require` additionally REQUESTS it (the test lever that forces the
+/// negotiation when a client would otherwise decline).
+fn gs_video_encryption_offer() -> EncOffer {
+    static ON: std::sync::OnceLock<EncOffer> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        match std::env::var("PUNKTFUNK_GS_ENCRYPT")
+            .as_deref()
+            .map(str::trim)
+        {
+            Ok("0") | Ok("off") | Ok("false") | Ok("no") => EncOffer::Off,
+            Ok("require") | Ok("required") => EncOffer::Required,
+            // Unset, `1`, `supported`, or anything unrecognized: the default offer.
+            _ => EncOffer::Supported,
+        }
+    })
+}
+
+/// The `(encryptionSupported, encryptionRequested)` masks an offer advertises — pure, so the
+/// advertisement is unit-testable without touching the process-global env.
+fn enc_flags(offer: EncOffer) -> (u32, u32) {
+    match offer {
+        EncOffer::Off => (0, 0),
+        EncOffer::Supported => (SS_ENC_VIDEO, 0),
+        EncOffer::Required => (SS_ENC_VIDEO, SS_ENC_VIDEO),
+    }
 }
 
 /// Host capability SDP returned by DESCRIBE. Advertises HEVC + AV1, the surround configs, and
@@ -396,16 +440,13 @@ fn describe_sdp() -> String {
         0
     };
     // Line-oriented a=key:value, matching what moonlight-common-c scans for.
-    let supported = if gs_video_encryption_offered() {
-        SS_ENC_VIDEO
-    } else {
-        0
-    };
+    let (supported, requested) = enc_flags(gs_video_encryption_offer());
     let mut lines: Vec<String> = vec![
         format!("a=x-ss-general.featureFlags:{feature_flags}"),
         format!("a=x-ss-general.encryptionSupported:{supported}"),
-        // Never REQUESTED: requiring encryption would refuse every client that doesn't do it.
-        "a=x-ss-general.encryptionRequested:0".into(),
+        // REQUESTED stays 0 in every shipping mode: requiring encryption would refuse every
+        // client that doesn't do it. Only the `require` test lever sets it.
+        format!("a=x-ss-general.encryptionRequested:{requested}"),
         "sprop-parameter-sets=AAAAAU".into(), // HEVC capability indicator
         "a=rtpmap:98 AV1/90000".into(),       // AV1 capability indicator
     ];
@@ -618,7 +659,7 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
     // The encryption bitmask the client CHOSE, echoed back from what DESCRIBE advertised
     // (WP7). Honor only the VIDEO bit, and only when we offered it — a client cannot turn on
     // a mode the host never advertised, whatever it echoes.
-    let encrypt_video = gs_video_encryption_offered()
+    let encrypt_video = gs_video_encryption_offer() != EncOffer::Off
         && parse_u("x-ss-general.encryptionEnabled").unwrap_or(0) & SS_ENC_VIDEO != 0;
     if encrypt_video {
         tracing::info!("RTSP ANNOUNCE: client enabled SS_ENC_VIDEO — sealing every video shard");
@@ -874,12 +915,40 @@ mod tests {
         assert_eq!(ap.channels, 2);
     }
 
+    /// WP7 advertisement: OFF advertises nothing (the shipping default, so a stock client
+    /// negotiates the plaintext wire exactly as it always has); `Supported` offers video
+    /// encryption without ever REQUIRING it; only the `require` test lever sets requested —
+    /// which is the whole reason it exists (a client that is merely *allowed* to encrypt may
+    /// decline on a LAN, and then an on-glass test proves nothing).
+    #[test]
+    fn encryption_is_offered_but_never_required_in_shipping_modes() {
+        assert_eq!(enc_flags(EncOffer::Off), (0, 0));
+        assert_eq!(enc_flags(EncOffer::Supported), (SS_ENC_VIDEO, 0));
+        assert_eq!(
+            enc_flags(EncOffer::Required),
+            (SS_ENC_VIDEO, SS_ENC_VIDEO),
+            "the test lever must also REQUEST it, or a client may decline"
+        );
+        // Whatever the mode, the host never advertises a bit it cannot serve.
+        for offer in [EncOffer::Off, EncOffer::Supported, EncOffer::Required] {
+            let (sup, req) = enc_flags(offer);
+            assert_eq!(sup & !SS_ENC_VIDEO, 0, "no unimplemented bits offered");
+            assert_eq!(req & !sup, 0, "never request what isn't supported");
+        }
+    }
+
     /// The DESCRIBE SDP carries the codec indicators and all six Opus configs, normal
     /// quality before high quality per channel count (the client takes the first match as
     /// its normal config and a second match as HQ).
     #[test]
     fn describe_advertises_codecs_and_surround() {
         let sdp = describe_sdp();
+        // The default build OFFERS video encryption (verified on glass) but never requires it,
+        // so a client that wants plaintext still gets exactly the wire it always got.
+        assert!(sdp.contains(&format!(
+            "a=x-ss-general.encryptionSupported:{SS_ENC_VIDEO}"
+        )));
+        assert!(sdp.contains("a=x-ss-general.encryptionRequested:0"));
         assert!(
             sdp.contains("sprop-parameter-sets=AAAAAU"),
             "HEVC indicator"

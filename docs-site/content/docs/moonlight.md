@@ -41,9 +41,10 @@ the secure native-only host):
   ```
 
 (Bare `serve` is the secure native-only default and stock Moonlight clients can't connect to it; the
-native plane is always on, and `--gamestream` adds the Moonlight-compat surface.) GameStream pairs
-over plain HTTP and its legacy control encryption is weaker than the native plane's, so only enable
-it on a **trusted LAN**. See [Running as a Service](/docs/running-as-a-service) for the bundled
+native plane is always on, and `--gamestream` adds the Moonlight-compat surface.) Video, audio and
+input are all encrypted on this path, but GameStream still *pairs* over plain HTTP and its control
+channel uses the older GameStream scheme rather than the native protocol's, so enable it on a
+**trusted LAN**. See [Running as a Service](/docs/running-as-a-service) for the bundled
 unit. The host advertises itself on the network, so Moonlight usually finds it on its own.
 
 ## 2. Add the host in Moonlight
@@ -89,8 +90,9 @@ The device then appears under **Paired devices**, and Moonlight remembers the ho
 Moonlight lists **Desktop** plus the games the host found installed (Steam, Epic, GOG, Xbox), with
 cover art — the same [library](/docs/game-library) the native clients show. Pick one and start
 streaming. While a session of yours is running, Moonlight offers **Resume** and **Quit** for it —
-resuming re-attaches to the session you left (only the device that started it sees this). The host creates a virtual display at the resolution and frame rate Moonlight requests
-(set these in Moonlight's settings), encodes it on the GPU, and streams it. Mouse, keyboard, and
+resuming re-attaches to the session you left (only the device that started it sees this). The host
+creates a virtual display at the resolution and frame rate Moonlight requests (set these in
+Moonlight's settings), encodes it on the GPU, and streams it. Mouse, keyboard, and
 controllers flow back to the host — and a Moonlight client that sends pen events, an iPad's Apple
 Pencil included, drives the same host-side tablet a native client would, with pressure and tilt
 intact (see [Pen and stylus](/docs/input#pen-and-stylus)).
@@ -116,11 +118,13 @@ That **Desktop** entry is the operator base list. An `apps.json` in the host's c
   acts on it: error correction is added when loss appears and wound back down when the link is
   clean, and sustained loss also eases the bitrate off (recovering as things settle). Nothing to
   configure — and it is why a marginal Wi-Fi link degrades rather than stuttering.
+- **Your video is encrypted.** The host offers per-packet video encryption and Moonlight turns it
+  on by itself, so the stream is encrypted end to end — audio and the control channel always were.
+  Nothing to configure.
 - Moonlight uses the GameStream protocol, so it doesn't get Punktfunk's native-protocol
-  extensions — no client-side speed test, no jumbo frames, and its control channel uses the older
-  GameStream encryption. Video error correction is *not* on that list: Moonlight-compatible FEC is
-  in every stream. On a good link the two protocols feel the same; a [native
-  client](/docs/clients) still has more headroom on a bad one.
+  extensions — no client-side speed test, no jumbo frames. Error correction and encryption are
+  *not* on that list any more: both are in every stream. On a good link the two protocols feel the
+  same; a [native client](/docs/clients) still has more headroom on a bad one.
 - Comparing Moonlight's performance overlay with a Punktfunk client's stats HUD? The numbers
   measure different slices of the pipeline — see [Understanding the Stats Overlay](/docs/stats)
   for a line-by-line comparison matrix before drawing conclusions.

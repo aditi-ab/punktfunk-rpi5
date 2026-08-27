@@ -329,8 +329,12 @@ impl VideoPacketizer {
                     multi_fec_blocks,
                     fec_info(k, i, wire_pct),
                 );
-                seal_shard(&mut buf, key, frame_index);
-                out.push(buf);
+                // A shard that could not be sealed is DROPPED, never sent: pushing the
+                // cleared buffer would put a 0-byte datagram on the wire. Unreachable in
+                // practice (GCM only refuses absurd lengths), and FEC covers the gap.
+                if seal_shard(&mut buf, key, frame_index) {
+                    out.push(buf);
+                }
             }
             // Moved out for the loop's `self.take_buf`/`self.pool` use, then restored so the
             // scratch Vec keeps its allocation across frames.
@@ -357,8 +361,9 @@ impl VideoPacketizer {
                     self.pool.push(par);
                     b
                 };
-                seal_shard(&mut buf, key, frame_index);
-                out.push(buf);
+                if seal_shard(&mut buf, key, frame_index) {
+                    out.push(buf);
+                }
             }
             self.parity_scratch = parity;
         }
@@ -375,19 +380,22 @@ impl VideoPacketizer {
 /// it is logged once-per-occurrence and the shard is dropped rather than sent as readable
 /// plaintext under an encrypted negotiation — the client discards a shard it can't
 /// authenticate, and FEC covers the gap.
-fn seal_shard(buf: &mut Vec<u8>, key: Option<[u8; 16]>, frame_index: u32) {
+fn seal_shard(buf: &mut [u8], key: Option<[u8; 16]>, frame_index: u32) -> bool {
     use aes_gcm::aead::consts::U12;
     use aes_gcm::aead::{AeadInOut, KeyInit};
     use aes_gcm::{aes::Aes128, AesGcm};
 
-    let Some(key) = key else { return };
+    let Some(key) = key else { return true };
+    // The caller's `off` and this `key` both derive from `self.enc_key` in one call, so a
+    // prefixed buffer is guaranteed here. Spelled out because a desync would not fail loudly:
+    // it would encrypt from offset 32 INTO the shard body and corrupt every packet silently.
+    debug_assert!(
+        buf.len() > ENC_PREFIX,
+        "a sealed shard must carry the ENC_VIDEO_HEADER prefix"
+    );
     let iv = next_iv();
-    let cipher = match AesGcm::<Aes128, U12>::new_from_slice(&key) {
-        Ok(c) => c,
-        Err(_) => {
-            buf.clear();
-            return;
-        }
+    let Ok(cipher) = AesGcm::<Aes128, U12>::new_from_slice(&key) else {
+        return false;
     };
     let tag = match cipher.encrypt_inout_detached(
         (&iv).into(),
@@ -397,13 +405,13 @@ fn seal_shard(buf: &mut Vec<u8>, key: Option<[u8; 16]>, frame_index: u32) {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = ?e, "gamestream: video shard seal failed — dropping it");
-            buf.clear();
-            return;
+            return false;
         }
     };
     buf[..12].copy_from_slice(&iv);
     buf[12..16].copy_from_slice(&frame_index.to_le_bytes());
     buf[16..ENC_PREFIX].copy_from_slice(&tag);
+    true
 }
 
 /// `fecInfo` (u32, little-endian): `dataShards<<22 | fecIndex<<12 | fecPercentage<<4`.
