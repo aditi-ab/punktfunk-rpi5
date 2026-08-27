@@ -164,6 +164,70 @@ per-mode frame cap is one step for every device —
 `{ "do": "rtss-cli property:set Global FramerateLimit $PF_STREAM_REFRESH" }` — instead of one
 hard-coded entry per client.
 
+### One entry, every client
+
+The point of those four variables is that the *entry* stops describing a device. Attach one script
+to the title and let the session tell it what it got — 60 Hz on the phone, 4K120 HDR on the TV, from
+the same two lines:
+
+```json
+{ "id": 2, "title": "Cyberpunk 2077", "cmd": "steam -applaunch 1091500",
+  "prep": [
+    { "do":   "/home/me/.config/punktfunk/scripts/mode.sh do",
+      "undo": "/home/me/.config/punktfunk/scripts/mode.sh undo" }
+  ] }
+```
+
+```sh
+#!/bin/sh
+# ~/.config/punktfunk/scripts/mode.sh — run as `mode.sh do` before the title, `mode.sh undo`
+# at session end. Nothing here names a client: the negotiated mode arrives in the environment.
+set -eu
+
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/MangoHud/MangoHud.conf"
+
+case "${1:-}" in
+do)
+  # Cap the game at the refresh this client actually negotiated.
+  cp -f "$CONF" "$CONF.pf-bak"
+  printf 'fps_limit=%s\n' "$PF_STREAM_REFRESH" >>"$CONF"
+
+  # Light the panel's HDR only when the session really negotiated it.
+  if [ "$PF_STREAM_HDR" = 1 ]; then
+    kscreen-doctor output.HDMI-A-1.hdr.enable
+  fi
+
+  # The raster, for anything that wants pixels — a launcher's window size, a per-mode
+  # config profile, or just a line in the journal naming what launched.
+  logger -t punktfunk \
+    "prep ${PF_APP_ID:-${PF_APP_TITLE:-desktop}}: ${PF_STREAM_WIDTH}x${PF_STREAM_HEIGHT}@${PF_STREAM_REFRESH}"
+  ;;
+undo)
+  mv -f "$CONF.pf-bak" "$CONF"
+  if [ "$PF_STREAM_HDR" = 1 ]; then
+    kscreen-doctor output.HDMI-A-1.hdr.disable
+  fi
+  ;;
+esac
+```
+
+Four things that example is quietly relying on:
+
+- **`undo` sees exactly what its `do` saw.** The values are captured once, at launch, and held for
+  the session — so teardown can branch on `PF_STREAM_HDR` and reach the same answer however the
+  stream ended.
+- **`PF_STREAM_HDR` is `1`/`0`**, the stream-marker file's spelling, not the `true`/`false` that
+  `PF_EVENT_*` uses. One script can be written against either.
+- **The app identity depends on the plane**: `PF_APP_ID` on a native client's launch,
+  `PF_APP_TITLE` from a Moonlight one. `${PF_APP_ID:-${PF_APP_TITLE:-desktop}}` reads whichever one
+  is set, and `:-` also catches the empty string a launch with no title of its own leaves behind.
+- **`set -u` is doing work.** An older host doesn't set these, and the step then fails loudly (and
+  disarms its own `undo`) instead of silently capping the game at `fps_limit=`.
+
+The same `prep` array works on a custom `library.json` entry, where the identity arrives as
+`PF_APP_ID`. The console's Library form has no input for prep steps and **clears** them on save, so
+edit that file directly.
+
 ## Reacting to a game, not a stream
 
 `stream.stopped` tells you the *stream* ended; `game.exited` tells you the *game* did. Often the
