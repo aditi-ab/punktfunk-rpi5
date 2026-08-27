@@ -1099,6 +1099,33 @@ impl AmfEncoder {
                 }
             }
             Codec::Av1 => {
+                // Never B-frames — the same insurance as H.264's `BPicturesPattern=0`, for the
+                // generation that can grow them: the three AV1 B-picture properties are VCN5
+                // features (header-verified 2026-08-26; defaults 0/false TODAY, but "defaults
+                // flip on newer hardware" is exactly how H.264 grew RDNA3+ B-frames). A B-frame
+                // would add a frame period of latency and break the FIFO wire contract on the
+                // one codec whose loss recovery is already full-IDR (no LTR, no IR). Optional:
+                // pre-VCN5 drivers reject the names, which is the correct no-op. (HEVC needs no
+                // twin — AMF defines NO B-frame property for it at all, and the 2026-08-26 VCN3
+                // capture measured 3 I + 52 P + 0 B.)
+                set_prop(
+                    comp,
+                    w!("Av1BPicturesPattern"),
+                    AmfVariant::from_i64(0),
+                    false,
+                )?;
+                set_prop(
+                    comp,
+                    w!("Av1MaxConsecutiveBPictures"),
+                    AmfVariant::from_i64(0),
+                    false,
+                )?;
+                set_prop(
+                    comp,
+                    w!("Av1AdaptiveMiniGop"),
+                    AmfVariant::from_bool(false),
+                    false,
+                )?;
                 // Sequence header OBU on every key frame — the AV1 twin of the HEVC IDR-aligned
                 // header insertion (self-contained join points on the wire).
                 set_prop(
@@ -2677,6 +2704,22 @@ mod tests {
                 }
             }
             assert_eq!(first_run[0].pts_ns, 1, "FIFO pts pairing");
+            // No reordering, ON THE BITSTREAM: every AU must come out in submit order. A
+            // B-frame (H.264 pre-`BPicturesPattern=0`, or AV1 on a VCN5 whose defaults grew
+            // them) reorders output, which both adds a frame period of latency and breaks the
+            // `Encoder` trait's FIFO contract — this asserts the property pins actually took,
+            // instead of trusting a `set_prop` that a driver may silently decline.
+            for run in [&first_run, &second_run] {
+                for pair in run.windows(2) {
+                    assert!(
+                        pair[1].pts_ns > pair[0].pts_ns,
+                        "{codec:?}: AUs must leave in submit order (reordering ⇒ B-frames), \
+                         got {} then {}",
+                        pair[0].pts_ns,
+                        pair[1].pts_ns
+                    );
+                }
+            }
             assert_eq!(second_run[0].pts_ns, 100, "post-reset FIFO pts pairing");
             eprintln!(
                 "live AMF {codec:?} encode: {} + {} AUs across a native reset, first IDR {} bytes",
