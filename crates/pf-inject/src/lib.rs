@@ -603,6 +603,19 @@ pub mod mouse_windows;
 /// run on a developer machine at all. See [`pad_slots`].
 #[path = "inject/pad_gate.rs"]
 pub mod pad_gate;
+/// Host-wide allocation of the OS-level pad slots ([`pad_pool::PadSlotPool`]) and the per-session
+/// wire-index → slot mapping over it ([`pad_pool::PadSlotMap`]).
+///
+/// Every OS name a virtual pad needs — the `Global\pf…-boot-<i>` mailboxes, the `SwDeviceCreate`
+/// instance ids, the DualSense pairing MAC, the Deck serial, the Switch MAC — is derived from a
+/// pad index, while every client numbers its first controller wire pad 0 and the host serves
+/// several sessions at once. This is what keeps those two facts from colliding.
+///
+/// Built on every target, like [`pad_gate`] and [`pad_slots`]: it is a bitmap and an array, it
+/// touches no OS pad API, and the collision it prevents is one only a multi-session host box can
+/// demonstrate — so the policy either has tests that run everywhere, or none that anyone runs.
+#[path = "inject/pad_pool.rs"]
+pub mod pad_pool;
 /// Shared virtual-pad slot table + creation lifecycle ([`pad_slots::PadSlots`]) — the
 /// `Vec<Option<Pad>>` table, `active_mask` unplug sweep, and gate-checked create every backend
 /// manager used to copy-paste (G12).

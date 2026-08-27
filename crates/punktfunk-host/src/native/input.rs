@@ -95,6 +95,18 @@ const MAX_WIRE_PADS: usize = punktfunk_core::input::MAX_PADS;
 /// [`resolve_pad_kind`] folds any kind a platform can't build into one it can, so this never
 /// constructs a manager the build lacks.
 struct Pads {
+    /// This session's wire index → host-wide OS pad slot ([`crate::inject::pad_pool`]).
+    ///
+    /// The number handed to a backend BECOMES the pad's OS identity — the `Global\pf…-boot-<i>`
+    /// mailbox, the `SwDeviceCreate` instance id, the DualSense pairing MAC, the Deck serial, the
+    /// Switch MAC. Every client numbers its own first controller wire pad 0 and the host serves
+    /// several sessions at once, so the wire index cannot be that identity: two clients each
+    /// holding a controller would collide on all of them. Slots are claimed on a pad's first
+    /// present frame and released when it goes away, so this is also what stops a session from
+    /// stranding an OS name after it ends.
+    slots: crate::inject::pad_pool::PadSlotMap<'static>,
+    /// One warn per session when the host has no OS slot left — not one per frame.
+    slots_exhausted_warned: bool,
     /// Declared (and host-resolved) kind per pad index; `default` until a `GamepadArrival` lands.
     kinds: [GamepadPref; MAX_WIRE_PADS],
     /// The kind of the manager that currently OWNS a built device at each index (`None` = no
@@ -156,6 +168,8 @@ impl Pads {
             "gamepad backends: per-pad router (session default)"
         );
         Pads {
+            slots: crate::inject::pad_pool::PadSlotMap::new(),
+            slots_exhausted_warned: false,
             kinds: [default; MAX_WIRE_PADS],
             owner: [None; MAX_WIRE_PADS],
             xbox360: None,
@@ -227,9 +241,74 @@ impl Pads {
         if idx >= MAX_WIRE_PADS {
             return;
         }
+        // Wire index → host-wide OS slot, the ONE place the translation happens. Claim on a
+        // present frame; a removal can only concern a slot this session already holds, and asking
+        // for one there would mint a device-shaped name for a pad that is going away.
+        let slot = if present {
+            self.slots.claim_for(idx)
+        } else {
+            self.slots.slot_of(idx)
+        };
+        let Some(slot) = slot else {
+            if present && !self.slots_exhausted_warned {
+                self.slots_exhausted_warned = true;
+                tracing::warn!(
+                    pad = idx,
+                    max = MAX_WIRE_PADS,
+                    "no host pad slot left — every OS slot is held by a live session, so this pad \
+                     gets no device. It appears when a slot frees (another session ending, or one \
+                     of its pads unplugging)."
+                );
+            }
+            return;
+        };
         let (kind, new_owner) = route_decision(self.owner[idx], self.kinds[idx], present);
         self.owner[idx] = new_owner;
-        self.route_handle(kind, ev);
+        self.route_handle(kind, &self.re_index(ev, slot));
+        if !present {
+            // The removal has reached the backend, so the OS name is the next session's to take.
+            //
+            // The device itself lingers for `pad_slots::SWEEP_GRACE` (300 ms) before the devnode
+            // actually goes, so a session claiming this slot inside that window can still lose the
+            // create race — on Windows that is one `IndexOwnedElsewhere` and the existing backoff,
+            // which heals on its own once the grace expires. Holding the slot until the sweep
+            // fired would trade that transient for a permanent leak on any session that unplugs a
+            // pad it never re-plugs, which is the worse of the two.
+            self.slots.release(idx);
+        }
+    }
+
+    /// Re-address an event from this session's wire numbering into the host-wide slot numbering
+    /// the backends create their devices under.
+    ///
+    /// The `active_mask` is translated too, and has to be: every manager's unplug sweep walks that
+    /// mask against the slots it actually created, so a wire-space mask would sweep away another
+    /// session's pad — or spare one this session had dropped.
+    fn re_index(
+        &self,
+        ev: &punktfunk_core::input::GamepadEvent,
+        slot: u8,
+    ) -> punktfunk_core::input::GamepadEvent {
+        use punktfunk_core::input::GamepadEvent;
+        match ev {
+            GamepadEvent::State(f) => {
+                let mut f = *f;
+                f.index = i16::from(slot);
+                f.active_mask = self.slots.os_mask(f.active_mask);
+                GamepadEvent::State(f)
+            }
+            GamepadEvent::Arrival {
+                kind,
+                capabilities,
+                audio_caps,
+                ..
+            } => GamepadEvent::Arrival {
+                index: slot,
+                kind: *kind,
+                capabilities: *capabilities,
+                audio_caps: *audio_caps,
+            },
+        }
     }
 
     /// Dispatch a decoded event to the manager for `kind`, creating it lazily.
@@ -475,6 +554,28 @@ impl Pads {
         mut rumble: impl FnMut(u16, u16, u16, u16, u16),
         mut hidout: impl FnMut(punktfunk_core::quic::HidOutput),
     ) {
+        // The reverse of `re_index`. A backend tags its feedback with the OS slot it created the
+        // device under; the client only ever knew its own wire index, so rumble and rich HID
+        // output have to come back the other way or they land on the wrong pad — and, with two
+        // sessions live, on the wrong client's pad.
+        //
+        // Snapshotted into a plain array first because the callbacks below are handed to
+        // `&mut self.<manager>`; borrowing `self.slots` inside them would not compile.
+        let mut wire_of = [None; MAX_WIRE_PADS];
+        for (slot, wire) in wire_of.iter_mut().enumerate() {
+            *wire = self.slots.wire_of(slot as u8);
+        }
+        // A slot with no wire index is not this session's pad; dropping its feedback is the point.
+        let mut rumble = |pad: u16, low, high, lt, rt| {
+            if let Some(wire) = wire_of.get(pad as usize).copied().flatten() {
+                rumble(wire as u16, low, high, lt, rt);
+            }
+        };
+        let mut hidout = |h: punktfunk_core::quic::HidOutput| {
+            if let Some(wire) = wire_of.get(h.pad() as usize).copied().flatten() {
+                hidout(h.with_pad(wire as u16));
+            }
+        };
         if let Some(m) = &mut self.xbox360 {
             m.pump_rumble(&mut rumble); // the X-Box pad has no rich-feedback plane
         }

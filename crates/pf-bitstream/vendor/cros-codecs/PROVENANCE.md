@@ -208,5 +208,33 @@ in the future."
     (`a_picture_whose_macroblock_count_overflows_is_a_parse_error_not_a_panic`).
     **Report upstream — not yet filed.**
 
+14. `src/codec/av1/parser.rs` — `read_obu`: bound `obu_size` against the buffer before it is
+    used to slice. `obu_size` is a leb128 read out of the stream (`read_leb128()? as usize`,
+    so anything up to `u32::MAX`) and nothing ties it to the bytes actually present; the OBU
+    was then built with an unchecked `&data[start_offset..start_offset + obu_size]`. Any
+    access unit whose last OBU declares more payload than remains — a truncated AU, or simply
+    an over-declared size — panicked with `range end index .. out of range for slice of length
+    ..`. That is a bounds check, not arithmetic, so it panics in release too (the workspace
+    leaves `overflow-checks` off, which is why the parser's other unchecked accumulations
+    merely wrap), and it aborts whichever thread is decoding.
+
+    Blast radius is every native AV1 rung: `pf-vkdecode`, `pf-dxvadec` and `pf-vaadec` are all
+    re-exports of `pf_bitstream::av1::Av1Planner`, whose `plan_au` hands raw access-unit bytes
+    straight to this function. Reachable from the project's own `PUNKTFUNK_AU_FAULT=truncate`
+    injector — whose `FaultMode::Truncate` docs reason only about Annex-B, where a NALU carries
+    no length, while AV1 OBUs do — and from any AU delivered short over the wire.
+
+    This was a gap in an otherwise consistent posture rather than a missing idea: `plan_au`
+    degrades every *other* malformation to `PlanWarning::TruncatedAu` or `PlanError::Parse`,
+    and `pf-vkdecode` re-validates `obu.end > au.len()` one layer up. Guarded with
+    `checked_add` plus a length compare, returning the same `String` error the rest of the
+    parser uses; the computed end is reused for `bytes_used` so the slice and the advance can
+    no longer disagree. Regression-tested in the file's own test module
+    (`an_obu_declaring_more_bytes_than_are_present_is_a_parse_error_not_a_panic`, which
+    reproduces the original panic exactly when the guard is reverted) and at the planner
+    boundary in `pf-bitstream`
+    (`av1::tests::a_truncated_access_unit_is_a_plan_error_not_a_panic`).
+    **Not filed upstream.**
+
 Re-sync procedure: fetch the AOSP tree, re-apply this trim, diff `codec/` +
 `bitstream_utils.rs` (expect near-zero conflicts), update the commit pin above.

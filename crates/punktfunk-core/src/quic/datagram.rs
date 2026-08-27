@@ -586,6 +586,72 @@ pub enum HidOutput {
 }
 
 impl HidOutput {
+    /// The pad this output is addressed to.
+    ///
+    /// `u16` because [`HidOutput::AudioCtl`] carries one; every other variant's `pad` is a `u8`
+    /// on the wire and widens losslessly.
+    pub fn pad(&self) -> u16 {
+        match self {
+            HidOutput::Led { pad, .. }
+            | HidOutput::PlayerLeds { pad, .. }
+            | HidOutput::Trigger { pad, .. }
+            | HidOutput::TrackpadHaptic { pad, .. }
+            | HidOutput::HidRaw { pad, .. } => u16::from(*pad),
+            HidOutput::AudioCtl { pad, .. } => *pad,
+        }
+    }
+
+    /// The same output, re-addressed to `pad`.
+    ///
+    /// The host needs this because a virtual pad's OS identity is host-wide while each session
+    /// numbers its own pads from zero (`pf_inject::pad_pool`): a backend reports feedback tagged
+    /// with the OS slot it created the device under, and that has to become the client's own wire
+    /// index before it goes out. Doing it here rather than at the call site keeps the variant list
+    /// in one place — a seventh variant that forgot to translate would be a silent mis-address.
+    ///
+    /// Pad indices are bounded by `input::MAX_PADS` (16), well inside the `u8` the narrow variants
+    /// carry; the assert pins that rather than trusting it.
+    pub fn with_pad(self, pad: u16) -> Self {
+        debug_assert!(
+            pad <= u16::from(u8::MAX),
+            "pad index {pad} does not fit the wire's u8 variants"
+        );
+        let narrow = pad as u8;
+        match self {
+            HidOutput::Led { r, g, b, .. } => HidOutput::Led {
+                pad: narrow,
+                r,
+                g,
+                b,
+            },
+            HidOutput::PlayerLeds { bits, .. } => HidOutput::PlayerLeds { pad: narrow, bits },
+            HidOutput::Trigger { which, effect, .. } => HidOutput::Trigger {
+                pad: narrow,
+                which,
+                effect,
+            },
+            HidOutput::TrackpadHaptic {
+                side,
+                amplitude,
+                period,
+                count,
+                ..
+            } => HidOutput::TrackpadHaptic {
+                pad: narrow,
+                side,
+                amplitude,
+                period,
+                count,
+            },
+            HidOutput::HidRaw { kind, data, .. } => HidOutput::HidRaw {
+                pad: narrow,
+                kind,
+                data,
+            },
+            HidOutput::AudioCtl { flags, raw, .. } => HidOutput::AudioCtl { pad, flags, raw },
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = vec![HIDOUT_MAGIC];
         match self {
@@ -1770,6 +1836,55 @@ mod tests {
             let mut bad = d.clone();
             bad[0] = HOST_TIMING_MAGIC;
             assert_eq!(decode_cursor_state_datagram(&bad), None);
+        }
+    }
+
+    /// Every variant must re-address, because the host translates a backend's OS pad slot into
+    /// the client's wire index on the way out (`pf_inject::pad_pool`). A variant that ignored
+    /// `with_pad` would deliver another pad's rumble to this one, silently.
+    #[test]
+    fn with_pad_re_addresses_every_hid_output_variant() {
+        let every = [
+            HidOutput::Led {
+                pad: 0,
+                r: 1,
+                g: 2,
+                b: 3,
+            },
+            HidOutput::PlayerLeds {
+                pad: 0,
+                bits: 0b101,
+            },
+            HidOutput::Trigger {
+                pad: 0,
+                which: 1,
+                effect: vec![1, 2, 3],
+            },
+            HidOutput::TrackpadHaptic {
+                pad: 0,
+                side: 1,
+                amplitude: 7,
+                period: 8,
+                count: 9,
+            },
+            HidOutput::HidRaw {
+                pad: 0,
+                kind: HID_RAW_OUTPUT,
+                data: vec![0xAA, 0xBB],
+            },
+            HidOutput::AudioCtl {
+                pad: 0,
+                flags: 0b1,
+                raw: [1, 2, 3, 4, 5, 6],
+            },
+        ];
+
+        for ev in every {
+            let before = ev.clone();
+            let moved = ev.with_pad(9);
+            assert_eq!(moved.pad(), 9, "{before:?} did not re-address");
+            // Re-addressing changes the pad and nothing else: putting it back is the identity.
+            assert_eq!(moved.with_pad(0), before, "{before:?} lost a field");
         }
     }
 }
