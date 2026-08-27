@@ -164,6 +164,21 @@ impl AscBackend {
     /// negotiated decode size; `surface_size` the LIVE view size the layer composites into;
     /// `panel_hz` the mode-table panel rate (seeds the learner);
     /// `dataspace` the `ADataSpace` from the negotiated colour; `source_hz` the negotiated stream rate.
+    ///
+    /// `overlay` sets the reader's gralloc ask. `true` adds `COMPOSER_OVERLAY`, letting HWC scan
+    /// the buffer out directly instead of paying a GPU composition pass — the right default, and
+    /// what every device the presenter was tuned on allocates without blinking. It is also the one
+    /// reader parameter that can make `AMediaCodec_start` fail AFTER a clean configure: start is
+    /// where ACodec dequeues (= gralloc-allocates) every codec output buffer from this reader's
+    /// window, with our consumer usage OR'd into the decoder's own producer bits — and an old
+    /// 32-bit OMX BSP (the Mi TV Stick's Amlogic gralloc) can refuse the combined
+    /// overlay + GPU-sampled + vendor-vdec allocation outright. `false` asks for
+    /// `GPU_SAMPLED_IMAGE` alone — the SurfaceTexture shape every TextureView/WebView video path
+    /// exercises, the most universally allocatable there is; SurfaceFlinger then GPU-composites the
+    /// layer (one 1080p quad — noise), and everything else about the backend is identical: real
+    /// latches, real fences, `setBuffer` has no overlay requirement. (`READER_MAX_IMAGES` is NOT a
+    /// start-time factor — consumer-side images allocate lazily during streaming — so usage is the
+    /// only axis a start-failure retry needs.)
     #[allow(clippy::too_many_arguments)]
     pub(super) fn create(
         window: &NativeWindow,
@@ -174,10 +189,13 @@ impl AscBackend {
         dataspace: i32,
         source_hz: u32,
         priority: PresentPriority,
+        overlay: bool,
     ) -> Option<AscBackend> {
         let layer = Layer::create(window, surface_size)?;
-        let usage = ndk::hardware_buffer::HardwareBufferUsage::GPU_SAMPLED_IMAGE
-            | ndk::hardware_buffer::HardwareBufferUsage::COMPOSER_OVERLAY;
+        let mut usage = ndk::hardware_buffer::HardwareBufferUsage::GPU_SAMPLED_IMAGE;
+        if overlay {
+            usage |= ndk::hardware_buffer::HardwareBufferUsage::COMPOSER_OVERLAY;
+        }
         let reader = match ImageReader::new_with_usage(
             src_w.max(1),
             src_h.max(1),
@@ -211,11 +229,12 @@ impl AscBackend {
             ),
         };
         log::info!(
-            "asc: backend up — {} ({}x{} @ {} Hz src, panel seed {} Hz, dataspace {:#x})",
+            "asc: backend up — {}, reader usage {} ({}x{} @ {} Hz src, panel seed {} Hz, dataspace {:#x})",
             match priority {
                 PresentPriority::Latency => "latency (newest-wins)".to_string(),
                 PresentPriority::Smooth { buffer } => format!("smooth (buffer {buffer})"),
             },
+            if overlay { "overlay" } else { "gpu-only" },
             src_w,
             src_h,
             source_hz,
