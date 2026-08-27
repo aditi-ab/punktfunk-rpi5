@@ -21,32 +21,18 @@
 #[allow(dead_code)]
 mod logfile;
 
+// The hand-off itself, verbatim the shell's `--console` flag — including the CREATE_NO_WINDOW
+// the console-subsystem session binary needs from a GUI parent. Kept in one file precisely
+// because the two copies of this hand-off had already drifted apart on that flag.
+#[cfg(windows)]
+#[path = "../couch.rs"]
+#[allow(dead_code)]
+mod couch;
+
 #[cfg(windows)]
 fn main() {
     logfile::init();
-    // The session binary ships beside us in the package; fall back to PATH for a dev run.
-    let session = std::env::current_exe()
-        .ok()
-        .map(|e| e.with_file_name("punktfunk-session.exe"))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| "punktfunk-session".into());
-
-    let mut cmd = std::process::Command::new(session);
-    cmd.arg("--browse");
-    if !std::env::args().any(|a| a == "--windowed") {
-        cmd.arg("--fullscreen");
-    }
-    cmd.stderr(std::process::Stdio::piped());
-    let run = cmd.spawn().and_then(|mut child| {
-        if let Some(stderr) = child.stderr.take() {
-            logfile::forward_child_stderr(stderr);
-        }
-        child.wait()
-    });
-    match run {
-        Ok(st) => std::process::exit(st.code().unwrap_or(0)),
-        Err(_) => std::process::exit(1),
-    }
+    couch::run_browse();
 }
 
 /// The workspace builds on Linux/macOS too; there is nothing to launch there.

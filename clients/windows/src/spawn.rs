@@ -7,6 +7,9 @@
 //! `{"ready":true}`, banner from the `{"error"|"ended": …}` line, `trust_rejected`
 //! routed to the re-pair PIN ceremony, `stats:` lines to the session status page.
 
+// The session binary's location: ONE resolver, shared with the couch entry points
+// (`crate::couch`), which the standalone `punktfunk-console.exe` bin includes by path.
+use crate::couch::session_binary;
 use std::io::BufRead as _;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -114,18 +117,6 @@ pub(crate) fn silent_exit_banner(code: i32) -> Option<String> {
             "The session didn't start (punktfunk-session exited with code {code}). Check {log}."
         )
     })
-}
-
-/// The session binary: installed next to the shell (the MSIX layout and dev
-/// `target\…` runs both land on the sibling), else `PATH`.
-pub(crate) fn session_binary() -> std::path::PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.with_file_name("punktfunk-session.exe");
-        if sibling.exists() {
-            return sibling;
-        }
-    }
-    "punktfunk-session".into()
 }
 
 /// Spawn the session binary for a connect with `fp_hex` pinned and feed its lifecycle to
