@@ -275,6 +275,7 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
                 codec: welcome.codec,
                 shard_payload: welcome.shard_payload,
                 host_caps: welcome.host_caps,
+                host_caps2: welcome.host_caps2,
                 mgmt_port: welcome.mgmt_port,
                 grants: welcome.grants,
                 expires_in_secs: welcome.expires_in_secs,

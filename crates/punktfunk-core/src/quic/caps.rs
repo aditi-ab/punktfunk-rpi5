@@ -210,6 +210,18 @@ pub const CLIENT_CAP_AUDIO_HIRES: u8 = 0x10;
 /// `0x01`/`0x02` are gamepad-state / clipboard.
 pub const HOST_CAP_AUDIO_HIRES: u8 = 0x80;
 
+/// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2) bit — the second capability byte
+/// the `0x80` wall above predicted, delivered as a trailing Welcome field (absent → `0`, the
+/// same append discipline as every field since `compositor`; no ABI bump needed).
+///
+/// The host marks its idle-keepalive re-encodes with
+/// [`USER_FLAG_REPEAT`](crate::packet::USER_FLAG_REPEAT), so the client's ABR can tell an
+/// idle window from an active one (ABR overhaul RFC §4.1). The bit is what makes the flag's
+/// ABSENCE meaningful: against a host that advertises it, an unflagged AU is genuinely new
+/// content; against an older host the client must treat activity as unknown and keep the
+/// legacy window arithmetic.
+pub const HOST_CAP2_REPEAT_MARK: u8 = 0x01;
+
 /// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 /// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 /// advertise this.
@@ -386,6 +398,7 @@ mod tests {
             audio_rate_hz: SAMPLE_RATE_HZ,
             audio_bits: BITS_16,
             audio_frame_us: 0,
+            host_caps2: 0,
         };
         let got = Welcome::decode(&w.encode()).unwrap();
         assert_eq!(got.host_caps & HOST_CAP_CLIPBOARD, HOST_CAP_CLIPBOARD);

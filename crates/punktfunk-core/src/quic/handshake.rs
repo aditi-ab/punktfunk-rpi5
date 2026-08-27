@@ -371,8 +371,16 @@ pub struct Welcome {
     /// settled or it sizes the whole session against the conservative initial value
     /// (`design/hi-res-audio.md` §4.2).
     ///
-    /// 2 LE bytes at 85..87 (or 117..119) — the last field of the message. Absent → `0`.
+    /// 2 LE bytes at 85..87 (or 117..119). Absent → `0`.
     pub audio_frame_us: u16,
+    /// The second host-capability byte — the `0x80` wall in `host_caps` predicted it; see
+    /// [`HOST_CAP2_REPEAT_MARK`](super::HOST_CAP2_REPEAT_MARK) (currently its only bit).
+    /// Emitting it (nonzero) extends the placeholder chain one link past the audio block, so
+    /// an Opus session then carries the audio block as its own defaults — every placeholder
+    /// decodes to exactly what its absence meant, the discipline every link of the chain keeps.
+    ///
+    /// One byte at 87 (or 119) — the last field of the message. Absent (an older host) → `0`.
+    pub host_caps2: u8,
 }
 
 /// `client → host`: data plane is bound, begin streaming.
@@ -707,26 +715,39 @@ impl Welcome {
         // and the client would open the wrong plane. Conversely an Opus session never emits the
         // block whatever the other three say, so today's Welcome stays byte-identical — the
         // interop guarantee the cipher byte bought and every link since has had to keep.
+        // …and `host_caps2` extends the chain one link past the audio block (same rule: its
+        // presence forces every earlier placeholder, each of which encodes exactly what its
+        // absence decodes to — an Opus session forced to emit the audio block writes
+        // `AUDIO_CODEC_OPUS` + zeros, which every shipped client reads as the defaults).
         let mgmt_present = self.mgmt_port != 0;
         let access_present = self.grants != super::access::GRANT_ALL || self.expires_in_secs != 0;
         let audio_present = self.audio_codec != AUDIO_CODEC_OPUS;
-        if self.cipher != CIPHER_AES_128_GCM || mgmt_present || access_present || audio_present {
+        let caps2_present = self.host_caps2 != 0;
+        if self.cipher != CIPHER_AES_128_GCM
+            || mgmt_present
+            || access_present
+            || audio_present
+            || caps2_present
+        {
             b.push(self.cipher);
             if let Some(k) = &self.key_chacha {
                 b.extend_from_slice(k);
             }
-            if mgmt_present || access_present || audio_present {
+            if mgmt_present || access_present || audio_present || caps2_present {
                 b.extend_from_slice(&self.mgmt_port.to_le_bytes());
             }
-            if access_present || audio_present {
+            if access_present || audio_present || caps2_present {
                 b.extend_from_slice(&self.grants.to_le_bytes());
                 b.extend_from_slice(&self.expires_in_secs.to_le_bytes());
             }
-            if audio_present {
+            if audio_present || caps2_present {
                 b.push(self.audio_codec);
                 b.extend_from_slice(&self.audio_rate_hz.to_le_bytes());
                 b.push(self.audio_bits);
                 b.extend_from_slice(&self.audio_frame_us.to_le_bytes());
+            }
+            if caps2_present {
+                b.push(self.host_caps2);
             }
         }
         b
@@ -834,6 +855,10 @@ impl Welcome {
             .get(audio_off + 6..audio_off + 8)
             .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
             .unwrap_or(0);
+        // The second capability byte trails the audio block — 87 for AES, 119 behind a ChaCha
+        // key. Absent (an older host) → 0: no repeat marking, and the client's ABR keeps its
+        // legacy window arithmetic.
+        let host_caps2 = b.get(audio_off + 8).copied().unwrap_or(0);
         Ok(Welcome {
             abi_version: u32at(4),
             udp_port: u16at(8),
@@ -910,6 +935,7 @@ impl Welcome {
             audio_rate_hz,
             audio_bits,
             audio_frame_us,
+            host_caps2,
         })
     }
 
@@ -1005,6 +1031,7 @@ mod tests {
             audio_rate_hz: SAMPLE_RATE_HZ,
             audio_bits: BITS_16,
             audio_frame_us: 0,
+            host_caps2: 0,
         };
         assert_eq!(Welcome::decode(&w.encode()).unwrap(), w);
 
@@ -1077,6 +1104,7 @@ mod tests {
             audio_rate_hz: SAMPLE_RATE_HZ,
             audio_bits: BITS_16,
             audio_frame_us: 0,
+            host_caps2: 0,
         };
         // An AES session's Welcome is byte-identical to the pre-cipher wire form (68 bytes) —
         // the old-client × new-host interop guarantee.
@@ -1334,6 +1362,7 @@ mod tests {
                 audio_rate_hz: SAMPLE_RATE_HZ,
                 audio_bits: BITS_16,
                 audio_frame_us: 0,
+                host_caps2: 0,
             }
             .encode(),
         )
@@ -1417,6 +1446,7 @@ mod tests {
                 audio_rate_hz: SAMPLE_RATE_HZ,
                 audio_bits: BITS_16,
                 audio_frame_us: 0,
+                host_caps2: 0,
             }
             .encode(),
         )
@@ -1539,6 +1569,7 @@ mod tests {
             audio_rate_hz: SAMPLE_RATE_HZ,
             audio_bits: BITS_16,
             audio_frame_us: 0,
+            host_caps2: 0,
         };
         let wenc = w.encode();
         assert_eq!(wenc.len(), 68); // 60 base + 4 colour + chroma + audio-channels + codec + host-caps
@@ -2013,6 +2044,7 @@ mod tests {
             audio_rate_hz: SAMPLE_RATE_HZ,
             audio_bits: BITS_16,
             audio_frame_us: 0,
+            host_caps2: 0,
         };
         // ── The interop floor: a plain Opus session is byte-identical to the pre-hi-res wire ──
         //
@@ -2172,6 +2204,83 @@ mod tests {
         let mut odd_rate = enc.clone();
         odd_rate[80..84].copy_from_slice(&44_100u32.to_le_bytes());
         assert_eq!(Welcome::decode(&odd_rate).unwrap().audio_rate_hz, 44_100);
+    }
+
+    /// `host_caps2` — the link past the audio block (ABR overhaul RFC §4.1): its presence
+    /// forces every earlier placeholder, each of which must decode to exactly what its
+    /// absence meant; absent (an older host) → 0.
+    #[test]
+    fn welcome_host_caps2_wire_under_both_ciphers() {
+        let base = Welcome {
+            abi_version: 1,
+            udp_port: 1,
+            mode: Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            },
+            fec: FecConfig {
+                scheme: FecScheme::Gf16,
+                fec_percent: 10,
+                max_data_per_block: 4096,
+            },
+            shard_payload: 1408,
+            encrypt: true,
+            key: [7; 16],
+            salt: [3; 4],
+            frames: 0,
+            compositor: CompositorPref::Auto,
+            gamepad: GamepadPref::Auto,
+            bitrate_kbps: 20_000,
+            bit_depth: 8,
+            color: ColorInfo::SDR_BT709,
+            chroma_format: CHROMA_IDC_420,
+            audio_channels: 2,
+            codec: CODEC_HEVC,
+            host_caps: HOST_CAP_GAMEPAD_STATE,
+            mgmt_port: 0,
+            grants: super::super::access::GRANT_ALL,
+            expires_in_secs: 0,
+            cipher: CIPHER_AES_128_GCM,
+            key_chacha: None,
+            audio_codec: AUDIO_CODEC_OPUS,
+            audio_rate_hz: SAMPLE_RATE_HZ,
+            audio_bits: BITS_16,
+            audio_frame_us: 0,
+            host_caps2: 0,
+        };
+        // Zero = not emitted: the plain Welcome keeps the 68-byte interop floor.
+        assert_eq!(base.encode().len(), 68);
+
+        // Set, over AES: the whole chain is forced as placeholders and the byte lands at 87.
+        let marked = Welcome {
+            host_caps2: HOST_CAP2_REPEAT_MARK,
+            ..base
+        };
+        let enc = marked.encode();
+        assert_eq!(enc.len(), 88);
+        let got = Welcome::decode(&enc).unwrap();
+        assert_eq!(got, marked);
+        // The forced placeholders decode to exactly what absence meant — an Opus session with
+        // caps2 must not read as hi-res, granted-nothing, or a mgmt port.
+        assert_eq!(got.audio_codec, AUDIO_CODEC_OPUS);
+        assert_eq!(got.audio_rate_hz, SAMPLE_RATE_HZ);
+        assert_eq!(got.grants, super::super::access::GRANT_ALL);
+        assert_eq!(got.mgmt_port, 0);
+
+        // Behind a ChaCha key the byte shifts with the rest of the tail (119, total 120).
+        let chacha = Welcome {
+            cipher: CIPHER_CHACHA20_POLY1305,
+            key_chacha: Some([9; 32]),
+            host_caps2: HOST_CAP2_REPEAT_MARK,
+            ..base
+        };
+        let enc = chacha.encode();
+        assert_eq!(enc.len(), 120);
+        assert_eq!(Welcome::decode(&enc).unwrap(), chacha);
+
+        // An older host's shorter wire decodes to 0 — "no repeat marking", never an error.
+        assert_eq!(Welcome::decode(&base.encode()).unwrap().host_caps2, 0);
     }
 
     /// The hi-res audio request on `Hello` (`design/hi-res-audio.md` §7) — the placeholder

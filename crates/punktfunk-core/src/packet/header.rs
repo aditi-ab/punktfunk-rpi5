@@ -55,6 +55,18 @@ pub const USER_FLAG_CHUNK_ALIGNED: u32 = 0x40;
 /// know this contract.
 pub const USER_FLAG_SLICE_STREAM: u32 = 0x80;
 
+/// `user_flags` bit: this AU is a host-side **repeat** — the encode loop re-encoded a held
+/// frame because the source produced nothing new (the idle keepalive), so it carries no new
+/// content. The client's ABR uses it to tell an idle window from an active one (ABR overhaul
+/// RFC §4.1): repeat-heavy windows must neither train the latency baselines nor read as "the
+/// target wasn't utilized" — that is how a static stretch used to poison the controller
+/// against the first moment of motion. Purely informational (no wire-shape change), so it is
+/// set unconditionally; receivers that predate it ignore the bit, and a client only TRUSTS
+/// its absence as "active frame" when the host advertised
+/// [`HOST_CAP2_REPEAT_MARK`](crate::quic::HOST_CAP2_REPEAT_MARK) — against an older host,
+/// zero repeat flags means "unknown", not "all active".
+pub const USER_FLAG_REPEAT: u32 = 0x100;
+
 /// Widest lost-frame range (frames, wrapping `last - first`) a reference-frame-invalidation
 /// recovery may be asked to repair; anything wider goes straight to the keyframe path on BOTH
 /// ends. RFI can only re-reference history the encoder still holds — NVENC keeps a 5-frame DPB,

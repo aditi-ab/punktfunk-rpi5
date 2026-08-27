@@ -46,9 +46,11 @@ Mac you type one in, and Apple TV's rate rides with the Stream mode preset.
 
 **Bitrate** — *default: Automatic.* For H.264, HEVC and AV1, Automatic means the host's default,
 **20 Mbps**, plus two things an explicit rate switches off: adaptive bitrate, and a link-capacity
-probe about two seconds in that lets the rate climb past 20 Mbps. An explicit rate is fixed for the
-session, clamped to **500 kbps – 8 Gbps**. A host card's menu has **Test network speed…** to suggest
-a value.
+probe about two seconds in that lets the rate climb past 20 Mbps. Automatic never descends below
+**2 Mbps** — on a link that thin the picture goes visibly soft rather than lossy, and the client
+logs a one-line warning the first time it happens. An explicit rate is fixed for the session,
+clamped to **500 kbps – 8 Gbps**. A host card's menu has **Test network speed…** to suggest a
+value.
 
 PyroWave is **always Automatic**: the rate is a fixed per-pixel budget for the negotiated mode
 (hundreds of Mbps), with adaptive bitrate and the probe off for the whole session. A fixed kbps
