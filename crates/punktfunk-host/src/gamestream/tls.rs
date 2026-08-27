@@ -95,8 +95,35 @@ pub(crate) async fn serve_https(
     }
 }
 
-/// Requests + signature-checks the client cert but accepts any (the pairing handshake is
-/// the real proof). Pinning to the paired set is a hardening follow-up.
+/// Requests the client cert and **verifies its `CertificateVerify` signature**, but does not
+/// judge the certificate itself. Authorization happens immediately after the handshake, against
+/// the pinned allow-list (`nvhttp::peer_is_paired`).
+///
+/// **This is the design, not an unfinished pin.** (Reviewed 2026-08-27; the comment here used to
+/// call pinning "a hardening follow-up", which read as debt.) Three things decide it:
+///
+/// * **A TLS handshake cannot know the route.** It completes before a single byte of the request
+///   line is parsed, so "pin the post-pair routes, accept-any on the pairing routes" is not
+///   expressible here — it would take a second listener on a second port, and the protocol fixes
+///   the ports.
+/// * **Some HTTPS traffic must come from unpaired peers.** `/serverinfo` over 47984 answers
+///   `PairStatus=0` precisely so a client can discover it needs to pair; refusing the handshake
+///   would remove the entry point to pairing. The management API shares this verifier and goes
+///   further, admitting *certless* browsers (`mandatory: false`) that authenticate by bearer
+///   token instead.
+/// * **Deferring the check costs nothing cryptographically.** The signature verification below is
+///   real — webpki's, or [`accept_legacy_moonlight_cert`]'s equivalent RSA check for the pre-v3
+///   certificates Moonlight presents — so a peer reaching a handler has *proved possession* of the
+///   private key for the certificate it presented. `peer_is_paired` then pins the SHA-256 of that
+///   same certificate before any state-changing work happens, and every route but `/serverinfo`
+///   goes through it. Rejecting an unpinned peer with an HTTP error rather than a TLS alert is a
+///   difference in *when*, not in *what is proven*.
+///
+/// What would genuinely be a hole is accepting the certificate without checking the signature —
+/// then anyone could replay a paired client's certificate, which is public, and pass the
+/// fingerprint gate without its key. That is why [`verify_tls12_signature`] /
+/// [`verify_tls13_signature`] below must keep returning a real verdict, and why the legacy
+/// fallback re-verifies rather than waving the certificate through.
 #[derive(Debug)]
 struct AcceptAnyClientCert {
     provider: Arc<CryptoProvider>,

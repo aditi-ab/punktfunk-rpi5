@@ -11,6 +11,19 @@
 //! the `/launch` `rikey` with a per-packet IV `BE32(rikeyid + seq)` (PKCS7 padding, RTP
 //! header left in the clear).
 //!
+//! **CBC here is unauthenticated, and that is the protocol, not a gap to close.** An attacker who
+//! can inject at the audio port can flip ciphertext bits and the client will decrypt and play the
+//! result, because there is no tag to reject it. The instinct is to reach for `SS_ENC_AUDIO`
+//! (0x04) as the authenticated answer — but per the sanctioned wire reference `SS_ENC_AUDIO`
+//! **selects exactly this mode**: "if SS_ENC_AUDIO: AES-128-CBC encrypt the PKCS7-padded Opus
+//! frame with IV = BE32(avRiKeyId + seq)", noted there as "CBC, not GCM. No auth tag appended
+//! (unlike video/control GCM)", and negotiated by `x-nv-general.featureFlags` bit 0x20 rather
+//! than the `encryptionSupported` mask. So GameStream has no authenticated audio mode to
+//! advertise: offering the flag would change nothing on the wire, and adding a tag would be a
+//! private extension no client can decode. (We encrypt unconditionally rather than on the flag,
+//! because modern Moonlight decrypts unconditionally — see above.) A session that needs
+//! authenticated audio needs the native punktfunk/1 plane, whose audio is AES-GCM.
+//!
 //! Surround sessions additionally carry Sunshine-style audio FEC: every aligned block of 4
 //! data packets is followed by 2 Reed–Solomon parity packets (`packetType = 127`, an
 //! `AUDIO_FEC_HEADER` after the RTP header). FEC is opportunistic on the client — in-order

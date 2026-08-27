@@ -799,13 +799,30 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         );
         hdr = false;
     }
-    // The client's requested CSC (moonlight-common-c SdpGenerator.c: `encoderCscMode =
-    // (colorspace << 1) | fullRange` — colorspace 0=Rec601, 1=Rec709, 2=Rec2020). Moonlight
-    // renderers configure their YUV→RGB from this REQUESTED value (not the bitstream VUI), so a
-    // host that encodes something else shifts the client's colours. INSTRUMENTATION ONLY for
-    // now: we always encode BT.709 limited for SDR (the IDD VideoConverter / VUI-driven NVENC)
-    // and BT.2020 PQ for HDR — log what clients actually ask for so honoring `encoderCscMode`
-    // can be scoped from field data rather than guessed. (Absent on very old clients.)
+    // The client's requested CSC (`encoderCscMode = (colorspace << 1) | fullRange` — colorspace
+    // 0=Rec601, 1=Rec709, 2=Rec2020). We encode BT.709 limited for SDR and BT.2020 PQ for HDR,
+    // and this value is read but not honored. Scoped 2026-08-27 from a live session rather than
+    // guessed, because the earlier note here overstated what is known:
+    //
+    // * **In an HDR session the request cannot be honored at all.** HDR10 *is* BT.2020 + PQ; a
+    //   client asking for Rec709 while negotiating `dynamicRangeMode=1` has asked for two
+    //   incompatible things, and the HDR half is the one that carries the grade. Field data says
+    //   this is the common case, not a corner: a stock Moonlight client on an HDR session sends
+    //   `csc=3` (Rec709 **full**) while streaming BT.2020 PQ. So the old code warned on every
+    //   HDR session about something it could never act on.
+    // * **Whether an ignored request actually shifts colours is UNVERIFIED.** The claim was that
+    //   Moonlight renders from this value rather than the bitstream VUI. The sanctioned wire
+    //   reference does not say that — it lists `encoderCscMode` among the keys a host parses and
+    //   nothing more — and we emit a correct, explicit VUI (`videoSignalTypePresentFlag` +
+    //   `colourDescriptionPresentFlag`), which a VUI-driven renderer would follow. Settling it
+    //   needs a capture or a look at a screen, not more reading.
+    // * **Honoring it is not "just plumbing".** `videoFullRangeFlag` is hardcoded to 0 in every
+    //   encoder backend and the capture-side CSC is fixed to match, so an SDR client asking for
+    //   full range needs a per-session colour request threaded from here through the capture CSC
+    //   into each backend's VUI — code the NATIVE plane shares and currently gets right.
+    //
+    // So: warn only where the request is both honorable in principle and unmet, and say what is
+    // actually known. (Absent on very old clients.)
     if let Some(csc) = parse_u("x-nv-video[0].encoderCscMode") {
         let (space, range) = (
             match csc >> 1 {
@@ -829,14 +846,24 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
                 range,
                 "GameStream client requested CSC — matches ours"
             );
+        } else if hdr {
+            // Not actionable: the session is HDR, so the colour space is settled by HDR10.
+            tracing::debug!(
+                csc,
+                requested = format!("{space} {range}"),
+                encoding = ours,
+                "GameStream client requested a CSC that HDR overrides — HDR10 is BT.2020 PQ by \
+                 definition, and the stream's VUI says so"
+            );
         } else {
             tracing::warn!(
                 csc,
                 requested = format!("{space} {range}"),
                 encoding = ours,
-                "GameStream client requested a CSC we don't encode — Moonlight renders by its \
-                 REQUEST, so its colours will be shifted (honoring encoderCscMode is a known \
-                 follow-up; report this log line)"
+                "GameStream client requested an SDR CSC we don't encode — we signal what we \
+                 encode in the VUI, so a VUI-driven client is still correct; a client that \
+                 renders from its own request would see shifted colours (unverified — honoring \
+                 the request needs the CSC + VUI threaded per session)"
             );
         }
     }
