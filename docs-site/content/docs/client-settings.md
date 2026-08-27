@@ -129,8 +129,7 @@ headphones plugged into the host keep playing, and both ends hear the same audio
 host's headphones live while the TV profile mutes them. Best-effort: it needs a host on 0.32 or
 newer, and with several clients streaming at once, any one asking wins for all of them. The
 host-wide equivalent is
-[`PUNKTFUNK_AUDIO_OUTPUT_MODE=follow_default`](/docs/configuration). Linux, Windows and the
-desktop console.
+[`PUNKTFUNK_AUDIO_OUTPUT_MODE=follow_default`](/docs/configuration). Offered everywhere.
 
 **Microphone** — *default: off on Linux, Windows, Android and the console home; on in the Apple
 app.* Sends this device's microphone to the host's virtual mic. Spelled *Stream microphone* on

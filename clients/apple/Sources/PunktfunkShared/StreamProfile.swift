@@ -115,6 +115,7 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
     public var audioFormat: String?
     public var micEnabled: Bool?
     public var echoCancel: Bool?
+    public var keepHostAudio: Bool?
     public var touchMode: String?
     public var mouseMode: String?
     public var invertScroll: Bool?
@@ -161,6 +162,7 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         case audioFormat = "audio_format"
         case micEnabled = "mic_enabled"
         case echoCancel = "echo_cancel"
+        case keepHostAudio = "keep_host_audio"
         case touchMode = "touch_mode"
         case mouseMode = "mouse_mode"
         case invertScroll = "invert_scroll"
@@ -199,6 +201,7 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         audioFormat = str(.audioFormat)
         micEnabled = bool(.micEnabled)
         echoCancel = bool(.echoCancel)
+        keepHostAudio = bool(.keepHostAudio)
         touchMode = str(.touchMode)
         mouseMode = str(.mouseMode)
         invertScroll = bool(.invertScroll)
@@ -239,6 +242,7 @@ public struct SettingsOverlay: Codable, Equatable, Sendable {
         try c.encodeIfPresent(audioFormat, forKey: AnyKey(Key.audioFormat.rawValue))
         try c.encodeIfPresent(micEnabled, forKey: AnyKey(Key.micEnabled.rawValue))
         try c.encodeIfPresent(echoCancel, forKey: AnyKey(Key.echoCancel.rawValue))
+        try c.encodeIfPresent(keepHostAudio, forKey: AnyKey(Key.keepHostAudio.rawValue))
         try c.encodeIfPresent(touchMode, forKey: AnyKey(Key.touchMode.rawValue))
         try c.encodeIfPresent(mouseMode, forKey: AnyKey(Key.mouseMode.rawValue))
         try c.encodeIfPresent(invertScroll, forKey: AnyKey(Key.invertScroll.rawValue))
@@ -297,6 +301,7 @@ public enum OverlayField {
         case "audio_format": overlay.audioFormat = nil
         case "mic_enabled": overlay.micEnabled = nil
         case "echo_cancel": overlay.echoCancel = nil
+        case "keep_host_audio": overlay.keepHostAudio = nil
         case "touch_mode": overlay.touchMode = nil
         case "mouse_mode": overlay.mouseMode = nil
         case "invert_scroll": overlay.invertScroll = nil
@@ -337,6 +342,7 @@ public enum OverlayField {
         case "audio_format": return o.audioFormat != nil
         case "mic_enabled": return o.micEnabled != nil
         case "echo_cancel": return o.echoCancel != nil
+        case "keep_host_audio": return o.keepHostAudio != nil
         case "touch_mode": return o.touchMode != nil
         case "mouse_mode": return o.mouseMode != nil
         case "invert_scroll": return o.invertScroll != nil

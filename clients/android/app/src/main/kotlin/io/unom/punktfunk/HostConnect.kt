@@ -101,6 +101,9 @@ suspend fun connectToHost(
             // Tier-A pad audio: ask for the 0xD1 plane only when a setting would render it, so a
             // user with it off does not make the host provision endpoints it will never feed.
             settings.padHaptics || settings.padSpeaker,
+            // "Keep host audio playing": the host taps its own default output rather than
+            // silencing it for the session. Free to ask for — an older host just ignores it.
+            settings.keepHostAudio,
         )
     }
 }

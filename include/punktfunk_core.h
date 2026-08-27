@@ -482,6 +482,17 @@
 // 24-bit is where the plane earns its bandwidth. (Mirrors `quic::CLIENT_CAP_AUDIO_HIRES`.)
 #define PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES 16
 
+// [`punktfunk_connect_ex9`] `client_caps` bit: ask the host to leave its OWN audio devices
+// alone for this session — capture whatever the operator's default playback device already
+// is, instead of parking the desktop mix on a silent endpoint. The host keeps playing (the
+// headphones plugged into the host PC stay live) and this client hears the same audio:
+// Moonlight's "Mute host PC speakers" box, unchecked, per session.
+//
+// REQUEST-only — there is no host-cap echo. An older host ignores the bit and re-routes as it
+// always did, which degrades to "audio still works, the host went quiet", so an embedder may
+// set it unconditionally from its user's setting. (Mirrors `quic::CLIENT_CAP_KEEP_HOST_AUDIO`.)
+#define PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO 32
+
 // `*ttl_ms` sentinel written by [`punktfunk_connection_next_rumble2`] for a legacy (v1) rumble
 // datagram — an old host that sent no self-termination lease. The client then falls back to its
 // own staleness heuristic for that update instead of a host-supplied deadline.
@@ -1100,7 +1111,7 @@
 // asked wins for all of them until it ends. Composes with the host-wide
 // `PUNKTFUNK_AUDIO_OUTPUT_MODE=follow_default`, which is this behaviour for every session.
 // `0x20` — `0x10` is [`CLIENT_CAP_AUDIO_HIRES`]; `0x40`/`0x80` remain free.
-#define CLIENT_CAP_KEEP_HOST_AUDIO 32
+#define PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO 32
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

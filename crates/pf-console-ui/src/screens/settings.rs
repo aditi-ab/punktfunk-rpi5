@@ -55,7 +55,7 @@ enum RowId {
     /// see the `enabled` note in [`row_spec`].
     AudioFormat,
     /// The per-session `CLIENT_CAP_KEEP_HOST_AUDIO` ask — the host keeps playing on its own
-    /// output while it streams. Desktop-only until the Android session advertises the bit.
+    /// output while it streams. Every platform: the Android session advertises the bit too.
     KeepHostAudio,
     Mic,
     EchoCancel,
@@ -990,9 +990,6 @@ fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
             | RowId::AllowVrr
             | RowId::Fullscreen
             | RowId::Shortcuts
-            // Desktop-only until the Android session advertises CLIENT_CAP_KEEP_HOST_AUDIO —
-            // a row whose bit never goes out would be a dead toggle.
-            | RowId::KeepHostAudio
     );
     match platform {
         Platform::Desktop => !android_only,
@@ -2665,7 +2662,6 @@ pub(super) mod tests {
                 RowId::TenBitSdr,
                 RowId::Vsync,
                 RowId::AllowVrr,
-                RowId::KeepHostAudio,
                 RowId::Shortcuts,
                 RowId::Fullscreen,
             ]

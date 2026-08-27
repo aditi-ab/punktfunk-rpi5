@@ -71,6 +71,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.fullscreenWhileStreaming) var fullscreenWhileStreaming = true
     @AppStorage(DefaultsKey.micEnabled) var micEnabled = true
     @AppStorage(DefaultsKey.echoCancel) var echoCancel = true
+    @AppStorage(DefaultsKey.keepHostAudio) var keepHostAudio = false
     @AppStorage(DefaultsKey.audioChannels) var audioChannels = 2
     @AppStorage(DefaultsKey.audioFormat) var audioFormat = AudioFormatChoice.opus.rawValue
     @AppStorage(DefaultsKey.codec) var codec = "auto"
