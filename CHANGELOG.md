@@ -29,8 +29,9 @@ is content-identical to v0.31.4, the `info.version` stamp being the whole diff.
 
 **Read `Breaking changes` regardless.** The auto-bitrate overhaul lands here in four phases, and
 Phase 4 redefines what the bitrate number *means* on the control plane — deliberately without a
-capability handshake. Alongside it: the 2026-08-25 security review (58 confirmed findings, one of
-them a console session cookie reaching code execution), a second GameStream security pass (media-port
+capability handshake. Alongside it: the 2026-08-25 security review (58 findings, most of them minor
+hardening; the most serious let an **authenticated** console session reach the pairing routes without
+the console password, and pairing is what grants launch), a second GameStream security pass (media-port
 endpoint proof, control-stream nonce separation), and the GameStream competitive program, which turns
 **both** video and control encryption on by default.
 
@@ -113,10 +114,14 @@ per-mode bpp pin and the ceiling, and `bitrate_auto` treats PyroWave sessions as
 switch re-resolves the pin whatever the `Hello` carried.
 
 **6. Console pairing routes move behind the console password** (security review). Arming, approving
-and PIN submission rode the generic catch-all with the operator's admin bearer attached — a console
-session cookie alone reached code execution. They now sit behind the console password like the other
-trust-root routes, and the armed PIN is returned **once** in that gated response instead of riding a
-1 s status poll. *A script driving the pairing routes with only a session cookie is now refused.*
+and PIN submission rode the generic catch-all with the operator's admin bearer attached, so — alone
+among the trust-root actions — they never re-asked for the console password. Scope it correctly: the
+caller had to be an **authenticated console session** already, so this was privilege escalation
+within the console, not something an unauthenticated network peer could reach. It matters because
+pairing is what grants launch, so a console sign-in became the ability to start a process on the
+host. They now sit behind the console password like the other trust-root routes, and the armed PIN is
+returned **once** in that gated response instead of riding a 1 s status poll. *A script driving the
+pairing routes with only a session cookie is now refused.*
 
 **7. Deep links auto-dial by stable record id only.** A display name or an address gets a
 confirmation on every client.
@@ -166,12 +171,14 @@ measured loss.
 
 ### Security review 2026-08-25
 
-58 confirmed findings across host, console, clients and supply chain. Nearly every serious one is a
-documented boundary whose code had stopped enforcing what its comment promised — so where the two
-disagreed the comment won and the code was made to match, and where it could not be, the comment was
-corrected instead.
+58 findings across host, console, clients and supply chain. **Read that number for what it is:** the
+long tail is minor hardening and build-infrastructure tightening, not 58 exploitable defects. What
+the serious ones share is a shape — a documented boundary whose code had stopped enforcing what its
+comment promised — so where the two disagreed the comment won and the code was made to match, and
+where it could not be, the comment was corrected instead.
 
-**Critical:** the console pairing routes, above. **High:** the plugin lane no longer reads the
+**Most serious:** the console pairing routes, above — escalation from an already-authenticated
+console session, not a pre-auth hole. **High:** the plugin lane no longer reads the
 unredacted log ring (which carried the webhook credentials the `/hooks` carve-out exists to
 withhold), and hook lines log an origin and a short id rather than a URL or a command line; a
 plugin-reported pid is held to `procscan`'s start-time floor before the SYSTEM host will signal it;
