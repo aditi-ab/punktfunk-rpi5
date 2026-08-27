@@ -50,6 +50,7 @@
 // contract, not wrapping the calls — until then the lint is off HERE and enforced everywhere else.
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use super::policy::{intra_refresh_period, intra_refresh_requested, ltr_test_force_at};
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{anyhow, bail, Context, Result};
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
@@ -536,27 +537,6 @@ fn usage_from_env(codec: Codec) -> i64 {
     }
 }
 
-/// Whether this session should run the **intra-refresh** loss-recovery mode (`PUNKTFUNK_INTRA_REFRESH`
-/// truthy — the same opt-in the Linux NVENC path uses): a moving intra wave refreshes the whole
-/// picture every [`intra_refresh_period`] frames, so FEC-unrecoverable loss heals without the
-/// 20-40× full-IDR spike, and the session glue rate-limits client keyframe requests
-/// ([`EncoderCaps::intra_refresh`]).
-fn intra_refresh_requested() -> bool {
-    std::env::var("PUNKTFUNK_INTRA_REFRESH")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-}
-
-/// Intra-refresh wave length in frames (default half a second, `PUNKTFUNK_IR_PERIOD_FRAMES`
-/// overrides) — same knob and default as the Linux NVENC intra-refresh mode.
-fn intra_refresh_period(fps: u32) -> u32 {
-    std::env::var("PUNKTFUNK_IR_PERIOD_FRAMES")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|v| *v >= 2)
-        .unwrap_or_else(|| (fps.max(16) / 2).max(2))
-}
-
 /// Number of user-controlled LTR slots. AMD exposes up to 2; two rotating slots hold a sliding pair
 /// of recent long-term references, so a loss can re-reference the newest one *before* the loss point.
 const NUM_LTR_SLOTS: usize = 2;
@@ -568,9 +548,7 @@ const NUM_LTR_SLOTS: usize = 2;
 /// LTR is mutually exclusive with it, so LTR wins). `PUNKTFUNK_NO_AMF_LTR=1` forces the old full-IDR
 /// recovery for debugging.
 fn ltr_disabled() -> bool {
-    std::env::var("PUNKTFUNK_NO_AMF_LTR")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+    super::policy::env_flag("PUNKTFUNK_NO_AMF_LTR")
 }
 
 /// Cadence (frames) between LTR marks — a fresh long-term reference roughly every half second by
@@ -578,22 +556,7 @@ fn ltr_disabled() -> bool {
 /// second of recent references, so a loss up to ~1 s old still has a known-good frame to force; a
 /// smaller interval means the forced reference is more recent (a smaller recovery-frame residual).
 fn ltr_mark_interval(fps: u32) -> i64 {
-    std::env::var("PUNKTFUNK_LTR_INTERVAL_FRAMES")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .filter(|v| *v >= 1)
-        .unwrap_or_else(|| (fps.max(2) / 2).max(1) as i64)
-}
-
-/// Validation hook (`PUNKTFUNK_LTR_FORCE_AT=N`, spike-only): at `frame_idx == N` the encoder
-/// self-triggers its real [`invalidate_ref_frames`](Encoder::invalidate_ref_frames) path, so a
-/// headless spike run can exercise LTR recovery end-to-end (mark → force → recovery-anchor tag)
-/// without a live client sending an [`RfiRequest`](punktfunk_core::quic::RfiRequest). `None` normally.
-fn ltr_test_force_at() -> Option<i64> {
-    std::env::var("PUNKTFUNK_LTR_FORCE_AT")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .filter(|v| *v > 0)
+    super::policy::ltr_interval_env().unwrap_or_else(|| (fps.max(2) / 2).max(1) as i64)
 }
 
 // ---------------------------------------------------------------------------------------------
