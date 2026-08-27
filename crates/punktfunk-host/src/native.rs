@@ -1785,21 +1785,21 @@ async fn serve_session(
     // `clip_offer_rx` shape). The sender lives in the access lifecycle task below; for a session
     // with no fingerprint it's dropped instead and the arm disables itself.
     let (access_tx, access_rx) = tokio::sync::mpsc::unbounded_channel::<AccessUpdate>();
-    tokio::spawn(control::run(
+    tokio::spawn(control::run(control::Task {
         ctrl_send,
         ctrl_recv,
-        hello.mode,
+        initial_mode: hello.mode,
         codec,
         live_reconfig_ok,
         adaptive_fec,
         session_bitrate_kbps,
-        live_bitrate.clone(),
-        encoder_ceiling_kbps.clone(),
-        cadence_degraded.clone(),
-        cadence_behind_score.clone(),
-        client_packets_received_ctl,
+        live_bitrate: live_bitrate.clone(),
+        encoder_ceiling_kbps: encoder_ceiling_kbps.clone(),
+        cadence_degraded: cadence_degraded.clone(),
+        cadence_behind_score: cadence_behind_score.clone(),
+        client_packets_received: client_packets_received_ctl,
         fec_target_ctl,
-        phase_ctl_control,
+        phase_ctl: phase_ctl_control,
         reconfig_tx,
         keyframe_tx,
         rfi_tx,
@@ -1813,11 +1813,11 @@ async fn serve_session(
         shard_ack_tx,
         cursor_shape_rx,
         cursor_client_draws,
-        clip_enabled.clone(),
+        clip_enabled: clip_enabled.clone(),
         clip,
-        session_grants.clone(),
+        session_grants: session_grants.clone(),
         access_rx,
-    ));
+    }));
     // The access lifecycle task (WP3): owns the session's expiry deadline and folds every watch
     // edit into the live mask. Only sessions with a fingerprint have a record to watch; dropping
     // `access_tx` otherwise retires the control task's update arm.

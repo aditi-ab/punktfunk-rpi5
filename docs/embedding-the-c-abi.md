@@ -253,9 +253,31 @@ and capture `observed_sha256_out` (trust-on-first-use), then pin it thereafter.
 
 ## 5. Connecting
 
-There is a **ladder** of `connect` variants; each adds parameters and defaults the rest to the prior
-variant's behavior. Use the highest one you need — they all return `PunktfunkConnection *` (NULL on
-failure) and block up to `timeout_ms` for the handshake, so **call off your UI thread.**
+**The recommended call is `punktfunk_connect_opts` (ABI ≥ 26)** — every option in one
+size-prefixed struct, so a new option is a new field instead of a new symbol:
+
+```c
+PunktfunkConnectOpts o = {0};               /* zero = auto/legacy for every option */
+o.struct_size   = sizeof(PunktfunkConnectOpts);
+o.host          = "192.168.1.50";
+o.port          = 9777;
+o.width = 1920; o.height = 1080; o.refresh_hz = 60;
+o.bitrate_kbps  = 20000;
+o.video_codecs  = PUNKTFUNK_CODEC_HEVC;     /* OR-in _H264 (software hosts) / _AV1 */
+o.preferred_codec = PUNKTFUNK_CODEC_HEVC;
+o.pin_sha256    = host_fp;                  /* or NULL for TOFU */
+o.client_cert_pem = cert; o.client_key_pem = key;
+o.timeout_ms    = 8000;
+
+int32_t status; uint8_t observed[32];
+PunktfunkConnection *c = punktfunk_connect_opts(&o, observed, &status);
+if (!c) { /* status says why — a PunktfunkStatus, including the typed host-rejection block */ }
+```
+
+Before it there is a **ladder** of `connect` variants; each adds parameters and defaults the rest
+to the prior variant's behavior. Every rung keeps its symbol and behavior forever, but the ladder
+is **closed** — new options land only in the struct. All of these return `PunktfunkConnection *`
+(NULL on failure) and block up to `timeout_ms` for the handshake, so **call off your UI thread.**
 
 | Variant          | Adds |
 |------------------|------|
@@ -266,7 +288,12 @@ failure) and block up to `timeout_ms` for the handshake, so **call off your UI t
 | `punktfunk_connect_ex4` | `launch_id` (auto-launch a library title) |
 | `punktfunk_connect_ex5` | `video_caps` (10-bit / HDR / 4:4:4 / host-timing) |
 | `punktfunk_connect_ex6` | `audio_channels` (2 / 6 / 8) |
-| **`punktfunk_connect_ex7`** | **`video_codecs` + `preferred_codec`** — the recommended full call |
+| `punktfunk_connect_ex7` | `video_codecs` + `preferred_codec` — the full positional call |
+| `punktfunk_connect_ex8` | `status_out` (typed WHY on a failed connect — `PunktfunkStatus`, incl. host rejections) |
+| `punktfunk_connect_ex9` | `client_caps` (client-drawn cursor, …) |
+| `punktfunk_connect_ex10` | `device_name` (the label this device knocks with) |
+| `punktfunk_connect_ex11` | `audio_rate_hz` + `audio_bits` (hi-res / lossless audio ask) |
+| **`punktfunk_connect_opts`** | **terminal: one growable struct** — new options stop being new symbols |
 
 ```c
 uint8_t caps   = 0;                       // add PUNKTFUNK_VIDEO_CAP_10BIT | _HDR | _444 as supported

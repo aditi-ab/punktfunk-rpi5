@@ -256,7 +256,16 @@ pub use stats::Stats;
 /// never sees it and [`WIRE_VERSION`] is unchanged. It relies on tracing's `log` feature, now
 /// declared explicitly by this crate (it was on transitively through quinn's defaults, which is
 /// not a thing an ABI promise should rest on).
-pub const ABI_VERSION: u32 = 25;
+/// **v26** adds [`abi::punktfunk_connect_opts`] + [`abi::PunktfunkConnectOpts`] — the whole
+/// connect surface in ONE size-prefixed, growable struct, closing the eleven-generation
+/// `punktfunk_connect_ex*` chain (each new option used to mint a new exported symbol plus a
+/// 20-something-parameter forwarding shim; `ex11` over `ex10` was two fields). ADDED, not
+/// widened: every `ex` variant keeps its symbol, signature and byte-identical behaviour, and an
+/// embedder that never calls the new form behaves exactly as on v25. New connect options land
+/// only in the struct from here on — appended behind its `struct_size` guard, zero meaning
+/// unspecified/auto — so they stop being ABI events at all. Client-local; [`WIRE_VERSION`] is
+/// unchanged.
+pub const ABI_VERSION: u32 = 26;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

@@ -37,6 +37,7 @@
 //! it stays behind the same gate and falls back to IDR wherever the driver declines. 4:4:4 stays
 //! `false` until probed on real hardware (design §8.6).
 
+use super::policy::{intra_refresh_requested, ltr_test_force_at};
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{anyhow, bail, Context, Result};
 use libvpl_sys as vpl;
@@ -143,52 +144,19 @@ const NUM_LTR_SLOTS: usize = 2;
 /// `PUNKTFUNK_NO_QSV_LTR` — defeat switch for the LTR-RFI path (parity with
 /// `PUNKTFUNK_NO_AMF_LTR`); loss recovery then always falls back to IDR.
 fn ltr_disabled() -> bool {
-    // Same accepted spellings as AMF's `ltr_disabled` — this had dropped the `trim()` and the
-    // `yes`/`on` forms, so a value with stray whitespace (easy to produce with `set VAR=1 `)
-    // silently left LTR enabled on Intel while the identical value worked on AMD.
-    std::env::var("PUNKTFUNK_NO_QSV_LTR")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+    super::policy::env_flag("PUNKTFUNK_NO_QSV_LTR")
 }
 
-/// Frames between LTR marks (`PUNKTFUNK_LTR_INTERVAL_FRAMES`, shared with AMF); default ~1/4 s
+/// Frames between LTR marks ([`super::policy::ltr_interval_env`] overrides); default ~1/4 s
 /// so a loss usually finds a slot only a few frames old.
 fn ltr_mark_interval(fps: u32) -> i64 {
-    std::env::var("PUNKTFUNK_LTR_INTERVAL_FRAMES")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or_else(|| (fps as i64 / 4).max(1))
+    super::policy::ltr_interval_env().unwrap_or_else(|| (fps as i64 / 4).max(1))
 }
 
-/// Spike-only validation hook (`PUNKTFUNK_LTR_FORCE_AT=N`, shared with AMF): self-trigger the
-/// real `invalidate_ref_frames` path at frame N so a headless run exercises mark → force →
-/// recovery-anchor without a live client.
-fn ltr_test_force_at() -> Option<i64> {
-    std::env::var("PUNKTFUNK_LTR_FORCE_AT")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-}
-
-/// Mirrors [`super::amf`]'s `PUNKTFUNK_INTRA_REFRESH` opt-in: request the intra-refresh wave
-/// instead of LTR (mutually exclusive — the wave sweeps the whole picture, LTR pins references).
-fn intra_refresh_requested() -> bool {
-    // Spelling parity with AMF (see `ltr_disabled` above).
-    std::env::var("PUNKTFUNK_INTRA_REFRESH")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-}
-
-/// The wave period in frames (~0.5 s), `PUNKTFUNK_IR_PERIOD_FRAMES` overrides — the same knob and
-/// default as AMF / Linux NVENC. (This claimed parity while ignoring the env var entirely, so the
-/// knob silently did nothing on Intel; the clamp is kept because `mfxU16` bounds the field.)
+/// The intra-refresh wave period, narrowed to the `mfxU16` field's useful 8..=240
+/// ([`super::policy::intra_refresh_period`] parses the shared knob).
 fn intra_refresh_period(fps: u32) -> u16 {
-    std::env::var("PUNKTFUNK_IR_PERIOD_FRAMES")
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .filter(|v| *v >= 2)
-        .unwrap_or(fps / 2)
-        .clamp(8, 240) as u16
+    super::policy::intra_refresh_period(fps).clamp(8, 240) as u16
 }
 
 // ---------------------------------------------------------------------------------------------

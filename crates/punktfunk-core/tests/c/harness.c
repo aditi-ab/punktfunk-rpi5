@@ -32,6 +32,29 @@ static PunktfunkConfig make_config(uint32_t role, uint32_t drop_period) {
 int main(void) {
     printf("punktfunk-core C ABI harness (abi_version=%u)\n", punktfunk_abi_version());
 
+    /* PunktfunkConnectOpts (v26): the C compiler must agree with Rust's const-asserted layout —
+     * 96 bytes on 64-bit / 68 on 32-bit, NO tail padding (the growth contract: an appended field
+     * may never land in bytes an older caller's sizeof already covered) — and the size-prefix
+     * guard must reject an undersized struct as a status, not a read. The declaration sits
+     * behind the header's quic guard; the staticlib this harness links always carries quic
+     * (see the -lopus/Security link line), so the check only needs the define. */
+#ifdef PUNKTFUNK_FEATURE_QUIC
+    if (sizeof(PunktfunkConnectOpts) != (sizeof(void *) == 8 ? 96u : 68u)) {
+        fprintf(stderr, "FAIL: PunktfunkConnectOpts is %zu bytes\n", sizeof(PunktfunkConnectOpts));
+        return 1;
+    }
+    {
+        PunktfunkConnectOpts o;
+        int32_t st = 0;
+        memset(&o, 0, sizeof(o));
+        o.struct_size = 4; /* an impossible, pre-v26 size */
+        if (punktfunk_connect_opts(&o, NULL, &st) != NULL || st != PUNKTFUNK_STATUS_INVALID_ARG) {
+            fprintf(stderr, "FAIL: undersized connect opts accepted (st=%d)\n", (int)st);
+            return 1;
+        }
+    }
+#endif
+
     const uint32_t DROP_PERIOD = 8;   /* drop 1 of every 8 packets */
     PunktfunkConfig host_cfg = make_config(0, DROP_PERIOD);
     PunktfunkConfig client_cfg = make_config(1, DROP_PERIOD);

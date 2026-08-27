@@ -1640,6 +1640,32 @@ fn settle_portal_cursor(
     false
 }
 
+/// The host-composite pair for the live compositor — `(gamescope_composite,
+/// metadata_composite)`: ONE derivation shared by bring-up and the mid-stream compositor
+/// retarget so the two cannot drift ([`settle_portal_cursor`]'s discipline). They had drifted:
+/// bring-up keyed the gamescope arm on the compositor alone, while the retarget read
+/// [`gamescope_cursor`] — which also folds in `gamescope_composites_cursor()`, the "the spawned
+/// gamescope paints the pointer into its node itself" capability. On such a gamescope the two
+/// answers differed at bring-up: a host composite planned for a pointer the node already
+/// carries, with no XFixes reader attached to feed it (`session_plan.rs` documents the pair
+/// contract — attach-without-blend wastes an X11 connection, blend-without-attach streams no
+/// pointer, and blending a self-painting node would draw the pointer twice).
+///
+/// `gamescope` is whether the LIVE compositor is gamescope — the retarget passes the
+/// newly-detected one, not the session's original.
+///
+/// [`gamescope_cursor`]: crate::session_plan::SessionPlan::gamescope_cursor
+fn composite_plan(
+    plan: &crate::session_plan::SessionPlan,
+    has_cursor_channel: bool,
+    gamescope: bool,
+) -> (bool, bool) {
+    (
+        plan.gamescope_cursor && !has_cursor_channel,
+        !has_cursor_channel && plan.cursor_blend && !gamescope,
+    )
+}
+
 pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDisplay>) -> Result<()> {
     // This thread runs the capture+encode loop (single-process — the only topology: Linux portal /
     // synthetic, Windows in-process IDD-push). Elevate it so a CPU-heavy game can't deschedule our GPU
@@ -1806,16 +1832,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         tracing::info!("cursor channel negotiated — forwarding shape/state, encoder blend off");
     }
     // gamescope (Phase C): no channel for a plain capture-mode client and no compositor-embedded
-    // pointer, so the host ALWAYS composites the XFixes-sourced cursor into the video. Active only
-    // when there's no cursor-forward channel (a future desktop-mode gamescope client takes the
-    // `cursor_fwd` path instead). See `plan.gamescope_cursor`.
-    // `mut`: a mid-stream Gaming↔Desktop switch (the capture-loss rebuild below) retargets the
-    // compositor, so this is recomputed there against the live compositor.
-    let mut gamescope_composite =
-        compositor == pf_vdisplay::Compositor::Gamescope && cursor_fwd.is_none();
-    if gamescope_composite {
-        tracing::info!("gamescope cursor: compositing the XFixes-sourced pointer into the video");
-    }
+    // pointer, so the host composites the XFixes-sourced cursor into the video — unless the
+    // spawned gamescope paints the pointer into its node itself (`plan.gamescope_cursor` folds
+    // that capability in; keying on the compositor alone here used to plan a composite the
+    // reader never feeds on such a node). Active only when there's no cursor-forward channel (a
+    // future desktop-mode gamescope client takes the `cursor_fwd` path instead).
+    //
     // No-channel metadata composite: the client never draws the pointer (it did not advertise
     // the cursor channel — e.g. a capture-latched client, `console.rs` `latched_mouse`), and
     // the compositor-EMBEDS fallback is a fiction on a Mutter virtual stream (the software
@@ -1824,10 +1846,17 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // schedules no update either, mutter#4939). So the plan asked the backend for
     // cursor-as-metadata and the HOST composites, permanently — the same arm a channel
     // session lands in after its capture-model flip, minus the channel.
-    // `mut`: recomputed with `gamescope_composite` on a mid-stream compositor retarget.
-    let mut metadata_composite = cursor_fwd.is_none()
-        && plan.cursor_blend
-        && compositor != pf_vdisplay::Compositor::Gamescope;
+    //
+    // `mut` on both: a mid-stream Gaming↔Desktop switch (the capture-loss rebuild below)
+    // retargets the compositor and re-derives the pair through the same [`composite_plan`].
+    let (mut gamescope_composite, mut metadata_composite) = composite_plan(
+        &plan,
+        cursor_fwd.is_some(),
+        compositor == pf_vdisplay::Compositor::Gamescope,
+    );
+    if gamescope_composite {
+        tracing::info!("gamescope cursor: compositing the XFixes-sourced pointer into the video");
+    }
     if metadata_composite {
         tracing::info!(
             "no cursor channel — compositing the metadata cursor into the video (embedded \
@@ -3528,11 +3557,11 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                                             crate::session_plan::gamescope_cursor_for(
                                                 c == crate::vdisplay::Compositor::Gamescope,
                                             );
-                                        gamescope_composite =
-                                            plan.gamescope_cursor && cursor_fwd.is_none();
-                                        metadata_composite = cursor_fwd.is_none()
-                                            && plan.cursor_blend
-                                            && c != crate::vdisplay::Compositor::Gamescope;
+                                        (gamescope_composite, metadata_composite) = composite_plan(
+                                            &plan,
+                                            cursor_fwd.is_some(),
+                                            c == crate::vdisplay::Compositor::Gamescope,
+                                        );
                                         // The retargeted backend starts with `hw_cursor`
                                         // unset — without re-applying the session's
                                         // out-of-band cursor request, the rebuilt display

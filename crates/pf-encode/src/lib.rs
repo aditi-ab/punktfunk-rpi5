@@ -2039,6 +2039,12 @@ mod nvenc_core;
 ))]
 #[path = "enc/rfi.rs"]
 mod rfi;
+// Loss-recovery env-knob parsing (IR/LTR opt-ins, periods, spike hooks) shared by the Linux and
+// Windows backends — rfi.rs's sibling: three hand-copies of the same env reads had diverged
+// twice before this extraction (see the module header). Defaults and API clamps stay per-backend.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[path = "enc/policy.rs"]
+mod policy;
 // Shared libavcodec glue (`pixel_to_av`, swscale consts) for the three libav backends — Linux
 // NVENC + VAAPI and Windows AMF/QSV — so the byte-identical pieces live once (plan §2.2, Tier 2).
 #[cfg(any(target_os = "linux", all(target_os = "windows", feature = "amf-qsv")))]

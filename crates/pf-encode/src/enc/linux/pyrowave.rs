@@ -118,12 +118,7 @@ pub(crate) fn capture_modifiers(fourcc: u32) -> Vec<u64> {
 /// **Log-only** — see [`select_physical_device`] for why no oracle, this one included, is
 /// allowed to CHANGE the selection.
 fn capture_anchor_node() -> std::path::PathBuf {
-    std::env::var("PUNKTFUNK_RENDER_NODE")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/dev/dri/renderD128"))
+    pf_gpu::render_node_env().unwrap_or_else(|| std::path::PathBuf::from("/dev/dri/renderD128"))
 }
 
 /// `(major, minor)` of a device node, split the way `VkPhysicalDeviceDrmPropertiesEXT` reports

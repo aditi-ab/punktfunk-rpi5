@@ -260,22 +260,15 @@ static IR_UNSUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// loss — the cascade). The session glue then rate-limits client keyframe requests
 /// ([`EncoderCaps::intra_refresh`](super::EncoderCaps)).
 fn intra_refresh_requested() -> bool {
-    std::env::var("PUNKTFUNK_INTRA_REFRESH")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+    super::policy::intra_refresh_requested()
         && !IR_UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The intra-refresh wave length in frames — ffmpeg derives `intraRefreshPeriod`/`Cnt` from
-/// `gop_size` before forcing the real GOP infinite, so this is what `gop_size` is set to in IR
-/// mode. Default = half a second of frames (heals fast, spreads the intra cost to ~2-3% per
-/// frame); `PUNKTFUNK_IR_PERIOD_FRAMES` overrides.
+/// The intra-refresh wave length in frames ([`super::policy::intra_refresh_period`]) — ffmpeg
+/// derives `intraRefreshPeriod`/`Cnt` from `gop_size` before forcing the real GOP infinite, so
+/// this is what `gop_size` is set to in IR mode.
 fn intra_refresh_period(fps: u32) -> i32 {
-    std::env::var("PUNKTFUNK_IR_PERIOD_FRAMES")
-        .ok()
-        .and_then(|s| s.parse::<i32>().ok())
-        .filter(|v| *v >= 2)
-        .unwrap_or_else(|| (fps.max(16) / 2) as i32)
+    super::policy::intra_refresh_period(fps) as i32
 }
 
 impl NvencEncoder {
