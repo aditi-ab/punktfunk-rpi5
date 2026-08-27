@@ -555,6 +555,15 @@ impl PipelineGap {
 /// negative). A frame drop means loss exceeded the current FEC budget (so `recovered` plateaus),
 /// so add a fixed bump to push the host's FEC up past the cap on the next adjustment. Returns
 /// parts-per-million, capped at 1e6.
+///
+/// EXCEPT the all-late window (`lost == 0 && late > 0`): every presumed-lost shard eventually
+/// ARRIVED — the frames died of lateness, not loss. That is a delivery HOLE (a host compose
+/// stall's resume edge, a client-radio pause), and neither lever this number drives can touch
+/// it: FEC repairs loss, not delay, and the host's bitrate backoff cannot shorten a hole.
+/// Bumping there was the false ratchet in the 2026-08-27 field log — `loss_ppm=50000` exactly,
+/// ×0.7³ to 6.86 Mbps in 4 s, on a wire with zero measured loss. A window with real silent loss
+/// keeps the bump: shards that never arrived at all sit in neither `recovered` nor `late`, so
+/// that window reads `late == 0` and still bumps.
 pub fn window_loss_ppm(recovered: u64, late: u64, received: u64, frames_dropped: u64) -> u32 {
     let lost = recovered.saturating_sub(late);
     let denom = received.saturating_add(lost);
@@ -562,7 +571,7 @@ pub fn window_loss_ppm(recovered: u64, late: u64, received: u64, frames_dropped:
         .saturating_mul(1_000_000)
         .checked_div(denom)
         .unwrap_or(0) as u32;
-    if frames_dropped > 0 {
+    if frames_dropped > 0 && (lost > 0 || late == 0) {
         ppm = ppm.saturating_add(50_000); // +5%: unrecoverable loss → raise FEC past the current cap
     }
     ppm.min(1_000_000)
@@ -1394,6 +1403,17 @@ mod tests {
         // `late` can outrun `recovered` across a window boundary (reorder straddling the report
         // tick) or via a rare wire duplicate — saturate at a clean window, never underflow.
         assert_eq!(window_loss_ppm(10, 25, 1000, 0), 0);
+        // The all-late window (lost == 0, late > 0): every presumed-lost shard arrived — the
+        // dropped frames died of LATENESS (a delivery hole), which neither FEC nor a bitrate
+        // backoff can fix. No bump — this was the 2026-08-27 false ratchet (loss_ppm=50000 on a
+        // wire with zero loss, ×0.7³ in 4 s).
+        assert_eq!(window_loss_ppm(50, 50, 1000, 2), 0);
+        assert_eq!(window_loss_ppm(10, 25, 1000, 4), 0);
+        // Mixed windows keep the bump: real net loss alongside lateness is still loss…
+        assert_eq!(window_loss_ppm(50, 30, 980, 1), 70_000);
+        // …and silent total loss (shards that never arrived count in NEITHER recovered nor
+        // late) reads late == 0 and still bumps — the case the bump exists for.
+        assert_eq!(window_loss_ppm(0, 0, 500, 2), 50_000);
     }
 
     #[test]
