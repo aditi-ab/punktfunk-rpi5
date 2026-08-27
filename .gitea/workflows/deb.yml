@@ -100,7 +100,7 @@ jobs:
       CC_x86_64_unknown_linux_gnu: sccache cc
       CXX_x86_64_unknown_linux_gnu: sccache c++
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
       # images; this heals the job while the running :latest predates the bake.
@@ -148,14 +148,14 @@ jobs:
       # cache is NOT; see below.
       - name: Cache keys
         run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             /usr/local/cargo/registry
             /usr/local/cargo/git
           key: cargo-home-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-home-
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           # -v3-: bypass a target cache poisoned by a disk-full build (see ci.yml).
@@ -204,7 +204,7 @@ jobs:
         run: echo "bunver=$(bun --version 2>/dev/null || echo none)" >> "$GITHUB_ENV"
       - name: Cache the built web console
         id: webconsole
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: web/.output
           key: web-console-linux-bun${{ env.bunver }}-${{ hashFiles('web/**', 'sdk/**') }}
@@ -343,7 +343,7 @@ jobs:
       CC_x86_64_unknown_linux_gnu: sccache cc
       CXX_x86_64_unknown_linux_gnu: sccache c++
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
       # images; this heals the job while the running :latest predates the bake.
@@ -373,14 +373,14 @@ jobs:
 
       - name: Cache keys
         run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             /usr/local/cargo/registry
             /usr/local/cargo/git
           key: cargo-home-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-home-
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           # Own key: this target dir is built against 24.04's glibc/toolchain and must NOT share
@@ -494,7 +494,7 @@ jobs:
       image: 192.168.1.58:5010/punktfunk-gamescope-trixie:latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Byte-identical to the other jobs' version step (pf-version.sh is deterministic per commit)
       # — but only DISTRIBUTION is used here. The package version is the gamescope upstream
@@ -513,7 +513,7 @@ jobs:
       # CACHED on packaging/gamescope/** alone — it depends on nothing else in this repo, so a
       # normal push restores a binary instead of spending ~10 minutes on someone else's tree.
       # Keyed `-trixie-` so the noble cache entries (which only ever held misses) can't be hit.
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: gamescope
         with:
           path: gs-cache
@@ -587,7 +587,7 @@ jobs:
       image: 192.168.1.58:5010/punktfunk-rust-ci-arm64cross:latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
       # images; this heals the job while the running :latest predates the bake.
@@ -622,14 +622,14 @@ jobs:
 
       - name: Cache keys
         run: echo "rustc=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_ENV"
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             /usr/local/cargo/registry
             /usr/local/cargo/git
           key: cargo-home-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-home-
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
           # Its OWN key — these are aarch64 artifacts under target/aarch64-unknown-linux-gnu/
@@ -709,7 +709,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Recomputes the SAME version string the builder jobs stamped — pf-version.sh is
       # deterministic per commit and GITHUB_RUN_NUMBER is shared across a run's jobs — so the check

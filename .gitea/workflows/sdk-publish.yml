@@ -37,7 +37,7 @@ jobs:
         working-directory: /
         run: apt-get update && apt-get install -y --no-install-recommends ca-certificates git nodejs
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Retried: bun's download-and-extract is single-shot, and a truncated tarball reads as
       # `Fail extracting tarball` (ci.yml's web job has the measurement). A publish job is the

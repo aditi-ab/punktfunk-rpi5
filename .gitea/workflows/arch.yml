@@ -163,7 +163,7 @@ jobs:
           fi
           echo "healed: builder now links $HAVE"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # A dispatched release rebuild takes its WORKFLOW from the ref you dispatch (the only
           # way it can carry inputs the tag predates) and its SOURCE from the tag. Empty string
@@ -174,7 +174,7 @@ jobs:
       # clients/windows, whose windows-reactor/windows deps are git-pinned — cargo must CLONE
       # them (windows-rs is huge) merely to resolve the workspace, even though nothing Windows
       # is ever compiled here. Cached, that cost is paid once per runner.
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             /usr/local/cargo/registry
@@ -241,7 +241,7 @@ jobs:
         run: echo "bunver=$(bun --version 2>/dev/null || echo none)" >> "$GITHUB_ENV"
       - name: Cache the built web console
         id: webconsole
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: web/.output
           key: web-console-linux-bun${{ env.bunver }}-${{ hashFiles('web/**', 'sdk/**') }}
@@ -359,7 +359,7 @@ jobs:
       # push restores the built package instead of spending ~10 minutes on someone else's C++ tree.
       # Arch is rolling, so the cache is invalidated by our own patch changes only — a stale binary
       # against newer system libs is the same risk the distro's own package carries between rebuilds.
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: gamescope
         with:
           path: dist-gamescope

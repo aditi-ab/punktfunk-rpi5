@@ -188,7 +188,7 @@ jobs:
             # rust-skia adds the target.
             session_flags: '--no-default-features'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Ensure Windows toolchain (WDK, Inno Setup, ARM64 target)
         shell: pwsh

@@ -145,7 +145,7 @@ jobs:
       # and a real `nix build` of a trivial derivation succeeds).
       NIX_REMOTE: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The Determinate installer needs curl + xz; git so nix can read the flake from the checkout;
       # rsync + ssh to ship the built cache to unom-1. (node:22-bookworm is the full image and

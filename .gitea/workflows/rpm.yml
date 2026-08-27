@@ -86,7 +86,7 @@ jobs:
     env:
       CARGO_HOME: /usr/local/cargo
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Shared compile cache (sccache -> RustFS S3 over the LAN). Baked into the builder
       # images; this heals the job while the running :latest predates the bake.
@@ -139,7 +139,7 @@ jobs:
             install -m0755 /tmp/bun /usr/local/bin/bun
           }
           bun --version
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /usr/local/cargo/registry
           key: cargo-home-fedora-${{ hashFiles('Cargo.lock') }}
@@ -181,7 +181,7 @@ jobs:
         run: echo "bunver=$(bun --version 2>/dev/null || echo none)" >> "$GITHUB_ENV"
       - name: Cache the built web console
         id: webconsole
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: web/.output
           key: web-console-linux-bun${{ env.bunver }}-${{ hashFiles('web/**', 'sdk/**') }}
@@ -284,7 +284,7 @@ jobs:
       # script). So the key is that directory's hash and a normal push restores a binary instead of
       # building one. Per-Fedora-major, because the binary is soname-coupled to its base exactly
       # like the RPM is — an f43 build does not start on f44 (libavutil.so.59 vs .60).
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: gamescope
         with:
           path: gs-cache

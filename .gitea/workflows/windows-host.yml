@@ -112,7 +112,7 @@ jobs:
     runs-on: windows-amd64
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Ensure Windows toolchain (WDK, FFmpeg, Inno Setup, ARM64 target)
         shell: pwsh
@@ -284,7 +284,7 @@ jobs:
       # see unom/infra runners/ci-core/README.md).
       - name: Cache web console output
         id: webconsole
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: web/.output
           key: web-console-win-${{ hashFiles('web/**', 'sdk/**') }}
@@ -541,7 +541,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Publish the canary update manifest
         env:
@@ -566,7 +566,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # build-data re-derives the WHOLE catalogue from the releases rather than appending this one,
       # so the result cannot drift and re-running any tag reproduces it byte for byte.

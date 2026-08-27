@@ -131,7 +131,7 @@ jobs:
 
       # node comes from the image now (act_runner execs a JS action with the CONTAINER's
       # node and injects none of its own), so checkout needs no install step ahead of it.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Tooling (baked — assert, don't install)
         run: |
@@ -178,7 +178,7 @@ jobs:
       # overwriting the baked installation with an older copy of itself. The crate sources
       # stay cached — they are keyed on Cargo.lock, which no image can pin.
       - name: Cache flatpak-builder state (crate sources, ccache)
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .flatpak-builder
           key: flatpak-builder-state-${{ hashFiles('Cargo.lock', 'packaging/flatpak/**') }}

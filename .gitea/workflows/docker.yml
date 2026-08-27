@@ -126,7 +126,7 @@ jobs:
           - image: punktfunk-flatpak-ci
             dockerfile: ci/flatpak-ci.Dockerfile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The key is the git TREE HASH of ci/ — every byte any of these Dockerfiles can see
       # (they all use ci/ as build context). One key for the whole family on purpose: a
@@ -224,7 +224,7 @@ jobs:
     env:
       IMAGE: punktfunk-rust-ci-arm64cross
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Content key
         run: |
@@ -305,7 +305,7 @@ jobs:
             dockerfile: docs-site/Dockerfile
             context: docs-site
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Login to registry
         # Username must be the owner of the REGISTRY_TOKEN PAT, not the push actor.
@@ -340,7 +340,7 @@ jobs:
     needs: apps
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Sync compose file
         # SHA-pinned (not tag-pinned): this action receives DEPLOY_SSH_KEY + host/user/port, so a
