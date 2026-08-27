@@ -63,7 +63,10 @@ object SendLogs {
                 .post(body.toRequestBody("text/plain; charset=utf-8".toMediaType()))
                 .build()
             client.newCall(req).execute().use { resp ->
-                if (resp.code == 200) "" else "host answered HTTP ${resp.code}"
+                // The host answers 201 Created, not 200 — this is a route that STORES a bundle
+                // (`mgmt/client_logs.rs`). Any 2xx is a success; OkHttp's own predicate spares us
+                // a second hand-written list of codes to get wrong.
+                if (resp.isSuccessful) "" else "host answered HTTP ${resp.code}"
             }
         }.getOrElse { it.message ?: "upload failed" }
         return if (err.isEmpty()) {
