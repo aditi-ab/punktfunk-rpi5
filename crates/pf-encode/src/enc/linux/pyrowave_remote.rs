@@ -369,7 +369,7 @@ fn handshake(mut link: Link, p: &Params, bitrate_bps: u64) -> Result<Handshake> 
     let hello = ToWorker::Hello {
         proto: worker::PROTO_VERSION,
         workspace_version: worker::WORKSPACE_VERSION.to_string(),
-        drm_node: std::env::var("PUNKTFUNK_RENDER_NODE").ok(),
+        drm_node: pf_gpu::render_node_env().map(|p| p.to_string_lossy().into_owned()),
         width: p.width,
         height: p.height,
         fps: p.fps,

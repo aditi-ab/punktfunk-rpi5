@@ -616,6 +616,20 @@ pub fn manual_selection() -> Option<GpuInfo> {
     gpus.into_iter().nth(i)
 }
 
+/// The raw `PUNKTFUNK_RENDER_NODE` override (the house DRM-node knob), parsed ONCE: trimmed,
+/// empty = unset. Three call sites used to read the env independently and disagreed on trim and
+/// empty handling. Callers that must NOT consult the console's manual GPU preference (PyroWave's
+/// oracle rules — no oracle may change ITS device selection) read this directly;
+/// [`linux_render_node`] layers the preference on top.
+#[cfg(target_os = "linux")]
+pub fn render_node_env() -> Option<PathBuf> {
+    std::env::var("PUNKTFUNK_RENDER_NODE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
 /// The VAAPI/DRM render node for this host: matched manual preference > `PUNKTFUNK_RENDER_NODE`
 /// (a deliberate live env read — see `config.rs` module docs) > `/dev/dri/renderD128`.
 #[cfg(target_os = "linux")]
@@ -625,11 +639,7 @@ pub fn linux_render_node() -> PathBuf {
     {
         return node;
     }
-    std::env::var("PUNKTFUNK_RENDER_NODE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/dev/dri/renderD128"))
+    render_node_env().unwrap_or_else(|| PathBuf::from("/dev/dri/renderD128"))
 }
 
 /// NVIDIA-presence probe (same device-node check as `encode::nvidia_present` — duplicated two
