@@ -1,6 +1,10 @@
 //! The `/serverinfo` capability/status XML Moonlight GETs before pairing and each launch.
 
-use super::{Host, APP_VERSION, GFE_VERSION, SERVER_CODEC_MODE_SUPPORT};
+use super::{Host, APP_VERSION, GFE_VERSION, SCM_HEVC, SERVER_CODEC_MODE_SUPPORT};
+
+/// The HEVC luma-pixel ceiling GFE advertises, which Moonlight compares the mode it wants
+/// against. Emitted only when the codec mask actually offers HEVC.
+const MAX_LUMA_PIXELS_HEVC: u64 = 1_869_449_984;
 
 /// Build the `<root status_code="200">…</root>` serverinfo document. `https` selects the
 /// paired-HTTPS variant (real MAC); `paired` is whether the HTTPS peer presented a client cert
@@ -32,6 +36,16 @@ pub fn serverinfo_xml(host: &Host, https: bool, paired: bool, current_game: u32)
         "SUNSHINE_SERVER_FREE"
     };
     let codec_mode_support = codec_mode_support();
+    // Follow the mask rather than stating this unconditionally: a host whose probe dropped HEVC
+    // (a software-encoder host does H.264 and nothing else) used to advertise capacity for HEVC in
+    // the same document that said it had no HEVC. Harmless while clients gate on the mask, but two
+    // advertisements that contradict each other stay harmless only by luck. `0` is the
+    // unambiguous "no HEVC capacity" answer in the field's own terms.
+    let max_luma_hevc = if codec_mode_support & SCM_HEVC != 0 {
+        MAX_LUMA_PIXELS_HEVC
+    } else {
+        0
+    };
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <root status_code="200">
@@ -41,7 +55,7 @@ pub fn serverinfo_xml(host: &Host, https: bool, paired: bool, current_game: u32)
 <uniqueid>{uniqueid}</uniqueid>
 <HttpsPort>{https_port}</HttpsPort>
 <ExternalPort>{http_port}</ExternalPort>
-<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>
+<MaxLumaPixelsHEVC>{max_luma_hevc}</MaxLumaPixelsHEVC>
 <mac>{mac}</mac>
 <LocalIP>{local_ip}</LocalIP>
 <ServerCodecModeSupport>{codec_mode_support}</ServerCodecModeSupport>
@@ -125,10 +139,8 @@ fn base_codec_mode_support() -> u32 {
     // Deliberately a local gate rather than delegating wholesale to `host_wire_caps()`: that would
     // be the drift-proof shape, but on Windows it re-runs the DXGI adapter enumeration several
     // times per `/serverinfo` GET (the probe helpers each sample it), and this endpoint is polled.
-    // The software case is a plain config read, so it costs nothing here. (Follow-up worth doing:
-    // the static `MaxLumaPixelsHEVC` in the XML above still advertises an HEVC limit even when the
-    // mask drops HEVC — harmless, since Moonlight gates on the mask, but it is a second and now
-    // inconsistent advertisement.)
+    // The software case is a plain config read, so it costs nothing here. (`MaxLumaPixelsHEVC`
+    // in the XML above now follows this mask, so the two can no longer disagree.)
     if matches!(
         pf_host_config::config().encoder_pref.as_str(),
         "software" | "sw" | "openh264"

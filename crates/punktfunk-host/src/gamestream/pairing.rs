@@ -25,6 +25,26 @@ use tokio::sync::Notify;
 /// own PIN; security-review 2026-06-28 #1). `getservercert` parks until a PIN arrives.
 /// Max pairing handshakes parked in [`PinGate::take`] at once (each holds a slot for up to
 /// 300s), bounding a pre-auth waiter flood. Real pairing is one operator-driven client at a time.
+///
+/// **On brute-forcing the 4-digit PIN** (audited 2026-08-27, apollo-comparison #96): 10⁴ is a
+/// small space, but nothing here is guessing at it, because **a network peer has no way to submit
+/// a PIN**. Submission is `POST /api/v1/pair/pin` on the bearer-authenticated management API and
+/// nowhere else, so there is no oracle to hammer and no attempt counter worth adding — a
+/// per-attempt cap would bound the *operator's* typos, not an attacker. A wrong PIN fails the
+/// ceremony and costs the attacker a fresh client handshake *and* a fresh operator submission,
+/// which is not a loop anyone can automate from the network.
+///
+/// What that leaves is not brute force but **capture**: the PIN slot is global and bound to no
+/// particular handshake, so a peer parked at the right moment can take the PIN the operator typed
+/// for someone else. That is the real residual, it is already narrowed twice — [`PinGate::submit`]
+/// refuses while more than one handshake is parked, and an unconsumed PIN expires rather than
+/// waiting to authenticate whoever knocks next — and the full fix is to key the gate by
+/// `uniqueid` (which also needs the management API to say *which* device is asking, so the
+/// operator answers a named prompt rather than a bare one).
+///
+/// The cap below does leak one bit to an unauthenticated peer — a refused `getservercert` tells it
+/// that `MAX_PARKED_WAITERS` handshakes are already parked. That is inherent to having a cap, and
+/// the alternative (an unbounded pre-auth park) is the worse trade.
 const MAX_PARKED_WAITERS: usize = 4;
 
 pub struct PinGate {

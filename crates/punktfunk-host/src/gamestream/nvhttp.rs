@@ -267,6 +267,10 @@ async fn h_launch(
             // waiting out its reconnect window — is reprieved by the stream thread, which resolves
             // the title anyway and so needs no second library scan here.
             st.quit.store(false, std::sync::atomic::Ordering::SeqCst);
+            // Fresh A/V ping payload for this session, before the client's RTSP SETUP asks for it:
+            // it is what the media planes use to tell this client's first datagram apart from any
+            // other arriving at the port from the same address.
+            st.mint_av_ping();
             *st.launch.lock().unwrap() = Some(session);
             tracing::info!(
                 w = session.width,
@@ -378,6 +382,10 @@ async fn h_resume(
             session.peer_ip = Some(a.ip());
         }
     }
+    // A resume is a new connection with a new RTSP handshake and new media threads, so it gets a
+    // new ping payload too — the old one may have been observed on the wire (RTSP is plaintext
+    // until `SS_ENC_CONTROL_V2`), and nothing that learns an endpoint after this point has seen it.
+    st.mint_av_ping();
     xml(session_url_xml(&st, "resume"))
 }
 

@@ -14,8 +14,10 @@
 //!
 //! The GCM nonce depends on what Moonlight negotiated (`encryptControlMessage` in
 //! moonlight-common-c). For `SS_ENC_CONTROL_V2` it is a 12-byte nonce with `seq` (LE) in bytes
-//! [0..4] and `b"CC"` (client→host) at [10..12]. For the legacy path — which we hit, since we
-//! advertise no encryption — it is a 16-byte nonce with only `iv[0] = seq & 0xff` and the rest
+//! [0..4] and `b"CC"` (client→host) at [10..12]. That is the path a stock client takes now that
+//! `SS_ENC_CONTROL_V2` is offered by default. The legacy path — a client that declines it, or a
+//! host set to `PUNKTFUNK_GS_ENCRYPT=video`/`0` — is a 16-byte nonce with only
+//! `iv[0] = seq & 0xff` and the rest
 //! zero. The tag is prepended to the ciphertext; there is no AAD; the key is the forward
 //! `hex::decode(rikey)`. We auto-detect the exact scheme via [`decrypt_control`] on the first
 //! packet that authenticates, since GCM gives no partial credit.
@@ -696,7 +698,8 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                 // EVIOCSFF until answered) and relay mixed rumble levels to the client.
                 //
                 // SECURITY NOTE (audit #5, legacy GCM nonce reuse): on the LEGACY control scheme
-                // (`NonceKind::Legacy*`, which we hit because we advertise no encryption) the nonce is
+                // (`NonceKind::Legacy*`, which we hit unless the client negotiated
+                // `SS_ENC_CONTROL_V2` — see `rtsp::SS_ENC_CONTROL_V2`) the nonce is
                 // just the per-direction `seq` (`iv[0]=seq&0xff`, rest zero) with NO direction byte —
                 // so host control messages (this `host_seq`, shared by rumble + the HDR-mode signal)
                 // and client input (its own seq) share the same (key, nonce) space when their seqs
@@ -705,8 +708,10 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                 // scheme adds `iv[10..12] = 'H','C'` to separate the host direction). It can't be fixed
                 // on the legacy wire without breaking Moonlight; the GCM key is the client-supplied
                 // `rikey` (so only a passive eavesdropper who missed the HTTPS /launch is the
-                // adversary). The real fix is V2 control-encryption negotiation; for untrusted networks
-                // use the native punktfunk/1 plane (correct per-direction nonces + seq-as-AAD).
+                // adversary). The real fix is V2 control-encryption negotiation, which this host now
+                // offers — a client that echoes `SS_ENC_CONTROL_V2` lands on `NonceKind::V2` and this
+                // note stops applying to it. For untrusted networks use the native punktfunk/1 plane
+                // (correct per-direction nonces + seq-as-AAD).
                 if let (Some(pid), Some(scheme)) = (peer, detected) {
                     let key = state.launch.lock().unwrap().map(|s| s.gcm_key);
                     // Remember it for the teardown message (see `last_key`).
@@ -1211,8 +1216,9 @@ fn encrypt_control(key: &[u8; 16], scheme: &Scheme, seq: u32, pt: &[u8]) -> Vec<
     wire
 }
 
-/// AES-128-GCM seal (companion to [`gcm_open`]); returns `ciphertext || tag`.
-fn gcm_seal(key: &[u8; 16], nonce: &[u8], pt: &[u8], aad: &[u8]) -> Vec<u8> {
+/// AES-128-GCM seal (companion to [`gcm_open`]); returns `ciphertext || tag`. Shared with the
+/// RTSP plane, which seals its own messages under the same session key.
+pub(super) fn gcm_seal(key: &[u8; 16], nonce: &[u8], pt: &[u8], aad: &[u8]) -> Vec<u8> {
     use aes_gcm::aead::consts::{U12, U16};
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use aes_gcm::{aes::Aes128, AesGcm};
@@ -1234,7 +1240,7 @@ fn gcm_seal(key: &[u8; 16], nonce: &[u8], pt: &[u8], aad: &[u8]) -> Vec<u8> {
 
 /// AES-128-GCM open with a 12- or 16-byte nonce and explicit AAD. Returns the plaintext iff
 /// the tag authenticates. `ct_tag` is `ciphertext || tag` (aes-gcm's expected order).
-fn gcm_open(key: &[u8; 16], nonce: &[u8], ct_tag: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn gcm_open(key: &[u8; 16], nonce: &[u8], ct_tag: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
     use aes_gcm::aead::consts::{U12, U16};
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use aes_gcm::{aes::Aes128, AesGcm};
