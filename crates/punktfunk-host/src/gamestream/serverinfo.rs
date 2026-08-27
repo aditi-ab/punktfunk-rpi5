@@ -16,12 +16,11 @@ use super::{Host, APP_VERSION, GFE_VERSION, SERVER_CODEC_MODE_SUPPORT};
 /// owner-only `/resume`/`/cancel` and break the reject/join/steal admission it gets via
 /// `/launch` today (and a busy signal over plain HTTP would leak what's running to the LAN).
 pub fn serverinfo_xml(host: &Host, https: bool, paired: bool, current_game: u32) -> String {
-    // MAC is hidden over plain HTTP (no per-client identity there).
-    let mac = if https {
-        "01:02:03:04:05:06"
-    } else {
-        "00:00:00:00:00:00"
-    };
+    // MAC is hidden over plain HTTP (no per-client identity there). Over HTTPS it is the REAL
+    // routed-NIC MAC (WP6.1): Moonlight persists this field for its Wake-on-LAN, so the fake
+    // constant this replaces made every client-side wake a silent no-op against this host.
+    let real_mac = if https { host_mac() } else { None };
+    let mac = real_mac.as_deref().unwrap_or("00:00:00:00:00:00");
     // PairStatus reflects the real allow-list: 1 only when the HTTPS peer's client-cert
     // fingerprint is pinned (the nvhttp handler computes `paired`); 0 otherwise (incl. plain HTTP).
     let pair_status = u8::from(paired);
@@ -57,6 +56,23 @@ pub fn serverinfo_xml(host: &Host, https: bool, paired: bool, current_game: u32)
         http_port = host.http_port,
         local_ip = host.local_ip(),
     )
+}
+
+/// The host's primary wake-capable MAC (`crate::wol::wake_macs`, routed NIC first) — cached on
+/// first SUCCESS only, because `/serverinfo` is polled and NIC enumeration per poll is waste,
+/// while a cold-booted host may have no routable address yet (the #366 boot-race lesson: a
+/// latched failure would advertise zeros forever). `None` until a read succeeds.
+fn host_mac() -> Option<String> {
+    static MAC: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let mut cached = MAC.lock().unwrap_or_else(|p| p.into_inner());
+    if cached.is_none() {
+        *cached = super::primary_local_ip()
+            .map(crate::wol::wake_macs)
+            .unwrap_or_default()
+            .into_iter()
+            .next();
+    }
+    cached.clone()
 }
 
 /// The `<ServerCodecModeSupport>` mask to advertise: the SDR baseline ([`base_codec_mode_support`])
@@ -235,6 +251,26 @@ mod tests {
         assert!(xml.contains(&format!(
             "<ServerCodecModeSupport>{mask}</ServerCodecModeSupport>"
         )));
+    }
+
+    /// WP6.1: plain HTTP never reveals a MAC; HTTPS carries the real routed-NIC MAC (or the
+    /// zeros fallback when none is readable — this CI host may have neither), and NEVER the
+    /// old fake `01:02:03:04:05:06` that made every Moonlight Wake-on-LAN a silent no-op.
+    #[test]
+    fn mac_is_real_or_hidden_never_fake() {
+        let host = Host {
+            hostname: "test".into(),
+            uniqueid: "uid".into(),
+            http_port: 47989,
+            https_port: 47984,
+            os_chain: "linux".into(),
+            os_name: "Linux".into(),
+        };
+        let http = serverinfo_xml(&host, false, false, 0);
+        assert!(http.contains("<mac>00:00:00:00:00:00</mac>"));
+        let https = serverinfo_xml(&host, true, true, 0);
+        assert!(!https.contains("01:02:03:04:05:06"), "the fake MAC is gone");
+        assert!(https.contains("<mac>"), "a mac element is always present");
     }
 
     /// WP3: `currentgame` + `state` move together — a caller shown a running app id gets
