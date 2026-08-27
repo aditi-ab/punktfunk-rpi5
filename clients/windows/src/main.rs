@@ -22,6 +22,9 @@
 
 #[cfg(windows)]
 mod app;
+// The `--console` couch hand-off, shared verbatim with `punktfunk-console.exe`.
+#[cfg(windows)]
+mod couch;
 // `punktfunk://` activation: single instance, hand-off, and the positional URL parse
 // (design/client-deep-links.md §4.2).
 #[cfg(windows)]
@@ -132,28 +135,7 @@ fn main() {
     // pairing, settings and Wake-on-LAN, all controller-driven. We just exec it and mirror
     // its exit code, so anything supervising this process sees the real result.
     if flag("--console") {
-        let mut cmd = std::process::Command::new(spawn::session_binary());
-        cmd.arg("--browse");
-        // A couch UI is fullscreen unless explicitly told otherwise.
-        if !flag("--windowed") {
-            cmd.arg("--fullscreen");
-        }
-        // Spawn (not `status()`) so the session's stderr rides the log tee — a couch launch
-        // (Start-menu tile, Steam shortcut) has no console to inherit either.
-        cmd.stderr(std::process::Stdio::piped());
-        let run = cmd.spawn().and_then(|mut child| {
-            if let Some(stderr) = child.stderr.take() {
-                logfile::forward_child_stderr(stderr);
-            }
-            child.wait()
-        });
-        match run {
-            Ok(st) => std::process::exit(st.code().unwrap_or(0)),
-            Err(e) => {
-                eprintln!("could not start the console UI: {e}");
-                std::process::exit(1);
-            }
-        }
+        couch::run_browse();
     }
 
     // Windowed (default): the WinUI 3 app owns host selection, settings, and pairing.
