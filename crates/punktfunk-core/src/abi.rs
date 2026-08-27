@@ -1743,6 +1743,7 @@ const _: () = {
     assert!(PUNKTFUNK_HOST_CAP_AUDIO_HIRES == crate::quic::HOST_CAP_AUDIO_HIRES);
     assert!(PUNKTFUNK_CLIENT_CAP_PAD_AUDIO == crate::quic::CLIENT_CAP_PAD_AUDIO);
     assert!(PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES == crate::quic::CLIENT_CAP_AUDIO_HIRES);
+    assert!(PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO == crate::quic::CLIENT_CAP_KEEP_HOST_AUDIO);
     assert!(PUNKTFUNK_PAD_AUDIO_KIND_HAPTICS == crate::quic::PAD_AUDIO_KIND_HAPTICS);
     assert!(PUNKTFUNK_PAD_AUDIO_KIND_SPEAKER == crate::quic::PAD_AUDIO_KIND_SPEAKER);
     // The setter's caps bits are the arrival flags bits 8/9 shifted down (the wire packing
@@ -2566,6 +2567,17 @@ pub const PUNKTFUNK_CLIENT_CAP_PAD_AUDIO: u8 = 0x08;
 /// asked for lossless — 1.5 Mbps to sound like transparent 256 kbps Opus is a poor trade, and
 /// 24-bit is where the plane earns its bandwidth. (Mirrors `quic::CLIENT_CAP_AUDIO_HIRES`.)
 pub const PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES: u8 = 0x10;
+
+/// [`punktfunk_connect_ex9`] `client_caps` bit: ask the host to leave its OWN audio devices
+/// alone for this session — capture whatever the operator's default playback device already
+/// is, instead of parking the desktop mix on a silent endpoint. The host keeps playing (the
+/// headphones plugged into the host PC stay live) and this client hears the same audio:
+/// Moonlight's "Mute host PC speakers" box, unchecked, per session.
+///
+/// REQUEST-only — there is no host-cap echo. An older host ignores the bit and re-routes as it
+/// always did, which degrades to "audio still works, the host went quiet", so an embedder may
+/// set it unconditionally from its user's setting. (Mirrors `quic::CLIENT_CAP_KEEP_HOST_AUDIO`.)
+pub const PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO: u8 = 0x20;
 
 /// A [`punktfunk_connect_ex10`] device name cut to what a [`crate::quic::Hello`] carries.
 /// [`crate::quic::HELLO_NAME_MAX`] is a BYTE cap while the cut must land on a character

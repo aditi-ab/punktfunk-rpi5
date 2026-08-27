@@ -511,14 +511,20 @@ final class SessionModel: ObservableObject {
             // the pointer and forwards shape/state, which StreamView draws as the real
             // NSCursor. Capture-mode sessions keep today's composited pointer.
             #if os(macOS)
-            let clientCaps: UInt8 =
+            let presentCaps: UInt8 =
                 (MouseInputMode(rawValue: effective.mouseMode) ?? .capture) == .desktop ? 0x01 : 0
             #else
             // iOS/tvOS run the stage-4 deadline presenter, whose link thread feeds
             // reportPhase — advertise the vsync-aware presenter (0x02, CLIENT_CAP_PHASE_LOCK).
             // macOS stays without it: the stage-2 arrival presenter has no latch grid.
-            let clientCaps: UInt8 = 0x02
+            let presentCaps: UInt8 = 0x02
             #endif
+            // "Keep host audio playing": the host taps its default playback device instead of
+            // parking it on a silent endpoint, so the speakers on the host PC stay live. Pure
+            // REQUEST — no host-cap echo — so an older host simply goes quiet as it always did.
+            let clientCaps =
+                presentCaps
+                | (effective.keepHostAudio ? PunktfunkConnection.clientCapKeepHostAudio : 0)
             let result = Result { try PunktfunkConnection(
                 host: host.address, port: host.port,
                 width: width, height: height, refreshHz: hz,

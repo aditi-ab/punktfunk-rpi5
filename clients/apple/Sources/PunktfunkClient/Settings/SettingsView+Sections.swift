@@ -627,6 +627,11 @@ extension SettingsView {
                     }
                 }
             }
+            described("The host's speakers or headphones keep playing while you stream — "
+                      + "needs a host on 0.32+",
+                      field: "keep_host_audio") {
+                Toggle("Keep host audio playing", isOn: scoped(SettingsFields.keepHostAudio))
+            }
             #if os(macOS)
             // Which speaker THIS Mac plays through is this device's audio routing (tier G).
             if !inProfileScope {

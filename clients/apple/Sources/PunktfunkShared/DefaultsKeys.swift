@@ -89,6 +89,13 @@ public enum DefaultsKey {
     /// speaker/mic or mic channel also bypasses it (the voice processor only follows the
     /// system default devices) — see SessionAudio's topology note.
     public static let echoCancel = "punktfunk.echoCancel"
+    /// Ask the host to leave ITS OWN audio devices alone for this session
+    /// (`PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO`): it captures whatever its default playback
+    /// device already is, so the speakers/headphones on the host PC keep playing while this
+    /// device hears the same audio. Off (the default) is today's behaviour — the host parks
+    /// playback on a silent endpoint and goes quiet for the session. Best-effort: an older
+    /// host ignores the ask and re-routes as it always did.
+    public static let keepHostAudio = "punktfunk.keepHostAudio"
     public static let speakerUID = "punktfunk.speakerUID"
     public static let micUID = "punktfunk.micUID"
     /// macOS: which input channel of the chosen mic device feeds the host. 0 = "Auto" (sum every

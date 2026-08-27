@@ -92,6 +92,17 @@ data class Settings(
      */
     val echoCancel: Boolean = true,
     /**
+     * Ask the host to leave ITS OWN audio devices alone for this session
+     * (`CLIENT_CAP_KEEP_HOST_AUDIO`): it captures whatever its default playback device already is,
+     * so the speakers or headphones on the host PC keep playing while this device hears the same
+     * audio. Off — the default, and what every build before this did — has the host park playback
+     * on a silent endpoint, which is why the host goes quiet the moment a stream starts.
+     *
+     * REQUEST-only: there is no host-cap echo, so an older host ignores the ask and re-routes as it
+     * always did ("audio still works, the host went quiet"), never a broken session.
+     */
+    val keepHostAudio: Boolean = false,
+    /**
      * How much the in-stream stats overlay shows — see [StatsVerbosity]. Defaults to
      * [StatsVerbosity.NORMAL] (the res/fps line + latency headline + reliability counters); the full
      * decoder/feed/equation HUD is [StatsVerbosity.DETAILED], and a single terse line is
@@ -330,6 +341,7 @@ class SettingsStore(context: Context) {
         codec = prefs.getString(K_CODEC, "auto") ?: "auto",
         micEnabled = prefs.getBoolean(K_MIC, false),
         echoCancel = prefs.getBoolean(K_ECHO_CANCEL, true),
+        keepHostAudio = prefs.getBoolean(K_KEEP_HOST_AUDIO, false),
         statsVerbosity = prefs.getString(K_STATS_VERBOSITY, null)
             ?.let { name -> StatsVerbosity.entries.firstOrNull { it.name == name } }
             // Migration from the pre-tier Boolean "stats_hud_enabled": an explicit OFF stays off;
@@ -387,6 +399,7 @@ class SettingsStore(context: Context) {
             .putString(K_CODEC, s.codec)
             .putBoolean(K_MIC, s.micEnabled)
             .putBoolean(K_ECHO_CANCEL, s.echoCancel)
+            .putBoolean(K_KEEP_HOST_AUDIO, s.keepHostAudio)
             .putString(K_STATS_VERBOSITY, s.statsVerbosity.name)
             .putString(K_TOUCH_MODE, s.touchMode.name)
             .putBoolean(K_GAMEPAD_UI, s.gamepadUiEnabled)
@@ -426,6 +439,7 @@ class SettingsStore(context: Context) {
         const val K_CODEC = "codec"
         const val K_MIC = "mic_enabled"
         const val K_ECHO_CANCEL = "echo_cancel"
+        const val K_KEEP_HOST_AUDIO = "keep_host_audio"
         const val K_STATS_VERBOSITY = "stats_verbosity"
 
         /** Pre-tier Boolean the [K_STATS_VERBOSITY] enum replaced — read once for migration, never

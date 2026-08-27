@@ -304,6 +304,7 @@ internal object ConsoleJson {
         j.put("mouse_mode", s.mouseMode.storedName)
         j.put("mic_enabled", s.micEnabled)
         j.put("echo_cancel", s.echoCancel)
+        j.put("keep_host_audio", s.keepHostAudio)
         j.put("audio_channels", s.audioChannels)
         j.put("audio_format", s.audioFormat)
         j.put("codec", s.codec)
@@ -361,6 +362,7 @@ internal object ConsoleJson {
                 ?: s.mouseMode,
             micEnabled = j.optBoolean("mic_enabled", s.micEnabled),
             echoCancel = j.optBoolean("echo_cancel", s.echoCancel),
+            keepHostAudio = j.optBoolean("keep_host_audio", s.keepHostAudio),
             audioChannels = j.optInt("audio_channels", s.audioChannels),
             audioFormat = str("audio_format", s.audioFormat),
             codec = str("codec", s.codec),

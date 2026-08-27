@@ -45,6 +45,7 @@ data class SettingsOverlay(
     val audioFormat: String? = null,
     val micEnabled: Boolean? = null,
     val echoCancel: Boolean? = null,
+    val keepHostAudio: Boolean? = null,
     val touchMode: TouchMode? = null,
     val mouseMode: MouseMode? = null,
     val invertScroll: Boolean? = null,
@@ -82,6 +83,7 @@ data class SettingsOverlay(
         audioFormat = audioFormat ?: base.audioFormat,
         micEnabled = micEnabled ?: base.micEnabled,
         echoCancel = echoCancel ?: base.echoCancel,
+        keepHostAudio = keepHostAudio ?: base.keepHostAudio,
         touchMode = touchMode ?: base.touchMode,
         mouseMode = mouseMode ?: base.mouseMode,
         invertScroll = invertScroll ?: base.invertScroll,
@@ -120,6 +122,8 @@ data class SettingsOverlay(
         audioFormat = if (after.audioFormat != before.audioFormat) after.audioFormat else audioFormat,
         micEnabled = if (after.micEnabled != before.micEnabled) after.micEnabled else micEnabled,
         echoCancel = if (after.echoCancel != before.echoCancel) after.echoCancel else echoCancel,
+        keepHostAudio =
+            if (after.keepHostAudio != before.keepHostAudio) after.keepHostAudio else keepHostAudio,
         touchMode = if (after.touchMode != before.touchMode) after.touchMode else touchMode,
         mouseMode = if (after.mouseMode != before.mouseMode) after.mouseMode else mouseMode,
         invertScroll = if (after.invertScroll != before.invertScroll) after.invertScroll else invertScroll,
@@ -152,6 +156,7 @@ data class SettingsOverlay(
         "audio_format" -> copy(audioFormat = null)
         "mic_enabled" -> copy(micEnabled = null)
         "echo_cancel" -> copy(echoCancel = null)
+        "keep_host_audio" -> copy(keepHostAudio = null)
         "touch_mode" -> copy(touchMode = null)
         "mouse_mode" -> copy(mouseMode = null)
         "invert_scroll" -> copy(invertScroll = null)
@@ -179,6 +184,7 @@ data class SettingsOverlay(
         if (audioFormat != null) add("audio_format")
         if (micEnabled != null) add("mic_enabled")
         if (echoCancel != null) add("echo_cancel")
+        if (keepHostAudio != null) add("keep_host_audio")
         if (touchMode != null) add("touch_mode")
         if (mouseMode != null) add("mouse_mode")
         if (invertScroll != null) add("invert_scroll")
@@ -214,6 +220,7 @@ data class SettingsOverlay(
         audioFormat?.let { j.put("audio_format", it) }
         micEnabled?.let { j.put("mic_enabled", it) }
         echoCancel?.let { j.put("echo_cancel", it) }
+        keepHostAudio?.let { j.put("keep_host_audio", it) }
         touchMode?.let { j.put("touch_mode", it.name) }
         mouseMode?.let { j.put("mouse_mode", it.storedName) }
         invertScroll?.let { j.put("invert_scroll", it) }
@@ -236,6 +243,7 @@ data class SettingsOverlay(
         private val KNOWN = setOf(
             "width", "height", "refresh_hz", "bitrate_kbps", "render_scale", "codec",
             "hdr_enabled", "compositor", "audio_channels", "audio_format", "mic_enabled", "echo_cancel",
+            "keep_host_audio",
             "touch_mode", "mouse_mode", "invert_scroll", "gamepad", "gamepad_forwarding",
             "system_buttons", "guide_gesture",
             "stats_verbosity",
@@ -255,6 +263,7 @@ data class SettingsOverlay(
             audioFormat = j.optStringOrNull("audio_format"),
             micEnabled = j.optBooleanOrNull("mic_enabled"),
             echoCancel = j.optBooleanOrNull("echo_cancel"),
+            keepHostAudio = j.optBooleanOrNull("keep_host_audio"),
             touchMode = j.optStringOrNull("touch_mode")
                 ?.let { n -> TouchMode.entries.firstOrNull { it.name == n } },
             mouseMode = j.optStringOrNull("mouse_mode")

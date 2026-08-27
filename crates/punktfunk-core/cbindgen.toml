@@ -98,6 +98,7 @@ include = ["PunktfunkEndReason"]
 # a benign redefinition in C. One name for one bit is the point — an embedder that reaches for
 # either spelling gets the same constant.
 "CLIENT_CAP_AUDIO_HIRES" = "PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES"
+"CLIENT_CAP_KEEP_HOST_AUDIO" = "PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO"
 "HOST_CAP_AUDIO_HIRES" = "PUNKTFUNK_HOST_CAP_AUDIO_HIRES"
 
 # R21: every remaining exported constant, prefixed. cbindgen emits a bare `#define` per

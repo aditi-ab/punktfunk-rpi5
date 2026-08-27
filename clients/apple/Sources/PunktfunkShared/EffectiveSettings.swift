@@ -33,6 +33,7 @@ public struct EffectiveSettings: Equatable, Sendable {
     public var audioFormat = AudioFormatChoice.opus.rawValue
     public var micEnabled = true
     public var echoCancel = true
+    public var keepHostAudio = false
     public var touchMode = "trackpad"
     public var mouseMode = "capture"
     public var invertScroll = false
@@ -101,6 +102,7 @@ public struct EffectiveSettings: Equatable, Sendable {
         audioFormat = str(DefaultsKey.audioFormat, audioFormat)
         micEnabled = bool(DefaultsKey.micEnabled, micEnabled)
         echoCancel = bool(DefaultsKey.echoCancel, echoCancel)
+        keepHostAudio = bool(DefaultsKey.keepHostAudio, keepHostAudio)
         touchMode = str(DefaultsKey.touchMode, touchMode)
         mouseMode = str(DefaultsKey.mouseMode, mouseMode)
         invertScroll = bool(DefaultsKey.invertScroll, invertScroll)
@@ -183,6 +185,7 @@ public struct EffectiveSettings: Equatable, Sendable {
         if let v = overlay.audioFormat { s.audioFormat = v }
         if let v = overlay.micEnabled { s.micEnabled = v }
         if let v = overlay.echoCancel { s.echoCancel = v }
+        if let v = overlay.keepHostAudio { s.keepHostAudio = v }
         if let v = overlay.touchMode { s.touchMode = v }
         if let v = overlay.mouseMode { s.mouseMode = v }
         if let v = overlay.invertScroll { s.invertScroll = v }

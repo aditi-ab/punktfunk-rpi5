@@ -275,6 +275,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
     launch: JString<'local>,
     device_name: JString<'local>,
     pad_audio_ok: jboolean,
+    keep_host_audio: jboolean,
 ) -> jlong {
     // Every JNI string this method needs, read up front in the one `Env` scope jni 0.22 grants a
     // native method; everything below is pure Rust over owned `String`s. `None` = the mandatory
@@ -436,6 +437,16 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect<'lo
         punktfunk_core::quic::CLIENT_CAP_PHASE_LOCK
             | if pad_audio_ok {
                 punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO
+            } else {
+                0
+            }
+            // The user's "Keep host audio playing" setting: the host taps whatever its default
+            // playback device already is instead of parking the desktop mix on a silent
+            // endpoint, so the speakers on the host PC stay live. REQUEST-only — there is no
+            // host-cap echo — so an older host ignores the bit and re-routes exactly as it
+            // always did ("the host went quiet"), never a broken session.
+            | if keep_host_audio {
+                punktfunk_core::quic::CLIENT_CAP_KEEP_HOST_AUDIO
             } else {
                 0
             },

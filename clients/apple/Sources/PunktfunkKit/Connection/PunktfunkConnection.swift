@@ -1446,6 +1446,13 @@ public final class PunktfunkConnection {
     /// auto-selected. Decoded by the Metal wavelet decoder, not VideoToolbox.
     public static let codecPyroWave: UInt8 = UInt8(PUNKTFUNK_CODEC_PYROWAVE)
 
+    /// `clientCaps` bit: ask the host to leave ITS OWN audio devices alone for this session —
+    /// it taps whatever its default playback device already is instead of parking the desktop
+    /// mix on a silent endpoint, so the host PC's speakers keep playing and this device hears
+    /// the same audio. REQUEST-only, no host-cap echo: an older host ignores it and goes quiet
+    /// exactly as it always did, so it is safe to set unconditionally from the user's setting.
+    public static let clientCapKeepHostAudio: UInt8 = UInt8(PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO)
+
     /// The `codec` SETTING (a `DefaultsKey.codec` / profile-overlay string) as a soft-preference
     /// byte; `0` = Automatic, i.e. the host decides. Lives here beside the bits so the settings
     /// string is mapped to the wire in exactly one place — a session and a speed test that

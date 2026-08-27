@@ -95,6 +95,11 @@ object NativeBridge {
          *  DualSense plane. Without it the host never sets `HOST_CAP_PAD_AUDIO` and emits nothing,
          *  so a captured pad's own render capabilities would have nothing to gate. */
         padAudioOk: Boolean,
+        /** Advertise `CLIENT_CAP_KEEP_HOST_AUDIO` — ask the host to tap its default playback
+         *  device instead of parking it on a silent endpoint, so the host PC's own speakers keep
+         *  playing. REQUEST-only (no host-cap echo): an older host ignores it and goes quiet
+         *  exactly as it always did. */
+        keepHostAudio: Boolean,
     ): Long
 
     /** 64-hex SHA-256 of the cert the host presented on [handle]; valid after a successful connect. */

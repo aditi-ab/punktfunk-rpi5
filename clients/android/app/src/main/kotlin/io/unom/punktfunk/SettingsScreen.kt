@@ -845,6 +845,13 @@ private fun AudioSettings(s: Settings, update: (Settings) -> Unit, onMicChange: 
                 "transparent. The overlay shows what a session actually got.",
         ) { f -> update(s.copy(audioFormat = f)) }
         ToggleRow(
+            title = "Keep host audio playing",
+            subtitle = "The host's speakers or headphones keep playing while you stream",
+            checked = s.keepHostAudio,
+            field = "keep_host_audio",
+            onCheckedChange = { on -> update(s.copy(keepHostAudio = on)) },
+        )
+        ToggleRow(
             title = "Microphone",
             subtitle = "Feeds this device's microphone to the host",
             checked = s.micEnabled,

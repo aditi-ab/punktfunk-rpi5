@@ -106,6 +106,10 @@ enum SettingsFields {
         .init(name: "echo_cancel", key: DefaultsKey.echoCancel,
               overlay: \.echoCancel, effective: \.echoCancel)
     }
+    static var keepHostAudio: SettingsField<Bool> {
+        .init(name: "keep_host_audio", key: DefaultsKey.keepHostAudio,
+              overlay: \.keepHostAudio, effective: \.keepHostAudio)
+    }
     static var touchMode: SettingsField<String> {
         .init(name: "touch_mode", key: DefaultsKey.touchMode,
               overlay: \.touchMode, effective: \.touchMode)
@@ -201,6 +205,7 @@ extension SettingsView {
         base.audioFormat = audioFormat
         base.micEnabled = micEnabled
         base.echoCancel = echoCancel
+        base.keepHostAudio = keepHostAudio
         base.gamepadType = gamepadType
         base.gamepadForwarding = gamepadForwarding
         base.statsVerbosity = statsVerbosityRaw
