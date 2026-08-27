@@ -305,6 +305,7 @@ pub fn capture_virtual_output(
         target,
         pref,
         want.hdr,
+        want.ten_bit_sdr,
         want.chroma_444,
         want.pyrowave,
         keep,

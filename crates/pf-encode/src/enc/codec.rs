@@ -33,7 +33,10 @@ use pf_frame::CapturedFrame;
 #[cfg(target_os = "windows")]
 pub(crate) fn ten_bit_input(format: pf_frame::PixelFormat, negotiated_depth: u8) -> bool {
     use pf_frame::PixelFormat;
-    let ten = matches!(format, PixelFormat::P010 | PixelFormat::Rgb10a2);
+    let ten = matches!(
+        format,
+        PixelFormat::P010 | PixelFormat::Rgb10a2 | PixelFormat::Rgb10a2Sdr
+    );
     if negotiated_depth >= 10 && !ten {
         tracing::warn!(
             ?format,

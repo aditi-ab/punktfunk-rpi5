@@ -390,14 +390,41 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 }
 ";
 
+/// The 10-bit **SDR** pass PS ([`HdrRgb10Converter::new_sdr_expand`]) — full-res, samples the
+/// 8-bit BGRA slot and writes the SAME sRGB values into the packed 10-bit target. No colour math
+/// on purpose: the UNORM sample→write roundtrip IS the 8→10 expansion (code 255/255 lands on
+/// 1023/1023), and the transfer stays sRGB/BT.709 exactly as the 8-bit SDR path treats BGRA —
+/// the depth gain is the ENCODER's (Main10 coding precision), not the source's.
+const SDR_RGB10_PS: &str = r"
+Texture2D<float4> tx : register(t0);
+SamplerState sm : register(s0);
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    return float4(tx.Sample(sm, uv).rgb, 1.0);
+}
+";
+
 impl HdrRgb10Converter {
+    /// The HDR pass: FP16 scRGB in, PQ-encoded BT.2020 RGB out.
     pub(crate) fn new(device: &ID3D11Device) -> Result<Self> {
+        Self::from_ps(
+            device,
+            HDR_RGB10_PS.replace("#include_common", HDR_P010_COMMON),
+        )
+    }
+
+    /// The 10-bit **SDR** pass: BGRA in, the same sRGB values out at 10-bit UNORM (see
+    /// [`SDR_RGB10_PS`]). Identical plumbing — only the pixel shader differs — so the two
+    /// depth paths share the VS/sampler/draw and cannot drift.
+    pub(crate) fn new_sdr_expand(device: &ID3D11Device) -> Result<Self> {
+        Self::from_ps(device, SDR_RGB10_PS.to_string())
+    }
+
+    fn from_ps(device: &ID3D11Device, src: String) -> Result<Self> {
         // SAFETY: every call is a `?`-checked D3D11 method on the live `device` borrow, over
         // fully-initialized stack descriptors and live `Option` out-params; `compile_shader`
         // receives `s!()` literals (its contract). Each created COM interface owns its own
         // reference, and no raw pointer outlives the call that produced it.
         unsafe {
-            let src = HDR_RGB10_PS.replace("#include_common", HDR_P010_COMMON);
             let vsb = compile_shader(HDR_VS, s!("main"), s!("vs_5_0"))?;
             let psb = compile_shader(&src, s!("main"), s!("ps_5_0"))?;
             let mut vs = None;

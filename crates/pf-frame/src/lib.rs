@@ -43,6 +43,13 @@ pub enum PixelFormat {
     /// produces this: scRGB FP16 desktop pixels are converted to BT.2020 PQ and written here, then
     /// handed to NVENC as `ABGR10` for an HEVC Main10 / HDR10 encode.
     Rgb10a2,
+    /// [`Rgb10a2`](Self::Rgb10a2)'s **SDR** twin: the same `R10G10B10A2` memory, but the values
+    /// are the plain sRGB desktop pixels expanded 8→10 bit — NOT PQ/BT.2020. The Windows 10-bit
+    /// SDR capture path produces this so NVENC encodes Main10 (finer coding precision = less
+    /// encode banding) under the ordinary BT.709 SDR VUI. A separate variant on purpose: the
+    /// encoder derives its colour signalling from the pixels that arrive, and one format
+    /// carrying two transfers would put PQ labels on SDR frames.
+    Rgb10a2Sdr,
     /// `NV12` (DXGI `NV12`): 8-bit BT.709 limited-range YUV 4:2:0. Produced by the D3D11 **video
     /// processor** (video engine, not the 3D engine) so the per-frame colour conversion doesn't fight a
     /// GPU-saturating game; handed to NVENC as `NV12` (it encodes YUV natively — no internal RGB→YUV).
@@ -111,8 +118,9 @@ pub fn drm_fourcc(format: PixelFormat) -> Option<u32> {
         X2Rgb10 => drm_fourcc_code(b"XR30"), // DRM_FORMAT_XRGB2101010
         X2Bgr10 => drm_fourcc_code(b"XB30"), // DRM_FORMAT_XBGR2101010
         // 24-bit packed RGB/BGR have no straightforward dmabuf import here; use the CPU path.
-        // Rgb10a2/P010 are Windows formats; Yuv444 is OUR convert output, never a capture source.
-        Rgb | Bgr | Rgb10a2 | P010 | Yuv444 => return None,
+        // Rgb10a2/Rgb10a2Sdr/P010 are Windows formats; Yuv444 is OUR convert output, never a
+        // capture source.
+        Rgb | Bgr | Rgb10a2 | Rgb10a2Sdr | P010 | Yuv444 => return None,
     })
 }
 
@@ -130,6 +138,13 @@ pub struct OutputFormat {
     /// HDR: the capturer converts to 10-bit (IDD-push FP16 → `P010`, or `Rgb10a2` for a 4:4:4 source).
     /// `false` = 8-bit SDR.
     pub hdr: bool,
+    /// 10-bit **SDR** session (`bit_depth == 10` negotiated, HDR not): on Windows the IDD-push
+    /// capturer expands the BGRA slot 8→10 bit into the packed [`PixelFormat::Rgb10a2Sdr`]
+    /// output so NVENC encodes Main10 under the BT.709 SDR VUI — finer coding precision without
+    /// touching the display's colour state (advanced colour stays off). Mutually exclusive with
+    /// `hdr` (the handshake resolves 10-bit HDR onto the `hdr` path). Ignored on Linux — no
+    /// SDR-10 capture chain exists there yet, and the handshake never negotiates it.
+    pub ten_bit_sdr: bool,
     /// Full-chroma 4:4:4 session: the capturer must keep full chroma. On Windows the IDD-push
     /// capturer hands the **BGRA** slot through (skipping the subsampling BGRA→NV12
     /// VideoConverter) so NVENC ingests full-chroma RGB and CSCs to 4:4:4 itself — measured
@@ -170,6 +185,9 @@ impl OutputFormat {
         OutputFormat {
             gpu,
             hdr,
+            // 10-bit SDR is punktfunk/1-native only (Moonlight's HDR checkbox is the whole
+            // depth story on the GameStream plane).
+            ten_bit_sdr: false,
             // The GameStream + spike paths are always 4:2:0 (4:4:4 is punktfunk/1-native only).
             chroma_444: false,
             // GameStream never negotiates PyroWave (native punktfunk/1 only).

@@ -234,6 +234,7 @@ fn sws_src(format: PixelFormat) -> Result<Pixel> {
         PixelFormat::Nv12
         | PixelFormat::P010
         | PixelFormat::Rgb10a2
+        | PixelFormat::Rgb10a2Sdr
         | PixelFormat::Yuv444
         | PixelFormat::X2Rgb10
         | PixelFormat::X2Bgr10 => {
@@ -250,7 +251,12 @@ fn sws_src(format: PixelFormat) -> Result<Pixel> {
 /// `submit_d3d11` then failed the depth check below, forever, with `reset()` unable to help
 /// because the rebuild re-derived the same wrong answer.
 fn is_10bit_format(format: PixelFormat) -> bool {
-    matches!(format, PixelFormat::P010 | PixelFormat::Rgb10a2)
+    // Rgb10a2Sdr joins for honesty, though it can't arrive here: the 10-bit SDR chain is
+    // gated to the direct-NVENC backend at the handshake.
+    matches!(
+        format,
+        PixelFormat::P010 | PixelFormat::Rgb10a2 | PixelFormat::Rgb10a2Sdr
+    )
 }
 
 /// Which lane the system-memory path routes a captured D3D11 format through. Device-free — the

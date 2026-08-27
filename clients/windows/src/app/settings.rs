@@ -487,9 +487,11 @@ struct OverrideFlags {
     codec: bool,
     hdr_enabled: bool,
     enable_444: bool,
+    ten_bit_sdr: bool,
     compositor: bool,
     audio_channels: bool,
     audio_format: bool,
+    keep_host_audio: bool,
     mic_enabled: bool,
     echo_cancel: bool,
     touch_mode: bool,
@@ -523,9 +525,11 @@ impl OverrideFlags {
             codec: o.codec.is_some(),
             hdr_enabled: o.hdr_enabled.is_some(),
             enable_444: o.enable_444.is_some(),
+            ten_bit_sdr: o.ten_bit_sdr.is_some(),
             compositor: o.compositor.is_some(),
             audio_channels: o.audio_channels.is_some(),
             audio_format: o.audio_format.is_some(),
+            keep_host_audio: o.keep_host_audio.is_some(),
             mic_enabled: o.mic_enabled.is_some(),
             echo_cancel: o.echo_cancel.is_some(),
             touch_mode: o.touch_mode.is_some(),
@@ -919,6 +923,9 @@ pub(crate) fn settings_page(
     let hdr_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.hdr_enabled, |s, on| {
         s.hdr_enabled = on
     });
+    let ten_bit_sdr_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.ten_bit_sdr, |s, on| {
+        s.ten_bit_sdr = on
+    });
     let chroma_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.enable_444, |s, on| {
         s.enable_444 = on
     });
@@ -1066,6 +1073,10 @@ pub(crate) fn settings_page(
     let format_combo = setting_combo(ctx, scope, (rev, set_rev), af_names, af_i, |s, i| {
         s.audio_format = AUDIO_FORMATS[i].0.to_string();
     });
+    let keep_host_audio_toggle =
+        setting_toggle(ctx, scope, (rev, set_rev), s.keep_host_audio, |s, on| {
+            s.keep_host_audio = on
+        });
     let mic_toggle = setting_toggle(ctx, scope, (rev, set_rev), s.mic_enabled, |s, on| {
         s.mic_enabled = on
     });
@@ -1230,6 +1241,17 @@ pub(crate) fn settings_page(
                         "Full-colour video: crisp small text and thin lines, at more \
                          bandwidth. Requires an NVIDIA host (NVENC) or the PyroWave \
                          codec \u{2014} other encoders stream 4:2:0.",
+                    ),
+                    described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "ten_bit_sdr",
+                        "10-bit SDR",
+                        over.ten_bit_sdr,
+                        ten_bit_sdr_toggle,
+                        "Smoother gradients without HDR \u{2014} the picture is encoded at \
+                         10-bit precision. Needs an NVIDIA host; HDR takes over when it \
+                         engages.",
                     ),
                 ],
                 None,
@@ -1541,6 +1563,17 @@ pub(crate) fn settings_page(
                              rate; the stats overlay names what the session actually got.",
                         )
                     }),
+                    Some(described_overridable(
+                        (rev, set_rev),
+                        scope,
+                        "keep_host_audio",
+                        "Keep host audio playing",
+                        over.keep_host_audio,
+                        keep_host_audio_toggle,
+                        "The host\u{2019}s own speakers or headphones keep playing while you \
+                         stream \u{2014} both ends hear the same audio. Needs a host on 0.32 \
+                         or newer.",
+                    )),
                     // The endpoint picks are facts about THIS device's hardware — never
                     // per profile, like Decoder/GPU.
                     (!profile_mode)

@@ -100,6 +100,14 @@ impl CaptureMode {
 /// An unrecognised value resolves to the default rather than failing: this is a field-debugging
 /// lever, and a typo in it must not cost a session its audio.
 fn capture_mode() -> CaptureMode {
+    if crate::audio::capture_policy::session_keeps_default() {
+        // A live session asked for the host's audio devices to be left alone
+        // (`CLIENT_CAP_KEEP_HOST_AUDIO`): follow the operator's default sink and tap its
+        // monitor — the sink keeps playing on the host, no default-sink claim. Wins over
+        // `PUNKTFUNK_STREAM_SINK` for the same reason `follow_default` beats a stale
+        // `PUNKTFUNK_HOST_AUDIO`: "don't touch my devices" is the more restrictive promise.
+        return CaptureMode::Monitor;
+    }
     capture_mode_from(std::env::var("PUNKTFUNK_STREAM_SINK").ok().as_deref())
 }
 

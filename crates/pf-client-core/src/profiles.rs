@@ -56,6 +56,8 @@ pub struct SettingsOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_444: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ten_bit_sdr: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub compositor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_channels: Option<u8>,
@@ -66,6 +68,8 @@ pub struct SettingsOverlay {
     /// same key, so one catalog covers all four clients.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_host_audio: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mic_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -140,6 +144,9 @@ impl SettingsOverlay {
         if let Some(v) = self.enable_444 {
             s.enable_444 = v;
         }
+        if let Some(v) = self.ten_bit_sdr {
+            s.ten_bit_sdr = v;
+        }
         if let Some(v) = &self.compositor {
             s.compositor = v.clone();
         }
@@ -148,6 +155,9 @@ impl SettingsOverlay {
         }
         if let Some(v) = &self.audio_format {
             s.audio_format = v.clone();
+        }
+        if let Some(v) = self.keep_host_audio {
+            s.keep_host_audio = v;
         }
         if let Some(v) = self.mic_enabled {
             s.mic_enabled = v;
@@ -242,6 +252,9 @@ impl SettingsOverlay {
         if after.enable_444 != before.enable_444 {
             self.enable_444 = Some(after.enable_444);
         }
+        if after.ten_bit_sdr != before.ten_bit_sdr {
+            self.ten_bit_sdr = Some(after.ten_bit_sdr);
+        }
         if after.compositor != before.compositor {
             self.compositor = Some(after.compositor.clone());
         }
@@ -250,6 +263,9 @@ impl SettingsOverlay {
         }
         if after.audio_format != before.audio_format {
             self.audio_format = Some(after.audio_format.clone());
+        }
+        if after.keep_host_audio != before.keep_host_audio {
+            self.keep_host_audio = Some(after.keep_host_audio);
         }
         if after.mic_enabled != before.mic_enabled {
             self.mic_enabled = Some(after.mic_enabled);
@@ -321,9 +337,11 @@ impl SettingsOverlay {
             "codec" => self.codec = None,
             "hdr_enabled" => self.hdr_enabled = None,
             "enable_444" => self.enable_444 = None,
+            "ten_bit_sdr" => self.ten_bit_sdr = None,
             "compositor" => self.compositor = None,
             "audio_channels" => self.audio_channels = None,
             "audio_format" => self.audio_format = None,
+            "keep_host_audio" => self.keep_host_audio = None,
             "mic_enabled" => self.mic_enabled = None,
             "echo_cancel" => self.echo_cancel = None,
             "touch_mode" => self.touch_mode = None,

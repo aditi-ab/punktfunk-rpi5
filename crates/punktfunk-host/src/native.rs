@@ -2246,10 +2246,28 @@ async fn serve_session(
     // the closure only runs when the title actually has prep steps.
     let _prep = hello.launch.as_deref().and_then(|id| {
         let cmds = crate::library::prep_for(id);
-        let env = [("PF_APP_ID".to_string(), id.to_string())];
+        // The app identity plus the negotiated mode (`prep_mode_env` — the marker file's
+        // `PF_STREAM_*` vocabulary), so a prep step can set a per-mode FPS cap instead of
+        // hard-coding one per device.
+        let mut env = vec![("PF_APP_ID".to_string(), id.to_string())];
+        env.extend(crate::hooks::prep_mode_env(
+            hello.mode.width,
+            hello.mode.height,
+            hello.mode.refresh_hz,
+            welcome.color.is_hdr(),
+        ));
         (!cmds.is_empty())
             .then(|| tokio::task::block_in_place(|| crate::hooks::run_prep(&cmds, &env)))
     });
+    // The client asked for this box's audio devices to be left alone
+    // (`CLIENT_CAP_KEEP_HOST_AUDIO` — its "keep playing on the host" setting): hold the
+    // wiring override for exactly this session's lifetime, BEFORE the data plane opens the
+    // audio capture. Windows then skips the IPolicyConfig default parking and loopbacks the
+    // operator's own default device; Linux taps the default sink's monitor instead of
+    // claiming the default. RAII — every exit path hands the devices back.
+    let _keep_host_audio = (hello.client_caps & punktfunk_core::quic::CLIENT_CAP_KEEP_HOST_AUDIO
+        != 0)
+        .then(crate::audio::capture_policy::keep_host_audio_guard);
     // The resolved number is the session's TOTAL WIRE budget (RFC §5.1): the Welcome, every
     // ack, the HUD and this whole control plane speak budget — only the encoder opens are
     // handed the derived video rate (`EncDerive` in the stream loop: budget minus the audio
@@ -2262,8 +2280,11 @@ async fn serve_session(
     // unconditionally (`resolve_bitrate_kbps_for` overrode any explicit rate — RFC §5.2).
     let bitrate_auto = hello.bitrate_kbps == 0 || codec == crate::encode::Codec::PyroWave;
     let bit_depth = welcome.bit_depth; // resolved encode bit depth (8, or 10 when negotiated)
-                                       // Resolved chroma — derive the typed value back from the wire byte the Welcome carried (so the
-                                       // session uses exactly what the client was told). `Yuv444` only when the handshake gate passed.
+                                       // The session's HDR verdict — read back from the Welcome's colour label (what the client
+                                       // was told) rather than re-derived from the depth: a 10-bit SDR session says 10 + SDR.
+    let hdr = welcome.color.is_hdr();
+    // Resolved chroma — derive the typed value back from the wire byte the Welcome carried (so the
+    // session uses exactly what the client was told). `Yuv444` only when the handshake gate passed.
     let chroma = if welcome.chroma_format == punktfunk_core::quic::CHROMA_IDC_444 {
         crate::encode::ChromaFormat::Yuv444
     } else {
@@ -2455,6 +2476,7 @@ async fn serve_session(
                         client_packets_received,
                         bitrate_auto,
                         bit_depth,
+                        hdr,
                         chroma,
                         codec,
                         probe_rx,

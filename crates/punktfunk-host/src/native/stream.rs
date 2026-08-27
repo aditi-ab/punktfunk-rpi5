@@ -1429,8 +1429,13 @@ pub(super) struct SessionContext {
     /// the NEGOTIATED MODE (`resolve_bitrate_kbps_for`) — a mid-stream mode switch re-resolves it
     /// for the new mode (the pin follows the resolution; an explicit client rate stays put).
     pub(super) bitrate_auto: bool,
-    /// Negotiated encode bit depth (8, or 10 = HEVC Main10).
+    /// Negotiated encode bit depth (8, or 10 = HEVC Main10 / 10-bit AV1). Does NOT imply HDR —
+    /// `hdr` below carries that separately (the 10-bit SDR path).
     pub(super) bit_depth: u8,
+    /// The session's HDR verdict — the Welcome's colour label (`welcome.color.is_hdr()`), which
+    /// the handshake resolved from the client's `VIDEO_CAP_HDR` ask + the capturer's HDR
+    /// capability. Drives the virtual display's HDR bring-up and the capturer's want-HDR flag.
+    pub(super) hdr: bool,
     /// Negotiated chroma subsampling (4:2:0, or 4:4:4 when the client + host + GPU all support it).
     pub(super) chroma: crate::encode::ChromaFormat,
     /// Negotiated video codec the encoder emits (HEVC by default; H.264 / AV1 when the client
@@ -1650,6 +1655,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
     // only per-session input — capture/topology/encoder are otherwise pure functions of `HostConfig`.
     let mut plan = crate::session_plan::SessionPlan::resolve(
         ctx.bit_depth,
+        ctx.hdr,
         ctx.chroma,
         ctx.codec,
         // Blend CAPABILITY (the single rule in `cursor_blend_for`): cursor-FORWARD sessions
@@ -1708,6 +1714,7 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
         client_packets_received,
         bitrate_auto,
         bit_depth,
+        hdr,
         // The resolved chroma is already captured in `plan` (above); ignore the duplicate here.
         chroma: _,
         // Likewise the codec — `plan.codec` (resolved from `ctx.codec`) is the source of truth below.
@@ -1910,11 +1917,12 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             // panel instead of the driver's built-in ~1000-nit placeholder. No-op on Linux
             // backends and for older/SDR clients.
             vd.set_client_hdr(client_hdr);
-            // THIS SESSION's colourimetry (distinct from the client panel's volume above): a
-            // 10-bit session needs the output brought up HDR, which on gamescope means spawning
+            // THIS SESSION's colourimetry (distinct from the client panel's volume above): an
+            // HDR session needs the output brought up HDR, which on gamescope means spawning
             // it with the HDR flags so nested games get HDR surfaces at all. Decided in the
             // Welcome (`capture::capturer_supports_hdr_for`), so it cannot change under us.
-            vd.set_hdr(bit_depth >= 10);
+            // The HDR verdict, not the depth — a 10-bit SDR session leaves the output SDR.
+            vd.set_hdr(hdr);
             // Out-of-band cursor request: cursor-forward sessions (Windows pf-vdisplay /
             // IddCx hardware cursor; Linux metadata mode) AND no-channel host-composite
             // sessions (Linux only — `metadata_composite` is `plan.cursor_blend`-gated, so
@@ -4815,6 +4823,9 @@ pub(super) fn prepare_display(
     // Passed through to [`build_pipeline`] — see its parameter of the same name.
     bitrate_auto: bool,
     bit_depth: u8,
+    // The session's HDR verdict (the Welcome's colour label) — NOT derivable from the depth
+    // since the 10-bit SDR path exists.
+    hdr: bool,
     // The budget→encoder conversion for the prep build (Welcome-time FEC snapshot — the
     // session loop's FEC watcher takes over once streaming).
     enc_of: super::EncDerive,
@@ -4830,6 +4841,7 @@ pub(super) fn prepare_display(
     // Welcome value passed here.
     let mut plan = crate::session_plan::SessionPlan::resolve(
         bit_depth,
+        hdr,
         chroma,
         codec,
         // Blend capability — must MATCH virtual_stream's resolve. Windows-only path, where
@@ -4852,7 +4864,8 @@ pub(super) fn prepare_display(
     let mut vd = crate::vdisplay::open(compositor)?;
     vd.set_client_identity(client_identity);
     vd.set_client_hdr(client_hdr);
-    vd.set_hdr(bit_depth >= 10);
+    // The session's HDR verdict, not the depth — a 10-bit SDR session leaves the output SDR.
+    vd.set_hdr(hdr);
     vd.set_hw_cursor(cursor_forward);
     vd.set_quit_flag(quit.clone());
     // Slot-scoped setup serialization + reconnect preempt — see the inline arm in
@@ -5309,10 +5322,11 @@ fn build_pipeline(
     // Pace the encoder + frame clock at the session's rate, floored by what the display achieved
     // — never above either.
     let effective_hz = pacing_hz(mode.refresh_hz, achieved_hz);
-    // HDR vs SDR for the IDD-push conversion: a negotiated 10-bit session (client advertised
-    // VIDEO_CAP_10BIT + host opted in via PUNKTFUNK_10BIT) is our HDR path → BT.2020 PQ Rgb10a2;
-    // otherwise the FP16 IDD frames are converted to 8-bit SDR. (Ignored by non-IDD-push backends,
-    // which auto-detect HDR from the monitor state.)
+    // HDR vs SDR for the IDD-push conversion: a negotiated HDR session (client advertised
+    // VIDEO_CAP_10BIT|VIDEO_CAP_HDR + host opted in via PUNKTFUNK_10BIT) is our HDR path →
+    // BT.2020 PQ; a 10-bit SDR session (`plan.ten_bit_sdr` via `output_format()`) expands
+    // BGRA 8→10 under the SDR VUI; otherwise the frames convert to 8-bit SDR. (Ignored by
+    // non-IDD-push backends, which auto-detect HDR from the monitor state.)
     //
     // KWin rewrites `SPA_META_Cursor` on every buffer, so its id-0 metas are an authoritative
     // "pointer hidden" the cursor blend/forward must honor — without this, the composited arrow

@@ -74,8 +74,10 @@ pub struct SessionOpts {
     pub invert_scroll: bool,
     /// Send system chords (Alt+Tab, the Windows key / Super) to the host while input is
     /// captured ([`Settings::inhibit_shortcuts`], default on). Off keeps them local — the
-    /// work profile that streams on a second screen and still Alt-Tabs here. Never applies
-    /// under the `desktop` mouse model, which is something you Alt-Tab *away* from.
+    /// work profile that streams on a second screen and still Alt-Tabs here. Applies in
+    /// BOTH mouse models (a remote desktop needs the host's Start menu too — see
+    /// [`apply_capture`]); the desktop model's unlocked pointer clicking another window
+    /// is the always-available way back.
     pub inhibit_shortcuts: bool,
     /// Presentation intent ([`Settings::present_priority`] resolved): `Latency` keeps the
     /// shipped arrival pacing (newest-wins, present the moment a frame can go out);
@@ -1217,20 +1219,30 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         // Cursor channel (M2): drain forwarded shape/state and drive the local OS cursor —
         // only meaningful in the desktop mouse model (capture's relative lock hides it).
         if let Some(st) = stream.as_mut() {
-            // Host-framebuffer px → window px: the aspect-fit factor the video is drawn at
-            // (same `min(surface/content)` as `finger_to_content`). The forwarded pointer is
-            // resampled by it so a high-DPI host's oversized bitmap lands sized to the streamed
-            // desktop rather than ballooning. 1:1 until the first frame gives `last_video`.
-            let fit_scale = st.last_video.map_or(1.0, |(vw, vh)| {
+            // Host-framebuffer px → cursor-surface px: the aspect-fit factor the video is
+            // drawn at (same `min(surface/content)` as `finger_to_content`) — times the
+            // client display's own content scale. Fit alone sizes the pointer to the
+            // STREAMED desktop (a high-DPI host's oversized bitmap lands proportional
+            // instead of ballooning) but ignores the panel it lands on: SDL shows a custom
+            // cursor's surface at ~1:1 physical pixels on every backend (Windows HCURSOR,
+            // XcursorImage, Wayland buffer-scale/viewport), so on a 200 % client every
+            // native pointer is 2× and ours came out half their size (2026-08 field
+            // report). The Apple client never had this hole — NSCursor is sized in POINTS,
+            // so its fit-only scale rides the backing factor for free; multiplying by
+            // `display_scale` is the same model spelled in pixels. 1:1 until the first
+            // frame gives `last_video`; 0 is SDL's display-scale error value, treated as 1.
+            let cursor_scale = st.last_video.map_or(1.0, |(vw, vh)| {
                 let (pw, ph) = window.size_in_pixels();
-                (pw as f32 / vw.max(1) as f32).min(ph as f32 / vh.max(1) as f32)
+                let fit = (pw as f32 / vw.max(1) as f32).min(ph as f32 / vh.max(1) as f32);
+                let density = window.display_scale();
+                fit * if density > 0.0 { density } else { 1.0 }
             });
             if let (Some(chan), Some(c)) = (st.cursor_chan.as_mut(), st.connector.as_ref()) {
                 let desktop_active = st
                     .capture
                     .as_ref()
                     .is_some_and(|cap| cap.captured() && cap.desktop());
-                chan.pump(c, &mouse, desktop_active, fit_scale);
+                chan.pump(c, &mouse, desktop_active, cursor_scale);
                 // §8 mid-stream render flip: tell the host who renders the pointer whenever the
                 // local model changes. The host may composite one ONLY while we hold a grabbed,
                 // hidden pointer — the capture model, engaged — because that is the one state
@@ -2666,8 +2678,12 @@ impl ResizeIndicator {
 /// The `desktop` mouse model never locks: the pointer roams (and leaves the window)
 /// freely, the local cursor is hidden over the window — the host's composited cursor,
 /// tracking our absolute sends, is the one you see (until the M2 cursor channel flips
-/// who draws it) — and system chords stay local (a remote desktop is something you
-/// Alt-Tab away from, not into). `desktop` only matters while `on`.
+/// who draws it). The keyboard grab follows `inhibit` in BOTH models: the earlier
+/// "desktop is something you Alt-Tab away from" rule made the setting inert exactly for
+/// the remote-desktop use it matters most for (Win opens the HOST's Start menu or it's
+/// not a desktop), and desktop mode keeps a way out capture mode doesn't have — the
+/// unlocked pointer clicks any other window, focus is lost, and the chords come back.
+/// `desktop` only matters while `on`.
 ///
 /// `grants` is the session's effective access mask (per-client access §7 "not capture
 /// what can't land"): no pointer lock without the POINTER bit, no keyboard grab without
@@ -2690,7 +2706,7 @@ fn apply_capture(
     // POINTER grant no absolute/relative send lands, so hiding it would leave a
     // keyboard-only session with no cursor at all.
     mouse.show_cursor(!(on && pointer));
-    let grab = on && !desktop && inhibit && grants & GRANT_KEYBOARD != 0;
+    let grab = on && inhibit && grants & GRANT_KEYBOARD != 0;
     if !window.set_keyboard_grab(grab) && grab {
         // The one refusal SDL reports is a missing mechanism — a Wayland compositor with no
         // shortcuts-inhibit global. Said once per process: the answer never changes

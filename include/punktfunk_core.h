@@ -834,12 +834,16 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) HEVC stream.
+// [`Hello::video_caps`] bit: the client can decode a 10-bit (Main10) stream. Alone — without
+// [`VIDEO_CAP_HDR`] — it is the **10-bit SDR** ask (0.32, the client's "10-bit SDR" setting):
+// the host encodes the SDR desktop at Main10 precision under a BT.709 SDR VUI, and neither
+// display's colour state is touched. Every pre-0.32 client sets the two bits together.
 #define PUNKTFUNK_VIDEO_CAP_10BIT 1
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`Hello::video_caps`] bit: the client can present BT.2020 PQ HDR10 (implies 10-bit).
+// [`Hello::video_caps`] bit: the client can present BT.2020 PQ HDR10 (implies 10-bit — set
+// together with [`VIDEO_CAP_10BIT`]).
 #define PUNKTFUNK_VIDEO_CAP_HDR 2
 #endif
 
@@ -1068,8 +1072,26 @@
 // requesting must not set this bit.
 //
 // `0x10` — `0x08` is [`CLIENT_CAP_PAD_AUDIO`], `0x04` is [`CLIENT_CAP_AUDIO_RED`], `0x02` is
-// [`CLIENT_CAP_PHASE_LOCK`], `0x01` is [`CLIENT_CAP_CURSOR`]. `0x20`/`0x40`/`0x80` remain free.
+// [`CLIENT_CAP_PHASE_LOCK`], `0x01` is [`CLIENT_CAP_CURSOR`].
 #define PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES 16
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Hello::client_caps`] bit: this session asks the host to leave the host's OWN audio devices
+// alone — capture whatever the operator's default playback device already is, instead of
+// re-routing the desktop mix onto a silent (or preferred) endpoint. A loopback/monitor tap
+// doesn't silence the device it taps, so the host keeps playing (the headphones plugged into
+// the host PC stay live) and the client hears the same audio — Moonlight's "Mute host PC
+// speakers" box, unchecked, as a per-session client choice.
+//
+// The user's-setting precedent ([`CLIENT_CAP_AUDIO_HIRES`]), and REQUEST-only — no `HOST_CAP`
+// echo: an older host ignores the bit and re-routes as it always did, which degrades to
+// "audio still works, host went quiet", not a broken session. Per-session best-effort on the
+// host: with several concurrent sessions the wiring is host-global, so any live session that
+// asked wins for all of them until it ends. Composes with the host-wide
+// `PUNKTFUNK_AUDIO_OUTPUT_MODE=follow_default`, which is this behaviour for every session.
+// `0x20` — `0x10` is [`CLIENT_CAP_AUDIO_HIRES`]; `0x40`/`0x80` remain free.
+#define CLIENT_CAP_KEEP_HOST_AUDIO 32
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

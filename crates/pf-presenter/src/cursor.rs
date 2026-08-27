@@ -8,10 +8,12 @@
 //!
 //! The host sends the bitmap in host-FRAMEBUFFER pixels, whose size tracks the host virtual
 //! display's DPI scaling (32 px at 100%, 96 px at 300%). Drawn 1:1 it balloons on a high-DPI
-//! host; instead we scale it by the SAME aspect-fit factor the video is drawn at
-//! (`min(window_px/mode)`), so the pointer stays sized to the streamed desktop at any host
-//! scaling. SDL cursors are fixed-size from their surface (no draw-time scaling), so we cache
-//! shapes RAW and resample per install — rebuilding when the serial OR the fit changes.
+//! host; instead we scale it by the aspect-fit factor the video is drawn at
+//! (`min(window_px/mode)`) TIMES the client display's content scale (SDL shows the surface at
+//! ~1:1 physical pixels on every backend, so without the second factor a 200 % client's
+//! pointer came out half the size of its native ones — see the run loop's `cursor_scale`).
+//! SDL cursors are fixed-size from their surface (no draw-time scaling), so we cache
+//! shapes RAW and resample per install — rebuilding when the serial OR the scale changes.
 
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::quic::{CursorState, HOST_CAP_CURSOR};
@@ -81,8 +83,10 @@ impl CursorChannel {
     /// `desktop_active` = the desktop mouse model is engaged (captured + desktop): only then
     /// do we own the local cursor's shape/visibility; under capture SDL's relative mode owns
     /// it, and released the system cursor must look normal. `fit_scale` is host-framebuffer
-    /// pixels → window pixels (the aspect-fit factor the video is drawn at); the shape is
-    /// resampled by it so the pointer matches the streamed desktop at any host DPI.
+    /// pixels → cursor-surface pixels (the run loop's `cursor_scale`: the aspect-fit factor
+    /// the video is drawn at, times the client display's content scale); the shape is
+    /// resampled by it so the pointer matches the streamed desktop at any host DPI *and*
+    /// the client's native pointers at any client DPI.
     pub fn pump(
         &mut self,
         connector: &NativeClient,

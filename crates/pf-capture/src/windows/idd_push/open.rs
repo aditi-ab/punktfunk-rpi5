@@ -162,7 +162,8 @@ impl IddPushCapturer {
     pub fn open(
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
-        client_10bit: bool,
+        want_hdr: bool,
+        ten_bit_sdr: bool,
         want_444: bool,
         pyrowave: bool,
         keepalive: Box<dyn Send>,
@@ -176,7 +177,8 @@ impl IddPushCapturer {
         match Self::open_inner(
             target,
             preferred,
-            client_10bit,
+            want_hdr,
+            ten_bit_sdr,
             want_444,
             pyrowave,
             sender,
@@ -195,7 +197,8 @@ impl IddPushCapturer {
     fn open_inner(
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
-        client_10bit: bool,
+        want_hdr: bool,
+        ten_bit_sdr: bool,
         want_444: bool,
         pyrowave: bool,
         sender: crate::FrameChannelSender,
@@ -218,7 +221,8 @@ impl IddPushCapturer {
         match Self::open_on(
             target.clone(),
             preferred,
-            client_10bit,
+            want_hdr,
+            ten_bit_sdr,
             want_444,
             pyrowave,
             luid,
@@ -253,7 +257,8 @@ impl IddPushCapturer {
                 Self::open_on(
                     target,
                     preferred,
-                    client_10bit,
+                    want_hdr,
+                    ten_bit_sdr,
                     want_444,
                     pyrowave,
                     drv,
@@ -270,7 +275,8 @@ impl IddPushCapturer {
     fn open_on(
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
-        client_10bit: bool,
+        want_hdr: bool,
+        ten_bit_sdr: bool,
         want_444: bool,
         pyrowave: bool,
         luid: LUID,
@@ -338,7 +344,7 @@ impl IddPushCapturer {
             //     lands on an SDR desktop and blows out — the composition must honor the negotiation.
             // An HDR-negotiated (10-bit) session instead enables HDR below and rides the FP16 scRGB
             // ring (design/pyrowave-444-hdr.md Phase 3 for PyroWave; the H.26x P010 path otherwise).
-            if !client_10bit {
+            if !want_hdr {
                 let _ = pf_win_display::win_display::set_advanced_color(target.target_id, false);
                 let settle = Instant::now();
                 while settle.elapsed() < Duration::from_millis(250) {
@@ -372,8 +378,8 @@ impl IddPushCapturer {
             // size the ring FP16 directly — don't race the advanced_color_enabled poll, which may not have
             // settled within 250 ms and would size the ring SDR while the driver composes FP16 → a format
             // mismatch → an immediate ring recreate + dropped first frames (audit §5.4).
-            let enabled_hdr = client_10bit
-                && pf_win_display::win_display::set_advanced_color(target.target_id, true);
+            let enabled_hdr =
+                want_hdr && pf_win_display::win_display::set_advanced_color(target.target_id, true);
             if enabled_hdr {
                 // Let the colorspace change settle before the driver composes + we size the ring:
                 // poll the CCD advanced-color state instead of a fixed sleep (latency plan P0.4),
@@ -399,7 +405,7 @@ impl IddPushCapturer {
             // A failed open-time read defaults to SDR (unless the 10-bit path enabled HDR above) —
             // there is no "last known" yet; the descriptor poller corrects a wrong guess mid-session.
             // An SDR-negotiated session (either codec) forced advanced color OFF above and composes
-            // SDR unconditionally: `client_10bit` gates HDR so a client that advertised SDR-only is
+            // SDR unconditionally: `want_hdr` gates HDR so a client that advertised SDR-only is
             // never handed a PQ stream, even if a physical display forces HDR on (the descriptor
             // poller re-asserts OFF; PyroWave's format guard/stash absorbs any lingering FP16 compose).
             // Keep the raw observation so Downgrade point D below can say whether the read reported
@@ -407,13 +413,13 @@ impl IddPushCapturer {
             // causes and different fixes.
             let observed_hdr =
                 pf_win_display::win_display::advanced_color_enabled(target.target_id);
-            let display_hdr = client_10bit && (enabled_hdr || observed_hdr.unwrap_or(false));
+            let display_hdr = want_hdr && (enabled_hdr || observed_hdr.unwrap_or(false));
             // Downgrade point D (design/hdr-10bit-default-and-av1.md item 2d): the session was
             // NEGOTIATED 10-bit (the client was told HDR in the Welcome), but the virtual display
             // could not enable advanced color — the ring sizes SDR and the encoder will emit 8-bit
             // BT.709, so the client's label overstates the stream until the descriptor poller sees
             // HDR come on. Loud, because every frame of this session is affected.
-            if client_10bit && !display_hdr {
+            if want_hdr && !display_hdr {
                 tracing::error!(
                     target = target.target_id,
                     want_hdr = true,
@@ -586,7 +592,8 @@ impl IddPushCapturer {
                 render_luid = format!("{:08x}:{:08x}", luid.HighPart, luid.LowPart),
                 mode = format!("{w}x{h}"),
                 display_hdr,
-                client_10bit,
+                want_hdr,
+                ten_bit_sdr,
                 want_444,
                 ring_fp16 = display_hdr,
                 // Whether DXGI ever reached the win32u GPU-preference hook. By this point the
@@ -610,7 +617,8 @@ impl IddPushCapturer {
                 height: h,
                 slots,
                 generation,
-                client_10bit,
+                want_hdr,
+                ten_bit_sdr,
                 display_hdr,
                 hdr_pin_warned: false,
                 hdr_pin_failures: 0,
@@ -648,6 +656,7 @@ impl IddPushCapturer {
                 video_conv: None,
                 hdr_p010_conv: None,
                 hdr_rgb10_conv: None,
+                sdr_rgb10_conv: None,
                 last_seq: 0,
                 last_present: None,
                 status_logged: false,

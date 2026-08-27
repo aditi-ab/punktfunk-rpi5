@@ -414,7 +414,11 @@ mod session_main {
             // The cost stays VISIBLE, not silent: the Detailed stats overlay prints the
             // resolved chroma ("4:4:4→4:2:0" when the host declined) and the decode path
             // frames actually took.
-            video_caps: pf_client_core::video::video_caps_for(settings.hdr_enabled, want_444),
+            video_caps: pf_client_core::video::video_caps_for(
+                settings.hdr_enabled,
+                settings.ten_bit_sdr,
+                want_444,
+            ),
             // This panel's HDR colour volume → the host's virtual-display EDID, so host
             // apps tone-map to the real glass. Windows reads it from DXGI (the
             // `--window-pos` monitor; advanced-color outputs only) — gated on the HDR
@@ -442,6 +446,7 @@ mod session_main {
             pad_haptics: settings.pad_haptics,
             pad_speaker: settings.pad_speaker.clone(),
             clipboard,
+            keep_host_audio: settings.keep_host_audio,
             // The Settings preference (auto → VAAPI where it exists; the presenter
             // demotes to software on boxes whose Vulkan can't import the dmabufs).
             // PUNKTFUNK_DECODER still overrides inside the decoder for bisects.

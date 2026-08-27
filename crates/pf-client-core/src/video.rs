@@ -1610,11 +1610,17 @@ const CHROMA_444: u8 = 3;
 /// ⚠ The mobile/TV embedders must NOT copy this blindly — Amlogic MediaCodec wedges on
 /// multi-slice AUs (see `VIDEO_CAP_MULTI_SLICE`), so they advertise per-decoder.
 ///
-/// HDR off means 10-bit is not advertised either, so the host never upgrades depth.
-pub fn video_caps_for(hdr_enabled: bool, want_444: bool) -> u8 {
+/// `ten_bit_sdr` is the "10-bit SDR" setting: it advertises `VIDEO_CAP_10BIT` WITHOUT the HDR
+/// bit, asking the host for Main10 coding precision (less encode banding) under an SDR stream —
+/// the display's colour state untouched at both ends. With HDR on it is subsumed (HDR already
+/// advertises the depth); with both off the host never upgrades depth.
+pub fn video_caps_for(hdr_enabled: bool, ten_bit_sdr: bool, want_444: bool) -> u8 {
     let mut caps = punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE;
     if hdr_enabled {
         caps |= punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR;
+    }
+    if ten_bit_sdr {
+        caps |= punktfunk_core::quic::VIDEO_CAP_10BIT;
     }
     if want_444 {
         caps |= punktfunk_core::quic::VIDEO_CAP_444;
@@ -2804,29 +2810,53 @@ mod tests {
         const V444: u8 = punktfunk_core::quic::VIDEO_CAP_444;
         // The regression itself: setting on, device can't → the bit must NOT go out.
         assert_eq!(
-            video_caps_for(true, false) & V444,
+            video_caps_for(true, false, false) & V444,
             0,
             "a 4:4:4 promise this device cannot keep costs HEVC entirely"
         );
         // ...and the feature still works where it can be honoured.
-        assert_ne!(video_caps_for(true, true) & V444, 0);
+        assert_ne!(video_caps_for(true, false, true) & V444, 0);
         // Never advertised unasked, whatever the device can do.
-        assert_eq!(video_caps_for(true, false) & V444, 0);
-        assert_eq!(video_caps_for(false, false) & V444, 0);
+        assert_eq!(video_caps_for(true, false, false) & V444, 0);
+        assert_eq!(video_caps_for(false, false, false) & V444, 0);
 
         // The 4:4:4 gate must not disturb the other two bits (10-bit/HDR is deliberately
         // NOT probe-gated — see `hevc_444_hardware_decodable`'s docs for why).
         const HDR_BITS: u8 =
             punktfunk_core::quic::VIDEO_CAP_10BIT | punktfunk_core::quic::VIDEO_CAP_HDR;
         for want_444 in [false, true] {
-            assert_eq!(video_caps_for(true, want_444) & HDR_BITS, HDR_BITS);
-            assert_eq!(video_caps_for(false, want_444) & HDR_BITS, 0);
+            assert_eq!(video_caps_for(true, false, want_444) & HDR_BITS, HDR_BITS);
+            assert_eq!(video_caps_for(false, false, want_444) & HDR_BITS, 0);
             assert_ne!(
-                video_caps_for(false, want_444) & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE,
+                video_caps_for(false, false, want_444)
+                    & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE,
                 0,
                 "MULTI_SLICE is unconditional for this embedder"
             );
         }
+    }
+
+    /// The 10-bit SDR setting advertises the DEPTH bit alone — never HDR — and is subsumed
+    /// by the HDR setting (which already advertises both).
+    #[test]
+    fn ten_bit_sdr_advertises_depth_without_hdr() {
+        const TEN: u8 = punktfunk_core::quic::VIDEO_CAP_10BIT;
+        const HDR: u8 = punktfunk_core::quic::VIDEO_CAP_HDR;
+        // The new combination: depth without the HDR label.
+        assert_eq!(video_caps_for(false, true, false) & (TEN | HDR), TEN);
+        // Off = today's 8-bit SDR.
+        assert_eq!(video_caps_for(false, false, false) & (TEN | HDR), 0);
+        // HDR on subsumes it — both bits, with or without the SDR-10 switch.
+        assert_eq!(video_caps_for(true, true, false) & (TEN | HDR), TEN | HDR);
+        // ...and it never disturbs 4:4:4 or MULTI_SLICE.
+        assert_eq!(
+            video_caps_for(false, true, false) & punktfunk_core::quic::VIDEO_CAP_444,
+            0
+        );
+        assert_ne!(
+            video_caps_for(false, true, false) & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE,
+            0
+        );
     }
 
     /// No presenter Vulkan device ⇒ no 4:4:4, and that is an ANSWER rather than a missing

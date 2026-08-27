@@ -416,13 +416,20 @@ pub struct IddPushCapturer {
     /// display's HDR mode flipped). Stamped into the header + each delivery so the driver re-attaches
     /// (and so stale-ring publishes are rejected).
     generation: u32,
-    /// The CLIENT's advertised 10-bit capability (= negotiated `bit_depth >= 10`). Gates the
-    /// composition depth: a 10-bit client PROACTIVELY enables advanced color at `open` (HDR without a
-    /// manual toggle); an SDR-only client forces it OFF and the descriptor poller PINS it there, so a
-    /// client that advertised SDR ("HDR off") is never handed the in-band PQ upgrade the pixel-format-
-    /// driven encoder would otherwise stamp from an HDR composition. (An HDR-negotiated H.26x session
-    /// still follows a host-side "Use HDR" flip; all clients decode Main10 + auto-detect PQ from the VUI.)
-    client_10bit: bool,
+    /// The session negotiated **HDR** (client advertised `VIDEO_CAP_HDR` and the handshake said
+    /// yes — no longer merely `bit_depth >= 10`, which the 10-bit SDR path below also reaches).
+    /// Gates the composition depth: an HDR session PROACTIVELY enables advanced color at `open`
+    /// (HDR without a manual toggle); any other session forces it OFF and the descriptor poller
+    /// PINS it there, so a client that did not ask for HDR is never handed the in-band PQ
+    /// upgrade the pixel-format-driven encoder would otherwise stamp from an HDR composition.
+    /// (An HDR-negotiated H.26x session still follows a host-side "Use HDR" flip; all clients
+    /// decode Main10 + auto-detect PQ from the VUI.)
+    want_hdr: bool,
+    /// The session negotiated 10-bit WITHOUT HDR (`OutputFormat::ten_bit_sdr`): the BGRA slot is
+    /// expanded 8→10 bit into the packed RGB10 output ([`PixelFormat::Rgb10a2Sdr`]) so NVENC
+    /// encodes Main10 under the ordinary BT.709 SDR VUI. The display's colour state is never
+    /// touched — `want_hdr` above stays false, advanced colour stays pinned off.
+    ten_bit_sdr: bool,
     /// The DISPLAY's CURRENT HDR state (from `advanced_color_enabled`) — the user can flip "Use HDR" in
     /// Windows mid-session. Drives the ring format (HDR → FP16 surfaces, SDR → BGRA) and the conversion.
     /// Polled in the capture loop; a change recreates the ring (see [`Self::recreate_ring`]).
@@ -532,6 +539,11 @@ pub struct IddPushCapturer {
     /// session negotiated 4:4:4 — the full-chroma twin of [`Self::hdr_p010_conv`]. Rebuilt with the
     /// ring on a mode/HDR flip.
     hdr_rgb10_conv: Option<HdrRgb10Converter>,
+    /// BGRA slot → packed 10-bit RGB by plain 8→10 expansion (`HdrRgb10Converter::new_sdr_expand`
+    /// — same sRGB values at UNORM precision), used on a 10-bit **SDR** session
+    /// ([`Self::ten_bit_sdr`], both 4:2:0 and 4:4:4 — NVENC does the CSC/subsampling either
+    /// way). Built lazily like its HDR twin above.
+    sdr_rgb10_conv: Option<HdrRgb10Converter>,
     last_seq: u64,
     last_present: Option<(ID3D11Texture2D, PixelFormat)>,
     status_logged: bool,
@@ -655,8 +667,8 @@ impl IddPushCapturer {
     /// `Nv12` (BT.709 8-bit limited), or full-chroma `Bgra` passthrough on a 4:4:4 session (NVENC
     /// CSCs RGB→YUV444 itself, following the BT.709 VUI — the one path that deliberately pays the
     /// SM-side CSC, because the video processor can only produce subsampled output). The
-    /// composition depth DOES follow the session's negotiated `client_10bit` — pinned at open
-    /// (`open.rs`, the `!client_10bit` force-off and the 10-bit enable) and re-pinned every sample
+    /// composition depth DOES follow the session's negotiated `want_hdr` — pinned at open
+    /// (`open.rs`, the `!want_hdr` force-off and the 10-bit enable) and re-pinned every sample
     /// by [`Self::poll_display_hdr`], because a PQ stream sent to a client that advertised SDR-only
     /// lands on an SDR desktop and blows out. (The older note here claimed the opposite — that the
     /// advertised `VIDEO_CAP_10BIT` was ignored because clients under-report it. That reasoning
@@ -684,6 +696,11 @@ impl IddPushCapturer {
                 return (DXGI_FORMAT_R10G10B10A2_UNORM, PixelFormat::Rgb10a2);
             }
             (DXGI_FORMAT_P010, PixelFormat::P010)
+        } else if self.ten_bit_sdr {
+            // 10-bit SDR (either chroma): the BGRA slot expanded 8→10 into packed RGB. The
+            // format is the SDR twin of `Rgb10a2` — NVENC ingests it as ABGR10 and encodes
+            // Main10 under the BT.709 VUI its CSC follows (the SDR 4:4:4 precedent below).
+            (DXGI_FORMAT_R10G10B10A2_UNORM, PixelFormat::Rgb10a2Sdr)
         } else if self.want_444 {
             (DXGI_FORMAT_B8G8R8A8_UNORM, PixelFormat::Bgra)
         } else {
@@ -816,9 +833,10 @@ impl IddPushCapturer {
         self.video_conv = None; // converters are sized + HDR-specific → rebuild at the new mode
         self.hdr_p010_conv = None;
         self.hdr_rgb10_conv = None;
+        self.sdr_rgb10_conv = None;
         // The PyroWave CSC is mode-baked too (BgraToYuvPlanes picks different SDR vs HDR shaders
         // and R8/R8G8 vs R16/R16G16 outputs). Without this, a display_hdr flip (Downgrade point D:
-        // client_10bit=true but HDR couldn't enable at open) reused the stale SDR converter against
+        // want_hdr=true but HDR couldn't enable at open) reused the stale SDR converter against
         // the freshly HDR-formatted pyro ring — every frame corrupted. `ensure_pyro_conv` only
         // builds when None, so it must be reset here like its siblings.
         self.pyro_conv = None;
@@ -859,12 +877,12 @@ impl IddPushCapturer {
         // is never recreated at the wrong format):
         //   - a PyroWave session: its encoder was opened for fixed plane formats (R8 SDR / R16 HDR),
         //     so it can't follow a flip the way H.26x re-inits do;
-        //   - ANY SDR-negotiated session (`!client_10bit`, either codec): a host-side flip to HDR
+        //   - ANY SDR-negotiated session (`!want_hdr`, either codec): a host-side flip to HDR
         //     must not promote the stream to P010 PQ behind a client that advertised SDR-only.
         // An HDR-negotiated H.26x session is NOT pinned — it still follows a host "Use HDR" flip in
         // either direction (its encoder re-inits on the depth change).
-        if (self.pyrowave || !self.client_10bit) && now.hdr != self.client_10bit {
-            let want = self.client_10bit;
+        if (self.pyrowave || !self.want_hdr) && now.hdr != self.want_hdr {
+            let want = self.want_hdr;
             // A display that refuses the pin refuses it on every 250 ms sample — past
             // [`Self::HDR_PIN_EAGER`] consecutive failures the write+read-back re-fires only on
             // every [`Self::HDR_PIN_RETRY_EVERY`]th sample (~4 s), instead of 4 CCD writes +
@@ -876,7 +894,7 @@ impl IddPushCapturer {
                 || self.desc_seq % Self::HDR_PIN_RETRY_EVERY == 0
             {
                 // OBSERVE the flip; never assert it. This used to discard `set_advanced_color`'s
-                // `bool` and then write `now.hdr = self.client_10bit` — substituting the DESIRED
+                // `bool` and then write `now.hdr = self.want_hdr` — substituting the DESIRED
                 // state for the observed one, which broke in both directions on a display that
                 // cannot be flipped (the state this file already logs as "Downgrade point D" at
                 // open):
@@ -907,7 +925,7 @@ impl IddPushCapturer {
                             observed_hdr = ?observed,
                             set_advanced_color_returned = requested,
                             pyrowave = self.pyrowave,
-                            client_10bit = self.client_10bit,
+                            want_hdr = self.want_hdr,
                             "IDD push: could not pin the display to the NEGOTIATED depth — following what \
                              it actually composes instead (a physical display forcing HDR, or a driver that \
                              refuses the flip). The stream's depth will not match the negotiation; the \
@@ -1112,6 +1130,12 @@ impl IddPushCapturer {
                     self.width,
                     self.height,
                 )?);
+            }
+        } else if self.ten_bit_sdr {
+            // 10-bit SDR (4:2:0 AND 4:4:4): one full-res 8→10 expansion pass to packed RGB;
+            // NVENC does the RGB→YUV CSC + any subsampling under the BT.709 VUI.
+            if self.sdr_rgb10_conv.is_none() {
+                self.sdr_rgb10_conv = Some(HdrRgb10Converter::new_sdr_expand(&self.device)?);
             }
         } else if self.want_444 {
             // Full-chroma passthrough — no conversion resources to build.
@@ -1630,6 +1654,17 @@ impl IddPushCapturer {
                         // The slot's P010 plane views, built once in `ensure_out_ring`.
                         let (y_rtv, uv_rtv) = rtvs.as_ref().expect("P010 out slot has plane RTVs");
                         conv.convert(&self.context, src, y_rtv, uv_rtv, self.width, self.height)?;
+                    }
+                } else if self.ten_bit_sdr {
+                    // 10-bit SDR: BGRA slot → packed 10-bit RGB, a plain 8→10 expansion (same
+                    // sRGB values at UNORM precision). NVENC ingests it as ABGR10 and encodes
+                    // Main10 under the BT.709 VUI — the CSC and any subsampling are NVENC's,
+                    // exactly like the SDR 4:4:4 passthrough below, one bit-depth up.
+                    if let Some(conv) = self.sdr_rgb10_conv.as_ref() {
+                        let src = blended.as_ref().map(|(_, srv)| srv).unwrap_or(&slot_srv);
+                        let (_, _, rtv) = out.as_ref().expect("out ring");
+                        let rtv = rtv.as_ref().expect("Rgb10a2Sdr out slot has an RTV");
+                        conv.convert(&self.context, src, rtv, self.width, self.height)?;
                     }
                 } else if self.want_444 {
                     // SDR 4:4:4: pass the BGRA slot through untouched — NVENC ingests full-chroma
