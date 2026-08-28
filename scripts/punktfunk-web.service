@@ -10,20 +10,29 @@
 #   systemctl --user enable --now punktfunk-web
 [Unit]
 Description=punktfunk management web console
-# web-init generates the login password; the host writes the mgmt token. Order after both.
+# web-init generates the login password AND blocks until the host has written the mgmt token +
+# identity cert. It is the readiness gate; `After=punktfunk-host.service` on its own is not one,
+# because the host is Type=simple and systemd calls it started the moment it is spawned — seconds
+# before either file lands. Keep web-init in BOTH lists: the ordering is what makes it a gate.
 After=punktfunk-web-init.service punktfunk-host.service
+# Wants, not Requires: if the pre-start unit itself fails, still try — the Restart backstop below
+# recovers, where a hard dependency would leave the console down.
 Wants=punktfunk-web-init.service
-# Retry indefinitely while the host is still writing the mgmt token + identity cert. Without this,
+# Backstop for whatever the gate above cannot cover (web-init timed out; the host restarted and
+# re-minted its identity under a running console; someone deleted a file). Retry indefinitely:
 # systemd's default rate limit (5 starts / 10 s) plus RestartSec=2 gives up permanently after ~10 s
-# - so a console enabled before the host's first run stayed dead until someone restarted it by hand
-# (the same defect the Windows PunktfunkWeb task had).
+# - so a console that hit a missing file stayed dead until someone restarted it by hand (the same
+# defect the Windows PunktfunkWeb task had).
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-# Both are KEY=VALUE files. mgmt-token is REQUIRED (written by the host's `serve`); if absent the
-# unit fails + Restart retries until the host has created it. web-password is '-' optional (web-init
-# creates it first, but a manual operator may inject PUNKTFUNK_UI_PASSWORD another way).
+# Both are KEY=VALUE files. mgmt-token is REQUIRED (written by the host's `serve`) — a console with
+# no token cannot reach the mgmt API at all, so failing closed beats serving a login page that 401s
+# on every call. punktfunk-web-init.service waits for it, so this no longer fails on a fresh
+# install's first enable; if it is somehow still absent the unit fails + Restart retries.
+# web-password is '-' optional (web-init creates it first, but a manual operator may inject
+# PUNKTFUNK_UI_PASSWORD another way).
 EnvironmentFile=%h/.config/punktfunk/mgmt-token
 EnvironmentFile=-%h/.config/punktfunk/web-password
 # The host's ACTUAL mgmt port: `serve` writes this file (mgmt::publish_endpoint) with the port it
@@ -38,8 +47,9 @@ EnvironmentFile=-%h/.config/punktfunk/mgmt-endpoint
 Environment=PORT=47992
 Environment=HOST=0.0.0.0
 # Serve HTTPS (HTTP/1.1 over TLS) with the host's own identity cert; mark the
-# session cookie Secure. The host's `serve` writes these PEMs; if absent at start the unit fails and
-# Restart retries (same as the mgmt-token wait above) rather than silently serving plain HTTP.
+# session cookie Secure. The host's `serve` writes these PEMs LAST — after the mgmt token, inside
+# mgmt::run — so they, not the token, are what web-init actually ends up waiting for. If absent at
+# start the server exits and Restart retries rather than silently serving plain HTTP.
 #
 # These name the LEGACY pair and the server prefers the native sibling
 # (native-cert.pem/native-key.pem) whenever it exists — `Environment=` cannot express "this file,

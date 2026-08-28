@@ -1,7 +1,15 @@
 #!/bin/sh
-# First-run setup for the punktfunk web console (run by punktfunk-web-init.service as the user):
-# generate the login password once, in the streaming user's config dir, and surface it to the
-# journal. The mgmt token is NOT created here — the host owns it (~/.config/punktfunk/mgmt-token).
+# Pre-start for the punktfunk web console (run by punktfunk-web-init.service as the user):
+#
+#   1. generate the login password once, in the streaming user's config dir, and surface it to
+#      the journal;
+#   2. wait for the host's first-run artifacts, so the console is not started before the files it
+#      cannot start without exist.
+#
+# The mgmt token is NOT created here — the host owns it (~/.config/punktfunk/mgmt-token); this
+# script only waits for it.
+#
+# Usage: web-init.sh [WAIT_SECONDS]   (default 30; the CI gate passes a small value)
 set -eu
 
 DIR="${XDG_CONFIG_HOME:-$HOME/.config}/punktfunk"
@@ -24,3 +32,63 @@ if [ ! -s "$PWFILE" ]; then
     echo "Read it with:  cut -d= -f2- $PWFILE"
     echo "(then open https://<host-ip>:47992 and log in)"
 fi
+
+# ---------------------------------------------------------------- wait for the host's first run
+#
+# The console cannot START without two things the HOST creates on its first `serve`: `mgmt-token`
+# (a MANDATORY EnvironmentFile on punktfunk-web.service) and the TLS pair `Bun.serve` listens with.
+#
+# punktfunk-web.service already says `After=punktfunk-host.service`, but that is not a readiness
+# gate: the host is `Type=simple`, so systemd considers it started the instant it is SPAWNED —
+# seconds before either file lands. Worse, the two are written far apart. `mgmt-token` is persisted
+# early in `serve` (main.rs, before the listeners), while the identity cert comes last, inside
+# `mgmt::run` -> `identity::load_or_adopt`. So waiting on the token alone would only move the
+# failure to the cert.
+#
+# Losing that race was a HARD systemd-level failure — "Failed to load environment files: No such
+# file or directory", result 'resources' — on the very first enable of a perfectly good install,
+# and only the Restart loop brought the console up two seconds later. Field report 2026-08-28
+# (Omarchy): `punktfunk-omarchy setup` enables the host and the console back to back, so it lost
+# the race every time and reported "Failed to start punktfunk management web console".
+#
+# This unit is `Type=oneshot` and punktfunk-web.service is ordered `After=` it, so blocking HERE is
+# the readiness gate that ordering already claimed to be — no new unit, no new directive, and the
+# check is the console's own precondition rather than a proxy for it.
+#
+# Steady state is free: the host PERSISTS all of these, so every start after its first run passes
+# on the first pass without sleeping.
+
+# Exactly what web/nitro-entry/tls-paths.mjs requires to serve: a token, plus a cert/key pair from
+# ONE directory — the native pair (what a current host mints) or the legacy pair (a host that
+# never took the identity split). Non-empty, not merely present, for the same reason tls-paths.mjs
+# tests size: `write_secret_file` is create+truncate+write, so a 0-byte file is a live mid-write.
+host_ready() {
+    [ -s "$DIR/mgmt-token" ] || return 1
+    if [ -s "$DIR/native-cert.pem" ] && [ -s "$DIR/native-key.pem" ]; then return 0; fi
+    if [ -s "$DIR/cert.pem" ] && [ -s "$DIR/key.pem" ]; then return 0; fi
+    return 1
+}
+
+# ponytail: a 1 s poll, not sd_notify. Making the host `Type=notify` is the real readiness
+# protocol, but it locks the unit file to the binary — and the documented install route copies
+# scripts/punktfunk-host.service into ~/.config/systemd/user BY HAND, so a new unit beside an
+# older host would hang for TimeoutStartSec and then fail to start at all. Upgrade to notify once
+# the units only ever ship alongside the binary that answers them.
+WAIT_SECS="${1:-30}"
+waited=0
+while ! host_ready; do
+    if [ "$waited" -ge "$WAIT_SECS" ]; then
+        # Not fatal: exit 0 so the console still starts and its own Restart=always retry takes
+        # over (the pre-existing behaviour). Say WHY, because the bare systemd error this replaces
+        # named a missing file and never the host that owes it.
+        echo "punktfunk-host has not written its mgmt token + identity cert after ${WAIT_SECS}s."
+        echo "Starting the console anyway — it retries every 2s until they appear."
+        echo "If it stays down:  systemctl --user status punktfunk-host"
+        break
+    fi
+    if [ "$waited" -eq 0 ]; then
+        echo "waiting for punktfunk-host to write its mgmt token + identity cert..."
+    fi
+    sleep 1
+    waited=$((waited + 1))
+done

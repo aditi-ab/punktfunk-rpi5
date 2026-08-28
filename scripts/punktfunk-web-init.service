@@ -1,12 +1,26 @@
-# punktfunk web console first-run setup — systemd USER one-shot.
+# punktfunk web console pre-start — systemd USER one-shot.
 #
-# Generates the console login password (PUNKTFUNK_UI_PASSWORD) in the streaming user's
-# ~/.config/punktfunk on first start, surfaced to the --user journal for retrieval. A .deb postinst
-# runs as root (wrong $HOME), so credential generation must happen as the user — hence this unit.
-# Pulled in by punktfunk-web.service (Wants=); also runnable directly.
+# Two jobs, both of which must happen BEFORE the console's first exec:
+#
+#  1. Generate the console login password (PUNKTFUNK_UI_PASSWORD) in the streaming user's
+#     ~/.config/punktfunk on first start, surfaced to the --user journal for retrieval. A .deb
+#     postinst runs as root (wrong $HOME), so credential generation must happen as the user —
+#     hence this unit.
+#  2. Block until the HOST has written the files the console cannot start without (mgmt-token +
+#     its identity cert/key). punktfunk-web.service's `After=punktfunk-host.service` does not do
+#     this: the host is Type=simple, so systemd calls it started the instant it is spawned. Being
+#     Type=oneshot, THIS unit is the ordering the console already declares — see web-init.sh.
+#
+# Pulled in by punktfunk-web.service (Wants= + After=); also runnable directly.
+#
+# Deliberately NOT gated on `ConditionPathExists=!%h/.config/punktfunk/web-password`, which is what
+# it carried while step 1 was its only job. That condition skips the unit from the second boot
+# onward — which is exactly when step 2 must still run, and it would tie a host-readiness gate to
+# the presence of an unrelated password file. The script is idempotent instead: it writes the
+# password only when absent, and in steady state the host's files already exist, so it returns
+# without sleeping.
 [Unit]
-Description=punktfunk web console first-run setup (login password)
-ConditionPathExists=!%h/.config/punktfunk/web-password
+Description=punktfunk web console pre-start (login password; waits for the host)
 
 [Service]
 Type=oneshot
