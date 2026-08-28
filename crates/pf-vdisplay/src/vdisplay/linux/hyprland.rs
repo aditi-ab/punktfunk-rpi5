@@ -520,21 +520,46 @@ fn reclaim_leftovers_once() {
 /// Best-effort by construction: a failure costs window placement, not the session, and a box with no
 /// physical head was already placing windows correctly.
 ///
-/// ⚠️ **This is a no-op under the Lua config manager.** Measured on .138 (0.55.4, Lua) 2026-08-18:
-/// `hyprctl dispatch focusmonitor <name>` is parsed as Lua (`hl.dispatch(focusmonitor <name>)`) and
-/// rejected, and `hl.dsp.focusmonitor` does not exist either — so the #283 window-placement fix
-/// does not reach a Lua-configured box. Both rejections carry "error", so [`hyprctl_dispatch`]
-/// reports them and this warns rather than failing silently; the gap itself is unfixed and belongs
-/// to the #283 follow-up, not to the topology work here.
+/// Two eras, same [`dpms_one`] shape and for the same reason. The classic
+/// `hyprctl dispatch focusmonitor <name>` is what a hyprlang box wants; under the **Lua** config
+/// manager `dispatch` is shorthand for `hl.dispatch(...)`, so those bare words parse as a Lua
+/// expression and die with `')' expected near '<name>'`.
+///
+/// ⭐ The Lua spelling is **`hl.dsp.focus({ monitor = "<name>" })`** — measured on Omarchy 4.0.1
+/// (Hyprland 0.56.2) 2026-08-28. The older note here said the fix could not reach a Lua box
+/// because "`hl.dsp.focusmonitor` does not exist"; that is true, and it was the wrong name. The
+/// compositor says so itself when asked with any other key:
+/// *"hl.focus: unrecognized arguments. Expected one of: direction, monitor, window,
+/// urgent_or_last, last"*.
+///
+/// This is not only about window placement on Omarchy. A headless output nothing has focused
+/// stays empty, an empty output produces no damage, and no damage means **no PipeWire frames** —
+/// the capture then fails its first-frame deadline and the client sees a black screen. So try
+/// classic, then Lua, and report both if neither lands.
 pub(crate) fn focus_output(name: &str) {
-    match hyprctl_dispatch(&focus_argv(name)) {
-        Ok(()) => tracing::info!(output = %name, "focused the streamed headless output"),
-        Err(e) => tracing::warn!(
-            output = %name, error = %format!("{e:#}"),
+    let classic = match hyprctl_dispatch(&focus_argv(name)) {
+        Ok(()) => None,
+        Err(e) => match hyprctl_dispatch(&["dispatch", &lua_focus_expr(name)]) {
+            Ok(()) => None,
+            Err(lua_err) => Some(format!("hyprlang: {e:#}; lua: {lua_err:#}")),
+        },
+    };
+    match classic {
+        None => tracing::info!(output = %name, "focused the streamed headless output"),
+        Some(why) => tracing::warn!(
+            output = %name, error = %why,
             "could not focus the streamed headless output — apps this session launches may open on \
-             a physical monitor instead of on the stream"
+             a physical monitor instead of on the stream, and an unfocused headless output can \
+             produce no frames at all"
         ),
     }
+}
+
+/// The Lua-config-manager spelling of "focus this monitor". Pure, so a test pins the shape: the
+/// quoting and the `monitor =` key are the whole trick, and an unquoted argument is exactly what
+/// the classic form gets wrong on that manager.
+fn lua_focus_expr(name: &str) -> String {
+    format!("hl.dsp.focus({{ monitor = \"{name}\" }})")
 }
 
 /// The `hyprctl` argv that focuses `name`, split out so a test pins its SHAPE.
@@ -1666,6 +1691,22 @@ mod tests {
             focus_argv("PF-1234-1"),
             ["dispatch", "focusmonitor", "PF-1234-1"]
         );
+    }
+
+    /// The Lua-era spelling, which is the half that was missing. Measured against Hyprland 0.56.2
+    /// on Omarchy 4.0.1: the key is `monitor` (the compositor lists the alternatives when it is
+    /// anything else) and the NAME MUST BE QUOTED — unquoted is precisely the classic form's
+    /// failure, `')' expected near 'PF'`, which is what left a headless output unfocused, empty,
+    /// and producing no frames at all.
+    #[test]
+    fn the_lua_focus_expression_quotes_the_monitor_name() {
+        assert_eq!(
+            lua_focus_expr("PF-1234-1"),
+            "hl.dsp.focus({ monitor = \"PF-1234-1\" })"
+        );
+        // The two eras must not converge on one string: each is rejected by the other's parser,
+        // and that is what makes "try one, then the other" safe to run blind.
+        assert_ne!(lua_focus_expr("PF-1"), focus_argv("PF-1").join(" "));
     }
 
     /// `HYPRLAND_INSTANCE_SIGNATURE` reaches `hyprctl` as a per-CHILD override, never as a `set_var`
