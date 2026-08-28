@@ -147,6 +147,15 @@ fn release(why: &str) {
 #[cfg(not(target_os = "linux"))]
 fn release(_why: &str) {}
 
+/// Drop any standing veto RIGHT NOW — the host-power path (`design/host-actions.md` §6): an
+/// explicit `power.sleep` must not be refused by our own block inhibitor (we deliberately never
+/// hold `-ignore-inhibit` rights). The session teardown that precedes it drops the holds too,
+/// but via the video loops' next stop-flag check — this is the synchronous belt so the
+/// `Suspend()` call can never race a veto that is already on its way out.
+pub fn release_now() {
+    release("a host power action is suspending/stopping this machine");
+}
+
 #[cfg(target_os = "linux")]
 fn release_locked(st: &mut State, why: &str) {
     if st.fd.take().is_some() {

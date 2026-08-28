@@ -3,6 +3,7 @@ import { useGetHostInfo, useListCompositors } from "@/api/gen/host/host";
 import { useLocale } from "@/lib/i18n";
 import { ConflictsCard } from "./ConflictsCard";
 import { GpuSection } from "./GpuCard";
+import { PowerSection } from "./PowerCard";
 import { UpdateSection } from "./UpdateCard";
 import { HostView } from "./view";
 
@@ -18,6 +19,7 @@ export const SectionHost: FC = () => {
 			conflicts={<ConflictsCard />}
 			gpu={<GpuSection />}
 			update={<UpdateSection />}
+			power={<PowerSection />}
 		/>
 	);
 };

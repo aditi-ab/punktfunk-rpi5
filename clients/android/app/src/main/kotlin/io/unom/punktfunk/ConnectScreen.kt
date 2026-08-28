@@ -54,6 +54,14 @@ import kotlinx.coroutines.withContext
 private const val REQUEST_ACCESS_TIMEOUT_MS = 185_000
 
 /**
+ * How long a host's advertised actions stay fresh before this screen asks again — the desktop's
+ * `pf_client_core::host_actions::TTL`. Long on purpose: what it governs (whether this device
+ * holds the Host-power grant, whether the box can suspend) changes when an operator edits
+ * access, not minute to minute, and every refresh is a TLS handshake against an idle host.
+ */
+private const val HOST_ACTIONS_TTL_MS = 300_000L
+
+/**
  * A no-PIN "request access" connect in flight — the host being requested (drives the cancelable
  * "Waiting for approval…" dialog) and a per-attempt flag the Cancel button trips. The connect is a
  * blocking call with no abort, so Cancel returns the UI immediately and a late result checks
@@ -291,6 +299,38 @@ fun ConnectScreen(
     var awaiting by remember { mutableStateOf<RequestAccessState?>(null) }
     // A saved host being edited (name / address / port / MAC).
     var editTarget by remember { mutableStateOf<KnownHost?>(null) }
+
+    // What each paired host says this device may do TO it — sleep, restart, shut it down
+    // (`design/host-actions.md` §7) — by fingerprint, with the moment we last asked.
+    //
+    // Learned on a slow TTL rather than when a menu opens: the row list has to be settled BEFORE
+    // the menu draws, or rows would appear under a finger already on its way down, and two of
+    // these rows end whatever is running on that machine. Empty for an older host (no such
+    // route), an unreachable one, and any device without the grant — the menu simply has no
+    // power rows then.
+    var hostActions by remember { mutableStateOf<Map<String, List<HostActions.Action>>>(emptyMap()) }
+    var hostActionsAt by remember { mutableStateOf<Map<String, Long>>(emptyMap()) }
+    val reachableNow by rememberUpdatedState(reachable)
+    LaunchedEffect(savedHosts, identity) {
+        val id = identity ?: return@LaunchedEffect
+        while (true) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            for (kh in savedHosts) {
+                if (!kh.paired || kh.fpHex.isEmpty()) continue
+                if (!kh.isOnline(discoveredNow, reachableNow)) continue
+                if (now - (hostActionsAt[kh.fpHex] ?: 0L) < HOST_ACTIONS_TTL_MS) continue
+                // Stamp BEFORE the request, so a slow host cannot make every lap ask again.
+                hostActionsAt = hostActionsAt + (kh.fpHex to now)
+                val found = withContext(Dispatchers.IO) {
+                    HostActions.list(id, kh.address, kh.effectiveMgmtPort, kh.fpHex)
+                }
+                hostActions = hostActions + (kh.fpHex to found)
+            }
+            delay(30_000)
+        }
+    }
+    // A destructive host action awaiting its confirmation (restart / shut down).
+    var confirmAction by remember { mutableStateOf<Pair<KnownHost, HostActions.Action>?>(null) }
 
     // Discovered hosts not already saved — a saved host (paired or TOFU) belongs in "Saved hosts",
     // not also in "Discovered", so we hide the overlap (matched by fingerprint when both carry it, so
@@ -635,6 +675,40 @@ fun ConnectScreen(
         if (copied) notice = message else status = message
     }
 
+    // Host actions (`design/host-actions.md` §7) — sleep, restart or shut the host down. The
+    // menu rows come from what the HOST said it lets this device do, so a device without the
+    // Host-power grant is offered none; a destructive one still asks first, because losing what
+    // is running on that machine is not something a mis-tap should be able to do.
+    fun runHostAction(kh: KnownHost, a: HostActions.Action) {
+        val id = identity ?: run {
+            status = "Identity not ready yet — try again in a moment"
+            return
+        }
+        val name = kh.name.ifBlank { kh.address }
+        notice = "${a.label} — asking $name…"
+        status = null
+        // Whatever the host said about itself is about to be wrong: ask again next sweep.
+        hostActionsAt = hostActionsAt - kh.fpHex
+        scope.launch {
+            notice = withContext(Dispatchers.IO) {
+                HostActions.invoke(
+                    id, kh.address, kh.effectiveMgmtPort, kh.fpHex, name, a.id, a.label,
+                )
+            }
+        }
+    }
+
+    fun hostAction(kh: KnownHost, a: HostActions.Action) {
+        when {
+            // The host already said it cannot do this right now — say why, rather than send a
+            // request we know it will refuse.
+            !a.available ->
+                notice = a.unavailableReason.ifEmpty { "${a.label} isn't available right now" }
+            a.danger -> confirmAction = kh to a
+            else -> runHostAction(kh, a)
+        }
+    }
+
     // "Send logs to host" — [SendLogs], the same upload the console's host menu runs. The outcome
     // is a notice either way (success and failure both name the host), because the row's whole job
     // is to tell a reporter whether the bundle actually landed.
@@ -793,6 +867,8 @@ fun ConnectScreen(
         onWake = { kh -> wakeHost(kh) },
         onSpeedTest = { kh -> startSpeedTest(HostCardEntry(kh, null)) },
         onSendLogs = { kh -> sendLogs(kh) },
+        hostActions = hostActions,
+        onHostAction = { kh, a -> hostAction(kh, a) },
         onCopyLink = { kh, pin -> copyLink(kh, pin) },
         onTogglePin = { kh, p -> togglePin(kh, p) },
         libraryEnabled = settings.libraryEnabled,
@@ -827,6 +903,18 @@ fun ConnectScreen(
     // `discovery.hosts.first { host.matches($0) }?.macAddresses`.
     val editSuggestedMacs =
         editTarget?.let { kh -> discovered.firstOrNull { kh.matches(it) }?.mac } ?: emptyList()
+
+    // A destructive host action's confirmation. Kept here rather than in ConnectPrompts because
+    // it is a one-question dialog owned by the row that raised it — the same place the row's
+    // handler lives.
+    confirmAction?.let { (kh, a) ->
+        HostActionConfirmDialog(
+            hostName = kh.name.ifBlank { kh.address },
+            action = a,
+            onConfirm = { confirmAction = null; runHostAction(kh, a) },
+            onDismiss = { confirmAction = null },
+        )
+    }
 
     // Everything that floats above whichever home was drawn, in one place and in one order — see
     // ConnectPrompts.kt. It decides nothing: each action below lands right back in the engine above.

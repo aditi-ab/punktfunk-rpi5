@@ -67,6 +67,12 @@ struct GamepadHostOptionsView: View {
     /// Upload this device's recent log to the host; answers with what to tell the user. nil on an
     /// unpaired host — the upload rides the pairing, so there is nothing to offer before it.
     var onSendLogs: (() async -> (ok: Bool, message: String))?
+    /// What the HOST says this device may do to it — sleep, restart, shut it down
+    /// (`design/host-actions.md` §7). Empty unless it answered and this device's access carries
+    /// the grant, so no row here can be refused for permission.
+    var hostActions: [HostAction] = []
+    /// Run one; answers with what to tell the user, like `onSendLogs`.
+    var onHostAction: ((HostAction) async -> (ok: Bool, message: String))?
     var close: (() -> Void)?
     var controllerActive = true
 
@@ -82,8 +88,15 @@ struct GamepadHostOptionsView: View {
     /// fires on the second. The touch grid removes behind a system confirmation dialog; a console
     /// is driven by a thumbstick from across a room, which is a good reason to be at least as
     /// strict as it is, and none at all to be looser.
+    /// Which row is armed, when the armed one is not Remove: the host's own destructive actions
+    /// (restart, shut down) take the same two-press treatment. Held as an id, not a flag, so an
+    /// arming press on one destructive row cannot fire a different one the cursor then reached.
+    @State private var armedRowID: String?
     @State private var armed = false
     @State private var copied = false
+    /// A host action's outcome, reported in place — this surface has no toast, exactly like
+    /// `sendLogs` above.
+    @State private var hostActionState: HostActionState = .idle
     /// The send-logs row's own state: its label and the detail band report the outcome in place,
     /// the same way Copy link says "Copied" — this surface has no toast.
     @State private var sendLogs: SendLogsState = .idle
@@ -93,8 +106,15 @@ struct GamepadHostOptionsView: View {
         case idle, sending, done(ok: Bool, message: String)
     }
 
+    private enum HostActionState: Equatable {
+        case idle, sending(String), done(ok: Bool, message: String)
+    }
+
     private enum Action: String {
         case wake
+        /// One of the host's own actions; WHICH one rides on the row (`Row.hostAction`),
+        /// because this enum's raw values are fixed and the host's list is not.
+        case hostAction
         case copyLink
         case edit
         case forgetPairing
@@ -108,7 +128,7 @@ struct GamepadHostOptionsView: View {
         GamepadMenuList(
             items: rows,
             focusID: $focusID,
-            onActivate: { run($0.action) },
+            onActivate: { run($0) },
             onBack: { performClose() },
             isActive: controllerActive
         ) { row, focused in
@@ -163,6 +183,8 @@ struct GamepadHostOptionsView: View {
         // two-press rule exists to catch.
         .onChange(of: focusID) { _, id in
             if id != Action.remove.rawValue { armed = false }
+            // Same rule for the host's own destructive rows: leaving one disarms it.
+            if id != armedRowID { armedRowID = nil }
         }
         #if !os(tvOS)
         .background {
@@ -187,7 +209,11 @@ struct GamepadHostOptionsView: View {
         let label: String
         var icon: String
         var isDestructive = false
-        var id: String { action.rawValue }
+        /// The host action this row runs, for `action == .hostAction`.
+        var hostAction: HostAction?
+        /// Ids must stay unique across the list — the host's rows share one `Action` case, so
+        /// they key on the action id the host sent.
+        var id: String { hostAction.map { "hostAction:\($0.id)" } ?? action.rawValue }
     }
 
     private var rows: [Row] {
@@ -203,6 +229,18 @@ struct GamepadHostOptionsView: View {
         // Waking a host that is already answering would just sit there counting seconds.
         if canWake, !isOnline {
             list.append(Row(action: .wake, label: "Wake host", icon: "power"))
+        }
+        // …and the other half of that round trip, immediately below it. A destructive one wears
+        // the same "press again" the Remove row does; an unavailable one stays listed and says
+        // why when pressed, rather than vanishing.
+        for a in hostActions {
+            let rowID = "hostAction:\(a.id)"
+            var label = a.available ? a.label : "\(a.label) (unavailable)"
+            if armedRowID == rowID { label = "\(a.label) \u{2014} press again" }
+            if case .sending(let id) = hostActionState, id == a.id { label = "\(a.label)\u{2026}" }
+            list.append(Row(
+                action: .hostAction, label: label, icon: "power",
+                isDestructive: a.danger, hostAction: a))
         }
         list.append(Row(action: .copyLink, label: copied ? "Copied" : "Copy link", icon: "link"))
         list.append(Row(action: .edit, label: "Edit\u{2026}", icon: "pencil"))
@@ -231,7 +269,27 @@ struct GamepadHostOptionsView: View {
     /// The explainer under the list — the same band the settings screen uses, and the only place a
     /// destructive action can say what it will actually do before it is pressed.
     private var detail: String {
-        switch rows.first(where: { $0.id == focusID })?.action {
+        let focused = rows.first(where: { $0.id == focusID })
+        switch focused?.action {
+        case .hostAction:
+            guard let a = focused?.hostAction else { return "" }
+            if case .done(_, let message) = hostActionState { return message }
+            if !a.available {
+                return a.unavailableReason ?? "This host can't do that right now."
+            }
+            if armedRowID == focused?.id {
+                return "Press again — this ends every stream and anything running on the host."
+            }
+            switch a.id {
+            case "power.sleep":
+                return "Put the host to sleep. Wake it again from this menu."
+            case "power.reboot":
+                return "Restart the host. Every stream ends and anything running on it stops."
+            case "power.shutdown":
+                return "Shut the host down. Wake-on-LAN can start it again if it is armed."
+            default:
+                return a.title
+            }
         case .wake:
             return "Send a Wake-on-LAN packet and wait for this host to answer."
         case .copyLink:
@@ -260,7 +318,7 @@ struct GamepadHostOptionsView: View {
             .init(
                 glyph: buttonGlyph(\.buttonA, fallback: "a.circle"), text: "Select",
                 action: { if let id = focusID, let row = rows.first(where: { $0.id == id }) {
-                    run(row.action)
+                    run(row)
                 } }),
             .init(
                 glyph: buttonGlyph(\.buttonB, fallback: "b.circle"), text: "Back",
@@ -270,8 +328,37 @@ struct GamepadHostOptionsView: View {
 
     // MARK: - Actions
 
-    private func run(_ action: Action) {
-        switch action {
+    private func run(_ row: Row) {
+        // Moving off an armed row disarms it — an arming press is about THAT row, and must not
+        // leave a live trigger on the destructive row beside it.
+        if armedRowID != row.id { armedRowID = nil }
+        switch row.action {
+        case .hostAction:
+            guard let a = row.hostAction, let onHostAction else { return }
+            // The host already said it cannot do this right now: say why rather than send a
+            // request we know it will refuse.
+            guard a.available else {
+                withAnimation(.smooth(duration: 0.2)) {
+                    hostActionState = .done(
+                        ok: false,
+                        message: a.unavailableReason ?? "\(a.label) isn't available right now.")
+                }
+                return
+            }
+            // Restart and shut down lose whatever is on that machine, so they arm first. Sleep
+            // is reversible from this very menu ("Wake host"), so it goes on one press.
+            if a.danger, armedRowID != row.id {
+                withAnimation(.smooth(duration: 0.2)) { armedRowID = row.id }
+                return
+            }
+            armedRowID = nil
+            withAnimation(.smooth(duration: 0.2)) { hostActionState = .sending(a.id) }
+            Task {
+                let outcome = await onHostAction(a)
+                withAnimation(.smooth(duration: 0.2)) {
+                    hostActionState = .done(ok: outcome.ok, message: outcome.message)
+                }
+            }
         case .wake:
             onWake()
             performClose()

@@ -29,14 +29,27 @@ object SessionAccess {
     /** Library launch (`Hello.launch`). */
     const val LAUNCH = 1 shl 5
 
+    /** Host power — the `power.*` host actions (`design/host-actions.md`); route-gated, never input. */
+    const val POWER = 1 shl 6
+
     /** Every defined grant — full control, and what an old host's Welcome decodes to. */
-    const val ALL = GAMEPAD or POINTER or KEYBOARD or CLIPBOARD or MIC or LAUNCH
+    const val ALL = GAMEPAD or POINTER or KEYBOARD or CLIPBOARD or MIC or LAUNCH or POWER
+
+    /** `ALL` before POWER existed (hosts ≤ 0.32.x) — see [normalizeLegacyFull]. */
+    private const val ALL_PRE_POWER = GAMEPAD or POINTER or KEYBOARD or CLIPBOARD or MIC or LAUNCH
+
+    /**
+     * The legacy-full read rule (host-actions §4.3): exactly the pre-power full mask (an old
+     * host's "Full control") reads as the current [ALL], so it labels "Full control", not
+     * "Custom". Any other mask passes through.
+     */
+    fun normalizeLegacyFull(grants: Int): Int = if (grants == ALL_PRE_POWER) ALL else grants
 
     /**
      * The preset name a mask displays as — §3.2's rule: three levels people actually reason
      * about, "Custom" for any other combination, never a raw bit list.
      */
-    fun label(grants: Int): String = when (grants and ALL) {
+    fun label(grants: Int): String = when (normalizeLegacyFull(grants) and ALL) {
         ALL -> "Full control"
         GAMEPAD -> "Controller only"
         0 -> "View only"

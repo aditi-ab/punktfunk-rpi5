@@ -258,6 +258,21 @@ pub enum EventKind {
     /// `GET /api/v1/store/catalog` / `…/installed`. Deliberately payload-free: the store's answer
     /// is a join over several sources of truth, so "go look again" is the only honest signal.
     StoreChanged,
+    /// A host action was invoked (`design/host-actions.md` §3.3) — v1: the `power.*` verbs.
+    /// Emitted on ACCEPT (`outcome: "accepted"`), and again if the executor later fails
+    /// (`outcome: "failed: …"`) — a succeeded power action ends this process, so "accepted with
+    /// no failure after it" is the success signal a hook can act on ("the host is going down").
+    #[serde(rename = "action.invoked")]
+    ActionInvoked {
+        /// The invoked action id (`power.sleep`, `power.reboot`, `power.shutdown`).
+        id: String,
+        /// The invoking paired device, when the cert lane invoked it; absent for the
+        /// operator's console (admin lane).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        device: Option<DeviceRef>,
+        /// `accepted`, or `failed: <the executor's error>`.
+        outcome: String,
+    },
     #[serde(rename = "host.started")]
     HostStarted {
         version: String,
@@ -293,6 +308,7 @@ impl EventKind {
             EventKind::UpdateApplied { .. } => "update.applied",
             EventKind::PluginsChanged { .. } => "plugins.changed",
             EventKind::StoreChanged => "store.changed",
+            EventKind::ActionInvoked { .. } => "action.invoked",
             EventKind::HostStarted { .. } => "host.started",
             EventKind::HostStopping => "host.stopping",
         }
@@ -322,6 +338,7 @@ impl EventKind {
             | EventKind::AccessGranted { device, .. }
             | EventKind::AccessChanged { device, .. }
             | EventKind::AccessExpired { device } => Some(&device.name),
+            EventKind::ActionInvoked { device, .. } => device.as_ref().map(|d| d.name.as_str()),
             _ => None,
         }
     }
@@ -337,6 +354,9 @@ impl EventKind {
             | EventKind::AccessGranted { device, .. }
             | EventKind::AccessChanged { device, .. }
             | EventKind::AccessExpired { device } => Some(&device.fingerprint),
+            EventKind::ActionInvoked { device, .. } => {
+                device.as_ref().map(|d| d.fingerprint.as_str())
+            }
             _ => None,
         }
     }
@@ -721,6 +741,58 @@ mod tests {
         assert_eq!(expired.client_name(), Some("Guest Deck"));
         assert_eq!(expired.fingerprint(), Some("ab12"));
         assert_eq!(expired.plane(), Some(Plane::Native));
+    }
+
+    /// The `action.invoked` wire shape (host actions design §3.3): a cert-lane invoke carries the
+    /// device; the console's (admin) invoke omits the field entirely — the optional convention.
+    #[test]
+    fn action_invoked_wire_shapes_and_filters() {
+        let ev = HostEvent {
+            seq: 10,
+            ts_ms: 1_700_000_000_000,
+            schema: 1,
+            kind: EventKind::ActionInvoked {
+                id: "power.sleep".into(),
+                device: Some(DeviceRef {
+                    name: "Living Room TV".into(),
+                    fingerprint: "ab12".into(),
+                    plane: Plane::Native,
+                }),
+                outcome: "accepted".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&ev).unwrap(),
+            r#"{"seq":10,"ts_ms":1700000000000,"schema":1,"kind":"action.invoked","id":"power.sleep","device":{"name":"Living Room TV","fingerprint":"ab12","plane":"native"},"outcome":"accepted"}"#
+        );
+        let admin = EventKind::ActionInvoked {
+            id: "power.shutdown".into(),
+            device: None,
+            outcome: "accepted".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&admin).unwrap(),
+            r#"{"kind":"action.invoked","id":"power.shutdown","outcome":"accepted"}"#
+        );
+        assert_eq!(admin.name(), "action.invoked");
+        assert!(kind_matches("action.*", admin.name()));
+        assert_eq!(admin.client_name(), None);
+        let cert = HostEvent {
+            seq: 11,
+            ts_ms: 0,
+            schema: 1,
+            kind: EventKind::ActionInvoked {
+                id: "power.sleep".into(),
+                device: Some(DeviceRef {
+                    name: "Guest Deck".into(),
+                    fingerprint: "ab12".into(),
+                    plane: Plane::Native,
+                }),
+                outcome: "accepted".into(),
+            },
+        };
+        assert_eq!(cert.kind.client_name(), Some("Guest Deck"));
+        assert_eq!(cert.kind.fingerprint(), Some("ab12"));
     }
 
     /// The `game.*` events must be reachable by the same hook/SSE filters as every other kind — a

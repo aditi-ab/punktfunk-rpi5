@@ -96,6 +96,16 @@ pub enum CardOutput {
     Library(ConnectRequest),
     /// Upload this device's recent log ring to the host (`logring::send_to_host`).
     SendLogs(ConnectRequest),
+    /// Run one of the host's OWN actions — sleep / restart / shut down it
+    /// (`design/host-actions.md` §7). `label` is what the menu called it, so the confirmation
+    /// and the toast say the same words the row did.
+    HostAction {
+        req: ConnectRequest,
+        action_id: String,
+        label: String,
+        /// Ask before running: the action loses whatever is on that machine.
+        danger: bool,
+    },
     /// Open the host edit sheet (name, profile binding, pinned cards, clipboard).
     Edit {
         fp_hex: String,
@@ -111,6 +121,9 @@ pub enum CardOutput {
     },
     /// Put this card's `punktfunk://` URL on the clipboard.
     CopyLink(String),
+    /// A one-line message for the window's toast overlay — a card that has something to say
+    /// and nothing to do (a host action the host has already told us it cannot run).
+    Toast(String),
     /// Write a desktop entry that launches this card's URL.
     CreateShortcut {
         label: String,
@@ -372,6 +385,38 @@ impl relm4::factory::FactoryComponent for HostCard {
                         }),
                     );
                 }
+                // The host's own actions, one registered action per offered row. Read from
+                // the shared cache the hosts page keeps warm, so the menu's rows and these
+                // handlers are built from the SAME answer — a menu whose rows outlived their
+                // handlers would run the wrong verb, and two of these verbs are irreversible.
+                let host_actions = pf_client_core::host_actions::cached(&k.fp_hex);
+                for (i, a) in host_actions.iter().enumerate() {
+                    let (req, id, label, danger) =
+                        (req.clone(), a.id.clone(), a.label().to_string(), a.danger);
+                    let available = a.available;
+                    let reason = a.unavailable_reason.clone().unwrap_or_default();
+                    add(
+                        &format!("action{i}"),
+                        Box::new(move || {
+                            if available {
+                                CardOutput::HostAction {
+                                    req: req.clone(),
+                                    action_id: id.clone(),
+                                    label: label.clone(),
+                                    danger,
+                                }
+                            } else {
+                                // The host already said it cannot do this right now; say why
+                                // rather than send a request we know it will refuse.
+                                CardOutput::Toast(if reason.is_empty() {
+                                    format!("{label} isn't available right now")
+                                } else {
+                                    reason.clone()
+                                })
+                            }
+                        }),
+                    );
+                }
                 // "Copy link" / "Create shortcut…": the self-emitted URL for this card, which
                 // is what an external tool (a Playnite entry, a Stream Deck macro) is
                 // configured with. It carries the stable id AND host+fp, so it still resolves
@@ -539,6 +584,20 @@ impl relm4::factory::FactoryComponent for HostCard {
                     // An explicit wake only when offline and a MAC is known.
                     if !online && !k.mac.is_empty() {
                         look.append(Some("Wake host"), Some("card.wake"));
+                    }
+                    // …and the other half of that round trip: whatever this host last said it
+                    // lets this device do to it (sleep, restart, shut down). Nothing is decided
+                    // here — the list is empty unless the host answered and this device's
+                    // access carries the grant, so no row ever appears that the host would
+                    // refuse. Indexed actions rather than fixed labels: a later host can add
+                    // one and this menu renders it with no client release.
+                    for (i, a) in host_actions.iter().enumerate() {
+                        let label = if a.available {
+                            a.label().to_string()
+                        } else {
+                            format!("{} (unavailable)", a.label())
+                        };
+                        look.append(Some(&label), Some(&format!("card.action{i}")));
                     }
                     menu.append_section(None, &look);
 
@@ -747,6 +806,15 @@ pub enum HostsOutput {
     Library(ConnectRequest, Option<u16>),
     /// With the mgmt port resolved the same way as [`HostsOutput::Library`]'s.
     SendLogs(ConnectRequest, Option<u16>),
+    /// Run one of the host's own actions (`design/host-actions.md` §7) — same mgmt-port
+    /// resolution as the two above.
+    HostAction {
+        req: ConnectRequest,
+        mgmt: Option<u16>,
+        action_id: String,
+        label: String,
+        danger: bool,
+    },
 }
 
 impl SimpleComponent for HostsPage {
@@ -1042,6 +1110,24 @@ impl SimpleComponent for HostsPage {
                     let mgmt = self.mgmt_port_for(&req);
                     let _ = sender.output(HostsOutput::SendLogs(req, mgmt));
                 }
+                CardOutput::HostAction {
+                    req,
+                    action_id,
+                    label,
+                    danger,
+                } => {
+                    let mgmt = self.mgmt_port_for(&req);
+                    let _ = sender.output(HostsOutput::HostAction {
+                        req,
+                        mgmt,
+                        action_id,
+                        label,
+                        danger,
+                    });
+                }
+                CardOutput::Toast(msg) => {
+                    let _ = sender.output(HostsOutput::Toast(msg));
+                }
                 CardOutput::Edit { fp_hex, name } => self.edit_host_dialog(&sender, &fp_hex, &name),
                 CardOutput::Forget { fp_hex, name } => self.forget_dialog(&sender, &fp_hex, &name),
                 CardOutput::Wake { mac, addr } => crate::wol::wake(&mac, addr.parse().ok()),
@@ -1123,7 +1209,8 @@ impl HostsPage {
                 // — the last one not cosmetic, since a host that moved off 47990 loses its
                 // library the moment mDNS is unavailable and the advert is the only place the
                 // real port ever lived.
-                if let Some(a) = self.adverts.values().find(|a| matches(k, a)) {
+                let advert = self.adverts.values().find(|a| matches(k, a));
+                if let Some(a) = advert {
                     crate::trust::learn_from_advert(
                         &k.fp_hex,
                         &k.addr,
@@ -1132,6 +1219,17 @@ impl HostsPage {
                         &a.os,
                         a.mgmt_port,
                     );
+                }
+                // Keep this host's advertised actions warm, so the card's menu is built from a
+                // settled answer rather than one that arrives while the menu is open. Gated on
+                // the TTL inside, so an ordinary refresh costs nothing. Same three rungs for
+                // the port as everything else here: live advert, then the stored one, then the
+                // default.
+                if k.paired && online {
+                    let mgmt = advert
+                        .and_then(|a| a.mgmt_port)
+                        .unwrap_or_else(|| k.effective_mgmt_port());
+                    pf_client_core::host_actions::refresh(&k.addr, mgmt, &k.fp_hex);
                 }
                 saved.push_back(HostCard {
                     connecting: self.connecting.as_deref() == Some(k.fp_hex.as_str()),

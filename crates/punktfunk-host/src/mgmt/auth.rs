@@ -313,11 +313,19 @@ fn path_matches(pattern: &str, path: &str) -> bool {
 /// a streaming client can't administer the host (unpair others, arm/read the PIN, stop sessions,
 /// edit the library). `/health` is handled separately (always open).
 pub(crate) fn cert_may_access(method: &Method, path: &str) -> bool {
-    // The ONE write on this lane: a paired device uploading its own log bundle for the operator
+    // The FIRST write on this lane: a paired device uploading its own log bundle for the operator
     // ("send logs to host" — the only way logs escape a Deck in Gaming Mode or a tvOS box).
     // Deliberately write-only: the device gets an id back and can read NOTHING — not the bundle
     // list, not even its own upload. Size- and quota-capped in the handler/store.
     if method == Method::POST && path == "/api/v1/client-logs" {
+        return true;
+    }
+    // The lane's SECOND write: invoking a host action (`design/host-actions.md` §5.2) — power
+    // is most useful OUT of session ("sleep the host" from the host tile), which is exactly
+    // this lane. Id-only, empty body, and the handler re-reads `effective(fp, now)` and demands
+    // the `GRANT_POWER` bit per request; the route being reachable grants nothing by itself.
+    // Discovery (`GET /actions`) rides the read list below, per-caller-filtered in the handler.
+    if method == Method::POST && path_matches("/api/v1/actions/{}", path) {
         return true;
     }
     method == Method::GET
@@ -326,6 +334,7 @@ pub(crate) fn cert_may_access(method: &Method, path: &str) -> bool {
             "/api/v1/host"
                 | "/api/v1/compositors"
                 | "/api/v1/status"
+                | "/api/v1/actions"
                 // The paired-client ROSTERS (`/clients`, `/native/clients`) are deliberately NOT on
                 // this lane — they expose every OTHER paired device's name + fingerprint, which one
                 // paired streaming client must not be able to enumerate. Only the bearer/loopback

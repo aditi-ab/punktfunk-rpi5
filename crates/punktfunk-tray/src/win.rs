@@ -477,16 +477,19 @@ fn show_menu(hwnd: HWND) {
             }
             if running {
                 add(IDM_STOP, "Stop host", false, Some(win_theme::GLYPH_SHIELD));
+                // "Restart Punktfunk", not "Restart host": this restarts the SERVICE, and the
+                // clients' host-power menus use "Restart host" for the MACHINE
+                // (design/host-actions.md §7) — one phrase must not mean two verbs.
                 add(
                     IDM_RESTART,
-                    "Restart host",
+                    "Restart Punktfunk",
                     false,
                     Some(win_theme::GLYPH_SHIELD),
                 );
             } else if matches!(status, TrayStatus::Error(_)) {
                 add(
                     IDM_RESTART,
-                    "Restart host",
+                    "Restart Punktfunk",
                     false,
                     Some(win_theme::GLYPH_SHIELD),
                 );

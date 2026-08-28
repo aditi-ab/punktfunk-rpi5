@@ -21,6 +21,24 @@ const MENU_SPEED: &str = "Test network speed\u{2026}";
 /// and an offline host could only ever report an error.
 const MENU_SEND_LOGS: &str = "Send logs to host";
 const MENU_WAKE: &str = "Wake host";
+/// The host's OWN actions — sleep / restart / shut down it (`design/host-actions.md` §7) —
+/// each prefixed so the shared click callback can tell them from the fixed entries and recover
+/// which one was picked. The rows come from what the HOST said it lets this device do, so a
+/// device without the Host-power grant sees none, and a later host can add one without a
+/// client release. Same shape as [`MENU_PIN`]'s dynamic family, for the same reason.
+const MENU_HOST_ACTION: &str = "\u{23fb} ";
+
+/// One host action's menu label. Used to BUILD the row and to recognise it again in the click
+/// callback — one function, so the two can never disagree, and the match stays exact rather
+/// than a prefix test that two similarly-named actions could both satisfy.
+#[cfg(windows)]
+fn host_action_label(a: &pf_client_core::host_actions::ActionInfo) -> String {
+    format!(
+        "{MENU_HOST_ACTION}{}{}",
+        a.label(),
+        if a.available { "" } else { " (unavailable)" }
+    )
+}
 /// One entry for every per-host property (name, address, MAC, clipboard sharing) — the
 /// Apple client's add/edit sheet. A menu item per field read as clutter and buried the ones
 /// that matter.
@@ -724,8 +742,23 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 );
             }
             let can_wake = !online && !k.mac.is_empty();
+            // What this host last said it lets this device do to it. Kept warm here — on the
+            // list's own refresh, gated by the cache's TTL — so the menu is BUILT from a
+            // settled answer: rows that appeared while a menu was open would land under a
+            // cursor already moving, and two of these rows shut a machine down.
+            if k.paired && online {
+                pf_client_core::host_actions::refresh(
+                    &k.addr,
+                    target
+                        .mgmt_port
+                        .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT),
+                    &k.fp_hex,
+                );
+            }
+            let host_actions = pf_client_core::host_actions::cached(&k.fp_hex);
             let menu = {
                 let (svc, target) = (props.svc.clone(), target.clone());
+                let click_actions = host_actions.clone();
                 let (sf, sr) = (set_forget.clone(), set_rename.clone());
                 let (fp, name) = (k.fp_hex.clone(), k.name.clone());
                 let menu_profiles = profiles.clone();
@@ -771,6 +804,13 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         if can_wake {
                             items.push(menu_item(MENU_WAKE));
                         }
+                        // …and the other half of that round trip, from the shared cache the
+                        // host list keeps warm. Empty unless the host answered AND this
+                        // device's access carries the grant, so no row here can be refused
+                        // for permission.
+                        for a in &host_actions {
+                            items.push(menu_item(host_action_label(a)));
+                        }
 
                         items.push(menu_separator());
                         items.push(menu_item(MENU_COPY_LINK));
@@ -799,6 +839,64 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         items
                     })
                     .on_item_clicked(move |item: String| match item.as_str() {
+                        // The host's own actions are dynamic too, and matched by prefix ahead
+                        // of the fixed entries. The label is recovered back to an id through
+                        // the SAME list the rows were built from, so a menu whose rows outlived
+                        // their handlers can never run a different verb than the one clicked —
+                        // which matters here more than anywhere else in this menu.
+                        _ if item.starts_with(MENU_HOST_ACTION) => {
+                            let Some(a) =
+                                click_actions.iter().find(|a| host_action_label(a) == item)
+                            else {
+                                return;
+                            };
+                            let set_status = svc.set_status.clone();
+                            let (action_id, label) = (a.id.clone(), a.label().to_string());
+                            if !a.available {
+                                // The host already said it cannot do this right now.
+                                set_status.call(
+                                    a.unavailable_reason
+                                        .clone()
+                                        .unwrap_or_else(|| format!("{label} isn't available")),
+                                );
+                                return;
+                            }
+                            let identity = svc.ctx.identity.clone();
+                            let target = target.clone();
+                            if let Some(fp) = target.fp_hex.as_deref() {
+                                // Whatever the host said about itself is about to be wrong.
+                                pf_client_core::host_actions::invalidate(fp);
+                            }
+                            set_status.call(format!("{label} — asking {}…", target.name));
+                            let _ = std::thread::Builder::new()
+                                .name("punktfunk-hostaction".into())
+                                .spawn(move || {
+                                    let pin = target
+                                        .fp_hex
+                                        .as_deref()
+                                        .and_then(crate::trust::parse_hex32);
+                                    let mgmt = target
+                                        .mgmt_port
+                                        .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
+                                    let msg = match pf_client_core::host_actions::invoke(
+                                        &target.addr,
+                                        mgmt,
+                                        &identity,
+                                        pin,
+                                        &action_id,
+                                    ) {
+                                        Ok(()) => {
+                                            tracing::info!(host = %target.name, action = %action_id, "host action accepted");
+                                            format!("{}: {label} — on its way", target.name)
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(host = %target.name, action = %action_id, error = %e, "host action refused");
+                                            format!("{label} failed — {e}")
+                                        }
+                                    };
+                                    set_status.call(msg);
+                                });
+                        }
                         // The profile items are dynamic, so they are matched by prefix before
                         // the fixed ones.
                         _ if item.starts_with(MENU_PIN) || item.starts_with(MENU_UNPIN) => {

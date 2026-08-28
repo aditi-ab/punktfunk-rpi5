@@ -8,8 +8,19 @@
 //! The Apple/Android clients mirror these rules rather than link them — the labels, the
 //! chip/notice wording and the derive-not-store rule below are the contract they copy.
 
-use punktfunk_core::quic::{GRANT_ALL, GRANT_PRESET_CONTROLLER_ONLY, GRANT_PRESET_VIEW_ONLY};
+use punktfunk_core::quic::{
+    normalize_legacy_full, GRANT_ALL, GRANT_PRESET_CONTROLLER_ONLY, GRANT_PRESET_VIEW_ONLY,
+};
 use std::time::{Duration, Instant};
+
+/// The mask as THIS build's vocabulary reads it: an old host's explicit pre-power "Full
+/// control" normalizes to the current `GRANT_ALL` (the legacy-full rule, host-actions §4.3),
+/// and bits newer than this build are dropped — so a new host's Full session never renders as
+/// "Custom" on an older client (the #408-family rider fix: `preset_label` used to compare the
+/// raw wire mask against `GRANT_ALL` unmasked).
+fn effective_mask(grants: u32) -> u32 {
+    normalize_legacy_full(grants) & GRANT_ALL
+}
 
 /// What this session may do and for how long — the client-side snapshot of the host's
 /// [`Welcome`](punktfunk_core::quic::Welcome) advert, revised by every mid-session
@@ -57,9 +68,11 @@ impl SessionAccess {
     }
 
     /// Full control, permanent — today's default look, which must stay unchanged: no chip,
-    /// no gating, no toasts (design §7; old-host degrade).
+    /// no gating, no toasts (design §7; old-host degrade). Compared through
+    /// [`effective_mask`], so neither an old host's pre-power full mask nor a future host's
+    /// wider one puts a chip on a session that is simply Full.
     pub fn is_default(&self) -> bool {
-        self.grants == GRANT_ALL && self.deadline.is_none()
+        effective_mask(self.grants) == GRANT_ALL && self.deadline.is_none()
     }
 
     /// Time left before this access expires — `None` = permanent, zero = already due
@@ -83,9 +96,11 @@ impl SessionAccess {
 }
 
 /// The user-facing preset name DERIVED from the mask (design §3.2 — never stored, no
-/// drift): the three presets, and "Custom" for any other combination.
+/// drift): the three presets, and "Custom" for any other combination. Matches on
+/// [`effective_mask`] so a host with a different grant vocabulary (older: pre-power full;
+/// newer: bits this build doesn't know) still labels a Full session "Full control".
 pub fn preset_label(grants: u32) -> &'static str {
-    match grants {
+    match effective_mask(grants) {
         GRANT_ALL => "Full control",
         GRANT_PRESET_CONTROLLER_ONLY => "Controller only",
         GRANT_PRESET_VIEW_ONLY => "View only",
@@ -135,6 +150,14 @@ mod tests {
         // the media-remote example, and a full mask missing one bit.
         assert_eq!(preset_label(GRANT_GAMEPAD | GRANT_CLIPBOARD), "Custom");
         assert_eq!(preset_label(GRANT_ALL & !GRANT_KEYBOARD), "Custom");
+        // The two vocabulary-drift cases (host-actions §4.3): an old host's pre-power full
+        // mask, and a future host's full mask with a bit this build doesn't know — both are
+        // simply Full, never "Custom".
+        assert_eq!(
+            preset_label(punktfunk_core::quic::GRANT_ALL_PRE_POWER),
+            "Full control"
+        );
+        assert_eq!(preset_label(GRANT_ALL | (1 << 20)), "Full control");
     }
 
     #[test]

@@ -47,6 +47,11 @@ struct HomeView: View {
     @State private var editTarget: StoredHost?
     /// The outcome of the last "Send Logs to Host" — drives its alert.
     @State private var sendLogsResult: (ok: Bool, message: String)?
+    /// What each paired host says this device may do to it (`design/host-actions.md` §7).
+    @StateObject private var hostPower = HostPowerStore.shared
+    /// A destructive host action awaiting its confirmation.
+    @State private var confirmHostAction: PendingHostAction?
+    @State private var hostActionResult: (ok: Bool, message: String)?
     // How this device shows its own list. `.added` is the default because it is what the grid
     // did before it could sort at all — an update should not rearrange anyone's hosts.
     @AppStorage(DefaultsKey.hostSort) private var sortRaw = HostSort.added.rawValue
@@ -139,6 +144,13 @@ struct HomeView: View {
             .task {
                 while !Task.isCancelled {
                     await store.refreshReachability(discovery: discovery)
+                    // Keep each reachable paired host's advertised actions warm on the same
+                    // beat, so a card's menu is BUILT from a settled answer rather than one
+                    // arriving while the menu is open. TTL-gated inside, so this costs nothing
+                    // on an ordinary lap.
+                    for host in store.hosts where host.pinnedSHA256 != nil && isOnline(host) {
+                        hostPower.refresh(host)
+                    }
                     try? await Task.sleep(for: .seconds(10))
                 }
             }
@@ -205,6 +217,39 @@ struct HomeView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(sendLogsResult?.message ?? "")
+        }
+        // A destructive host action asks first: restart and shut down lose whatever is running
+        // on that machine, and a mis-tap on a phone must not be able to do that. Sleep is
+        // reversible from the same menu ("Wake Host"), so it never reaches here.
+        .alert(
+            confirmHostAction.map { "\($0.action.label)?" } ?? "",
+            isPresented: Binding(
+                get: { confirmHostAction != nil },
+                set: { if !$0 { confirmHostAction = nil } })
+        ) {
+            Button("Cancel", role: .cancel) { confirmHostAction = nil }
+            if let pending = confirmHostAction {
+                Button(pending.action.label, role: .destructive) {
+                    confirmHostAction = nil
+                    runHostAction(pending.action, on: pending.host)
+                }
+            }
+        } message: {
+            Text(
+                confirmHostAction.map {
+                    "This ends every stream from \($0.host.displayName) and anything running "
+                        + "on it. You'll need to wake or start it again."
+                } ?? "")
+        }
+        .alert(
+            hostActionResult?.ok == true ? "On Its Way" : "Couldn't Do That",
+            isPresented: Binding(
+                get: { hostActionResult != nil },
+                set: { if !$0 { hostActionResult = nil } })
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(hostActionResult?.message ?? "")
         }
         #if os(macOS)
         .frame(minWidth: 480, minHeight: 360)
@@ -306,8 +351,32 @@ struct HomeView: View {
             onEdit: { editTarget = host },
             onSendLogs: host.pinnedSHA256 != nil
                 ? { Task { sendLogsResult = await SendLogs.toHost(host) } } : nil,
+            // A pinned card is a shortcut to one profile, not a second host, so it carries no
+            // host actions — the same rule the console's menu applies.
+            hostActions: pinned == nil ? hostPower.actions(for: host) : [],
+            onHostAction: { action in hostAction(action, on: host) },
             profileMenu: profileMenu(for: host),
             pinnedProfile: pinned)
+    }
+
+    /// A host action picked from a card's menu: explain an unavailable one, confirm a
+    /// destructive one, run the rest.
+    private func hostAction(_ action: HostAction, on host: StoredHost) {
+        guard action.available else {
+            hostActionResult = (
+                false,
+                action.unavailableReason ?? "\(action.label) isn't available right now.")
+            return
+        }
+        if action.danger {
+            confirmHostAction = PendingHostAction(host: host, action: action)
+        } else {
+            runHostAction(action, on: host)
+        }
+    }
+
+    private func runHostAction(_ action: HostAction, on host: StoredHost) {
+        Task { hostActionResult = await hostPower.invoke(action, on: host) }
     }
 
     /// The profile affordances every host card carries (§5.2/§5.2a).

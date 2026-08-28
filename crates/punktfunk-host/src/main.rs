@@ -105,6 +105,7 @@ mod native_pairing;
 mod osinfo;
 mod pipeline;
 mod plugins;
+mod power;
 // Finding a launched game's processes from its store's detect signals — the read side of the
 // session⇄game lifetime binding (design/session-game-lifetime.md §4). Per-OS matchers inside; on a
 // platform with neither (macOS, which has no launch path either) the module is an empty shell.

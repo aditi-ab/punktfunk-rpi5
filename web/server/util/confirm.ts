@@ -11,6 +11,10 @@
 //   - PUT  /api/v1/hooks                   — a hook is a shell command the host runs on its events
 //   - the library writes that carry `prep`/`launch.kind == "command"` — same primitive, gated
 //     conditionally in util/libraryConfirm.ts
+//   - POST /api/v1/actions/{id}           — the host power actions (sleep/reboot/shutdown,
+//                                            design/host-actions.md §7): ending the machine from
+//                                            a 7-day cookie alone is exactly what this gate exists
+//                                            to prevent
 //   - the PAIRING routes — arming a window, approving a knock, submitting a GameStream PIN. A
 //     paired device injects keyboard and mouse on the host desktop, so admitting one IS code
 //     execution, and it was the shortest path past this gate (security-review 2026-08-25).

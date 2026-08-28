@@ -248,7 +248,9 @@ to wake the machine — if the adapter is not in it, nothing on the network can 
   round that everywhere except the Linux app.
 - **Magic packets are broadcasts.** They do not cross subnets, a VPN or a mesh network. Client and
   host have to share a LAN segment.
-- **Punktfunk never puts a host to sleep, and never wakes one on a schedule.** A packet goes out
-  because a connect needs it, or because you asked for one.
+- **Punktfunk never sleeps or wakes a host on its own.** A wake packet goes out because a connect
+  needs it, or because you asked for one — and putting the host *back* to sleep is likewise an
+  explicit, permission-gated action: see [Host power](/docs/host-power) for the other half of the
+  round trip.
 - **There is no host-side switch.** The host publishes its MAC address and warns when its card is
   not armed. Whether to wake, when, and how long to wait is decided on the client.

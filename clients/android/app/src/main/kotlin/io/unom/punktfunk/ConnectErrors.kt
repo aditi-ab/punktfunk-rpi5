@@ -58,6 +58,11 @@ object ConnectErrors {
         "launch-not-permitted" ->
             "This device's access doesn't include launching games — connect to the desktop, " +
                 "or ask the host's owner."
+        // A host power action (design/host-actions.md) ended the session deliberately.
+        // Without this arm it falls through to the generic failure, and sleeping your own
+        // host from the couch reads as a crash.
+        "host-power" ->
+            "The host is going to sleep or shutting down — wake it when you want to play again."
         else -> null
     }
 

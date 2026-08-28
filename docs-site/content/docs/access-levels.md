@@ -30,7 +30,7 @@ The preset label is derived from the underlying toggles, so a hand-tuned combina
 
 ## The advanced toggles
 
-Each preset is a bundle of six independent grants, under **Advanced** in the edit sheet:
+Each preset is a bundle of independent grants, under **Advanced** in the edit sheet:
 
 | Toggle | Covers |
 |---|---|
@@ -40,6 +40,7 @@ Each preset is a bundle of six independent grants, under **Advanced** in the edi
 | **Clipboard** | The [shared clipboard](/docs/clipboard). Both switches still apply: the host operator's clipboard policy *and* this grant have to allow it — the grant can only narrow, never widen, what the operator permits. An ungranted device gets a clean "not permitted" instead of a toggle that silently does nothing. |
 | **Microphone** | Sending the client's microphone to the host. Without it, the session never attaches to the host's mic service at all. |
 | **Launch** | Starting a game from the host's [library](/docs/game-library) when connecting. Without it, a connect that asks to launch is refused with a clear error rather than dropped onto the bare desktop. The library stays *visible* — this governs launching, not browsing. |
+| **Host power** | Sleeping, restarting or shutting down the host machine from the client (see [Host power](/docs/host-power)). Included in Full control on purpose: a device with Keyboard and Pointer can already reach the desktop's own power menu, so withholding only the polite path would be a lock painted on an open door. The bit's real job is keeping power away from *limited* devices — the controller-only guest and the view-only spectator cannot touch it. |
 
 **Controller only deliberately does not include Launch**: in co-play the owner drives what runs.
 Want a guest picking games? Turn on that one Advanced toggle.

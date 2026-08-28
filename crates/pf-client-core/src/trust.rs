@@ -876,6 +876,10 @@ pub fn connect_reject_message(reason: punktfunk_core::reject::RejectReason) -> S
              a game, or ask the host's owner to allow launching."
                 .into()
         }
+        R::HostPower => {
+            "The host is going to sleep or shutting down — wake it when you want to play again."
+                .into()
+        }
     }
 }
 

@@ -92,6 +92,7 @@ fn hosts() -> Vec<HostRow> {
         clipboard_sync: false,
         last_used: None,
         os: String::new(),
+        actions: Vec::new(),
         pin: None,
         bound_profile: None,
     };

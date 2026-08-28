@@ -13,6 +13,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import io.unom.punktfunk.CONNECT_TIMEOUT_MS
 import io.unom.punktfunk.ConnectErrors
+import io.unom.punktfunk.HostActions
 import io.unom.punktfunk.ProfileStore
 import io.unom.punktfunk.Settings
 import io.unom.punktfunk.SettingsStore
@@ -98,6 +99,11 @@ object SkiaConsole {
     private var discovered: List<DiscoveredHost> = emptyList()
     private var reachable: Set<String> = emptySet()
     private var settings: Settings = Settings()
+
+    /** What each paired host last said this device may do TO it, by fingerprint, and when we
+     *  last asked — the Android half of the desktop's shared actions cache. Main-thread only. */
+    private val hostActions = mutableMapOf<String, List<HostActions.Action>>()
+    private val hostActionsAt = mutableMapOf<String, Long>()
 
     // What the composable hands us while it is on screen.
     private var onConnected: ((ActiveSession) -> Unit)? = null
@@ -417,10 +423,45 @@ object SkiaConsole {
 
     private fun pushHosts() {
         if (handle == 0L) return
+        refreshHostActions()
         NativeBridge.nativeConsoleSetHosts(
             handle,
-            ConsoleJson.hostRows(knownHostStore.all(), discovered, reachable, profileStore.all()),
+            ConsoleJson.hostRows(
+                knownHostStore.all(), discovered, reachable, profileStore.all(), hostActions,
+            ),
         )
+    }
+
+    /**
+     * Keep each paired, reachable host's advertised actions fresh (`design/host-actions.md` §7),
+     * mirroring the desktop's `pf_client_core::host_actions::refresh`.
+     *
+     * On a slow TTL and never when a menu opens: the row list has to be SETTLED before the menu
+     * draws, or rows would appear under a cursor already moving toward something else — and two
+     * of those rows shut a machine down.
+     */
+    private fun refreshHostActions() {
+        val id = identity ?: return
+        val now = android.os.SystemClock.elapsedRealtime()
+        for (h in knownHostStore.all()) {
+            if (!h.paired || h.fpHex.isEmpty()) continue
+            val online = discovered.any {
+                it.fingerprint.equals(h.fpHex, ignoreCase = true) ||
+                    (it.host == h.address && it.port == h.port)
+            } || "${h.address}:${h.port}" in reachable
+            if (!online) continue
+            // Stamp BEFORE the request, so a slow host cannot make every push spawn another.
+            if (now - (hostActionsAt[h.fpHex] ?: 0L) < HOST_ACTIONS_TTL_MS) continue
+            hostActionsAt[h.fpHex] = now
+            val (addr, mgmt, fp) = Triple(h.address, h.effectiveMgmtPort, h.fpHex)
+            ioPool.execute {
+                val found = HostActions.list(id, addr, mgmt, fp)
+                main.post {
+                    hostActions[fp] = found
+                    pushHosts()
+                }
+            }
+        }
     }
 
     private fun pushKnownHosts() {
@@ -573,6 +614,7 @@ object SkiaConsole {
                     c.optJSONObject("RefreshRunning")?.let { fetchLibrary(it, refreshOnly = true) }
                     c.optJSONObject("Pair")?.let(::pair)
                     c.optJSONObject("SendLogs")?.let(::sendLogs)
+                    c.optJSONObject("HostAction")?.let(::hostAction)
                     c.optJSONObject("SaveHost")?.let(::saveHost)
                     c.optJSONObject("UpdateHost")?.let(::updateHost)
                     c.optJSONObject("ForgetHost")?.let(::forgetHost)
@@ -660,6 +702,26 @@ object SkiaConsole {
         val app = appContext ?: return
         ioPool.execute {
             val message = io.unom.punktfunk.SendLogs.toHost(app, id, addr, mgmt, fp, hostName)
+            main.post { notice(message) }
+        }
+    }
+
+    /**
+     * Sleep / restart / shut the host down (`design/host-actions.md` §7) — the console already
+     * confirmed a destructive one twice before raising this, and the host re-checks this
+     * device's Host-power grant on arrival, so nothing is decided here.
+     */
+    private fun hostAction(c: JSONObject) {
+        val addr = c.optString("addr"); val mgmt = c.optInt("mgmt"); val fp = c.optString("fp_hex")
+        val hostName = c.optString("host_name").ifEmpty { addr }
+        val actionId = c.optString("action_id"); val label = c.optString("label")
+        val id = identity
+        if (id == null) {
+            notice("Identity not ready yet — try again in a moment")
+            return
+        }
+        ioPool.execute {
+            val message = HostActions.invoke(id, addr, mgmt, fp, hostName, actionId, label)
             main.post { notice(message) }
         }
     }
@@ -825,4 +887,9 @@ object SkiaConsole {
 
     /** The no-PIN request-access park (≥ the host's approval window) — ConnectScreen's figure. */
     private const val REQUEST_ACCESS_TIMEOUT_MS = 185_000
+
+    /** How long a host's advertised actions stay fresh before we ask again — the desktop's
+     *  `pf_client_core::host_actions::TTL`. Long on purpose: what it governs changes when an
+     *  operator edits access, not minute to minute, and each refresh is a TLS handshake. */
+    private const val HOST_ACTIONS_TTL_MS = 300_000L
 }

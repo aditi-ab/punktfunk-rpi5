@@ -210,6 +210,7 @@ mod tests {
             clipboard_sync: false,
             last_used: None,
             os: String::new(),
+            actions: Vec::new(),
             pin: pin.map(|id| ProfileChip {
                 id: id.into(),
                 name: "Work".into(),

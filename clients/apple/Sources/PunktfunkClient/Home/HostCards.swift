@@ -140,6 +140,13 @@ struct HostCardView: View {
     /// Upload this device's recent log to the host (`SendLogs`). `nil` when the host is unpaired —
     /// the upload is authenticated by the pairing, so there is nothing to offer before it.
     var onSendLogs: (() -> Void)? = nil
+    /// What this host says this device may do TO it — sleep, restart, shut it down
+    /// (`design/host-actions.md` §7). Empty on every surface that doesn't offer them, and on
+    /// every host that hasn't answered or hasn't granted them.
+    var hostActions: [HostAction] = []
+    /// Run one of the above. `nil` alongside a non-empty `hostActions` would be a bug, so the
+    /// rows render disabled in that case rather than silently doing nothing.
+    var onHostAction: ((HostAction) -> Void)? = nil
     /// This card's profile affordances — nil on surfaces that don't offer them.
     var profileMenu: HostProfileMenu? = nil
     /// Set on a PINNED card: the profile this card connects with. nil = the host's primary card,
@@ -260,6 +267,17 @@ struct HostCardView: View {
             }
             if !isOnline, !host.wakeMacs.isEmpty, PunktfunkConnection.wakeOnLANAvailable, let onWake {
                 Button("Wake Host", systemImage: "power", action: onWake)
+            }
+            // …and the other half of that round trip: what the HOST says this device may do to
+            // it. Empty unless it answered and this device's access carries the grant, so no row
+            // here can be refused for permission. A destructive one confirms in the caller.
+            ForEach(hostActions) { action in
+                Button(
+                    action.available ? action.label : "\(action.label) (Unavailable)",
+                    systemImage: "power",
+                    role: action.danger ? .destructive : nil
+                ) { onHostAction?(action) }
+                .disabled(onHostAction == nil)
             }
             if host.pinnedSHA256 != nil {
                 // Dropping the pin does NOT downgrade to TOFU: the next connect must re-pair via

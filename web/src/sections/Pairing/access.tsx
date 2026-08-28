@@ -27,7 +27,19 @@ export const GRANT_KEYBOARD = 0x04;
 export const GRANT_CLIPBOARD = 0x08;
 export const GRANT_MIC = 0x10;
 export const GRANT_LAUNCH = 0x20;
-export const GRANT_ALL = 0x3f;
+export const GRANT_POWER = 0x40;
+export const GRANT_ALL = 0x7f;
+
+/** `GRANT_ALL` before the Power bit existed (hosts ≤ 0.32.x). */
+const GRANT_ALL_PRE_POWER = 0x3f;
+
+/**
+ * The legacy-full read rule (host-actions §4.3): a stored mask that is EXACTLY the pre-power
+ * full mask was an explicit "Full control" from before Power existed — read it as today's
+ * `GRANT_ALL`, so the chip stays "Full" and the edit sheet's toggles agree with it.
+ */
+export const normalizeLegacyFull = (mask: number): number =>
+	mask === GRANT_ALL_PRE_POWER ? GRANT_ALL : mask;
 
 /** The guest preset (D2): controller only, WITHOUT launch — the owner drives what runs. */
 export const PRESET_CONTROLLER = GRANT_GAMEPAD;
@@ -39,7 +51,7 @@ export type AccessLevel = "full" | "controller" | "view" | "custom";
 
 /** Preset name for a mask — derived, never stored (design §3.2). */
 export const levelOfMask = (mask: number): AccessLevel => {
-	switch (mask & GRANT_ALL) {
+	switch (normalizeLegacyFull(mask) & GRANT_ALL) {
 		case GRANT_ALL:
 			return "full";
 		case PRESET_CONTROLLER:
@@ -104,8 +116,9 @@ export const draftFromStored = (
 	expiresUnix: number | null | undefined,
 	grantedUnix: number | null | undefined,
 ): AccessDraft => {
-	// null grants = a pre-grants record = full control (the API contract).
-	const mask = grants ?? GRANT_ALL;
+	// null grants = a pre-grants record = full control (the API contract); an explicit
+	// pre-power full mask normalizes so the toggles agree with the "Full" chip.
+	const mask = normalizeLegacyFull(grants ?? GRANT_ALL);
 	if (expiresUnix == null || grantedUnix == null || expiresUnix <= grantedUnix)
 		return { grants: mask, expiry: "forever", customHours: 4 };
 	const secs = expiresUnix - grantedUnix;
@@ -168,14 +181,24 @@ export const AccessChip: FC<{
 	);
 };
 
-/** The six toggles behind Advanced, in bit order. Labels name what the bit covers. */
-const GRANT_TOGGLES: { bit: number; label: () => string }[] = [
+/** The toggles behind Advanced, in bit order. Labels name what the bit covers. */
+const GRANT_TOGGLES: {
+	bit: number;
+	label: () => string;
+	/** One line under the label, for a bit whose reach isn't obvious from its name alone. */
+	caption?: () => string;
+}[] = [
 	{ bit: GRANT_GAMEPAD, label: () => m.access_grant_gamepad() },
 	{ bit: GRANT_POINTER, label: () => m.access_grant_pointer() },
 	{ bit: GRANT_KEYBOARD, label: () => m.access_grant_keyboard() },
 	{ bit: GRANT_CLIPBOARD, label: () => m.access_grant_clipboard() },
 	{ bit: GRANT_MIC, label: () => m.access_grant_mic() },
 	{ bit: GRANT_LAUNCH, label: () => m.access_grant_launch() },
+	{
+		bit: GRANT_POWER,
+		label: () => m.access_grant_power(),
+		caption: () => m.access_grant_power_caption(),
+	},
 ];
 
 /**
@@ -243,7 +266,7 @@ export const AccessControls: FC<{
 				</button>
 				{advanced && (
 					<div className="grid grid-cols-2 gap-x-4 gap-y-2 rounded-md border p-3">
-						{GRANT_TOGGLES.map(({ bit, label }) => (
+						{GRANT_TOGGLES.map(({ bit, label, caption }) => (
 							<Label
 								key={bit}
 								className="flex items-center gap-2 text-sm font-normal"
@@ -260,7 +283,16 @@ export const AccessControls: FC<{
 										})
 									}
 								/>
-								{label()}
+								{caption ? (
+									<span className="flex flex-col">
+										{label()}
+										<span className="text-xs text-muted-foreground">
+											{caption()}
+										</span>
+									</span>
+								) : (
+									label()
+								)}
 							</Label>
 						))}
 					</div>

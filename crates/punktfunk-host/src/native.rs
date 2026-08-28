@@ -706,8 +706,10 @@ fn close_rejected(conn: &quinn::Connection, reason: punktfunk_core::reject::Reje
 /// malicious client must not turn the log into the DoS — with the totals surfaced once in the
 /// datagram loop's end-of-stream line.
 struct GrantDrops {
-    counts: [AtomicU64; 6],
-    warned: [AtomicBool; 6],
+    // One slot per grant BIT (7 with `Power`), indexed by bit position — Power never produces
+    // input drops, but `idx` must stay in bounds for every `GrantClass`.
+    counts: [AtomicU64; 7],
+    warned: [AtomicBool; 7],
 }
 
 impl GrantDrops {
@@ -817,6 +819,10 @@ async fn access_lifecycle(
     device: crate::events::DeviceRef,
 ) {
     let mut warned = spent_warnings(deadline, wall_unix_now());
+    // The host-power signal (`design/host-actions.md` §5.8): a `power.*` action ending every
+    // session closes THIS connection with the typed code, so the client says "the host is
+    // going to sleep" instead of a bare transport error.
+    let mut power_rx = crate::power::closing_rx();
     loop {
         let now = wall_unix_now();
         if let Some(d) = deadline {
@@ -883,6 +889,12 @@ async fn access_lifecycle(
                         grants: st.grants,
                         remaining_secs: remaining_secs_wire(deadline, now),
                     });
+                }
+            }
+            changed = power_rx.changed() => {
+                if changed.is_ok() && *power_rx.borrow_and_update() {
+                    close_rejected(&conn, punktfunk_core::reject::RejectReason::HostPower);
+                    return;
                 }
             }
             _ = conn.closed() => return, // session over — nothing left to guard

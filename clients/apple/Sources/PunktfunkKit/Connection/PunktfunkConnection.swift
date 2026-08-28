@@ -105,6 +105,10 @@ public enum HostRejection: Sendable {
     /// The Hello asked to launch a title but this device's grants exclude `LAUNCH` — refused
     /// at the handshake so the user gets a sentence, not a bare desktop they didn't ask for.
     case launchNotPermitted
+    /// A host power action (`design/host-actions.md`) is ending every session: the host is
+    /// going to sleep or shutting down, deliberately. Without this case the close reads as a
+    /// transport failure, and sleeping your own host from the couch looks like a crash.
+    case hostPower
 
     init?(status: Int32) {
         switch status {
@@ -119,6 +123,7 @@ public enum HostRejection: Sendable {
         case PUNKTFUNK_STATUS_REJECTED_BUSY.rawValue: self = .busy
         case PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED.rawValue: self = .accessExpired
         case PUNKTFUNK_STATUS_REJECTED_LAUNCH_NOT_PERMITTED.rawValue: self = .launchNotPermitted
+        case PUNKTFUNK_STATUS_REJECTED_HOST_POWER.rawValue: self = .hostPower
         default: return nil
         }
     }
@@ -154,6 +159,9 @@ public enum HostRejection: Sendable {
         case .launchNotPermitted:
             return "This device isn't permitted to launch games on the host — connect "
                 + "to the desktop instead, or ask the owner to allow launching."
+        case .hostPower:
+            return "The host is going to sleep or shutting down — wake it when you want "
+                + "to play again."
         }
     }
 }
@@ -556,9 +564,21 @@ public final class PunktfunkConnection {
     public static let grantClipboard: UInt32 = 1 << 3
     public static let grantMic: UInt32 = 1 << 4
     public static let grantLaunch: UInt32 = 1 << 5
+    /// Host power — the `power.*` host actions (`design/host-actions.md`); route-gated on the
+    /// mgmt cert lane, never carried by any input event.
+    public static let grantPower: UInt32 = 1 << 6
     /// Every defined grant — full control, today's behavior and what an old host's Welcome
     /// decodes to.
-    public static let grantAll: UInt32 = 0x3F
+    public static let grantAll: UInt32 = 0x7F
+    /// `grantAll` before Power existed (hosts ≤ 0.32.x) — see ``normalizedGrants(_:)``.
+    public static let grantAllPrePower: UInt32 = 0x3F
+
+    /// The legacy-full read rule (host-actions §4.3): exactly the pre-power full mask — an old
+    /// host's "Full control" — reads as the current ``grantAll``, so a Full session against an
+    /// old host neither wears a chip nor labels "Custom". Any other mask passes through.
+    public static func normalizedGrants(_ grants: UInt32) -> UInt32 {
+        grants == grantAllPrePower ? grantAll : grants
+    }
 
     /// The three user-facing access presets plus "Custom", DERIVED from the mask (never
     /// stored — design §3.2, no drift). The label vocabulary is the cross-client one the web
@@ -570,7 +590,7 @@ public final class PunktfunkConnection {
         case custom
 
         public init(grants: UInt32) {
-            switch grants & PunktfunkConnection.grantAll {
+            switch PunktfunkConnection.normalizedGrants(grants) & PunktfunkConnection.grantAll {
             case PunktfunkConnection.grantAll: self = .fullControl
             case PunktfunkConnection.grantGamepad: self = .controllerOnly
             case 0: self = .viewOnly
@@ -631,9 +651,11 @@ public final class PunktfunkConnection {
     /// The session's grants allow mic injection — hide the mic UI without it.
     public var canUseMic: Bool { accessGrants & Self.grantMic != 0 }
     /// Anything about this session's access differs from the everyday full-and-permanent —
-    /// the chip's visibility gate: full + permanent must look exactly like today.
+    /// the chip's visibility gate: full + permanent must look exactly like today. Compared
+    /// through ``normalizedGrants(_:)`` so an old host's pre-power full mask stays chipless.
     public var accessIsLimited: Bool {
-        accessGrants & Self.grantAll != Self.grantAll || accessExpiresInSeconds != 0
+        Self.normalizedGrants(accessGrants) & Self.grantAll != Self.grantAll
+            || accessExpiresInSeconds != 0
     }
 
     /// The grant bit one wire input kind needs — the Swift mirror of core's exhaustive

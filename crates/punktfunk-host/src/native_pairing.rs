@@ -223,7 +223,10 @@ impl NativePairing {
                 if c.expires_unix.is_some_and(|t| now_unix >= t) {
                     None
                 } else {
-                    Some(c.grants.unwrap_or(GRANT_ALL) & GRANT_ALL)
+                    Some(
+                        punktfunk_core::quic::normalize_legacy_full(c.grants.unwrap_or(GRANT_ALL))
+                            & GRANT_ALL,
+                    )
                 }
             }
         }

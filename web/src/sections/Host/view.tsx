@@ -17,10 +17,12 @@ export const HostView: FC<{
 	gpu?: ReactNode;
 	/** The update-check card (a self-contained container — see `UpdateCard.tsx`). */
 	update?: ReactNode;
+	/** The host-power actions card (a self-contained container — see `PowerCard.tsx`). */
+	power?: ReactNode;
 	/** Warning about other Moonlight-compatible servers on this machine — renders nothing when
 	 * there are none (see `ConflictsCard.tsx`). Sits at the top: it explains "nothing can connect". */
 	conflicts?: ReactNode;
-}> = ({ host, compositors, gpu, update, conflicts }) => {
+}> = ({ host, compositors, gpu, update, power, conflicts }) => {
 	const h = host.data;
 	return (
 		<Section maxWidth={false}>
@@ -98,6 +100,8 @@ export const HostView: FC<{
 				</QueryState>
 
 				{update}
+
+				{power}
 
 				{gpu}
 
