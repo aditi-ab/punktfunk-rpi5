@@ -118,10 +118,24 @@ must still exist in the tree, the counts of undocumented `PUNKTFUNK_*` variables
 `punktfunk-host` subcommands may never grow (document the new knob, or consciously raise the
 baseline in the script), and internal docs links must resolve.
 
-Match the surrounding code's comment density and naming. Commit messages end with the
-`Co-Authored-By` trailer (see `git log`).
+Match the surrounding code's comment density and naming.
 
 See the [README's Build & test section](README.md#build--test-from-source) for the extra dev
 commands (the FEC loss harness, the standalone C-ABI proof) and
 [Design invariants](README.md#design-invariants) for the rules a change is expected to hold to, and
 the [docs site](https://docs.punktfunk.unom.io) for architecture and per-platform guides.
+
+## How to write it (commits, changelog, comments)
+
+House style lives in **[docs/writing.md](docs/writing.md)**, which also carries a per-PR checklist.
+The three rules you need before your first commit:
+
+- **Commit subjects follow [Conventional Commits](https://www.conventionalcommits.org/) —
+  `type(scope): summary`, 72-character cap, imperative, no trailing period.** The *why* goes in
+  the body, wrapped at 72. The investigation goes on the pull request, not in the message. A Gitea
+  PR title becomes the merge subject, so write the PR title as a conventional commit too.
+- **New `CHANGELOG.md` sections use [Keep a Changelog](https://keepachangelog.com/) categories**
+  — `Breaking` / `Added` / `Changed` / `Fixed` / `Security` — plus the version table. Keep the
+  existing sections as they are. What a *user* can do goes in `docs/releases/vX.Y.Z.md` instead.
+- **A comment states an invariant or a trap, not a recap of the diff.** If a trust boundary
+  matters, a type, test or assertion has to enforce it — a comment alone never does.

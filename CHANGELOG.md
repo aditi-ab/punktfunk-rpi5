@@ -10,6 +10,11 @@ long enough to bury the user-facing half it was appended to. See `docs/releases/
 If you embed `punktfunk-core`, package Punktfunk, or write a plugin, this file is for you. Start
 with the version table of the release you are moving to, then read **Breaking changes**.
 
+New sections use [Keep a Changelog](https://keepachangelog.com/) categories — `Breaking`,
+`Added`, `Changed`, `Fixed`, `Security` — plus the version table, and stay to one screen for a
+patch and two for a minor. Sections written before 28 August 2026 predate that rule and are left
+as they are. See `docs/writing.md` §2.
+
 ---
 
 ## v0.32.0

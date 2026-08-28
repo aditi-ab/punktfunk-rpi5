@@ -2,6 +2,20 @@
 
 Guidance for coding agents working in this repository.
 
+## Writing standards
+
+Read `docs/writing.md` before you write a commit message, a `CHANGELOG.md` entry, or a comment.
+It is the house style for all three, and §4 is a per-PR checklist. The short version:
+
+- Commit subject is `type(scope): summary` — imperative, **72-character hard cap**, no trailing
+  period, one logical change. No `Co-Authored-By` trailer.
+- The commit body is *why*, wrapped at 72. The investigation, the measurements and the rejected
+  paths go on the pull request, never in the message.
+- Write the Gitea PR title as a conventional commit; Gitea makes it the merge subject.
+- New `CHANGELOG.md` sections use Keep a Changelog categories. Leave the older sections alone.
+- A comment states an invariant or a trap. A comment never enforces a trust boundary — a type,
+  a test or an assertion does.
+
 ## Agent skills
 
 ### Issue tracker
