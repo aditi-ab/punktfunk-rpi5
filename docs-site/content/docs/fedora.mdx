@@ -6,6 +6,14 @@ description: Install the Punktfunk host on Fedora 43 or newer from the RPM repo 
 For **Fedora 43 or newer** (Workstation or KDE). Bazzite and other Fedora Atomic spins have
 [their own page](/docs/bazzite).
 
+**One command instead?** The [guided installer](/docs/install#guided-install-preview) (preview) does
+everything on this page — it detects the distro, installs the host, joins the groups, opens the
+firewall and starts it:
+
+<Installer />
+
+The steps below are the same thing by hand, and stay the documented path.
+
 ## 1. GPU driver
 
 - **NVIDIA:** the driver and an NVENC-capable FFmpeg both come from **RPM Fusion** — Fedora's own
