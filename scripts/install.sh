@@ -4,10 +4,11 @@
 #   curl -fsSL https://punktfunk.unom.io/install.sh | sh
 #   curl -fsSLO https://punktfunk.unom.io/install.sh && sh install.sh --help   # read it first
 #
-# Zero-to-streaming for a Linux host: detect the distro → add the package repo → install → deal
-# with a Sunshine/Apollo/Vibeshine already on the box (move one port) → groups → options →
-# firewall → start the services → verify → print how to pair. Plain POSIX sh, `read` prompts,
-# no TUI. Every prompt has a default so `--yes` (or no terminal) runs unattended.
+# Zero-to-streaming for a Linux host: detect the distro → ask intent (not internals) → print
+# the choices → add the package repo → install → deal with a Sunshine/Apollo/Vibeshine already
+# on the box (move one port) → groups → options → firewall → start the services → verify →
+# print how to pair. Plain POSIX sh, `read` prompts, no TUI. Every prompt has a default so
+# `--yes` (or no terminal) runs unattended; the default follows the box, not a global no.
 #
 # This is WP4 of the docs-and-onboarding overhaul and is labelled PREVIEW on purpose: the per-distro
 # docs pages (https://docs.punktfunk.unom.io/docs/install) remain the documented default until it
@@ -25,10 +26,10 @@ USER=${USER:-$(id -un)}; export USER
 YES=${PUNKTFUNK_INSTALL_YES:-0}
 CHANNEL=${PUNKTFUNK_INSTALL_CHANNEL:-stable}
 CHANNEL_SET=0; [ -n "${PUNKTFUNK_INSTALL_CHANNEL:-}" ] && CHANNEL_SET=1   # asked for, vs. defaulted
-GAMESTREAM=${PUNKTFUNK_INSTALL_GAMESTREAM:-}     # 1/0, empty = ask (default no)
-CLIPBOARD=${PUNKTFUNK_INSTALL_CLIPBOARD:-}       # 1/0, empty = ask (default no)
-PF_GROUP=${PUNKTFUNK_INSTALL_PUNKTFUNK_GROUP:-}  # 1/0, empty = ask (default no)
-LINGER=${PUNKTFUNK_INSTALL_LINGER:-}             # 1/0, empty = ask (default no)
+GAMESTREAM=${PUNKTFUNK_INSTALL_GAMESTREAM:-}     # 1/0, empty = ask
+CLIPBOARD=${PUNKTFUNK_INSTALL_CLIPBOARD:-}       # 1/0, empty = ask
+PF_GROUP=${PUNKTFUNK_INSTALL_PUNKTFUNK_GROUP:-}  # 1/0, empty = ask
+LINGER=${PUNKTFUNK_INSTALL_LINGER:-}             # 1/0, empty = ask
 MGMT_PORT=${PUNKTFUNK_INSTALL_MGMT_PORT:-47991}  # where the management API moves to on a conflict
 START=1
 DRY=${PUNKTFUNK_INSTALL_DRY_RUN:-0}
@@ -42,10 +43,10 @@ usage: sh install.sh [options]
   -y, --yes             no prompts: take every default (also the behaviour without a terminal)
   --channel stable|canary   package channel (default stable; canary = latest main build). On a box
                         that already has the host this SWITCHES channel, either direction.
-  --gamestream | --no-gamestream   also serve stock Moonlight clients (default no — trusted LANs only)
-  --clipboard | --no-clipboard     allow the shared clipboard on this host (default no)
-  --punktfunk-group | --no-punktfunk-group   join the punktfunk group (virtual Steam Deck pad; default no)
-  --linger | --no-linger           start the host at boot with nobody logged in (default no)
+  --gamestream | --no-gamestream   Moonlight/Artemis/third-party clients (default depends on the box)
+  --clipboard | --no-clipboard     shared clipboard (default no)
+  --punktfunk-group | --no-punktfunk-group   full controller / virtual Steam Deck pad (default depends on the box)
+  --linger | --no-linger           start at boot with nobody logged in (default depends on the box)
   --mgmt-port N         port to move the management API to if Sunshine/Apollo holds 47990 (default $MGMT_PORT)
   --no-start            install and configure, but don't enable the services
   --uninstall           stop the services and remove the packages + repo (config stays: $DOCS/uninstall)
@@ -120,7 +121,13 @@ run() {
     fi
     printf '  + %s\n' "$cmd"
     [ "$DRY" = 1 ] && return 0
-    if [ -n "$TTY" ]; then sh -ec "$cmd" < "$TTY"; else sh -ec "$cmd" < /dev/null; fi \
+    # --yes means unattended: never block on a sudo password (sudo reads the TTY, not stdin).
+    # Printed command stays without -n so the platforms.json verbatim gate still matches.
+    exec_cmd=$cmd
+    if [ "$YES" = 1 ]; then
+        exec_cmd=$(printf '%s' "$cmd" | sed 's/sudo /sudo -n /g')
+    fi
+    if [ -n "$TTY" ] && [ "$YES" != 1 ]; then sh -ec "$exec_cmd" < "$TTY"; else sh -ec "$exec_cmd" < /dev/null; fi \
         || die "that step failed — fix it and re-run (the script is safe to repeat), or follow the page by hand: $DOCS_PAGE"
 }
 
@@ -295,6 +302,115 @@ if [ "$FAMILY" = dnf ]; then
         *)  die "no RPM group for Fedora $VERSION_ID yet — $DOCS/build-from-source" ;;
     esac
 fi
+
+# ---------------------------------------------------------------------------- choices
+# Empty flag/env still means "ask". The default behind Enter (and --yes) follows the box:
+# couch/HTPC distros want the Deck pad and linger; an active Sunshine-family host wants
+# Moonlight compat; a seatless session wants linger. Clipboard stays off. Flags/env win.
+has_graphical_seat() {
+    [ -n "${DISPLAY:-}" ] && return 0
+    [ -n "${WAYLAND_DISPLAY:-}" ] && return 0
+    case "${XDG_SESSION_TYPE:-}" in x11|wayland) return 0 ;; esac
+    return 1
+}
+couch_box() {
+    [ "$FAMILY" = sysext ] && return 0
+    [ "$ID" = bazzite ] && return 0
+    [ "$ID" = nobara ] && return 0
+    command -v ujust >/dev/null 2>&1 && return 0
+    return 1
+}
+# Same split as `punktfunk-host detect-conflicts`: exit 1 only when a Sunshine-family host
+# runs or autostarts. A dormant leftover is not a reason to open Moonlight ports.
+sunshine_active() {
+    if command -v punktfunk-host >/dev/null 2>&1; then
+        punktfunk-host detect-conflicts >/dev/null 2>&1 && return 1 || return 0
+    fi
+    for u in sunshine.service apollo.service vibeshine.service; do
+        systemctl is-active --quiet "$u" 2>/dev/null && return 0
+        systemctl is-enabled --quiet "$u" 2>/dev/null && return 0
+        systemctl --user is-active --quiet "$u" 2>/dev/null && return 0
+        systemctl --user is-enabled --quiet "$u" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+GROUP_WHY=; GS_WHY=; LINGER_WHY=
+DEF_GROUP=n; DEF_GS=n; DEF_LINGER=n
+
+if couch_box; then
+    DEF_GROUP=y
+    DEF_LINGER=y
+    case "$ID" in
+        bazzite)
+            GROUP_WHY="Bazzite — virtual Steam Deck pad"
+            LINGER_WHY="Bazzite hosts are usually headless" ;;
+        nobara)
+            GROUP_WHY="Nobara — virtual Steam Deck pad"
+            LINGER_WHY="Nobara hosts are usually headless" ;;
+        *)
+            GROUP_WHY="Game Mode / HTPC box — virtual Steam Deck pad"
+            LINGER_WHY="Game Mode / HTPC box" ;;
+    esac
+fi
+if ! has_graphical_seat; then
+    DEF_LINGER=y
+    [ -z "$LINGER_WHY" ] && LINGER_WHY="no graphical session"
+fi
+if sunshine_active; then
+    DEF_GS=y
+    GS_WHY="Sunshine/Apollo already on this box"
+fi
+
+if [ -z "$PF_GROUP" ]; then
+    if [ "$DEF_GROUP" = y ]; then
+        case "$ID" in
+            bazzite) q="Bazzite detected — joining the punktfunk group so the virtual Steam Deck pad works" ;;
+            nobara)  q="Nobara detected — joining the punktfunk group so the virtual Steam Deck pad works" ;;
+            *)       q="Game Mode / HTPC box detected — joining the punktfunk group so the virtual Steam Deck pad works" ;;
+        esac
+        ask "$q" y && PF_GROUP=1 || PF_GROUP=0
+    else
+        ask "Do you want the full controller — paddles, trackpads, gyro? (skip it and the pad arrives as a plain Xbox 360 controller)" n && PF_GROUP=1 || PF_GROUP=0
+        GROUP_WHY=
+    fi
+    [ "$PF_GROUP" = 0 ] && GROUP_WHY=
+fi
+if [ -z "$GAMESTREAM" ]; then
+    if [ "$DEF_GS" = y ]; then
+        ask "Sunshine or Apollo is already on this box — also serve Moonlight, Artemis, or another third-party client? (Punktfunk's own apps don't need this)" y && GAMESTREAM=1 || GAMESTREAM=0
+    else
+        ask "Will you connect with Moonlight, Artemis, or another third-party client? (Punktfunk's own apps don't need this)" n && GAMESTREAM=1 || GAMESTREAM=0
+        GS_WHY=
+    fi
+    [ "$GAMESTREAM" = 0 ] && GS_WHY=
+fi
+if [ -z "$CLIPBOARD" ]; then
+    ask "Share the clipboard between this host and your clients? (each client still opts in per host)" n && CLIPBOARD=1 || CLIPBOARD=0
+fi
+if [ -z "$LINGER" ]; then
+    if [ "$DEF_LINGER" = y ]; then
+        ask "$LINGER_WHY — start the host at boot with nobody logged in?" y && LINGER=1 || LINGER=0
+    else
+        ask "Is this a box you stream from and rarely log into? (starts the host at boot with nobody logged in)" n && LINGER=1 || LINGER=0
+        LINGER_WHY=
+    fi
+    [ "$LINGER" = 0 ] && LINGER_WHY=
+fi
+
+yn() { [ "$1" = 1 ] && printf yes || printf no; }
+choice_line() {
+    if [ -n "$3" ] && [ "$2" = 1 ]; then
+        printf '  %s: %s  (%s)\n' "$1" "$(yn "$2")" "$3"
+    else
+        printf '  %s: %s\n' "$1" "$(yn "$2")"
+    fi
+}
+say "Choices (nothing below has run yet)"
+choice_line "Full controller" "$PF_GROUP" "$GROUP_WHY"
+choice_line "Third-party clients (Moonlight, Artemis)" "$GAMESTREAM" "$GS_WHY"
+choice_line "Shared clipboard" "$CLIPBOARD" ""
+choice_line "Start at boot with nobody logged in" "$LINGER" "$LINGER_WHY"
 
 # ---------------------------------------------------------------------------- 1. install
 # The snippets below are data/platforms.json's install lines, verbatim (stable channel); canary
@@ -547,9 +663,6 @@ elif ! getent group input >/dev/null 2>&1; then
 else
     run 'sudo usermod -aG input "$USER"'; RELOGIN=1
 fi
-if [ -z "$PF_GROUP" ]; then
-    ask "Also join the punktfunk group? It enables the virtual Steam Deck controller (paddles, trackpads, gyro) by granting usbip attach — only on a machine you trust ($DOCS/gamescope#nobara-and-other-autologin-display-managers)" n && PF_GROUP=1 || PF_GROUP=0
-fi
 if [ "$PF_GROUP" = 1 ]; then
     if id -nG "$USER" 2>/dev/null | tr ' ' '\n' | grep -qx punktfunk; then ok "already in the punktfunk group"
     else run 'sudo usermod -aG punktfunk "$USER"'; RELOGIN=1; fi
@@ -557,15 +670,9 @@ fi
 
 # ---------------------------------------------------------------------------- 4. options
 say "Options (host.env — everything here is off by default and reversible)"
-if [ -z "$GAMESTREAM" ]; then
-    ask "Also serve stock Moonlight clients (GameStream compat)? Its pairing runs over plain HTTP — trusted LANs only; Punktfunk's own apps don't need it" n && GAMESTREAM=1 || GAMESTREAM=0
-fi
 if [ "$GAMESTREAM" = 1 ]; then
     [ "$CONFLICT" = 1 ] && warn "with another GameStream host running, only one can bind the Moonlight ports — stop the other first or skip this"
     set_env PUNKTFUNK_GAMESTREAM 1
-fi
-if [ -z "$CLIPBOARD" ]; then
-    ask "Allow the shared clipboard on this host (each client still opts in per host)?" n && CLIPBOARD=1 || CLIPBOARD=0
 fi
 [ "$CLIPBOARD" = 1 ] && set_env PUNKTFUNK_CLIPBOARD on
 
@@ -591,6 +698,9 @@ fi
 # ---------------------------------------------------------------------------- 6. start
 if [ "$START" = 1 ]; then
     say "Starting the host and the web console"
+    # Linger is what creates a user manager on a seatless box; apply it before probing
+    # `systemctl --user`, otherwise SSH/headless installs print the enable command and stop.
+    [ "$LINGER" = 1 ] && run 'sudo loginctl enable-linger "$USER"'
     if ! systemctl --user show-environment >/dev/null 2>&1; then
         warn "no user systemd session here (ssh without a login session?) — run this from a terminal in your desktop session:"
         echo "     systemctl --user enable --now punktfunk-host punktfunk-web"
@@ -606,10 +716,6 @@ if [ "$START" = 1 ]; then
         # The plugin runner fills the game library; apt/dnf/sysext start it themselves, Arch doesn't.
         if systemctl --user list-unit-files punktfunk-scripting.service 2>/dev/null | grep -q disabled; then units="$units punktfunk-scripting"; fi
         run "systemctl --user enable --now $units"
-        if [ -z "$LINGER" ]; then
-            ask "Start the host at boot even with nobody logged in (headless box)?" n && LINGER=1 || LINGER=0
-        fi
-        [ "$LINGER" = 1 ] && run 'sudo loginctl enable-linger "$USER"'
     fi
 fi
 

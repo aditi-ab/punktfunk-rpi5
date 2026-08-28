@@ -31,6 +31,7 @@
 #   7. The installer under --dry-run against faked os-release files detects every family it claims
 #      to (and --uninstall prints each family's removal) — the committed half of the manual
 #      16-file matrix PR #345 was verified with. Needs curl on PATH (the script's own prerequisite).
+#      Per-family *defaults* (group / linger / GameStream) live in check-install-defaults.sh.
 #   8. scripts/web-init.sh — the web console's host-readiness gate — actually waits for the host's
 #      first-run files and actually stops waiting when they land, against a faked config dir. Not
 #      docs drift, but the same shape: a packaging script no build exercises, whose failure mode
@@ -165,6 +166,7 @@ installer_case fedora-rm 'ID=fedora\nVERSION_ID=44\n'                   'yum.rep
 installer_case arch-rm   'ID=arch\n'                                   '/etc/pacman.conf' --uninstall
 installer_case omarchy-rm 'ID=omarchy\nID_LIKE=arch\n'                  'punktfunk-omarchy remove' --uninstall
 installer_case bazzite-rm 'ID=bazzite\nID_LIKE="fedora"\nVERSION_ID=43\n' 'punktfunk-sysext remove' --uninstall
+sh scripts/ci/check-install-defaults.sh || fail=1
 
 # ---------------------------------------------------------------- gate 8: channel switching
 # A box that already has all three binaries, on a repo config naming one channel, told --channel

@@ -18,14 +18,25 @@ on:
     paths:
       - scripts/install.sh
       - data/platforms.json
+      - scripts/ci/check-install-defaults.sh
       - .gitea/workflows/installer-smoke.yml
   pull_request:
     paths:
       - scripts/install.sh
       - data/platforms.json
+      - scripts/ci/check-install-defaults.sh
       - .gitea/workflows/installer-smoke.yml
 
 jobs:
+  defaults:
+    name: derived defaults
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Assert per-family installer defaults
+        run: sh scripts/ci/check-install-defaults.sh
+
   smoke:
     name: smoke (${{ matrix.family }})
     runs-on: ubuntu-24.04
