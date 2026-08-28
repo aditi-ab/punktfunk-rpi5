@@ -73,10 +73,12 @@ export async function verifyHandoff(
 	for (const [t, at] of seen) if (now - at > HANDOFF_TTL_MS) seen.delete(t);
 
 	const parts = ticket.split(".");
-	if (parts.length !== 3 || parts.some((p) => p.length === 0)) {
-		return { ok: false, reason: "malformed" };
-	}
+	if (parts.length !== 3) return { ok: false, reason: "malformed" };
 	const [ts, nonce, mac] = parts;
+	// `split` yields `string | undefined` per element under `noUncheckedIndexedAccess`, and the
+	// length check above does not narrow a plain array — so this both proves it to the compiler and
+	// rejects the empty segments a `"1..2"` ticket would otherwise sneak through.
+	if (!ts || !nonce || !mac) return { ok: false, reason: "malformed" };
 	if (
 		!/^\d+$/.test(ts) ||
 		!/^[0-9a-f]+$/.test(nonce) ||
