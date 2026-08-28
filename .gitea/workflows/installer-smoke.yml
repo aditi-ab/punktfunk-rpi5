@@ -40,14 +40,20 @@ jobs:
             image: debian:trixie
             prep: apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl git nodejs
             rmweb: apt-get purge -y punktfunk-web
+            oncanary: grep -q ' canary main' /etc/apt/sources.list.d/punktfunk.list
+            onstable: grep -q ' stable main' /etc/apt/sources.list.d/punktfunk.list
           - family: fedora-44
             image: fedora:44
             prep: dnf install -y -q curl git nodejs
             rmweb: dnf remove -y punktfunk-web
+            oncanary: grep -q 'fedora-44-canary' /etc/yum.repos.d/punktfunk.repo
+            onstable: grep -q 'rpm/fedora-44$' /etc/yum.repos.d/punktfunk.repo
           - family: arch
             image: archlinux:base
             prep: pacman -Sy --noconfirm --needed curl git nodejs && (pacman-key --init >/dev/null 2>&1 || true)
             rmweb: pacman -Rns --noconfirm punktfunk-web
+            oncanary: grep -q '^\[punktfunk-canary\]' /etc/pacman.conf && ! grep -q '^\[punktfunk\]' /etc/pacman.conf
+            onstable: grep -q '^\[punktfunk\]' /etc/pacman.conf && ! grep -q '^\[punktfunk-canary\]' /etc/pacman.conf
     container:
       image: ${{ matrix.image }}
     steps:
@@ -81,6 +87,39 @@ jobs:
           ! command -v punktfunk-web-server
           sh scripts/install.sh --yes --no-start
           command -v punktfunk-web-server
+      # The channel switch, both ways, against the real registries — the half no textual gate can
+      # reach. Two things are actually at risk here and nowhere else: that the canary repo resolves
+      # at all, and that the walk back DOWN to stable happens instead of silently no-opping (canary
+      # is always a minor ahead, so every package manager refuses that step without being told).
+      # The version moving and then coming back is the proof; the repo-config greps localise a
+      # failure to the rewrite half. A red here can also mean the family's canary channel is empty
+      # — check https://git.unom.io/unom/-/packages before hunting in the script.
+      - name: Switch to canary and back to stable
+        run: |
+          set -eu
+          stable_v=$(punktfunk-host --version | head -1)
+          sh scripts/install.sh --yes --no-start --channel canary
+          ${{ matrix.oncanary }}
+          canary_v=$(punktfunk-host --version | head -1)
+          test "$canary_v" != "$stable_v" \
+            || { echo "switch to canary left the version at $stable_v"; exit 1; }
+          command -v punktfunk-web-server
+          sh scripts/install.sh --yes --no-start --channel stable
+          ${{ matrix.onstable }}
+          back_v=$(punktfunk-host --version | head -1)
+          test "$back_v" = "$stable_v" \
+            || { echo "walk back to stable gave $back_v, not $stable_v (a downgrade that did not happen?)"; exit 1; }
+      # A re-run with no --channel must follow the box, not the flag's stable default.
+      - name: A bare re-run does not drag a canary box back to stable
+        run: |
+          set -eu
+          sh scripts/install.sh --yes --no-start --channel canary
+          canary_v=$(punktfunk-host --version | head -1)
+          sh scripts/install.sh --yes --no-start
+          ${{ matrix.oncanary }}
+          test "$(punktfunk-host --version | head -1)" = "$canary_v" \
+            || { echo "a bare re-run moved a canary box off $canary_v"; exit 1; }
+          sh scripts/install.sh --yes --no-start --channel stable
       - name: --uninstall takes the packages and the repo off again
         run: |
           sh scripts/install.sh --yes --uninstall
