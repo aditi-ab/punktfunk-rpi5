@@ -159,6 +159,15 @@ pub enum AppMsg {
     /// outcome lands as a Toast either way. The mgmt port rides along, resolved like
     /// OpenLibrary's.
     SendLogs(ConnectRequest, Option<u16>),
+    /// Run one of the host's own actions — sleep / restart / shut down it
+    /// (`design/host-actions.md` §7). `danger` asks first; the outcome is a toast.
+    HostAction {
+        req: ConnectRequest,
+        mgmt: Option<u16>,
+        action_id: String,
+        label: String,
+        danger: bool,
+    },
     /// The speed-test dialog resolved (either way) — release `busy`.
     SpeedTestDone,
     ShowPreferences,
@@ -271,6 +280,19 @@ impl SimpleComponent for AppModel {
                     HostsOutput::SpeedTest(req) => AppMsg::SpeedTest(req),
                     HostsOutput::Library(req, mgmt) => AppMsg::OpenLibrary(req, mgmt),
                     HostsOutput::SendLogs(req, mgmt) => AppMsg::SendLogs(req, mgmt),
+                    HostsOutput::HostAction {
+                        req,
+                        mgmt,
+                        action_id,
+                        label,
+                        danger,
+                    } => AppMsg::HostAction {
+                        req,
+                        mgmt,
+                        action_id,
+                        label,
+                        danger,
+                    },
                     HostsOutput::Toast(msg) => AppMsg::Toast(msg),
                 });
 
@@ -460,6 +482,76 @@ impl SimpleComponent for AppModel {
                             Err(e) => {
                                 tracing::warn!(host = %req.name, error = %e, "client log upload failed");
                                 format!("Couldn't send logs — {e}")
+                            }
+                        };
+                        let _ = out.send(AppMsg::Toast(msg));
+                    })
+                    .ok();
+            }
+            AppMsg::HostAction {
+                req,
+                mgmt,
+                action_id,
+                label,
+                danger,
+            } => {
+                let mgmt = mgmt.unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
+                // Restart and shut down lose whatever is running on that machine, so they ask
+                // first — the same treatment Forget gets. Sleep is reversible from the same
+                // menu ("Wake host"), so it goes straight through.
+                if danger {
+                    let dialog = adw::AlertDialog::new(
+                        Some(&format!("{label}?")),
+                        Some(&format!(
+                            "This ends every stream from {} and anything running on it. \
+                             You'll need to wake or start it again.",
+                            req.name
+                        )),
+                    );
+                    dialog.add_responses(&[("cancel", "Cancel"), ("go", &label)]);
+                    dialog.set_response_appearance("go", adw::ResponseAppearance::Destructive);
+                    dialog.set_default_response(Some("cancel"));
+                    dialog.set_close_response("cancel");
+                    let out = sender.input_sender().clone();
+                    let (req, action_id, label) = (req.clone(), action_id.clone(), label.clone());
+                    dialog.connect_response(Some("go"), move |_, _| {
+                        out.send(AppMsg::HostAction {
+                            req: req.clone(),
+                            mgmt: Some(mgmt),
+                            action_id: action_id.clone(),
+                            label: label.clone(),
+                            // Asked and answered.
+                            danger: false,
+                        })
+                        .ok();
+                    });
+                    dialog.present(Some(&self.window));
+                    return;
+                }
+                // Blocking network on a worker, outcome as a toast — the SendLogs recipe. A
+                // 202 is the last word: the host ends every session and acts a second later,
+                // so there is nothing to poll and nothing to undo.
+                let identity = self.identity.clone();
+                let pin = req.fp_hex.as_deref().and_then(trust::parse_hex32);
+                if let Some(fp) = req.fp_hex.as_deref() {
+                    // Whatever the host said about itself is about to be wrong.
+                    pf_client_core::host_actions::invalidate(fp);
+                }
+                self.toast(&format!("{label} — asking {}…", req.name));
+                let out = sender.input_sender().clone();
+                std::thread::Builder::new()
+                    .name("punktfunk-hostaction".into())
+                    .spawn(move || {
+                        let msg = match pf_client_core::host_actions::invoke(
+                            &req.addr, mgmt, &identity, pin, &action_id,
+                        ) {
+                            Ok(()) => {
+                                tracing::info!(host = %req.name, action = %action_id, "host action accepted");
+                                format!("{}: {label} — on its way", req.name)
+                            }
+                            Err(e) => {
+                                tracing::warn!(host = %req.name, action = %action_id, error = %e, "host action refused");
+                                format!("{label} failed — {e}")
                             }
                         };
                         let _ = out.send(AppMsg::Toast(msg));

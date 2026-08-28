@@ -168,6 +168,45 @@ public struct RunningGame: Codable, Hashable, Sendable {
     public var isUp: Bool { state != "exited" }
 }
 
+/// One action a host offers THIS device, from `/api/v1/actions` (`design/host-actions.md` §3.2)
+/// — v1: sleep, restart, shut down.
+///
+/// Unknown ids are expected and fine: the client renders ``title`` verbatim for anything it has
+/// no local wording for, which is what lets a later host add actions with no client release.
+public struct HostAction: Codable, Hashable, Sendable, Identifiable {
+    /// Stable id: `power.sleep`, `power.reboot`, `power.shutdown` today.
+    public var id: String
+    /// The host's own display title — the fallback label for an id this client doesn't know.
+    public var title: String
+    /// Action group (`power` for the built-ins).
+    public var group: String
+    /// Confirm before running: the action loses whatever is on that machine (restart, shut down).
+    public var danger: Bool
+    /// Whether the host can run it right now (a machine that cannot suspend, a foreign inhibitor).
+    public var available: Bool
+    /// Why not, when it can't — shown rather than hidden, so "greyed out" always has a reason.
+    public var unavailableReason: String?
+    /// Whether THIS device's access covers it (the host's Host-power grant). The client only ever
+    /// keeps the permitted ones.
+    public var permitted: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case id, title, group, danger, available, permitted
+        case unavailableReason = "unavailable_reason"
+    }
+
+    /// This client's wording for a known id, else the host's own title — so a familiar action is
+    /// worded the way the rest of this app words it, without hiding an unfamiliar one.
+    public var label: String {
+        switch id {
+        case "power.sleep": return "Sleep Host"
+        case "power.reboot": return "Restart Host"
+        case "power.shutdown": return "Shut Down Host"
+        default: return title
+        }
+    }
+}
+
 /// Stateless fetcher for a host's library.
 public enum LibraryClient {
     /// `GET https://<address>:<port>/api/v1/library`, authenticated by **mTLS**: the client
@@ -269,11 +308,78 @@ public enum LibraryClient {
         }
     }
 
+    /// What this host lets THIS device do to it — sleep, restart, shut it down
+    /// (`design/host-actions.md` §7) — from `GET /api/v1/actions`.
+    ///
+    /// Only the PERMITTED rows come back: the host is the only judge of whether this device's
+    /// access carries the Host-power grant, and a row it would refuse is not this client's to
+    /// render. Best-effort by contract, like ``running(address:port:certPEM:keyPEM:hostFingerprint:)``
+    /// — an older host (no such route), an unreachable one, or a shape we don't recognise yields
+    /// an empty list. A missing menu row costs a menu row; a thrown error would cost the screen.
+    public static func actions(
+        address: String,
+        port: UInt16 = punktfunkDefaultMgmtPort,
+        certPEM: String,
+        keyPEM: String,
+        hostFingerprint: Data?
+    ) async -> [HostAction] {
+        guard let identity = try? clientIdentity(certPEM: certPEM, keyPEM: keyPEM),
+              let response = try? await send(
+                  path: "/api/v1/actions", address: address, port: port,
+                  identity: identity, hostFingerprint: hostFingerprint),
+              response.status == 200,
+              let list = try? JSONDecoder().decode(HostActionList.self, from: response.body)
+        else { return [] }
+        return list.actions.filter(\.permitted)
+    }
+
+    /// Invoke one host action by id (`POST /api/v1/actions/{id}`, empty body).
+    ///
+    /// Returning normally means the host ACCEPTED it (202) — it now ends every session and acts
+    /// about a second later, so this is the last word the client will get. A refusal throws
+    /// with the host's own sentence ("another device is streaming from this host right now"),
+    /// which tells a person what to do where a bare status code would not.
+    ///
+    /// The body stays empty by design: the id is the whole request, and no request field ever
+    /// reaches the host's privileged path.
+    public static func invokeAction(
+        id: String,
+        address: String,
+        port: UInt16 = punktfunkDefaultMgmtPort,
+        certPEM: String,
+        keyPEM: String,
+        hostFingerprint: Data
+    ) async throws {
+        let identity = try clientIdentity(certPEM: certPEM, keyPEM: keyPEM)
+        let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        let response = try await send(
+            path: "/api/v1/actions/\(escaped)", address: address, port: port,
+            identity: identity, hostFingerprint: hostFingerprint,
+            body: (Data(), "application/json"))
+        switch response.status {
+        case 200, 202:
+            return
+        case 401, 403:
+            throw LibraryError.unauthorized
+        default:
+            // The `ApiError` envelope carries the host's reason; prefer it over the code.
+            let json = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any]
+            if let why = json?["error"] as? String, !why.isEmpty {
+                throw LibraryError.unreachable(why)
+            }
+            throw LibraryError.http(response.status)
+        }
+    }
+
     /// Just the slice of `/status` this client reads. Everything else on that payload is the
     /// operator console's business, and decoding only what we use keeps an unrelated schema change
     /// on the host from breaking the library screen.
     private struct HostStatus: Decodable {
         var games: [RunningGame]?
+    }
+
+    private struct HostActionList: Decodable {
+        var actions: [HostAction]
     }
 
     /// `https://addr:port`, IPv6 literals bracketed — the mirror of the Rust client's `base_url`.

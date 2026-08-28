@@ -52,6 +52,13 @@ pub struct HostRow {
     /// future tile OS glyph. Empty = unknown (older host). Plumbed now; drawing is a
     /// follow-up — the Skia glyph set doesn't exist yet.
     pub os: String,
+    /// What this host lets THIS device do to it beyond streaming — sleep, restart, shut down
+    /// (`design/host-actions.md` §7), as the host itself reported them. Empty for an
+    /// unreachable host, an older one with no such route, and any device whose access does not
+    /// carry the Host-power grant: the host is the only judge of that, and a row it would
+    /// refuse is not offered. `serde(default)` so a producer predating the field still parses.
+    #[serde(default)]
+    pub actions: Vec<HostAction>,
     /// `Some` = this row is a pinned profile card (§5.2a): a shortcut tile rendered right
     /// after its host's primary tile, sharing its live state, that connects with THIS
     /// profile. `None` = the host's primary tile.
@@ -60,6 +67,30 @@ pub struct HostRow {
     /// (`KnownHost::profile_id`), resolved, so the tile can say what a plain A-press uses.
     /// Always `None` on pinned rows — there the profile IS `pin`.
     pub bound_profile: Option<ProfileChip>,
+}
+
+/// One action a host offers this device, resolved by the service thread from the host's own
+/// `GET /api/v1/actions` (`design/host-actions.md` §3.2) — v1: sleep, restart, shut down.
+///
+/// Presentational on purpose: the label is already the one this client would use for a known
+/// id and the host's own title for an id this client has never heard of, so a later host can
+/// add an action and this console renders it with no release. The shell never decides WHETHER
+/// an action may run — the host answered that before the row existed, and answers it again on
+/// invoke.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HostAction {
+    /// Stable action id, the invoke argument (`power.sleep`).
+    pub id: String,
+    /// Row label, already resolved (local wording for a known id, else the host's title).
+    pub label: String,
+    /// Confirm twice — the action loses state (restart, shut down).
+    pub danger: bool,
+    /// The host can run it right now. `false` still shows the row, disabled, because
+    /// "unavailable, because X" is more use than a row that quietly vanished.
+    pub available: bool,
+    /// Why it can't run, when it can't. Empty otherwise.
+    #[serde(default)]
+    pub unavailable_reason: String,
 }
 
 /// The pairing ceremony's observable state (one at a time — the ceremony is modal).
@@ -255,6 +286,23 @@ pub enum ConsoleCmd {
     /// of them is the same shape — do the platform thing, report back as a notice — and a
     /// command per grant would make adding the next pad a change in three crates.
     PadAction { action: String, pad_key: String },
+    /// Invoke one of the host's own actions — sleep / restart / shut down it
+    /// (`design/host-actions.md`). Same lane and trust as [`ConsoleCmd::SendLogs`]; the host
+    /// re-checks this device's Host-power grant on arrival, so the row having existed grants
+    /// nothing. Parameterised by `action_id` for the same reason [`ConsoleCmd::PadAction`] is:
+    /// the host is free to grow the list, and a command per verb would make that a change in
+    /// three crates. The outcome arrives as a notice toast.
+    HostAction {
+        addr: String,
+        mgmt: u16,
+        fp_hex: String,
+        host_name: String,
+        /// The action's stable id (`power.sleep`).
+        action_id: String,
+        /// Its resolved label, for the toast — so the service thread need not re-derive
+        /// wording the screen has already settled.
+        label: String,
+    },
 }
 
 /// The overlay→binary command queue. A plain deque under the same locking discipline as
@@ -297,6 +345,7 @@ mod tests {
             clipboard_sync: false,
             last_used: None,
             os: String::new(),
+            actions: Vec::new(),
             pin: None,
             bound_profile: None,
         };

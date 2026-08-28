@@ -309,3 +309,33 @@ internal fun EditHostDialog(
         },
     )
 }
+
+/**
+ * "Restart host?" / "Shut down host?" — the confirmation a destructive host action takes before
+ * it runs (`design/host-actions.md` §7). Sleep is reversible from the same menu ("Wake host"),
+ * so it never reaches here; restart and shut down lose whatever is on that machine, so they do.
+ */
+@Composable
+internal fun HostActionConfirmDialog(
+    hostName: String,
+    action: HostActions.Action,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("${action.label}?") },
+        text = {
+            Text(
+                "This ends every stream from $hostName and anything running on it. " +
+                    "You'll need to wake or start it again.",
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) { Text(action.label) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
+}

@@ -2523,6 +2523,7 @@ pub(super) mod tests {
             clipboard_sync: false,
             last_used: None,
             os: String::new(),
+            actions: Vec::new(),
             pin: Some(crate::model::ProfileChip {
                 id: "p1".into(),
                 name: "Work".into(),

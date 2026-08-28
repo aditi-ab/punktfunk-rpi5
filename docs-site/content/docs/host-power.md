@@ -8,6 +8,11 @@ loop: **Sleep host**, **Restart host** and **Shut down host**, from the web cons
 (password-confirmed) or — with the right access — from a paired client. Finish playing on the TV,
 sleep the host from the couch, wake it again tomorrow.
 
+On a client the rows sit in the host's own menu, right where **Wake host** appears when it is
+asleep: the gamepad console's host options, the Linux and Windows host card menus, and the Apple
+and Android host cards. They appear only when the host offered them, so a device without the
+grant simply has no power rows. Restart and shut down confirm before they run.
+
 ## Who may do it
 
 - The **web console** always can — it is the operator's own surface, behind the console login

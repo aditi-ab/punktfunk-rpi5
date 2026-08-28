@@ -63,6 +63,12 @@ pub mod library;
 // Per-host catalog cache, so a library screen has titles to show while a sleeping host boots.
 #[cfg(any(target_os = "linux", windows))]
 pub mod library_cache;
+// Host actions — sleep/restart/shut down the host (design/host-actions.md §7). Android-enabled
+// for the MODEL half (the row type + labelling rules the console screens read); the ureq calls
+// inside stay desktop-gated, exactly like `library`, since Android dials the same routes through
+// its own mTLS OkHttp client.
+#[cfg(any(target_os = "linux", windows, target_os = "android"))]
+pub mod host_actions;
 // Android-enabled for the RING half (note/render — std only): the client's "Send logs to
 // host" needs the ring on every platform. The `send_to_host` uploader inside stays
 // desktop-gated with the rest of the ureq fetches; Android posts the rendered bundle

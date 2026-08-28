@@ -82,6 +82,10 @@ internal fun ConnectGrid(
     onSpeedTest: (KnownHost) -> Unit,
     /** Upload this device's recent log to the host — see the menu row's gate below. */
     onSendLogs: (KnownHost) -> Unit,
+    /** What each paired host last said this device may do TO it, by fingerprint
+     *  (`design/host-actions.md` §7). Absent = no rows. */
+    hostActions: Map<String, List<HostActions.Action>>,
+    onHostAction: (KnownHost, HostActions.Action) -> Unit,
     onCopyLink: (KnownHost, StreamProfile?) -> Unit,
     onTogglePin: (KnownHost, StreamProfile) -> Unit,
     /** The experimental game-library toggle — off hides "Browse library…" everywhere. */
@@ -117,6 +121,17 @@ internal fun ConnectGrid(
         // the one whose logs somebody needs, and the touch home was its only shell.
         if (pin == null && kh.paired && kh.isOnline(discovered, reachable)) {
             add(HostMenuItem("Send logs to host") { onSendLogs(kh) })
+        }
+        // The host's own actions — sleep, restart, shut it down (`design/host-actions.md` §7),
+        // the other half of the Wake-on-LAN round trip. Nothing is decided here: the list is
+        // empty unless the host answered AND this device's access carries the grant, so no row
+        // appears that the host would refuse. A pinned card is a shortcut to one profile, not a
+        // second host, so it offers none — same rule as "Send logs" above.
+        if (pin == null) {
+            hostActions[kh.fpHex].orEmpty().forEach { a ->
+                val label = if (a.available) a.label else "${a.label} (unavailable)"
+                add(HostMenuItem(label) { onHostAction(kh, a) })
+            }
         }
         add(HostMenuItem("Copy link") { onCopyLink(kh, pin) })
         if (profiles.isEmpty()) return@buildList

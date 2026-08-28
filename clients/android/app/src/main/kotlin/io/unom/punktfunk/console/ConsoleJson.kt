@@ -1,6 +1,7 @@
 package io.unom.punktfunk.console
 
 import android.view.InputDevice
+import io.unom.punktfunk.HostActions
 import io.unom.punktfunk.MouseMode
 import io.unom.punktfunk.Settings
 import io.unom.punktfunk.StatsVerbosity
@@ -33,6 +34,22 @@ internal object ConsoleJson {
         .put("name", p.name)
         .put("accent", p.accent ?: JSONObject.NULL)
 
+    /** A host's advertised actions in the console model's shape (`HostRow.actions`). */
+    private fun actionRows(actions: List<HostActions.Action>?): JSONArray {
+        val arr = JSONArray()
+        for (a in actions.orEmpty()) {
+            arr.put(
+                JSONObject()
+                    .put("id", a.id)
+                    .put("label", a.label)
+                    .put("danger", a.danger)
+                    .put("available", a.available)
+                    .put("unavailable_reason", a.unavailableReason),
+            )
+        }
+        return arr
+    }
+
     /**
      * The home carousel: saved hosts (name order — Android records carry no last-used time),
      * each followed by its pinned profile cards, then discovered-but-unsaved hosts. Mirrors
@@ -44,6 +61,10 @@ internal object ConsoleJson {
         discovered: List<DiscoveredHost>,
         reachable: Set<String>,
         profiles: List<StreamProfile>,
+        /** What each paired host last said this device may do TO it, by fingerprint
+         *  (`design/host-actions.md` §7). Absent = no rows, which is also what an older host
+         *  and an ungranted device produce. */
+        hostActions: Map<String, List<HostActions.Action>> = emptyMap(),
     ): String {
         val out = JSONArray()
         fun advertFor(h: KnownHost): DiscoveredHost? = discovered.firstOrNull { d ->
@@ -68,6 +89,7 @@ internal object ConsoleJson {
                 .put("clipboard_sync", h.clipboardSync)
                 .put("last_used", JSONObject.NULL)
                 .put("os", advert?.os?.takeIf { it.isNotEmpty() } ?: h.os)
+                .put("actions", actionRows(hostActions[h.fpHex]))
                 .put("pin", JSONObject.NULL)
                 .put(
                     "bound_profile",

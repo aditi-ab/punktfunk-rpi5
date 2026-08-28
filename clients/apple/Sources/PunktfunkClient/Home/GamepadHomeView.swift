@@ -107,6 +107,9 @@ struct GamepadHomeView: View {
     /// The profile catalog — pinned host+profile combos render as their own tiles here, which is
     /// how a controller picks a profile: one focus-and-press instead of a menu (design §5.4).
     @ObservedObject private var profiles = ProfileStore.shared
+    /// What each paired host says this device may do TO it (`design/host-actions.md` §7) —
+    /// shared with the touch grid, so the two menus cannot disagree about what a host offers.
+    @ObservedObject private var hostPower = HostPowerStore.shared
     /// Same gate the touch grid's "Browse Library…" context-menu item uses (default ON; the
     /// Settings "Game library" toggle opts out).
     @AppStorage(DefaultsKey.libraryEnabled) private var libraryEnabled = true
@@ -655,6 +658,10 @@ struct GamepadHomeView: View {
                 store.setPinned(host.id, profileID: profile.id, pinned: false)
             },
             onSendLogs: host.pinnedSHA256 != nil ? { await SendLogs.toHost(host) } : nil,
+            // A pinned card is a shortcut to one profile, not a second host, so it carries no
+            // host actions — the same rule the touch grid and the console menu apply.
+            hostActions: target.profile == nil ? hostPower.actions(for: host) : [],
+            onHostAction: { action in await hostPower.invoke(action, on: host) },
             close: { if !transitioning { hostOptionsTarget = nil } },
             controllerActive: active)
     }

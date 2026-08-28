@@ -64,7 +64,7 @@ pub use input::Key;
 pub use library::{LibraryGame, LibraryPhase, LibraryShared, Stale};
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub use model::{
-    ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, ProfileChip, WakeStatus,
+    ConsoleBus, ConsoleCmd, ConsoleShared, HostAction, HostRow, PairPhase, ProfileChip, WakeStatus,
 };
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub use platform::{Platform, PlatformScreen};

@@ -33,6 +33,12 @@ use skia_safe::{Canvas, Rect};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Action {
     Wake,
+    /// One of the host's OWN actions — sleep / restart / shut down it
+    /// (`design/host-actions.md` §7), indexed into [`HostRow::actions`], which the service
+    /// thread filled from the host's discovery. Indexed rather than a variant per verb
+    /// because the console must render an action this build has never heard of: the host
+    /// already sent a label and said whether this device may run it.
+    Host(usize),
     SendLogs,
     /// Open this host's game library — the same shelf the home carousel's Y opens, offered
     /// here because Y is a face button and a TV remote has none. Saved-and-paired only,
@@ -76,11 +82,15 @@ pub(crate) struct OptionsScreen {
     /// be able to do that.
     subject: Subject,
     list: MenuList,
-    /// Forget is the one action here with no undo, so the row arms on the first press and
-    /// only fires on the second. The other clients forget outright; a console is driven by
-    /// a thumbstick from across a room, which is a good reason to be stricter than they
+    /// The row currently armed, if any: an action with no undo arms on the first press and
+    /// only fires on the second. Forget was the first; the host's own destructive actions
+    /// (restart, shut down) join it. The other clients forget outright; a console is driven
+    /// by a thumbstick from across a room, which is a good reason to be stricter than they
     /// are, and none at all to be looser.
-    armed: bool,
+    ///
+    /// Holding WHICH action is armed, rather than a bare flag, is what stops an arming press
+    /// on one destructive row from firing a different one the cursor then landed on.
+    armed: Option<Action>,
 }
 
 impl OptionsScreen {
@@ -92,7 +102,7 @@ impl OptionsScreen {
         OptionsScreen {
             subject,
             list: MenuList::new(),
-            armed: false,
+            armed: None,
         }
     }
 
@@ -148,6 +158,11 @@ impl OptionsScreen {
         if host.can_wake && !host.online {
             a.push(Action::Wake);
         }
+        // …and the other half of that round trip, immediately below it: the host's own
+        // actions, as IT reported them for this device. Nothing is decided here — the list is
+        // empty unless the host is reachable and this device's access carries the grant, so
+        // "Sleep host" appears exactly where "Wake host" was the evening before.
+        a.extend((0..host.actions.len()).map(Action::Host));
         // "Send logs" needs a paired identity (the upload authenticates with the streaming
         // cert) and a reachable host — on anything else the row would only ever toast an
         // error. This is the log-escape hatch for platforms whose own filesystem the user
@@ -180,6 +195,13 @@ impl OptionsScreen {
     fn label(&self, a: Action) -> String {
         match a {
             Action::Wake => "Wake host".into(),
+            Action::Host(i) => match self.host().actions.get(i) {
+                Some(act) if self.armed == Some(a) => {
+                    format!("{} \u{2014} press again", act.label)
+                }
+                Some(act) => act.label.clone(),
+                None => String::new(),
+            },
             Action::SendLogs => "Send logs to host".into(),
             Action::Library => "Library".into(),
             Action::CopyLink => "Copy link".into(),
@@ -193,10 +215,24 @@ impl OptionsScreen {
                     "Off"
                 }
             ),
-            Action::Forget if self.armed => "Forget \u{2014} press again".into(),
+            Action::Forget if self.armed == Some(Action::Forget) => {
+                "Forget \u{2014} press again".into()
+            }
             Action::Forget => "Forget".into(),
             Action::Unpin => "Unpin card".into(),
             Action::Cancel => "Cancel".into(),
+        }
+    }
+
+    /// Whether a row reads as live. Only a host action can be dead: the host said it cannot
+    /// run that verb right now (no suspend support, a foreign inhibitor, a second local user).
+    /// The row stays — activating it explains why — because a row that quietly vanished would
+    /// leave the person wondering whether they had imagined it (the host's own honesty rule:
+    /// "unavailable, because X", never a dead switch and never a silence).
+    fn enabled(&self, a: Action) -> bool {
+        match a {
+            Action::Host(i) => self.host().actions.get(i).is_none_or(|act| act.available),
+            _ => true,
         }
     }
 
@@ -236,10 +272,11 @@ impl OptionsScreen {
         let Some(action) = actions.get(self.list.cursor).copied() else {
             return pulse;
         };
-        // Moving off the armed Forget row disarms it: an arming press is about THAT row,
-        // and leaving it must not leave a live trigger behind for the next visit.
-        if !matches!(msg, ListMsg::Activate) && action != Action::Forget {
-            self.armed = false;
+        // Moving off an armed row disarms it: an arming press is about THAT row, and leaving
+        // it must not leave a live trigger behind — neither for the next visit, nor for the
+        // destructive row the cursor happened to land on next.
+        if !matches!(msg, ListMsg::Activate) && self.armed != Some(action) {
+            self.armed = None;
         }
         match msg {
             ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
@@ -340,10 +377,50 @@ impl OptionsScreen {
                 fx.cmds.push(ConsoleCmd::SetClipboard { key, on });
                 fx.pop();
             }
-            Action::Forget if !self.armed => self.armed = true,
+            Action::Forget if self.armed != Some(Action::Forget) => {
+                self.armed = Some(Action::Forget)
+            }
             Action::Forget => {
                 fx.cmds.push(ConsoleCmd::ForgetHost { key });
                 fx.toast = Some(format!("Forgot {}", self.host().name));
+                fx.pop();
+            }
+            Action::Host(i) => {
+                let host = self.host();
+                let Some(act) = host.actions.get(i) else {
+                    return; // the row list changed under the cursor — do nothing, silently
+                };
+                // A host the host itself says it cannot do right now: say why rather than
+                // send a request we know it will refuse.
+                if !act.available {
+                    let why = act.unavailable_reason.clone();
+                    fx.toast = Some(if why.is_empty() {
+                        format!("{} isn't available right now", act.label)
+                    } else {
+                        why
+                    });
+                    fx.pop();
+                    return;
+                }
+                // Restart and shut down lose whatever is running on that machine, so they take
+                // the Forget treatment: arm, then fire. Sleep is reversible from the same menu
+                // (Wake host), so it goes on one press.
+                if act.danger && self.armed != Some(action) {
+                    self.armed = Some(action);
+                    return;
+                }
+                fx.cmds.push(ConsoleCmd::HostAction {
+                    addr: host.addr.clone(),
+                    mgmt: host.mgmt_port,
+                    fp_hex: host.fp_hex.clone(),
+                    host_name: host.name.clone(),
+                    action_id: act.id.clone(),
+                    label: act.label.clone(),
+                });
+                fx.toast = Some(format!(
+                    "{} \u{2014} asking {}\u{2026}",
+                    act.label, host.name
+                ));
                 fx.pop();
             }
             Action::Unpin => {
@@ -412,7 +489,7 @@ impl OptionsScreen {
         let rows: Vec<RowSpec> = self
             .actions(ctx.platform)
             .into_iter()
-            .map(|a| RowSpec::action(self.label(a), true))
+            .map(|a| RowSpec::action(self.label(a), self.enabled(a)))
             .collect();
         self.list
             .render(canvas, list_rect, &rows, fonts, k, dt, true);
@@ -473,8 +550,32 @@ mod tests {
             clipboard_sync: false,
             last_used: None,
             os: String::new(),
+            actions: Vec::new(),
             pin: None,
             bound_profile: None,
+        }
+    }
+
+    /// A host that reported the three power actions for this device, sleep available.
+    fn powered() -> HostRow {
+        let act = |id: &str, label: &str, danger: bool, available: bool| crate::model::HostAction {
+            id: id.into(),
+            label: label.into(),
+            danger,
+            available,
+            unavailable_reason: if available {
+                String::new()
+            } else {
+                "this machine does not support sleep".into()
+            },
+        };
+        HostRow {
+            actions: vec![
+                act("power.sleep", "Sleep host", false, true),
+                act("power.reboot", "Restart host", true, true),
+                act("power.shutdown", "Shut down host", true, true),
+            ],
+            ..host()
         }
     }
 
@@ -548,6 +649,102 @@ mod tests {
         assert!(reachable
             .actions(crate::platform::Platform::Android)
             .contains(&Action::SendLogs));
+    }
+
+    /// The host's own actions sit right under Wake — the two halves of one round trip — and
+    /// only exist because the HOST offered them: an empty list (older host, unreachable host,
+    /// or a device without the grant) leaves the menu exactly as it was.
+    #[test]
+    fn host_actions_appear_only_when_the_host_offered_them() {
+        let none = OptionsScreen::for_host(&host());
+        assert!(!none
+            .actions(crate::platform::Platform::Desktop)
+            .iter()
+            .any(|a| matches!(a, Action::Host(_))));
+
+        let s = OptionsScreen::for_host(&powered());
+        let rows = s.actions(crate::platform::Platform::Desktop);
+        assert_eq!(
+            rows.iter().filter(|a| matches!(a, Action::Host(_))).count(),
+            3
+        );
+        assert_eq!(s.label(Action::Host(0)), "Sleep host");
+        // An id this build has never heard of still renders — the host sent the label.
+        let future = OptionsScreen::for_host(&HostRow {
+            actions: vec![crate::model::HostAction {
+                id: "plugin:vpn:toggle".into(),
+                label: "Toggle the VPN".into(),
+                danger: false,
+                available: true,
+                unavailable_reason: String::new(),
+            }],
+            ..host()
+        });
+        assert_eq!(future.label(Action::Host(0)), "Toggle the VPN");
+    }
+
+    /// Sleep is reversible from this very menu, so it goes on one press. Restart and shut down
+    /// are not, so they take Forget's arm-then-fire — and arming one must never leave the
+    /// OTHER one live, which is exactly the bug a bare `armed` flag would have shipped.
+    #[test]
+    fn destructive_host_actions_arm_before_they_fire() {
+        let mut s = OptionsScreen::for_host(&powered());
+        let mut fx = Outbox::default();
+        run_action(&mut s, Action::Host(0), &mut fx); // sleep — one press
+        assert!(matches!(
+            fx.cmds.first(),
+            Some(ConsoleCmd::HostAction { action_id, .. }) if action_id == "power.sleep"
+        ));
+
+        let mut s = OptionsScreen::for_host(&powered());
+        let mut fx = Outbox::default();
+        run_action(&mut s, Action::Host(2), &mut fx); // shut down — arms
+        assert!(fx.cmds.is_empty(), "the first press only arms");
+        assert_eq!(
+            s.label(Action::Host(2)),
+            "Shut down host \u{2014} press again"
+        );
+        // The armed row is that one row: moving to Restart and pressing must not shut down.
+        assert_eq!(s.label(Action::Host(1)), "Restart host");
+        let mut fx = Outbox::default();
+        run_action(&mut s, Action::Host(1), &mut fx);
+        assert!(
+            fx.cmds.is_empty(),
+            "arming shut down must not leave restart armed"
+        );
+        // Pressing the armed row again fires it.
+        let mut s = OptionsScreen::for_host(&powered());
+        let mut fx = Outbox::default();
+        run_action(&mut s, Action::Host(2), &mut fx);
+        run_action(&mut s, Action::Host(2), &mut fx);
+        assert!(matches!(
+            fx.cmds.first(),
+            Some(ConsoleCmd::HostAction { action_id, .. }) if action_id == "power.shutdown"
+        ));
+    }
+
+    /// An action the host says it cannot run right now stays on the menu, disabled, and
+    /// explains itself — never a silent row and never a request we know will be refused.
+    #[test]
+    fn an_unavailable_action_explains_itself_instead_of_firing() {
+        let mut s = OptionsScreen::for_host(&HostRow {
+            actions: vec![crate::model::HostAction {
+                id: "power.sleep".into(),
+                label: "Sleep host".into(),
+                danger: false,
+                available: false,
+                unavailable_reason: "this machine does not support sleep".into(),
+            }],
+            ..host()
+        });
+        assert!(!s.enabled(Action::Host(0)));
+        let mut fx = Outbox::default();
+        run_action(&mut s, Action::Host(0), &mut fx);
+        assert!(fx.cmds.is_empty(), "no request the host would refuse");
+        assert_eq!(
+            fx.toast.as_deref(),
+            Some("this machine does not support sleep")
+        );
     }
 
     #[test]
@@ -654,7 +851,7 @@ mod tests {
 
         run_action(&mut s, Action::Forget, &mut fx);
         assert!(fx.cmds.is_empty(), "the first press only arms");
-        assert!(s.armed);
+        assert_eq!(s.armed, Some(Action::Forget));
         assert!(s.label(Action::Forget).contains("press again"));
 
         run_action(&mut s, Action::Forget, &mut fx);
@@ -669,7 +866,7 @@ mod tests {
     fn leaving_the_forget_row_disarms_it() {
         let mut s = OptionsScreen::for_host(&host());
         let actions = s.actions(crate::platform::Platform::Desktop);
-        s.armed = true;
+        s.armed = Some(Action::Forget);
         s.list.cursor = actions.iter().position(|a| *a == Action::Cancel).unwrap();
         let mut ctx_settings = pf_client_core::trust::Settings::default();
         let mut ctx = Ctx {
@@ -686,7 +883,10 @@ mod tests {
         };
         let mut fx = Outbox::default();
         s.dispatch(ListMsg::None, None, &actions, &mut ctx, &mut fx);
-        assert!(!s.armed, "a cursor move off the row cancels the arming");
+        assert_eq!(
+            s.armed, None,
+            "a cursor move off the row cancels the arming"
+        );
     }
 
     #[test]

@@ -85,6 +85,9 @@ pub fn run(target: Option<&str>) -> u8 {
                 clipboard_sync: k.is_some_and(|h| h.clipboard_sync),
                 last_used: k.and_then(|h| h.last_used),
                 os: k.map(|h| h.os.clone()).unwrap_or_default(),
+                // A seed row is a host nobody has reached yet; the refresh tick fills this in
+                // once it is paired and answering.
+                actions: Vec::new(),
                 pin: None,
                 bound_profile: None,
             };
@@ -340,6 +343,7 @@ fn fake_host_row() -> HostRow {
         clipboard_sync: false,
         last_used: None,
         os: "linux/arch/steamos".into(),
+        actions: Vec::new(),
         pin: None,
         bound_profile: None,
     }
@@ -437,6 +441,7 @@ impl ServiceState {
             if self.last_probe.elapsed() >= Duration::from_secs(10) {
                 self.last_probe = Instant::now();
                 self.sweep();
+                self.refresh_actions();
             }
 
             self.console.set_hosts(self.rows());
@@ -519,6 +524,41 @@ impl ServiceState {
                             Err(e) => {
                                 tracing::warn!(host = %host_name, error = %e, "client log upload failed");
                                 console.set_notice(format!("Couldn't send logs — {e}"));
+                            }
+                        }
+                    })
+                    .ok();
+            }
+            ConsoleCmd::HostAction {
+                addr,
+                mgmt,
+                fp_hex,
+                host_name,
+                action_id,
+                label,
+            } => {
+                // Same lane and budgets as SendLogs above, and the same worker-thread reason.
+                // A 202 is the last word: the host ends every session and acts a second later,
+                // so there is nothing to poll and nothing to undo — say it plainly and let the
+                // tile go dark on its own.
+                let identity = self.identity.clone();
+                let pin = trust::parse_hex32(&fp_hex);
+                let console = self.console.clone();
+                // Whatever the host said about itself is about to be wrong.
+                pf_client_core::host_actions::invalidate(&fp_hex);
+                std::thread::Builder::new()
+                    .name("punktfunk-hostaction".into())
+                    .spawn(move || {
+                        match pf_client_core::host_actions::invoke(
+                            &addr, mgmt, &identity, pin, &action_id,
+                        ) {
+                            Ok(()) => {
+                                tracing::info!(host = %host_name, action = %action_id, "host action accepted");
+                                console.set_notice(format!("{host_name}: {label} — on its way"));
+                            }
+                            Err(e) => {
+                                tracing::warn!(host = %host_name, action = %action_id, error = %e, "host action refused");
+                                console.set_notice(format!("{label} failed — {e}"));
                             }
                         }
                     })
@@ -765,6 +805,17 @@ impl ServiceState {
             .ok();
     }
 
+    /// Keep every paired, reachable host's advertised actions fresh (the shared TTL'd cache in
+    /// `pf_client_core::host_actions`). Idempotent and cheap — it only reaches the network when
+    /// an entry has actually lapsed.
+    fn refresh_actions(&self) {
+        for r in self.rows() {
+            if r.paired && r.online && r.pin.is_none() {
+                pf_client_core::host_actions::refresh(&r.addr, r.mgmt_port, &r.fp_hex);
+            }
+        }
+    }
+
     fn advertised(&self, row: &HostRow) -> bool {
         self.discovered.values().any(|d| {
             (!row.fp_hex.is_empty() && d.fp_hex == row.fp_hex)
@@ -839,6 +890,20 @@ impl ServiceState {
                         .filter(|d| !d.os.is_empty())
                         .map(|d| d.os.clone())
                         .unwrap_or_else(|| h.os.clone()),
+                    // Whatever this host last told us it lets this device do to it. Empty
+                    // until the first refresh answers, and empty forever for a host that has
+                    // no such route or a device without the grant — the menu simply has no
+                    // power rows then.
+                    actions: pf_client_core::host_actions::cached(&h.fp_hex)
+                        .into_iter()
+                        .map(|a| pf_console_ui::HostAction {
+                            label: a.label().to_string(),
+                            id: a.id,
+                            danger: a.danger,
+                            available: a.available,
+                            unavailable_reason: a.unavailable_reason.unwrap_or_default(),
+                        })
+                        .collect(),
                     pin: None,
                     bound_profile: h
                         .profile_id
@@ -895,6 +960,8 @@ impl ServiceState {
                 clipboard_sync: false,
                 last_used: None,
                 os: d.os.clone(),
+                // Discovered but unsaved: not paired, so there is nothing it would let us do.
+                actions: Vec::new(),
                 pin: None,
                 bound_profile: None,
             })
