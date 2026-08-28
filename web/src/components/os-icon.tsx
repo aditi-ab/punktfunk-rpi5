@@ -82,11 +82,11 @@ const resolve = (os?: string): { viewBox: string; d: string } | undefined => {
 };
 
 /** The host's OS mark; a generic monitor when the chain is absent or entirely unknown. */
-export const OsIcon: FC<{ os?: string; className?: string; label?: string }> = ({
-	os,
-	className,
-	label,
-}) => {
+export const OsIcon: FC<{
+	os?: string;
+	className?: string;
+	label?: string;
+}> = ({ os, className, label }) => {
 	const icon = resolve(os);
 	if (!icon) return <Monitor className={className} aria-hidden />;
 	return (

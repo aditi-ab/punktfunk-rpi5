@@ -27,7 +27,9 @@ interface EntryLike {
 }
 
 /** Does this entry carry a field the host will hand to a shell? */
-export function carriesCommandExecution(entry: EntryLike | null | undefined): boolean {
+export function carriesCommandExecution(
+	entry: EntryLike | null | undefined,
+): boolean {
 	if (!entry || typeof entry !== "object") return false;
 	if (Array.isArray(entry.prep) && entry.prep.length > 0) return true;
 	return entry.launch?.kind === "command";

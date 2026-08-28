@@ -1,5 +1,6 @@
 import { QueryClient } from "@tanstack/react-query";
 import { createRouter as createTanStackRouter } from "@tanstack/react-router";
+import { reloadOnStaleChunk } from "@unom/ui/preload-reload";
 import { ApiError } from "./api/fetcher";
 import { routeTree } from "./routeTree.gen";
 
@@ -38,6 +39,10 @@ function createQueryClient() {
  */
 let browserQueryClient: QueryClient | undefined;
 
+// Same rebuild, same reason: `reloadOnStaleChunk` registers once, so its callback reads
+// whichever router is live at event time instead of the one discarded by hydration.
+let liveRouter: { latestLocation: { href: string } } | undefined;
+
 export function getRouter() {
 	let queryClient: QueryClient;
 	if (typeof window === "undefined") {
@@ -47,7 +52,7 @@ export function getRouter() {
 		queryClient = browserQueryClient;
 	}
 
-	return createTanStackRouter({
+	const router = createTanStackRouter({
 		routeTree,
 		context: { queryClient },
 		defaultPreload: "intent",
@@ -56,6 +61,17 @@ export function getRouter() {
 			<QueryProvider client={queryClient}>{children}</QueryProvider>
 		),
 	});
+
+	liveRouter = router;
+
+	// A deploy replaces every hashed chunk, so a console left open across one asks for files
+	// the new server has never heard of and the next navigation dies — with `defaultPreload:
+	// "intent"`, a hover is enough to trip it. Handing back where the router was heading means
+	// the click that tripped it still lands on the page the operator asked for; during a
+	// hover-preload that is the current URL, which degrades to a plain reload.
+	reloadOnStaleChunk(10_000, () => liveRouter?.latestLocation.href);
+
+	return router;
 }
 
 // Local import kept below the function so the module reads top-down.

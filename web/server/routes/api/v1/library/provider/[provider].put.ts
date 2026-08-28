@@ -8,7 +8,12 @@
 //
 // Wins over the `/api/**` catch-all by h3 route specificity — the catch-all injects the admin
 // bearer unconditionally, so without this file the host-side check is inert for this caller.
-import { defineEventHandler, getRequestURL, getRouterParam, readBody } from "h3";
+import {
+	defineEventHandler,
+	getRequestURL,
+	getRouterParam,
+	readBody,
+} from "h3";
 import { forwardJson } from "../../../../../util/forward";
 import { confirmIfCommandExecution } from "../../../../../util/libraryConfirm";
 

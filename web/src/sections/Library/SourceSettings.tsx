@@ -156,8 +156,10 @@ interface JsonSchemaDoc {
  * a form that only reads the top level silently loses every title and default on those fields.
  */
 const flatten = (node: JsonSchemaNode): JsonSchemaNode =>
+	// Object.assign rather than a spread: the accumulator starts as a fresh copy of `node`, so
+	// mutating it is contained here, and it stays O(n) instead of rebuilding the object per branch.
 	(node.allOf ?? []).reduce<JsonSchemaNode>(
-		(acc, branch) => ({ ...acc, ...branch }),
+		(acc, branch) => Object.assign(acc, branch),
 		{ ...node },
 	);
 

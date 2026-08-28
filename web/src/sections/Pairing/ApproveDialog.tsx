@@ -15,8 +15,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { m } from "@/paraglide/messages";
 import {
-	type AccessDraft,
 	AccessControls,
+	type AccessDraft,
 	draftExpirySecs,
 	draftFromStored,
 	GRANT_ALL,
@@ -124,7 +124,9 @@ export const ApproveDialog: FC<{
 					</DialogHeader>
 
 					<div className="space-y-2">
-						<Label htmlFor="approve-name">{m.pairing_pending_name_prompt()}</Label>
+						<Label htmlFor="approve-name">
+							{m.pairing_pending_name_prompt()}
+						</Label>
 						<Input
 							id="approve-name"
 							autoFocus
@@ -140,7 +142,11 @@ export const ApproveDialog: FC<{
 						</p>
 					)}
 
-					<AccessControls value={draft} onChange={setDraft} idPrefix="approve" />
+					<AccessControls
+						value={draft}
+						onChange={setDraft}
+						idPrefix="approve"
+					/>
 
 					{/* Approving pairs the device outright — no PIN — so it re-confirms the console
 					    password, which the BFF verifies and strips (util/confirm.ts). Both approve
