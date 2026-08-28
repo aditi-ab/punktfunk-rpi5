@@ -1,0 +1,4 @@
+• Fixes streaming quality collapsing after one bad moment. On 0.32.0 a stream could drop to 2 Mbps and stay there for the rest of the session.
+• Sleep, restart or shut down your host from the app — the same menu that wakes it.
+• New "Keep host audio playing" setting, so the speakers on your host stay live while you stream.
+• Your device stops picking a random route to your host when a virtual private network is running.
