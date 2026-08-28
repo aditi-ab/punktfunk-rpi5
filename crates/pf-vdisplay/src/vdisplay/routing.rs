@@ -501,6 +501,13 @@ pub fn takeover_privilege_verdict() -> TakeoverVerdict {
 #[cfg(target_os = "linux")]
 pub fn restore_takeover_now() {
     gamescope::restore_takeover_now();
+    // The xdph screen-share picker is the other thing a host can outlive holding. It is NOT
+    // restored per cast on purpose — doing that rewrites the config on every session, which
+    // restarts xdph, which orphans the portal runtime's cached D-Bus connection and produces a
+    // stream that never delivers a buffer (see `hyprland::StopGuard::drop`). Shutdown is the right
+    // moment: no cast is live, so the restart it triggers costs nothing, and the operator's own
+    // picker is back the instant the host is gone. No-op on a box we never took it over on.
+    hyprland::restore_picker_on_shutdown();
 }
 
 #[cfg(not(target_os = "linux"))]

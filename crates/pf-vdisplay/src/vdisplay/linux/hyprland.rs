@@ -441,12 +441,21 @@ impl Drop for StopGuard {
             // the increment happens in the same arm that arms `closed`.
             return;
         };
-        // Hand the picker back once the LAST of our casts is gone. Done before the close wait
-        // below rather than after: that wait can burn its whole budget on a wedged xdph, and the
-        // user's screen sharing should not be held hostage to it.
-        if LIVE_CASTS.fetch_sub(1, Ordering::SeqCst) == 1 {
-            restore_xdph_config();
-        }
+        LIVE_CASTS.fetch_sub(1, Ordering::SeqCst);
+        // 🛑 **Do NOT hand the picker back here.** Restoring per-cast means the NEXT session finds
+        // the config changed, rewrites it, and restarts xdph — and a ScreenCast bound across an
+        // xdph restart never delivers a buffer. The portal runtime caches its D-Bus connection
+        // process-globally (see `portal_thread`), so the restart orphans the cached connection and
+        // the handshake then succeeds against a session nothing is alive to serve. Measured on
+        // Omarchy 4.0.1: every session after the first died on
+        // `no PipeWire frame within 10s … format negotiated but no buffers arrived`, which is a
+        // black screen on the client, with xdph's own log showing it starting up mid-cast.
+        //
+        // Leaving the shim installed is safe precisely because it DELEGATES: with no selection
+        // pending it execs the picker that was there before us, so an ordinary browser share
+        // behaves exactly as it did. That is what D6 actually asks for — the user's screen sharing
+        // keeps working — and it is why the takeover can be idempotent instead of churning.
+        // The config is put back by `punktfunk-omarchy remove`, from the marker we wrote.
         match closed.recv_timeout(CAST_CLOSE_BUDGET) {
             // Closed — xdph has torn the capture down, the output is safe to remove.
             Ok(()) => {}
@@ -1454,14 +1463,19 @@ fn ensure_xdph_config() -> Result<()> {
 /// Hand `custom_picker_binary` back to whoever had it before us, and restart xdph so the change
 /// takes (it reads config only at startup).
 ///
-/// Called when the **last** cast of this process ends — see [`LIVE_CASTS`] — and safe to call on a
-/// box whose config we never touched, where it does nothing at all.
+/// Called from the host's **shutdown** path ([`crate::restore_takeover_now`]), never per cast —
+/// see [`StopGuard::drop`] for why per-cast churn is a black screen. Safe to call on a box whose
+/// config we never touched, where it does nothing at all.
 ///
 /// The restart is the acknowledged cost (design D6(d)): xdph has no way to tell us whether another
 /// application's cast is live, so a share started *during* our session can be cut here. That is the
 /// same restart the takeover above already performs, at the other end of the session, and it is the
 /// lesser of the two evils — the alternative is leaving a running xdph pointed at a shim whose
 /// selection file is gone, which breaks the box's screen sharing until the next login.
+pub(crate) fn restore_picker_on_shutdown() {
+    restore_xdph_config();
+}
+
 fn restore_xdph_config() {
     let Ok(path) = xdph_config_path() else { return };
     match crate::portal_config::restore_key(&path, XDPH_BLOCK, XDPH_PICKER_KEY) {
