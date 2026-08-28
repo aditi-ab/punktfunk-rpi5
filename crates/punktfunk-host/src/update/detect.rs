@@ -37,6 +37,15 @@ fn classify(p: &pf_update_check::detect::Probe) -> (InstallKind, Channel) {
 /// The per-kind "how to update" command the console shows while (or instead of) an apply
 /// path existing (design §5). One line, copy-pastable, no placeholders.
 pub(crate) fn channel_hint(kind: InstallKind) -> String {
+    // Omarchy flavour (design D5): same pacman DELIVERY, different command. `omarchy update` is
+    // the only supported way to run a transaction there — it snapshots first, then migrates, then
+    // runs their hooks — and our packages ride it automatically once the repo is configured. The
+    // flavour lives here rather than in `pf-update-check` deliberately: that crate is shared with
+    // the Linux client, and client-on-Omarchy is explicitly out of scope.
+    #[cfg(target_os = "linux")]
+    if kind == InstallKind::Pacman && crate::osinfo::is_omarchy() {
+        return "omarchy update   (snapshots first; punktfunk rides the same transaction)".into();
+    }
     pf_update_check::detect::update_command(kind, Product::Host)
 }
 

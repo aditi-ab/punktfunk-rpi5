@@ -1,0 +1,619 @@
+#!/usr/bin/env bash
+#
+# punktfunk-omarchy — wire a punktfunk host into an Omarchy 4.x box, the Omarchy way.
+#
+#   punktfunk-omarchy setup     enable, open the firewall, add the console to the app menu
+#   punktfunk-omarchy remove    reverse every one of those, leaving nothing behind
+#   punktfunk-omarchy status    what is on, what is not, and what to do next
+#
+# Modelled on `omarchy-install-service-sunshine`, which is the shape an Omarchy user already knows:
+# LAN-scoped ufw rules tagged with a comment, a user systemd unit, a webapp entry in the menu. The
+# package installs this script but never RUNS it — a package that opened firewall ports or edited a
+# user's config on install would be doing both behind the operator's back, and consent here is the
+# whole point. Every step is idempotent, and `remove` reverses each one exactly.
+#
+# Deliberately NOT a `punktfunk-host` subcommand: everything here is shell-level system wiring
+# (systemctl, ufw, omarchy's own tools) that the host binary has no business knowing about, and a
+# user can read and audit a shell script before running it as themselves.
+
+set -euo pipefail
+
+readonly TAG="punktfunk-omarchy"        # ufw comment tag: how `remove` finds our rules
+readonly WEBAPP="Punktfunk Console"
+readonly HOOKS_SRC="/usr/share/punktfunk/omarchy"
+readonly HOST_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/punktfunk/host.env"
+readonly DROPIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/punktfunk-host.service.d"
+readonly DROPIN="$DROPIN_DIR/desktop-session.conf"
+
+# ── output ─────────────────────────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; N=$'\e[0m'
+else B=""; G=""; Y=""; R=""; N=""; fi
+say()  { printf '%s\n' "$*"; }
+step() { printf '%s==>%s %s\n' "$B" "$N" "$*"; }
+ok()   { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*"; }
+bad()  { printf '  %s✗%s %s\n' "$R" "$N" "$*"; }
+die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+
+ask() {  # ask "question" -> 0 on yes. Defaults to NO, and to no in a non-interactive shell.
+  [[ -t 0 ]] || return 1
+  local reply
+  read -r -p "  $1 [y/N] " reply
+  [[ "$reply" == [yY] || "$reply" == [yY][eE][sS] ]]
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ── guards ─────────────────────────────────────────────────────────────────────────────────────
+
+# `ID=omarchy` in os-release, which Omarchy rewrites on every `omarchy-settings` upgrade — the same
+# fact the host itself detects on. Everything below assumes Omarchy's own tools and layout, so on
+# any other distro this script would be quietly wrong rather than merely unnecessary.
+require_omarchy() {
+  local id=""
+  [[ -r /etc/os-release ]] && id="$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-}")"
+  [[ "$id" == "omarchy" ]] || die "this is not an Omarchy box (os-release ID='${id:-unknown}').
+On plain Arch, install the package and follow docs/arch — you already have everything this
+script would set up, minus the Omarchy-specific parts."
+  [[ $EUID -ne 0 ]] || die "run this as your normal user, not root — it enables USER services and
+edits YOUR config. It will ask for sudo where it genuinely needs it (ufw, group membership)."
+}
+
+# ── ufw (D4) ───────────────────────────────────────────────────────────────────────────────────
+#
+# The Omarchy idiom is not "open a port to the world" but "open it to the networks you are actually
+# on", tagged so it can be found again — exactly what their Sunshine installer does. We reuse the
+# app profiles the package already ships (/etc/ufw/applications.d/punktfunk), so the port list lives
+# in ONE place and this script never repeats it.
+
+lan_sources() {  # the CIDRs (and tailscale) a rule should accept from
+  printf '%s\n' 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12
+  ip link show tailscale0 >/dev/null 2>&1 && printf '%s\n' tailscale0
+}
+
+ufw_rule() {  # ufw_rule <profile> <source> — idempotent (ufw dedupes identical rules)
+  local profile="$1" src="$2"
+  if [[ "$src" == tailscale0 ]]; then
+    sudo ufw allow in on tailscale0 to any app "$profile" comment "$TAG" >/dev/null
+  else
+    sudo ufw allow from "$src" to any app "$profile" comment "$TAG" >/dev/null
+  fi
+}
+
+ufw_unrule() {
+  local profile="$1" src="$2"
+  if [[ "$src" == tailscale0 ]]; then
+    sudo ufw --force delete allow in on tailscale0 to any app "$profile" >/dev/null 2>&1 || true
+  else
+    sudo ufw --force delete allow from "$src" to any app "$profile" >/dev/null 2>&1 || true
+  fi
+}
+
+open_firewall() {
+  have ufw || { warn "ufw is not installed — nothing to open"; return 0; }
+  [[ -r /etc/ufw/applications.d/punktfunk ]] || {
+    warn "the punktfunk ufw profiles are missing (is punktfunk-host installed from the package?)"
+    return 0
+  }
+  local profiles=(punktfunk-native)
+  # The web console only if it is actually installed — opening a port nothing listens on is noise.
+  # (`|| true` throughout this script wherever a bare `[[ … ]] && …` is a STATEMENT: under `set -e`
+  # a false test is a non-zero exit status, and the script would abort mid-setup with no message.)
+  [[ -f /usr/lib/systemd/user/punktfunk-web.service ]] && profiles+=(punktfunk-web) || true
+  # GameStream stays CLOSED unless the operator turned the plane on. Its ports are exactly the ones
+  # `omarchy install service sunshine` claims, so opening them by default invites a bind conflict
+  # and a confusing "which host answered?" on a box that has both.
+  if grep -qs '^PUNKTFUNK_GAMESTREAM=1' "$HOST_ENV"; then
+    profiles+=(punktfunk-gamestream)
+  fi
+  local src
+  for p in "${profiles[@]}"; do
+    while read -r src; do ufw_rule "$p" "$src"; done < <(lan_sources)
+    ok "ufw: $p opened to local networks (tagged \"$TAG\")"
+  done
+  sudo ufw reload >/dev/null 2>&1 || true
+}
+
+close_firewall() {
+  have ufw || return 0
+  local src
+  for p in punktfunk-native punktfunk-web punktfunk-gamestream; do
+    while read -r src; do ufw_unrule "$p" "$src"; done < <(lan_sources)
+  done
+  sudo ufw reload >/dev/null 2>&1 || true
+  ok "ufw: punktfunk rules removed"
+}
+
+# ── setup ──────────────────────────────────────────────────────────────────────────────────────
+
+setup_groups() {
+  step "Groups"
+  local relogin=0
+  for g in input punktfunk; do
+    getent group "$g" >/dev/null 2>&1 || { warn "group '$g' does not exist — skipping"; continue; }
+    if id -nG "$USER" | tr ' ' '\n' | grep -qx "$g"; then
+      ok "already in '$g'"
+    elif ask "add $USER to the '$g' group?"; then
+      if sudo usermod -aG "$g" "$USER"; then
+        ok "added to '$g'"; relogin=1
+      else
+        bad "could not add you to '$g' — add it by hand: sudo usermod -aG $g $USER"
+      fi
+    else
+      warn "skipped '$g'"
+    fi
+  done
+  # Group membership is applied at LOGIN. The host reads its groups when it starts, so a session
+  # that has not been restarted still runs with the old set — this is the single most common
+  # "I already added myself!" support state there is.
+  [[ $relogin -eq 1 ]] && warn "log out and back in before streaming — new groups apply at login"
+  return 0
+}
+
+# Omarchy ships TWO session entries and they behave differently for us:
+#
+#   hyprland-uwsm.desktop  "Hyprland (uwsm-managed)"  → uwsm starts graphical-session.target
+#   hyprland.desktop       "Hyprland"                 → start-hyprland, target NEVER starts
+#
+# On the plain one, `graphical-session.target` stays inactive — measured on 4.0.1, where Omarchy's
+# OWN units that want it (omarchy-crash-watch, omarchy-sleep-lock) are `enabled` and `dead` too.
+# So the drop-in cannot be described as "the host restarts with your session" without checking.
+session_is_systemd_managed() {
+  systemctl --user is-active --quiet graphical-session.target
+}
+
+setup_units() {
+  step "Autostart"
+  # Install the drop-in either way: it is additive (the base unit keeps WantedBy=default.target, so
+  # the host still comes up at login), it is inert while the target never starts, and it becomes
+  # correct by itself if the operator later picks the uwsm session. What changes is only what we
+  # CLAIM, because "it restarts with your session" is the kind of promise that gets discovered to be
+  # false at the worst moment.
+  mkdir -p "$DROPIN_DIR"
+  if [[ -r /usr/share/punktfunk/punktfunk-host-desktop-session.conf ]]; then
+    install -Dm0644 /usr/share/punktfunk/punktfunk-host-desktop-session.conf "$DROPIN"
+    if session_is_systemd_managed; then
+      ok "bound punktfunk-host to graphical-session.target — it restarts with your session"
+    else
+      ok "punktfunk-host will start at login"
+      warn "this session is not systemd-managed, so the host will NOT restart when the session does"
+      say "     Your session is \"Hyprland\"; picking \"Hyprland (uwsm-managed)\" at the login screen"
+      say "     starts graphical-session.target and gets you that. It is rarely worth it here: the"
+      say "     host re-derives the live compositor on every connect, which is the failure this"
+      say "     binding guards against on KDE and GNOME."
+    fi
+  else
+    warn "the session drop-in template is missing from the package — skipping"
+  fi
+  systemctl --user daemon-reload
+  # `enable --now` can fail for reasons worth SEEING (a masked unit, a missing binary, a user
+  # manager with no session bus). Under `set -e` an unguarded `&&` would abort the whole setup here
+  # with no message at all — which is the one outcome that leaves an operator with no idea what ran.
+  if systemctl --user enable --now punktfunk-host.service; then
+    ok "punktfunk-host enabled and started"
+  else
+    bad "punktfunk-host did not start — see: systemctl --user status punktfunk-host"
+  fi
+  if [[ -f /usr/lib/systemd/user/punktfunk-web.service ]]; then
+    if systemctl --user enable --now punktfunk-web.service; then
+      ok "punktfunk-web enabled and started"
+    else
+      bad "punktfunk-web did not start — see: systemctl --user status punktfunk-web"
+    fi
+  fi
+}
+
+setup_webapp() {
+  step "App menu"
+  have omarchy-webapp-install || { warn "omarchy-webapp-install not found — skipping"; return 0; }
+  # Sunshine's own installer takes the same --ignore-certificate-errors: the console presents the
+  # host's self-signed certificate, which no browser will ever accept on a LAN name.
+  #
+  # The icon is an ICON NAME, not a path — the desktop spec resolves it through the icon theme, and
+  # the scalable `io.unom.Punktfunk` the host package ships scales to whatever size the launcher
+  # asks for. Passing a path to a file that did not exist is how the first version produced an
+  # entry with a blank `Icon=` and no picture in the launcher.
+  # ⚠ `omarchy-webapp-install` takes an icon URL and derives a name with `${ref%.*}` + slugify, so a
+  # DOTTED theme name comes out mangled — `io.unom.Punktfunk` became `Icon=io-unom`, which resolves
+  # to nothing. Their tool is built for downloading a site's favicon; ours is already installed by
+  # the package. So let it create the entry, then set the two lines we own (below), which is what
+  # we already do for Exec.
+  local icon=io.unom.Punktfunk
+  find /usr/share/icons -name "${icon}.*" -print -quit 2>/dev/null | grep -q . \
+    || icon=punktfunk-tray   # older package: the tray mark is the only one installed
+  if omarchy-webapp-install "$WEBAPP" "https://localhost:47992" "$icon" \
+       --ignore-certificate-errors 2>/dev/null; then
+    ok "\"$WEBAPP\" added to Apps (Super+Space)"
+    # Point the entry at a one-shot ticket instead of the bare URL, so opening the console from the
+    # launcher lands logged in. `ctl console-url` signs it with the management token, which only
+    # this uid can read — a LAN visitor still gets the login page.
+    local entry
+    entry=$(grep -rl "^Name=$WEBAPP$" "$HOME/.local/share/applications" 2>/dev/null | head -1)
+    if [[ -n "$entry" ]] && have punktfunk-host; then
+      sed -i "s|^Exec=.*|Exec=sh -c 'omarchy-launch-webapp \"\$(punktfunk-host ctl console-url)\"'|" "$entry"
+      sed -i "s|^Icon=.*|Icon=$icon|" "$entry"
+      grep -q '^Icon=' "$entry" || printf 'Icon=%s\n' "$icon" >> "$entry"
+      ok "the console entry opens already logged in, with the Punktfunk mark"
+    fi
+  else
+    warn "could not add the webapp — add it by hand from the Omarchy menu if you want it"
+  fi
+  setup_menu
+}
+
+# ── the Omarchy menu (Super+Space) ─────────────────────────────────────────────────────────────
+#
+# The rows we add, as JSONC lines. Dotted ids define the tree, so `punktfunk` is a root submenu and
+# `punktfunk.*` are its children. `when` hides a row the box cannot honour, which is what keeps the
+# menu honest on a machine where the host is not running.
+# A function, not a `readonly` computed at load time: the rest of this script resolves config paths
+# where they are USED (see `write_hooks`), and a load-time constant silently ignores an
+# `XDG_CONFIG_HOME` set afterwards — which is exactly how the self-check ended up editing the real
+# config of the machine running it instead of its own scratch directory.
+menu_file() { printf '%s/omarchy/extensions/omarchy-menu.jsonc' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+readonly MENU_BEGIN="// >>> punktfunk (managed by punktfunk-omarchy — do not edit between these markers)"
+readonly MENU_END="// <<< punktfunk"
+
+menu_rows() {
+  cat <<'EOF'
+  "punktfunk": {"icon":"󰍹","label":"Punktfunk","aliases":["streaming","stream"]},
+  "punktfunk.console": {"icon":"󰖟","label":"Open console","description":"Pairing, devices, settings — opens already logged in","action":"sh -c 'omarchy-launch-webapp \"$(punktfunk-host ctl console-url)\"'"},
+  "punktfunk.pair": {"icon":"󰐕","label":"Pair a device","description":"Open a pairing window and show the PIN","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl pair arm; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
+  "punktfunk.pending": {"icon":"󰀦","label":"Devices waiting","description":"Approve or deny a device that is asking to pair","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl pending; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
+  "punktfunk.devices": {"icon":"󰄋","label":"Paired devices","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl clients; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
+  "punktfunk.stop": {"icon":"󰚌","label":"Stop the session","when":"punktfunk-host ctl status --json | grep -q '\"active_sessions\":[1-9]'","action":"punktfunk-host ctl stop-session"},
+  "punktfunk.status": {"icon":"","label":"Status","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-omarchy status; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
+  "punktfunk.restart": {"icon":"󰑓","label":"Restart the host","action":"systemctl --user restart punktfunk-host"},
+EOF
+}
+
+# Strip JSONC to JSON so python can parse it: line comments, then trailing commas.
+menu_is_valid() {
+  sed -E 's://.*$::' "$1" \
+    | python3 -c 'import json,re,sys; json.loads(re.sub(r",(\s*[}\]])", r"\1", sys.stdin.read()))' 2>/dev/null
+}
+
+setup_menu() {
+  step "Omarchy menu"
+  local MENU_FILE; MENU_FILE="$(menu_file)"
+  mkdir -p "$(dirname "$MENU_FILE")"
+  [[ -f "$MENU_FILE" ]] || printf '{\n}\n' > "$MENU_FILE"
+
+  # 🛑 This file is a SINGLE document, and one parse error drops EVERY row the user owns — not just
+  # ours. So: work on a copy, validate it, and only then move it into place. A file we cannot parse
+  # to begin with is left completely alone; it is not ours to repair.
+  if ! menu_is_valid "$MENU_FILE"; then
+    warn "$MENU_FILE does not parse as JSONC — leaving it alone"
+    say  "     Fix it, then re-run: punktfunk-omarchy setup"
+    return 0
+  fi
+
+  local tmp; tmp="$(mktemp "${MENU_FILE}.punktfunk-XXXXXX")"
+  # Drop any previous block of ours, then insert the current one before the closing brace, so this
+  # is idempotent and an upgrade replaces the rows rather than stacking a second copy.
+  awk -v b="$MENU_BEGIN" -v e="$MENU_END" '
+    index($0,b){skip=1} skip && index($0,e){skip=0; next} skip{next} {print}
+  ' "$MENU_FILE" > "$tmp"
+
+  # Insert before the document's LAST closing brace. Deliberately not `awk -v rows=…`: awk refuses
+  # a newline inside a -v assignment ("newline in string"), so the rows silently never landed and
+  # the file came back unchanged while this reported success.
+  local close
+  close=$(grep -n '^[[:space:]]*}[[:space:]]*$' "$tmp" | tail -1 | cut -d: -f1)
+  if [[ -z "$close" ]]; then
+    rm -f "$tmp"
+    warn "could not find the closing brace in $MENU_FILE — leaving it alone"
+    return 0
+  fi
+  {
+    head -n "$((close - 1))" "$tmp"
+    printf '%s\n' "$MENU_BEGIN"
+    menu_rows
+    printf '%s\n' "$MENU_END"
+    tail -n "+$close" "$tmp"
+  } > "$tmp.2"
+
+  # Both halves of "it worked": it still parses, AND our rows are actually in it. The first alone
+  # is satisfied by a no-op edit, which is exactly how the awk bug above reported a false success.
+  if menu_is_valid "$tmp.2" && grep -q '"punktfunk.console"' "$tmp.2"; then
+    mv -f "$tmp.2" "$MENU_FILE"
+    rm -f "$tmp"
+    ok "Punktfunk added to the Omarchy menu (Super+Space → Punktfunk)"
+  else
+    rm -f "$tmp" "$tmp.2"
+    bad "the menu edit would not have parsed — your file is untouched"
+  fi
+}
+
+remove_menu() {
+  local MENU_FILE; MENU_FILE="$(menu_file)"
+  [[ -f "$MENU_FILE" ]] || return 0
+  grep -qF "$MENU_BEGIN" "$MENU_FILE" || return 0
+  local tmp; tmp="$(mktemp "${MENU_FILE}.punktfunk-XXXXXX")"
+  awk -v b="$MENU_BEGIN" -v e="$MENU_END" '
+    index($0,b){skip=1} skip && index($0,e){skip=0; next} skip{next} {print}
+  ' "$MENU_FILE" > "$tmp"
+  if menu_is_valid "$tmp"; then mv -f "$tmp" "$MENU_FILE"; ok "menu entries removed"
+  else rm -f "$tmp"; warn "could not remove the menu entries cleanly — edit $MENU_FILE by hand"; fi
+}
+
+# Hooks live in ~/.config/punktfunk/hooks.json — a LIST of {on, run} entries the host reads per
+# event (automation.md). We write that file only when the operator has none: merging JSON in bash
+# would need jq and, worse, would edit a document that is theirs. If they already have hooks, we
+# print exactly what to add and let them own it.
+# Every entry line carries a trailing comma; `write_hooks` strips the last one. That is what lets
+# the blocks below be concatenated in any combination without producing invalid JSON.
+hooks_json() {
+  cat <<EOF
+    { "on": "pairing.pending", "run": "$HOOKS_SRC/hooks/pairing-pending", "debounce_ms": 2000 },
+    { "on": "stream.started",  "run": "$HOOKS_SRC/hooks/stream-started" },
+    { "on": "stream.stopped",  "run": "$HOOKS_SRC/hooks/stream-stopped" },
+EOF
+}
+
+idle_hooks_json() {
+  cat <<EOF
+    { "on": "stream.started",  "run": "$HOOKS_SRC/hooks/idle-guard on" },
+    { "on": "stream.stopped",  "run": "$HOOKS_SRC/hooks/idle-guard off" },
+EOF
+}
+
+# Write hooks.json from the selected blocks, or print them when the operator already has one.
+# `$1..` are the names of functions producing entry blocks.
+write_hooks() {
+  local blocks=() f
+  for f in "$@"; do blocks+=("$($f)"); done
+  local body; body="$(printf '%s\n' "${blocks[@]}" | sed '$ s/,[[:space:]]*$//')"
+  local file="${XDG_CONFIG_HOME:-$HOME/.config}/punktfunk/hooks.json"
+  if [[ -s "$file" ]]; then
+    warn "you already have $file — not touching it. Add these entries to its \"hooks\" list:"
+    printf '%s\n' "$body" | sed 's/^/    /'
+    return 0
+  fi
+  mkdir -p "$(dirname "$file")"
+  { echo '{'; echo '  "hooks": ['; printf '%s\n' "$body"; echo '  ]'; echo '}'; } > "$file"
+  chmod 0600 "$file"
+  ok "hooks written to $file"
+  # The host verifies that a hook SCRIPT path (and every directory above it) is operator- or
+  # root-owned and not group/world-writable before running it — the sshd/sudoers rule. Ours live
+  # under /usr/share, so they pass; a copy into $HOME would too, but only if $HOME is not group-
+  # writable. Say it here rather than let a hook refuse to run with no obvious cause.
+  ok "hooks applied immediately — the host re-reads this file per event, no restart needed"
+}
+
+setup_hooks() {
+  step "Notifications"
+  [[ -d "$HOOKS_SRC/hooks" ]] || { warn "no sample hooks in $HOOKS_SRC — skipping"; return 0; }
+  # The host already emits every lifecycle event and already runs hook commands (automation.md);
+  # these scripts are the glue to `omarchy-notification-send`, so the toasts get the user's theme
+  # and Omarchy's own action buttons for free and the host gains no notification code at all.
+  ask "send Omarchy toasts for pairing requests and stream start/stop?" && WANT_TOASTS=1 || warn "skipped"
+}
+
+setup_idle() {
+  step "Idle"
+  [[ -x "$HOOKS_SRC/hooks/idle-guard" ]] || { warn "no idle hook in $HOOKS_SRC — skipping"; return 0; }
+  say "  During an input-quiet stream (a film, a cutscene) Omarchy's idle timer still counts down,"
+  say "  because nothing is moving the pointer here. This keeps the box awake for the length of a"
+  say "  session and puts your own setting back afterwards — it never forces 'allow idle' on you."
+  ask "keep the screen awake while a stream is running?" && WANT_IDLE=1 || warn "skipped"
+}
+
+setup_theme() {
+  step "Theme"
+  [[ -r "$HOOKS_SRC/themed/punktfunk.json.tpl" ]] || { warn "no theme template — skipping"; return 0; }
+  ask "follow the Omarchy theme in the web console?" || { warn "skipped"; return 0; }
+  local themed="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/themed"
+  mkdir -p "$themed"
+  install -m0644 "$HOOKS_SRC/themed/punktfunk.json.tpl" "$themed/punktfunk.json.tpl"
+  ok "theme template installed — it renders on every omarchy-theme-set"
+}
+
+check_conflicts() {
+  step "Other streaming hosts"
+  have punktfunk-host || return 0
+  if punktfunk-host detect-conflicts >/dev/null 2>&1; then
+    ok "nothing else is streaming from this box"
+    return 0
+  fi
+  punktfunk-host detect-conflicts 2>&1 | sed 's/^/  /'
+  say ""
+  say "  Sunshine and punktfunk COEXIST on the native plane: 9777/47990/47992 are ours alone, so"
+  say "  the punktfunk client and the web console work with Sunshine running and untouched."
+  say "  They COLLIDE on the GameStream/Moonlight ports (47984/47989/48010, 47998-48010) — ours are"
+  say "  off by default, so leave them off unless you are migrating."
+  say "  To migrate: ${B}omarchy remove service sunshine${N}, then re-run this setup."
+}
+
+cmd_setup() {
+  require_omarchy
+  step "Punktfunk on Omarchy"
+  have punktfunk-host || die "punktfunk-host is not installed. Add the [punktfunk] repo and
+  sudo pacman -S punktfunk-host punktfunk-web
+then run this again. See https://punktfunk.com/docs/omarchy"
+  setup_groups
+  setup_units
+  step "Firewall"
+  open_firewall
+  setup_webapp
+  # Both opt-ins land in ONE hooks.json, so they are asked for first and written once — two passes
+  # over the same file is how the second one ends up printing "you already have hooks.json".
+  WANT_TOASTS=0; WANT_IDLE=0
+  setup_hooks
+  setup_idle
+  if [[ $WANT_TOASTS -eq 1 || $WANT_IDLE -eq 1 ]]; then
+    local blocks=()
+    [[ $WANT_TOASTS -eq 1 ]] && blocks+=(hooks_json) || true
+    [[ $WANT_IDLE -eq 1 ]] && blocks+=(idle_hooks_json) || true
+    write_hooks "${blocks[@]}"
+  fi
+  setup_theme
+  check_conflicts
+  say ""
+  cmd_status
+  say ""
+  say "${B}Next:${N} open ${B}$WEBAPP${N} from Apps (Super+Space) and pair your first device —"
+  say "or do it without a browser: ${B}punktfunk-host ctl pair arm${N}, then ${B}punktfunk-host ctl pending${N}."
+}
+
+# ── remove ─────────────────────────────────────────────────────────────────────────────────────
+
+cmd_remove() {
+  require_omarchy
+  step "Removing the Omarchy integration"
+  systemctl --user disable --now punktfunk-host.service 2>/dev/null && ok "punktfunk-host stopped and disabled" || true
+  systemctl --user disable --now punktfunk-web.service 2>/dev/null && ok "punktfunk-web stopped and disabled" || true
+  if [[ -f "$DROPIN" ]]; then
+    rm -f "$DROPIN"
+    rmdir --ignore-fail-on-non-empty "$DROPIN_DIR" 2>/dev/null || true
+    ok "session drop-in removed"
+  fi
+  systemctl --user daemon-reload
+  close_firewall
+  if have omarchy-webapp-remove; then
+    omarchy-webapp-remove "$WEBAPP" >/dev/null 2>&1 && ok "\"$WEBAPP\" removed from Apps" || true
+  else
+    rm -f "$HOME/.local/share/applications/${WEBAPP// /}.desktop" 2>/dev/null || true
+  fi
+  remove_menu
+  # Hooks: only remove a hooks.json that is entirely OURS. A file the operator has since edited is
+  # theirs — deleting it would take their webhooks with it — so we say what to remove instead.
+  local hf="${XDG_CONFIG_HOME:-$HOME/.config}/punktfunk/hooks.json"
+  if [[ -f "$hf" ]]; then
+    if ! grep -qv -e "$HOOKS_SRC" -e '^\s*[]{}[]' -e '"hooks"' "$hf"; then
+      rm -f "$hf"; ok "notification and idle hooks removed"
+    else
+      warn "$hf has entries that are not ours — left alone. Remove the lines naming $HOOKS_SRC by hand."
+    fi
+  fi
+  local tpl="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/themed/punktfunk.json.tpl"
+  [[ -f "$tpl" ]] && { rm -f "$tpl"; ok "theme template removed"; } || true
+  # The screen-share picker: the host hands `custom_picker_binary` back on its own when the last
+  # cast ends, but a host that was killed mid-session never got to. Put it back from the marker the
+  # host leaves in the file (see pf-vdisplay's portal_config) — a plain awk edit, no host needed.
+  restore_picker
+  say ""
+  say "Your groups, your pairings and ~/.config/punktfunk are untouched — this removes the Omarchy"
+  say "wiring, not punktfunk. To go all the way: sudo pacman -R punktfunk-host punktfunk-web"
+}
+
+# Undo a leftover `custom_picker_binary` takeover in ~/.config/hypr/xdph.conf, using the
+# `# punktfunk: previous custom_picker_binary = <value>` marker the host writes beside it.
+restore_picker() {
+  local f="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/xdph.conf"
+  [[ -r "$f" ]] || return 0
+  grep -q '^\s*# punktfunk: previous custom_picker_binary =' "$f" || return 0
+  local tmp; tmp="$(mktemp "${f}.punktfunk-XXXXXX")"
+  awk '
+    /^[[:space:]]*# punktfunk: previous custom_picker_binary =/ {
+      line = $0
+      sub(/^[[:space:]]*# punktfunk: previous custom_picker_binary =[[:space:]]*/, "", line)
+      prior = line
+      match($0, /^[[:space:]]*/); indent = substr($0, 1, RLENGTH)
+      next
+    }
+    /^[[:space:]]*custom_picker_binary[[:space:]]*=/ {
+      if (prior != "" && prior != "(none)") print indent "custom_picker_binary = " prior
+      next
+    }
+    { print }
+  ' "$f" > "$tmp" && mv -f "$tmp" "$f" && ok "screen-share picker restored in $f"
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+# ── status ─────────────────────────────────────────────────────────────────────────────────────
+
+cmd_status() {
+  require_omarchy
+  step "Status"
+  local ver; ver="$(omarchy-version 2>/dev/null || true)"
+  say "  Omarchy      ${ver:-unknown}"
+  say "  punktfunk    $(punktfunk-host --version 2>/dev/null || echo 'not installed')"
+
+  systemctl --user is-active --quiet punktfunk-host.service \
+    && ok "host running" || bad "host not running (systemctl --user start punktfunk-host)"
+  if [[ -f /usr/lib/systemd/user/punktfunk-web.service ]]; then
+    systemctl --user is-active --quiet punktfunk-web.service \
+      && ok "web console running — https://localhost:47992" || warn "web console installed but not running"
+  fi
+  if [[ -f "$DROPIN" ]]; then
+    if session_is_systemd_managed; then
+      ok "restarts with the desktop session (graphical-session.target is up)"
+    else
+      warn "starts at login, but will not restart with the session (this session is not systemd-managed)"
+    fi
+  else
+    warn "not bound to the desktop session"
+  fi
+
+  if have ufw; then
+    # `ufw status` needs root, and on a box where sudo asks for a password `sudo -n` simply fails.
+    # Absence of OUTPUT must never be reported as absence of RULES: the first version of this said
+    # "no punktfunk rules (run: punktfunk-omarchy setup)" immediately after setup had added six of
+    # them, which sends an operator to re-run the thing that already worked.
+    local ufw_out
+    ufw_out="$(sudo -n ufw status 2>/dev/null)" || ufw_out=""
+    if [[ -z "$ufw_out" ]]; then
+      # NOT "sudo punktfunk-omarchy status": this script refuses to run as root (it reports on YOUR
+      # units and YOUR groups, and root has neither), so that advice would be a dead end.
+      say "  ufw          (needs root to read — check with: sudo ufw status | grep $TAG)"
+    elif grep -q "$TAG" <<<"$ufw_out"; then
+      ok "ufw: punktfunk rules present"
+    else
+      warn "ufw: no punktfunk rules (run: punktfunk-omarchy setup)"
+    fi
+  fi
+
+  for g in input punktfunk; do
+    id -nG "$USER" | tr ' ' '\n' | grep -qx "$g" && ok "in group '$g'" || warn "not in group '$g'"
+  done
+
+  have hyprctl && ok "Hyprland reachable" || warn "hyprctl not reachable (is this running inside the session?)"
+  if have hyprctl; then
+    # Silent denial is the failure mode this catches: with permissions enforced, screencopy and
+    # virtual input are refused as BLACK FRAMES and DROPPED INPUT, never as an error.
+    if hyprctl -j getoption ecosystem:enforce_permissions 2>/dev/null | grep -q '"int": *[1-9]'; then
+      bad "Hyprland ecosystem.enforce_permissions is ON — streams may show black frames"
+      say "     add to ~/.config/hypr/hyprland.lua (or a permissions module):"
+      say "       o.permission(\"/usr/bin/punktfunk-host\", \"screencopy\", \"allow\")"
+      say "       o.permission(\"/usr/bin/punktfunk-host\", \"plugin\",     \"allow\")"
+    else
+      ok "Hyprland permission enforcement off (nothing to grant)"
+    fi
+  fi
+  # Ask systemd, not pgrep. `xdg-desktop-portal-hyprland` is 27 characters and Linux truncates a
+  # process's `comm` to 15, so `pgrep -x` on that name can NEVER match — it reported the portal
+  # missing on a box that was capturing through it a minute earlier. (pgrep itself warns about
+  # this, to stderr, which a `>/dev/null 2>&1` check throws away.)
+  if systemctl --user is-active --quiet xdg-desktop-portal-hyprland.service; then
+    ok "xdg-desktop-portal-hyprland running"
+  else
+    warn "xdg-desktop-portal-hyprland not running (screen capture needs it)"
+  fi
+
+  # The data plane is an EPHEMERAL UDP port, so there is no rule to add for it and `punched=false`
+  # under ufw is expected, not broken: the host's first outbound packet creates the conntrack state
+  # the return path rides. Say so here, because "hole punch failed" in a log reads like a fault.
+  say ""
+  say "  The video data plane uses an ephemeral UDP port and needs no ufw rule — the host's own"
+  say "  outbound packet opens the return path. Pin it with PUNKTFUNK_DATA_PORT + one more rule"
+  say "  only if you want strict egress control (costs you concurrent sessions on that port)."
+}
+
+case "${1:-}" in
+  setup)  cmd_setup ;;
+  remove) cmd_remove ;;
+  status) cmd_status ;;
+  ""|-h|--help|help)
+    cat <<'EOF'
+punktfunk-omarchy — wire a punktfunk host into an Omarchy box
+
+  punktfunk-omarchy setup     groups, autostart, ufw, app-menu entry, optional toasts/idle/theme
+  punktfunk-omarchy remove    reverse all of it (pairings and config are left alone)
+  punktfunk-omarchy status    what is on and what to do next
+
+Docs: https://punktfunk.com/docs/omarchy
+EOF
+    ;;
+  *) die "unknown command '$1' (try: setup | remove | status)" ;;
+esac

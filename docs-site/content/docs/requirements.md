@@ -156,6 +156,16 @@ Minimum compositor versions (newer is fine):
 
 - **KWin ≥ 6.5.6** ([KDE Plasma](/docs/kde)) — headless virtual outputs.
 - **GNOME ≥ 48** ([Mutter](/docs/gnome)) — virtual-monitor screen-cast.
+- **Hyprland — no version floor** ([Hyprland](/docs/hyprland)): the `hyprctl` path is
+  version-independent, and both config eras (hyprlang and the newer Lua one) are handled. Contracts
+  are verified against **0.55.4** and **0.56.2**. What Hyprland *does* need is
+  **`xdg-desktop-portal-hyprland`** — capture goes through it, and Hyprland does not pull it in.
+  On **0.49+**, if you have turned `ecosystem.enforce_permissions` on (off by default), grant the
+  host screencopy and virtual input: a denial is *silent black frames and dropped input*, never an
+  error.
+- **Omarchy ≥ 4.0** ([Omarchy](/docs/omarchy)) — not a compositor floor but an integration one: 4.0
+  replaced the shell, the menu format and the Hyprland config language at once, so every point
+  `punktfunk-omarchy` touches is different below it.
 - **gamescope ≥ 3.16.22** ([Bazzite/Steam](/docs/gamescope)) — below this, headless capture
   deadlocks against PipeWire ≥ 1.6.
 - **gamescope ≥ 3.16.23** for the Steam overlay (Shift+Tab / Quick Access Menu) to reach the stream

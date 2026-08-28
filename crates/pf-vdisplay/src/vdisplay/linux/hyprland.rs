@@ -65,10 +65,38 @@ fn selection_file() -> String {
 
 /// The installed custom-picker shim: a tiny script that cats [`selection_file`]. xdph runs
 /// `custom_picker_binary` and reads one selection line from its stdout; an empty read (no session
-/// has written the file) leaves xdph to its interactive picker — the graceful fallback.
+/// has written the file) leaves xdph to its own fallback.
 fn picker_shim_path() -> String {
     let dir = crate::session::runtime_dir();
     format!("{dir}/punktfunk-xdph-picker.sh")
+}
+
+/// The xdph config we manage one key in, and the key.
+fn xdph_config_path() -> Result<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .ok_or_else(|| anyhow!("neither XDG_CONFIG_HOME nor HOME set"))?;
+    Ok(base.join("hypr").join("xdph.conf"))
+}
+const XDPH_BLOCK: crate::portal_config::Block<'static> =
+    crate::portal_config::Block::Hyprlang("screencopy");
+const XDPH_PICKER_KEY: &str = "custom_picker_binary";
+
+/// Is a picker command safe to paste into the shim's `exec` line?
+///
+/// The value comes from the user's own config, so this is not a privilege boundary — they already
+/// own both files and the shell that runs them. It is a *robustness* boundary: a newline would
+/// truncate the script into something that silently does the wrong thing, and command substitution
+/// in a file we generate is the kind of thing a reader has to stop and reason about. A picker is a
+/// command name with maybe some flags; anything else, we simply omit the fallback and behave
+/// exactly as before.
+fn picker_is_plain(cmd: &str) -> bool {
+    !cmd.is_empty()
+        && cmd.len() <= 512
+        && cmd
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || " ._/@:+=-".contains(c))
 }
 
 /// The picker line for output `name` — `[SELECTION]/screen:<name>`, whose every byte is load-bearing.
@@ -390,6 +418,11 @@ const CAST_CLOSE_BUDGET: Duration = Duration::from_secs(3);
 /// `xdp_dbus_impl_session_call_close_sync`), so by the time `close()` returns, xdph has already run
 /// `destroyStream` and logged `Session destroyed`. The output we remove next is one nobody is
 /// capturing.
+/// How many casts of ours are live right now. The picker config is borrowed for exactly as long as
+/// this is non-zero (design D6(b): restore "the moment no punktfunk session needs the shim"), and a
+/// host that streams two outputs at once must not hand the picker back when the first one ends.
+static LIVE_CASTS: AtomicU32 = AtomicU32::new(0);
+
 struct StopGuard {
     stop: Arc<AtomicBool>,
     /// Signalled by the portal thread once it has closed the ScreenCast session.
@@ -404,8 +437,25 @@ impl Drop for StopGuard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         let Some(closed) = self.closed.take() else {
+            // No cast was ever established, so this guard never counted toward [`LIVE_CASTS`] —
+            // the increment happens in the same arm that arms `closed`.
             return;
         };
+        LIVE_CASTS.fetch_sub(1, Ordering::SeqCst);
+        // 🛑 **Do NOT hand the picker back here.** Restoring per-cast means the NEXT session finds
+        // the config changed, rewrites it, and restarts xdph — and a ScreenCast bound across an
+        // xdph restart never delivers a buffer. The portal runtime caches its D-Bus connection
+        // process-globally (see `portal_thread`), so the restart orphans the cached connection and
+        // the handshake then succeeds against a session nothing is alive to serve. Measured on
+        // Omarchy 4.0.1: every session after the first died on
+        // `no PipeWire frame within 10s … format negotiated but no buffers arrived`, which is a
+        // black screen on the client, with xdph's own log showing it starting up mid-cast.
+        //
+        // Leaving the shim installed is safe precisely because it DELEGATES: with no selection
+        // pending it execs the picker that was there before us, so an ordinary browser share
+        // behaves exactly as it did. That is what D6 actually asks for — the user's screen sharing
+        // keeps working — and it is why the takeover can be idempotent instead of churning.
+        // The config is put back by `punktfunk-omarchy remove`, from the marker we wrote.
         match closed.recv_timeout(CAST_CLOSE_BUDGET) {
             // Closed — xdph has torn the capture down, the output is safe to remove.
             Ok(()) => {}
@@ -479,21 +529,46 @@ fn reclaim_leftovers_once() {
 /// Best-effort by construction: a failure costs window placement, not the session, and a box with no
 /// physical head was already placing windows correctly.
 ///
-/// ⚠️ **This is a no-op under the Lua config manager.** Measured on .138 (0.55.4, Lua) 2026-08-18:
-/// `hyprctl dispatch focusmonitor <name>` is parsed as Lua (`hl.dispatch(focusmonitor <name>)`) and
-/// rejected, and `hl.dsp.focusmonitor` does not exist either — so the #283 window-placement fix
-/// does not reach a Lua-configured box. Both rejections carry "error", so [`hyprctl_dispatch`]
-/// reports them and this warns rather than failing silently; the gap itself is unfixed and belongs
-/// to the #283 follow-up, not to the topology work here.
+/// Two eras, same [`dpms_one`] shape and for the same reason. The classic
+/// `hyprctl dispatch focusmonitor <name>` is what a hyprlang box wants; under the **Lua** config
+/// manager `dispatch` is shorthand for `hl.dispatch(...)`, so those bare words parse as a Lua
+/// expression and die with `')' expected near '<name>'`.
+///
+/// ⭐ The Lua spelling is **`hl.dsp.focus({ monitor = "<name>" })`** — measured on Omarchy 4.0.1
+/// (Hyprland 0.56.2) 2026-08-28. The older note here said the fix could not reach a Lua box
+/// because "`hl.dsp.focusmonitor` does not exist"; that is true, and it was the wrong name. The
+/// compositor says so itself when asked with any other key:
+/// *"hl.focus: unrecognized arguments. Expected one of: direction, monitor, window,
+/// urgent_or_last, last"*.
+///
+/// This is not only about window placement on Omarchy. A headless output nothing has focused
+/// stays empty, an empty output produces no damage, and no damage means **no PipeWire frames** —
+/// the capture then fails its first-frame deadline and the client sees a black screen. So try
+/// classic, then Lua, and report both if neither lands.
 pub(crate) fn focus_output(name: &str) {
-    match hyprctl_dispatch(&focus_argv(name)) {
-        Ok(()) => tracing::info!(output = %name, "focused the streamed headless output"),
-        Err(e) => tracing::warn!(
-            output = %name, error = %format!("{e:#}"),
+    let classic = match hyprctl_dispatch(&focus_argv(name)) {
+        Ok(()) => None,
+        Err(e) => match hyprctl_dispatch(&["dispatch", &lua_focus_expr(name)]) {
+            Ok(()) => None,
+            Err(lua_err) => Some(format!("hyprlang: {e:#}; lua: {lua_err:#}")),
+        },
+    };
+    match classic {
+        None => tracing::info!(output = %name, "focused the streamed headless output"),
+        Some(why) => tracing::warn!(
+            output = %name, error = %why,
             "could not focus the streamed headless output — apps this session launches may open on \
-             a physical monitor instead of on the stream"
+             a physical monitor instead of on the stream, and an unfocused headless output can \
+             produce no frames at all"
         ),
     }
+}
+
+/// The Lua-config-manager spelling of "focus this monitor". Pure, so a test pins the shape: the
+/// quoting and the `monitor =` key are the whole trick, and an unquoted argument is exactly what
+/// the classic form gets wrong on that manager.
+fn lua_focus_expr(name: &str) -> String {
+    format!("hl.dsp.focus({{ monitor = \"{name}\" }})")
 }
 
 /// The `hyprctl` argv that focuses `name`, split out so a test pins its SHAPE.
@@ -992,6 +1067,9 @@ fn select_and_cast(
             // A cast exists now, so teardown has something to close and must wait for it. Only this
             // arm arms the wait: see the field note on `StopGuard::closed`.
             guard.closed = Some(closed_rx);
+            // …and only this arm counts toward the borrowed picker, for the same reason: a
+            // handshake that never produced a cast has nothing to hand back.
+            LIVE_CASTS.fetch_add(1, Ordering::SeqCst);
             Ok((fd, node_id, cursor_mode, guard))
         }
         Ok(Err(e)) => bail!("ScreenCast portal on {output} failed: {e}"),
@@ -1308,11 +1386,45 @@ fn warn_if_permissions_enforced() {
 /// Make sure xdph uses our custom picker: install the shim (once) and write the managed config,
 /// restarting xdph if the config changed (it reads config only at startup). Mirrors the wlroots
 /// `ensure_xdpw_config` pattern.
+///
+/// **The picker is the user's, borrowed — not taken** (design D6). `custom_picker_binary` is one
+/// key with one holder, and on a distro that ships its own (Omarchy sets
+/// `hyprland-preview-share-picker`, the picker every Chromium share on the box goes through)
+/// pointing it at us is pointing *every* share at us. Two things keep that honest:
+///
+///  * the shim **delegates**: with no selection pending it `exec`s whatever was configured before
+///    us, so an ordinary browser share behaves exactly as it did — during our session, after it,
+///    after a crash, and after a reboot that emptied `$XDG_RUNTIME_DIR`. This is the part that does
+///    not depend on us getting a teardown right;
+///  * the config edit records what it replaced, so [`restore_xdph_config`] can put their value
+///    back verbatim when the last cast ends.
 fn ensure_xdph_config() -> Result<()> {
-    // 1. Install the picker shim (idempotent — content is fixed).
+    let path = xdph_config_path()?;
+    // What the user had here before us — from our own marker if we have taken this over already
+    // (a second session, a moved `$XDG_RUNTIME_DIR`), else whatever is in the file now. Reading
+    // the marker FIRST is what stops the second takeover from recording our own shim as "theirs".
+    let (current, prior) = crate::portal_config::peek(&path, XDPH_BLOCK, XDPH_PICKER_KEY);
+    let fallback = match prior {
+        Some(p) => p,
+        None => current,
+    }
+    .filter(|c| picker_is_plain(c));
+
+    // 1. Install the picker shim (idempotent — content is fixed for a given fallback).
     let shim = picker_shim_path();
     let sel = selection_file();
-    let shim_body = format!("#!/bin/sh\nexec cat \"{sel}\" 2>/dev/null\n");
+    // `-s` not `-f`: an empty selection file means "no selection", which is the fallback's case.
+    // Unquoted expansion on the `exec` line is deliberate — a picker may carry flags, and
+    // `picker_is_plain` is what makes word-splitting the only thing that can happen here.
+    let shim_body = match &fallback {
+        Some(cmd) => format!(
+            "#!/bin/sh\n# Managed by punktfunk. Hands xdph the output this host is streaming; with\n# no selection pending, defers to the picker configured before us.\n[ -s \"{sel}\" ] && exec cat \"{sel}\"\nexec {cmd} \"$@\"\n"
+        ),
+        // Nothing to defer to: an empty read leaves xdph to its own fallback, as before.
+        None => format!(
+            "#!/bin/sh\n# Managed by punktfunk.\n[ -s \"{sel}\" ] && exec cat \"{sel}\"\nexit 0\n"
+        ),
+    };
     if std::fs::read_to_string(&shim).is_ok_and(|c| c == shim_body) {
         // already installed
     } else {
@@ -1333,26 +1445,58 @@ fn ensure_xdph_config() -> Result<()> {
     }
 
     // 2. Write the managed xdph config and restart xdph on change.
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
-        .ok_or_else(|| anyhow!("neither XDG_CONFIG_HOME nor HOME set"))?;
-    let path = base.join("hypr").join("xdph.conf");
     // ONE key, in place. This used to `fs::write` a complete file over whatever the user had,
     // destroying every other xdph setting they owned on first connect.
-    let changed = crate::portal_config::ensure_key(
-        &path,
-        crate::portal_config::Block::Hyprlang("screencopy"),
-        "custom_picker_binary",
-        &shim,
-    )?;
+    let changed = crate::portal_config::ensure_key(&path, XDPH_BLOCK, XDPH_PICKER_KEY, &shim)?;
     if !changed {
         return Ok(());
     }
-    tracing::info!(path = %path.display(), "pointed xdg-desktop-portal-hyprland at the managed picker shim");
-    // Bounded: `systemctl --user` blocks on the user manager's job queue, and this runs on the
-    // session's stream thread. Its result was already ignored — a timeout just means xdph picks the
-    // new config up whenever it next starts.
+    tracing::info!(
+        path = %path.display(),
+        defers_to = fallback.as_deref().unwrap_or("(xdph's own fallback)"),
+        "pointed xdg-desktop-portal-hyprland at the managed picker shim"
+    );
+    restart_xdph();
+    Ok(())
+}
+
+/// Hand `custom_picker_binary` back to whoever had it before us, and restart xdph so the change
+/// takes (it reads config only at startup).
+///
+/// Called from the host's **shutdown** path ([`crate::restore_takeover_now`]), never per cast —
+/// see [`StopGuard::drop`] for why per-cast churn is a black screen. Safe to call on a box whose
+/// config we never touched, where it does nothing at all.
+///
+/// The restart is the acknowledged cost (design D6(d)): xdph has no way to tell us whether another
+/// application's cast is live, so a share started *during* our session can be cut here. That is the
+/// same restart the takeover above already performs, at the other end of the session, and it is the
+/// lesser of the two evils — the alternative is leaving a running xdph pointed at a shim whose
+/// selection file is gone, which breaks the box's screen sharing until the next login.
+pub(crate) fn restore_picker_on_shutdown() {
+    restore_xdph_config();
+}
+
+fn restore_xdph_config() {
+    let Ok(path) = xdph_config_path() else { return };
+    match crate::portal_config::restore_key(&path, XDPH_BLOCK, XDPH_PICKER_KEY) {
+        Ok(false) => return, // not ours; nothing to undo
+        Ok(true) => tracing::info!(
+            path = %path.display(),
+            "restored the screen-share picker xdg-desktop-portal-hyprland had before this host"
+        ),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %format!("{e:#}"),
+                "could not restore the previous screen-share picker");
+            return;
+        }
+    }
+    restart_xdph();
+}
+
+/// Bounded: `systemctl --user` blocks on the user manager's job queue, and this runs on the
+/// session's stream thread. The result is ignored — a timeout just means xdph picks the new config
+/// up whenever it next starts.
+fn restart_xdph() {
     let _ = crate::proc::status_within(
         Command::new("systemctl").args([
             "--user",
@@ -1361,7 +1505,6 @@ fn ensure_xdph_config() -> Result<()> {
         ]),
         PORTAL_RESTART_BUDGET,
     );
-    Ok(())
 }
 
 /// The ScreenCast portal handshake — the xdg ScreenCast portal is backend-neutral (served here by
@@ -1562,6 +1705,22 @@ mod tests {
             focus_argv("PF-1234-1"),
             ["dispatch", "focusmonitor", "PF-1234-1"]
         );
+    }
+
+    /// The Lua-era spelling, which is the half that was missing. Measured against Hyprland 0.56.2
+    /// on Omarchy 4.0.1: the key is `monitor` (the compositor lists the alternatives when it is
+    /// anything else) and the NAME MUST BE QUOTED — unquoted is precisely the classic form's
+    /// failure, `')' expected near 'PF'`, which is what left a headless output unfocused, empty,
+    /// and producing no frames at all.
+    #[test]
+    fn the_lua_focus_expression_quotes_the_monitor_name() {
+        assert_eq!(
+            lua_focus_expr("PF-1234-1"),
+            "hl.dsp.focus({ monitor = \"PF-1234-1\" })"
+        );
+        // The two eras must not converge on one string: each is rejected by the other's parser,
+        // and that is what makes "try one, then the other" safe to run blind.
+        assert_ne!(lua_focus_expr("PF-1"), focus_argv("PF-1").join(" "));
     }
 
     /// `HYPRLAND_INSTANCE_SIGNATURE` reaches `hyprctl` as a per-CHILD override, never as a `set_var`

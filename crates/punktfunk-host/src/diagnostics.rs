@@ -41,6 +41,8 @@ pub mod ids {
     pub const VIRTUAL_DECK_VHCI: &str = "virtual_deck_vhci";
     pub const UINPUT_ACCESS: &str = "uinput_access";
     pub const SERVER_CONFLICT: &str = "server_conflict";
+    pub const HYPRLAND_PERMISSIONS: &str = "hyprland_permissions";
+    pub const OMARCHY_UPDATES: &str = "omarchy_updates";
 }
 
 /// What a probe found. `Inapplicable` is deliberately distinct from `Ok`: "this box will never do
@@ -526,6 +528,8 @@ mod tests {
             ids::VIRTUAL_DECK_VHCI,
             ids::UINPUT_ACCESS,
             ids::SERVER_CONFLICT,
+            ids::HYPRLAND_PERMISSIONS,
+            ids::OMARCHY_UPDATES,
         ] {
             assert!(
                 ids.iter().any(|i| i == expected),

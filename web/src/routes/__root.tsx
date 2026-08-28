@@ -11,7 +11,8 @@ import {
 import "@fontsource-variable/geist";
 import { Toaster } from "@unom/ui/toast";
 import { MotionConfig } from "motion/react";
-import { useEffect } from "react";
+import { type CSSProperties, useEffect } from "react";
+import { useUiConfig } from "@/api/uiConfig";
 import { AppShell } from "@/components/app-shell";
 import { DialogsProvider } from "@/components/dialogs";
 import { adoptStoredLocale, useLocale } from "@/lib/i18n";
@@ -59,8 +60,30 @@ function RootComponent() {
 	const isLogin = useRouterState({
 		select: (s) => s.location.pathname === "/login",
 	});
+	// On an Omarchy box that opted in, follow the desktop's theme: `mode` picks the palette the
+	// whole stylesheet already keys off, and `accent` re-tints the brand, which `--primary`,
+	// `--accent` and `--ring` all derive from — so one value moves the buttons, the active nav and
+	// the focus rings together. Everywhere else `theme` is null and the console keeps its own
+	// violet, which is also what SSR renders and what shows for the moment before this resolves.
+	//
+	// BOTH brand variables, not just `--pf-brand`: the light palette derives `--primary` from it,
+	// but `.dark` derives `--primary` from `--pf-brand-light`. Setting only the first re-tints the
+	// console in light mode and does nothing at all in dark — which is the mode it ships in.
+	const { data: uiConfig } = useUiConfig();
+	const theme = uiConfig?.theme ?? null;
 	return (
-		<html lang={locale} className="dark">
+		<html
+			lang={locale}
+			className={theme?.mode === "light" ? undefined : "dark"}
+			style={
+				theme
+					? ({
+							"--pf-brand": theme.accent,
+							"--pf-brand-light": theme.accent,
+						} as CSSProperties)
+					: undefined
+			}
+		>
 			<head>
 				<HeadContent />
 			</head>

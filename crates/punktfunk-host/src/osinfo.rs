@@ -113,6 +113,25 @@ fn parse_os_release(contents: &str) -> OsInfo {
     OsInfo { chain, pretty }
 }
 
+/// Is this an **Omarchy** box? (`ID=omarchy`, which the chain carries verbatim as its leaf.)
+///
+/// A *flavour*, never a family: `ID_LIKE=arch` already routes everything family-shaped — the
+/// install ladder, `InstallKind::Pacman`, the docs — correctly, and nothing here should change
+/// that. What the flavour decides is narrower and listed in one place so it stays auditable:
+///
+///  * the update tier (`crate::update`): Omarchy's own `omarchy update` owns the pacman
+///    transaction, and a pacman guard blocks the direct `pacman -Syu` our root helper would run,
+///    so the console reports **notify-only** and names their command;
+///  * diagnostics rows (`crate::diagnostics`), which is where an operator finds out what an
+///    Omarchy-specific check saw.
+///
+/// Detected from the same `os-release` parse as [`detect`], which Omarchy rewrites on every
+/// `omarchy-settings` upgrade — so it survives updates, which a marker file in our own package
+/// would not. Misdetection degrades to plain-Arch behaviour, which is exactly the old behaviour.
+pub fn is_omarchy() -> bool {
+    detect().chain.ends_with("/omarchy")
+}
+
 /// Strip one matching pair of surrounding `"` or `'` quotes.
 fn unquote(v: &str) -> String {
     let v = v.trim();
@@ -169,6 +188,23 @@ mod tests {
             parsed("ID=bazzite\nID_LIKE=\"fedora\"\nPRETTY_NAME=\"Bazzite 42 (Kinoite)\"\n");
         assert_eq!(chain, "linux/fedora/bazzite");
         assert_eq!(pretty, "Bazzite 42 (Kinoite)");
+    }
+
+    /// Omarchy 4.x writes `ID=omarchy` / `ID_LIKE=arch` / `VERSION_ID=<pkgver>` and *rewrites*
+    /// os-release on every `omarchy-settings` upgrade, so this is the detection that survives an
+    /// `omarchy update`. It must land in the arch family (the install ladder and `InstallKind`
+    /// depend on it) AND keep `omarchy` as the leaf (the flavour predicate reads it).
+    #[test]
+    fn omarchy_is_arch_family_and_keeps_its_leaf() {
+        let (chain, pretty) = parsed(
+            "NAME=\"Omarchy\"\nPRETTY_NAME=\"Omarchy\"\nID=omarchy\nID_LIKE=arch\nVERSION_ID=4.0.1\n",
+        );
+        assert_eq!(chain, "linux/arch/omarchy");
+        assert_eq!(pretty, "Omarchy");
+        assert!(chain.ends_with("/omarchy"), "is_omarchy() reads this");
+        // …and a plain Arch box must NOT trip the flavour.
+        let (arch, _) = parsed("ID=arch\nPRETTY_NAME=\"Arch Linux\"\n");
+        assert!(!arch.ends_with("/omarchy"));
     }
 
     #[test]

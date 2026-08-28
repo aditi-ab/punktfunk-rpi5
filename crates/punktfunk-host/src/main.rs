@@ -94,6 +94,10 @@ mod log_capture;
 mod mgmt;
 #[forbid(unsafe_code)]
 mod mgmt_token;
+// `ctl` is a CLIENT of everything above — it holds the operator token and the certificate pin, so
+// it gets the same `forbid` as the surfaces it talks to.
+#[forbid(unsafe_code)]
+mod ctl;
 #[cfg_attr(not(test), forbid(unsafe_code))]
 mod native;
 #[forbid(unsafe_code)]
@@ -336,6 +340,9 @@ fn is_management_cli(args: &[String]) -> bool {
         | Some("driver")
         | Some("web")
         | Some("tray")
+        // A loopback API client. None of the host-startup work applies, and `watch` is a
+        // long-lived process — the GPU clock profile and the DXGI hook must not follow it.
+        | Some("ctl")
         | Some("openapi")
         | Some("library")
         | Some("detect-conflicts")
@@ -468,6 +475,10 @@ fn real_main() -> Result<()> {
             }
             Ok(())
         }
+        // The operator control surface: `ctl status`, `ctl approve 3`, `ctl watch`, … A loopback
+        // client of this same binary's management API, so a shell plugin or a script can drive
+        // pairing and sessions without a browser (design/omarchy-integration.md D13). See ctl.rs.
+        Some("ctl") => ctl::main(&args[1..]),
         // Install and run host plugins: `plugins add playnite`, `plugins enable`, … Package ops are
         // forwarded to the bun runner; enable/disable/status drive the systemd unit (Linux) or the
         // PunktfunkScripting scheduled task (Windows). See plugins.rs.
@@ -1052,6 +1063,9 @@ fn print_usage() {
 USAGE:
     punktfunk-host serve [OPTIONS]            native punktfunk/1 host + management REST API
                                               (secure default; add --gamestream for Moonlight compat)
+    punktfunk-host ctl <VERB>                 operator control over the local management API —
+                                              pairing, devices, sessions, `watch` (line-JSON for a
+                                              shell widget); `ctl --help` for the verb list
     punktfunk-host plugins <CMD>              install/run host plugins (add, remove, list, enable,
                                               disable, status) — `plugins --help` for details
     punktfunk-host tray <CMD>                 status-tray lifecycle (start, stop, status) — Windows;

@@ -38,6 +38,18 @@ pub fn load_or_generate_plugin() -> Result<String> {
     load_or_generate_impl(PLUGIN_ENV_VAR, PLUGIN_FILE)
 }
 
+/// Read the persisted operator token from `dir`, or `None` when there isn't one. **Never mints.**
+///
+/// This is what `ctl` uses: a client that generated its own `mgmt-token` would be planting the
+/// credential the host then adopts — the `web-password` silent-adoption finding (security sweep
+/// 2026-08-15) with the roles reversed. The host is the only minter; every other reader either
+/// finds a token or fails loudly. It also deliberately ignores `PUNKTFUNK_MGMT_TOKEN`: a consumer
+/// that took the token from its environment would publish it in `/proc/<pid>/environ`.
+pub(crate) fn read_persisted(dir: &Path) -> Option<String> {
+    let contents = fs::read_to_string(dir.join(FILE)).ok()?;
+    parse_token(&contents, ENV_VAR)
+}
+
 fn load_or_generate_impl(env_var: &str, file: &str) -> Result<String> {
     if let Ok(v) = std::env::var(env_var) {
         let v = v.trim();

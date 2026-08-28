@@ -73,6 +73,15 @@ pub(crate) fn apply_support() -> &'static str {
     if apply_disabled() {
         return "notify";
     }
+    // Omarchy owns the pacman transaction (design D5). `omarchy update` snapshots with snapper,
+    // runs the full sysupgrade, then migrations and hooks — and a pacman guard blocks the bare
+    // `pacman -Syu` our root helper would run, so a one-click apply here would either be refused
+    // or bypass the snapshot the user's rollback depends on. Our packages ride their transaction
+    // for free once the repo is configured, so notify-only loses nothing.
+    #[cfg(target_os = "linux")]
+    if crate::osinfo::is_omarchy() {
+        return "notify";
+    }
     let (kind, _) = detect::detect();
     match kind {
         detect::InstallKind::WindowsInstaller => "full",
@@ -104,6 +113,11 @@ pub(crate) fn apply_support() -> &'static str {
 pub(crate) fn opt_in_hint() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
+        // Never invite an Omarchy operator to join `punktfunk-update`: apply is notify-only there
+        // regardless (D5), so the opt-in would buy them a group membership and no button.
+        if crate::osinfo::is_omarchy() {
+            return None;
+        }
         let (kind, _) = detect::detect();
         let capable = matches!(
             kind,
@@ -395,6 +409,14 @@ pub(crate) fn start_apply(force: bool, session_active: bool) -> Result<(), Apply
             | detect::InstallKind::SteamosSource
     );
     if !windows_leg && !linux_leg {
+        return Err(ApplyError::Unsupported);
+    }
+    // The same D5 refusal as `apply_support`, enforced here rather than only reported there: a
+    // direct POST to the apply route on an Omarchy box that HAS the helper, the group and the
+    // full-sysupgrade opt-in would otherwise run `pacman -Syu` straight into their guard — or
+    // past it, skipping the snapper snapshot their rollback story is built on.
+    #[cfg(target_os = "linux")]
+    if crate::osinfo::is_omarchy() {
         return Err(ApplyError::Unsupported);
     }
     #[cfg(target_os = "linux")]
