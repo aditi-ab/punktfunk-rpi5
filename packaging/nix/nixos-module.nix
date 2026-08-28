@@ -613,16 +613,20 @@ in
         ];
       };
 
-      # First-run setup: generate the console login password once, in the user's config dir, and
-      # surface it to the --user journal. Self-gates via ConditionPathExists (mirrors
-      # scripts/punktfunk-web-init.service).
+      # Console pre-start: generate the login password once, in the user's config dir, surface it to
+      # the --user journal, THEN block until the host has written the mgmt token + identity cert.
+      # Being Type=oneshot, this is the readiness gate punktfunk-web's `after` already implies but
+      # cannot enforce on its own (the host is Type=simple). Mirrors
+      # scripts/punktfunk-web-init.service — keep both in step.
       systemd.user.services.punktfunk-web-init = {
-        description = "punktfunk web console first-run setup (login password)";
+        description = "punktfunk web console pre-start (login password; waits for the host)";
         documentation = [ "https://git.unom.io/unom/punktfunk" ];
-        # ⚠ ConditionUser here is TRIGGERING (`|`) and ConditionPathExists is not, so systemd
-        # requires the path condition AND at least one user condition — which is the intent.
+        # NO ConditionPathExists on web-password: that skipped this unit from the second boot
+        # onward, which is precisely when the host-readiness wait must still run. web-init.sh is
+        # idempotent instead (it writes the password only when absent, and returns without sleeping
+        # once the host's files exist). ConditionUser is TRIGGERING (`|`), so at least one must hold
+        # — same shape as punktfunk-web below.
         unitConfig = {
-          ConditionPathExists = "!%h/.config/punktfunk/web-password";
           ConditionUser = userScope;
         };
         path = [ pkgs.coreutils ];
@@ -635,27 +639,36 @@ in
 
       # The console itself: Nitro SSR on bun, HTTPS on 47992 with the host's identity cert, proxying
       # the host's loopback mgmt API with the bearer token injected server-side. mgmt-token is
-      # REQUIRED (the host's `serve` writes it) — if absent the unit fails and Restart retries until
-      # the host has created it; web-password is optional ('-'). Mirrors scripts/punktfunk-web.service.
+      # REQUIRED (the host's `serve` writes it) — a console with no token cannot reach the mgmt API
+      # at all, so failing closed beats a login page that 401s on every call. punktfunk-web-init
+      # waits for it, so this no longer fails on a fresh install's first start; if it is somehow
+      # still absent the unit fails and Restart retries. web-password is optional ('-'). Mirrors
+      # scripts/punktfunk-web.service.
       systemd.user.services.punktfunk-web = {
         description = "punktfunk management web console";
         documentation = [ "https://git.unom.io/unom/punktfunk" ];
         # Same scoping as the host: root's instance would take 47992 from the real one.
         unitConfig.ConditionUser = userScope;
+        # punktfunk-web-init is the readiness gate (Type=oneshot, so ordering after it genuinely
+        # waits). `punktfunk-host.service` alone is NOT one — the host is Type=simple, so systemd
+        # calls it started the instant it is spawned, seconds before it writes the mgmt token and
+        # its identity cert. Keep web-init in BOTH lists: the ordering is what makes it a gate.
         after = [
           "punktfunk-web-init.service"
           "punktfunk-host.service"
         ];
+        # wants, not requires: if the pre-start unit itself fails, still try — the Restart backstop
+        # below recovers, where a hard dependency would leave the console down.
         wants = [ "punktfunk-web-init.service" ];
         wantedBy = optional cfg.web.autoStart "default.target";
-        # Retry INDEFINITELY while the host is still writing the mgmt token + identity cert. The
-        # EnvironmentFile below is mandatory on purpose, so the unit genuinely fails until those
-        # exist — and systemd's default rate limit (5 starts / 10 s) against `RestartSec = 2` gives
-        # up permanently after ~10 s, which on an appliance is exactly the window before the host's
-        # first `serve` completes. A console enabled before the host's first run then stayed dead
-        # until someone restarted it by hand. The shipped unit (scripts/punktfunk-web.service) has
-        # carried this since that defect was found; it was missed in the port, while the comment
-        # below went on promising the behaviour it removes.
+        # Backstop for whatever the gate cannot cover (web-init timed out; the host restarted and
+        # re-minted its identity under a running console; someone deleted a file). Retry
+        # INDEFINITELY: the EnvironmentFile below is mandatory on purpose, so the unit genuinely
+        # fails while the token is missing — and systemd's default rate limit (5 starts / 10 s)
+        # against `RestartSec = 2` gives up permanently after ~10 s. A console that hit a missing
+        # file then stayed dead until someone restarted it by hand. The shipped unit
+        # (scripts/punktfunk-web.service) has carried this since that defect was found; it was
+        # missed in the port, while the comment below went on promising the behaviour it removes.
         unitConfig.StartLimitIntervalSec = 0;
         environment = {
           # PUNKTFUNK_MGMT_URL is deliberately absent: the host publishes the port it actually bound

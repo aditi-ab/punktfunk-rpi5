@@ -160,12 +160,15 @@ let
         scoped "punktfunk-host" && scoped "punktfunk-web" && scoped "punktfunk-scripting";
     }
     {
-      # web-init already carried a ConditionPathExists. That one is NON-triggering, so systemd
-      # requires it AND at least one triggering user condition — adding ours must not drop it.
-      name = "web-init keeps its path condition alongside the user scope";
+      # web-init is the console's readiness gate (it blocks until the host has written the mgmt
+      # token + identity cert), so it has to RUN on every start — not just the first. The
+      # `ConditionPathExists=!…/web-password` it used to carry skipped it from the second boot
+      # onward, which is exactly when the wait still matters; web-init.sh is idempotent instead.
+      # Keep the user scope: root's instance has no business generating the operator's password.
+      name = "web-init is user-scoped and NOT self-skipped by the password file";
       ok =
         has desktop "punktfunk-web-init" "ConditionUser=|alice"
-        && has desktop "punktfunk-web-init" "ConditionPathExists=!%h/.config/punktfunk/web-password";
+        && !(has desktop "punktfunk-web-init" "ConditionPathExists=");
     }
     {
       # With no host.users to name, still keep SYSTEM users (root) out, while leaving the module

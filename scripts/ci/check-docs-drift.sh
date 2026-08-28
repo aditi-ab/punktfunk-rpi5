@@ -31,6 +31,10 @@
 #   7. The installer under --dry-run against faked os-release files detects every family it claims
 #      to (and --uninstall prints each family's removal) — the committed half of the manual
 #      16-file matrix PR #345 was verified with. Needs curl on PATH (the script's own prerequisite).
+#   8. scripts/web-init.sh — the web console's host-readiness gate — actually waits for the host's
+#      first-run files and actually stops waiting when they land, against a faked config dir. Not
+#      docs drift, but the same shape: a packaging script no build exercises, whose failure mode
+#      (the console failing its first enable on a fresh install) only shows up on real glass.
 #
 # Textual gates, so textual limits: gate 2/3 match token spelling, not env reads — a var name in
 # a code comment counts as "exists", and a quoted constant that isn't an env var counts toward
@@ -211,5 +215,94 @@ switch_case pac-down 'ID=arch\n' etc/pacman.conf '[punktfunk-canary]\nServer = x
 switch_case sys-down 'ID=bazzite\nID_LIKE="fedora"\nVERSION_ID=43\n' etc/punktfunk-sysext.conf 'CHANNEL=canary\n' \
     'punktfunk-sysext.sh install --channel stable' --channel stable
 rm -rf "$sw" "$osr"
+
+# ------------------------------------------------- gate 8: the web console's host-readiness gate
+# scripts/web-init.sh is what stops punktfunk-web.service from starting before the host has written
+# the files it cannot start without. `After=punktfunk-host.service` never did that (the host is
+# Type=simple), and the console's first enable on a fresh install failed at the systemd level as a
+# result — field report 2026-08-28, Omarchy. Run the real script against a faked config dir.
+wi="$tmp/web-init"
+# $1 = wait seconds, $2 = config dir. Echoes the script's output; sets wi_rc / wi_secs.
+run_web_init() {
+    _t0=$(date +%s)
+    wi_out=$(XDG_CONFIG_HOME="$2" sh scripts/web-init.sh "$1" 2>&1) && wi_rc=0 || wi_rc=$?
+    wi_secs=$(( $(date +%s) - _t0 ))
+}
+# Report a case: $1 = name, $2 = 'wait'|'ready', the rest is context already in wi_out.
+web_init_case() {
+    if [ "$wi_rc" -ne 0 ]; then
+        echo "::error::web-init.sh ($1) exited $wi_rc — it must never fail the unit:"
+        printf '%s\n' "$wi_out" | sed 's/^/    /'
+        fail=1
+        return
+    fi
+    case "$wi_out" in
+        *'has not written its mgmt token'*) _saw=wait ;;
+        *) _saw=ready ;;
+    esac
+    if [ "$_saw" != "$2" ]; then
+        echo "::error::web-init.sh ($1): expected it to $2, but it did $_saw:"
+        printf '%s\n' "$wi_out" | sed 's/^/    /'
+        fail=1
+    fi
+}
+seed_token() { printf 'PUNKTFUNK_MGMT_TOKEN=deadbeef\n' > "$1/punktfunk/mgmt-token"; }
+# $2 is the filename PREFIX: "native-" for the current identity, "" for the legacy pair.
+seed_pair() { printf 'cert\n' > "$1/punktfunk/$2cert.pem"; printf 'key\n' > "$1/punktfunk/$2key.pem"; }
+
+# A bare config dir: nothing the console needs. It must WAIT, then give up cleanly (exit 0, so the
+# console still starts and its Restart backstop takes over) — never fail the unit.
+mkdir -p "$wi/empty/punktfunk"
+run_web_init 1 "$wi/empty"
+web_init_case "nothing written yet" wait
+case "$wi_out" in *'waiting for punktfunk-host'*) ;; *)
+    echo "::error::web-init.sh never announced the wait — the sleep path did not run:"
+    printf '%s\n' "$wi_out" | sed 's/^/    /'
+    fail=1 ;;
+esac
+
+# THE REGRESSION THIS GATE EXISTS FOR. The host writes mgmt-token EARLY in `serve` and its identity
+# cert LAST (inside mgmt::run), so a gate that waits for the token alone still hands the console a
+# directory with no cert to listen with — it just moves the failure. Token present, cert absent
+# must still WAIT.
+mkdir -p "$wi/token-only/punktfunk"
+seed_token "$wi/token-only"
+run_web_init 1 "$wi/token-only"
+web_init_case "token written, identity cert not yet" wait
+
+# Everything present: return immediately, no sleeping. This is every start after the host's first
+# run, so it has to be free.
+mkdir -p "$wi/native/punktfunk"
+seed_token "$wi/native"
+seed_pair "$wi/native" native-
+run_web_init 30 "$wi/native"
+web_init_case "token + native identity present" ready
+[ "$wi_secs" -le 2 ] || { echo "::error::web-init.sh slept ${wi_secs}s with every file already present"; fail=1; }
+
+# A host that never took the identity split serves the LEGACY pair and has no native-*.pem at all
+# (crate::identity / web/nitro-entry/tls-paths.mjs). Waiting for a file it will never write would
+# stall the console on every upgraded box.
+mkdir -p "$wi/legacy/punktfunk"
+seed_token "$wi/legacy"
+seed_pair "$wi/legacy" ""
+run_web_init 30 "$wi/legacy"
+web_init_case "token + legacy identity present" ready
+
+# The property the whole gate is for: it must NOTICE the files arriving and stop waiting, rather
+# than sleeping out its whole budget. Written in the host's real order (token, then cert).
+mkdir -p "$wi/late/punktfunk"
+(
+    sleep 2
+    seed_token "$wi/late"
+    seed_pair "$wi/late" native-
+) &
+run_web_init 30 "$wi/late"
+wait
+web_init_case "files appear while waiting" ready
+if [ "$wi_secs" -lt 2 ] || [ "$wi_secs" -ge 30 ]; then
+    echo "::error::web-init.sh returned after ${wi_secs}s — expected it to wait for the files (>=2s) and stop as soon as they landed (<30s)"
+    fail=1
+fi
+rm -rf "$wi"
 
 exit "$fail"
