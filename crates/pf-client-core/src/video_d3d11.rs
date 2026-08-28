@@ -54,14 +54,14 @@ use windows::core::Interface;
 use windows::Win32::d3d11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
     ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
-    ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-    D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_STREAM,
-    D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
-    D3D11_VPOV_DIMENSION_TEXTURE2D,
+    ID3D11VideoProcessorEnumerator1, ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+    D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
 use windows::Win32::d3dcommon::{D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
 use windows::Win32::dxgi::{
@@ -71,8 +71,8 @@ use windows::Win32::dxgi::{
     DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709,
     DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020,
     DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
-    DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE,
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_P010, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_RATIONAL,
+    DXGI_SAMPLE_DESC, DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE,
 };
 use windows::Win32::windef::RECT;
 use windows::Win32::winnt::HANDLE;
@@ -203,6 +203,86 @@ pub(crate) fn create_device(luid: Option<[u8; 8]>) -> Result<(ID3D11Device, ID3D
         let _ = unsafe { mt.SetMultithreadProtected(true) };
     }
     Ok((device, context))
+}
+
+/// Can this adapter's video processor actually CONVERT a PQ decode surface to sRGB — the
+/// tonemap [`HandoffRing::present`] relies on for a PQ stream whenever the presenter has no
+/// HDR10 swapchain to pass it through ([`crate::video::VulkanDecodeDevice::d3d11_hdr10`]
+/// false)?
+///
+/// Asked because setting the colorspaces is not a negotiation: `VideoProcessorSetStream/
+/// OutputColorSpace1` accept anything, and `VideoProcessorBlt` succeeds either way — a
+/// driver that cannot do the conversion renders garbage instead of failing. The host
+/// records the sibling failure on NVIDIA in `pf-capture`'s `VideoConverter` docs (RGB→P010
+/// "renders green"); field report 2026-08-26 is this direction on the client: an Arc A370M
+/// went green on every HDR session while AV1 8-bit SDR at the same 2880x1620@120 streamed
+/// clean.
+///
+/// One throwaway device + enumerator on the presenter's adapter, asked the exact pair the
+/// SDR ring sets: P010 `YCBCR_STUDIO_G2084_LEFT_P2020` in, BGRA8 `RGB_FULL_G22_NONE_P709`
+/// out. Only the driver's definitive "no" answers `false`; an API failure answers `true`
+/// (today's behaviour) — a box whose D3D11 is broken enough to fail the probe fails
+/// D3D11VA construction too, and PQ then presents through a rung whose tonemap is our own
+/// shader. Cost is a few ms, paid once per connect and only on the path that needs the
+/// answer (`crate::video::hdr_presentable` short-circuits it away everywhere else).
+pub(crate) fn pq_tonemap_supported(luid: Option<[u8; 8]>) -> bool {
+    fn probe(luid: Option<[u8; 8]>) -> Result<bool> {
+        let (device, _context) = create_device(luid)?;
+        let video_device: ID3D11VideoDevice = device
+            .cast()
+            .context("device lacks ID3D11VideoDevice (created without VIDEO_SUPPORT)")?;
+        // The enumerator wants a content shape; conversion support is a format/colorspace
+        // fact, so any plausible size asks the same question.
+        let rate = DXGI_RATIONAL {
+            Numerator: 60,
+            Denominator: 1,
+        };
+        let desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+            InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+            InputFrameRate: rate,
+            InputWidth: 1920,
+            InputHeight: 1080,
+            OutputFrameRate: rate,
+            OutputWidth: 1920,
+            OutputHeight: 1080,
+            Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+        };
+        // SAFETY: COM calls on the live device/enumerator just created, over a borrowed
+        // fully-initialized stack descriptor; the conversion query fills a BOOL by value.
+        unsafe {
+            let enumerator = video_device
+                .CreateVideoProcessorEnumerator(&desc)
+                .context("CreateVideoProcessorEnumerator")?;
+            let enumerator1: ID3D11VideoProcessorEnumerator1 = enumerator
+                .cast()
+                .context("enumerator lacks ID3D11VideoProcessorEnumerator1 (pre-Win10?)")?;
+            let ok = enumerator1
+                .CheckVideoProcessorFormatConversion(
+                    DXGI_FORMAT_P010,
+                    DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                )
+                .context("CheckVideoProcessorFormatConversion")?;
+            Ok(ok.as_bool())
+        }
+    }
+    match probe(luid) {
+        Ok(supported) => {
+            if !supported {
+                tracing::warn!(
+                    "video processor reports NO P010 PQ→sRGB conversion — a PQ stream on the \
+                     D3D11VA rung would render garbage (green) instead of tone-mapping"
+                );
+            }
+            supported
+        }
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:#}"),
+                "PQ tonemap probe failed — assuming supported");
+            true
+        }
+    }
 }
 
 /// One shareable ring slot: the NV12/P010 texture, its keyed mutex, and the NT handle the
@@ -638,13 +718,14 @@ impl HandoffRing {
 /// `tex_*` is the DXVA-aligned decode surface (>= the frame); the gap is the padding the
 /// stream source rect excludes.
 ///
-/// Keyed by DECODER rather than latched once per process. Two rungs shared this hand-off
-/// until M10 (libavcodec's D3D11VA and the native one), and a single process-wide latch
-/// meant a session that pinned the native rung and then demoted logged the native layout
-/// and nothing else, leaving the rung that actually painted the session's frames
-/// undocumented in exactly the report that needs it. One rung fills the ring today, so the
-/// set holds one short entry — kept keyed because the property is about which decoder
-/// wrote the surface, and that is the question a new-GPU forensics report asks.
+/// Keyed by DECODER × LAYOUT rather than latched once per process. Decoder, because two
+/// rungs shared this hand-off until M10 and a process-wide latch left whichever rung a
+/// session demoted onto undocumented in exactly the report that needs it. Layout
+/// (frame + pool dims + PQ), because a mid-stream `Reconfigure` or in-band SDR↔PQ flip
+/// rebuilds the decode pool at a new shape, and a latch keyed on the decoder alone left
+/// the frame-vs-padding relationship — the very thing a green-bar/smear report hinges
+/// on — logged only for the shape the session STARTED at. `slice` stays out of the key:
+/// it varies per frame and would turn one line per shape into one per DPB slot.
 fn log_layout_once(
     width: u32,
     height: u32,
@@ -656,12 +737,13 @@ fn log_layout_once(
 ) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    type LayoutKey = (String, u32, u32, u32, u32, bool);
+    static SEEN: OnceLock<Mutex<HashSet<LayoutKey>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
     // A poisoned lock costs a log line, never a frame: a panic while holding it can only have
     // happened inside the set, and the worst outcome of ignoring it is a repeated line.
     let first = match seen.lock() {
-        Ok(mut seen) => seen.insert(decoder.to_owned()),
+        Ok(mut seen) => seen.insert((decoder.to_owned(), width, height, tex_w, tex_h, pq)),
         Err(_) => false,
     };
     if first {

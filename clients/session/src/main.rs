@@ -369,6 +369,22 @@ mod session_main {
                  to (PyroWave carries 4:4:4 on any GPU, if the link can take it)."
             );
         }
+        // …and the HDR promise, same discipline: `VIDEO_CAP_HDR` invites a PQ stream, and
+        // a Windows box with no HDR10 swapchain whose video processor cannot tone-map
+        // PQ→sRGB shows that stream as garbage — the D3D11VA Blt accepts the colorspaces
+        // and renders green where the conversion is missing (Arc A370M field report,
+        // 2026-08-26). `ten_bit_sdr` is deliberately NOT gated on this: a 10-bit SDR
+        // stream is no tonemap, and every hardware rung decodes P010.
+        let hdr_enabled =
+            settings.hdr_enabled && pf_client_core::video::hdr_presentable(vulkan.as_ref());
+        if settings.hdr_enabled && !hdr_enabled {
+            tracing::warn!(
+                "HDR requested but this device cannot present a PQ stream (no HDR10 \
+                 swapchain, and the video processor reports no PQ→sRGB conversion) — \
+                 asking for SDR instead. Advertising it would paint the stream green: \
+                 the driver accepts the tonemap it cannot do and renders garbage."
+            );
+        }
         SessionParams {
             host: addr,
             port,
@@ -415,7 +431,7 @@ mod session_main {
             // resolved chroma ("4:4:4→4:2:0" when the host declined) and the decode path
             // frames actually took.
             video_caps: pf_client_core::video::video_caps_for(
-                settings.hdr_enabled,
+                hdr_enabled,
                 settings.ten_bit_sdr,
                 want_444,
             ),
@@ -427,8 +443,7 @@ mod session_main {
             // defaults; `PUNKTFUNK_CLIENT_PEAK_NITS` (read in the session pump) pins one
             // manually on either OS and wins over both.
             #[cfg(windows)]
-            display_hdr: settings
-                .hdr_enabled
+            display_hdr: hdr_enabled
                 .then(|| pf_client_core::video_d3d11::display_hdr_volume(window_pos()))
                 .flatten(),
             #[cfg(not(windows))]
