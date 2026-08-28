@@ -207,17 +207,134 @@ setup_webapp() {
   step "App menu"
   have omarchy-webapp-install || { warn "omarchy-webapp-install not found — skipping"; return 0; }
   # Sunshine's own installer takes the same --ignore-certificate-errors: the console presents the
-  # host's self-signed certificate, which no browser will ever accept on a LAN name. This puts
-  # "Punktfunk Console" in Apps (Super+Space) without editing the user's menu JSONC — that file is a
-  # single document where one parse error silently drops EVERY entry they own, so we do not write it.
-  local icon=/usr/share/icons/hicolor/256x256/apps/io.unom.Punktfunk.png
-  [[ -r "$icon" ]] || icon=""
-  if omarchy-webapp-install "$WEBAPP" "https://localhost:47992" ${icon:+"$icon"} \
+  # host's self-signed certificate, which no browser will ever accept on a LAN name.
+  #
+  # The icon is an ICON NAME, not a path — the desktop spec resolves it through the icon theme, and
+  # the scalable `io.unom.Punktfunk` the host package ships scales to whatever size the launcher
+  # asks for. Passing a path to a file that did not exist is how the first version produced an
+  # entry with a blank `Icon=` and no picture in the launcher.
+  # ⚠ `omarchy-webapp-install` takes an icon URL and derives a name with `${ref%.*}` + slugify, so a
+  # DOTTED theme name comes out mangled — `io.unom.Punktfunk` became `Icon=io-unom`, which resolves
+  # to nothing. Their tool is built for downloading a site's favicon; ours is already installed by
+  # the package. So let it create the entry, then set the two lines we own (below), which is what
+  # we already do for Exec.
+  local icon=io.unom.Punktfunk
+  find /usr/share/icons -name "${icon}.*" -print -quit 2>/dev/null | grep -q . \
+    || icon=punktfunk-tray   # older package: the tray mark is the only one installed
+  if omarchy-webapp-install "$WEBAPP" "https://localhost:47992" "$icon" \
        --ignore-certificate-errors 2>/dev/null; then
     ok "\"$WEBAPP\" added to Apps (Super+Space)"
+    # Point the entry at a one-shot ticket instead of the bare URL, so opening the console from the
+    # launcher lands logged in. `ctl console-url` signs it with the management token, which only
+    # this uid can read — a LAN visitor still gets the login page.
+    local entry
+    entry=$(grep -rl "^Name=$WEBAPP$" "$HOME/.local/share/applications" 2>/dev/null | head -1)
+    if [[ -n "$entry" ]] && have punktfunk-host; then
+      sed -i "s|^Exec=.*|Exec=sh -c 'omarchy-launch-webapp \"\$(punktfunk-host ctl console-url)\"'|" "$entry"
+      sed -i "s|^Icon=.*|Icon=$icon|" "$entry"
+      grep -q '^Icon=' "$entry" || printf 'Icon=%s\n' "$icon" >> "$entry"
+      ok "the console entry opens already logged in, with the Punktfunk mark"
+    fi
   else
     warn "could not add the webapp — add it by hand from the Omarchy menu if you want it"
   fi
+  setup_menu
+}
+
+# ── the Omarchy menu (Super+Space) ─────────────────────────────────────────────────────────────
+#
+# The rows we add, as JSONC lines. Dotted ids define the tree, so `punktfunk` is a root submenu and
+# `punktfunk.*` are its children. `when` hides a row the box cannot honour, which is what keeps the
+# menu honest on a machine where the host is not running.
+# A function, not a `readonly` computed at load time: the rest of this script resolves config paths
+# where they are USED (see `write_hooks`), and a load-time constant silently ignores an
+# `XDG_CONFIG_HOME` set afterwards — which is exactly how the self-check ended up editing the real
+# config of the machine running it instead of its own scratch directory.
+menu_file() { printf '%s/omarchy/extensions/omarchy-menu.jsonc' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+readonly MENU_BEGIN="// >>> punktfunk (managed by punktfunk-omarchy — do not edit between these markers)"
+readonly MENU_END="// <<< punktfunk"
+
+menu_rows() {
+  cat <<'EOF'
+  "punktfunk": {"icon":"󰍹","label":"Punktfunk","aliases":["streaming","stream"]},
+  "punktfunk.console": {"icon":"󰖟","label":"Open console","description":"Pairing, devices, settings — opens already logged in","action":"sh -c 'omarchy-launch-webapp \"$(punktfunk-host ctl console-url)\"'"},
+  "punktfunk.pair": {"icon":"󰐕","label":"Pair a device","description":"Open a pairing window and show the PIN","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl pair arm; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
+  "punktfunk.pending": {"icon":"󰀦","label":"Devices waiting","description":"Approve or deny a device that is asking to pair","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl pending; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
+  "punktfunk.devices": {"icon":"󰄋","label":"Paired devices","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl clients; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
+  "punktfunk.stop": {"icon":"󰚌","label":"Stop the session","when":"punktfunk-host ctl status --json | grep -q '\"active_sessions\":[1-9]'","action":"punktfunk-host ctl stop-session"},
+  "punktfunk.status": {"icon":"","label":"Status","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-omarchy status; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
+  "punktfunk.restart": {"icon":"󰑓","label":"Restart the host","action":"systemctl --user restart punktfunk-host"},
+EOF
+}
+
+# Strip JSONC to JSON so python can parse it: line comments, then trailing commas.
+menu_is_valid() {
+  sed -E 's://.*$::' "$1" \
+    | python3 -c 'import json,re,sys; json.loads(re.sub(r",(\s*[}\]])", r"\1", sys.stdin.read()))' 2>/dev/null
+}
+
+setup_menu() {
+  step "Omarchy menu"
+  local MENU_FILE; MENU_FILE="$(menu_file)"
+  mkdir -p "$(dirname "$MENU_FILE")"
+  [[ -f "$MENU_FILE" ]] || printf '{\n}\n' > "$MENU_FILE"
+
+  # 🛑 This file is a SINGLE document, and one parse error drops EVERY row the user owns — not just
+  # ours. So: work on a copy, validate it, and only then move it into place. A file we cannot parse
+  # to begin with is left completely alone; it is not ours to repair.
+  if ! menu_is_valid "$MENU_FILE"; then
+    warn "$MENU_FILE does not parse as JSONC — leaving it alone"
+    say  "     Fix it, then re-run: punktfunk-omarchy setup"
+    return 0
+  fi
+
+  local tmp; tmp="$(mktemp "${MENU_FILE}.punktfunk-XXXXXX")"
+  # Drop any previous block of ours, then insert the current one before the closing brace, so this
+  # is idempotent and an upgrade replaces the rows rather than stacking a second copy.
+  awk -v b="$MENU_BEGIN" -v e="$MENU_END" '
+    index($0,b){skip=1} skip && index($0,e){skip=0; next} skip{next} {print}
+  ' "$MENU_FILE" > "$tmp"
+
+  # Insert before the document's LAST closing brace. Deliberately not `awk -v rows=…`: awk refuses
+  # a newline inside a -v assignment ("newline in string"), so the rows silently never landed and
+  # the file came back unchanged while this reported success.
+  local close
+  close=$(grep -n '^[[:space:]]*}[[:space:]]*$' "$tmp" | tail -1 | cut -d: -f1)
+  if [[ -z "$close" ]]; then
+    rm -f "$tmp"
+    warn "could not find the closing brace in $MENU_FILE — leaving it alone"
+    return 0
+  fi
+  {
+    head -n "$((close - 1))" "$tmp"
+    printf '%s\n' "$MENU_BEGIN"
+    menu_rows
+    printf '%s\n' "$MENU_END"
+    tail -n "+$close" "$tmp"
+  } > "$tmp.2"
+
+  # Both halves of "it worked": it still parses, AND our rows are actually in it. The first alone
+  # is satisfied by a no-op edit, which is exactly how the awk bug above reported a false success.
+  if menu_is_valid "$tmp.2" && grep -q '"punktfunk.console"' "$tmp.2"; then
+    mv -f "$tmp.2" "$MENU_FILE"
+    rm -f "$tmp"
+    ok "Punktfunk added to the Omarchy menu (Super+Space → Punktfunk)"
+  else
+    rm -f "$tmp" "$tmp.2"
+    bad "the menu edit would not have parsed — your file is untouched"
+  fi
+}
+
+remove_menu() {
+  local MENU_FILE; MENU_FILE="$(menu_file)"
+  [[ -f "$MENU_FILE" ]] || return 0
+  grep -qF "$MENU_BEGIN" "$MENU_FILE" || return 0
+  local tmp; tmp="$(mktemp "${MENU_FILE}.punktfunk-XXXXXX")"
+  awk -v b="$MENU_BEGIN" -v e="$MENU_END" '
+    index($0,b){skip=1} skip && index($0,e){skip=0; next} skip{next} {print}
+  ' "$MENU_FILE" > "$tmp"
+  if menu_is_valid "$tmp"; then mv -f "$tmp" "$MENU_FILE"; ok "menu entries removed"
+  else rm -f "$tmp"; warn "could not remove the menu entries cleanly — edit $MENU_FILE by hand"; fi
 }
 
 # Hooks live in ~/.config/punktfunk/hooks.json — a LIST of {on, run} entries the host reads per
@@ -358,6 +475,7 @@ cmd_remove() {
   else
     rm -f "$HOME/.local/share/applications/${WEBAPP// /}.desktop" 2>/dev/null || true
   fi
+  remove_menu
   # Hooks: only remove a hooks.json that is entirely OURS. A file the operator has since edited is
   # theirs — deleting it would take their webhooks with it — so we say what to remove instead.
   local hf="${XDG_CONFIG_HOME:-$HOME/.config}/punktfunk/hooks.json"

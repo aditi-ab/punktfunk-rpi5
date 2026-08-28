@@ -101,5 +101,50 @@ cp "$WORK/mine/punktfunk/hooks.json" "$WORK/expected"
 XDG_CONFIG_HOME="$WORK/mine" write_hooks hooks_json >/dev/null
 check "an operator's own hooks.json is never overwritten" "$WORK/expected" "$WORK/mine/punktfunk/hooks.json"
 
+echo "omarchy menu merge"
+
+# The menu is a SINGLE JSONC document and one parse error drops every row the user owns, so the
+# merge gets the same scrutiny as the picker restore.
+menudir="$WORK/menu/omarchy/extensions"
+mkdir -p "$menudir"
+cat > "$menudir/omarchy-menu.jsonc" <<'EOF'
+{
+  // a comment the user wrote
+  "personal": {"icon":"","label":"Personal"},
+  "personal.notes": {"icon":"󰎞","label":"Notes","action":"true"},
+}
+EOF
+cp "$menudir/omarchy-menu.jsonc" "$WORK/menu-before"
+
+XDG_CONFIG_HOME="$WORK/menu" setup_menu >/dev/null 2>&1
+f="$menudir/omarchy-menu.jsonc"
+
+if XDG_CONFIG_HOME="$WORK/menu" menu_is_valid "$f"; then
+  printf '  ok   the merged menu still parses as JSONC\n'
+else
+  printf '  FAIL the merged menu does not parse\n'; cat "$f"; fails=$((fails + 1))
+fi
+if grep -q '"personal.notes"' "$f" && grep -q '"punktfunk.console"' "$f"; then
+  printf "  ok   the user's rows survived and ours were added\n"
+else
+  printf "  FAIL rows lost in the merge\n"; fails=$((fails + 1))
+fi
+
+# Idempotent: a second run must not stack a second copy.
+XDG_CONFIG_HOME="$WORK/menu" setup_menu >/dev/null 2>&1
+n=$(grep -c '"punktfunk.console"' "$f")
+if [[ "$n" == "1" ]]; then printf '  ok   re-running does not duplicate the block\n'
+else printf '  FAIL block appears %s times after two runs\n' "$n"; fails=$((fails + 1)); fi
+
+# And `remove` puts the file back exactly as the user had it.
+XDG_CONFIG_HOME="$WORK/menu" remove_menu >/dev/null 2>&1
+check "remove restores the user's file byte for byte" "$WORK/menu-before" "$f"
+
+# A file that does not parse to begin with is not ours to repair — leave it untouched.
+printf '{ this is not json\n' > "$f"
+cp "$f" "$WORK/menu-broken"
+XDG_CONFIG_HOME="$WORK/menu" setup_menu >/dev/null 2>&1
+check "a config we cannot parse is left alone" "$WORK/menu-broken" "$f"
+
 echo
 if [[ $fails -eq 0 ]]; then echo "all checks passed"; else echo "$fails check(s) failed"; exit 1; fi

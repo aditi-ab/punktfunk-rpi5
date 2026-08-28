@@ -125,6 +125,13 @@ fn run(args: &[&str], json: bool) -> Result<()> {
             out(json, &v, |_| println!("PIN submitted"));
             Ok(())
         }
+        // Not an API call at all: a ticket the console can verify with the token it already holds.
+        // See `console_url` — the point is that reading the 0600 token IS the proof.
+        "console-url" => {
+            let url = console_url()?;
+            out(json, &json!({ "url": url }), move |_| println!("{url}"));
+            Ok(())
+        }
         "clients" => {
             let c = Client::connect(None)?;
             // Both planes, labelled — a device list that silently covered only one of them is how
@@ -303,6 +310,49 @@ fn access(args: &[&str], json: bool) -> Result<()> {
     )?;
     out(json, &v, move |_| println!("{fp}: access set to {preset}"));
     Ok(())
+}
+
+/// A one-shot console URL carrying a ticket that logs the operator straight in.
+///
+/// **What is being trusted, and what is not.** The console binds all interfaces so it can be
+/// reached from a phone on the LAN, and its admin surface is pairing, unpair and session control —
+/// so the network is not evidence of anything and the password stays. What IS evidence is the
+/// **mgmt token**: a 0600 file inside the 0700 config dir, readable only by the uid the host runs
+/// as. Whoever can read it can already drive the whole admin API directly (it is the credential
+/// the console's own proxy presents), so letting them skip a password they could simply read
+/// widens nothing. A visitor without a ticket still meets the login page.
+///
+/// The ticket is `<unix-seconds>.<nonce>.<HMAC-SHA256>` over `pf-console-handoff:v1:ts:nonce`,
+/// keyed by the token. The console recomputes it with its own copy — no new host route, no shared
+/// state, nothing to expire on this side. TTL and single-use are enforced by the console
+/// (`web/server/routes/_auth/handoff.get.ts`); the nonce is what keeps two launches in the same
+/// second from colliding in its replay set.
+fn console_url() -> Result<String> {
+    use hmac::{Hmac, KeyInit, Mac};
+    let dir = pf_paths::config_dir();
+    let token = crate::mgmt_token::read_persisted(&dir).ok_or_else(|| {
+        Failure::unreachable(format!(
+            "no management token in {} — the console shares this file, so without it there is \
+             nothing for a handoff to prove. Start the host once and retry.",
+            dir.join("mgmt-token").display()
+        ))
+    })?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut raw = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut raw);
+    let nonce = hex::encode(raw);
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(token.as_bytes())
+        .map_err(|e| Failure::api(format!("could not key the handoff HMAC: {e}")))?;
+    mac.update(format!("pf-console-handoff:v1:{ts}:{nonce}").as_bytes());
+    let sig = hex::encode(mac.finalize().into_bytes());
+    // The console's own port, not the mgmt one. It is not published anywhere the way
+    // `mgmt-endpoint` is, so the documented default stands until somebody moves it.
+    Ok(format!(
+        "https://localhost:47992/_auth/handoff?t={ts}.{nonce}.{sig}"
+    ))
 }
 
 fn grants_for(preset: &str) -> Result<u32> {
@@ -530,6 +580,12 @@ PAIRING
     approve <ID> [--name N] [--preset P] [--expires-in S]
     deny <ID>
     pin <PIN>                    submit the PIN a Moonlight/GameStream client is showing
+
+CONSOLE
+    console-url                  print a one-shot URL that opens the web console already logged in.
+                                 The ticket is signed with the management token, so being able to
+                                 read that 0600 file IS the proof — a visitor without one still
+                                 meets the login page.
 
 DEVICES
     clients                      paired devices on both planes

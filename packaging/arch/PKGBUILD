@@ -327,6 +327,11 @@ package_punktfunk-host() {
   # behind the operator's back. `punktfunk-omarchy setup` is the consent step.
   install -Dm0755 "$R/packaging/linux/omarchy/punktfunk-omarchy" \
     "$pkgdir/usr/bin/punktfunk-omarchy"
+  # The app mark, so a launcher entry has something to draw. Only the CLIENT package shipped it,
+  # which is why the Omarchy webapp entry came out with a blank `Icon=` on a host-only box — the
+  # name resolved to nothing. Scalable, so every launcher size is covered by one file.
+  install -Dm0644 "$R/packaging/linux/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg" \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg"
   for h in pairing-pending stream-started stream-stopped idle-guard; do
     install -Dm0755 "$R/packaging/linux/omarchy/hooks/$h" \
       "$pkgdir/usr/share/punktfunk/omarchy/hooks/$h"
