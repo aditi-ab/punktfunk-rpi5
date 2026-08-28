@@ -11,7 +11,7 @@
 		"dev": "vite dev --port 47992",
 		"prebuild": "orval --config orval.config.ts",
 		"build": "vite build",
-		"postbuild": "node tools/check-i18n.mjs",
+		"postbuild": "node tools/check-i18n.mjs && node tools/check-omarchy-palette.mjs",
 		"start": "bun run .output/server/index.mjs",
 		"api:gen": "orval --config orval.config.ts",
 		"lint": "tsc --noEmit",

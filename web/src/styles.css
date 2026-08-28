@@ -31,6 +31,7 @@
 	--pf-brand: #6c5bf3; /* deep violet — primary on light */
 	--pf-brand-light: #a79ff8; /* light violet — primary on dark */
 	--pf-highlight: #d2c9fb; /* lens highlight */
+	--pf-glow: rgb(108 91 243 / 0.45); /* the lens mark's drop shadow */
 
 	/* Surfaces — light · lavender (white bg, faint-violet cards/borders). */
 	--background: #ffffff;
@@ -107,6 +108,74 @@
 	--warning: oklch(0.78 0.16 75);
 	--destructive: oklch(0.62 0.21 18);
 	--destructive-foreground: oklch(0.985 0 0);
+}
+
+/* ── Omarchy: the desktop's own palette, expanded into the console's tokens. ──
+   `data-omarchy` and the three --pf-* values below it are set by routes/__root.tsx
+   from the theme file Omarchy renders for us (server/util/omarchyTheme.ts); on
+   every other box the attribute is absent and none of this applies.
+
+   `:root[data-omarchy]` outranks both `:root` and `.dark`, so ONE block covers both
+   modes: the surface mixes take their direction from the theme's own background /
+   foreground pair, and "toward the foreground" is darker on a light theme and
+   lighter on a dark one — which is exactly what surfaces need either way.
+
+   Every ratio here was measured against six shipped Omarchy themes (Tokyo Night,
+   Gruvbox, Nord, Catppuccin Latte, Rose Pine Dawn, Everforest Light) for WCAG
+   contrast and, for the mark, for visible separation between its three tints.
+
+   Surfaces and the brand follow the theme. --success / --warning / --destructive do
+   NOT: they encode meaning, and a theme whose accent is red must not leave "delete"
+   and "save" the same colour. */
+:root[data-omarchy] {
+	--background: var(--pf-bg);
+	--foreground: var(--pf-fg);
+	/* Cards, hovers and borders are the background lifted off itself by increasing
+	   amounts of foreground, so they stay in the theme's hue instead of sitting on it. */
+	--card: color-mix(in oklab, var(--pf-bg) 94%, var(--pf-fg));
+	--card-foreground: var(--pf-fg);
+	--popover: var(--card);
+	--popover-foreground: var(--pf-fg);
+	--muted: color-mix(in oklab, var(--pf-bg) 90%, var(--pf-fg));
+	/* ponytail: 88% is as muted as this can go and stay readable, and on a theme whose
+	   own foreground is only 5.2:1 against its own background (Everforest Light) NO
+	   ratio reaches 4.5 on a card — the headroom is the theme's, not ours. Measured
+	   worst case 3.8:1 there; every dark theme clears 4.5 comfortably. Give this its own
+	   token if a theme ever needs a hand-picked value. */
+	--muted-foreground: color-mix(in oklab, var(--pf-fg) 88%, var(--pf-bg));
+	--secondary: color-mix(in oklab, var(--pf-bg) 86%, var(--pf-fg));
+	--secondary-foreground: var(--pf-fg);
+	--border: color-mix(in oklab, var(--pf-bg) 80%, var(--pf-fg));
+	--input: var(--border);
+
+	/* shadcn's `accent` is a subtle hover SURFACE (and @unom/ui's card ring), not the
+	   brand at full strength — so it is a background-weighted tint of the accent, which
+	   is what keeps the theme's own foreground readable on top of it. */
+	--accent: color-mix(in oklab, var(--pf-bg) 86%, var(--pf-accent));
+	--accent-foreground: var(--pf-fg);
+
+	/* The lens mark, rebuilt from the accent: deep circle, lighter circle, and the
+	   highlight where they overlap. Mixed toward black and white rather than toward the
+	   theme's own foreground — measured, because on a theme whose accent and foreground
+	   are close (Tokyo Night) mixing them collapses the three tints into one flat blob.
+	   These also carry --primary and --ring, which is why they are worth this care. */
+	--pf-brand: color-mix(in oklab, var(--pf-accent) 88%, black);
+	--pf-brand-light: color-mix(in oklab, var(--pf-accent) 55%, white);
+	--pf-highlight: color-mix(in oklab, var(--pf-accent) 15%, white);
+	--pf-glow: color-mix(in oklab, var(--pf-accent) 45%, transparent);
+}
+
+/* `.dark` takes --primary from the LIGHT tint, so the text on it has to be the dark
+   end of the theme — its own background. */
+:root[data-omarchy].dark {
+	--primary-foreground: var(--pf-bg);
+}
+
+/* Light mode takes --primary from --pf-brand and keeps :root's white text, so the
+   button has to be deep enough to hold it: a soft accent (a dusty rose, a sage) is
+   only 3.9:1 at --pf-brand, and 5.7:1 here. */
+:root[data-omarchy]:not(.dark) {
+	--primary: color-mix(in oklab, var(--pf-accent) 75%, black);
 }
 
 /* Map the palette to Tailwind colour/util tokens — both the shadcn vocabulary

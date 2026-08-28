@@ -60,26 +60,30 @@ function RootComponent() {
 	const isLogin = useRouterState({
 		select: (s) => s.location.pathname === "/login",
 	});
-	// On an Omarchy box that opted in, follow the desktop's theme: `mode` picks the palette the
-	// whole stylesheet already keys off, and `accent` re-tints the brand, which `--primary`,
-	// `--accent` and `--ring` all derive from — so one value moves the buttons, the active nav and
-	// the focus rings together. Everywhere else `theme` is null and the console keeps its own
-	// violet, which is also what SSR renders and what shows for the moment before this resolves.
+	// On an Omarchy box that opted in, follow the desktop's theme. Three raw values go in and
+	// `data-omarchy` turns on the block in styles.css that expands them: `mode` picks the palette
+	// the whole stylesheet already keys off, the accent re-tints the brand (and with it `--primary`,
+	// `--accent`, `--ring` and the lens mark), and the background/foreground pair is what every
+	// surface — cards, hovers, borders — is mixed out of. Everywhere else `theme` is null, the
+	// attribute is absent and the console keeps its own violet, which is also what SSR renders and
+	// what shows for the moment before this resolves.
 	//
-	// BOTH brand variables, not just `--pf-brand`: the light palette derives `--primary` from it,
-	// but `.dark` derives `--primary` from `--pf-brand-light`. Setting only the first re-tints the
-	// console in light mode and does nothing at all in dark — which is the mode it ships in.
+	// The expansion lives in CSS rather than here on purpose: `color-mix()` does it natively, in one
+	// place, for both modes at once — and it is the only way `.dark`'s own values get overridden
+	// without this component knowing which of them each mode uses.
 	const { data: uiConfig } = useUiConfig();
 	const theme = uiConfig?.theme ?? null;
 	return (
 		<html
 			lang={locale}
 			className={theme?.mode === "light" ? undefined : "dark"}
+			data-omarchy={theme ? "" : undefined}
 			style={
 				theme
 					? ({
-							"--pf-brand": theme.accent,
-							"--pf-brand-light": theme.accent,
+							"--pf-accent": theme.accent,
+							"--pf-bg": theme.background,
+							"--pf-fg": theme.foreground,
 						} as CSSProperties)
 					: undefined
 			}
