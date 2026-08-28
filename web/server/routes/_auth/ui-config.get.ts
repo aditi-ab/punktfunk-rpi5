@@ -8,6 +8,7 @@
 // it, and nothing here is a secret. Deliberately NOT an inference the client makes for itself
 // (`location.port + 1` would silently point at whatever else is on that port).
 import { defineEventHandler } from "h3";
+import { type OmarchyTheme, omarchyTheme } from "../../util/omarchyTheme";
 import { pluginOriginPort } from "../../util/pluginOrigin";
 
 export interface UiConfig {
@@ -20,13 +21,23 @@ export interface UiConfig {
 	 */
 	pluginUi: "origin" | "same-origin" | "unavailable";
 	pluginPort: number | null;
+	/**
+	 * The active Omarchy theme, when this box has one — `null` everywhere else, which is every
+	 * non-Omarchy box and every Omarchy box whose operator did not opt in. The console keys its
+	 * own palette off it so the page matches the desktop that launched it.
+	 */
+	theme: OmarchyTheme | null;
 }
 
 export default defineEventHandler((): UiConfig => {
+	// Read per request: `omarchy-theme-set` rewrites the file whenever the user switches theme,
+	// and the client refetches on navigation, so the console follows without a restart.
+	const theme = omarchyTheme();
 	const port = pluginOriginPort();
-	if (port) return { pluginUi: "origin", pluginPort: port };
+	if (port) return { pluginUi: "origin", pluginPort: port, theme };
 	// `import.meta.dev` is Nitro's build-time dev flag — false in every shipped build, so a
 	// production bind failure can never resolve to the same-origin arrangement.
-	if (import.meta.dev) return { pluginUi: "same-origin", pluginPort: null };
-	return { pluginUi: "unavailable", pluginPort: null };
+	if (import.meta.dev)
+		return { pluginUi: "same-origin", pluginPort: null, theme };
+	return { pluginUi: "unavailable", pluginPort: null, theme };
 });

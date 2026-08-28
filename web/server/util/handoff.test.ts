@@ -95,7 +95,8 @@ describe("verifyHandoff", () => {
 	 * the console silently stops accepting the launcher's link.
 	 */
 	test("verifies a ticket the Rust host actually minted", async () => {
-		const token = "b8e4a1c07f2d4e6a9b3c5d8e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c";
+		const token =
+			"b8e4a1c07f2d4e6a9b3c5d8e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c";
 		const ts = 1787939345;
 		const nonce = "aecc270f4cbe52e9b5f55cf7e416ba65";
 		// Recomputed here from the same inputs; the point is that the SHAPE and the message string

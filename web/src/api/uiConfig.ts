@@ -5,9 +5,17 @@
 // origin, and the port has to come from the server — only it knows whether the listener bound.
 import { useQuery } from "@tanstack/react-query";
 
+/** The desktop's own theme, when the console is running on an Omarchy box that opted in. */
+export interface OmarchyTheme {
+	mode: "light" | "dark";
+	accent: string;
+}
+
 export interface UiConfig {
 	pluginUi: "origin" | "same-origin" | "unavailable";
 	pluginPort: number | null;
+	/** `null` on every box that is not a themed Omarchy one — the console keeps its own palette. */
+	theme: OmarchyTheme | null;
 }
 
 /**

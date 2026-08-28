@@ -18,7 +18,10 @@ export const HANDOFF_TTL_MS = 60_000;
 
 export type HandoffVerdict =
 	| { ok: true }
-	| { ok: false; reason: "malformed" | "expired" | "replayed" | "bad-signature" };
+	| {
+			ok: false;
+			reason: "malformed" | "expired" | "replayed" | "bad-signature";
+	  };
 
 /** The signed message. Kept in one place because it is a cross-language contract: change it here
  * and `console_url` in the host must change in the same commit. */
@@ -74,7 +77,11 @@ export async function verifyHandoff(
 		return { ok: false, reason: "malformed" };
 	}
 	const [ts, nonce, mac] = parts;
-	if (!/^\d+$/.test(ts) || !/^[0-9a-f]+$/.test(nonce) || !/^[0-9a-f]+$/.test(mac)) {
+	if (
+		!/^\d+$/.test(ts) ||
+		!/^[0-9a-f]+$/.test(nonce) ||
+		!/^[0-9a-f]+$/.test(mac)
+	) {
 		return { ok: false, reason: "malformed" };
 	}
 

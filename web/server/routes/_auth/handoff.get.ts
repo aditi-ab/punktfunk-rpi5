@@ -14,7 +14,13 @@
 //
 // The decision itself lives in `util/handoff` so it can be tested without an h3 event; this file
 // owns only the cookie and the redirect.
-import { createError, defineEventHandler, getQuery, sendRedirect, useSession } from "h3";
+import {
+	createError,
+	defineEventHandler,
+	getQuery,
+	sendRedirect,
+	useSession,
+} from "h3";
 import {
 	mgmtToken,
 	type SessionData,
@@ -33,7 +39,10 @@ export default defineEventHandler(async (event) => {
 	if (!key) {
 		// Without the token the console can verify nothing — and it also cannot reach the host at
 		// all, so there is nothing behind this door worth opening.
-		throw createError({ statusCode: 503, statusMessage: "handoff not configured" });
+		throw createError({
+			statusCode: 503,
+			statusMessage: "handoff not configured",
+		});
 	}
 
 	const verdict = await verifyHandoff(
@@ -44,7 +53,10 @@ export default defineEventHandler(async (event) => {
 	if (!verdict.ok) {
 		// One status for every rejection. Telling a caller *which* way their ticket was wrong is
 		// free information for someone probing, and the operator's own ticket never fails.
-		throw createError({ statusCode: 401, statusMessage: "invalid handoff ticket" });
+		throw createError({
+			statusCode: 401,
+			statusMessage: "invalid handoff ticket",
+		});
 	}
 
 	const session = await useSession<SessionData>(event, sessionConfig());
