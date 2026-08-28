@@ -45,7 +45,9 @@
 
 use super::{DisplayOwnership, Mode, VirtualDisplay, VirtualOutput};
 use anyhow::{anyhow, bail, Context, Result};
+use std::io::BufRead;
 use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
@@ -362,6 +364,7 @@ impl VirtualDisplay for HyprlandDisplay {
             remote_fd: Some(fd),
             preferred_mode: Some((mode.width, mode.height, mode.refresh_hz)),
             keepalive: Box::new(Keepalive {
+                _reload: watch_config_reloads(name.clone(), mode),
                 _stop: stop,
                 _output: output,
             }),
@@ -389,8 +392,109 @@ impl VirtualDisplay for HyprlandDisplay {
 /// output xdph was still actively capturing, every single teardown. See [`StopGuard`] for what that
 /// did to xdph.
 struct Keepalive {
+    /// First, so the watcher is gone before the cast stops and the output is removed — it must
+    /// never re-apply a monitor rule onto a head this same teardown is about to delete.
+    _reload: Option<ReloadWatcher>,
     _stop: StopGuard,
     _output: OutputGuard,
+}
+
+/// Puts the streamed head's monitor rule back after a `hyprctl reload`.
+///
+/// 🛑 **A reload drops EVERY runtime `hyprctl keyword`** (see [`restore_heads`], which relies on
+/// exactly that) — and [`set_monitor_rule`]'s mode is one of them. So a reload silently returns the
+/// streamed head to its default size mid-stream, and the client sees a resolution change nobody
+/// asked for. Nothing in Hyprland re-applies it.
+///
+/// On Omarchy that is not an edge case, it is routine: `omarchy-theme-set` ends in
+/// `omarchy-restart-hyprctl`, which is literally `hyprctl reload`, so **every theme switch reset the
+/// stream's resolution** (field report 2026-08-28). Resizing the client window appeared to fix it
+/// only because a resize on Linux re-creates the output, which runs [`set_monitor_rule`] again.
+///
+/// This subscribes to the compositor's own event socket rather than polling, so the rule is back
+/// within a round trip and an idle session costs nothing. Any reload gets it — the operator's own
+/// `hyprctl reload`, `omarchy-refresh-config`, a theme switch — not just the one that was reported.
+///
+/// ponytail: the MODE only. A reload also undoes `topology: exclusive`'s head disables, but
+/// re-disabling them from here risks a permanently dark desk: teardown's own [`restore_heads`] runs
+/// a `hyprctl reload` to re-light them, and this watcher lives on a different object than that
+/// restore does, so nothing orders the two. Re-apply the disables here once they share a lifetime.
+fn watch_config_reloads(name: String, mode: Mode) -> Option<ReloadWatcher> {
+    let path = event_socket_path()?;
+    let sock = match UnixStream::connect(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(
+                path = %path.display(), error = %e,
+                "hyprland: no event socket — a `hyprctl reload` (every theme switch, on Omarchy) \
+                 will reset this stream's resolution until the client resizes"
+            );
+            return None;
+        }
+    };
+    // The guard's copy: shutting THIS down is what unparks the blocking read below.
+    let stopper = sock.try_clone().ok()?;
+    thread::spawn(move || {
+        for line in std::io::BufReader::new(sock).lines() {
+            // A read error — the guard's shutdown, or the compositor going away — ends the watch.
+            // There is nothing left to re-apply a rule to in either case.
+            let Ok(line) = line else { return };
+            if !is_config_reload(&line) {
+                continue;
+            }
+            tracing::info!(
+                output = %name, w = mode.width, h = mode.height,
+                "hyprland: config reloaded — re-applying the streamed head's monitor rule"
+            );
+            if let Err(e) = set_monitor_rule(&name, mode) {
+                // `set_monitor_rule` only errors when the head has no framebuffer at all, which
+                // after a reload means it is gone (teardown, or the compositor restarted). Stop.
+                tracing::warn!(
+                    output = %name, error = %format!("{e:#}"),
+                    "hyprland: could not re-apply the monitor rule after a config reload — the \
+                     client keeps the head's default resolution until it resizes"
+                );
+                return;
+            }
+        }
+    });
+    Some(ReloadWatcher(stopper))
+}
+
+/// Ends [`watch_config_reloads`]'s thread by shutting its socket down underneath it.
+///
+/// The thread is parked in a blocking read, so a plain stop flag would leave it alive until the
+/// compositor happened to emit an event — one stranded thread per session, and sessions are minted
+/// on every mid-stream resize. `shutdown` makes that read return immediately.
+struct ReloadWatcher(UnixStream);
+
+impl Drop for ReloadWatcher {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// Hyprland's event socket for the instance we are driving, or `None` when there is none to find.
+/// Same signature [`hyprctl_command`] threads onto every child, so the watch and the commands can
+/// never end up aimed at different compositors.
+fn event_socket_path() -> Option<std::path::PathBuf> {
+    let sig = crate::session::hypr_signature()?;
+    let runtime = crate::with_env_lock(|| std::env::var_os("XDG_RUNTIME_DIR"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(format!("/run/user/{}", crate::proc::current_uid()))
+        });
+    Some(runtime.join("hypr").join(sig).join(".socket2.sock"))
+}
+
+/// Is this event line the config reload?
+///
+/// Hyprland's `.socket2.sock` speaks `<name>>><data>`, so the match is on the NAME. A `contains`
+/// would also fire on any event whose DATA happens to hold the word — a window titled
+/// `configreloaded`, a workspace named after it — and every false hit is a `hyprctl` round trip and
+/// a mode re-apply on a live stream.
+fn is_config_reload(line: &str) -> bool {
+    line.split(">>").next() == Some("configreloaded")
 }
 
 /// How long teardown waits for the portal to confirm the ScreenCast session is closed before giving
@@ -1684,6 +1788,22 @@ fn portal_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole re-apply hangs off this one line match, and both ways of getting it wrong are
+    /// expensive: too strict and a theme switch still resets the stream's resolution; too loose
+    /// (a `contains`) and any window whose TITLE holds the word triggers a `hyprctl` round trip
+    /// plus a mode re-apply, on every keystroke that retitles it.
+    #[test]
+    fn only_the_config_reload_event_re_applies_the_monitor_rule() {
+        assert!(is_config_reload("configreloaded>>"));
+        // Real lines from `.socket2.sock`, none of which is a reload.
+        assert!(!is_config_reload("monitoradded>>PF-1234-1"));
+        assert!(!is_config_reload("monitorremovedv2>>3,PF-1234-1,PF-1234-1"));
+        assert!(!is_config_reload("activewindow>>kitty,~/src"));
+        // The `contains` trap: the word is in the DATA, not the event name.
+        assert!(!is_config_reload("activewindowv2>>title: configreloaded"));
+        assert!(!is_config_reload("workspace>>configreloaded"));
+    }
 
     /// The Lua config manager parses a `dispatch` argument as a Lua expression, so the monitor
     /// name and the state must both be QUOTED — an unquoted `dpms off HDMI-A-1` is what dies with

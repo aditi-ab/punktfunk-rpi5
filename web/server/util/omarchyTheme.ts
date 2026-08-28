@@ -9,6 +9,10 @@
 // Deliberately a FILE read and not an integration: there is no Omarchy API to call, the host learns
 // nothing, and a box that never opted in simply has no file — which is why every failure here is
 // "no theme", never an error. The console's own palette is the fallback and always was.
+//
+// All four values are carried, not just the accent: an accent alone leaves the console's own violet
+// chrome under a themed button, which is what "the theme is not fully applied" means in practice.
+// `styles.css` mixes the surfaces out of the background/foreground pair.
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +23,12 @@ export interface OmarchyTheme {
 	/** The theme's accent, as a CSS colour. Mapped onto `--pf-brand`, which `--primary`,
 	 *  `--accent` and `--ring` all derive from, so one value re-tints the console. */
 	accent: string;
+	/** The desktop's own page colour. Mapped onto `--pf-bg`, which the console's cards, hovers
+	 *  and borders are all mixed out of — this is the value that makes the console look like it
+	 *  belongs to the theme rather than merely agreeing with its accent. */
+	background: string;
+	/** The desktop's own text colour (`--pf-fg`), and the other end of every one of those mixes. */
+	foreground: string;
 }
 
 /** Where Omarchy renders our template. `XDG_STATE_HOME` first, because that is what the spec says
@@ -64,9 +74,21 @@ export function omarchyTheme(): OmarchyTheme | null {
 		const parsed = JSON.parse(raw) as Record<string, unknown>;
 		const mode = parsed.mode === "light" ? "light" : "dark";
 		// An unrendered template still contains its `{{ accent }}` placeholder — that is not a
-		// colour, and `isSafeColor` is what stops it reaching the page as one.
-		if (!isSafeColor(parsed.accent)) return null;
-		return { mode, accent: parsed.accent.trim() };
+		// colour, and `isSafeColor` is what stops it reaching the page as one. All THREE colours
+		// are required: the template renders them together, so a file missing one is a file we do
+		// not understand, and half a palette reads worse than the console's own.
+		if (
+			!isSafeColor(parsed.accent) ||
+			!isSafeColor(parsed.background) ||
+			!isSafeColor(parsed.foreground)
+		)
+			return null;
+		return {
+			mode,
+			accent: parsed.accent.trim(),
+			background: parsed.background.trim(),
+			foreground: parsed.foreground.trim(),
+		};
 	} catch {
 		return null; // half-written during a theme switch, or hand-edited into invalid JSON
 	}

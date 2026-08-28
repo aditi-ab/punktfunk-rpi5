@@ -9,6 +9,8 @@ import { useQuery } from "@tanstack/react-query";
 export interface OmarchyTheme {
 	mode: "light" | "dark";
 	accent: string;
+	background: string;
+	foreground: string;
 }
 
 export interface UiConfig {
@@ -19,8 +21,17 @@ export interface UiConfig {
 }
 
 /**
- * Deployment facts the console cannot infer. Cached for the session — the ports cannot change
- * without the server restarting, which reloads the page anyway.
+ * Deployment facts the console cannot infer.
+ *
+ * Polled, and it did not used to be: the ports genuinely cannot change without a server restart
+ * (which reloads the page), so this was cached for the session — but the THEME on the same payload
+ * changes whenever the user runs `omarchy-theme-set`, and a console that only asked at startup sat
+ * in the old palette until someone reloaded it by hand. Polling and not pushing because the
+ * console's SSE stream is a proxy of the HOST's, and the host reads nothing about themes.
+ *
+ * The interval does not run while the tab is in the background (TanStack's default), and the
+ * refetch-on-focus this re-enables means switching theme and looking at the console is already
+ * enough. One small local file read per tick.
  */
 export const useUiConfig = () =>
 	useQuery({
@@ -32,7 +43,7 @@ export const useUiConfig = () =>
 			if (!r.ok) throw new Error(`ui-config ${r.status}`);
 			return (await r.json()) as UiConfig;
 		},
-		staleTime: Number.POSITIVE_INFINITY,
+		refetchInterval: 2_000,
 		retry: 2,
 	});
 

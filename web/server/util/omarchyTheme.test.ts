@@ -8,6 +8,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { omarchyTheme } from "./omarchyTheme";
 
+/** A rendered theme file, with `over` replacing any of its fields. All four are required by
+ *  `omarchyTheme`, so a test that names only the field it is about still gets a valid file. */
+function rendered(over: Record<string, unknown> = {}): string {
+	return JSON.stringify({
+		mode: "dark",
+		background: "#1e1e2e",
+		foreground: "#cdd6f4",
+		accent: "#89b4fa",
+		...over,
+	});
+}
+
 /** Point `omarchyTheme` at a scratch XDG_STATE_HOME holding `content` (or nothing). */
 function withTheme<T>(content: string | null, fn: () => T): T {
 	const dir = mkdtempSync(join(tmpdir(), "pf-theme-"));
@@ -27,22 +39,37 @@ function withTheme<T>(content: string | null, fn: () => T): T {
 }
 
 describe("omarchyTheme", () => {
-	test("reads mode and accent from a rendered template", () => {
-		expect(
-			withTheme('{"mode":"dark","accent":"#89b4fa"}', omarchyTheme),
-		).toEqual({
+	test("reads the whole palette from a rendered template", () => {
+		expect(withTheme(rendered(), omarchyTheme)).toEqual({
 			mode: "dark",
+			background: "#1e1e2e",
+			foreground: "#cdd6f4",
 			accent: "#89b4fa",
 		});
 	});
 
 	test("light mode survives; anything else is dark", () => {
+		expect(withTheme(rendered({ mode: "light" }), omarchyTheme)?.mode).toBe(
+			"light",
+		);
+		expect(withTheme(rendered({ mode: "nonsense" }), omarchyTheme)?.mode).toBe(
+			"dark",
+		);
+	});
+
+	test("a partial palette is no theme, not a half-themed console", () => {
+		// The accent alone is what the console used to take, and it left the violet chrome under a
+		// themed button. Every surface is now mixed from the background/foreground pair, so a file
+		// carrying neither has nothing to mix — fall back to the console's own palette entire.
 		expect(
-			withTheme('{"mode":"light","accent":"#1e66f5"}', omarchyTheme)?.mode,
-		).toBe("light");
+			withTheme('{"mode":"dark","accent":"#89b4fa"}', omarchyTheme),
+		).toBeNull();
 		expect(
-			withTheme('{"mode":"nonsense","accent":"#1e66f5"}', omarchyTheme)?.mode,
-		).toBe("dark");
+			withTheme(rendered({ background: undefined }), omarchyTheme),
+		).toBeNull();
+		expect(
+			withTheme(rendered({ foreground: undefined }), omarchyTheme),
+		).toBeNull();
 	});
 
 	test("no file is no theme, not an error", () => {
@@ -53,22 +80,32 @@ describe("omarchyTheme", () => {
 		// The exact shape of a `.tpl` Omarchy never rendered — the placeholder is not a colour, and
 		// letting it through would put `{{ accent }}` into a style declaration.
 		expect(
-			withTheme('{"mode":"{{ mode }}","accent":"{{ accent }}"}', omarchyTheme),
+			withTheme(
+				'{"mode":"{{ mode }}","background":"{{ background }}",' +
+					'"foreground":"{{ foreground }}","accent":"{{ accent }}"}',
+				omarchyTheme,
+			),
 		).toBeNull();
 	});
 
 	test("refuses anything that could break out of a style declaration", () => {
-		for (const accent of [
+		const hostile = [
 			"red; background: url(http://evil/)",
 			"#fff; --primary: blue",
 			"</style><script>alert(1)</script>",
 			"expression(alert(1))",
 			"url(javascript:alert(1))",
 			"#".repeat(200),
-		]) {
-			expect(
-				withTheme(JSON.stringify({ mode: "dark", accent }), omarchyTheme),
-			).toBeNull();
+		];
+		// EVERY colour reaches the DOM, not just the accent — background and foreground are inlined
+		// into the same style attribute, so each of the three has to be validated, and a test that
+		// only covered `accent` would have missed the two that were added later.
+		for (const field of ["accent", "background", "foreground"]) {
+			for (const value of hostile) {
+				expect(
+					withTheme(rendered({ [field]: value }), omarchyTheme),
+				).toBeNull();
+			}
 		}
 	});
 
@@ -80,10 +117,9 @@ describe("omarchyTheme", () => {
 			"rgb(137, 180, 250)",
 			"oklch(0.7 0.1 250)",
 		]) {
-			expect(
-				withTheme(JSON.stringify({ mode: "dark", accent }), omarchyTheme)
-					?.accent,
-			).toBe(accent);
+			expect(withTheme(rendered({ accent }), omarchyTheme)?.accent).toBe(
+				accent,
+			);
 		}
 	});
 

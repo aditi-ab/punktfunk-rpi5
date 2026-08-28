@@ -8,7 +8,7 @@ import { Wordmark } from "./wordmark";
 export function Logo({ className }: { className?: string }) {
 	return (
 		<div className={cn("relative inline-block", className)}>
-			<BrandMark className="absolute left-0 top-0 w-[24%] -translate-x-[55%] -translate-y-[58%] drop-shadow-[0_4px_24px_rgba(108,91,243,0.45)]" />
+			<BrandMark className="absolute left-0 top-0 w-[24%] -translate-x-[55%] -translate-y-[58%] drop-shadow-[0_4px_24px_var(--pf-glow)]" />
 			<Wordmark className="block h-auto w-full" />
 		</div>
 	);
