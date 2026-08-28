@@ -24,6 +24,7 @@ USER=${USER:-$(id -un)}; export USER
 # ---------------------------------------------------------------------------- options
 YES=${PUNKTFUNK_INSTALL_YES:-0}
 CHANNEL=${PUNKTFUNK_INSTALL_CHANNEL:-stable}
+CHANNEL_SET=0; [ -n "${PUNKTFUNK_INSTALL_CHANNEL:-}" ] && CHANNEL_SET=1   # asked for, vs. defaulted
 GAMESTREAM=${PUNKTFUNK_INSTALL_GAMESTREAM:-}     # 1/0, empty = ask (default no)
 CLIPBOARD=${PUNKTFUNK_INSTALL_CLIPBOARD:-}       # 1/0, empty = ask (default no)
 PF_GROUP=${PUNKTFUNK_INSTALL_PUNKTFUNK_GROUP:-}  # 1/0, empty = ask (default no)
@@ -39,7 +40,8 @@ punktfunk guided host installer (preview)
 
 usage: sh install.sh [options]
   -y, --yes             no prompts: take every default (also the behaviour without a terminal)
-  --channel stable|canary   package channel (default stable; canary = latest main build)
+  --channel stable|canary   package channel (default stable; canary = latest main build). On a box
+                        that already has the host this SWITCHES channel, either direction.
   --gamestream | --no-gamestream   also serve stock Moonlight clients (default no — trusted LANs only)
   --clipboard | --no-clipboard     allow the shared clipboard on this host (default no)
   --punktfunk-group | --no-punktfunk-group   join the punktfunk group (virtual Steam Deck pad; default no)
@@ -60,8 +62,8 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         -y|--yes) YES=1 ;;
-        --channel) shift; CHANNEL=${1:-} ;;
-        --channel=*) CHANNEL=${1#*=} ;;
+        --channel) shift; CHANNEL=${1:-}; CHANNEL_SET=1 ;;
+        --channel=*) CHANNEL=${1#*=}; CHANNEL_SET=1 ;;
         --gamestream) GAMESTREAM=1 ;;      --no-gamestream) GAMESTREAM=0 ;;
         --clipboard) CLIPBOARD=1 ;;        --no-clipboard) CLIPBOARD=0 ;;
         --punktfunk-group) PF_GROUP=1 ;;   --no-punktfunk-group) PF_GROUP=0 ;;
@@ -110,6 +112,8 @@ run() {
             -e 's/^sudo apt install /sudo apt install -y /' \
             -e 's/^sudo dnf install /sudo dnf install -y /' \
             -e 's/^sudo pacman -Syu /sudo pacman -Syu --noconfirm /' \
+            -e 's/^sudo pacman -S /sudo pacman -S --noconfirm /' \
+            -e 's/^sudo dnf distro-sync /sudo dnf distro-sync -y /' \
             -e 's/^sudo apt purge /sudo apt purge -y /' \
             -e 's/^sudo dnf remove /sudo dnf remove -y /' \
             -e 's/^sudo pacman -Rns /sudo pacman -Rns --noconfirm /')
@@ -153,6 +157,7 @@ EOF
 [ -n "${SUDO_USER:-}" ] && [ "$(id -u)" = 0 ] && die "run this as your normal user, not under sudo — it calls sudo itself where needed, and the host runs as you (host.env, the services)"
 command -v curl >/dev/null 2>&1 || die "curl is required (install it with your package manager first)"
 OS_RELEASE=${PUNKTFUNK_INSTALL_OS_RELEASE:-/etc/os-release}   # override for testing the detection
+ETC=${PUNKTFUNK_INSTALL_ETC:-}                                # ditto, for reading the repo config
 [ -r "$OS_RELEASE" ] || die "no /etc/os-release — can't tell which distro this is: $DOCS/install"
 . "$OS_RELEASE"
 ID=${ID:-}; ID_LIKE=${ID_LIKE:-}; VERSION_ID=${VERSION_ID:-}; PRETTY=${PRETTY_NAME:-$ID}
@@ -184,6 +189,51 @@ else
 fi
 say "Detected $PRETTY → $FAMILY (guide: $DOCS_PAGE)"
 
+# Which channel is this box already on? The repo config *is* the answer — there is no marker to
+# consult and no `punktfunk-host` subcommand that prints it. Echoes stable|canary, or nothing at
+# all when no punktfunk repo is configured (a source build, a hand-dropped binary).
+current_channel() {
+    case "$FAMILY" in
+        apt)
+            if   grep -qs ' canary main' "$ETC/etc/apt/sources.list.d/punktfunk.list"; then echo canary
+            elif [ -r "$ETC/etc/apt/sources.list.d/punktfunk.list" ];                  then echo stable; fi ;;
+        dnf)
+            if   grep -qs '^baseurl=.*-canary' "$ETC/etc/yum.repos.d/punktfunk.repo"; then echo canary
+            elif [ -r "$ETC/etc/yum.repos.d/punktfunk.repo" ];                        then echo stable; fi ;;
+        pacman)
+            if   grep -qs '^\[punktfunk-canary\]' "$ETC/etc/pacman.conf"; then echo canary
+            elif grep -qs '^\[punktfunk\]' "$ETC/etc/pacman.conf";        then echo stable; fi ;;
+        sysext)
+            # No repo file to read: punktfunk-sysext writes its conf only when --channel was
+            # passed, so a stable install leaves nothing behind and "absent" cannot tell an
+            # untouched box from a stable one. The installed binary is what breaks the tie.
+            command -v punktfunk-host >/dev/null 2>&1 || return 0
+            c=$(sed -n 's/^CHANNEL=//p' "$ETC/etc/punktfunk-sysext.conf" 2>/dev/null | head -1)
+            echo "${c:-stable}" ;;
+    esac
+}
+# Every punktfunk package installed here, space-separated. --uninstall removes exactly this set;
+# a channel switch has to MOVE exactly this set, or the ones the installer does not itself install
+# (punktfunk-gamescope, punktfunk-client) are stranded on the channel the box just left.
+installed_pf() {
+    case "$FAMILY" in
+        apt)    dpkg-query -W -f='${Package} ${db:Status-Status}\n' 'punktfunk*' 2>/dev/null | awk '$2=="installed"{printf "%s ", $1}' ;;
+        dnf)    rpm -qa --qf '%{NAME} ' 'punktfunk*' 2>/dev/null ;;
+        pacman) pacman -Qq 2>/dev/null | grep '^punktfunk' | tr '\n' ' ' ;;
+    esac
+}
+# The packages a switch must land on the new channel: the three this script installs, plus anything
+# else punktfunk already on the box.
+switch_pkgs() {
+    set -- "$@"
+    for _p in $(installed_pf); do
+        case " $* " in *" $_p "*) ;; *) set -- "$@" "$_p" ;; esac
+    done
+    echo "$*"
+}
+# Drops whichever punktfunk section pacman.conf holds — the stable one, the canary one, or both.
+PACMAN_RM_REPO="sudo sed -i '/^\\[punktfunk\\(-canary\\)\\{0,1\\}\\]\$/,/^Server = /d' /etc/pacman.conf"
+
 # ---------------------------------------------------------------------------- --uninstall
 # The reverse of step 1 + step 6, as $DOCS/uninstall spells it out per family: user units off first
 # (package removal can't see the enable symlinks in $HOME), then only the punktfunk packages that
@@ -193,20 +243,20 @@ if [ "$UNINSTALL" = 1 ]; then
     run 'systemctl --user disable --now punktfunk-host punktfunk-web punktfunk-scripting 2>/dev/null || true'
     case "$FAMILY" in
         apt)
-            pkgs=$(dpkg-query -W -f='${Package} ${db:Status-Status}\n' 'punktfunk*' 2>/dev/null | awk '$2=="installed"{printf "%s ", $1}')
+            pkgs=$(installed_pf)
             [ -n "$pkgs" ] && run "sudo apt purge $pkgs"
             run 'sudo rm -f /etc/apt/sources.list.d/punktfunk.list /etc/apt/keyrings/punktfunk.asc'
             run 'sudo apt update'
             ;;
         dnf)
-            pkgs=$(rpm -qa --qf '%{NAME} ' 'punktfunk*' 2>/dev/null)
+            pkgs=$(installed_pf)
             [ -n "$pkgs" ] && run "sudo dnf remove $pkgs"
             run 'sudo rm -f /etc/yum.repos.d/punktfunk.repo'
             ;;
         pacman)
-            pkgs=$(pacman -Qq 2>/dev/null | grep '^punktfunk' | tr '\n' ' ')
+            pkgs=$(installed_pf)
             [ -n "$pkgs" ] && run "sudo pacman -Rns $pkgs"
-            run "sudo sed -i '/^\\[punktfunk\\(-canary\\)\\{0,1\\}\\]\$/,/^Server = /d' /etc/pacman.conf"
+            run "$PACMAN_RM_REPO"
             ;;
         sysext)
             run 'sudo punktfunk-sysext remove'
@@ -255,10 +305,21 @@ MISSING=
 have punktfunk-host       || MISSING="$MISSING host"
 have punktfunk-web-server || MISSING="$MISSING web-console"
 have punktfunk-scripting  || MISSING="$MISSING plugin-runner"
-if [ -z "$MISSING" ]; then
-    say "host, web console and plugin runner are already installed ($(punktfunk-host --version 2>/dev/null | head -1)) — skipping the install, continuing with setup"
-else
-    say "Installing:$MISSING ($CHANNEL channel)"
+
+# Which channel the box is on already, and whether --channel is asking to move it. Without an
+# explicit --channel we follow the box rather than the flag's default: a bare re-run of this script
+# on a canary machine (to fix a group, to open the firewall) must never quietly drag it to stable.
+CUR=$(current_channel)
+SWITCH=0
+if [ "$CHANNEL_SET" = 1 ] && [ -n "$CUR" ] && [ "$CUR" != "$CHANNEL" ]; then
+    SWITCH=1
+elif [ "$CHANNEL_SET" = 0 ] && [ -n "$CUR" ]; then
+    CHANNEL=$CUR
+fi
+
+# (Re)point the package repo at $CHANNEL. Shared by the install and the switch, so the channel is
+# written in exactly one place per family — and the lines stay platforms.json's, verbatim.
+write_repo() {
     case "$FAMILY" in
         apt)
             repo_line='echo "deb [signed-by=/etc/apt/keyrings/punktfunk.asc] https://git.unom.io/api/packages/unom/debian stable main" | sudo tee /etc/apt/sources.list.d/punktfunk.list'
@@ -267,7 +328,6 @@ else
             run 'curl -fsSL https://git.unom.io/api/packages/unom/debian/repository.key | sudo tee /etc/apt/keyrings/punktfunk.asc >/dev/null'
             run "$repo_line"
             run 'sudo apt update'
-            run 'sudo apt install punktfunk-host punktfunk-web punktfunk-scripting'
             ;;
         pacman)
             repo_line=$(cat <<'LINE'
@@ -279,19 +339,6 @@ LINE
             run 'curl -fsS https://git.unom.io/api/packages/unom/arch/repository.key | sudo pacman-key --add -'
             run 'sudo pacman-key --lsign-key E0CA04465C99C936E0B0C6510A317015A34DDD69'
             run "$repo_line"
-            # Omarchy ships a libalpm PreTransaction hook that ABORTS any transaction whose pacman
-            # invocation carries both -S and -u, to funnel system upgrades through `omarchy update`.
-            # So Arch's one-liner dies there with "Woah partner..." and installs nothing (measured
-            # on 4.0.1). `-Sy` refreshes without a sysupgrade and is not blocked; `-S` then installs
-            # exactly the three packages. On plain Arch the full `-Syu` stays right — a partial
-            # upgrade against a ROLLING repo is the thing that breaks those boxes, and Omarchy's
-            # frozen snapshot mirror is precisely why it does not break here.
-            if [ "$ID" = omarchy ]; then
-                run 'sudo pacman -Sy'
-                run 'sudo pacman -S punktfunk-host punktfunk-web punktfunk-scripting'
-            else
-                run 'sudo pacman -Syu punktfunk-host punktfunk-web punktfunk-scripting'
-            fi
             ;;
         dnf)
             group=$RPM_GROUP
@@ -311,6 +358,109 @@ REPO
 CMD
 )"
             [ "$group" = fedora-44 ] || run "sudo sed -i 's|/rpm/fedora-44|/rpm/$group|' /etc/yum.repos.d/punktfunk.repo"
+            ;;
+        sysext)
+            : ;;   # no repo file — punktfunk-sysext records the channel itself, in its own conf
+    esac
+}
+
+# ---------------------------------------------------------------- 1a. switch channel
+# Moving between channels is a repo rewrite plus a re-resolve that is allowed to go DOWN: canary is
+# always one minor ahead of stable by construction ($DOCS/channels), so canary→stable is a
+# downgrade and every package manager refuses one unless told otherwise. Each family's command
+# below names all three packages, so a switch also fills in any that were missing.
+if [ "$SWITCH" = 1 ]; then
+    say "Channel switch: $CUR → $CHANNEL ($DOCS/channels)"
+    if ask "Move this host from the $CUR channel to $CHANNEL? Config, pairings and the console password are untouched" y; then
+        case "$FAMILY" in
+            apt)
+                write_repo
+                # apt will not walk back to a lower candidate on its own — it has to be told the
+                # exact version. After write_repo the target channel is the only punktfunk source,
+                # so madison's first row IS that channel's newest.
+                pins=
+                for pkg in $(switch_pkgs punktfunk-host punktfunk-web punktfunk-scripting); do
+                    if [ "$DRY" = 1 ]; then
+                        pins="$pins $pkg=<version>"
+                    else
+                        v=$(apt-cache madison "$pkg" 2>/dev/null | awk 'NR==1{print $3}')
+                        # A package the target channel does not carry keeps what it has; naming it
+                        # with no version would drag it to the highest version from ANY source.
+                        [ -n "$v" ] && pins="$pins $pkg=$v"
+                    fi
+                done
+                [ -n "$pins" ] || die "the $CHANNEL apt channel offers no punktfunk packages — check /etc/apt/sources.list.d/punktfunk.list ($DOCS/channels)"
+                run "sudo apt install --allow-downgrades$pins"
+                ;;
+            pacman)
+                run "$PACMAN_RM_REPO"   # drop the old section first, or both repos end up enabled
+                write_repo
+                # -Sy then -S, never -Syu: `-S` installs what the repo holds even when that is
+                # older than what is on the box (pacman calls it out as a downgrade), while `-Syu`
+                # would look at a lower stable version and do nothing at all.
+                run 'sudo pacman -Sy'
+                run "sudo pacman -S $(switch_pkgs punktfunk-host punktfunk-web punktfunk-scripting)"
+                ;;
+            dnf)
+                write_repo
+                run 'sudo dnf install punktfunk punktfunk-web punktfunk-scripting'
+                # install covers stable→canary and anything missing; distro-sync is what pulls them
+                # back DOWN onto a lower stable version on the way home.
+                run "sudo dnf distro-sync $(switch_pkgs punktfunk punktfunk-web punktfunk-scripting)"
+                ;;
+            sysext)
+                # The sysext script keeps its own per-feed rollback floor, so it moves both ways.
+                run 'curl -fsSLO https://git.unom.io/unom/punktfunk/raw/branch/main/packaging/bazzite/punktfunk-sysext.sh'
+                run "sudo bash punktfunk-sysext.sh install --channel $CHANNEL"
+                ;;
+        esac
+        DID=1
+    else
+        SWITCH=0; CHANNEL=$CUR
+        echo "     Staying on $CUR. The per-family one-liners are on $DOCS/channels"
+    fi
+fi
+
+# ---------------------------------------------------------------- 1. install
+# The snippets below are data/platforms.json's install lines, verbatim (stable channel); canary
+# and the Fedora group are edited in. check-docs-drift.sh gate 6 keeps them identical.
+#
+# The host, the console and the plugin runner are three separate packages on every family, so "is
+# the host there?" is the wrong question to skip the install on. A box that has the host but no
+# console — installed by hand, from an older docs line, or by a package manager told to drop weak
+# deps (dnf `install_weak_deps=False`, APT::Install-Recommends "0") — would never get one however
+# often this ran, and the console is where you pair, approve a device and change every setting.
+# Ask per binary instead: each family's line below names all three, and installing one that is
+# already there is a no-op.
+if [ "$SWITCH" = 1 ]; then
+    :   # the switch above already installed all three, on the channel that was asked for
+elif [ -z "$MISSING" ]; then
+    say "host, web console and plugin runner are already installed ($(punktfunk-host --version 2>/dev/null | head -1)${CUR:+, $CUR channel}) — skipping the install, continuing with setup"
+    [ "$CHANNEL_SET" = 1 ] && [ -z "$CUR" ] && \
+        warn "--channel $CHANNEL had nothing to act on: no punktfunk package repo is configured here, so this install did not come from one (built from source?). Channels: $DOCS/channels"
+else
+    say "Installing:$MISSING ($CHANNEL channel)"
+    write_repo
+    case "$FAMILY" in
+        apt)
+            run 'sudo apt install punktfunk-host punktfunk-web punktfunk-scripting'
+            ;;
+        pacman)
+            # Omarchy ships a libalpm PreTransaction hook that ABORTS any transaction whose pacman
+            # invocation carries both -S and -u, to funnel system upgrades through `omarchy update`.
+            # So Arch's one-liner dies there with "Woah partner..." and installs nothing (measured
+            # on 4.0.1). `-Sy` refreshes without a sysupgrade and is not blocked; `-S` then installs
+            # exactly the three packages. On plain Arch the full `-Syu` stays right — a partial
+            # upgrade against a ROLLING repo is the thing that breaks those boxes, and Omarchy's
+            # frozen snapshot mirror is precisely why it does not break here.
+            if [ "$ID" = omarchy ]; then
+                run 'sudo pacman -Sy'
+                run 'sudo pacman -S punktfunk-host punktfunk-web punktfunk-scripting'
+            else
+                run 'sudo pacman -Syu punktfunk-host punktfunk-web punktfunk-scripting'
+            fi
+            ;;
+        dnf)
             run 'sudo dnf install punktfunk punktfunk-web punktfunk-scripting'
             ;;
         sysext)
@@ -320,10 +470,14 @@ CMD
             run "$install_line"
             ;;
     esac
+    DID=1
+fi
+
+if [ "${DID:-0}" = 1 ]; then
     hash -r 2>/dev/null || true
     if [ "$DRY" != 1 ]; then
         have punktfunk-host || die "the install finished but punktfunk-host isn't on PATH — open a new terminal and re-run, or see $DOCS_PAGE"
-        ok "punktfunk-host $(punktfunk-host --version 2>/dev/null | head -1) installed"
+        ok "punktfunk-host $(punktfunk-host --version 2>/dev/null | head -1) on the $CHANNEL channel"
         # Not fatal — the host still streams — but say it out loud here rather than let step 7
         # hand out a console URL for something that is not on the box.
         if have punktfunk-web-server; then ok "the web console (punktfunk-web) is installed"

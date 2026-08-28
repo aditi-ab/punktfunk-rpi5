@@ -36,13 +36,18 @@ Prefer to read what runs first (it's plain `sh`, ~450 lines):
 
 It asks before anything optional (Moonlight compat, the shared clipboard, the `punktfunk` group,
 starting at boot) and every answer has a default, so `sh install.sh --yes` — or piping it with no
-terminal — runs unattended; `--channel canary`, `--mgmt-port`, `--no-start`, `--uninstall` and the environment
+terminal — runs unattended; `--channel stable|canary`, `--mgmt-port`, `--no-start`, `--uninstall` and the environment
 twins (`PUNKTFUNK_INSTALL_YES`, `PUNKTFUNK_INSTALL_CHANNEL`, `PUNKTFUNK_INSTALL_GAMESTREAM`,
 `PUNKTFUNK_INSTALL_CLIPBOARD`, `PUNKTFUNK_INSTALL_PUNKTFUNK_GROUP`, `PUNKTFUNK_INSTALL_LINGER`,
 `PUNKTFUNK_INSTALL_MGMT_PORT`) are listed by `--help`. It covers Ubuntu/Debian, Fedora, Arch-family
 and Bazzite/Fedora Atomic; NixOS, SteamOS and Windows it points at their pages. **Preview:** the
 per-system pages above remain the documented path, and the script runs exactly the install commands
 they show (CI fails if the two drift apart). Re-running is safe.
+
+`--channel` also **switches** a host that is already installed — see
+[Release Channels](/docs/channels#switch-an-installed-box-between-channels). Without the flag the
+script follows whichever channel the box is already on, so re-running it to fix a group or a
+firewall rule never moves you off canary.
 
 ## Good to know
 

@@ -141,10 +141,22 @@ trap by construction, which is why a single `vX.Y.Z` tag can safely release the 
 once (the old `host-v*` / `win-v*` / `host-win-v*` tag namespaces are retired — `v*` is the only
 release tag now).
 
-## Migrating an existing box to canary
+## Switch an installed box between channels
 
-Boxes added before this split point at the current stable channels, which now only move on releases.
-Point your dev fleet at **canary**:
+On a Linux host the guided installer does it, in either direction — it rewrites the repo, and
+re-resolves the packages in a direction the package manager would otherwise refuse (canary is always
+a minor ahead of stable, so **canary → stable is a downgrade**):
+
+```sh
+curl -fsSLO https://punktfunk.unom.io/install.sh
+sh install.sh --channel canary    # or: --channel stable
+```
+
+It asks before moving, names both channels, and leaves `~/.config/punktfunk` alone — config,
+pairings and the console password carry across both ways. Run it with **no** `--channel` and it
+follows whatever the box is already on, so re-running it for anything else never moves you.
+
+By hand, or on a platform the script does not cover — the repo is one path segment either way:
 
 ```sh
 # apt
@@ -155,6 +167,18 @@ sudo apt update && sudo apt upgrade
 sudo sed -i 's#/rpm/bazzite#/rpm/bazzite-canary#' /etc/yum.repos.d/punktfunk.repo   # or fedora-44 → fedora-44-canary
 rpm-ostree upgrade
 
+# pacman (Arch): rename the section, then -S (NOT -Syu — it will not step down to a lower version)
+sudo sed -i 's/^\[punktfunk\]$/[punktfunk-canary]/' /etc/pacman.conf
+sudo pacman -Sy && sudo pacman -S punktfunk-host punktfunk-web punktfunk-scripting
+
+# Bazzite sysext
+sudo punktfunk-sysext install --channel canary
+
 # Flatpak (Steam Deck client)
 flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.Canary.flatpakref
 ```
+
+Coming **back** to stable is the same edit reversed, plus the flag that permits a step down —
+`sudo apt install --allow-downgrades punktfunk-host=<version>` (get it from `apt-cache madison`),
+`sudo dnf distro-sync punktfunk punktfunk-web punktfunk-scripting`, `sudo pacman -S …` as above, or
+`sudo punktfunk-sysext install --channel stable`.
