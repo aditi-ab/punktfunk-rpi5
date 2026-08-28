@@ -1567,14 +1567,16 @@ pub fn av1_hardware_decodable(vk: Option<&VulkanDecodeDevice>) -> bool {
 /// and a device offering `YUV444_8` but not `YUV444_10` would land in exactly the hole this
 /// closes. Asking for both costs one extra capability query and removes the case entirely.
 ///
-/// ⚠ Deliberately NOT extended to `VIDEO_CAP_10BIT`/`VIDEO_CAP_HDR`, which are advertised
-/// unprobed for the same reason this one was. The asymmetry is real: all three hardware
-/// rungs implement 10-bit 4:2:0 (`profile_for` maps `(H265, 1, 10)` and `(Av1, 1, 10)`;
-/// pf-dxvadec carries P010), so a Vulkan-only probe there would answer `false` on boxes
-/// whose VAAPI/DXVA rung decodes 10-bit perfectly and would silently withdraw HDR from
-/// them — a visible regression bought against a case that has never been observed. Gating
-/// 10-bit honestly needs a libva/D3D11 probe, which this path cannot afford (same reason
-/// [`av1_hardware_decodable`] does not consult VAAPI).
+/// ⚠ Deliberately NOT extended to `VIDEO_CAP_10BIT`, which is advertised unprobed for the
+/// same reason this one was. The asymmetry is real: all three hardware rungs implement
+/// 10-bit 4:2:0 (`profile_for` maps `(H265, 1, 10)` and `(Av1, 1, 10)`; pf-dxvadec carries
+/// P010), so a Vulkan-only probe there would answer `false` on boxes whose VAAPI/DXVA rung
+/// decodes 10-bit perfectly and would silently withdraw depth from them — a visible
+/// regression bought against a case that has never been observed. Gating decode-10-bit
+/// honestly needs a libva/D3D11 probe, which this path cannot afford (same reason
+/// [`av1_hardware_decodable`] does not consult VAAPI). `VIDEO_CAP_HDR` IS gated since the
+/// 2026-08-26 Arc field report — but on a different question, PRESENTATION, where the
+/// decode reasoning above does not apply: see [`hdr_presentable`].
 pub fn hevc_444_hardware_decodable(vk: Option<&VulkanDecodeDevice>) -> bool {
     #[cfg(any(target_os = "linux", windows))]
     {
@@ -1596,13 +1598,51 @@ pub fn hevc_444_hardware_decodable(vk: Option<&VulkanDecodeDevice>) -> bool {
 /// above and any future caller cannot disagree about the magic number.
 const CHROMA_444: u8 = 3;
 
+/// Can this client PRESENT a PQ (HDR) stream correctly — the promise `VIDEO_CAP_HDR`
+/// makes, asked the way [`hevc_444_hardware_decodable`] asks its question: by the caller,
+/// once, while the device bundle is still borrowable.
+///
+/// Decode is not the question — every hardware rung carries 10-bit 4:2:0 (see the note on
+/// [`hevc_444_hardware_decodable`]) — presentation is. On Windows the D3D11VA hand-off
+/// shows a PQ stream either as HDR10 pass-through ([`VulkanDecodeDevice::d3d11_hdr10`])
+/// or through the video processor's PQ→sRGB tonemap, and that tonemap is a driver
+/// capability nothing validated: the Blt succeeds and renders garbage where it is missing
+/// (field report 2026-08-26 — Arc A370M client, every HDR session green with a
+/// decode-recovery storm, AV1 8-bit SDR at the same 2880x1620@120 clean). A device that
+/// can do neither must not invite a PQ stream it can only show as garbage — and the
+/// promise has to hold for D3D11VA specifically, not just the rung `auto` picks first,
+/// because D3D11VA is in every Windows ladder (first on Intel/unknown, the demotion
+/// target on NVIDIA/AMD).
+///
+/// Everywhere else the answer is `true`: every Vulkan-presenter lane (native Vulkan,
+/// VAAPI, software) tonemaps PQ in our own CSC shader, no driver opinion involved. The
+/// same holds on Windows when the D3D11 import path is absent — the D3D11VA rung is then
+/// skipped entirely (`supports_d3d11() == false`) and PQ presents through the shader.
+pub fn hdr_presentable(vk: Option<&VulkanDecodeDevice>) -> bool {
+    #[cfg(windows)]
+    {
+        vk.is_none_or(|v| {
+            !v.d3d11_import
+                || v.d3d11_hdr10
+                || crate::video_d3d11::pq_tonemap_supported(v.adapter_luid)
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = vk;
+        true
+    }
+}
+
 /// The desktop session's `video_caps` bitfield, as a pure function of the two user
 /// switches that move it — so the rule can be tested without a GPU, a host or a Hello.
 ///
 /// `want_444` is the "Full chroma" setting **already ANDed with this device's ability to
-/// decode it** ([`hevc_444_hardware_decodable`]). Split that way on purpose: the caller
-/// owns the expensive driver question and can log its own refusal with the user's setting
-/// in hand, while the bit arithmetic — the part that was wrong — stays testable.
+/// decode it** ([`hevc_444_hardware_decodable`]), and `hdr_enabled` the HDR setting
+/// **already ANDed with this device's ability to present PQ** ([`hdr_presentable`]).
+/// Split that way on purpose: the caller owns the expensive driver questions and can log
+/// its own refusal with the user's setting in hand, while the bit arithmetic — the part
+/// that was wrong — stays testable.
 ///
 /// `MULTI_SLICE` is unconditional and is decoder truth for THIS embedder: every desktop
 /// decode stack (Vulkan Video, D3D11VA, VAAPI, openh264/rav1d) handles AUs carrying
