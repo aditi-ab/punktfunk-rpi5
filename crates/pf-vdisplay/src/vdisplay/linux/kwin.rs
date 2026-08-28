@@ -571,7 +571,7 @@ impl VirtualDisplay for KwinDisplay {
         // sessions drops — under a still-live sibling). Instead stash it as a closure the registry lifts
         // into the display group and runs once, when the group's LAST member is torn down (ordered before
         // that display's output is reclaimed, so KWin never sees zero outputs). Empty ⇒ nothing to restore.
-        self.pending_restore = (!disabled.is_empty()).then(|| {
+        let prepared = (!disabled.is_empty()).then(|| {
             let disabled = disabled.clone();
             // In-process first; fall back to kscreen-doctor if the compositor doesn't answer in
             // budget. **Both halves now return honest verdicts** — `reenable_outputs` reports
@@ -604,6 +604,11 @@ impl VirtualDisplay for KwinDisplay {
                     .ok();
             }) as Box<dyn FnOnce() + Send>
         });
+        // Keep the FIRST restore. KWin is registry-POOLED, so the registry drains this slot right
+        // after every `create` and it is normally empty here — but guard it the way the
+        // pass-through backends must, so a retry-loop create can never overwrite a held restore.
+        // See [`stash_topology_restore`].
+        crate::backend::stash_topology_restore(&mut self.pending_restore, prepared);
         // Layout position (§6.2) is applied by the registry via `apply_position` right after create
         // (it owns the display group, so it computes auto-row / manual placement over the whole group).
         let mut out = VirtualOutput::owned(
