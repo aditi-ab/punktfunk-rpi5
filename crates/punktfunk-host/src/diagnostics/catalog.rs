@@ -31,6 +31,110 @@ pub(crate) fn register_all(reg: &Diagnostics) {
     reg.register(virtual_deck_vhci);
     reg.register(uinput_access);
     reg.register(server_conflict);
+    reg.register(hyprland_permissions);
+    reg.register(omarchy_updates);
+}
+
+// ---------------------------------------------------------------------------------------------
+// hyprland_permissions
+// ---------------------------------------------------------------------------------------------
+
+/// Hyprland 0.49+ has `ecosystem.enforce_permissions`. It is off by default, but when it is on and
+/// the host has not been granted, screencopy and virtual input are **denied silently** — black
+/// frames and dropped input, with no error anywhere. That is the entire reason this check exists:
+/// every other failure on this path reports itself, and this one reports nothing at all.
+///
+/// Not Omarchy-specific — it applies to every Hyprland box — but Omarchy is exactly the kind of
+/// distro that might turn it on in a future release, which is what made it worth a row.
+fn hyprland_permissions() -> HostCheck {
+    let id = ids::HYPRLAND_PERMISSIONS;
+    if !cfg!(target_os = "linux") {
+        return HostCheck::inapplicable(id, "Hyprland's permission system is a Linux feature.");
+    }
+    // `hyprctl` reachable at all is the "is this a Hyprland session?" test — the same one the
+    // backend uses. An absent binary or a compositor that is not Hyprland is not a problem here.
+    let Some(out) = command_output(
+        "hyprctl",
+        &["-j", "getoption", "ecosystem:enforce_permissions"],
+    ) else {
+        return HostCheck::inapplicable(
+            id,
+            "This machine is not running a Hyprland session, so Hyprland's permission system \
+             does not apply.",
+        );
+    };
+    let enforced = serde_json::from_str::<serde_json::Value>(&out)
+        .ok()
+        .and_then(|j| j.get("int").and_then(|v| v.as_i64()))
+        .is_some_and(|v| v != 0);
+    if !enforced {
+        return HostCheck::ok(
+            id,
+            "Hyprland is not enforcing per-application permissions, so nothing needs granting.",
+        );
+    }
+    HostCheck::problem(
+        id,
+        CheckStatus::Warn,
+        // Warning, not Critical: enforcement being ON does not mean we are DENIED — a box where
+        // the host is already granted streams perfectly, and this probe cannot tell the two apart
+        // from outside the compositor. Claiming Critical here would cry wolf on a healthy box.
+        Severity::Warning,
+        "Hyprland is enforcing permissions and this host may not be granted".to_string(),
+        "Hyprland denies screencopy and virtual input SILENTLY — the client sees black frames and \
+         input that does nothing, and neither the host nor the compositor logs an error. If \
+         streaming already works, the host is already granted and there is nothing to do."
+            .to_string(),
+    )
+    .with_remedy(Remedy {
+        text: "Grant this host screencopy and virtual input in your Hyprland config, then reload \
+               it. On a Lua-era config (Hyprland 4.x / Omarchy) the lines go in hyprland.lua or a \
+               module it includes; on hyprlang they are `permission = …` lines."
+            .to_string(),
+        command: Some(
+            "o.permission(\"/usr/bin/punktfunk-host\", \"screencopy\", \"allow\")\n\
+             o.permission(\"/usr/bin/punktfunk-host\", \"plugin\", \"allow\")"
+                .to_string(),
+        ),
+        relogin_required: false,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// omarchy_updates
+// ---------------------------------------------------------------------------------------------
+
+/// On Omarchy, updates go through `omarchy update` and the console's apply button is deliberately
+/// absent (design D5). Without a row saying so, "the update button is missing on my box" is an
+/// unanswerable support question — the check exists to answer it in the place the operator is
+/// already looking.
+fn omarchy_updates() -> HostCheck {
+    let id = ids::OMARCHY_UPDATES;
+    if !crate::osinfo::is_omarchy() {
+        return HostCheck::inapplicable(id, "This machine is not running Omarchy.");
+    }
+    let version = command_output("omarchy-version", &[]).unwrap_or_default();
+    let pretty = &crate::osinfo::detect().pretty;
+    let summary = if version.is_empty() {
+        format!("{pretty}: update with `omarchy update`")
+    } else {
+        format!("{version}: update with `omarchy update`")
+    };
+    HostCheck::ok(id, summary)
+        .with_param("update_command", "omarchy update")
+        .with_param("version", version)
+}
+
+/// Run a command and return its trimmed stdout, or `None` if it is absent or failed. Shared by the
+/// two checks above; deliberately not a general helper — the catalog's other probes ask the owning
+/// crate rather than shelling out, and these two have no owning crate to ask.
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(program).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
 }
 
 // ---------------------------------------------------------------------------------------------
