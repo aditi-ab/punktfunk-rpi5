@@ -2959,12 +2959,14 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
             if enc.reconfigure_bitrate(ed.enc_kbps(new_kbps) as u64 * 1000) {
                 // Adopt the encoder's post-clamp truth, not the request: it feeds the send
                 // pacer, the console/mgmt view and the control task's acks, and a short apply
-                // teaches the ceiling used above.
+                // teaches the ceiling used above. Read back in the request's own truncated
+                // terms (`applied_budget_kbps`) — the unit roundtrip deflates by design, and
+                // mistaking that for a driver clamp stored a phantom ceiling on every apply.
                 let applied_kbps = enc
                     .applied_bitrate_bps()
                     .map(|b| (b / 1000) as u32)
                     .filter(|&k| k > 0)
-                    .map(|k| ed.budget_kbps(k))
+                    .map(|k| ed.applied_budget_kbps(new_kbps, k))
                     .unwrap_or(new_kbps);
                 tracing::info!(
                     from_kbps = bitrate_kbps,
@@ -3013,12 +3015,13 @@ pub(super) fn virtual_stream(ctx: SessionContext, prepared: Option<PreparedDispl
                 ) {
                     Ok(mut new_enc) => {
                         // The fresh encoder may have clamped to its codec-level ceiling —
-                        // adopt (and record) ITS rate, not the request; see the in-place arm.
+                        // adopt (and record) ITS rate, not the request; see the in-place arm
+                        // (including the roundtrip-aware read-back).
                         let applied_kbps = new_enc
                             .applied_bitrate_bps()
                             .map(|b| (b / 1000) as u32)
                             .filter(|&k| k > 0)
-                            .map(|k| ed.budget_kbps(k))
+                            .map(|k| ed.applied_budget_kbps(new_kbps, k))
                             .unwrap_or(new_kbps);
                         tracing::info!(
                             from_kbps = bitrate_kbps,
