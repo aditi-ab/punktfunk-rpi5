@@ -1089,6 +1089,23 @@ impl EncDerive {
             )
         }
     }
+
+    /// The budget an encoder read-back corresponds to, in the REQUEST's own truncated terms.
+    /// The budget→enc→budget roundtrip deflates by design (`budget_kbps_for_encoder` never
+    /// inflates), so a read-back that lost only the truncation IS the full ask — comparing
+    /// the raw roundtrip against the request instead minted a phantom encoder ceiling 1–2
+    /// kbps under EVERY successful apply, the control task then clamped every climb to it,
+    /// and the client's controller learned it as a host cap: field sessions ratcheted
+    /// 20 → 2.3 Mbps with no way back (0.32.0 regression). Only a genuine driver
+    /// short-apply — below what the request itself derives to — reports short.
+    fn applied_budget_kbps(&self, requested_budget_kbps: u32, applied_enc_kbps: u32) -> u32 {
+        let b = self.budget_kbps(applied_enc_kbps);
+        if b >= self.budget_kbps(self.enc_kbps(requested_budget_kbps)) {
+            requested_budget_kbps
+        } else {
+            b
+        }
+    }
 }
 
 /// The audio plane's wire reservation for the budget derivation, from the RESOLVED Welcome:
@@ -2662,6 +2679,32 @@ fn delivered_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_apply_readback_is_the_request_not_the_deflated_roundtrip() {
+        // The 0.32.0 field regression: budget→enc→budget truncates 1–2 kbps, and comparing
+        // that read-back against the raw request minted a phantom encoder ceiling on every
+        // apply (sessions ratcheted 20 → 2.3 Mbps, every climb refused). A read-back equal
+        // to what the request itself derives to must report the FULL request…
+        let ed = EncDerive {
+            audio_kbps: 576,
+            shard_payload: 1408,
+            fec_percent: 8,
+            identity: false,
+        };
+        for budget in [2349u32, 4799, 6857, 9798, 14000, 20000, 940_032] {
+            let asked_enc = ed.enc_kbps(budget);
+            assert!(
+                ed.budget_kbps(asked_enc) <= budget,
+                "roundtrip must not inflate"
+            );
+            assert_eq!(ed.applied_budget_kbps(budget, asked_enc), budget);
+        }
+        // …while a genuine driver short-apply (the ABR-overdrive case) still reports short.
+        let asked_enc = ed.enc_kbps(1_010_000);
+        let short = ed.applied_budget_kbps(1_010_000, asked_enc * 3 / 4);
+        assert!(short < ed.budget_kbps(ed.enc_kbps(1_010_000)));
+    }
 
     #[test]
     fn live_mode_pack_roundtrips_and_interval_recovers_hz() {

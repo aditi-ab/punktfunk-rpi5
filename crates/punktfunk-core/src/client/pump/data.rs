@@ -188,7 +188,11 @@ impl DataPump {
             .unwrap_or_else(|| probe_target_kbps(stream_cap_kbps));
         const CAPACITY_PROBE_MS: u32 = 800;
         const CAPACITY_PROBE_DELAY: Duration = Duration::from_secs(2);
-        const CAPACITY_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+        // Wide enough for the burst's own aftermath: on a constrained path the burst leaves a
+        // queue + QUIC loss-recovery backoff between the host's "complete" and our receipt (a
+        // field session measured 8.6 s), and a result past the deadline is thrown away — the
+        // probe then cost the disturbance AND taught nothing.
+        const CAPACITY_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
         let mut capacity_probe_at: Option<Instant> = (bitrate_kbps == 0
             && !rate_pinned
             && resolved_bitrate_kbps > 0
@@ -386,7 +390,14 @@ impl DataPump {
             // and no correlation id, so a clobber both wrecks the user's "Test connection" figure
             // (its base counters get re-snapshotted mid-burst against the full-burst denominator)
             // and mis-scales our own ceiling. Retry once it finishes.
-            if capacity_probe_at.is_some_and(|at| Instant::now() >= at) && probe_active {
+            // "Settled" means a frame actually decoded, not a wall-clock delay: the 2 s timer
+            // alone fired the burst while a slow host bring-up (IDD display acquisition ran
+            // ~6 s in the field) was still emitting its FIRST IDR — the burst drowned it
+            // (black video for 5–11 s, decoder refusing AUs) and the host, busy bringing up,
+            // answered past the timeout anyway. Reschedule until video flows.
+            if capacity_probe_at.is_some_and(|at| Instant::now() >= at)
+                && (probe_active || st.frames_completed == 0)
+            {
                 capacity_probe_at = Some(Instant::now() + CAPACITY_PROBE_DELAY);
             } else if capacity_probe_at.is_some_and(|at| Instant::now() >= at) {
                 capacity_probe_at = None;
