@@ -10,6 +10,14 @@ package needs 2.39) — [build from source](/docs/build-from-source) there, or u
 > KDE (KWin 6.3) is below the floor, and a Cinnamon desktop (Linux Mint, LMDE) can only host through
 > gamescope. [What each desktop can do, and what Linux Mint 22 can't](/docs/requirements#cinnamon-linux-mint-and-lmde).
 
+**One command instead?** The [guided installer](/docs/install#guided-install-preview) (preview) does
+everything on this page — it detects the distro, installs the host, joins the groups, opens the
+firewall and starts it:
+
+<Installer />
+
+The steps below are the same thing by hand, and stay the documented path.
+
 ## 1. GPU driver
 
 - **NVIDIA:** the driver lives in `non-free`, which a default install doesn't enable. Enable it,

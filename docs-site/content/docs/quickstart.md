@@ -14,7 +14,7 @@ install command, the group to join, and nothing else:
 
 | Linux | Windows |
 |---|---|
-| [Ubuntu](/docs/ubuntu) · [Debian](/docs/debian) · [Fedora](/docs/fedora) · [Arch / CachyOS](/docs/arch) · [Bazzite](/docs/bazzite) · [SteamOS](/docs/steamos-host) · [NixOS](/docs/nixos) | [Windows 11](/docs/windows-host) |
+| [Ubuntu](/docs/ubuntu) · [Debian](/docs/debian) · [Fedora](/docs/fedora) · [Arch / CachyOS](/docs/arch) · [Omarchy](/docs/omarchy) · [Bazzite](/docs/bazzite) · [SteamOS](/docs/steamos-host) · [NixOS](/docs/nixos) | [Windows 11](/docs/windows-host) |
 
 Not sure your machine qualifies? [Requirements](/docs/requirements) is the checklist.
 

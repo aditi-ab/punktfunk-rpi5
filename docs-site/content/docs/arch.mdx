@@ -7,6 +7,14 @@ For **Arch Linux** and Arch-based distros (CachyOS, EndeavourOS, …). The host 
 binary repo and updates with `pacman -Syu` like everything else. SteamOS is different — it has
 [its own page](/docs/steamos-host).
 
+**One command instead?** The [guided installer](/docs/install#guided-install-preview) (preview) does
+everything on this page — it detects the distro, installs the host, joins the groups, opens the
+firewall and starts it:
+
+<Installer />
+
+The steps below are the same thing by hand, and stay the documented path.
+
 ## 1. GPU driver
 
 - **NVIDIA:** `sudo pacman -S --needed nvidia-utils` (NVENC and the zero-copy path; Arch's `ffmpeg`
