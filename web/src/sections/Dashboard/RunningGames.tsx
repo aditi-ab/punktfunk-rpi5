@@ -93,7 +93,9 @@ const GameRow: FC<{
 							})
 						: untracked
 							? m.games_untracked_note()
-							: [game.client, planeLabel(game.plane)].filter(Boolean).join(" · ")}
+							: [game.client, planeLabel(game.plane)]
+									.filter(Boolean)
+									.join(" · ")}
 				</p>
 			</div>
 			<Button

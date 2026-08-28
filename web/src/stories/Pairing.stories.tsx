@@ -1,7 +1,10 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { MoonlightPairing } from "@/sections/Pairing/MoonlightPairingCard";
 import { NativePairingCard } from "@/sections/Pairing/NativePairingCard";
-import { PairedDevices, type PairedRow } from "@/sections/Pairing/PairedDevices";
+import {
+	PairedDevices,
+	type PairedRow,
+} from "@/sections/Pairing/PairedDevices";
 import { PendingDevices } from "@/sections/Pairing/PendingDevices";
 import { PairingView } from "@/sections/Pairing/view";
 import {

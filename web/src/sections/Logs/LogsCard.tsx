@@ -153,6 +153,7 @@ export const LogsCard: FC<{
 	// offers to remove it. Do NOT take that fix — it is a TRIGGER, the signal that new lines arrived.
 	// Removing it reinstates the bug this replaced: the effect stops re-running and follow-mode
 	// quietly stops following. The same warning was here before, on `visible.length`.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: newestVisible is a deliberate trigger, not a read — see the note above; removing it stops follow-mode from following.
 	useEffect(() => {
 		if (!follow) return;
 		const el = listRef.current;

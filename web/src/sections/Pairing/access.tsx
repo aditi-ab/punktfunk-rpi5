@@ -131,10 +131,7 @@ export const draftFromStored = (
 export const useNowUnix = (stepMs = 30_000): number => {
 	const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
 	useEffect(() => {
-		const t = setInterval(
-			() => setNow(Math.floor(Date.now() / 1000)),
-			stepMs,
-		);
+		const t = setInterval(() => setNow(Math.floor(Date.now() / 1000)), stepMs);
 		return () => clearInterval(t);
 	}, [stepMs]);
 	return now;
@@ -142,7 +139,8 @@ export const useNowUnix = (stepMs = 30_000): number => {
 
 /** Remaining seconds → a short "left" label ("2 h left"); the caller has ruled out ≤ 0. */
 export const fmtRemaining = (secs: number): string => {
-	if (secs >= 48 * 3600) return m.access_left_days({ d: Math.round(secs / 86400) });
+	if (secs >= 48 * 3600)
+		return m.access_left_days({ d: Math.round(secs / 86400) });
 	if (secs >= 3600) return m.access_left_hours({ h: Math.round(secs / 3600) });
 	if (secs >= 60) return m.access_left_minutes({ min: Math.ceil(secs / 60) });
 	return m.access_left_under_minute();
@@ -270,7 +268,9 @@ export const AccessControls: FC<{
 			</div>
 
 			<div className="space-y-2">
-				<Label htmlFor={`${idPrefix}-expires`}>{m.access_expires_label()}</Label>
+				<Label htmlFor={`${idPrefix}-expires`}>
+					{m.access_expires_label()}
+				</Label>
 				<Select
 					value={value.expiry}
 					onValueChange={(expiry) =>
@@ -284,7 +284,9 @@ export const AccessControls: FC<{
 						{allowKeepExpiry && (
 							<SelectItem value="keep">{m.access_expires_keep()}</SelectItem>
 						)}
-						<SelectItem value="forever">{m.access_expires_forever()}</SelectItem>
+						<SelectItem value="forever">
+							{m.access_expires_forever()}
+						</SelectItem>
 						<SelectItem value="1h">{m.access_expires_1h()}</SelectItem>
 						<SelectItem value="4h">{m.access_expires_4h()}</SelectItem>
 						<SelectItem value="8h">{m.access_expires_8h()}</SelectItem>

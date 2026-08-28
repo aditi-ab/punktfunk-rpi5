@@ -12,8 +12,8 @@ import {
 } from "@/components/ui/dialog";
 import { m } from "@/paraglide/messages";
 import {
-	type AccessDraft,
 	AccessControls,
+	type AccessDraft,
 	draftExpirySecs,
 	GRANT_ALL,
 } from "./access";
@@ -45,7 +45,15 @@ export const EditAccessSheet: FC<{
 	/** Hands off to the existing unpair confirmation. */
 	onRemove: (fingerprint: string) => void;
 	isPending: boolean;
-}> = ({ target, nowUnix, onCancel, onSave, onExpireNow, onRemove, isPending }) => {
+}> = ({
+	target,
+	nowUnix,
+	onCancel,
+	onSave,
+	onExpireNow,
+	onRemove,
+	isPending,
+}) => {
 	const [draft, setDraft] = useState<AccessDraft>({
 		grants: GRANT_ALL,
 		expiry: "keep",
@@ -63,8 +71,7 @@ export const EditAccessSheet: FC<{
 		});
 	}, [target]);
 
-	const expired =
-		target?.expiresUnix != null && target.expiresUnix <= nowUnix;
+	const expired = target?.expiresUnix != null && target.expiresUnix <= nowUnix;
 
 	const save = () => {
 		if (!target) return;
@@ -93,7 +100,9 @@ export const EditAccessSheet: FC<{
 					<DialogHeader>
 						<DialogTitle>{m.access_edit_title()}</DialogTitle>
 						<DialogDescription>
-							{m.access_edit_desc({ name: target.name || target.fingerprint.slice(0, 16) })}
+							{m.access_edit_desc({
+								name: target.name || target.fingerprint.slice(0, 16),
+							})}
 						</DialogDescription>
 					</DialogHeader>
 

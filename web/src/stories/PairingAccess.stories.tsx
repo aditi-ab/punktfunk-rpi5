@@ -1,7 +1,10 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { ApproveDialog } from "@/sections/Pairing/ApproveDialog";
 import { EditAccessSheet } from "@/sections/Pairing/EditAccessSheet";
-import { PairedDevices, type PairedRow } from "@/sections/Pairing/PairedDevices";
+import {
+	PairedDevices,
+	type PairedRow,
+} from "@/sections/Pairing/PairedDevices";
 import {
 	accessNowUnix,
 	nativeClients,

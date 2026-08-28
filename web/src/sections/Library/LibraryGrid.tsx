@@ -1,6 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
-import { type FC, useEffect, useMemo } from "react";
+import { type FC, useMemo } from "react";
 import {
 	getGetLibraryQueryKey,
 	useDeleteCustomGame,
@@ -27,16 +27,11 @@ export const LibraryGridSection: FC<{
 	onEdit: (entry: OperatorGameEntry) => void;
 	/** Show only entries owned by this provider, or everything when null. */
 	providerFilter?: string | null;
-	/** Reports the full (unfiltered) list up, so the providers card can count owners. */
-	onEntries?: (entries: OperatorGameEntry[]) => void;
-}> = ({ onEdit, providerFilter, onEntries }) => {
+}> = ({ onEdit, providerFilter }) => {
 	const qc = useQueryClient();
 	const { confirm } = useDialogs();
 	const library = useGetLibrary();
 	const all = library.data;
-	useEffect(() => {
-		if (all) onEntries?.(all);
-	}, [all, onEntries]);
 	// Filtering CLIENT-side: `GET /library?provider=` exists, but the page already holds the whole
 	// list for the grid, and a second parameterised query would just be a second cache entry of the
 	// same data going stale independently.

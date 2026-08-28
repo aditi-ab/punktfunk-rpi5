@@ -421,8 +421,7 @@ export const PairedDevices: FC<{
 												size="icon"
 												aria-label={m.action_unpair()}
 												disabled={
-													isUnpairingAll ||
-													pendingFingerprint === r.fingerprint
+													isUnpairingAll || pendingFingerprint === r.fingerprint
 												}
 												onClick={() => onUnpair(r.protocol, r.fingerprint)}
 											>
