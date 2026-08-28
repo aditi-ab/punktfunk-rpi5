@@ -171,19 +171,31 @@ pub struct HyprlandDisplay {
     /// [`VirtualDisplay::last_portal_cursor_mode`], which is how the host learns that a cursor
     /// overlay is never coming instead of inferring it from an absence.
     last_cursor_mode: Option<crate::portal_cursor::Mode>,
-    /// The topology-restore action the last `create` prepared (re-enable the heads an `exclusive`
-    /// topology disabled), pending pickup by the registry via [`take_topology_restore`] — so the
-    /// operator's screens come back when the display GROUP's last member drops (design §6.1), not
-    /// when this one session ends. A backstop [`Drop`] runs it if the registry never took it, so a
-    /// physical head is never left dark. Mirrors `kwin.rs`'s field of the same name.
+    /// The topology-restore action the FIRST `create` on this instance prepared (re-enable the heads
+    /// an `exclusive` topology disabled). Written only through
+    /// [`stash_topology_restore`](crate::backend::stash_topology_restore) — first-wins, because one
+    /// instance serves every attempt of the host's pipeline retry loop and only attempt 1 finds
+    /// heads to disable.
+    ///
+    /// ⚠️ Unlike KWin's field of the same name, this one is NOT picked up by the registry, and
+    /// [`Drop`] is therefore the ONLY thing that ever runs it — not a backstop. A Hyprland display
+    /// carries a portal fd, so `registry::acquire` returns it as pass-through *before* it reaches
+    /// `take_topology_restore()`; nothing lifts this into a display group. The comment that used to
+    /// sit here claimed the opposite, which is how a stranded restore read as a registry bug.
+    ///
+    /// The live consequence of that (unfixed, separate from the strand): the restore is effectively
+    /// per-SESSION here, so two concurrent `exclusive` sessions sharing this desk will have the
+    /// first one to end re-enable the heads under the second. Closing it means giving the
+    /// pass-through path group bookkeeping it does not have today — #284's territory.
     pending_restore: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Drop for HyprlandDisplay {
     fn drop(&mut self) {
-        // Backstop only: the registry takes the restore right after `create` (moving it into the
-        // group), so this is normally `None`. If some path skipped the take, re-enable here rather
-        // than strand the operator's heads dark.
+        // The ONLY path that runs it (see the field docs — the registry never takes a pass-through
+        // display's restore). This is what re-lights the desk when a pipeline build fails: the
+        // failure unwinds past `PreparedDisplay`, dropping the backend instance that still holds
+        // attempt 1's restore.
         if let Some(restore) = self.pending_restore.take() {
             restore();
         }
@@ -200,7 +212,8 @@ impl HyprlandDisplay {
     }
 
     /// Apply the effective [`crate::policy::Topology`] for the just-created output `ours`, and stash
-    /// the restore for the registry (see [`Self::pending_restore`]).
+    /// the restore this instance runs on drop (see [`Self::pending_restore`] — the registry does not
+    /// take a pass-through display's restore).
     ///
     /// Called at the very END of [`create`](VirtualDisplay::create), on purpose: nothing can fail
     /// after it, so there is no path that disables the operator's heads and then unwinds past the
@@ -215,9 +228,13 @@ impl HyprlandDisplay {
             Topology::Primary => warn_primary_is_not_expressible(),
             Topology::Exclusive => {
                 let disabled = disable_other_heads(ours);
-                self.pending_restore = (!disabled.is_empty()).then(|| {
+                let prepared = (!disabled.is_empty()).then(|| {
                     Box::new(move || restore_heads(&disabled)) as Box<dyn FnOnce() + Send>
                 });
+                // Keep the FIRST restore, never the latest: the retry loop calls `create` up to
+                // eight times on this one instance, and only attempt 1 has heads to disable — so a
+                // plain assignment overwrote it with attempt 2's `None` and stranded the desk dark.
+                crate::backend::stash_topology_restore(&mut self.pending_restore, prepared);
             }
         }
     }

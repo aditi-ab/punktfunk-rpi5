@@ -306,3 +306,117 @@ pub trait VirtualDisplay: Send {
         true
     }
 }
+
+/// Stash a freshly-prepared topology restore into a backend instance's pending slot, keeping the
+/// **first** restore that instance ever captured.
+///
+/// One backend instance serves EVERY attempt of the host's pipeline retry loop (`native/stream.rs`
+/// opens the display once and lends it to `build_pipeline_with_retry` for up to 8 attempts), so
+/// `create` — and with it the backend's topology step — runs repeatedly against this one slot.
+/// Attempt 1 disables the operator's heads and prepares the restore; attempts 2..n then *correctly*
+/// find nothing left to disable and prepare `None`, because attempt 1 already darkened everything.
+///
+/// Assigning that `None` over the held restore is what left an `exclusive` Hyprland desk dark after
+/// a failed build: attempt 1's closure was dropped rather than run, so by the time the failure
+/// unwound and the backend dropped, its backstop had nothing to re-enable and only a hand-run
+/// `hyprctl reload` brought the heads back. Skipping the assignment is the whole fix.
+///
+/// First-wins keeps the *right* list too, not merely a surviving one: attempt 1 looked at the desk
+/// while it was still lit, so its set is every head that was on. Any later attempt can only see a
+/// subset of that.
+///
+/// Backends whose restore the registry drains after each `create` (KWin — pooled, so
+/// [`VirtualDisplay::take_topology_restore`] empties the slot) reach this with `None` held and are
+/// unaffected; it matters for the pass-through backends (Hyprland, wlroots/sway carry a portal fd,
+/// so the registry returns them before the take and the slot is never drained).
+pub(crate) fn stash_topology_restore(
+    slot: &mut Option<Box<dyn FnOnce() + Send>>,
+    prepared: Option<Box<dyn FnOnce() + Send>>,
+) {
+    if slot.is_none() {
+        *slot = prepared;
+    }
+}
+
+#[cfg(test)]
+mod topology_restore_tests {
+    use super::stash_topology_restore;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn counting(hits: &Arc<AtomicUsize>) -> Option<Box<dyn FnOnce() + Send>> {
+        let hits = Arc::clone(hits);
+        Some(Box::new(move || {
+            hits.fetch_add(1, Ordering::SeqCst);
+        }))
+    }
+
+    /// The failure shape this exists for: the retry loop runs `create` eight times against ONE
+    /// backend instance, only the first of which has heads to disable — and the build then fails,
+    /// so the backstop `Drop` is the only thing that will ever run the restore. It must still be
+    /// holding one.
+    #[test]
+    fn eight_failed_attempts_do_not_strand_the_restore() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut slot: Option<Box<dyn FnOnce() + Send>> = None;
+
+        // Attempt 1: the desk was lit, two heads went dark, restore prepared.
+        stash_topology_restore(&mut slot, counting(&hits));
+        // Attempts 2..8: `disable_other_heads` correctly finds nothing enabled but the managed
+        // output, so each prepares `None`. None of them may take attempt 1's restore away.
+        for _ in 0..7 {
+            stash_topology_restore(&mut slot, None);
+        }
+
+        let restore = slot.expect("the retry loop stranded the restore — the desk stays dark");
+        restore();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the restore must run exactly once, on the failure unwind"
+        );
+    }
+
+    /// A second prepared restore never displaces the first: attempt 1 saw the full set of lit
+    /// heads, a later one can only have seen a subset.
+    #[test]
+    fn a_later_restore_never_displaces_the_first() {
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let mut slot: Option<Box<dyn FnOnce() + Send>> = None;
+
+        stash_topology_restore(&mut slot, counting(&first));
+        stash_topology_restore(&mut slot, counting(&second));
+
+        slot.expect("a restore should be held")();
+        assert_eq!(first.load(Ordering::SeqCst), 1, "the first must be kept");
+        assert_eq!(
+            second.load(Ordering::SeqCst),
+            0,
+            "the second must be dropped"
+        );
+    }
+
+    /// An empty slot still accepts one — including after the registry drained it (the KWin path),
+    /// so a pooled backend's later create can hand off a fresh restore as before.
+    #[test]
+    fn an_empty_slot_still_accepts_a_restore() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut slot: Option<Box<dyn FnOnce() + Send>> = None;
+
+        stash_topology_restore(&mut slot, counting(&hits));
+        let _drained = slot.take(); // the registry lifted it into the group
+        assert!(slot.is_none());
+        stash_topology_restore(&mut slot, counting(&hits));
+        assert!(slot.is_some(), "a drained slot must be refillable");
+    }
+
+    /// Nothing to disable and nothing held stays nothing held — an `extend`-shaped session must not
+    /// grow a restore out of thin air.
+    #[test]
+    fn nothing_prepared_leaves_the_slot_empty() {
+        let mut slot: Option<Box<dyn FnOnce() + Send>> = None;
+        stash_topology_restore(&mut slot, None);
+        assert!(slot.is_none());
+    }
+}

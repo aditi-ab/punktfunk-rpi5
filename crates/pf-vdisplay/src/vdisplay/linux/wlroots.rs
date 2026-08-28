@@ -75,18 +75,22 @@ pub struct WlrootsDisplay {
     /// overlay is never coming instead of inferring it from an absence.
     last_cursor_mode: Option<crate::portal_cursor::Mode>,
     /// The topology-restore action the last `create` prepared (re-enable the heads an `exclusive`
-    /// topology disabled), pending pickup by the registry via [`take_topology_restore`] — so the
-    /// operator's screens come back when the display GROUP's last member drops (design §6.1), not
-    /// when this one session ends. A backstop [`Drop`] runs it if the registry never took it, so a
-    /// physical head is never left dark. Mirrors `kwin.rs` and the Hyprland twin.
+    /// topology disabled). Written only through
+    /// [`stash_topology_restore`](crate::backend::stash_topology_restore) — first-wins, because one
+    /// instance serves every attempt of the host's pipeline retry loop and only attempt 1 finds
+    /// heads to disable.
+    ///
+    /// ⚠️ As on the Hyprland twin (and unlike KWin), the registry never picks this up: a sway display
+    /// carries a portal fd, so `registry::acquire` returns it as pass-through before reaching
+    /// `take_topology_restore()`. [`Drop`] is the ONLY thing that runs it, with the same per-session
+    /// caveat for concurrent `exclusive` sessions noted there.
     pending_restore: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Drop for WlrootsDisplay {
     fn drop(&mut self) {
-        // Backstop only: the registry takes the restore right after `create` (moving it into the
-        // group), so this is normally `None`. If some path skipped the take, re-enable here rather
-        // than strand the operator's heads dark.
+        // The ONLY path that runs it (see the field docs — the registry never takes a pass-through
+        // display's restore); it is what re-lights the desk when a pipeline build fails.
         if let Some(restore) = self.pending_restore.take() {
             restore();
         }
@@ -103,7 +107,8 @@ impl WlrootsDisplay {
     }
 
     /// Apply the effective [`crate::policy::Topology`] for the just-created output `ours`, and stash
-    /// the restore for the registry (see [`Self::pending_restore`]).
+    /// the restore this instance runs on drop (see [`Self::pending_restore`] — the registry does not
+    /// take a pass-through display's restore).
     ///
     /// Called at the very END of [`create`](VirtualDisplay::create), on purpose: nothing can fail
     /// after it, so there is no path that disables the operator's heads and then unwinds past the
@@ -118,9 +123,13 @@ impl WlrootsDisplay {
             Topology::Primary => warn_primary_is_not_expressible(),
             Topology::Exclusive => {
                 let disabled = disable_other_heads(ours);
-                self.pending_restore = (!disabled.is_empty()).then(|| {
+                let prepared = (!disabled.is_empty()).then(|| {
                     Box::new(move || restore_heads(&disabled)) as Box<dyn FnOnce() + Send>
                 });
+                // Keep the FIRST restore, never the latest — the same retry-loop trap as the
+                // Hyprland twin, and sway is pass-through (portal fd) too, so this slot is likewise
+                // never drained by the registry. See [`stash_topology_restore`].
+                crate::backend::stash_topology_restore(&mut self.pending_restore, prepared);
             }
         }
     }
