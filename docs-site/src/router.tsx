@@ -1,5 +1,11 @@
 import { createRouter as createTanStackRouter, Link } from '@tanstack/react-router'
+import { reloadOnStaleChunk } from '@unom/ui/preload-reload'
 import { routeTree } from './routeTree.gen'
+
+// Hydration can build a second router and discard the first. `reloadOnStaleChunk`
+// registers once, so its callback has to read whichever router is live at event
+// time rather than closing over the one that happened to exist at startup.
+let liveRouter: { latestLocation: { href: string } } | undefined
 
 export function getRouter() {
   const router = createTanStackRouter({
@@ -9,58 +15,16 @@ export function getRouter() {
     defaultNotFoundComponent: NotFound,
   })
 
-  reloadOnStaleChunk(router)
+  liveRouter = router
+
+  // A deploy replaces every hashed chunk, so a tab opened before it asks for files the
+  // new server has never heard of and the next navigation dies — with `defaultPreload:
+  // 'intent'`, a hover is enough to trip it. Handing back where the router was heading
+  // means the click that tripped it still lands on the page the reader asked for; during
+  // a hover-preload that is the current URL, which degrades to a plain reload.
+  reloadOnStaleChunk(10_000, () => liveRouter?.latestLocation.href)
 
   return router
-}
-
-const RELOAD_GUARD_KEY = 'pf.stale-chunk-reload'
-
-// Hydration can build a second router and discard the first, so the listener reads
-// whichever router is live at event time instead of capturing one at setup.
-let liveRouter: { latestLocation: { href: string } } | undefined
-
-/**
- * Survive a deploy that lands while a tab is open.
- *
- * Every build hashes its chunk filenames and a deploy replaces the whole `.output`,
- * so a tab still holding the previous build's HTML asks for `/assets/*-<oldhash>.js`
- * — which the new server has never heard of. Routes are code-split, so that 404
- * surfaces on the first navigation (or, with `defaultPreload: 'intent'`, on the
- * first hover) as a rejected dynamic import that takes the page down.
- *
- * Vite raises `vite:preloadError` for exactly this case — its preload helper wraps
- * both the dependency preloads and the module import itself — and a full page load
- * is the entire fix, because the fresh HTML names the new chunks.
- *
- * Deliberately NOT `preventDefault()`: that suppresses Vite's rethrow and resolves
- * the import with `undefined`, handing the router a broken module on the way out.
- */
-function reloadOnStaleChunk(router: { latestLocation: { href: string } }) {
-  if (typeof window === 'undefined') return
-  const alreadyListening = liveRouter !== undefined
-  liveRouter = router
-  if (alreadyListening) return
-
-  window.addEventListener('vite:preloadError', () => {
-    // If the reload lands on HTML that STILL names missing chunks, stop: better to
-    // let the error surface than to spin in a reload loop.
-    try {
-      const last = Number(sessionStorage.getItem(RELOAD_GUARD_KEY))
-      if (Date.now() - last < 10_000) return
-      sessionStorage.setItem(RELOAD_GUARD_KEY, String(Date.now()))
-    } catch {
-      // Storage can be blocked outright (private mode, cookie policy). No guard
-      // then, but a reload still beats a dead page.
-    }
-
-    // `latestLocation` is where the router was heading, so a click that tripped this
-    // lands on the page the user actually asked for. During a hover preload it is
-    // the current URL, which makes this a plain reload.
-    const target = liveRouter?.latestLocation.href
-    if (target) window.location.href = target
-    else window.location.reload()
-  })
 }
 
 function NotFound() {
