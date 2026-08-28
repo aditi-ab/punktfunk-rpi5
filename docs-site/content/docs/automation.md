@@ -251,8 +251,20 @@ Ending the session when a game exits needs no script: it is the default, on the 
 
 ## The event stream (`GET /api/v1/events`)
 
-For code, subscribe to the SSE stream on the management API (loopback + bearer token — the
-same credentials as the rest of the admin surface):
+For a shell script or a status widget, the easy way is
+[`punktfunk-host ctl watch`](/docs/host-cli#ctl) — it does the SSE, the `Last-Event-ID` resume and
+the reconnect for you, and prints **one JSON object per line**, so the credentials never leave the
+host binary:
+
+```sh
+punktfunk-host ctl watch --kinds pairing.pending,stream.'*'
+```
+
+It also emits a synthetic `{"kind":"ctl.resync"}` line when the stream fell off the host's catch-up
+ring, which is the signal to re-snapshot rather than trust what you have.
+
+For code that wants the raw stream, subscribe to SSE on the management API directly (loopback +
+bearer token — the same credentials as the rest of the admin surface):
 
 ```sh
 . ~/.config/punktfunk/mgmt-token   # sets PUNKTFUNK_MGMT_TOKEN

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+#
+# punktfunk hook: a device is asking to pair → an Omarchy toast with an Approve action.
+#
+# Wired by `punktfunk-omarchy setup` as a `pairing.pending` entry in ~/.config/punktfunk/hooks.json.
+# The host runs it detached with the event JSON on stdin and every scalar leaf flattened into
+# `PF_EVENT_*` (see automation.md), so nothing here has to parse JSON.
+#
+# The toast shows the claimed NAME and the fingerprint TAIL together, and always both: the name is
+# what the device says it is and can be anything, the tail is what it cannot forge. Approving is a
+# deliberate act — this notification never approves anything by itself, it only takes you to where
+# you can.
+
+set -euo pipefail
+
+name="${PF_EVENT_DEVICE_NAME:-${PF_EVENT_CLIENT_NAME:-a device}}"
+fp="${PF_EVENT_DEVICE_FINGERPRINT:-${PF_EVENT_FINGERPRINT:-}}"
+id="${PF_EVENT_DEVICE_ID:-${PF_EVENT_ID:-}}"
+tail="${fp: -10}"
+
+body="\"$name\" wants to pair"
+# `|| true`: under `set -e` a false `[[ … ]]` used as a STATEMENT exits the script — and a hook
+# that exits before its own notification is a pairing request nobody ever sees.
+[[ -n "$tail" ]] && body="$body · …$tail" || true
+
+command -v omarchy-notification-send >/dev/null || exit 0
+
+# `--exec` gives the toast a button. It approves by ID, never "the newest request": two devices
+# knocking at once is exactly when a "newest" shortcut admits the wrong one.
+if [[ -n "$id" ]] && command -v punktfunk-host >/dev/null; then
+  omarchy-notification-send \
+    --urgency=critical \
+    --icon=network-wireless \
+    "Punktfunk pairing request" "$body" \
+    --exec "Approve:punktfunk-host ctl approve $id" \
+    --exec "Deny:punktfunk-host ctl deny $id"
+else
+  omarchy-notification-send \
+    --urgency=critical \
+    --icon=network-wireless \
+    "Punktfunk pairing request" "$body — approve it in the console"
+fi

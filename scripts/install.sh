@@ -173,6 +173,12 @@ elif like fedora; then
     FAMILY=dnf;     DOCS_PAGE=$DOCS/fedora
 elif like arch; then
     FAMILY=pacman;  DOCS_PAGE=$DOCS/arch
+    # Omarchy is Arch underneath — same repo, same packages, same commands — so it is a FLAVOUR of
+    # the pacman family, not a family of its own. What differs is everything after the install:
+    # ufw is on by default, autostart is a user unit bound to graphical-session.target, the console
+    # belongs in their app menu, and updates go through `omarchy update`. `punktfunk-omarchy setup`
+    # is the one command that does all of it; the guide is its own page.
+    [ "$ID" = omarchy ] && DOCS_PAGE=$DOCS/omarchy
 else
     die "no package repo for '$PRETTY' yet — $DOCS/build-from-source"
 fi
@@ -310,6 +316,27 @@ CMD
         # hand out a console URL for something that is not on the box.
         if have punktfunk-web-server; then ok "the web console (punktfunk-web) is installed"
         else warn "the web console (punktfunk-web) did NOT get installed — pairing, approving a device and every setting live there. Install it by hand: $DOCS_PAGE"; fi
+    fi
+fi
+
+# ------------------------------------------------------------------- 1b. Omarchy hand-off
+# Everything from here to step 6 is the generic Linux wiring: join a group, open the firewall wide,
+# enable a user unit. On Omarchy each of those has a better local answer — LAN-scoped tagged ufw
+# rules, a drop-in that ties the host to the session uwsm actually starts, the console as an entry
+# in their app menu, toasts through their notifier — and `punktfunk-omarchy setup` is the one
+# command that does all of them AND knows how to reverse itself. So offer it instead of doing a
+# second, weaker version of the same work. Declining just continues generically; nothing is lost.
+if [ "$ID" = omarchy ]; then
+    say "Omarchy"
+    if have punktfunk-omarchy || [ "$DRY" = 1 ]; then
+        if ask "Finish with the Omarchy integration (ufw scoped to your LAN, autostart with the session, console in the app menu, optional toasts)?" y; then
+            run 'punktfunk-omarchy setup'
+            [ "$DRY" != 1 ] && exit 0
+        else
+            echo "     Run it later with: punktfunk-omarchy setup   ($DOCS/omarchy)"
+        fi
+    else
+        warn "punktfunk-omarchy is not on PATH — the host package should ship it; see $DOCS/omarchy"
     fi
 fi
 

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+#
+# punktfunk hook: a stream started → a low-urgency Omarchy toast saying who and at what.
+# Wired as a `stream.started` entry in ~/.config/punktfunk/hooks.json by `punktfunk-omarchy setup`.
+
+set -euo pipefail
+
+client="${PF_EVENT_STREAM_CLIENT:-a client}"
+mode="${PF_EVENT_STREAM_MODE:-}"
+app="${PF_EVENT_STREAM_APP:-}"
+
+body="$client connected"
+# `|| true`: a false `[[ … ]]` as a statement exits a `set -e` script, and a hook that exits early
+# is a toast that never appears.
+[[ -n "$mode" ]] && body="$body · $mode" || true
+[[ "${PF_EVENT_STREAM_HDR:-false}" == "true" ]] && body="$body HDR" || true
+[[ -n "$app" ]] && body="$body · $app" || true
+
+command -v omarchy-notification-send >/dev/null || exit 0
+omarchy-notification-send --urgency=low --icon=video-display "Punktfunk streaming" "$body"

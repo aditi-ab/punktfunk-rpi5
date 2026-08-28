@@ -197,6 +197,11 @@ package_punktfunk-host() {
               'kwin: stream a KDE Plasma desktop (kwin VirtualDisplay backend)'
               'mutter: stream a GNOME desktop (Mutter RecordVirtual backend)'
               'sway: stream a wlroots desktop (Sway VirtualDisplay backend)'
+              # Owed independently of Omarchy: the Hyprland backend has been first-class for
+              # releases (headless outputs, xdph capture, exclusive topology) with no dependency
+              # naming it, so a Hyprland box could install the host and find capture unavailable.
+              'hyprland: stream a Hyprland desktop (headless-output backend) — Omarchy ships this'
+              'xdg-desktop-portal-hyprland: ScreenCast portal for the Hyprland backend (REQUIRED to capture on Hyprland)'
               'xdg-desktop-portal-kde: portal for the headless KDE session helper'
               'xdg-desktop-portal-wlr: portal for the headless Sway session helper'
               'punktfunk-web: browser management console (device pairing + status)'
@@ -311,6 +316,23 @@ package_punktfunk-host() {
   install -Dm0644 "$R/packaging/bazzite/gamescope-headless-session" \
     "$pkgdir/etc/gamescope-session-plus/sessions.d/steam"
   install -Dm0644 "$R/api/openapi.json"                 "$pkgdir/usr/share/punktfunk/openapi.json"
+  # The session drop-in as a TEMPLATE the Omarchy setup script installs into the user's unit dir.
+  # It is already shipped to /usr/lib/systemd/user/... as a documented no-op elsewhere; here it is
+  # a file `punktfunk-omarchy setup` can copy, because on Omarchy graphical-session.target really
+  # starts and binding to it is what makes the host restart with the session.
+  install -Dm0644 "$R/scripts/punktfunk-host-desktop-session.conf" \
+    "$pkgdir/usr/share/punktfunk/punktfunk-host-desktop-session.conf"
+  # Omarchy integration (design/omarchy-integration.md). The script is INSTALLED, never run: a
+  # package that opened firewall ports or edited a user's config on install would be doing both
+  # behind the operator's back. `punktfunk-omarchy setup` is the consent step.
+  install -Dm0755 "$R/packaging/linux/omarchy/punktfunk-omarchy" \
+    "$pkgdir/usr/bin/punktfunk-omarchy"
+  for h in pairing-pending stream-started stream-stopped idle-guard; do
+    install -Dm0755 "$R/packaging/linux/omarchy/hooks/$h" \
+      "$pkgdir/usr/share/punktfunk/omarchy/hooks/$h"
+  done
+  install -Dm0644 "$R/packaging/linux/omarchy/themed/punktfunk.json.tpl" \
+    "$pkgdir/usr/share/punktfunk/omarchy/themed/punktfunk.json.tpl"
   # Firewall openers — NOT auto-enabled (an Arch package never touches the admin's running firewall).
   # Stock Arch ships no firewall; CachyOS ships ufw; some spins (EndeavourOS) enable firewalld — so we
   # install BOTH a ufw application profile and firewalld service definitions, and the one for whatever

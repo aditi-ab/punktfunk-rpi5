@@ -1,0 +1,189 @@
+---
+title: Omarchy
+description: Install the Punktfunk host on Omarchy 4.x — one setup command wires up the firewall, autostart, the app menu and toasts the Omarchy way.
+---
+
+**Omarchy 4.x ("Quattro")** is Arch underneath, so the packages, the repo and `pacman` all work
+exactly as on the [Arch page](/docs/arch). What is different is everything *around* the install:
+ufw is on by default, autostart is a user unit tied to the uwsm session, apps belong in the
+Omarchy menu, and updates go through `omarchy update`. One command handles all of it.
+
+<Callout type="info">
+Omarchy already ships Sunshine as an installable service and preinstalls moonlight-qt. Punktfunk
+**coexists** with Sunshine on its own ports — see [Sunshine on the same
+box](#sunshine-on-the-same-box) before you turn anything on.
+</Callout>
+
+## 1. GPU driver
+
+Same as Arch:
+
+- **NVIDIA:** `sudo pacman -S --needed nvidia-utils`
+- **AMD / Intel:** the Mesa stack you already have (`vulkan-radeon` / `vulkan-intel`,
+  `libva-mesa-driver` / `intel-media-driver`).
+
+## 2. Install the host
+
+<Install platform="omarchy" />
+
+`punktfunk-web` is the browser console and is optional but recommended — it is where the deep
+settings live. (`punktfunk-scripting` adds the plugin runner that fills your game library.)
+
+<Callout type="warn">
+Omarchy pins Arch packages to a **frozen snapshot mirror**, so its `ffmpeg` may sit behind rolling
+Arch. If `pacman` reports an unsatisfiable `libav*.so` dependency, the package is newer than your
+snapshot — wait for the next `omarchy update`, or [build from
+source](/docs/build-from-source).
+</Callout>
+
+## 3. Wire it into Omarchy
+
+```sh
+punktfunk-omarchy setup
+```
+
+That one command, each step idempotent and each one reversible:
+
+| Step | What it does |
+| --- | --- |
+| **Groups** | offers to add you to `input` (virtual gamepads) and `punktfunk` (the virtual Steam Deck pad). Both apply at your **next login**. |
+| **Autostart** | enables `punktfunk-host` as a user service and binds it to `graphical-session.target`, so the host starts *and restarts* with your Hyprland session. |
+| **Firewall** | adds ufw rules scoped to your local networks (and `tailscale0` if you have it), each tagged `punktfunk-omarchy` so `remove` finds them again. |
+| **App menu** | installs "Punktfunk Console" as an Omarchy webapp — it appears in Apps (`Super`+`Space`). |
+| **Toasts** *(optional)* | pairing requests and stream start/stop as Omarchy notifications, with **Approve** / **Deny** buttons on the pairing one. |
+| **Idle** *(optional)* | keeps the screen awake for the length of a stream and restores your own setting afterwards. |
+| **Theme** *(optional)* | a `~/.config/omarchy/themed/` template so the console follows `omarchy-theme-set`. |
+
+Check it any time with `punktfunk-omarchy status`, and undo all of it with `punktfunk-omarchy
+remove` (your pairings and `~/.config/punktfunk` are left alone).
+
+## 4. Pair
+
+Open **Punktfunk Console** from Apps and pair your first device — or stay in the terminal:
+
+```sh
+punktfunk-host ctl pair arm      # opens a pairing window and prints the PIN
+punktfunk-host ctl pending       # devices knocking, with names and fingerprint tails
+punktfunk-host ctl approve 1
+```
+
+See [the ctl reference](/docs/host-cli#ctl) for the full verb list.
+
+## Firewall and the video data plane
+
+`punktfunk-omarchy setup` opens the control ports the Omarchy way — scoped to RFC1918 ranges rather
+than to the whole world:
+
+```
+ufw allow from 192.168.0.0/16 to any app punktfunk-native comment "punktfunk-omarchy"
+```
+
+**The video data plane has no rule, and that is expected.** It binds an ephemeral UDP port chosen
+per session, so there is nothing fixed to open. Under ufw's default deny-incoming the client's
+first packet is dropped and the session falls back to a blind send: the host's own outbound packet
+creates the conntrack entry, and the return path rides it. On a LAN — which is the whole point of
+hosting here — this works, and it is why `punched=false` in the logs is normal rather than a fault.
+
+If you want strict control instead, pin the port and open exactly it:
+
+```sh
+echo 'PUNKTFUNK_DATA_PORT=9778' >> ~/.config/punktfunk/host.env
+sudo ufw allow from 192.168.0.0/16 to any port 9778 proto udp comment "punktfunk-omarchy"
+systemctl --user restart punktfunk-host
+```
+
+The cost is one concurrent session on that port; extra sessions fall back to ephemeral ports again.
+
+## Updating
+
+Punktfunk updates with everything else:
+
+```sh
+omarchy update
+```
+
+Our repo rides that transaction once it is configured, and it snapshots with snapper first. The web
+console therefore shows updates as **notify-only** on Omarchy and points at this command rather than
+offering a one-click apply: a bare `pacman -Syu` is blocked by Omarchy's own guard, and going around
+it would skip the snapshot your rollback depends on.
+
+A snapper rollback reverts `/usr` — the binaries — while `~/.config/punktfunk` and your pairings
+live in `/home` and persist. Nothing needs re-pairing after a rollback.
+
+## Sunshine on the same box
+
+`omarchy install service sunshine` and Punktfunk can run together, with one caveat:
+
+- **The native plane coexists.** Ports 9777 (QUIC), 47990 (management API) and 47992 (console) are
+  ours alone, so the Punktfunk apps and the console work with Sunshine running and untouched.
+- **The GameStream plane collides.** Moonlight compatibility uses 47984/47989/48010 and
+  47998–48010 — exactly Sunshine's ports. Ours are **off by default**; leave them off unless you
+  are migrating, and only one host can bind them.
+
+To migrate: `omarchy remove service sunshine`, then re-run `punktfunk-omarchy setup` and answer yes
+to GameStream if you still want stock Moonlight clients. More in [Switching from
+Sunshine](/docs/switching-from-sunshine).
+
+## Screen sharing keeps working
+
+Omarchy ships its own screen-share picker (`hyprland-preview-share-picker`), the one every browser
+share on the box goes through. Punktfunk needs that same setting to select a headless output
+without a dialog, so while a stream runs it borrows the setting — and **defers to your picker**
+whenever no Punktfunk selection is pending. Your browser shares behave exactly as before, during a
+session and after it, and the original value is written back when the last stream ends. If a host
+is killed mid-session, `punktfunk-omarchy remove` puts it back too.
+
+## Keyboard shortcut (optional)
+
+Punktfunk claims no chord — Omarchy occupies most of `Super`+*. Add your own to
+`~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + SHIFT + P", "Punktfunk", { webapp = "https://localhost:47992" })
+```
+
+## Wake-on-LAN and disk encryption
+
+Omarchy enables **full-disk encryption by default**. [Wake-on-LAN](/docs/wake-on-lan) still wakes
+the machine, but a cold boot stops at the LUKS passphrase prompt — nothing can stream until someone
+types it. Wake from **suspend** is unaffected, so suspend rather than shut down a box you want to
+wake into.
+
+## Troubleshooting
+
+Run `punktfunk-omarchy status` first — it checks the units, the ufw rules, your groups, the portal
+and Hyprland's permission mode in one pass.
+
+**Black frames, or input that does nothing.** Check whether Hyprland's permission enforcement is on:
+
+```sh
+hyprctl -j getoption ecosystem:enforce_permissions
+```
+
+If it is, the compositor is *silently* denying screencopy and virtual input — there is no error, only
+black frames and dropped input. Grant the host in your Hyprland config:
+
+```lua
+o.permission("/usr/bin/punktfunk-host", "screencopy", "allow")
+o.permission("/usr/bin/punktfunk-host", "plugin", "allow")
+```
+
+**No picture at all.** `xdg-desktop-portal-hyprland` must be running — it is what capture goes
+through. `systemctl --user status xdg-desktop-portal-hyprland`.
+
+**The host is not running after a reboot.** `punktfunk-omarchy status` will say whether it is bound
+to the desktop session; if not, re-run `punktfunk-omarchy setup`.
+
+More in [Troubleshooting](/docs/troubleshooting) and on the [Hyprland page](/docs/hyprland), which
+covers the compositor-level details this page assumes.
+
+## Uninstall
+
+```sh
+punktfunk-omarchy remove                      # the Omarchy wiring
+sudo pacman -R punktfunk-host punktfunk-web   # the packages
+```
+
+`remove` reverses every step of `setup` — units, drop-in, ufw rules, the webapp, the hooks, the
+theme template — and restores the screen-share picker. Your config and pairings survive both; see
+[Uninstall](/docs/uninstall) to clear those too.

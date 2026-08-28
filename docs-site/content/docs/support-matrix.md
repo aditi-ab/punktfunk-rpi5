@@ -628,6 +628,12 @@ whose caveat *is* "nobody has run this on real hardware" — a wrong ✅ is wors
   well-trodden path, and there is no probe that would catch it failing. One spawn-and-capture run on
   an NVIDIA box settles it.
 - **Touch input from a Windows client.** Same shared code as Linux, no on-glass run.
+- **The whole Omarchy integration on an Omarchy box.** `punktfunk-omarchy setup`, the LAN-scoped
+  ufw rules, the webapp menu entry, the notification and idle hooks, and the screen-share picker
+  hand-back are all written against Omarchy 4.0.1's documented seams and unit-tested where they
+  parse or generate a file — but none of it has been run on Omarchy. Nothing about it is enabled
+  until an operator runs that command, so a plain Arch box is unaffected either way. One install →
+  setup → pair → stream run on a 4.x box settles it.
 - **The `pf-webos` LG TV client.** A community project in another repository. Its codecs, HDR
   behaviour and feature set cannot be established from here.
 - **Everything client-side about Moonlight.** Wake-on-LAN, overlays, updates and which extensions

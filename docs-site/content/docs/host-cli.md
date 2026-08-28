@@ -10,6 +10,7 @@ command — [`punktfunk`](#punktfunk-on-the-client-machine), which ships with th
 | Command | What it does | Platform |
 |---|---|---|
 | [`serve`](#serve) | Run the host. | all |
+| [`ctl`](#ctl) | Drive a running host: pairing, devices, sessions, events. | all |
 | [`punktfunk1-host`](#punktfunk1-host) | Standalone native-only test host. | all |
 | [`service`](#service-windows) | Register, start, stop and remove the Windows service. | Windows |
 | [`tray`](#tray-windows) | Start, stop or query the status-tray icon. | Windows |
@@ -75,6 +76,97 @@ By default the host **requires pairing** — see [Pairing & Trust](/docs/pairing
 turn off the mandatory-pairing default and serve any device on the network (trusted single-user setups
 only). `punktfunk1-host` (below) requires pairing by default too; its `--allow-tofu` flag is the
 test-host equivalent of `--open`.
+
+## `ctl`
+
+Drive a **running** host from a terminal: approve a device, type a Moonlight PIN, rename or unpair,
+stop a session, watch events. Everything the [web console](/docs/web-console) does day to day,
+without a browser — and everything it does is the same management API the console talks to, over
+loopback.
+
+```sh
+punktfunk-host ctl status
+punktfunk-host ctl pending
+punktfunk-host ctl approve 3
+```
+
+| Verb | What it does |
+|---|---|
+| `status` | Host state, live session count, paired-device counts. |
+| `sessions` | The active session(s) and any launched game. |
+| `pair status` | Is a pairing window open, and is a PIN waiting? |
+| `pair arm` | Open a native pairing window and print the PIN. `--ttl <s>` how long the window stays open, `--expires-in <s>` how long the device's access lasts, `--preset <full\|controller\|view>`, `--fingerprint <fp>` to bind the window to **one** device. |
+| `pair disarm` | Close it. |
+| `pending` | Devices knocking, with their claimed name and fingerprint tail. |
+| `approve <ID>` | Admit one, by id. `--name`, `--preset`, `--expires-in` as above. |
+| `deny <ID>` | Refuse one. |
+| `pin <PIN>` | Submit the PIN a Moonlight/GameStream client is showing. |
+| `clients` | Paired devices on both planes, labelled. |
+| `rename <FP> <NAME>` | Name a device. |
+| `access <FP> <PRESET>` | `full`, `controller` or `view` — see [Access levels](/docs/access-levels). The full grant matrix stays in the console. |
+| `unpair <FP>` | Remove one device. `unpair --all` removes every device on both planes (asks first; needs `--yes` with `--json`). |
+| `stop-session` | Stop the active session. |
+| `end-game` | End the launched game. |
+| `watch` | Stream host events as line-JSON on stdout, one object per line. `--kinds stream.*,pairing.pending` filters; `--since <seq>` resumes. |
+
+Add `--json` to any verb for machine-readable output: `{"v":1,"data":…}` on success,
+`{"v":1,"error":{"code":…,"message":…}}` on failure, both on stdout. That envelope is the contract —
+the tables above are for humans and are not stable.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Success. |
+| `1` | The host refused the request (the message carries its reason). |
+| `2` | Usage error. |
+| `3` | No host reachable — not running, or never run on this machine. |
+| `4` | **Certificate pin mismatch.** Kept distinct on purpose: a script that treats it as "host down" and retries would be retrying into whatever is answering on that port. |
+
+### Watching events
+
+`watch` holds one long-lived connection and reconnects by itself, which makes it the right shape for
+a status widget or a script:
+
+```sh
+punktfunk-host ctl watch --kinds pairing.pending,stream.'*' | while read -r line; do
+  echo "$line"
+done
+```
+
+Two synthetic lines are ours rather than the host's:
+
+- `{"v":1,"kind":"ctl.resync"}` — the stream fell behind the host's catch-up ring, so anything you
+  believe about pending devices or live sessions may be stale. Re-run `ctl status` / `ctl pending`
+  instead of trusting your incremental state.
+- `{"v":1,"kind":"ctl.disconnected","data":{"error":…}}` — the connection dropped; a reconnect is
+  already in progress.
+
+The host caps concurrent event streams (the console holds one); past the cap you get a `503` with
+the host's own message and exit 1.
+
+### How it authenticates
+
+`ctl` reads two files from the host's config directory (`~/.config/punktfunk`, mode 0700) and
+nothing else:
+
+- `mgmt-token` — the operator token the host mints for itself on first start, the same one the web
+  console uses. `ctl` **consumes** it and never creates one: a missing token is an error, not a
+  prompt.
+- `native-cert.pem` (or `cert.pem` on older hosts) — the host's own certificate, which `ctl` pins
+  **before** sending the token. If the process answering on the management port presents anything
+  else, the connection fails during the TLS handshake and no credential is ever transmitted —
+  that is exit code 4.
+
+There is deliberately **no `--token` flag and no token environment variable**. A credential on a
+command line or in an environment is readable by other processes on the box through
+`/proc/<pid>/cmdline` and `/proc/<pid>/environ`, which is exactly what the 0700 config directory
+exists to prevent. The consequence worth knowing: a host started with `--mgmt-token` (or
+`PUNKTFUNK_MGMT_TOKEN`) and no persisted token file cannot be reached by `ctl`. Every packaged
+install persists one, so this only affects hand-run dev hosts.
+
+Everything runs over loopback, because the management API honours the admin surface from loopback
+peers only — `ctl` adds no listener and no new way in.
 
 ## `punktfunk1-host`
 

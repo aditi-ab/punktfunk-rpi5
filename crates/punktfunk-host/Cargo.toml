@@ -9,7 +9,10 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-punktfunk-core = { path = "../punktfunk-core", features = ["quic"] }
+# `ureq-tls` is for `ctl`: ureq's own `TlsConfig` has no hook for a custom certificate verifier,
+# so the pinned operator client hands rustls a `ClientConfig` through core's shared glue — the same
+# path the tray and the desktop client already take. `quic` brings `tls` (and `PinVerify`) with it.
+punktfunk-core = { path = "../punktfunk-core", features = ["quic", "ureq-tls"] }
 # Signed update-manifest fetch/verify + install-kind detection, shared with the Linux client.
 pf-update-check = { path = "../pf-update-check" }
 # Config-dir + owner-private file helpers (moved out of the gamestream junk drawer, plan §W6).

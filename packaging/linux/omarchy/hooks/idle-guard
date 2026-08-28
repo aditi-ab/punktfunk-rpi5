@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+#
+# punktfunk hook: hold Omarchy's idle timer off for the length of a stream — and put the user's
+# own setting back afterwards (design D9).
+#
+#   idle-guard on    # a stream started: remember the current state, then stay awake
+#   idle-guard off   # the last stream ended: restore what was remembered
+#
+# Why this is needed at all: remote input normally resets the compositor's idle timer, so an
+# ordinary game session never blanks. The acute case is an INPUT-QUIET stream — a film, a long
+# cutscene, a lobby — where nothing moves the pointer for half an hour and the box locks in the
+# middle of it.
+#
+# 🛑 The rule that makes this safe to install: **restore, never assume.** An operator who set
+# `stay-awake` themselves must still have it after a session ends, so `on` snapshots the state and
+# `off` puts that snapshot back rather than blindly running `allow-idle`. The snapshot lives in
+# $XDG_RUNTIME_DIR, so a reboot cannot leave a stale one behind.
+#
+# What this does NOT do: suppress an explicit lock. `omarchy.lock` invoked by the user (or by
+# suspend) still locks — only the idle countdown is held off, and only while streaming.
+
+set -euo pipefail
+
+STATE="${XDG_RUNTIME_DIR:-/tmp}/punktfunk-omarchy-idle-prior"
+
+command -v omarchy-toggle-idle >/dev/null || exit 0
+
+case "${1:-}" in
+  on)
+    # Refcount-free by design: `stream.started` firing twice (two clients) just re-reads a state
+    # that is already `stay-awake`, and the snapshot is written only if there is not one already —
+    # so the SECOND stream cannot overwrite the user's real setting with our own.
+    if [[ ! -f "$STATE" ]]; then
+      omarchy-toggle-idle status > "$STATE" 2>/dev/null || echo unknown > "$STATE"
+    fi
+    omarchy-toggle-idle stay-awake >/dev/null 2>&1 || true
+    ;;
+  off)
+    prior="$(cat "$STATE" 2>/dev/null || echo unknown)"
+    rm -f "$STATE"
+    case "$prior" in
+      # They already wanted the box awake — leave it that way.
+      *stay-awake*) : ;;
+      *allow-idle*) omarchy-toggle-idle allow-idle >/dev/null 2>&1 || true ;;
+      # No snapshot (a host that crashed and restarted, or a tool whose output we did not
+      # recognise): do NOT guess. Leaving the box awake is recoverable in one click; forcing
+      # allow-idle on someone who had deliberately set stay-awake is not.
+      *) : ;;
+    esac
+    ;;
+  *)
+    echo "usage: idle-guard on|off" >&2
+    exit 2
+    ;;
+esac

@@ -22,6 +22,19 @@ pub(crate) enum Block<'a> {
     Hyprlang(&'a str),
 }
 
+/// The comment we leave beside a key we took over, recording what the user had there:
+/// `# punktfunk: previous <key> = <value>` (or `= (none)` when the key did not exist).
+///
+/// Why in the file rather than in our own state directory: this has to survive a SIGKILLed host,
+/// a reboot (which empties `$XDG_RUNTIME_DIR`) and an uninstall that leaves the config behind, and
+/// it has to be written atomically together with the change it describes. A sidecar state file
+/// satisfies none of those; a comment in the same atomic write satisfies all three. It is also
+/// legible: an operator reading their own `xdph.conf` can see exactly what we replaced and put it
+/// back by hand.
+const PRIOR: &str = "# punktfunk: previous";
+/// What the marker records when the key was absent before we set it.
+const PRIOR_NONE: &str = "(none)";
+
 /// Is `line` the header that opens `block`?
 fn opens(line: &str, block: Block<'_>) -> bool {
     let t = line.trim();
@@ -40,33 +53,10 @@ fn assigns(line: &str, key: &str) -> bool {
     line.split('=').next().is_some_and(|lhs| lhs.trim() == key)
 }
 
-/// Set `key` to `value` inside `block`, preserving every other line.
-///
-/// Three cases, all of which the tests pin: the block is absent (append it), the block has the key
-/// (replace that one line, keeping its indentation), and the block lacks the key (insert before the
-/// block ends).
-pub(crate) fn upsert(existing: &str, block: Block<'_>, key: &str, value: &str) -> String {
-    let sep = match block {
-        Block::Ini(_) => "=",
-        Block::Hyprlang(_) => " = ",
-    };
-    let assignment = |indent: &str| format!("{indent}{key}{sep}{value}");
-
-    let lines: Vec<&str> = existing.lines().collect();
-    let Some(open_at) = lines.iter().position(|l| opens(l, block)) else {
-        // Absent: append the whole block, keeping the user's file intact above it.
-        let mut out = existing.trim_end().to_string();
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str(&match block {
-            Block::Ini(name) => format!("[{name}]\n{}\n", assignment("")),
-            Block::Hyprlang(name) => format!("{name} {{\n{}\n}}\n", assignment("    ")),
-        });
-        return out;
-    };
-
-    // Where the block ends: the next `[`-header for INI, the closing brace for hyprlang, else EOF.
+/// The span of `block` in `lines`: `(index of its header, index one past its last line)`.
+/// `None` when the block is absent.
+fn block_span(lines: &[&str], block: Block<'_>) -> Option<(usize, usize)> {
+    let open_at = lines.iter().position(|l| opens(l, block))?;
     let end_at = lines
         .iter()
         .enumerate()
@@ -77,17 +67,142 @@ pub(crate) fn upsert(existing: &str, block: Block<'_>, key: &str, value: &str) -
         })
         .map(|(i, _)| i)
         .unwrap_or(lines.len());
+    Some((open_at, end_at))
+}
 
+/// The value `key` currently holds in `block`, if it holds one.
+pub(crate) fn current_value(existing: &str, block: Block<'_>, key: &str) -> Option<String> {
+    let lines: Vec<&str> = existing.lines().collect();
+    let (open_at, end_at) = block_span(&lines, block)?;
+    (open_at + 1..end_at)
+        .find(|&i| assigns(lines[i], key))
+        .map(|i| {
+            lines[i]
+                .split_once('=')
+                .map_or("", |(_, v)| v)
+                .trim()
+                .to_string()
+        })
+}
+
+/// What the user had at `key` before we took it over, read back from our marker comment:
+/// `Some(Some(v))` = they had `v`, `Some(None)` = the key was absent, `None` = we never took it
+/// over (so there is nothing of ours to undo, and the value there is genuinely theirs).
+pub(crate) fn prior_value(existing: &str, block: Block<'_>, key: &str) -> Option<Option<String>> {
+    let lines: Vec<&str> = existing.lines().collect();
+    let (open_at, end_at) = block_span(&lines, block)?;
+    let want = format!("{PRIOR} {key} =");
+    let raw = (open_at + 1..end_at)
+        .map(|i| lines[i].trim())
+        .find_map(|l| l.strip_prefix(&want))?
+        .trim()
+        .to_string();
+    Some((raw != PRIOR_NONE).then_some(raw))
+}
+
+/// Undo our takeover of `key`: put the recorded prior value back (or delete the key when there was
+/// none) and drop the marker. `None` when no marker is present — the file is not ours to touch.
+///
+/// Deliberately NOT "delete our line": D6 asks for the *prior value*, because on Omarchy that value
+/// is `hyprland-preview-share-picker`, i.e. every browser share on the box. Deleting the key would
+/// fall back to whatever xdph defaults to, which is not the same thing as what the user had.
+pub(crate) fn restore(existing: &str, block: Block<'_>, key: &str) -> Option<String> {
+    let prior = prior_value(existing, block, key)?;
+    let lines: Vec<&str> = existing.lines().collect();
+    let (open_at, end_at) = block_span(&lines, block)?;
+    let marker = format!("{PRIOR} {key} =");
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        let inside = i > open_at && i < end_at;
+        if inside && line.trim().starts_with(&marker) {
+            continue; // the marker itself goes away with the takeover it records
+        }
+        if inside && assigns(line, key) {
+            // `Some` → put their line back with their indentation and the grammar's separator,
+            // exactly as `upsert` wrote ours. `None` → there was no such key before us, so there
+            // is none after us either: drop the line rather than blank it.
+            if let Some(v) = &prior {
+                let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+                let sep = match block {
+                    Block::Ini(_) => "=",
+                    Block::Hyprlang(_) => " = ",
+                };
+                out.push(format!("{indent}{key}{sep}{v}"));
+            }
+            continue;
+        }
+        out.push((*line).to_string());
+    }
+    let mut joined = out.join("\n");
+    if existing.ends_with('\n') || !joined.ends_with('\n') {
+        joined.push('\n');
+    }
+    Some(joined)
+}
+
+/// Set `key` to `value` inside `block`, preserving every other line.
+///
+/// Three cases, all of which the tests pin: the block is absent (append it), the block has the key
+/// (replace that one line, keeping its indentation), and the block lacks the key (insert before the
+/// block ends).
+///
+/// The first time we replace a key we also leave a [`PRIOR`] marker recording what was there, so
+/// [`restore`] can put it back after a crash, a reboot or an uninstall. Written once: a later edit
+/// (the shim path moves with `$XDG_RUNTIME_DIR`) must not record OUR previous value as the user's.
+pub(crate) fn upsert(existing: &str, block: Block<'_>, key: &str, value: &str) -> String {
+    let sep = match block {
+        Block::Ini(_) => "=",
+        Block::Hyprlang(_) => " = ",
+    };
+    let assignment = |indent: &str| format!("{indent}{key}{sep}{value}");
+
+    let lines: Vec<&str> = existing.lines().collect();
+    let Some((open_at, end_at)) = block_span(&lines, block) else {
+        // Absent: append the whole block, keeping the user's file intact above it. There was no
+        // key here, so the marker records that — an uninstall must remove our line, not leave a
+        // key the user never had.
+        let mut out = existing.trim_end().to_string();
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        let marker = |indent: &str| format!("{indent}{PRIOR} {key} = {PRIOR_NONE}");
+        out.push_str(&match block {
+            Block::Ini(name) => format!("[{name}]\n{}\n{}\n", marker(""), assignment("")),
+            Block::Hyprlang(name) => format!(
+                "{name} {{\n{}\n{}\n}}\n",
+                marker("    "),
+                assignment("    ")
+            ),
+        });
+        return out;
+    };
+
+    // Already marked? Then we have taken this key over before and the marker holds the USER's
+    // value; re-recording here would overwrite it with our own previous shim path.
+    let marked = prior_value(existing, block, key).is_some();
     let mut out: Vec<String> = lines.iter().map(|l| (*l).to_string()).collect();
     if let Some(i) = (open_at + 1..end_at).find(|&i| assigns(lines[i], key)) {
         let indent: String = lines[i].chars().take_while(|c| c.is_whitespace()).collect();
+        let had = lines[i]
+            .split_once('=')
+            .map_or("", |(_, v)| v)
+            .trim()
+            .to_string();
         out[i] = assignment(&indent);
+        if !marked {
+            out.insert(i, format!("{indent}{PRIOR} {key} = {had}"));
+        }
     } else {
         let indent = match block {
             Block::Ini(_) => "",
             Block::Hyprlang(_) => "    ",
         };
-        out.insert(end_at, assignment(indent));
+        if !marked {
+            out.insert(end_at, format!("{indent}{PRIOR} {key} = {PRIOR_NONE}"));
+            out.insert(end_at + 1, assignment(indent));
+        } else {
+            out.insert(end_at, assignment(indent));
+        }
     }
     let mut joined = out.join("\n");
     if existing.ends_with('\n') || !joined.ends_with('\n') {
@@ -166,6 +281,58 @@ pub(crate) fn ensure_key(path: &Path, block: Block<'_>, key: &str, value: &str) 
                 "could not back up the existing portal config; editing it anyway"
             ),
         }
+    }
+    write_atomic(path, updated.as_bytes())?;
+    Ok(true)
+}
+
+/// Read `path` and hand back its text, or `None` when it does not exist. Any other read failure —
+/// including non-UTF-8 — is an error for the same reason [`ensure_key`] spells out: a config we
+/// cannot read is a config we refuse to rewrite.
+fn read_config(path: &Path) -> Result<Option<String>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(
+            std::str::from_utf8(&bytes)
+                .with_context(|| {
+                    format!("{} is not UTF-8 — refusing to rewrite it", path.display())
+                })?
+                .to_string(),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// The value `key` holds in `path` today, and what the user had there before we took it over.
+/// Both `None` on a file we have never touched (or that does not exist).
+pub(crate) fn peek(
+    path: &Path,
+    block: Block<'_>,
+    key: &str,
+) -> (Option<String>, Option<Option<String>>) {
+    let Ok(Some(text)) = read_config(path) else {
+        return (None, None);
+    };
+    (
+        current_value(&text, block, key),
+        prior_value(&text, block, key),
+    )
+}
+
+/// Undo our takeover of `key` in `path` — see [`restore`]. Returns `true` when the file changed.
+///
+/// A file with no marker of ours is left byte-for-byte alone and reports `false`: this must be safe
+/// to call unconditionally (at teardown, from an uninstall script, after a crash) on a box where we
+/// never touched the config at all.
+pub(crate) fn restore_key(path: &Path, block: Block<'_>, key: &str) -> Result<bool> {
+    let Some(existing) = read_config(path)? else {
+        return Ok(false);
+    };
+    let Some(updated) = restore(&existing, block, key) else {
+        return Ok(false);
+    };
+    if updated == existing {
+        return Ok(false);
     }
     write_atomic(path, updated.as_bytes())?;
     Ok(true)
@@ -265,7 +432,9 @@ mod tests {
             out.contains("[somethingelse]\nkeep=me"),
             "user content kept"
         );
-        assert!(out.contains("[screencast]\nchooser_cmd=cat x"));
+        assert!(out.contains(
+            "[screencast]\n# punktfunk: previous chooser_cmd = (none)\nchooser_cmd=cat x"
+        ));
     }
 
     #[test]
@@ -273,7 +442,9 @@ mod tests {
         let user = "[screencast]\nchooser_type=simple\nchooser_cmd=OLD\noutput_name=DP-1\n";
         let out = upsert(user, Block::Ini("screencast"), "chooser_cmd", "NEW");
         assert!(out.contains("chooser_cmd=NEW"));
-        assert!(!out.contains("OLD"));
+        // OLD survives ONLY as the restore marker — no live assignment may still name it.
+        assert!(!out.lines().any(|l| l.trim() == "chooser_cmd=OLD"));
+        assert!(out.contains("# punktfunk: previous chooser_cmd = OLD"));
         assert!(out.contains("chooser_type=simple"), "sibling key kept");
         assert!(out.contains("output_name=DP-1"), "sibling key kept");
     }
@@ -301,7 +472,10 @@ mod tests {
             "/run/user/1000/shim.sh",
         );
         assert!(out.contains("custom_picker_binary = /run/user/1000/shim.sh"));
-        assert!(!out.contains("OLD"));
+        assert!(!out
+            .lines()
+            .any(|l| l.trim() == "custom_picker_binary = OLD"));
+        assert!(out.contains("# punktfunk: previous custom_picker_binary = OLD"));
         assert!(
             out.contains("allow_token_by_default = true"),
             "sibling kept"
@@ -349,7 +523,125 @@ mod tests {
     fn an_empty_file_yields_just_the_block() {
         assert_eq!(
             upsert("", Block::Ini("screencast"), "k", "v"),
-            "[screencast]\nk=v\n"
+            "[screencast]\n# punktfunk: previous k = (none)\nk=v\n"
+        );
+    }
+
+    // ── the takeover is reversible (design D6) ─────────────────────────────────────────────────
+    //
+    // Omarchy ships its OWN `~/.config/hypr/xdph.conf` naming
+    // `custom_picker_binary = hyprland-preview-share-picker` — the picker every Chromium share on
+    // the box goes through. Taking that key over without a way back is not a cosmetic leftover: it
+    // is "screen sharing stopped working on this machine" for as long as the config survives, i.e.
+    // past a reboot and past an uninstall.
+
+    /// The round trip that matters: their picker → ours → theirs, byte-identical.
+    #[test]
+    fn an_omarchy_picker_survives_the_round_trip() {
+        let user = "screencopy {\n    allow_token_by_default = true\n    custom_picker_binary = hyprland-preview-share-picker\n}\n";
+        let ours = upsert(
+            user,
+            Block::Hyprlang("screencopy"),
+            "custom_picker_binary",
+            "/run/user/1000/pf-picker.sh",
+        );
+        assert!(ours.contains("custom_picker_binary = /run/user/1000/pf-picker.sh"));
+        assert_eq!(
+            prior_value(&ours, Block::Hyprlang("screencopy"), "custom_picker_binary"),
+            Some(Some("hyprland-preview-share-picker".to_string()))
+        );
+        let back = restore(&ours, Block::Hyprlang("screencopy"), "custom_picker_binary")
+            .expect("a file we took over is restorable");
+        assert_eq!(
+            back, user,
+            "the user's file must come back exactly as it was"
+        );
+    }
+
+    /// A second takeover (the shim path moves with `$XDG_RUNTIME_DIR`) must not record OUR path as
+    /// theirs — that is how a restore puts back a dead runtime path instead of their picker.
+    #[test]
+    fn a_second_takeover_keeps_the_first_prior_value() {
+        let user = "screencopy {\n    custom_picker_binary = theirs\n}\n";
+        let once = upsert(
+            user,
+            Block::Hyprlang("screencopy"),
+            "custom_picker_binary",
+            "/run/a",
+        );
+        let twice = upsert(
+            &once,
+            Block::Hyprlang("screencopy"),
+            "custom_picker_binary",
+            "/run/b",
+        );
+        assert!(twice.contains("custom_picker_binary = /run/b"));
+        assert_eq!(
+            restore(
+                &twice,
+                Block::Hyprlang("screencopy"),
+                "custom_picker_binary"
+            )
+            .as_deref(),
+            Some(user)
+        );
+    }
+
+    /// When the key did not exist before us, restoring REMOVES it — putting an empty or defaulted
+    /// value there would be a setting the user never had.
+    #[test]
+    fn a_key_we_invented_is_removed_on_restore_not_blanked() {
+        let user = "screencopy {\n    allow_token_by_default = true\n}\n";
+        let ours = upsert(
+            user,
+            Block::Hyprlang("screencopy"),
+            "custom_picker_binary",
+            "/run/a",
+        );
+        assert_eq!(
+            prior_value(&ours, Block::Hyprlang("screencopy"), "custom_picker_binary"),
+            Some(None)
+        );
+        assert_eq!(
+            restore(&ours, Block::Hyprlang("screencopy"), "custom_picker_binary").as_deref(),
+            Some(user)
+        );
+    }
+
+    /// Restoring a file we never touched must be a no-op, not a deletion — this runs at teardown
+    /// on every Hyprland box, including ones whose config is entirely the user's.
+    #[test]
+    fn a_file_without_our_marker_is_not_ours_to_restore() {
+        let user = "screencopy {\n    custom_picker_binary = theirs\n}\n";
+        assert_eq!(
+            restore(user, Block::Hyprlang("screencopy"), "custom_picker_binary"),
+            None
+        );
+        assert_eq!(restore("", Block::Ini("screencast"), "chooser_cmd"), None);
+    }
+
+    /// The INI half (xdpw) reverses identically — the two backends share this module precisely so
+    /// a fix on one is not a fix on one.
+    #[test]
+    fn the_ini_grammar_reverses_too() {
+        let user = "[screencast]\nchooser_type=simple\nchooser_cmd=slurp\noutput_name=DP-1\n";
+        let ours = upsert(user, Block::Ini("screencast"), "chooser_cmd", "/run/a");
+        assert_eq!(
+            restore(&ours, Block::Ini("screencast"), "chooser_cmd").as_deref(),
+            Some(user)
+        );
+    }
+
+    #[test]
+    fn current_value_reads_what_is_there_now() {
+        let user = "screencopy {\n    custom_picker_binary = theirs\n}\n";
+        assert_eq!(
+            current_value(user, Block::Hyprlang("screencopy"), "custom_picker_binary").as_deref(),
+            Some("theirs")
+        );
+        assert_eq!(
+            current_value(user, Block::Hyprlang("screencopy"), "nope"),
+            None
         );
     }
 }
@@ -429,9 +721,51 @@ mod io_tests {
         assert!(ensure_key(&p, Block::Ini("screencast"), "chooser_cmd", "cat x").expect("write"));
         assert_eq!(
             std::fs::read_to_string(&p).expect("created"),
-            "[screencast]\nchooser_cmd=cat x\n"
+            "[screencast]\n# punktfunk: previous chooser_cmd = (none)\nchooser_cmd=cat x\n"
         );
         assert!(!backup_of(&p).exists());
+    }
+
+    /// The on-disk half of the D6 round trip, including the case that made it a hard requirement:
+    /// an Omarchy box whose `xdph.conf` names their own share picker. After `restore_key` the file
+    /// must be byte-identical to what they shipped.
+    #[test]
+    fn restore_key_puts_the_users_picker_back_byte_for_byte() {
+        let s = Scratch::new("restore");
+        let p = s.path("xdph.conf");
+        let user = "screencopy {\n    allow_token_by_default = true\n    custom_picker_binary = hyprland-preview-share-picker\n}\n";
+        std::fs::write(&p, user).expect("seed");
+        let block = Block::Hyprlang("screencopy");
+        assert!(
+            ensure_key(&p, block, "custom_picker_binary", "/run/user/1000/pf.sh").expect("take")
+        );
+        assert_eq!(
+            peek(&p, block, "custom_picker_binary"),
+            (
+                Some("/run/user/1000/pf.sh".to_string()),
+                Some(Some("hyprland-preview-share-picker".to_string()))
+            )
+        );
+        assert!(restore_key(&p, block, "custom_picker_binary").expect("restore"));
+        assert_eq!(std::fs::read_to_string(&p).expect("restored"), user);
+        // Idempotent, and safe to call on a file that is no longer ours.
+        assert!(!restore_key(&p, block, "custom_picker_binary").expect("second restore"));
+        assert_eq!(std::fs::read_to_string(&p).expect("unchanged"), user);
+    }
+
+    /// Teardown calls this on every Hyprland box. A config that was never ours — and a config that
+    /// does not exist — must come through untouched.
+    #[test]
+    fn restore_key_is_a_no_op_on_a_config_we_never_took_over() {
+        let s = Scratch::new("restore-noop");
+        let p = s.path("xdph.conf");
+        let block = Block::Hyprlang("screencopy");
+        assert!(!restore_key(&p, block, "custom_picker_binary").expect("absent file"));
+        assert!(!p.exists(), "restoring must not CREATE a config");
+        let user = "screencopy {\n    custom_picker_binary = theirs\n}\n";
+        std::fs::write(&p, user).expect("seed");
+        assert!(!restore_key(&p, block, "custom_picker_binary").expect("not ours"));
+        assert_eq!(std::fs::read_to_string(&p).expect("intact"), user);
     }
 
     /// `create_new` is what makes the backup once-only, and this is the invariant it buys: after a
@@ -586,7 +920,7 @@ mod io_tests {
         );
         assert_eq!(
             std::fs::read_to_string(&real).expect("target created"),
-            "[screencast]\nchooser_cmd=cat x\n"
+            "[screencast]\n# punktfunk: previous chooser_cmd = (none)\nchooser_cmd=cat x\n"
         );
     }
 }
