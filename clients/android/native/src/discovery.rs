@@ -178,11 +178,12 @@ fn resolve(info: &ResolvedService) -> Option<Host> {
     if !proto.is_empty() && proto != PROTO {
         return None; // some other DNS-SD service sharing the type — ignore
     }
-    let addr = info
-        .get_addresses_v4()
-        .iter()
-        .next()
-        .map(|a| a.to_string())?;
+    // Deterministic pick from the union of per-interface answers (the host OS's responder
+    // contributes VPN/overlay addresses; `iter().next()` on the HashSet dialed an arbitrary
+    // one) — same policy as the desktop client, shared in `punktfunk_core::discovery`.
+    let candidates: Vec<std::net::Ipv4Addr> = info.get_addresses_v4().into_iter().collect();
+    let addr = punktfunk_core::discovery::pick_host_addr(&candidates, val("addr").parse().ok())?
+        .to_string();
     let id = val("id");
     let fullname = info.get_fullname();
     Some(Host {

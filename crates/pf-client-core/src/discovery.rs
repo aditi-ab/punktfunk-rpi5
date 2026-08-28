@@ -141,9 +141,19 @@ pub fn browse() -> (async_channel::Receiver<DiscoveryEvent>, Rescan) {
                         // responder often answers AAAA for its hostname) would render a host card
                         // that fails on every click. A v6-only advert is dropped — the honest
                         // "not found" — until the stack actually speaks IPv6.
-                        let Some(addr) =
-                            info.get_addresses_v4().iter().next().map(|a| a.to_string())
-                        else {
+                        //
+                        // Among the v4 addresses, pick deterministically: the set is a union of
+                        // per-interface answers from EVERY responder (a host on ZeroTier/…
+                        // contributes its overlay address via the OS responder), and taking
+                        // `iter().next()` of the HashSet dialed an arbitrary one — a field
+                        // client streamed over the host's VPN while both machines shared a LAN.
+                        let candidates: Vec<std::net::Ipv4Addr> =
+                            info.get_addresses_v4().into_iter().collect();
+                        let Some(addr) = punktfunk_core::discovery::pick_host_addr(
+                            &candidates,
+                            val("addr").parse().ok(),
+                        )
+                        .map(|a| a.to_string()) else {
                             continue;
                         };
                         let id = val("id");
