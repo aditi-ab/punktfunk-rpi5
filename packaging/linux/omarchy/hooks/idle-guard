@@ -16,6 +16,14 @@
 # `off` puts that snapshot back rather than blindly running `allow-idle`. The snapshot lives in
 # $XDG_RUNTIME_DIR, so a reboot cannot leave a stale one behind.
 #
+# ⚠ `omarchy-toggle-idle status` prints **JSON**, not a keyword:
+#     {"enabled":true,"class":"enabled","tooltip":"Allow Idle Lock & Screensaver"}   # stay-awake ON
+#     {"enabled":false,"class":"disabled","tooltip":"Stay Awake"}                    # stay-awake OFF
+# Note the trap in that payload: the tooltip names the action the button WOULD take, so the string
+# "Stay Awake" appears exactly when stay-awake is OFF. Matching on the tooltip — or on the words
+# `stay-awake`/`allow-idle`, which never appear at all — gets it backwards or silently never
+# matches. `"enabled":true` is the only field that means what it says. (Measured on Omarchy 4.0.1.)
+#
 # What this does NOT do: suppress an explicit lock. `omarchy.lock` invoked by the user (or by
 # suspend) still locks — only the idle countdown is held off, and only while streaming.
 
@@ -31,7 +39,13 @@ case "${1:-}" in
     # that is already `stay-awake`, and the snapshot is written only if there is not one already —
     # so the SECOND stream cannot overwrite the user's real setting with our own.
     if [[ ! -f "$STATE" ]]; then
-      omarchy-toggle-idle status > "$STATE" 2>/dev/null || echo unknown > "$STATE"
+      case "$(omarchy-toggle-idle status 2>/dev/null)" in
+        *'"enabled":true'*)  echo stay-awake > "$STATE" ;;
+        *'"enabled":false'*) echo allow-idle > "$STATE" ;;
+        # An output shape we do not recognise (a future Omarchy). Record that we do not know,
+        # and `off` will leave the setting alone rather than guess at it.
+        *)                   echo unknown    > "$STATE" ;;
+      esac
     fi
     omarchy-toggle-idle stay-awake >/dev/null 2>&1 || true
     ;;
@@ -40,11 +54,11 @@ case "${1:-}" in
     rm -f "$STATE"
     case "$prior" in
       # They already wanted the box awake — leave it that way.
-      *stay-awake*) : ;;
-      *allow-idle*) omarchy-toggle-idle allow-idle >/dev/null 2>&1 || true ;;
-      # No snapshot (a host that crashed and restarted, or a tool whose output we did not
-      # recognise): do NOT guess. Leaving the box awake is recoverable in one click; forcing
-      # allow-idle on someone who had deliberately set stay-awake is not.
+      stay-awake) : ;;
+      allow-idle) omarchy-toggle-idle allow-idle >/dev/null 2>&1 || true ;;
+      # No snapshot (a host that crashed and restarted), or a status we could not read: do NOT
+      # guess. Leaving the box awake is recoverable in one click; forcing allow-idle on someone
+      # who had deliberately set stay-awake is not.
       *) : ;;
     esac
     ;;

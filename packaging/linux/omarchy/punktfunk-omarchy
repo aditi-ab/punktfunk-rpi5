@@ -150,16 +150,38 @@ setup_groups() {
   return 0
 }
 
+# Omarchy ships TWO session entries and they behave differently for us:
+#
+#   hyprland-uwsm.desktop  "Hyprland (uwsm-managed)"  → uwsm starts graphical-session.target
+#   hyprland.desktop       "Hyprland"                 → start-hyprland, target NEVER starts
+#
+# On the plain one, `graphical-session.target` stays inactive — measured on 4.0.1, where Omarchy's
+# OWN units that want it (omarchy-crash-watch, omarchy-sleep-lock) are `enabled` and `dead` too.
+# So the drop-in cannot be described as "the host restarts with your session" without checking.
+session_is_systemd_managed() {
+  systemctl --user is-active --quiet graphical-session.target
+}
+
 setup_units() {
   step "Autostart"
-  # The drop-in binds the host to graphical-session.target. On generic Hyprland that target never
-  # starts and the drop-in is a documented no-op; Omarchy's uwsm session DOES start it, so here it
-  # buys what it was written for on Plasma: the host restarts WITH the session, instead of surviving
-  # a logout holding a dead Wayland socket and a portal connection to a compositor that is gone.
+  # Install the drop-in either way: it is additive (the base unit keeps WantedBy=default.target, so
+  # the host still comes up at login), it is inert while the target never starts, and it becomes
+  # correct by itself if the operator later picks the uwsm session. What changes is only what we
+  # CLAIM, because "it restarts with your session" is the kind of promise that gets discovered to be
+  # false at the worst moment.
   mkdir -p "$DROPIN_DIR"
   if [[ -r /usr/share/punktfunk/punktfunk-host-desktop-session.conf ]]; then
     install -Dm0644 /usr/share/punktfunk/punktfunk-host-desktop-session.conf "$DROPIN"
-    ok "bound punktfunk-host to graphical-session.target"
+    if session_is_systemd_managed; then
+      ok "bound punktfunk-host to graphical-session.target — it restarts with your session"
+    else
+      ok "punktfunk-host will start at login"
+      warn "this session is not systemd-managed, so the host will NOT restart when the session does"
+      say "     Your session is \"Hyprland\"; picking \"Hyprland (uwsm-managed)\" at the login screen"
+      say "     starts graphical-session.target and gets you that. It is rarely worth it here: the"
+      say "     host re-derives the live compositor on every connect, which is the failure this"
+      say "     binding guards against on KDE and GNOME."
+    fi
   else
     warn "the session drop-in template is missing from the package — skipping"
   fi
@@ -396,15 +418,31 @@ cmd_status() {
     systemctl --user is-active --quiet punktfunk-web.service \
       && ok "web console running — https://localhost:47992" || warn "web console installed but not running"
   fi
-  [[ -f "$DROPIN" ]] && ok "starts with the desktop session" || warn "not bound to the desktop session"
+  if [[ -f "$DROPIN" ]]; then
+    if session_is_systemd_managed; then
+      ok "restarts with the desktop session (graphical-session.target is up)"
+    else
+      warn "starts at login, but will not restart with the session (this session is not systemd-managed)"
+    fi
+  else
+    warn "not bound to the desktop session"
+  fi
 
   if have ufw; then
-    if sudo -n ufw status 2>/dev/null | grep -q "$TAG"; then
+    # `ufw status` needs root, and on a box where sudo asks for a password `sudo -n` simply fails.
+    # Absence of OUTPUT must never be reported as absence of RULES: the first version of this said
+    # "no punktfunk rules (run: punktfunk-omarchy setup)" immediately after setup had added six of
+    # them, which sends an operator to re-run the thing that already worked.
+    local ufw_out
+    ufw_out="$(sudo -n ufw status 2>/dev/null)" || ufw_out=""
+    if [[ -z "$ufw_out" ]]; then
+      # NOT "sudo punktfunk-omarchy status": this script refuses to run as root (it reports on YOUR
+      # units and YOUR groups, and root has neither), so that advice would be a dead end.
+      say "  ufw          (needs root to read — check with: sudo ufw status | grep $TAG)"
+    elif grep -q "$TAG" <<<"$ufw_out"; then
       ok "ufw: punktfunk rules present"
-    elif sudo -n true 2>/dev/null; then
-      warn "ufw: no punktfunk rules (run: punktfunk-omarchy setup)"
     else
-      say "  ufw          (needs sudo to inspect)"
+      warn "ufw: no punktfunk rules (run: punktfunk-omarchy setup)"
     fi
   fi
 
@@ -425,8 +463,15 @@ cmd_status() {
       ok "Hyprland permission enforcement off (nothing to grant)"
     fi
   fi
-  pgrep -x xdg-desktop-portal-hyprland >/dev/null 2>&1 \
-    && ok "xdg-desktop-portal-hyprland running" || warn "xdg-desktop-portal-hyprland not running (screen capture needs it)"
+  # Ask systemd, not pgrep. `xdg-desktop-portal-hyprland` is 27 characters and Linux truncates a
+  # process's `comm` to 15, so `pgrep -x` on that name can NEVER match — it reported the portal
+  # missing on a box that was capturing through it a minute earlier. (pgrep itself warns about
+  # this, to stderr, which a `>/dev/null 2>&1` check throws away.)
+  if systemctl --user is-active --quiet xdg-desktop-portal-hyprland.service; then
+    ok "xdg-desktop-portal-hyprland running"
+  else
+    warn "xdg-desktop-portal-hyprland not running (screen capture needs it)"
+  fi
 
   # The data plane is an EPHEMERAL UDP port, so there is no rule to add for it and `punched=false`
   # under ufw is expected, not broken: the host's first outbound packet creates the conntrack state

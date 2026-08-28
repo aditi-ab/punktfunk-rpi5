@@ -30,6 +30,14 @@ Same as Arch:
 settings live. (`punktfunk-scripting` adds the plugin runner that fills your game library.)
 
 <Callout type="warn">
+**Not `pacman -Syu <package>` — that is the Arch line and Omarchy refuses it.** Omarchy installs a
+pacman hook that aborts any transaction carrying both `-S` and `-u`, so it can funnel system
+upgrades through `omarchy update`; the Arch one-liner dies with *"Woah partner…"* and installs
+nothing. `-Sy` refreshes the databases without a system upgrade and is not blocked, and `-S` then
+installs. Everything else about the repo is identical to Arch.
+</Callout>
+
+<Callout type="warn">
 Omarchy pins Arch packages to a **frozen snapshot mirror**, so its `ffmpeg` may sit behind rolling
 Arch. If `pacman` reports an unsatisfiable `libav*.so` dependency, the package is newer than your
 snapshot — wait for the next `omarchy update`, or [build from
@@ -47,7 +55,7 @@ That one command, each step idempotent and each one reversible:
 | Step | What it does |
 | --- | --- |
 | **Groups** | offers to add you to `input` (virtual gamepads) and `punktfunk` (the virtual Steam Deck pad). Both apply at your **next login**. |
-| **Autostart** | enables `punktfunk-host` as a user service and binds it to `graphical-session.target`, so the host starts *and restarts* with your Hyprland session. |
+| **Autostart** | enables `punktfunk-host` as a user service so it comes up at login. It also installs the `graphical-session.target` binding — see [Autostart and your session](#autostart-and-your-session) for when that does more than nothing. |
 | **Firewall** | adds ufw rules scoped to your local networks (and `tailscale0` if you have it), each tagged `punktfunk-omarchy` so `remove` finds them again. |
 | **App menu** | installs "Punktfunk Console" as an Omarchy webapp — it appears in Apps (`Super`+`Space`). |
 | **Toasts** *(optional)* | pairing requests and stream start/stop as Omarchy notifications, with **Approve** / **Deny** buttons on the pairing one. |
@@ -68,6 +76,29 @@ punktfunk-host ctl approve 1
 ```
 
 See [the ctl reference](/docs/host-cli#ctl) for the full verb list.
+
+## Autostart and your session
+
+Omarchy offers **two** Hyprland entries at the login screen, and they differ in a way that matters
+here:
+
+| Session | What it runs | `graphical-session.target` |
+| --- | --- | --- |
+| **Hyprland** | `start-hyprland` | never starts |
+| **Hyprland (uwsm-managed)** | `uwsm start … Hyprland` | starts with the session |
+
+`punktfunk-omarchy setup` enables the host as a user service, so **it comes up at login either
+way**. What the second session additionally buys is that the host *restarts* when the session does,
+instead of surviving a logout holding a Wayland socket that died with the old compositor.
+
+On the plain **Hyprland** session that target never starts — which is also why Omarchy's own
+`omarchy-crash-watch` and `omarchy-sleep-lock` units sit enabled-but-dead there. `punktfunk-omarchy
+status` tells you which situation you are in.
+
+It is rarely worth switching sessions just for this: on Hyprland the host re-derives the live
+compositor on every connect, so the stale-socket failure the binding guards against on KDE and
+GNOME does not really arise. If you want it anyway, pick *Hyprland (uwsm-managed)* at the login
+screen — nothing about Punktfunk needs changing.
 
 ## Firewall and the video data plane
 

@@ -99,7 +99,7 @@
       ]
     },
     {
-      "$comment": "Omarchy IS Arch for delivery — same signed repo, same packages, same pacman lines byte-for-byte (drift gate 6 requires every install line to appear verbatim in scripts/install.sh, which has exactly one pacman branch). Everything Omarchy-specific is the setup line after them.",
+      "$comment": "Omarchy IS Arch for delivery — same signed repo, same packages — but NOT the same install command. Omarchy ships a libalpm PreTransaction hook (00-omarchy-update-guard) that ABORTS any transaction whose pacman invocation carries both -S and -u, so Arch's `pacman -Syu <pkgs>` dies with 'Woah partner...' and installs nothing (measured on 4.0.1, 2026-08-28). `-Sy` refreshes without a sysupgrade and is not blocked, and `-S` then installs. Everything Omarchy-specific is the setup line after them.",
       "id": "omarchy",
       "name": "Omarchy",
       "installs": "host",
@@ -110,7 +110,8 @@
         "curl -fsS https://git.unom.io/api/packages/unom/arch/repository.key | sudo pacman-key --add -",
         "sudo pacman-key --lsign-key E0CA04465C99C936E0B0C6510A317015A34DDD69",
         "grep -q '^\\[punktfunk\\]' /etc/pacman.conf || printf '\\n[punktfunk]\\nServer = https://git.unom.io/api/packages/unom/arch/$repo/$arch\\n' | sudo tee -a /etc/pacman.conf >/dev/null",
-        "sudo pacman -Syu punktfunk-host punktfunk-web punktfunk-scripting",
+        "sudo pacman -Sy",
+        "sudo pacman -S punktfunk-host punktfunk-web punktfunk-scripting",
         "punktfunk-omarchy setup"
       ]
     },

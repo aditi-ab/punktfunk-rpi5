@@ -13,6 +13,9 @@
 //!   `ctl status` / `ctl pending` rather than trusting its incremental state.
 //! - `{"v":1,"kind":"ctl.disconnected","data":{"error":"…"}}` — the stream dropped and we are
 //!   backing off. Purely informational; the reconnect is automatic.
+//! - `{"v":1,"kind":"ctl.heartbeat"}` — the host's SSE keep-alive, roughly every 15 s. A consumer
+//!   can use it as a liveness signal, and it is also what lets *us* notice that our own consumer
+//!   has gone away (see [`emit`]).
 //!
 //! The cursor advances on every frame with an `id:`, so a host restart mid-watch resumes from the
 //! last event actually delivered. Backoff is capped and jittered only by the cap: an operator's
@@ -98,8 +101,16 @@ fn pump(client: &Client, kinds: Option<&str>, cursor: &mut Option<u64>) -> Resul
         };
         let value = value.strip_prefix(' ').unwrap_or(value);
         match field {
-            // A comment (`: keep-alive`) splits with an empty field name.
-            "" => {}
+            // A comment (`: keep-alive`) splits with an empty field name. The host sends one every
+            // 15 s, and we turn it into the one line that proves BOTH directions are alive.
+            //
+            // The write is the point. Our consumer is a shell widget, and when it dies its end of
+            // our stdout pipe closes — but a stream that is only ever READ never notices, so an
+            // idle host leaves `ctl watch` running forever against the server's connection cap.
+            // Measured on an Omarchy box: six orphaned watchers after three shell restarts, all on
+            // a host with no events at all. Writing here turns the next keep-alive into an EPIPE,
+            // and [`emit`] exits on it.
+            "" => emit(serde_json::json!({ "v": SCHEMA_VERSION, "kind": "ctl.heartbeat" })),
             "id" => id = value.parse().ok(),
             "event" => kind = Some(value.to_string()),
             "data" => {
@@ -143,12 +154,18 @@ fn emit_control(kind: &str, error: Option<&str>) {
     emit(line);
 }
 
-/// One line, flushed. A widget reading incrementally must not wait on a 8 KiB stdio buffer to
+/// One line, flushed. A widget reading incrementally must not wait on an 8 KiB stdio buffer to
 /// fill before it learns a device is knocking.
+///
+/// **A failed write ends the process**, rather than being ignored as it was: the only reason a
+/// write to our own stdout fails is that the consumer is gone, and carrying on would hold an SSE
+/// stream open against the host's connection cap for as long as the box stays up. Exit 0 — the
+/// consumer going away is a normal end to a `watch`, not an error anyone needs to see.
 fn emit(line: serde_json::Value) {
     let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "{line}");
-    let _ = out.flush();
+    if writeln!(out, "{line}").is_err() || out.flush().is_err() {
+        std::process::exit(0);
+    }
 }
 
 /// Minimal percent-encoding for the `kinds` query value. The grammar the host accepts is
