@@ -61,6 +61,7 @@ pub mod client;
 pub mod clipboard;
 pub mod config;
 pub mod crypto;
+pub mod discovery;
 pub mod error;
 pub mod fec;
 pub mod input;

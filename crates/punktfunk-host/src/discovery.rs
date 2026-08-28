@@ -21,6 +21,11 @@
 //! - `os` — the host's OS identity chain (`windows` | `macos` | `linux[/<family>][/<id>]`, e.g.
 //!   `linux/fedora/bazzite` — see [`crate::osinfo`]), so a client can show an OS icon on the host
 //!   card. Advisory/unauthenticated like `mac`: a wrong value only draws a wrong icon.
+//! - `addr` — the IPv4 this advert was registered for (the host's routed primary). The A-record
+//!   set a client resolves is a union polluted by OTHER responders answering per-interface (the
+//!   host OS's own mDNS stack answers for `<host>.local.` on a VPN/overlay interface with that
+//!   interface's address); the client's picker (`punktfunk_core::discovery`) uses this declared
+//!   value to break ties among addresses it resolved anyway. Advisory like the rest.
 
 use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
@@ -220,6 +225,9 @@ pub fn advertise_native(
         if !macs.is_empty() {
             props.insert("mac".into(), macs.join(","));
         }
+        // `addr` — which of the host's addresses this advert is FOR (see module doc): the
+        // client-side picker's tie-breaker against per-interface answers from other responders.
+        props.insert("addr".into(), ip.to_string());
         // Detect & warn (never modifies) if the routed NIC isn't armed to wake — the usual reason
         // WoL silently fails. Re-checked on an address change because the routed NIC may be a
         // different one now.
