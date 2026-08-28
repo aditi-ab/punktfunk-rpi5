@@ -147,6 +147,11 @@ installer_case fedora   'ID=fedora\nVERSION_ID=44\n'                    'sudo dn
 installer_case fedora43 'ID=fedora\nVERSION_ID=43\n'                    '/rpm/bazzite'
 installer_case arch     'ID=arch\n'                                    'sudo pacman -Syu --noconfirm punktfunk-host punktfunk-web punktfunk-scripting'
 installer_case cachyos  'ID=cachyos\nID_LIKE="arch"\n'                  'sudo pacman -Syu --noconfirm punktfunk-host punktfunk-web punktfunk-scripting'
+# Omarchy: arch family, but its libalpm guard kills any -S+-u transaction, so the install must
+# split into -Sy then -S (and --yes still has to reach that -S), and the run must hand off to
+# `punktfunk-omarchy setup` rather than do a second, weaker version of the same wiring.
+installer_case omarchy  'ID=omarchy\nID_LIKE=arch\nVERSION_ID=4.0.1\n'    'sudo pacman -S --noconfirm punktfunk-host punktfunk-web punktfunk-scripting'
+installer_case omarchy2 'ID=omarchy\nID_LIKE=arch\nVERSION_ID=4.0.1\n'    'punktfunk-omarchy setup'
 installer_case bazzite  'ID=bazzite\nID_LIKE="fedora"\nVERSION_ID=43\n' 'punktfunk-sysext.sh install'
 installer_case nixos    'ID=nixos\n'                                   'docs/nixos'
 installer_case steamos  'ID=steamos\nID_LIKE=arch\n'                    'docs/steamos-host'
@@ -154,6 +159,7 @@ installer_case gentoo   'ID=gentoo\n'                                  'build-fr
 installer_case debian-rm 'ID=debian\nVERSION_ID=13\n'                   'sources.list.d/punktfunk.list' --uninstall
 installer_case fedora-rm 'ID=fedora\nVERSION_ID=44\n'                   'yum.repos.d/punktfunk.repo' --uninstall
 installer_case arch-rm   'ID=arch\n'                                   '/etc/pacman.conf' --uninstall
+installer_case omarchy-rm 'ID=omarchy\nID_LIKE=arch\n'                  'punktfunk-omarchy remove' --uninstall
 installer_case bazzite-rm 'ID=bazzite\nID_LIKE="fedora"\nVERSION_ID=43\n' 'punktfunk-sysext remove' --uninstall
 
 # ---------------------------------------------------------------- gate 8: channel switching

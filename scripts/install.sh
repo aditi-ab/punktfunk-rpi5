@@ -254,6 +254,13 @@ if [ "$UNINSTALL" = 1 ]; then
             run 'sudo rm -f /etc/yum.repos.d/punktfunk.repo'
             ;;
         pacman)
+            # `punktfunk-omarchy setup` put wiring OUTSIDE the packages — ufw rules, a user-unit
+            # drop-in, an app-menu entry, hooks.json, a picker takeover in xdph.conf. Its own
+            # `remove` is the reverse, and it ships IN the host package, so it has to run before
+            # pacman takes it away. It is idempotent: safe when setup never ran.
+            if [ "$ID" = omarchy ] && { command -v punktfunk-omarchy >/dev/null 2>&1 || [ "$DRY" = 1 ]; }; then
+                run 'punktfunk-omarchy remove'
+            fi
             pkgs=$(installed_pf)
             [ -n "$pkgs" ] && run "sudo pacman -Rns $pkgs"
             run "$PACMAN_RM_REPO"
