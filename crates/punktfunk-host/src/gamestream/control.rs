@@ -158,15 +158,17 @@ impl SessionAccess {
 /// whole session (per-event logging is the DoS), totals surfaced once at session end. Plain
 /// integers, not atomics: the control thread is the only writer and reader.
 struct GrantDrops {
-    counts: [u64; 6],
-    warned: [bool; 6],
+    // One slot per grant BIT (7 with `Power`), indexed by bit position — Power never produces
+    // input drops, but `idx` must stay in bounds for every `GrantClass`.
+    counts: [u64; 7],
+    warned: [bool; 7],
 }
 
 impl GrantDrops {
     fn new() -> GrantDrops {
         GrantDrops {
-            counts: [0; 6],
-            warned: [false; 6],
+            counts: [0; 7],
+            warned: [false; 7],
         }
     }
 
@@ -1424,7 +1426,7 @@ mod tests {
         assert_eq!(drops.counts[super::GrantDrops::idx(GrantClass::Gamepad)], 0);
         // Session end logs totals once and resets for the next session.
         drops.end_of_session();
-        assert_eq!(drops.counts, [0u64; 6]);
+        assert_eq!(drops.counts, [0u64; 7]);
     }
 
     /// The session's live access state (WP13): a fingerprint with NO grants record is

@@ -20,7 +20,8 @@ class SessionAccessTest {
         assertEquals(8, SessionAccess.CLIPBOARD)
         assertEquals(16, SessionAccess.MIC)
         assertEquals(32, SessionAccess.LAUNCH)
-        assertEquals(0x3F, SessionAccess.ALL)
+        assertEquals(64, SessionAccess.POWER)
+        assertEquals(0x7F, SessionAccess.ALL)
     }
 
     @Test
@@ -35,6 +36,9 @@ class SessionAccessTest {
             SessionAccess.label(SessionAccess.GAMEPAD or SessionAccess.CLIPBOARD),
         )
         assertEquals("Custom", SessionAccess.label(SessionAccess.ALL and SessionAccess.LAUNCH.inv()))
+        // The legacy-full read rule (host-actions §4.3): an old host's pre-power "Full control"
+        // (exactly 0x3F) still labels Full, never Custom.
+        assertEquals("Full control", SessionAccess.label(0x3F))
     }
 
     @Test

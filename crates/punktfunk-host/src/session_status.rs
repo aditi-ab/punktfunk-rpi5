@@ -356,6 +356,19 @@ pub fn stop_by_fingerprint(fp_hex: &str) -> usize {
     n
 }
 
+/// Whether any live native session belongs to a client OTHER than `fp_hex` — the host-power
+/// busy policy (`design/host-actions.md` §5.5): a granted guest must not pull the host out from
+/// under someone else's live stream. Label matching as in [`stop_by_fingerprint`] (the
+/// 12-hex-char fingerprint prefix); an anonymous, IP-labelled session always counts as another
+/// client — it is certainly not the invoking paired device.
+pub fn other_client_live(fp_hex: &str) -> bool {
+    registry()
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|s| !(s.client.len() == 12 && fp_hex.starts_with(s.client.as_str())))
+}
+
 pub fn stop_all_quit() {
     for s in registry().lock().unwrap().iter() {
         s.quit.store(true, Ordering::SeqCst);

@@ -556,9 +556,21 @@ public final class PunktfunkConnection {
     public static let grantClipboard: UInt32 = 1 << 3
     public static let grantMic: UInt32 = 1 << 4
     public static let grantLaunch: UInt32 = 1 << 5
+    /// Host power — the `power.*` host actions (`design/host-actions.md`); route-gated on the
+    /// mgmt cert lane, never carried by any input event.
+    public static let grantPower: UInt32 = 1 << 6
     /// Every defined grant — full control, today's behavior and what an old host's Welcome
     /// decodes to.
-    public static let grantAll: UInt32 = 0x3F
+    public static let grantAll: UInt32 = 0x7F
+    /// `grantAll` before Power existed (hosts ≤ 0.32.x) — see ``normalizedGrants(_:)``.
+    public static let grantAllPrePower: UInt32 = 0x3F
+
+    /// The legacy-full read rule (host-actions §4.3): exactly the pre-power full mask — an old
+    /// host's "Full control" — reads as the current ``grantAll``, so a Full session against an
+    /// old host neither wears a chip nor labels "Custom". Any other mask passes through.
+    public static func normalizedGrants(_ grants: UInt32) -> UInt32 {
+        grants == grantAllPrePower ? grantAll : grants
+    }
 
     /// The three user-facing access presets plus "Custom", DERIVED from the mask (never
     /// stored — design §3.2, no drift). The label vocabulary is the cross-client one the web
@@ -570,7 +582,7 @@ public final class PunktfunkConnection {
         case custom
 
         public init(grants: UInt32) {
-            switch grants & PunktfunkConnection.grantAll {
+            switch PunktfunkConnection.normalizedGrants(grants) & PunktfunkConnection.grantAll {
             case PunktfunkConnection.grantAll: self = .fullControl
             case PunktfunkConnection.grantGamepad: self = .controllerOnly
             case 0: self = .viewOnly
@@ -631,9 +643,11 @@ public final class PunktfunkConnection {
     /// The session's grants allow mic injection — hide the mic UI without it.
     public var canUseMic: Bool { accessGrants & Self.grantMic != 0 }
     /// Anything about this session's access differs from the everyday full-and-permanent —
-    /// the chip's visibility gate: full + permanent must look exactly like today.
+    /// the chip's visibility gate: full + permanent must look exactly like today. Compared
+    /// through ``normalizedGrants(_:)`` so an old host's pre-power full mask stays chipless.
     public var accessIsLimited: Bool {
-        accessGrants & Self.grantAll != Self.grantAll || accessExpiresInSeconds != 0
+        Self.normalizedGrants(accessGrants) & Self.grantAll != Self.grantAll
+            || accessExpiresInSeconds != 0
     }
 
     /// The grant bit one wire input kind needs — the Swift mirror of core's exhaustive

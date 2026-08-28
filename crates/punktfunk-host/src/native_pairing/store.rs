@@ -126,6 +126,8 @@ impl TrustStore {
     /// expired, `Some(mask)` otherwise (absent grants = [`GRANT_ALL`], the pre-grants record).
     /// The mask is ANDed with [`GRANT_ALL`] on the way out: a store written by a future host
     /// version (or hand-edited) can't smuggle reserved bits into this version's enforcement.
+    /// An explicitly stored pre-power "Full control" (exactly the old `GRANT_ALL`) reads as the
+    /// current one — the legacy-full rule, `normalize_legacy_full` (host-actions §4.3).
     /// `now_unix` is the caller's wall clock — passed in, not sampled here, so the expiry
     /// evaluation and whatever decision it feeds share one instant.
     pub(super) fn effective(&self, fp_hex: &str, now_unix: i64) -> Option<u32> {
@@ -138,7 +140,7 @@ impl TrustStore {
         if c.expires_unix.is_some_and(|t| now_unix >= t) {
             return None;
         }
-        Some(c.grants.unwrap_or(GRANT_ALL) & GRANT_ALL)
+        Some(punktfunk_core::quic::normalize_legacy_full(c.grants.unwrap_or(GRANT_ALL)) & GRANT_ALL)
     }
 
     /// The stored record for a fingerprint (for the facade's watch-state snapshot and the

@@ -48,6 +48,10 @@ pub const ACCESS_EXPIRED_CLOSE_CODE: u32 = 0x69;
 /// Refused AT the handshake — a crisp typed reason beats silently dropping the user onto a
 /// bare desktop they didn't ask for. Connecting *without* a launch request still works.
 pub const LAUNCH_NOT_PERMITTED_CLOSE_CODE: u32 = 0x6A;
+/// A host power action (`power.sleep`/`reboot`/`shutdown`, `design/host-actions.md`) is ending
+/// every session: the host is going to sleep or shutting down, deliberately — not a crash, not
+/// the network. Old clients render the generic close; acceptable degrade.
+pub const HOST_POWER_CLOSE_CODE: u32 = 0x6B;
 
 /// Why a host turned a connection away, decoded from the QUIC application close code — the
 /// client-side view of [`PAIR_NOT_ARMED_CLOSE_CODE`]..[`WIRE_VERSION_CLOSE_CODE`] plus
@@ -81,6 +85,8 @@ pub enum RejectReason {
     AccessExpired,
     /// This device's grants don't include launching games (the `LAUNCH` bit is clear).
     LaunchNotPermitted,
+    /// The host is going to sleep or shutting down (a host power action ended the session).
+    HostPower,
 }
 
 impl RejectReason {
@@ -100,6 +106,7 @@ impl RejectReason {
             SETUP_FAILED_CLOSE_CODE => Self::SetupFailed,
             ACCESS_EXPIRED_CLOSE_CODE => Self::AccessExpired,
             LAUNCH_NOT_PERMITTED_CLOSE_CODE => Self::LaunchNotPermitted,
+            HOST_POWER_CLOSE_CODE => Self::HostPower,
             _ => return None,
         })
     }
@@ -119,6 +126,7 @@ impl RejectReason {
             Self::SetupFailed => SETUP_FAILED_CLOSE_CODE,
             Self::AccessExpired => ACCESS_EXPIRED_CLOSE_CODE,
             Self::LaunchNotPermitted => LAUNCH_NOT_PERMITTED_CLOSE_CODE,
+            Self::HostPower => HOST_POWER_CLOSE_CODE,
         }
     }
 
@@ -138,6 +146,7 @@ impl RejectReason {
             Self::SetupFailed => "setup-failed",
             Self::AccessExpired => "access-expired",
             Self::LaunchNotPermitted => "launch-not-permitted",
+            Self::HostPower => "host-power",
         }
     }
 }
@@ -159,6 +168,7 @@ impl std::fmt::Display for RejectReason {
             Self::SetupFailed => "the host could not start the stream session",
             Self::AccessExpired => "your access to this host has expired",
             Self::LaunchNotPermitted => "this device is not permitted to launch games on the host",
+            Self::HostPower => "the host is going to sleep or shutting down",
         })
     }
 }
@@ -167,7 +177,7 @@ impl std::fmt::Display for RejectReason {
 mod tests {
     use super::*;
 
-    const ALL: [RejectReason; 12] = [
+    const ALL: [RejectReason; 13] = [
         RejectReason::PairingNotArmed,
         RejectReason::PairingBoundToOtherDevice,
         RejectReason::PairingRateLimited,
@@ -180,6 +190,7 @@ mod tests {
         RejectReason::SetupFailed,
         RejectReason::AccessExpired,
         RejectReason::LaunchNotPermitted,
+        RejectReason::HostPower,
     ];
 
     #[test]
@@ -200,9 +211,10 @@ mod tests {
     #[test]
     fn foreign_codes_stay_untyped() {
         // Bare closes, the client's own pair-done codes, and the deliberate-end codes must
-        // never read as a host rejection. (0x69/0x6A left this list when they became the
-        // access-expired / launch-not-permitted codes; 0x6B is the block's next free id.)
-        for code in [0u32, 1, 0x41, 0x51, 0x52, 0x5f, 0x6B, 0x70, u32::MAX] {
+        // never read as a host rejection. (0x69/0x6A/0x6B left this list when they became the
+        // access-expired / launch-not-permitted / host-power codes; 0x6C is the block's next
+        // free id.)
+        for code in [0u32, 1, 0x41, 0x51, 0x52, 0x5f, 0x6C, 0x70, u32::MAX] {
             assert_eq!(RejectReason::from_close_code(code), None);
         }
     }

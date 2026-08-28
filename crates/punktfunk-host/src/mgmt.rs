@@ -29,6 +29,7 @@ use utoipa::{Modify, OpenApi};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use utoipa_scalar::{Scalar, Servable};
 
+mod actions;
 mod auth;
 mod client_logs;
 mod clients;
@@ -411,7 +412,9 @@ fn api_router_parts() -> (Router<Arc<MgmtState>>, utoipa::openapi::OpenApi) {
         .routes(routes!(store::get_runtime, store::set_runtime))
         .routes(routes!(update::get_update_status))
         .routes(routes!(update::force_update_check))
-        .routes(routes!(update::apply_update));
+        .routes(routes!(update::apply_update))
+        .routes(routes!(actions::list_actions))
+        .routes(routes!(actions::invoke_action));
     OpenApiRouter::with_openapi(ApiDoc::openapi())
         .nest("/api/v1", api_v1)
         .split_for_parts()
@@ -454,6 +457,7 @@ pub fn openapi_json() -> String {
         (name = "plugins", description = "Plugin directory: running `punktfunk-plugin-*` processes register a lease and, optionally, a loopback UI the web console proxies and adds to its nav"),
         (name = "store", description = "Plugin store: browse signed catalogs (verified first-party entries, attributed third-party sources), install/uninstall as tracked jobs, and switch the plugin runner on"),
         (name = "update", description = "Host update check: install kind + channel, the last verified release manifest, and whether a newer host exists (admin lane only)"),
+        (name = "actions", description = "Host actions: discover what this host offers (per-caller availability + permission) and invoke one by id — v1: sleep, restart, shut down the machine, gated per device by the Host power grant"),
     )
 )]
 struct ApiDoc;

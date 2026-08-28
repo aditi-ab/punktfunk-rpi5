@@ -824,10 +824,24 @@
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Host power: invoking the `power.*` host actions (sleep/reboot/shutdown) over the mgmt cert
+// lane (`design/host-actions.md` §4). Route-gated like `CLIPBOARD`/`MIC`/`LAUNCH` — no
+// datagram ever carries it, so [`classify`] is untouched. Machine power ONLY: future
+// plugin/custom actions get their own class, never this bit.
+#define PUNKTFUNK_GRANT_POWER (1 << 6)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Every defined grant. Also the value an *absent* mask means — a record from before grants
 // existed (or an old host's Welcome that omits the field) is full control, so existing
 // pairings keep today's behavior.
-#define PUNKTFUNK_GRANT_ALL (((((PUNKTFUNK_GRANT_GAMEPAD | PUNKTFUNK_GRANT_POINTER) | PUNKTFUNK_GRANT_KEYBOARD) | PUNKTFUNK_GRANT_CLIPBOARD) | PUNKTFUNK_GRANT_MIC) | PUNKTFUNK_GRANT_LAUNCH)
+#define PUNKTFUNK_GRANT_ALL ((((((PUNKTFUNK_GRANT_GAMEPAD | PUNKTFUNK_GRANT_POINTER) | PUNKTFUNK_GRANT_KEYBOARD) | PUNKTFUNK_GRANT_CLIPBOARD) | PUNKTFUNK_GRANT_MIC) | PUNKTFUNK_GRANT_LAUNCH) | PUNKTFUNK_GRANT_POWER)
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`GRANT_ALL`] as it was before [`GRANT_POWER`] existed (hosts ≤ 0.32.x) — the mask an
+// explicitly saved "Full control" wrote back then. See [`normalize_legacy_full`].
+#define PUNKTFUNK_GRANT_ALL_PRE_POWER (((((PUNKTFUNK_GRANT_GAMEPAD | PUNKTFUNK_GRANT_POINTER) | PUNKTFUNK_GRANT_KEYBOARD) | PUNKTFUNK_GRANT_CLIPBOARD) | PUNKTFUNK_GRANT_MIC) | PUNKTFUNK_GRANT_LAUNCH)
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -1945,6 +1959,11 @@
 // bare desktop they didn't ask for. Connecting *without* a launch request still works.
 #define PUNKTFUNK_LAUNCH_NOT_PERMITTED_CLOSE_CODE 106
 
+// A host power action (`power.sleep`/`reboot`/`shutdown`, `design/host-actions.md`) is ending
+// every session: the host is going to sleep or shutting down, deliberately — not a crash, not
+// the network. Old clients render the generic close; acceptable degrade.
+#define PUNKTFUNK_HOST_POWER_CLOSE_CODE 107
+
 // Minimum supported multiplier (renders under native, upscaled on present).
 #define PUNKTFUNK_MIN_SCALE 0.5
 
@@ -1981,6 +2000,7 @@ enum PunktfunkStatus
     PUNKTFUNK_STATUS_REJECTED_SETUP_FAILED = -29,
     PUNKTFUNK_STATUS_REJECTED_ACCESS_EXPIRED = -30,
     PUNKTFUNK_STATUS_REJECTED_LAUNCH_NOT_PERMITTED = -31,
+    PUNKTFUNK_STATUS_REJECTED_HOST_POWER = -32,
     PUNKTFUNK_STATUS_PANIC = -99,
 };
 #ifndef __cplusplus

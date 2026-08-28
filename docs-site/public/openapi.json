@@ -13,6 +13,114 @@
     "version": "0.32.0"
   },
   "paths": {
+    "/api/v1/actions": {
+      "get": {
+        "tags": [
+          "actions"
+        ],
+        "summary": "List host actions",
+        "description": "The actions this host offers, as seen by the caller: platform availability (with the honest\nreason when something can't run) and whether THIS caller is permitted to invoke each one.\nAdmin lane: everything permitted. Paired-cert lane: permission follows the device's live\naccess mask (the Host power grant). Clients render rows generically — unknown ids still\nwork with the server-supplied title.",
+        "operationId": "listActions",
+        "responses": {
+          "200": {
+            "description": "The actions, per-caller",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/actions/{id}": {
+      "post": {
+        "tags": [
+          "actions"
+        ],
+        "summary": "Invoke a host action",
+        "description": "Runs one action by id — empty body, no parameters: the id selects a fixed host-side\nbehavior, and nothing in the request reaches the privileged path. On `202` the host first\nends every streaming session cleanly (clients see a typed \"the host is going to sleep /\nshutting down\" close), waits ~1 s so this response flushes, then acts.\n\nPaired-cert callers need the **Host power** grant, and are refused (`409`) while another\ndevice's session is live — a granted guest cannot yank the host out from under the owner\nmid-stream. The admin console is never blocked (it warns instead). One action runs at a\ntime host-wide.",
+        "operationId": "invokeAction",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Action id (`power.sleep`, `power.reboot`, `power.shutdown`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Accepted — sessions are being ended and the action follows in about a second"
+          },
+          "401": {
+            "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "This caller's access does not include this action (no Host power grant)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown action id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Refused: an action is already in flight, another device's session is live (cert lane), or the platform said no (a foreign sleep inhibitor, a second local user, …)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "This host platform has no executor for it (macOS host)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/client-logs": {
       "get": {
         "tags": [
@@ -4331,6 +4439,67 @@
   },
   "components": {
     "schemas": {
+      "ActionInfo": {
+        "type": "object",
+        "description": "One action as the caller sees it (`GET /actions`).",
+        "required": [
+          "id",
+          "title",
+          "group",
+          "danger",
+          "available",
+          "permitted"
+        ],
+        "properties": {
+          "available": {
+            "type": "boolean",
+            "description": "Whether this host can run it right now (platform probe — a VM that can't S3 lists\nsleep as unavailable rather than offering a dead switch)."
+          },
+          "danger": {
+            "type": "boolean",
+            "description": "Whether a client UI should double-confirm (the action loses state — reboot/shutdown)."
+          },
+          "group": {
+            "type": "string",
+            "description": "Action group (`power` for the built-ins)."
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable action id (`power.sleep`, …) — the invoke path parameter.",
+            "example": "power.sleep"
+          },
+          "permitted": {
+            "type": "boolean",
+            "description": "Whether THIS caller may invoke it (admin lane: always; cert lane: the `GRANT_POWER`\nbit of the device's live access mask)."
+          },
+          "title": {
+            "type": "string",
+            "description": "Display title. Clients localize known ids and fall back to this for unknown ones."
+          },
+          "unavailable_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it is unavailable, when it is."
+          }
+        }
+      },
+      "ActionList": {
+        "type": "object",
+        "description": "`GET /actions` response.",
+        "required": [
+          "actions"
+        ],
+        "properties": {
+          "actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActionInfo"
+            }
+          }
+        }
+      },
       "ActiveGame": {
         "type": "object",
         "description": "One launched game, for the console's running-game card.",
@@ -6138,6 +6307,42 @@
                 "enum": [
                   "store.changed"
                 ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A host action was invoked (`design/host-actions.md` §3.3) — v1: the `power.*` verbs.\nEmitted on ACCEPT (`outcome: \"accepted\"`), and again if the executor later fails\n(`outcome: \"failed: …\"`) — a succeeded power action ends this process, so \"accepted with\nno failure after it\" is the success signal a hook can act on (\"the host is going down\").",
+            "required": [
+              "id",
+              "outcome",
+              "kind"
+            ],
+            "properties": {
+              "device": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/DeviceRef",
+                    "description": "The invoking paired device, when the cert lane invoked it; absent for the\noperator's console (admin lane)."
+                  }
+                ]
+              },
+              "id": {
+                "type": "string",
+                "description": "The invoked action id (`power.sleep`, `power.reboot`, `power.shutdown`)."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "action.invoked"
+                ]
+              },
+              "outcome": {
+                "type": "string",
+                "description": "`accepted`, or `failed: <the executor's error>`."
               }
             }
           },
@@ -9142,6 +9347,10 @@
     {
       "name": "update",
       "description": "Host update check: install kind + channel, the last verified release manifest, and whether a newer host exists (admin lane only)"
+    },
+    {
+      "name": "actions",
+      "description": "Host actions: discover what this host offers (per-caller availability + permission) and invoke one by id — v1: sleep, restart, shut down the machine, gated per device by the Host power grant"
     }
   ]
 }

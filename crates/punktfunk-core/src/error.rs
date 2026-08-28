@@ -64,6 +64,7 @@ pub enum PunktfunkStatus {
     RejectedSetupFailed = -29,
     RejectedAccessExpired = -30,
     RejectedLaunchNotPermitted = -31,
+    RejectedHostPower = -32,
     Panic = -99,
 }
 
@@ -95,6 +96,7 @@ impl PunktfunkError {
                     R::SetupFailed => PunktfunkStatus::RejectedSetupFailed,
                     R::AccessExpired => PunktfunkStatus::RejectedAccessExpired,
                     R::LaunchNotPermitted => PunktfunkStatus::RejectedLaunchNotPermitted,
+                    R::HostPower => PunktfunkStatus::RejectedHostPower,
                 }
             }
         }

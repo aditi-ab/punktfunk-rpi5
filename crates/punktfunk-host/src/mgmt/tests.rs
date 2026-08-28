@@ -159,6 +159,91 @@ async fn send_cert(app: &Router, mut req: axum::http::Request<Body>, fp: &str) -
     app.clone().oneshot(req).await.expect("infallible").status()
 }
 
+/// The host-actions surface (design/host-actions.md): discovery reports `permitted` per caller
+/// from the device's LIVE mask; invoke 403s without the Power grant and 404s an unknown id.
+/// An explicitly stored pre-power "Full control" (`0x3F`) carries Power via the legacy-full
+/// read rule (§4.3). Deliberately NO test ever reaches a 202 accept — on a real box that
+/// would genuinely suspend it.
+#[tokio::test]
+async fn host_actions_follow_the_power_grant() {
+    use punktfunk_core::quic::{GRANT_ALL_PRE_POWER, GRANT_GAMEPAD};
+    let np = Arc::new(
+        crate::native_pairing::NativePairing::load_with(
+            Some(std::env::temp_dir().join(format!("pf-mgmt-actions-{}.json", std::process::id()))),
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let guest_fp = "aaaa00000001";
+    let owner_fp = "bbbb00000002";
+    let legacy_fp = "cccc00000003";
+    np.add_with_access(
+        "guest",
+        guest_fp,
+        Some(crate::native_pairing::Access {
+            grants: GRANT_GAMEPAD,
+            expires_unix: None,
+        }),
+    )
+    .unwrap();
+    np.add("owner", owner_fp).unwrap(); // absent grants = full control, Power included
+    np.add_with_access(
+        "legacy",
+        legacy_fp,
+        Some(crate::native_pairing::Access {
+            grants: GRANT_ALL_PRE_POWER, // an explicit pre-power "Full control"
+            expires_unix: None,
+        }),
+    )
+    .unwrap();
+    let app = test_app_native(test_state(), np);
+
+    let discover = |fp: &str| {
+        let mut req = get_req("/api/v1/actions");
+        req.extensions_mut()
+            .insert(PeerCertFingerprint(Some(fp.to_string())));
+        req
+    };
+    let (status, body) = send(&app, discover(guest_fp)).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body["actions"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{body}");
+    assert!(
+        rows.iter().all(|a| a["permitted"] == false),
+        "a controller-only guest must not be offered power: {body}"
+    );
+    for fp in [owner_fp, legacy_fp] {
+        let (_, body) = send(&app, discover(fp)).await;
+        assert!(
+            body["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["permitted"] == true),
+            "full control (current or legacy-stored) carries Power: {body}"
+        );
+    }
+    // The admin bearer (no cert) sees everything permitted — the console is the owner surface.
+    let (_, body) = send(&app, get_req("/api/v1/actions")).await;
+    assert!(body["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|a| a["permitted"] == true));
+
+    let post = |path: &str| axum::http::Request::post(path).body(Body::empty()).unwrap();
+    // Invoke without the grant: the typed 403, distinct from unpaired (which never gets here).
+    assert_eq!(
+        send_cert(&app, post("/api/v1/actions/power.sleep"), guest_fp).await,
+        StatusCode::FORBIDDEN,
+        "no Power bit ⇒ 403"
+    );
+    // Unknown id: 404, before any permission or platform question.
+    let (status, _) = send(&app, post("/api/v1/actions/no.such")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 /// A paired *streaming* cert (mTLS, no bearer) authorizes only the read-only allowlist; every
 /// state-changing or PIN-exposing route still requires the operator's bearer token (audit #4).
 #[tokio::test]
@@ -1650,6 +1735,12 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("GET", "/api/v1/update/status", false, false),
         ("POST", "/api/v1/update/check", false, false),
         ("POST", "/api/v1/update/apply", false, false),
+        // ---- host actions (design/host-actions.md): the cert lane's surface — discovery is
+        // per-caller-filtered, invoke demands the GRANT_POWER bit in the handler. The plugin
+        // token gets NEITHER route: a plugin that wants to power-manage the host is an
+        // operator-hook/automation story, not a shared-token capability (§3.4).
+        ("GET", "/api/v1/actions", false, true),
+        ("POST", "/api/v1/actions/{id}", false, true),
     ];
 
     /// A path template's concrete form: every `{param}` segment becomes a literal, so the gates

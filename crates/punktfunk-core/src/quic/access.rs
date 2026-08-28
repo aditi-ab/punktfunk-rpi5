@@ -32,12 +32,42 @@ pub const GRANT_CLIPBOARD: u32 = 1 << 3;
 pub const GRANT_MIC: u32 = 1 << 4;
 /// Library launch: `Hello.launch` resolution (and any future in-session launch/end verbs).
 pub const GRANT_LAUNCH: u32 = 1 << 5;
+/// Host power: invoking the `power.*` host actions (sleep/reboot/shutdown) over the mgmt cert
+/// lane (`design/host-actions.md` §4). Route-gated like `CLIPBOARD`/`MIC`/`LAUNCH` — no
+/// datagram ever carries it, so [`classify`] is untouched. Machine power ONLY: future
+/// plugin/custom actions get their own class, never this bit.
+pub const GRANT_POWER: u32 = 1 << 6;
 
 /// Every defined grant. Also the value an *absent* mask means — a record from before grants
 /// existed (or an old host's Welcome that omits the field) is full control, so existing
 /// pairings keep today's behavior.
-pub const GRANT_ALL: u32 =
+pub const GRANT_ALL: u32 = GRANT_GAMEPAD
+    | GRANT_POINTER
+    | GRANT_KEYBOARD
+    | GRANT_CLIPBOARD
+    | GRANT_MIC
+    | GRANT_LAUNCH
+    | GRANT_POWER;
+
+/// [`GRANT_ALL`] as it was before [`GRANT_POWER`] existed (hosts ≤ 0.32.x) — the mask an
+/// explicitly saved "Full control" wrote back then. See [`normalize_legacy_full`].
+pub const GRANT_ALL_PRE_POWER: u32 =
     GRANT_GAMEPAD | GRANT_POINTER | GRANT_KEYBOARD | GRANT_CLIPBOARD | GRANT_MIC | GRANT_LAUNCH;
+
+/// The legacy-full read rule (`design/host-actions.md` §4.3): a mask that is EXACTLY the
+/// pre-power [`GRANT_ALL_PRE_POWER`] was written by "Full control" before the Power bit existed
+/// — read it as the current [`GRANT_ALL`], so an old explicit-Full record neither renders as
+/// "Custom" nor silently lacks Power while looking Full. Not an escalation: that mask holds
+/// `KEYBOARD`+`POINTER`, which already reach the streamed desktop's power menu (§4.2). The
+/// deliberate consequence: "everything except Power" is not an expressible stored mask — by
+/// design, because it would be a lock painted on an open door. Any other mask passes through.
+pub fn normalize_legacy_full(mask: u32) -> u32 {
+    if mask == GRANT_ALL_PRE_POWER {
+        GRANT_ALL
+    } else {
+        mask
+    }
+}
 
 /// The reserved-must-be-zero region: a mask with any of these bits set is invalid today and is
 /// rejected at the management API (never silently cleared — the caller meant *something* this
@@ -64,6 +94,8 @@ pub enum GrantClass {
     Clipboard,
     Mic,
     Launch,
+    /// The `power.*` host actions (route-gated on the mgmt cert lane; never an input event).
+    Power,
 }
 
 impl GrantClass {
@@ -77,6 +109,7 @@ impl GrantClass {
             Self::Clipboard => GRANT_CLIPBOARD,
             Self::Mic => GRANT_MIC,
             Self::Launch => GRANT_LAUNCH,
+            Self::Power => GRANT_POWER,
         }
     }
 }
@@ -124,6 +157,7 @@ mod tests {
             GRANT_CLIPBOARD,
             GRANT_MIC,
             GRANT_LAUNCH,
+            GRANT_POWER,
         ];
         let mut acc = 0u32;
         for b in bits {
@@ -138,11 +172,27 @@ mod tests {
 
     #[test]
     fn presets_match_the_design() {
-        // Full = everything; Controller-only = pad bit ONLY (no LAUNCH — §11 D2); View = nothing.
+        // Full = everything (Power included — host-actions §4.2); Controller-only = pad bit
+        // ONLY (no LAUNCH — §11 D2, and certainly no POWER); View = nothing.
         assert_eq!(GRANT_PRESET_FULL, GRANT_ALL);
+        assert_eq!(GRANT_PRESET_FULL & GRANT_POWER, GRANT_POWER);
         assert_eq!(GRANT_PRESET_CONTROLLER_ONLY, GRANT_GAMEPAD);
         assert_eq!(GRANT_PRESET_CONTROLLER_ONLY & GRANT_LAUNCH, 0);
         assert_eq!(GRANT_PRESET_VIEW_ONLY, 0);
+    }
+
+    #[test]
+    fn legacy_full_reads_as_the_current_full() {
+        // Exactly the pre-power full mask (an explicitly saved "Full control" from ≤ 0.32.x)
+        // normalizes to today's GRANT_ALL — anything else, limited or already-current, passes
+        // through untouched (host-actions §4.3).
+        assert_eq!(GRANT_ALL_PRE_POWER, 0x3F);
+        assert_eq!(normalize_legacy_full(GRANT_ALL_PRE_POWER), GRANT_ALL);
+        assert_eq!(normalize_legacy_full(GRANT_ALL), GRANT_ALL);
+        assert_eq!(normalize_legacy_full(GRANT_GAMEPAD), GRANT_GAMEPAD);
+        assert_eq!(normalize_legacy_full(0), 0);
+        let limited = GRANT_ALL_PRE_POWER & !GRANT_KEYBOARD;
+        assert_eq!(normalize_legacy_full(limited), limited);
     }
 
     #[test]
@@ -181,5 +231,6 @@ mod tests {
         assert_eq!(GrantClass::Clipboard.bit(), GRANT_CLIPBOARD);
         assert_eq!(GrantClass::Mic.bit(), GRANT_MIC);
         assert_eq!(GrantClass::Launch.bit(), GRANT_LAUNCH);
+        assert_eq!(GrantClass::Power.bit(), GRANT_POWER);
     }
 }

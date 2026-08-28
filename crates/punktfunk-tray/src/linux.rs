@@ -155,7 +155,10 @@ impl ksni::Tray for HostTray {
             }
             .into(),
             StandardItem {
-                label: "Restart host".into(),
+                // "Restart Punktfunk", not "Restart host": this restarts the SERVICE, and the
+                // clients' host-power menus use "Restart host" for the MACHINE
+                // (design/host-actions.md §7) — one phrase must not mean two verbs.
+                label: "Restart Punktfunk".into(),
                 visible: running || matches!(self.status, TrayStatus::Error(_)),
                 activate: Box::new(|t: &mut Self| t.systemctl("restart")),
                 ..Default::default()
