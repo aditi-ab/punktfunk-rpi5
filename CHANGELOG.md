@@ -19,229 +19,96 @@ as they are. See `docs/writing.md` §2.
 
 ## v0.33.0
 
-45 commits since v0.32.0 (29 non-merge), counted at the tip this was cut from.
-
-**Nothing versioned moves.** Wire protocol stays 2, C ABI stays 26, driver protocol 6, gamepad
-channel 3, plugin index schema 1, host event schema 1, gamescope `pfhdr8`. The management API is
-the one surface that grows: `api/openapi.json` gains `/api/v1/actions` and `/api/v1/actions/{id}`.
-First section written to `docs/writing.md` §2.
-
-**Two things an embedder must read.** `PUNKTFUNK_GRANT_ALL` widens from `0x3F` to `0x7F` — a value
-change to an existing macro, not an addition — and `CLIENT_CAP_KEEP_HOST_AUDIO` is renamed to
-`PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO`. Both are under **Breaking**.
+45 commits since v0.32.0. Wire stays 2. C ABI stays 26. OpenAPI adds the actions routes.
+Embedders: read **Breaking**. Detail: `design/host-actions.md`.
 
 ### Versions
 
 | | v0.32.0 | v0.33.0 | Notes |
 |---|---|---|---|
-| Wire protocol | 2 | **2** | unchanged. Two additions, each ignorable by an older peer: close code `107` (`HOST_POWER_CLOSE_CODE`, reject reason `HostPower`) and the advisory mDNS TXT key `addr` |
-| C ABI | 26 | **26** | unchanged. Additive: `PUNKTFUNK_GRANT_POWER` (`1 << 6`), `PUNKTFUNK_GRANT_ALL_PRE_POWER`, `PUNKTFUNK_HOST_POWER_CLOSE_CODE`, `PUNKTFUNK_STATUS_REJECTED_HOST_POWER` (`-32`). **But `PUNKTFUNK_GRANT_ALL` changes value** — see Breaking |
-| Rust edition | 2024 | **2024** | unchanged |
-| MSRV (`rust-version`) | 1.85 | **1.85** | unchanged |
-| Workspace crate dirs | 27 | **27** | unchanged (39 `[workspace] members`, also unchanged) |
-| Virtual-display driver protocol | 6 | **6** | unchanged (minimum accepted still 3); `pf-driver-proto` shows no diff against the v0.32.0 tag |
-| Windows virtual-gamepad channel | 3 | **3** | unchanged; nothing under the Windows gamepad backends moved |
-| Plugin index schema | 1 | **1** | unchanged |
-| Host event schema | 1 | **1** | unchanged. Additive: the `action.invoked` event kind, carrying `id`, an optional `device` and `outcome` |
-| `api/openapi.json` | 0.32.0 | **0.33.0** | **MOVES.** Two added paths, `GET /api/v1/actions` and `POST /api/v1/actions/{id}`. `api/` and `docs-site/public/` are byte-identical to each other |
-| gamescope patch level (`+pfhdrN`) | 8 | **8** | unchanged; `packaging/gamescope/PKGBUILD` shows no diff |
-| `@punktfunk/host` (SDK) | 0.1.6 | **0.1.6** | unchanged **on purpose**. `sdk/src/gen/punktfunk.ts` is regenerated with the actions types, but the plugin token is refused both routes, so no plugin can call them. Cut `sdk-v0.1.7` when a plugin-reachable route moves |
-| `@punktfunk/plugin-kit` | 0.4.4 | **0.4.4** | unchanged; nothing under `plugin-kit/` moved |
+| Wire protocol | 2 | **2** | Additive: close code `107` (`HostPower`); mDNS TXT `addr` |
+| C ABI | 26 | **26** | Additive constants below. **`PUNKTFUNK_GRANT_ALL` changes value** — Breaking |
+| Rust edition | 2024 | **2024** | |
+| MSRV | 1.85 | **1.85** | |
+| Workspace crate dirs | 27 | **27** | |
+| Driver protocol | 6 | **6** | |
+| Windows gamepad channel | 3 | **3** | |
+| Plugin index schema | 1 | **1** | |
+| Host event schema | 1 | **1** | Additive: `action.invoked` |
+| `api/openapi.json` | 0.32.0 | **0.33.0** | `GET /api/v1/actions`, `POST /api/v1/actions/{id}` |
+| gamescope (`+pfhdrN`) | 8 | **8** | |
+| `@punktfunk/host` | 0.1.6 | **0.1.6** | Types regenerated; plugin token still cannot call the new routes |
+| `@punktfunk/plugin-kit` | 0.4.4 | **0.4.4** | |
 
 ### Breaking
 
-- **`PUNKTFUNK_GRANT_ALL` widens `0x3F` → `0x7F`.** `GRANT_POWER` (`1 << 6`) joins the mask. Code
-  comparing a stored mask against `GRANT_ALL` for equality now reads a pre-power record as Custom.
-  The host applies a legacy-full rule — an explicitly stored `0x3F` reads as the current
-  `GRANT_ALL` — so existing Full-control pairings keep Full control and gain Power with it. An
-  embedder holding its own copy of a mask must apply the same rule, or compare against the new
-  `PUNKTFUNK_GRANT_ALL_PRE_POWER`. *A pairing saved as Full control before this release can now
-  sleep, restart and shut down the host.*
-- **`CLIENT_CAP_KEEP_HOST_AUDIO` is renamed `PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO`.** cbindgen had
-  no rename entry, so v0.32.0 emitted the bare name into every embedder's namespace. The value is
-  still `32`. Anything compiled against the unprefixed spelling fails to compile; add the prefix.
-- **The `custom_picker_binary` shim is restored on host exit, not after each cast** (Hyprland,
-  Omarchy). Restoring per cast rewrote `xdph.conf` and restarted
-  `xdg-desktop-portal-hyprland`, and a ScreenCast bound across that restart never delivers a
-  buffer — so every session after the first produced no frames. The shim now stays installed
-  between sessions and delegates to the previously configured picker, so ordinary browser shares
-  behave as before. `punktfunk-omarchy remove` restores it from its marker.
+- **`PUNKTFUNK_GRANT_ALL` is `0x7F`, was `0x3F`.** `GRANT_POWER` (`1 << 6`) joined the mask.
+  The host treats a stored `0x3F` as current `GRANT_ALL`, so existing Full-control pairings
+  gain Power (sleep / reboot / shutdown). If you keep your own copy of the mask, apply the
+  same rule or compare against `PUNKTFUNK_GRANT_ALL_PRE_POWER`.
+- **`CLIENT_CAP_KEEP_HOST_AUDIO` is now `PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO`.** Value is
+  still `32`. Rebuild against the prefix; the unprefixed name no longer compiles.
 
 ### Added
 
-- **Host actions: a reusable registry with three power built-ins.** `GET /api/v1/actions` returns
-  the caller's permitted actions with honest availability; `POST /api/v1/actions/{id}` invokes one
-  by id on the mgmt cert lane. `power.sleep`, `power.reboot` and `power.shutdown` ship. Executors:
-  logind via zbus behind the shipped polkit rule, deliberately without `-ignore-inhibit`; Windows
-  `SeShutdownPrivilege` + `InitiateSystemShutdownExW` / `SetSuspendState`; macOS answers 501.
-  Ordering is reply-202 → typed close → 1 s grace → act, single-flight, and another device's live
-  session blocks a cert-lane invoke with 409. Denials log once per `(fingerprint, action)` per
-  boot. **The plugin token gets neither route.** See `design/host-actions.md`.
-- **`PUNKTFUNK_GRANT_POWER` (`1 << 6`)** — route-gated like `CLIPBOARD` / `MIC` / `LAUNCH`; no
-  datagram carries it, so `classify` is untouched. Machine power only: future plugin or custom
-  actions get their own class, never this bit.
-- **`punktfunk-host ctl`** — 15 verbs over the existing admin lane. Pairing arm/pending/approve/
-  deny, the Moonlight PIN, both planes' device lists with rename/unpair/access presets, and
-  session stop/end-game. `watch` bridges the server-sent-event stream to line-JSON on stdout, with
-  `Last-Event-ID` resume and a synthetic `ctl.resync` line after a `dropped` frame. `--json`
-  returns a versioned envelope. **Pin before token:** the agent pins the host's own leaf through
-  punktfunk-core's `PinVerify`, so rustls rejects a squatter *during the handshake* and ureq never
-  serialises an `Authorization` header. There is deliberately no `--token` flag and no token env
-  read — a credential in either is readable cross-uid through `/proc`. The pin is
-  `native-cert.pem` then `cert.pem`, because the mgmt listener serves the native identity.
-- **`punktfunk-omarchy setup | remove | status`** — installed by the host package, never run by it.
-  It sets up LAN-scoped comment-tagged ufw rules, the uwsm session drop-in, and the console as a
-  webapp. It also merges an app-menu submenu between markers into the user's
-  `omarchy-menu.jsonc`, writes sample hooks through `hooks.json`, adds an idle guard that
-  snapshots and restores the user's own stay-awake setting, and installs the theme template.
-  `osinfo::is_omarchy()` makes the console update tier notify-only, enforced at the apply route
-  rather than merely reported.
-- **Console handoff ticket.** `punktfunk-host ctl console-url` mints
-  `<unix-seconds>.<nonce>.<HMAC-SHA256>` over `pf-console-handoff:v1:ts:nonce`, signed with the
-  management token both sides already hold. 60 s TTL, single use, symmetric window, one 401 for
-  every rejection. No new host route and no shared state. The test suite carries a vector minted by
-  the real Rust host and cross-checked against python's `hmac`.
-- **mDNS advisory TXT key `addr`.** The host declares which address its advert is for. It never
-  overrides reachability — it settles a multi-NIC host's tie, and old hosts without it still
-  resolve deterministically.
-- **`action.invoked` on the host event bus.** Emitted on ACCEPT, and again if the executor later
-  fails. A succeeded power action ends the process, so "accepted with no failure after it" is the
-  success signal a hook can act on.
-- **Two diagnostics catalog rows.** `hyprland_permissions` — Hyprland 0.49+ can deny screencopy and
-  virtual input **silently**, and no probe outside the compositor can tell granted from denied, so
-  it is a Warning rather than Critical. `omarchy_updates` — the console's apply button is
-  deliberately absent on Omarchy, and without a row naming where updates come from, "my update
-  button is missing" is unanswerable.
+- **Host actions.** `GET /api/v1/actions` lists what the caller may run; `POST /api/v1/actions/{id}`
+  invokes one on the mgmt cert lane. Built-ins: `power.sleep`, `power.reboot`, `power.shutdown`.
+  A live session on another device returns 409. macOS returns 501. Plugin token is refused both
+  routes. See `design/host-actions.md`.
+- **`PUNKTFUNK_GRANT_POWER` (`1 << 6`).** Route-gated like clipboard / mic / launch. Not on the
+  datagram path. Also added: `PUNKTFUNK_GRANT_ALL_PRE_POWER`, `PUNKTFUNK_HOST_POWER_CLOSE_CODE`
+  (`107`), `PUNKTFUNK_STATUS_REJECTED_HOST_POWER` (`-32`).
+- **`punktfunk-host ctl`.** Pairing, PIN, device lists, session stop, `watch` (SSE → line JSON).
+  Pins `native-cert.pem` then `cert.pem` before any request. No `--token` flag and no token env.
+- **`punktfunk-omarchy setup | remove | status`.** Ships with the host package; the host never
+  runs it. ufw, uwsm drop-in, console webapp, menu, hooks, idle guard, theme.
+- **Console handoff ticket.** `punktfunk-host ctl console-url` mints a 60 s single-use HMAC.
+  No new host route.
+- **mDNS TXT `addr`.** Advisory only: which address this advert is for. Older hosts without it
+  still resolve.
+- **`action.invoked` host event.** Fired on accept, and again if the executor fails.
+- **Diagnostics rows** `hyprland_permissions` and `omarchy_updates`.
 
 ### Changed
 
-- **`docs/writing.md` is the writing rulebook.** Conventional Commits with a 72-character subject
-  cap, Keep a Changelog categories for new CHANGELOG sections, and comments that state an invariant
-  rather than recap a diff. CONTRIBUTING, AGENTS.md and the PR template point at it. Nothing
-  existing is rewritten.
-- **`scripts/install.sh --channel` switches an installed host, in both directions.** It previously
-  applied only to a box with nothing installed. canary→stable is a downgrade, which every package
-  manager refuses unless told. So apt gets explicit `madison` version pins, pacman `-Sy` then `-S`
-  (never `-Syu`, which looks at the lower stable version and does nothing), and dnf a
-  `distro-sync` behind the `install`. A switch moves every punktfunk package on the box, not the
-  three the script installs. With no explicit `--channel` the script follows whatever the box is
-  on, so a bare re-run cannot drag a canary box back a channel.
-- **Omarchy installs with `pacman -Sy` then `pacman -S`, never `-Syu`.** Omarchy ships a libalpm
-  PreTransaction hook that aborts any transaction whose pacman invocation carries both `-S` and
-  `-u`. Plain Arch keeps its full `-Syu`.
-- **`punktfunk-web.service` waits on `punktfunk-web-init.service`** (`Type=oneshot`) for the
-  management token and a non-empty identity cert/key pair. `After=punktfunk-host.service` was never
-  a readiness gate: the host is `Type=simple`, so systemd calls it started the instant it is
-  spawned. The two files are written far apart — the token early in `serve`, the cert last inside
-  `identity::load_or_adopt` — so waiting on the token alone would only move the failure. Timing out
-  is not fatal: web-init exits 0, the `Restart` backstop takes over, and the log names the
-  precondition. Also drops `ConditionPathExists=!%h/.config/punktfunk/web-password`, which skipped
-  the unit from the second boot onward. Mirrored into the NixOS module.
-- **Tray's service-restart row is now "Restart Punktfunk"**, before the clients ship a
-  machine-level "Restart host".
-- **Web and docs-site dependency majors.** Vite 7 → 8, `@vitejs/plugin-react` 5 → 6,
-  `vite-tsconfig-paths` 5 → 6, `@types/node` 22 → 26, TypeScript 5.9 → 7, biome 2.5, `@unom/ui`
-  0.10.0, `motion` 13.1, `@unom/app-ui` 0.3.0. The stale-chunk recovery now comes from `@unom/ui`'s
-  `reloadOnStaleChunk` instead of a fourth local copy.
-- **`check-docs-drift.sh`'s undocumented-env baseline gains the four new ABI constants.** The
-  ratchet matches `PUNKTFUNK_*` by token spelling and cannot tell an environment variable from a
-  cbindgen export.
+- **`install.sh --channel` now switches an already-installed host.** Omarchy uses `pacman -Sy`
+  then `-S`, never `-Syu` (a PreTransaction hook aborts `-Su`). A bare re-run follows the
+  box's current channel.
+- **`punktfunk-web.service` waits on `punktfunk-web-init.service`** for the management token
+  and a non-empty identity cert. `After=punktfunk-host.service` was not a readiness gate.
+- **Tray row** is now "Restart Punktfunk".
 
 ### Fixed
 
-- **Automatic bitrate ratcheted to the floor and never climbed back** (0.32.0 regression). Phase 4
-  hands the encoder `enc_kbps(budget)` and reads back through `budget_kbps()`. That roundtrip
-  deflates 1–2 kbps by design, so the `applied < requested` compare recorded a phantom
-  `encoder_ceiling_kbps` on **every** successful apply. The control task clamps each later
-  `SetBitrate` to it, the client learned it as a host cap, and every descent lowered the ceiling
-  further — a one-way ratchet. 0.31.4 was immune, its read-back staying in encoder units.
-  `EncDerive::applied_budget_kbps` now reads back in the request's own truncated terms, so only an
-  apply short of what the request itself derives to records a ceiling. Regression test proven
-  against the backed-out fix.
-- **The startup link-capacity probe fired before video existed.** It ran on a flat 2 s timer, but
-  host bring-up takes 6–8 s (indirect display driver acquisition), so the burst landed on the
-  first IDR frame: 5–11 s of black video, the decoder refusing access units, 2101 audio
-  underruns. It then missed its own 6 s timeout anyway (8.6 s measured), so the ceiling stayed
-  negotiated — all disturbance, no measurement. The probe now arms only once a frame has
-  completed, with a 15 s timeout.
-- **A Hyprland `topology: exclusive` session left the desk dark after a failed build.** The host
-  lends one backend instance to `build_pipeline_with_retry` for up to eight attempts, and
-  `pending_restore` was assigned unconditionally — so attempt 2, correctly finding nothing left to
-  disable, dropped attempt 1's restore closure on the floor. `stash_topology_restore` makes the
-  slot first-wins, which is also the right list: attempt 1 looked at the desk while it was still
-  lit. KWin gets the same guard. Two doc corrections, since they are what made this read as a
-  registry bug: the Hyprland and sway `pending_restore` comments claimed the registry lifts the
-  restore and `Drop` is a backstop. Both carry a portal fd, so `registry::acquire` returns them as
-  pass-through at the `remote_fd.is_some()` check — several statements *above* its
-  `take_topology_restore()` call — and `Drop` is the only thing that runs them.
-- **A theme switch reset the streamed head's resolution.** `omarchy-theme-set` ends in
-  `omarchy-restart-hyprctl`, which is `hyprctl reload`, and a reload drops every runtime `hyprctl
-  keyword` — our monitor rule included. The Hyprland backend now subscribes to the compositor event
-  socket and re-applies the rule on `configreloaded`, so any reload gets it. A socket read, not a
-  poll. The mode only: re-disabling `exclusive`'s heads from this watcher risks a permanently dark
-  desk, because teardown's own `restore_heads` runs a reload and nothing orders the two.
-- **The streamed head could not be focused on a Lua-configured Hyprland.** The spelling is
-  `hl.dsp.focus({ monitor = "<name>" })`, measured on Hyprland 0.56.2 — the compositor volunteers
-  it when asked with any other key. An unfocused headless output stays empty, an empty output
-  produces no damage, no damage means no PipeWire frames, and capture then misses its first-frame
-  deadline: a black screen on every Omarchy box.
-- **Clients rolled dice on a multi-address host.** The host registers exactly one address, but the
-  OS mDNS responder also answers A queries per interface. So the resolved set a client folds is a
-  union polluted by every overlay network whose multicast reaches it — and both clients picked
-  with `HashSet::iter().next()`, re-rolled on every re-announce. `punktfunk_core::discovery` now
-  ranks, best wins: longest common prefix with any local unicast address, then the host's declared
-  `addr`, then prefix against the default-route source, then numerically lowest. Shared by the
-  desktop and Android clients.
-- **The client advertised HDR its video processor could not tone-map.** `VIDEO_CAP_HDR` invites a
-  PQ stream, and on a Windows box with no HDR10 swapchain the D3D11VA hand-off relies on the video
-  processor's PQ→sRGB tonemap — a driver capability nothing validated. Field 2026-08-26: an Arc
-  A370M went green on every HDR session while AV1 8-bit SDR at the same mode streamed clean.
-  `video_d3d11::pq_tonemap_supported()` asks `CheckVideoProcessorFormatConversion` for the exact
-  pair the SDR ring sets (P010 G2084 studio in, BGRA8 sRGB out). Only a definitive driver "no"
-  answers false; API failure keeps today's behaviour. `ten_bit_sdr` stays unprobed on purpose —
-  10-bit SDR is no tonemap.
-- **`keep_host_audio` reached only three surfaces.** Shipped wired end to end in 0.32.0, but Apple
-  and Android carried no reference to it — there is no shared settings schema, and each client
-  hand-mirrors `trust::Settings`. Both now have the defaults key, the profile overlay, the settings
-  row and the capability bit in their connect. `pf-console-ui`'s `RowId::KeepHostAudio` leaves
-  `desktop_only`.
-- **`punktfunk-omarchy status` lied twice.** It reported "no punktfunk rules" seconds after adding
-  six, because a failed `sudo -n` read was being treated as proof of absence. And it reported xdph
-  missing on a box that was capturing through it: `pgrep -x` can never match
-  `xdg-desktop-portal-hyprland`, since Linux truncates comm to 15 characters.
-- **The idle guard never restored anything.** `omarchy-toggle-idle status` prints JSON, not a
-  keyword, and its tooltip names the action the button *would* take — so the string "Stay Awake"
-  appears precisely when stay-awake is off. Every arm fell through to "do nothing" and the box
-  stayed awake after every session. Now reads `"enabled":true`.
-- **`ctl watch` leaked a process per dead consumer.** A watcher only ever reads, so when the widget
-  died its end of our stdout pipe closed unnoticed. The SSE keep-alive now surfaces as a
-  `ctl.heartbeat` line, which gives us a write to fail on, and a failed write ends the process.
-- **`install.sh --uninstall` left everything the packages did not own** — tagged ufw rules, the
-  user-unit drop-in, the app-menu entry, `hooks.json`, and the `custom_picker_binary` takeover.
-  The last of those kept pointing a live compositor at a picker shim that was no longer installed.
-  It now runs `punktfunk-omarchy remove` before pacman takes the package away.
-- **A deploy under an open tab killed the next navigation** (web, docs-site). Routes are
-  code-split, so a tab holding pre-deploy HTML asks for chunks the new server has never heard of;
-  `defaultPreload: "intent"` made a hover enough to trip it. Both routers now handle
-  `vite:preloadError` and navigate to `latestLocation` rather than reloading in place, with a
-  sessionStorage stamp against a reload loop. Deliberately not `preventDefault()`, which suppresses
-  Vite's rethrow and hands the router an `undefined` module.
-- **The launcher entry drew no icon.** The host package shipped no app icon at all, and
-  `omarchy-webapp-install` derives an icon name that resolves to nothing. The host package now
-  ships the scalable mark, and setup writes `Icon=` and `Exec=` itself.
-- **The console ignored the desktop theme, then wore only half of it.** `useUiConfig` was
-  `staleTime: Infinity`, so the console sat in the old palette until someone reloaded it — now
-  polled at 2 s, and refetched on focus. Separately, only `accent` and `mode` were carried, while
-  `background` and `foreground` were dropped on the floor. All three now reach the page, expanded
-  into every surface through `color-mix(in oklab, …)`. `--success` / `--warning` / `--destructive`
-  deliberately do not follow: they encode meaning, and a theme whose accent is red must not leave
-  "delete" and "save" the same colour. `web/tools/check-omarchy-palette.mjs` reads the ratios back
-  out of the stylesheet and asserts WCAG contrast across six shipped themes in `postbuild`.
-- **Web: three findings biome surfaced.** `noUncheckedIndexedAccess` type errors in the ticket
-  parser, an unread `entries` state in Library written on every grid load, and an O(n²) `flatten`
-  in SourceSettings.
-
----
+- **0.32.0 ABR never climbed.** The encoder round-trip lost 1–2 kbps and every apply recorded
+  a phantom ceiling. Read-back is now in the request's own units.
+- **Startup probe ran before the first frame**, so the burst hit the IDR. It now arms after
+  a completed frame (15 s timeout).
+- **Hyprland/KWin `topology: exclusive` restore was overwritten on pipeline retry**, leaving
+  physical heads off. First restore wins.
+- **Hyprland `custom_picker_binary` shim is restored on host exit, not after each cast.**
+  Per-cast restore restarted the portal and killed every session after the first.
+  `punktfunk-omarchy remove` still restores the previous picker.
+- **Hyprland monitor rule survived `hyprctl reload`.** Theme switches no longer reset the
+  streamed head. Mode only — exclusive heads are not re-disabled from this watcher.
+- **Lua Hyprland focus** is `hl.dsp.focus({ monitor = "<name>" })`. Unfocused headless
+  outputs produced no frames.
+- **Multi-address mDNS.** Clients rank by longest common prefix, then advertised `addr`,
+  then default-route source. They no longer pick `HashSet::iter().next()`.
+- **`VIDEO_CAP_HDR` is off when the D3D11 video processor cannot PQ→sRGB tonemap.**
+  10-bit SDR is unprobed on purpose.
+- **`keep_host_audio` on Apple and Android.** 0.32.0 shipped the bit; those clients never
+  sent it.
+- **`punktfunk-omarchy status`** no longer treats a failed `sudo -n` as "no rules", and
+  matches `xdg-desktop-portal-hyprland` past the 15-character `comm` cap.
+- **Idle guard** reads `"enabled": true` from `omarchy-toggle-idle status` JSON, so stay-awake
+  is actually restored.
+- **`ctl watch`** exits when the consumer goes away (heartbeat write).
+- **`install.sh --uninstall`** runs `punktfunk-omarchy remove` before pacman, so the picker
+  shim is not left pointing at a missing binary.
+- **Host package ships the app icon**; setup writes `Icon=` and `Exec=` itself.
+- **Console follows the desktop theme** (`accent`, `mode`, `background`, `foreground`).
+  Semantic colours (`--success` / `--warning` / `--destructive`) do not follow the accent.
 
 ## v0.32.0
 

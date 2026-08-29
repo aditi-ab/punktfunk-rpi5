@@ -140,6 +140,29 @@ ABI 25 → 26 (additive). Wire protocol stays 2.
   Pairing grants launch. The routes now re-ask.
 ```
 
+### Bullet shape
+
+Two sentences per bullet.
+
+1. What changed.
+2. What the reader must do, if anything.
+
+The bold lead is a noun or an API name, not a plot summary.
+Version-table Notes cells are one clause. If it needs a paragraph, it is a Breaking bullet.
+
+Forbidden in `CHANGELOG.md`:
+
+- Metaphor (dice, floor, "lied", "wore", ratchet-as-plot)
+- Field measurements (SKU, soak minutes, underrun counts)
+- Causation chains ("so… which means… because…")
+- Meta ("first section written to this rulebook")
+- Why you did not take the other path
+- Behaviour restorations filed under **Breaking** — those are **Fixed**
+
+Those belong on the PR or in `docs/adr/` / `design/`. Link them.
+
+A minor that "nothing versioned moves" still fits on two screens if the bullets follow this shape. Headings without this rule produce 200-line poems in boxes.
+
 ### Length
 
 | Release | Target |
