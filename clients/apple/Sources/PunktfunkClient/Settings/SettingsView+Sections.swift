@@ -790,10 +790,11 @@ extension SettingsView {
                 // (EffectiveSettings.sc2Capture: deliberately not profileable, it is about
                 // hardware THIS device captures). tvOS has no CoreBluetooth capture path.
                 // The capture engages at the next stream; the in-stream badge announces it.
-                described("Reads an OS-paired Steam Controller over Bluetooth and passes it "
-                    + "through to the host as itself — the host's Steam drives the real pad.",
+                // One clause of what it does + one of what it costs (the caption rule); the
+                // opening clause is Android's word-for-word, the rider is the Apple-only cost.
+                described("Stream a Steam Controller 2 as-is; needs Bluetooth access.",
                     field: "sc2_capture") {
-                    Toggle("Steam Controller passthrough", isOn: $sc2Capture)
+                    Toggle("Steam Controller 2 passthrough", isOn: $sc2Capture)
                         .disabled(!effective.gamepadForwarding)
                 }
                 #endif

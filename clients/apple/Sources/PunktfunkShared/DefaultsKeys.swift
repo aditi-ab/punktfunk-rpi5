@@ -49,10 +49,16 @@ public enum DefaultsKey {
     public static let gamepadForwarding = "punktfunk.gamepadForwarding"
     /// Steam Controller 2 as-is passthrough (CoreBluetooth capture of a paired SC2's vendor
     /// GATT service → the host's virtual 28DE:1302, which the host's Steam drives directly).
-    /// Off by default — the cross-client `sc2_capture` idea, mirroring Android's
-    /// `settings.sc2Capture` gate — and read at connect beside `gamepadForwarding`: both must
-    /// be on for `SessionModel` to build an `Sc2Capture`. iOS/macOS only (tvOS has no
-    /// CoreBluetooth capture; the code is `#if`-gated out there).
+    /// The cross-client `sc2_capture` key — same gate as Android's `settings.sc2Capture`, read at
+    /// connect beside `gamepadForwarding`: both must be on for `SessionModel` to build an
+    /// `Sc2Capture`. iOS/macOS only (tvOS has no CoreBluetooth capture; the code is `#if`-gated
+    /// out there).
+    ///
+    /// ⚠ The DEFAULT deliberately differs from Android's, which is ON: engaging this on Apple
+    /// raises a CoreBluetooth permission prompt, so a default-on toggle would ask every user for
+    /// the radio whether or not they own an SC2. Android's capture needs no prompt for an
+    /// already-attached pad, so it can default on and cost nothing when none is present. Do not
+    /// "align" the two without moving the prompt.
     public static let sc2Capture = "punktfunk.sc2Capture"
     /// Where a controller's SYSTEM buttons (guide + the share/QAM misc) land while streaming:
     /// `"auto"` | `"forward"` | `"local"` — the cross-client `system_buttons` key. Auto
