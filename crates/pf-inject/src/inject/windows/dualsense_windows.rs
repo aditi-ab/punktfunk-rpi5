@@ -139,13 +139,34 @@ impl OutputDrain {
     }
 
     /// Drain every output report published since the last call, oldest → newest, invoking
-    /// `per_report` with each report's exact bytes. Returns `true` on ring OVERFLOW — more than
-    /// the negotiated ring length landed since the last poll (or the driver lapped us mid-copy):
-    /// the pending window was DISCARDED as possibly torn, the legacy latest-report slot was
-    /// salvaged into ONE `per_report` call (the freshest coalesced state — the driver
-    /// dual-publishes every report there), and the caller must still treat its downstream
-    /// feedback state as unknown (`PadFeedback::resync`) for the planes that report didn't carry.
-    pub(super) fn drain(&mut self, base: *mut u8, mut per_report: impl FnMut(&[u8])) -> bool {
+    /// `per_report` with each report's exact bytes plus a `feature` flag. The flag is
+    /// [`pf_driver_proto::triton::out_is_feature`] applied to the slot's raw ring length — bit 31
+    /// marks a Triton FEATURE set (Steam's lizard-off / IMU-enable SETs) as opposed to an ordinary
+    /// OUTPUT report (rumble); every non-Triton devtype's producer never sets the bit, so it reads
+    /// as `false` there. [`pf_driver_proto::triton::out_len`] masks the bit back OUT of the raw
+    /// value **before** the existing 64-byte slot-length clamp below, so a tagged slot's length
+    /// still clamps on its real payload size, not on `raw_len | 0x8000_0000`.
+    ///
+    /// Returns `true` on ring OVERFLOW — more than the negotiated ring length landed since the
+    /// last poll (or the driver lapped us mid-copy): the pending window was DISCARDED as possibly
+    /// torn, the legacy latest-report slot was salvaged into ONE `per_report` call (the freshest
+    /// coalesced state — the driver dual-publishes every report there), and the caller must still
+    /// treat its downstream feedback state as unknown (`PadFeedback::resync`) for the planes that
+    /// report didn't carry.
+    ///
+    /// **KNOWN LIMIT (accepted):** the overflow-salvage path just below and the legacy
+    /// (pre-ring-driver) path at the bottom both read the section's single untagged
+    /// latest-output slot, which carries no feature bit at all — every frame they deliver comes
+    /// through `per_report` with `feature == false`, whatever it actually was. A FEATURE report
+    /// that lands during a ring overflow, or on an old driver that never wrote the ring, therefore
+    /// replays on the client as an OUTPUT report — one wrong BLE characteristic write. This heals
+    /// itself: Steam re-sends the same settings SET roughly every 3 s, and the next ring-fed poll
+    /// carries the correct tag.
+    pub(super) fn drain_tagged(
+        &mut self,
+        base: *mut u8,
+        mut per_report: impl FnMut(&[u8], bool),
+    ) -> bool {
         // SAFETY: base points at SHM_SIZE bytes; `OFF_RING_HEAD` (== 160) is 4-aligned off the
         // page-aligned base. The driver bumps `ring_head` AFTER writing the slot, so an Acquire
         // load orders the slot copies below — the same pairing the legacy `out_seq` idiom uses.
@@ -178,15 +199,16 @@ impl OutputDrain {
                 // when the window provably stayed inside the ring.
                 let n = pending as usize;
                 let mut bufs =
-                    [([0u8; 64], 0usize); pf_driver_proto::gamepad::OUT_RING_LEN_V22_USIZE];
+                    [([0u8; 64], 0usize, false); pf_driver_proto::gamepad::OUT_RING_LEN_V22_USIZE];
                 for (k, buf) in bufs.iter_mut().enumerate().take(n) {
                     let idx = (self.tail.wrapping_add(k as u32) % ring_len) as usize;
                     let slot = OFF_OUT_RING + idx * OUT_SLOT_SIZE;
                     // SAFETY: slot .. slot+OUT_SLOT_SIZE is inside the SHM_SIZE section (idx <
                     // `ring_len` ≤ OUT_RING_LEN_V22, whose last slot ends at 4064 ≤ SHM_SIZE);
                     // the len field is 4-aligned (`OFF_OUT_RING` == 256, `OUT_SLOT_SIZE` == 68).
-                    let len = unsafe { std::ptr::read_unaligned(base.add(slot) as *const u32) };
-                    buf.1 = (len as usize).min(64);
+                    let raw_len = unsafe { std::ptr::read_unaligned(base.add(slot) as *const u32) };
+                    buf.2 = pf_driver_proto::triton::out_is_feature(raw_len);
+                    buf.1 = (pf_driver_proto::triton::out_len(raw_len) as usize).min(64);
                     // SAFETY: the slot's data region is slot+4 .. slot+4+64, inside the section;
                     // `buf.0` is a live local 64-byte array.
                     unsafe {
@@ -198,9 +220,9 @@ impl OutputDrain {
                     (*(base.add(OFF_RING_HEAD) as *const AtomicU32)).load(Ordering::Acquire)
                 };
                 if head2.wrapping_sub(self.tail) <= ring_len {
-                    for (data, len) in bufs.iter().take(n) {
+                    for (data, len, feature) in bufs.iter().take(n) {
                         if *len > 0 {
-                            per_report(&data[..*len]);
+                            per_report(&data[..*len], *feature);
                         }
                     }
                     self.tail = head;
@@ -216,19 +238,21 @@ impl OutputDrain {
             // value lasts one poll at storm rates, and the caller's resync still silences every
             // plane the salvaged report doesn't assert. A report that lands between the reload
             // and the copy is salvaged now AND drained next poll — harmless, reports are
-            // valid-flag-gated state and the caller's dedup drops the repeat.
+            // valid-flag-gated state and the caller's dedup drops the repeat. No feature tag lives
+            // on this slot — see the KNOWN LIMIT above.
             // SAFETY: as the first `ring_head` load above.
             self.tail =
                 unsafe { (*(base.add(OFF_RING_HEAD) as *const AtomicU32)).load(Ordering::Acquire) };
             let mut out = [0u8; 64];
             // SAFETY: the legacy output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
             unsafe { std::ptr::copy_nonoverlapping(base.add(OFF_OUTPUT), out.as_mut_ptr(), 64) };
-            per_report(&out);
+            per_report(&out, false);
             return true;
         }
         // Legacy driver (never wrote the ring): the latest-report slot + seq — exactly the old
         // single-slot semantics, coalescing and all; the rumble-keyed idle watchdog is the bound
-        // there until the driver package is updated.
+        // there until the driver package is updated. No feature tag lives on this slot either —
+        // see the KNOWN LIMIT above.
         // SAFETY: `OFF_OUT_SEQ` (== 72) is 4-aligned off the page-aligned base; Acquire pairs with
         // the driver's publish-then-bump store order.
         let seq = unsafe { (*(base.add(OFF_OUT_SEQ) as *const AtomicU32)).load(Ordering::Acquire) };
@@ -237,9 +261,16 @@ impl OutputDrain {
             let mut out = [0u8; 64];
             // SAFETY: output slot is OFF_OUTPUT..OFF_OUTPUT+64 within the section.
             unsafe { std::ptr::copy_nonoverlapping(base.add(OFF_OUTPUT), out.as_mut_ptr(), 64) };
-            per_report(&out);
+            per_report(&out, false);
         }
         false
+    }
+
+    /// Thin [`Self::drain_tagged`] delegate for every existing caller (DualSense/DualShock4/Edge/
+    /// Deck) that has no use for the Triton feature/output tag — discards the flag and forwards
+    /// the bytes exactly as before.
+    pub(super) fn drain(&mut self, base: *mut u8, mut per_report: impl FnMut(&[u8])) -> bool {
+        self.drain_tagged(base, |b, _| per_report(b))
     }
 }
 
@@ -796,6 +827,24 @@ mod drain_tests {
         ring_publish(buf, bytes, OUT_RING_LEN, false);
     }
 
+    /// Mimic the Triton devtype's producer tagging a ring slot as a FEATURE frame: the same v2.1
+    /// dual write as `publish`, except the slot's stamped length carries
+    /// `pf_driver_proto::triton::OUT_FEATURE_BIT` ORed in — the tag `drain_tagged` must strip back
+    /// out and surface as its `feature` flag.
+    fn publish_tagged(buf: &mut [u32], bytes: &[u8]) {
+        legacy_publish(buf, bytes);
+        let head = read32(buf, OFF_RING_HEAD);
+        let slot = OFF_OUT_RING + (head % OUT_RING_LEN) as usize * OUT_SLOT_SIZE;
+        write32(
+            buf,
+            slot,
+            bytes.len() as u32 | pf_driver_proto::triton::OUT_FEATURE_BIT,
+        );
+        let b = bytes_mut(buf);
+        b[slot + 4..slot + 4 + bytes.len()].copy_from_slice(bytes);
+        write32(buf, OFF_RING_HEAD, head.wrapping_add(1));
+    }
+
     /// Mimic the v2.2 driver's dual write: same, with the long-ring slot math and the
     /// `out_ring_len` echo stamped before the head bump.
     fn v22_publish(buf: &mut [u32], bytes: &[u8]) {
@@ -840,6 +889,24 @@ mod drain_tests {
         let mut got = Vec::new();
         let resync = d.drain(base(buf), |b| got.push(b.to_vec()));
         (got, resync)
+    }
+
+    /// Triton feature frames ride the ring with bit 31 of `len` set; the tagged drain must strip
+    /// the bit from the length and surface it as a flag. Untagged slots (every other devtype, and
+    /// every plain `publish`) must come through with `feature == false`.
+    #[test]
+    fn tagged_drain_separates_feature_frames_from_output_frames() {
+        let mut buf = section();
+        publish(&mut buf, &[0x80, 0x00, 0xFF]); // plain output frame
+        publish_tagged(&mut buf, &[0x01, 0x87, 0x03, 0x09, 0x00, 0x00]); // feature frame (len | bit31)
+        let mut got = Vec::new();
+        let mut d = OutputDrain::new(); // no Default impl exists — every drain test uses new()
+        d.drain_tagged(base(&mut buf), |bytes, feature| {
+            got.push((bytes.to_vec(), feature));
+        });
+        assert_eq!(got[0], (vec![0x80, 0x00, 0xFF], false));
+        assert_eq!(got[1].0, vec![0x01, 0x87, 0x03, 0x09, 0x00, 0x00]);
+        assert!(got[1].1);
     }
 
     /// THE stop-coalesce repro (`design/rumble-root-fix.md` §A): a rumble-stop report followed by
@@ -1031,6 +1098,7 @@ mod drain_tests {
             WinDsIdentity::dualsense_edge().hwid,
             super::super::dualshock4_windows::DS4_HWID,
             super::super::steam_deck_windows::DECK_HWID,
+            super::super::triton_windows::TRITON_HWID,
         ]
         .into_iter()
         // Every Xbox identity, not just the first — a new one added to the table without its INF
@@ -1167,7 +1235,7 @@ mod drain_tests {
             .collect();
         assert_eq!(
             entries.len(),
-            7,
+            8,
             "parsed {entries:?} out of the driver's table — the shape changed and this test went \
              vacuous; fix the parse rather than deleting the assert"
         );
@@ -1193,6 +1261,10 @@ mod drain_tests {
             (
                 super::super::steam_deck_windows::DECK_HWID,
                 pf_driver_proto::gamepad::DEVTYPE_STEAMDECK,
+            ),
+            (
+                super::super::triton_windows::TRITON_HWID,
+                pf_driver_proto::gamepad::DEVTYPE_TRITON,
             ),
         ]
         .into_iter()

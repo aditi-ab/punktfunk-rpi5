@@ -169,6 +169,18 @@ UI. The Apple and Android apps claim nothing, so their chords keep working; Andr
 DualSense and Steam Controller 2 USB captures, which do claim the device. The rows below grey out
 while this is off.
 
+**Steam Controller passthrough** (`sc2_capture`) — *default: on for Android, off for Apple*. Reads
+an already-paired Steam Controller 2 directly and passes it to the host **as itself**: the host
+presents a real `28DE:1302` that its own Steam drives, so the trackpads, gyro and haptics behave as
+they do locally instead of being flattened into a generic pad. Android captures over USB, the Puck
+dongle, or Bluetooth; Apple over Bluetooth only. Needs *Forward controllers* on, and a Linux or
+Windows host — elsewhere the pad falls back to its ordinary type.
+
+It defaults **off on Apple** because switching it on prompts for Bluetooth permission, which is a
+question worth asking only from a controller the app can see you own. Android needs no such prompt
+for a pad already attached, so it defaults on and simply does nothing when no SC2 is present. The
+capture engages at the next stream, and a badge confirms it.
+
 **Gamepad type** (*Controller type* on Apple, Android and the console home) — *default: Automatic*,
 which matches each physical controller. Pickers offer Xbox 360, Xbox One, DualSense and DualShock 4
 everywhere, plus Steam Deck on Linux, Android and the console home. The host builds each virtual

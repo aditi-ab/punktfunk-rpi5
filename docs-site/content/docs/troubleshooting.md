@@ -485,6 +485,15 @@ Unlike every other pad Punktfunk presents, the Steam Controller 2 has exactly on
 state reports ride a vendor collection, so the pad produces no evdev node for anything else to read.
 If Steam can't open its `hidraw` node, you don't get a degraded controller, you get no controller.
 
+**On a Windows host, stop here — the rest of this section is Linux only.** Windows has no `udev`
+and no permission gate to open: the pad is a UMDF device the `pf_gamepad` driver package serves, so
+Steam reaches it as soon as the devnode enumerates. An empty controller list there means the driver
+package is missing or stale instead. Reinstall it and reconnect:
+
+```powershell
+punktfunk-host.exe driver install --gamepad
+```
+
 The node is root-only until a udev rule says otherwise, and distro `steam-devices` rule sets are
 per-product-id: a host whose copy predates the SC2 (it shipped in 2026) never grants it. Punktfunk
 ships the rule itself from 0.30.0 on. On an older host, add it by hand:

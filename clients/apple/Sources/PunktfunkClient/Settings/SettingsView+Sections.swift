@@ -785,6 +785,19 @@ extension SettingsView {
                     }
                     .disabled(!effective.gamepadForwarding)
                 }
+                #if os(iOS) || os(macOS)
+                // Steam Controller 2 as-is passthrough — device tier like the pad rows above
+                // (EffectiveSettings.sc2Capture: deliberately not profileable, it is about
+                // hardware THIS device captures). tvOS has no CoreBluetooth capture path.
+                // The capture engages at the next stream; the in-stream badge announces it.
+                // One clause of what it does + one of what it costs (the caption rule); the
+                // opening clause is Android's word-for-word, the rider is the Apple-only cost.
+                described("Stream a Steam Controller 2 as-is; needs Bluetooth access.",
+                    field: "sc2_capture") {
+                    Toggle("Steam Controller 2 passthrough", isOn: $sc2Capture)
+                        .disabled(!effective.gamepadForwarding)
+                }
+                #endif
             }
             described("The virtual pad the host creates — Automatic matches your controller.",
                 field: "gamepad") {

@@ -221,6 +221,23 @@ public extension PunktfunkConnection {
 }
 
 public final class PunktfunkConnection {
+    /// One-shot ABI version-equality gate (`static let` = dispatch_once), touched before the
+    /// first C call a connection makes. This enforces the guard the v27 `PunktfunkHidOutput`
+    /// widening's safety argument rests on: `punktfunk_abi_version()` mismatch has always meant
+    /// "incompatible core", and a mismatched header/library pairing must fail HERE, loudly —
+    /// not later as a 19-vs-85-byte memory write when the core poll-fills the hidout out-slot.
+    /// In-tree the xcframework bundles header + staticlib from one build, so this can only fire
+    /// on a stale or hand-assembled bundle; out-of-tree embedders keep the documented checklist.
+    private static let abiVersionGate: Void = {
+        let linked = punktfunk_abi_version()
+        let built = UInt32(PUNKTFUNK_ABI_VERSION)
+        if linked != built {
+            fatalError(
+                "punktfunk-core ABI mismatch: header is v\(built), linked core is v\(linked)"
+                    + " — rebuild the xcframework")
+        }
+    }()
+
     private var handle: OpaquePointer?
     /// Set by close() before it contends for the plane locks: the pullers see it at their
     /// next poll boundary and exit, so close() can't be starved by back-to-back polls
@@ -835,6 +852,7 @@ public final class PunktfunkConnection {
         deviceName: String? = nil, // nil = this device's OS name (`DeviceName.current`)
         timeoutMs: UInt32 = 10_000
     ) throws {
+        _ = Self.abiVersionGate // version-equality guard — fail loudly before the first C call
         if let pin = pinSHA256, pin.count != 32 { throw PunktfunkClientError.invalidPin }
         var observed = [UInt8](repeating: 0, count: 32)
         // Why a failed connect failed (PunktfunkStatus): lets a typed host rejection
@@ -1400,9 +1418,11 @@ public final class PunktfunkConnection {
         }
     }
 
-    /// One DualSense feedback event a game wrote to the host's virtual pad — replay it on
-    /// the real controller (GCDeviceLight, GCControllerPlayerIndex,
-    /// GCDualSenseAdaptiveTrigger). Only a `.dualSense` session emits these.
+    /// One HID-output feedback event a game wrote to the host's virtual pad — replay it on the
+    /// real controller (GCDeviceLight, GCControllerPlayerIndex, GCDualSenseAdaptiveTrigger for
+    /// the DualSense kinds; the SC2 capture's GATT writes for `.hidRaw`). Only a `.dualSense`
+    /// session emits the first three; only an as-is Steam Controller 2 passthrough pad emits
+    /// `.hidRaw`.
     public enum HidOutputEvent: Sendable, Equatable {
         /// Lightbar color.
         case led(pad: UInt8, r: UInt8, g: UInt8, b: UInt8)
@@ -1412,12 +1432,19 @@ public final class PunktfunkConnection {
         /// trigger parameter block (mode byte + params, ≤ 11 bytes) — parse with
         /// `DualSenseTriggerEffect`.
         case triggerEffect(pad: UInt8, which: UInt8, effect: [UInt8])
+        /// A raw report the host's hidraw consumer (Steam) wrote to an as-is passthrough pad,
+        /// to replay verbatim on the physical device: `kind` is `PUNKTFUNK_HID_RAW_OUTPUT` (0,
+        /// an OUTPUT report — Triton rumble/haptics) or `PUNKTFUNK_HID_RAW_FEATURE` (1, a
+        /// SET_REPORT — lizard mode, IMU enable); `data` the full report, id byte first, ≤ 64
+        /// bytes (feature frames arrive whole/zero-padded by design).
+        case hidRaw(pad: UInt8, kind: UInt8, data: [UInt8])
     }
 
-    /// Pull the next PlayStation-pad feedback event (lightbar / player LEDs / adaptive
-    /// triggers); nil on timeout, throws `.closed` once the session ended. Drain from the
-    /// (single) feedback thread, alongside `nextRumble`. Nothing arrives unless the session's
-    /// virtual pad is a DualSense (all three) or a DualShock 4 (lightbar only) — poll with a
+    /// Pull the next HID-output feedback event (lightbar / player LEDs / adaptive triggers —
+    /// or a raw `.hidRaw` report on an SC2 passthrough pad); nil on timeout, throws `.closed`
+    /// once the session ended. Drain from the (single) feedback thread, alongside `nextRumble`.
+    /// Nothing arrives unless a pad's virtual device is a DualSense (the first three), a
+    /// DualShock 4 (lightbar only), or an as-is Steam Controller 2 (`.hidRaw`) — poll with a
     /// short timeout, never spin.
     public func nextHidOutput(timeoutMs: UInt32 = 0) throws -> HidOutputEvent? {
         feedbackLock.lock()
@@ -1438,6 +1465,11 @@ public final class PunktfunkConnection {
                 let len = Int(min(out.effect_len, UInt8(PUNKTFUNK_HID_EFFECT_MAX)))
                 let effect = withUnsafeBytes(of: out.effect) { Array($0.prefix(len)) }
                 return .triggerEffect(pad: out.pad, which: out.which, effect: effect)
+            case PUNKTFUNK_HIDOUT_HID_RAW:
+                // Same tuple-copy idiom for the raw report body (ABI v27).
+                let len = Int(min(out.raw_len, UInt8(PUNKTFUNK_HID_REPORT_MAX)))
+                let data = withUnsafeBytes(of: out.raw) { Array($0.prefix(len)) }
+                return .hidRaw(pad: out.pad, kind: out.hid_kind, data: data)
             default:
                 return nil // unknown kind from a newer host — skip (forward-compatible)
             }
@@ -1725,6 +1757,26 @@ public final class PunktfunkConnection {
         rich.gyro = gyro
         rich.accel = accel
         _ = punktfunk_connection_send_rich_input(h, &rich)
+    }
+
+    /// Send one raw HID input report from a client-captured controller — the as-is Steam
+    /// Controller 2 passthrough's up direction (`[0xCC][0x04]` on the wire; ABI v27,
+    /// `punktfunk_connection_send_hid_report`). `data` is the report id-first, exactly as the
+    /// device produced it; the core clamps to `PUNKTFUNK_HID_REPORT_MAX` and copies before
+    /// returning, so the pointer may target a caller-owned REUSABLE buffer — this runs at the
+    /// controller's own report rate (~66 Hz over BLE) and must not allocate per call. Best-effort
+    /// non-blocking enqueue (state reports are idempotent snapshots); pointless unless the pad
+    /// declared `.steamController2` — the host drops it elsewhere. Thread-safe; silently dropped
+    /// after close, and gated on the GAMEPAD grant like every other controller send.
+    public func sendHidReport(pad: UInt8, _ data: UnsafeRawBufferPointer) {
+        guard let base = data.baseAddress, !data.isEmpty else { return }
+        abiLock.lock()
+        defer { abiLock.unlock() }
+        // Raw pad input rides the GAMEPAD grant (it IS controller input) — same gate as `send`.
+        guard let h = handle, !closeRequested, granted(Self.grantGamepad, handle: h)
+        else { return }
+        _ = punktfunk_connection_send_hid_report(
+            h, pad, base.assumingMemoryBound(to: UInt8.self), UInt(data.count))
     }
 
     // MARK: - Shared clipboard (design/clipboard-and-file-transfer.md §5)
