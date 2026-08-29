@@ -873,11 +873,10 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         if (w > 0 && h > 0) w.toFloat() / h.toFloat() else 0f
     }
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        // One rect for the picture AND for the input that lands on it. Every absolute mapping —
-        // direct-pointer touch, multi-touch passthrough, the pen lane — measures against the size of
-        // the node it sits on, so putting the gesture layer on this same rect keeps all three correct
-        // by construction rather than by threading an offset through each of them. The cost is that
-        // trackpad swipes starting inside a letterbox bar don't register; the picture is the surface.
+        // The picture is aspect-fitted; the gesture layer below spans the WHOLE container and maps
+        // every absolute contact — direct-pointer touch, passthrough, the pen lane — into this same
+        // fit through `videoFitRect`, so a swipe that starts on a letterbox bar still registers and
+        // a contact on a bar lands on the nearest picture edge.
         val videoFit = if (videoAspect > 0f) {
             Modifier.align(Alignment.Center).aspectRatio(videoAspect)
         } else {
@@ -1103,13 +1102,14 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             LaunchedEffect(stylus) { stylus.heartbeatLoop() }
         }
         Box(
-            videoFit.pointerInput(handle, touchMode, pointerOk) {
+            Modifier.fillMaxSize().pointerInput(handle, touchMode, pointerOk) {
                 when {
                     !pointerOk -> {} // no capture — the Access chip is what says why
-                    touchMode == TouchMode.TOUCH -> streamTouchPassthrough(handle, stylus)
+                    touchMode == TouchMode.TOUCH -> streamTouchPassthrough(handle, stylus, videoAspect)
                     else -> streamTouchInput(
                         handle,
                         stylus,
+                        videoAspect,
                         trackpad = touchMode == TouchMode.TRACKPAD,
                         invertScroll = initialSettings.invertScroll,
                         onCycleStats = { statsVerbosity = statsVerbosity.next() },
