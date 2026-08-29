@@ -121,27 +121,16 @@ impl SwitchProPad {
                 id,
                 &device_info_payload(&switch_mac(self.index)),
             ),
-            // SPI flash read: echoed addr + len + the canned calibration bytes. An unmapped
-            // range answers zeroes (echoed header, zero data) — the driver then warns and uses
-            // its defaults instead of stalling through 2 × 1 s timeouts.
+            // SPI flash read: echoed addr + len + the flash bytes living at that address. Any
+            // range is served (unmodelled addresses read as zero), because the kernel and SDL
+            // ask for the same calibration in different shapes — see `spi_flash_read`.
             0x10 => {
                 let addr = args
                     .get(..4)
                     .map(|a| u32::from_le_bytes([a[0], a[1], a[2], a[3]]))
                     .unwrap_or(0);
                 let len = args.get(4).copied().unwrap_or(0);
-                let payload = spi_flash_read(addr, len).unwrap_or_else(|| {
-                    tracing::debug!(
-                        addr = format!("{addr:#x}"),
-                        len,
-                        "unmapped SPI read — zero fill"
-                    );
-                    let mut p = Vec::with_capacity(5 + len as usize);
-                    p.extend_from_slice(&addr.to_le_bytes());
-                    p.push(len);
-                    p.extend(std::iter::repeat_n(0u8, len as usize));
-                    p
-                });
+                let payload = spi_flash_read(addr, len);
                 build_subcmd_reply(&st, self.timer, 0x90, id, &payload)
             }
             // Everything else the driver sends (input mode 0x03, IMU 0x40, vibration 0x48,

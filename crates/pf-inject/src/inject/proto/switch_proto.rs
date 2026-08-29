@@ -348,44 +348,62 @@ pub fn switch_mac(index: u8) -> [u8; 6] {
     [0x7C, 0xBB, 0x8A, 0xDF, 0x00, index]
 }
 
-/// The canned SPI-flash contents (subcommand `0x10`): reply payload = echoed LE address +
-/// echoed length + the flash bytes. `None` for an unmapped range (the caller then replies with
-/// zeroes — the driver falls back to defaults rather than aborting).
+/// The modelled contents of the pad's SPI flash as `(start address, bytes)` blocks. Everything
+/// outside them reads back zero.
 ///
-/// Served ranges:
-/// - `0x8010`/`0x801B`/`0x8026` (user-cal magics, 2 B): NOT `0xB2 0xA1` → user cal absent, the
-///   driver takes the factory path.
-/// - `0x603D`/`0x6046` (factory stick cal, 9 B): [`STICK_CENTER`] ± [`STICK_RANGE`] on every
-///   axis. **Byte order differs**: left = max-above ++ center ++ min-below; right = center ++
-///   min-below ++ max-above (`joycon_read_stick_calibration`).
 /// - `0x6020` (factory IMU cal, 24 B): offsets 0, accel scale 16384, gyro scale 13371 — the
 ///   driver's own defaults, making its per-sample math the identity (accel) / ×1000 (gyro).
-pub fn spi_flash_read(addr: u32, len: u8) -> Option<Vec<u8>> {
+/// - `0x603D`/`0x6046` (factory stick cal, 9 B each, contiguous): [`STICK_CENTER`] ±
+///   [`STICK_RANGE`] on every axis. **Byte order differs**: left = max-above ++ center ++
+///   min-below; right = center ++ min-below ++ max-above (`joycon_read_stick_calibration`).
+/// - `0x8010`/`0x801B`/`0x8026` (user-cal magics): NOT `0xB2 0xA1` → user cal absent, so every
+///   consumer takes the factory path.
+fn flash_blocks() -> [(u32, Vec<u8>); 6] {
     let cal_pair = pack12(STICK_RANGE, STICK_RANGE);
     let center_pair = pack12(STICK_CENTER, STICK_CENTER);
-    let data: Vec<u8> = match (addr, len) {
-        (0x8010 | 0x801B | 0x8026, 2) => vec![0xFF, 0xFF],
-        (0x603D, 9) => [cal_pair, center_pair, cal_pair].concat(),
-        (0x6046, 9) => [center_pair, cal_pair, cal_pair].concat(),
-        (0x6020, 24) => {
-            let mut v = Vec::with_capacity(24);
-            v.extend_from_slice(&[0u8; 6]); // accel offsets = 0
-            for _ in 0..3 {
-                v.extend_from_slice(&16384u16.to_le_bytes()); // accel scale (driver default)
+    let mut imu = Vec::with_capacity(24);
+    imu.extend_from_slice(&[0u8; 6]); // accel offsets = 0
+    for _ in 0..3 {
+        imu.extend_from_slice(&16384u16.to_le_bytes()); // accel scale (driver default)
+    }
+    imu.extend_from_slice(&[0u8; 6]); // gyro offsets = 0
+    for _ in 0..3 {
+        imu.extend_from_slice(&13371u16.to_le_bytes()); // gyro scale (driver default)
+    }
+    [
+        (0x6020, imu),
+        (0x603D, [cal_pair, center_pair, cal_pair].concat()),
+        (0x6046, [center_pair, cal_pair, cal_pair].concat()),
+        (0x8010, vec![0xFF, 0xFF]),
+        (0x801B, vec![0xFF, 0xFF]),
+        (0x8026, vec![0xFF, 0xFF]),
+    ]
+}
+
+/// Serve an SPI-flash read (subcommand `0x10`): reply payload = echoed LE address + echoed
+/// length + the `len` bytes living at `addr` in [`flash_blocks`].
+///
+/// **Answer by RANGE, never by exact `(addr, len)`.** Two consumers read the same flash with
+/// different shapes, and only one of them is the kernel: `hid-nintendo` reads the two factory
+/// stick blocks as separate 9-byte reads, while SDL — which is Steam's own Switch driver, and
+/// therefore what a game actually sees — reads all 18 bytes at `0x603D` in one go and the
+/// 22-byte user block at `0x8010`. Matching exact pairs served the kernel and silently
+/// zero-filled Steam, which zeroed its stick centre and pinned both sticks to a corner.
+pub fn spi_flash_read(addr: u32, len: u8) -> Vec<u8> {
+    let mut data = vec![0u8; len as usize];
+    for (start, bytes) in flash_blocks() {
+        for (i, slot) in data.iter_mut().enumerate() {
+            let a = addr.saturating_add(i as u32);
+            if let Some(b) = a.checked_sub(start).and_then(|o| bytes.get(o as usize)) {
+                *slot = *b;
             }
-            v.extend_from_slice(&[0u8; 6]); // gyro offsets = 0
-            for _ in 0..3 {
-                v.extend_from_slice(&13371u16.to_le_bytes()); // gyro scale (driver default)
-            }
-            v
         }
-        _ => return None,
-    };
+    }
     let mut payload = Vec::with_capacity(5 + data.len());
     payload.extend_from_slice(&addr.to_le_bytes());
     payload.push(len);
     payload.extend_from_slice(&data);
-    Some(payload)
+    payload
 }
 
 /// One decoded host-bound output report from the driver.
@@ -568,7 +586,7 @@ mod tests {
     #[test]
     fn spi_blobs_valid() {
         for addr in [0x8010u32, 0x801B, 0x8026] {
-            let p = spi_flash_read(addr, 2).unwrap();
+            let p = spi_flash_read(addr, 2);
             assert_eq!(&p[..4], &addr.to_le_bytes());
             assert_eq!(p[4], 2);
             assert!(!(p[5] == 0xB2 && p[6] == 0xA1));
@@ -579,7 +597,7 @@ mod tests {
             (a, y)
         };
         // Left: max-above ++ center ++ min-below.
-        let l = spi_flash_read(0x603D, 9).unwrap();
+        let l = spi_flash_read(0x603D, 9);
         let (data, hdr) = (&l[5..], &l[..5]);
         assert_eq!(hdr, &[0x3D, 0x60, 0, 0, 9]);
         let (max_above, _) = unpack(&data[0..3]);
@@ -588,18 +606,46 @@ mod tests {
         assert_eq!(center, STICK_CENTER);
         assert!(center - min_below < center && center < center + max_above);
         // Right: center ++ min-below ++ max-above.
-        let r = spi_flash_read(0x6046, 9).unwrap();
+        let r = spi_flash_read(0x6046, 9);
         let (rc, _) = unpack(&r[5..8]);
         assert_eq!(rc, STICK_CENTER);
         // IMU: offsets 0, driver-default scales — the identity calibration.
-        let imu = spi_flash_read(0x6020, 24).unwrap();
+        let imu = spi_flash_read(0x6020, 24);
         let d = &imu[5..];
         assert_eq!(&d[0..6], &[0; 6]);
         assert_eq!(&d[6..8], &16384u16.to_le_bytes());
         assert_eq!(&d[12..18], &[0; 6]);
         assert_eq!(&d[18..20], &13371u16.to_le_bytes());
-        // Unmapped range → None.
-        assert!(spi_flash_read(0x6050, 12).is_none());
+        // An unmodelled range still answers, echoing addr+len over zero data.
+        let gap = spi_flash_read(0x6050, 12);
+        assert_eq!(&gap[..5], &[0x50, 0x60, 0, 0, 12]);
+        assert_eq!(&gap[5..], &[0u8; 12]);
+    }
+
+    /// ⭐ SDL — Steam's own Switch driver, and so what a GAME sees — reads the same calibration
+    /// in shapes `hid-nintendo` never asks for: all 18 factory bytes at `0x603D` in one read,
+    /// and the 22-byte user block at `0x8010`. Serving reads by exact `(addr, len)` answered the
+    /// kernel and zero-filled Steam, which zeroed its stick centre so every raw value read as
+    /// positive — both sticks pinned toward one corner, unable to travel past centre.
+    #[test]
+    fn spi_serves_sdl_read_shapes() {
+        // Factory: one 18-byte read = the left block then the right block, contiguous.
+        let f = spi_flash_read(0x603D, 18);
+        assert_eq!(&f[..5], &[0x3D, 0x60, 0, 0, 18]);
+        assert_eq!(&f[5..14], &spi_flash_read(0x603D, 9)[5..]);
+        assert_eq!(&f[14..], &spi_flash_read(0x6046, 9)[5..]);
+        // SDL's own centre parse over its left half must land on our centre, not 0.
+        let cal = &f[5..];
+        let cx = (((cal[4] as u16) << 8) & 0xF00) | cal[3] as u16;
+        let cy = ((cal[5] as u16) << 4) | ((cal[4] as u16) >> 4);
+        assert_eq!((cx, cy), (STICK_CENTER, STICK_CENTER));
+        // User: one 22-byte read; both magics sit where SDL looks and neither is B2 A1.
+        let u = spi_flash_read(0x8010, 22);
+        assert_eq!(&u[..5], &[0x10, 0x80, 0, 0, 22]);
+        let user = &u[5..];
+        assert_eq!(user.len(), 22);
+        assert_eq!(&user[0..2], &[0xFF, 0xFF]); // left magic  @ 0x8010
+        assert_eq!(&user[11..13], &[0xFF, 0xFF]); // right magic @ 0x801B
     }
 
     /// Motion unit conversion: wire (20 LSB/°·s, 10000 LSB/g) → raw (14.247 LSB/°·s, 4096 LSB/g).
