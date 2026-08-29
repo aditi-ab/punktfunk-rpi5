@@ -15,6 +15,8 @@ final class RingState: ObservableObject {
     /// 0 closed … 1 open — driven by the twist until `committed`.
     @Published var progress: CGFloat = 0
     @Published var committed = false
+    /// The wind-in after a close: the overlay stays mounted while the discs ease back.
+    @Published var closing = false
     @Published var clockwise = true
     /// Stream-view points; the ring is centred here, clamped so it stays on screen.
     @Published var centre = CGPoint.zero
@@ -50,7 +52,7 @@ final class RingState: ObservableObject {
     @Published var warnTick = 0
     private var twistArmed = false
 
-    var visible: Bool { committed || progress > 0 }
+    var visible: Bool { committed || progress > 0 || closing }
 
     func handle(_ event: DialEvent) {
         switch event {
@@ -84,6 +86,15 @@ final class RingState: ObservableObject {
     }
 
     func close() {
+        if committed {
+            // An open ring winds in over ~120 ms before it unmounts; a cancel short of commit
+            // leaves at once (`progress` alone held it).
+            closing = true
+            Task {
+                try? await Task.sleep(for: .milliseconds(140))
+                closing = false
+            }
+        }
         committed = false
         progress = 0
         sheet = false
@@ -189,7 +200,51 @@ struct RingOverlay: View {
     let cfg: OverlayConfig
     let actions: RingActions
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var shown: CGFloat = 0
+    /// False for the first frame, so a ring opened by a disc or `Select+A` springs from the
+    /// centre instead of appearing in place.
+    @State private var appeared = false
+
+    /// What places the discs: the twist (frame by frame, no animation), the open (each disc on
+    /// its own spring), or the wind-in. `-1` is the unrendered first frame.
+    private var phase: Int {
+        if !appeared { return -1 }
+        if state.committed { return 1 }
+        return state.closing ? 2 : 0
+    }
+
+    /// Disc `k` (6 = centre) at 0 (centre, hidden) … 1 (its ring position). Under the twist,
+    /// button k lags the previous one by `slotLag` so the ring visibly unwinds; the centre
+    /// arrives last.
+    private func discQ(_ k: Int) -> CGFloat {
+        switch phase {
+        case 1: return 1
+        case 0:
+            let last: CGFloat = k == 6 ? 6 : 5
+            return min(max((state.progress - CGFloat(k) * slotLag) / (1 - last * slotLag), 0), 1)
+        default: return 0
+        }
+    }
+
+    /// The open is a bouncier spring per disc, the centre first and each slot 25 ms behind
+    /// the last, from wherever the twist left it. Reduce Motion keeps the plain fade.
+    private func discAnimation(_ k: Int) -> Animation? {
+        switch phase {
+        case 1:
+            if reduceMotion { return .easeOut(duration: 0.12) }
+            let order = k == 6 ? 0 : k + 1
+            return .spring(response: 0.4, dampingFraction: 0.62).delay(Double(order) * 0.025)
+        case 2: return .easeIn(duration: 0.12)
+        default: return nil
+        }
+    }
+
+    private var scrimAnimation: Animation? {
+        switch phase {
+        case 1: return reduceMotion ? .easeOut(duration: 0.12) : .spring(response: 0.35, dampingFraction: 0.6)
+        case 2: return .easeIn(duration: 0.12)
+        default: return nil
+        }
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -199,41 +254,44 @@ struct RingOverlay: View {
             ZStack {
                 // The scrim: a tap outside closes the ring, and nothing reaches the stream
                 // while it is open.
-                Color.black.opacity(0.18 * shown)
+                Color.black.opacity(0.18 * (phase == 1 ? 1 : phase == 0 ? state.progress : 0))
                     .contentShape(Rectangle())
                     .onTapGesture {
                         if state.sheet { state.sheet = false } else { state.close() }
                     }
+                    .animation(scrimAnimation, value: phase)
+                // The discs stay in the tree at 0 so each can spring from the centre; the
+                // overlay itself unmounts once closed (tenet 1).
                 ForEach(0..<OverlayConfig.ringSlots, id: \.self) { k in
-                    let q = min(max((shown - CGFloat(k) * slotLag) / (1 - 5 * slotLag), 0), 1)
-                    if q > 0 {
-                        // Slot k sits at 12, 2, 4… o'clock and travels out along a short
-                        // spiral that turns the way the hand turns.
-                        let turn: CGFloat = state.clockwise ? -40 : 40
-                        let deg = -90 + 60 * CGFloat(k) + (1 - q) * turn
-                        let rad = deg * .pi / 180
-                        let slot = cfg.ring[k]
-                        let s = slot.map { spec($0, cfg, actions) }
-                        slotButton(s, size: slotSize, scale: 0.6 + 0.4 * q, alpha: q,
-                                   armed: s != nil && state.armed == s?.id,
-                                   highlighted: state.highlight == k) {
-                            if let slot, let s { fire(s, slot) }
-                        }
-                        .position(x: cx + ringRadius * q * cos(rad), y: cy + ringRadius * q * sin(rad))
+                    let q = discQ(k)
+                    // Slot k sits at 12, 2, 4… o'clock and travels out along a short
+                    // spiral that turns the way the hand turns.
+                    let turn: CGFloat = state.clockwise ? -40 : 40
+                    let deg = -90 + 60 * CGFloat(k) + (1 - q) * turn
+                    let rad = deg * .pi / 180
+                    let slot = cfg.ring[k]
+                    let s = slot.map { spec($0, cfg, actions) }
+                    slotButton(s, size: slotSize, scale: 0.6 + 0.4 * q, alpha: q,
+                               armed: s != nil && state.armed == s?.id,
+                               highlighted: state.highlight == k) {
+                        if let slot, let s { fire(s, slot) }
                     }
+                    .position(x: cx + ringRadius * q * cos(rad), y: cy + ringRadius * q * sin(rad))
+                    .allowsHitTesting(q > 0)
+                    .animation(discAnimation(k), value: phase)
                 }
-                // The centre arrives last and opens the sheet.
-                let cq = min(max((shown - 6 * slotLag) / (1 - 6 * slotLag), 0), 1)
-                if cq > 0 {
-                    slotButton(SlotSpec(id: "more", label: "More", icon: "ellipsis"),
-                               size: centreSize, scale: 0.6 + 0.4 * cq, alpha: cq, armed: false,
-                               highlighted: state.highlight == 6) {
-                        state.touch()
-                        state.pressTick &+= 1
-                        state.sheet = true
-                    }
-                    .position(x: cx, y: cy)
+                // The centre opens the sheet.
+                let cq = discQ(6)
+                slotButton(SlotSpec(id: "more", label: "More", icon: "ellipsis"),
+                           size: centreSize, scale: 0.6 + 0.4 * cq, alpha: cq, armed: false,
+                           highlighted: state.highlight == 6) {
+                    state.touch()
+                    state.pressTick &+= 1
+                    state.sheet = true
                 }
+                .position(x: cx, y: cy)
+                .allowsHitTesting(cq > 0)
+                .animation(discAnimation(6), value: phase)
                 // The label under the ring: a hint, else the highlighted slot's name.
                 let label: String? = state.hint ?? state.highlight.flatMap { h in
                     h == 6 ? "More" : cfg.ring[h].map { spec($0, cfg, actions).label }
@@ -258,17 +316,15 @@ struct RingOverlay: View {
         }
         .ignoresSafeArea()
         .onAppear {
-            sync()
+            appeared = true
             if state.native == nil { state.native = actions.currentMode() }
         }
-        .onChange(of: state.progress) { _, _ in sync() }
         .onChange(of: state.navSeq) { _, _ in
             if let n = state.pendingNav {
                 state.pendingNav = nil
                 handleNav(n)
             }
         }
-        .onChange(of: state.committed) { _, _ in sync() }
         .animation(reduceMotion ? .easeOut(duration: 0.12) : .smooth(duration: 0.25), value: state.sheet)
         // Idle: the exit disc's 8 s rule, for the same latency reason — unless the sheet is up.
         .task(id: "\(state.lastTouch.timeIntervalSinceReferenceDate)-\(state.sheet)") {
@@ -290,19 +346,6 @@ struct RingOverlay: View {
         .sensoryFeedback(.impact(weight: .light), trigger: state.pressTick)
         .sensoryFeedback(.impact(flexibility: .rigid, intensity: 0.7), trigger: state.refuseTick)
         .sensoryFeedback(.warning, trigger: state.warnTick)
-    }
-
-    /// The twist drives the opening frame by frame; the commit settles with a spring.
-    private func sync() {
-        if state.committed {
-            withAnimation(reduceMotion ? .easeOut(duration: 0.12) : .spring(response: 0.35, dampingFraction: 0.6)) {
-                shown = 1
-            }
-        } else {
-            var t = Transaction()
-            t.disablesAnimations = true
-            withTransaction(t) { shown = state.progress }
-        }
     }
 
     /// The pad (design §2.6): Right steps the highlight clockwise, Left anticlockwise, Up jumps
