@@ -63,6 +63,64 @@ public struct OverlayShortcut: Equatable, Sendable {
     }
 }
 
+/// The Windows virtual-key code a shortcut key name stands for (the wire speaks VKs); `nil` for
+/// a name this build does not know. Twin of the Rust `key_vk`.
+public func keyVk(_ name: String) -> UInt32? {
+    let n = name.trimmingCharacters(in: .whitespaces).lowercased()
+    switch n {
+    case "ctrl", "control": return 0x11
+    case "shift": return 0x10
+    case "alt", "option": return 0x12
+    case "win", "cmd", "super", "meta": return 0x5B
+    case "escape", "esc": return 0x1B
+    case "tab": return 0x09
+    case "enter", "return": return 0x0D
+    case "space": return 0x20
+    case "backspace": return 0x08
+    case "delete", "del": return 0x2E
+    case "insert": return 0x2D
+    case "home": return 0x24
+    case "end": return 0x23
+    case "pageup": return 0x21
+    case "pagedown": return 0x22
+    case "up": return 0x26
+    case "down": return 0x28
+    case "left": return 0x25
+    case "right": return 0x27
+    case "printscreen": return 0x2C
+    case "pause": return 0x13
+    case "capslock": return 0x14
+    default:
+        let u = Array(n.unicodeScalars)
+        if u.count == 1, ("a"..."z").contains(n) { return 0x41 + (u[0].value - 97) }
+        if u.count == 1, ("0"..."9").contains(n) { return 0x30 + (u[0].value - 48) }
+        if n.hasPrefix("f"), let f = Int(n.dropFirst()), (1...24).contains(f) { return UInt32(0x70 + f - 1) }
+        return nil
+    }
+}
+
+/// A chord as a keycap chip reads it: `Ctrl+⇧+Esc`.
+public func chordChip(_ keys: [String]) -> String {
+    keys.map { k -> String in
+        switch k.lowercased() {
+        case "ctrl", "control": return "Ctrl"
+        case "shift": return "⇧"
+        case "alt", "option": return "Alt"
+        case "win", "cmd", "super", "meta": return "❖"
+        case "escape", "esc": return "Esc"
+        case "enter", "return": return "↵"
+        case "backspace": return "⌫"
+        case "delete", "del": return "Del"
+        case "space": return "␣"
+        case "up": return "↑"
+        case "down": return "↓"
+        case "left": return "←"
+        case "right": return "→"
+        default: return k.prefix(1).uppercased() + k.dropFirst()
+        }
+    }.joined(separator: "+")
+}
+
 /// The virtual controller's preset: `layout` is `full`, `sticks` or `dpad`.
 public struct PadConfig: Equatable, Sendable {
     public var layout = "full"

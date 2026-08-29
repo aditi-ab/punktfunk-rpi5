@@ -31,12 +31,17 @@ public enum TouchInputMode: String, CaseIterable, Sendable {
     case pointer
     case touch
 
-    /// The persisted setting, defaulting to trackpad when unset/unknown.
+    /// The persisted setting, defaulting to trackpad when unset/unknown — unless the ring's
+    /// Touch mode slot cycled it for this session (`sessionOverride`, cleared at session end).
     public static var current: TouchInputMode {
-        TouchInputMode(
+        sessionOverride ?? TouchInputMode(
             rawValue: SessionSettings.current.touchMode
         ) ?? .trackpad
     }
+
+    /// A mid-stream switch from the quick-action ring: session-scoped, never persisted, and
+    /// applied from the NEXT gesture (the stream view latches the route per gesture).
+    public static var sessionOverride: TouchInputMode?
 }
 
 /// The gesture state machine behind the two mouse modes. One instance per stream view, fed
@@ -93,16 +98,6 @@ final class TouchMouse {
     var onKeyboardGesture: ((Bool) -> Void)?
     /// The two-finger twist turning the quick-action ring (`DialEvent`).
     var onDial: ((DialEvent) -> Void)?
-
-    /// The twist's progress, for the ring: `turn` on every move once armed, then `commit` at
-    /// the commit angle, or `cancel` when the fingers lift short of it (or wind it back).
-    enum DialEvent: Equatable {
-        /// `progress` 0…1 drives the ring's unwind; `clockwise` is the hand's direction;
-        /// `at` (view points) the centroid the ring is centred on.
-        case turn(progress: CGFloat, clockwise: Bool, at: CGPoint)
-        case commit
-        case cancel
-    }
 
     /// The twist: the finger-to-finger vector when the pair formed, the centroid then, and
     /// whether it has armed (owns the gesture) / committed (the ring stays open).

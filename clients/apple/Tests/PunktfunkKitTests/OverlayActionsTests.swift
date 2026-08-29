@@ -54,6 +54,22 @@ final class OverlayActionsTests: XCTestCase {
         XCTAssertTrue(cfg.ring.allSatisfy { $0 == nil })
     }
 
+    func testKeyNamesMapToWindowsVKs() {
+        XCTAssertEqual(keyVk("ctrl"), 0x11)
+        XCTAssertEqual(keyVk("Shift"), 0x10)
+        XCTAssertEqual(keyVk("escape"), 0x1B)
+        XCTAssertEqual(keyVk("tab"), 0x09)
+        XCTAssertEqual(keyVk("a"), 0x41)
+        XCTAssertEqual(keyVk("z"), 0x5A)
+        XCTAssertEqual(keyVk("0"), 0x30)
+        XCTAssertEqual(keyVk("f1"), 0x70)
+        XCTAssertEqual(keyVk("f12"), 0x7B)
+        XCTAssertNil(keyVk("f25"))
+        XCTAssertNil(keyVk("hyper"))
+        XCTAssertNil(keyVk(""))
+        XCTAssertEqual(chordChip(["ctrl", "shift", "escape"]), "Ctrl+⇧+Esc")
+    }
+
     func testSlotIdsAreStableStrings() {
         for id in [
             "end_stream", "disconnect_linger", "touch_mode", "keyboard", "stats", "mic", "pad",

@@ -299,6 +299,8 @@ extension Notification.Name {
     /// menus) — it exists so the menu item is honest whenever it CAN fire, and as the shortcut's
     /// discoverable menu-bar surface.
     public static let punktfunkReleaseCapture = Notification.Name("io.unom.punktfunk.release-capture")
+    /// The quick-action ring's Keyboard slot: summon the stream view's soft keyboard (iOS).
+    public static let punktfunkShowSoftKeyboard = Notification.Name("io.unom.punktfunk.show-soft-keyboard")
 
     /// Posted by the app's Stream menu ("Toggle Fullscreen", ⌃⌘F) and by InputCapture's monitor
     /// when the same combo fires while input is captured (the menu key-equivalent never reaches a

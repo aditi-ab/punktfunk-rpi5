@@ -111,6 +111,9 @@ public struct StreamView: NSViewRepresentable {
         captureEnabled: Bool = true,
         onCaptureChange: ((Bool) -> Void)? = nil,
         onDisconnectRequest: (() -> Void)? = nil,
+        // Call-site parity with the touch platforms: macOS has no twist (the ring opens from
+        // the keyboard there, a later work package), so the parameter is accepted and unused.
+        onDial: ((DialEvent) -> Void)? = nil,
         onFrame: (@Sendable (AccessUnit) -> Void)? = nil,
         onSessionEnd: (@Sendable () -> Void)? = nil,
         onResizeTarget: ((UInt32, UInt32) -> Void)? = nil,
