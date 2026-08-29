@@ -44,7 +44,7 @@ use windows::{
             Direct3D11::{D3D11_TEXTURE2D_DESC, ID3D11Texture2D},
             Dxgi::{IDXGIDevice, IDXGIResource},
         },
-        System::Performance::QueryPerformanceCounter,
+        System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
         System::Threading::{
             AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, GetCurrentThread,
             SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL, WaitForSingleObject,
@@ -200,6 +200,26 @@ fn qpc() -> u64 {
     {
         t as u64
     }
+}
+
+/// QPC ticks → whole milliseconds. Signed: a frame's display time can sit AFTER our acquire.
+fn qpc_ms(ticks: i64) -> i64 {
+    use std::sync::OnceLock;
+    static FREQ: OnceLock<i64> = OnceLock::new();
+    let f = *FREQ.get_or_init(|| {
+        let mut f = 0i64;
+        // SAFETY: out-pointer to a valid local; the frequency is fixed at boot.
+        let _ = unsafe { QueryPerformanceFrequency(&mut f) };
+        f.max(1)
+    });
+    ticks.saturating_mul(1000) / f
+}
+
+/// Wall-clock milliseconds since the Unix epoch — lines a driver-log witness up with host.log.
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
 }
 
 /// A minimal newtype to move a raw pointer / handle across the thread boundary. The wrapped value is a
@@ -475,6 +495,11 @@ impl SwapChainProcessor {
         // First `IddCxSwapChainReportFrameStatistics` outcome, logged once (the rest of the
         // session reports silently) so a field log answers "did the stats path engage".
         let mut logged_stats = false;
+        // Frame witness (see the success branch): the previous acquire's OS frame number and
+        // wall time, plus the last late-frame line's time (its throttle).
+        let mut last_pfn: u32 = 0;
+        let mut last_frame_at: Option<Instant> = None;
+        let mut last_late_log: Option<Instant> = None;
         // The frame-channel delivery gate (see `monitor::frame_channel_gen`): the loop only takes
         // the monitors mutex when a delivery LANDED since it last looked. Seeded one behind the
         // current generation so a delivery that arrived before this worker started (host delivered
@@ -621,6 +646,35 @@ impl SwapChainProcessor {
                 break;
             } else if hr_success(hr) {
                 let acquire_qpc = qpc();
+                // Frame witness: the two stamps the OS puts on every frame (`IDDCX_METADATA2`),
+                // which split a FRAME-GENERATION hole from inside the swap-chain. Logged when a
+                // frame ends >= 1 s of silence, or arrives >= 250 ms after its display time (at
+                // most one line per 2 s). Read the line as: a PresentationFrameNumber JUMP = DWM
+                // composed frames this swap-chain never received; +1 with a large `late` = the
+                // frames were composed on time and delivered late; +1 and fresh = DWM composed
+                // nothing for this head. `dirty=1` on a static desktop is the OS's no-update repeat.
+                let pfn = buffer.MetaData.PresentationFrameNumber;
+                let display_qpc = buffer.MetaData.PresentDisplayQPCTime;
+                #[allow(clippy::cast_possible_wrap)]
+                let late_ms =
+                    (display_qpc != 0).then(|| qpc_ms(acquire_qpc as i64 - display_qpc as i64));
+                let silence = last_frame_at.map_or(Duration::ZERO, |t| t.elapsed());
+                if silence >= Duration::from_secs(1)
+                    || (late_ms.is_some_and(|l| l >= 250)
+                        && last_late_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)))
+                {
+                    dbglog!(
+                        "[pf-vd] frame-witness (target={target_id}) t={} silence={}ms pfn={pfn} (+{}) late={} dirty={}",
+                        unix_ms(),
+                        silence.as_millis(),
+                        pfn.wrapping_sub(last_pfn),
+                        late_ms.map_or("n/a".to_string(), |l| format!("{l}ms")),
+                        buffer.MetaData.DirtyRectCount
+                    );
+                    last_late_log = Some(Instant::now());
+                }
+                last_pfn = pfn;
+                last_frame_at = Some(Instant::now());
                 if !logged_frame {
                     dbglog!(
                         "[pf-vd] swap-chain run_core: FIRST FRAME acquired (target={target_id}) — DWM IS compositing the virtual display!"
