@@ -335,6 +335,18 @@ internal suspend fun PointerInputScope.streamTouchInput(
                             ev.changes.forEach { it.consume() }
                             continue
                         }
+                        // Undecided: under DIAL_SLOP of travel and under DIAL_ARM_DEG of turn the
+                        // pair may still become a twist, so no scroll notch goes out yet — a
+                        // notch is final (scrollEmitted) and a real twist drifts its centroid
+                        // past SCROLL_DIV long before it turns 10°. The anchor follows the
+                        // centroid so the scroll starts smoothly once the slop is crossed.
+                        if (!scrollEmitted && travel < DIAL_SLOP) {
+                            scrolling = true
+                            scrollCount = 2
+                            prevCx = cx
+                            prevCy = cy
+                            continue
+                        }
                     }
                     // Two fingers → scroll by the centroid delta; never move the cursor.
                     // (Re-)anchor whenever the finger COUNT changes, not just on scroll start: the

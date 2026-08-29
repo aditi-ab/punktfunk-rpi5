@@ -228,7 +228,16 @@ final class TouchMouse {
         let c = CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
         if !d.armed {
             let travel = hypot(c.x - d.anchor.x, c.y - d.anchor.y)
-            if travel >= Tuning.dialSlop || abs(phi) < Tuning.dialArmDeg { return false }
+            if travel >= Tuning.dialSlop { return false }
+            // Undecided: under the slop and under the arm angle the pair may still become a
+            // twist, so no scroll notch goes out yet — a notch is final (`scrollEmitted`), and
+            // a real twist drifts its centroid past `scrollNotchPt` before it turns 10°. The
+            // anchor follows the centroid so the scroll starts smoothly once the slop is crossed.
+            if abs(phi) < Tuning.dialArmDeg {
+                scrolling = true
+                scrollAnchor = c
+                return true
+            }
             d.armed = true
             moved = true // a twist is never a tap…
             scrolling = true // …and dropping to one finger must not jerk the cursor

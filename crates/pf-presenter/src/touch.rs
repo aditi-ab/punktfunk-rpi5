@@ -404,8 +404,18 @@ impl Gestures {
         let (cx, cy) = self.centroid();
         if !dial.armed {
             let travel = (cx - dial.anchor.0).hypot(cy - dial.anchor.1);
-            if travel >= DIAL_SLOP || phi.abs() < DIAL_ARM_DEG {
+            if travel >= DIAL_SLOP {
                 return None;
+            }
+            // Undecided: under the slop and under the arm angle the pair may still become a
+            // twist, so no scroll notch goes out yet — a notch is final (`scroll_emitted`),
+            // and a real twist drifts its centroid past `SCROLL_DIV` long before it turns
+            // 10°. The anchor follows the centroid so the scroll starts smoothly once the
+            // slop is crossed.
+            if phi.abs() < DIAL_ARM_DEG {
+                self.scrolling = true;
+                self.scroll_anchor = (cx, cy);
+                return Some(Vec::new());
             }
             self.moved = true; // a twist is never a tap
             self.scrolling = true; // and dropping to one finger must not jerk the cursor
@@ -870,15 +880,41 @@ mod tests {
     }
 
     #[test]
+    fn a_drifting_twist_still_arms_and_scrolls_nothing() {
+        // Real fingers never pivot about a fixed point: the centroid drifts a few px per
+        // sample while the pair turns. Under the slop that drift is not a scroll — a single
+        // notch would lock the gesture as a scroll before the twist could reach 10°.
+        let mut g = Gestures::new(true, false);
+        let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
+        let _ = g.down(2, 140.0, 200.0, ABS, 2.0);
+        let mut acts = Vec::new();
+        for step in 1..=5 {
+            let c = (120.0 + 2.0 * step as f32, 200.0 - 2.0 * step as f32); // ~14 px in all
+            let (p1, p2) = twisted(c, 7.0 * step as f32);
+            acts.extend(g.motion(1, p1.0, p1.1, ABS, 10.0 * step as f64));
+            acts.extend(g.motion(2, p2.0, p2.1, ABS, 10.0 * step as f64 + 1.0));
+        }
+        assert!(
+            !acts.iter().any(|a| matches!(a, Act::Scroll { .. })),
+            "no notch while the pair is undecided: {acts:?}"
+        );
+        assert!(
+            acts.iter().any(|a| matches!(a, Act::Dial { .. })),
+            "the twist arms despite the drift: {acts:?}"
+        );
+        assert!(acts.contains(&Act::DialCommit), "35° commits: {acts:?}");
+    }
+
+    #[test]
     fn a_scroll_then_a_rotation_stays_a_scroll() {
         let mut g = Gestures::new(true, false);
         let c = (120.0, 200.0);
         let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
         let _ = g.down(2, 140.0, 200.0, ABS, 2.0);
-        let mut acts = g.motion(1, 100.0, 180.0, ABS, 10.0); // 20 px up: notches fire
-        acts.extend(g.motion(2, 140.0, 180.0, ABS, 11.0));
+        let mut acts = g.motion(1, 100.0, 170.0, ABS, 10.0); // 30 px up: past the slop
+        acts.extend(g.motion(2, 140.0, 170.0, ABS, 11.0)); // notches fire
         assert!(acts.iter().any(|a| matches!(a, Act::Scroll { .. })));
-        let (p1, p2) = twisted((c.0, 180.0), 40.0); // then a big twist around the new centroid
+        let (p1, p2) = twisted((c.0, 170.0), 40.0); // then a big twist around the new centroid
         acts = g.motion(1, p1.0, p1.1, ABS, 20.0);
         acts.extend(g.motion(2, p2.0, p2.1, ABS, 21.0));
         assert!(
