@@ -35,15 +35,17 @@ Prefer to read what runs first (it's plain `sh`, ~450 lines):
 
 <Installer inspect />
 
-It asks before anything optional (Moonlight compat, the shared clipboard, the `punktfunk` group,
-starting at boot) and every answer has a default, so `sh install.sh --yes` — or piping it with no
-terminal — runs unattended; `--channel stable|canary`, `--mgmt-port`, `--no-start`, `--uninstall` and the environment
-twins (`PUNKTFUNK_INSTALL_YES`, `PUNKTFUNK_INSTALL_CHANNEL`, `PUNKTFUNK_INSTALL_GAMESTREAM`,
-`PUNKTFUNK_INSTALL_CLIPBOARD`, `PUNKTFUNK_INSTALL_PUNKTFUNK_GROUP`, `PUNKTFUNK_INSTALL_LINGER`,
-`PUNKTFUNK_INSTALL_MGMT_PORT`) are listed by `--help`. It covers Ubuntu/Debian, Fedora, Arch-family
-and Bazzite/Fedora Atomic; NixOS, SteamOS and Windows it points at their pages. **Preview:** the
-per-system pages above remain the documented path, and the script runs exactly the install commands
-they show (CI fails if the two drift apart). Re-running is safe.
+It asks about intent, not internals (full controller, third-party Moonlight clients, clipboard,
+start at boot) and every answer has a default, so `sh install.sh --yes` — or piping it with no
+terminal — runs unattended. The default follows the box: Bazzite and Nobara join the `punktfunk`
+group and linger; an active Sunshine/Apollo host opts into Moonlight compat; a seatless SSH
+session lingers. Clipboard stays off. `--channel stable|canary`, `--mgmt-port`, `--no-start`,
+`--uninstall` and the environment twins (`PUNKTFUNK_INSTALL_YES`, `PUNKTFUNK_INSTALL_CHANNEL`,
+`PUNKTFUNK_INSTALL_GAMESTREAM`, `PUNKTFUNK_INSTALL_CLIPBOARD`, `PUNKTFUNK_INSTALL_PUNKTFUNK_GROUP`,
+`PUNKTFUNK_INSTALL_LINGER`, `PUNKTFUNK_INSTALL_MGMT_PORT`) are listed by `--help`. It covers
+Ubuntu/Debian, Fedora, Arch-family and Bazzite/Fedora Atomic; NixOS, SteamOS and Windows it points
+at their pages. **Preview:** the per-system pages above remain the documented path, and the script
+runs exactly the install commands they show (CI fails if the two drift apart). Re-running is safe.
 
 `--channel` also **switches** a host that is already installed — see
 [Release Channels](/docs/channels#switch-an-installed-box-between-channels). Without the flag the
