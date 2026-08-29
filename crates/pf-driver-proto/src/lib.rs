@@ -1443,6 +1443,10 @@ pub mod triton {
     /// 10 bytes there, not 64). An unknown id returns 64 — no trim, never guess a length.
     /// Provenance: the captured 372-byte descriptor ([`RDESC`]) plus the per-id output
     /// characteristic map, verified per-actuator against real hardware (bench 2026-06-09).
+    ///
+    /// ⚠ HAND-MIRRORED on the Apple client as `Sc2Device.strippedOutputLen` (id-EXCLUDED, so
+    /// `stripped + 1` == the value here), which trims the GATT write. Its test transcribes these
+    /// numbers, so it cannot catch a change made HERE — edit this table and you must edit that one.
     pub const fn out_report_len(id: u8) -> usize {
         match id {
             0x80 => 10,

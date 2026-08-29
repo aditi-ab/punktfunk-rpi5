@@ -50,9 +50,14 @@ enum Sc2Device {
 
     /// Declared STRIPPED payload length per output report id (wire length = stripped + 1). The
     /// hardware-verified table; its id-INCLUDED mirror is the host's
-    /// `pf_driver_proto::triton::out_report_len` — `Sc2DeviceTests` pins `strippedLen + 1 ==
-    /// hostLen` for every known id so a drift on either side fails CI. `nil` = unknown id: clamp
-    /// to what arrived minus the id byte, never guess-trim beyond that.
+    /// `pf_driver_proto::triton::out_report_len`.
+    ///
+    /// ⚠ The two tables are HAND-MIRRORED, not generated. `Sc2DeviceTests` pins `strippedLen + 1`
+    /// against a Swift *transcription* of the host values, so it catches a drift made HERE — it
+    /// cannot see a change made on the Rust side, which would leave this table silently stale and
+    /// the GATT write trimmed to the wrong length. Editing either table means editing both (the
+    /// Rust doc carries the same warning). `nil` = unknown id: clamp to what arrived minus the id
+    /// byte, never guess-trim beyond that.
     static func strippedOutputLen(id: UInt8) -> Int? {
         switch id {
         case 0x80: return 9 // grip rumble    → 100F6CB5 (left/right motor fields)
