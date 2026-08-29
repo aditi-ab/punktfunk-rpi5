@@ -43,7 +43,9 @@ mod os_marks;
 pub mod platform;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod pointer;
-#[cfg(any(target_os = "linux", windows, target_os = "android"))]
+// The in-stream ring on Skia is the DESKTOP shell's (Android has its Compose ring, and the
+// host-action cache it reads is desktop-gated).
+#[cfg(any(target_os = "linux", windows))]
 mod ring;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod screens;
