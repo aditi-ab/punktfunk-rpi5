@@ -255,12 +255,15 @@ pub struct DisplayPolicy {
     /// untouched.
     #[serde(default)]
     pub ddc_power_off: bool,
-    /// EXPERIMENTAL (Windows): DISABLE physical monitors' PnP device nodes for the stream's
-    /// duration (persistently, so a standby monitor/TV whose hot-plug events re-arrive stays
-    /// disabled) and re-enable them at teardown. Two selectors: the monitors an `Exclusive`
-    /// isolate deactivated, plus — in ANY topology — external monitors that are connected but not
-    /// part of the desktop (the standby TV that was never active, whose input auto-scan /
-    /// instant-on HPD cycling re-probes the link every few seconds). Targets the same
+    /// EXPERIMENTAL (Windows): DISABLE the OPERATOR'S OWN physical monitors' PnP device nodes for
+    /// the stream's duration (persistently, so a monitor whose hot-plug events re-arrive stays
+    /// disabled) and re-enable them at teardown — the monitors an `Exclusive` isolate
+    /// deactivated. Still opt-in, because it takes displays the operator was actually using.
+    ///
+    /// The *other* selector — external monitors connected but part of NO topology (the standby
+    /// TV that was never active, whose input auto-scan / instant-on HPD cycling re-probes the
+    /// link every few seconds) — no longer needs this flag: it runs by default, see
+    /// [`standby_sink_neutralise`]. Setting this flag still implies it. Targets the same
     /// "connected-but-dark head" periodic-stutter class as [`Self::ddc_power_off`], but at the
     /// Windows-reaction level: a disabled devnode's wake events trigger no PnP arrival, no CCD
     /// re-evaluation, no DWM invalidation. A crash-recovery journal re-enables leftovers on host
@@ -759,6 +762,15 @@ impl DisplayPolicyStore {
         self.get().edid_lock
     }
 
+    /// Whether to neutralise CONNECTED-BUT-INACTIVE EXTERNAL sinks (the standby TV/monitor that
+    /// is not part of the desktop in any topology) for the stream's duration — **on by default**,
+    /// see [`standby_sink_neutralise`]. The user's own displays are NOT in scope here: that is the
+    /// deactivated-set selector, still gated on the opt-in [`Self::pnp_disable_monitors`].
+    pub fn standby_sink_neutralise(&self) -> bool {
+        standby_sink_neutralise(std::env::var("PUNKTFUNK_STANDBY_SINK_KEEP").ok().as_deref())
+            || self.get().pnp_disable_monitors
+    }
+
     /// Persist + adopt a new policy (sanitized first). The in-memory value changes only if the disk
     /// write succeeds, so a full disk can't leave memory and file disagreeing — and the whole
     /// transaction runs under [`Self::write`], so neither can two concurrent PUTs.
@@ -1082,6 +1094,25 @@ pub fn load_custom_presets() -> Vec<CustomPreset> {
             Vec::new()
         }
     }
+}
+
+/// Should a connected-but-inactive EXTERNAL sink be neutralised while streaming? **Yes unless the
+/// operator opts out** with `PUNKTFUNK_STANDBY_SINK_KEEP` (any value but `0`/`off`/empty).
+///
+/// Default-on because it is measured: 16 alternating pairs on the .173 lab box (standby LG TV on
+/// HDMI, IDD-push loopback under continuous cursor damage, 150 s per leg), each leg asserting the
+/// treatment actually applied via the sweep's own `PnP-disable: monitor devnode disabled` line.
+/// **The baseline produced a hole-free leg 0 times in 16; the sweep produced one 8 times in 16**
+/// (Fisher p≈0.002), median hole 6.3 s → 0.7 s, total 370.7 s → 213.6 s. It is an improvement,
+/// NOT a cure: 6 of the 16 treated legs still took FRAME-GENERATION holes — the OS dropping
+/// composed frames for the virtual head while other processes present normally — some tens of
+/// seconds long, and the hole-time rank-sum is only borderline (p≈0.055).
+///
+/// The operator's own displays are out of scope: this selector only ever sees external physicals
+/// that are in NO topology, so an internal laptop panel can never be picked (see
+/// `monitor_devnode::disable_connected_inactive`).
+pub fn standby_sink_neutralise(opt_out: Option<&str>) -> bool {
+    !matches!(opt_out, Some(v) if !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("off"))
 }
 
 /// 12 hex chars from the name + wall-clock nanos + a `nonce` — no uuid dep (the host `library`
@@ -1752,6 +1783,19 @@ mod tests {
         let p = DisplayPolicyStore::parse(std::path::Path::new("t.json"), doc).unwrap();
         assert_eq!(p.max_displays, 2);
         assert_eq!(p.identity, Identity::default());
+    }
+
+    #[test]
+    fn standby_sink_neutralise_is_on_unless_explicitly_kept() {
+        // Unset, empty, and the two "off" spellings all mean: neutralise (the measured default).
+        assert!(standby_sink_neutralise(None));
+        assert!(standby_sink_neutralise(Some("")));
+        assert!(standby_sink_neutralise(Some("0")));
+        assert!(standby_sink_neutralise(Some("off")));
+        assert!(standby_sink_neutralise(Some("OFF")));
+        // Anything else is the operator asking to keep the sink alive.
+        assert!(!standby_sink_neutralise(Some("1")));
+        assert!(!standby_sink_neutralise(Some("keep")));
     }
 
     #[test]

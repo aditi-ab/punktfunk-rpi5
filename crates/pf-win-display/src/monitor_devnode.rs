@@ -1,4 +1,7 @@
-//! PnP monitor-devnode disable — the EXPERIMENTAL `pnp_disable_monitors` display-policy axis.
+//! PnP monitor-devnode disable. Two selectors with two different defaults:
+//! [`disable_connected_inactive`] (standby sinks — **on by default**, measured; see
+//! `pf_vdisplay::policy::standby_sink_neutralise`) and [`disable_for_deactivated`] (the
+//! operator's own displays — still the EXPERIMENTAL opt-in `pnp_disable_monitors` axis).
 //!
 //! An `Exclusive` isolate removes the physical monitors from the desktop TOPOLOGY (CCD), but their
 //! PnP device nodes stay live — so a standby monitor/TV that periodically wakes its connection

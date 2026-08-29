@@ -1523,11 +1523,16 @@ impl VirtualDisplayManager {
                 // re-requesting the phantom rate takes the plain JOIN branch and never tries again.
                 mode = committed_mode_or(added.target_id, mode);
 
-                // EXPERIMENTAL `pnp_disable_monitors`, second selector (ANY topology): monitors
-                // that are connected but NOT part of the desktop — the standby TV/monitor the
+                // Standby-sink neutralisation, second selector (ANY topology): monitors that are
+                // connected but NOT part of the desktop — the standby TV/monitor the
                 // deactivated-set selector above structurally misses (it never had an active path
                 // to deactivate), yet whose periodic standby wake events drive the same Windows
-                // reaction cascade (rationale in `windows/monitor_devnode.rs`). Runs AFTER the
+                // reaction cascade (rationale in `windows/monitor_devnode.rs`). **On by default**
+                // since the 2026-08-29 .173 A/B measured it removing the FRAME-GENERATION holes
+                // (see `policy::standby_sink_neutralise` for the numbers and the opt-out); the
+                // operator's own displays stay opt-in under `pnp_disable_monitors`, because only
+                // THIS selector is limited to external physicals that are in no topology at all.
+                // Runs AFTER the
                 // settle so the active flags it reads are the committed ones (a display still
                 // mid-activation from the primary topology's force-EXTEND must not read as
                 // inactive and get disabled) — and since the verified wait above only confirms
@@ -1536,7 +1541,7 @@ impl VirtualDisplayManager {
                 // In Extend the active physical panels are untouched by construction. First
                 // member only — the sweep is group-scoped like the isolate; later members join
                 // an already-swept desktop.
-                if first_member && crate::policy::prefs().pnp_disable_monitors() {
+                if first_member && crate::policy::prefs().standby_sink_neutralise() {
                     if let Some(rest) =
                         Duration::from_millis(1500).checked_sub(settle_start.elapsed())
                     {
