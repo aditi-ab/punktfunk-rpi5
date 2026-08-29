@@ -396,6 +396,14 @@ struct ContentView: View {
                 ring.close()
                 // Host-action slots are pre-fetched here, never when the ring opens (§3.1).
                 if let host = model.activeHost { HostPowerStore.shared.refresh(host) }
+                // `Select+A` on a pad opens the ring at the screen centre; while it is up the
+                // pad belongs to it.
+                model.onRingChord = { [ring] in
+                    ring.pressTick &+= 1
+                    let b = UIScreen.main.bounds
+                    ring.openAt(CGPoint(x: b.midX, y: b.midY))
+                }
+                model.onRingNav = { [ring] nav in ring.nav(nav) }
                 #endif
                 #endif
                 // A session actually started — remember it on the card ("Connected … ago"
@@ -1287,6 +1295,7 @@ struct ContentView: View {
                             actions: ringActions(conn))
                     }
                 }
+                .onChange(of: ring.committed) { _, open in model.setRingOpen(open) }
                 #endif
             }
         }

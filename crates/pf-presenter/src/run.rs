@@ -732,6 +732,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     let gamepad_subsystem = sdl.gamepad().context("SDL gamepad")?;
     let (gamepad, mut pump) = GamepadService::pumped(gamepad_subsystem);
     let escape_rx = gamepad.escape_events();
+    let ring_rx = gamepad.ring_events();
+    // The ring's pad ownership, edge-tracked: on open the pads are masked (a held trigger is
+    // released on the host) and polled into menu events; on close they are re-adopted.
+    let mut ring_was_open = false;
     let disconnect_rx = gamepad.disconnect_events();
     let menu_rx = gamepad.menu_events();
     if matches!(mode, ModeCtl::Browse(_)) {
@@ -1395,6 +1399,34 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 ti.start(&window);
             } else {
                 ti.stop(&window);
+            }
+        }
+
+        // `Select+A` on a pad: the ring, at the window centre (design §2.6). The pad's
+        // highlight starts on the centre, so `Select+A` then `A` opens the sheet.
+        while ring_rx.try_recv().is_ok() {
+            if let (Some(o), true) = (overlay.as_mut(), stream.is_some()) {
+                let (pw, ph) = window.size_in_pixels();
+                o.ring_input(RingInput::Toggle {
+                    x: pw as f32 / 2.0,
+                    y: ph as f32 / 2.0,
+                });
+            }
+        }
+        // While the ring is up the pad belongs to the ring: masked off the wire, polled into
+        // menu events the overlay consumes. The three gates that keep pad input off client UI
+        // in-stream flip here together.
+        let ring_open = stream.is_some() && overlay.as_ref().is_some_and(|o| o.ring_open());
+        if ring_open != ring_was_open {
+            ring_was_open = ring_open;
+            gamepad.set_masked(ring_open);
+            gamepad.set_ring_nav(ring_open);
+        }
+        if ring_open {
+            while let Ok(ev) = menu_rx.try_recv() {
+                if let Some(o) = overlay.as_mut() {
+                    o.handle_menu(ev);
+                }
             }
         }
 

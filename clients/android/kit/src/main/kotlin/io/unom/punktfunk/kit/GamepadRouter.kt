@@ -1,5 +1,6 @@
 package io.unom.punktfunk.kit
 
+import kotlin.math.abs
 import android.content.Context
 import android.hardware.input.InputManager
 import android.os.Handler
@@ -35,6 +36,9 @@ import java.util.concurrent.ConcurrentHashMap
  * threads, [padPresent]/[padHasOwnMotion] from the phone-gyro thread and [deviceMotion] from the
  * pad-sensor thread, so the slot table is a [ConcurrentHashMap].
  */
+/** What a pad does to the quick-action ring while it owns the pad (design §2.6). */
+enum class RingNav { UP, DOWN, LEFT, RIGHT, CONFIRM, BACK, CENTRE }
+
 class GamepadRouter(
     context: Context,
     private val handle: Long,
@@ -123,6 +127,9 @@ class GamepadRouter(
         var pendingGuide: Runnable? = null
         var pendingTapUp: Runnable? = null
         var selectAsGuide = false
+        /** `Select+A` opened the ring: neither press reached the host, so neither release may. */
+        var swallowA = false
+        var swallowSelect = false
     }
 
     /** deviceId → slot. Concurrent: the feedback poll threads read it via [deviceForPad]. */
@@ -196,6 +203,43 @@ class GamepadRouter(
     var onStatsChord: (() -> Unit)? = null
 
     /**
+     * `Select+A`, Select first, while Select is still pending its guide hold: the quick-action
+     * ring's opener (design/touch-client-overlay.md §2.6) — the first chord the host never sees.
+     * A is "jump" or "confirm" in most games, so both presses are swallowed.
+     */
+    var onRingChord: (() -> Unit)? = null
+
+    /** A pad press while the ring owns the pad ([setRingOpen]). Main thread. */
+    var onRingNav: ((RingNav) -> Unit)? = null
+
+    @Volatile private var ringOpen = false
+    /** The left stick's current direction while the ring is up, for edge-triggered nav. */
+    private var stickDir: RingNav? = null
+
+    /**
+     * The ring is up: everything held is released on the host NOW (a held sprint must not
+     * survive a menu), and until it closes every press becomes [onRingNav] instead of a wire
+     * send. On close nothing is replayed — the next physical press re-establishes itself.
+     */
+    fun setRingOpen(open: Boolean) {
+        if (ringOpen == open) return
+        ringOpen = open
+        stickDir = null
+        if (open) slots.values.forEach { releaseHeld(it) }
+    }
+
+    private fun ringNavFor(bit: Int): RingNav? = when (bit) {
+        Gamepad.BTN_DPAD_UP -> RingNav.UP
+        Gamepad.BTN_DPAD_DOWN -> RingNav.DOWN
+        Gamepad.BTN_DPAD_LEFT -> RingNav.LEFT
+        Gamepad.BTN_DPAD_RIGHT -> RingNav.RIGHT
+        Gamepad.BTN_A -> RingNav.CONFIRM
+        Gamepad.BTN_B -> RingNav.BACK
+        Gamepad.BTN_Y -> RingNav.CENTRE
+        else -> null
+    }
+
+    /**
      * Invoked (main thread) once per pad when a captured controller WITH a gyro turns out to be in
      * a session whose virtual pad has no motion plane — its motion is not being sent, because every
      * sample would be decoded and dropped host-side.
@@ -266,6 +310,12 @@ class GamepadRouter(
      * the instant chords ([MIC_CHORD], [STATS_CHORD], and the mute button's own mic toggle).
      */
     private fun slotButton(slot: Slot, bit: Int, down: Boolean, send: Boolean) {
+        // The ring owns the pad: presses drive it, and nothing reaches the wire (the slot's
+        // held state was released when it opened).
+        if (ringOpen) {
+            if (down && send) ringNavFor(bit)?.let { onRingNav?.invoke(it) }
+            return
+        }
         // Raw system buttons stay local under the "local" policy — no wire send and no held
         // tracking, symmetric on both edges so nothing leaks into the chords either. A Steam
         // Controller 2's QAM button is BTN_MISC1 and keeps exactly that behaviour.
@@ -282,6 +332,17 @@ class GamepadRouter(
             return
         }
         if (down) {
+            // `Select+A`, Select first: the ring chord. The pending Select was never sent, A
+            // is not sent, and both releases are dropped when they come.
+            if (bit == Gamepad.BTN_A && slot.pendingGuide != null && send) {
+                slot.pendingGuide?.let { mainHandler.removeCallbacks(it) }
+                slot.pendingGuide = null
+                slot.swallowSelect = true
+                slot.swallowA = true
+                slot.held = slot.held or bit
+                onRingChord?.invoke()
+                return
+            }
             if (guideGesture && send) {
                 // A Select pressed ALONE is held back until it resolves: a tap (delivered
                 // on release), a combo member (the next button flushes it as a real
@@ -324,6 +385,12 @@ class GamepadRouter(
             }
             if (completesChord(wasHeld, bit, STATS_CHORD)) onStatsChord?.invoke()
         } else {
+            // A swallowed chord button: its press never went out, so its release must not.
+            if ((bit == Gamepad.BTN_A && slot.swallowA) || (bit == Gamepad.BTN_BACK && slot.swallowSelect)) {
+                if (bit == Gamepad.BTN_A) slot.swallowA = false else slot.swallowSelect = false
+                slot.held = slot.held and bit.inv()
+                return
+            }
             val owned = guideGesture && bit == Gamepad.BTN_BACK && consumeSelectRelease(slot)
             if (!owned && send && forwarding && !localOnly(slot, bit)) {
                 NativeBridge.nativeSendGamepadButton(handle, bit, false, slot.index)
@@ -432,6 +499,24 @@ class GamepadRouter(
         val dev = event.device ?: return false
         if (!isForwardable(dev)) return false
         val slot = slotFor(dev) ?: return false
+        if (ringOpen) {
+            // The left stick steps the ring like the D-pad, edge-triggered on leaving neutral.
+            val x = event.getAxisValue(MotionEvent.AXIS_X)
+            val y = event.getAxisValue(MotionEvent.AXIS_Y)
+            val dir = when {
+                y < -0.6f -> RingNav.UP
+                y > 0.6f -> RingNav.DOWN
+                x < -0.6f -> RingNav.LEFT
+                x > 0.6f -> RingNav.RIGHT
+                abs(x) < 0.4f && abs(y) < 0.4f -> null
+                else -> stickDir
+            }
+            if (dir != stickDir) {
+                stickDir = dir
+                dir?.let { onRingNav?.invoke(it) }
+            }
+            return true
+        }
         if (forwarding) slot.mapper.onMotion(event)
         return true
     }
@@ -715,6 +800,10 @@ class GamepadRouter(
                 NativeBridge.nativeSendGamepadButton(handle, Gamepad.BTN_GUIDE, false, slot.index)
             }
         }
+        // A swallowed chord's buttons were never pressed on the wire: drop them from the
+        // release sweep, and keep the flags so their eventual physical releases are dropped.
+        if (slot.swallowA) slot.held = slot.held and Gamepad.BTN_A.inv()
+        if (slot.swallowSelect) slot.held = slot.held and Gamepad.BTN_BACK.inv()
         var bits = slot.held
         while (bits != 0) {
             val bit = bits and -bits // lowest set bit

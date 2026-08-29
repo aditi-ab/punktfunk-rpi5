@@ -45,6 +45,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -67,6 +68,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.unom.punktfunk.kit.NativeBridge
+import io.unom.punktfunk.kit.RingNav
 import kotlinx.coroutines.delay
 import kotlin.math.cos
 import kotlin.math.roundToInt
@@ -103,6 +105,23 @@ class RingState {
     var hint by mutableStateOf<String?>(null)
     var lastTouch by mutableLongStateOf(0L)
     private var twistArmed = false
+    /** The pad's highlight: a slot 0…5, or 6 for the centre (the initial one — `Select+A`
+     *  then A opens the sheet in two presses). `null` until a pad moves it. */
+    var highlight by mutableStateOf<Int?>(null)
+    /** The sheet row the pad is on. */
+    var sheetCursor by mutableIntStateOf(0)
+    /** The mode at first open — the Resolution row's "Native". */
+    var nativeMode: IntArray? = null
+    /** A pad press awaiting the overlay ([RingOverlay] consumes it); [navSeq] makes each one an event. */
+    var pendingNav by mutableStateOf<RingNav?>(null)
+    var navSeq by mutableIntStateOf(0)
+    /** Open/close edges, for the shell: the pad router masks itself while the ring is up. */
+    var onOpenChange: ((Boolean) -> Unit)? = null
+
+    fun nav(n: RingNav) {
+        pendingNav = n
+        navSeq++
+    }
 
     val visible: Boolean get() = committed || progress > 0f
 
@@ -118,9 +137,11 @@ class RingState {
     }
 
     fun commit() {
+        val was = committed
         committed = true
         progress = 1f
         touch()
+        if (!was) onOpenChange?.invoke(true)
     }
 
     /** The twist lifted short of commit, or wound back after one: the ring winds back in. */
@@ -132,12 +153,15 @@ class RingState {
     }
 
     fun close() {
+        val was = committed
         committed = false
         progress = 0f
         sheet = false
         armed = null
         hint = null
+        highlight = null
         twistArmed = false
+        if (was) onOpenChange?.invoke(false)
     }
 
     fun touch() {
@@ -288,6 +312,8 @@ fun RingOverlay(
         }
     }
     var textDialog by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { if (state.nativeMode == null) state.nativeMode = actions.currentMode() }
+    val rows = if (state.sheet) sheetRows(state, cfg, actions, haptics) { textDialog = true } else emptyList()
 
     // The haptic vocabulary: a tap per press, a firm "no" on a dimmed button, a warning when a
     // destructive slot arms, and the confirm on the commit (StreamScreen fires that one).
@@ -327,6 +353,39 @@ fun RingOverlay(
         if (s.toggle) state.hint = spec(slot, cfg, actions).let { "${it.label}: ${it.state}" }
     }
 
+    // The pad (design §2.6): Right steps the highlight clockwise, Left anticlockwise, Up jumps
+    // to 12 o'clock, Down to 6, Y returns it to the centre; A fires the highlight (the centre
+    // opens the sheet), B closes. In the sheet, Up/Down walk the rows, Left/Right adjust one.
+    LaunchedEffect(state.navSeq) {
+        val n = state.pendingNav ?: return@LaunchedEffect
+        state.pendingNav = null
+        state.touch()
+        if (state.sheet) {
+            when (n) {
+                RingNav.UP -> { state.sheetCursor = (state.sheetCursor - 1).coerceAtLeast(0); haptics.tick() }
+                RingNav.DOWN -> { state.sheetCursor = (state.sheetCursor + 1).coerceAtMost(rows.lastIndex.coerceAtLeast(0)); haptics.tick() }
+                RingNav.LEFT -> rows.getOrNull(state.sheetCursor)?.onAdjust?.let { it(-1); haptics.tick() } ?: haptics.boundary()
+                RingNav.RIGHT -> rows.getOrNull(state.sheetCursor)?.onAdjust?.let { it(1); haptics.tick() } ?: haptics.boundary()
+                RingNav.CONFIRM -> rows.getOrNull(state.sheetCursor)?.let { if (it.enabled) haptics.tick() else haptics.boundary(); it.onTap() }
+                RingNav.BACK -> { state.sheet = false; haptics.tick() }
+                RingNav.CENTRE -> {}
+            }
+            return@LaunchedEffect
+        }
+        val h = state.highlight ?: 6
+        when (n) {
+            RingNav.RIGHT -> { state.highlight = if (h >= 6) 0 else (h + 1) % 6; haptics.tick() }
+            RingNav.LEFT -> { state.highlight = if (h >= 6) 5 else (h + 5) % 6; haptics.tick() }
+            RingNav.UP -> { state.highlight = 0; haptics.tick() }
+            RingNav.DOWN -> { state.highlight = 3; haptics.tick() }
+            RingNav.CENTRE -> { state.highlight = 6; haptics.tick() }
+            RingNav.CONFIRM -> if (h >= 6) { haptics.tick(); state.sheetCursor = 0; state.sheet = true } else {
+                cfg.ring[h]?.let { fire(spec(it, cfg, actions), it) } ?: haptics.boundary()
+            }
+            RingNav.BACK -> state.close()
+        }
+    }
+
     Box(
         modifier
             .fillMaxSize()
@@ -356,6 +415,7 @@ fun RingOverlay(
                 scale = 0.6f + 0.4f * q,
                 alpha = q,
                 armed = s != null && state.armed == s.id,
+                highlighted = state.highlight == k,
                 modifier = Modifier.offset { IntOffset(x.roundToInt(), y.roundToInt()) },
                 onTap = { if (slot != null && s != null) fire(s, slot) },
             )
@@ -370,11 +430,16 @@ fun RingOverlay(
                 scale = 0.6f + 0.4f * cq,
                 alpha = cq,
                 armed = false,
+                highlighted = state.highlight == 6,
                 modifier = Modifier.offset { IntOffset((cx - centreHalf).roundToInt(), (cy - centreHalf).roundToInt()) },
                 onTap = { state.touch(); haptics.tick(); state.sheet = true },
             )
         }
-        state.hint?.let { hint ->
+        // The label under the ring: a hint, else the highlighted slot's name.
+        val label = state.hint ?: state.highlight?.let { h ->
+            if (h == 6) "More" else cfg.ring[h]?.let { spec(it, cfg, actions).label }
+        }
+        label?.let { hint ->
             val labelY = cy + radiusPx + slotPx
             Text(
                 hint,
@@ -388,7 +453,7 @@ fun RingOverlay(
             )
         }
         if (state.sheet) {
-            RingSheet(state, cfg, actions, haptics, Modifier.align(Alignment.BottomCenter))
+            RingSheet(state, rows, haptics, Modifier.align(Alignment.BottomCenter))
         }
     }
 
@@ -415,6 +480,7 @@ private fun RingButton(
     alpha: Float,
     armed: Boolean,
     modifier: Modifier,
+    highlighted: Boolean = false,
     onTap: () -> Unit,
 ) {
     val tint = when {
@@ -428,7 +494,11 @@ private fun RingButton(
             .graphicsLayer { scaleX = scale; scaleY = scale; this.alpha = alpha }
             .clip(CircleShape)
             .background(Color.Black.copy(alpha = if (armed) 0.75f else 0.55f))
-            .border(1.dp, Color.White.copy(alpha = if (armed) 0.6f else 0.18f), CircleShape)
+            .border(
+                if (highlighted) 2.dp else 1.dp,
+                Color.White.copy(alpha = if (highlighted) 0.8f else if (armed) 0.6f else 0.18f),
+                CircleShape,
+            )
             .clickable(enabled = spec != null, onClick = onTap)
             .semantics {
                 contentDescription = spec?.label ?: "Empty slot"
@@ -448,17 +518,92 @@ private fun RingButton(
     }
 }
 
-/** Depth two: the complete catalogue in a fixed order (D2), as a scrollable bottom panel. */
-@Composable
-private fun RingSheet(
+/** One row of the sheet as data, so a finger and a pad drive the same list. */
+private data class SheetRowSpec(
+    val header: String? = null,
+    val label: String,
+    val value: String = "",
+    val enabled: Boolean = true,
+    /** Left/Right on a pad: cycle a value (the resolution rows); a tap cycles forward. */
+    val onAdjust: ((Int) -> Unit)? = null,
+    val onTap: () -> Unit,
+)
+
+private val RES_PRESETS = listOf("1440p" to (2560 to 1440), "1080p" to (1920 to 1080), "720p" to (1280 to 720))
+private val HZ_PRESETS = listOf(120, 60)
+
+/** Depth two: the complete catalogue in a fixed order (D2). */
+private fun sheetRows(
     state: RingState,
     cfg: OverlayConfig,
     actions: RingActions,
     haptics: ConsoleHaptics,
-    modifier: Modifier,
-) {
+    requestText: () -> Unit,
+): List<SheetRowSpec> {
+    val rows = mutableListOf<SheetRowSpec>()
+    val mode = actions.currentMode()
+    val native = state.nativeMode ?: mode
+    val (w, h, hz) = Triple(mode.getOrElse(0) { 0 }, mode.getOrElse(1) { 0 }, mode.getOrElse(2) { 60 })
+    val (nw, nh, nhz) = Triple(native.getOrElse(0) { 0 }, native.getOrElse(1) { 0 }, native.getOrElse(2) { 60 })
+    val resLabel = if (w == nw && h == nh) "Native ($w×$h)" else RES_PRESETS.firstOrNull { it.second == (w to h) }?.first ?: "$w×$h"
+    fun adjustRes(dir: Int) {
+        val options = listOf(nw to nh) + RES_PRESETS.map { it.second }
+        val i = options.indexOf(w to h).coerceAtLeast(0)
+        val n = options.size
+        val next = options[((i + dir) % n + n) % n]
+        actions.requestMode(next.first, next.second, hz)
+    }
+    fun adjustHz(dir: Int) {
+        val options = (listOf(nhz) + HZ_PRESETS).distinct()
+        val i = options.indexOf(hz).coerceAtLeast(0)
+        val n = options.size
+        actions.requestMode(w, h, options[((i + dir) % n + n) % n])
+    }
+    rows += SheetRowSpec("Session", "End stream", if (state.armed == "end_stream") "tap again" else "") {
+        if (state.armed == "end_stream") { state.close(); actions.endStream() } else { haptics.boundary(); state.armed = "end_stream" }
+    }
+    rows += SheetRowSpec(null, "Disconnect, keep the game running") { state.close(); actions.disconnectLinger() }
+    rows += SheetRowSpec("Resolution", "Resolution", resLabel, onAdjust = ::adjustRes) { adjustRes(1) }
+    rows += SheetRowSpec(null, "Refresh", "$hz Hz", onAdjust = ::adjustHz) { adjustHz(1) }
+    val tm = spec(SlotId.TouchMode, cfg, actions)
+    rows += SheetRowSpec("Input", tm.label, tm.state) { actions.cycleTouchMode() }
+    val kb = spec(SlotId.Keyboard, cfg, actions)
+    rows += SheetRowSpec(null, kb.label, if (kb.enabled) "" else kb.reason, kb.enabled) { if (kb.enabled) { state.close(); actions.keyboard() } }
+    val st = spec(SlotId.SendText, cfg, actions)
+    rows += SheetRowSpec(null, st.label, if (st.enabled) "" else st.reason, st.enabled) { if (st.enabled) requestText() }
+    val pad = spec(SlotId.Pad, cfg, actions)
+    rows += SheetRowSpec(null, pad.label, pad.reason, false) {}
+    rows += SheetRowSpec("View", "Statistics", actions.stats().label) { actions.cycleStats() }
+    val mic = spec(SlotId.Mic, cfg, actions)
+    rows += SheetRowSpec("Audio", mic.label, if (mic.enabled) mic.state else mic.reason, mic.enabled) { if (mic.enabled) actions.toggleMic() }
+    actions.hostActions().forEachIndexed { i, act ->
+        val id = "host:${act.id}"
+        rows += SheetRowSpec(
+            if (i == 0) "Host" else null, act.label,
+            when {
+                !act.available -> act.unavailableReason
+                state.armed == id -> "tap again"
+                else -> ""
+            },
+            act.available,
+        ) {
+            if (!act.available) return@SheetRowSpec
+            if (act.danger && state.armed != id) { haptics.boundary(); state.armed = id } else { state.close(); actions.invokeHost(act) }
+        }
+    }
+    cfg.shortcuts.forEachIndexed { i, s ->
+        val ok = actions.keyboardGranted() && s.keys.all { keyVk(it) != null }
+        rows += SheetRowSpec(if (i == 0) "Shortcuts" else null, s.label.ifEmpty { chordChip(s.keys) }, chordChip(s.keys), ok) {
+            if (ok) { state.close(); actions.sendShortcut(s.keys) }
+        }
+    }
+    return rows
+}
+
+/** The sheet as a scrollable bottom panel; the pad's cursor row is tinted. */
+@Composable
+private fun RingSheet(state: RingState, rows: List<SheetRowSpec>, haptics: ConsoleHaptics, modifier: Modifier) {
     val scroll = rememberScrollState()
-    var textDialog by remember { mutableStateOf(false) }
     Column(
         modifier
             .fillMaxWidth(0.92f)
@@ -468,127 +613,32 @@ private fun RingSheet(
             .padding(vertical = 8.dp)
             .verticalScroll(scroll),
     ) {
-        @Composable
-        fun row(label: String, value: String = "", enabled: Boolean = true, onTap: () -> Unit) {
+        rows.forEachIndexed { i, r ->
+            r.header?.let { text ->
+                Text(
+                    text, color = Color.White.copy(alpha = 0.6f), fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(start = 20.dp, top = 12.dp, bottom = 4.dp),
+                )
+            }
             Row(
                 Modifier
                     .fillMaxWidth()
-                    .clickable { state.touch(); if (enabled) haptics.tick() else haptics.boundary(); onTap() }
-                    .padding(horizontal = 20.dp, vertical = 12.dp)
-                    .alpha(if (enabled) 1f else 0.45f),
-            ) {
-                Text(label, color = Color.White, fontSize = 15.sp, modifier = Modifier.weight(1f))
-                if (value.isNotEmpty()) Text(value, color = Color.White.copy(alpha = 0.7f), fontSize = 15.sp)
-            }
-        }
-        @Composable
-        fun header(text: String) {
-            Text(
-                text, color = Color.White.copy(alpha = 0.6f), fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.padding(start = 20.dp, top = 12.dp, bottom = 4.dp),
-            )
-        }
-        header("Session")
-        row("End stream", if (state.armed == "end_stream") "tap again" else "") {
-            if (state.armed == "end_stream") { state.close(); actions.endStream() } else { haptics.boundary(); state.armed = "end_stream" }
-        }
-        row("Disconnect, keep the game running") { state.close(); actions.disconnectLinger() }
-
-        header("Resolution")
-        val mode = actions.currentMode()
-        val native = mode.getOrElse(0) { 0 } to mode.getOrElse(1) { 0 }
-        Row(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-            listOf("Native" to native, "1440p" to (2560 to 1440), "1080p" to (1920 to 1080), "720p" to (1280 to 720))
-                .forEach { (name, wh) ->
-                    Chip(name, selected = wh.first == mode.getOrElse(0) { 0 } && wh.second == mode.getOrElse(1) { 0 }) {
+                    .background(if (state.sheetCursor == i) Color.White.copy(alpha = 0.12f) else Color.Transparent)
+                    .clickable {
                         state.touch()
-                        if (wh.first > 0) actions.requestMode(wh.first, wh.second, mode.getOrElse(2) { 60 })
+                        state.sheetCursor = i
+                        if (r.enabled) haptics.tick() else haptics.boundary()
+                        r.onTap()
                     }
-                }
-        }
-        Row(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-            listOf("120 Hz" to 120, "60 Hz" to 60).forEach { (name, hz) ->
-                Chip(name, selected = mode.getOrElse(2) { 0 } == hz) {
-                    state.touch()
-                    actions.requestMode(mode.getOrElse(0) { 0 }, mode.getOrElse(1) { 0 }, hz)
-                }
-            }
-        }
-
-        header("Input")
-        val tm = spec(SlotId.TouchMode, cfg, actions)
-        row(tm.label, tm.state) { actions.cycleTouchMode() }
-        val kb = spec(SlotId.Keyboard, cfg, actions)
-        row(kb.label, if (kb.enabled) "" else kb.reason, kb.enabled) { if (kb.enabled) { state.close(); actions.keyboard() } }
-        val st = spec(SlotId.SendText, cfg, actions)
-        row(st.label, if (st.enabled) "" else st.reason, st.enabled) { if (st.enabled) textDialog = true }
-        val pad = spec(SlotId.Pad, cfg, actions)
-        row(pad.label, pad.reason, false) {}
-
-        header("View")
-        row("Statistics", actions.stats().label) { actions.cycleStats() }
-
-        header("Audio")
-        val mic = spec(SlotId.Mic, cfg, actions)
-        row(mic.label, if (mic.enabled) mic.state else mic.reason, mic.enabled) { if (mic.enabled) actions.toggleMic() }
-
-        val hosts = actions.hostActions()
-        if (hosts.isNotEmpty()) {
-            header("Host")
-            hosts.forEach { act ->
-                val id = "host:${act.id}"
-                row(
-                    act.label,
-                    when {
-                        !act.available -> act.unavailableReason
-                        state.armed == id -> "tap again"
-                        else -> ""
-                    },
-                    act.available,
-                ) {
-                    if (!act.available) return@row
-                    if (act.danger && state.armed != id) { haptics.boundary(); state.armed = id } else { state.close(); actions.invokeHost(act) }
-                }
-            }
-        }
-        if (cfg.shortcuts.isNotEmpty()) {
-            header("Shortcuts")
-            cfg.shortcuts.forEach { s ->
-                val ok = actions.keyboardGranted() && s.keys.all { keyVk(it) != null }
-                row(s.label.ifEmpty { chordChip(s.keys) }, chordChip(s.keys), ok) {
-                    if (ok) { state.close(); actions.sendShortcut(s.keys) }
-                }
+                    .padding(horizontal = 20.dp, vertical = 12.dp)
+                    .alpha(if (r.enabled) 1f else 0.45f),
+            ) {
+                Text(r.label, color = Color.White, fontSize = 15.sp, modifier = Modifier.weight(1f))
+                if (r.value.isNotEmpty()) Text(r.value, color = Color.White.copy(alpha = 0.7f), fontSize = 15.sp)
             }
         }
         Spacer(Modifier.height(4.dp))
     }
-    if (textDialog) {
-        var text by remember { mutableStateOf("") }
-        AlertDialog(
-            onDismissRequest = { textDialog = false },
-            title = { Text("Send text") },
-            text = { OutlinedTextField(text, { text = it }, singleLine = true, modifier = Modifier.fillMaxWidth()) },
-            confirmButton = {
-                TextButton(onClick = { textDialog = false; state.close(); actions.sendText(text) }) { Text("Send") }
-            },
-            dismissButton = { TextButton(onClick = { textDialog = false }) { Text("Cancel") } },
-        )
-    }
-}
-
-@Composable
-private fun Chip(label: String, selected: Boolean, onTap: () -> Unit) {
-    Text(
-        label,
-        color = Color.White,
-        fontSize = 13.sp,
-        modifier = Modifier
-            .padding(4.dp)
-            .clip(RoundedCornerShape(16.dp))
-            .background(Color.White.copy(alpha = if (selected) 0.28f else 0.10f))
-            .clickable(onClick = onTap)
-            .padding(horizontal = 12.dp, vertical = 6.dp),
-    )
 }
 
 /** The chord as key events: modifiers down in order, the key, modifiers up in reverse. */

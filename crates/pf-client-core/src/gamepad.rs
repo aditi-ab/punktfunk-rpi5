@@ -216,6 +216,10 @@ enum Ctl {
     MenuMode(bool),
     MenuRumble(MenuPulse),
     Mask(bool),
+    /// The in-stream ring is up: translate the first forwarded pad into [`MenuEvent`]s
+    /// (design/touch-client-overlay.md §2.6). Pairs with [`Ctl::Mask`], which is what
+    /// stops the same presses reaching the host.
+    RingNav(bool),
 }
 
 #[derive(Clone)]
@@ -232,6 +236,8 @@ pub struct GamepadService {
     /// Menu-navigation events while menu mode is on and no session is attached; the
     /// launcher page consumes them.
     menu_rx: async_channel::Receiver<MenuEvent>,
+    /// `Select+A` while streaming — the first swallowed chord: the ring opener.
+    ring_rx: async_channel::Receiver<()>,
 }
 
 impl GamepadService {
@@ -242,11 +248,20 @@ impl GamepadService {
         let (escape_tx, escape_rx) = async_channel::unbounded();
         let (disconnect_tx, disconnect_rx) = async_channel::unbounded();
         let (menu_tx, menu_rx) = async_channel::unbounded();
+        let (ring_tx, ring_rx) = async_channel::unbounded();
         let (p, a) = (pads.clone(), active.clone());
         if let Err(e) = std::thread::Builder::new()
             .name("punktfunk-gamepad".into())
             .spawn(move || {
-                if let Err(e) = run(p, a, &ctl_rx, &escape_tx, &disconnect_tx, &menu_tx) {
+                if let Err(e) = run(
+                    p,
+                    a,
+                    &ctl_rx,
+                    &escape_tx,
+                    &disconnect_tx,
+                    &menu_tx,
+                    &ring_tx,
+                ) {
                     tracing::warn!(error = %e, "gamepad service ended — pads disabled");
                 }
             })
@@ -260,6 +275,7 @@ impl GamepadService {
             escape_rx,
             disconnect_rx,
             menu_rx,
+            ring_rx,
         }
     }
 
@@ -284,6 +300,7 @@ impl GamepadService {
         let (escape_tx, escape_rx) = async_channel::unbounded();
         let (disconnect_tx, disconnect_rx) = async_channel::unbounded();
         let (menu_tx, menu_rx) = async_channel::unbounded();
+        let (ring_tx, ring_rx) = async_channel::unbounded();
         let worker = Worker::new(
             subsystem,
             pads.clone(),
@@ -291,6 +308,7 @@ impl GamepadService {
             escape_tx,
             disconnect_tx,
             menu_tx,
+            ring_tx,
         );
         (
             GamepadService {
@@ -300,6 +318,7 @@ impl GamepadService {
                 escape_rx,
                 disconnect_rx,
                 menu_rx,
+                ring_rx,
             },
             GamepadPump { worker, ctl_rx },
         )
@@ -321,6 +340,18 @@ impl GamepadService {
     /// session is attached. A fresh clone per call; the launcher spawns a future on it.
     pub fn menu_events(&self) -> async_channel::Receiver<MenuEvent> {
         self.menu_rx.clone()
+    }
+
+    /// `Select+A` on a forwarded pad — the in-stream ring's opener, swallowed on both
+    /// buttons (design/touch-client-overlay.md §2.6). One event per chord.
+    pub fn ring_events(&self) -> async_channel::Receiver<()> {
+        self.ring_rx.clone()
+    }
+
+    /// The ring is up: the first forwarded pad drives it as menu events. Pair with
+    /// [`Self::set_masked`], which keeps the same presses off the wire.
+    pub fn set_ring_nav(&self, on: bool) {
+        let _ = self.ctl.send(Ctl::RingNav(on));
     }
 
     /// Turn menu mode on/off: while on (and no session attached) the worker holds the
@@ -788,6 +819,9 @@ struct Slot {
     /// the slot closes so a contact held at that moment doesn't stick. surface 0 = the legacy
     /// single touchpad, 1/2 = a Steam left/right pad.
     held_touches: std::collections::HashSet<(u8, u8)>,
+    /// `A` opened the ring while Select was pending: neither press reached the host, so
+    /// the release must not either.
+    swallow_a: bool,
     /// Per Steam-pad surface (index 0 = left/surface 1, 1 = right/surface 2): the last wire
     /// coordinates + whether a finger is on it. Pad CLICKS arrive as buttons with no position,
     /// so the click forward reuses the surface's live contact point.
@@ -834,6 +868,7 @@ impl Slot {
             last_axis: [i32::MIN; 6],
             held_buttons: Vec::new(),
             held_touches: std::collections::HashSet::new(),
+            swallow_a: false,
             surface_last: [(0, 0, false); 2],
             held_clicks: [false; 2],
             last_accel: [0; 3],
@@ -872,6 +907,9 @@ struct SelectGesture {
     as_guide: bool,
     /// A delivered tap's release is owed at this time.
     release_due: Option<Instant>,
+    /// The pending Select became the ring chord: its press never went out, so its release
+    /// is owned (and dropped) here rather than forwarded.
+    swallowed: bool,
 }
 
 impl SelectGesture {
@@ -889,6 +927,16 @@ impl SelectGesture {
         false
     }
 
+    /// `A` went down while Select was pending: the ring chord. Nothing goes out, and the
+    /// Select's later release is dropped too. Returns false when no Select was pending.
+    fn swallow_for_ring(&mut self) -> bool {
+        if self.pending_since.take().is_some() {
+            self.swallowed = true;
+            return true;
+        }
+        false
+    }
+
     /// Another button went down on this slot: a pending Select is a real Select after
     /// all — its deferred down goes out before the caller sends the new button's.
     fn on_other_down(&mut self, out: &mut Vec<(u32, bool)>) {
@@ -900,6 +948,10 @@ impl SelectGesture {
     /// Select released. Returns true when the gesture owned this release (the caller
     /// skips the normal button-up send).
     fn on_select_up(&mut self, now: Instant, out: &mut Vec<(u32, bool)>) -> bool {
+        if self.swallowed {
+            self.swallowed = false;
+            return true;
+        }
         if self.as_guide {
             self.as_guide = false;
             out.push((wire::BTN_GUIDE, false));
@@ -934,6 +986,7 @@ impl SelectGesture {
     /// Slot close / gesture disarm: nothing may stay down (or owed) on the wire.
     fn flush(&mut self, out: &mut Vec<(u32, bool)>) {
         self.pending_since = None;
+        self.swallowed = false;
         if self.as_guide {
             self.as_guide = false;
             out.push((wire::BTN_GUIDE, false));
@@ -1005,9 +1058,14 @@ struct Worker {
     menu_mode: bool,
     menu_nav: MenuNav,
     menu_tx: async_channel::Sender<MenuEvent>,
+    ring_tx: async_channel::Sender<()>,
     /// A system overlay owns input ([`GamepadService::set_masked`]): forwarded pads are held
     /// neutral and menu translation is paused, with every slot still OPEN.
     masked: bool,
+    /// The in-stream ring is up ([`GamepadService::set_ring_nav`]): the first slot's pad is
+    /// polled into [`MenuEvent`]s regardless of the mask (the mask is what keeps its presses
+    /// off the wire meanwhile).
+    ring_nav: bool,
 }
 
 impl Worker {
@@ -1964,6 +2022,10 @@ impl Worker {
                     }
                     self.sync_open();
                 }
+                Ok(Ctl::RingNav(on)) => {
+                    self.ring_nav = on;
+                    self.menu_nav.reset();
+                }
                 Ok(Ctl::MenuRumble(pulse)) => {
                     if self.attached.is_none() {
                         if let Some((_, pad)) = self.menu_open.as_mut() {
@@ -2061,6 +2123,15 @@ impl Worker {
                     if !self.system_forward && matches!(bit, wire::BTN_GUIDE | wire::BTN_MISC1) {
                         return;
                     }
+                    // `Select+A`, Select first: the ring chord, and the first chord the host
+                    // never sees — A is "jump" or "confirm" in most games. Both presses are
+                    // swallowed (the Select was still pending, so nothing has gone out).
+                    if bit == wire::BTN_A && slot.gesture.swallow_for_ring() {
+                        slot.swallow_a = true;
+                        slot.held_buttons.push(bit);
+                        let _ = self.ring_tx.try_send(());
+                        return;
+                    }
                     let mut due = Vec::new();
                     let held_back = if !self.guide_gesture {
                         false
@@ -2099,6 +2170,10 @@ impl Worker {
                         return;
                     }
                     slot.held_buttons.retain(|&b| b != bit);
+                    if bit == wire::BTN_A && slot.swallow_a {
+                        slot.swallow_a = false; // its press never went out either
+                        return;
+                    }
                     let mut due = Vec::new();
                     let owned = self.guide_gesture
                         && bit == wire::BTN_BACK
@@ -2242,15 +2317,21 @@ impl Worker {
     /// on and no session is attached (attach supersedes; SDL events merely wake the loop,
     /// so a press is translated the iteration it arrives).
     fn menu_poll(&mut self) {
-        // Masked covers the launcher too: with the Deck's Steam menu up over our console, the
-        // same stick that scrolls Steam's UI would otherwise also be scrolling ours behind it.
-        if !self.menu_mode || self.attached.is_some() || self.masked {
+        use sdl3::gamepad::{Axis, Button};
+        // The in-stream ring polls the first forwarded pad (its events are masked off the
+        // wire meanwhile). Otherwise: masked covers the launcher too — with the Deck's Steam
+        // menu up over our console, the same stick that scrolls Steam's UI would otherwise
+        // also be scrolling ours behind it.
+        let pad = if self.ring_nav {
+            self.slots.first().map(|s| &s.pad)
+        } else if !self.menu_mode || self.attached.is_some() || self.masked {
             return;
-        }
-        let Some((_, pad)) = self.menu_open.as_ref() else {
+        } else {
+            self.menu_open.as_ref().map(|(_, p)| p)
+        };
+        let Some(pad) = pad else {
             return;
         };
-        use sdl3::gamepad::{Axis, Button};
         let s = MenuSample {
             buttons: [
                 pad.button(Button::South),
@@ -2447,6 +2528,7 @@ impl Worker {
         escape_tx: async_channel::Sender<()>,
         disconnect_tx: async_channel::Sender<()>,
         menu_tx: async_channel::Sender<MenuEvent>,
+        ring_tx: async_channel::Sender<()>,
     ) -> Worker {
         Worker {
             subsystem,
@@ -2473,7 +2555,9 @@ impl Worker {
             menu_mode: false,
             menu_nav: MenuNav::new(),
             menu_tx,
+            ring_tx,
             masked: false,
+            ring_nav: false,
         }
     }
 }
@@ -2485,6 +2569,7 @@ fn run(
     escape_tx: &async_channel::Sender<()>,
     disconnect_tx: &async_channel::Sender<()>,
     menu_tx: &async_channel::Sender<MenuEvent>,
+    ring_tx: &async_channel::Sender<()>,
 ) -> Result<(), String> {
     // Off-main-thread + no video subsystem: keep SDL away from signals, poll pads on its
     // own thread.
@@ -2505,6 +2590,7 @@ fn run(
         escape_tx.clone(),
         disconnect_tx.clone(),
         menu_tx.clone(),
+        ring_tx.clone(),
     );
 
     loop {
@@ -2548,6 +2634,23 @@ fn run(
 #[cfg(test)]
 mod select_gesture_tests {
     use super::*;
+
+    /// `Select+A` with Select pending: nothing goes out, and the Select's release is owned.
+    #[test]
+    fn a_while_select_is_pending_swallows_both() {
+        let mut g = SelectGesture::default();
+        let mut out = Vec::new();
+        let t = Instant::now();
+        assert!(g.on_select_down(t, true, &mut out));
+        assert!(g.swallow_for_ring());
+        assert!(out.is_empty(), "the pending press stays swallowed: {out:?}");
+        assert!(
+            g.on_select_up(t, &mut out),
+            "the release is owned, not forwarded"
+        );
+        assert!(out.is_empty(), "…and emits nothing: {out:?}");
+        assert!(!g.swallow_for_ring(), "no pending Select ⇒ not the chord");
+    }
 
     #[test]
     fn tap_delivers_press_then_scheduled_release() {

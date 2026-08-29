@@ -26,6 +26,19 @@ final class RingState: ObservableObject {
     @Published var lastTouch = Date()
     /// The mode the Welcome carried, captured at first open — the Resolution row's first chip.
     var native: (w: UInt32, h: UInt32, hz: UInt32)?
+    /// The pad's highlight: a slot 0…5, or 6 for the centre (the initial one — `Select+A`
+    /// then A opens the sheet in two presses). `nil` until a pad moves it.
+    @Published var highlight: Int?
+    /// The sheet row the pad is on.
+    @Published var sheetCursor = 0
+    /// A pad press awaiting the overlay (`RingOverlay` consumes it); `navSeq` makes each an event.
+    var pendingNav: RingNav?
+    @Published var navSeq = 0
+
+    func nav(_ n: RingNav) {
+        pendingNav = n
+        navSeq &+= 1
+    }
 
     // Haptic triggers: `.sensoryFeedback` fires on change, so each is a counter. The vocabulary
     // is one tick when the twist arms, a thump at commit, a tap per press, a firm "no" on a
@@ -76,6 +89,7 @@ final class RingState: ObservableObject {
         sheet = false
         armed = nil
         hint = nil
+        highlight = nil
         twistArmed = false
     }
 
@@ -201,7 +215,8 @@ struct RingOverlay: View {
                         let slot = cfg.ring[k]
                         let s = slot.map { spec($0, cfg, actions) }
                         slotButton(s, size: slotSize, scale: 0.6 + 0.4 * q, alpha: q,
-                                   armed: s != nil && state.armed == s?.id) {
+                                   armed: s != nil && state.armed == s?.id,
+                                   highlighted: state.highlight == k) {
                             if let slot, let s { fire(s, slot) }
                         }
                         .position(x: cx + ringRadius * q * cos(rad), y: cy + ringRadius * q * sin(rad))
@@ -211,14 +226,19 @@ struct RingOverlay: View {
                 let cq = min(max((shown - 6 * slotLag) / (1 - 6 * slotLag), 0), 1)
                 if cq > 0 {
                     slotButton(SlotSpec(id: "more", label: "More", icon: "ellipsis"),
-                               size: centreSize, scale: 0.6 + 0.4 * cq, alpha: cq, armed: false) {
+                               size: centreSize, scale: 0.6 + 0.4 * cq, alpha: cq, armed: false,
+                               highlighted: state.highlight == 6) {
                         state.touch()
                         state.pressTick &+= 1
                         state.sheet = true
                     }
                     .position(x: cx, y: cy)
                 }
-                if let hint = state.hint {
+                // The label under the ring: a hint, else the highlighted slot's name.
+                let label: String? = state.hint ?? state.highlight.flatMap { h in
+                    h == 6 ? "More" : cfg.ring[h].map { spec($0, cfg, actions).label }
+                }
+                if let hint = label {
                     Text(hint)
                         .font(.geist(13, .medium, relativeTo: .caption))
                         .foregroundStyle(.white.opacity(0.9))
@@ -227,7 +247,7 @@ struct RingOverlay: View {
                         .position(x: cx, y: cy + ringRadius + slotSize)
                 }
                 if state.sheet {
-                    RingSheet(state: state, cfg: cfg, actions: actions)
+                    RingSheet(state: state, rows: sheetRows())
                         .frame(maxHeight: geo.size.height * 0.6)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                         .padding(.bottom, 16)
@@ -242,6 +262,12 @@ struct RingOverlay: View {
             if state.native == nil { state.native = actions.currentMode() }
         }
         .onChange(of: state.progress) { _, _ in sync() }
+        .onChange(of: state.navSeq) { _, _ in
+            if let n = state.pendingNav {
+                state.pendingNav = nil
+                handleNav(n)
+            }
+        }
         .onChange(of: state.committed) { _, _ in sync() }
         .animation(reduceMotion ? .easeOut(duration: 0.12) : .smooth(duration: 0.25), value: state.sheet)
         // Idle: the exit disc's 8 s rule, for the same latency reason — unless the sheet is up.
@@ -276,6 +302,54 @@ struct RingOverlay: View {
             var t = Transaction()
             t.disablesAnimations = true
             withTransaction(t) { shown = state.progress }
+        }
+    }
+
+    /// The pad (design §2.6): Right steps the highlight clockwise, Left anticlockwise, Up jumps
+    /// to 12 o'clock, Down to 6, Y returns it to the centre; A fires the highlight (the centre
+    /// opens the sheet), B closes. In the sheet, Up/Down walk the rows, Left/Right adjust one.
+    private func handleNav(_ n: RingNav) {
+        state.touch()
+        if state.sheet {
+            let rows = sheetRows()
+            switch n {
+            case .up: state.sheetCursor = max(state.sheetCursor - 1, 0); state.pressTick &+= 1
+            case .down: state.sheetCursor = min(state.sheetCursor + 1, max(rows.count - 1, 0)); state.pressTick &+= 1
+            case .left, .right:
+                if let adjust = rows[safe: state.sheetCursor]?.adjust {
+                    adjust(n == .left ? -1 : 1)
+                    state.pressTick &+= 1
+                } else {
+                    state.refuseTick &+= 1
+                }
+            case .confirm:
+                if let row = rows[safe: state.sheetCursor] {
+                    if row.enabled { state.pressTick &+= 1 } else { state.refuseTick &+= 1 }
+                    row.tap()
+                }
+            case .back: state.sheet = false; state.pressTick &+= 1
+            case .centre: break
+            }
+            return
+        }
+        let h = state.highlight ?? 6
+        switch n {
+        case .right: state.highlight = h >= 6 ? 0 : (h + 1) % 6; state.pressTick &+= 1
+        case .left: state.highlight = h >= 6 ? 5 : (h + 5) % 6; state.pressTick &+= 1
+        case .up: state.highlight = 0; state.pressTick &+= 1
+        case .down: state.highlight = 3; state.pressTick &+= 1
+        case .centre: state.highlight = 6; state.pressTick &+= 1
+        case .confirm:
+            if h >= 6 {
+                state.pressTick &+= 1
+                state.sheetCursor = 0
+                state.sheet = true
+            } else if let slot = cfg.ring[h] {
+                fire(spec(slot, cfg, actions), slot)
+            } else {
+                state.refuseTick &+= 1
+            }
+        case .back: state.close()
         }
     }
 
@@ -323,7 +397,7 @@ struct RingOverlay: View {
 
     /// One round glass button — the exit disc's primitive, at ring size.
     private func slotButton(_ s: SlotSpec?, size: CGFloat, scale: CGFloat, alpha: CGFloat, armed: Bool,
-                            action: @escaping () -> Void) -> some View {
+                            highlighted: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Group {
                 if let chip = s?.chip {
@@ -336,7 +410,9 @@ struct RingOverlay: View {
             .foregroundStyle(armed ? Color.red : (s?.enabled ?? false ? Color.white : Color.white.opacity(0.35)))
             .frame(width: size, height: size)
             .glassBackground(Circle(), interactive: true)
-            .overlay(Circle().strokeBorder(Color.white.opacity(armed ? 0.6 : 0.18), lineWidth: 1))
+            .overlay(Circle().strokeBorder(
+                Color.white.opacity(highlighted ? 0.85 : (armed ? 0.6 : 0.18)),
+                lineWidth: highlighted ? 2 : 1))
             .contentShape(Circle())
         }
         .buttonStyle(.plain)
@@ -349,94 +425,118 @@ struct RingOverlay: View {
     }
 }
 
-/// Depth two: the complete catalogue in a fixed order (D2), as a scrollable glass panel.
+/// One row of the sheet as data, so a finger and a pad drive the same list.
+private struct SheetRowSpec {
+    var header: String? = nil
+    var label: String
+    var value = ""
+    var enabled = true
+    /// Left/Right on a pad: cycle a value (the resolution rows); a tap cycles forward.
+    var adjust: ((Int) -> Void)? = nil
+    var tap: () -> Void
+}
+
+private let resPresets: [(String, UInt32, UInt32)] = [("1440p", 2560, 1440), ("1080p", 1920, 1080), ("720p", 1280, 720)]
+private let hzPresets: [UInt32] = [120, 60]
+
+extension Collection {
+    fileprivate subscript(safe i: Index) -> Element? { indices.contains(i) ? self[i] : nil }
+}
+
+extension RingOverlay {
+    /// Depth two: the complete catalogue in a fixed order (D2).
+    fileprivate func sheetRows() -> [SheetRowSpec] {
+        let a = actions
+        let mode = a.currentMode()
+        let native = state.native ?? mode
+        let resLabel: String = {
+            if mode.w == native.w && mode.h == native.h { return "Native (\(mode.w)×\(mode.h))" }
+            return resPresets.first { $0.1 == mode.w && $0.2 == mode.h }?.0 ?? "\(mode.w)×\(mode.h)"
+        }()
+        func adjustRes(_ dir: Int) {
+            let options = [(native.w, native.h)] + resPresets.map { ($0.1, $0.2) }
+            let i = options.firstIndex { $0 == (mode.w, mode.h) } ?? 0
+            let n = options.count
+            let next = options[((i + dir) % n + n) % n]
+            a.requestMode(next.0, next.1, mode.hz)
+        }
+        func adjustHz(_ dir: Int) {
+            var options = [native.hz]
+            for hz in hzPresets where !options.contains(hz) { options.append(hz) }
+            let i = options.firstIndex(of: mode.hz) ?? 0
+            let n = options.count
+            a.requestMode(mode.w, mode.h, options[((i + dir) % n + n) % n])
+        }
+        var rows: [SheetRowSpec] = []
+        rows.append(SheetRowSpec(header: "Session", label: "End stream",
+                                 value: state.armed == "end_stream" ? "tap again" : "") { [state] in
+            if state.armed == "end_stream" { state.close(); a.endStream() } else { state.warnTick &+= 1; state.armed = "end_stream" }
+        })
+        rows.append(SheetRowSpec(label: "Disconnect, keep the game running") { [state] in state.close(); a.disconnectLinger() })
+        rows.append(SheetRowSpec(header: "Resolution", label: "Resolution", value: resLabel, adjust: adjustRes) { adjustRes(1) })
+        rows.append(SheetRowSpec(label: "Refresh", value: "\(mode.hz) Hz", adjust: adjustHz) { adjustHz(1) })
+        let tm = spec(.touchMode, cfg, a)
+        rows.append(SheetRowSpec(header: "Input", label: tm.label, value: tm.state) { a.cycleTouchMode() })
+        rows.append(SheetRowSpec(label: "Keyboard") { [state] in state.close(); a.keyboard() })
+        let pad = spec(.pad, cfg, a)
+        rows.append(SheetRowSpec(label: pad.label, value: pad.reason, enabled: false) {})
+        rows.append(SheetRowSpec(header: "View", label: "Statistics", value: a.stats().label) { a.cycleStats() })
+        let mic = spec(.mic, cfg, a)
+        rows.append(SheetRowSpec(header: "Audio", label: mic.label, value: mic.enabled ? mic.state : mic.reason,
+                                 enabled: mic.enabled) { if mic.enabled { a.toggleMic() } })
+        for (i, act) in a.hostActions().enumerated() {
+            let id = "host:\(act.id)"
+            let value = !act.available ? (act.unavailableReason ?? "") : (state.armed == id ? "tap again" : "")
+            rows.append(SheetRowSpec(header: i == 0 ? "Host" : nil, label: act.label, value: value,
+                                     enabled: act.available) { [state] in
+                guard act.available else { state.refuseTick &+= 1; return }
+                if act.danger, state.armed != id { state.warnTick &+= 1; state.armed = id } else { state.close(); a.invokeHost(act) }
+            })
+        }
+        for (i, sc) in cfg.shortcuts.enumerated() {
+            let ok = !sc.keys.isEmpty && sc.keys.allSatisfy { keyVk($0) != nil }
+            rows.append(SheetRowSpec(header: i == 0 ? "Shortcuts" : nil,
+                                     label: sc.label.isEmpty ? chordChip(sc.keys) : sc.label,
+                                     value: chordChip(sc.keys), enabled: ok) { [state] in
+                guard ok else { state.refuseTick &+= 1; return }
+                state.close()
+                a.sendShortcut(sc.keys)
+            })
+        }
+        return rows
+    }
+}
+
+/// The sheet as a scrollable glass panel; the pad's cursor row is tinted.
 private struct RingSheet: View {
     @ObservedObject var state: RingState
-    let cfg: OverlayConfig
-    let actions: RingActions
+    let rows: [SheetRowSpec]
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                header("Session")
-                row("End stream", state.armed == "end_stream" ? "tap again" : "") {
-                    if state.armed == "end_stream" {
-                        state.close()
-                        actions.endStream()
-                    } else {
-                        state.warnTick &+= 1
-                        state.armed = "end_stream"
-                    }
-                }
-                row("Disconnect, keep the game running") { state.close(); actions.disconnectLinger() }
-
-                header("Resolution")
-                let mode = actions.currentMode()
-                let native = state.native ?? mode
-                HStack(spacing: 6) {
-                    chip("Native", selected: mode.w == native.w && mode.h == native.h) {
-                        actions.requestMode(native.w, native.h, mode.hz)
-                    }
-                    ForEach([("1440p", 2560, 1440), ("1080p", 1920, 1080), ("720p", 1280, 720)], id: \.0) { p in
-                        chip(p.0, selected: mode.w == UInt32(p.1) && mode.h == UInt32(p.2)) {
-                            actions.requestMode(UInt32(p.1), UInt32(p.2), mode.hz)
-                        }
-                    }
-                }
-                .padding(.horizontal, 16).padding(.vertical, 4)
-                HStack(spacing: 6) {
-                    chip("Native", selected: mode.hz == native.hz) { actions.requestMode(mode.w, mode.h, native.hz) }
-                    ForEach([120, 60], id: \.self) { hz in
-                        chip("\(hz) Hz", selected: mode.hz == UInt32(hz)) { actions.requestMode(mode.w, mode.h, UInt32(hz)) }
-                    }
-                }
-                .padding(.horizontal, 16).padding(.vertical, 4)
-
-                header("Input")
-                let tm = spec(.touchMode, cfg, actions)
-                row(tm.label, tm.state) { actions.cycleTouchMode() }
-                row("Keyboard") { state.close(); actions.keyboard() }
-                let pad = spec(.pad, cfg, actions)
-                row(pad.label, pad.reason, enabled: false) {}
-
-                header("View")
-                row("Statistics", actions.stats().label) { actions.cycleStats() }
-
-                header("Audio")
-                let mic = spec(.mic, cfg, actions)
-                row(mic.label, mic.enabled ? mic.state : mic.reason, enabled: mic.enabled) {
-                    if mic.enabled { actions.toggleMic() }
-                }
-
-                let hosts = actions.hostActions()
-                if !hosts.isEmpty {
-                    header("Host")
-                    ForEach(hosts) { act in
-                        let id = "host:\(act.id)"
-                        row(act.label,
-                            !act.available ? (act.unavailableReason ?? "") : (state.armed == id ? "tap again" : ""),
-                            enabled: act.available) {
-                            guard act.available else { state.refuseTick &+= 1; return }
-                            if act.danger, state.armed != id {
-                                state.warnTick &+= 1
-                                state.armed = id
-                            } else {
-                                state.close()
-                                actions.invokeHost(act)
+                ForEach(rows.indices, id: \.self) { i in
+                    let r = rows[i]
+                    if let h = r.header { header(h) }
+                    Button {
+                        state.touch()
+                        state.sheetCursor = i
+                        if r.enabled { state.pressTick &+= 1 } else { state.refuseTick &+= 1 }
+                        r.tap()
+                    } label: {
+                        HStack {
+                            Text(r.label).font(.geist(15, .regular)).foregroundStyle(.white)
+                            Spacer()
+                            if !r.value.isEmpty {
+                                Text(r.value).font(.geist(15, .regular)).foregroundStyle(.white.opacity(0.7))
                             }
                         }
+                        .padding(.horizontal, 20).padding(.vertical, 12)
+                        .background(state.sheetCursor == i ? Color.white.opacity(0.12) : Color.clear)
+                        .contentShape(Rectangle())
                     }
-                }
-                if !cfg.shortcuts.isEmpty {
-                    header("Shortcuts")
-                    ForEach(cfg.shortcuts, id: \.id) { s in
-                        let ok = !s.keys.isEmpty && s.keys.allSatisfy { keyVk($0) != nil }
-                        row(s.label.isEmpty ? chordChip(s.keys) : s.label, chordChip(s.keys), enabled: ok) {
-                            guard ok else { state.refuseTick &+= 1; return }
-                            state.close()
-                            actions.sendShortcut(s.keys)
-                        }
-                    }
+                    .buttonStyle(.plain)
+                    .opacity(r.enabled ? 1 : 0.45)
                 }
             }
             .padding(.vertical, 8)
@@ -451,42 +551,6 @@ private struct RingSheet: View {
             .font(.geist(12, .semibold, relativeTo: .caption))
             .foregroundStyle(.white.opacity(0.6))
             .padding(.horizontal, 20).padding(.top, 12).padding(.bottom, 4)
-    }
-
-    private func row(_ label: String, _ value: String = "", enabled: Bool = true,
-                     action: @escaping () -> Void) -> some View {
-        Button {
-            state.touch()
-            state.pressTick &+= 1
-            action()
-        } label: {
-            HStack {
-                Text(label).font(.geist(15, .regular)).foregroundStyle(.white)
-                Spacer()
-                if !value.isEmpty {
-                    Text(value).font(.geist(15, .regular)).foregroundStyle(.white.opacity(0.7))
-                }
-            }
-            .padding(.horizontal, 20).padding(.vertical, 12)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .opacity(enabled ? 1 : 0.45)
-    }
-
-    private func chip(_ label: String, selected: Bool, action: @escaping () -> Void) -> some View {
-        Button {
-            state.touch()
-            state.pressTick &+= 1
-            action()
-        } label: {
-            Text(label)
-                .font(.geist(13, .medium, relativeTo: .caption))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 12).padding(.vertical, 6)
-                .background(Color.white.opacity(selected ? 0.28 : 0.10), in: Capsule())
-        }
-        .buttonStyle(.plain)
     }
 }
 #endif

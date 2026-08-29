@@ -15,7 +15,7 @@ use crate::pointer::{Pointer, PointerKind};
 use crate::theme::{fill, stroke, Fonts, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec};
 use pf_client_core::host_actions::{self, ActionInfo};
-use pf_client_core::menu_nav::{MenuDir, MenuEvent};
+use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use pf_client_core::overlay_actions::{chord_chip, key_vk, OverlayConfig, RingPlatform, SlotId};
 use pf_client_core::ring::{RingCommand, RingFacts, RingInput};
 use skia_safe::{Canvas, Color4f, Point, RRect, Rect};
@@ -72,6 +72,9 @@ pub(crate) struct Ring {
     hint: Option<String>,
     hint_at: Instant,
     last_touch: Instant,
+    /// The pad's highlight: a slot 0…5, or 6 for the centre (the initial one — `Select+A`
+    /// then `A` opens the sheet in two presses). `None` until a pad or key moves it.
+    highlight: Option<usize>,
     /// Hit rects as drawn last frame: six slots, then the centre.
     geom: Vec<Rect>,
     sheet_rect: Rect,
@@ -95,6 +98,7 @@ impl Ring {
             hint: None,
             hint_at: Instant::now(),
             last_touch: Instant::now(),
+            highlight: None,
             geom: vec![Rect::new_empty(); 7],
             sheet_rect: Rect::new_empty(),
             list: MenuList::new(),
@@ -158,6 +162,7 @@ impl Ring {
         self.sheet = false;
         self.armed = None;
         self.hint = None;
+        self.highlight = None;
     }
 
     fn touch(&mut self) {
@@ -202,6 +207,7 @@ impl Ring {
         self.sheet.hash(&mut h);
         self.armed.hash(&mut h);
         self.hint.hash(&mut h);
+        self.highlight.hash(&mut h);
         self.list.cursor.hash(&mut h);
         self.facts.touch_mode.hash(&mut h);
         self.facts.stats_tier.hash(&mut h);
@@ -531,40 +537,84 @@ impl Ring {
         true
     }
 
-    /// Keyboard while open: Escape closes (the sheet first), Return opens the sheet, and the
-    /// sheet takes Up/Down/Left/Right/Return like every console list.
+    /// Keyboard while open — the pad's vocabulary on keys: arrows move the highlight, Return
+    /// activates, Escape backs out. Always consumed while open.
     pub(crate) fn key(&mut self, key: Key) -> bool {
         if !self.open() {
             return false;
         }
-        self.touch();
         let ev = match key {
-            Key::Escape => {
-                if self.sheet {
-                    self.sheet = false;
-                } else {
-                    self.close();
-                }
-                return true;
-            }
-            Key::Return | Key::Space if !self.sheet => {
-                self.sheet = true;
-                self.list = MenuList::new();
-                return true;
-            }
+            Key::Escape => MenuEvent::Back,
             Key::Return | Key::Space => MenuEvent::Confirm,
             Key::Up => MenuEvent::Move(MenuDir::Up),
             Key::Down => MenuEvent::Move(MenuDir::Down),
             Key::Left => MenuEvent::Move(MenuDir::Left),
             Key::Right => MenuEvent::Move(MenuDir::Right),
+            Key::Y => MenuEvent::Secondary,
             _ => return true,
         };
-        if self.sheet {
-            let rows = self.sheet_rows();
-            let (msg, _) = self.list.menu(ev, rows.len());
-            self.sheet_msg(msg, &rows);
-        }
+        self.menu(ev);
         true
+    }
+
+    /// The pad while open (design §2.6): Right steps the highlight clockwise, Left
+    /// anticlockwise, Up jumps to 12 o'clock, Down to 6, Y returns it to the centre; A fires
+    /// the highlight (the centre opens the sheet), B closes (the sheet first). In the sheet,
+    /// the list takes the moves and Left/Right adjusts a resolution row.
+    pub(crate) fn menu(&mut self, ev: MenuEvent) -> Option<MenuPulse> {
+        if !self.open() {
+            return None;
+        }
+        self.touch();
+        if self.sheet {
+            if ev == MenuEvent::Back {
+                self.sheet = false;
+                return Some(MenuPulse::Confirm);
+            }
+            let rows = self.sheet_rows();
+            let (msg, pulse) = self.list.menu(ev, rows.len());
+            self.sheet_msg(msg, &rows);
+            return pulse;
+        }
+        let h = self.highlight.unwrap_or(6);
+        match ev {
+            MenuEvent::Move(MenuDir::Right) => {
+                self.highlight = Some(if h >= 6 { 0 } else { (h + 1) % 6 });
+                Some(MenuPulse::Move)
+            }
+            MenuEvent::Move(MenuDir::Left) => {
+                self.highlight = Some(if h >= 6 { 5 } else { (h + 5) % 6 });
+                Some(MenuPulse::Move)
+            }
+            MenuEvent::Move(MenuDir::Up) => {
+                self.highlight = Some(0);
+                Some(MenuPulse::Move)
+            }
+            MenuEvent::Move(MenuDir::Down) => {
+                self.highlight = Some(3);
+                Some(MenuPulse::Move)
+            }
+            MenuEvent::Secondary => {
+                self.highlight = Some(6);
+                Some(MenuPulse::Move)
+            }
+            MenuEvent::Confirm => {
+                if h >= 6 {
+                    self.sheet = true;
+                    self.list = MenuList::new();
+                } else if let Some(slot) = self.cfg.ring[h].clone() {
+                    self.fire(&slot);
+                } else {
+                    return Some(MenuPulse::Boundary);
+                }
+                Some(MenuPulse::Confirm)
+            }
+            MenuEvent::Back => {
+                self.close();
+                Some(MenuPulse::Confirm)
+            }
+            _ => None,
+        }
     }
 
     /// Draw the ring (and the sheet) over the stream chrome. `scale` is the chrome scale.
@@ -641,6 +691,13 @@ impl Ring {
                 is_armed,
                 white,
             );
+            if self.highlight == Some(k) {
+                canvas.draw_circle(
+                    Point::new(x, y),
+                    r + 3.0 * scale,
+                    &stroke(white(0.8 * q), 2.0 * scale),
+                );
+            }
             self.geom[k] = Rect::from_xywh(x - r, y - r, 2.0 * r, 2.0 * r);
         }
         // The centre arrives last and opens the sheet.
@@ -669,11 +726,25 @@ impl Ring {
                 false,
                 white,
             );
+            if self.highlight == Some(6) {
+                canvas.draw_circle(
+                    Point::new(cx, cy),
+                    r + 3.0 * scale,
+                    &stroke(white(0.8 * cq), 2.0 * scale),
+                );
+            }
             self.geom[6] = Rect::from_xywh(cx - r, cy - r, 2.0 * r, 2.0 * r);
         } else {
             self.geom[6] = Rect::new_empty();
         }
-        if let Some(hint) = &self.hint {
+        // The label under the ring: a hint, else the highlighted slot's name (the label a
+        // finger would reveal).
+        let label = self.hint.clone().or_else(|| match self.highlight {
+            Some(6) => Some("More".into()),
+            Some(k) => self.cfg.ring[k].as_ref().map(|s| self.spec(s).label),
+            None => None,
+        });
+        if let Some(hint) = &label {
             let size = f64::from(13.0 * scale);
             let tw = fonts.measure(hint, W::Medium, size);
             let (px, py) = (14.0 * scale, 8.0 * scale);
@@ -879,6 +950,35 @@ mod tests {
             }),
             "wraps the other way"
         );
+    }
+
+    #[test]
+    fn the_pad_steps_the_highlight_and_confirms_it() {
+        let mut r = Ring::new();
+        r.set_facts(&facts());
+        r.input(RingInput::Toggle { x: 1.0, y: 1.0 });
+        assert_eq!(r.highlight, None, "centre until moved");
+        r.menu(MenuEvent::Move(MenuDir::Right));
+        assert_eq!(
+            r.highlight,
+            Some(0),
+            "from the centre, Right lands on 12 o'clock"
+        );
+        r.menu(MenuEvent::Move(MenuDir::Left));
+        assert_eq!(r.highlight, Some(5), "anticlockwise wraps");
+        r.menu(MenuEvent::Move(MenuDir::Down));
+        assert_eq!(r.highlight, Some(3));
+        r.menu(MenuEvent::Secondary);
+        assert_eq!(r.highlight, Some(6));
+        r.menu(MenuEvent::Confirm);
+        assert!(r.sheet, "A on the centre opens the sheet");
+        r.menu(MenuEvent::Back);
+        assert!(!r.sheet && r.open(), "B leaves the sheet, keeps the ring");
+        r.menu(MenuEvent::Move(MenuDir::Up));
+        r.menu(MenuEvent::Confirm); // slot 0 of the desktop default = End stream: arms
+        assert_eq!(r.armed.as_deref(), Some("end_stream"));
+        r.menu(MenuEvent::Back);
+        assert!(!r.open(), "B closes the ring");
     }
 
     #[test]

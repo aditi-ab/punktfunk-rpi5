@@ -82,6 +82,9 @@ public final class GamepadCapture {
         /// A delivered tap's release is owed (`tapTimer` scheduled) — its down went out
         /// outside `buttons`, so `flush` must know to lift it.
         var tapReleaseOwed = false
+        /// `Select+A` opened the ring: neither press reached the host, so neither release may.
+        var swallowA = false
+        var swallowSelect = false
         var gestureTimer: Timer?
         var tapTimer: Timer?
         init(controller: GCController, pad: UInt32, pref: PunktfunkConnection.GamepadType) {
@@ -157,6 +160,25 @@ public final class GamepadCapture {
     /// IMU is never powered in this case (see `openSlot`), which is also what stops the pad
     /// burning battery streaming gyro nobody reads.
     public var onMotionUnreachable: ((PunktfunkConnection.GamepadType) -> Void)?
+
+    /// `Select+A`, Select first, while Select is still pending its guide hold: the quick-action
+    /// ring's opener (design/touch-client-overlay.md §2.6) — the first chord the host never
+    /// sees. A is "jump" or "confirm" in most games, so both presses are swallowed.
+    public var onRingChord: (() -> Void)?
+    /// A pad press while the ring owns the pad (`ringOpen`).
+    public var onRingNav: ((RingNav) -> Void)?
+    /// The ring is up: everything held is released on the host NOW (a held sprint must not
+    /// survive a menu), and until it closes the hardware state is adopted silently while its
+    /// edges drive the ring. On close nothing is replayed: what is still held is already the
+    /// slot's state, so the next diff sends only real changes.
+    public var ringOpen = false {
+        didSet {
+            guard ringOpen != oldValue else { return }
+            stickDir = nil
+            if ringOpen { for slot in slots { flush(slot) } }
+        }
+    }
+    private var stickDir: RingNav?
 
     /// Forward this device's controllers to the host at all (`Settings.gamepadForwarding`,
     /// default true). Off is for a couch whose controller reaches the host another way — USB
@@ -454,6 +476,31 @@ public final class GamepadCapture {
         // until it resolves (tap on release / synthetic guide past the threshold).
         if guideGesture { raw = gestureFiltered(slot, raw) }
         let newButtons = raw | (slot.buttons & GamepadWire.guide)
+        let newAxes = Self.axesOf(g)
+        if ringOpen {
+            // Adopt, don't send: the flush at open released everything; a press inside the ring
+            // must not fire in the game the instant it closes.
+            let pressed = newButtons & ~slot.buttons
+            slot.buttons = newButtons
+            slot.axes = newAxes
+            let map: [(UInt32, RingNav)] = [
+                (GamepadWire.dpadUp, .up), (GamepadWire.dpadDown, .down),
+                (GamepadWire.dpadLeft, .left), (GamepadWire.dpadRight, .right),
+                (GamepadWire.a, .confirm), (GamepadWire.b, .back), (GamepadWire.y, .centre),
+            ]
+            for (bit, nav) in map where pressed & bit != 0 { onRingNav?(nav) }
+            // The left stick steps like the D-pad, edge-triggered on leaving neutral.
+            let (lx, ly) = (g.leftThumbstick.xAxis.value, g.leftThumbstick.yAxis.value)
+            let dir: RingNav?
+            if ly > 0.6 { dir = .up } else if ly < -0.6 { dir = .down }
+            else if lx < -0.6 { dir = .left } else if lx > 0.6 { dir = .right }
+            else if abs(lx) < 0.4, abs(ly) < 0.4 { dir = nil } else { dir = stickDir }
+            if dir != stickDir {
+                stickDir = dir
+                if let dir { onRingNav?(dir) }
+            }
+            return
+        }
         let changed = newButtons ^ slot.buttons
         if changed != 0 {
             let was = slot.buttons
@@ -475,7 +522,16 @@ public final class GamepadCapture {
                 StatsVerbosity.cycle()
             }
         }
-        let newAxes: [Int32] = [
+        for (i, v) in newAxes.enumerated() where v != slot.axes[i] {
+            wire?.send(.gamepadAxis(UInt32(i), value: v, pad: slot.pad))
+            slot.axes[i] = v
+        }
+        updateEscapeChord()
+    }
+
+    /// The six wire axes from a profile, in the wire's order and scale.
+    private static func axesOf(_ g: GCExtendedGamepad) -> [Int32] {
+        [
             Int32(g.leftThumbstick.xAxis.value * 32767),
             Int32(g.leftThumbstick.yAxis.value * 32767),
             Int32(g.rightThumbstick.xAxis.value * 32767),
@@ -483,11 +539,6 @@ public final class GamepadCapture {
             Int32(g.leftTrigger.value * 255),
             Int32(g.rightTrigger.value * 255),
         ]
-        for (i, v) in newAxes.enumerated() where v != slot.axes[i] {
-            wire?.send(.gamepadAxis(UInt32(i), value: v, pad: slot.pad))
-            slot.axes[i] = v
-        }
-        updateEscapeChord()
     }
 
     /// The hold-Select→guide state machine over one sync's raw mask (pf-client-core's
@@ -501,8 +552,17 @@ public final class GamepadCapture {
     /// Select stays OUT of `slot.buttons`, so the escape chord doesn't complete on top of
     /// an in-flight guide-hold — release Select and press the chord plainly instead (the
     /// chord's four-at-once press never lingers in pending long enough to be affected).
-    private func gestureFiltered(_ slot: Slot, _ raw: UInt32) -> UInt32 {
+    private func gestureFiltered(_ slot: Slot, _ rawIn: UInt32) -> UInt32 {
         let back = GamepadWire.back
+        var raw = rawIn
+        // A swallowed chord's buttons stay out of the mask until they physically release: their
+        // presses never went out, so their releases must not either.
+        if slot.swallowA {
+            if raw & GamepadWire.a != 0 { raw &= ~GamepadWire.a } else { slot.swallowA = false }
+        }
+        if slot.swallowSelect {
+            if raw & back != 0 { raw &= ~back } else { slot.swallowSelect = false }
+        }
         let backDown = raw & back != 0
         let othersDown = raw & ~back != 0
         if slot.selectAsGuide {
@@ -516,6 +576,14 @@ public final class GamepadCapture {
                 endPending(slot)
                 deliverTap(slot)
                 return raw
+            }
+            if raw & GamepadWire.a != 0 {
+                // `Select+A`, Select first: the ring chord — swallowed on both buttons.
+                endPending(slot)
+                slot.swallowSelect = true
+                slot.swallowA = true
+                onRingChord?()
+                return raw & ~back & ~GamepadWire.a
             }
             if othersDown {
                 // A combo after all — Select unsuppresses and the diff sends its down.

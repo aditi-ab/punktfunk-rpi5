@@ -311,6 +311,15 @@ final class SessionModel: ObservableObject {
     private var statsTimer: Timer?
     private var audio: SessionAudio?
     private var gamepadCapture: GamepadCapture?
+    /// The in-stream ring's pad path (design/touch-client-overlay.md §2.6), forwarded from the
+    /// capture so the view can wire them once per session.
+    var onRingChord: (() -> Void)?
+    var onRingNav: ((RingNav) -> Void)?
+
+    /// The ring is up: the pad belongs to it (flushed on the host, edges become navigation).
+    func setRingOpen(_ open: Bool) {
+        gamepadCapture?.ringOpen = open
+    }
     private var gamepadFeedback: GamepadFeedback?
     #if os(iOS) || os(macOS)
     /// The live session's Steam Controller 2 as-is passthrough (`settings.sc2Capture` &&
@@ -1126,6 +1135,8 @@ final class SessionModel: ObservableObject {
         // A pad with a gyro that this session cannot carry — say so once, briefly, and name the
         // setting that fixes it. Already main-actor (GamepadCapture fires it there).
         capture.onMotionUnreachable = { [weak self] kind in self?.noteMotionUnreachable(kind) }
+        capture.onRingChord = { [weak self] in self?.onRingChord?() }
+        capture.onRingNav = { [weak self] nav in self?.onRingNav?(nav) }
         capture.start()
         gamepadCapture = capture
         let feedback = GamepadFeedback(connection: conn, manager: .shared)

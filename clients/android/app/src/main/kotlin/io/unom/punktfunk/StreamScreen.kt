@@ -263,6 +263,11 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         mutableStateOf(if (touchUnsupported) TouchMode.TRACKPAD else initialSettings.touchMode)
     }
     val hostAcceptsTouch = remember(handle) { NativeBridge.nativeHostSupportsTouch(handle) }
+    // The quick-action ring (design/touch-client-overlay.md §2), declared ahead of the pad
+    // router that opens and drives it.
+    val ring = remember(handle) { RingState() }
+    var containerSize by remember { mutableStateOf(IntSize.Zero) }
+    val haptics = rememberConsoleHaptics()
     var touchHint by remember { mutableStateOf(touchUnsupported) }
     LaunchedEffect(touchHint) {
         if (touchHint) {
@@ -526,6 +531,13 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         // local on purpose: this mirrors the tap exactly (`onCycleStats` below), and the settings
         // row calls it a live cycle — the stored default is what the next stream starts from.
         router.onStatsChord = { statsVerbosity = statsVerbosity.next() }
+        // `Select+A` opens the ring at the screen centre; while it is up the pad belongs to it.
+        router.onRingChord = {
+            haptics.confirm()
+            ring.openAt(Offset(containerSize.width / 2f, containerSize.height / 2f))
+        }
+        router.onRingNav = { ring.nav(it) }
+        ring.onOpenChange = { open -> router.setRingOpen(open) }
         // Physical mouse: uncaptured hover/click/wheel forwards as absolute pointing; captured
         // (setting or the Ctrl+Alt+Shift+Q chord) raw deltas forward as relative mouse-look.
         // The local cursor is hidden over the stream — the host's own cursor, composited into
@@ -813,6 +825,9 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             router.onExitArmed = null // don't poke Compose state from release()'s disarm while tearing down
             router.onMicChord = null // same: no mute toggle on buttons released during teardown
             router.onStatsChord = null // same: no tier cycle on buttons released during teardown
+            router.onRingChord = null
+            router.onRingNav = null
+            ring.onOpenChange = null
             router.onMotionUnreachable = null // same: no notice raised by a slot closing at teardown
             router.release() // flush every slot (nothing sticks host-side) + drop the hot-plug listener
             activity?.gamepadRouter = null
@@ -861,8 +876,6 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // The quick-action ring (design/touch-client-overlay.md §2). Back opens it at the screen
     // centre instead of ending the session — an edge swipe mid-game used to tear the session down
     // with no confirmation (§5.3). "End stream" is a slot inside, behind a two-press arm.
-    val ring = remember(handle) { RingState() }
-    var containerSize by remember { mutableStateOf(IntSize.Zero) }
     BackHandler {
         when {
             ring.sheet -> ring.sheet = false
@@ -896,7 +909,6 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         mutableStateOf(NativeBridge.nativeVideoSize(handle)?.takeIf { it.size >= 2 } ?: intArrayOf(0, 0, 60))
     }
     val scope = rememberCoroutineScope()
-    val haptics = rememberConsoleHaptics()
 
     // Leaving the app (Home, task switch, screen off) MUST end the session. Android does not
     // suspend a process for going to background, so without this the native worker kept running and

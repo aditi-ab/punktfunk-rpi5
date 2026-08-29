@@ -326,6 +326,9 @@ impl Overlay for SkiaOverlay {
     }
 
     fn handle_menu(&mut self, event: MenuEvent) -> Option<MenuPulse> {
+        if !self.console_visible() && self.ring.open() {
+            return self.ring.menu(event);
+        }
         if self.console_visible() {
             self.shell.as_mut().and_then(|s| {
                 // The presenter's menu_rx carries pad events only (its keyboard goes
