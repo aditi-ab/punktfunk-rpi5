@@ -1132,6 +1132,9 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                                 keyCapture?.setImeVisible(show)
                             }
                         },
+                        // The two-finger twist turns the quick-action ring, which lands with
+                        // the in-stream overlay (design/touch-client-overlay.md T9).
+                        onDial = {},
                     )
                 }
             },

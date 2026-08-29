@@ -15,6 +15,7 @@ import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
 import io.unom.punktfunk.kit.NativeBridge
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 
@@ -26,6 +27,24 @@ private const val TAP_SLOP = 12f
 private const val TAP_DRAG_MS = 250L
 private const val LONG_PRESS_MS = 500L
 private const val SCROLL_DIV = 4f
+
+// The dial (design/touch-client-overlay.md §2.1): a two-finger TWIST opens the quick-action ring.
+// DIAL_ARM_DEG: below this rotation the gesture is still a scroll candidate — natural scrolls
+// rotate a few degrees, and this is what absorbs them. DIAL_COMMIT_DEG: the ring commits and stays
+// open after the fingers lift. DIAL_SLOP: centroid travel beyond this before arming means scroll.
+private const val DIAL_ARM_DEG = 10f
+private const val DIAL_COMMIT_DEG = 30f
+private const val DIAL_SLOP = 2 * TAP_SLOP
+
+/** The twist's progress, for the ring: [Turn] on every move once armed, then [Commit] at the
+ *  commit angle, or [Cancel] when the fingers lift short of it (or wind it back). */
+sealed class DialEvent {
+    /** [progress] 0…1 drives the ring's unwind; [clockwise] is the hand's direction; [x]/[y]
+     *  (container px) the centroid the ring is centred on. */
+    data class Turn(val progress: Float, val clockwise: Boolean, val x: Float, val y: Float) : DialEvent()
+    object Commit : DialEvent()
+    object Cancel : DialEvent()
+}
 
 // Three-finger vertical swipe: the fraction of the view height the centroid must travel to
 // summon (up) / dismiss (down) the local soft keyboard.
@@ -176,6 +195,7 @@ internal suspend fun PointerInputScope.streamTouchInput(
     invertScroll: Boolean,
     onCycleStats: () -> Unit,
     onKeyboard: (show: Boolean) -> Unit,
+    onDial: (DialEvent) -> Unit,
 ) {
     val scrollDir = if (invertScroll) -1 else 1
     var lastTapUp = 0L
@@ -208,6 +228,17 @@ internal suspend fun PointerInputScope.streamTouchInput(
         var maxFingers = 1
         var scrolling = false
         var scrollCount = 0 // pointer count the scroll centroid is anchored at
+        // A scroll notch went on the wire: a scroll for the gesture's lifetime, never a dial.
+        var scrollEmitted = false
+        // The twist: the finger-to-finger vector when the pair formed, the centroid then, and
+        // whether it has armed (owns the gesture) / committed (the ring stays open).
+        var dialIds: Pair<PointerId, PointerId>? = null
+        var dialVx = 0f
+        var dialVy = 0f
+        var dialAnchorX = 0f
+        var dialAnchorY = 0f
+        var dialArmed = false
+        var dialCommitted = false
         // Keyboard-swipe state: the 3+-finger centroid anchor (per finger count, like the
         // scroll anchor) and a once-per-gesture latch.
         var kbCount = 0
@@ -244,6 +275,15 @@ internal suspend fun PointerInputScope.streamTouchInput(
                 }
                 stylus?.intercept(ev, videoFitRect(size, videoAspect))
                 val pressed = ev.changes.filter { it.pressed && !isStylus(it, stylus) }
+                    .sortedBy { it.id.value }
+                // Any change of the pair ends the twist: a lift short of commit winds the ring
+                // back in; a committed ring stays open and the UI owns it from here.
+                if (pressed.size != 2 && dialIds != null) {
+                    if (dialArmed && !dialCommitted) onDial(DialEvent.Cancel)
+                    dialIds = null
+                    dialArmed = false
+                    dialCommitted = false
+                }
                 if (pressed.isEmpty()) {
                     upTime = ev.changes.firstOrNull()?.uptimeMillis ?: upTime
                     break
@@ -254,9 +294,49 @@ internal suspend fun PointerInputScope.streamTouchInput(
                 if (pressed.size < 3) kbCount = 0
 
                 if (pressed.size == 2) {
-                    // Two fingers → scroll by the centroid delta; never move the cursor.
                     val cx = (pressed.sumOf { it.position.x.toDouble() } / pressed.size).toFloat()
                     val cy = (pressed.sumOf { it.position.y.toDouble() } / pressed.size).toFloat()
+                    // The dial first (design §2.1): a twist of the finger-to-finger vector past
+                    // DIAL_ARM_DEG with the centroid still owns the gesture; a scroll notch
+                    // already sent, or centroid travel past DIAL_SLOP, means the hand is
+                    // scrolling. A pinch with no rotation is nothing.
+                    val (a, b) = pressed
+                    val ids = a.id to b.id
+                    if (dialIds != ids && !scrollEmitted) {
+                        dialIds = ids
+                        dialVx = b.position.x - a.position.x
+                        dialVy = b.position.y - a.position.y
+                        dialAnchorX = cx
+                        dialAnchorY = cy
+                    }
+                    if (dialIds == ids && (dialArmed || !scrollEmitted)) {
+                        val vx = b.position.x - a.position.x
+                        val vy = b.position.y - a.position.y
+                        val phi = Math.toDegrees(
+                            atan2(dialVx * vy - dialVy * vx, dialVx * vx + dialVy * vy).toDouble(),
+                        ).toFloat() // signed; + = clockwise on a y-down screen
+                        val travel = hypot(cx - dialAnchorX, cy - dialAnchorY)
+                        if (dialArmed || (travel < DIAL_SLOP && abs(phi) >= DIAL_ARM_DEG)) {
+                            if (!dialArmed) {
+                                dialArmed = true
+                                moved = true // a twist is never a tap…
+                                scrolling = true // …and dropping to one finger must not jerk the cursor
+                            }
+                            val p = ((abs(phi) - DIAL_ARM_DEG) / (DIAL_COMMIT_DEG - DIAL_ARM_DEG))
+                                .coerceIn(0f, 1f)
+                            onDial(DialEvent.Turn(p, phi > 0f, cx, cy))
+                            if (p >= 1f && !dialCommitted) {
+                                dialCommitted = true
+                                onDial(DialEvent.Commit)
+                            } else if (p <= 0f && dialCommitted) {
+                                dialCommitted = false
+                                onDial(DialEvent.Cancel)
+                            }
+                            ev.changes.forEach { it.consume() }
+                            continue
+                        }
+                    }
+                    // Two fingers → scroll by the centroid delta; never move the cursor.
                     // (Re-)anchor whenever the finger COUNT changes, not just on scroll start: the
                     // centroid of three fingers sits far from the centroid of two, and real fingers
                     // never land (or lift) in the same input frame — so the 2→3 transition would
@@ -275,11 +355,13 @@ internal suspend fun PointerInputScope.streamTouchInput(
                         NativeBridge.nativeSendScroll(handle, 0, sy * 120 * scrollDir)
                         prevCy = cy
                         moved = true
+                        scrollEmitted = true
                     }
                     if (sx != 0) {
                         NativeBridge.nativeSendScroll(handle, 1, sx * 120 * scrollDir)
                         prevCx = cx
                         moved = true
+                        scrollEmitted = true
                     }
                 } else if (pressed.size >= 3) {
                     // Three+ fingers → the keyboard swipe, never scroll (the documented

@@ -24,7 +24,7 @@ use crate::present_pace::{
     Cadence, CadenceProbe, FrameStore, LatchClock, PresentGate, SourcePacer, MARGIN_MAX_NS,
     MARGIN_STEP_NS,
 };
-use crate::touch::Abs;
+use crate::touch::{Abs, Act};
 use crate::vk::{FrameInput, Presenter};
 use anyhow::{Context as _, Result};
 use pf_client_core::gamepad::GamepadService;
@@ -1154,8 +1154,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     timestamp,
                     ..
                 } => {
-                    if is_direct_touch(touch_id)
-                        && dispatch_finger(
+                    if is_direct_touch(touch_id) {
+                        for act in dispatch_finger(
                             FingerPhase::Down,
                             &window,
                             &mut stream,
@@ -1163,9 +1163,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             x,
                             y,
                             timestamp,
-                        )
-                    {
-                        bump_stats_tier(&mut stats_verbosity, &mut stream, &presenter);
+                        ) {
+                            on_touch_act(act, &mut stats_verbosity, &mut stream, &presenter);
+                        }
                     }
                 }
                 Event::FingerMotion {
@@ -1176,8 +1176,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     timestamp,
                     ..
                 } => {
-                    if is_direct_touch(touch_id)
-                        && dispatch_finger(
+                    if is_direct_touch(touch_id) {
+                        for act in dispatch_finger(
                             FingerPhase::Move,
                             &window,
                             &mut stream,
@@ -1185,9 +1185,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             x,
                             y,
                             timestamp,
-                        )
-                    {
-                        bump_stats_tier(&mut stats_verbosity, &mut stream, &presenter);
+                        ) {
+                            on_touch_act(act, &mut stats_verbosity, &mut stream, &presenter);
+                        }
                     }
                 }
                 Event::FingerUp {
@@ -1198,8 +1198,8 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     timestamp,
                     ..
                 } => {
-                    if is_direct_touch(touch_id)
-                        && dispatch_finger(
+                    if is_direct_touch(touch_id) {
+                        for act in dispatch_finger(
                             FingerPhase::Up,
                             &window,
                             &mut stream,
@@ -1207,9 +1207,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             x,
                             y,
                             timestamp,
-                        )
-                    {
-                        bump_stats_tier(&mut stats_verbosity, &mut stream, &presenter);
+                        ) {
+                            on_touch_act(act, &mut stats_verbosity, &mut stream, &presenter);
+                        }
                     }
                 }
                 // The wake forwarder's FrameWake (and any other user event): pure
@@ -2887,9 +2887,9 @@ fn dispatch_finger(
     x: f32,
     y: f32,
     timestamp: u64,
-) -> bool {
+) -> Vec<Act> {
     let Some(st) = stream.as_mut() else {
-        return false;
+        return Vec::new();
     };
     let (pw, ph) = window.size_in_pixels();
     let (wx, wy) = (x * pw as f32, y * ph as f32);
@@ -2909,10 +2909,10 @@ fn dispatch_finger(
             w: 0,
             h: 0,
         },
-        None => return false,
+        None => return Vec::new(),
     };
     let Some(cap) = st.capture.as_mut() else {
-        return false;
+        return Vec::new();
     };
     cap.dispatch_finger(
         phase,
@@ -2922,6 +2922,25 @@ fn dispatch_finger(
         abs,
         timestamp as f64 / 1_000_000.0,
     )
+}
+
+/// A run-loop intent from the touch gesture engine: the three-finger tap bumps the stats tier;
+/// the dial — a two-finger twist — turns the quick-action ring. The ring layer lands with the
+/// desktop overlay (design/touch-client-overlay.md T8); until then the twist is logged so the
+/// gesture can be tuned on glass.
+fn on_touch_act(
+    act: Act,
+    verbosity: &mut StatsVerbosity,
+    stream: &mut Option<StreamState>,
+    presenter: &Presenter,
+) {
+    match act {
+        Act::CycleStats => bump_stats_tier(verbosity, stream, presenter),
+        Act::Dial { .. } | Act::DialCommit | Act::DialCancel => {
+            tracing::debug!(?act, "touch dial");
+        }
+        _ => {}
+    }
 }
 
 /// Advance the stats-overlay tier and re-render the OSD immediately from the last window

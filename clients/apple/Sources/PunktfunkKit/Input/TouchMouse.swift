@@ -69,6 +69,14 @@ final class TouchMouse {
         /// Three-finger vertical swipe: the fraction of the view height the centroid must
         /// travel to summon (up) / dismiss (down) the local soft keyboard.
         static let keyboardSwipeFraction: CGFloat = 0.10
+        /// The dial (design/touch-client-overlay.md §2.1): a two-finger TWIST opens the
+        /// quick-action ring. Below `dialArmDeg` the gesture is still a scroll candidate —
+        /// natural scrolls rotate a few degrees, and this absorbs them; at `dialCommitDeg` the
+        /// ring commits and stays open after the fingers lift; centroid travel past
+        /// `dialSlop` (pt) before arming means scroll, not dial.
+        static let dialArmDeg: CGFloat = 10
+        static let dialCommitDeg: CGFloat = 30
+        static let dialSlop: CGFloat = 2 * tapSlop
 
         /// Acceleration multiplier for a finger speed in physical px per ms.
         static func accel(forSpeed speed: CGFloat) -> CGFloat {
@@ -83,6 +91,32 @@ final class TouchMouse {
     /// Three-finger vertical swipe crossed the threshold: `true` = show the local soft
     /// keyboard (swipe up), `false` = dismiss it (swipe down). Fires at most once per gesture.
     var onKeyboardGesture: ((Bool) -> Void)?
+    /// The two-finger twist turning the quick-action ring (`DialEvent`).
+    var onDial: ((DialEvent) -> Void)?
+
+    /// The twist's progress, for the ring: `turn` on every move once armed, then `commit` at
+    /// the commit angle, or `cancel` when the fingers lift short of it (or wind it back).
+    enum DialEvent: Equatable {
+        /// `progress` 0…1 drives the ring's unwind; `clockwise` is the hand's direction;
+        /// `at` (view points) the centroid the ring is centred on.
+        case turn(progress: CGFloat, clockwise: Bool, at: CGPoint)
+        case commit
+        case cancel
+    }
+
+    /// The twist: the finger-to-finger vector when the pair formed, the centroid then, and
+    /// whether it has armed (owns the gesture) / committed (the ring stays open).
+    private struct Dial {
+        let keys: (ObjectIdentifier, ObjectIdentifier)
+        let vec: CGVector
+        let anchor: CGPoint
+        var armed = false
+        var committed = false
+    }
+
+    private var dial: Dial?
+    /// A scroll notch went on the wire: a scroll for the gesture's lifetime, never a dial.
+    private var scrollEmitted = false
 
     /// No gesture in flight (all fingers up) — the view uses this to release its mode latch.
     var isIdle: Bool { !sessionActive && lastPos.isEmpty }
@@ -133,6 +167,8 @@ final class TouchMouse {
             maxFingers = 0
             moved = false
             scrolling = false
+            scrollEmitted = false
+            dial = nil
             kbCount = 0
             kbFired = false
             // A touch landing just after a quick tap nearby = tap-and-drag: hold the left
@@ -156,6 +192,63 @@ final class TouchMouse {
         }
         maxFingers = max(maxFingers, lastPos.count)
         if lastPos.count > 1 { cancelLongPress() }
+        switch lastPos.count {
+        case 2 where !scrollEmitted && dial == nil:
+            // The second finger: remember the finger-to-finger vector — the dial's reference.
+            let keys = Array(lastPos.keys)
+            let (a, b) = (lastPos[keys[0]]!, lastPos[keys[1]]!)
+            dial = Dial(
+                keys: (keys[0], keys[1]),
+                vec: CGVector(dx: b.x - a.x, dy: b.y - a.y),
+                anchor: CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2))
+        case 3...:
+            endDial() // a third finger ends the twist
+        default:
+            break
+        }
+    }
+
+    /// The twist is over (a finger lifted or a third landed): an armed-but-uncommitted ring
+    /// winds back in; a committed ring stays open for the UI.
+    private func endDial() {
+        guard let d = dial else { return }
+        dial = nil
+        if d.armed, !d.committed { onDial?(.cancel) }
+    }
+
+    /// The dial's share of a two-finger move; `true` when the twist owns the gesture (the
+    /// scroll path then never runs). Rules, in order (design §2.1): a scroll notch already
+    /// sent ⇒ never a dial; centroid travel past `dialSlop` before arming ⇒ scroll; rotation
+    /// ≥ `dialArmDeg` ⇒ the twist arms and owns the gesture; progress `(|Δφ| − arm) /
+    /// (commit − arm)` feeds the ring; at 1 the ring commits, and winding back to 0 after a
+    /// commit closes it again. A pinch with no rotation never arms and moves no centroid.
+    private func dialStep() -> Bool {
+        guard var d = dial, d.armed || !scrollEmitted,
+              let a = lastPos[d.keys.0], let b = lastPos[d.keys.1]
+        else { return false }
+        let v = CGVector(dx: b.x - a.x, dy: b.y - a.y)
+        let cross = d.vec.dx * v.dy - d.vec.dy * v.dx
+        let dot = d.vec.dx * v.dx + d.vec.dy * v.dy
+        let phi = atan2(cross, dot) * 180 / .pi // signed; + = clockwise on a y-down screen
+        let c = CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
+        if !d.armed {
+            let travel = hypot(c.x - d.anchor.x, c.y - d.anchor.y)
+            if travel >= Tuning.dialSlop || abs(phi) < Tuning.dialArmDeg { return false }
+            d.armed = true
+            moved = true // a twist is never a tap…
+            scrolling = true // …and dropping to one finger must not jerk the cursor
+        }
+        let progress = min(max((abs(phi) - Tuning.dialArmDeg) / (Tuning.dialCommitDeg - Tuning.dialArmDeg), 0), 1)
+        onDial?(.turn(progress: progress, clockwise: phi > 0, at: c))
+        if progress >= 1, !d.committed {
+            d.committed = true
+            onDial?(.commit)
+        } else if progress <= 0, d.committed {
+            d.committed = false
+            onDial?(.cancel)
+        }
+        dial = d
+        return true
     }
 
     private func scheduleLongPress() {
@@ -188,7 +281,7 @@ final class TouchMouse {
         // re-anchors instead of reading the count change as swipe travel.
         if lastPos.count < 3 { kbCount = 0 }
         if lastPos.count == 2 {
-            scrollByCentroid()
+            if !dialStep() { scrollByCentroid() }
         } else if lastPos.count >= 3 {
             keyboardSwipe(in: view)
         } else if !scrolling, let touch = touches.first(where: {
@@ -208,6 +301,7 @@ final class TouchMouse {
             if trackKey == ObjectIdentifier(touch) { trackKey = nil }
             upTime = max(upTime, touch.timestamp)
         }
+        endDial() // any lift ends the twist
         guard lastPos.isEmpty, sessionActive else { return }
         sessionActive = false
         if dragHeld {
@@ -233,6 +327,7 @@ final class TouchMouse {
     /// never synthesize a click out of a cancellation.
     func cancelled(_ touches: Set<UITouch>) {
         cancelLongPress()
+        endDial()
         for touch in touches {
             lastPos.removeValue(forKey: ObjectIdentifier(touch))
             if trackKey == ObjectIdentifier(touch) { trackKey = nil }
@@ -250,6 +345,7 @@ final class TouchMouse {
 
     private func abortSession() {
         cancelLongPress()
+        endDial()
         if dragHeld {
             dragHeld = false
             send?(.mouseButton(Button.left, down: false))
@@ -281,11 +377,13 @@ final class TouchMouse {
             send?(.scroll(notchesY * 120 * sign))
             scrollAnchor.y = cy
             moved = true
+            scrollEmitted = true
         }
         if notchesX != 0 {
             send?(.scroll(notchesX * 120 * sign, horizontal: true))
             scrollAnchor.x = cx
             moved = true
+            scrollEmitted = true
         }
     }
 
