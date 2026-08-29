@@ -28,6 +28,27 @@ use pf_client_core::trust::{MouseMode, TouchMode};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::quic::{classify, GRANT_KEYBOARD, GRANT_POINTER};
+
+impl Act {
+    /// The `(InputKind, code, x, y, flags)` this intent sends. `Button`/`CycleStats` don't map
+    /// to a single motion send, so callers special-case them; this covers the motion/scroll
+    /// intents shared with the raw pointer path. Lives here, not in `touch.rs`, so the
+    /// gesture engine stays free of the platform-gated core dependency and tests everywhere.
+    pub fn wire(self) -> Option<(InputKind, u32, i32, i32, u32)> {
+        match self {
+            Act::MoveRel { dx, dy } => Some((InputKind::MouseMove, 0, dx, dy, 0)),
+            Act::MoveAbs(a) => Some((
+                InputKind::MouseMoveAbs,
+                0,
+                a.x,
+                a.y,
+                ((a.w & 0xffff) << 16) | (a.h & 0xffff),
+            )),
+            Act::Scroll { axis, delta } => Some((InputKind::MouseScroll, axis, delta, 0, 0)),
+            Act::Button { .. } | Act::CycleStats => None,
+        }
+    }
+}
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

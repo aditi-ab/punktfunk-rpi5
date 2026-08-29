@@ -13,9 +13,9 @@
 //!
 //! Shared gestures: tap = left click · two-finger tap = right click · two-finger drag =
 //! scroll · tap-then-press-and-drag = held left drag · three-finger tap = cycle the stats
-//! overlay tier. (The Android/Apple twins additionally map a three-finger vertical SWIPE to
-//! their local soft keyboard and gate scroll to exactly two fingers for it; SDL builds have
-//! no soft keyboard to summon, so here 2+ fingers scroll.)
+//! overlay tier. Three or more fingers never scroll: the Android/Apple twins map a
+//! three-finger vertical SWIPE to their local soft keyboard, and SDL builds have none to
+//! summon, so here a three-finger drag does nothing but disqualify the tap.
 //!
 //! Unlike the Android/Apple hosts (which hand the engine a whole event's worth of changed
 //! touches at once), SDL delivers ONE finger transition per event, so this is a strictly
@@ -24,7 +24,6 @@
 //! normalized 0..1 finger coordinates by the window's pixel size) so the pixel-based
 //! ballistics constants port from Android 1:1; timestamps are milliseconds.
 
-use punktfunk_core::input::InputKind;
 use std::collections::HashMap;
 
 // Gesture/ballistics tuning (physical px / ms), matching the Android reference exactly.
@@ -57,9 +56,9 @@ pub struct Abs {
     pub h: u32,
 }
 
-/// A wire intent the engine emits; the owner ([`Capture`](crate::input::Capture)) translates
-/// each into an actual `send_input`, and folds [`CycleStats`](Act::CycleStats) back to the
-/// run loop.
+/// A wire intent the engine emits; the owner (`Capture` in `input.rs`, which also holds the
+/// intent → `InputKind` translation) sends each one, and folds [`CycleStats`](Act::CycleStats)
+/// back to the run loop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Act {
     /// Relative cursor motion (`MouseMove`).
@@ -72,26 +71,6 @@ pub enum Act {
     Scroll { axis: u32, delta: i32 },
     /// Three-finger tap: cycle the stats-overlay verbosity tier (the run loop owns it).
     CycleStats,
-}
-
-impl Act {
-    /// The `(InputKind, code, x, y, flags)` this intent sends. `Button`/`CycleStats` don't map
-    /// to a single motion send, so callers special-case them; this covers the motion/scroll
-    /// intents shared with the raw pointer path.
-    pub fn wire(self) -> Option<(InputKind, u32, i32, i32, u32)> {
-        match self {
-            Act::MoveRel { dx, dy } => Some((InputKind::MouseMove, 0, dx, dy, 0)),
-            Act::MoveAbs(a) => Some((
-                InputKind::MouseMoveAbs,
-                0,
-                a.x,
-                a.y,
-                ((a.w & 0xffff) << 16) | (a.h & 0xffff),
-            )),
-            Act::Scroll { axis, delta } => Some((InputKind::MouseScroll, axis, delta, 0, 0)),
-            Act::Button { .. } | Act::CycleStats => None,
-        }
-    }
 }
 
 /// The trackpad/pointer gesture state machine. One per session; `trackpad` picks the model
@@ -107,10 +86,11 @@ pub struct Gestures {
     max_fingers: usize,
     moved: bool,
     scrolling: bool,
-    /// Finger count the scroll centroid is anchored at — re-anchor on a count change so a
-    /// 2→3 transition isn't read as a scroll notch.
-    scroll_count: usize,
     scroll_anchor: (f32, f32),
+    /// Three-or-more-finger centroid anchor, per finger count (0 = none): real fingers never
+    /// land or lift in the same event, so a count change must re-anchor, not read as travel.
+    many_count: usize,
+    many_anchor: (f32, f32),
     /// A tap-then-press-and-drag is holding the left button down for this whole gesture.
     drag_held: bool,
     // Trackpad relative-motion state: the tracked finger, its last position/time, and the
@@ -134,8 +114,9 @@ impl Gestures {
             max_fingers: 0,
             moved: false,
             scrolling: false,
-            scroll_count: 0,
             scroll_anchor: (0.0, 0.0),
+            many_count: 0,
+            many_anchor: (0.0, 0.0),
             drag_held: false,
             track_id: None,
             prev: (0.0, 0.0),
@@ -158,7 +139,7 @@ impl Gestures {
             self.max_fingers = 0;
             self.moved = false;
             self.scrolling = false;
-            self.scroll_count = 0;
+            self.many_count = 0;
             // A touch landing just after a quick tap nearby = tap-and-drag.
             self.drag_held = t - self.last_tap_up < TAP_DRAG_MS
                 && (wx - self.last_tap_pt.0).abs() < TAP_SLOP
@@ -188,14 +169,21 @@ impl Gestures {
             return Vec::new();
         }
         self.positions.insert(id, (wx, wy));
-        if self.positions.len() >= 2 {
-            self.scroll_by_centroid()
-        } else if !self.scrolling {
+        // Dropping below three fingers forgets the many-finger anchor, so a 3→2→3 bounce
+        // re-anchors instead of reading the count change as travel.
+        if self.positions.len() < 3 {
+            self.many_count = 0;
+        }
+        match self.positions.len() {
+            2 => self.scroll_by_centroid(),
+            n if n >= 3 => {
+                self.many_fingers();
+                Vec::new()
+            }
             // One finger, and the gesture never became a scroll (dropping back from two
             // fingers to one must not jerk the cursor).
-            self.single_finger(id, wx, wy, abs, t)
-        } else {
-            Vec::new()
+            _ if !self.scrolling => self.single_finger(id, wx, wy, abs, t),
+            _ => Vec::new(),
         }
     }
 
@@ -260,22 +248,25 @@ impl Gestures {
         self.last_tap_up = 0.0;
     }
 
-    /// Two (or more) fingers → scroll by the centroid delta; never move the cursor. Fires a
-    /// notch per `SCROLL_DIV` px of pan and re-anchors on fire; finger up scrolls up, finger
-    /// right scrolls right (the host WHEEL(120) convention).
-    fn scroll_by_centroid(&mut self) -> Vec<Act> {
-        let mut acts = Vec::new();
+    /// The live fingers' centroid.
+    fn centroid(&self) -> (f32, f32) {
         let n = self.positions.len() as f32;
         let (mut sx, mut sy) = (0.0f32, 0.0f32);
         for &(px, py) in self.positions.values() {
             sx += px;
             sy += py;
         }
-        let (cx, cy) = (sx / n, sy / n);
-        // (Re-)anchor on scroll start AND whenever the finger count changes.
-        if !self.scrolling || self.positions.len() != self.scroll_count {
+        (sx / n, sy / n)
+    }
+
+    /// Exactly two fingers → scroll by the centroid delta; never move the cursor. Fires a
+    /// notch per `SCROLL_DIV` px of pan and re-anchors on fire; finger up scrolls up, finger
+    /// right scrolls right (the host WHEEL(120) convention).
+    fn scroll_by_centroid(&mut self) -> Vec<Act> {
+        let mut acts = Vec::new();
+        let (cx, cy) = self.centroid();
+        if !self.scrolling {
             self.scrolling = true;
-            self.scroll_count = self.positions.len();
             self.scroll_anchor = (cx, cy);
         }
         let notches_y = ((self.scroll_anchor.1 - cy) / SCROLL_DIV) as i32;
@@ -297,6 +288,24 @@ impl Gestures {
             self.moved = true;
         }
         acts
+    }
+
+    /// Three or more fingers: no scroll, no cursor motion. Centroid travel beyond `TAP_SLOP`
+    /// disqualifies the tap (else a short three-finger swipe would still cycle the stats).
+    /// Leaving the scroll state stale would read the 3→2 centroid jump as a wheel notch, and
+    /// the tracked finger's position froze meanwhile, so both re-anchor fresh on the way back.
+    fn many_fingers(&mut self) {
+        let (cx, cy) = self.centroid();
+        if self.positions.len() != self.many_count {
+            self.many_count = self.positions.len();
+            self.many_anchor = (cx, cy);
+        } else if (cx - self.many_anchor.0).abs() > TAP_SLOP
+            || (cy - self.many_anchor.1).abs() > TAP_SLOP
+        {
+            self.moved = true;
+        }
+        self.scrolling = false;
+        self.track_id = None;
     }
 
     /// One finger, not scrolling: trackpad relative ballistics, or pointer absolute follow.
@@ -477,6 +486,25 @@ mod tests {
                 .any(|a| matches!(a, Act::Scroll { axis: 0, delta } if *delta > 0)),
             "expected an upward vertical scroll, got {scrolls:?}"
         );
+    }
+
+    #[test]
+    fn three_finger_drag_scrolls_nothing() {
+        let mut g = Gestures::new(true);
+        let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
+        let _ = g.down(2, 130.0, 200.0, ABS, 2.0);
+        let _ = g.down(3, 160.0, 200.0, ABS, 4.0);
+        // All three slide up 40 px: the twins reserve this for their keyboard swipe, so the
+        // desktop must neither scroll nor move the cursor…
+        let mut acts = g.motion(1, 100.0, 160.0, ABS, 10.0);
+        acts.extend(g.motion(2, 130.0, 160.0, ABS, 12.0));
+        acts.extend(g.motion(3, 160.0, 160.0, ABS, 14.0));
+        assert_eq!(acts, vec![], "a three-finger drag must emit nothing");
+        // …and the travel disqualifies the three-finger tap on lift.
+        acts.extend(g.up(1, 40.0));
+        acts.extend(g.up(2, 41.0));
+        acts.extend(g.up(3, 42.0));
+        assert_eq!(acts, vec![]);
     }
 
     #[test]

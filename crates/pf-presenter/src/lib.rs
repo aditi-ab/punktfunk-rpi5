@@ -56,7 +56,7 @@ pub mod overlay;
 mod present_pace;
 #[cfg(any(target_os = "linux", windows))]
 mod run;
-#[cfg(any(target_os = "linux", windows))]
+// Pure gesture logic with no SDL or Vulkan dependency: built (and tested) on every platform.
 pub mod touch;
 #[cfg(any(target_os = "linux", windows))]
 pub mod vk;
