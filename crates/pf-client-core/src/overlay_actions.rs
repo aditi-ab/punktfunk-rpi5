@@ -84,6 +84,52 @@ pub struct Shortcut {
     pub keys: Vec<String>,
 }
 
+/// The Windows virtual-key code a shortcut key name stands for — the wire speaks VKs, and a
+/// profile written on one client must fire on every other, so names, not codes, are stored.
+/// Modifiers, navigation keys, `f1`…`f24`, `a`…`z`, `0`…`9`; `None` for a name this build does
+/// not know (the chord then does not fire, and the editor shows the key as unknown).
+pub fn key_vk(name: &str) -> Option<u8> {
+    let n = name.trim().to_ascii_lowercase();
+    let vk = match n.as_str() {
+        "ctrl" | "control" => 0x11,
+        "shift" => 0x10,
+        "alt" | "option" => 0x12,
+        "win" | "cmd" | "super" | "meta" => 0x5B,
+        "escape" | "esc" => 0x1B,
+        "tab" => 0x09,
+        "enter" | "return" => 0x0D,
+        "space" => 0x20,
+        "backspace" => 0x08,
+        "delete" | "del" => 0x2E,
+        "insert" => 0x2D,
+        "home" => 0x24,
+        "end" => 0x23,
+        "pageup" => 0x21,
+        "pagedown" => 0x22,
+        "up" => 0x26,
+        "down" => 0x28,
+        "left" => 0x25,
+        "right" => 0x27,
+        "printscreen" => 0x2C,
+        "pause" => 0x13,
+        "capslock" => 0x14,
+        _ => {
+            let b = n.as_bytes();
+            return match b {
+                [c @ b'a'..=b'z'] => Some(0x41 + (c - b'a')),
+                [c @ b'0'..=b'9'] => Some(0x30 + (c - b'0')),
+                [b'f', rest @ ..] if !rest.is_empty() => n[1..]
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|f| (1..=24).contains(f))
+                    .map(|f| 0x70 + f - 1),
+                _ => None,
+            };
+        }
+    };
+    Some(vk)
+}
+
 /// The virtual controller's preset (Android and Apple only): `layout` is `full`, `sticks` or
 /// `dpad`; `opacity` and `scale` are the two sliders.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -272,6 +318,22 @@ mod tests {
         let cfg = OverlayConfig::parse(r#"{"v":2,"ring":[]}"#, RingPlatform::Touch);
         assert_eq!(cfg.pad, PadConfig::default());
         assert!(cfg.ring.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn key_names_map_to_windows_vks() {
+        assert_eq!(key_vk("ctrl"), Some(0x11));
+        assert_eq!(key_vk("Shift"), Some(0x10));
+        assert_eq!(key_vk("escape"), Some(0x1B));
+        assert_eq!(key_vk("tab"), Some(0x09));
+        assert_eq!(key_vk("a"), Some(0x41));
+        assert_eq!(key_vk("z"), Some(0x5A));
+        assert_eq!(key_vk("0"), Some(0x30));
+        assert_eq!(key_vk("f1"), Some(0x70));
+        assert_eq!(key_vk("f12"), Some(0x7B));
+        assert_eq!(key_vk("f25"), None);
+        assert_eq!(key_vk("hyper"), None);
+        assert_eq!(key_vk(""), None);
     }
 
     #[test]

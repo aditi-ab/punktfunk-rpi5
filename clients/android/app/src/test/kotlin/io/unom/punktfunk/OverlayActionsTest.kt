@@ -64,6 +64,23 @@ class OverlayActionsTest {
     }
 
     @Test
+    fun keyNamesMapToWindowsVks() {
+        assertEquals(0x11, keyVk("ctrl"))
+        assertEquals(0x10, keyVk("Shift"))
+        assertEquals(0x1B, keyVk("escape"))
+        assertEquals(0x09, keyVk("tab"))
+        assertEquals(0x41, keyVk("a"))
+        assertEquals(0x5A, keyVk("z"))
+        assertEquals(0x30, keyVk("0"))
+        assertEquals(0x70, keyVk("f1"))
+        assertEquals(0x7B, keyVk("f12"))
+        assertNull(keyVk("f25"))
+        assertNull(keyVk("hyper"))
+        assertNull(keyVk(""))
+        assertEquals("Ctrl+⇧+Esc", chordChip(listOf("ctrl", "shift", "escape")))
+    }
+
+    @Test
     fun slotIdsAreStableStrings() {
         for (id in listOf(
             "end_stream", "disconnect_linger", "touch_mode", "keyboard", "stats", "mic", "pad",
