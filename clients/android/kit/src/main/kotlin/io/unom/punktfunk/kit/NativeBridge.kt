@@ -266,8 +266,8 @@ object NativeBridge {
      * Resolved at the handshake, so it is known before the first frame — the stream view sizes
      * itself to THIS aspect rather than stretching the picture to the panel's, and pins the
      * panel's display mode to the stream refresh. The trailing `refreshHz` was appended later
-     * (an older native lib returns only `[width, height]` — index defensively). Fixed for the
-     * session; read once. Cheap; UI-safe.
+     * (an older native lib returns only `[width, height]` — index defensively). Follows an
+     * accepted [nativeRequestMode] switch once the host's ack lands. Cheap; UI-safe.
      */
     external fun nativeVideoSize(handle: Long): IntArray?
 

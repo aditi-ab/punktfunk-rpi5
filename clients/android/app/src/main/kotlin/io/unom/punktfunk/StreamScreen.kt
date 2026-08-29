@@ -903,8 +903,9 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             delay(300_000)
         }
     }
-    // The mode as last requested from the sheet (Android has no live read-back of the
-    // negotiated mode; `nativeVideoSize` is the handshake's answer).
+    // The live session mode: `nativeVideoSize` follows an accepted mode switch, but its ack lands
+    // off the composition, so a request writes the asked-for mode here at once and re-reads the
+    // truth shortly after (a rejection shows through then).
     var requestedMode by remember(handle) {
         mutableStateOf(NativeBridge.nativeVideoSize(handle)?.takeIf { it.size >= 2 } ?: intArrayOf(0, 0, 60))
     }
@@ -1251,7 +1252,13 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                 sendShortcut = { sendChord(handle, it) },
                 currentMode = { requestedMode },
                 requestMode = { w, h, hz ->
-                    if (NativeBridge.nativeRequestMode(handle, w, h, hz)) requestedMode = intArrayOf(w, h, hz)
+                    if (NativeBridge.nativeRequestMode(handle, w, h, hz)) {
+                        requestedMode = intArrayOf(w, h, hz)
+                        scope.launch {
+                            delay(500)
+                            NativeBridge.nativeVideoSize(handle)?.takeIf { it.size >= 3 }?.let { requestedMode = it }
+                        }
+                    }
                 },
             ),
             containerSize = containerSize,
