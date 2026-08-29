@@ -29,8 +29,9 @@ use std::{
 };
 
 use wdk_sys::iddcx::{
-    IDARG_IN_RELEASEANDACQUIREBUFFER2, IDARG_IN_SETREALTIMEGPUPRIORITY,
-    IDARG_IN_SWAPCHAINSETDEVICE, IDARG_OUT_RELEASEANDACQUIREBUFFER2, IDDCX_SWAPCHAIN,
+    self, IDARG_IN_RELEASEANDACQUIREBUFFER2, IDARG_IN_REPORTFRAMESTATISTICS,
+    IDARG_IN_SETREALTIMEGPUPRIORITY, IDARG_IN_SWAPCHAINSETDEVICE,
+    IDARG_OUT_RELEASEANDACQUIREBUFFER2, IDDCX_SWAPCHAIN,
 };
 // `HANDLE` is the shared wdk-sys typedef (`crate::types`) re-used by the iddcx bindings — take it from
 // the crate root, which is guaranteed to export it (the iddcx module only re-exports it if bindgen
@@ -40,9 +41,10 @@ use windows::{
     Win32::{
         Foundation::HANDLE as WHANDLE,
         Graphics::{
-            Direct3D11::ID3D11Texture2D,
+            Direct3D11::{D3D11_TEXTURE2D_DESC, ID3D11Texture2D},
             Dxgi::{IDXGIDevice, IDXGIResource},
         },
+        System::Performance::QueryPerformanceCounter,
         System::Threading::{
             AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, GetCurrentThread,
             SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL, WaitForSingleObject,
@@ -118,6 +120,86 @@ fn rt_gpu_mode() -> RtGpuMode {
             Some(_) => RtGpuMode::Realtime,
         }
     })
+}
+
+/// Read a MACHINE environment variable from the registry — where `setx /M` writes it.
+///
+/// `std::env` is NOT enough in this process: WUDFHost inherits its environment from WUDFSvc,
+/// which inherited it from the SCM at boot, and the SCM never refreshes on `WM_SETTINGCHANGE`.
+/// So a `setx /M` set today is invisible to `std::env::var_os` until a REBOOT — measured on
+/// .173 (2026-08-29): the toggle below had no effect across device restarts with fresh WUDFHost
+/// PIDs until this read was added. ⚠ [`rt_gpu_mode`] carries the same trap and is deliberately
+/// left alone: its variables predate the 2026-08 REALTIME conviction, so making them suddenly
+/// readable could re-arm the convicted amplifier on a box that still carries a stale
+/// `PFVD_RT_GPU=1`.
+fn machine_env(name: &str) -> Option<String> {
+    use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+    use windows::core::{HSTRING, PCWSTR};
+    const KEY: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+    let (subkey, value) = (HSTRING::from(KEY), HSTRING::from(name));
+    let mut buf = [0u16; 256];
+    let mut size = std::mem::size_of_val(&buf) as u32;
+    // SAFETY: both name pointers address NUL-terminated HSTRING buffers alive for the call;
+    // `buf`/`size` are a matched out-buffer and its byte length. RRF_RT_REG_SZ makes the call
+    // reject any non-string value rather than write a foreign type into the buffer.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if rc.is_err() {
+        return None;
+    }
+    // `size` is bytes INCLUDING the terminator; trim to chars and drop trailing NULs.
+    let chars = (size as usize / 2).min(buf.len());
+    Some(
+        String::from_utf16_lossy(&buf[..chars])
+            .trim_end_matches('\0')
+            .to_string(),
+    )
+}
+
+/// Whether the drain loop reports per-frame statistics to the OS
+/// (`IddCxSwapChainReportFrameStatistics`). Default **ON**: the canonical MS sample leaves the
+/// call as a TODO and this driver never made it, but the statistics feed the OS's per-output
+/// scheduling, and the 2026-08 case-#4 evidence shape is DWM starving exactly one head — this
+/// one — while composing a lit sibling at full rate (virtual-head-selective compose
+/// starvation). Reporting is the contract-following default; `setx /M PFVD_FRAME_STATS 0` (or
+/// `off`) + a device restart is the A/B escape hatch — read via [`machine_env`], because the
+/// process environment never sees it.
+fn frame_stats_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let off = |v: &str| v == "0" || v.eq_ignore_ascii_case("off");
+        let set = std::env::var("PFVD_FRAME_STATS")
+            .ok()
+            .or_else(|| machine_env("PFVD_FRAME_STATS"));
+        let on = !set.as_deref().is_some_and(off);
+        dbglog!(
+            "[pf-vd] frame statistics: {} (PFVD_FRAME_STATS={set:?})",
+            if on { "ON" } else { "OFF" }
+        );
+        on
+    })
+}
+
+/// Current QPC tick count (the clock `IDDCX_FRAME_STATISTICS`' `*QpcTime` fields are stamped
+/// in). Never fails on XP+; a zero on the impossible error path is a harmless "no timing" stat.
+fn qpc() -> u64 {
+    let mut t = 0i64;
+    // SAFETY: out-pointer to a valid local.
+    let _ = unsafe { QueryPerformanceCounter(&mut t) };
+    #[allow(clippy::cast_sign_loss)]
+    {
+        t as u64
+    }
 }
 
 /// A minimal newtype to move a raw pointer / handle across the thread boundary. The wrapped value is a
@@ -390,6 +472,9 @@ impl SwapChainProcessor {
 
         let mut logged_pending = false;
         let mut logged_frame = false;
+        // First `IddCxSwapChainReportFrameStatistics` outcome, logged once (the rest of the
+        // session reports silently) so a field log answers "did the stats path engage".
+        let mut logged_stats = false;
         // The frame-channel delivery gate (see `monitor::frame_channel_gen`): the loop only takes
         // the monitors mutex when a delivery LANDED since it last looked. Seeded one behind the
         // current generation so a delivery that arrived before this worker started (host delivered
@@ -535,6 +620,7 @@ impl SwapChainProcessor {
                 // The wait was cancelled or something unexpected happened.
                 break;
             } else if hr_success(hr) {
+                let acquire_qpc = qpc();
                 if !logged_frame {
                     dbglog!(
                         "[pf-vd] swap-chain run_core: FIRST FRAME acquired (target={target_id}) — DWM IS compositing the virtual display!"
@@ -550,6 +636,12 @@ impl SwapChainProcessor {
                 // surface set per assign/unassign cycle (reconnect, mode change, HDR flip) — so adopt
                 // the reference UNCONDITIONALLY (publisher or not); it is released when `res` drops at
                 // the end of this block. (Publisher attach happens at the loop top.)
+                // Frame-statistics inputs, harvested alongside the publish: our "send" is the ring
+                // publish (the GPU copy into the shared section), and the pixel/byte counts come
+                // from the surface descriptor.
+                let send_start_qpc = qpc();
+                let mut stat_pixels: u32 = 0;
+                let mut stat_bytes: u32 = 0;
                 {
                     let raw = buffer.MetaData.pSurface as *mut core::ffi::c_void;
                     if !raw.is_null() {
@@ -559,6 +651,14 @@ impl SwapChainProcessor {
                         // the copy is ordered before the consumer via the slot keyed mutex).
                         let res = unsafe { IDXGIResource::from_raw(raw) };
                         if let Ok(tex) = res.cast::<ID3D11Texture2D>() {
+                            let mut desc = D3D11_TEXTURE2D_DESC::default();
+                            // SAFETY: `tex` is the live acquired surface; GetDesc fills the local.
+                            unsafe { tex.GetDesc(&mut desc) };
+                            stat_pixels = desc.Width.saturating_mul(desc.Height);
+                            // Assumes the common 32-bpp swap-chain format (an FP16 surface is
+                            // really 8 bytes/px — a 2× understatement there, acceptable for a
+                            // statistic: the OS wants magnitude, not an invoice).
+                            stat_bytes = stat_pixels.saturating_mul(4);
                             match publisher.as_mut().map(|p| p.publish(&tex)) {
                                 // Ring took it (or the host is alive and busy) — nothing to retain.
                                 Some(PublishOutcome::Published | PublishOutcome::Dropped) => {}
@@ -578,6 +678,68 @@ impl SwapChainProcessor {
                             }
                         }
                         // `res` drops here → the acquire's surface reference is released, pre-Finished.
+                    }
+                }
+
+                // Report the frame's statistics BEFORE FinishedProcessingFrame — while the frame
+                // is still the swap-chain's open frame (the case-#4 A/B — see
+                // `frame_stats_enabled` and the wdk-iddcx wrapper doc). COMPLETED status, the
+                // metadata's present number (64→32-bit truncation wraps after ~4 billion frames —
+                // irrelevant), acquire and publish QPC brackets, and the surface's pixel/byte
+                // magnitudes. Best-effort: a failing HRESULT is logged once (with the sent
+                // values) and never breaks the drain loop — draining is load-bearing, statistics
+                // are advisory.
+                if frame_stats_enabled() {
+                    let mut stats_in = pod_init!(IDARG_IN_REPORTFRAMESTATISTICS);
+                    let s = &mut stats_in.FrameStatistics;
+                    let pfn_raw = buffer.MetaData.PresentationFrameNumber;
+                    let send_stop_qpc = qpc();
+                    #[allow(clippy::cast_possible_truncation)]
+                    let step_size = size_of::<iddcx::IDDCX_FRAME_STATISTICS_STEP>() as u32;
+                    // The processing-step array. The DDI's validator REJECTS an empty one
+                    // (`FrameProcessingStepsCount = 0` + null pointer) with
+                    // STATUS_INVALID_PARAMETER even though every documented field is set per
+                    // contract — measured on .173, 2026-08-29, by probing the shapes. Our one
+                    // "processing step" is the copy into the host ring, reported as the
+                    // ENCODE start/end interval. Element-wise init: bindgen derives no `Copy`.
+                    let mut steps = [
+                        pod_init!(iddcx::IDDCX_FRAME_STATISTICS_STEP),
+                        pod_init!(iddcx::IDDCX_FRAME_STATISTICS_STEP),
+                    ];
+                    steps[0].Size = step_size;
+                    steps[0].Type = iddcx::IDDCX_FRAME_STATISTICS_STEP_TYPE::IDDCX_FRAME_STATISTICS_STEP_TYPE_ENCODE_START;
+                    steps[0].QpcTime = send_start_qpc;
+                    steps[1].Size = step_size;
+                    steps[1].Type = iddcx::IDDCX_FRAME_STATISTICS_STEP_TYPE::IDDCX_FRAME_STATISTICS_STEP_TYPE_ENCODE_END;
+                    steps[1].QpcTime = send_stop_qpc;
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        s.Size = size_of::<iddcx::IDDCX_FRAME_STATISTICS>() as u32;
+                        s.PresentationFrameNumber = pfn_raw as u32;
+                    }
+                    s.FrameStatus = iddcx::IDDCX_FRAME_STATUS::IDDCX_FRAME_STATUS_COMPLETED;
+                    // An unsliced frame reports FrameSliceTotal=1 with CurrentSlice=0.
+                    s.FrameSliceTotal = 1;
+                    s.FrameAcquireQpcTime = acquire_qpc;
+                    s.SendStartQpcTime = send_start_qpc;
+                    s.SendStopQpcTime = send_stop_qpc;
+                    // SendCompleteQpcTime stays zero: the contract reserves it for drivers with
+                    // an asynchronous transmit completion routine, which this publish is not.
+                    s.FrameProcessingStepsCount = 2;
+                    s.pFrameProcessingStep = steps.as_mut_ptr();
+                    s.ProcessedPixelCount = stat_pixels;
+                    s.FrameSizeInBytes = stat_bytes;
+                    // Remaining fields stay zeroed: no re-encodes, `CurrentSlice` 0, default flags.
+                    // SAFETY: driver is loaded; `swap_chain` is valid; `stats_in` is a filled
+                    // local and `steps` outlives the synchronous call.
+                    let hr = unsafe {
+                        wdk_iddcx::IddCxSwapChainReportFrameStatistics(swap_chain, &stats_in)
+                    };
+                    if !logged_stats {
+                        dbglog!(
+                            "[pf-vd] swap-chain run_core: first frame-statistics report (target={target_id}) rc={hr:#x} pfn={pfn_raw} px={stat_pixels} bytes={stat_bytes}"
+                        );
+                        logged_stats = true;
                     }
                 }
 
