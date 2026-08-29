@@ -71,6 +71,9 @@ final class Sc2BleLink: NSObject {
     private var lizardSends = 0
     private var sweepCounter = 0
     private var inCounter = 0
+    /// Output report ids already reported as having no characteristic on this firmware — the
+    /// unknown-firmware signal is worth exactly one line per id, not one per resend at 25-40 ms.
+    private var unmappedIds: Set<UInt8> = []
 
     init(
         queue: DispatchQueue,
@@ -135,6 +138,17 @@ final class Sc2BleLink: NSObject {
                 guard let write = Sc2Device.outputWrite(frame: frame) else { return }
                 payload = write.payload
                 target = allChars[write.charUUID] ?? sweepCandidate(id: frame[0])
+                // A miss means this firmware does not put report `id` at 100F6C<id+0x35>. There
+                // is no safe way to recover it live — ten output characteristics share one
+                // property mask and nothing distinguishes rumble from a trackpad pulse, so any
+                // guess is as likely to drive the wrong actuator as the right one. Drop the
+                // write and say so ONCE per id: with the connect-time GATT census above, a log
+                // bundle from one affected pad is enough to add its ids to
+                // `Sc2Device.outputCharUUID` — the map is the only reliable fix.
+                if target == nil, unmappedIds.insert(frame[0]).inserted {
+                    let id = String(format: "%02x", frame[0])
+                    log.warning("SC2: firmware has no characteristic for output id 0x\(id) (expected \(write.charUUID)) — dropping it; that actuator stays silent on this pad")
+                }
             } else {
                 // FEATURE: strip the 0x01 channel report-id, write to 100F6C34 whole
                 // (zero-padding included — the firmware accepts the padded form).
