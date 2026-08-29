@@ -55,7 +55,10 @@ root helper, the `punktfunk` group, and lingering, and left the box with nothing
 desktop session, so Steam's own "Switch to Desktop" hung until a reboot.
 
 > **Join the `punktfunk` group on any box you stream Game Mode from.** The guided installer
-> defaults to yes on Bazzite, Nobara, and other `ujust` / Fedora Atomic boxes. The takeover
+> defaults to yes on Bazzite and Nobara; on any other distro it asks, and `--punktfunk-group`
+> answers it up front. (Silverblue, Kinoite, Bluefin and Aurora are desktop images, so they get
+> the ordinary "ask, default no" — being Fedora Atomic is not on its own a Game Mode box.) The
+> takeover
 > itself no longer needs the group — it now gates the usbip nodes the virtual Steam Deck pad
 > attaches through, so without it the pad arrives as an ordinary Xbox 360 controller:
 >

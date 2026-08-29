@@ -121,13 +121,17 @@ run() {
     fi
     printf '  + %s\n' "$cmd"
     [ "$DRY" = 1 ] && return 0
-    # --yes means unattended: never block on a sudo password (sudo reads the TTY, not stdin).
+    # No terminal at all (a systemd unit, CI, `ssh box 'curl … | sh'`) — nothing can type a
+    # password, so make sudo say that and exit instead of waiting on one. A terminal is still a
+    # terminal under --yes: sudo reads /dev/tty, not stdin, so its prompt works and -n must NOT
+    # apply, or `sh install.sh --yes` typed at a prompt dies on the first step without a cached
+    # ticket. No TTY already forces YES=1 above, so this is the narrower of the two conditions.
     # Printed command stays without -n so the platforms.json verbatim gate still matches.
     exec_cmd=$cmd
-    if [ "$YES" = 1 ]; then
+    if [ -z "$TTY" ]; then
         exec_cmd=$(printf '%s' "$cmd" | sed 's/sudo /sudo -n /g')
     fi
-    if [ -n "$TTY" ] && [ "$YES" != 1 ]; then sh -ec "$exec_cmd" < "$TTY"; else sh -ec "$exec_cmd" < /dev/null; fi \
+    if [ -n "$TTY" ]; then sh -ec "$exec_cmd" < "$TTY"; else sh -ec "$exec_cmd" < /dev/null; fi \
         || die "that step failed — fix it and re-run (the script is safe to repeat), or follow the page by hand: $DOCS_PAGE"
 }
 
@@ -313,18 +317,23 @@ has_graphical_seat() {
     case "${XDG_SESSION_TYPE:-}" in x11|wayland) return 0 ;; esac
     return 1
 }
-couch_box() {
-    [ "$FAMILY" = sysext ] && return 0
-    [ "$ID" = bazzite ] && return 0
-    [ "$ID" = nobara ] && return 0
-    command -v ujust >/dev/null 2>&1 && return 0
-    return 1
-}
+# Only the Game Mode / HTPC images, which is exactly what the docs promise. `rpm-ostree`,
+# `bootc` and `ujust` are NOT tells: Silverblue, Kinoite, Bluefin and Aurora ship all three and
+# are desktop workstations, so keying off FAMILY=sysext or a `ujust` on PATH would join their
+# users to the punktfunk group and enable linger under --yes without ever asking.
+couch_box() { like bazzite || like nobara; }
 # Same split as `punktfunk-host detect-conflicts`: exit 1 only when a Sunshine-family host
 # runs or autostarts. A dormant leftover is not a reason to open Moonlight ports.
 sunshine_active() {
     if command -v punktfunk-host >/dev/null 2>&1; then
-        punktfunk-host detect-conflicts >/dev/null 2>&1 && return 1 || return 0
+        punktfunk-host detect-conflicts >/dev/null 2>&1
+        # Only 1 is an answer. Any other code is a host too old to know the subcommand, a
+        # half-installed one, or a crash — fall through to the unit probe rather than opening
+        # the plain-HTTP GameStream surface on a guess.
+        case $? in
+            0) return 1 ;;
+            1) return 0 ;;
+        esac
     fi
     for u in sunshine.service apollo.service vibeshine.service; do
         systemctl is-active --quiet "$u" 2>/dev/null && return 0
@@ -365,13 +374,14 @@ fi
 if [ -z "$PF_GROUP" ]; then
     if [ "$DEF_GROUP" = y ]; then
         case "$ID" in
-            bazzite) q="Bazzite detected — joining the punktfunk group so the virtual Steam Deck pad works" ;;
-            nobara)  q="Nobara detected — joining the punktfunk group so the virtual Steam Deck pad works" ;;
-            *)       q="Game Mode / HTPC box detected — joining the punktfunk group so the virtual Steam Deck pad works" ;;
+            bazzite) q="Bazzite detected" ;;
+            nobara)  q="Nobara detected" ;;
+            *)       q="Game Mode / HTPC box detected" ;;
         esac
-        ask "$q" y && PF_GROUP=1 || PF_GROUP=0
+        # Ask about intent, but never hide what the answer grants: the group gates usbip attach.
+        ask "$q — join the punktfunk group for the full controller (paddles, trackpads, gyro)? It grants usbip attach, so only on a machine you trust ($DOCS/gamescope#nobara-and-other-autologin-display-managers)" y && PF_GROUP=1 || PF_GROUP=0
     else
-        ask "Do you want the full controller — paddles, trackpads, gyro? (skip it and the pad arrives as a plain Xbox 360 controller)" n && PF_GROUP=1 || PF_GROUP=0
+        ask "Do you want the full controller — paddles, trackpads, gyro? It joins the punktfunk group, which grants usbip attach — only on a machine you trust ($DOCS/gamescope#nobara-and-other-autologin-display-managers). Skip it and the pad arrives as a plain Xbox 360 controller" n && PF_GROUP=1 || PF_GROUP=0
         GROUP_WHY=
     fi
     [ "$PF_GROUP" = 0 ] && GROUP_WHY=
@@ -406,8 +416,9 @@ choice_line() {
         printf '  %s: %s\n' "$1" "$(yn "$2")"
     fi
 }
+# Under --yes this summary is the ONLY place the group grant is stated, so it names the group.
 say "Choices (nothing below has run yet)"
-choice_line "Full controller" "$PF_GROUP" "$GROUP_WHY"
+choice_line "Full controller (joins the punktfunk group)" "$PF_GROUP" "$GROUP_WHY"
 choice_line "Third-party clients (Moonlight, Artemis)" "$GAMESTREAM" "$GS_WHY"
 choice_line "Shared clipboard" "$CLIPBOARD" ""
 choice_line "Start at boot with nobody logged in" "$LINGER" "$LINGER_WHY"
@@ -696,11 +707,16 @@ else
 fi
 
 # ---------------------------------------------------------------------------- 6. start
+# Linger is configuration, not starting, so --no-start still honours it — the summary above
+# promised it either way, and a promise the run silently drops is worse than not offering it.
+# It is also what creates the user manager on a seatless box, so it has to land before the
+# `systemctl --user` probe below, or SSH/headless installs print the enable command and stop.
+if [ "$LINGER" = 1 ]; then
+    say "Starting at boot with nobody logged in"
+    run 'sudo loginctl enable-linger "$USER"'
+fi
 if [ "$START" = 1 ]; then
     say "Starting the host and the web console"
-    # Linger is what creates a user manager on a seatless box; apply it before probing
-    # `systemctl --user`, otherwise SSH/headless installs print the enable command and stop.
-    [ "$LINGER" = 1 ] && run 'sudo loginctl enable-linger "$USER"'
     if ! systemctl --user show-environment >/dev/null 2>&1; then
         warn "no user systemd session here (ssh without a login session?) — run this from a terminal in your desktop session:"
         echo "     systemctl --user enable --now punktfunk-host punktfunk-web"
