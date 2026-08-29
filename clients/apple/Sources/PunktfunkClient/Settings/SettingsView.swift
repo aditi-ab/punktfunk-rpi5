@@ -121,6 +121,10 @@ struct SettingsView: View {
     // when this is false (see `isCustomResolution`), so it survives relaunches without persisting.
     @State var customMode = false
     #endif
+    /// Steam Controller 2 passthrough (device tier — the controllers section's row; the row
+    /// itself is #if os(iOS)||os(macOS), so the storage sits OUTSIDE the iOS-only block
+    /// above — declared there it is invisible to the macOS build that reads it.
+    @AppStorage(DefaultsKey.sc2Capture) var sc2Capture = false
     #if os(macOS)
     @AppStorage(DefaultsKey.mouseMode) var mouseMode = MouseInputMode.capture.rawValue
     /// Cross-client `inhibit_shortcuts` — here, the ⌘-chord passthrough (⌘Q & co. reach the host

@@ -1170,6 +1170,13 @@ struct ContentView: View {
                             MotionUnreachableBadge()
                                 .transition(.opacity.combined(with: .scale(scale: 0.9)))
                         }
+                        // The SC2 passthrough's claim edge (never true on tvOS — no capture
+                        // there). Same transient contract as the motion hint above; without it
+                        // the raw BLE capture engages with no visible trace anywhere in the app.
+                        if captureEnabled, model.sc2CapturedHint {
+                            Sc2CapturedBadge()
+                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                        }
                         // The Touch (passthrough) model met a host that drops contacts; the
                         // fingers run the trackpad engine instead, and this says so once.
                         if captureEnabled, model.touchFallbackNotice {
@@ -1216,6 +1223,11 @@ struct ContentView: View {
                     .animation(.easeOut(duration: 0.2), value: model.micMuted)
                     .animation(.easeOut(duration: 0.2), value: model.accessWarning)
                     .animation(.easeOut(duration: 0.2), value: model.accessLimited)
+                    // The motion hint was the one badge missing from this cluster — its
+                    // `.transition` fired in an unanimated transaction and popped. One list,
+                    // so every badge in the stack enters and exits the same way.
+                    .animation(.easeOut(duration: 0.2), value: model.motionUnreachableKind)
+                    .animation(.easeOut(duration: 0.2), value: model.sc2CapturedHint)
                 }
                 #if os(iOS)
                 // Touch users have no menu / ⌘D, so when the HUD's Disconnect button isn't on

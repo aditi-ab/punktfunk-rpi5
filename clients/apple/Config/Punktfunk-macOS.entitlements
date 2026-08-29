@@ -35,9 +35,10 @@
 	<true/>
 
 	<!-- Game controllers over Bluetooth via the GameController framework
-	     (GCController.startWirelessControllerDiscovery — Xbox/DualSense). No CoreBluetooth in
-	     the app, so no NSBluetoothAlwaysUsageDescription is required, but the sandbox still
-	     gates GameController's BT HID access on this key. -->
+	     (GCController.startWirelessControllerDiscovery — Xbox/DualSense), AND the Steam
+	     Controller 2 as-is passthrough's CoreBluetooth client (Sc2BleLink reads the SC2's
+	     custom Valve GATT service), whose NSBluetoothAlwaysUsageDescription lives in the
+	     shared Config/Info.plist. The sandbox gates both on this key. -->
 	<key>com.apple.security.device.bluetooth</key>
 	<true/>
 

@@ -570,7 +570,10 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
     // `--edge` drives the DualSense Edge backend (device_type 2) and additionally holds
     // the R4/L4 paddles on the pressed beats, so a HID read shows the Edge bits in
     // report byte 10 (0x80|0x40) next to Cross. `--deck` drives the Steam Deck backend
-    // (device_type 3, the MI_02-promoted identity) — watch Steam claim it live.
+    // (device_type 3, the MI_02-promoted identity) — watch Steam claim it live. `--triton`
+    // drives the Steam Controller 2 backend (device_type 7); with no raw report mirrored
+    // (raw_len = 0) every typed frame takes the synthesized-0x42 fallback, so a visible
+    // stick sweep IS that fallback working.
     let edge = args.iter().any(|a| a == "--edge");
     let deck = args.iter().any(|a| a == "--deck");
     // `--idle-after N` drives normally for N seconds, then STOPS sending state frames while still
@@ -596,7 +599,8 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let extra_buttons: u32 = if edge || deck {
+    let triton = args.iter().any(|a| a == "--triton");
+    let extra_buttons: u32 = if edge || deck || triton {
         punktfunk_core::input::gamepad::BTN_PADDLE1 | punktfunk_core::input::gamepad::BTN_PADDLE2
     } else {
         0
@@ -789,6 +793,11 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
         drive!(
             crate::inject::steam_deck_windows::SteamDeckWindowsManager::new(),
             "Steam Deck"
+        );
+    } else if triton {
+        drive!(
+            crate::inject::triton_windows::TritonWindowsManager::new(),
+            "Steam Controller 2"
         );
     } else {
         drive!(

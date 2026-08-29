@@ -44,6 +44,10 @@ public struct EffectiveSettings: Equatable, Sendable {
     public var inhibitShortcuts = true
     public var gamepadType = 0
     public var gamepadForwarding = true
+    /// Steam Controller 2 as-is passthrough (`DefaultsKey.sc2Capture`, default off). Read at
+    /// connect beside `gamepadForwarding`. Deliberately NOT profileable (no overlay field): the
+    /// toggle is about hardware this device captures, not about how a host is streamed.
+    public var sc2Capture = false
     /// Cross-client `system_buttons`: "auto" | "forward" | "local".
     public var systemButtons = "auto"
     /// Cross-client `guide_gesture`: "auto" | "on" | "off".
@@ -112,6 +116,7 @@ public struct EffectiveSettings: Equatable, Sendable {
         inhibitShortcuts = bool(DefaultsKey.inhibitShortcuts, inhibitShortcuts)
         gamepadType = int(DefaultsKey.gamepadType, gamepadType)
         gamepadForwarding = bool(DefaultsKey.gamepadForwarding, gamepadForwarding)
+        sc2Capture = bool(DefaultsKey.sc2Capture, sc2Capture)
         systemButtons = str(DefaultsKey.systemButtons, systemButtons)
         guideGesture = str(DefaultsKey.guideGesture, guideGesture)
         statsVerbosity = Self.storedStatsVerbosity(defaults)

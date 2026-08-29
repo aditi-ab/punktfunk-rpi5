@@ -700,14 +700,17 @@ pub mod steam_usbip;
 #[path = "inject/linux/switch_pro.rs"]
 pub mod switch_pro;
 /// Transport-independent Switch Pro Controller codec + the canned `hid-nintendo` handshake
-/// replies, used by the Linux UHID backend ([`switch_pro`]).
-#[cfg(target_os = "linux")]
+/// replies, used by the Linux UHID backend (`switch_pro`). Deliberately NOT cfg-gated like
+/// `switch_pro` (and for the same reason as `triton_proto` below): pure byte-packing with no
+/// OS surface, so its layout tests — and the cross-backend motion **unit contract** in
+/// `tests/motion_contract.rs`, which pins this codec's IMU units alongside every other
+/// backend's — compile and run on any host, Windows included.
 #[path = "inject/proto/switch_proto.rs"]
 pub mod switch_proto;
-/// Transport-independent Steam Controller 2 (Triton) contract: descriptor, SDL-documented report
-/// layout, the typed fallback serializer, and the rumble-output parser. Linux-only consumer today
-/// ([`steam_controller2`]).
-#[cfg(target_os = "linux")]
+/// Transport-independent Steam Controller 2 (Triton) contract: state layout, feature
+/// query-dance, rumble parse. Deliberately NOT cfg-gated like `steam_controller2`: it is
+/// pure byte-packing with no OS surface, so its layout tests compile and run on any host —
+/// consumers are the Linux uhid/usbip leg and the Windows `triton_windows` backend.
 #[path = "inject/proto/triton_proto.rs"]
 pub mod triton_proto;
 /// Linux: virtual Steam Controller 2 over **USB/IP** — a real USB device byte-matched to the
@@ -716,6 +719,13 @@ pub mod triton_proto;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/triton_usbip.rs"]
 pub mod triton_usbip;
+/// Windows: virtual Steam Controller 2 (Triton, `28DE:1302`) over the same UMDF minidriver +
+/// shared-memory channel (device-type 7) — as-is raw passthrough of a client-captured physical
+/// pad, with Steam's feature/output writes drained back kind-tagged (FEATURE vs OUTPUT) for
+/// replay on the client's real controller.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/triton_windows.rs"]
+pub mod triton_windows;
 /// Linux: the `/dev/uhid` event ABI shared by every UHID gamepad backend — the constants each
 /// used to transcribe for itself, plus the field accessors that read a payload's real length.
 #[cfg(target_os = "linux")]

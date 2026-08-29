@@ -257,6 +257,19 @@ final class SessionModel: ObservableObject {
     /// How long the motion hint stays up — the start-of-stream shortcut banner's 6 s, since the
     /// two share the bottom-centre stack and a player reads them the same way.
     private static let motionHintSeconds: UInt64 = 6
+    /// True while the "Steam Controller passing through" badge shows — set on the SC2
+    /// capture's claim edge (stream start, or the pad powering on mid-session), auto-dropped
+    /// after `motionHintSeconds` like the motion hint it stacks with, and dropped EARLY on a
+    /// release edge so the badge can never outlive the passthrough it announces. The badge is
+    /// the capture's ONLY UI surface: the raw BLE device never enters GameController, so the
+    /// Controllers page cannot list it. Never true on tvOS (no `Sc2Capture` there).
+    @Published private(set) var sc2CapturedHint = false
+    #if os(iOS) || os(macOS)
+    /// Drops `sc2CapturedHint` — same contract as `motionHintTimer` (restart on a new claim,
+    /// cancel on teardown rather than firing into a torn-down model). Gated with the capture
+    /// itself: only `noteSc2Phase` and the disconnect teardown touch it.
+    private var sc2HintTimer: Task<Void, Never>?
+    #endif
     /// The touch model is passthrough, but this host drops contacts (no `HOST_CAP2_TOUCH`): the
     /// stream view runs the trackpad model instead, and this says so once, for
     /// `motionHintSeconds`, in the same bottom-centre slot. Otherwise the setting is silently
@@ -299,6 +312,13 @@ final class SessionModel: ObservableObject {
     private var audio: SessionAudio?
     private var gamepadCapture: GamepadCapture?
     private var gamepadFeedback: GamepadFeedback?
+    #if os(iOS) || os(macOS)
+    /// The live session's Steam Controller 2 as-is passthrough (`settings.sc2Capture` &&
+    /// `settings.gamepadForwarding`) — built beside GamepadCapture/GamepadFeedback in
+    /// `beginStreaming`, torn down in `disconnect` in the Android order (unhook the hidRaw
+    /// sink → feedback stops → capture stops, which also frees its wire index).
+    private var sc2Capture: Sc2Capture?
+    #endif
     #if !os(tvOS)
     /// The live session's clipboard bridge (design/clipboard-and-file-transfer.md §5) — created
     /// by `beginStreaming` when the per-host toggle is on and the host advertises
@@ -740,6 +760,27 @@ final class SessionModel: ObservableObject {
         }
     }
 
+    #if os(iOS) || os(macOS)
+    /// The SC2 passthrough's claim/release edges (`Sc2Capture.onPhaseChange`, delivered on
+    /// main). A claim shows the badge briefly — motion-hint style; a release drops it at
+    /// once, because a badge still saying "passing through" over a released slot would be
+    /// exactly the silent lie the badge exists to prevent.
+    private func noteSc2Phase(_ phase: Sc2Capture.Phase) {
+        sc2HintTimer?.cancel()
+        switch phase {
+        case .captured:
+            sc2CapturedHint = true
+            sc2HintTimer = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(Self.motionHintSeconds))
+                guard !Task.isCancelled else { return }
+                self?.sc2CapturedHint = false
+            }
+        case .released:
+            sc2CapturedHint = false
+        }
+    }
+    #endif
+
     /// Push the EFFECTIVE mute — the user's choice OR the background keep-alive's privacy mute —
     /// onto the audio engine. The two reasons are composed here and nowhere else: whichever one
     /// changed, the other still holds, so returning from the background can't un-mute a user who
@@ -882,6 +923,22 @@ final class SessionModel: ObservableObject {
         // connection is still up); the feedback drain joins off-main like audio.
         gamepadCapture?.stop()
         gamepadCapture = nil
+        #if os(iOS) || os(macOS)
+        // Android's teardown order: unhook the hidRaw sink first (no raw replay onto a dying
+        // capture), then the capture — its stop sends gamepadRemove and frees the wire index
+        // while the connection is still up. The feedback drain joins off-main below.
+        gamepadFeedback?.setHidRawSink(nil)
+        sc2Capture?.stop()
+        sc2Capture = nil
+        // The stop path CANNOT rely on the capture's `.released` edge: `sc2Capture = nil`
+        // above deallocates it before its main-queue release hop runs, so the weakly-held
+        // callback is already gone. Clear the badge directly — same cancel-before-clear
+        // discipline as the motion hint above, and same reason: a "passing through" badge
+        // carried into the next stream would be a lie about a session that no longer exists.
+        sc2HintTimer?.cancel()
+        sc2HintTimer = nil
+        sc2CapturedHint = false
+        #endif
         #if os(tvOS)
         remotePointer?.stop() // releases any held click while the connection is still up
         remotePointer = nil
@@ -1074,6 +1131,31 @@ final class SessionModel: ObservableObject {
         let feedback = GamepadFeedback(connection: conn, manager: .shared)
         feedback.start()
         gamepadFeedback = feedback
+        #if os(iOS) || os(macOS)
+        // Steam Controller 2 as-is passthrough (opt-in): capture an OS-paired SC2's vendor GATT
+        // service and forward its raw reports — the host mirrors a real 28DE:1302 that its
+        // Steam drives directly, and Steam's rumble/settings writes come back through the
+        // feedback drain's hidRaw sink onto the physical controller. Gated like Android
+        // (StreamScreen's `sc2Capture && gamepadForwarding`); started after GamepadFeedback so
+        // the sink's drain is already up. The wire slot is claimed lazily on the first state
+        // report, so an absent controller costs nothing but the 2 s acquisition poll.
+        // Also grant-gated (per-client access §7, the clipboard's "not asking keeps the UI
+        // honest" rule): in a controller-excluded session the connection would silently drop
+        // the arrival and every report — holding the BLE radio, claiming a wire slot, and
+        // showing a "passing through" badge for a passthrough that cannot happen. A grant
+        // added mid-session engages on the next stream, exactly like the clipboard.
+        if settings.sc2Capture, settings.gamepadForwarding, conn.canSendGamepad {
+            let sc2 = Sc2Capture(connection: conn, manager: .shared)
+            // The same escape-chord contract as GamepadCapture — a captured SC2's raw feed
+            // bypasses GC entirely, so it brings its own way out of the stream.
+            sc2.onDisconnectRequest = { [weak self] in self?.disconnect() }
+            // Claim/release → the bottom-stack badge (the capture's only UI surface).
+            sc2.onPhaseChange = { [weak self] phase in self?.noteSc2Phase(phase) }
+            feedback.setHidRawSink(sc2.onHidRaw)
+            sc2.start()
+            sc2Capture = sc2
+        }
+        #endif
         #if !os(tvOS)
         // Shared clipboard: opt-in per host AND host-advertised (older hosts / operator-disabled
         // hosts never see a ClipControl) AND granted to this device (per-client access §5 —
