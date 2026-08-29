@@ -102,14 +102,19 @@ class RingState {
     /** The label under the ring: a slot's name, why it is unavailable, or "press again". */
     var hint by mutableStateOf<String?>(null)
     var lastTouch by mutableLongStateOf(0L)
+    private var twistArmed = false
 
     val visible: Boolean get() = committed || progress > 0f
 
-    fun turn(p: Float, cw: Boolean, x: Float, y: Float) {
-        if (committed) return
+    /** Returns true on the first turn of a twist — the moment the dial arms, worth one tick. */
+    fun turn(p: Float, cw: Boolean, x: Float, y: Float): Boolean {
+        if (committed) return false
         progress = p
         clockwise = cw
         centre = Offset(x, y)
+        val first = !twistArmed
+        twistArmed = true
+        return first
     }
 
     fun commit() {
@@ -132,6 +137,7 @@ class RingState {
         sheet = false
         armed = null
         hint = null
+        twistArmed = false
     }
 
     fun touch() {
@@ -244,6 +250,7 @@ fun RingOverlay(
     cfg: OverlayConfig,
     actions: RingActions,
     containerSize: IntSize,
+    haptics: ConsoleHaptics,
     modifier: Modifier = Modifier,
 ) {
     if (!state.visible) return
@@ -282,18 +289,23 @@ fun RingOverlay(
     }
     var textDialog by remember { mutableStateOf(false) }
 
+    // The haptic vocabulary: a tap per press, a firm "no" on a dimmed button, a warning when a
+    // destructive slot arms, and the confirm on the commit (StreamScreen fires that one).
     fun fire(s: SlotSpec, slot: SlotId) {
         state.touch()
         if (!s.enabled) {
+            haptics.boundary()
             state.armed = null
             state.hint = s.reason
             return
         }
         if (s.armed && state.armed != s.id) {
+            haptics.boundary()
             state.armed = s.id
             state.hint = "${s.label}? Tap again"
             return
         }
+        haptics.tick()
         state.armed = null
         state.hint = null
         when (slot) {
@@ -359,7 +371,7 @@ fun RingOverlay(
                 alpha = cq,
                 armed = false,
                 modifier = Modifier.offset { IntOffset((cx - centreHalf).roundToInt(), (cy - centreHalf).roundToInt()) },
-                onTap = { state.touch(); state.sheet = true },
+                onTap = { state.touch(); haptics.tick(); state.sheet = true },
             )
         }
         state.hint?.let { hint ->
@@ -376,7 +388,7 @@ fun RingOverlay(
             )
         }
         if (state.sheet) {
-            RingSheet(state, cfg, actions, Modifier.align(Alignment.BottomCenter))
+            RingSheet(state, cfg, actions, haptics, Modifier.align(Alignment.BottomCenter))
         }
     }
 
@@ -438,7 +450,13 @@ private fun RingButton(
 
 /** Depth two: the complete catalogue in a fixed order (D2), as a scrollable bottom panel. */
 @Composable
-private fun RingSheet(state: RingState, cfg: OverlayConfig, actions: RingActions, modifier: Modifier) {
+private fun RingSheet(
+    state: RingState,
+    cfg: OverlayConfig,
+    actions: RingActions,
+    haptics: ConsoleHaptics,
+    modifier: Modifier,
+) {
     val scroll = rememberScrollState()
     var textDialog by remember { mutableStateOf(false) }
     Column(
@@ -455,7 +473,7 @@ private fun RingSheet(state: RingState, cfg: OverlayConfig, actions: RingActions
             Row(
                 Modifier
                     .fillMaxWidth()
-                    .clickable { state.touch(); onTap() }
+                    .clickable { state.touch(); if (enabled) haptics.tick() else haptics.boundary(); onTap() }
                     .padding(horizontal = 20.dp, vertical = 12.dp)
                     .alpha(if (enabled) 1f else 0.45f),
             ) {
@@ -472,7 +490,7 @@ private fun RingSheet(state: RingState, cfg: OverlayConfig, actions: RingActions
         }
         header("Session")
         row("End stream", if (state.armed == "end_stream") "tap again" else "") {
-            if (state.armed == "end_stream") { state.close(); actions.endStream() } else state.armed = "end_stream"
+            if (state.armed == "end_stream") { state.close(); actions.endStream() } else { haptics.boundary(); state.armed = "end_stream" }
         }
         row("Disconnect, keep the game running") { state.close(); actions.disconnectLinger() }
 
@@ -529,7 +547,7 @@ private fun RingSheet(state: RingState, cfg: OverlayConfig, actions: RingActions
                     act.available,
                 ) {
                     if (!act.available) return@row
-                    if (act.danger && state.armed != id) state.armed = id else { state.close(); actions.invokeHost(act) }
+                    if (act.danger && state.armed != id) { haptics.boundary(); state.armed = id } else { state.close(); actions.invokeHost(act) }
                 }
             }
         }

@@ -1187,7 +1187,8 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                         // The two-finger twist turns the quick-action ring, frame by frame.
                         onDial = { ev ->
                             when (ev) {
-                                is DialEvent.Turn -> ring.turn(ev.progress, ev.clockwise, ev.x, ev.y)
+                                is DialEvent.Turn ->
+                                    if (ring.turn(ev.progress, ev.clockwise, ev.x, ev.y)) haptics.tick()
                                 DialEvent.Commit -> { ring.commit(); haptics.confirm() }
                                 DialEvent.Cancel -> ring.cancel()
                             }
@@ -1242,6 +1243,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                 },
             ),
             containerSize = containerSize,
+            haptics = haptics,
         )
         micHint?.let { MicChordHint(it, Modifier.align(Alignment.TopCenter).padding(top = 16.dp)) }
         // Bottom, not top: this can coincide with a mic-chord confirmation or the exit cue, and a
