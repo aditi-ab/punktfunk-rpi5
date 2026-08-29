@@ -153,7 +153,7 @@ impl Capture {
             touch_slots: HashMap::new(),
             touch_mode,
             invert_scroll,
-            gestures: Gestures::new(touch_mode == TouchMode::Trackpad),
+            gestures: Gestures::new(touch_mode == TouchMode::Trackpad, invert_scroll),
             grants,
         }
     }

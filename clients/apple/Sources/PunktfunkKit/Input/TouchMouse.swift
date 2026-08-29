@@ -239,15 +239,18 @@ final class TouchMouse {
             scrolling = true
             scrollAnchor = CGPoint(x: cx, y: cy)
         }
+        // Read live, like `InputCapture.sendScroll`: these notches bypass that sink (they go
+        // straight to the connection), so the invert setting is applied here, at the notch.
+        let sign: Int32 = SessionSettings.current.invertScroll ? -1 : 1
         let notchesY = Int32((scrollAnchor.y - cy) / Tuning.scrollNotchPt)
         let notchesX = Int32((cx - scrollAnchor.x) / Tuning.scrollNotchPt)
         if notchesY != 0 {
-            send?(.scroll(notchesY * 120))
+            send?(.scroll(notchesY * 120 * sign))
             scrollAnchor.y = cy
             moved = true
         }
         if notchesX != 0 {
-            send?(.scroll(notchesX * 120, horizontal: true))
+            send?(.scroll(notchesX * 120 * sign, horizontal: true))
             scrollAnchor.x = cx
             moved = true
         }

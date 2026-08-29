@@ -77,6 +77,9 @@ pub enum Act {
 /// (false = pointer). Fed only DIRECT touchscreen fingers.
 pub struct Gestures {
     trackpad: bool,
+    /// `-1` with the invert-scroll setting on: applied where the notch is made (the twins do
+    /// the same), so the touch path honours the setting the wheel path already did.
+    scroll_sign: i32,
     /// Live fingers → current window-pixel position (the centroid needs every finger, but a
     /// move event only carries the one that changed).
     positions: HashMap<u64, (f32, f32)>,
@@ -105,9 +108,10 @@ pub struct Gestures {
 }
 
 impl Gestures {
-    pub fn new(trackpad: bool) -> Gestures {
+    pub fn new(trackpad: bool, invert_scroll: bool) -> Gestures {
         Gestures {
             trackpad,
+            scroll_sign: if invert_scroll { -1 } else { 1 },
             positions: HashMap::new(),
             active: false,
             start: (0.0, 0.0),
@@ -274,7 +278,7 @@ impl Gestures {
         if notches_y != 0 {
             acts.push(Act::Scroll {
                 axis: 0,
-                delta: notches_y * 120,
+                delta: notches_y * 120 * self.scroll_sign,
             });
             self.scroll_anchor.1 = cy;
             self.moved = true;
@@ -282,7 +286,7 @@ impl Gestures {
         if notches_x != 0 {
             acts.push(Act::Scroll {
                 axis: 1,
-                delta: notches_x * 120,
+                delta: notches_x * 120 * self.scroll_sign,
             });
             self.scroll_anchor.0 = cx;
             self.moved = true;
@@ -372,7 +376,7 @@ mod tests {
 
     #[test]
     fn trackpad_tap_is_a_left_click_with_no_motion() {
-        let mut g = Gestures::new(true);
+        let mut g = Gestures::new(true, false);
         let mut acts = g.down(1, 50.0, 50.0, ABS, 0.0);
         acts.extend(g.up(1, 40.0));
         // A trackpad tap places no cursor and moves nothing — just a click.
@@ -393,7 +397,7 @@ mod tests {
 
     #[test]
     fn pointer_tap_places_the_cursor_then_clicks() {
-        let mut g = Gestures::new(false);
+        let mut g = Gestures::new(false, false);
         let mut acts = g.down(1, 50.0, 50.0, abs_at(640, 360), 0.0);
         acts.extend(g.up(1, 40.0));
         assert_eq!(
@@ -414,7 +418,7 @@ mod tests {
 
     #[test]
     fn two_finger_tap_is_a_right_click() {
-        let mut g = Gestures::new(true);
+        let mut g = Gestures::new(true, false);
         let mut acts = g.down(1, 50.0, 50.0, ABS, 0.0);
         acts.extend(g.down(2, 80.0, 52.0, ABS, 5.0));
         acts.extend(g.up(1, 40.0));
@@ -436,7 +440,7 @@ mod tests {
 
     #[test]
     fn three_finger_tap_cycles_stats() {
-        let mut g = Gestures::new(true);
+        let mut g = Gestures::new(true, false);
         let mut acts = g.down(1, 50.0, 50.0, ABS, 0.0);
         acts.extend(g.down(2, 80.0, 50.0, ABS, 2.0));
         acts.extend(g.down(3, 110.0, 50.0, ABS, 4.0));
@@ -448,7 +452,7 @@ mod tests {
 
     #[test]
     fn trackpad_drag_emits_relative_motion() {
-        let mut g = Gestures::new(true);
+        let mut g = Gestures::new(true, false);
         assert!(g.down(1, 100.0, 100.0, ABS, 0.0).is_empty());
         // A big move over 16 ms — relative, with acceleration, so it should exceed 1:1.
         let acts = g.motion(1, 140.0, 100.0, ABS, 16.0);
@@ -465,7 +469,7 @@ mod tests {
 
     #[test]
     fn pointer_motion_follows_the_finger_absolutely() {
-        let mut g = Gestures::new(false);
+        let mut g = Gestures::new(false, false);
         let _ = g.down(1, 100.0, 100.0, abs_at(300, 300), 0.0);
         let acts = g.motion(1, 140.0, 120.0, abs_at(360, 340), 16.0);
         assert_eq!(acts, vec![Act::MoveAbs(abs_at(360, 340))]);
@@ -473,7 +477,7 @@ mod tests {
 
     #[test]
     fn two_finger_pan_scrolls_by_the_centroid() {
-        let mut g = Gestures::new(true);
+        let mut g = Gestures::new(true, false);
         let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
         let _ = g.down(2, 120.0, 200.0, ABS, 2.0);
         // Both fingers slide up 40 px → the centroid rises 40 px → +ve (finger-up) notches.
@@ -489,8 +493,28 @@ mod tests {
     }
 
     #[test]
+    fn invert_scroll_flips_the_touch_notch() {
+        let mut g = Gestures::new(true, true);
+        let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
+        let _ = g.down(2, 120.0, 200.0, ABS, 2.0);
+        let a1 = g.motion(1, 100.0, 160.0, ABS, 10.0);
+        let a2 = g.motion(2, 120.0, 160.0, ABS, 12.0);
+        let scrolls: Vec<_> = a1.into_iter().chain(a2).collect();
+        // Fingers up, setting on → the notch goes the other way.
+        assert!(
+            scrolls
+                .iter()
+                .any(|a| matches!(a, Act::Scroll { axis: 0, delta } if *delta < 0)),
+            "expected an inverted (negative) vertical scroll, got {scrolls:?}"
+        );
+        assert!(!scrolls
+            .iter()
+            .any(|a| matches!(a, Act::Scroll { delta, .. } if *delta > 0)));
+    }
+
+    #[test]
     fn three_finger_drag_scrolls_nothing() {
-        let mut g = Gestures::new(true);
+        let mut g = Gestures::new(true, false);
         let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
         let _ = g.down(2, 130.0, 200.0, ABS, 2.0);
         let _ = g.down(3, 160.0, 200.0, ABS, 4.0);
@@ -509,7 +533,7 @@ mod tests {
 
     #[test]
     fn tap_then_press_drag_holds_the_left_button() {
-        let mut g = Gestures::new(true);
+        let mut g = Gestures::new(true, false);
         // Tap at (50,50), lifting at t=10.
         let _ = g.down(1, 50.0, 50.0, ABS, 0.0);
         let click = g.up(1, 10.0);
@@ -549,7 +573,7 @@ mod tests {
 
     #[test]
     fn reset_clears_a_drag_without_re_emitting() {
-        let mut g = Gestures::new(true);
+        let mut g = Gestures::new(true, false);
         let _ = g.down(1, 50.0, 50.0, ABS, 0.0);
         let _ = g.up(1, 5.0); // arm
         let _ = g.down(2, 51.0, 50.0, ABS, 50.0); // drag begins (left held)

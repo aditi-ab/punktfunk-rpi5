@@ -931,10 +931,12 @@ public final class InputCapture {
     /// Fractional remainders accumulate so slow two-finger scrolling isn't truncated away.
     public func sendScroll(dx rawDx: Float, dy rawDy: Float) {
         guard forwarding else { return }
-        // Optionally invert both axes (read live). This is the ONE scroll sink for every platform —
-        // the macOS wheel, the iOS trackpad pan, and a GCMouse wheel all land here — so the toggle
-        // flips them consistently. Residuals are accumulated AFTER inversion so a direction change
-        // between events doesn't strand a fractional remainder of the old sign.
+        // Optionally invert both axes (read live). Every POINTER scroll lands here — the macOS
+        // wheel, the iOS trackpad pan, a GCMouse wheel — so the toggle flips them consistently.
+        // The one other sink is the touch engine's two-finger scroll (`TouchMouse.scrollByCentroid`),
+        // which sends straight to the connection and reads the same setting itself. Residuals are
+        // accumulated AFTER inversion so a direction change between events doesn't strand a
+        // fractional remainder of the old sign.
         let invert = SessionSettings.current.invertScroll
         let dx = invert ? -rawDx : rawDx
         let dy = invert ? -rawDy : rawDy
