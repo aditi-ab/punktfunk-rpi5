@@ -1649,7 +1649,10 @@ public final class Stage2Pipeline {
         // logs "[CAMetalLayer nextDrawable] returning nil because allocation failed" once per
         // refresh until the first frame arrives. Before that frame there is nothing to present
         // anyway, and the first frame waits at most one refresh for the first vend.
-        let startLink: () -> Void = {
+        // Per-GENERATION stop flag (the session `token` still stops every generation): the
+        // watchdog below retires a link that stopped vending and starts a fresh one, and the
+        // retired thread must exit without taking the session with it.
+        let startLink: (StopFlag) -> Void = { linkStop in
             let linkThread = Thread {
                 let delegate = DeadlineLinkDelegate(
                     stash: stash, renderSignal: renderSignal, hint: hint, stats: debugStats,
@@ -1658,12 +1661,18 @@ public final class Stage2Pipeline {
                 let link = CAMetalDisplayLink(metalLayer: layer)
                 link.preferredFrameLatency = latencyAsk // see the ladder note above
                 if let range = hint.drain() { link.preferredFrameRateRange = range }
-                link.delegate = delegate // weak — this closure is the strong ref
+                // The link holds the delegate WEAKLY and `delegate` is a local, not a capture —
+                // its last use is this store, so ARC may release it right here and leave a link
+                // that never calls back. `withExtendedLifetime` is the strong ref, not the
+                // closure (which captures only the values the init consumed).
+                link.delegate = delegate
                 link.add(to: RunLoop.current, forMode: .default)
-                while !token.isStopped {
-                    autoreleasepool {
-                        _ = RunLoop.current.run(
-                            mode: .default, before: Date(timeIntervalSinceNow: 0.1))
+                withExtendedLifetime(delegate) {
+                    while !token.isStopped, !linkStop.isStopped {
+                        autoreleasepool {
+                            _ = RunLoop.current.run(
+                                mode: .default, before: Date(timeIntervalSinceNow: 0.1))
+                        }
                     }
                 }
                 link.invalidate()
@@ -1673,10 +1682,26 @@ public final class Stage2Pipeline {
             linkThread.start()
         }
 
+        // Stale-link watchdog threshold. Stage-4 owns NO drawable source of its own — every
+        // drawable arrives as `update.drawable`, so a link that stops calling back is a stream
+        // that never presents again (the frozen picture keeps audio and input alive, so it reads
+        // as a hang, not a disconnect). Field 2026-08-28, iPad Pro / iOS 27 over Tailscale: three
+        // presents returned `presentedTime == 0` against the 2-slot pool, the link went silent
+        // mid-second, and `pf-present` then logged `ok=0 noDrawable=120 vendLeadMs n=0` until the
+        // user quit — twice in one session, both times cured instantly by reconnecting.
+        // 0.25 s is ~30 refreshes at 120 Hz against a normal vend wait of one refresh, so it
+        // cannot fire on ordinary phase jitter; the cost of a false positive is one relinked
+        // frame, the cost of missing it is the whole session.
+        let linkStaleAfter: CFTimeInterval = 0.25
+
         let renderThread = Thread {
             defer { renderStopped.signal() }
-            // Whether startLink ran — render-thread confined (only this thread triggers it).
-            var linkLive = false
+            // The live link generation's stop flag — nil until the first frame starts one.
+            // Render-thread confined (only this thread starts, retires or reads it).
+            var linkStop: StopFlag?
+            // When the link last handed over a drawable, for the stale-link watchdog. Reset on
+            // every (re)start too, so a fresh link gets its first vend before it can be judged.
+            var lastVend = CACurrentMediaTime()
             // Per-iteration autorelease pool — same contract as the arrival/glass loop (the
             // vended drawable and its retinue are autoreleased objects on a runloop-less thread).
             while !token.isStopped { autoreleasepool {
@@ -1707,9 +1732,11 @@ public final class Stage2Pipeline {
                         isHDR: planes.pq)
                 }
                 // First frame: the layer now has a real config — start vending (see startLink).
-                if !linkLive {
-                    linkLive = true
-                    startLink()
+                if linkStop == nil {
+                    let stop = StopFlag()
+                    linkStop = stop
+                    lastVend = CACurrentMediaTime()
+                    startLink(stop)
                 }
                 guard let drawable = stash.take() else {
                     // No vend yet (session start: the reconcile above just unblocked the
@@ -1718,10 +1745,33 @@ public final class Stage2Pipeline {
                     // frame while it waits, and the update's signal retries the pairing.
                     ring.putBack(frame)
                     debugStats?.noDrawableWake()
+                    // …unless the link has gone silent (see `linkStaleAfter`). Only a decoded
+                    // frame reaches here, so a quiet stream never trips this. Retire the
+                    // generation and relink: invalidating the old link also returns the
+                    // drawables it holds, so this recovers a dead link and an exhausted pool
+                    // alike. The retired thread sees its flag within one runloop poll (≤100 ms)
+                    // and invalidates there; the brief two-link overlap is harmless because the
+                    // old link is, by definition, not vending.
+                    // ponytail: unbounded retries (~4/s while frames arrive and no link vends).
+                    // A relink that works logs once; a repeat IS the signal that relinking is
+                    // not the cure, and it lands in the send-logs ring where we can read it.
+                    // Add a backoff only if that noise ever costs more than it tells us.
+                    let stalledFor = CACurrentMediaTime() - lastVend
+                    if let stale = linkStop, stalledFor > linkStaleAfter {
+                        stale.stop()
+                        let stop = StopFlag()
+                        linkStop = stop
+                        lastVend = CACurrentMediaTime()
+                        startLink(stop)
+                        let ms = Int(stalledFor * 1000)
+                        presentLog.error(
+                            "stage4: link stalled \(ms) ms with no vend — retiring it, relinking")
+                    }
                     debugStats?.flushIfDue(ring: ring, gate: nil)
                     return
                 }
                 let renderStarted = CACurrentMediaTime()
+                lastVend = renderStarted
                 let issuedNs = Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: renderStarted)
                 let onGlass: (Int64?) -> Void = { presentedNs in
                     let atNs = presentedNs
