@@ -37,6 +37,9 @@ final class Sc2BleLink: NSObject {
     private let serviceCB = CBUUID(string: Sc2Device.serviceUUID)
     private let inputCB = CBUUID(string: Sc2Device.inputCharUUID)
     private let reportCB = CBUUID(string: Sc2Device.reportCharUUID)
+    /// Report 0x47's characteristic. Never subscribed (see `Sc2Device.timestampCharUUID`); held
+    /// here only so the sweep can exclude a known-purpose characteristic by UUID.
+    private let timestampCB = CBUUID(string: Sc2Device.timestampCharUUID)
     /// Device Information — every BLE device exposes it, which is what makes it the handle for
     /// `retrieveConnectedPeripherals` (the OS-paired controller is NOT advertising).
     private let deviceInfoCB = CBUUID(string: "180A")
@@ -157,11 +160,20 @@ final class Sc2BleLink: NSObject {
         }
     }
 
-    /// Firmware without a per-report characteristic at id+0x35: sweep the writable candidates
-    /// (~1 s each at the 25 Hz resend rate) rather than dropping — the discovery-order
-    /// fallback, kept because it is how the real map was found on the bench in the first place.
+    /// Firmware without a per-report characteristic at id+0x35: rotate through the writable
+    /// candidates (~1 s each at the 25 Hz resend rate) to find where its outputs live. This is
+    /// how the real map was found on the bench, and it stays for the next unknown firmware.
+    ///
+    /// ⚠ BENCH TOOL — gated off in shipping builds, because it does not converge. Nothing here
+    /// observes whether a write produced haptics, so there is no success signal to latch: the
+    /// rotation runs for the life of the session, and on an unknown firmware MOST output frames
+    /// land on the wrong characteristic forever rather than eventually settling on the right one
+    /// (with N candidates the correct one is live 1 second in every N). That is not a fallback
+    /// that degrades gracefully — losing haptics on such a pad is the better failure than feeding
+    /// output payloads to parsers we have not identified. Flip `verbose` to map a new firmware,
+    /// then add its ids to `Sc2Device.outputCharUUID`.
     private func sweepCandidate(id: UInt8) -> CBCharacteristic? {
-        guard !candidateChars.isEmpty else { return nil }
+        guard Self.verbose, !candidateChars.isEmpty else { return nil }
         let index = (sweepCounter / 25) % candidateChars.count
         if sweepCounter % 25 == 0 {
             log.info("SC2: no per-report char for id=0x\(String(format: "%02x", id)) — sweeping candidate \(index)")
@@ -329,8 +341,15 @@ extension Sc2BleLink: CBPeripheralDelegate {
             let uuid = ch.uuid.uuidString.lowercased()
             allChars[uuid] = ch
             if !ch.properties.isDisjoint(with: [.write, .writeWithoutResponse]) {
-                candidateChars.append(ch)
                 writable += 1
+                // ⚠ A characteristic whose purpose is KNOWN is never a sweep candidate. 100F6C34
+                // is writable (props 0x0a) and parses what it receives as a settings command
+                // (`0x87` = write register/value, the lizard-off and gyro-enable path), so an
+                // output payload swept onto it can persist an arbitrary firmware setting on the
+                // user's own controller. Counted in the census, excluded from the rotation.
+                if ch.uuid != reportCB && ch.uuid != inputCB && ch.uuid != timestampCB {
+                    candidateChars.append(ch)
+                }
             }
             if ch.properties.contains(.notify) { notifying += 1 }
             if Self.verbose {
