@@ -392,27 +392,28 @@ struct MotionUnreachableBadge: View {
     }
 }
 
-/// "This host doesn't accept touch" — the passthrough touch model met a host whose injector
-/// drops contacts (no `HOST_CAP2_TOUCH`); the session runs the trackpad model instead. Same
-/// slot and lifetime as the motion badge, for the same reason: the setting would otherwise be
-/// silently ignored.
-struct TouchFallbackBadge: View {
+/// The Steam Controller passthrough badge — the SC2 capture's claim edge made visible.
+/// It is the capture's ONLY UI surface: the raw BLE device never enters GameController, so
+/// the Controllers page cannot list it, and without this the pad's arrival is indistinguishable
+/// from the setting being off. Transient like the motion hint it stacks with (shown on the
+/// claim — stream start or a mid-session power-on — dropped early on release).
+struct Sc2CapturedBadge: View {
     var body: some View {
         HStack(spacing: 7) {
-            Image(systemName: "hand.tap")
+            Image(systemName: "gamecontroller.fill")
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.yellow)
-            Text("This host doesn't accept touch — using the trackpad model")
+                .foregroundStyle(.green)
+            Text("Steam Controller passing through")
                 .font(.geist(12, .medium, relativeTo: .caption))
                 .foregroundStyle(.white.opacity(0.9))
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .glassBackground(Capsule())
-        .environment(\.colorScheme, .dark)
+        .environment(\.colorScheme, .dark) // reads over any frame, like the resize overlay
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "This host does not accept touch input. Fingers drive the cursor as a trackpad instead.")
+            "Steam Controller connected — passing through to the host as itself.")
     }
 }
 
@@ -535,3 +536,27 @@ enum DeviceMetrics {
     }
 }
 #endif
+
+/// "This host doesn't accept touch" — the passthrough touch model met a host whose injector
+/// drops contacts (no `HOST_CAP2_TOUCH`); the session runs the trackpad model instead. Same
+/// slot and lifetime as the motion badge, for the same reason: the setting would otherwise be
+/// silently ignored.
+struct TouchFallbackBadge: View {
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "hand.tap")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.yellow)
+            Text("This host doesn't accept touch — using the trackpad model")
+                .font(.geist(12, .medium, relativeTo: .caption))
+                .foregroundStyle(.white.opacity(0.9))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .glassBackground(Capsule())
+        .environment(\.colorScheme, .dark)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "This host does not accept touch input. Fingers drive the cursor as a trackpad instead.")
+    }
+}

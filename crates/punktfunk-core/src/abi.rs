@@ -1170,13 +1170,24 @@ pub const PUNKTFUNK_HIDOUT_TRACKPAD_HAPTIC: u8 = 4;
 /// audio-valid flags); `effect[0..6]` = bytes 5..=10 of the report verbatim
 /// (headphone/speaker/mic volumes + routing) with `effect_len = 6`. Forwarded change-only.
 pub const PUNKTFUNK_HIDOUT_AUDIO_CTL: u8 = 5;
+/// `PunktfunkHidOutput::kind` — a raw report the host's hidraw consumer (Steam) wrote to an
+/// as-is passthrough pad (`HidOutput::HidRaw`, the reverse of
+/// [`punktfunk_connection_send_hid_report`]): `hid_kind` (`PUNKTFUNK_HID_RAW_OUTPUT` /
+/// `PUNKTFUNK_HID_RAW_FEATURE`) + `raw`/`raw_len` valid. Replay it verbatim on the physical
+/// device — an OUTPUT report on the interrupt-OUT endpoint / per-report GATT characteristic
+/// (Triton rumble `0x80`, haptic pulse `0x81`, …), a FEATURE report as `SET_REPORT` / a GATT
+/// feature write (lizard mode, IMU enable). Only an as-is passthrough session
+/// (`PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2`) emits these; clients without such a capture drop them.
+pub const PUNKTFUNK_HIDOUT_HID_RAW: u8 = 6;
 /// Capacity of `PunktfunkHidOutput::effect` (the DualSense trigger parameter block).
 pub const PUNKTFUNK_HID_EFFECT_MAX: u8 = 11;
 
-/// One DualSense HID-output feedback event a game wrote to the host's virtual pad
+/// One HID-output feedback event a game wrote to the host's virtual pad
 /// ([`punktfunk_connection_next_hidout`]). `kind` selects which fields are meaningful — replay it
-/// on a real DualSense (lightbar color, player LEDs, or an adaptive-trigger effect via the
-/// platform's `GCDualSenseAdaptiveTrigger`-style API).
+/// on the real controller: DualSense feedback (lightbar color, player LEDs, an adaptive-trigger
+/// effect via the platform's `GCDualSenseAdaptiveTrigger`-style API), or — on an as-is Steam
+/// Controller 2 passthrough session — a raw report to forward verbatim
+/// (`PUNKTFUNK_HIDOUT_HID_RAW`).
 #[cfg(feature = "quic")]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1202,15 +1213,26 @@ pub struct PunktfunkHidOutput {
     /// exported precisely so embedders can size their own buffers against it, and it declaring one
     /// number while the struct it describes hardcoded another was the whole hazard.
     pub effect: [u8; PUNKTFUNK_HID_EFFECT_MAX as usize],
+    /// HidRaw: `PUNKTFUNK_HID_RAW_OUTPUT` (an OUTPUT report — a hidraw `write()`) or
+    /// `PUNKTFUNK_HID_RAW_FEATURE` (a FEATURE report — `SET_REPORT`). Distinct from `kind`,
+    /// which says this event IS a raw report; this says which device channel replays it.
+    pub hid_kind: u8,
+    /// HidRaw: number of valid bytes in `raw` (≤ `PUNKTFUNK_HID_REPORT_MAX`).
+    pub raw_len: u8,
+    /// HidRaw: the full report, id byte first — exactly what the host's hidraw consumer wrote
+    /// (Steam writes feature frames whole, so trailing zero-padding is normal; OUTPUT frames
+    /// arrive host-trimmed to the declared report length on current hosts). Sized off
+    /// [`HID_REPORT_MAX`](crate::quic::HID_REPORT_MAX), the wire bound for the same bytes.
+    pub raw: [u8; crate::quic::HID_REPORT_MAX],
 }
 
 #[cfg(feature = "quic")]
 impl PunktfunkHidOutput {
-    /// `None` for a [`HidOutput::HidRaw`](crate::quic::HidOutput) — a raw passthrough report
-    /// (up to 64 bytes) doesn't fit this struct's 11-byte `effect` buffer, and no C-ABI embedder
-    /// declares the as-is SC2 kind that would receive one; the pull site skips it rather than
-    /// truncating it into an unreplayable stub.
-    fn from_hid(h: &crate::quic::HidOutput) -> Option<PunktfunkHidOutput> {
+    /// Total since ABI v27: every [`HidOutput`](crate::quic::HidOutput) variant has a C
+    /// representation. `HidRaw` used to map to `None` (the struct predated the as-is SC2
+    /// passthrough and had no buffer for a 64-byte report; the pull site skipped it) — the
+    /// Apple client now declares that kind, so the report rides `raw`/`raw_len`/`hid_kind`.
+    fn from_hid(h: &crate::quic::HidOutput) -> PunktfunkHidOutput {
         use crate::quic::HidOutput;
         let mut out = PunktfunkHidOutput {
             kind: 0,
@@ -1222,6 +1244,9 @@ impl PunktfunkHidOutput {
             which: 0,
             effect_len: 0,
             effect: [0u8; 11],
+            hid_kind: 0,
+            raw_len: 0,
+            raw: [0u8; crate::quic::HID_REPORT_MAX],
         };
         match h {
             HidOutput::Led { pad, r, g, b } => {
@@ -1261,7 +1286,16 @@ impl PunktfunkHidOutput {
                 out.effect[4..6].copy_from_slice(&count.to_le_bytes());
                 out.effect_len = 6;
             }
-            HidOutput::HidRaw { .. } => return None,
+            HidOutput::HidRaw { pad, kind, data } => {
+                out.kind = PUNKTFUNK_HIDOUT_HID_RAW;
+                out.pad = *pad;
+                out.hid_kind = *kind;
+                // `decode` already bounds the Vec to HID_REPORT_MAX; clamp again so a
+                // locally-constructed oversize value can never overrun the fixed body.
+                let n = data.len().min(out.raw.len());
+                out.raw[..n].copy_from_slice(&data[..n]);
+                out.raw_len = n as u8;
+            }
             HidOutput::AudioCtl { pad, flags, raw } => {
                 // Same packing idiom as TrackpadHaptic: `which` carries the flags byte,
                 // `effect[0..6]` the raw audio region. The u16 wire pad narrows losslessly
@@ -1274,7 +1308,7 @@ impl PunktfunkHidOutput {
                 out.effect_len = 6;
             }
         }
-        Some(out)
+        out
     }
 }
 
@@ -1353,6 +1387,12 @@ pub const PUNKTFUNK_RICH_MOTION: u8 = 2;
 /// it today; *sending* it from a C client needs the size-prefixed `PunktfunkRichInputEx` +
 /// `punktfunk_connection_send_rich_input2` (added with client capture).
 pub const PUNKTFUNK_RICH_TOUCHPAD_EX: u8 = 3;
+/// `RichInput::HidReport` kind on the wire (`[0xCC][0x04][pad][len][data…]`) — one raw HID input
+/// report from a client-captured controller, forwarded verbatim for the host's as-is virtual pad
+/// (the Steam Controller 2 passthrough, `PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2`). A C client sends it
+/// through [`punktfunk_connection_send_hid_report`], never by building the datagram itself; the
+/// constant exists so client-side tests can pin the wire byte against this header.
+pub const PUNKTFUNK_RICH_HID_REPORT: u8 = 4;
 
 /// One rich client→host input for the host's virtual DualSense
 /// ([`punktfunk_connection_send_rich_input`]): a touchpad contact or a motion sample. Set `kind`
@@ -1800,12 +1840,18 @@ const _: () = {
     assert!(PUNKTFUNK_GAMEPAD_BTN_MISC1 == g::BTN_MISC1);
 };
 
-// The additive M3 kinds (TouchpadEx / TrackpadHaptic) must never grow the legacy ABI structs —
-// they have no `struct_size` guard, so a layout change would corrupt old-built callers' buffers.
+// Neither struct has a `struct_size` guard, so a layout change corrupts old-built callers'
+// buffers — an ADDITIVE kind (the M3 TouchpadEx / TrackpadHaptic precedent) must never grow
+// them, and any deliberate widening has to arrive with an [`crate::ABI_VERSION`] bump so the
+// version equality check is what an old binary fails, not a memory write.
+// `PunktfunkRichInput` is frozen at its original 20 bytes. `PunktfunkHidOutput` was widened
+// ONCE, deliberately, with ABI v27 (19 → 85: the `hid_kind`/`raw_len`/`raw` tail for
+// `PUNKTFUNK_HIDOUT_HID_RAW`, appended so the pre-v27 prefix layout is unchanged) — see the v27
+// entry on [`crate::ABI_VERSION`] for why a new pull symbol was NOT the right shape there.
 #[cfg(feature = "quic")]
 const _: () = {
     assert!(core::mem::size_of::<PunktfunkRichInput>() == 20);
-    assert!(core::mem::size_of::<PunktfunkHidOutput>() == 19);
+    assert!(core::mem::size_of::<PunktfunkHidOutput>() == 19 + 2 + crate::quic::HID_REPORT_MAX);
 };
 
 /// Trust: `pin_sha256` (NULL or 32 bytes) is the expected SHA-256 fingerprint of the host's
@@ -3673,8 +3719,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_pad_audio(
                 if f.opus.is_empty() || f.opus.len() > buf_len {
                     // DTX silence (skipped like the audio-PCM path — decoding an empty payload
                     // as loss would synthesize concealment) or doesn't fit — report "nothing
-                    // this poll" (the next_hidout HidRaw-skip precedent; truncated Opus would
-                    // be undecodable anyway).
+                    // this poll" and let the embedder's poll loop continue (truncated Opus
+                    // would be undecodable anyway).
                     return 0;
                 }
                 // SAFETY: per the ABI contract - each out-param below is OPTIONAL, so it is null-
@@ -4060,11 +4106,12 @@ pub unsafe extern "C" fn punktfunk_connection_set_rumble_quirks(
     })
 }
 
-/// Pull the next DualSense HID-output feedback event (lightbar / player LEDs / adaptive trigger)
-/// the host's virtual pad received from a game, into `*out`. [`PunktfunkStatus::NoFrame`] on
-/// timeout, [`PunktfunkStatus::Closed`] once the session ended. Only the DualSense host backend
-/// emits these. Same threading rules as [`punktfunk_connection_next_rumble`] (one puller, may run
-/// alongside the other planes).
+/// Pull the next HID-output feedback event the host's virtual pad received from a game
+/// (DualSense lightbar / player LEDs / adaptive trigger — or, on an as-is Steam Controller 2
+/// passthrough session, a raw `PUNKTFUNK_HIDOUT_HID_RAW` report to replay verbatim), into
+/// `*out`. [`PunktfunkStatus::NoFrame`] on timeout, [`PunktfunkStatus::Closed`] once the session
+/// ended. Only the DualSense and SC2 host backends emit these. Same threading rules as
+/// [`punktfunk_connection_next_rumble`] (one puller, may run alongside the other planes).
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable for one `PunktfunkHidOutput`.
@@ -4090,17 +4137,12 @@ pub unsafe extern "C" fn punktfunk_connection_next_hidout(
             .inner
             .next_hidout(std::time::Duration::from_millis(timeout_ms as u64))
         {
-            Ok(h) => match PunktfunkHidOutput::from_hid(&h) {
-                Some(v) => {
-                    // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this
-                    // path, written once by value.
-                    unsafe { *out = v };
-                    PunktfunkStatus::Ok
-                }
-                // A raw as-is passthrough report (no C representation) — report "nothing this
-                // poll" and let the embedder's poll loop continue; see `from_hid`.
-                None => PunktfunkStatus::NoFrame,
-            },
+            Ok(h) => {
+                // SAFETY: per the ABI contract - a caller-owned out-param, non-null on this
+                // path, written once by value.
+                unsafe { *out = PunktfunkHidOutput::from_hid(&h) };
+                PunktfunkStatus::Ok
+            }
             Err(e) => e.status(),
         }
     })
@@ -4648,6 +4690,68 @@ pub unsafe extern "C" fn punktfunk_connection_send_rich_input2(
                 Err(e) => e.status(),
             },
             None => PunktfunkStatus::InvalidArg,
+        }
+    })
+}
+
+/// The clamp behind [`punktfunk_connection_send_hid_report`], split out so the tests reach it
+/// without a live connection: `pad` masked into the 16-pad wire space and the report bounded to
+/// [`HID_REPORT_MAX`](crate::quic::HID_REPORT_MAX) — the same rules the Android JNI shim applies
+/// (`clients/android/native/src/session/input.rs`, `nativeSendPadHidReport`), so the two client
+/// entry points can never disagree about what reaches the wire.
+#[cfg(feature = "quic")]
+fn hid_report_rich_input(pad: u8, report: &[u8]) -> crate::quic::RichInput {
+    let n = report.len().min(crate::quic::HID_REPORT_MAX);
+    let mut data = [0u8; crate::quic::HID_REPORT_MAX];
+    data[..n].copy_from_slice(&report[..n]);
+    crate::quic::RichInput::HidReport {
+        pad: pad & 0xF,
+        len: n as u8,
+        data,
+    }
+}
+
+/// Send one raw HID input report from a client-captured controller — the as-is Steam Controller 2
+/// passthrough's up direction (`[0xCC][0x04]` on the wire, [`RichInput::HidReport`](crate::quic::RichInput))
+/// — as a QUIC datagram (non-blocking enqueue). `data[..len]` is the report exactly as the device
+/// produced it on its interrupt endpoint / GATT notify, id byte first (`0x42`/`0x45`/`0x47` state,
+/// `0x43` battery, …); `len` is clamped to `PUNKTFUNK_HID_REPORT_MAX` and `pad` masked into the
+/// 16-pad wire space. Best-effort/lossy by design — state reports are idempotent snapshots at the
+/// device's own rate, so a lost datagram self-heals on the next one. A no-op unless the pad
+/// declared `PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2` and the host runs the as-is backend.
+/// [`PunktfunkStatus::InvalidArg`] on an empty report.
+///
+/// # Safety
+/// `c` is a valid connection handle; `data` points to `len` readable bytes.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_send_hid_report(
+    c: *mut PunktfunkConnection,
+    pad: u8,
+    data: *const u8,
+    len: usize,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        if data.is_null() {
+            return PunktfunkStatus::NullPointer;
+        }
+        if len == 0 {
+            return PunktfunkStatus::InvalidArg;
+        }
+        // SAFETY: per the ABI contract - a caller-supplied pointer/length pair describing one
+        // readable region, borrowed only for this call (the clamp copies before returning).
+        let report =
+            unsafe { std::slice::from_raw_parts(data, len.min(crate::quic::HID_REPORT_MAX)) };
+        match c.inner.send_rich_input(hid_report_rich_input(pad, report)) {
+            Ok(()) => PunktfunkStatus::Ok,
+            Err(e) => e.status(),
         }
     })
 }
@@ -6203,6 +6307,21 @@ pub unsafe extern "C" fn punktfunk_reanchor_gate_is_holding(
 }
 
 #[cfg(test)]
+mod abi_version_tests {
+    /// Pin [`crate::ABI_VERSION`] — the value [`super::punktfunk_abi_version`] reports and every
+    /// embedder equality-checks against its header's `PUNKTFUNK_ABI_VERSION` (the Apple client
+    /// refuses to run on a mismatch; the v27 `PunktfunkHidOutput` widening's safety argument
+    /// rests on that check). A bump must be DELIBERATE: it arrives with its own
+    /// [`crate::ABI_VERSION`] doc entry AND this pin updated in the same change — the test
+    /// exists so an accidental edit cannot drift the version silently.
+    #[test]
+    fn abi_version_is_pinned() {
+        assert_eq!(crate::ABI_VERSION, 27);
+        assert_eq!(super::punktfunk_abi_version(), 27);
+    }
+}
+
+#[cfg(test)]
 mod log_sink_tests {
     use super::*;
     use std::sync::Mutex;
@@ -6359,30 +6478,87 @@ mod tests {
 
     /// The `AudioCtl` → `PunktfunkHidOutput` mapping: kind 5, pad narrowed, `which` carries the
     /// flags byte, `effect[0..6]` the raw audio region with `effect_len = 6` (the TrackpadHaptic
-    /// packing idiom — no struct growth, so the size guard above stays at 19).
+    /// packing idiom — no per-kind struct growth; the v27 `raw` tail stays zero here).
     #[test]
     fn hidout_abi_maps_audio_ctl() {
         let out = PunktfunkHidOutput::from_hid(&crate::quic::HidOutput::AudioCtl {
             pad: 3,
             flags: 0x17,
             raw: [0x50, 0x60, 0x70, 0x05, 0, 0],
-        })
-        .unwrap();
+        });
         assert_eq!(out.kind, PUNKTFUNK_HIDOUT_AUDIO_CTL);
         assert_eq!(out.pad, 3);
         assert_eq!(out.which, 0x17);
         assert_eq!(out.effect_len, 6);
         assert_eq!(out.effect[..6], [0x50, 0x60, 0x70, 0x05, 0, 0]);
         assert_eq!(out.effect[6..], [0; 5]);
-        // A raw passthrough report still has no C representation (skipped at the pull site).
-        assert!(
-            PunktfunkHidOutput::from_hid(&crate::quic::HidOutput::HidRaw {
-                pad: 0,
-                kind: 0,
-                data: vec![0x80],
-            })
-            .is_none()
-        );
+        assert_eq!(out.raw_len, 0);
+    }
+
+    /// The v27 inversion of the old HidRaw skip: a raw as-is passthrough report (Steam's hidraw
+    /// write to the host's virtual SC2) now HAS a C representation — kind 6, the device channel
+    /// in `hid_kind`, and the whole report in `raw`/`raw_len` — so the Apple client's SC2 capture
+    /// can replay it on the physical controller instead of the pull site dropping it as NoFrame.
+    #[test]
+    fn hidout_abi_maps_hid_raw() {
+        // An OUTPUT report (Triton grip rumble 0x80, host-trimmed to its declared 10 bytes).
+        let rumble: Vec<u8> = vec![0x80, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let out = PunktfunkHidOutput::from_hid(&crate::quic::HidOutput::HidRaw {
+            pad: 2,
+            kind: crate::quic::HID_RAW_OUTPUT,
+            data: rumble.clone(),
+        });
+        assert_eq!(out.kind, PUNKTFUNK_HIDOUT_HID_RAW);
+        assert_eq!(out.pad, 2);
+        assert_eq!(out.hid_kind, crate::quic::HID_RAW_OUTPUT);
+        assert_eq!(out.raw_len, 10);
+        assert_eq!(out.raw[..10], rumble[..]);
+        assert_eq!(out.raw[10..], [0; crate::quic::HID_REPORT_MAX - 10]);
+        // The other fields stay zero — `kind` alone says which ones are meaningful.
+        assert_eq!(out.effect_len, 0);
+
+        // A FEATURE frame arrives WHOLE (64 bytes, zero-padded — Steam sends settings frames
+        // un-trimmed) and must round-trip whole; anything longer clamps instead of overrunning.
+        let mut lizard = vec![0u8; crate::quic::HID_REPORT_MAX + 8];
+        lizard[..6].copy_from_slice(&[0x01, 0x87, 0x03, 0x09, 0x00, 0x00]);
+        let out = PunktfunkHidOutput::from_hid(&crate::quic::HidOutput::HidRaw {
+            pad: 0,
+            kind: crate::quic::HID_RAW_FEATURE,
+            data: lizard.clone(),
+        });
+        assert_eq!(out.hid_kind, crate::quic::HID_RAW_FEATURE);
+        assert_eq!(out.raw_len as usize, crate::quic::HID_REPORT_MAX);
+        assert_eq!(out.raw[..], lizard[..crate::quic::HID_REPORT_MAX]);
+    }
+
+    /// `punktfunk_connection_send_hid_report`'s clamp, via its pure core: `pad` masked to the
+    /// 16-pad wire space and the report bounded to `HID_REPORT_MAX` — byte-for-byte the Android
+    /// JNI shim's rules, so both clients put identical `[0xCC][0x04]` bodies on the wire.
+    #[test]
+    fn send_hid_report_clamps_like_the_android_shim() {
+        // A BLE state report (0x45-first, 46 bytes) passes through unclamped.
+        let mut state = vec![0u8; 46];
+        state[0] = 0x45;
+        state[1] = 0xE5; // seq
+        match hid_report_rich_input(3, &state) {
+            crate::quic::RichInput::HidReport { pad, len, data } => {
+                assert_eq!(pad, 3);
+                assert_eq!(len, 46);
+                assert_eq!(data[..46], state[..]);
+                assert_eq!(data[46..], [0; crate::quic::HID_REPORT_MAX - 46]);
+            }
+            other => panic!("expected HidReport, got {other:?}"),
+        }
+        // Oversize input truncates to the wire body; a pad above the wire space wraps into it.
+        let big = vec![0xAB; 100];
+        match hid_report_rich_input(0x17, &big) {
+            crate::quic::RichInput::HidReport { pad, len, data } => {
+                assert_eq!(pad, 0x7);
+                assert_eq!(len as usize, crate::quic::HID_REPORT_MAX);
+                assert_eq!(data, [0xAB; crate::quic::HID_REPORT_MAX]);
+            }
+            other => panic!("expected HidReport, got {other:?}"),
+        }
     }
 
     /// The legacy audio format: Opus on `0xC9`, 48 kHz, 16-bit, stereo. What every session ran

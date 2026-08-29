@@ -18,6 +18,11 @@
 // queue; the drain thread itself touches neither (it routes rumble to the pad's renderer under a
 // lock and hops HID to main). When a controller leaves the forwarded set the old pad is reset
 // (triggers off, player index unset) and its renderer silenced.
+//
+// One 0xCD kind never reaches main at all: `.hidRaw` — Steam's raw writes to an as-is Steam
+// Controller 2 passthrough pad — routes on the drain thread straight to the registered
+// `setHidRawSink` (the SC2 capture's replay entry point), because no GameController profile is
+// involved and the rumble replay cadence (25–40 ms) should not queue behind main.
 
 import Combine
 import CoreHaptics
@@ -51,6 +56,14 @@ public final class GamepadFeedback {
     /// drain thread is safe — only the map lookup needs the lock.
     private let routingLock = NSLock()
     private var rumbleByPad: [UInt8: RumbleRenderer] = [:]
+
+    /// The raw-report sink for `.hidRaw` events — the Steam Controller 2 capture's
+    /// `Sc2Capture.onHidRaw(pad:kind:data:)`, registered by the session owner. Guarded by
+    /// `routingLock` (set on the main actor, read on the drain thread). Routed WITHOUT the
+    /// main-actor hop the led/trigger path takes: Steam replays rumble at a 25–40 ms cadence,
+    /// the sink filters by pad itself, and its GATT write hops to the BLE queue anyway. nil
+    /// (no capture registered) drops the event — the shape every unroutable feedback takes.
+    private var hidRawSink: ((_ pad: UInt8, _ kind: UInt8, _ data: [UInt8]) -> Void)?
 
     /// Opt-in device mirror (`DefaultsKey.rumbleOnDevice`, iPhone only): rumble the host
     /// addresses to controller 1 (wire pad 0) is ALSO rendered on this device's own Taptic
@@ -211,6 +224,7 @@ public final class GamepadFeedback {
         let renderers = withRouting { () -> [RumbleRenderer] in
             let r = Array(rumbleByPad.values)
             rumbleByPad.removeAll()
+            hidRawSink = nil // no raw replay onto a capture the session owner is tearing down
             return r
         }
         for r in renderers { r.stop() }
@@ -250,7 +264,23 @@ public final class GamepadFeedback {
         return body()
     }
 
+    /// Register (or clear) the `.hidRaw` sink — the session owner wires `Sc2Capture.onHidRaw`
+    /// here beside starting the capture, and clears it BEFORE stopping either side (the
+    /// Android teardown order: unhook → feedback.stop → capture.stop).
+    public func setHidRawSink(
+        _ sink: ((_ pad: UInt8, _ kind: UInt8, _ data: [UInt8]) -> Void)?
+    ) {
+        withRouting { hidRawSink = sink }
+    }
+
     private func render(_ ev: PunktfunkConnection.HidOutputEvent) {
+        // Raw SC2 reports stay on the drain thread — no GameController profile is touched, and
+        // the main-actor hop would only add latency to Steam's 25–40 ms rumble resends.
+        if case let .hidRaw(pad, kind, data) = ev {
+            let sink = withRouting { hidRawSink }
+            sink?(pad, kind, data)
+            return
+        }
         DispatchQueue.main.async {
             MainActor.assumeIsolated { self.apply(ev) }
         }
@@ -275,6 +305,10 @@ public final class GamepadFeedback {
             if let trigger = adaptiveTrigger(slot.controller, which) {
                 parsed.apply(to: trigger)
             }
+        case .hidRaw:
+            // Routed on the drain thread (`render`) straight to the registered sink — a raw
+            // report never touches a GameController profile, so it never reaches this actor.
+            break
         }
     }
 

@@ -96,8 +96,11 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         // New Steam Controller (2026, `28DE:1302`): passed through as-is on Linux — the Triton
         // UHID backend mirrors the client's raw reports under the real identity and Steam on
         // the host drives it over hidraw (no kernel driver binds the PID; Steam Input is the
-        // consumer). No Windows backend; folds to Xbox360 there.
+        // consumer).
         GamepadPref::SteamController2 if linux => GamepadPref::SteamController2,
+        // Windows backend: DEVTYPE_TRITON via the pf_gamepad shm channel (triton_windows.rs).
+        // The Puck stays folded — its 7-interface 28DE:1304 topology has no Windows synthesis.
+        GamepadPref::SteamController2 if windows => GamepadPref::SteamController2,
         GamepadPref::SteamController2Puck if linux => GamepadPref::SteamController2Puck,
         _ => GamepadPref::Xbox360,
     }
@@ -568,7 +571,10 @@ mod tests {
             pick_gamepad(Auto, Some("ibex"), true, false),
             SteamController2
         );
-        assert_eq!(pick_gamepad(SteamController2, None, false, true), Xbox360);
+        assert_eq!(
+            pick_gamepad(SteamController2, None, false, true),
+            SteamController2
+        );
         assert_eq!(pick_gamepad(SteamController2, None, false, false), Xbox360);
         assert_eq!(
             pick_gamepad(SteamController2Puck, None, true, false),

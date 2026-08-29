@@ -19,6 +19,14 @@
 	<array>
 		<string>_punktfunk._udp</string>
 	</array>
+	<!-- CoreBluetooth: the Steam Controller 2 as-is passthrough (Sc2BleLink) reads an OS-paired
+	     SC2's custom Valve GATT service. Both keys so older iOS releases (which read the
+	     Peripheral key) get a string too. Shared by
+	     all three app targets — harmless on tvOS, where the capture code is #if-gated out. -->
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Bluetooth lets Punktfunk read your Steam Controller and pass it through to the streaming PC.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>Bluetooth lets Punktfunk read your Steam Controller and pass it through to the streaming PC.</string>
 	<!-- NOTE: there is deliberately NO NSAppTransportSecurity dict here. ATS stays fully ON.
 	     The host is self-signed at a user-supplied address, which default ATS can never accept
 	     (it exempts only .local, unqualified names, and RFC1918/link-local literals — notably NOT
