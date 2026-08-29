@@ -128,37 +128,41 @@ defaults_case bazzite-sysext "$BAZ" desktop "$ujbin" 'Full controller (joins the
 # one the matrix would happily certify a summary the run drops on the floor.
 defaults_case bazzite-linger "$BAZ" desktop '' '+ sudo loginctl enable-linger'
 
-# ------------------------------------------------------------------ run(): who gets `sudo -n`
+# ------------------------------------------------ run(): the command must survive to the shell
 # --dry-run returns before run() executes anything, so the matrix above is structurally blind to
-# this. Lift the real function out of the script and drive it against a stub sudo instead. A
-# terminal keeps sudo's own password prompt even under --yes — sudo reads /dev/tty, not stdin —
-# and only a session with no terminal at all gets -n, where nothing can type a password anyway.
+# what run() does to a command. That blindness cost a red smoke job: a `sudo` → `sudo -n` rewrite
+# under --yes met install.sh's own root-container shim, which is `exec "$@"`, and `exec -n …` is
+# not a command. So the stub here IS that shim, byte for byte, and the assertion is simply that
+# the command still runs. Any flag injected into a sudo line fails this in every mode.
 # TTY=/dev/null stands in for a terminal: run() only tests whether the variable is set, and a CI
 # runner has no controlling terminal to open.
 sudobin=$(mktemp -d)
 trap 'rm -rf "$osr" "$gsbin" "$ujbin" "$sudobin"' EXIT
-printf '#!/bin/sh\n[ "${1:-}" = -n ] && { echo SUDO-N; exit 0; }\necho SUDO-PLAIN\n' > "$sudobin/sudo"
+printf '#!/bin/sh\nexec "$@"\n' > "$sudobin/sudo"
 chmod +x "$sudobin/sudo"
 
-# name TTY-value YES expected-substring
+# name TTY-value YES
+# The probe is `sudo expr 40 + 2`, and the assertion is on its OUTPUT (42), which appears in the
+# command's *text* nowhere. run() echoes every command before running it, so a marker word would
+# match that echo and pass even when nothing executed.
 run_case() {
     {
         echo 'die() { echo DIED; exit 1; }'
         awk '/^run\(\) \{/,/^\}/' scripts/install.sh
-        printf "DRY=0; TTY=%s; YES=%s; DOCS_PAGE=x\nrun 'sudo true'\n" "$2" "$3"
+        printf "DRY=0; TTY=%s; YES=%s; DOCS_PAGE=x\nrun 'sudo expr 40 + 2'\n" "$2" "$3"
     } > "$sudobin/harness.sh"
     got=$(PATH="$sudobin:$PATH" sh "$sudobin/harness.sh" 2>&1)
     case "$got" in
-        *"$4"*) ;;
+        *42*) ;;
         *)
-            echo "::error::run() with $1: expected '$4', got:"
+            echo "::error::run() with $1: the sudo line never reached the shell:"
             printf '%s\n' "$got" | sed 's/^/    /'
             fail=1 ;;
     esac
 }
-run_case 'a terminal and --yes'  /dev/null 1 SUDO-PLAIN
-run_case 'a terminal, prompting' /dev/null 0 SUDO-PLAIN
-run_case 'no terminal at all'    ''        1 SUDO-N
+run_case 'a terminal and --yes'  /dev/null 1
+run_case 'a terminal, prompting' /dev/null 0
+run_case 'no terminal (the smoke job, root + shim)' '' 1
 
 if [ "$fail" -ne 0 ]; then
     echo "installer default matrix failed"

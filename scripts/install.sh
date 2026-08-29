@@ -121,17 +121,13 @@ run() {
     fi
     printf '  + %s\n' "$cmd"
     [ "$DRY" = 1 ] && return 0
-    # No terminal at all (a systemd unit, CI, `ssh box 'curl … | sh'`) — nothing can type a
-    # password, so make sudo say that and exit instead of waiting on one. A terminal is still a
-    # terminal under --yes: sudo reads /dev/tty, not stdin, so its prompt works and -n must NOT
-    # apply, or `sh install.sh --yes` typed at a prompt dies on the first step without a cached
-    # ticket. No TTY already forces YES=1 above, so this is the narrower of the two conditions.
-    # Printed command stays without -n so the platforms.json verbatim gate still matches.
-    exec_cmd=$cmd
-    if [ -z "$TTY" ]; then
-        exec_cmd=$(printf '%s' "$cmd" | sed 's/sudo /sudo -n /g')
-    fi
-    if [ -n "$TTY" ]; then sh -ec "$exec_cmd" < "$TTY"; else sh -ec "$exec_cmd" < /dev/null; fi \
+    # Deliberately no `sudo -n` rewrite. It breaks the root-container shim below — that shim is
+    # `exec "$@"`, and `exec -n install …` is not a command — which is a path installer-smoke
+    # covers. It also buys nothing it claims to: with no terminal, sudo already exits at once
+    # with "no tty present and no askpass program specified" instead of hanging, and on a box
+    # where an askpass helper IS configured, -n would break the one unattended path that works.
+    # Stdin is the terminal when there is one so a package manager's own prompt still reaches it.
+    if [ -n "$TTY" ]; then sh -ec "$cmd" < "$TTY"; else sh -ec "$cmd" < /dev/null; fi \
         || die "that step failed — fix it and re-run (the script is safe to repeat), or follow the page by hand: $DOCS_PAGE"
 }
 
