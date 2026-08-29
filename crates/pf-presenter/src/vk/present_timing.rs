@@ -10,7 +10,11 @@
 //!
 //! Lifecycle: `vkWaitForPresentKHR` requires the swapchain to stay alive for the call's
 //! duration, so [`PresentTimer::drain`] must run before any `vkDestroySwapchainKHR`
-//! (recreate and teardown both do). Waits carry a 250 ms cap: presentation ids complete
+//! (recreate and teardown both do) — AND before a `vkCreateSwapchainKHR` that names the
+//! live swapchain as `oldSwapchain`, which externally-synchronises it and lets the driver
+//! retire it under a parked waiter. Stating only the destroy half is how the drain came to
+//! sit after the create, which is a Windows `VK_ERROR_UNKNOWN` on an F11 mode change.
+//! Waits carry a 250 ms cap: presentation ids complete
 //! in submission order (a MAILBOX-replaced image's id completes with the present that
 //! replaced it), so a wait only outlives that cap when the pipeline is already wedged —
 //! the timeout keeps the drain bounded rather than wedging a resize with it.

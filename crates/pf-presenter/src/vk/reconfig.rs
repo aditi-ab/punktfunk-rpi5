@@ -79,6 +79,21 @@ impl Presenter {
             min_images = min_images.min(caps.max_image_count);
         }
 
+        // The present-wait waiter is the last thing still holding the live swapchain, and
+        // `vkCreateSwapchainKHR` externally-synchronises `oldSwapchain` — so the drain
+        // belongs BEFORE the create, not merely before the destroy. It used to sit after
+        // the create, which left a waiter parked inside `vkWaitForPresentKHR(old)` while
+        // the driver retired that same swapchain underneath it. The window that opens is
+        // widest exactly where the field reports land: a mode change orphans its last
+        // present, so that wait runs the full 250 ms cap instead of completing at the
+        // next vblank. Bounded by that same cap, and normally instant.
+        if let Some(t) = &self.present_timer {
+            t.drain();
+        }
+        // An unclaimed last present belonged to the dying swapchain — drop the claim.
+        // (`note_presented` is the only producer and shares this thread, so nothing can
+        // hand the waiter a new job between the drain above and the destroy below.)
+        self.last_presented = None;
         let old = self.swapchain;
         let info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface)
@@ -99,19 +114,24 @@ impl Presenter {
         // SAFETY: per the Vulkan contract above - a create/allocate call on the live device, over
         // builder structs that are locals outliving the call; the handle it returns is owned by
         // the value being built here.
-        let swapchain = unsafe { self.swap_d.create_swapchain(&info, None) }
-            .map_err(|e| anyhow!("vkCreateSwapchainKHR: {e}{}", kmsdrm_swapchain_hint()))?;
+        // The parameters ride the failure text: a swapchain refusal is otherwise a bare
+        // driver code, and the first question every field report raises — which size,
+        // which format, which present mode — cost nothing to answer here.
+        let swapchain = unsafe { self.swap_d.create_swapchain(&info, None) }.map_err(|e| {
+            anyhow!(
+                "vkCreateSwapchainKHR: {e} ({}x{}, {:?} / {:?}, {:?}, {min_images} images){}",
+                extent.width,
+                extent.height,
+                self.format.format,
+                self.format.color_space,
+                self.present_mode,
+                kmsdrm_swapchain_hint()
+            )
+        })?;
         // The old swapchain and everything tied to its images dies NOW: the fence
-        // quiesce covered our own command buffers, the queue drain above covered the
-        // presentation engine's semaphore waits — nothing can still reference them.
-        // The present-wait waiter is the one remaining referent: `vkWaitForPresentKHR`
-        // requires the swapchain alive for the call, so drain it first (bounded by the
-        // waiter's 250 ms cap; ids complete in order so this is normally instant).
-        if let Some(t) = &self.present_timer {
-            t.drain();
-        }
-        // An unclaimed last present belonged to the dying swapchain — drop the claim.
-        self.last_presented = None;
+        // quiesce covered our own command buffers, the queue drain covered the
+        // presentation engine's semaphore waits, and the present-wait drain above
+        // released the last referent — nothing can still reference them.
         let (overlay_views, overlay_framebuffers) = self.overlay_pipe.take_targets();
         // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
         // type and live for the call, and every builder struct is a local that outlives it.

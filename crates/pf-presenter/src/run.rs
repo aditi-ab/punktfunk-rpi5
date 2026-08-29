@@ -888,7 +888,29 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         }
                     }
                     WindowEvent::PixelSizeChanged(..) | WindowEvent::Resized(..) => {
-                        presenter.recreate_swapchain(&window)?;
+                        // A driver that refuses the new size used to end the SESSION: this
+                        // `?` walked out of `run_session`, and the shell reported a live
+                        // stream as "couldn't connect". Field-reported on Windows 11 as
+                        // F11 → `vkCreateSwapchainKHR: VK_ERROR_UNKNOWN`, with the reverse
+                        // toggle fine. A refused fullscreen swapchain costs the
+                        // fullscreen, not the stream: fall back to the geometry that was
+                        // already working and let the size event that follows rebuild
+                        // against it. A windowed failure still propagates — there is no
+                        // smaller state left to fall back to.
+                        if let Err(e) = presenter.recreate_swapchain(&window) {
+                            if !fullscreen {
+                                return Err(e);
+                            }
+                            tracing::warn!(
+                                error = format!("{e:#}"),
+                                "swapchain recreate failed — leaving fullscreen"
+                            );
+                            fullscreen = false;
+                            if let Err(e) = window.set_fullscreen(false) {
+                                tracing::warn!(error = %e, "failed to leave fullscreen");
+                            }
+                            continue;
+                        }
                         presenter.present(&window, FrameInput::Redraw, overlay_frame.as_ref())?;
                         // Match-window (D2): (re)stamp the debounce — the request fires
                         // once ~400 ms pass with no further size events, never per
