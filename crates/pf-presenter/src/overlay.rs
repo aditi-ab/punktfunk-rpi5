@@ -80,6 +80,9 @@ pub struct FrameCtx<'a> {
     pub pad_pref: Option<GamepadPref>,
     /// Every connected pad (the console settings' "Use controller" row).
     pub pads: &'a [pf_client_core::gamepad::PadInfo],
+    /// The quick-action ring's session facts (design/touch-client-overlay.md §3.1): what each
+    /// slot shows and whether it is available. `None` outside a stream.
+    pub ring: Option<&'a RingFacts>,
 }
 
 /// One overlay image ready to composite: RGBA, PREMULTIPLIED alpha, already in
@@ -98,6 +101,7 @@ pub struct OverlayFrame {
 // under their old paths — `run.rs` and the session's console service spell them
 // `pf_presenter::overlay::…`.
 pub use pf_client_core::console::{OverlayAction, PointerButton, PointerInput, SessionPhase};
+pub use pf_client_core::ring::{RingCommand, RingFacts, RingInput};
 
 /// The console-UI side. Object-safe; the session binary passes
 /// `Option<Box<dyn Overlay>>` (None = the Skia-free power-user build).
@@ -148,4 +152,18 @@ pub trait Overlay {
     /// until `frame()` runs again (the presenter runs one frame in flight and the
     /// implementation keeps a ring of two, so alternating satisfies this).
     fn frame(&mut self, ctx: &FrameCtx) -> anyhow::Result<Option<OverlayFrame>>;
+
+    /// The quick-action ring's inputs: the two-finger twist, or the key that opens it.
+    fn ring_input(&mut self, _input: RingInput) {}
+
+    /// The ring is up: pointer and key events belong to it, and touch fingers stop feeding
+    /// the gesture engine (the ring's buttons take them).
+    fn ring_open(&self) -> bool {
+        false
+    }
+
+    /// Drain one command the ring raised. Called each iteration while streaming.
+    fn take_ring_command(&mut self) -> Option<RingCommand> {
+        None
+    }
 }

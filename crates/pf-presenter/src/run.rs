@@ -18,7 +18,8 @@
 
 use crate::input::{Capture, FingerPhase};
 use crate::overlay::{
-    FrameCtx, Overlay, OverlayAction, OverlayFrame, PointerButton, PointerInput, SessionPhase,
+    FrameCtx, Overlay, OverlayAction, OverlayFrame, PointerButton, PointerInput, RingCommand,
+    RingFacts, RingInput, SessionPhase,
 };
 use crate::present_pace::{
     Cadence, CadenceProbe, FrameStore, LatchClock, PresentGate, SourcePacer, MARGIN_MAX_NS,
@@ -79,6 +80,9 @@ pub struct SessionOpts {
     /// [`apply_capture`]); the desktop model's unlocked pointer clicking another window
     /// is the always-available way back.
     pub inhibit_shortcuts: bool,
+    /// The quick-action ring's configuration blob ([`Settings::overlay_actions`], the
+    /// resolved profile's); empty = the platform default ring.
+    pub overlay_actions: String,
     /// Presentation intent ([`Settings::present_priority`] resolved): `Latency` keeps the
     /// shipped arrival pacing (newest-wins, present the moment a frame can go out);
     /// `Smooth { buffer }` runs the smoothing FIFO drained one frame per latch slot
@@ -378,6 +382,10 @@ struct StreamState {
     /// and when it went up — cleared after [`ACCESS_NOTICE_S`]. Rides the hint-pill slot
     /// with priority: an access change outranks "click to capture" for a few seconds.
     session_notice: Option<(String, Instant)>,
+    /// The host's pinned fingerprint (hex) once connected — the key the pre-fetched host
+    /// actions are cached under — and the mode the Welcome carried (the ring's "Native").
+    fp_hex: String,
+    native_mode: (u32, u32, u32),
     /// The params this session was started with, kept so a codec fallback can re-dial
     /// with `exclude_codecs` widened — see [`SessionEvent::CodecFallback`]. Cloned once
     /// per session start, so anything the SESSION changed after launch (an accepted mode
@@ -439,6 +447,8 @@ impl StreamState {
             canceled: false,
             ready_announced: false,
             mode_line: String::new(),
+            fp_hex: String::new(),
+            native_mode: (0, 0, 0),
             profile,
             latch_grid,
             clock_offset: None,
@@ -801,6 +811,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
     // events on desktop, and the door Steam's on-screen keyboard types through under
     // gamescope). Toggled edge-wise — start/stop are not free on Wayland.
     let mut text_input_on = false;
+    // The ring's Keyboard slot: hold text input on, which is what summons Steam's on-screen
+    // keyboard under gamescope (a desktop has a real one).
+    let mut ring_keyboard = false;
 
     let outcome = 'main: loop {
         // --- SDL events (input, window, gamepads) ---------------------------------------
@@ -1038,6 +1051,18 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         tracing::info!(tier = ?stats_verbosity, "chord: stats verbosity");
                         continue;
                     }
+                    // The quick-action ring, at the window centre (a locked pointer has no
+                    // position worth opening at). "O" for overlay; the twist opens it too.
+                    if chord && sc == Scancode::O {
+                        if let (Some(o), true) = (overlay.as_mut(), stream.is_some()) {
+                            let (pw, ph) = window.size_in_pixels();
+                            o.ring_input(RingInput::Toggle {
+                                x: pw as f32 / 2.0,
+                                y: ph as f32 / 2.0,
+                            });
+                        }
+                        continue;
+                    }
                     // Mic mute (B4) — "V" for voice; M and S are taken. Per session and never
                     // persisted: this is the doorbell/cough key, not a settings change. The
                     // uplink keeps running while muted (see `MicStreamer::spawn`); only the
@@ -1155,6 +1180,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     ..
                 } => {
                     if is_direct_touch(touch_id) {
+                        if ring_finger(&mut overlay, &window, FingerPhase::Down, x, y) {
+                            continue;
+                        }
                         for act in dispatch_finger(
                             FingerPhase::Down,
                             &window,
@@ -1164,7 +1192,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             y,
                             timestamp,
                         ) {
-                            on_touch_act(act, &mut stats_verbosity, &mut stream, &presenter);
+                            on_touch_act(
+                                act,
+                                &mut stats_verbosity,
+                                &mut stream,
+                                &presenter,
+                                &mut overlay,
+                            );
                         }
                     }
                 }
@@ -1177,6 +1211,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     ..
                 } => {
                     if is_direct_touch(touch_id) {
+                        if ring_finger(&mut overlay, &window, FingerPhase::Move, x, y) {
+                            continue;
+                        }
                         for act in dispatch_finger(
                             FingerPhase::Move,
                             &window,
@@ -1186,7 +1223,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             y,
                             timestamp,
                         ) {
-                            on_touch_act(act, &mut stats_verbosity, &mut stream, &presenter);
+                            on_touch_act(
+                                act,
+                                &mut stats_verbosity,
+                                &mut stream,
+                                &presenter,
+                                &mut overlay,
+                            );
                         }
                     }
                 }
@@ -1199,6 +1242,9 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     ..
                 } => {
                     if is_direct_touch(touch_id) {
+                        // The lift ALSO reaches the engine, so it never keeps a finger that
+                        // is gone (the ring took the down; the engine's up is then inert).
+                        ring_finger(&mut overlay, &window, FingerPhase::Up, x, y);
                         for act in dispatch_finger(
                             FingerPhase::Up,
                             &window,
@@ -1208,7 +1254,13 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                             y,
                             timestamp,
                         ) {
-                            on_touch_act(act, &mut stats_verbosity, &mut stream, &presenter);
+                            on_touch_act(
+                                act,
+                                &mut stats_verbosity,
+                                &mut stream,
+                                &presenter,
+                                &mut overlay,
+                            );
                         }
                     }
                 }
@@ -1488,6 +1540,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                         continue;
                     }
                     st.mode_line = format!("{}×{}@{}", m.width, m.height, m.refresh_hz);
+                    st.native_mode = (m.width, m.height, m.refresh_hz);
+                    st.fp_hex = pf_client_core::trust::hex(&fingerprint);
+                    // The ring's host-action slots are pre-fetched here, never when it opens.
+                    let host_addr = st.params.host.clone();
+                    pf_client_core::host_actions::refresh(&host_addr, c.mgmt_port(), &st.fp_hex);
                     // The RESOLVED rate — a `0 = native` request becomes a real number
                     // here, and this is the last moment before frames start arriving.
                     st.source_interval_ns = frame_interval_ns(m.refresh_hz, native.refresh_hz);
@@ -1811,6 +1868,27 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         if let Some(cap) = stream.as_mut().and_then(|st| st.capture.as_mut()) {
             cap.tick(sdl3::timer::ticks() as f64);
         }
+        // The quick-action ring's commands, drained once per pass.
+        let mut ring_cmds = Vec::new();
+        if let (Some(o), true) = (overlay.as_mut(), stream.is_some()) {
+            while let Some(cmd) = o.take_ring_command() {
+                ring_cmds.push(cmd);
+            }
+        }
+        for cmd in ring_cmds {
+            tracing::info!(?cmd, "ring");
+            match cmd {
+                RingCommand::CycleStats => {
+                    bump_stats_tier(&mut stats_verbosity, &mut stream, &presenter);
+                }
+                RingCommand::Keyboard => ring_keyboard = !ring_keyboard,
+                other => {
+                    if let Some(st) = stream.as_mut() {
+                        ring_command(other, st, &mut window, &mouse, inhibit_shortcuts);
+                    }
+                }
+            }
+        }
 
         // Access toast expiry — before the overlay borrows the stream immutably.
         if let Some(st) = stream.as_mut() {
@@ -1871,6 +1949,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             // pump is what knows whether an uplink exists (it may have failed to open), and a
             // mirrored copy would be the thing that goes stale at session end.
             let mic_muted = stream.as_ref().is_some_and(|st| st.handle.mic.muted());
+            let ring_facts = stream
+                .as_ref()
+                .filter(|st| st.connector.is_some())
+                .map(|st| ring_facts(st, &opts, stats_verbosity, mic_muted));
             let ctx = FrameCtx {
                 width: pw,
                 height: ph,
@@ -1887,6 +1969,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 pad: pad.as_ref().map(|p| p.name.as_str()),
                 pad_pref: pad.as_ref().map(|p| p.pref),
                 pads: &pads,
+                ring: ring_facts.as_ref(),
             };
             match o.frame(&ctx) {
                 Ok(f) => overlay_frame = f,
@@ -2925,21 +3008,167 @@ fn dispatch_finger(
 }
 
 /// A run-loop intent from the touch gesture engine: the three-finger tap bumps the stats tier;
-/// the dial — a two-finger twist — turns the quick-action ring. The ring layer lands with the
-/// desktop overlay (design/touch-client-overlay.md T8); until then the twist is logged so the
-/// gesture can be tuned on glass.
+/// the dial — a two-finger twist — turns the quick-action ring in the overlay.
 fn on_touch_act(
     act: Act,
     verbosity: &mut StatsVerbosity,
     stream: &mut Option<StreamState>,
     presenter: &Presenter,
+    overlay: &mut Option<Box<dyn Overlay>>,
 ) {
-    match act {
-        Act::CycleStats => bump_stats_tier(verbosity, stream, presenter),
-        Act::Dial { .. } | Act::DialCommit | Act::DialCancel => {
-            tracing::debug!(?act, "touch dial");
+    let input = match act {
+        Act::CycleStats => return bump_stats_tier(verbosity, stream, presenter),
+        Act::Dial {
+            progress,
+            clockwise,
+            x,
+            y,
+        } => RingInput::Turn {
+            progress,
+            clockwise,
+            x,
+            y,
+        },
+        Act::DialCommit => RingInput::Commit,
+        Act::DialCancel => RingInput::Cancel,
+        _ => return,
+    };
+    if let Some(o) = overlay.as_mut() {
+        o.ring_input(input);
+    }
+}
+
+/// A touchscreen finger while the ring is up goes to the ring as a pointer, not to the
+/// gesture engine. Returns true when the ring took it.
+fn ring_finger(
+    overlay: &mut Option<Box<dyn Overlay>>,
+    window: &sdl3::video::Window,
+    phase: FingerPhase,
+    x: f32,
+    y: f32,
+) -> bool {
+    let Some(o) = overlay.as_mut().filter(|o| o.ring_open()) else {
+        return false;
+    };
+    let (pw, ph) = window.size_in_pixels();
+    let (x, y) = (x * pw as f32, y * ph as f32);
+    let input = match phase {
+        FingerPhase::Down => PointerInput::Down {
+            x,
+            y,
+            button: PointerButton::Primary,
+            touch: true,
+        },
+        FingerPhase::Move => PointerInput::Move { x, y },
+        FingerPhase::Up => PointerInput::Up {
+            x,
+            y,
+            button: PointerButton::Primary,
+        },
+    };
+    o.handle_pointer(input);
+    true
+}
+
+/// The ring's session facts for this frame (design/touch-client-overlay.md §3.1).
+fn ring_facts(
+    st: &StreamState,
+    opts: &SessionOpts,
+    stats: StatsVerbosity,
+    mic_muted: bool,
+) -> RingFacts {
+    let c = st.connector.as_ref().expect("filtered on connector");
+    let m = c.mode();
+    RingFacts {
+        overlay_actions: opts.overlay_actions.clone(),
+        touch_mode: st
+            .capture
+            .as_ref()
+            .map_or(TouchMode::Trackpad, Capture::touch_mode)
+            .as_name()
+            .into(),
+        host_accepts_touch: c.host_caps2() & punktfunk_core::quic::HOST_CAP2_TOUCH != 0,
+        stats_tier: stats.label().into(),
+        // The mic control answers `toggle` with `None` when no uplink runs; the cheap
+        // read-only tell is the same `Option` on a no-op query, which it does not offer —
+        // so a session with a mic is one whose settings asked for it.
+        mic_available: st.params.mic_enabled,
+        mic_muted,
+        mode: (m.width, m.height, m.refresh_hz),
+        native_mode: st.native_mode,
+        addr: st.params.host.clone(),
+        mgmt_port: c.mgmt_port(),
+        fp_hex: st.fp_hex.clone(),
+        host_name: opts.window_title.clone(),
+    }
+}
+
+/// Run one ring command against the live session (the stats tier and the keyboard are the
+/// loop's own and are handled at the call site).
+fn ring_command(
+    cmd: RingCommand,
+    st: &mut StreamState,
+    window: &mut sdl3::video::Window,
+    mouse: &sdl3::mouse::MouseUtil,
+    inhibit_shortcuts: bool,
+) {
+    match cmd {
+        RingCommand::EndStream => {
+            st.request_quit();
+            apply_capture(window, mouse, false, false, inhibit_shortcuts, 0);
         }
-        _ => {}
+        RingCommand::DisconnectLinger => {
+            // Leave without the quit close code: the host lingers for a reconnect.
+            if let Some(cap) = &mut st.capture {
+                cap.release(true);
+            }
+            st.handle.stop.store(true, Ordering::SeqCst);
+            apply_capture(window, mouse, false, false, inhibit_shortcuts, 0);
+        }
+        RingCommand::ToggleMic => {
+            st.handle.mic.toggle();
+        }
+        RingCommand::CycleTouchMode => {
+            let accepts_touch = st
+                .connector
+                .as_ref()
+                .is_some_and(|c| c.host_caps2() & punktfunk_core::quic::HOST_CAP2_TOUCH != 0);
+            if let Some(cap) = &mut st.capture {
+                let next = match (cap.touch_mode(), accepts_touch) {
+                    (TouchMode::Trackpad, _) => TouchMode::Pointer,
+                    (TouchMode::Pointer, true) => TouchMode::Touch,
+                    _ => TouchMode::Trackpad,
+                };
+                cap.set_touch_mode(next);
+            }
+        }
+        RingCommand::RequestMode {
+            width,
+            height,
+            refresh_hz,
+        } => {
+            if let Some(c) = &st.connector {
+                if let Err(e) = c.request_mode(punktfunk_core::config::Mode {
+                    width,
+                    height,
+                    refresh_hz,
+                }) {
+                    tracing::warn!(error = %e, "ring: mode request");
+                }
+            }
+        }
+        RingCommand::Shortcut(keys) => {
+            let vks: Vec<u8> = keys
+                .iter()
+                .filter_map(|k| pf_client_core::overlay_actions::key_vk(k))
+                .collect();
+            if vks.len() == keys.len() {
+                if let Some(cap) = &mut st.capture {
+                    cap.send_chord(&vks);
+                }
+            }
+        }
+        RingCommand::CycleStats | RingCommand::Keyboard => {}
     }
 }
 

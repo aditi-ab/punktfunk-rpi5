@@ -15,7 +15,8 @@ use ash::vk as avk;
 use ash::vk::Handle as _;
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use pf_presenter::overlay::{
-    FrameCtx, Overlay, OverlayAction, OverlayFrame, PointerInput, SessionPhase, SharedDevice,
+    FrameCtx, Overlay, OverlayAction, OverlayFrame, PointerInput, RingCommand, RingInput,
+    SessionPhase, SharedDevice,
 };
 use skia_safe::gpu::vk as skvk;
 use skia_safe::gpu::{self, DirectContext, SurfaceOrigin};
@@ -62,6 +63,9 @@ struct Drawn {
     /// mid-stream resize is in flight forces the per-frame redraw the spinner needs; `0`
     /// when no resize is showing (so a still stream stays damage-free).
     resize_step: u16,
+    /// The quick-action ring's drawing state folded into one number (`0` = closed); its
+    /// opening animation changes it every frame, a settled ring changes nothing.
+    ring: u64,
 }
 
 /// The stream chrome's base metrics, in pixels at 100 % scale (96 dpi). Everything here is
@@ -104,6 +108,9 @@ pub struct SkiaOverlay {
     /// When the current mid-stream resize scrim began showing — drives its spinner phase.
     /// `None` = no resize in flight (`FrameCtx::resizing` was false last frame).
     resizing_since: Option<Instant>,
+    /// The in-stream quick-action ring (design/touch-client-overlay.md §2).
+    ring: crate::ring::Ring,
+    ring_drawn_at: Option<Instant>,
 }
 
 struct Gpu {
@@ -133,6 +140,8 @@ impl SkiaOverlay {
             shell: None,
             streaming_since: None,
             banner_text: None,
+            ring: crate::ring::Ring::new(),
+            ring_drawn_at: None,
             resizing_since: None,
         }
     }
@@ -267,8 +276,25 @@ impl Overlay for SkiaOverlay {
 
     fn handle_event(&mut self, event: &sdl3::event::Event) -> bool {
         // Keyboard + text into the console while it's on screen — never for
-        // chord-modified keys (those stay the run loop's), never during a stream.
+        // chord-modified keys (those stay the run loop's), never during a stream — except
+        // into the quick-action ring while it is up.
         if !self.console_visible() {
+            if let sdl3::event::Event::KeyDown {
+                scancode: Some(sc),
+                keymod,
+                ..
+            } = event
+            {
+                use sdl3::keyboard::Mod;
+                if self.ring.open()
+                    && !keymod
+                        .intersects(Mod::LCTRLMOD | Mod::RCTRLMOD | Mod::LALTMOD | Mod::RALTMOD)
+                {
+                    if let Some(key) = key_of(*sc) {
+                        return self.ring.key(key);
+                    }
+                }
+            }
             return false;
         }
         let Some(shell) = &mut self.shell else {
@@ -314,7 +340,31 @@ impl Overlay for SkiaOverlay {
 
     fn handle_pointer(&mut self, input: PointerInput) -> bool {
         if !self.console_visible() {
-            return false;
+            if !self.ring.open() {
+                return false;
+            }
+            use crate::pointer::{Pointer, PointerKind};
+            use pf_client_core::console::PointerButton;
+            let (x, y, kind) = match input {
+                PointerInput::Move { x, y } => (x, y, PointerKind::Move),
+                PointerInput::Down {
+                    x,
+                    y,
+                    button: PointerButton::Primary,
+                    ..
+                } => (x, y, PointerKind::Press),
+                PointerInput::Down { x, y, .. } => (x, y, PointerKind::Back),
+                PointerInput::Up { x, y, .. } => (x, y, PointerKind::Release),
+                PointerInput::Wheel { x, y, dy, .. } => {
+                    (x, y, PointerKind::Scroll { up: dy > 0.0 })
+                }
+                _ => return true,
+            };
+            return self.ring.pointer(Pointer {
+                x: f64::from(x),
+                y: f64::from(y),
+                kind,
+            });
         }
         match &mut self.shell {
             Some(shell) => shell.pointer_input(input),
@@ -324,6 +374,18 @@ impl Overlay for SkiaOverlay {
 
     fn take_action(&mut self) -> Option<OverlayAction> {
         self.shell.as_mut().and_then(|s| s.take_action())
+    }
+
+    fn ring_input(&mut self, input: RingInput) {
+        self.ring.input(input);
+    }
+
+    fn ring_open(&self) -> bool {
+        self.ring.open()
+    }
+
+    fn take_ring_command(&mut self) -> Option<RingCommand> {
+        self.ring.take_command()
     }
 
     fn text_input_active(&self) -> bool {
@@ -398,6 +460,17 @@ impl Overlay for SkiaOverlay {
         // spinning through the damage gate; `+ 1` keeps an active resize's step nonzero
         // even on its first frame (phase 0) so the guard below doesn't skip it.
         let resize_step = resize_phase.map_or(0, |p| (p * 120.0) as u16 + 1);
+        if let Some(facts) = ctx.ring {
+            self.ring.set_facts(facts);
+        }
+        self.ring.tick();
+        // The ring's host actions ride the console's own bus, like the power rows do.
+        for cmd in self.ring.take_cmds() {
+            if let Some(shell) = &self.shell {
+                shell.send_cmd(cmd);
+            }
+        }
+        let ring_key = self.ring.damage();
         if ctx.stats.is_none()
             && ctx.hint.is_none()
             && ctx.access.is_none()
@@ -405,6 +478,7 @@ impl Overlay for SkiaOverlay {
             && !ctx.mic_muted
             && banner_step == 0
             && resize_step == 0
+            && ring_key == 0
         {
             self.drawn = Drawn::default(); // forget content so re-show re-renders
             return Ok(None);
@@ -423,6 +497,7 @@ impl Overlay for SkiaOverlay {
             scale_pct: (scale * 100.0).round() as u16,
             banner_step,
             resize_step,
+            ring: ring_key,
         };
         if want == self.drawn {
             // Unchanged — hand the presenter the already-rendered image.
@@ -488,6 +563,17 @@ impl Overlay for SkiaOverlay {
             }
         }
 
+        // The ring sits over everything else: it owns the glass while it is up. It needs the
+        // console's fonts, which a plain `--connect` session never loads — the ring is a
+        // console-shell feature.
+        if ring_key != 0 {
+            let dt = ring_dt(&mut self.ring_drawn_at);
+            if let Some(fonts) = self.fonts.as_ref() {
+                self.ring
+                    .render(canvas, ctx.width, ctx.height, scale, fonts, dt);
+            }
+        }
+
         // Flush on the shared queue, ending in SHADER_READ_ONLY on our family — the
         // layout the presenter's composite samples (its own barrier covers visibility).
         // Lock: queue external sync vs FFmpeg's pump-thread submits (same queue).
@@ -514,6 +600,17 @@ impl Overlay for SkiaOverlay {
             height: slot.height,
         }))
     }
+}
+
+/// Seconds since the ring last drew — its spring's clock. Capped so a paused loop does not
+/// snap the animation.
+fn ring_dt(drawn_at: &mut Option<Instant>) -> f64 {
+    let now = Instant::now();
+    let dt = drawn_at
+        .map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f64())
+        .min(0.1);
+    *drawn_at = Some(now);
+    dt
 }
 
 impl SkiaOverlay {

@@ -130,6 +130,35 @@ pub fn key_vk(name: &str) -> Option<u8> {
     Some(vk)
 }
 
+/// A chord as a keycap chip reads it: `Ctrl+⇧+Esc`.
+pub fn chord_chip(keys: &[String]) -> String {
+    keys.iter()
+        .map(|k| match k.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => "Ctrl".to_string(),
+            "shift" => "⇧".into(),
+            "alt" | "option" => "Alt".into(),
+            "win" | "cmd" | "super" | "meta" => "❖".into(),
+            "escape" | "esc" => "Esc".into(),
+            "enter" | "return" => "↵".into(),
+            "backspace" => "⌫".into(),
+            "delete" | "del" => "Del".into(),
+            "space" => "␣".into(),
+            "up" => "↑".into(),
+            "down" => "↓".into(),
+            "left" => "←".into(),
+            "right" => "→".into(),
+            _ => {
+                let mut c = k.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
 /// The virtual controller's preset (Android and Apple only): `layout` is `full`, `sticks` or
 /// `dpad`; `opacity` and `scale` are the two sliders.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -334,6 +363,8 @@ mod tests {
         assert_eq!(key_vk("f25"), None);
         assert_eq!(key_vk("hyper"), None);
         assert_eq!(key_vk(""), None);
+        let keys: Vec<String> = ["ctrl", "shift", "escape"].map(String::from).into();
+        assert_eq!(chord_chip(&keys), "Ctrl+⇧+Esc");
     }
 
     #[test]

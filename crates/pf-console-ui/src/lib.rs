@@ -44,6 +44,8 @@ pub mod platform;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod pointer;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
+mod ring;
+#[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod screens;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod shell;

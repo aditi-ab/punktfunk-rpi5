@@ -1069,6 +1069,12 @@ impl Shell {
         }
     }
 
+    /// One command straight onto the bus — the in-stream ring's host actions, which have no
+    /// screen and so no `Outbox`.
+    pub(crate) fn send_cmd(&self, cmd: ConsoleCmd) {
+        self.bus.send(cmd);
+    }
+
     fn apply(&mut self, fx: Outbox) {
         for cmd in fx.cmds {
             // An input-initiated wake must gate input in the SAME call, exactly like

@@ -613,6 +613,65 @@ impl Capture {
         }
     }
 
+    pub fn touch_mode(&self) -> TouchMode {
+        self.touch_mode
+    }
+
+    /// The ring's Touch mode slot: switch the model mid-stream. Anything a gesture holds is
+    /// released first (a held drag must not survive a model switch), and the engine restarts.
+    pub fn set_touch_mode(&mut self, mode: TouchMode) {
+        for b in self.held_buttons.drain() {
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::MouseButtonUp,
+                b,
+                0,
+                0,
+                0,
+            );
+        }
+        for (_, slot) in self.touch_slots.drain() {
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::TouchUp,
+                slot,
+                0,
+                0,
+                0,
+            );
+        }
+        self.touch_mode = mode;
+        self.gestures = Gestures::new(mode == TouchMode::Trackpad, self.invert_scroll);
+    }
+
+    /// A ring shortcut: the chord's VKs down in order, then up in reverse.
+    pub fn send_chord(&mut self, vks: &[u8]) {
+        for &vk in vks {
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::KeyDown,
+                u32::from(vk),
+                0,
+                0,
+                0,
+            );
+        }
+        for &vk in vks.iter().rev() {
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::KeyUp,
+                u32::from(vk),
+                0,
+                0,
+                0,
+            );
+        }
+    }
+
     /// Time passes: the gesture engine's long-press arm. Once per run-loop iteration; `t_ms`
     /// is the finger clock (SDL ticks). Passthrough fingers have no timer.
     pub fn tick(&mut self, t_ms: f64) {
