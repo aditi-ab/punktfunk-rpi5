@@ -392,6 +392,30 @@ struct MotionUnreachableBadge: View {
     }
 }
 
+/// "This host doesn't accept touch" — the passthrough touch model met a host whose injector
+/// drops contacts (no `HOST_CAP2_TOUCH`); the session runs the trackpad model instead. Same
+/// slot and lifetime as the motion badge, for the same reason: the setting would otherwise be
+/// silently ignored.
+struct TouchFallbackBadge: View {
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "hand.tap")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.yellow)
+            Text("This host doesn't accept touch — using the trackpad model")
+                .font(.geist(12, .medium, relativeTo: .caption))
+                .foregroundStyle(.white.opacity(0.9))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .glassBackground(Capsule())
+        .environment(\.colorScheme, .dark)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "This host does not accept touch input. Fingers drive the cursor as a trackpad instead.")
+    }
+}
+
 #if !os(tvOS)
 /// The session's access chip (per-client access §7) — "Controller only · ends in 1 h 58 m".
 /// Rides over the stream for the life of a LIMITED session, at every stats tier and with the

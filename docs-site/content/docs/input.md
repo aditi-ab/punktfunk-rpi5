@@ -205,6 +205,11 @@ Wherever the compositor offers no touchscreen device to drive, only the first fi
 an absolute pointer — tapping still clicks; pinches and multi-finger gestures don't survive. The
 trackpad and pointer models are unaffected: they send ordinary mouse events.
 
+A host says whether it injects touch at all. Against one that does not (the wlroots row above,
+or Windows before 1809), a client set to Touch passthrough runs the trackpad model for that
+session and says so in a short notice when the stream starts, instead of forwarding contacts the
+host would drop.
+
 ## Pen and stylus
 
 A stylus is not treated as a finger. Punktfunk carries **position, tip pressure, tilt angle and tilt

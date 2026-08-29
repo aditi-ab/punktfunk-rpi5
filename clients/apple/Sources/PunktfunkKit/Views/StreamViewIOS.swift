@@ -481,6 +481,7 @@ public final class StreamViewController: StreamViewControllerBase {
         // Apple Pencil → the stylus plane, only against a pen-capable host (elsewhere the
         // Pencil stays a finger, exactly as before). Same trust gate as touch.
         streamView.penEnabled = connection.hostSupportsPen
+        streamView.touchPassthroughEnabled = connection.hostSupportsTouch
         streamView.onPenBatch = { [weak self, weak connection] batch in
             guard self?.captureEnabled == true else { return }
             connection?.sendPen(batch)
@@ -1070,6 +1071,9 @@ final class StreamLayerUIView: UIView {
     /// The host advertised `HOST_CAP_PEN`, so Pencil input splits out of the finger path onto
     /// the pen plane — independent of the touch-input mode (drawing must not depend on it).
     var penEnabled = false
+    /// The host injects wire touch contacts (`HOST_CAP2_TOUCH`). Off, the `touch` model's
+    /// fingers drive the trackpad engine instead of vanishing on the host.
+    var touchPassthroughEnabled = true
     /// Pencil proximity transitions (hover or contact) — the presenter's panel-rate boost.
     var onPenProximity: ((Bool) -> Void)?
     /// Indirect pointer (mouse/trackpad with no lock) → absolute cursor moves.
@@ -1208,7 +1212,8 @@ final class StreamLayerUIView: UIView {
     /// Route direct fingers by the touch-input model, latched for the whole gesture:
     /// passthrough → real wire touches; trackpad/pointer → the TouchMouse gesture engine.
     private func forwardFingers(_ touches: Set<UITouch>, kind: TouchKind) {
-        let mode = fingerRoute ?? TouchInputMode.current
+        var mode = fingerRoute ?? TouchInputMode.current
+        if mode == .touch, !touchPassthroughEnabled { mode = .trackpad }
         fingerRoute = mode
         switch mode {
         case .touch:

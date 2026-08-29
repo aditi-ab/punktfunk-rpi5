@@ -1712,6 +1712,13 @@ pub const PUNKTFUNK_HOST_CAP_PAD_AUDIO: u8 = 0x40;
 /// (Mirrors `quic::HOST_CAP_AUDIO_HIRES`.)
 pub const PUNKTFUNK_HOST_CAP_AUDIO_HIRES: u8 = 0x80;
 
+/// Host-capability bit in [`punktfunk_connection_host_caps2`] (the SECOND byte): the host's
+/// injector puts wire touch contacts on its desktop. A client offering a touch-passthrough model
+/// tests this before routing fingers as contacts; without the bit it should fall back to a
+/// cursor model and say so, because the host drops every contact silently. (Mirrors
+/// `quic::HOST_CAP2_TOUCH`.)
+pub const PUNKTFUNK_HOST_CAP2_TOUCH: u8 = 0x02;
+
 /// Pad-audio `kind` ([`punktfunk_connection_next_pad_audio`]): the BACK channel pair — DualSense
 /// voice-coil haptics, 5 ms Opus frames. (Mirrors `quic::PAD_AUDIO_KIND_HAPTICS`.)
 pub const PUNKTFUNK_PAD_AUDIO_KIND_HAPTICS: u8 = 0;
@@ -1741,6 +1748,7 @@ const _: () = {
     assert!(PUNKTFUNK_HOST_CAP_PEN == crate::quic::HOST_CAP_PEN);
     assert!(PUNKTFUNK_HOST_CAP_PAD_AUDIO == crate::quic::HOST_CAP_PAD_AUDIO);
     assert!(PUNKTFUNK_HOST_CAP_AUDIO_HIRES == crate::quic::HOST_CAP_AUDIO_HIRES);
+    assert!(PUNKTFUNK_HOST_CAP2_TOUCH == crate::quic::HOST_CAP2_TOUCH);
     assert!(PUNKTFUNK_CLIENT_CAP_PAD_AUDIO == crate::quic::CLIENT_CAP_PAD_AUDIO);
     assert!(PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES == crate::quic::CLIENT_CAP_AUDIO_HIRES);
     assert!(PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO == crate::quic::CLIENT_CAP_KEEP_HOST_AUDIO);
@@ -4980,6 +4988,37 @@ pub unsafe extern "C" fn punktfunk_connection_host_caps(
         unsafe {
             if !caps.is_null() {
                 *caps = c.inner.host_caps();
+            }
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
+/// The SECOND host capability byte the session's `Welcome` carried — today
+/// `PUNKTFUNK_HOST_CAP2_TOUCH`. `0` toward an older host, which never sends the byte. Safe any
+/// time after connect.
+///
+/// # Safety
+/// `c` is a valid connection handle; `caps` is writable (NULL is skipped).
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_host_caps2(
+    c: *const PunktfunkConnection,
+    caps: *mut u8,
+) -> PunktfunkStatus {
+    guard(|| {
+        // SAFETY: per the ABI contract - an opaque handle from a `*_new`/`*_pair` that the caller
+        // has not yet freed, or null, which `as_mut`/`as_ref` reports as `None` and the `match`
+        // here handles.
+        let c = match unsafe { c.as_ref() } {
+            Some(c) => c,
+            None => return PunktfunkStatus::NullPointer,
+        };
+        // SAFETY: per the ABI contract - the out-param is OPTIONAL, so it is null-checked before
+        // it is written; a non-null one is a caller-owned writable slot.
+        unsafe {
+            if !caps.is_null() {
+                *caps = c.inner.host_caps2();
             }
         }
         PunktfunkStatus::Ok

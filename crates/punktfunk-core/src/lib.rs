@@ -266,7 +266,14 @@ pub use stats::Stats;
 /// only in the struct from here on — appended behind its `struct_size` guard, zero meaning
 /// unspecified/auto — so they stop being ABI events at all. Client-local; [`WIRE_VERSION`] is
 /// unchanged.
-pub const ABI_VERSION: u32 = 26;
+/// **v27** adds [`abi::punktfunk_connection_host_caps2`] and `PUNKTFUNK_HOST_CAP2_TOUCH` — the
+/// Welcome's second capability byte, which no embedder could read before. A client offering a
+/// touch-passthrough model gates it on the bit and falls back to a cursor model with a notice,
+/// because a host without it drops every contact silently (design/touch-client-overlay.md §5.4).
+/// ADDED, not widened: one function and one constant; an embedder that never calls it behaves
+/// exactly as on v26. The byte itself has ridden the Welcome as a trailing field since the repeat
+/// mark, so [`WIRE_VERSION`] is unchanged.
+pub const ABI_VERSION: u32 = 27;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

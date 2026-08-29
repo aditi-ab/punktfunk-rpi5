@@ -526,6 +526,13 @@ object NativeBridge {
     external fun nativeHostSupportsPen(handle: Long): Boolean
 
     /**
+     * Whether the host advertised touch injection (`HOST_CAP2_TOUCH`). Without it a passthrough
+     * contact lands nowhere, so the stream runs the trackpad model instead and says so. False on
+     * `0` and toward an older host.
+     */
+    external fun nativeHostSupportsTouch(handle: Long): Boolean
+
+    /**
      * One stylus batch of STATE-FULL samples (the pen plane; design/pen-tablet-input.md §7):
      * [count] × 10 floats, oldest first — `[state, tool, x, y, pressure, distance, tilt_deg,
      * azimuth_deg, roll_deg, dt_us]`. `state` = the wire in-range/touching/barrel bits; `tool`

@@ -332,6 +332,29 @@ pub fn text_input_supported() -> bool {
     false
 }
 
+/// Whether the session's inject backend puts wire touch contacts on the desktop
+/// (`HOST_CAP2_TOUCH` — design/touch-client-overlay.md §5.4). Linux: libei (portal or gamescope
+/// EIS) and KWin fake-input carry touch; the wlroots virtual-pointer backend has no touch protocol
+/// and drops every contact. Consulted at Welcome time so a client can fall back from passthrough
+/// instead of sending contacts nowhere.
+#[cfg(target_os = "linux")]
+pub fn touch_supported() -> bool {
+    !matches!(default_backend(), Backend::WlrVirtual)
+}
+
+/// Windows: touch injects through a `PT_TOUCH` synthetic pointer device, which exists from build
+/// 1809 — the same probe as [`pen_supported`], without the pen kill-switch.
+#[cfg(target_os = "windows")]
+pub fn touch_supported() -> bool {
+    pen::synthetic_pen_available()
+}
+
+/// No injector ⇒ no touch.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn touch_supported() -> bool {
+    false
+}
+
 /// Whether this host can inject full-fidelity stylus input (`HOST_CAP_PEN` —
 /// design/pen-tablet-input.md): Linux only, via the [`pen::VirtualPen`] uinput tablet, so the
 /// probe is "can we open /dev/uinput" (the same permission the virtual gamepads need) plus the

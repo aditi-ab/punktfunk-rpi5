@@ -242,7 +242,19 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     var statsVerbosity by remember { mutableStateOf(initialSettings.statsVerbosity) }
     val statsOn = statsVerbosity != StatsVerbosity.OFF
     // Touch model is fixed per session (re-keys the gesture handler below if it ever changes).
-    val touchMode = initialSettings.touchMode
+    // Passthrough needs a host that injects touch; without the bit every contact would vanish, so
+    // the session runs the trackpad model instead and `touchHint` below says so, once.
+    val touchUnsupported = remember(handle) {
+        initialSettings.touchMode == TouchMode.TOUCH && !NativeBridge.nativeHostSupportsTouch(handle)
+    }
+    val touchMode = if (touchUnsupported) TouchMode.TRACKPAD else initialSettings.touchMode
+    var touchHint by remember { mutableStateOf(touchUnsupported) }
+    LaunchedEffect(touchHint) {
+        if (touchHint) {
+            delay(6000)
+            touchHint = false
+        }
+    }
     // "Low-latency mode" master toggle, resolved once for the session. On (the default) enables the
     // fast pipeline — decoder ranking + vendor keys + async loop (native side), HDMI ALLM below,
     // game-tagged audio, and DSCP marking (applied earlier, at connect); off falls back to the
@@ -1038,7 +1050,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         // and names the setting that fixes it, while the banner repeats shortcuts that will be
         // there next stream too. Two pills sharing an edge for six seconds would cost the reader
         // both.
-        if (bannerUp && !motionHint) {
+        if (bannerUp && !motionHint && !touchHint) {
             StreamStartBanner(
                 text = buildList {
                     if (padPresent) {
@@ -1135,8 +1147,27 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         // notice landing on top of one of those would cost the user both.
         if (motionHint) {
             MotionUnreachableHint(Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp))
+        } else if (touchHint) {
+            TouchFallbackHint(Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp))
         }
     }
+}
+
+/**
+ * "This host doesn't accept touch" — shown briefly when the Touch (passthrough) model meets a host
+ * whose injector drops contacts (no `HOST_CAP2_TOUCH`). The session runs the trackpad model
+ * instead; without this line the user would see their setting silently ignored.
+ */
+@Composable
+private fun TouchFallbackHint(modifier: Modifier = Modifier) {
+    Text(
+        "This host doesn't accept touch — using the trackpad model",
+        modifier = modifier
+            .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        color = Color.White,
+        fontSize = 15.sp,
+    )
 }
 
 /**

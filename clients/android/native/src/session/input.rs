@@ -12,8 +12,8 @@ use jni::sys::{jboolean, jint, jlong};
 use jni::EnvUnowned;
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::quic::{
-    PenSample, PenTool, RichInput, HID_REPORT_MAX, HOST_CAP_PEN, HOST_CAP_TEXT_INPUT,
-    PEN_ANGLE_UNKNOWN, PEN_BATCH_MAX, PEN_DISTANCE_UNKNOWN, PEN_TILT_UNKNOWN,
+    PenSample, PenTool, RichInput, HID_REPORT_MAX, HOST_CAP2_TOUCH, HOST_CAP_PEN,
+    HOST_CAP_TEXT_INPUT, PEN_ANGLE_UNKNOWN, PEN_BATCH_MAX, PEN_DISTANCE_UNKNOWN, PEN_TILT_UNKNOWN,
 };
 
 use super::SessionHandle;
@@ -181,6 +181,23 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostSupport
     // SAFETY: live handle per the nativeConnect/nativeClose contract; host_caps is &self.
     let h = unsafe { &*(handle as *const SessionHandle) };
     h.client.host_caps() & HOST_CAP_PEN != 0
+}
+
+/// `NativeBridge.nativeHostSupportsTouch(handle)` — the host advertised `HOST_CAP2_TOUCH`, so
+/// passthrough contacts land somewhere. Without it Kotlin runs the trackpad model instead and
+/// says so (design/touch-client-overlay.md §5.4). `0` handle → false.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHostSupportsTouch(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+) -> jboolean {
+    if handle == 0 {
+        return false;
+    }
+    // SAFETY: live handle per the nativeConnect/nativeClose contract; host_caps2 is &self.
+    let h = unsafe { &*(handle as *const SessionHandle) };
+    h.client.host_caps2() & HOST_CAP2_TOUCH != 0
 }
 
 /// Floats per sample in the `nativeSendPen` flat array.
