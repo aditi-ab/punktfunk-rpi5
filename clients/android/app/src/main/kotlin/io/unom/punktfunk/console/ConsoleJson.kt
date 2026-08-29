@@ -338,6 +338,7 @@ internal object ConsoleJson {
         j.put("ui_palette", s.uiPalette)
         j.put("auto_wake", s.autoWakeEnabled)
         j.put("invert_scroll", s.invertScroll)
+        j.put("overlay_actions", s.overlayActions)
         j.put("pad_haptics", s.padHaptics)
         j.put("pad_speaker", if (s.padSpeaker) "pad" else "off")
         // Android-only rows ride `Settings::extra`, which is `#[serde(flatten)]` — so they are
@@ -397,6 +398,7 @@ internal object ConsoleJson {
             uiPalette = str("ui_palette", s.uiPalette),
             autoWakeEnabled = j.optBoolean("auto_wake", s.autoWakeEnabled),
             invertScroll = j.optBoolean("invert_scroll", s.invertScroll),
+            overlayActions = str("overlay_actions", s.overlayActions),
             padHaptics = j.optBoolean("pad_haptics", s.padHaptics),
             padSpeaker = when (j.optString("pad_speaker", "")) {
                 "pad", "mix" -> true

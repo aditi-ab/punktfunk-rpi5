@@ -169,6 +169,10 @@ public enum DefaultsKey {
     /// the macOS wheel, the iOS trackpad pan, and a GCMouse wheel. For users whose host expects the
     /// opposite convention from their local OS preference.
     public static let invertScroll = "punktfunk.invertScroll"
+    /// The in-stream quick-action ring: one JSON blob parsed by `OverlayConfig.parse` (six slots,
+    /// shortcuts, the virtual pad's preset). Empty = the platform default ring. Cross-client
+    /// `overlay_actions`, profileable as the whole blob.
+    public static let overlayActions = "punktfunk.overlayActions"
     /// Location-based modifier mapping (a `ModifierLayout` value, default `.mac`): which Windows VK
     /// each PHYSICAL modifier position forwards to the host. `.mac` keeps ⌥ Option → Alt and
     /// ⌘ Command → Super/Win (the Apple positions). `.windows` swaps the Alt/Super ROLE between the

@@ -49,6 +49,9 @@ data class SettingsOverlay(
     val touchMode: TouchMode? = null,
     val mouseMode: MouseMode? = null,
     val invertScroll: Boolean? = null,
+    /** The whole ring blob (design/touch-client-overlay.md D10): a profile inherits the default
+     *  ring entirely or owns its own ring and shortcuts. */
+    val overlayActions: String? = null,
     val gamepad: Int? = null,
     val gamepadForwarding: Boolean? = null,
     val systemButtons: String? = null,
@@ -87,6 +90,7 @@ data class SettingsOverlay(
         touchMode = touchMode ?: base.touchMode,
         mouseMode = mouseMode ?: base.mouseMode,
         invertScroll = invertScroll ?: base.invertScroll,
+        overlayActions = overlayActions ?: base.overlayActions,
         gamepad = gamepad ?: base.gamepad,
         gamepadForwarding = gamepadForwarding ?: base.gamepadForwarding,
         systemButtons = systemButtons ?: base.systemButtons,
@@ -127,6 +131,8 @@ data class SettingsOverlay(
         touchMode = if (after.touchMode != before.touchMode) after.touchMode else touchMode,
         mouseMode = if (after.mouseMode != before.mouseMode) after.mouseMode else mouseMode,
         invertScroll = if (after.invertScroll != before.invertScroll) after.invertScroll else invertScroll,
+        overlayActions =
+            if (after.overlayActions != before.overlayActions) after.overlayActions else overlayActions,
         gamepad = if (after.gamepad != before.gamepad) after.gamepad else gamepad,
         gamepadForwarding =
             if (after.gamepadForwarding != before.gamepadForwarding) after.gamepadForwarding
@@ -160,6 +166,7 @@ data class SettingsOverlay(
         "touch_mode" -> copy(touchMode = null)
         "mouse_mode" -> copy(mouseMode = null)
         "invert_scroll" -> copy(invertScroll = null)
+        "overlay_actions" -> copy(overlayActions = null)
         "gamepad" -> copy(gamepad = null)
         "gamepad_forwarding" -> copy(gamepadForwarding = null)
         "system_buttons" -> copy(systemButtons = null)
@@ -188,6 +195,7 @@ data class SettingsOverlay(
         if (touchMode != null) add("touch_mode")
         if (mouseMode != null) add("mouse_mode")
         if (invertScroll != null) add("invert_scroll")
+        if (overlayActions != null) add("overlay_actions")
         if (gamepad != null) add("gamepad")
         if (gamepadForwarding != null) add("gamepad_forwarding")
         if (systemButtons != null) add("system_buttons")
@@ -224,6 +232,7 @@ data class SettingsOverlay(
         touchMode?.let { j.put("touch_mode", it.name) }
         mouseMode?.let { j.put("mouse_mode", it.storedName) }
         invertScroll?.let { j.put("invert_scroll", it) }
+        overlayActions?.let { j.put("overlay_actions", it) }
         gamepad?.let { j.put("gamepad", it) }
         gamepadForwarding?.let { j.put("gamepad_forwarding", it) }
         systemButtons?.let { j.put("system_buttons", it) }
@@ -244,7 +253,7 @@ data class SettingsOverlay(
             "width", "height", "refresh_hz", "bitrate_kbps", "render_scale", "codec",
             "hdr_enabled", "compositor", "audio_channels", "audio_format", "mic_enabled", "echo_cancel",
             "keep_host_audio",
-            "touch_mode", "mouse_mode", "invert_scroll", "gamepad", "gamepad_forwarding",
+            "touch_mode", "mouse_mode", "invert_scroll", "overlay_actions", "gamepad", "gamepad_forwarding",
             "system_buttons", "guide_gesture",
             "stats_verbosity",
             "low_latency_mode", "present_priority", "smooth_buffer",
@@ -269,6 +278,7 @@ data class SettingsOverlay(
             mouseMode = j.optStringOrNull("mouse_mode")
                 ?.let { n -> MouseMode.entries.firstOrNull { it.storedName == n } },
             invertScroll = j.optBooleanOrNull("invert_scroll"),
+            overlayActions = j.optStringOrNull("overlay_actions"),
             gamepad = j.optIntOrNull("gamepad"),
             gamepadForwarding = j.optBooleanOrNull("gamepad_forwarding"),
             systemButtons = j.optStringOrNull("system_buttons"),

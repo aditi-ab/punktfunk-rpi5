@@ -275,6 +275,11 @@ data class Settings(
      * the Apple/GTK clients' "Invert scroll direction".
      */
     val invertScroll: Boolean = false,
+    /**
+     * The in-stream quick-action ring, one JSON blob parsed by [OverlayConfig.parse] (six slots,
+     * shortcuts, the virtual pad's preset). Empty = the platform default ring.
+     */
+    val overlayActions: String = "",
     // NOTE: clipboard sync is NOT here. It is a decision about a HOST, not about this device or
     // this stream (design/client-settings-profiles.md §3, tier H), so it lives on the host record
     // — see `KnownHost.clipboardSync`. It used to be a global here; `KnownHostStore.migrate`
@@ -379,6 +384,7 @@ class SettingsStore(context: Context) {
             // lands where it already was.
             ?: if (prefs.getBoolean(K_POINTER_CAPTURE, false)) MouseMode.CAPTURE else MouseMode.DESKTOP,
         invertScroll = prefs.getBoolean(K_INVERT_SCROLL, false),
+        overlayActions = prefs.getString(K_OVERLAY_ACTIONS, "") ?: "",
     )
 
     fun save(s: Settings) {
@@ -419,6 +425,7 @@ class SettingsStore(context: Context) {
             .putBoolean(K_PAD_SPEAKER, s.padSpeaker)
             .putString(K_MOUSE_MODE, s.mouseMode.storedName)
             .putBoolean(K_INVERT_SCROLL, s.invertScroll)
+            .putString(K_OVERLAY_ACTIONS, s.overlayActions)
             .apply()
     }
 
@@ -477,6 +484,7 @@ class SettingsStore(context: Context) {
         /** Legacy Boolean the [K_MOUSE_MODE] enum replaced — read once for migration, never written. */
         const val K_POINTER_CAPTURE = "pointer_capture"
         const val K_INVERT_SCROLL = "invert_scroll"
+        const val K_OVERLAY_ACTIONS = "overlay_actions"
 
         /** Legacy Boolean the enum replaced — read once as the migration default, never written. */
         const val K_TRACKPAD = "trackpad_mode"

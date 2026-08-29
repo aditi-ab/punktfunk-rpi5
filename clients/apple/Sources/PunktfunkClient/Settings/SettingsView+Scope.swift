@@ -122,6 +122,10 @@ enum SettingsFields {
         .init(name: "invert_scroll", key: DefaultsKey.invertScroll,
               overlay: \.invertScroll, effective: \.invertScroll)
     }
+    static var overlayActions: SettingsField<String> {
+        .init(name: "overlay_actions", key: DefaultsKey.overlayActions,
+              overlay: \.overlayActions, effective: \.overlayActions)
+    }
     static var inhibitShortcuts: SettingsField<Bool> {
         .init(name: "inhibit_shortcuts", key: DefaultsKey.inhibitShortcuts,
               overlay: \.inhibitShortcuts, effective: \.inhibitShortcuts)
@@ -212,6 +216,7 @@ extension SettingsView {
         base.fullscreenWhileStreaming = fullscreenWhileStreaming
         base.presentPriority = presentPriority
         base.smoothBuffer = smoothBuffer
+        base.overlayActions = overlayActions
         #if !os(tvOS)
         base.invertScroll = invertScroll
         base.modifierLayout = modifierLayout
