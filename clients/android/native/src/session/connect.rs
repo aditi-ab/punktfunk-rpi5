@@ -538,6 +538,40 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDisconnectQ
     })
 }
 
+/// `NativeBridge.nativeRequestMode(handle, w, h, hz): Boolean` — ask the host to switch the live
+/// session to `w`×`h`@`hz` without reconnecting (the in-stream Resolution row). Non-blocking
+/// enqueue, like `punktfunk_connection_request_mode`: on acceptance the stream continues at the new
+/// mode from an IDR with in-band parameter sets; a rejection leaves the session unchanged. `false`
+/// on a `0` handle, a closed session, or a non-positive dimension.
+///
+/// # Safety contract
+/// `handle` must be `0` or a live handle from [`Java_io_unom_punktfunk_kit_NativeBridge_nativeConnect`],
+/// not freed / closed concurrently with this call.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeRequestMode(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    width: jint,
+    height: jint,
+    refresh_hz: jint,
+) -> jboolean {
+    jni_guard(false, || {
+        if handle == 0 || width <= 0 || height <= 0 || refresh_hz <= 0 {
+            return false;
+        }
+        // SAFETY: per the contract, `handle` is a live `Box<SessionHandle>` — borrowed only.
+        let sh = unsafe { &*(handle as *const SessionHandle) };
+        sh.client
+            .request_mode(Mode {
+                width: width as u32,
+                height: height as u32,
+                refresh_hz: refresh_hz as u32,
+            })
+            .is_ok()
+    })
+}
+
 /// `NativeBridge.nativeHostFingerprint(handle): String` — the SHA-256 (64-hex) of the cert the host
 /// presented on this connection. Valid after a successful `nativeConnect`; Kotlin pins it on a TOFU
 /// connect. `""` on a `0` handle.

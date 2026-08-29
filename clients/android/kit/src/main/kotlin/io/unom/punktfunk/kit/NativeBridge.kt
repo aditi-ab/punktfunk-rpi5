@@ -177,6 +177,14 @@ object NativeBridge {
      */
     external fun nativeDisconnectQuit(handle: Long)
 
+    /**
+     * Ask the host to switch the live session to [width]×[height] at [refreshHz] with no reconnect.
+     * Non-blocking: on acceptance the stream continues at the new mode from a keyframe that carries
+     * its own parameter sets; a rejection leaves the session unchanged. `false` when the request
+     * could not be queued (a `0` handle, a closed session, or a non-positive dimension).
+     */
+    external fun nativeRequestMode(handle: Long, width: Int, height: Int, refreshHz: Int): Boolean
+
     /** Tear down a session handle returned by [nativeConnect]. No-op on `0`. */
     external fun nativeClose(handle: Long)
 
