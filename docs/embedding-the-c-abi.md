@@ -480,6 +480,12 @@ punktfunk_connection_send_input(c, &ev);
 - `punktfunk_connection_send_rich_input(c, &rich)` — DualSense touchpad contact / motion sample.
 - `punktfunk_connection_send_rich_input2(c, &richEx)` — the forward-compatible superset (Steam
   trackpads, signed coords, pressure); set `struct_size = sizeof(PunktfunkRichInputEx)`.
+- `punktfunk_connection_send_hid_report(c, pad, data, len)` *(v27+)* — one raw HID input report
+  from a controller **you** captured, forwarded verbatim for the host's as-is virtual pad. Only
+  meaningful for a pad that declared `PUNKTFUNK_GAMEPAD_STEAMCONTROLLER2`; the host drops it
+  otherwise. `data` is the report id-first exactly as the device produced it, `len` is clamped to
+  `PUNKTFUNK_HID_REPORT_MAX`. Lossy by design — state reports are idempotent snapshots, so a lost
+  datagram self-heals on the next one. The return leg is `PUNKTFUNK_HIDOUT_HID_RAW` (§9).
 
 ### Stylus / pen
 
@@ -551,9 +557,18 @@ Pull these on your feedback thread (or poll with `timeout_ms = 0`). Same
   Nothing sources non-zero trigger levels end to end yet: only the Windows HID Xbox pad has the
   channel at all (XInput's `XINPUT_VIBRATION` and evdev's `FF_RUMBLE` each have exactly two
   members), and it is reachable only through GameInput/WGI.
-- **DualSense HID output** — `punktfunk_connection_next_hidout(c, &out, timeout)`. `out.kind` selects
-  lightbar RGB / player LEDs / adaptive-trigger effect / trackpad haptic. Replay on a real DualSense
-  via the platform's controller API. Only a DualSense-backend session emits these.
+- **HID output** — `punktfunk_connection_next_hidout(c, &out, timeout)`. `out.kind` selects
+  lightbar RGB / player LEDs / adaptive-trigger effect / trackpad haptic — replay on a real
+  DualSense via the platform's controller API. Only a DualSense-backend session emits those four.
+  *(v27+)* `PUNKTFUNK_HIDOUT_HID_RAW` is the fifth kind, emitted only by an as-is Steam Controller 2
+  passthrough session: `out.raw[..out.raw_len]` is a report the host's hidraw consumer (Steam) wrote,
+  to replay verbatim on the physical pad — as an OUTPUT report or a `SET_REPORT` per `out.hid_kind`
+  (`PUNKTFUNK_HID_RAW_OUTPUT` / `PUNKTFUNK_HID_RAW_FEATURE`). It is the return leg of
+  `punktfunk_connection_send_hid_report` (§8). A client with no such capture ignores it.
+  ⚠ **v27 widened `PunktfunkHidOutput` 19 → 85 bytes** to carry that report. The pre-v27 prefix is
+  byte-identical, so no field moved — but a binary built against a v26 header passes a 19-byte
+  out-slot the core would overrun. The startup `punktfunk_abi_version()` equality check below is
+  what makes that safe; do not skip it.
 - **HDR metadata** — `punktfunk_connection_next_hdr_meta(c, &meta, timeout)`. ST.2086 mastering
   display + content light level, in HDR10 SEI fixed-point units — ready to hand to DXGI
   `DXGI_HDR_METADATA_HDR10`, Apple `CAEDRMetadata`, or Android `KEY_HDR_STATIC_INFO`. Only an HDR
