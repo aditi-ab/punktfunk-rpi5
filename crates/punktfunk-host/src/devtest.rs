@@ -599,8 +599,8 @@ pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-        let triton = args.iter().any(|a| a == "--triton");
-        let extra_buttons: u32 = if edge || deck || triton {
+    let triton = args.iter().any(|a| a == "--triton");
+    let extra_buttons: u32 = if edge || deck || triton {
         punktfunk_core::input::gamepad::BTN_PADDLE1 | punktfunk_core::input::gamepad::BTN_PADDLE2
     } else {
         0
