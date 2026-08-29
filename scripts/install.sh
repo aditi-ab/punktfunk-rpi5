@@ -709,7 +709,15 @@ fi
 # `systemctl --user` probe below, or SSH/headless installs print the enable command and stop.
 if [ "$LINGER" = 1 ]; then
     say "Starting at boot with nobody logged in"
-    run 'sudo loginctl enable-linger "$USER"'
+    # A container (installer-smoke, a chroot, docker) has no logind: enable-linger there fails
+    # with "System has not been booted with systemd as init system", and linger would mean
+    # nothing anyway. Say so and carry on — the rest of the install worked. --dry-run still
+    # prints the command, because it reports what a real box would do.
+    if [ "$DRY" = 1 ] || [ -d /run/systemd/system ]; then
+        run 'sudo loginctl enable-linger "$USER"'
+    else
+        warn "no systemd as PID 1 here (a container?) — skipping linger, nothing would honour it"
+    fi
 fi
 if [ "$START" = 1 ]; then
     say "Starting the host and the web console"
