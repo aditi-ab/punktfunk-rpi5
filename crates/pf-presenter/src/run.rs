@@ -1792,6 +1792,11 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         if let Some(st) = stream.as_mut() {
             st.resize_overlay.tick(Instant::now());
         }
+        // Touch long-press arm: a still finger raises no SDL event, so the gesture engine
+        // needs the clock — SDL ticks, the millisecond base the finger timestamps use.
+        if let Some(cap) = stream.as_mut().and_then(|st| st.capture.as_mut()) {
+            cap.tick(sdl3::timer::ticks() as f64);
+        }
 
         // Access toast expiry — before the overlay borrows the stream immutably.
         if let Some(st) = stream.as_mut() {

@@ -31,6 +31,9 @@ use std::collections::HashMap;
 const TAP_SLOP: f32 = 12.0;
 /// A new touch this soon (ms) after a tap, near it, starts a held left-button drag.
 const TAP_DRAG_MS: f64 = 250.0;
+/// One finger held still this long (ms) presses the left button and drags until it lifts —
+/// the touch idiom for "pick this up" (windows, text, files).
+const LONG_PRESS_MS: f64 = 500.0;
 /// Two-finger pan distance (px) per 120-unit wheel notch (smaller = faster scroll).
 const SCROLL_DIV: f32 = 4.0;
 /// Base finger-px → host-px gain (~1:1, never twitchy).
@@ -86,6 +89,8 @@ pub struct Gestures {
     /// A gesture is in flight (≥ 1 finger down since the first touch).
     active: bool,
     start: (f32, f32),
+    /// When the first finger landed (ms) — the long-press clock.
+    down_t: f64,
     max_fingers: usize,
     moved: bool,
     scrolling: bool,
@@ -115,6 +120,7 @@ impl Gestures {
             positions: HashMap::new(),
             active: false,
             start: (0.0, 0.0),
+            down_t: 0.0,
             max_fingers: 0,
             moved: false,
             scrolling: false,
@@ -140,6 +146,7 @@ impl Gestures {
         if first {
             self.active = true;
             self.start = (wx, wy);
+            self.down_t = t;
             self.max_fingers = 0;
             self.moved = false;
             self.scrolling = false;
@@ -235,6 +242,28 @@ impl Gestures {
                     self.last_tap_pt = self.start;
                 }
             }
+        }
+        acts
+    }
+
+    /// Time passes with fingers down. A still finger produces no event, so the long-press
+    /// arm needs the clock: one finger, never a second, under the tap slop, held for
+    /// `LONG_PRESS_MS` → the left button goes down and the lift releases it exactly like a
+    /// tap-then-drag. Call once per run-loop iteration; `t` is the finger events' clock.
+    pub fn tick(&mut self, t: f64) -> Vec<Act> {
+        let mut acts = Vec::new();
+        if self.active
+            && self.positions.len() == 1
+            && self.max_fingers == 1
+            && !self.moved
+            && !self.drag_held
+            && t - self.down_t >= LONG_PRESS_MS
+        {
+            self.drag_held = true;
+            acts.push(Act::Button {
+                gs: BTN_LEFT,
+                down: true,
+            });
         }
         acts
     }
@@ -569,6 +598,43 @@ mod tests {
                 down: false
             }]
         );
+    }
+
+    #[test]
+    fn long_press_arms_a_drag() {
+        let mut g = Gestures::new(true, false);
+        assert!(g.down(1, 50.0, 50.0, ABS, 0.0).is_empty());
+        assert!(g.tick(400.0).is_empty(), "under the hold time: nothing");
+        assert_eq!(
+            g.tick(520.0),
+            vec![Act::Button {
+                gs: BTN_LEFT,
+                down: true
+            }]
+        );
+        assert!(g.tick(600.0).is_empty(), "arms once");
+        let _ = g.motion(1, 90.0, 50.0, ABS, 620.0); // drags with the button held
+        assert_eq!(
+            g.up(1, 700.0),
+            vec![Act::Button {
+                gs: BTN_LEFT,
+                down: false
+            }]
+        );
+    }
+
+    #[test]
+    fn long_press_after_motion_or_a_second_finger_does_not_arm() {
+        let mut g = Gestures::new(true, false);
+        let _ = g.down(1, 50.0, 50.0, ABS, 0.0);
+        let _ = g.motion(1, 90.0, 50.0, ABS, 100.0); // past the slop: a swipe, not a press
+        assert!(g.tick(600.0).is_empty());
+        assert!(g.up(1, 700.0).is_empty()); // and a swipe is not a click either
+
+        let _ = g.down(2, 50.0, 50.0, ABS, 1000.0);
+        let _ = g.down(3, 80.0, 50.0, ABS, 1010.0);
+        let _ = g.up(3, 1020.0); // a second finger came and went: no press
+        assert!(g.tick(1600.0).is_empty());
     }
 
     #[test]

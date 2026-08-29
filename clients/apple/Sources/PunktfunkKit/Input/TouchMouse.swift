@@ -1,8 +1,8 @@
 // Finger touches → host mouse, for the touchscreen devices: a port of the Android client's
 // touch gesture model (clients/android .../TouchInput.kt) so the two touch clients feel
 // identical. Two mouse modes share one gesture vocabulary — tap = left click · two-finger
-// tap = right click · two-finger drag = scroll · tap-then-press-and-drag = held left drag
-// (text selection / window moves) · three-finger tap = cycles the stats overlay tiers
+// tap = right click · two-finger drag = scroll · tap-then-press-and-drag OR press-and-hold =
+// held left drag (text selection / window moves) · three-finger tap = cycles the stats overlay tiers
 // (off → compact → normal → detailed, matching Android) · three-finger swipe up/down =
 // summon/dismiss the local soft keyboard for typing on the host (`onKeyboardGesture`):
 //
@@ -52,6 +52,9 @@ final class TouchMouse {
         static let tapSlop: CGFloat = 8
         /// A new touch this soon (s) after a tap, near it, starts a held left-button drag.
         static let tapDragWindow: TimeInterval = 0.25
+        /// One finger held still this long (s) presses the left button and drags until it
+        /// lifts — the touch idiom for "pick this up".
+        static let longPress: TimeInterval = 0.5
         /// Two-finger pan distance (pt) per 120-unit wheel notch — matches the feel of the
         /// indirect-trackpad scroll path in StreamViewIOS (~10 pt per notch).
         static let scrollNotchPt: CGFloat = 10
@@ -111,6 +114,9 @@ final class TouchMouse {
     // Tap-drag arming: a quick tap leaves a window in which the next nearby touch drags.
     private var lastTapUp: TimeInterval = 0
     private var lastTapPoint = CGPoint.zero
+    /// The pending long-press arm — a still finger raises no touch event, so the hold is a
+    /// main-queue timer, cancelled by motion past the slop, a second finger, or any lift.
+    private var longPress: DispatchWorkItem?
 
     /// GameStream mouse button ids.
     private enum Button { static let left: UInt32 = 1; static let right: UInt32 = 3 }
@@ -146,8 +152,31 @@ final class TouchMouse {
             prevTime = first.timestamp
             carryX = 0
             carryY = 0
+            if !dragHeld { scheduleLongPress() }
         }
         maxFingers = max(maxFingers, lastPos.count)
+        if lastPos.count > 1 { cancelLongPress() }
+    }
+
+    private func scheduleLongPress() {
+        cancelLongPress()
+        let item = DispatchWorkItem { [weak self] in self?.longPressFired() }
+        longPress = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Tuning.longPress, execute: item)
+    }
+
+    private func cancelLongPress() {
+        longPress?.cancel()
+        longPress = nil
+    }
+
+    /// The hold elapsed: one finger, never a second, still under the slop → press and hold
+    /// the left button; `ended` releases it exactly like a tap-then-drag.
+    private func longPressFired() {
+        longPress = nil
+        guard sessionActive, lastPos.count == 1, maxFingers == 1, !moved, !dragHeld else { return }
+        dragHeld = true
+        send?(.mouseButton(Button.left, down: true))
     }
 
     func moved(_ touches: Set<UITouch>, in view: UIView) {
@@ -167,10 +196,12 @@ final class TouchMouse {
         }) {
             singleFinger(touch, in: view)
         }
+        if moved { cancelLongPress() }
     }
 
     func ended(_ touches: Set<UITouch>, in view: UIView) {
         guard sessionActive || !lastPos.isEmpty else { return }
+        cancelLongPress()
         var upTime: TimeInterval = 0
         for touch in touches {
             lastPos.removeValue(forKey: ObjectIdentifier(touch))
@@ -201,6 +232,7 @@ final class TouchMouse {
     /// System-cancelled touches (incoming call, gesture takeover): release anything held but
     /// never synthesize a click out of a cancellation.
     func cancelled(_ touches: Set<UITouch>) {
+        cancelLongPress()
         for touch in touches {
             lastPos.removeValue(forKey: ObjectIdentifier(touch))
             if trackKey == ObjectIdentifier(touch) { trackKey = nil }
@@ -217,6 +249,7 @@ final class TouchMouse {
     }
 
     private func abortSession() {
+        cancelLongPress()
         if dragHeld {
             dragHeld = false
             send?(.mouseButton(Button.left, down: false))

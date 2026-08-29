@@ -611,6 +611,17 @@ impl Capture {
         }
     }
 
+    /// Time passes: the gesture engine's long-press arm. Once per run-loop iteration; `t_ms`
+    /// is the finger clock (SDL ticks). Passthrough fingers have no timer.
+    pub fn tick(&mut self, t_ms: f64) {
+        if !self.captured || self.touch_mode == TouchMode::Touch {
+            return;
+        }
+        for act in self.gestures.tick(t_ms) {
+            self.apply_touch_act(act);
+        }
+    }
+
     /// Send one gesture [`Act`] on the wire, tracking button holds in `held_buttons` so a
     /// capture release flushes them (a tap-drag's left button never sticks down). Returns
     /// true for [`Act::CycleStats`], which is a run-loop signal, not a wire event.
