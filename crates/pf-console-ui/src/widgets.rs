@@ -158,6 +158,10 @@ pub(crate) struct MenuList {
     /// tests against. One entry per row, `Rect::new_empty()` for rows scrolled out of view,
     /// so an index into this is an index into `rows`.
     geom: Vec<Rect>,
+    /// Nothing left on the move after the last render — no entrance, every focus ease and
+    /// spring at its target, the scroll where it wants to be. `false` until the first
+    /// render, so a fresh list always asks for a frame.
+    settled: bool,
 }
 
 impl MenuList {
@@ -178,7 +182,15 @@ impl MenuList {
             age: 0.0,
             snap: true,
             geom: Vec::new(),
+            settled: false,
         }
+    }
+
+    /// Is anything still on the move — an entrance, a focus ease, a spring, the scroll?
+    /// The damage-gated stream overlay asks every frame and keeps redrawing until this is
+    /// false; the console draws every frame regardless and never needs to ask.
+    pub(crate) fn animating(&self) -> bool {
+        !self.settled
     }
 
     /// Move the cursor WITHOUT the scroll gliding there. For a tab switch, where the whole
@@ -310,6 +322,11 @@ impl MenuList {
             } else {
                 approach(*f, target, dt, 0.06)
             };
+            // An approach never arrives on its own; land it once it is imperceptible, so
+            // the list can report itself settled.
+            if (*f - target).abs() < 0.002 {
+                *f = target;
+            }
         }
         for (i, s) in self.focus_pop.iter_mut().enumerate() {
             let target = if active && i == self.cursor { 1.0 } else { 0.0 };
@@ -404,6 +421,30 @@ impl MenuList {
         } else {
             approach(self.scroll, target, dt, 0.08)
         };
+        if (self.scroll - target).abs() < 0.25 {
+            self.scroll = target;
+        }
+        // Settled once nothing above has anywhere left to go — read back by `animating`.
+        // The springs land exactly (`settle`), the eases are landed above.
+        let cursor = if active { Some(self.cursor) } else { None };
+        let focus_target = |i: usize| if Some(i) == cursor { 1.0 } else { 0.0 };
+        self.settled = self.entrance.is_none()
+            && self
+                .focus
+                .iter()
+                .enumerate()
+                .all(|(i, f)| *f == focus_target(i))
+            && self
+                .focus_pop
+                .iter()
+                .enumerate()
+                .all(|(i, s)| s.vel == 0.0 && s.pos == focus_target(i))
+            && self.bump.pos == 0.0
+            && self.bump.vel == 0.0
+            && self.press.pos == 1.0
+            && self.press.vel == 0.0
+            && self.slip.pos == 0.0
+            && self.scroll == target;
 
         let row_w = (ROW_MAX_W * k).min(f64::from(rect.width()) - 48.0 * k);
         let x0 = f64::from(rect.left) + (f64::from(rect.width()) - row_w) / 2.0;

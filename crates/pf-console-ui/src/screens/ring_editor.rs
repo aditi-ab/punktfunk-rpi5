@@ -65,6 +65,12 @@ pub(crate) struct RingEditorScreen {
     stage: Rect,
     list_rect: Rect,
     reset_armed: bool,
+    /// The stick's sector as last reported, whichever widget has the focus — so a handoff
+    /// back to the ring knows whether the stick is still held.
+    stick: Option<u8>,
+    /// The list was just entered by the stick's sector; the four-way move that rides behind
+    /// it in the same sample must not also step the list.
+    swallow_move: bool,
 }
 
 impl RingEditorScreen {
@@ -80,6 +86,8 @@ impl RingEditorScreen {
             stage: Rect::new_empty(),
             list_rect: Rect::new_empty(),
             reset_armed: false,
+            stick: None,
+            swallow_move: false,
         };
         s.ring.edit_at(0.0, 0.0);
         s.adopt(&ctx.settings.overlay_actions, ctx.platform);
@@ -275,6 +283,9 @@ impl RingEditorScreen {
         ctx: &mut Ctx,
         fx: &mut Outbox,
     ) -> Option<MenuPulse> {
+        if let MenuEvent::Sector(s) = ev {
+            self.stick = s;
+        }
         if let Some(p) = self.picker.as_mut() {
             if ev == MenuEvent::Back {
                 self.picker = None;
@@ -295,13 +306,21 @@ impl RingEditorScreen {
         }
         match self.focus {
             Focus::Ring => {
-                // Down past 6 o'clock walks into the list; anywhere else the ring keeps it.
-                if ev == MenuEvent::Move(MenuDir::Down)
-                    && self.ring.highlight() == Some(3)
-                    && !self.ring.carrying()
-                {
+                // Down past 6 o'clock walks into the list: the D-pad's Down there, or the
+                // stick pushed down AGAIN once its first push has put the highlight there.
+                // Never the stick's own four-way move: it rides behind the sector that
+                // landed on 6, and the ring ignores it while the stick is engaged.
+                let at_six = self.ring.highlight() == Some(3) && !self.ring.carrying();
+                let walks = at_six
+                    && !self.ring.stick_engaged()
+                    && matches!(
+                        ev,
+                        MenuEvent::Move(MenuDir::Down) | MenuEvent::Sector(Some(3))
+                    );
+                if walks {
                     self.focus = Focus::List;
                     self.list.jump_to(0);
+                    self.swallow_move = matches!(ev, MenuEvent::Sector(_));
                     return Some(MenuPulse::Move);
                 }
                 let pulse = self.ring.menu(ev);
@@ -312,13 +331,19 @@ impl RingEditorScreen {
                 pulse
             }
             Focus::List => {
+                if std::mem::take(&mut self.swallow_move) && matches!(ev, MenuEvent::Move(_)) {
+                    return None;
+                }
                 if ev == MenuEvent::Back {
                     fx.pop();
                     return None;
                 }
                 if ev == MenuEvent::Move(MenuDir::Up) && self.list.cursor == 0 {
+                    // Back onto the ring at 6 o'clock. A stick still held stays the
+                    // ring's until it lets go, so its repeats step nothing.
                     self.focus = Focus::Ring;
                     self.ring.set_highlight(3);
+                    self.ring.adopt_stick(self.stick.is_some());
                     return Some(MenuPulse::Move);
                 }
                 let (msg, pulse) = self.list.menu(ev, self.row_count());
@@ -531,6 +556,8 @@ mod tests {
             stage: Rect::new_empty(),
             list_rect: Rect::new_empty(),
             reset_armed: false,
+            stick: None,
+            swallow_move: false,
         };
         s.open_picker(0);
         let p = s.picker.as_ref().expect("the picker");

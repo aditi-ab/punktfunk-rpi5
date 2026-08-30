@@ -1209,6 +1209,12 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     if is_direct_touch(touch_id) {
                         // A real finger reached SDL: the touchscreen is ours, not Steam's.
                         if let Some(st) = stream.as_mut() {
+                            if !st.touch_mouse.fingers_seen {
+                                tracing::info!(
+                                    touch_id,
+                                    "first touchscreen finger: direct touch reaches the client"
+                                );
+                            }
                             st.touch_mouse.fingers_seen = true;
                         }
                         if ring_finger(&mut overlay, &window, FingerPhase::Down, x, y) {
@@ -1229,6 +1235,18 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                 &mut stream,
                                 &presenter,
                                 &mut overlay,
+                            );
+                        }
+                    } else if let Some(st) = stream.as_mut() {
+                        // A finger from a device SDL does not call a touchscreen: ignored,
+                        // and said once — on a Deck this is the difference between "no
+                        // touch arrived" and "touch arrived and was thrown away".
+                        if !st.touch_mouse.indirect_seen {
+                            st.touch_mouse.indirect_seen = true;
+                            tracing::info!(
+                                touch_id,
+                                "finger from a non-direct touch device — ignored (a trackpad \
+                                 drives the mouse)"
                             );
                         }
                     }
@@ -1608,6 +1626,14 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     // here, and this is the last moment before frames start arriving.
                     st.source_interval_ns = frame_interval_ns(m.refresh_hz, native.refresh_hz);
                     tracing::info!(mode = %st.mode_line, "connected");
+                    // Which touch devices SDL sees, and of what kind. Under gamescope this
+                    // is the tell for whether Steam Input hands the touchscreen through as
+                    // touch (design §5.5): no DIRECT device here, no twist can ever arrive.
+                    tracing::info!(
+                        devices = ?touch_devices(),
+                        gamescope = pf_client_core::overlay_focus::gamescope_session(),
+                        "touch devices"
+                    );
                     window
                         .set_title(&format!("{} · {}", opts.window_title, st.mode_line))
                         .ok();
@@ -3002,6 +3028,52 @@ fn overlay_pointer(event: &Event, window: &sdl3::video::Window) -> Option<Pointe
         } => PointerInput::Cancel,
         _ => return None,
     })
+}
+
+/// Every touch device SDL sees, as `(id, kind, name)` — logged at connect: under gamescope
+/// this is the tell for whether Steam Input hands the touchscreen through as touch (§5.5).
+fn touch_devices() -> Vec<(u64, &'static str, String)> {
+    use sdl3::sys::stdinc::SDL_free;
+    use sdl3::sys::touch::{
+        SDL_GetTouchDeviceName, SDL_GetTouchDeviceType, SDL_GetTouchDevices, SDL_TouchDeviceType,
+    };
+    let kind = |t: SDL_TouchDeviceType| {
+        if t == SDL_TouchDeviceType::DIRECT {
+            "direct"
+        } else if t == SDL_TouchDeviceType::INDIRECT_ABSOLUTE {
+            "indirect-absolute"
+        } else if t == SDL_TouchDeviceType::INDIRECT_RELATIVE {
+            "indirect-relative"
+        } else {
+            "invalid"
+        }
+    };
+    let mut n: std::ffi::c_int = 0;
+    // SAFETY: SDL hands back an array it owns (freed here once read, and never touched
+    // after) and names it owns (copied out before the free, never kept); a null array or
+    // name is checked before use.
+    unsafe {
+        let ids = SDL_GetTouchDevices(&mut n);
+        if ids.is_null() {
+            return Vec::new();
+        }
+        let out = std::slice::from_raw_parts(ids, usize::try_from(n).unwrap_or(0))
+            .iter()
+            .map(|id| {
+                let name = SDL_GetTouchDeviceName(*id);
+                let name = if name.is_null() {
+                    String::new()
+                } else {
+                    std::ffi::CStr::from_ptr(name)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                (id.0, kind(SDL_GetTouchDeviceType(*id)), name)
+            })
+            .collect();
+        SDL_free(ids.cast());
+        out
+    }
 }
 
 /// Is this SDL touch device a real touchscreen (DIRECT, window-relative coordinates)?

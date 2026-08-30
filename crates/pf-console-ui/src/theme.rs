@@ -74,6 +74,61 @@ pub(crate) fn shaded_stroke(width: f32) -> Paint {
     p
 }
 
+/// The in-stream ring's scrim: a pool of shade around the ring's centre, thinning to a light
+/// veil by `r` and flat beyond it — the discs sit in the shade, the stream past them stays
+/// legible. `alpha` scales the whole thing with the ring's opening.
+pub(crate) fn ring_scrim(cx: f32, cy: f32, r: f32, alpha: f32) -> Paint {
+    let mut p = shaded();
+    let colors = [
+        Color4f::new(0.0, 0.0, 0.0, 0.36 * alpha),
+        Color4f::new(0.0, 0.0, 0.0, 0.14 * alpha),
+    ];
+    p.set_shader(gradient::shaders::radial_gradient(
+        (Point::new(cx, cy), r),
+        &gradient::Gradient::new(
+            gradient::Colors::new_evenly_spaced(&colors, TileMode::Clamp, None),
+            gradient::Interpolation::default(),
+        ),
+        None,
+    ));
+    p
+}
+
+/// A soft drop shadow under a disc or a card: black at `alpha`, blurred by `sigma` — what
+/// lifts a translucent shape off a moving picture.
+pub(crate) fn soft_shadow(alpha: f32, sigma: f32) -> Paint {
+    let mut p = fill(Color4f::new(0.0, 0.0, 0.0, alpha));
+    p.set_mask_filter(MaskFilter::blur(skia_safe::BlurStyle::Normal, sigma, None));
+    p
+}
+
+/// The ring's highlight halo: a white stroke `width` wide at `alpha`, blurred by `sigma` so
+/// the light bleeds past the disc's edge. Drawn under the crisp ring.
+pub(crate) fn glow_ring(alpha: f32, width: f32, sigma: f32) -> Paint {
+    let mut p = stroke(Color4f::new(1.0, 1.0, 1.0, alpha), width);
+    p.set_mask_filter(MaskFilter::blur(skia_safe::BlurStyle::Normal, sigma, None));
+    p
+}
+
+/// The light catching a disc's top edge — glass's one cheap tell over a stream the console
+/// cannot blur: a hairline whose white fades from `alpha` at `top` to nothing by `bottom`.
+pub(crate) fn rim_light(top: f32, bottom: f32, alpha: f32, width: f32) -> Paint {
+    let mut p = shaded_stroke(width);
+    let colors = [
+        Color4f::new(1.0, 1.0, 1.0, alpha),
+        Color4f::new(1.0, 1.0, 1.0, 0.0),
+    ];
+    p.set_shader(gradient::shaders::linear_gradient(
+        (Point::new(0.0, top), Point::new(0.0, bottom)),
+        &gradient::Gradient::new(
+            gradient::Colors::new_evenly_spaced(&colors, TileMode::Clamp, None),
+            gradient::Interpolation::default(),
+        ),
+        None,
+    ));
+    p
+}
+
 /// The paint for a `save_layer` — it carries alpha and colour filters, and never any geometry
 /// of its own, so anti-aliasing has nothing to act on. Its own constructor so the AA guard (and
 /// a reader) can tell a compositing paint from a drawing one without reading the call site.

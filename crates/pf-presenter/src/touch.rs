@@ -568,6 +568,8 @@ pub struct SteamTouchMouse {
     game_mode: bool,
     /// A direct-touch finger reached SDL this session: the touchscreen is ours, nothing leaks.
     pub fingers_seen: bool,
+    /// A finger from a NON-direct device was ignored this session — said once in the log.
+    pub indirect_seen: bool,
     leaked: bool,
     noticed: bool,
 }
@@ -577,6 +579,7 @@ impl SteamTouchMouse {
         Self {
             game_mode,
             fingers_seen: false,
+            indirect_seen: false,
             leaked: false,
             noticed: false,
         }

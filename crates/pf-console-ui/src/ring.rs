@@ -9,10 +9,11 @@
 //! scrim); commands go out through [`Ring::take_command`], host actions through the console's
 //! own bus ([`Ring::take_cmds`]).
 
+use crate::anim::{approach, springs, Spring};
 use crate::input::Key;
 use crate::model::ConsoleCmd;
 use crate::pointer::{Pointer, PointerKind};
-use crate::theme::{fill, stroke, Fonts, W};
+use crate::theme::{fill, glow_ring, rim_light, ring_scrim, soft_shadow, stroke, Fonts, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec};
 use pf_client_core::host_actions::{self, ActionInfo};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
@@ -132,6 +133,19 @@ pub(crate) struct Ring {
     /// picks the slot and the four-way moves it also raises are ignored; the D-pad steps
     /// again once it lets go.
     stick: bool,
+    /// Counts `tick`s, so the damage key changes every frame while something is still on
+    /// the move: the stream overlay redraws only when that key changes, and a spring or a
+    /// list entrance that nothing else touches would otherwise freeze on its first frame.
+    frame: u64,
+    /// The arrival: after the commit, `shown` springs to 1 from wherever the twist left it.
+    spring: Spring,
+    /// Closed for input, still winding in: the discs spiral back and fade for a moment.
+    closing: bool,
+    /// Each slot's highlight amount (the centre is 6), eased so the glow and the lift travel
+    /// between discs instead of snapping.
+    hot: [f32; 7],
+    /// The sheet's rise, 0 → 1 as it opens.
+    sheet_rise: f64,
     /// Hit rects as drawn last frame: six slots, then the centre.
     geom: Vec<Rect>,
     sheet_rect: Rect,
@@ -159,6 +173,11 @@ impl Ring {
             last_touch: Instant::now(),
             highlight: None,
             stick: false,
+            frame: 0,
+            spring: Spring::rest(0.0),
+            closing: false,
+            hot: [0.0; 7],
+            sheet_rise: 0.0,
             geom: vec![Rect::new_empty(); 7],
             sheet_rect: Rect::new_empty(),
             list: MenuList::new(),
@@ -173,6 +192,24 @@ impl Ring {
 
     pub(crate) fn open(&self) -> bool {
         self.committed || self.progress > 0.0
+    }
+
+    /// Open, or closed and still winding in — what `render` and the damage key go by. Input
+    /// goes by [`Ring::open`]: a closing ring takes nothing.
+    fn visible(&self) -> bool {
+        self.open() || self.closing
+    }
+
+    /// The stick owns the highlight (a sector is engaged) — see `stick`.
+    pub(crate) fn stick_engaged(&self) -> bool {
+        self.stick
+    }
+
+    /// A screen handing focus back while the stick is still held: the ring adopts the
+    /// stick as engaged, so the four-way repeats it keeps raising step nothing until the
+    /// stick lets go (`Sector(None)`).
+    pub(crate) fn adopt_stick(&mut self, engaged: bool) {
+        self.stick = engaged;
     }
 
     /// Make this ring the editor (§3.3): open at `(x, y)`, never idle-closing, the first slot
@@ -247,6 +284,7 @@ impl Ring {
 
     fn commit(&mut self) {
         self.committed = true;
+        self.closing = false;
         self.progress = 1.0;
         self.touch();
     }
@@ -254,7 +292,13 @@ impl Ring {
     fn close(&mut self) {
         self.committed = false;
         self.progress = 0.0;
-        self.shown = 0.0;
+        // Not a snap to nothing: the discs wind back in (`render` runs `shown` down and
+        // clears `closing` when it lands). Reduce motion closes at once.
+        self.closing = self.shown > 0.0 && !crate::theme::reduce_motion();
+        if !self.closing {
+            self.shown = 0.0;
+        }
+        self.sheet_rise = 0.0;
         self.sheet = false;
         self.armed = None;
         self.hint = None;
@@ -274,6 +318,7 @@ impl Ring {
     /// Timeouts: the exit disc's 8 s idle rule (unless the sheet is up), and the 2 s life of
     /// an armed slot or a hint. Once per frame, before the damage key is read.
     pub(crate) fn tick(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
         if self.committed
             && !self.sheet
             && self.editing.is_none()
@@ -297,7 +342,7 @@ impl Ring {
 
     /// Everything the drawing depends on, folded into one number for the damage gate.
     pub(crate) fn damage(&self) -> u64 {
-        if !self.open() {
+        if !self.visible() {
             return 0;
         }
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -314,7 +359,38 @@ impl Ring {
         self.facts.stats_tier.hash(&mut h);
         self.facts.mic_muted.hash(&mut h);
         self.facts.mode.hash(&mut h);
+        // While anything is still on the move the key changes every frame, so the overlay
+        // keeps drawing until it has all landed.
+        if self.animating() {
+            self.frame.hash(&mut h);
+        }
         h.finish().max(1)
+    }
+
+    /// Is any spring, ease or entrance still short of where it is going? Read before a
+    /// frame, so it describes the state the last render left behind.
+    fn animating(&self) -> bool {
+        if self.closing {
+            return true;
+        }
+        if self.committed && (self.shown != 1.0 || self.spring.vel != 0.0) {
+            return true;
+        }
+        if self.sheet && (self.sheet_rise < 1.0 || self.list.animating()) {
+            return true;
+        }
+        (0..7).any(|k| self.hot[k] != self.hot_target(k))
+    }
+
+    /// Where slot `k`'s highlight amount is heading: lit for the pad's highlight and for a
+    /// lifted disc, dark otherwise.
+    fn hot_target(&self, k: usize) -> f32 {
+        let lifted = self.editing.as_ref().and_then(|e| e.lifted);
+        if self.highlight == Some(k) || lifted == Some(k) {
+            1.0
+        } else {
+            0.0
+        }
     }
 
     /// The host's pre-fetched actions. The cache is the desktop shell's; the Android console
@@ -871,27 +947,63 @@ impl Ring {
         fonts: &Fonts,
         dt: f64,
     ) {
-        if !self.open() {
+        if !self.visible() {
             return;
         }
-        // The twist drives the opening; the commit settles toward 1. Reduce motion (design
-        // §2.3): a crossfade in place — no spring, no spiral, no scale travel; the twist still
-        // opens it.
+        // The twist drives the opening; the commit springs the rest of the way — a whisker
+        // past the seats and back, so the twist's momentum carries into the arrival. Reduce
+        // motion (design §2.3): a crossfade in place — no spring, no spiral, no scale
+        // travel; the twist still opens it. Closed, the discs wind back in and fade.
         let reduce = crate::theme::reduce_motion();
-        if self.committed {
+        if self.closing {
+            self.shown = approach(f64::from(self.shown), 0.0, dt, 0.045) as f32;
+            self.spring = Spring::rest(f64::from(self.shown));
+            if self.shown < 0.02 {
+                self.shown = 0.0;
+                self.closing = false;
+                self.geom.iter_mut().for_each(|g| *g = Rect::new_empty());
+                self.sheet_rect = Rect::new_empty();
+                return;
+            }
+        } else if self.committed {
             if reduce {
                 self.shown = 1.0;
+                self.spring = Spring::rest(1.0);
             } else {
-                let k = 1.0 - (-dt as f32 * 14.0).exp();
-                self.shown += (1.0 - self.shown) * k;
-                if self.shown > 0.995 {
-                    self.shown = 1.0;
-                }
+                self.spring.step_spec(1.0, springs::RING, dt);
+                self.spring.settle(1.0, 0.002, 0.02);
+                self.shown = self.spring.pos as f32;
             }
         } else {
             self.shown = self.progress;
+            self.spring = Spring::rest(f64::from(self.progress));
         }
+        for k in 0..7 {
+            let target = self.hot_target(k);
+            self.hot[k] = if reduce {
+                target
+            } else {
+                approach(f64::from(self.hot[k]), f64::from(target), dt, 0.07) as f32
+            };
+            if (self.hot[k] - target).abs() < 0.001 {
+                self.hot[k] = target;
+            }
+        }
+        self.sheet_rise = if !self.sheet {
+            0.0
+        } else if reduce {
+            1.0
+        } else {
+            let r = approach(self.sheet_rise, 1.0, dt, 0.09);
+            if r > 0.995 {
+                1.0
+            } else {
+                r
+            }
+        };
         let shown = self.shown;
+        // Opacity never exceeds 1 — the spring's overshoot is travel and size, not alpha.
+        let vis = shown.min(1.0);
         let radius = RADIUS * scale;
         let slot_d = SLOT_D * scale;
         let margin = radius + slot_d / 2.0 + 16.0 * scale;
@@ -909,9 +1021,10 @@ impl Ring {
         // own backdrop and widgets under the ring, so it draws none.
         let editing = self.editing.is_some();
         if !editing {
+            // A pool of shade around the ring, thinning to a light veil over the rest.
             canvas.draw_rect(
                 Rect::from_wh(width as f32, height as f32),
-                &fill(Color4f::new(0.0, 0.0, 0.0, 0.18 * shown)),
+                &ring_scrim(cx, cy, radius * 2.8, vis),
             );
         }
         let lifted = self.editing.as_ref().and_then(|e| e.lifted);
@@ -922,20 +1035,23 @@ impl Ring {
 
         let armed = self.armed.clone();
         for k in 0..6 {
-            let q = ((shown - k as f32 * SLOT_LAG) / (1.0 - 5.0 * SLOT_LAG)).clamp(0.0, 1.0);
+            let q_raw = (shown - k as f32 * SLOT_LAG) / (1.0 - 5.0 * SLOT_LAG);
+            let q = q_raw.clamp(0.0, 1.0);
             if q <= 0.0 {
                 self.geom[k] = Rect::new_empty();
                 continue;
             }
             // Slot k sits at 12, 2, 4… o'clock and travels out along a short spiral that
-            // turns the way the hand turns. Under reduce motion it sits in place from the
-            // start and only fades (`q` still drives the alpha below).
-            let travel = if reduce { 1.0 } else { q };
+            // turns the way the hand turns; the spring's overshoot carries it a hair past
+            // its seat and back. Under reduce motion it sits in place from the start and
+            // only fades (`q` still drives the alpha below).
+            let travel = if reduce { 1.0 } else { q_raw.clamp(0.0, 1.15) };
             let turn = if self.clockwise { -40.0 } else { 40.0 };
-            let deg = pf_client_core::ring::slot_angle_deg(k) + (1.0 - travel) * turn;
+            let deg = pf_client_core::ring::slot_angle_deg(k) + (1.0 - travel.min(1.0)) * turn;
             let (s, c) = deg.to_radians().sin_cos();
             let (mut x, mut y) = (cx + radius * travel * c, cy + radius * travel * s);
-            let mut r = slot_d / 2.0 * (0.6 + 0.4 * travel);
+            let hot = self.hot[k];
+            let mut r = slot_d / 2.0 * (0.6 + 0.4 * travel) * (1.0 + 0.08 * hot);
             // Editing: a carried disc follows the pointer; a lifted one sits raised.
             if let Some((_, dx, dy)) = carried.filter(|(slot, _, _)| *slot == k) {
                 x += dx;
@@ -948,6 +1064,11 @@ impl Ring {
             let is_armed = spec
                 .as_ref()
                 .is_some_and(|s| armed.as_deref() == Some(&s.id));
+            canvas.draw_circle(
+                Point::new(x, y + 3.0 * scale),
+                r,
+                &soft_shadow(0.5 * q, 7.0 * scale),
+            );
             draw_disc(
                 canvas,
                 fonts,
@@ -960,20 +1081,21 @@ impl Ring {
                 is_armed,
                 white,
             );
-            if self.highlight == Some(k) || lifted == Some(k) {
-                let a = if lifted == Some(k) { 1.0 } else { 0.8 };
-                canvas.draw_circle(
-                    Point::new(x, y),
-                    r + 3.0 * scale,
-                    &stroke(white(a * q), 2.0 * scale),
-                );
-            }
+            canvas.draw_circle(
+                Point::new(x, y),
+                r - 0.5 * scale,
+                &rim_light(y - r, y, 0.32 * q, scale),
+            );
+            highlight_ring(canvas, x, y, r, hot * q, scale, white);
             self.geom[k] = Rect::from_xywh(x - r, y - r, 2.0 * r, 2.0 * r);
         }
         // The centre arrives last and opens the sheet.
-        let cq = ((shown - 6.0 * SLOT_LAG) / (1.0 - 6.0 * SLOT_LAG)).clamp(0.0, 1.0);
+        let cq_raw = (shown - 6.0 * SLOT_LAG) / (1.0 - 6.0 * SLOT_LAG);
+        let cq = cq_raw.clamp(0.0, 1.0);
         if cq > 0.0 {
-            let r = CENTRE_D * scale / 2.0 * (0.6 + 0.4 * cq);
+            let pop = if reduce { 1.0 } else { cq_raw.clamp(0.0, 1.15) };
+            let hot = self.hot[6];
+            let r = CENTRE_D * scale / 2.0 * (0.6 + 0.4 * pop) * (1.0 + 0.06 * hot);
             // In the editor the centre is not editable, so it sits dimmed and inert.
             let more = Spec {
                 id: "more".into(),
@@ -985,6 +1107,11 @@ impl Ring {
                 toggle: false,
                 state: String::new(),
             };
+            canvas.draw_circle(
+                Point::new(cx, cy + 3.0 * scale),
+                r,
+                &soft_shadow(0.5 * cq, 7.0 * scale),
+            );
             draw_disc(
                 canvas,
                 fonts,
@@ -997,13 +1124,12 @@ impl Ring {
                 false,
                 white,
             );
-            if self.highlight == Some(6) {
-                canvas.draw_circle(
-                    Point::new(cx, cy),
-                    r + 3.0 * scale,
-                    &stroke(white(0.8 * cq), 2.0 * scale),
-                );
-            }
+            canvas.draw_circle(
+                Point::new(cx, cy),
+                r - 0.5 * scale,
+                &rim_light(cy - r, cy, 0.32 * cq, scale),
+            );
+            highlight_ring(canvas, cx, cy, r, hot * cq, scale, white);
             self.geom[6] = Rect::from_xywh(cx - r, cy - r, 2.0 * r, 2.0 * r);
         } else {
             self.geom[6] = Rect::new_empty();
@@ -1032,10 +1158,14 @@ impl Ring {
             let tw = fonts.measure(hint, W::Medium, size);
             let (px, py) = (14.0 * scale, 8.0 * scale);
             let (w, h) = (tw + 2.0 * px, LABEL_H * scale);
-            let (x, y) = (cx - w / 2.0, cy + radius + slot_d);
+            // Rides in with the ring: fades with it and settles up from a little below.
+            let (x, y) = (
+                cx - w / 2.0,
+                cy + radius + slot_d + (1.0 - vis) * 8.0 * scale,
+            );
             canvas.draw_rrect(
                 RRect::new_rect_xy(Rect::from_xywh(x, y, w, h), h / 2.0, h / 2.0),
-                &fill(Color4f::new(0.0, 0.0, 0.0, 0.62)),
+                &fill(Color4f::new(0.0, 0.0, 0.0, 0.62 * vis)),
             );
             fonts.draw(
                 canvas,
@@ -1044,7 +1174,7 @@ impl Ring {
                 f64::from(y + py + size as f32 * 0.8),
                 W::Medium,
                 size,
-                white(0.92),
+                white(0.92 * vis),
             );
         }
         if self.sheet {
@@ -1068,16 +1198,24 @@ impl Ring {
         let k = f64::from(scale);
         let w = (520.0 * scale).min(width as f32 * 0.92);
         let h = ((rows.len() as f32 * 50.0 + 24.0) * scale).min(height as f32 * 0.6);
+        let rise = self.sheet_rise as f32;
         let x = (width as f32 - w) / 2.0;
-        let y = height as f32 - h - 16.0 * scale;
+        // The sheet rises into its seat from a little below, fading in as it comes; its
+        // rows fan in on the list's own entrance.
+        let y = height as f32 - h - 16.0 * scale + (1.0 - rise) * 28.0 * scale;
         let rect = Rect::from_xywh(x, y, w, h);
+        let corner = 16.0 * scale;
         canvas.draw_rrect(
-            RRect::new_rect_xy(rect, 16.0 * scale, 16.0 * scale),
-            &fill(Color4f::new(0.0, 0.0, 0.0, 0.78)),
+            RRect::new_rect_xy(rect.with_offset((0.0, 4.0 * scale)), corner, corner),
+            &soft_shadow(0.4 * rise, 12.0 * scale),
         );
         canvas.draw_rrect(
-            RRect::new_rect_xy(rect, 16.0 * scale, 16.0 * scale),
-            &stroke(Color4f::new(1.0, 1.0, 1.0, 0.18), scale),
+            RRect::new_rect_xy(rect, corner, corner),
+            &fill(Color4f::new(0.0, 0.0, 0.0, 0.78 * rise)),
+        );
+        canvas.draw_rrect(
+            RRect::new_rect_xy(rect, corner, corner),
+            &stroke(Color4f::new(1.0, 1.0, 1.0, 0.18 * rise), scale),
         );
         let inner = Rect::from_ltrb(
             rect.left + 8.0 * scale,
@@ -1091,6 +1229,33 @@ impl Ring {
         canvas.restore();
         self.sheet_rect = rect;
     }
+}
+
+/// The pad's highlight on a disc: a soft white glow past the edge and a crisp ring on it,
+/// both at `amount` — eased by the caller, so the mark travels between discs.
+fn highlight_ring(
+    canvas: &Canvas,
+    x: f32,
+    y: f32,
+    r: f32,
+    amount: f32,
+    scale: f32,
+    white: impl Fn(f32) -> Color4f,
+) {
+    if amount <= 0.01 {
+        return;
+    }
+    let rr = r + 3.0 * scale;
+    canvas.draw_circle(
+        Point::new(x, y),
+        rr,
+        &glow_ring(0.5 * amount, 3.0 * scale, 6.0 * scale),
+    );
+    canvas.draw_circle(
+        Point::new(x, y),
+        rr,
+        &stroke(white(0.85 * amount), 2.0 * scale),
+    );
 }
 
 /// One translucent disc with its short label — the in-stream pill family's surface, round.
@@ -1356,6 +1521,37 @@ mod tests {
         assert_eq!(r.armed.as_deref(), Some("end_stream"));
         r.menu(MenuEvent::Back);
         assert!(!r.open(), "B closes the ring");
+    }
+
+    /// The stream overlay redraws only when `damage` changes, so the ring reports itself
+    /// animating — and changes its key every tick — until every spring, ease and entrance
+    /// has landed; settled, a tick changes nothing. Closed, it stays visible to wind in.
+    #[test]
+    fn the_damage_key_keeps_changing_until_the_ring_has_settled() {
+        let mut r = Ring::new();
+        r.set_facts(&facts());
+        r.input(RingInput::Toggle { x: 300.0, y: 300.0 });
+        assert!(r.animating(), "the arrival is on the move");
+        r.tick();
+        let a = r.damage();
+        r.tick();
+        assert_ne!(a, r.damage(), "a tick is a new key while animating");
+        // No canvas here: land the spring by hand, the way a render would.
+        r.spring = Spring::rest(1.0);
+        r.shown = 1.0;
+        assert!(!r.animating(), "landed");
+        r.tick();
+        let b = r.damage();
+        r.tick();
+        assert_eq!(b, r.damage(), "settled: a tick changes nothing");
+        r.menu(MenuEvent::Move(MenuDir::Right));
+        assert!(r.animating(), "the highlight's glow is on the move");
+        r.input(RingInput::Toggle { x: 0.0, y: 0.0 });
+        assert!(!r.open(), "closed for input at once");
+        assert!(
+            r.visible() && r.animating() && r.damage() != 0,
+            "still drawn while it winds in"
+        );
     }
 
     /// Design §2.6, D12: the stick's sector IS the slot, and while it is engaged the four-way

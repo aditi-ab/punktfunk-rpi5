@@ -90,6 +90,13 @@ pub(crate) mod springs {
         response: 0.18,
         damping: 0.65,
     };
+    /// The quick-action ring's arrival under the fingers. Looser than [`FOCUS`]: six discs
+    /// flying to their seats want a visible whisker past them and back, or the twist's
+    /// momentum reads as stopping dead at the commit.
+    pub(crate) const RING: SpringSpec = SpringSpec {
+        response: 0.38,
+        damping: 0.72,
+    };
 }
 
 /// A damped spring with persistent velocity. `k`/`c` choose the feel; see the pairs in
