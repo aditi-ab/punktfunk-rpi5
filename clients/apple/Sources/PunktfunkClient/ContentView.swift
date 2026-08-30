@@ -1167,6 +1167,12 @@ struct ContentView: View {
                             Sc2CapturedBadge()
                                 .transition(.opacity.combined(with: .scale(scale: 0.9)))
                         }
+                        // The Touch (passthrough) model met a host that drops contacts; the
+                        // fingers run the trackpad engine instead, and this says so once.
+                        if captureEnabled, model.touchFallbackNotice {
+                            TouchFallbackBadge()
+                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                        }
                         // The expiry-warning toast (T−5 m / T−1 m, per-client access §7) —
                         // transient, every platform, every tier: "the pad just died" must
                         // read as "the evening's access ended" while it can still be fixed.

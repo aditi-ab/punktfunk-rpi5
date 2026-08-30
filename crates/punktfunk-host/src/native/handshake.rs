@@ -1102,7 +1102,15 @@ pub(super) async fn negotiate(
         // This host marks its idle-keepalive re-encodes with USER_FLAG_REPEAT (ABR overhaul
         // RFC §4.1) — the bit is what lets the client's ABR trust an unflagged AU as new
         // content.
-        host_caps2: punktfunk_core::quic::HOST_CAP2_REPEAT_MARK,
+        host_caps2: punktfunk_core::quic::HOST_CAP2_REPEAT_MARK
+            // Wire touch contacts land on this desktop. Without the bit a client's passthrough
+            // model falls back to trackpad and says so, instead of sending contacts the injector
+            // drops on the floor (wlroots) or cannot create a device for (Windows < 1809).
+            | if crate::inject::touch_supported() {
+                punktfunk_core::quic::HOST_CAP2_TOUCH
+            } else {
+                0
+            },
     };
     io::write_msg(send, &welcome.encode()).await?;
     bringup.mark("welcome");

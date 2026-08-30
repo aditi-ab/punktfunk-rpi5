@@ -374,7 +374,8 @@ pub struct Welcome {
     /// 2 LE bytes at 85..87 (or 117..119). Absent → `0`.
     pub audio_frame_us: u16,
     /// The second host-capability byte — the `0x80` wall in `host_caps` predicted it; see
-    /// [`HOST_CAP2_REPEAT_MARK`](super::HOST_CAP2_REPEAT_MARK) (currently its only bit).
+    /// [`HOST_CAP2_REPEAT_MARK`](super::HOST_CAP2_REPEAT_MARK) and
+    /// [`HOST_CAP2_TOUCH`](super::HOST_CAP2_TOUCH).
     /// Emitting it (nonzero) extends the placeholder chain one link past the audio block, so
     /// an Opus session then carries the audio block as its own defaults — every placeholder
     /// decodes to exactly what its absence meant, the discipline every link of the chain keeps.

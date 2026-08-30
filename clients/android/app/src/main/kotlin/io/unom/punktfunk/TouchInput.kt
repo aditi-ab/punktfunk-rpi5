@@ -1,5 +1,6 @@
 package io.unom.punktfunk
 
+import android.os.SystemClock
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.ui.input.pointer.AwaitPointerEventScope
 import androidx.compose.ui.input.pointer.PointerId
@@ -9,16 +10,21 @@ import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.changedToDownIgnoreConsumed
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.positionChanged
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
 import io.unom.punktfunk.kit.NativeBridge
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 
 // Touch-gesture tuning (px / ms). TAP_SLOP: movement under this still counts as a tap, not a drag.
-// TAP_DRAG_MS: a new touch within this long after a tap starts a left-button drag. SCROLL_DIV: px of
-// two-finger pan per wheel notch (smaller = faster scroll).
+// TAP_DRAG_MS: a new touch within this long after a tap starts a left-button drag. LONG_PRESS_MS:
+// one finger held still this long presses the left button and drags until it lifts. SCROLL_DIV:
+// px of two-finger pan per wheel notch (smaller = faster scroll).
 private const val TAP_SLOP = 12f
 private const val TAP_DRAG_MS = 250L
+private const val LONG_PRESS_MS = 500L
 private const val SCROLL_DIV = 4f
 
 // Three-finger vertical swipe: the fraction of the view height the centroid must travel to
@@ -45,8 +51,8 @@ private const val ACCEL_MAX = 3.0f
  *    host-normalized against the overlay size), the old "direct pointing" behaviour.
  *
  * Both share the same gesture vocabulary: tap = left click; two-finger tap = right click;
- * two-finger drag = scroll; tap-then-press-and-drag = left-drag (text selection / moving
- * windows); three-finger tap = [onCycleStats] (cycle the stats-HUD verbosity tier);
+ * two-finger drag = scroll; tap-then-press-and-drag OR press-and-hold-then-drag = left-drag
+ * (text selection / moving windows); three-finger tap = [onCycleStats] (cycle the stats-HUD tier);
  * three-finger swipe up/down = [onKeyboard] (summon/dismiss the local soft keyboard, for
  * typing on the host).
  */
@@ -58,6 +64,32 @@ private const val ACCEL_MAX = 3.0f
  * normalizes and maps into the output). On teardown (stream leaves composition) every still-held
  * contact is lifted so nothing stays stuck on the host.
  */
+/**
+ * The picture's rect inside a container of [size] for a stream of [aspect] (width / height): the
+ * same centre-aligned aspect fit the video surface is laid out with. The gesture layer spans the
+ * whole container so a finger on a letterbox bar still counts, and every absolute mapping —
+ * direct pointer, passthrough, the pen lane — measures against this rect, clamped, because a
+ * contact outside the picture has no host position of its own. `aspect <= 0` (unknown) fills.
+ */
+internal fun videoFitRect(size: IntSize, aspect: Float): IntRect {
+    val w = size.width
+    val h = size.height
+    if (aspect <= 0f || w <= 0 || h <= 0) return IntRect(IntOffset.Zero, size)
+    return if (w.toFloat() / h > aspect) {
+        val vw = (h * aspect).roundToInt() // wider container: bars left and right
+        val left = (w - vw) / 2
+        IntRect(left, 0, left + vw, h)
+    } else {
+        val vh = (w / aspect).roundToInt() // taller container: bars top and bottom
+        val top = (h - vh) / 2
+        IntRect(0, top, w, top + vh)
+    }
+}
+
+/** [x] in container pixels → picture-surface pixels, clamped to the picture's edge. */
+private fun IntRect.clampX(x: Float): Int = (x - left).roundToInt().coerceIn(0, width - 1)
+private fun IntRect.clampY(y: Float): Int = (y - top).roundToInt().coerceIn(0, height - 1)
+
 /** Whether this change belongs to the stylus lane (only when a pen-capable host is live). */
 private fun isStylus(c: PointerInputChange, stylus: StylusStream?): Boolean =
     stylus != null && (c.type == PointerType.Stylus || c.type == PointerType.Eraser)
@@ -66,10 +98,11 @@ private fun isStylus(c: PointerInputChange, stylus: StylusStream?): Boolean =
  *  mouse/touch gesture. Toward a pen-less host ([stylus] == null) a stylus stays a finger. */
 private suspend fun AwaitPointerEventScope.awaitFirstFingerDown(
     stylus: StylusStream?,
+    videoAspect: Float,
 ): PointerInputChange {
     while (true) {
         val ev = awaitPointerEvent()
-        stylus?.intercept(ev, size)
+        stylus?.intercept(ev, videoFitRect(size, videoAspect))
         val down = ev.changes.firstOrNull {
             it.changedToDownIgnoreConsumed() && !isStylus(it, stylus)
         }
@@ -77,7 +110,11 @@ private suspend fun AwaitPointerEventScope.awaitFirstFingerDown(
     }
 }
 
-internal suspend fun PointerInputScope.streamTouchPassthrough(handle: Long, stylus: StylusStream?) {
+internal suspend fun PointerInputScope.streamTouchPassthrough(
+    handle: Long,
+    stylus: StylusStream?,
+    videoAspect: Float,
+) {
     val ids = mutableMapOf<PointerId, Int>()
     fun alloc(p: PointerId): Int {
         var id = 0
@@ -89,14 +126,15 @@ internal suspend fun PointerInputScope.streamTouchPassthrough(handle: Long, styl
         awaitPointerEventScope {
             while (true) {
                 val ev = awaitPointerEvent()
-                stylus?.intercept(ev, size)
-                val sw = size.width
-                val sh = size.height
+                val r = videoFitRect(size, videoAspect)
+                stylus?.intercept(ev, r)
+                val sw = r.width
+                val sh = r.height
                 if (sw <= 0 || sh <= 0) continue
                 for (c in ev.changes) {
                     if (isStylus(c, stylus)) continue // the pen plane owns it
-                    val x = c.position.x.roundToInt().coerceIn(0, sw - 1)
-                    val y = c.position.y.roundToInt().coerceIn(0, sh - 1)
+                    val x = r.clampX(c.position.x)
+                    val y = r.clampY(c.position.y)
                     when {
                         c.changedToDownIgnoreConsumed() ->
                             NativeBridge.nativeSendTouch(handle, alloc(c.id), 0, x, y, sw, sh)
@@ -113,8 +151,7 @@ internal suspend fun PointerInputScope.streamTouchPassthrough(handle: Long, styl
                                 for (hs in c.historical) {
                                     NativeBridge.nativeSendTouch(
                                         handle, id, 1,
-                                        hs.position.x.roundToInt().coerceIn(0, sw - 1),
-                                        hs.position.y.roundToInt().coerceIn(0, sh - 1),
+                                        r.clampX(hs.position.x), r.clampY(hs.position.y),
                                         sw, sh,
                                     )
                                 }
@@ -134,6 +171,7 @@ internal suspend fun PointerInputScope.streamTouchPassthrough(handle: Long, styl
 internal suspend fun PointerInputScope.streamTouchInput(
     handle: Long,
     stylus: StylusStream?,
+    videoAspect: Float,
     trackpad: Boolean,
     invertScroll: Boolean,
     onCycleStats: () -> Unit,
@@ -144,19 +182,12 @@ internal suspend fun PointerInputScope.streamTouchInput(
     var lastTapX = 0f
     var lastTapY = 0f
     fun moveAbs(x: Float, y: Float) {
-        val sw = size.width
-        val sh = size.height
-        if (sw <= 0 || sh <= 0) return
-        NativeBridge.nativeSendPointerAbs(
-            handle,
-            x.coerceIn(0f, (sw - 1).toFloat()).roundToInt(),
-            y.coerceIn(0f, (sh - 1).toFloat()).roundToInt(),
-            sw,
-            sh,
-        )
+        val r = videoFitRect(size, videoAspect)
+        if (r.width <= 0 || r.height <= 0) return
+        NativeBridge.nativeSendPointerAbs(handle, r.clampX(x), r.clampY(y), r.width, r.height)
     }
     awaitEachGesture {
-        val down = awaitFirstFingerDown(stylus)
+        val down = awaitFirstFingerDown(stylus, videoAspect)
         val startX = down.position.x
         val startY = down.position.y
         // A touch landing just after a quick tap nearby = tap-and-drag: hold the left
@@ -168,6 +199,10 @@ internal suspend fun PointerInputScope.streamTouchInput(
         // whole point — you nudge it with swipes instead).
         if (!trackpad) moveAbs(startX, startY)
         if (isDrag) NativeBridge.nativeSendPointerButton(handle, 1, true)
+        // The left button this gesture holds (tap-drag from the start, or a long press later);
+        // released exactly once, in the `finally`, so a teardown mid-drag never strands it.
+        var dragHeld = isDrag
+        val downT = down.uptimeMillis
 
         var moved = false
         var maxFingers = 1
@@ -191,142 +226,157 @@ internal suspend fun PointerInputScope.streamTouchInput(
         var accX = 0f
         var accY = 0f
 
-        while (true) {
-            val ev = awaitPointerEvent()
-            stylus?.intercept(ev, size)
-            val pressed = ev.changes.filter { it.pressed && !isStylus(it, stylus) }
-            if (pressed.isEmpty()) {
-                upTime = ev.changes.firstOrNull()?.uptimeMillis ?: upTime
-                break
-            }
-            if (pressed.size > maxFingers) maxFingers = pressed.size
-            // Dropping below three fingers forgets the keyboard-swipe anchor, so a 3→2→3
-            // bounce re-anchors instead of reading the count change as swipe travel.
-            if (pressed.size < 3) kbCount = 0
-
-            if (pressed.size == 2) {
-                // Two fingers → scroll by the centroid delta; never move the cursor.
-                val cx = (pressed.sumOf { it.position.x.toDouble() } / pressed.size).toFloat()
-                val cy = (pressed.sumOf { it.position.y.toDouble() } / pressed.size).toFloat()
-                // (Re-)anchor whenever the finger COUNT changes, not just on scroll start: the
-                // centroid of three fingers sits far from the centroid of two, and real fingers
-                // never land (or lift) in the same input frame — so the 2→3 transition would
-                // otherwise read as a scroll notch, sending a phantom wheel tick to the host AND
-                // setting `moved`, which disqualified the tap classification below and made the
-                // 3-finger stats tap unreachable on real hardware.
-                if (!scrolling || pressed.size != scrollCount) {
-                    scrolling = true
-                    scrollCount = pressed.size
-                    prevCx = cx
-                    prevCy = cy
-                }
-                val sy = ((prevCy - cy) / SCROLL_DIV).toInt() // finger up → wheel up
-                val sx = ((cx - prevCx) / SCROLL_DIV).toInt()
-                if (sy != 0) {
-                    NativeBridge.nativeSendScroll(handle, 0, sy * 120 * scrollDir)
-                    prevCy = cy
-                    moved = true
-                }
-                if (sx != 0) {
-                    NativeBridge.nativeSendScroll(handle, 1, sx * 120 * scrollDir)
-                    prevCx = cx
-                    moved = true
-                }
-            } else if (pressed.size >= 3) {
-                // Three+ fingers → the keyboard swipe, never scroll (the documented
-                // vocabulary is TWO-finger scroll; 3+ only fell into the scroll path as an
-                // accident of its old `>= 2` bound). Anchor the centroid per finger count
-                // (same reasoning as the scroll anchor above) and fire once per gesture when
-                // the vertical travel crosses the threshold: up = show, down = hide.
-                val cx = (pressed.sumOf { it.position.x.toDouble() } / pressed.size).toFloat()
-                val cy = (pressed.sumOf { it.position.y.toDouble() } / pressed.size).toFloat()
-                if (pressed.size != kbCount) {
-                    kbCount = pressed.size
-                    kbAnchorX = cx
-                    kbAnchorY = cy
+        try {
+            while (true) {
+                // A still finger raises no event, so the long press is a timeout: while one finger
+                // is down and nothing has moved, wait at most until the hold time; running out
+                // means "held still that long" and picks up the drag.
+                val ev = if (!dragHeld && !moved && maxFingers == 1) {
+                    val remaining = LONG_PRESS_MS - (SystemClock.uptimeMillis() - downT)
+                    if (remaining <= 0) null else withTimeoutOrNull(remaining) { awaitPointerEvent() }
                 } else {
-                    val dy = cy - kbAnchorY
-                    // Real centroid travel disqualifies the tap classification below (else a
-                    // sub-threshold swipe would still fire the three-finger stats tap).
-                    if (abs(dy) > TAP_SLOP || abs(cx - kbAnchorX) > TAP_SLOP) moved = true
-                    if (!kbFired && abs(dy) >= size.height * KB_SWIPE_FRACTION) {
-                        kbFired = true
-                        onKeyboard(dy < 0) // finger up → show, finger down → hide
+                    awaitPointerEvent()
+                }
+                if (ev == null) {
+                    dragHeld = true
+                    NativeBridge.nativeSendPointerButton(handle, 1, true)
+                    continue
+                }
+                stylus?.intercept(ev, videoFitRect(size, videoAspect))
+                val pressed = ev.changes.filter { it.pressed && !isStylus(it, stylus) }
+                if (pressed.isEmpty()) {
+                    upTime = ev.changes.firstOrNull()?.uptimeMillis ?: upTime
+                    break
+                }
+                if (pressed.size > maxFingers) maxFingers = pressed.size
+                // Dropping below three fingers forgets the keyboard-swipe anchor, so a 3→2→3
+                // bounce re-anchors instead of reading the count change as swipe travel.
+                if (pressed.size < 3) kbCount = 0
+
+                if (pressed.size == 2) {
+                    // Two fingers → scroll by the centroid delta; never move the cursor.
+                    val cx = (pressed.sumOf { it.position.x.toDouble() } / pressed.size).toFloat()
+                    val cy = (pressed.sumOf { it.position.y.toDouble() } / pressed.size).toFloat()
+                    // (Re-)anchor whenever the finger COUNT changes, not just on scroll start: the
+                    // centroid of three fingers sits far from the centroid of two, and real fingers
+                    // never land (or lift) in the same input frame — so the 2→3 transition would
+                    // otherwise read as a scroll notch, sending a phantom wheel tick to the host AND
+                    // setting `moved`, which disqualified the tap classification below and made the
+                    // 3-finger stats tap unreachable on real hardware.
+                    if (!scrolling || pressed.size != scrollCount) {
+                        scrolling = true
+                        scrollCount = pressed.size
+                        prevCx = cx
+                        prevCy = cy
                     }
-                }
-                // Leaving the scroll state stale would read the 3→2 centroid jump as a wheel
-                // notch; clearing it makes a return to two fingers re-anchor fresh. Same for
-                // the trackpad's tracked finger: its prev position froze while 3+ fingers were
-                // down, so dropping straight back to one finger must re-anchor (zero delta),
-                // not replay the whole 3-finger phase as one cursor jump.
-                scrolling = false
-                scrollCount = 0
-                trackId = PointerId(Long.MIN_VALUE)
-            } else if (!scrolling) {
-                // One finger (skipped once a gesture turned into a scroll, so dropping
-                // back to one finger doesn't jerk the cursor).
-                val p = pressed.firstOrNull { it.id == down.id } ?: pressed.first()
-                if (abs(p.position.x - startX) > TAP_SLOP ||
-                    abs(p.position.y - startY) > TAP_SLOP
-                ) {
-                    moved = true
-                }
-                if (trackpad) {
-                    // Relative: move by the finger delta × (sensitivity × acceleration),
-                    // carrying the sub-pixel remainder. Re-anchor (zero delta this frame)
-                    // if the tracked finger changed, so lifting one of several fingers
-                    // never jumps the cursor.
-                    if (p.id != trackId) {
-                        trackId = p.id
+                    val sy = ((prevCy - cy) / SCROLL_DIV).toInt() // finger up → wheel up
+                    val sx = ((cx - prevCx) / SCROLL_DIV).toInt()
+                    if (sy != 0) {
+                        NativeBridge.nativeSendScroll(handle, 0, sy * 120 * scrollDir)
+                        prevCy = cy
+                        moved = true
+                    }
+                    if (sx != 0) {
+                        NativeBridge.nativeSendScroll(handle, 1, sx * 120 * scrollDir)
+                        prevCx = cx
+                        moved = true
+                    }
+                } else if (pressed.size >= 3) {
+                    // Three+ fingers → the keyboard swipe, never scroll (the documented
+                    // vocabulary is TWO-finger scroll; 3+ only fell into the scroll path as an
+                    // accident of its old `>= 2` bound). Anchor the centroid per finger count
+                    // (same reasoning as the scroll anchor above) and fire once per gesture when
+                    // the vertical travel crosses the threshold: up = show, down = hide.
+                    val cx = (pressed.sumOf { it.position.x.toDouble() } / pressed.size).toFloat()
+                    val cy = (pressed.sumOf { it.position.y.toDouble() } / pressed.size).toFloat()
+                    if (pressed.size != kbCount) {
+                        kbCount = pressed.size
+                        kbAnchorX = cx
+                        kbAnchorY = cy
+                    } else {
+                        val dy = cy - kbAnchorY
+                        // Real centroid travel disqualifies the tap classification below (else a
+                        // sub-threshold swipe would still fire the three-finger stats tap).
+                        if (abs(dy) > TAP_SLOP || abs(cx - kbAnchorX) > TAP_SLOP) moved = true
+                        if (!kbFired && abs(dy) >= size.height * KB_SWIPE_FRACTION) {
+                            kbFired = true
+                            onKeyboard(dy < 0) // finger up → show, finger down → hide
+                        }
+                    }
+                    // Leaving the scroll state stale would read the 3→2 centroid jump as a wheel
+                    // notch; clearing it makes a return to two fingers re-anchor fresh. Same for
+                    // the trackpad's tracked finger: its prev position froze while 3+ fingers were
+                    // down, so dropping straight back to one finger must re-anchor (zero delta),
+                    // not replay the whole 3-finger phase as one cursor jump.
+                    scrolling = false
+                    scrollCount = 0
+                    trackId = PointerId(Long.MIN_VALUE)
+                } else if (!scrolling) {
+                    // One finger (skipped once a gesture turned into a scroll, so dropping
+                    // back to one finger doesn't jerk the cursor).
+                    val p = pressed.firstOrNull { it.id == down.id } ?: pressed.first()
+                    if (abs(p.position.x - startX) > TAP_SLOP ||
+                        abs(p.position.y - startY) > TAP_SLOP
+                    ) {
+                        moved = true
+                    }
+                    if (trackpad) {
+                        // Relative: move by the finger delta × (sensitivity × acceleration),
+                        // carrying the sub-pixel remainder. Re-anchor (zero delta this frame)
+                        // if the tracked finger changed, so lifting one of several fingers
+                        // never jumps the cursor.
+                        if (p.id != trackId) {
+                            trackId = p.id
+                            prevX = p.position.x
+                            prevY = p.position.y
+                            prevT = p.uptimeMillis
+                        }
+                        val dx = p.position.x - prevX
+                        val dy = p.position.y - prevY
+                        val dt = (p.uptimeMillis - prevT).coerceAtLeast(1L)
                         prevX = p.position.x
                         prevY = p.position.y
                         prevT = p.uptimeMillis
+                        val speed = hypot(dx, dy) / dt // finger px per ms
+                        val accel = (1f + ACCEL_GAIN * (speed - ACCEL_SPEED_FLOOR).coerceAtLeast(0f))
+                            .coerceAtMost(ACCEL_MAX)
+                        accX += dx * POINTER_SENS * accel
+                        accY += dy * POINTER_SENS * accel
+                        val outX = accX.toInt() // truncates toward zero → remainder kept w/ sign
+                        val outY = accY.toInt()
+                        if (outX != 0 || outY != 0) {
+                            NativeBridge.nativeSendPointerMove(handle, outX, outY)
+                            accX -= outX
+                            accY -= outY
+                        }
+                    } else {
+                        // Direct: cursor follows the finger — historical points first (batched
+                        // MotionEvent samples), so the host cursor traces the finger's real path.
+                        for (hs in p.historical) moveAbs(hs.position.x, hs.position.y)
+                        moveAbs(p.position.x, p.position.y)
                     }
-                    val dx = p.position.x - prevX
-                    val dy = p.position.y - prevY
-                    val dt = (p.uptimeMillis - prevT).coerceAtLeast(1L)
-                    prevX = p.position.x
-                    prevY = p.position.y
-                    prevT = p.uptimeMillis
-                    val speed = hypot(dx, dy) / dt // finger px per ms
-                    val accel = (1f + ACCEL_GAIN * (speed - ACCEL_SPEED_FLOOR).coerceAtLeast(0f))
-                        .coerceAtMost(ACCEL_MAX)
-                    accX += dx * POINTER_SENS * accel
-                    accY += dy * POINTER_SENS * accel
-                    val outX = accX.toInt() // truncates toward zero → remainder kept w/ sign
-                    val outY = accY.toInt()
-                    if (outX != 0 || outY != 0) {
-                        NativeBridge.nativeSendPointerMove(handle, outX, outY)
-                        accX -= outX
-                        accY -= outY
-                    }
-                } else {
-                    // Direct: cursor follows the finger — historical points first (batched
-                    // MotionEvent samples), so the host cursor traces the finger's real path.
-                    for (hs in p.historical) moveAbs(hs.position.x, hs.position.y)
-                    moveAbs(p.position.x, p.position.y)
                 }
+                ev.changes.forEach { it.consume() }
             }
-            ev.changes.forEach { it.consume() }
-        }
 
-        if (isDrag) {
-            NativeBridge.nativeSendPointerButton(handle, 1, false) // end the drag
-        } else if (!moved) {
-            when {
-                maxFingers >= 3 -> onCycleStats() // in-stream HUD verbosity cycle
-                maxFingers == 2 -> { // two-finger tap → right click
-                    NativeBridge.nativeSendPointerButton(handle, 3, true)
-                    NativeBridge.nativeSendPointerButton(handle, 3, false)
-                }
-                else -> { // tap → left click (at the cursor's current spot), arm tap-drag
-                    NativeBridge.nativeSendPointerButton(handle, 1, true)
-                    NativeBridge.nativeSendPointerButton(handle, 1, false)
-                    lastTapUp = upTime
-                    lastTapX = startX
-                    lastTapY = startY
+            if (!dragHeld && !moved) {
+                when {
+                    maxFingers >= 3 -> onCycleStats() // in-stream HUD verbosity cycle
+                    maxFingers == 2 -> { // two-finger tap → right click
+                        NativeBridge.nativeSendPointerButton(handle, 3, true)
+                        NativeBridge.nativeSendPointerButton(handle, 3, false)
+                    }
+                    else -> { // tap → left click (at the cursor's current spot), arm tap-drag
+                        NativeBridge.nativeSendPointerButton(handle, 1, true)
+                        NativeBridge.nativeSendPointerButton(handle, 1, false)
+                        lastTapUp = upTime
+                        lastTapX = startX
+                        lastTapY = startY
+                    }
                 }
             }
+        } finally {
+            if (dragHeld) NativeBridge.nativeSendPointerButton(handle, 1, false) // end the drag
         }
     }
 }

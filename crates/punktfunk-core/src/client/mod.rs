@@ -290,6 +290,9 @@ pub struct NativeClient {
     /// The host capability bitfield ([`crate::quic::Welcome::host_caps`]) — see
     /// [`NativeClient::host_caps`].
     pub host_caps: u8,
+    /// The second capability byte ([`crate::quic::Welcome::host_caps2`]) — see
+    /// [`NativeClient::host_caps2`].
+    pub host_caps2: u8,
     /// The host's management-API port ([`crate::quic::Welcome::mgmt_port`]), or `0` when the host
     /// did not advertise one — see [`NativeClient::mgmt_port`].
     pub mgmt_port: u16,
@@ -1035,6 +1038,7 @@ impl NativeClient {
             next_xfer_id: AtomicU32::new(1),
             pen_seq: AtomicU16::new(0),
             host_caps: negotiated.host_caps,
+            host_caps2: negotiated.host_caps2,
             mgmt_port: negotiated.mgmt_port,
             probe,
             shutdown,
@@ -1704,6 +1708,13 @@ impl NativeClient {
     /// shared-clipboard toggle.
     pub fn host_caps(&self) -> u8 {
         self.host_caps
+    }
+
+    /// The second host capability byte ([`crate::quic::Welcome::host_caps2`]:
+    /// [`crate::quic::HOST_CAP2_TOUCH`] says the host injects wire touch contacts). `0` from an
+    /// older host, which never advertises the byte.
+    pub fn host_caps2(&self) -> u8 {
+        self.host_caps2
     }
 
     /// The host's management-API port, from this session's [`crate::quic::Welcome`] — where its

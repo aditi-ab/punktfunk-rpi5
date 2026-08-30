@@ -288,7 +288,14 @@ pub use stats::Stats;
 /// symbols so one of them could stay 19 bytes would push the fork into every embedder forever,
 /// for a struct only poll-written by the core into caller memory. No wire change — both datagram
 /// forms shipped with the passthrough itself — so [`WIRE_VERSION`] is unchanged.
-pub const ABI_VERSION: u32 = 27;
+/// **v28** adds [`abi::punktfunk_connection_host_caps2`] and `PUNKTFUNK_HOST_CAP2_TOUCH` — the
+/// Welcome's second capability byte, which no embedder could read before. A client offering a
+/// touch-passthrough model gates it on the bit and falls back to a cursor model with a notice,
+/// because a host without it drops every contact silently (design/touch-client-overlay.md §5.4).
+/// ADDED, not widened: one function and one constant; an embedder that never calls it behaves
+/// exactly as on v27. The byte itself has ridden the Welcome as a trailing field since the repeat
+/// mark, so [`WIRE_VERSION`] is unchanged.
+pub const ABI_VERSION: u32 = 28;
 
 /// The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 /// Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**

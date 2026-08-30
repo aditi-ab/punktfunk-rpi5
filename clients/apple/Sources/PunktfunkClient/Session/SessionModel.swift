@@ -270,6 +270,12 @@ final class SessionModel: ObservableObject {
     /// itself: only `noteSc2Phase` and the disconnect teardown touch it.
     private var sc2HintTimer: Task<Void, Never>?
     #endif
+    /// The touch model is passthrough, but this host drops contacts (no `HOST_CAP2_TOUCH`): the
+    /// stream view runs the trackpad model instead, and this says so once, for
+    /// `motionHintSeconds`, in the same bottom-centre slot. Otherwise the setting is silently
+    /// ignored and every finger vanishes.
+    @Published private(set) var touchFallbackNotice = false
+    private var touchHintTimer: Task<Void, Never>?
     /// Resize overlay (design/midstream-resolution-resize.md — client resize UX): true from the
     /// instant a Match-window resize starts steering toward a new size until a frame at that size
     /// decodes (or a safety timeout). Drives the blur+spinner so the unavoidable host-rebuild delay
@@ -586,12 +592,14 @@ final class SessionModel: ObservableObject {
                         // requestAccess: the operator approved this device on the host, so the
                         // session is trusted — stream directly (the caller pins it as paired).
                         self.connection = conn
+                        self.noteTouchFallback(conn)
                         self.startStatsTimer()
                         self.beginStreaming()
                     } else if allowTofu {
                         // Host advertised pair=optional — offer the reduced-security TOFU prompt
                         // over the live (blurred) stream (rule 3a).
                         self.connection = conn
+                        self.noteTouchFallback(conn)
                         self.startStatsTimer()
                         self.phase = .awaitingTrust(fingerprint: conn.hostFingerprint)
                     } else {
@@ -727,6 +735,21 @@ final class SessionModel: ObservableObject {
     ///
     /// Last pad wins, and its timer restarts: two such pads are the same one fact to a player, and
     /// a second hint appearing under a still-visible first would only read as a stutter.
+    /// Raise `touchFallbackNotice` when the passthrough touch model meets a host without touch
+    /// injection — the same fallback `StreamLayerUIView` applies to the fingers themselves.
+    private func noteTouchFallback(_ conn: PunktfunkConnection) {
+        #if os(iOS)
+        guard TouchInputMode.current == .touch, !conn.hostSupportsTouch else { return }
+        touchFallbackNotice = true
+        touchHintTimer?.cancel()
+        touchHintTimer = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.motionHintSeconds))
+            guard !Task.isCancelled else { return }
+            self?.touchFallbackNotice = false
+        }
+        #endif
+    }
+
     private func noteMotionUnreachable(_ kind: PunktfunkConnection.GamepadType) {
         motionUnreachableKind = kind
         motionHintTimer?.cancel()
@@ -881,6 +904,9 @@ final class SessionModel: ObservableObject {
         motionHintTimer?.cancel()
         motionHintTimer = nil
         motionUnreachableKind = nil
+        touchHintTimer?.cancel()
+        touchHintTimer = nil
+        touchFallbackNotice = false
         // Access state is per-session: back to the invisible full-and-permanent default, and
         // no warning latch may carry into the next stream (same discipline as the mic mute).
         accessWarningTimer?.cancel()

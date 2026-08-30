@@ -377,7 +377,7 @@ struct StreamState {
     /// A transient access toast ("Access is now Controller only", "Access ends in 5 m")
     /// and when it went up — cleared after [`ACCESS_NOTICE_S`]. Rides the hint-pill slot
     /// with priority: an access change outranks "click to capture" for a few seconds.
-    access_notice: Option<(String, Instant)>,
+    session_notice: Option<(String, Instant)>,
     /// The params this session was started with, kept so a codec fallback can re-dial
     /// with `exclude_codecs` widened — see [`SessionEvent::CodecFallback`]. Cloned once
     /// per session start, so anything the SESSION changed after launch (an accepted mode
@@ -431,7 +431,7 @@ impl StreamState {
             capture: None,
             cursor_chan: None,
             access: pf_client_core::access::SessionAccess::default(),
-            access_notice: None,
+            session_notice: None,
             last_hint: None,
             hint_override: false,
             sent_client_draws: None,
@@ -1513,9 +1513,23 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     // Access event lands in this same drain, but the capture below must
                     // be built gated, not re-gated a beat later).
                     st.access = pf_client_core::access::SessionAccess::from_connector(&c);
+                    // Passthrough needs a host that injects touch. Without the bit every
+                    // contact would vanish with no error anywhere, so the session runs the
+                    // trackpad model instead and the notice says so.
+                    let touch_mode = if opts.touch_mode == TouchMode::Touch
+                        && c.host_caps2() & punktfunk_core::quic::HOST_CAP2_TOUCH == 0
+                    {
+                        st.session_notice = Some((
+                            "This host does not accept touch — using the trackpad model".into(),
+                            Instant::now(),
+                        ));
+                        TouchMode::Trackpad
+                    } else {
+                        opts.touch_mode
+                    };
                     let mut cap = Capture::new(
                         c.clone(),
-                        opts.touch_mode,
+                        touch_mode,
                         opts.invert_scroll,
                         opts.mouse_mode,
                         abs_ok,
@@ -1587,7 +1601,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     st.access = access;
                     if let Some(n) = notice {
                         tracing::info!(notice = %n, "session access changed");
-                        st.access_notice = Some((n, Instant::now()));
+                        st.session_notice = Some((n, Instant::now()));
                     }
                     if let Some(cap) = st.capture.as_mut() {
                         cap.set_grants(access.grants);
@@ -1792,15 +1806,20 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
         if let Some(st) = stream.as_mut() {
             st.resize_overlay.tick(Instant::now());
         }
+        // Touch long-press arm: a still finger raises no SDL event, so the gesture engine
+        // needs the clock — SDL ticks, the millisecond base the finger timestamps use.
+        if let Some(cap) = stream.as_mut().and_then(|st| st.capture.as_mut()) {
+            cap.tick(sdl3::timer::ticks() as f64);
+        }
 
         // Access toast expiry — before the overlay borrows the stream immutably.
         if let Some(st) = stream.as_mut() {
             if st
-                .access_notice
+                .session_notice
                 .as_ref()
                 .is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(ACCESS_NOTICE_S))
             {
-                st.access_notice = None;
+                st.session_notice = None;
             }
         }
 
@@ -1843,10 +1862,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 }
                 _ => None,
             };
-            let access_notice = stream
+            let session_notice = stream
                 .as_ref()
                 .filter(|st| st.connector.is_some())
-                .and_then(|st| st.access_notice.as_ref().map(|(n, _)| n.as_str()));
+                .and_then(|st| st.session_notice.as_ref().map(|(n, _)| n.as_str()));
             let pad = gamepad.active();
             let pads = gamepad.pads();
             let resizing = stream
@@ -1866,7 +1885,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                 stats,
                 hint,
                 access: access_chip.as_deref(),
-                notice: access_notice,
+                notice: session_notice,
                 mic_muted,
                 resizing,
                 pad: pad.as_ref().map(|p| p.name.as_str()),

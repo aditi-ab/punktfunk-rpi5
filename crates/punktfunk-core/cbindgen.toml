@@ -100,6 +100,7 @@ include = ["PunktfunkEndReason"]
 "CLIENT_CAP_AUDIO_HIRES" = "PUNKTFUNK_CLIENT_CAP_AUDIO_HIRES"
 "CLIENT_CAP_KEEP_HOST_AUDIO" = "PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO"
 "HOST_CAP_AUDIO_HIRES" = "PUNKTFUNK_HOST_CAP_AUDIO_HIRES"
+"HOST_CAP2_TOUCH" = "PUNKTFUNK_HOST_CAP2_TOUCH"
 
 # R21: every remaining exported constant, prefixed. cbindgen emits a bare `#define` per
 # `pub const`, so without an entry here names as generic as MAX_PADS, TAG_LEN, ABI_VERSION and

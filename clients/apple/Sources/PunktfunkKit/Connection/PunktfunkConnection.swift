@@ -570,6 +570,16 @@ public final class PunktfunkConnection {
         hostCaps & UInt8(PUNKTFUNK_HOST_CAP_PEN) != 0
     }
 
+    /// The second host capability byte (`punktfunk_connection_host_caps2`); `0` from an older host.
+    public private(set) var hostCaps2: UInt8 = 0
+
+    /// The host injects wire touch contacts (`HOST_CAP2_TOUCH`) — the gate for the passthrough
+    /// touch model. Without it the stream view routes fingers through the trackpad engine and the
+    /// session says so once, because the host would drop every contact silently.
+    public var hostSupportsTouch: Bool {
+        hostCaps2 & UInt8(PUNKTFUNK_HOST_CAP2_TOUCH) != 0
+    }
+
     // MARK: - Per-client access (design/per-client-access.md §7)
 
     /// The `PUNKTFUNK_GRANT_*` access bits — what a paired device may DO on the host, per the
@@ -985,6 +995,9 @@ public final class PunktfunkConnection {
         var caps: UInt8 = 0
         _ = punktfunk_connection_host_caps(handle, &caps)
         hostCaps = caps
+        var caps2: UInt8 = 0
+        _ = punktfunk_connection_host_caps2(handle, &caps2)
+        hostCaps2 = caps2
         // Where this host serves its game library, straight from the session's Welcome. 0 = the
         // host advertised none (older host / no management API), and the caller keeps whatever it
         // already had. This is the answer that does NOT require an mDNS advert to have been seen.

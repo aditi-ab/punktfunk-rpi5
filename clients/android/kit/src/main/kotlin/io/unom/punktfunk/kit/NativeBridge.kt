@@ -177,6 +177,14 @@ object NativeBridge {
      */
     external fun nativeDisconnectQuit(handle: Long)
 
+    /**
+     * Ask the host to switch the live session to [width]×[height] at [refreshHz] with no reconnect.
+     * Non-blocking: on acceptance the stream continues at the new mode from a keyframe that carries
+     * its own parameter sets; a rejection leaves the session unchanged. `false` when the request
+     * could not be queued (a `0` handle, a closed session, or a non-positive dimension).
+     */
+    external fun nativeRequestMode(handle: Long, width: Int, height: Int, refreshHz: Int): Boolean
+
     /** Tear down a session handle returned by [nativeConnect]. No-op on `0`. */
     external fun nativeClose(handle: Long)
 
@@ -516,6 +524,13 @@ object NativeBridge {
      * for splitting stylus pointers out of the touch path onto the pen plane. False on `0`.
      */
     external fun nativeHostSupportsPen(handle: Long): Boolean
+
+    /**
+     * Whether the host advertised touch injection (`HOST_CAP2_TOUCH`). Without it a passthrough
+     * contact lands nowhere, so the stream runs the trackpad model instead and says so. False on
+     * `0` and toward an older host.
+     */
+    external fun nativeHostSupportsTouch(handle: Long): Boolean
 
     /**
      * One stylus batch of STATE-FULL samples (the pen plane; design/pen-tablet-input.md §7):

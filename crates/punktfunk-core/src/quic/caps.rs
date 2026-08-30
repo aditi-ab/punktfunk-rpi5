@@ -242,6 +242,15 @@ pub const HOST_CAP_AUDIO_HIRES: u8 = 0x80;
 /// legacy window arithmetic.
 pub const HOST_CAP2_REPEAT_MARK: u8 = 0x01;
 
+/// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2) bit: the host's live injector puts
+/// wire touch contacts (`TouchDown` / `TouchMove` / `TouchUp`) on its desktop. Linux sets it on
+/// the libei, gamescope-EIS and KWin backends; the wlroots virtual-pointer backend has no touch
+/// protocol and drops every contact, and Windows below build 1809 cannot create a `PT_TOUCH`
+/// device. A client whose touch model is passthrough falls back to its trackpad model without the
+/// bit and says so — otherwise every contact vanishes with no error anywhere
+/// (design/touch-client-overlay.md §5.4). `0x02` — `0x01` is [`HOST_CAP2_REPEAT_MARK`].
+pub const HOST_CAP2_TOUCH: u8 = 0x02;
+
 /// [`Hello::video_codecs`] bit: the client can decode H.264 / AVC. The GPU-less **software**
 /// encode path (openh264) emits H.264, so a client that wants to stream from a software host MUST
 /// advertise this.

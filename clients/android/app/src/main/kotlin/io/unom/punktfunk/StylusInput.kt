@@ -4,7 +4,7 @@ import android.view.MotionEvent
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.input.pointer.PointerEvent
 import androidx.compose.ui.input.pointer.PointerType
-import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.IntRect
 import io.unom.punktfunk.kit.NativeBridge
 import kotlinx.coroutines.delay
 
@@ -50,14 +50,14 @@ internal class StylusStream(private val handle: Long) {
      * carried any (the caller's finger/gesture handling must then skip those changes).
      */
     @OptIn(ExperimentalComposeUiApi::class)
-    fun intercept(ev: PointerEvent, size: IntSize): Boolean {
+    fun intercept(ev: PointerEvent, rect: IntRect): Boolean {
         val stylusChanges = ev.changes.filter {
             it.type == PointerType.Stylus || it.type == PointerType.Eraser
         }
         if (stylusChanges.isEmpty()) return false
         stylusChanges.forEach { it.consume() }
         val me = ev.motionEvent ?: return true
-        if (size.width <= 0 || size.height <= 0) return true
+        if (rect.width <= 0 || rect.height <= 0) return true
         // At most one stylus exists — find its pointer index by tool type.
         val idx = (0 until me.pointerCount).firstOrNull {
             me.getToolType(it) == MotionEvent.TOOL_TYPE_STYLUS ||
@@ -70,20 +70,20 @@ internal class StylusStream(private val handle: Long) {
             -> {
                 touching = true
                 inRange = true
-                emitSamples(me, idx, size)
+                emitSamples(me, idx, rect)
             }
             MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE -> {
                 sawHover = true
                 inRange = true
                 touching = false
-                emitSamples(me, idx, size)
+                emitSamples(me, idx, rect)
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
                 touching = false
                 // Hover-capable hardware keeps proximity (HOVER_EXIT owns the leave);
                 // anything else leaves range on lift — the host never parks a phantom pen.
                 inRange = sawHover
-                emitSamples(me, idx, size)
+                emitSamples(me, idx, rect)
             }
             MotionEvent.ACTION_HOVER_EXIT, MotionEvent.ACTION_CANCEL -> release()
             else -> {}
@@ -123,14 +123,14 @@ internal class StylusStream(private val handle: Long) {
 
     /** Historical (coalesced) samples oldest-first, then the current one — one emit; the JNI
      * layer splits runs longer than the wire's 8-sample batch cap into consecutive sends. */
-    private fun emitSamples(me: MotionEvent, idx: Int, size: IntSize) {
+    private fun emitSamples(me: MotionEvent, idx: Int, rect: IntRect) {
         val history = minOf(me.historySize, MAX_SAMPLES - 1)
         var count = 0
         var prevT = if (history > 0) me.getHistoricalEventTime(0) else me.eventTime
         for (h in (me.historySize - history) until me.historySize) {
             val t = me.getHistoricalEventTime(h)
             fill(
-                batch, count * STRIDE, size,
+                batch, count * STRIDE, rect,
                 x = me.getHistoricalX(idx, h), y = me.getHistoricalY(idx, h),
                 pressure = me.getHistoricalPressure(idx, h),
                 tiltRad = me.getHistoricalAxisValue(MotionEvent.AXIS_TILT, idx, h),
@@ -143,7 +143,7 @@ internal class StylusStream(private val handle: Long) {
             count++
         }
         fill(
-            batch, count * STRIDE, size,
+            batch, count * STRIDE, rect,
             x = me.getX(idx), y = me.getY(idx), pressure = me.getPressure(idx),
             tiltRad = me.getAxisValue(MotionEvent.AXIS_TILT, idx),
             orientRad = me.getAxisValue(MotionEvent.AXIS_ORIENTATION, idx),
@@ -159,7 +159,7 @@ internal class StylusStream(private val handle: Long) {
     private fun fill(
         out: FloatArray,
         off: Int,
-        size: IntSize,
+        rect: IntRect,
         x: Float,
         y: Float,
         pressure: Float,
@@ -177,8 +177,9 @@ internal class StylusStream(private val handle: Long) {
         if (buttons and MotionEvent.BUTTON_STYLUS_SECONDARY != 0) state += PEN_BARREL2
         out[off + 0] = state
         out[off + 1] = if (tool == MotionEvent.TOOL_TYPE_ERASER) 1f else 0f
-        out[off + 2] = (x / (size.width - 1).coerceAtLeast(1)).coerceIn(0f, 1f)
-        out[off + 3] = (y / (size.height - 1).coerceAtLeast(1)).coerceIn(0f, 1f)
+        // Normalised against the PICTURE rect (a contact on a letterbox bar clamps to its edge).
+        out[off + 2] = ((x - rect.left) / (rect.width - 1).coerceAtLeast(1)).coerceIn(0f, 1f)
+        out[off + 3] = ((y - rect.top) / (rect.height - 1).coerceAtLeast(1)).coerceIn(0f, 1f)
         out[off + 4] = if (touching) pressure.coerceIn(0f, 1f) else 0f
         // AXIS_DISTANCE units are device-arbitrary; 0..1 covers real hardware, and 0 while
         // hovering legitimately means "at the hover floor".

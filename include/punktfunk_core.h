@@ -216,7 +216,14 @@
 // symbols so one of them could stay 19 bytes would push the fork into every embedder forever,
 // for a struct only poll-written by the core into caller memory. No wire change — both datagram
 // forms shipped with the passthrough itself — so [`WIRE_VERSION`] is unchanged.
-#define PUNKTFUNK_ABI_VERSION 27
+// **v28** adds [`abi::punktfunk_connection_host_caps2`] and `PUNKTFUNK_HOST_CAP2_TOUCH` — the
+// Welcome's second capability byte, which no embedder could read before. A client offering a
+// touch-passthrough model gates it on the bit and falls back to a cursor model with a notice,
+// because a host without it drops every contact silently (design/touch-client-overlay.md §5.4).
+// ADDED, not widened: one function and one constant; an embedder that never calls it behaves
+// exactly as on v27. The byte itself has ridden the Welcome as a trailing field since the repeat
+// mark, so [`WIRE_VERSION`] is unchanged.
+#define PUNKTFUNK_ABI_VERSION 28
 
 // The punktfunk/1 **wire** version — what `Hello`/`Welcome` carry and hosts equality-check.
 // Deliberately its own constant: [`ABI_VERSION`] tracks the embeddable **C surface**
@@ -475,6 +482,13 @@
 // but they should still read [`punktfunk_connection_audio_sample_rate`] to size their ring.
 // (Mirrors `quic::HOST_CAP_AUDIO_HIRES`.)
 #define PUNKTFUNK_HOST_CAP_AUDIO_HIRES 128
+
+// Host-capability bit in [`punktfunk_connection_host_caps2`] (the SECOND byte): the host's
+// injector puts wire touch contacts on its desktop. A client offering a touch-passthrough model
+// tests this before routing fingers as contacts; without the bit it should fall back to a
+// cursor model and say so, because the host drops every contact silently. (Mirrors
+// `quic::HOST_CAP2_TOUCH`.)
+#define PUNKTFUNK_HOST_CAP2_TOUCH 2
 
 // Pad-audio `kind` ([`punktfunk_connection_next_pad_audio`]): the BACK channel pair — DualSense
 // voice-coil haptics, 5 ms Opus frames. (Mirrors `quic::PAD_AUDIO_KIND_HAPTICS`.)
@@ -1201,6 +1215,17 @@
 // content; against an older host the client must treat activity as unknown and keep the
 // legacy window arithmetic.
 #define PUNKTFUNK_HOST_CAP2_REPEAT_MARK 1
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2) bit: the host's live injector puts
+// wire touch contacts (`TouchDown` / `TouchMove` / `TouchUp`) on its desktop. Linux sets it on
+// the libei, gamescope-EIS and KWin backends; the wlroots virtual-pointer backend has no touch
+// protocol and drops every contact, and Windows below build 1809 cannot create a `PT_TOUCH`
+// device. A client whose touch model is passthrough falls back to its trackpad model without the
+// bit and says so — otherwise every contact vanishes with no error anywhere
+// (design/touch-client-overlay.md §5.4). `0x02` — `0x01` is [`HOST_CAP2_REPEAT_MARK`].
+#define PUNKTFUNK_HOST_CAP2_TOUCH 2
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
@@ -4063,6 +4088,16 @@ PunktfunkStatus punktfunk_connection_mgmt_port(const PunktfunkConnection *c, uin
 // # Safety
 // `c` is a valid connection handle; `caps` is writable (NULL is skipped).
 PunktfunkStatus punktfunk_connection_host_caps(const PunktfunkConnection *c, uint8_t *caps);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The SECOND host capability byte the session's `Welcome` carried — today
+// `PUNKTFUNK_HOST_CAP2_TOUCH`. `0` toward an older host, which never sends the byte. Safe any
+// time after connect.
+//
+// # Safety
+// `c` is a valid connection handle; `caps` is writable (NULL is skipped).
+PunktfunkStatus punktfunk_connection_host_caps2(const PunktfunkConnection *c, uint8_t *caps);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
