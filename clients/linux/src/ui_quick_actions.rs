@@ -625,20 +625,22 @@ fn picker(button: &gtk::Button, k: usize, shared: &Shared, rebuild: Option<Rc<dy
     // No "Move" section: dragging one disc onto another is the swap, and a slot can always be
     // set outright from the catalogue above — so the six "Swap with…" rows only lengthened the
     // list with a second way to do what the list already does.
-    // Wide enough for the rows it holds. A `ScrolledWindow` asks for its MINIMUM width unless
-    // told otherwise, so the popover came out at the 320 px floor and wrapped entries like
-    // "Disconnect, keep the game running" into a narrow column. Propagating the natural width
-    // sizes it to the list instead, with the floor kept as a floor and a ceiling so one long
-    // shortcut label cannot stretch the popover across the window.
+    // ⚠ `min_content_width` does NOT hold this open: a ScrolledWindow whose horizontal policy is
+    // `Never` propagates its CHILD's minimum width and ignores that property. The child is a
+    // ListBox of AdwActionRows whose titles wrap, and a wrapping label's minimum width is one
+    // word — so the popover collapsed to a column a character or two wide, which is what it did
+    // for real. `set_size_request` is a true minimum GTK cannot ignore; the natural width then
+    // grows it to fit the rows, up to a ceiling so one long shortcut label cannot stretch the
+    // popover across the window.
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .propagate_natural_height(true)
         .propagate_natural_width(true)
         .max_content_height(420)
-        .min_content_width(360)
         .max_content_width(560)
         .child(&list)
         .build();
+    scroll.set_size_request(380, -1);
     popover.set_child(Some(&scroll));
     popover.set_parent(button);
     // A popover must leave its parent once closed, or GTK complains when the disc goes; the
