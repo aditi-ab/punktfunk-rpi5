@@ -12,8 +12,9 @@ pub(crate) mod library;
 pub(crate) mod options;
 pub(crate) mod pair;
 pub(crate) mod pin_hosts;
-pub(crate) mod ring_shortcuts;
+pub(crate) mod ring_editor;
 pub(crate) mod settings;
+pub(crate) mod shortcut_editor;
 
 /// The context menu under the name the home carousel still opens it by. Home predates the
 /// generalisation and spells both the module and the type "host options"; it is the same
@@ -194,9 +195,11 @@ pub(crate) enum Screen {
     /// and tests only the platform can perform. Android-reachable only — the settings row
     /// that opens it is in `settings::row_on`'s Android-only list.
     Controllers(controllers::ControllersScreen),
-    /// The quick-action ring's shortcuts: the blob's chords and an editor for one. Raised by
-    /// the settings row of the same name.
-    RingShortcuts(ring_shortcuts::RingShortcutsScreen),
+    /// The quick-action ring's editor — the ring itself, over a stage (design
+    /// touch-client-overlay.md §3.3). Raised by the Quick actions settings row.
+    RingEditor(Box<ring_editor::RingEditorScreen>),
+    /// One of the ring's shortcuts, new or existing. Raised from the ring editor.
+    ShortcutEditor(shortcut_editor::ShortcutEditorScreen),
     /// The context menu: a subject and the actions that apply to it — a host's Wake / Copy
     /// link / Edit / Forget, a title's Copy link — raised by [`Outbox::options`]. It still
     /// carries the host menu's name because [`host_options`] does; both are one rename.
@@ -216,7 +219,8 @@ impl Screen {
             Screen::Collections(s) => s.menu(ev, ctx, fx),
             Screen::Settings(s) => s.menu(ev, ctx, fx),
             Screen::AddHost(s) => s.menu(ev, ctx, fx),
-            Screen::RingShortcuts(s) => s.menu(ev, ctx, fx),
+            Screen::RingEditor(s) => s.menu(ev, ctx, fx),
+            Screen::ShortcutEditor(s) => s.menu(ev, ctx, fx),
             Screen::Pair(s) => s.menu(ev, ctx, fx),
             Screen::PinHosts(s) => s.menu(ev, ctx, fx),
             Screen::BindProfile(s) => s.menu(ev, ctx, fx),
@@ -237,7 +241,8 @@ impl Screen {
             Screen::Collections(s) => s.pointer(p, ctx, fx),
             Screen::Settings(s) => s.pointer(p, ctx, fx),
             Screen::AddHost(s) => s.pointer(p, ctx, fx),
-            Screen::RingShortcuts(s) => s.pointer(p, ctx, fx),
+            Screen::RingEditor(s) => s.pointer(p, ctx, fx),
+            Screen::ShortcutEditor(s) => s.pointer(p, ctx, fx),
             Screen::Pair(s) => s.pointer(p, ctx, fx),
             Screen::PinHosts(s) => s.pointer(p, ctx, fx),
             Screen::BindProfile(s) => s.pointer(p, ctx, fx),
@@ -251,7 +256,7 @@ impl Screen {
     pub(crate) fn text_input(&mut self, text: &str) {
         match self {
             Screen::AddHost(s) => s.text_input(text),
-            Screen::RingShortcuts(s) => s.text_input(text),
+            Screen::ShortcutEditor(s) => s.text_input(text),
             Screen::Pair(s) => s.text_input(text),
             Screen::Settings(s) => s.text_input(text),
             _ => {}
@@ -267,7 +272,7 @@ impl Screen {
     pub(crate) fn edit_key(&mut self, key: crate::input::Key, ctx: &mut Ctx) -> bool {
         match self {
             Screen::AddHost(s) => s.edit_key(key),
-            Screen::RingShortcuts(s) => s.edit_key(key),
+            Screen::ShortcutEditor(s) => s.edit_key(key),
             Screen::Pair(s) => s.edit_key(key),
             Screen::Settings(s) => s.edit_key(key, ctx),
             _ => false,
@@ -278,7 +283,7 @@ impl Screen {
     pub(crate) fn editing(&self) -> bool {
         match self {
             Screen::AddHost(s) => s.editing(),
-            Screen::RingShortcuts(s) => s.editing(),
+            Screen::ShortcutEditor(s) => s.editing(),
             Screen::Pair(s) => s.editing(),
             Screen::Settings(s) => s.editing(),
             _ => false,
@@ -299,7 +304,8 @@ impl Screen {
             Screen::Collections(s) => s.title(),
             Screen::Settings(_) => "Settings".into(),
             Screen::AddHost(s) => s.title(),
-            Screen::RingShortcuts(s) => s.title(),
+            Screen::RingEditor(s) => s.title(),
+            Screen::ShortcutEditor(s) => s.title(),
             Screen::Pair(s) => format!("Pair with {}", s.host_name()),
             Screen::PinHosts(s) => format!("Pin \u{201c}{}\u{201d}", s.profile_name()),
             Screen::BindProfile(s) => format!("Default for {}", s.host_name()),
@@ -315,7 +321,8 @@ impl Screen {
             Screen::Collections(s) => s.hints(ctx),
             Screen::Settings(s) => s.hints(ctx),
             Screen::AddHost(s) => s.hints(ctx),
-            Screen::RingShortcuts(s) => s.hints(ctx),
+            Screen::RingEditor(s) => s.hints(ctx),
+            Screen::ShortcutEditor(s) => s.hints(ctx),
             Screen::Pair(s) => s.hints(ctx),
             Screen::PinHosts(s) => s.hints(ctx),
             Screen::BindProfile(s) => s.hints(ctx),
@@ -342,7 +349,8 @@ impl Screen {
             Screen::Collections(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::Settings(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::AddHost(s) => s.render(canvas, rect, k, dt, fonts, ctx),
-            Screen::RingShortcuts(s) => s.render(canvas, rect, k, dt, fonts, ctx),
+            Screen::RingEditor(s) => s.render(canvas, rect, k, dt, fonts, ctx),
+            Screen::ShortcutEditor(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::Pair(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::PinHosts(s) => s.render(canvas, rect, k, dt, fonts, ctx),
             Screen::BindProfile(s) => s.render(canvas, rect, k, dt, fonts, ctx),

@@ -60,6 +60,55 @@ enum SheetRow {
     Refresh,
 }
 
+/// The editor's state on the ring (design §3.3, "the editor is the ring"): a press on a slot
+/// picks instead of firing, Y lifts the highlighted disc and A drops it on another slot, a
+/// pointer carries a disc onto another. The centre is inert, nothing fires, nothing closes on
+/// its own.
+#[derive(Default)]
+struct Editing {
+    /// The disc a pad lifted (Y), waiting for the slot A drops it on.
+    lifted: Option<usize>,
+    /// The disc a pointer carries: its slot, where the press landed, and how far it went.
+    drag: Option<Drag>,
+}
+
+struct Drag {
+    slot: usize,
+    x0: f64,
+    y0: f64,
+    dx: f32,
+    dy: f32,
+}
+
+impl Drag {
+    /// A carry past this is a drag; under it the release is the pick.
+    const SLOP: f32 = 10.0;
+
+    fn moved(&self) -> bool {
+        self.dx.hypot(self.dy) > Self::SLOP
+    }
+}
+
+/// What the editor asks of its screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EditEvent {
+    /// Choose what slot `k` holds.
+    Pick(usize),
+    /// Swap the contents of the two slots.
+    Swap(usize, usize),
+}
+
+/// The three power actions as a host that offers all three would show them; a dimmed "does
+/// not offer it" in the editor would lie about the slot.
+fn preview_host_label(id: &str) -> &str {
+    match id {
+        "power.sleep" => "Sleep host",
+        "power.reboot" => "Restart host",
+        "power.shutdown" => "Shut down host",
+        other => other,
+    }
+}
+
 pub(crate) struct Ring {
     progress: f32,
     committed: bool,
@@ -83,6 +132,8 @@ pub(crate) struct Ring {
     cfg: OverlayConfig,
     pending: VecDeque<RingCommand>,
     cmds: Vec<ConsoleCmd>,
+    editing: Option<Editing>,
+    edits: VecDeque<EditEvent>,
 }
 
 impl Ring {
@@ -106,11 +157,47 @@ impl Ring {
             cfg: OverlayConfig::platform_default(RingPlatform::Desktop),
             pending: VecDeque::new(),
             cmds: Vec::new(),
+            editing: None,
+            edits: VecDeque::new(),
         }
     }
 
     pub(crate) fn open(&self) -> bool {
         self.committed || self.progress > 0.0
+    }
+
+    /// Make this ring the editor (§3.3): open at `(x, y)`, never idle-closing, the first slot
+    /// highlighted so a pad has somewhere to start.
+    pub(crate) fn edit_at(&mut self, x: f32, y: f32) {
+        self.editing = Some(Editing::default());
+        self.centre = (x, y);
+        self.commit();
+        self.highlight = Some(0);
+    }
+
+    /// Where the editor's ring is centred, for a screen laying out around it.
+    pub(crate) fn recentre(&mut self, x: f32, y: f32) {
+        self.centre = (x, y);
+    }
+
+    pub(crate) fn highlight(&self) -> Option<usize> {
+        self.highlight
+    }
+
+    /// The pad's highlight, set by a screen handing focus back to the ring.
+    pub(crate) fn set_highlight(&mut self, k: usize) {
+        self.highlight = Some(k.min(5));
+    }
+
+    /// A disc is lifted or carried: the screen keeps its focus on the ring.
+    pub(crate) fn carrying(&self) -> bool {
+        self.editing
+            .as_ref()
+            .is_some_and(|e| e.lifted.is_some() || e.drag.is_some())
+    }
+
+    pub(crate) fn take_edit(&mut self) -> Option<EditEvent> {
+        self.edits.pop_front()
     }
 
     /// The session facts, per frame. The ring config is re-parsed only when the blob changes.
@@ -177,7 +264,11 @@ impl Ring {
     /// Timeouts: the exit disc's 8 s idle rule (unless the sheet is up), and the 2 s life of
     /// an armed slot or a hint. Once per frame, before the damage key is read.
     pub(crate) fn tick(&mut self) {
-        if self.committed && !self.sheet && self.last_touch.elapsed() > IDLE_CLOSE {
+        if self.committed
+            && !self.sheet
+            && self.editing.is_none()
+            && self.last_touch.elapsed() > IDLE_CLOSE
+        {
             self.close();
         }
         if (self.armed.is_some() || self.hint.is_some()) && self.hint_at.elapsed() > HINT_LIFE {
@@ -216,8 +307,18 @@ impl Ring {
         h.finish().max(1)
     }
 
+    /// The host's pre-fetched actions. The cache is the desktop shell's; the Android console
+    /// only ever draws this ring as the editor, where the three power actions are previewed
+    /// (`preview_host_label`).
     fn actions(&self) -> Vec<ActionInfo> {
-        host_actions::cached(&self.facts.fp_hex)
+        #[cfg(any(target_os = "linux", windows))]
+        {
+            host_actions::cached(&self.facts.fp_hex)
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            Vec::new()
+        }
     }
 
     fn spec(&self, slot: &SlotId) -> Spec {
@@ -286,6 +387,10 @@ impl Ring {
                 enabled: false,
                 reason: "Not on this client yet — use the keyboard".into(),
                 ..plain("send_text", "Send text", "Text")
+            },
+            SlotId::Host(id) if self.editing.is_some() => Spec {
+                armed: true,
+                ..plain(&format!("host:{id}"), preview_host_label(id), "Power")
             },
             SlotId::Host(id) => {
                 let act = self.actions().into_iter().find(|a| &a.id == id);
@@ -491,10 +596,15 @@ impl Ring {
         }
     }
 
-    /// Pointer input while open; always consumed (the scrim owns the glass).
+    /// Pointer input while open; always consumed (the scrim owns the glass). The editor's
+    /// ring takes only what lands on a disc or belongs to a carry, so the screen's own
+    /// widgets under it keep their pointer.
     pub(crate) fn pointer(&mut self, p: Pointer) -> bool {
         if !self.open() {
             return false;
+        }
+        if self.editing.is_some() {
+            return self.edit_pointer(p);
         }
         match p.kind {
             PointerKind::Back => {
@@ -537,6 +647,59 @@ impl Ring {
         true
     }
 
+    /// A press on a disc starts a carry; a release short of the slop is the pick, one over
+    /// another slot is the swap. Anything off the discs is the screen's.
+    fn edit_pointer(&mut self, p: Pointer) -> bool {
+        let geom = self.geom.clone();
+        let Some(ed) = self.editing.as_mut() else {
+            return false;
+        };
+        match p.kind {
+            PointerKind::Press => match p.pick(&geom) {
+                Some(k) if k < 6 => {
+                    ed.drag = Some(Drag {
+                        slot: k,
+                        x0: p.x,
+                        y0: p.y,
+                        dx: 0.0,
+                        dy: 0.0,
+                    });
+                    ed.lifted = None;
+                    self.highlight = Some(k);
+                    self.touch();
+                    true
+                }
+                _ => false,
+            },
+            PointerKind::Move => match ed.drag.as_mut() {
+                Some(d) => {
+                    d.dx = (p.x - d.x0) as f32;
+                    d.dy = (p.y - d.y0) as f32;
+                    true
+                }
+                None => false,
+            },
+            PointerKind::Release => {
+                let Some(d) = ed.drag.take() else {
+                    return false;
+                };
+                // The carried disc's own rect has followed the pointer, so look past it.
+                let target = (0..6).find(|&j| j != d.slot && p.hits(geom[j]));
+                match target {
+                    Some(j) if d.moved() => self.edits.push_back(EditEvent::Swap(d.slot, j)),
+                    _ if !d.moved() => self.edits.push_back(EditEvent::Pick(d.slot)),
+                    _ => {}
+                }
+                true
+            }
+            PointerKind::Cancel => {
+                ed.drag = None;
+                false
+            }
+            PointerKind::Scroll { .. } | PointerKind::Back => false,
+        }
+    }
+
     /// Keyboard while open — the pad's vocabulary on keys: arrows move the highlight, Return
     /// activates, Escape backs out. Always consumed while open.
     pub(crate) fn key(&mut self, key: Key) -> bool {
@@ -566,6 +729,9 @@ impl Ring {
             return None;
         }
         self.touch();
+        if self.editing.is_some() {
+            return self.edit_menu(ev);
+        }
         if self.sheet {
             if ev == MenuEvent::Back {
                 self.sheet = false;
@@ -617,6 +783,50 @@ impl Ring {
         }
     }
 
+    /// The pad in the editor (§3.3): Right and Left step the highlight round the ring, Up and
+    /// Down jump to 12 and 6 o'clock, A picks what the slot holds — or drops a lifted disc on
+    /// it — Y lifts the disc (Y again puts it down), B puts a lifted disc down; with nothing
+    /// lifted B is the screen's. The centre is inert.
+    fn edit_menu(&mut self, ev: MenuEvent) -> Option<MenuPulse> {
+        let h = self.highlight.unwrap_or(0).min(5);
+        let ed = self.editing.as_mut()?;
+        match ev {
+            MenuEvent::Move(MenuDir::Right) => {
+                self.highlight = Some((h + 1) % 6);
+                Some(MenuPulse::Move)
+            }
+            MenuEvent::Move(MenuDir::Left) => {
+                self.highlight = Some((h + 5) % 6);
+                Some(MenuPulse::Move)
+            }
+            MenuEvent::Move(MenuDir::Up) => {
+                self.highlight = Some(0);
+                Some(MenuPulse::Move)
+            }
+            MenuEvent::Move(MenuDir::Down) => {
+                self.highlight = Some(3);
+                Some(MenuPulse::Move)
+            }
+            MenuEvent::Secondary => {
+                ed.lifted = if ed.lifted == Some(h) { None } else { Some(h) };
+                Some(MenuPulse::Confirm)
+            }
+            MenuEvent::Confirm => {
+                match ed.lifted.take() {
+                    Some(j) if j != h => self.edits.push_back(EditEvent::Swap(j, h)),
+                    Some(_) => {}
+                    None => self.edits.push_back(EditEvent::Pick(h)),
+                }
+                Some(MenuPulse::Confirm)
+            }
+            MenuEvent::Back if ed.lifted.is_some() => {
+                ed.lifted = None;
+                Some(MenuPulse::Confirm)
+            }
+            _ => None,
+        }
+    }
+
     /// Draw the ring (and the sheet) over the stream chrome. `scale` is the chrome scale.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render(
@@ -662,11 +872,20 @@ impl Ring {
             .clamp(margin, (height as f32 - margin).max(margin));
         let white = |a: f32| Color4f::new(1.0, 1.0, 1.0, a);
 
-        // The scrim: nothing reaches the stream while the ring is open.
-        canvas.draw_rect(
-            Rect::from_wh(width as f32, height as f32),
-            &fill(Color4f::new(0.0, 0.0, 0.0, 0.18 * shown)),
-        );
+        // The scrim: nothing reaches the stream while the ring is open. The editor has its
+        // own backdrop and widgets under the ring, so it draws none.
+        let editing = self.editing.is_some();
+        if !editing {
+            canvas.draw_rect(
+                Rect::from_wh(width as f32, height as f32),
+                &fill(Color4f::new(0.0, 0.0, 0.0, 0.18 * shown)),
+            );
+        }
+        let lifted = self.editing.as_ref().and_then(|e| e.lifted);
+        let carried = self
+            .editing
+            .as_ref()
+            .and_then(|e| e.drag.as_ref().map(|d| (d.slot, d.dx, d.dy)));
 
         let armed = self.armed.clone();
         for k in 0..6 {
@@ -682,8 +901,16 @@ impl Ring {
             let turn = if self.clockwise { -40.0 } else { 40.0 };
             let deg = -90.0 + 60.0 * k as f32 + (1.0 - travel) * turn;
             let (s, c) = deg.to_radians().sin_cos();
-            let (x, y) = (cx + radius * travel * c, cy + radius * travel * s);
-            let r = slot_d / 2.0 * (0.6 + 0.4 * travel);
+            let (mut x, mut y) = (cx + radius * travel * c, cy + radius * travel * s);
+            let mut r = slot_d / 2.0 * (0.6 + 0.4 * travel);
+            // Editing: a carried disc follows the pointer; a lifted one sits raised.
+            if let Some((_, dx, dy)) = carried.filter(|(slot, _, _)| *slot == k) {
+                x += dx;
+                y += dy;
+                r *= 1.08;
+            } else if lifted == Some(k) {
+                r *= 1.12;
+            }
             let spec = self.cfg.ring[k].as_ref().map(|slot| self.spec(slot));
             let is_armed = spec
                 .as_ref()
@@ -700,11 +927,12 @@ impl Ring {
                 is_armed,
                 white,
             );
-            if self.highlight == Some(k) {
+            if self.highlight == Some(k) || lifted == Some(k) {
+                let a = if lifted == Some(k) { 1.0 } else { 0.8 };
                 canvas.draw_circle(
                     Point::new(x, y),
                     r + 3.0 * scale,
-                    &stroke(white(0.8 * q), 2.0 * scale),
+                    &stroke(white(a * q), 2.0 * scale),
                 );
             }
             self.geom[k] = Rect::from_xywh(x - r, y - r, 2.0 * r, 2.0 * r);
@@ -713,11 +941,12 @@ impl Ring {
         let cq = ((shown - 6.0 * SLOT_LAG) / (1.0 - 6.0 * SLOT_LAG)).clamp(0.0, 1.0);
         if cq > 0.0 {
             let r = CENTRE_D * scale / 2.0 * (0.6 + 0.4 * cq);
+            // In the editor the centre is not editable, so it sits dimmed and inert.
             let more = Spec {
                 id: "more".into(),
                 label: "More".into(),
                 short: "More".into(),
-                enabled: true,
+                enabled: !editing,
                 reason: String::new(),
                 armed: false,
                 toggle: false,
@@ -747,10 +976,22 @@ impl Ring {
             self.geom[6] = Rect::new_empty();
         }
         // The label under the ring: a hint, else the highlighted slot's name (the label a
-        // finger would reveal).
+        // finger would reveal). The editor says what the next press does.
         let label = self.hint.clone().or_else(|| match self.highlight {
+            _ if lifted.is_some() => Some("Move to a slot and press A to swap".into()),
             Some(6) => Some("More".into()),
-            Some(k) => self.cfg.ring[k].as_ref().map(|s| self.spec(s).label),
+            Some(k) => Some(
+                self.cfg.ring[k]
+                    .as_ref()
+                    .map(|s| self.spec(s).label)
+                    .unwrap_or_else(|| {
+                        if editing {
+                            "Empty — press A to choose".into()
+                        } else {
+                            "Empty".into()
+                        }
+                    }),
+            ),
             None => None,
         });
         if let Some(hint) = &label {
@@ -853,6 +1094,12 @@ fn draw_disc(
         white(0.35 * alpha)
     };
     let size = f64::from(12.0 * scale * (r / (SLOT_D * scale / 2.0)).clamp(0.6, 1.2));
+    // A shortcut is a stacked keycap: the modifiers small on top, the key large under them —
+    // one line ran to the disc's edge and past it.
+    if spec.id.starts_with("shortcut:") && spec.short.contains('+') {
+        keycap_text(canvas, fonts, x, y, r, size, &spec.short, color);
+        return;
+    }
     let tw = fonts.measure(&spec.short, W::SemiBold, size);
     fonts.draw(
         canvas,
@@ -862,6 +1109,94 @@ fn draw_disc(
         W::SemiBold,
         size,
         color,
+    );
+}
+
+/// A chord's legend (`Ctrl+Shift+Esc`) on a disc: the modifiers small on top, the key large
+/// under them. `size` is the disc's base text size.
+#[allow(clippy::too_many_arguments)]
+fn keycap_text(
+    canvas: &Canvas,
+    fonts: &Fonts,
+    x: f32,
+    y: f32,
+    r: f32,
+    size: f64,
+    chip: &str,
+    color: Color4f,
+) {
+    let Some((mods, key)) = chip.rsplit_once('+') else {
+        let tw = fonts.measure(chip, W::SemiBold, size * 1.25);
+        fonts.draw(
+            canvas,
+            chip,
+            f64::from(x - tw / 2.0),
+            f64::from(y + size as f32 * 0.45),
+            W::SemiBold,
+            size * 1.25,
+            color,
+        );
+        return;
+    };
+    let mods = mods.replace('+', " ");
+    let small = size * 0.62;
+    let big = size * 1.25;
+    let mw = fonts.measure(&mods, W::Medium, small);
+    fonts.draw(
+        canvas,
+        &mods,
+        f64::from(x - mw / 2.0),
+        f64::from(y - r * 0.22),
+        W::Medium,
+        small,
+        color,
+    );
+    let kw = fonts.measure(key, W::SemiBold, big);
+    fonts.draw(
+        canvas,
+        key,
+        f64::from(x - kw / 2.0),
+        f64::from(y + r * 0.42),
+        W::SemiBold,
+        big,
+        color,
+    );
+}
+
+/// A shortcut's disc as the ring draws it, for the editors' previews: the translucent disc,
+/// the hairline, and the chord as a stacked keycap. `chip` empty draws an empty disc.
+pub(crate) fn draw_keycap_disc(
+    canvas: &Canvas,
+    fonts: &Fonts,
+    x: f32,
+    y: f32,
+    r: f32,
+    scale: f32,
+    chip: &str,
+) {
+    canvas.draw_circle(
+        Point::new(x, y),
+        r,
+        &fill(Color4f::new(0.0, 0.0, 0.0, 0.55)),
+    );
+    canvas.draw_circle(
+        Point::new(x, y),
+        r,
+        &stroke(Color4f::new(1.0, 1.0, 1.0, 0.18), scale),
+    );
+    if chip.is_empty() {
+        return;
+    }
+    let size = f64::from(12.0 * scale * (r / (SLOT_D * scale / 2.0)).clamp(0.6, 1.6));
+    keycap_text(
+        canvas,
+        fonts,
+        x,
+        y,
+        r,
+        size,
+        chip,
+        Color4f::new(1.0, 1.0, 1.0, 0.95),
     );
 }
 
@@ -988,6 +1323,64 @@ mod tests {
         assert_eq!(r.armed.as_deref(), Some("end_stream"));
         r.menu(MenuEvent::Back);
         assert!(!r.open(), "B closes the ring");
+    }
+
+    /// The editor (§3.3): A on a slot asks for a pick, Y lifts and A on another slot asks for
+    /// a swap, B with a disc lifted only puts it down, and the ring never closes by itself.
+    #[test]
+    fn the_editor_picks_lifts_and_swaps_without_ever_firing() {
+        let mut r = Ring::new();
+        r.set_facts(&facts());
+        r.edit_at(300.0, 300.0);
+        assert_eq!(r.highlight(), Some(0), "a pad has somewhere to start");
+        r.menu(MenuEvent::Confirm);
+        assert_eq!(r.take_edit(), Some(EditEvent::Pick(0)));
+        assert_eq!(r.take_command(), None, "End stream did not arm or fire");
+        assert_eq!(r.armed, None);
+        r.menu(MenuEvent::Secondary); // lift slot 0
+        assert!(r.carrying());
+        r.menu(MenuEvent::Move(MenuDir::Right));
+        r.menu(MenuEvent::Move(MenuDir::Right));
+        r.menu(MenuEvent::Confirm); // drop on slot 2
+        assert_eq!(r.take_edit(), Some(EditEvent::Swap(0, 2)));
+        assert!(!r.carrying());
+        r.menu(MenuEvent::Secondary);
+        assert!(
+            matches!(r.menu(MenuEvent::Back), Some(MenuPulse::Confirm)),
+            "B puts it down"
+        );
+        assert!(!r.carrying());
+        assert!(
+            r.menu(MenuEvent::Back).is_none(),
+            "with nothing lifted B is the screen's"
+        );
+        assert!(r.open(), "and the ring stayed open");
+    }
+
+    /// A pointer: a press and release on one disc is the pick; a press carried onto another
+    /// disc is the swap; a press between the discs is the screen's.
+    #[test]
+    fn the_editor_takes_a_click_as_a_pick_and_a_carry_as_a_swap() {
+        let mut r = Ring::new();
+        r.set_facts(&facts());
+        r.edit_at(300.0, 300.0);
+        // Stand in for a frame: the slot rects at 12 and 2 o'clock, the ring fully shown.
+        r.geom[0] = Rect::from_xywh(272.0, 152.0, 56.0, 56.0);
+        r.geom[1] = Rect::from_xywh(376.0, 212.0, 56.0, 56.0);
+        let at = |x: f64, y: f64, kind: PointerKind| Pointer { x, y, kind };
+        assert!(
+            !r.pointer(at(300.0, 300.0, PointerKind::Press)),
+            "between the discs"
+        );
+        assert!(r.pointer(at(300.0, 180.0, PointerKind::Press)));
+        assert!(r.pointer(at(302.0, 181.0, PointerKind::Release)));
+        assert_eq!(r.take_edit(), Some(EditEvent::Pick(0)));
+        assert!(r.pointer(at(300.0, 180.0, PointerKind::Press)));
+        assert!(r.pointer(at(360.0, 220.0, PointerKind::Move)));
+        assert!(r.carrying());
+        assert!(r.pointer(at(404.0, 240.0, PointerKind::Release)));
+        assert_eq!(r.take_edit(), Some(EditEvent::Swap(0, 1)));
+        assert!(!r.carrying());
     }
 
     #[test]

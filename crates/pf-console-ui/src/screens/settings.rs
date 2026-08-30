@@ -21,7 +21,6 @@ use crate::widgets::{
 };
 use pf_client_core::audio_format::{AUDIO_FORMATS, AUDIO_FORMAT_OPUS};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
-use pf_client_core::overlay_actions::{chord_chip, OverlayConfig, RingPlatform, SlotId};
 use pf_client_core::trust::{MouseMode, StatsVerbosity, TouchMode};
 use skia_safe::{Canvas, Rect};
 
@@ -78,16 +77,10 @@ enum RowId {
     Mouse,
     InvertScroll,
     Shortcuts,
-    /// One slot of the quick-action ring (0 = 12 o'clock), stepped through everything the
-    /// ring can hold — `trust::Settings::overlay_actions`, the whole blob (design
-    /// touch-client-overlay.md §3.3, the list form). Shortcut CREATION is not here yet: a
-    /// slot can point at a chord the blob already carries, made on a phone or the desktop app.
-    RingSlot(usize),
-    /// The blob's shortcut chords and their editor (an action row — opens
-    /// [`super::ring_shortcuts::RingShortcutsScreen`]).
-    RingShortcuts,
-    /// Back to the platform ring: empties the blob.
-    RingReset,
+    /// The quick-action ring — `trust::Settings::overlay_actions`, the whole blob — edited
+    /// on the ring itself (an action row — opens [`super::ring_editor::RingEditorScreen`],
+    /// design touch-client-overlay.md §3.3).
+    QuickActions,
     Stats,
     Fullscreen,
     AutoWake,
@@ -159,54 +152,6 @@ mod android_keys {
 /// The Android console-UI mode's stored values (`GamepadUi.kt`).
 const GAMEPAD_UI_MODES: [(&str, &str); 2] =
     [("connected", "With a controller"), ("always", "Always")];
-
-const RING_SLOT_LABELS: [&str; 6] = [
-    "Ring, 12 o'clock",
-    "Ring, 2 o'clock",
-    "Ring, 4 o'clock",
-    "Ring, 6 o'clock",
-    "Ring, 8 o'clock",
-    "Ring, 10 o'clock",
-];
-
-/// The ring rows parse the blob on the platform's default ring, like the ring itself does.
-fn ring_platform(platform: crate::platform::Platform) -> RingPlatform {
-    match platform {
-        crate::platform::Platform::Desktop => RingPlatform::Desktop,
-        crate::platform::Platform::Android => RingPlatform::Touch,
-    }
-}
-
-/// What a slot can hold, in stepping order: empty, the built-ins, the three host power
-/// actions by their advertised ids, then the blob's own shortcuts. `(id, label)`.
-fn ring_options(cfg: &OverlayConfig) -> Vec<(String, String)> {
-    let mut v: Vec<(String, String)> = [
-        ("", "Empty"),
-        ("end_stream", "End stream"),
-        ("disconnect_linger", "Disconnect, keep the game running"),
-        ("touch_mode", "Touch mode"),
-        ("keyboard", "Keyboard"),
-        ("stats", "Statistics"),
-        ("mic", "Microphone"),
-        ("pad", "Virtual controller"),
-        ("send_text", "Send text"),
-        ("host:power.sleep", "Host: sleep"),
-        ("host:power.reboot", "Host: reboot"),
-        ("host:power.shutdown", "Host: shut down"),
-    ]
-    .into_iter()
-    .map(|(id, label)| (id.to_string(), label.to_string()))
-    .collect();
-    v.extend(cfg.shortcuts.iter().map(|sc| {
-        let label = if sc.label.is_empty() {
-            chord_chip(&sc.keys)
-        } else {
-            sc.label.clone()
-        };
-        (format!("shortcut:{}", sc.id), label)
-    }));
-    v
-}
 
 /// `pad_audio::speaker_active`'s answer, restated: only `"pad"` renders today ("mix" is
 /// the declared TODO that renders as off). Local because that module owns the actual
@@ -316,14 +261,7 @@ const TABS: [(&str, &[RowId]); 7] = [
             RowId::Mouse,
             RowId::InvertScroll,
             RowId::Shortcuts,
-            RowId::RingSlot(0),
-            RowId::RingSlot(1),
-            RowId::RingSlot(2),
-            RowId::RingSlot(3),
-            RowId::RingSlot(4),
-            RowId::RingSlot(5),
-            RowId::RingShortcuts,
-            RowId::RingReset,
+            RowId::QuickActions,
         ],
     ),
     (
@@ -805,28 +743,14 @@ impl SettingsScreen {
                     ListMsg::None => pulse,
                 };
             }
-            // The shortcuts live on their own screen: a list of the blob's chords and an
-            // editor with the on-screen keyboard.
-            RowId::RingShortcuts => {
+            // The ring is edited on the ring itself, on its own screen; ◀ ▶ thud.
+            RowId::QuickActions => {
                 return match msg {
                     ListMsg::Activate => {
-                        fx.push(Screen::RingShortcuts(
-                            super::ring_shortcuts::RingShortcutsScreen::new(ctx),
-                        ));
+                        fx.push(Screen::RingEditor(Box::new(
+                            super::ring_editor::RingEditorScreen::new(ctx),
+                        )));
                         pulse
-                    }
-                    ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
-                    ListMsg::None => pulse,
-                };
-            }
-            // An action row, not a value: A empties the blob (the platform default), ◀ ▶ thud.
-            RowId::RingReset => {
-                return match msg {
-                    ListMsg::Activate => {
-                        *ctx.settings = ctx.store.load();
-                        ctx.settings.overlay_actions.clear();
-                        ctx.store.save(ctx.settings);
-                        Some(MenuPulse::Move)
                     }
                     ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
                     ListMsg::None => pulse,
@@ -1141,8 +1065,11 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
         }
         RowId::Controllers => return RowSpec::action("Connected controllers", true),
         RowId::Licenses => return RowSpec::action("Open-source licences", true),
-        RowId::RingReset => return RowSpec::action("Reset quick actions", true),
-        RowId::RingShortcuts => return RowSpec::action("Quick-action shortcuts", true),
+        RowId::QuickActions => {
+            let mut r = RowSpec::action("Quick actions", true);
+            r.header = Some("Quick actions");
+            return r;
+        }
         _ => {}
     }
     let s = &ctx.settings;
@@ -1322,19 +1249,6 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             on_off(pad_speaker_on(&s.pad_speaker)).into(),
         ),
         RowId::Touch => (None, "Touch mode", s.touch_mode().label().into()),
-        RowId::RingSlot(k) => {
-            let cfg = OverlayConfig::parse(&s.overlay_actions, ring_platform(ctx.platform));
-            let id = cfg.ring[k].as_ref().map(SlotId::id).unwrap_or_default();
-            let label = ring_options(&cfg)
-                .into_iter()
-                .find(|(i, _)| *i == id)
-                .map_or_else(|| "Empty".to_string(), |(_, l)| l);
-            (
-                if k == 0 { Some("Quick actions") } else { None },
-                RING_SLOT_LABELS[k],
-                label,
-            )
-        }
         RowId::Mouse => (None, "Mouse mode", s.mouse_mode().label().into()),
         RowId::InvertScroll => (None, "Invert scroll", on_off(s.invert_scroll).into()),
         RowId::Shortcuts => (
@@ -1424,8 +1338,7 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
         | RowId::NoProfiles
         | RowId::Controllers
         | RowId::Licenses
-        | RowId::RingReset
-        | RowId::RingShortcuts => {
+        | RowId::QuickActions => {
             unreachable!("returned above")
         }
     };
@@ -1557,14 +1470,9 @@ fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             }
         },
         RowId::InvertScroll => "Reverses the wheel and trackpad scroll direction sent to the host.",
-        RowId::RingSlot(_) => {
-            "Which action this position of the in-stream ring fires; ◀ ▶ steps through \
-             everything the ring can hold, including this profile's own shortcuts."
-        }
-        RowId::RingReset => "Restores the platform ring and removes the shortcuts.",
-        RowId::RingShortcuts => {
-            "The chords a ring slot can send — add one, name it, pick its keys; a new one \
-             takes the first empty slot."
+        RowId::QuickActions => {
+            "The ring a two-finger twist or Select+A opens in a stream: what its six buttons \
+             hold, and the shortcut chords they can send. Edited on the ring itself."
         }
         RowId::Shortcuts => {
             "Alt+Tab, Super and friends reach the host while input is captured. \
@@ -1877,18 +1785,6 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         }
         RowId::InvertScroll => toggle(&mut s.invert_scroll, delta, wrap),
         RowId::Shortcuts => toggle(&mut s.inhibit_shortcuts, delta, wrap),
-        RowId::RingSlot(k) => {
-            let mut cfg = OverlayConfig::parse(&s.overlay_actions, ring_platform(ctx.platform));
-            let options = ring_options(&cfg);
-            let id = cfg.ring[k].as_ref().map(SlotId::id).unwrap_or_default();
-            let cur = options.iter().position(|(i, _)| *i == id);
-            step_option(cur, options.len(), delta, wrap).map(|i| {
-                cfg.ring[k] = SlotId::parse(&options[i].0);
-                // The whole blob, explicit from the first edit: a profile that inherits
-                // this device's ring inherits all of it (D10).
-                s.overlay_actions = cfg.to_json();
-            })
-        }
         RowId::Stats => {
             let cur = StatsVerbosity::ALL
                 .iter()
@@ -1934,8 +1830,7 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         | RowId::NoProfiles
         | RowId::Controllers
         | RowId::Licenses
-        | RowId::RingReset
-        | RowId::RingShortcuts => None,
+        | RowId::QuickActions => None,
     }
     .is_some()
 }
@@ -2754,10 +2649,10 @@ pub(super) mod tests {
         assert!(fx.nav.is_none());
     }
 
-    /// The quick-action rows: a slot steps through the catalogue and writes the whole blob
-    /// back, ◀ ▶ clamp at Empty, and a shortcut the blob carries is the last option.
+    /// The quick-action row is an action row on every platform — the ring is edited on the
+    /// ring itself, not stepped here — and ◀ ▶ on it is never a value edit.
     #[test]
-    fn ring_slot_rows_step_the_catalogue_and_write_the_blob() {
+    fn the_quick_actions_row_opens_the_editor_and_steps_nothing() {
         let (mut settings, pads) = ctx_parts();
         let library = crate::library::LibraryShared::default();
         let mut ctx = Ctx {
@@ -2772,36 +2667,17 @@ pub(super) mod tests {
             device_name: "t",
             t: 0.0,
         };
+        let row = row_spec(RowId::QuickActions, &ctx, &[]);
+        assert!(row.value.is_none(), "an action row");
+        assert_eq!(row.label, "Quick actions");
+        assert!(!adjust(RowId::QuickActions, 1, false, &mut ctx));
         assert!(
             ctx.settings.overlay_actions.is_empty(),
-            "the platform default"
+            "the row itself never writes the blob"
         );
-        // The desktop default's 12 o'clock is End stream; one step on is the linger disconnect,
-        // and the untouched slots are now written out explicitly.
-        assert!(adjust(RowId::RingSlot(0), 1, false, &mut ctx));
-        let cfg = OverlayConfig::parse(&ctx.settings.overlay_actions, RingPlatform::Desktop);
-        assert_eq!(cfg.ring[0], Some(SlotId::DisconnectLinger));
-        assert_eq!(cfg.ring[5], Some(SlotId::SendText));
-        // Back to End stream, to Empty, and the ◀ thuds at Empty.
-        assert!(adjust(RowId::RingSlot(0), -1, false, &mut ctx));
-        assert!(adjust(RowId::RingSlot(0), -1, false, &mut ctx));
-        assert!(!adjust(RowId::RingSlot(0), -1, false, &mut ctx));
-        let cfg = OverlayConfig::parse(&ctx.settings.overlay_actions, RingPlatform::Desktop);
-        assert_eq!(cfg.ring[0], None);
-        // A shortcut in the blob is the last option: from Empty, A (wrapping) backwards reaches it.
-        ctx.settings.overlay_actions = r#"{"v":2,"ring":[],"shortcuts":[{"id":"s1","label":"Task Manager","keys":["ctrl","shift","escape"]}]}"#.into();
-        assert!(adjust(RowId::RingSlot(5), -1, true, &mut ctx));
-        let cfg = OverlayConfig::parse(&ctx.settings.overlay_actions, RingPlatform::Desktop);
-        assert_eq!(cfg.ring[5], Some(SlotId::Shortcut("s1".into())));
-        assert_eq!(
-            cfg.shortcuts.len(),
-            1,
-            "the shortcut survives the round trip"
-        );
-        assert_eq!(
-            row_spec(RowId::RingSlot(5), &ctx, &[]).value.as_deref(),
-            Some("Task Manager")
-        );
+        assert!(TABS
+            .iter()
+            .any(|(tab, rows)| *tab == "Input" && rows.contains(&RowId::QuickActions)));
     }
 
     /// Every row the screen knows about must live in exactly one tab — a row missing from
@@ -2934,8 +2810,8 @@ pub(super) mod tests {
         // 37 desktop rows (the daily-driver batch added 10-bit SDR and Keep host audio) +
         // the ten Android-only ones (design android-skia-console-port.md D3): eight
         // `extra`-backed settings and two platform-screen action rows + the quick-action
-        // ring's six slot rows, its shortcuts screen and its reset (every platform).
-        assert_eq!(seen.len(), 55, "{seen:?}");
+        // ring's one action row (every platform; the editor is the ring itself).
+        assert_eq!(seen.len(), 48, "{seen:?}");
         assert!(seen.contains(&RowId::Palette));
         assert!(seen.contains(&RowId::ReduceMotion));
         assert!(seen.contains(&RowId::ReduceUiResolution));

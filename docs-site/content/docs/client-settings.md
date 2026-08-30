@@ -243,9 +243,11 @@ there is nothing to inhibit.
 **Invert scroll direction** — *default: off*, i.e. the host scrolls the way this machine does.
 
 **Quick actions** — *Android, iPhone/iPad, Apple TV and the console home.* What the six buttons
-of the in-stream ring hold, and the custom shortcut chords they can send. On the phones the editor
-is the ring itself; the console edits the slots as rows and keeps the global ring only (it never
-edits profiles). See [the quick-action ring](/docs/input#the-quick-action-ring).
+of the in-stream ring hold, and the custom shortcut chords they can send. The editor is the ring
+itself on every client — tap or click a button to change it, drag one onto another to swap; with a
+controller, the stick walks the buttons, A changes one, Y lifts it and A drops it on another. A
+shortcut is a name, the modifiers, and a key picked on a keyboard. The console keeps the global
+ring only (it never edits profiles). See [the quick-action ring](/docs/input#the-quick-action-ring).
 
 **Virtual controller** — *Android and iPhone/iPad only*, under Quick actions. **Layout**
 (*default: Full*) picks which controls the on-screen controller shows: Full, Sticks and shoulders,

@@ -24,6 +24,7 @@ pub(crate) enum ListMsg {
 }
 
 /// One row's look, rebuilt by the screen each frame (never stale).
+#[derive(Clone)]
 pub(crate) struct RowSpec {
     /// Section header drawn above this row (the first row of each group carries it).
     pub header: Option<&'static str>,
