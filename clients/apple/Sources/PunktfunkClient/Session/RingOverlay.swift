@@ -305,7 +305,9 @@ struct RingOverlay: View {
                     .offset(drag?.k == k ? drag?.offset ?? .zero : .zero)
                     .position(x: cx + ringRadius * q * cos(rad), y: cy + ringRadius * q * sin(rad))
                     .allowsHitTesting(q > 0)
-                    .simultaneousGesture(slotDrag(k))
+                    // Editing: one gesture owns the disc, so a drag never also fires the tap.
+                    // In-stream the mask leaves the Button alone.
+                    .highPriorityGesture(slotDrag(k), including: editing == nil ? .subviews : .all)
                     .animation(discAnimation(k), value: phase)
                 }
                 // The centre opens the sheet.
@@ -466,20 +468,25 @@ struct RingOverlay: View {
         }
     }
 
-    /// Editing: a disc dragged onto another slot swaps the two (§3.3). Released near the centre
-    /// or over its own slot it springs home and nothing changes. Inert in-stream: the guard
-    /// leaves a tap on a disc exactly as it was.
+    /// Editing: the disc's one gesture. A touch that stays put is the pick; one carried onto
+    /// another slot swaps the two (§3.3); released near the centre or over its own slot it
+    /// springs home and nothing changes. Masked off in-stream (see the call site).
     private func slotDrag(_ k: Int) -> some Gesture {
-        DragGesture(minimumDistance: 8)
+        DragGesture(minimumDistance: 0)
             .onChanged { v in
                 guard editing != nil, state.committed else { return }
-                drag = (k, v.translation)
+                let moved = hypot(v.translation.width, v.translation.height) > 8
+                if moved || drag != nil { drag = (k, v.translation) }
             }
             .onEnded { v in
                 defer {
                     withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) { drag = nil }
                 }
                 guard let editing, state.committed else { return }
+                if hypot(v.translation.width, v.translation.height) <= 8 {
+                    editing.pick(k)
+                    return
+                }
                 let rad = (-90 + 60 * CGFloat(k)) * .pi / 180
                 let dx = ringRadius * cos(rad) + v.translation.width
                 let dy = ringRadius * sin(rad) + v.translation.height
