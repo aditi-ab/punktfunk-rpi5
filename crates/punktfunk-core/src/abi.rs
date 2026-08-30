@@ -6316,8 +6316,9 @@ mod abi_version_tests {
     /// exists so an accidental edit cannot drift the version silently.
     #[test]
     fn abi_version_is_pinned() {
-        assert_eq!(crate::ABI_VERSION, 27);
-        assert_eq!(super::punktfunk_abi_version(), 27);
+        // v28: `punktfunk_connection_host_caps2` + `PUNKTFUNK_HOST_CAP2_TOUCH` (additive).
+        assert_eq!(crate::ABI_VERSION, 28);
+        assert_eq!(super::punktfunk_abi_version(), 28);
     }
 }
 

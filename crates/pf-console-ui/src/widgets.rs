@@ -188,7 +188,9 @@ impl MenuList {
 
     /// Is anything still on the move — an entrance, a focus ease, a spring, the scroll?
     /// The damage-gated stream overlay asks every frame and keeps redrawing until this is
-    /// false; the console draws every frame regardless and never needs to ask.
+    /// false; the console draws every frame regardless and never needs to ask — which is
+    /// why the Android console (editor only, no stream overlay) never calls it.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn animating(&self) -> bool {
         !self.settled
     }

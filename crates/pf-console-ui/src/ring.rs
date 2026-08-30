@@ -15,7 +15,7 @@ use crate::model::ConsoleCmd;
 use crate::pointer::{Pointer, PointerKind};
 use crate::theme::{fill, glow_ring, rim_light, ring_scrim, soft_shadow, stroke, Fonts, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec};
-use pf_client_core::host_actions::{self, ActionInfo};
+use pf_client_core::host_actions::ActionInfo;
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use pf_client_core::overlay_actions::{chord_chip, key_vk, OverlayConfig, RingPlatform, SlotId};
 use pf_client_core::ring::{RingCommand, RingFacts, RingInput};
@@ -254,6 +254,11 @@ impl Ring {
         self.facts = facts.clone();
     }
 
+    // The next six are the IN-STREAM ring's surface, driven only by the desktop overlay
+    // (`skia_overlay`, Linux/Windows). The Android console holds the ring solely as the
+    // editor, so its clippy sees them unused — allowed rather than cfg'd out, because
+    // cfg'ing them would cascade into their parameter types' imports.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn input(&mut self, input: RingInput) {
         match input {
             RingInput::Turn {
@@ -332,15 +337,18 @@ impl Ring {
         }
     }
 
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn take_command(&mut self) -> Option<RingCommand> {
         self.pending.pop_front()
     }
 
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn take_cmds(&mut self) -> Vec<ConsoleCmd> {
         std::mem::take(&mut self.cmds)
     }
 
     /// Everything the drawing depends on, folded into one number for the damage gate.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn damage(&self) -> u64 {
         if !self.visible() {
             return 0;
@@ -369,6 +377,7 @@ impl Ring {
 
     /// Is any spring, ease or entrance still short of where it is going? Read before a
     /// frame, so it describes the state the last render left behind.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     fn animating(&self) -> bool {
         if self.closing {
             return true;
@@ -399,7 +408,7 @@ impl Ring {
     fn actions(&self) -> Vec<ActionInfo> {
         #[cfg(any(target_os = "linux", windows))]
         {
-            host_actions::cached(&self.facts.fp_hex)
+            pf_client_core::host_actions::cached(&self.facts.fp_hex)
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         {
@@ -788,6 +797,7 @@ impl Ring {
 
     /// Keyboard while open — the pad's vocabulary on keys: arrows move the highlight, Return
     /// activates, Escape backs out. Always consumed while open.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn key(&mut self, key: Key) -> bool {
         if !self.open() {
             return false;
