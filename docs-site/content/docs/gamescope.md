@@ -236,6 +236,13 @@ own name and does **not** replace your system gamescope — your Gaming Mode kee
 - **NixOS** — `services.punktfunk.host.gamescopeHdr` (default `true`).
 - **Anything else** — `bash packaging/gamescope/build-punktfunk-gamescope.sh` from the source tree.
 
+**Restart the host after installing it** — `systemctl --user restart punktfunk-host`, or your
+platform's equivalent. The host asks the gamescope binary what it can do **once per process** and
+keeps the answer, because a session's bit depth has to be settled before the display exists. So a
+build installed under a running host is not seen: streaming keeps working, in SDR, and the only
+sign is the startup line saying `gamescope has no +pfhdr marker`. After the restart that line reads
+`using the punktfunk build (10-bit HDR capture available)` instead.
+
 HDR is attempted by default once the build is present (`PUNKTFUNK_GAMESCOPE_HDR=0` forces SDR).
 
 **The build only reaches sessions the host starts itself** — managed, `PUNKTFUNK_GAMESCOPE_SESSION`,
