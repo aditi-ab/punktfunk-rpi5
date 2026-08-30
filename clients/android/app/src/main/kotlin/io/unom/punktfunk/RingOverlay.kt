@@ -197,6 +197,10 @@ class RingActions(
     val hostActions: () -> List<HostActions.Action>,
     val invokeHost: (HostActions.Action) -> Unit,
     val sendShortcut: (List<String>) -> Unit,
+    /** The virtual controller (§4): whether its input can reach the host, whether it is up, and the toggle. */
+    val padAvailable: () -> Boolean,
+    val padShown: () -> Boolean,
+    val togglePad: () -> Unit,
     /** `[w, h, hz]` as last requested (Android has no live read-back of the negotiated mode). */
     val currentMode: () -> IntArray,
     val requestMode: (Int, Int, Int) -> Unit,
@@ -253,7 +257,8 @@ private fun spec(slot: SlotId, cfg: OverlayConfig, a: RingActions): SlotSpec = w
     )
     SlotId.Pad -> SlotSpec(
         "pad", "Virtual controller", Icons.Filled.SportsEsports,
-        enabled = false, reason = "The virtual controller arrives in a later release",
+        enabled = a.padAvailable(), reason = "Controller input is not forwarded this session",
+        toggle = true, state = if (a.padShown()) "On" else "Off",
     )
     SlotId.SendText -> SlotSpec(
         "send_text", "Send text", Icons.Filled.TextFields,
@@ -368,7 +373,7 @@ fun RingOverlay(
             SlotId.Keyboard -> { state.close(); actions.keyboard() }
             SlotId.Stats -> actions.cycleStats()
             SlotId.Mic -> actions.toggleMic()
-            SlotId.Pad -> {}
+            SlotId.Pad -> actions.togglePad()
             SlotId.SendText -> textDialog = true
             is SlotId.Host -> {
                 actions.hostActions().firstOrNull { it.id == slot.actionId }?.let { state.close(); actions.invokeHost(it) }
@@ -717,7 +722,7 @@ private fun sheetRows(
     val st = spec(SlotId.SendText, cfg, actions)
     rows += SheetRowSpec(null, st.label, if (st.enabled) "" else st.reason, st.enabled) { if (st.enabled) requestText() }
     val pad = spec(SlotId.Pad, cfg, actions)
-    rows += SheetRowSpec(null, pad.label, pad.reason, false) {}
+    rows += SheetRowSpec(null, pad.label, if (pad.enabled) pad.state else pad.reason, pad.enabled) { if (pad.enabled) actions.togglePad() }
     rows += SheetRowSpec("View", "Statistics", actions.stats().label) { actions.cycleStats() }
     val mic = spec(SlotId.Mic, cfg, actions)
     rows += SheetRowSpec("Audio", mic.label, if (mic.enabled) mic.state else mic.reason, mic.enabled) { if (mic.enabled) actions.toggleMic() }

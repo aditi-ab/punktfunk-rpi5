@@ -67,6 +67,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
 import io.unom.punktfunk.kit.DeviceGyro
 import io.unom.punktfunk.kit.DsCapture
+import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.GamepadFeedback
 import io.unom.punktfunk.kit.GamepadRouter
 import io.unom.punktfunk.kit.deviceBodyVibrator
@@ -268,6 +269,20 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     val ring = remember(handle) { RingState() }
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     val haptics = rememberConsoleHaptics()
+    val overlayCfg = remember(initialSettings.overlayActions) { OverlayConfig.parse(initialSettings.overlayActions) }
+    // The virtual controller (design §4): shown from the ring's `pad` slot, per session. While
+    // up it holds one wire pad on the router, so the host sees one controller arrive and, on
+    // hide, one leave (§9). Never toggled by the ring's own open and close (§8 trap 4).
+    var padShown by remember(handle) { mutableStateOf(false) }
+    var virtualPad by remember(handle) { mutableStateOf<GamepadRouter.ExternalPad?>(null) }
+    DisposableEffect(padShown) {
+        val ext = if (padShown) activity?.gamepadRouter?.openExternal(Gamepad.PREF_XBOX360) else null
+        virtualPad = ext
+        onDispose {
+            ext?.close()
+            virtualPad = null
+        }
+    }
     var touchHint by remember { mutableStateOf(touchUnsupported) }
     LaunchedEffect(touchHint) {
         if (touchHint) {
@@ -1216,11 +1231,18 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
         // Chord confirmation (gamepad/TV) — mute has no standing indicator, so this is the whole
         // of its feedback: a toggle that showed nothing at all would be indistinguishable from one
         // that never registered.
+        // The virtual controller: above the gesture layer, so its controls take their fingers
+        // first and every other finger falls through; below the ring, whose scrim owns every
+        // finger while it is up. Composed only while shown (tenet 1).
+        virtualPad?.let { ext ->
+            val sink = remember(ext) { PadSink(ext::button, ext::axis) }
+            VirtualPadLayer(overlayCfg.pad, containerSize, sink, haptics)
+        }
         // The ring, above the gesture layer so its buttons take the finger first. Composed only
         // while open: a closed overlay costs nothing (tenet 1).
         RingOverlay(
             state = ring,
-            cfg = remember(initialSettings.overlayActions) { OverlayConfig.parse(initialSettings.overlayActions) },
+            cfg = overlayCfg,
             actions = RingActions(
                 endStream = { NativeBridge.nativeDisconnectQuit(handle); onSessionEnded(SessionEndReason.LOCAL) },
                 disconnectLinger = { onSessionEnded(SessionEndReason.LOCAL) },
@@ -1250,6 +1272,9 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
                     }
                 },
                 sendShortcut = { sendChord(handle, it) },
+                padAvailable = { activity?.gamepadRouter?.sendsEnabled() == true },
+                padShown = { padShown },
+                togglePad = { padShown = !padShown },
                 currentMode = { requestedMode },
                 requestMode = { w, h, hz ->
                     if (NativeBridge.nativeRequestMode(handle, w, h, hz)) {

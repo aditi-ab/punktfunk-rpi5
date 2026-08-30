@@ -27,11 +27,13 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -44,6 +46,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
+import kotlin.math.roundToInt
 
 /**
  * The quick-action ring's editor (design/touch-client-overlay.md §3.3): the editor IS the ring —
@@ -139,6 +142,27 @@ internal fun QuickActionsScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(start = 4.dp),
             )
+        }
+        // The virtual controller's preset and look (§4.3), written to the blob's `pad` through the
+        // same path the ring uses.
+        SettingsGroup(
+            "Virtual controller",
+            footer = "Shown from the ring's Virtual controller button. A finger on one of its controls drives the game; a finger anywhere else drives the touch mode.",
+        ) {
+            SettingDropdown(
+                label = "Layout",
+                options = listOf("full" to "Full", "sticks" to "Sticks and shoulders", "dpad" to "D-pad and face buttons"),
+                selected = cfg.pad.layout,
+                caption = "Which controls the controller shows; fewer controls leave more of the picture uncovered.",
+            ) { onChange(cfg.copy(pad = cfg.pad.copy(layout = it)).toJson()) }
+            PadSlider(
+                "Opacity", cfg.pad.opacity, PAD_OPACITY_MIN..1f,
+                "How strongly the controls draw over the picture; higher hides more of the game.",
+            ) { onChange(cfg.copy(pad = cfg.pad.copy(opacity = it)).toJson()) }
+            PadSlider(
+                "Scale", cfg.pad.scale, PAD_SCALE_MIN..PAD_SCALE_MAX,
+                "How large the controls are; larger ones cover more of the picture.",
+            ) { onChange(cfg.copy(pad = cfg.pad.copy(scale = it)).toJson()) }
         }
         SettingsGroup("Shortcuts", footer = "A chord the ring sends to the host. A new one takes the first empty slot.") {
             cfg.shortcuts.forEach { sc ->
@@ -248,6 +272,23 @@ private fun RingStage(cfg: OverlayConfig, editing: RingEditing) {
     }
 }
 
+/** A slider that names its value as a percentage and writes it when the finger lifts, not per frame. */
+@Composable
+private fun PadSlider(
+    label: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    caption: String,
+    onCommit: (Float) -> Unit,
+) {
+    var v by remember(value) { mutableFloatStateOf(value) }
+    Column {
+        Text("$label · ${(v * 100).roundToInt()}%", style = MaterialTheme.typography.bodyLarge)
+        Slider(value = v, onValueChange = { v = it }, valueRange = range, onValueChangeFinished = { onCommit(v) })
+        Text(caption, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
 /** The ring's commands with nothing behind them: the editor shows, it never fires (§3.3). */
 private val previewActions = RingActions(
     endStream = {}, disconnectLinger = {},
@@ -266,6 +307,7 @@ private val previewActions = RingActions(
         )
     },
     invokeHost = {}, sendShortcut = {},
+    padAvailable = { true }, padShown = { false }, togglePad = {},
     currentMode = { intArrayOf(1920, 1080, 60) }, requestMode = { _, _, _ -> },
 )
 
@@ -283,7 +325,7 @@ private fun slotGroups(cfg: OverlayConfig): List<SlotGroup> {
         SlotGroup("Input", listOf(
             SlotOption("touch_mode", "Touch mode"),
             SlotOption("keyboard", "Keyboard"),
-            SlotOption("pad", "Virtual controller", "Arrives in a later release"),
+            SlotOption("pad", "Virtual controller", "Shows or hides the on-screen controller"),
             SlotOption("send_text", "Send text"),
         )),
         SlotGroup("View", listOf(SlotOption("stats", "Statistics"))),

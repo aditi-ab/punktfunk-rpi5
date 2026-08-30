@@ -1154,7 +1154,7 @@ private fun ClickableRow(title: String, subtitle: String, onClick: () -> Unit) {
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun <T> SettingDropdown(
+internal fun <T> SettingDropdown(
     label: String,
     options: List<Pair<T, String>>,
     selected: T,

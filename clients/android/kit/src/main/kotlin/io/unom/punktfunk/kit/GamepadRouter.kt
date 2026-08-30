@@ -626,9 +626,13 @@ class GamepadRouter(
             slot?.let { slotButton(it, bit, down, send = true) }
         }
 
-        /** One axis update ([Gamepad].AXIS_*: stick i16 +y=up / trigger 0..255). On-change only. */
+        /**
+         * One axis update ([Gamepad].AXIS_*: stick i16 +y=up / trigger 0..255). On-change only.
+         * Dropped while the ring owns the pad, like a button: [setRingOpen] zeroed the axes on
+         * the wire, and a stick still held under the ring must not write over that.
+         */
         fun axis(id: Int, value: Int) {
-            if (slot != null && forwarding) NativeBridge.nativeSendGamepadAxis(handle, id, value, index)
+            if (slot != null && forwarding && !ringOpen) NativeBridge.nativeSendGamepadAxis(handle, id, value, index)
         }
 
         /** One raw HID report, forwarded verbatim for the host's as-is virtual pad. */
