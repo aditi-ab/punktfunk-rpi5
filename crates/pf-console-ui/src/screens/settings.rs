@@ -83,6 +83,9 @@ enum RowId {
     /// touch-client-overlay.md §3.3, the list form). Shortcut CREATION is not here yet: a
     /// slot can point at a chord the blob already carries, made on a phone or the desktop app.
     RingSlot(usize),
+    /// The blob's shortcut chords and their editor (an action row — opens
+    /// [`super::ring_shortcuts::RingShortcutsScreen`]).
+    RingShortcuts,
     /// Back to the platform ring: empties the blob.
     RingReset,
     Stats,
@@ -319,6 +322,7 @@ const TABS: [(&str, &[RowId]); 7] = [
             RowId::RingSlot(3),
             RowId::RingSlot(4),
             RowId::RingSlot(5),
+            RowId::RingShortcuts,
             RowId::RingReset,
         ],
     ),
@@ -801,6 +805,20 @@ impl SettingsScreen {
                     ListMsg::None => pulse,
                 };
             }
+            // The shortcuts live on their own screen: a list of the blob's chords and an
+            // editor with the on-screen keyboard.
+            RowId::RingShortcuts => {
+                return match msg {
+                    ListMsg::Activate => {
+                        fx.push(Screen::RingShortcuts(
+                            super::ring_shortcuts::RingShortcutsScreen::new(ctx),
+                        ));
+                        pulse
+                    }
+                    ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
+                    ListMsg::None => pulse,
+                };
+            }
             // An action row, not a value: A empties the blob (the platform default), ◀ ▶ thud.
             RowId::RingReset => {
                 return match msg {
@@ -1124,6 +1142,7 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
         RowId::Controllers => return RowSpec::action("Connected controllers", true),
         RowId::Licenses => return RowSpec::action("Open-source licences", true),
         RowId::RingReset => return RowSpec::action("Reset quick actions", true),
+        RowId::RingShortcuts => return RowSpec::action("Quick-action shortcuts", true),
         _ => {}
     }
     let s = &ctx.settings;
@@ -1405,7 +1424,8 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
         | RowId::NoProfiles
         | RowId::Controllers
         | RowId::Licenses
-        | RowId::RingReset => {
+        | RowId::RingReset
+        | RowId::RingShortcuts => {
             unreachable!("returned above")
         }
     };
@@ -1542,6 +1562,10 @@ fn detail(id: RowId, ctx: &Ctx) -> &'static str {
              everything the ring can hold, including this profile's own shortcuts."
         }
         RowId::RingReset => "Restores the platform ring and removes the shortcuts.",
+        RowId::RingShortcuts => {
+            "The chords a ring slot can send — add one, name it, pick its keys; a new one \
+             takes the first empty slot."
+        }
         RowId::Shortcuts => {
             "Alt+Tab, Super and friends reach the host while input is captured. \
              Off, they act on this device instead."
@@ -1910,7 +1934,8 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         | RowId::NoProfiles
         | RowId::Controllers
         | RowId::Licenses
-        | RowId::RingReset => None,
+        | RowId::RingReset
+        | RowId::RingShortcuts => None,
     }
     .is_some()
 }
@@ -2909,8 +2934,8 @@ pub(super) mod tests {
         // 37 desktop rows (the daily-driver batch added 10-bit SDR and Keep host audio) +
         // the ten Android-only ones (design android-skia-console-port.md D3): eight
         // `extra`-backed settings and two platform-screen action rows + the quick-action
-        // ring's six slot rows and its reset (every platform).
-        assert_eq!(seen.len(), 54, "{seen:?}");
+        // ring's six slot rows, its shortcuts screen and its reset (every platform).
+        assert_eq!(seen.len(), 55, "{seen:?}");
         assert!(seen.contains(&RowId::Palette));
         assert!(seen.contains(&RowId::ReduceMotion));
         assert!(seen.contains(&RowId::ReduceUiResolution));
