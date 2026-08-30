@@ -497,7 +497,8 @@ extension SettingsView {
             described("Which actions the in-stream ring offers and the shortcuts it can send; "
                       + "a profile that changes it owns the whole ring.", field: "overlay_actions") {
                 NavigationLink("Quick actions") {
-                    QuickActionsEditor(blob: scoped(SettingsFields.overlayActions)) {
+                    QuickActionsEditor(blob: scoped(SettingsFields.overlayActions),
+                                       overridden: isOverridden("overlay_actions")) {
                         if inProfileScope {
                             resetOverride("overlay_actions")
                         } else {

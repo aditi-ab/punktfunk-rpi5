@@ -126,6 +126,13 @@ struct RingActions {
     var requestMode: (UInt32, UInt32, UInt32) -> Void
 }
 
+/// The editor's hooks (design §3.3): a tap on a slot picks its action instead of firing it, and
+/// a disc dragged onto another slot swaps the two. Nil in-stream.
+struct RingEditing {
+    var pick: (Int) -> Void
+    var swap: (Int, Int) -> Void
+}
+
 /// One button as the ring draws it: glyph or keycap chip, its state, and why it is dimmed.
 private struct SlotSpec {
     var id: String
@@ -199,7 +206,11 @@ struct RingOverlay: View {
     @ObservedObject var state: RingState
     let cfg: OverlayConfig
     let actions: RingActions
+    /// Set by the settings editor; nil in-stream.
+    var editing: RingEditing? = nil
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// The disc under an editing drag and how far it has been carried.
+    @State private var drag: (k: Int, offset: CGSize)?
     /// False for the first frame, so a ring opened by a disc or `Select+A` springs from the
     /// centre instead of appearing in place.
     @State private var appeared = false
@@ -259,6 +270,8 @@ struct RingOverlay: View {
                     .onTapGesture {
                         if state.sheet { state.sheet = false } else { state.close() }
                     }
+                    // In the editor the backdrop under the ring owns the twist and the tap.
+                    .allowsHitTesting(editing == nil)
                     .animation(scrimAnimation, value: phase)
                 // The discs stay in the tree at 0 so each can spring from the centre; the
                 // overlay itself unmounts once closed (tenet 1).
@@ -274,10 +287,16 @@ struct RingOverlay: View {
                     slotButton(s, size: slotSize, scale: 0.6 + 0.4 * q, alpha: q,
                                armed: s != nil && state.armed == s?.id,
                                highlighted: state.highlight == k) {
-                        if let slot, let s { fire(s, slot) }
+                        if let editing {
+                            editing.pick(k)
+                        } else if let slot, let s {
+                            fire(s, slot)
+                        }
                     }
+                    .offset(drag?.k == k ? drag?.offset ?? .zero : .zero)
                     .position(x: cx + ringRadius * q * cos(rad), y: cy + ringRadius * q * sin(rad))
                     .allowsHitTesting(q > 0)
+                    .simultaneousGesture(slotDrag(k))
                     .animation(discAnimation(k), value: phase)
                 }
                 // The centre opens the sheet.
@@ -328,7 +347,7 @@ struct RingOverlay: View {
         .animation(reduceMotion ? .easeOut(duration: 0.12) : .smooth(duration: 0.25), value: state.sheet)
         // Idle: the exit disc's 8 s rule, for the same latency reason — unless the sheet is up.
         .task(id: "\(state.lastTouch.timeIntervalSinceReferenceDate)-\(state.sheet)") {
-            guard state.committed, !state.sheet else { return }
+            guard state.committed, !state.sheet, editing == nil else { return }
             try? await Task.sleep(for: .seconds(8))
             if !Task.isCancelled { state.close() }
         }
@@ -438,6 +457,30 @@ struct RingOverlay: View {
         }
     }
 
+    /// Editing: a disc dragged onto another slot swaps the two (§3.3). Released near the centre
+    /// or over its own slot it springs home and nothing changes. Inert in-stream: the guard
+    /// leaves a tap on a disc exactly as it was.
+    private func slotDrag(_ k: Int) -> some Gesture {
+        DragGesture(minimumDistance: 8)
+            .onChanged { v in
+                guard editing != nil, state.committed else { return }
+                drag = (k, v.translation)
+            }
+            .onEnded { v in
+                defer {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) { drag = nil }
+                }
+                guard let editing, state.committed else { return }
+                let rad = (-90 + 60 * CGFloat(k)) * .pi / 180
+                let dx = ringRadius * cos(rad) + v.translation.width
+                let dy = ringRadius * sin(rad) + v.translation.height
+                guard hypot(dx, dy) > ringRadius / 2 else { return }
+                let deg = atan2(dy, dx) * 180 / .pi + 90
+                let target = ((Int((deg / 60).rounded()) % 6) + 6) % 6
+                if target != k { editing.swap(k, target) }
+            }
+    }
+
     /// One round glass button — the exit disc's primitive, at ring size.
     private func slotButton(_ s: SlotSpec?, size: CGFloat, scale: CGFloat, alpha: CGFloat, armed: Bool,
                             highlighted: Bool = false, action: @escaping () -> Void) -> some View {
@@ -459,7 +502,8 @@ struct RingOverlay: View {
             .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .disabled(s == nil)
+        // An empty slot is inert in-stream and a pick target in the editor.
+        .disabled(s == nil && editing == nil)
         .scaleEffect(scale)
         .opacity(alpha)
         .accessibilityLabel(s?.label ?? "Empty slot")
