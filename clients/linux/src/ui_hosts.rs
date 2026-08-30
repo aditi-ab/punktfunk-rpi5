@@ -213,7 +213,22 @@ impl relm4::factory::FactoryComponent for HostCard {
             spinner.set_halign(gtk::Align::Center);
             content.append(&spinner);
         } else {
+            // The card's one big circle carries the host's OS mark, not its initial: which
+            // machine this is answers a more useful question than which letter it starts with,
+            // and the name is already spelled out directly underneath. A host that advertises
+            // no OS chain — an older one — keeps the initial, so nothing regresses to a blank.
             let avatar = adw::Avatar::new(48, Some(&req.name), true);
+            let os_chain = match &self.kind {
+                CardKind::Saved { host: k, .. } => k.os.as_str(),
+                CardKind::Discovered(a) => a.os.as_str(),
+            };
+            if let Some(icon) = os_icon_name(os_chain) {
+                // Adwaita's Avatar prefers initials whenever it is allowed to; the icon only
+                // shows once they are turned off. The generated background colour stays.
+                avatar.set_show_initials(false);
+                avatar.set_icon_name(Some(&icon));
+                avatar.set_tooltip_text(Some(os_chain));
+            }
             avatar.set_halign(gtk::Align::Center);
             content.append(&avatar);
         }
@@ -231,15 +246,8 @@ impl relm4::factory::FactoryComponent for HostCard {
         let status = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         status.set_halign(gtk::Align::Center);
         status.set_margin_top(4);
-        // The host's OS mark leads the row; nothing at all for an older host that doesn't
-        // advertise one, so those cards render exactly as they always did.
-        let os_chain = match &self.kind {
-            CardKind::Saved { host: k, .. } => k.os.as_str(),
-            CardKind::Discovered(a) => a.os.as_str(),
-        };
-        if let Some(img) = os_icon_image(os_chain) {
-            status.append(&img);
-        }
+        // No OS mark here any more: it moved up into the avatar, where it is the card's
+        // leading visual rather than the smallest glyph in the status row.
         let pill = |text: &str, class: &str| {
             let l = gtk::Label::new(Some(text));
             l.add_css_class("pf-pill");
@@ -676,19 +684,13 @@ const OS_ICON_TOKENS: &[&str] = &[
     "opensuse", "bazzite", "cachyos", "nobara",
 ];
 
-/// The card's OS glyph for an advertised chain, or `None` (no widget) when the host doesn't
-/// advertise one / nothing in the chain is recognized-and-drawable. Symbolic, so it recolors
-/// with the Adwaita theme like every other status glyph; the raw chain is the tooltip.
-fn os_icon_image(chain: &str) -> Option<gtk::Image> {
+/// The symbolic icon name for an advertised chain, or `None` when the host doesn't advertise
+/// one / nothing in the chain is recognized-and-drawable. Chains walk most-specific-first.
+fn os_icon_name(chain: &str) -> Option<String> {
     let token = crate::os::os_icon_tokens(chain)
         .into_iter()
         .find(|t| OS_ICON_TOKENS.contains(&t.as_str()))?;
-    let img = gtk::Image::from_icon_name(&format!("pf-os-{token}-symbolic"));
-    img.set_pixel_size(14);
-    img.add_css_class("dim-label");
-    img.set_valign(gtk::Align::Center);
-    img.set_tooltip_text(Some(chain));
-    Some(img)
+    Some(format!("pf-os-{token}-symbolic"))
 }
 
 fn profile_pill(p: &Profile) -> gtk::Widget {

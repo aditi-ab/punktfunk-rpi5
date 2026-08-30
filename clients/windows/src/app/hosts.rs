@@ -141,6 +141,9 @@ fn host_tile(
     id: &str,
     hover: &Hover,
     name: &str,
+    /// The host's OS-identity chain — the avatar's mark. Empty for a host that advertises
+    /// none, which falls the avatar back to the name's initial.
+    os: &str,
     sub: &str,
     status_row: Element,
     menu: Option<Button>,
@@ -148,10 +151,7 @@ fn host_tile(
 ) -> Element {
     let mut summary = border(
         vstack((
-            avatar(name)
-                .width(44.0)
-                .height(44.0)
-                .horizontal_alignment(HorizontalAlignment::Left),
+            avatar(name, os).horizontal_alignment(HorizontalAlignment::Left),
             text_block(name)
                 .font_size(15.0)
                 .semibold()
@@ -207,8 +207,8 @@ pub(crate) struct Hover {
 /// The status row at the bottom of a tile: the host's OS mark (when advertised), presence
 /// dot + Online/Offline, plus a trust chip only where it says something (see
 /// [`status_row_with`]).
-fn status_row(os: &str, online: Option<bool>, badge: Option<(&str, Pill)>) -> Element {
-    status_row_with(os, online, badge, None)
+fn status_row(online: Option<bool>, badge: Option<(&str, Pill)>) -> Element {
+    status_row_with(online, badge, None)
 }
 
 /// [`status_row`] plus the profile: what a plain click on THIS tile will use — its own
@@ -222,25 +222,13 @@ fn status_row(os: &str, online: Option<bool>, badge: Option<(&str, Pill)>) -> El
 /// discovered host). The profile is a small dot in the profile's own colour plus its name
 /// in plain caption text — recognisable at a glance without competing with the host name.
 fn status_row_with(
-    os: &str,
     online: Option<bool>,
     badge: Option<(&str, Pill)>,
     profile: Option<(&str, Option<String>)>,
 ) -> Element {
     let mut items: Vec<Element> = Vec::new();
-    // The OS mark leads the row; nothing at all for an older host that doesn't advertise
-    // one, so those tiles render exactly as they always did. Raster at 16px from the
-    // materialized cache (reactor has no vector element); the raw chain is the tooltip.
-    if let Some(uri) = super::os_icons::uri(os) {
-        items.push(
-            Image::new_with_uri(uri)
-                .width(16.0)
-                .height(16.0)
-                .tooltip(os)
-                .vertical_alignment(VerticalAlignment::Center)
-                .into(),
-        );
-    }
+    // No OS mark here any more: it moved up into the avatar, where it is the tile's leading
+    // visual rather than the smallest thing in the status row.
     if let Some(online) = online {
         items.push(
             presence_dot(online)
@@ -1046,9 +1034,9 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 &k.fp_hex,
                 &hover,
                 &k.name,
+                &k.os,
                 &format!("{}:{}", k.addr, k.port),
                 status_row_with(
-                    &k.os,
                     Some(online),
                     // Paired is the resting state — no chip; TOFU-only trust is worth one.
                     (!k.paired).then_some(("Trusted", Pill::Info)),
@@ -1155,9 +1143,9 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     &format!("{}#{id}", k.fp_hex),
                     &hover,
                     &k.name,
+                    &k.os,
                     &format!("{}:{}", k.addr, k.port),
                     status_row_with(
-                        &k.os,
                         Some(online),
                         (!k.paired).then_some(("Trusted", Pill::Info)),
                         Some((name.as_str(), accent.clone())),
@@ -1222,8 +1210,9 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 &format!("{}:{}", h.addr, h.port),
                 &hover,
                 &h.name,
+                &h.os,
                 &format!("{}:{}", h.addr, h.port),
-                status_row(&h.os, None, Some((badge, kind))),
+                status_row(None, Some((badge, kind))),
                 None,
                 Some(Box::new(move || initiate(&ctx2, target.clone(), &ss, &st))),
             ));
