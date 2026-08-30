@@ -34,7 +34,7 @@ private let builtinGroups: [SlotGroup] = [
     .init(id: "Input", options: [
         .init(id: "touch_mode", label: "Touch mode"),
         .init(id: "keyboard", label: "Keyboard"),
-        .init(id: "pad", label: "Virtual controller", note: "Arrives in a later release"),
+        .init(id: "pad", label: "Virtual controller", note: "Shows or hides the on-screen controller"),
         .init(id: "send_text", label: "Send text", note: "Not on this device yet"),
     ]),
     .init(id: "View", options: [.init(id: "stats", label: "Statistics")]),
@@ -132,6 +132,29 @@ struct QuickActionsEditor: View {
                        + "This profile has its own quick actions; the default ring no longer reaches it."
                      : "Tap a button to change it, drag one onto another to swap.")
             }
+            // The virtual controller's preset and look (§4.3), written to the blob's `pad`
+            // through the same binding the ring uses.
+            Section {
+                Picker("Layout", selection: Binding(get: { cfg.pad.layout }, set: { l in setPad { $0.layout = l } })) {
+                    Text("Full").tag("full")
+                    Text("Sticks and shoulders").tag("sticks")
+                    Text("D-pad and face buttons").tag("dpad")
+                }
+                PadSlider(label: "Opacity", value: cfg.pad.opacity, range: VirtualPad.opacityRange,
+                          caption: "How strongly the controls draw over the picture; higher hides more of the game.") { v in
+                    setPad { $0.opacity = v }
+                }
+                PadSlider(label: "Scale", value: cfg.pad.scale, range: VirtualPad.scaleRange,
+                          caption: "How large the controls are; larger ones cover more of the picture.") { v in
+                    setPad { $0.scale = v }
+                }
+            } header: {
+                Text("Virtual controller")
+            } footer: {
+                Text("Shown from the ring's Virtual controller button. A finger on one of its controls "
+                     + "drives the game; a finger anywhere else drives the touch mode. Layout picks which "
+                     + "controls it shows; fewer controls leave more of the picture uncovered.")
+            }
             Section {
                 ForEach(cfg.shortcuts, id: \.id) { sc in
                     Button {
@@ -198,6 +221,7 @@ struct QuickActionsEditor: View {
             micAvailable: { true }, micMuted: { false }, toggleMic: {},
             hostActions: { previewHosts }, invokeHost: { _ in },
             sendShortcut: { _ in },
+            padAvailable: { true }, padShown: { false }, togglePad: {},
             currentMode: { (1920, 1080, 60) }, requestMode: { _, _, _ in })
     }
 
@@ -216,6 +240,12 @@ struct QuickActionsEditor: View {
     private func set(_ k: Int, _ id: String) {
         var c = cfg
         c.ring[k] = SlotId.parse(id)
+        blob = c.toJSON()
+    }
+
+    private func setPad(_ change: (inout PadConfig) -> Void) {
+        var c = cfg
+        change(&c.pad)
         blob = c.toJSON()
     }
 
@@ -247,6 +277,28 @@ struct QuickActionsEditor: View {
             return s
         }
         blob = c.toJSON()
+    }
+}
+
+/// A slider that names its value as a percentage and writes it when the finger lifts, not per frame.
+private struct PadSlider: View {
+    let label: String
+    let value: Float
+    let range: ClosedRange<Float>
+    let caption: String
+    let commit: (Float) -> Void
+    @State private var live: Float = 0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("\(label) · \(Int((live * 100).rounded()))%")
+            Slider(value: $live, in: range) { editing in
+                if !editing { commit(live) }
+            }
+            Text(caption).font(.footnote).foregroundStyle(.secondary)
+        }
+        .onAppear { live = value }
+        .onChange(of: value) { _, v in live = v }
     }
 }
 

@@ -124,6 +124,10 @@ struct RingActions {
     var hostActions: () -> [HostAction]
     var invokeHost: (HostAction) -> Void
     var sendShortcut: ([String]) -> Void
+    /// The virtual controller (§4): whether its input can reach the host, whether it is up, and the toggle.
+    var padAvailable: () -> Bool
+    var padShown: () -> Bool
+    var togglePad: () -> Void
     var currentMode: () -> (w: UInt32, h: UInt32, hz: UInt32)
     var requestMode: (UInt32, UInt32, UInt32) -> Void
 }
@@ -183,8 +187,14 @@ private func spec(_ slot: SlotId, _ cfg: OverlayConfig, _ a: RingActions) -> Slo
                         enabled: a.micAvailable(), reason: "No microphone is running this session",
                         toggle: true, state: a.micMuted() ? "Muted" : "On")
     case .pad:
+        #if os(tvOS)
         return SlotSpec(id: "pad", label: "Virtual controller", icon: "gamecontroller",
-                        enabled: false, reason: "The virtual controller arrives in a later release")
+                        enabled: false, reason: "Apple TV has no touch screen")
+        #else
+        return SlotSpec(id: "pad", label: "Virtual controller", icon: "gamecontroller",
+                        enabled: a.padAvailable(), reason: "Controller input is not forwarded this session",
+                        toggle: true, state: a.padShown() ? "On" : "Off")
+        #endif
     case .sendText:
         return SlotSpec(id: "send_text", label: "Send text", icon: "textformat",
                         enabled: false, reason: "Use the keyboard on this device")
@@ -477,7 +487,8 @@ struct RingOverlay: View {
         case .keyboard: state.close(); actions.keyboard()
         case .stats: actions.cycleStats()
         case .mic: actions.toggleMic()
-        case .pad, .sendText: break
+        case .pad: actions.togglePad()
+        case .sendText: break
         case .host(let id):
             if let act = actions.hostActions().first(where: { $0.id == id }) {
                 state.close()
@@ -660,7 +671,9 @@ extension RingOverlay {
         rows.append(SheetRowSpec(header: "Input", label: tm.label, value: tm.state) { a.cycleTouchMode() })
         rows.append(SheetRowSpec(label: "Keyboard") { [state] in state.close(); a.keyboard() })
         let pad = spec(.pad, cfg, a)
-        rows.append(SheetRowSpec(label: pad.label, value: pad.reason, enabled: false) {})
+        rows.append(SheetRowSpec(label: pad.label, value: pad.enabled ? pad.state : pad.reason, enabled: pad.enabled) {
+            if pad.enabled { a.togglePad() }
+        })
         rows.append(SheetRowSpec(header: "View", label: "Statistics", value: a.stats().label) { a.cycleStats() })
         let mic = spec(.mic, cfg, a)
         rows.append(SheetRowSpec(header: "Audio", label: mic.label, value: mic.enabled ? mic.state : mic.reason,

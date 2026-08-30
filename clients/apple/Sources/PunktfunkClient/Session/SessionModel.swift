@@ -319,6 +319,34 @@ final class SessionModel: ObservableObject {
     /// The ring is up: the pad belongs to it (flushed on the host, edges become navigation).
     func setRingOpen(_ open: Bool) {
         gamepadCapture?.ringOpen = open
+        virtualPad?.masked = open
+    }
+
+    /// The virtual on-screen controller (design/touch-client-overlay.md §4): shown from the
+    /// ring's `pad` slot, per session. While up it holds one wire pad, so the host sees one
+    /// controller arrive and, on hide, one leave (§9). Never toggled by the ring's own open and
+    /// close (§8 trap 4).
+    @Published private(set) var virtualPadShown = false
+    private(set) var virtualPad: VirtualPadWire?
+
+    /// Whether the pad's input can reach the host at all: the forwarding setting and the
+    /// session's controller grant, the two gates a real pad's sends have.
+    var virtualPadAvailable: Bool {
+        settings.gamepadForwarding && connection?.canSendGamepad == true
+    }
+
+    func toggleVirtualPad() {
+        if let pad = virtualPad {
+            pad.close()
+            virtualPad = nil
+            virtualPadShown = false
+            return
+        }
+        guard let conn = connection, let pad = VirtualPadWire(connection: conn, manager: .shared) else { return }
+        // Toggled from the ring, so the ring is up: the pad starts masked and unmasks on close.
+        pad.masked = gamepadCapture?.ringOpen ?? false
+        virtualPad = pad
+        virtualPadShown = true
     }
     private var gamepadFeedback: GamepadFeedback?
     #if os(iOS) || os(macOS)
@@ -928,6 +956,10 @@ final class SessionModel: ObservableObject {
         accessWarned1m = false
         let audio = self.audio
         self.audio = nil
+        // The virtual pad's slot goes the same way, while the connection is still up.
+        virtualPad?.close()
+        virtualPad = nil
+        virtualPadShown = false
         // Gamepad capture is main-actor (releases held buttons on the wire while the
         // connection is still up); the feedback drain joins off-main like audio.
         gamepadCapture?.stop()

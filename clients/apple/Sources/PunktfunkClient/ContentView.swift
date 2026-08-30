@@ -1306,6 +1306,15 @@ struct ContentView: View {
                         }
                     }
                 }
+                // The virtual controller: above the stream's touch surface, so its controls take
+                // their fingers first and every other finger falls through; below the ring, whose
+                // scrim owns every finger while it is up. Mounted only while shown (tenet 1).
+                .overlay {
+                    if captureEnabled, model.virtualPadShown, let pad = model.virtualPad {
+                        VirtualPadLayer(config: OverlayConfig.parse(SessionSettings.current.overlayActions).pad,
+                                        wire: pad)
+                    }
+                }
                 // The quick-action ring: opened by the two-finger twist under the fingers, or by
                 // the disc above. Mounted only while open — a closed overlay costs nothing.
                 .overlay {
@@ -1369,6 +1378,9 @@ struct ContentView: View {
                 for vk in vks { conn.send(.key(vk, down: true)) }
                 for vk in vks.reversed() { conn.send(.key(vk, down: false)) }
             },
+            padAvailable: { [model] in model.virtualPadAvailable },
+            padShown: { [model] in model.virtualPadShown },
+            togglePad: { [model] in model.toggleVirtualPad() },
             currentMode: {
                 let m = conn.currentMode()
                 return (m.width, m.height, m.refreshHz)
