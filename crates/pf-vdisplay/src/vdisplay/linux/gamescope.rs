@@ -1416,11 +1416,23 @@ fn write_steamos_dropin(shim_dir: &std::path::Path, mode: Mode, hdr: bool) -> Re
         w = mode.width,
         h = mode.height,
         hz = game_hz(mode.refresh_hz),
-        // Read (unquoted) by the PATH shim — empty for an SDR session. Quoted HERE because a
-        // systemd `Environment=` value with spaces must be, or only the first flag survives.
+        // Read (unquoted) by the PATH shim — empty for an SDR session on a stock gamescope. Quoted
+        // HERE because a systemd `Environment=` value with spaces must be, or only the first flag
+        // survives.
+        //
+        // `refresh_rate_args` rides along because this path has no other way to deliver it. The two
+        // session-plus paths hand the set to the SCRIPT as `CUSTOM_REFRESH_RATES` and let it build
+        // the flag; SteamOS's `gamescope-session` is Valve's, has never read that variable, and the
+        // shim only forwards `PF_HDR_ARGS` — so without this the flag reaches no SteamOS session at
+        // all, and Steam's in-session display menu shows one refresh entry and no resolutions.
+        // Empty below `+pfhdr3`, exactly like the other two arg builders.
         hdr_args = hdr_args(hdr)
             .into_iter()
             .chain(cursor_args())
+            // The advertised SET, not the rate we run at: `-r` is `PF_HZ` (frame-limited) above,
+            // while the set is keyed on the session's own mode — the same split `launch_session`
+            // makes between its `game` and `offered`.
+            .chain(refresh_rate_args(mode.refresh_hz.max(1)))
             .collect::<Vec<_>>()
             .join(" "),
     );
@@ -5529,20 +5541,31 @@ fn refresh_rate_args(session_hz: u32) -> Vec<String> {
     if !gamescope_can_offer_refresh_rates() {
         return Vec::new();
     }
-    let mut rates = pf_host_config::config().gamescope_refresh_rates.clone();
+    vec![
+        "--custom-refresh-rates".to_string(),
+        refresh_rate_list(
+            session_hz,
+            &pf_host_config::config().gamescope_refresh_rates,
+        ),
+    ]
+}
+
+/// The comma-joined rate set [`refresh_rate_args`] hands gamescope. Split out pure because both
+/// managed paths interpolate it into an UNQUOTED `${PF_HDR_ARGS}` that the shell word-splits, so
+/// "contains no whitespace" is a correctness property of this string and not a formatting detail —
+/// a space here would split one flag into two argv entries and gamescope would reject the launch.
+fn refresh_rate_list(session_hz: u32, configured: &[u32]) -> String {
+    let mut rates = configured.to_vec();
     if !rates.contains(&session_hz) {
         rates.push(session_hz);
     }
     rates.sort_unstable();
     rates.dedup();
-    vec![
-        "--custom-refresh-rates".to_string(),
-        rates
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(","),
-    ]
+    rates
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// What a bare SPAWN will actually run, resolved ONCE per `create`: the per-session launch command
@@ -5699,7 +5722,7 @@ mod tests {
         free_box_session_for_exclusive, game_hz, gamescope_output_size, hdr_args, idle_dropin_body,
         idle_dropin_path, install_idle_dropin, is_steam_launch, managed_darken_acquire_edge,
         managed_darken_release_edge, mask_unit, missing_flags, mode_mismatch,
-        nested_wrapper_script, our_wsi_layer_dir, parse_listed_units, plan_bind,
+        nested_wrapper_script, our_wsi_layer_dir, parse_listed_units, plan_bind, refresh_rate_list,
         release_autologin_mask, remove_idle_dropin, script_hardcodes_gamescope, sentinel_advanced,
         shape_dedicated_command, switch_ends_mask_window, takeover_state_is_live, unmask_unit,
         xwayland_refusal_marker, BindOff, BindPlan, BoxOutputSize, DmHelperError, SessionBind,
@@ -5876,6 +5899,30 @@ mod tests {
             args.iter().any(|a| a == "--hdr-debug-force-support"),
             "without the force flag the headless connector reports no HDR support, so the WSI \
              layer advertises no HDR surfaces and games render SDR"
+        );
+    }
+
+    /// The rate set rides into both managed sessions inside an UNQUOTED `${PF_HDR_ARGS}`, which the
+    /// shim's shell word-splits. So whitespace in this string is not cosmetic: it would split one
+    /// flag into two argv entries and gamescope would reject the launch. The session rate must also
+    /// survive, since it is the rate the session actually runs at.
+    #[test]
+    fn the_refresh_rate_list_is_word_split_safe_and_keeps_the_session_rate() {
+        let list = refresh_rate_list(240, &[60, 120]);
+        assert_eq!(list, "60,120,240", "sorted, deduped, session rate appended");
+        assert!(
+            !list.contains(char::is_whitespace),
+            "an unquoted ${{PF_HDR_ARGS}} word-splits on whitespace"
+        );
+        assert_eq!(
+            refresh_rate_list(60, &[60]),
+            "60",
+            "a configured set that already holds the session rate gains no duplicate"
+        );
+        assert_eq!(
+            refresh_rate_list(90, &[]),
+            "90",
+            "unset, we advertise exactly the rate the client asked for"
         );
     }
 
