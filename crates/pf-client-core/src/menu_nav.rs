@@ -45,6 +45,10 @@ pub enum MenuDir {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuEvent {
     Move(MenuDir),
+    /// The left stick's angle as one of the ring's six 60° sectors (design §2.6, D12): fired
+    /// when the sector changes — `Some(k)` for slot `k`, `None` when the stick returns to
+    /// neutral. Only the ring reads it; every list keeps stepping on `Move`.
+    Sector(Option<u8>),
     /// A — activate the focused item.
     Confirm,
     /// B — back / quit.
@@ -93,6 +97,42 @@ pub struct MenuNav {
     /// When `dir` engaged — start of the initial-repeat delay.
     dir_since: Instant,
     last_repeat: Instant,
+    /// The ring sector the stick last resolved to (see [`ring_sector`]).
+    sector: Option<u8>,
+    /// `sector` went out as an event. A sector the snapshot adopted never did, so its release
+    /// stays silent too — the ring never engaged that stick.
+    sector_announced: bool,
+}
+
+/// A sector, once engaged, keeps the stick until the angle is this far past its 30° edge —
+/// a stick resting on the boundary between two slots would otherwise flicker between them.
+pub const SECTOR_OVERLAP_DEG: f32 = 5.0;
+
+/// The ring slot the left stick points at, given the sector already engaged: past the
+/// deadzone (by magnitude — a diagonal counts) the angle falls into one of six 60° sectors
+/// centred on the slots (slot `k` sits at `-90° + 60°·k`, 12 o'clock first, clockwise). An
+/// engaged sector holds until the stick drops under [`MENU_RELEASE`] (then `None`) or the
+/// angle leaves it by [`SECTOR_OVERLAP_DEG`]. SDL sticks are +y = down.
+pub fn ring_sector(lx: i16, ly: i16, current: Option<u8>) -> Option<u8> {
+    let (x, y) = (f32::from(lx), f32::from(ly));
+    let mag = x.hypot(y);
+    let floor = if current.is_some() {
+        f32::from(MENU_RELEASE)
+    } else {
+        f32::from(MENU_DEADZONE)
+    };
+    if mag <= floor {
+        return None;
+    }
+    // Degrees clockwise from 12 o'clock, so slot k's centre is at 60·k.
+    let deg = (y.atan2(x).to_degrees() + 90.0).rem_euclid(360.0);
+    if let Some(k) = current {
+        let off = (deg - 60.0 * f32::from(k) + 180.0).rem_euclid(360.0) - 180.0;
+        if off.abs() <= 30.0 + SECTOR_OVERLAP_DEG {
+            return Some(k);
+        }
+    }
+    Some((((deg + 30.0) / 60.0) as u8) % 6)
 }
 
 impl Default for MenuNav {
@@ -109,6 +149,8 @@ impl MenuNav {
             dir: None,
             dir_since: Instant::now(),
             last_repeat: Instant::now(),
+            sector: None,
+            sector_announced: false,
         }
     }
 
@@ -116,6 +158,8 @@ impl MenuNav {
     pub fn reset(&mut self) {
         self.snapshot_pending = true;
         self.dir = None;
+        self.sector = None;
+        self.sector_announced = false;
     }
 
     /// Direction from the left stick (dominant axis wins past the deadzone), falling back
@@ -173,13 +217,26 @@ impl MenuNav {
 
     pub fn poll(&mut self, s: &MenuSample, now: Instant, out: &mut Vec<MenuEvent>) {
         let dir = self.resolve_engaged(s);
+        let sector = ring_sector(s.lx, s.ly, self.sector);
         if self.snapshot_pending {
             self.snapshot_pending = false;
             self.was = s.buttons;
             self.dir = dir;
             self.dir_since = now;
             self.last_repeat = now;
+            self.sector = sector;
+            self.sector_announced = false;
             return;
+        }
+        // The sector goes out BEFORE the buttons and the four-way move of the same sample, so
+        // the ring has engaged the stick by the time the move that would step it arrives, and
+        // an A in the same sample lands on the slot the stick points at.
+        if sector != self.sector {
+            self.sector = sector;
+            if sector.is_some() || self.sector_announced {
+                out.push(MenuEvent::Sector(sector));
+            }
+            self.sector_announced = sector.is_some();
         }
         // buttons order a, b, x, y, l1, r1 → the matching event per index.
         const EVENTS: [MenuEvent; 6] = [
@@ -307,11 +364,17 @@ mod menu_nav_tests {
         assert!(events(&mut nav, &held, t).is_empty(), "snapshot poll fired");
         // Still held: nothing (no rising edge, direction unchanged since snapshot).
         assert!(events(&mut nav, &held, t + Duration::from_millis(10)).is_empty());
-        // Release, then press again → now it fires.
+        // Release — silently, the adopted sector included — then press again → now it
+        // fires, the ring's sector first so an A in the same sample lands on the slot the
+        // stick points at.
         assert!(events(&mut nav, &sample(), t + Duration::from_millis(20)).is_empty());
         assert_eq!(
             events(&mut nav, &held, t + Duration::from_millis(30)),
-            vec![MenuEvent::Confirm, MenuEvent::Move(MenuDir::Right)]
+            vec![
+                MenuEvent::Sector(Some(2)),
+                MenuEvent::Confirm,
+                MenuEvent::Move(MenuDir::Right)
+            ]
         );
     }
 
@@ -391,13 +454,15 @@ mod menu_nav_tests {
         right.lx = 30000;
         let mut left = sample();
         left.lx = -30000;
+        // The ring's sector rides ahead of every stick move (3 o'clock is the edge between
+        // slots 1 and 2, 9 o'clock between 4 and 5).
         assert_eq!(
             events(&mut nav, &right, t + Duration::from_millis(10)),
-            vec![MenuEvent::Move(MenuDir::Right)]
+            vec![MenuEvent::Sector(Some(2)), MenuEvent::Move(MenuDir::Right)]
         );
         assert_eq!(
             events(&mut nav, &left, t + Duration::from_millis(20)),
-            vec![MenuEvent::Move(MenuDir::Left)]
+            vec![MenuEvent::Sector(Some(5)), MenuEvent::Move(MenuDir::Left)]
         );
     }
 
@@ -427,6 +492,69 @@ mod menu_nav_tests {
     }
 
     #[test]
+    fn the_stick_angle_picks_a_ring_sector_with_hysteresis() {
+        // Neutral, and the deadzone by magnitude: a diagonal just past it counts.
+        assert_eq!(ring_sector(0, 0, None), None);
+        assert_eq!(
+            ring_sector(12000, 12000, None),
+            Some(2),
+            "16 971 > 16 384, 45° = slot 2"
+        );
+        assert_eq!(ring_sector(11000, 11000, None), None, "15 556 < 16 384");
+        // The six centres, 12 o'clock first, clockwise (SDL +y = down).
+        assert_eq!(ring_sector(0, -30000, None), Some(0));
+        assert_eq!(ring_sector(26000, -15000, None), Some(1));
+        assert_eq!(ring_sector(26000, 15000, None), Some(2));
+        assert_eq!(ring_sector(0, 30000, None), Some(3));
+        assert_eq!(ring_sector(-26000, 15000, None), Some(4));
+        assert_eq!(ring_sector(-26000, -15000, None), Some(5));
+        // 28° off slot 0 toward slot 1 is still slot 0 …
+        let (x, y) = (14084, -26489); // 30 000 at 28°
+        assert_eq!(ring_sector(x, y, None), Some(0));
+        // … and 32° past the edge stays with an engaged slot 0, flips fresh to slot 1.
+        let (x, y) = (15897, -25441); // 30 000 at 32°
+        assert_eq!(
+            ring_sector(x, y, Some(0)),
+            Some(0),
+            "5° of overlap holds it"
+        );
+        assert_eq!(ring_sector(x, y, None), Some(1));
+        assert_eq!(
+            ring_sector(x, y, Some(5)),
+            Some(1),
+            "36° from slot 5's edge lets go"
+        );
+        // An engaged sector releases only under MENU_RELEASE, not at the deadzone.
+        assert_eq!(ring_sector(0, -12000, Some(0)), Some(0));
+        assert_eq!(ring_sector(0, -9000, Some(0)), None);
+    }
+
+    #[test]
+    fn the_sector_goes_out_before_the_move_and_only_on_change() {
+        let mut nav = MenuNav::new();
+        let t0 = Instant::now();
+        assert!(events(&mut nav, &sample(), t0).is_empty(), "snapshot");
+        let mut s = sample();
+        s.lx = 26000;
+        s.ly = 15000;
+        assert_eq!(
+            events(&mut nav, &s, t0),
+            vec![MenuEvent::Sector(Some(2)), MenuEvent::Move(MenuDir::Right)]
+        );
+        assert!(
+            events(&mut nav, &s, t0).is_empty(),
+            "held: no repeat yet, no new sector"
+        );
+        s.ly = -15000;
+        assert_eq!(events(&mut nav, &s, t0), vec![MenuEvent::Sector(Some(1))]);
+        assert_eq!(
+            events(&mut nav, &sample(), t0),
+            vec![MenuEvent::Sector(None)],
+            "neutral releases the sector"
+        );
+    }
+
+    #[test]
     fn engaged_direction_holds_until_its_own_axis_releases() {
         // The on-glass "random jumps": a stick engaged DOWN drifts right past the
         // dominant-axis boundary while ly is still well above the release threshold. The
@@ -438,13 +566,15 @@ mod menu_nav_tests {
         s.ly = 25_000;
         assert_eq!(
             events(&mut nav, &s, t + Duration::from_millis(10)),
-            vec![MenuEvent::Move(MenuDir::Down)]
+            vec![MenuEvent::Sector(Some(3)), MenuEvent::Move(MenuDir::Down)]
         );
         s.lx = 30_000;
         s.ly = 12_000; // above MENU_RELEASE (9830), below MENU_DEADZONE
-        assert!(
-            events(&mut nav, &s, t + Duration::from_millis(20)).is_empty(),
-            "the dominant-axis flip fired RIGHT while DOWN was still engaged"
+        assert_eq!(
+            events(&mut nav, &s, t + Duration::from_millis(20)),
+            vec![MenuEvent::Sector(Some(2))],
+            "the dominant-axis flip fired RIGHT while DOWN was still engaged; the ring's \
+             sector, which has no axis to hold, followed the angle to 4 o'clock"
         );
         // Only once ly lets go does the stick re-resolve — to RIGHT, immediately.
         s.ly = 5_000;
@@ -456,7 +586,7 @@ mod menu_nav_tests {
         s.lx = -30_000;
         assert_eq!(
             events(&mut nav, &s, t + Duration::from_millis(40)),
-            vec![MenuEvent::Move(MenuDir::Left)]
+            vec![MenuEvent::Sector(Some(4)), MenuEvent::Move(MenuDir::Left)]
         );
     }
 

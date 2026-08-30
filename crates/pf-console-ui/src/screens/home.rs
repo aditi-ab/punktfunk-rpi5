@@ -184,6 +184,8 @@ impl HomeScreen {
                 }
                 None => None,
             },
+            // The ring's sector: the shelf steps on `Move`.
+            MenuEvent::Sector(_) => None,
             MenuEvent::Tertiary => {
                 fx.push(Screen::Settings(super::settings::SettingsScreen::new(
                     ctx.store,

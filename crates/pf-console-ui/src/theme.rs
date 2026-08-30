@@ -74,30 +74,6 @@ pub(crate) fn shaded_stroke(width: f32) -> Paint {
     p
 }
 
-/// The ring editor's stage: a soft, colourful diagonal gradient for the ring to sit on. Glass
-/// needs something behind it to read as glass, and a flat colour would lie about the look
-/// (design touch-client-overlay.md §3.3).
-pub(crate) fn stage_gradient(rect: Rect) -> Paint {
-    let mut p = shaded();
-    let colors = [
-        Color4f::new(0.38, 0.23, 0.66, 1.0),
-        Color4f::new(0.10, 0.38, 0.55, 1.0),
-        Color4f::new(0.07, 0.51, 0.46, 1.0),
-    ];
-    p.set_shader(gradient::shaders::linear_gradient(
-        (
-            Point::new(rect.left, rect.top),
-            Point::new(rect.right, rect.bottom),
-        ),
-        &gradient::Gradient::new(
-            gradient::Colors::new_evenly_spaced(&colors, TileMode::Clamp, None),
-            gradient::Interpolation::default(),
-        ),
-        None,
-    ));
-    p
-}
-
 /// The paint for a `save_layer` — it carries alpha and colour filters, and never any geometry
 /// of its own, so anti-aliasing has nothing to act on. Its own constructor so the AA guard (and
 /// a reader) can tell a compositing paint from a drawing one without reading the call site.

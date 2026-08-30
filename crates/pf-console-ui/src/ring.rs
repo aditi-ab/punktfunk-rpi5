@@ -27,6 +27,9 @@ use std::time::{Duration, Instant};
 /// shared numbers every desktop drawing of the ring reads.
 const RADIUS: f32 = pf_client_core::ring::RING_RADIUS;
 const SLOT_D: f32 = pf_client_core::ring::SLOT_DIAMETER;
+/// The label band under the ring (design units): its 13 pt text inside an 8 pt pill. The
+/// editor sizes its stage by it so the label is never clipped.
+pub(crate) const LABEL_H: f32 = 13.0 + 2.0 * 8.0;
 const CENTRE_D: f32 = pf_client_core::ring::CENTRE_DIAMETER;
 const IDLE_CLOSE: Duration = Duration::from_secs(8);
 const HINT_LIFE: Duration = Duration::from_secs(2);
@@ -125,6 +128,10 @@ pub(crate) struct Ring {
     /// The pad's highlight: a slot 0…5, or 6 for the centre (the initial one — `Select+A`
     /// then `A` opens the sheet in two presses). `None` until a pad or key moves it.
     highlight: Option<usize>,
+    /// The stick is past the deadzone and owns the highlight (design §2.6): its sector
+    /// picks the slot and the four-way moves it also raises are ignored; the D-pad steps
+    /// again once it lets go.
+    stick: bool,
     /// Hit rects as drawn last frame: six slots, then the centre.
     geom: Vec<Rect>,
     sheet_rect: Rect,
@@ -151,6 +158,7 @@ impl Ring {
             hint_at: Instant::now(),
             last_touch: Instant::now(),
             highlight: None,
+            stick: false,
             geom: vec![Rect::new_empty(); 7],
             sheet_rect: Rect::new_empty(),
             list: MenuList::new(),
@@ -251,6 +259,7 @@ impl Ring {
         self.armed = None;
         self.hint = None;
         self.highlight = None;
+        self.stick = false;
     }
 
     fn touch(&mut self) {
@@ -745,6 +754,17 @@ impl Ring {
         }
         let h = self.highlight.unwrap_or(6);
         match ev {
+            // The weapon-wheel idiom: the stick's angle is the slot, neutral is the centre.
+            MenuEvent::Sector(sector) => {
+                self.stick = sector.is_some();
+                let next = sector.map_or(6, |k| usize::from(k) % 6);
+                if self.highlight == Some(next) {
+                    return None;
+                }
+                self.highlight = Some(next);
+                Some(MenuPulse::Move)
+            }
+            MenuEvent::Move(_) if self.stick => None,
             MenuEvent::Move(MenuDir::Right) => {
                 self.highlight = Some(if h >= 6 { 0 } else { (h + 1) % 6 });
                 Some(MenuPulse::Move)
@@ -792,6 +812,18 @@ impl Ring {
         let h = self.highlight.unwrap_or(0).min(5);
         let ed = self.editing.as_mut()?;
         match ev {
+            // The stick points at a slot; back to neutral it leaves the highlight where it
+            // is, since the centre is inert here.
+            MenuEvent::Sector(sector) => {
+                self.stick = sector.is_some();
+                let next = usize::from(sector?) % 6;
+                if self.highlight == Some(next) {
+                    return None;
+                }
+                self.highlight = Some(next);
+                Some(MenuPulse::Move)
+            }
+            MenuEvent::Move(_) if self.stick => None,
             MenuEvent::Move(MenuDir::Right) => {
                 self.highlight = Some((h + 1) % 6);
                 Some(MenuPulse::Move)
@@ -999,7 +1031,7 @@ impl Ring {
             let size = f64::from(13.0 * scale);
             let tw = fonts.measure(hint, W::Medium, size);
             let (px, py) = (14.0 * scale, 8.0 * scale);
-            let (w, h) = (tw + 2.0 * px, size as f32 + 2.0 * py);
+            let (w, h) = (tw + 2.0 * px, LABEL_H * scale);
             let (x, y) = (cx - w / 2.0, cy + radius + slot_d);
             canvas.draw_rrect(
                 RRect::new_rect_xy(Rect::from_xywh(x, y, w, h), h / 2.0, h / 2.0),
@@ -1324,6 +1356,52 @@ mod tests {
         assert_eq!(r.armed.as_deref(), Some("end_stream"));
         r.menu(MenuEvent::Back);
         assert!(!r.open(), "B closes the ring");
+    }
+
+    /// Design §2.6, D12: the stick's sector IS the slot, and while it is engaged the four-way
+    /// moves it also raises step nothing; neutral is the centre in-stream and leaves the
+    /// highlight alone in the editor; the D-pad steps again once the stick lets go.
+    #[test]
+    fn the_stick_points_at_a_slot_and_the_dpad_steps_only_when_it_lets_go() {
+        let mut r = Ring::new();
+        r.set_facts(&facts());
+        r.input(RingInput::Toggle { x: 1.0, y: 1.0 });
+        assert!(matches!(
+            r.menu(MenuEvent::Sector(Some(4))),
+            Some(MenuPulse::Move)
+        ));
+        assert_eq!(r.highlight, Some(4));
+        assert!(
+            r.menu(MenuEvent::Move(MenuDir::Right)).is_none(),
+            "the stick's own move"
+        );
+        assert_eq!(r.highlight, Some(4));
+        assert!(
+            r.menu(MenuEvent::Sector(Some(4))).is_none(),
+            "same sector: nothing to say"
+        );
+        r.menu(MenuEvent::Sector(None));
+        assert_eq!(r.highlight, Some(6), "neutral is the centre");
+        r.menu(MenuEvent::Move(MenuDir::Right));
+        assert_eq!(r.highlight, Some(0), "the D-pad steps again");
+        r.menu(MenuEvent::Back);
+        assert!(!r.stick);
+
+        let mut e = Ring::new();
+        e.set_facts(&facts());
+        e.edit_at(300.0, 300.0);
+        e.menu(MenuEvent::Sector(Some(2)));
+        assert_eq!(e.highlight, Some(2));
+        e.menu(MenuEvent::Move(MenuDir::Left));
+        assert_eq!(e.highlight, Some(2), "held: the move is the stick's");
+        e.menu(MenuEvent::Sector(None));
+        assert_eq!(
+            e.highlight,
+            Some(2),
+            "the centre is inert here, so the slot stays"
+        );
+        e.menu(MenuEvent::Move(MenuDir::Left));
+        assert_eq!(e.highlight, Some(1));
     }
 
     /// The editor (§3.3): A on a slot asks for a pick, Y lifts and A on another slot asks for

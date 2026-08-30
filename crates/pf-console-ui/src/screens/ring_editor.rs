@@ -9,19 +9,24 @@
 
 use crate::glyphs::{Hint, HintKey};
 use crate::pointer::{Pointer, PointerKind};
-use crate::ring::{EditEvent, Ring};
+use crate::ring::{EditEvent, Ring, LABEL_H};
 use crate::screens::{Ctx, Outbox, Screen};
-use crate::theme::{fg, fill, focus_halo, stage_gradient, stroke, Fonts, EDGE_INSET, W};
+use crate::theme::{card_face, fg, fill, focus_halo, stroke, Fonts, EDGE_INSET, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec, ROW_MAX_W};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use pf_client_core::overlay_actions::{
     catalogue, chord_chip, CatalogueEntry, OverlayConfig, RingPlatform, SlotId,
 };
-use pf_client_core::ring::RingFacts;
+use pf_client_core::ring::{RingFacts, RING_RADIUS, SLOT_DIAMETER};
 use skia_safe::{Canvas, Color4f, RRect, Rect};
 
-/// The stage under the ring and the caption over it, in design units.
-const STAGE_H: f64 = 330.0;
+/// The stage under the ring and the caption over it, in design units. The stage fits the
+/// ring exactly as it draws in-stream — the top slot, the bottom slot and the label band
+/// under it — with one pad above and below, so nothing of the ring is clipped.
+const STAGE_PAD: f64 = 16.0;
+const RING_ABOVE: f64 = (RING_RADIUS + SLOT_DIAMETER / 2.0) as f64;
+const RING_BELOW: f64 = (RING_RADIUS + SLOT_DIAMETER + LABEL_H) as f64;
+const STAGE_H: f64 = STAGE_PAD + RING_ABOVE + RING_BELOW + STAGE_PAD;
 const CAPTION_H: f64 = 34.0;
 const CORNER: f64 = 22.0;
 
@@ -416,8 +421,8 @@ impl RingEditorScreen {
         let kf = k as f32;
         fonts.leading(
             canvas,
-            "A on a button changes it. Y lifts a button and A drops it on another to swap; \
-             with a pointer, click or drag.",
+            "Point the stick at a button; A changes it. Y lifts a button and A drops it on \
+             another to swap; with a pointer, click or drag.",
             W::Regular,
             13.0 * k,
             fg(0.55),
@@ -426,8 +431,8 @@ impl RingEditorScreen {
             ROW_MAX_W * 0.9 * k,
         );
 
-        // The stage: a soft, colourful gradient — glass needs something behind it to read
-        // as glass, and a flat colour would lie about the look.
+        // The stage: a flat card face, like every other card on this shell (a gradient
+        // read as decoration on the Deck).
         let stage_w = (ROW_MAX_W * k).min(f64::from(rect.width()) - 48.0 * k) as f32;
         let stage = Rect::from_xywh(
             rect.center_x() - stage_w / 2.0,
@@ -437,15 +442,17 @@ impl RingEditorScreen {
         );
         self.stage = stage;
         let rr = RRect::new_rect_xy(stage, CORNER as f32 * kf, CORNER as f32 * kf);
-        canvas.draw_rrect(rr, &stage_gradient(stage));
+        canvas.draw_rrect(rr, &fill(card_face(0.20)));
         canvas.draw_rrect(rr, &stroke(fg(0.14), kf));
         if self.focus == Focus::Ring && self.picker.is_none() {
             focus_halo(canvas, stage, CORNER as f32 * kf, kf, 1.0);
         }
 
-        // The ring, centred on the stage; its own pixels only inside it.
-        self.ring
-            .recentre(stage.center_x(), stage.top + stage.height() * 0.46);
+        // The ring, one pad below the stage's top; its own pixels only inside it.
+        self.ring.recentre(
+            stage.center_x(),
+            stage.top + (STAGE_PAD + RING_ABOVE) as f32 * kf,
+        );
         canvas.save();
         canvas.clip_rrect(rr, None, None);
         self.ring.render(
