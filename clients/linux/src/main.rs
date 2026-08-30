@@ -29,6 +29,8 @@ mod ui_flow;
 mod ui_hosts;
 #[cfg(target_os = "linux")]
 mod ui_library;
+/// The quick-action ring's editor — the ring itself, as a preferences subpage.
+mod ui_quick_actions;
 #[cfg(target_os = "linux")]
 mod ui_settings;
 #[cfg(target_os = "linux")]

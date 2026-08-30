@@ -40,6 +40,23 @@ const CSS: &str = "
    -- a quote in here would end it.) */
 .pf-override-dot { min-width: 8px; min-height: 8px; border-radius: 999px;
                    background: @accent_color; }
+/* The quick-action ring's editor (ui_quick_actions.rs): the stage is the soft gradient glass
+   needs behind it; a disc is the in-stream ring's own surface -- dark, translucent, a white
+   hairline -- so the editor shows the real thing. (No quotes in here.) */
+.pf-ring-stage { border-radius: 22px;
+                 background: linear-gradient(135deg, #613aa8 0%, #1a608c 55%, #128276 100%); }
+.pf-ring-disc { background: rgba(0, 0, 0, 0.55); border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 999px; color: white; padding: 0; }
+.pf-ring-disc:hover { background: rgba(0, 0, 0, 0.7); }
+.pf-ring-disc.pf-dim { color: rgba(255, 255, 255, 0.4); }
+.pf-ring-centre { border-radius: 999px; background: rgba(0, 0, 0, 0.35);
+                  color: rgba(255, 255, 255, 0.4); }
+.pf-ring-word { font-size: 0.85em; font-weight: 600; }
+.pf-keycap-mods { font-size: 0.6em; font-weight: 500; }
+.pf-keycap-key { font-size: 1.0em; font-weight: 700; }
+.pf-keycap-small .pf-keycap-mods { font-size: 0.5em; }
+.pf-keycap-small .pf-keycap-key { font-size: 0.75em; }
+.pf-key { min-width: 36px; padding: 4px 8px; }
 /* Profile colour swatches (the accent a profile's chips carry). One class per palette entry
    because a per-widget CSS provider for eight buttons is a lot of machinery for a dot. */
 .pf-swatch { min-width: 26px; min-height: 26px; border-radius: 999px; padding: 0; }
