@@ -32,8 +32,6 @@ const HIT_SLOP: f64 = 1.2;
 /// The Lucide mark on a disc, in DIPs. The console draws it at 1.05x the disc's radius; this is
 /// that, so a disc reads the same weight in the editor as it does in the stream.
 const ICON_DIP: f64 = SLOT_DIAMETER as f64 * 1.05 / 2.0;
-/// What an unavailable slot and the inert centre fade to — the alpha the words carried.
-const DIM_INK: f64 = 0.41;
 
 const MODIFIERS: [&str; 4] = ["ctrl", "alt", "shift", "win"];
 
@@ -808,11 +806,9 @@ fn shortcuts(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>)
     } else {
         "Reset to default"
     })
-    .icon(if ui.reset_armed {
-        lucide::icon("rotate-cw")
-    } else {
-        lucide::icon("rotate-cw")
-    })
+    // One mark either way: the accent fill below is what says it is armed, and the glyph takes
+    // the on-accent brush by itself.
+    .icon(lucide::icon("rotate-cw"))
     .tooltip("Restores the platform ring and removes the shortcuts")
     .on_click({
         let (props, ui, set_ui) = (props.clone(), ui.clone(), set_ui.clone());
