@@ -1070,7 +1070,9 @@ impl Shell {
     }
 
     /// One command straight onto the bus — the in-stream ring's host actions, which have no
-    /// screen and so no `Outbox`.
+    /// screen and so no `Outbox`. Only the desktop overlay calls it; the Android console's
+    /// ring is the editor alone.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(crate) fn send_cmd(&self, cmd: ConsoleCmd) {
         self.bus.send(cmd);
     }

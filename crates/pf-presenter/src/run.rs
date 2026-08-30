@@ -443,9 +443,7 @@ impl StreamState {
             cursor_chan: None,
             access: pf_client_core::access::SessionAccess::default(),
             session_notice: None,
-            touch_mouse: crate::touch::SteamTouchMouse::new(
-                pf_client_core::overlay_focus::gamescope_session(),
-            ),
+            touch_mouse: crate::touch::SteamTouchMouse::new(in_gamescope()),
             last_hint: None,
             hint_override: false,
             sent_client_draws: None,
@@ -1631,7 +1629,7 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     // touch (design §5.5): no DIRECT device here, no twist can ever arrive.
                     tracing::info!(
                         devices = ?touch_devices(),
-                        gamescope = pf_client_core::overlay_focus::gamescope_session(),
+                        gamescope = in_gamescope(),
                         "touch devices"
                     );
                     window
@@ -3028,6 +3026,19 @@ fn overlay_pointer(event: &Event, window: &sdl3::video::Window) -> Option<Pointe
         } => PointerInput::Cancel,
         _ => return None,
     })
+}
+
+/// Inside a gamescope session? `overlay_focus` (and gamescope itself) exist only on Linux;
+/// everywhere else the answer is simply no.
+fn in_gamescope() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        pf_client_core::overlay_focus::gamescope_session()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 /// Every touch device SDL sees, as `(id, kind, name)` — logged at connect: under gamescope
