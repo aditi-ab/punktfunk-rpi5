@@ -16,16 +16,15 @@
 // The third `TouchInputMode` (`touch`) never reaches this type: `StreamLayerUIView` forwards
 // those fingers as REAL wire touches (multi-touch passthrough) instead.
 
-#if os(iOS)
 import Foundation
-import PunktfunkCore
 import PunktfunkShared
-import UIKit
 
 /// How touchscreen fingers drive the host — persisted under `DefaultsKey.touchMode`, latched
 /// per gesture by `StreamLayerUIView` (a Settings change applies from the NEXT touch, and a
 /// gesture never splits across models). `trackpad` is the default: a cursor is the
 /// universally workable model; passthrough only helps hosts/apps that actually speak touch.
+/// Every platform (the ring's Touch mode slot names it on tvOS, dimmed); the machine below
+/// is iOS-only.
 public enum TouchInputMode: String, CaseIterable, Sendable {
     case trackpad
     case pointer
@@ -43,6 +42,10 @@ public enum TouchInputMode: String, CaseIterable, Sendable {
     /// applied from the NEXT gesture (the stream view latches the route per gesture).
     public static var sessionOverride: TouchInputMode?
 }
+
+#if os(iOS)
+import PunktfunkCore
+import UIKit
 
 /// The gesture state machine behind the two mouse modes. One instance per stream view, fed
 /// only the DIRECT touches (fingers/Pencil — indirect pointers have their own path). Runs

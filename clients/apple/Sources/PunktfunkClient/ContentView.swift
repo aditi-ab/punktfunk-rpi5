@@ -116,6 +116,11 @@ struct ContentView: View {
     @StateObject private var ring = RingState()
     #endif
     #endif
+    #if os(tvOS)
+    /// The same ring on the Apple TV: a short Back on the remote or `Select+A` opens it, the
+    /// pad drives it (§2.5, §2.6).
+    @StateObject private var ring = RingState()
+    #endif
     #if !os(macOS)
     @State private var showSettings = false
     #endif
@@ -405,6 +410,22 @@ struct ContentView: View {
                 }
                 model.onRingNav = { [ring] nav in ring.nav(nav) }
                 #endif
+                #endif
+                #if os(tvOS)
+                ring.close()
+                if let host = model.activeHost { HostPowerStore.shared.refresh(host) }
+                // A short Back on the remote (or `Select+A`) toggles the ring at the screen
+                // centre; B or a second short Back closes it.
+                model.onRingChord = { [ring] in
+                    if ring.committed {
+                        ring.close()
+                    } else {
+                        ring.pressTick &+= 1
+                        let b = UIScreen.main.bounds
+                        ring.openAt(CGPoint(x: b.midX, y: b.midY))
+                    }
+                }
+                model.onRingNav = { [ring] nav in ring.nav(nav) }
                 #endif
                 // A session actually started — remember it on the card ("Connected … ago"
                 // plus the accent ring on the most recent host).
@@ -1297,6 +1318,18 @@ struct ContentView: View {
                 }
                 .onChange(of: ring.committed) { _, open in model.setRingOpen(open) }
                 #endif
+                #if os(tvOS)
+                // The ring on the Apple TV: mounted only while open, like iOS.
+                .overlay {
+                    if captureEnabled, ring.visible {
+                        RingOverlay(
+                            state: ring,
+                            cfg: OverlayConfig.parse(SessionSettings.current.overlayActions),
+                            actions: ringActions(conn))
+                    }
+                }
+                .onChange(of: ring.committed) { _, open in model.setRingOpen(open) }
+                #endif
             }
         }
     }
@@ -1304,7 +1337,9 @@ struct ContentView: View {
     #if os(iOS)
     /// The two-finger twist → the ring. Nil on the platforms without a twist.
     private var dialSink: ((DialEvent) -> Void)? { { [ring] event in ring.handle(event) } }
+    #endif
 
+    #if os(iOS) || os(tvOS)
     /// The session's live state and commands behind each ring slot.
     private func ringActions(_ conn: PunktfunkConnection) -> RingActions {
         RingActions(

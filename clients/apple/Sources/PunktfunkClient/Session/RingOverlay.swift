@@ -2,9 +2,11 @@
 // under the fingers plus a centre "More" that opens the sheet — the complete catalogue with
 // values. The two-finger twist drives the opening frame by frame (`RingState.handle`); the exit
 // disc opens it at the corner. Closed, it leaves the view hierarchy entirely (tenet 1: any layer
-// above the stream costs a refresh of display latency on iOS).
+// above the stream costs a refresh of display latency on iOS). tvOS carries the same ring,
+// opened by a short Back on the remote or `Select+A` and driven by the pad (§2.5, §2.6); it
+// has no twist, no tap and no drag, so those paths are iOS-only below.
 
-#if os(iOS)
+#if os(iOS) || os(tvOS)
 import PunktfunkKit
 import PunktfunkShared
 import SwiftUI
@@ -157,6 +159,10 @@ private func spec(_ slot: SlotId, _ cfg: OverlayConfig, _ a: RingActions) -> Slo
         return SlotSpec(id: "disconnect_linger", label: "Disconnect, keep the game running",
                         icon: "rectangle.portrait.and.arrow.right")
     case .touchMode:
+        #if os(tvOS)
+        return SlotSpec(id: "touch_mode", label: "Touch mode", icon: "hand.tap",
+                        enabled: false, reason: "Apple TV has no touch screen")
+        #else
         let m = a.touchMode()
         let icon: String
         switch m {
@@ -166,6 +172,7 @@ private func spec(_ slot: SlotId, _ cfg: OverlayConfig, _ a: RingActions) -> Slo
         }
         return SlotSpec(id: "touch_mode", label: "Touch mode", icon: icon, toggle: true,
                         state: m.rawValue.capitalized)
+        #endif
     case .keyboard:
         return SlotSpec(id: "keyboard", label: "Keyboard", icon: "keyboard")
     case .stats:
@@ -276,9 +283,11 @@ struct RingOverlay: View {
                 // while it is open.
                 Color.black.opacity(0.18 * (phase == 1 ? 1 : phase == 0 ? state.progress : 0))
                     .contentShape(Rectangle())
+                    #if os(iOS)
                     .onTapGesture {
                         if state.sheet { state.sheet = false } else { state.close() }
                     }
+                    #endif
                     // In the editor the backdrop under the ring owns the twist and the tap.
                     .allowsHitTesting(editing == nil)
                     .animation(scrimAnimation, value: phase)
@@ -305,9 +314,11 @@ struct RingOverlay: View {
                     .offset(drag?.k == k ? drag?.offset ?? .zero : .zero)
                     .position(x: cx + ringRadius * q * cos(rad), y: cy + ringRadius * q * sin(rad))
                     .allowsHitTesting(q > 0)
+                    #if os(iOS)
                     // Editing: one gesture owns the disc, so a drag never also fires the tap.
                     // In-stream the mask leaves the Button alone.
                     .highPriorityGesture(slotDrag(k), including: editing == nil ? .subviews : .all)
+                    #endif
                     .animation(discAnimation(k), value: phase)
                 }
                 // The centre opens the sheet.
@@ -371,11 +382,13 @@ struct RingOverlay: View {
                 state.hint = nil
             }
         }
+        #if os(iOS)
         .sensoryFeedback(.selection, trigger: state.armTick)
         .sensoryFeedback(.impact(weight: .medium), trigger: state.commitTick)
         .sensoryFeedback(.impact(weight: .light), trigger: state.pressTick)
         .sensoryFeedback(.impact(flexibility: .rigid, intensity: 0.7), trigger: state.refuseTick)
         .sensoryFeedback(.warning, trigger: state.warnTick)
+        #endif
     }
 
     /// The pad (design §2.6): Right steps the highlight clockwise, Left anticlockwise, Up jumps
@@ -468,6 +481,7 @@ struct RingOverlay: View {
         }
     }
 
+    #if os(iOS)
     /// Editing: the disc's one gesture. A touch that stays put is the pick; one carried onto
     /// another slot swaps the two (§3.3); released near the centre or over its own slot it
     /// springs home and nothing changes. Masked off in-stream (see the call site).
@@ -496,6 +510,7 @@ struct RingOverlay: View {
                 if target != k { editing.swap(k, target) }
             }
     }
+    #endif
 
     /// One round glass button — the exit disc's primitive, at ring size.
     private func slotButton(_ s: SlotSpec?, size: CGFloat, scale: CGFloat, alpha: CGFloat, armed: Bool,

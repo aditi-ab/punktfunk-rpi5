@@ -68,6 +68,10 @@ public final class SiriRemotePointer {
 
     /// Fired ON MAIN after Back/Menu was held ≥ `disconnectHold` and released.
     public var onDisconnectRequest: (() -> Void)?
+    /// Fired ON MAIN after a SHORT Back/Menu press (released under `disconnectHold`): the
+    /// quick-action ring's opener on tvOS (design/touch-client-overlay.md §2.5). A long hold
+    /// still exits.
+    public var onShortBack: (() -> Void)?
 
     public init(connection: PunktfunkConnection) {
         self.connection = connection
@@ -248,9 +252,12 @@ public final class SiriRemotePointer {
         menuDownAt = nil
         if heldFor >= Self.disconnectHold {
             onDisconnectRequest?()
+        } else {
+            // A short press opens (or closes) the quick-action ring. It is never forwarded as
+            // a host key — that would make trackpad fumbles type — and the accompanying UIKit
+            // menu press is swallowed in ContentView.
+            onShortBack?()
         }
-        // A short press is deliberately nothing: the accompanying UIKit menu press is swallowed
-        // in ContentView, and forwarding it as a host key would make trackpad fumbles type.
     }
 
     private func releaseHeld() {

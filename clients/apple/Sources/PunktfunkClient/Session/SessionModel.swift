@@ -1180,6 +1180,9 @@ final class SessionModel: ObservableObject {
         #if os(tvOS)
         let pointer = SiriRemotePointer(connection: conn)
         pointer.onDisconnectRequest = { [weak self] in self?.disconnect() }
+        // The remote's short Back is the ring's opener on tvOS — the same hook the pad chord
+        // uses, so the view wires one closure for both.
+        pointer.onShortBack = { [weak self] in self?.onRingChord?() }
         pointer.start()
         remotePointer = pointer
         #endif
