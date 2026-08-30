@@ -227,6 +227,10 @@ struct RingOverlay: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// The disc under an editing drag and how far it has been carried.
     @State private var drag: (k: Int, offset: CGSize)?
+    /// Editing: which slot each disc is drawn in. Identity except while a swap plays: the two
+    /// discs travel to each other's slots on a spring, then the blob is written and this
+    /// snaps back to identity with the contents swapped — nothing visible moves at that point.
+    @State private var order = Array(0..<OverlayConfig.ringSlots)
     /// False for the first frame, so a ring opened by a disc or `Select+A` springs from the
     /// centre instead of appearing in place.
     @State private var appeared = false
@@ -276,12 +280,18 @@ struct RingOverlay: View {
     var body: some View {
         GeometryReader { geo in
             let margin = ringRadius + slotSize / 2 + 16
-            let cx = min(max(state.centre.x, margin), max(geo.size.width - margin, margin))
-            let cy = min(max(state.centre.y, margin), max(geo.size.height - margin, margin))
+            // Clamped so the whole ring stays on screen; a stage narrower than two margins
+            // (the editor's) centres it instead of pinning it to one side.
+            let cx = geo.size.width < 2 * margin
+                ? geo.size.width / 2
+                : min(max(state.centre.x, margin), geo.size.width - margin)
+            let cy = geo.size.height < 2 * margin
+                ? geo.size.height / 2
+                : min(max(state.centre.y, margin), geo.size.height - margin)
             ZStack {
                 // The scrim: a tap outside closes the ring, and nothing reaches the stream
-                // while it is open.
-                Color.black.opacity(0.18 * (phase == 1 ? 1 : phase == 0 ? state.progress : 0))
+                // while it is open. The editor has no stream under it and draws none.
+                Color.black.opacity(editing == nil ? 0.18 * (phase == 1 ? 1 : phase == 0 ? state.progress : 0) : 0)
                     .contentShape(Rectangle())
                     #if os(iOS)
                     .onTapGesture {
@@ -296,9 +306,10 @@ struct RingOverlay: View {
                 ForEach(0..<OverlayConfig.ringSlots, id: \.self) { k in
                     let q = discQ(k)
                     // Slot k sits at 12, 2, 4… o'clock and travels out along a short
-                    // spiral that turns the way the hand turns.
+                    // spiral that turns the way the hand turns. `order` redirects a disc to
+                    // another slot while a swap plays.
                     let turn: CGFloat = state.clockwise ? -40 : 40
-                    let deg = -90 + 60 * CGFloat(k) + (1 - q) * turn
+                    let deg = -90 + 60 * CGFloat(order[k]) + (1 - q) * turn
                     let rad = deg * .pi / 180
                     let slot = cfg.ring[k]
                     let s = slot.map { spec($0, cfg, actions) }
@@ -320,6 +331,7 @@ struct RingOverlay: View {
                     .highPriorityGesture(slotDrag(k), including: editing == nil ? .subviews : .all)
                     #endif
                     .animation(discAnimation(k), value: phase)
+                    .animation(.spring(response: 0.4, dampingFraction: 0.72), value: order)
                 }
                 // The centre opens the sheet. In the editor it is not editable, so it sits
                 // dimmed and inert rather than offering a preview nobody asked for.
@@ -509,7 +521,22 @@ struct RingOverlay: View {
                 guard hypot(dx, dy) > ringRadius / 2 else { return }
                 let deg = atan2(dy, dx) * 180 / .pi + 90
                 let target = ((Int((deg / 60).rounded()) % 6) + 6) % 6
-                if target != k { editing.swap(k, target) }
+                guard target != k, order == Array(0..<OverlayConfig.ringSlots) else { return }
+                // The two discs travel to each other's slots (the dragged one from wherever it
+                // was released); once they land the blob is written and `order` resets in a
+                // transaction with animations off, so the swap of contents draws nothing.
+                withAnimation(.spring(response: 0.4, dampingFraction: 0.72)) {
+                    order.swapAt(k, target)
+                }
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(450))
+                    var t = Transaction()
+                    t.disablesAnimations = true
+                    withTransaction(t) {
+                        order = Array(0..<OverlayConfig.ringSlots)
+                        editing.swap(k, target)
+                    }
+                }
             }
     }
     #endif

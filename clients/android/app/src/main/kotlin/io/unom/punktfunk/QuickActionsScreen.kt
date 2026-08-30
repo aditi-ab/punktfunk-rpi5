@@ -124,11 +124,18 @@ internal fun QuickActionsScreen(
             }
             Text("Quick actions", style = MaterialTheme.typography.headlineMedium)
         }
-        SettingsGroup(
-            footer = "Tap a button to change it, drag one onto another to swap." +
-                if (overridden) " This profile has its own quick actions; the default ring no longer reaches it." else "",
-        ) {
+        // The ring stands on its own, not in a card: the card's inset left the stage narrower
+        // than the ring's margins, and a card around a control that draws its own discs read
+        // as a fill. Its caption sits under it the way a group's footer does.
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             RingStage(cfg, RingEditing(pick = { picking = it }, swap = ::swap))
+            Text(
+                "Tap a button to change it, drag one onto another to swap." +
+                    if (overridden) " This profile has its own quick actions; the default ring no longer reaches it." else "",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 4.dp),
+            )
         }
         SettingsGroup("Shortcuts", footer = "A chord the ring sends to the host. A new one takes the first empty slot.") {
             cfg.shortcuts.forEach { sc ->

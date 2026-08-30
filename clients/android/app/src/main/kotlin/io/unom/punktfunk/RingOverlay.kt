@@ -2,6 +2,8 @@ package io.unom.punktfunk
 
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
@@ -52,6 +54,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -74,6 +77,7 @@ import androidx.compose.ui.unit.sp
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.RingNav
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
@@ -302,9 +306,12 @@ fun RingOverlay(
     val radiusPx = with(density) { RING_RADIUS.toPx() }
     val slotPx = with(density) { SLOT_D.toPx() }
     val marginPx = radiusPx + slotPx / 2 + with(density) { 16.dp.toPx() }
-    // Clamped into the container so the whole ring is always on screen.
-    val cx = state.centre.x.coerceIn(marginPx, (containerSize.width - marginPx).coerceAtLeast(marginPx))
-    val cy = state.centre.y.coerceIn(marginPx, (containerSize.height - marginPx).coerceAtLeast(marginPx))
+    // Clamped into the container so the whole ring is always on screen; a container narrower
+    // than two margins (the editor's stage) centres it instead of pinning it to one side.
+    val cx = if (containerSize.width < 2 * marginPx) containerSize.width / 2f
+        else state.centre.x.coerceIn(marginPx, containerSize.width - marginPx)
+    val cy = if (containerSize.height < 2 * marginPx) containerSize.height / 2f
+        else state.centre.y.coerceIn(marginPx, containerSize.height - marginPx)
 
     // The twist drives the opening frame by frame; the commit settles with a spring; a close
     // shrinks it into the centre.
@@ -411,7 +418,8 @@ fun RingOverlay(
             .fillMaxSize()
             // The scrim: a tap outside the ring closes it, and nothing reaches the stream while
             // it is open. No backdrop blur — a blur over a video surface is a full-screen pass.
-            .background(Color.Black.copy(alpha = 0.18f * shown.value))
+            // The editor has no stream under it and draws no scrim.
+            .background(Color.Black.copy(alpha = if (editing == null) 0.18f * shown.value else 0f))
             // In the editor the backdrop under the ring owns the twist; the scrim takes nothing.
             .then(
                 if (editing == null) {
@@ -427,17 +435,27 @@ fun RingOverlay(
         val slotHalf = slotPx / 2
         // The disc under an editing drag and how far it has been carried.
         var drag by remember { mutableStateOf<Pair<Int, Offset>?>(null) }
+        // Editing: which slot each disc is drawn in. Identity except while a swap plays: the
+        // two discs travel to each other's slots on a spring, then the blob is written and
+        // this snaps back to identity with the contents swapped — nothing visible moves then.
+        var order by remember { mutableStateOf((0 until 6).toList()) }
+        var swapping by remember { mutableStateOf(false) }
+        val scope = rememberCoroutineScope()
         cfg.ring.forEachIndexed { k, slot ->
             val q = ((shown.value - k * SLOT_LAG) / (1f - 5 * SLOT_LAG)).coerceIn(0f, 1f)
             if (q <= 0f) return@forEachIndexed
             // Slot k sits at 12, 2, 4… o'clock; it travels out along a short spiral that turns
-            // the way the hand turns.
+            // the way the hand turns. `order` redirects a disc to another slot while a swap plays.
             val turn = if (state.clockwise) -40f else 40f
-            val deg = -90f + 60f * k + (1f - q) * turn
+            val deg = -90f + 60f * order[k] + (1f - q) * turn
             val rad = Math.toRadians(deg.toDouble())
             val carried = drag?.takeIf { it.first == k }?.second ?: Offset.Zero
-            val x = cx + radiusPx * q * cos(rad).toFloat() - slotHalf + carried.x
-            val y = cy + radiusPx * q * sin(rad).toFloat() - slotHalf + carried.y
+            val targetX = cx + radiusPx * q * cos(rad).toFloat() - slotHalf + carried.x
+            val targetY = cy + radiusPx * q * sin(rad).toFloat() - slotHalf + carried.y
+            // Only a swap animates the position; the twist and a drag follow the finger.
+            val swapSpring = if (swapping) spring<Float>(dampingRatio = 0.72f, stiffness = Spring.StiffnessMediumLow) else snap()
+            val x by animateFloatAsState(targetX, swapSpring, label = "slotX")
+            val y by animateFloatAsState(targetY, swapSpring, label = "slotY")
             val s = slot?.let { spec(it, cfg, actions) }
             // Editing: a disc dragged onto another slot swaps the two (§3.3); released near the
             // centre or over its own slot, nothing changes. The drag consumes past touch slop,
@@ -456,7 +474,22 @@ fun RingOverlay(
                             if (hypot(px, py) <= radiusPx / 2) return@detectDragGestures
                             val angle = Math.toDegrees(atan2(py, px).toDouble()) + 90.0
                             val target = (((angle / 60.0).roundToInt() % 6) + 6) % 6
-                            if (target != k) editing.swap(k, target)
+                            if (target == k || swapping) return@detectDragGestures
+                            // The two discs travel to each other's slots; once they land the
+                            // blob is written and `order` resets with the spring off, so the
+                            // swap of contents draws nothing.
+                            swapping = true
+                            order = order.toMutableList().also { o ->
+                                val t = o[k]
+                                o[k] = o[target]
+                                o[target] = t
+                            }
+                            scope.launch {
+                                delay(450)
+                                swapping = false
+                                order = (0 until 6).toList()
+                                editing.swap(k, target)
+                            }
                         },
                         onDragCancel = { drag = null },
                     ) { change, delta ->
