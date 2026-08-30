@@ -475,7 +475,7 @@ fn edit_editor(
             hstack((
                 button("Save")
                     .accent()
-                    .icon(lucide::icon_on("check"))
+                    .icon(lucide::icon("check"))
                     .on_click(commit),
                 button("Cancel")
                     .subtle()
@@ -614,7 +614,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             .vertical_alignment(VerticalAlignment::Center),
             hstack({
                 let mut actions: Vec<Element> = vec![button("Add host")
-                    .icon(lucide::icon_on("plus"))
+                    .icon(lucide::icon("plus"))
                     .accent()
                     .on_click({
                         let sa = set_show_add.clone();
@@ -1340,7 +1340,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             hstack((
                 button("Connect")
                     .accent()
-                    .icon(lucide::icon_on("arrow-right"))
+                    .icon(lucide::icon("arrow-right"))
                     .on_click(connect_manual),
                 button("Cancel").on_click({
                     let sa = set_show_add.clone();

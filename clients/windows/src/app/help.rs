@@ -78,7 +78,7 @@ fn shortcuts_reference() -> Element {
 pub(crate) fn help_page(set_screen: &AsyncSetState<Screen>) -> Element {
     let back_btn = button("Back")
         .accent()
-        .icon(lucide::icon_on("arrow-left"))
+        .icon(lucide::icon("arrow-left"))
         .on_click({
             let ss = set_screen.clone();
             move || ss.call(Screen::Hosts)

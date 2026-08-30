@@ -34,7 +34,7 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
         );
         button("Pair & Connect")
             .accent()
-            .icon(lucide::icon_on("check"))
+            .icon(lucide::icon("check"))
             .on_click(move || {
                 let pin = live.borrow().trim().to_string();
                 let (ctx3, ss, st, target3) =

@@ -154,8 +154,14 @@ if (-not (Test-Path $notices)) {
 }
 Copy-Item $notices $licDir -Force
 
-# tile/store assets
+# tile/store assets — and the Lucide icon font, which the shell loads by the ms-appx URI in
+# app/lucide.rs. It is checked in beside the tile art rather than staged by the build, so this
+# copy is the ONLY route it takes into a shipped package.
 Copy-Item (Join-Path $assets '*') (Join-Path $layout 'Assets') -Force
+# Assert it landed: without the font every icon in the shell renders as a private-use box, and
+# nothing else in this script would notice.
+$font = Join-Path $layout 'Assets\lucide.ttf'
+if (-not (Test-Path $font)) { throw "missing Assets\lucide.ttf in the layout — the shell's icon font (see clients/windows/src/app/lucide.rs)" }
 
 # manifest with version + publisher + architecture substituted
 $manifest = (Get-Content -Raw $manifestTemplate).Replace('{VERSION}', $Version).Replace('{PUBLISHER}', $Publisher).Replace('{ARCH}', $Arch)

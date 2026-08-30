@@ -196,11 +196,11 @@ pub struct AppCtx {
 }
 
 pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_reactor::Result<()> {
-    // Every mark this shell draws loads as a file:/// URI — the host tiles' OS marks, the
-    // library's launcher marks and the Lucide UI set. Put the embedded PNGs on disk first.
+    // The BRAND marks load as file:/// URIs — the host tiles' OS marks and the library's
+    // launcher marks. Put the embedded PNGs on disk first. (The Lucide UI set needs nothing
+    // here: it is a font beside the exe, which XAML loads on demand.)
     os_icons::install();
     launcher_icons::install();
-    lucide::install();
     let ctx = Arc::new(AppCtx {
         identity,
         settings: Mutex::new(Settings::load()),

@@ -357,7 +357,7 @@ fn edit_profile_modal(
             let close_sheet = close_sheet.clone();
             button("Save")
                 .accent()
-                .icon(lucide::icon_on("save"))
+                .icon(lucide::icon("save"))
                 .on_click(close_sheet)
         }
         .into(),

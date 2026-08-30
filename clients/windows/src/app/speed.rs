@@ -176,7 +176,7 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
                 None => buttons.push(
                     button(format!("Use {recommended_mbps:.0} Mb/s"))
                         .accent()
-                        .icon(lucide::icon_on("check"))
+                        .icon(lucide::icon("check"))
                         .on_click(write_global.clone())
                         .into(),
                 ),
@@ -186,7 +186,7 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
                         p.name
                     ))
                     .accent()
-                    .icon(lucide::icon_on("check"))
+                    .icon(lucide::icon("check"))
                     .on_click(write_profile(p.id.clone()))
                     .into(),
                 ),
@@ -200,7 +200,7 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
                     buttons.push(
                         button(format!("Set in \u{201c}{}\u{201d}", p.name))
                             .accent()
-                            .icon(lucide::icon_on("check"))
+                            .icon(lucide::icon("check"))
                             .on_click(write_profile(p.id.clone()))
                             .into(),
                     );

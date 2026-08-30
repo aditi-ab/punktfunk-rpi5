@@ -331,18 +331,24 @@ pub(super) fn quick_actions_section(props: &Props, cx: &mut RenderCx) -> Element
     vstack(parts).spacing(14.0).into()
 }
 
-/// A disc's Lucide mark, in the white bake — a disc is dark on both themes, so the theme's own
-/// foreground would vanish into it. `dim` is the unavailable slot, faded rather than hidden.
+/// A disc's Lucide mark, as a glyph of the icon font at exactly `size`. Not [`lucide::icon`]:
+/// that hands the mark to a control to size and tint, and a disc is neither — it is our own
+/// dark surface on both themes, so the ink is white whatever the theme says, and the size is
+/// the ring's geometry rather than a button's. `dim` is the unavailable slot, faded not hidden.
 fn mark(name: &str, size: f64, dim: bool) -> Element {
-    Element::from(
-        Image::new_with_uri(lucide::ring_uri(name))
-            .stretch(Stretch::Uniform)
-            .width(size)
-            .height(size)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .vertical_alignment(VerticalAlignment::Center),
-    )
-    .opacity(if dim { DIM_INK } else { 1.0 })
+    let ink = Color {
+        a: if dim { 100 } else { 242 },
+        r: 255,
+        g: 255,
+        b: 255,
+    };
+    text_block(lucide::glyph(name))
+        .font_family(lucide::FAMILY)
+        .font_size(size)
+        .foreground(ink)
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .vertical_alignment(VerticalAlignment::Center)
+        .into()
 }
 
 /// A disc's face: the slot's Lucide mark, or a stacked keycap for a shortcut. The mark comes
@@ -803,7 +809,7 @@ fn shortcuts(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>)
         "Reset to default"
     })
     .icon(if ui.reset_armed {
-        lucide::icon_on("rotate-cw")
+        lucide::icon("rotate-cw")
     } else {
         lucide::icon("rotate-cw")
     })
@@ -1095,22 +1101,24 @@ fn shortcut_editor(
 mod tests {
     use super::*;
 
-    /// Every disc the ring can hold draws as a mark, not a word, and its mark is baked here.
+    /// Every disc the ring can hold draws as a mark, not a word, and that mark has a glyph.
     /// The editor has no fallback to fall back TO now that the words are gone — a slot whose
     /// mark is missing renders an empty disc.
     #[test]
-    fn every_slot_on_the_ring_draws_a_baked_mark() {
+    fn every_slot_on_the_ring_draws_a_glyph() {
         let cfg = OverlayConfig::platform_default(RingPlatform::Desktop);
         for slot in cfg.ring.iter().flatten() {
             let id = slot.id();
             let name = slot_icon(&id, "").unwrap_or_else(|| panic!("{id} has no mark"));
             assert!(
-                !lucide::ring_uri(name).is_empty() || std::env::var_os("LOCALAPPDATA").is_none(),
-                "{id}: '{name}' has no white bake"
+                !lucide::glyph(name).is_empty(),
+                "{id}: the font has no '{name}'"
             );
         }
         // The centre and the empty slot draw marks of their own, outside the ring's contents.
         assert_eq!(slot_icon("more", ""), Some("ellipsis"));
+        assert!(!lucide::glyph("ellipsis").is_empty());
+        assert!(!lucide::glyph("plus").is_empty());
     }
 
     /// A press on a disc is that disc, a press between them is nothing, and the drag slop

@@ -431,7 +431,7 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
             body.push(
                 button("Retry")
                     .accent()
-                    .icon(lucide::icon_on("refresh-cw"))
+                    .icon(lucide::icon("refresh-cw"))
                     .on_click(move || start_fetch(&ctx2, &set_library))
                     .horizontal_alignment(HorizontalAlignment::Left)
                     .into(),

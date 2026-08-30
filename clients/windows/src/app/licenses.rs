@@ -26,7 +26,7 @@ const THIRD_PARTY_NOTICES: &str = include_str!("../../THIRD-PARTY-NOTICES.txt");
 pub(crate) fn licenses_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Element {
     let back_btn = button("Back")
         .accent()
-        .icon(lucide::icon_on("arrow-left"))
+        .icon(lucide::icon("arrow-left"))
         .on_click({
             let (c, ss) = (ctx.clone(), set_screen.clone());
             move || {
