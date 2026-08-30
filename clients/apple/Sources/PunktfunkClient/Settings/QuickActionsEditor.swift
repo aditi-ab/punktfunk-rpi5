@@ -330,8 +330,6 @@ private struct ShortcutEditor: View {
     private var mods: [String] { draft.keys.filter { modifierKeys.contains($0) } }
     private var key: String? { draft.keys.first { !modifierKeys.contains($0) } }
 
-    private let grid = [GridItem(.adaptive(minimum: 44), spacing: 6)]
-
     var body: some View {
         NavigationStack {
             Form {
@@ -363,7 +361,10 @@ private struct ShortcutEditor: View {
                 }
                 ForEach(keyGroups, id: \.title) { group in
                     Section(group.title) {
-                        LazyVGrid(columns: grid, spacing: 6) {
+                        // Word keys (Backspace, PgDn, PrtSc) get wider cells; every cap keeps
+                        // one line at one height and shrinks its text rather than growing.
+                        let wide = group.keys.contains { keyLegend($0).count > 2 }
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: wide ? 80 : 44), spacing: 6)], spacing: 6) {
                             ForEach(group.keys, id: \.self) { k in
                                 let on = key == k
                                 Button {
@@ -371,7 +372,10 @@ private struct ShortcutEditor: View {
                                 } label: {
                                     Text(keyLegend(k))
                                         .font(.geistFixed(13, on ? .semibold : .medium))
-                                        .frame(maxWidth: .infinity, minHeight: 30)
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.6)
+                                        .frame(maxWidth: .infinity)
+                                        .frame(height: 30)
                                 }
                                 .buttonStyle(.bordered)
                                 .tint(on ? Color.brand : Color.secondary)
