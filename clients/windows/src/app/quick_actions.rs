@@ -335,7 +335,7 @@ pub(super) fn quick_actions_section(props: &Props, cx: &mut RenderCx) -> Element
 /// foreground would vanish into it. `dim` is the unavailable slot, faded rather than hidden.
 fn mark(name: &str, size: f64, dim: bool) -> Element {
     Element::from(
-        Image::new_with_uri(lucide::uri_on(name))
+        Image::new_with_uri(lucide::ring_uri(name))
             .stretch(Stretch::Uniform)
             .width(size)
             .height(size)
@@ -1105,7 +1105,7 @@ mod tests {
             let id = slot.id();
             let name = slot_icon(&id, "").unwrap_or_else(|| panic!("{id} has no mark"));
             assert!(
-                !lucide::uri_on(name).is_empty() || std::env::var_os("LOCALAPPDATA").is_none(),
+                !lucide::ring_uri(name).is_empty() || std::env::var_os("LOCALAPPDATA").is_none(),
                 "{id}: '{name}' has no white bake"
             );
         }

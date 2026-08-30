@@ -27,6 +27,7 @@ MASTERS=assets/lucide
 TABLE=crates/pf-client-core/src/lucide.rs
 WIN=clients/windows/assets/lucide
 WIN_ON=clients/windows/assets/lucide-on
+WIN_RING=clients/windows/assets/lucide-ring
 
 # The same mid-grey as the OS and launcher marks, for the same reason: the Windows shell has
 # no theme-aware tint, so one colour has to stay legible on both the light and dark WinUI
@@ -34,9 +35,18 @@ WIN_ON=clients/windows/assets/lucide-on
 # accent-filled button, and the ring's discs.
 WIN_GREY='#8A8F98'
 WIN_WHITE='#FFFFFF'
-# 128 px covers a 24 DIP icon at 400 % scaling with room to spare, and a 2 px stroke rasters
-# to a handful of kB — the whole set is smaller than one launcher mark.
-WIN_SIZE=128
+
+# ⚠ THE BAKE SIZE IS THE ON-SCREEN SIZE for anything handed to reactor's `.icon()`. It builds
+# a WinUI `BitmapIcon` and drops it into the control with no size set; a `BitmapIcon` measures
+# at its source PIXEL count, read as DIPs. (A `SymbolIcon` self-sizes to its glyph, which is
+# why swapping symbols for bitmaps needs this care.) A NavigationViewItem's template happens to
+# clamp its icon, an ordinary Button does not — so a 128 px bake came out right in the sidebar
+# and enormous on every button. 16 px is Segoe Fluent's optical weight in a button.
+WIN_ICON_SIZE=16
+# The ring's discs are the exception: they draw through `Image`, which DOES take an explicit
+# width and height, so a large source only buys resolution. 96 px covers a 29 DIP disc mark at
+# 300 % scaling.
+WIN_RING_SIZE=96
 
 log() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 
@@ -45,7 +55,7 @@ command -v rsvg-convert >/dev/null 2>&1 || {
   exit 1
 }
 
-mkdir -p "$WIN" "$WIN_ON"
+mkdir -p "$WIN" "$WIN_ON" "$WIN_RING"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -53,15 +63,16 @@ trap 'rm -rf "$tmp"' EXIT
 log "Shared path table (Skia console + GTK shell)"
 python3 scripts/gen-lucide-icons.py "$MASTERS" "$TABLE"
 
-log "Windows PNGs (${WIN_SIZE} px, grey + white)"
+log "Windows PNGs (icons ${WIN_ICON_SIZE} px grey + white, ring ${WIN_RING_SIZE} px white)"
 for src in "$MASTERS"/*.svg; do
   t=$(basename "$src" .svg)
   sed "s/currentColor/$WIN_GREY/" "$src" > "$tmp/$t.grey.svg"
   sed "s/currentColor/$WIN_WHITE/" "$src" > "$tmp/$t.white.svg"
-  rsvg-convert -w "$WIN_SIZE" -h "$WIN_SIZE" -f png -o "$WIN/$t.png" "$tmp/$t.grey.svg"
-  rsvg-convert -w "$WIN_SIZE" -h "$WIN_SIZE" -f png -o "$WIN_ON/$t.png" "$tmp/$t.white.svg"
+  rsvg-convert -w "$WIN_ICON_SIZE" -h "$WIN_ICON_SIZE" -f png -o "$WIN/$t.png" "$tmp/$t.grey.svg"
+  rsvg-convert -w "$WIN_ICON_SIZE" -h "$WIN_ICON_SIZE" -f png -o "$WIN_ON/$t.png" "$tmp/$t.white.svg"
+  rsvg-convert -w "$WIN_RING_SIZE" -h "$WIN_RING_SIZE" -f png -o "$WIN_RING/$t.png" "$tmp/$t.white.svg"
 done
-log "  $(ls "$MASTERS"/*.svg | wc -l | tr -d ' ') icons x 2 colours"
+log "  $(ls "$MASTERS"/*.svg | wc -l | tr -d ' ') icons x 3 bakes"
 
 # The generated table goes through rustfmt: `cargo fmt --all --check` is a CI gate, and a
 # GENERATED file that fails it would fail the build every time someone re-ran this script.
