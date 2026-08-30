@@ -29,6 +29,12 @@ to sleep or shutting down"* rather than a connection error — waits a moment so
 the invoker, then asks the operating system to act. The host tile flips to asleep/offline, and for
 sleep the **Wake host** action brings it back.
 
+It also tears the virtual displays down before it goes, so a wake starts clean instead of resuming
+onto a display built for whoever put the machine to sleep. A display on keep-alive **Forever** is
+deliberately kept — that pin is what keeps a gamescope game running across disconnects — so if you
+use one and a wake lands on a black screen, **release it** from the console (**Virtual displays**
+→ *Release*).
+
 ## Why an action can be refused
 
 The host says no, with the reason, instead of pretending:
