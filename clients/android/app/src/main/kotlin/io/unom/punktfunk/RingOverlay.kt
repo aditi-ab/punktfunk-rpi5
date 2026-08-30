@@ -453,7 +453,7 @@ fun RingOverlay(
             val targetX = cx + radiusPx * q * cos(rad).toFloat() - slotHalf + carried.x
             val targetY = cy + radiusPx * q * sin(rad).toFloat() - slotHalf + carried.y
             // Only a swap animates the position; the twist and a drag follow the finger.
-            val swapSpring = if (swapping) spring<Float>(dampingRatio = 0.72f, stiffness = Spring.StiffnessMediumLow) else snap()
+            val swapSpring = if (swapping) spring<Float>(dampingRatio = 0.82f, stiffness = Spring.StiffnessMedium) else snap()
             val x by animateFloatAsState(targetX, swapSpring, label = "slotX")
             val y by animateFloatAsState(targetY, swapSpring, label = "slotY")
             val s = slot?.let { spec(it, cfg, actions) }
@@ -484,8 +484,10 @@ fun RingOverlay(
                                 o[k] = o[target]
                                 o[target] = t
                             }
+                            // Past the spring's settle: a reset while the discs still move
+                            // jumped them the last few pixels as the contents swapped.
                             scope.launch {
-                                delay(450)
+                                delay(650)
                                 swapping = false
                                 order = (0 until 6).toList()
                                 editing.swap(k, target)

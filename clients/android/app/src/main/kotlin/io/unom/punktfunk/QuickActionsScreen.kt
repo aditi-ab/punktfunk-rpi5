@@ -25,6 +25,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -124,11 +125,13 @@ internal fun QuickActionsScreen(
             }
             Text("Quick actions", style = MaterialTheme.typography.headlineMedium)
         }
-        // The ring stands on its own, not in a card: the card's inset left the stage narrower
-        // than the ring's margins, and a card around a control that draws its own discs read
-        // as a fill. Its caption sits under it the way a group's footer does.
+        // The ring in a card like every other field, but without the group's 16 dp inset: the
+        // inset left the stage narrower than the ring. Its caption sits under the card the way a
+        // group's footer does.
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            RingStage(cfg, RingEditing(pick = { picking = it }, swap = ::swap))
+            OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+                RingStage(cfg, RingEditing(pick = { picking = it }, swap = ::swap))
+            }
             Text(
                 "Tap a button to change it, drag one onto another to swap." +
                     if (overridden) " This profile has its own quick actions; the default ring no longer reaches it." else "",

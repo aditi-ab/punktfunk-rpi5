@@ -331,7 +331,7 @@ struct RingOverlay: View {
                     .highPriorityGesture(slotDrag(k), including: editing == nil ? .subviews : .all)
                     #endif
                     .animation(discAnimation(k), value: phase)
-                    .animation(.spring(response: 0.4, dampingFraction: 0.72), value: order)
+                    .animation(.spring(response: 0.35, dampingFraction: 0.82), value: order)
                 }
                 // The centre opens the sheet. In the editor it is not editable, so it sits
                 // dimmed and inert rather than offering a preview nobody asked for.
@@ -525,11 +525,13 @@ struct RingOverlay: View {
                 // The two discs travel to each other's slots (the dragged one from wherever it
                 // was released); once they land the blob is written and `order` resets in a
                 // transaction with animations off, so the swap of contents draws nothing.
-                withAnimation(.spring(response: 0.4, dampingFraction: 0.72)) {
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
                     order.swapAt(k, target)
                 }
+                // Past the spring's settle: a reset while the discs still move jumped them
+                // the last few points as the contents swapped, which read as a flash.
                 Task { @MainActor in
-                    try? await Task.sleep(for: .milliseconds(450))
+                    try? await Task.sleep(for: .milliseconds(650))
                     var t = Transaction()
                     t.disablesAnimations = true
                     withTransaction(t) {
