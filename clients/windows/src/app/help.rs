@@ -3,6 +3,7 @@
 //! counterpart of the GTK client's Keyboard Shortcuts window; the bindings themselves live in
 //! the session window, so both clients document the same set.
 
+use super::lucide;
 use super::style::*;
 use super::Screen;
 use windows_reactor::*;
@@ -75,10 +76,13 @@ fn shortcuts_reference() -> Element {
 /// the capture model, and the shortcuts reference. Hook-free — called inline from `root` like
 /// the other static screens.
 pub(crate) fn help_page(set_screen: &AsyncSetState<Screen>) -> Element {
-    let back_btn = button("Back").accent().icon(Symbol::Back).on_click({
-        let ss = set_screen.clone();
-        move || ss.call(Screen::Hosts)
-    });
+    let back_btn = button("Back")
+        .accent()
+        .icon(lucide::icon_on("arrow-left"))
+        .on_click({
+            let ss = set_screen.clone();
+            move || ss.call(Screen::Hosts)
+        });
 
     let intro = card(
         vstack((

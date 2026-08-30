@@ -3,6 +3,7 @@
 //! forget) and a manual connect entry — the same card layout as the Linux and Apple clients.
 
 use super::connect::{initiate, initiate_waking, open_console};
+use super::lucide;
 use super::speed::SpeedState;
 use super::style::*;
 use super::{Screen, Svc, Target};
@@ -474,7 +475,7 @@ fn edit_editor(
             hstack((
                 button("Save")
                     .accent()
-                    .icon(Symbol::Accept)
+                    .icon(lucide::icon_on("check"))
                     .on_click(commit),
                 button("Cancel")
                     .subtle()
@@ -594,8 +595,12 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     // and the rest icon-only with tooltips: four written-out buttons in a row read as four
     // competing calls to action (review feedback), and icon-only needs no compact-width
     // special case either.
-    let icon_btn =
-        |label: &str, sym: Symbol| button("").icon(sym).tooltip(label).automation_name(label);
+    let icon_btn = |label: &str, mark: &str| {
+        button("")
+            .icon(lucide::icon(mark))
+            .tooltip(label)
+            .automation_name(label)
+    };
     body.push(
         grid((
             vstack((
@@ -609,7 +614,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             .vertical_alignment(VerticalAlignment::Center),
             hstack({
                 let mut actions: Vec<Element> = vec![button("Add host")
-                    .icon(Symbol::Add)
+                    .icon(lucide::icon_on("plus"))
                     .accent()
                     .on_click({
                         let sa = set_show_add.clone();
@@ -620,7 +625,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 // re-query interval off to as much as an hour — so a host that appeared since
                 // startup, or whose announcement was lost to multicast, may need an actual ask.
                 actions.push(
-                    icon_btn("Scan the network for hosts again", Symbol::Refresh)
+                    icon_btn("Scan the network for hosts again", "refresh-cw")
                         .on_click({
                             let (c, st) = (ctx.clone(), set_status.clone());
                             move || {
@@ -638,7 +643,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     actions.push(
                         icon_btn(
                             "Console UI \u{2014} the controller-driven couch interface",
-                            Symbol::Play,
+                            "gamepad-2",
                         )
                         .on_click({
                             let (c, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
@@ -650,7 +655,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     );
                 }
                 actions.push(
-                    icon_btn("Keyboard shortcuts", Symbol::Keyboard)
+                    icon_btn("Keyboard shortcuts", "keyboard")
                         .on_click({
                             let ss = set_screen.clone();
                             move || ss.call(Screen::Help)
@@ -658,7 +663,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                         .into(),
                 );
                 actions.push(
-                    icon_btn("Settings", Symbol::Setting)
+                    icon_btn("Settings", "settings")
                         .on_click({
                             let (c, ss) = (ctx.clone(), set_screen.clone());
                             move || {
@@ -767,7 +772,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 let (link_host, link_profile) = (k.clone(), None::<String>);
                 let shortcut_host = k.clone();
                 button("")
-                    .icon(Symbol::More)
+                    .icon(lucide::icon("ellipsis"))
                     .subtle()
                     .tooltip("More options")
                     .automation_name("More options")
@@ -1093,7 +1098,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                     let unpin_label = format!("{MENU_UNPIN}{name}");
                     let unpin_item = unpin_label.clone();
                     button("")
-                        .icon(Symbol::More)
+                        .icon(lucide::icon("ellipsis"))
                         .subtle()
                         .tooltip("More options")
                         .automation_name("More options")
@@ -1335,7 +1340,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
             hstack((
                 button("Connect")
                     .accent()
-                    .icon(Symbol::Forward)
+                    .icon(lucide::icon_on("arrow-right"))
                     .on_click(connect_manual),
                 button("Cancel").on_click({
                     let sa = set_show_add.clone();

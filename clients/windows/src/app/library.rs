@@ -16,6 +16,7 @@
 //! speed test's generation guard.
 
 use super::connect::initiate_launch;
+use super::lucide;
 use super::style::*;
 use super::{AppCtx, Screen, Svc};
 use pf_client_core::library;
@@ -365,7 +366,7 @@ fn poster_tile(
     grid(vec![
         tappable.into(),
         button("")
-            .icon(Symbol::More)
+            .icon(lucide::icon("ellipsis"))
             .subtle()
             .tooltip("More options")
             .automation_name(format!("More options for {}", game.title))
@@ -396,7 +397,7 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
     let tile_w = (content_w - POSTER_GAP * (cols as f64 - 1.0)) / cols as f64;
     let poster_h = tile_w * POSTER_RATIO;
 
-    let back_btn = button("Back").icon(Symbol::Back).on_click({
+    let back_btn = button("Back").icon(lucide::icon("arrow-left")).on_click({
         let ss = ss.clone();
         move || ss.call(Screen::Hosts)
     });
@@ -430,7 +431,7 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
             body.push(
                 button("Retry")
                     .accent()
-                    .icon(Symbol::Refresh)
+                    .icon(lucide::icon_on("refresh-cw"))
                     .on_click(move || start_fetch(&ctx2, &set_library))
                     .horizontal_alignment(HorizontalAlignment::Left)
                     .into(),

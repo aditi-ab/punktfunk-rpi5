@@ -2,6 +2,7 @@
 //! real data plane, have the host burst probe filler for 2 s up to its 3 Gbps ceiling, and
 //! report goodput · loss · a recommended bitrate (≈70 % of measured), applied in one tap.
 
+use super::lucide;
 use super::style::*;
 use super::{Screen, Svc};
 use crate::probe::run_speed_probe;
@@ -84,7 +85,7 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
     let back_btn = {
         let ss = set_screen.clone();
         button("Close")
-            .icon(Symbol::Back)
+            .icon(lucide::icon("arrow-left"))
             .on_click(move || ss.call(Screen::Hosts))
             .horizontal_alignment(HorizontalAlignment::Center)
     };
@@ -175,7 +176,7 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
                 None => buttons.push(
                     button(format!("Use {recommended_mbps:.0} Mb/s"))
                         .accent()
-                        .icon(Symbol::Accept)
+                        .icon(lucide::icon_on("check"))
                         .on_click(write_global.clone())
                         .into(),
                 ),
@@ -185,21 +186,21 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
                         p.name
                     ))
                     .accent()
-                    .icon(Symbol::Accept)
+                    .icon(lucide::icon_on("check"))
                     .on_click(write_profile(p.id.clone()))
                     .into(),
                 ),
                 Some(p) => {
                     buttons.push(
                         button("Set as default")
-                            .icon(Symbol::Accept)
+                            .icon(lucide::icon("check"))
                             .on_click(write_global.clone())
                             .into(),
                     );
                     buttons.push(
                         button(format!("Set in \u{201c}{}\u{201d}", p.name))
                             .accent()
-                            .icon(Symbol::Accept)
+                            .icon(lucide::icon_on("check"))
                             .on_click(write_profile(p.id.clone()))
                             .into(),
                     );
@@ -208,7 +209,7 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
             buttons.push({
                 let ss = set_screen.clone();
                 button("Close")
-                    .icon(Symbol::Cancel)
+                    .icon(lucide::icon("x"))
                     .on_click(move || ss.call(Screen::Hosts))
                     .into()
             });

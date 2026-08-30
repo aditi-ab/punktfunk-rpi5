@@ -1,18 +1,22 @@
 //! The quick-action ring's editor on Windows (design/touch-client-overlay.md §3.3): the editor
-//! IS the ring — six discs on the ring's own geometry over a gradient stage, drawn with WinUI's
-//! own elements. A click on a disc opens its picker (the catalogue by group, notes where a slot
-//! is unavailable here); a disc dragged onto another swaps the two; a row of six buttons under
-//! the ring gives a keyboard and a screen reader the same reach. Under it the shortcuts: a
-//! name, the four modifiers as toggles, the key on a keyboard-shaped grid or pressed on the
-//! real keyboard, Save and Remove. Every edit commits at once through the settings page's own
+//! IS the ring — six discs on the ring's own geometry over a flat card stage, drawn with WinUI's
+//! own elements. Each disc wears the slot's Lucide mark, the same mark the in-stream ring draws
+//! for it, and the name of the disc under the pointer reads out in the band below the ring. A
+//! click on a disc opens its picker (the catalogue by group, notes where a slot is unavailable
+//! here); a disc dragged onto another swaps the two; a row of six buttons under the ring gives a
+//! keyboard and a screen reader the same reach. Under it the shortcuts: a name, the four
+//! modifiers as toggles, the key on a keyboard-shaped grid or pressed on the real keyboard, Save
+//! and Remove. Every edit commits at once through the settings page's own
 //! [`super::settings::commit`], so a profile owns the whole ring the moment it touches it (D10).
-//! The model — catalogue, geometry, chords — is `pf_client_core`'s.
+//! The model — catalogue, geometry, chords, icons — is `pf_client_core`'s.
 
+use super::lucide;
 use super::settings::{active_profile, commit};
 use super::style::*;
 use super::AppCtx;
 use pf_client_core::overlay_actions::{
-    catalogue, chord_chip, key_legend, OverlayConfig, RingPlatform, Shortcut, SlotId, RING_SLOTS,
+    catalogue, chord_chip, key_legend, slot_icon, OverlayConfig, RingPlatform, Shortcut, SlotId,
+    RING_SLOTS,
 };
 use pf_client_core::ring::{slot_offset, CENTRE_DIAMETER, RING_RADIUS, SLOT_DIAMETER};
 use std::sync::Arc;
@@ -25,6 +29,11 @@ const STAGE_H: f64 = 340.0;
 const DRAG_SLOP: f64 = 8.0;
 /// A disc takes a press this far past its edge, so a pointer need not be exact.
 const HIT_SLOP: f64 = 1.2;
+/// The Lucide mark on a disc, in DIPs. The console draws it at 1.05x the disc's radius; this is
+/// that, so a disc reads the same weight in the editor as it does in the stream.
+const ICON_DIP: f64 = SLOT_DIAMETER as f64 * 1.05 / 2.0;
+/// What an unavailable slot and the inert centre fade to — the alpha the words carried.
+const DIM_INK: f64 = 0.41;
 
 const MODIFIERS: [&str; 4] = ["ctrl", "alt", "shift", "win"];
 
@@ -151,14 +160,17 @@ impl Draft {
     }
 }
 
-/// The editor's own state: which disc is open in the picker, a carry in progress, a shortcut
-/// being edited, and whether the next chord on the keyboard is being captured.
+/// The editor's own state: which disc is open in the picker, which the pointer is over, a
+/// carry in progress, a shortcut being edited, whether the next chord on the keyboard is being
+/// captured, and whether the reset has been armed by a first press.
 #[derive(Clone, PartialEq, Default)]
 struct Ui {
     selected: Option<usize>,
+    hover: Option<usize>,
     drag: Option<Drag>,
     draft: Option<Draft>,
     capture: bool,
+    reset_armed: bool,
 }
 
 /// The scope's effective ring: the globals with the profile's overrides on top.
@@ -227,70 +239,6 @@ fn disc_at(x: f64, y: f64) -> Option<usize> {
         let (cx, cy) = disc_centre(k);
         (x - cx).hypot(y - cy) <= r
     })
-}
-
-// ---- the stage's gradient: WinUI's brushes here are flat, so the gradient is an image ----
-
-/// A 24-bit BMP of the stage's diagonal gradient — the soft, colourful backdrop glass needs
-/// behind it. Written once beside the art cache and loaded as a file URI, since the reactor's
-/// brushes are flat colours and its images come from URIs.
-fn stage_bmp(w: u32, h: u32) -> Vec<u8> {
-    let row = (w * 3).div_ceil(4) * 4;
-    let pixels = row * h;
-    let mut out = Vec::with_capacity(54 + pixels as usize);
-    let size = 54 + pixels;
-    out.extend_from_slice(b"BM");
-    out.extend_from_slice(&size.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&54u32.to_le_bytes());
-    out.extend_from_slice(&40u32.to_le_bytes());
-    out.extend_from_slice(&(w as i32).to_le_bytes());
-    out.extend_from_slice(&(h as i32).to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&24u16.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&pixels.to_le_bytes());
-    out.extend_from_slice(&2835i32.to_le_bytes());
-    out.extend_from_slice(&2835i32.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    let stops: [(f64, [f64; 3]); 3] = [
-        (0.0, [97.0, 58.0, 168.0]),
-        (0.55, [26.0, 96.0, 140.0]),
-        (1.0, [18.0, 130.0, 118.0]),
-    ];
-    let pad = (row - w * 3) as usize;
-    // Rows bottom-up, as BMP stores them.
-    for y in (0..h).rev() {
-        for x in 0..w {
-            let t = (x as f64 / w as f64 + y as f64 / h as f64) / 2.0;
-            let (a, b) = if t < stops[1].0 {
-                (stops[0], stops[1])
-            } else {
-                (stops[1], stops[2])
-            };
-            let f = ((t - a.0) / (b.0 - a.0)).clamp(0.0, 1.0);
-            let c = |i: usize| (a.1[i] + (b.1[i] - a.1[i]) * f).round() as u8;
-            out.extend_from_slice(&[c(2), c(1), c(0)]);
-        }
-        out.extend(std::iter::repeat_n(0u8, pad));
-    }
-    out
-}
-
-/// The stage image's `file:///` URI, writing the bitmap on first use. `None` when there is
-/// nowhere to write it; the stage is then a flat tint.
-fn stage_uri() -> Option<String> {
-    let dir = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("punktfunk");
-    let path = dir.join("ring-stage-v1.bmp");
-    if !path.exists() {
-        std::fs::create_dir_all(&dir).ok()?;
-        std::fs::write(&path, stage_bmp(STAGE_W as u32, STAGE_H as u32)).ok()?;
-    }
-    Some(format!(
-        "file:///{}",
-        path.to_string_lossy().replace('\\', "/")
-    ))
 }
 
 // ---- keys ----
@@ -370,6 +318,7 @@ pub(super) fn quick_actions_section(props: &Props, cx: &mut RenderCx) -> Element
         .horizontal_alignment(HorizontalAlignment::Left)
         .into(),
         ring(props, &cfg, &ui, &set_ui),
+        ring_label(&cfg, &ui),
         legend_row(props, &cfg, &ui, &set_ui),
     ];
     if let Some(k) = ui.selected {
@@ -382,7 +331,24 @@ pub(super) fn quick_actions_section(props: &Props, cx: &mut RenderCx) -> Element
     vstack(parts).spacing(14.0).into()
 }
 
-/// A disc's face: the short word, or a stacked keycap for a shortcut.
+/// A disc's Lucide mark, in the white bake — a disc is dark on both themes, so the theme's own
+/// foreground would vanish into it. `dim` is the unavailable slot, faded rather than hidden.
+fn mark(name: &str, size: f64, dim: bool) -> Element {
+    Element::from(
+        Image::new_with_uri(lucide::uri_on(name))
+            .stretch(Stretch::Uniform)
+            .width(size)
+            .height(size)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .vertical_alignment(VerticalAlignment::Center),
+    )
+    .opacity(if dim { DIM_INK } else { 1.0 })
+}
+
+/// A disc's face: the slot's Lucide mark, or a stacked keycap for a shortcut. The mark comes
+/// from the SHARED slot table, so a disc here carries exactly what the in-stream ring draws for
+/// the same slot. Only an id the table cannot know — an unknown host action, a future slot —
+/// falls back to its short word, which is what the console does too.
 fn disc_face(cfg: &OverlayConfig, slot: Option<&SlotId>, dim: bool) -> Element {
     let ink = if dim {
         Color {
@@ -400,16 +366,14 @@ fn disc_face(cfg: &OverlayConfig, slot: Option<&SlotId>, dim: bool) -> Element {
         }
     };
     let Some(slot) = slot else {
-        return text_block("+")
-            .font_size(16.0)
-            .foreground(ink)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .vertical_alignment(VerticalAlignment::Center)
-            .into();
+        return mark("plus", ICON_DIP * 0.8, true);
     };
     if let SlotId::Shortcut(id) = slot {
         let keys = cfg.shortcut(id).map(|s| s.keys.clone()).unwrap_or_default();
         return keycap(&keys, ink, 9.0, 14.0);
+    }
+    if let Some(name) = slot_icon(&slot.id(), "") {
+        return mark(name, ICON_DIP, dim);
     }
     text_block(short_label(cfg, slot))
         .font_size(12.0)
@@ -492,50 +456,30 @@ fn disc(face: Element, diameter: f64, raised: bool, selected: bool) -> Border {
 /// a disc stops reporting to it.
 fn ring(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>) -> Element {
     let mut children: Vec<Element> = Vec::new();
-    match stage_uri() {
-        Some(uri) => children.push(
-            Image::new_with_uri(uri)
-                .stretch(Stretch::Fill)
-                .width(STAGE_W)
-                .height(STAGE_H)
-                .canvas_left(0.0)
-                .canvas_top(0.0)
-                .into(),
-        ),
-        None => children.push(
-            Shape::rectangle()
-                .fill(Color::rgb(38, 72, 128))
-                .corner_radius(22.0)
-                .width(STAGE_W)
-                .height(STAGE_H)
-                .canvas_left(0.0)
-                .canvas_top(0.0)
-                .into(),
-        ),
-    }
+    // The stage is a flat card face, like every other card on this shell. It used to be a
+    // gradient, baked to a BMP because reactor's brushes are flat — decoration that read as
+    // a different app, and the same reason the console's editor dropped its own.
+    children.push(
+        border(vstack(Vec::<Element>::new()))
+            .background(ThemeRef::CardBackground)
+            .border_brush(ThemeRef::CardStroke)
+            .border_thickness(uniform(1.0))
+            .corner_radius(22.0)
+            .width(STAGE_W)
+            .height(STAGE_H)
+            .canvas_left(0.0)
+            .canvas_top(0.0)
+            .into(),
+    );
     // The centre: what the sheet opens from in-stream — not editable here, dimmed and inert.
+    // It wears the ring's own `more` mark, so the editor's centre is the centre people press.
     let cd = CENTRE_DIAMETER as f64;
     children.push(
-        disc(
-            text_block("More")
-                .font_size(12.0)
-                .semibold()
-                .foreground(Color {
-                    a: 100,
-                    r: 255,
-                    g: 255,
-                    b: 255,
-                })
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .vertical_alignment(VerticalAlignment::Center)
-                .into(),
-            cd,
-            false,
-            false,
-        )
-        .canvas_left(STAGE_W / 2.0 - cd / 2.0)
-        .canvas_top(STAGE_H / 2.0 - cd / 2.0)
-        .into(),
+        disc(mark("ellipsis", ICON_DIP, true), cd, false, false)
+            .tooltip("More \u{2014} the rest of the actions, in the stream")
+            .canvas_left(STAGE_W / 2.0 - cd / 2.0)
+            .canvas_top(STAGE_H / 2.0 - cd / 2.0)
+            .into(),
     );
     let d = SLOT_DIAMETER as f64;
     for k in 0..RING_SLOTS {
@@ -582,15 +526,25 @@ fn ring(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>) -> E
     let moved = {
         let (ui, set_ui) = (ui.clone(), set_ui.clone());
         move |info: PointerEventInfo| {
-            let Some(mut dr) = ui.drag else { return };
-            if !info.is_left_button_pressed {
+            if let Some(mut dr) = ui.drag
+                && info.is_left_button_pressed
+            {
+                dr.dx = info.x - dr.x0;
+                dr.dy = info.y - dr.y0;
+                let mut u = ui.clone();
+                u.drag = Some(dr);
+                set_ui.call(u);
                 return;
             }
-            dr.dx = info.x - dr.x0;
-            dr.dy = info.y - dr.y0;
-            let mut u = ui.clone();
-            u.drag = Some(dr);
-            set_ui.call(u);
+            // Otherwise the pointer is only passing over: name the disc it is on, in the band
+            // under the ring. Only on a CHANGE — a set per pointer sample would re-render the
+            // whole section on every mouse move across the stage.
+            let hover = disc_at(info.x, info.y);
+            if hover != ui.hover {
+                let mut u = ui.clone();
+                u.hover = hover;
+                set_ui.call(u);
+            }
         }
     };
     let release = {
@@ -619,9 +573,10 @@ fn ring(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>) -> E
     let leave = {
         let (ui, set_ui) = (ui.clone(), set_ui.clone());
         move || {
-            if ui.drag.is_some() {
+            if ui.drag.is_some() || ui.hover.is_some() {
                 let mut u = ui.clone();
                 u.drag = None;
+                u.hover = None;
                 set_ui.call(u);
             }
         }
@@ -634,6 +589,32 @@ fn ring(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>) -> E
         .on_pointer_moved(moved)
         .on_pointer_released(release)
         .on_pointer_exited(leave)
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .into()
+}
+
+/// The band under the ring: the full name of the disc the pointer is on, or of the one the
+/// picker is open over. The in-stream ring carries the same band under its own discs, and it is
+/// where the name went when the discs became marks. It keeps its height whatever it says, so
+/// the ring does not hop as the pointer crosses a disc.
+fn ring_label(cfg: &OverlayConfig, ui: &Ui) -> Element {
+    let text = ui
+        .hover
+        .or(ui.selected)
+        .and_then(|k| cfg.ring[k].as_ref())
+        .map(|slot| {
+            let (label, note) = describe(cfg, slot);
+            if note.is_empty() {
+                label
+            } else {
+                format!("{label} \u{2014} {note}")
+            }
+        })
+        .unwrap_or_default();
+    text_block(text)
+        .font_size(13.0)
+        .semibold()
+        .height(20.0)
         .horizontal_alignment(HorizontalAlignment::Center)
         .into()
 }
@@ -814,27 +795,48 @@ fn shortcuts(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>)
             .into(),
         );
     }
+    // The reset is two presses, and it says so on the button — the console's own armed row,
+    // and the same wording every other client's reset carries.
+    let reset = button(if ui.reset_armed {
+        "Press again to reset"
+    } else {
+        "Reset to default"
+    })
+    .icon(if ui.reset_armed {
+        lucide::icon_on("rotate-cw")
+    } else {
+        lucide::icon("rotate-cw")
+    })
+    .tooltip("Restores the platform ring and removes the shortcuts")
+    .on_click({
+        let (props, ui, set_ui) = (props.clone(), ui.clone(), set_ui.clone());
+        move || {
+            if ui.reset_armed {
+                commit(&props.ctx, &props.scope, (props.rev, &props.set_rev), |s| {
+                    s.overlay_actions.clear();
+                });
+            }
+            let mut u = ui.clone();
+            u.reset_armed = !ui.reset_armed;
+            set_ui.call(u);
+        }
+    });
     let actions = hstack((
-        button("Add shortcut").on_click({
+        button("Add shortcut").icon(lucide::icon("plus")).on_click({
             let (ui, set_ui) = (ui.clone(), set_ui.clone());
             move || {
                 let mut u = ui.clone();
                 u.draft = Some(Draft::default());
                 u.capture = false;
+                u.reset_armed = false;
                 set_ui.call(u);
             }
         }),
-        // The reset is two presses: the menu is the second.
-        drop_down_button("Reset…")
-            .menu_flyout(vec![menu_item("Reset quick actions to default")])
-            .on_item_clicked({
-                let props = props.clone();
-                move |_: String| {
-                    commit(&props.ctx, &props.scope, (props.rev, &props.set_rev), |s| {
-                        s.overlay_actions.clear();
-                    });
-                }
-            }),
+        if ui.reset_armed {
+            reset.accent()
+        } else {
+            reset
+        },
     ))
     .spacing(8.0)
     .into();
@@ -850,6 +852,13 @@ fn shortcuts(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>)
     }
     parts.extend(rows);
     parts.push(actions);
+    parts.push(
+        text_block("Reset restores the platform ring and removes the shortcuts.")
+            .font_size(12.0)
+            .foreground(ThemeRef::SecondaryText)
+            .wrap()
+            .into(),
+    );
     card(vstack(parts).spacing(10.0)).into()
 }
 
@@ -1086,24 +1095,22 @@ fn shortcut_editor(
 mod tests {
     use super::*;
 
-    /// The stage bitmap is a well-formed 24-bit BMP of the stage's size, rows padded to four
-    /// bytes, its corners the gradient's end colours.
+    /// Every disc the ring can hold draws as a mark, not a word, and its mark is baked here.
+    /// The editor has no fallback to fall back TO now that the words are gone — a slot whose
+    /// mark is missing renders an empty disc.
     #[test]
-    fn the_stage_bitmap_is_a_bmp_of_the_stage() {
-        let (w, h) = (STAGE_W as u32, STAGE_H as u32);
-        let bmp = stage_bmp(w, h);
-        assert_eq!(&bmp[0..2], b"BM");
-        let row = (w * 3).div_ceil(4) * 4;
-        assert_eq!(bmp.len() as u32, 54 + row * h);
-        assert_eq!(u32::from_le_bytes(bmp[18..22].try_into().unwrap()), w);
-        assert_eq!(u32::from_le_bytes(bmp[22..26].try_into().unwrap()), h);
-        // The last stored row is the TOP of the image: its first pixel is the first stop.
-        let top_left = 54 + (row * (h - 1)) as usize;
-        assert_eq!(
-            &bmp[top_left..top_left + 3],
-            &[168, 58, 97],
-            "BGR of (97,58,168)"
-        );
+    fn every_slot_on_the_ring_draws_a_baked_mark() {
+        let cfg = OverlayConfig::platform_default(RingPlatform::Desktop);
+        for slot in cfg.ring.iter().flatten() {
+            let id = slot.id();
+            let name = slot_icon(&id, "").unwrap_or_else(|| panic!("{id} has no mark"));
+            assert!(
+                !lucide::uri_on(name).is_empty() || std::env::var_os("LOCALAPPDATA").is_none(),
+                "{id}: '{name}' has no white bake"
+            );
+        }
+        // The centre and the empty slot draw marks of their own, outside the ring's contents.
+        assert_eq!(slot_icon("more", ""), Some("ellipsis"));
     }
 
     /// A press on a disc is that disc, a press between them is nothing, and the drag slop

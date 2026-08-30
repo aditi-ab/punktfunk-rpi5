@@ -1,6 +1,7 @@
 //! Static screen: the app's own license + the third-party software notices (reached from
 //! Settings).
 
+use super::lucide;
 use super::style::*;
 use super::{AppCtx, Screen};
 use std::sync::Arc;
@@ -23,15 +24,18 @@ const APP_LICENSE: &str = concat!(
 const THIRD_PARTY_NOTICES: &str = include_str!("../../THIRD-PARTY-NOTICES.txt");
 
 pub(crate) fn licenses_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>) -> Element {
-    let back_btn = button("Back").accent().icon(Symbol::Back).on_click({
-        let (c, ss) = (ctx.clone(), set_screen.clone());
-        move || {
-            // Back RE-ENTERS the settings page — re-base its snapshot on the file, same
-            // as the hosts page's Settings button (see settings::refresh_snapshot).
-            super::settings::refresh_snapshot(&c);
-            ss.call(Screen::Settings)
-        }
-    });
+    let back_btn = button("Back")
+        .accent()
+        .icon(lucide::icon_on("arrow-left"))
+        .on_click({
+            let (c, ss) = (ctx.clone(), set_screen.clone());
+            move || {
+                // Back RE-ENTERS the settings page — re-base its snapshot on the file, same
+                // as the hosts page's Settings button (see settings::refresh_snapshot).
+                super::settings::refresh_snapshot(&c);
+                ss.call(Screen::Settings)
+            }
+        });
 
     let app_card = card(
         vstack((
