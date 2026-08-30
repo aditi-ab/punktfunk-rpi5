@@ -1001,12 +1001,15 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             }
         }
         // The Access chip — what this session is allowed to do, said in the preset vocabulary
-        // ("Controller only · 1 h 58 m left"), standing for the whole stream. Full control with
-        // no expiry — every session against an old host, and most against a new one — shows
-        // NOTHING: the chip exists for the sessions where input silently not landing needs an
-        // explanation, not as new chrome on everyone's stream. TopEnd, in the shared pill family
-        // (TopStart is the HUD's, TopCentre the transient cues', BottomCentre the banner's).
+        // ("Controller only · 1 h 58 m left"), shown while the stats HUD is on. It rides the
+        // stats tier rather than standing for the whole stream: a pill that never goes away is
+        // chrome you read as distraction. Full control with no expiry — every session against an
+        // old host, and most against a new one — shows NOTHING: the chip exists for the sessions
+        // where input silently not landing needs an explanation, not as new chrome on everyone's
+        // stream. TopEnd, in the shared pill family (TopStart is the HUD's, TopCentre the
+        // transient cues', BottomCentre the banner's).
         val accessChip = when {
+            !statsOn -> null
             accessGrants and SessionAccess.ALL == SessionAccess.ALL && accessRemaining == 0 -> null
             accessRemaining > 0 ->
                 "${SessionAccess.label(accessGrants)} · " +

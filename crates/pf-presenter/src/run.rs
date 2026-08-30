@@ -1831,12 +1831,16 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
             };
             // The access chip (design §7 "say what this session is"): a small standing
             // pill — "Controller only · ends in 1 h 58 m" — in the same overlay family as
-            // the stats HUD, at every stats tier including Off. `None` (and so exactly
-            // today's look) for a full-control permanent session, which is every session
-            // against an old host. The countdown re-derives per pass; the overlay's
-            // damage gate turns its once-a-minute text change into a redraw.
+            // the stats HUD, and shown with it: a pill that never goes away is chrome you
+            // read as distraction, so it rides the stats tier rather than standing over
+            // every limited session. `None` (and so exactly today's look) for a
+            // full-control permanent session, which is every session against an old host.
+            // The countdown re-derives per pass; the overlay's damage gate turns its
+            // once-a-minute text change into a redraw.
             let access_chip = match &stream {
-                Some(st) if st.connector.is_some() => st.access.chip_text(Instant::now()),
+                Some(st) if st.connector.is_some() && stats_verbosity != StatsVerbosity::Off => {
+                    st.access.chip_text(Instant::now())
+                }
                 _ => None,
             };
             let access_notice = stream

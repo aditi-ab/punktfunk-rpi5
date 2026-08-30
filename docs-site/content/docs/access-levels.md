@@ -96,6 +96,11 @@ without the Keyboard grant), hide the clipboard and mic controls when ungranted,
 overlay chip naming the session's access and time remaining, and surface the expiry warnings as
 toasts.
 
+The chip rides the [stats overlay](/docs/stats) — it is there at every tier above off, and gone
+with the overlay off. A guest who wants to check what they are allowed to do brings it up the same
+way they bring up the stats. The expiry warnings are separate: they are toasts, they announce a
+change rather than describe a state, and they appear whatever the overlay is set to.
+
 ## Where enforcement happens
 
 The host checks every input event against the device's grants before injecting it, refuses

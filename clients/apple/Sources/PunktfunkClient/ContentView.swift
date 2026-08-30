@@ -1175,12 +1175,14 @@ struct ContentView: View {
                                 .transition(.opacity.combined(with: .scale(scale: 0.9)))
                         }
                         #if !os(tvOS)
-                        // The access chip — up for the life of a LIMITED session ("Controller
-                        // only · ends in 1 h 58 m"), at every tier and with the overlay off.
-                        // Never mounted for a full-and-permanent session (every old host):
-                        // today's look must not change there. tvOS states it as a line in the
-                        // stats overlay instead (StreamHUDView).
-                        if captureEnabled && model.accessLimited {
+                        // The access chip — up for a LIMITED session ("Controller only ·
+                        // ends in 1 h 58 m") while the stats overlay is on. It rides the
+                        // stats tier rather than standing for the whole stream: a pill that
+                        // never goes away is chrome you read as distraction. Never mounted
+                        // for a full-and-permanent session (every old host): today's look
+                        // must not change there. tvOS states it as a line in the stats
+                        // overlay instead (StreamHUDView).
+                        if captureEnabled && statsVerbosity != .off && model.accessLimited {
                             AccessChipBadge(
                                 label: model.accessLevel.label,
                                 remainingSecs: model.accessRemainingSecs)
@@ -1207,6 +1209,9 @@ struct ContentView: View {
                     .animation(.easeOut(duration: 0.2), value: model.micMuted)
                     .animation(.easeOut(duration: 0.2), value: model.accessWarning)
                     .animation(.easeOut(duration: 0.2), value: model.accessLimited)
+                    // The access chip now rides the stats tier, so the tier is a visibility
+                    // driver for this stack too — without it the chip pops on the toggle.
+                    .animation(.easeOut(duration: 0.2), value: statsVerbosity)
                     // The motion hint was the one badge missing from this cluster — its
                     // `.transition` fired in an unanimated transaction and popped. One list,
                     // so every badge in the stack enters and exits the same way.
