@@ -1045,7 +1045,12 @@ impl Ring {
             // turns the way the hand turns; the spring's overshoot carries it a hair past
             // its seat and back. Under reduce motion it sits in place from the start and
             // only fades (`q` still drives the alpha below).
-            let travel = if reduce { 1.0 } else { q_raw.clamp(0.0, 1.15) };
+            // The spring's excess past 1 is what overshoots. The stagger's own headroom is
+            // not: `q_raw` sits ABOVE 1 for the early slots whenever `shown` is near 1 (it
+            // divides the lag out), so clamping it high would park them past their seats
+            // for good — at rest every disc sits exactly on its seat.
+            let over = (shown - 1.0).max(0.0);
+            let travel = if reduce { 1.0 } else { (q + over).min(1.15) };
             let turn = if self.clockwise { -40.0 } else { 40.0 };
             let deg = pf_client_core::ring::slot_angle_deg(k) + (1.0 - travel.min(1.0)) * turn;
             let (s, c) = deg.to_radians().sin_cos();
@@ -1093,7 +1098,9 @@ impl Ring {
         let cq_raw = (shown - 6.0 * SLOT_LAG) / (1.0 - 6.0 * SLOT_LAG);
         let cq = cq_raw.clamp(0.0, 1.0);
         if cq > 0.0 {
-            let pop = if reduce { 1.0 } else { cq_raw.clamp(0.0, 1.15) };
+            // As with the slots: only the spring's excess overshoots.
+            let over = (shown - 1.0).max(0.0);
+            let pop = if reduce { 1.0 } else { (cq + over).min(1.15) };
             let hot = self.hot[6];
             let r = CENTRE_D * scale / 2.0 * (0.6 + 0.4 * pop) * (1.0 + 0.06 * hot);
             // In the editor the centre is not editable, so it sits dimmed and inert.

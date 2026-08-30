@@ -29,6 +29,10 @@ const RING_BELOW: f64 = (RING_RADIUS + SLOT_DIAMETER + LABEL_H) as f64;
 const STAGE_H: f64 = STAGE_PAD + RING_ABOVE + RING_BELOW + STAGE_PAD;
 const CAPTION_H: f64 = 34.0;
 const CORNER: f64 = 22.0;
+/// Height kept for the shortcut rows under the stage before the stage starts scaling down.
+const LIST_MIN: f64 = 140.0;
+/// The ring's horizontal extent plus breathing room — the width half of the fit.
+const RING_W: f64 = 2.0 * RING_ABOVE + 24.0;
 
 /// The ring rows parse the blob on the platform's default ring, like the ring itself does.
 pub(crate) fn ring_platform(platform: crate::platform::Platform) -> RingPlatform {
@@ -457,13 +461,20 @@ impl RingEditorScreen {
         );
 
         // The stage: a flat card face, like every other card on this shell (a gradient
-        // read as decoration on the Deck).
+        // read as decoration on the Deck). On a screen too short or too narrow for the
+        // full-size ring, the whole stage scales down instead — the ring is drawn at the
+        // same reduced scale below, so it is never clipped, whatever the window.
+        let caption_h = (CAPTION_H + 12.0) * k;
         let stage_w = (ROW_MAX_W * k).min(f64::from(rect.width()) - 48.0 * k) as f32;
+        let fit_h = (f64::from(rect.height()) - caption_h - LIST_MIN * k) / (STAGE_H * k);
+        let fit_w = f64::from(stage_w) / (RING_W * k);
+        let fit = fit_h.min(fit_w).clamp(0.35, 1.0) as f32;
+        let rk = kf * fit;
         let stage = Rect::from_xywh(
             rect.center_x() - stage_w / 2.0,
-            rect.top + (CAPTION_H + 12.0) as f32 * kf,
+            rect.top + caption_h as f32,
             stage_w,
-            (STAGE_H * k) as f32,
+            (STAGE_H * k) as f32 * fit,
         );
         self.stage = stage;
         let rr = RRect::new_rect_xy(stage, CORNER as f32 * kf, CORNER as f32 * kf);
@@ -473,10 +484,11 @@ impl RingEditorScreen {
             focus_halo(canvas, stage, CORNER as f32 * kf, kf, 1.0);
         }
 
-        // The ring, one pad below the stage's top; its own pixels only inside it.
+        // The ring, one pad below the stage's top, at the stage's own scale; its pixels
+        // only inside it.
         self.ring.recentre(
             stage.center_x(),
-            stage.top + (STAGE_PAD + RING_ABOVE) as f32 * kf,
+            stage.top + (STAGE_PAD + RING_ABOVE) as f32 * rk,
         );
         canvas.save();
         canvas.clip_rrect(rr, None, None);
@@ -484,7 +496,7 @@ impl RingEditorScreen {
             canvas,
             rect.right.max(1.0) as u32,
             rect.bottom.max(1.0) as u32,
-            kf,
+            rk,
             fonts,
             dt,
         );
@@ -507,7 +519,15 @@ impl RingEditorScreen {
 
         // The picker: a card over everything, the way the ring's own sheet sits.
         if let Some(pk) = self.picker.as_mut() {
-            canvas.draw_rect(rect, &fill(Color4f::new(0.0, 0.0, 0.0, 0.45)));
+            // Over EVERYTHING, the heading included — the content rect is not the screen,
+            // and a scrim that stops at its edge reads as a band. The canvas is translated
+            // (insets, transitions), so overshoot every edge by more than any heading,
+            // hint bar or inset can be. The hint bar draws after this and stays legible,
+            // carrying the picker's own controls.
+            canvas.draw_rect(
+                rect.with_outset((2000.0 * kf, 2000.0 * kf)),
+                &fill(Color4f::new(0.0, 0.0, 0.0, 0.45)),
+            );
             let w = (520.0 * kf).min(rect.width() * 0.92);
             let h = ((pk.rows.len() as f32 * 50.0 + 60.0) * kf).min(rect.height() * 0.9);
             let card = Rect::from_xywh(rect.center_x() - w / 2.0, rect.center_y() - h / 2.0, w, h);
