@@ -321,17 +321,19 @@ struct RingOverlay: View {
                     #endif
                     .animation(discAnimation(k), value: phase)
                 }
-                // The centre opens the sheet.
+                // The centre opens the sheet. In the editor it is not editable, so it sits
+                // dimmed and inert rather than offering a preview nobody asked for.
                 let cq = discQ(6)
                 slotButton(SlotSpec(id: "more", label: "More", icon: "ellipsis"),
-                           size: centreSize, scale: 0.6 + 0.4 * cq, alpha: cq, armed: false,
+                           size: centreSize, scale: 0.6 + 0.4 * cq,
+                           alpha: cq * (editing == nil ? 1 : 0.45), armed: false,
                            highlighted: state.highlight == 6) {
                     state.touch()
                     state.pressTick &+= 1
                     state.sheet = true
                 }
                 .position(x: cx, y: cy)
-                .allowsHitTesting(cq > 0)
+                .allowsHitTesting(cq > 0 && editing == nil)
                 .animation(discAnimation(6), value: phase)
                 // The label under the ring: a hint, else the highlighted slot's name.
                 let label: String? = state.hint ?? state.highlight.flatMap { h in

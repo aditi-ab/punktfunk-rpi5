@@ -111,16 +111,6 @@ struct QuickActionsEditor: View {
                         DialCatcher(onDial: { ring.handle($0) }) { ring.sheet = false }
                         RingOverlay(state: ring, cfg: cfg, actions: preview,
                                     editing: RingEditing(pick: { picking = PickSlot(k: $0) }, swap: swap))
-                        VStack {
-                            Spacer()
-                            Text("Tap a button to change it, drag one onto another to swap.")
-                                .font(.geist(12, .medium, relativeTo: .caption))
-                                .foregroundStyle(.white.opacity(0.9))
-                                .padding(.horizontal, 12).padding(.vertical, 6)
-                                .glassBackground(Capsule())
-                                .padding(.bottom, 10)
-                        }
-                        .allowsHitTesting(false)
                     }
                     .environment(\.colorScheme, .dark)
                     .onAppear {
@@ -137,9 +127,10 @@ struct QuickActionsEditor: View {
                 .frame(height: 400)
                 .listRowInsets(EdgeInsets())
             } footer: {
-                if overridden {
-                    Text("This profile has its own quick actions; the default ring no longer reaches it.")
-                }
+                Text(overridden
+                     ? "Tap a button to change it, drag one onto another to swap. "
+                       + "This profile has its own quick actions; the default ring no longer reaches it."
+                     : "Tap a button to change it, drag one onto another to swap.")
             }
             Section {
                 ForEach(cfg.shortcuts, id: \.id) { sc in

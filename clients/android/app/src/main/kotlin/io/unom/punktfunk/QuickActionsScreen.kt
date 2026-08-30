@@ -1,7 +1,6 @@
 package io.unom.punktfunk
 
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -16,7 +15,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -39,13 +37,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 
 /**
@@ -129,7 +125,8 @@ internal fun QuickActionsScreen(
             Text("Quick actions", style = MaterialTheme.typography.headlineMedium)
         }
         SettingsGroup(
-            footer = if (overridden) "This profile has its own quick actions; the default ring no longer reaches it." else null,
+            footer = "Tap a button to change it, drag one onto another to swap." +
+                if (overridden) " This profile has its own quick actions; the default ring no longer reaches it." else "",
         ) {
             RingStage(cfg, RingEditing(pick = { picking = it }, swap = ::swap))
         }
@@ -201,25 +198,31 @@ private fun RingStage(cfg: OverlayConfig, editing: RingEditing) {
             if (!ring.committed && ring.progress == 0f) ring.openAt(centre)
         }
     }
+    // No fill of its own: the card it sits in is the field. The twist surface is a SIBLING
+    // under the ring, as the stream's gesture layer is — on a parent it took the moves before
+    // the discs' drag detectors saw them, so a drag never started.
     Box(
         Modifier
             .fillMaxWidth()
             .height(380.dp)
-            .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(12.dp))
-            .onSizeChanged { size = it }
-            .pointerInput(Unit) {
-                streamTouchInput(
-                    handle = 0L, stylus = null, videoAspect = 1f, trackpad = true, invertScroll = false,
-                    onCycleStats = {}, onKeyboard = {},
-                ) { ev ->
-                    when (ev) {
-                        is DialEvent.Turn -> if (ring.turn(ev.progress, ev.clockwise, ev.x, ev.y)) haptics.tick()
-                        DialEvent.Commit -> { ring.commit(); haptics.confirm() }
-                        DialEvent.Cancel -> ring.cancel()
-                    }
-                }
-            },
+            .onSizeChanged { size = it },
     ) {
+        Box(
+            Modifier
+                .matchParentSize()
+                .pointerInput(Unit) {
+                    streamTouchInput(
+                        handle = 0L, stylus = null, videoAspect = 1f, trackpad = true, invertScroll = false,
+                        onCycleStats = {}, onKeyboard = {},
+                    ) { ev ->
+                        when (ev) {
+                            is DialEvent.Turn -> if (ring.turn(ev.progress, ev.clockwise, ev.x, ev.y)) haptics.tick()
+                            DialEvent.Commit -> { ring.commit(); haptics.confirm() }
+                            DialEvent.Cancel -> ring.cancel()
+                        }
+                    }
+                },
+        )
         RingOverlay(
             state = ring,
             cfg = cfg,
@@ -227,16 +230,6 @@ private fun RingStage(cfg: OverlayConfig, editing: RingEditing) {
             containerSize = size,
             haptics = haptics,
             editing = editing,
-        )
-        Text(
-            "Tap a button to change it, drag one onto another to swap.",
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 10.dp)
-                .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
-                .padding(horizontal = 12.dp, vertical = 6.dp),
-            color = Color.White,
-            fontSize = 12.sp,
         )
     }
 }
@@ -422,7 +415,12 @@ private fun ShortcutEditor(
                         FilterChip(
                             selected = key == k,
                             onClick = { key = k },
-                            label = { Text(keyLegend(k), maxLines = 1, softWrap = false) },
+                            // A fixed-width chip lays its label out from the start; centre it.
+                            label = {
+                                Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                                    Text(keyLegend(k), maxLines = 1, softWrap = false)
+                                }
+                            },
                             modifier = Modifier.width(if (keyLegend(k).length > 2) 88.dp else 48.dp),
                         )
                     }

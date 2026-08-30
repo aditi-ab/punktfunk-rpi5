@@ -485,14 +485,16 @@ fun RingOverlay(
         val cq = ((shown.value - 6 * SLOT_LAG) / (1f - 6 * SLOT_LAG)).coerceIn(0f, 1f)
         if (cq > 0f) {
             val centreHalf = with(density) { CENTRE_D.toPx() } / 2
+            // In the editor the centre is not editable, so it sits dimmed and inert.
             RingButton(
                 spec = SlotSpec("more", "More", Icons.Filled.MoreHoriz),
                 size = CENTRE_D,
                 scale = 0.6f + 0.4f * cq,
-                alpha = cq,
+                alpha = cq * (if (editing == null) 1f else 0.45f),
                 armed = false,
                 highlighted = state.highlight == 6,
                 modifier = Modifier.offset { IntOffset((cx - centreHalf).roundToInt(), (cy - centreHalf).roundToInt()) },
+                inert = editing != null,
                 onTap = { state.touch(); haptics.tick(); state.sheet = true },
             )
         }
@@ -544,6 +546,8 @@ private fun RingButton(
     highlighted: Boolean = false,
     /** The editor: an empty slot is a pick target, not inert. */
     editable: Boolean = false,
+    /** The editor's centre: drawn, never pressed. */
+    inert: Boolean = false,
     onTap: () -> Unit,
 ) {
     val tint = when {
@@ -562,7 +566,7 @@ private fun RingButton(
                 Color.White.copy(alpha = if (highlighted) 0.8f else if (armed) 0.6f else 0.18f),
                 CircleShape,
             )
-            .clickable(enabled = spec != null || editable, onClick = onTap)
+            .clickable(enabled = !inert && (spec != null || editable), onClick = onTap)
             .semantics {
                 contentDescription = spec?.label ?: "Empty slot"
                 stateDescription = when {
