@@ -631,12 +631,19 @@ impl Ring {
         if !self.open() {
             return;
         }
-        // The twist drives the opening; the commit settles toward 1.
+        // The twist drives the opening; the commit settles toward 1. Reduce motion (design
+        // §2.3): a crossfade in place — no spring, no spiral, no scale travel; the twist still
+        // opens it.
+        let reduce = crate::theme::reduce_motion();
         if self.committed {
-            let k = 1.0 - (-dt as f32 * 14.0).exp();
-            self.shown += (1.0 - self.shown) * k;
-            if self.shown > 0.995 {
+            if reduce {
                 self.shown = 1.0;
+            } else {
+                let k = 1.0 - (-dt as f32 * 14.0).exp();
+                self.shown += (1.0 - self.shown) * k;
+                if self.shown > 0.995 {
+                    self.shown = 1.0;
+                }
             }
         } else {
             self.shown = self.progress;
@@ -669,12 +676,14 @@ impl Ring {
                 continue;
             }
             // Slot k sits at 12, 2, 4… o'clock and travels out along a short spiral that
-            // turns the way the hand turns.
+            // turns the way the hand turns. Under reduce motion it sits in place from the
+            // start and only fades (`q` still drives the alpha below).
+            let travel = if reduce { 1.0 } else { q };
             let turn = if self.clockwise { -40.0 } else { 40.0 };
-            let deg = -90.0 + 60.0 * k as f32 + (1.0 - q) * turn;
+            let deg = -90.0 + 60.0 * k as f32 + (1.0 - travel) * turn;
             let (s, c) = deg.to_radians().sin_cos();
-            let (x, y) = (cx + radius * q * c, cy + radius * q * s);
-            let r = slot_d / 2.0 * (0.6 + 0.4 * q);
+            let (x, y) = (cx + radius * travel * c, cy + radius * travel * s);
+            let r = slot_d / 2.0 * (0.6 + 0.4 * travel);
             let spec = self.cfg.ring[k].as_ref().map(|slot| self.spec(slot));
             let is_armed = spec
                 .as_ref()
