@@ -667,25 +667,10 @@ fn legend_row(props: &Props, cfg: &OverlayConfig, ui: &Ui, set_ui: &SetState<Ui>
 /// slot cannot work on this shell, and the swap targets for a keyboard.
 fn picker(props: &Props, cfg: &OverlayConfig, k: usize, ui: &Ui, set_ui: &SetState<Ui>) -> Element {
     let current = cfg.ring[k].as_ref().map(SlotId::id).unwrap_or_default();
-    let (label, _) = cfg.ring[k]
-        .as_ref()
-        .map(|s| describe(cfg, s))
-        .unwrap_or(("Empty".into(), String::new()));
-    let mut parts: Vec<Element> = vec![hstack((
-        text_block(format!("{}: {label}", CLOCK[k]))
-            .semibold()
-            .vertical_alignment(VerticalAlignment::Center),
-        button("Done").subtle().on_click({
-            let (ui, set_ui) = (ui.clone(), set_ui.clone());
-            move || {
-                let mut u = ui.clone();
-                u.selected = None;
-                set_ui.call(u);
-            }
-        }),
-    ))
-    .spacing(12.0)
-    .into()];
+    // No title and no Done: the band above already names the slot being edited, the disc is
+    // ringed white while its picker is open, and a pick closes the card — the GTK popover's
+    // behaviour, which needed neither either.
+    let mut parts: Vec<Element> = Vec::new();
     for group in catalogue(cfg, RingPlatform::Desktop) {
         parts.push(section(group.title));
         let mut row: Vec<Element> = Vec::new();
@@ -700,10 +685,14 @@ fn picker(props: &Props, cfg: &OverlayConfig, k: usize, ui: &Ui, set_ui: &SetSta
             };
             let mut b = button(text).on_click({
                 let (props, cfg, id) = (props.clone(), cfg.clone(), entry.id.clone());
+                let (ui, set_ui) = (ui.clone(), set_ui.clone());
                 move || {
                     let mut next = cfg.clone();
                     next.ring[k] = SlotId::parse(&id);
                     write(&props, &next);
+                    let mut u = ui.clone();
+                    u.selected = None;
+                    set_ui.call(u);
                 }
             });
             b = if is_current {
@@ -715,30 +704,6 @@ fn picker(props: &Props, cfg: &OverlayConfig, k: usize, ui: &Ui, set_ui: &SetSta
         }
         parts.push(wrap_row(row));
     }
-    parts.push(section("Move"));
-    let targets: Vec<String> = (0..RING_SLOTS)
-        .filter(|&j| j != k)
-        .map(|j| format!("Swap with {}", CLOCK[j]))
-        .collect();
-    parts.push(
-        Element::from(
-            drop_down_button("Swap with…")
-                .menu_flyout(targets.iter().map(|t| menu_item(t.clone())).collect())
-                .on_item_clicked({
-                    let (props, cfg) = (props.clone(), cfg.clone());
-                    move |item: String| {
-                        if let Some(j) =
-                            (0..RING_SLOTS).find(|&j| item == format!("Swap with {}", CLOCK[j]))
-                        {
-                            let mut next = cfg.clone();
-                            next.ring.swap(k, j);
-                            write(&props, &next);
-                        }
-                    }
-                }),
-        )
-        .horizontal_alignment(HorizontalAlignment::Left),
-    );
     card(vstack(parts).spacing(8.0)).into()
 }
 

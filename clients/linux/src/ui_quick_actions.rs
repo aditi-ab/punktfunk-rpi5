@@ -610,25 +610,9 @@ fn picker(button: &gtk::Button, k: usize, shared: &Shared, rebuild: Option<Rc<dy
             list.append(&row);
         }
     }
-    list.append(&header("Move"));
-    for j in (0..RING_SLOTS).filter(|&j| j != k) {
-        let row = adw::ActionRow::builder()
-            .title(format!("Swap with {}", CLOCK[j]))
-            .use_markup(false)
-            .activatable(true)
-            .build();
-        let (shared, rebuild, popover) = (shared.clone(), rebuild.clone(), popover.clone());
-        row.connect_activated(move |_| {
-            let mut cfg = shared.cfg();
-            cfg.ring.swap(k, j);
-            shared.write(&cfg);
-            popover.popdown();
-            if let Some(f) = &rebuild {
-                f();
-            }
-        });
-        list.append(&row);
-    }
+    // No "Move" section: dragging one disc onto another is the swap, and a slot can always be
+    // set outright from the catalogue above — so the six "Swap with…" rows only lengthened the
+    // list with a second way to do what the list already does.
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .propagate_natural_height(true)
