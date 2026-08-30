@@ -61,7 +61,7 @@ mod tests {
     /// would otherwise be a silently missing mark on two shells.
     #[test]
     fn every_icon_parses_and_fits_its_box() {
-        for (name, data) in pf_client_core::lucide::ALL {
+        for (name, data, _glyph) in pf_client_core::lucide::ALL {
             let path =
                 parse_path::from_svg(data).unwrap_or_else(|| panic!("{name} does not parse"));
             let b = path.compute_tight_bounds();
