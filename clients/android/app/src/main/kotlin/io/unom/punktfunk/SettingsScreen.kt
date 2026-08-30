@@ -944,11 +944,22 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
                 subtitle = "What the app detects, with a live input test",
                 onClick = onOpenControllers,
             )
-            // Rumble mirroring needs a body vibrator to mirror ONTO — a TV box has none, so the row
-            // would be a silent no-op there.
+            // Both rows below say "this phone" and mean this device's own body — so they are gated
+            // on the FORM FACTOR first, and only then on the hardware.
+            //
+            // The hardware probe alone was not enough. A TV box was assumed to answer no to both;
+            // a Shield answers yes to both (field report, #449). The likely route is the attached
+            // controller — a default `Vibrator` and a SensorManager gyroscope that belong to the
+            // pad, not to a body the box doesn't have — but the form factor is the honest gate
+            // either way, because these rows promise something a TV cannot do.
+            //
+            // Gated here rather than inside `deviceBodyVibrator`: its other two callers — the
+            // console's menu haptics and the in-stream mirror — want exactly the vibrator it
+            // returns today, whatever the form factor.
             val context = LocalContext.current
+            val tv = remember { isTvDevice(context) }
             val hasBodyVibrator = remember { deviceBodyVibrator(context) != null }
-            if (hasBodyVibrator) {
+            if (!tv && hasBodyVibrator) {
                 ToggleRow(
                     title = "Rumble on this phone",
                     subtitle = "Also play controller 1's rumble on this phone's motor",
@@ -957,9 +968,9 @@ private fun ControllerSettings(s: Settings, update: (Settings) -> Unit, onOpenCo
                 )
             }
             // The rumble mirror's sibling, data flowing the other way: needs a gyroscope to
-            // mirror FROM — a TV box has none, so the row would be a silent no-op there.
+            // mirror FROM, and a body to tilt.
             val hasGyroscope = remember { DeviceGyro.available(context) }
-            if (hasGyroscope) {
+            if (!tv && hasGyroscope) {
                 ToggleRow(
                     title = "Gyro from this phone",
                     subtitle = "When the controller has no gyro, send this phone's motion " +
