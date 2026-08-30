@@ -16,20 +16,23 @@ better:
   per version.
 - **"How finished is this?"** — [How finished each part is](/docs/support-matrix#how-finished-each-part-is).
 
-**Nothing on this page is shipped unless it says so.** Recently shipped work — pen and stylus input,
-mirroring one of the host's real monitors, a stream that ends when the game does, settings profiles
-and `punktfunk://` links, the `punktfunk` command line, HDR on gamescope hosts, and update checks
-with one-click host updating — is described in the release notes for 0.19 through 0.22.3, and its
-present-day behaviour is in the matrix.
+**Nothing on this page is shipped unless it says so.** Recently shipped work — mid-stream microphone
+mute with echo cancellation, desktop apps that decode on your GPU with no FFmpeg in them, lossless
+audio, guest access with a time limit, a plugin-driven game library, coexisting with Sunshine and
+Apollo, a one-command Linux install, controller speaker and haptics from Linux hosts, host power
+control from any client, and Omarchy as a supported host — is described in the
+[release notes](https://git.unom.io/unom/punktfunk/releases), and its present-day behaviour is in
+the matrix.
 
 ## Working on now
 
 **Windows host hardening.** The Windows host is the newest large surface in the project and gets the
-most attention. Two strands: on-glass validation of the AMD (AMF) and Intel (QSV) encode paths,
-which are CI-green but far less exercised than NVENC; and capture-stall attribution — the host now
-carries dedicated instrumentation that says *which* link went quiet when a stream stutters — the
-content that stopped being drawn, or the display path that stopped presenting it — so field reports
-stop being guesswork.
+most attention. Two strands: field hardening of the AMD (AMF) and Intel (QSV) encode paths — both
+ship in the installer and both are validated on real hardware, but they see far less use than
+NVENC, so their loss-recovery and 10-bit arms are where new reports land; and capture-stall
+attribution — the host now carries dedicated instrumentation that says *which* link went quiet when
+a stream stutters — the content that stopped being drawn, or the display path that stopped
+presenting it — so field reports stop being guesswork.
 
 **Latency under load.** The remaining wins are no longer in the encoder. They are in when a frame is
 handed to the display: client-side presentation phase control, keeping a decoded frame from waiting
@@ -49,10 +52,10 @@ it shows the bitrate a live session is using and stops there, while the client a
 link and act on the result.
 
 **Closing the unverified cells.** The matrix's [What is not
-verified](/docs/support-matrix#what-is-not-verified) list is a work list, not a disclaimer: a
-Hyprland virtual output on real display hardware, client-drawn cursors on sway/wlroots and Hyprland,
-gamescope headless capture on the proprietary NVIDIA driver, touch input from a Windows client. Most
-are settled by a single session log on the right machine.
+verified](/docs/support-matrix#what-is-not-verified) list is a work list, not a disclaimer:
+client-drawn cursors on sway/wlroots and Hyprland, gamescope headless capture on the proprietary
+NVIDIA driver, touch input from a Windows client, and re-applying a resolution after an Omarchy
+theme switch. Most are settled by a single session log on the right machine.
 
 ## Next
 
@@ -62,11 +65,13 @@ QUIC connection migration so a client roams between Wi-Fi and cellular without d
 The control plane is already QUIC over UDP, so this is mostly signalling and relay rather than a
 protocol change.
 
-**A host that knows who is connecting.** Two related pieces. *Per-user sessions*: a connecting
-client picks an identity — an Apple TV profile, say — which maps to a real account on the host, and
-that person lands in their own desktop, signed in, without touching the machine. And *gamescope
-multi-user isolation*: per-session input and audio, so concurrent clients are fully independent
-desktops rather than several views of one (the shared-desktop case already works).
+**A host that knows who is connecting.** Streaming to several clients at once already ships — each
+one gets its own virtual display at its own resolution and refresh rate, so a laptop, a desktop and
+a TV can all be connected at the same time. What is missing is *identity*, in two pieces.
+*Per-user sessions*: a connecting client picks an identity — an Apple TV profile, say — which maps
+to a real account on the host, and that person lands in their own desktop, signed in, without
+touching the machine. And *gamescope multi-user isolation*: per-session input and audio, so those
+concurrent clients become fully independent desktops rather than several views of one.
 
 **The rest of remote work.** Multi-monitor streaming (the host's several outputs as separate client
 windows), virtual-webcam redirection (the client's camera appears as a webcam on the host, so video
