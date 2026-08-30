@@ -38,9 +38,12 @@ esac
 
 ffhash=$(mktemp)
 trap 'rm -f "$ffhash"' EXIT
-# framehash lines: "0,  <pts>, <pts_time>, <duration>, <size>, sha256=<hex>".
+# framehash data lines are "0, <dts>, <pts>, <duration>, <size>, <bare hex>" — the digest is the
+# LAST comma-separated field with no `hash=` prefix of any kind, and every header line starts with
+# '#'. (Matching on a prefix silently produced an EMPTY hash file and a "0 frames" report that
+# looked like ffmpeg had failed to decode anything.)
 ffmpeg -v error -i "$stream" -pix_fmt "$raw_fmt" -f framehash -hash sha256 - \
-  | awk -F'sha256=' '/sha256=/ { print $2 }' > "$ffhash"
+  | awk -F, '/^[0-9]/ { gsub(/[[:space:]]/, "", $NF); print $NF }' > "$ffhash"
 
 ours=$(wc -l < "$pfhash" | tr -d ' ')
 theirs=$(wc -l < "$ffhash" | tr -d ' ')
