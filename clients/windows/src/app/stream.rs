@@ -34,7 +34,8 @@ pub(crate) fn session_page(ctx: &Arc<super::AppCtx>, hud: &HudSample) -> Element
 
     // Header: monogram + title + the one thing worth knowing (where the video went).
     let header: Element = grid((
-        avatar(&host)
+        // Monogram, as the comment above says: `Target` carries no OS chain to mark with.
+        avatar(&host, "")
             .grid_column(0)
             .vertical_alignment(VerticalAlignment::Center),
         vstack((

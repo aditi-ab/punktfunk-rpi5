@@ -141,8 +141,9 @@ fn host_tile(
     id: &str,
     hover: &Hover,
     name: &str,
-    /// The host's OS-identity chain — the avatar's mark. Empty for a host that advertises
-    /// none, which falls the avatar back to the name's initial.
+    // The host's OS-identity chain — the avatar's mark. Empty for a host that advertises
+    // none, which falls the avatar back to the name's initial. (`//`, not `///`: rustc rejects
+    // a doc comment on a parameter.)
     os: &str,
     sub: &str,
     status_row: Element,

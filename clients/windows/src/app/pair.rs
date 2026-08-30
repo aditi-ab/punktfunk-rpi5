@@ -94,7 +94,8 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
 
     let content = card(vstack((
         grid((
-            avatar(&target.name)
+            // `Target` holds no OS chain, so the pairing card keeps the monogram.
+            avatar(&target.name, "")
                 .grid_column(0)
                 .vertical_alignment(VerticalAlignment::Center),
             vstack((
