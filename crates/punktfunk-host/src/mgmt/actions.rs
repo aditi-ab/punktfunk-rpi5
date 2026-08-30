@@ -303,6 +303,8 @@ pub(crate) async fn invoke_action(
         crate::session_status::stop_all_quit();
         let _ = app.quit_session("host power action");
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // Nothing may outlive the box going under — the displays go first.
+        drain_displays().await;
         // Our own suspend veto must be gone before logind is asked (we never hold
         // -ignore-inhibit rights): synchronous belt over the session-teardown braces.
         crate::sleep_inhibit::release_now();
@@ -325,4 +327,134 @@ pub(crate) async fn invoke_action(
         IN_FLIGHT.store(false, Ordering::SeqCst);
     });
     StatusCode::ACCEPTED.into_response()
+}
+
+/// How long a power action waits for the signaled sessions to drop their virtual displays before
+/// it goes under anyway. Over the 1.5 s release grace `native/handshake.rs` gives the same "let the
+/// session drop its display" wait, and short enough that a wedged teardown cannot strand someone
+/// waiting for the box to sleep.
+const DISPLAY_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+const DISPLAY_DRAIN_TICK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// One sweep's plan over a display snapshot: the `lingering` slots to release now, and how many
+/// displays we are still waiting on. **Pinned displays are exempt from both** — see
+/// [`drain_displays`]. Pure so the exemption is testable; the registry is a process global.
+fn drain_plan<'a>(displays: impl Iterator<Item = (&'a str, u64)>) -> (Vec<u64>, usize) {
+    let (mut release, mut waiting) = (Vec::new(), 0usize);
+    for (state, slot) in displays {
+        match state {
+            "lingering" => {
+                release.push(slot);
+                waiting += 1;
+            }
+            // Active = a session still tearing down; wait it out. Pinned = deliberate, leave it.
+            "pinned" => {}
+            _ => waiting += 1,
+        }
+    }
+    (release, waiting)
+}
+
+/// Tear the virtual displays down BEFORE the box goes under.
+///
+/// [`crate::session_status::stop_all_quit`] above marks the teardown deliberate, so the display is
+/// meant to skip its keep-alive linger — but that teardown is ASYNC: the stream loops have to
+/// notice the flag and drop the lease, and the reply-flush grace above is shorter than the 1.5 s
+/// the same wait gets in `native/handshake.rs`.
+///
+/// ⚠ Going under on top of a display that is still up is NOT a transient. The linger deadline is a
+/// `std::time::Instant`, and on Linux that clock does not advance while the box is suspended — so
+/// the box wakes with the stale display standing and its window unspent. On a SteamOS managed
+/// takeover that display is a headless gamescope session holding the box's own panels DPMS-off.
+///
+/// [`crate::vdisplay::registry::release`] refuses ACTIVE displays (releasing one with live sessions
+/// is session management), so the poll IS the wait: each tick sweeps whatever has reached
+/// `lingering`, and we return once nothing but pinned displays is left.
+///
+/// 🛑 **A Pinned display is left standing on purpose.** `KeepAlive::Forever` means "until host
+/// shutdown or an explicit `POST /display/release`" — a disconnect does not free it and neither
+/// does a different client connecting, because reuse is keyed on backend + mode. On gamescope's
+/// bare spawn that keep-alive also covers the nested session AND ITS GAME, so force-releasing a pin
+/// here would kill a running game on every sleep, which is the exact thing the operator pinned it
+/// to avoid. The stale-display hazard above therefore still applies under `forever` — that is the
+/// operator's standing choice, and the info line below is what makes it legible in a field log.
+async fn drain_displays() {
+    let deadline = std::time::Instant::now() + DISPLAY_DRAIN_BUDGET;
+    loop {
+        let snap = crate::vdisplay::registry::snapshot();
+        let (release, waiting) =
+            drain_plan(snap.displays.iter().map(|d| (d.state.as_str(), d.slot)));
+        let pinned = snap.displays.len() - waiting;
+        if waiting == 0 {
+            if pinned > 0 {
+                tracing::info!(
+                    pinned,
+                    "pinned display(s) left standing across the power action (keep-alive is \
+                     `forever`) — free them with POST /display/release if a wake lands dark"
+                );
+            }
+            return;
+        }
+        // Checked BEFORE the release so a slot that refuses to clear cannot spin past the budget.
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                displays = waiting,
+                "virtual display(s) still up at the power-action budget — going under anyway; \
+                 a wake may land on a stale display"
+            );
+            return;
+        }
+        if !release.is_empty() {
+            // `release` tears the display down INLINE — it kills the gamescope session and runs
+            // the topology/DPMS restores — so it must not run on a runtime worker, for the same
+            // reason `power::act` below is spawned blocking.
+            let _ = tokio::task::spawn_blocking(move || {
+                for slot in release {
+                    crate::vdisplay::registry::release(Some(slot));
+                }
+            })
+            .await;
+        }
+        tokio::time::sleep(DISPLAY_DRAIN_TICK).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{drain_displays, drain_plan, DISPLAY_DRAIN_BUDGET};
+
+    /// The common case is "Sleep host" with nobody streaming: no display is registered, so the
+    /// drain must cost nothing. An inverted emptiness check here would add the whole budget to
+    /// every power action on every host.
+    #[tokio::test]
+    async fn drain_displays_returns_at_once_when_no_display_is_up() {
+        let t0 = std::time::Instant::now();
+        drain_displays().await;
+        assert!(
+            t0.elapsed() < DISPLAY_DRAIN_BUDGET / 2,
+            "drain burned the budget with no displays up: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn lingering_is_released_active_is_waited_out_pinned_is_left_alone() {
+        let (release, waiting) =
+            drain_plan([("lingering", 1u64), ("active", 2), ("pinned", 3)].into_iter());
+        assert_eq!(release, vec![1], "only a lingering display is released");
+        assert_eq!(
+            waiting, 2,
+            "active + lingering are waited on, pinned is not"
+        );
+    }
+
+    /// The regression this guards: force-releasing a pin would kill the nested gamescope session
+    /// and its running game on every sleep. A box with nothing BUT pinned displays must drain
+    /// clean, releasing none of them.
+    #[test]
+    fn a_pinned_only_box_drains_clean_and_releases_nothing() {
+        let (release, waiting) = drain_plan([("pinned", 7u64), ("pinned", 8)].into_iter());
+        assert!(release.is_empty(), "a pin must survive a power action");
+        assert_eq!(waiting, 0, "pinned displays must not hold the drain open");
+    }
 }
