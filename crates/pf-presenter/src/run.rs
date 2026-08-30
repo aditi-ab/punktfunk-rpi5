@@ -2928,7 +2928,7 @@ fn apply_capture(
         static SAID: AtomicBool = AtomicBool::new(false);
         if !SAID.swap(true, Ordering::Relaxed) {
             let err = sdl3::get_error();
-            if std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some() {
+            if pf_client_core::gamescope::under_gamescope() {
                 tracing::debug!(error = %err, "no keyboard grab under gamescope — chords already ours");
             } else {
                 tracing::warn!(

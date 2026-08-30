@@ -103,8 +103,7 @@ impl OverlayFocus {
 /// Gaming Mode / any gamescope session — the only place this signal exists. Mirrors the same
 /// env checks the shells already use to detect Gaming Mode.
 pub fn gamescope_session() -> bool {
-    std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some()
-        || std::env::var_os("SteamDeck").is_some()
+    crate::gamescope::under_gamescope()
         || std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.eq_ignore_ascii_case("gamescope"))
 }
 

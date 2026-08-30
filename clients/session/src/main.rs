@@ -146,10 +146,10 @@ mod session_main {
 
     /// Running under Gaming Mode (a Deck, or any gamescope session): the environment
     /// where the local Steam UI owns the physical Steam/QAM buttons — the system-button
-    /// "auto" policy keys off this.
+    /// "auto" policy keys off this. Gaming Mode means gamescope is really there, which is
+    /// not what the bare env vars say — see [`pf_client_core::gamescope`].
     pub(crate) fn gaming_mode() -> bool {
-        std::env::var_os("SteamDeck").is_some()
-            || std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some()
+        pf_client_core::gamescope::under_gamescope()
     }
 
     /// Run fullscreen: `--fullscreen`, or the Deck/gamescope env as a fallback so a
@@ -1055,9 +1055,10 @@ mod session_main {
             .clone()
             .map_or_else(|| host_label.clone(), |id| format!("{host_label} · {id}"));
 
-        let fullscreen = arg_flag("--fullscreen")
-            || std::env::var_os("SteamDeck").is_some()
-            || std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some();
+        // `--fullscreen` carries the client's own `fullscreen_on_stream`, so the env may only
+        // ADD to it under a real gamescope — reading it loosely made every flatpak stream
+        // fullscreen no matter what the setting said.
+        let fullscreen = arg_flag("--fullscreen") || gaming_mode();
 
         let opts = pf_presenter::SessionOpts {
             window_title: format!("Punktfunk · {title}"),

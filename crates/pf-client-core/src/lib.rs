@@ -93,6 +93,10 @@ pub mod access;
 // The host's OS-identity chain (mDNS `os=` TXT): sanitize + icon-walk order. Pure string
 // logic, built everywhere (the Apple/Android ports mirror it rather than link it).
 pub mod os;
+// "Are we really under gamescope?" — our flatpak exports the env var the naive test reads, so
+// every Gaming-Mode decision goes through here. Built everywhere: the answer is just "no" off
+// Linux, which keeps the callers free of cfgs.
+pub mod gamescope;
 // "A system overlay owns the controller" for gamescope Gaming Mode — the signal behind the
 // gamepad input mask, which SDL's own focus gate structurally cannot provide there.
 #[cfg(target_os = "linux")]

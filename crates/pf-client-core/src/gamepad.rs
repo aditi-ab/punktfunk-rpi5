@@ -190,7 +190,9 @@ fn declared_kind(setting: GamepadPref, physical: GamepadPref) -> GamepadPref {
 pub fn is_steam_deck() -> bool {
     static DECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DECK.get_or_init(|| {
-        if std::env::var_os("SteamDeck").is_some() {
+        // Valve documents the VALUE, not the name: desktop Steam exports `SteamDeck=0` into
+        // everything it launches, so a presence check calls every PC with Steam a Deck.
+        if std::env::var("SteamDeck").is_ok_and(|v| v.trim() == "1") {
             return true;
         }
         let dmi = |f: &str| std::fs::read_to_string(format!("/sys/class/dmi/id/{f}"));
