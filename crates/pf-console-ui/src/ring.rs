@@ -1086,6 +1086,10 @@ impl Ring {
                 is_armed,
                 white,
             );
+            if spec.is_none() && editing {
+                // An empty slot in the editor invites; in-stream it stays plain glass.
+                crate::icons::draw_icon(canvas, crate::icons::PLUS, x, y, r * 0.7, white(0.35 * q));
+            }
             canvas.draw_circle(
                 Point::new(x, y),
                 r - 0.5 * scale,
@@ -1238,6 +1242,29 @@ impl Ring {
     }
 }
 
+/// The icon a built-in slot draws instead of a word (Lucide, via [`crate::icons`]) — the
+/// mic swaps to its struck form while muted. `None` for what the set cannot know: a
+/// shortcut (its keycap chord IS its face) and any host action beyond the three powers.
+fn slot_icon(id: &str, state: &str) -> Option<crate::icons::Icon> {
+    use crate::icons;
+    Some(match id {
+        "end_stream" => icons::SQUARE,
+        "disconnect_linger" => icons::LOG_OUT,
+        "touch_mode" => icons::POINTER,
+        "keyboard" => icons::KEYBOARD,
+        "stats" => icons::CHART_COLUMN,
+        "mic" if state == "Muted" => icons::MIC_OFF,
+        "mic" => icons::MIC,
+        "pad" => icons::GAMEPAD_2,
+        "send_text" => icons::SEND,
+        "more" => icons::ELLIPSIS,
+        "host:power.sleep" => icons::MOON,
+        "host:power.reboot" => icons::ROTATE_CW,
+        "host:power.shutdown" => icons::POWER,
+        _ => return None,
+    })
+}
+
 /// The pad's highlight on a disc: a soft white glow past the edge and a crisp ring on it,
 /// both at `amount` — eased by the caller, so the mark travels between discs.
 fn highlight_ring(
@@ -1303,6 +1330,12 @@ fn draw_disc(
     // one line ran to the disc's edge and past it.
     if spec.id.starts_with("shortcut:") && spec.short.contains('+') {
         keycap_text(canvas, fonts, x, y, r, size, &spec.short, color);
+        return;
+    }
+    // Every built-in slot draws as its icon; only an id the set does not know — an unknown
+    // host action, a future slot — falls back to its short word.
+    if let Some(icon) = slot_icon(&spec.id, &spec.state) {
+        crate::icons::draw_icon(canvas, icon, x, y, r * 1.05, color);
         return;
     }
     let tw = fonts.measure(&spec.short, W::SemiBold, size);
@@ -1605,6 +1638,31 @@ mod tests {
         );
         e.menu(MenuEvent::Move(MenuDir::Left));
         assert_eq!(e.highlight, Some(1));
+    }
+
+    /// Every built-in slot the ring can hold draws as an icon, not a word; the muted mic
+    /// swaps to its struck form; shortcuts and unknown host actions stay text.
+    #[test]
+    fn every_built_in_slot_has_an_icon() {
+        for id in [
+            "end_stream",
+            "disconnect_linger",
+            "touch_mode",
+            "keyboard",
+            "stats",
+            "mic",
+            "pad",
+            "send_text",
+            "more",
+            "host:power.sleep",
+            "host:power.reboot",
+            "host:power.shutdown",
+        ] {
+            assert!(slot_icon(id, "").is_some(), "{id} has no icon");
+        }
+        assert!(slot_icon("mic", "Muted").is_some());
+        assert!(slot_icon("host:custom.eject", "").is_none());
+        assert!(slot_icon("shortcut:s1", "").is_none());
     }
 
     /// The editor (§3.3): A on a slot asks for a pick, Y lifts and A on another slot asks for

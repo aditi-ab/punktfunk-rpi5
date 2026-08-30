@@ -30,6 +30,8 @@ pub mod console;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod glyphs;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
+mod icons;
+#[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod input;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod launcher_icons;

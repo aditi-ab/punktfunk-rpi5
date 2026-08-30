@@ -65,6 +65,9 @@ LICENSE_OVERRIDES = {
 # workspace-member skip in main() hides them from `cargo metadata`, so they are listed
 # here explicitly: (label, license file relative to the repo root, source URL).
 VENDORED_TREES = [
+    ("Lucide 0.462.0 (icon path data, crates/pf-console-ui)",
+     "crates/pf-console-ui/LUCIDE-LICENSE",
+     "https://lucide.dev"),
     ("pyrowave (vendored, crates/pyrowave-sys)",
      "crates/pyrowave-sys/vendor/pyrowave/LICENSE",
      "https://github.com/Themaister/pyrowave"),
