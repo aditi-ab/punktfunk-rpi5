@@ -30,6 +30,8 @@ pub mod console;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod glyphs;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
+mod icons;
+#[cfg(any(target_os = "linux", windows, target_os = "android"))]
 pub mod input;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod launcher_icons;
@@ -43,6 +45,11 @@ mod os_marks;
 pub mod platform;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod pointer;
+// The in-stream ring on Skia is the DESKTOP shell's (Android has its Compose ring); the Android
+// console draws it only as the settings editor, where the desktop-gated host-action cache is
+// not consulted.
+#[cfg(any(target_os = "linux", windows, target_os = "android"))]
+mod ring;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]
 mod screens;
 #[cfg(any(target_os = "linux", windows, target_os = "android"))]

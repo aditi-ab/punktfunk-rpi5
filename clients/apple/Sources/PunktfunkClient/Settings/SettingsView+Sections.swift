@@ -494,6 +494,43 @@ extension SettingsView {
                     Text("Touch passthrough").tag(TouchInputMode.touch.rawValue)
                 }
             }
+            described("Which actions the in-stream ring offers and the shortcuts it can send; "
+                      + "a profile that changes it owns the whole ring.", field: "overlay_actions") {
+                // A SHEET, not a push: the detail column is not a NavigationStack, and a
+                // NavigationLink pushed from it popped the collapsed iPhone stack to the category
+                // list on the way back and left the selection dead (AboutView's rows say the same).
+                Button {
+                    showQuickActions = true
+                } label: {
+                    HStack {
+                        Text("Quick actions")
+                        Spacer(minLength: 8)
+                        Image(systemName: "chevron.right")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                            .accessibilityHidden(true)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .sheet(isPresented: $showQuickActions) {
+                    NavigationStack {
+                        QuickActionsEditor(blob: scoped(SettingsFields.overlayActions),
+                                           overridden: isOverridden("overlay_actions")) {
+                            if inProfileScope {
+                                resetOverride("overlay_actions")
+                            } else {
+                                scoped(SettingsFields.overlayActions).wrappedValue = ""
+                            }
+                        }
+                        .toolbar {
+                            ToolbarItem(placement: .confirmationAction) {
+                                Button("Done") { showQuickActions = false }
+                            }
+                        }
+                    }
+                }
+            }
             // Whether a hardware mouse attached to THIS iPad gets locked is a fact about this
             // device's input hardware (tier G), not about how a host is streamed.
             if !inProfileScope, UIDevice.current.userInterfaceIdiom == .pad {

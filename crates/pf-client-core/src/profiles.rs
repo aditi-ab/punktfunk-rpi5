@@ -80,6 +80,10 @@ pub struct SettingsOverlay {
     pub mouse_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invert_scroll: Option<bool>,
+    /// The whole ring blob (design/touch-client-overlay.md D10): a profile either inherits the
+    /// default ring entirely or owns its own ring and shortcuts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay_actions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inhibit_shortcuts: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,6 +177,9 @@ impl SettingsOverlay {
         }
         if let Some(v) = self.invert_scroll {
             s.invert_scroll = v;
+        }
+        if let Some(v) = &self.overlay_actions {
+            s.overlay_actions = v.clone();
         }
         if let Some(v) = self.inhibit_shortcuts {
             s.inhibit_shortcuts = v;
@@ -282,6 +289,9 @@ impl SettingsOverlay {
         if after.invert_scroll != before.invert_scroll {
             self.invert_scroll = Some(after.invert_scroll);
         }
+        if after.overlay_actions != before.overlay_actions {
+            self.overlay_actions = Some(after.overlay_actions.clone());
+        }
         if after.inhibit_shortcuts != before.inhibit_shortcuts {
             self.inhibit_shortcuts = Some(after.inhibit_shortcuts);
         }
@@ -347,6 +357,7 @@ impl SettingsOverlay {
             "touch_mode" => self.touch_mode = None,
             "mouse_mode" => self.mouse_mode = None,
             "invert_scroll" => self.invert_scroll = None,
+            "overlay_actions" => self.overlay_actions = None,
             "inhibit_shortcuts" => self.inhibit_shortcuts = None,
             "gamepad" => self.gamepad = None,
             "gamepad_forwarding" => self.gamepad_forwarding = None,
@@ -685,6 +696,38 @@ mod tests {
 
         assert!(o.clear("echo_cancel"));
         assert_eq!(o.echo_cancel, None);
+        assert!(o.is_empty());
+    }
+
+    /// `overlay_actions` is a first-class overlay field carrying the WHOLE ring blob
+    /// (design/touch-client-overlay.md D10): it applies, absorbs, clears, and serialises under
+    /// the key the Apple and Android clients write.
+    #[test]
+    fn overlay_actions_is_a_first_class_override() {
+        let base = Settings::default();
+        assert!(
+            base.overlay_actions.is_empty(),
+            "empty = the platform default ring"
+        );
+        let blob = r#"{"v":2,"ring":["mic"]}"#;
+
+        let mut o = SettingsOverlay::default();
+        let before = o.apply(&base);
+        let mut after = before.clone();
+        after.overlay_actions = blob.into();
+        o.absorb(&before, &after);
+        assert_eq!(o.overlay_actions.as_deref(), Some(blob));
+        assert_eq!(o.apply(&base).overlay_actions, blob);
+        assert!(o.extra.is_empty());
+
+        let text = serde_json::to_string(&o).unwrap();
+        assert!(text.contains("\"overlay_actions\":"), "{text}");
+        let from_apple: SettingsOverlay =
+            serde_json::from_str(r#"{"overlay_actions":"{\"v\":2}"}"#).unwrap();
+        assert_eq!(from_apple.overlay_actions.as_deref(), Some("{\"v\":2}"));
+        assert!(from_apple.extra.is_empty());
+
+        assert!(o.clear("overlay_actions"));
         assert!(o.is_empty());
     }
 

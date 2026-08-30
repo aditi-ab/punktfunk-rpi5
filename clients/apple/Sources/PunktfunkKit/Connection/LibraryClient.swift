@@ -190,6 +190,19 @@ public struct HostAction: Codable, Hashable, Sendable, Identifiable {
     /// keeps the permitted ones.
     public var permitted: Bool
 
+    /// A hand-made action — the quick-actions editor previews the three power slots without a
+    /// host on the line.
+    public init(id: String, title: String, group: String = "power", danger: Bool = false,
+                available: Bool = true, unavailableReason: String? = nil, permitted: Bool = true) {
+        self.id = id
+        self.title = title
+        self.group = group
+        self.danger = danger
+        self.available = available
+        self.unavailableReason = unavailableReason
+        self.permitted = permitted
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id, title, group, danger, available, permitted
         case unavailableReason = "unavailable_reason"

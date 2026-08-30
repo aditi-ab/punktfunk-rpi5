@@ -49,6 +49,8 @@ mod library;
 mod licenses;
 mod os_icons;
 mod pair;
+/// The quick-action ring's editor — the ring itself, a section of the settings page.
+mod quick_actions;
 mod settings;
 mod speed;
 mod stream;

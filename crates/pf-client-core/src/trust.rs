@@ -1362,6 +1362,12 @@ pub struct Settings {
     /// "Invert scroll direction"). Default off = the host scrolls the way this machine does.
     #[serde(default)]
     pub invert_scroll: bool,
+    /// The in-stream quick-action ring: one JSON blob parsed by
+    /// [`crate::overlay_actions::OverlayConfig::parse`] (six slots, shortcuts, the virtual
+    /// pad's preset). Empty = the platform default ring. One opaque field, not a dozen
+    /// booleans: every cross-client setting costs about six hand edits per client.
+    #[serde(default)]
+    pub overlay_actions: String,
     /// Playback endpoint for stream audio — on Linux the PipeWire `node.name` the
     /// playback stream targets (`target.object`); on Windows the WASAPI `IMMDevice`
     /// endpoint id; empty = the OS default (the Apple client's Speaker picker). The
@@ -1563,6 +1569,7 @@ impl Default for Settings {
             library_collections: false,
             auto_wake: true,
             invert_scroll: false,
+            overlay_actions: String::new(),
             speaker_device: String::new(),
             mic_device: String::new(),
             pad_haptics: true,

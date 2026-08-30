@@ -133,7 +133,10 @@ another screen is awkward. Two things to know:
 > touchscreen arrive at the stream as *real touch*. Leaving Steam Input **On** with that layout
 > gives you native touch plus a standard gamepad; setting it **Off** gives you the full Steam Deck
 > pad — paddles, both trackpads, gyro — but the touchscreen stops working as touch. Pick per game,
-> on the game page → ⚙ → **Controller Settings**.
+> on the game page → ⚙ → **Controller Settings**. Without that layout, Steam Input hands the
+> client a *mouse* whose motion carries the finger's absolute position; the client drops that
+> motion instead of letting it walk the host cursor into a corner, says so once, and no touch
+> mode does anything until the layout is picked.
 
 To **leave a stream**: **hold [L1 + R1 + Start + Select](/docs/input#leaving-with-a-controller)**
 for about a second and a half, or close the "game" from the Steam overlay. Either ends the session

@@ -455,7 +455,7 @@ fn draw_glyph(
             canvas.draw_circle(center, r as f32, &fill(fg(0.10)));
             canvas.draw_circle(center, r as f32, &stroke(fg(0.32), (1.2 * k) as f32));
             if style == GlyphStyle::Shapes {
-                draw_ps_shape(canvas, face, center, (4.6 * k) as f32, (1.7 * k) as f32);
+                draw_ps_shape(canvas, face, center, (5.2 * k) as f32, (1.8 * k) as f32);
             } else {
                 let letter = face_letter(face, style);
                 let size = 12.0 * k;
@@ -497,23 +497,15 @@ fn draw_glyph(
             let center = Point::new((x + r) as f32, cy as f32);
             canvas.draw_circle(center, r as f32, &fill(fg(0.10)));
             canvas.draw_circle(center, r as f32, &stroke(fg(0.32), (1.2 * k) as f32));
-            let (cx, cyf) = (center.x, center.y);
-            let (half_w, rise) = ((4.6 * k) as f32, (3.2 * k) as f32);
-            let mut p = stroke(fg(0.92), (1.7 * k) as f32);
-            p.set_stroke_cap(skia_safe::PaintCap::Round);
-            p.set_stroke_join(skia_safe::PaintJoin::Round);
-            let mut path = PathBuilder::new();
-            path.move_to((cx + half_w, cyf - rise)); // the hook, up on the right…
-            path.line_to((cx + half_w, cyf + rise * 0.2)); // …dropping to the shaft…
-            path.line_to((cx - half_w, cyf + rise * 0.2)); // …running left toward the head.
-            canvas.draw_path(&path.detach(), &p);
-            let head = (2.6 * k) as f32;
-            let tip = cx - half_w;
-            let mut arrow = PathBuilder::new();
-            arrow.move_to((tip + head, cyf + rise * 0.2 - head));
-            arrow.line_to((tip, cyf + rise * 0.2));
-            arrow.line_to((tip + head, cyf + rise * 0.2 + head));
-            canvas.draw_path(&arrow.detach(), &p);
+            // The set's return arrow, sized to sit inside the badge.
+            crate::icons::draw_icon(
+                canvas,
+                crate::icons::CORNER_DOWN_LEFT,
+                center.x,
+                center.y,
+                (12.5 * k) as f32,
+                fg(0.92),
+            );
         }
         Resolved::Shoulders => {
             let mut pen = x;
@@ -524,6 +516,11 @@ fn draw_glyph(
                 canvas.draw_rrect(
                     RRect::new_rect_xy(rect, (4.0 * k) as f32, (4.0 * k) as f32),
                     &fill(fg(0.10)),
+                );
+                // The keycaps' hairline, so every container on the bar wears the same edge.
+                canvas.draw_rrect(
+                    RRect::new_rect_xy(rect, (4.0 * k) as f32, (4.0 * k) as f32),
+                    &stroke(fg(0.28), (1.2 * k) as f32),
                 );
                 let size = 10.0 * k;
                 let tw = fonts.measure(label, W::SemiBold, size) as f64;
@@ -540,42 +537,44 @@ fn draw_glyph(
             }
         }
         g @ (Resolved::Up | Resolved::Down) => {
-            // ▲ / ▼ — one solid triangle in a badge-sized slot, the same triangle either
-            // way up: apex toward the direction it names, base at the other end.
+            // ▲ / ▼ as the set's chevron, stroked like every other mark — a direction is
+            // not a button, so it wears no badge.
             let r = BADGE_D * k / 2.0;
-            let (cx, cyf) = ((x + r) as f32, cy as f32);
-            let (tw, th) = ((5.5 * k) as f32, (4.5 * k) as f32);
-            let (apex, base) = if matches!(g, Resolved::Down) {
-                (cyf + th, cyf - th)
+            let icon = if matches!(g, Resolved::Down) {
+                crate::icons::CHEVRON_DOWN
             } else {
-                (cyf - th, cyf + th)
+                crate::icons::CHEVRON_UP
             };
-            let mut tri = PathBuilder::new();
-            tri.move_to((cx, apex));
-            tri.line_to((cx - tw, base));
-            tri.line_to((cx + tw, base));
-            tri.close();
-            canvas.draw_path(&tri.detach(), &fill(fg(0.85)));
+            crate::icons::draw_icon(
+                canvas,
+                icon,
+                (x + r) as f32,
+                cy as f32,
+                (BADGE_D * k) as f32,
+                fg(0.92),
+            );
         }
         Resolved::Adjust => {
-            // ◀ ▶ — two small solid triangles.
+            // ◀ ▶ — the set's chevrons, one either side of the slot's centre.
             let r = BADGE_D * k / 2.0;
             let (cx, cyf) = ((x + r) as f32, cy as f32);
-            let (tw, th) = ((4.5 * k) as f32, (5.5 * k) as f32);
-            let gap = (2.6 * k) as f32;
-            let paint = fill(fg(0.85));
-            let mut left = PathBuilder::new();
-            left.move_to((cx - gap, cyf - th));
-            left.line_to((cx - gap - tw, cyf));
-            left.line_to((cx - gap, cyf + th));
-            left.close();
-            canvas.draw_path(&left.detach(), &paint);
-            let mut right = PathBuilder::new();
-            right.move_to((cx + gap, cyf - th));
-            right.line_to((cx + gap + tw, cyf));
-            right.line_to((cx + gap, cyf + th));
-            right.close();
-            canvas.draw_path(&right.detach(), &paint);
+            let b = (20.0 * k) as f32;
+            crate::icons::draw_icon(
+                canvas,
+                crate::icons::CHEVRON_LEFT,
+                cx - (4.6 * k) as f32,
+                cyf,
+                b,
+                fg(0.92),
+            );
+            crate::icons::draw_icon(
+                canvas,
+                crate::icons::CHEVRON_RIGHT,
+                cx + (4.6 * k) as f32,
+                cyf,
+                b,
+                fg(0.92),
+            );
         }
         Resolved::Key(text) => {
             let w = keycap_w(fonts, text, k);
@@ -587,7 +586,9 @@ fn draw_glyph(
             );
             canvas.draw_rrect(
                 RRect::new_rect_xy(rect, (5.0 * k) as f32, (5.0 * k) as f32),
-                &stroke(fg(0.28), 1.0),
+                // Scaled: an unscaled hairline read thinner than every other edge on a
+                // HiDPI screen.
+                &stroke(fg(0.28), (1.2 * k) as f32),
             );
             let size = 11.0 * k;
             let tw = fonts.measure(text, W::SemiBold, size) as f64;
@@ -609,6 +610,7 @@ fn draw_glyph(
 fn draw_ps_shape(canvas: &Canvas, face: Face, center: Point, r: f32, width: f32) {
     let mut p = stroke(fg(0.92), width);
     p.set_stroke_cap(skia_safe::PaintCap::Round);
+    p.set_stroke_join(skia_safe::PaintJoin::Round);
     let (cx, cy) = (center.x, center.y);
     match face {
         Face::A => {

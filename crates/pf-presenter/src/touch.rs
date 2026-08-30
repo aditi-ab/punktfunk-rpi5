@@ -36,6 +36,22 @@ const TAP_DRAG_MS: f64 = 250.0;
 const LONG_PRESS_MS: f64 = 500.0;
 /// Two-finger pan distance (px) per 120-unit wheel notch (smaller = faster scroll).
 const SCROLL_DIV: f32 = 4.0;
+/// The dial (design/touch-client-overlay.md §2.1): a two-finger TWIST opens the quick-action
+/// ring. Below this rotation the gesture is still a scroll candidate — natural scrolls rotate a
+/// few degrees, and this is what absorbs them; much below 8° two-finger scrolling gets flaky.
+const DIAL_ARM_DEG: f32 = 10.0;
+/// At this rotation the ring commits: it stays open after the fingers lift.
+const DIAL_COMMIT_DEG: f32 = 30.0;
+/// Centroid travel (px) beyond this before arming means scroll, not dial.
+const DIAL_SLOP: f32 = 2.0 * TAP_SLOP;
+/// SDL reports the fingers of one input frame as separate events with the same timestamp, so
+/// the twist is judged only when the other finger's position is from the same frame (its event
+/// is at most this far back) — halfway through a plain scroll step the finger-to-finger vector
+/// looks rotated by tens of degrees.
+const DIAL_FRAME_MS: f64 = 4.0;
+/// …or when the other finger has not moved for this long: a thumb pivot, one finger turning
+/// around a still one, is a real twist and never completes a pair.
+const DIAL_PIVOT_MS: f64 = 50.0;
 /// Base finger-px → host-px gain (~1:1, never twitchy).
 const POINTER_SENS: f32 = 1.3;
 /// Above `ACCEL_SPEED_FLOOR` px/ms the gain ramps by `ACCEL_GAIN` per px/ms, capped at
@@ -62,7 +78,7 @@ pub struct Abs {
 /// A wire intent the engine emits; the owner (`Capture` in `input.rs`, which also holds the
 /// intent → `InputKind` translation) sends each one, and folds [`CycleStats`](Act::CycleStats)
 /// back to the run loop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Act {
     /// Relative cursor motion (`MouseMove`).
     MoveRel { dx: i32, dy: i32 },
@@ -74,6 +90,33 @@ pub enum Act {
     Scroll { axis: u32, delta: i32 },
     /// Three-finger tap: cycle the stats-overlay verbosity tier (the run loop owns it).
     CycleStats,
+    /// A two-finger twist is turning the quick-action ring: `progress` 0…1 drives its unwind
+    /// frame by frame, `clockwise` is the hand's direction, `x`/`y` (window px) the centroid
+    /// the ring is centred on. Emitted on every move once the twist has armed.
+    Dial {
+        progress: f32,
+        clockwise: bool,
+        x: f32,
+        y: f32,
+    },
+    /// The twist reached `DIAL_COMMIT_DEG`: the ring stays open after the fingers lift.
+    DialCommit,
+    /// The twist ended short of commit, or wound back below the arm angle after committing:
+    /// the ring winds back in and nothing was sent — no scroll, no click.
+    DialCancel,
+}
+
+/// The dial's share of a two-finger gesture: the finger-to-finger vector the moment the second
+/// finger landed, compared against the live one on every move.
+#[derive(Clone, Copy)]
+struct Dial {
+    ids: (u64, u64),
+    vec: (f32, f32),
+    /// The centroid at the second finger's landing — travel past `DIAL_SLOP` before arming
+    /// means the hand is scrolling, not turning.
+    anchor: (f32, f32),
+    armed: bool,
+    committed: bool,
 }
 
 /// The trackpad/pointer gesture state machine. One per session; `trackpad` picks the model
@@ -86,6 +129,8 @@ pub struct Gestures {
     /// Live fingers → current window-pixel position (the centroid needs every finger, but a
     /// move event only carries the one that changed).
     positions: HashMap<u64, (f32, f32)>,
+    /// Live fingers → the time (ms) of their last event; the dial's same-frame test.
+    times: HashMap<u64, f64>,
     /// A gesture is in flight (≥ 1 finger down since the first touch).
     active: bool,
     start: (f32, f32),
@@ -95,6 +140,11 @@ pub struct Gestures {
     moved: bool,
     scrolling: bool,
     scroll_anchor: (f32, f32),
+    /// A scroll notch went on the wire this gesture: it is a scroll for its lifetime, never a
+    /// dial.
+    scroll_emitted: bool,
+    /// The two-finger twist in flight, from the second finger's landing to any lift.
+    dial: Option<Dial>,
     /// Three-or-more-finger centroid anchor, per finger count (0 = none): real fingers never
     /// land or lift in the same event, so a count change must re-anchor, not read as travel.
     many_count: usize,
@@ -118,6 +168,7 @@ impl Gestures {
             trackpad,
             scroll_sign: if invert_scroll { -1 } else { 1 },
             positions: HashMap::new(),
+            times: HashMap::new(),
             active: false,
             start: (0.0, 0.0),
             down_t: 0.0,
@@ -125,6 +176,8 @@ impl Gestures {
             moved: false,
             scrolling: false,
             scroll_anchor: (0.0, 0.0),
+            scroll_emitted: false,
+            dial: None,
             many_count: 0,
             many_anchor: (0.0, 0.0),
             drag_held: false,
@@ -143,6 +196,7 @@ impl Gestures {
         let mut acts = Vec::new();
         let first = self.positions.is_empty() && !self.active;
         self.positions.insert(id, (wx, wy));
+        self.times.insert(id, t);
         if first {
             self.active = true;
             self.start = (wx, wy);
@@ -150,6 +204,8 @@ impl Gestures {
             self.max_fingers = 0;
             self.moved = false;
             self.scrolling = false;
+            self.scroll_emitted = false;
+            self.dial = None;
             self.many_count = 0;
             // A touch landing just after a quick tap nearby = tap-and-drag.
             self.drag_held = t - self.last_tap_up < TAP_DRAG_MS
@@ -171,6 +227,24 @@ impl Gestures {
             self.carry = (0.0, 0.0);
         }
         self.max_fingers = self.max_fingers.max(self.positions.len());
+        match self.positions.len() {
+            // The second finger: remember the finger-to-finger vector — the dial's reference —
+            // unless this gesture already scrolled (then it is a scroll for its lifetime).
+            2 if !self.scroll_emitted && self.dial.is_none() => {
+                if let Some((&other, &op)) = self.positions.iter().find(|(k, _)| **k != id) {
+                    self.dial = Some(Dial {
+                        ids: (other, id),
+                        vec: (wx - op.0, wy - op.1),
+                        anchor: self.centroid(),
+                        armed: false,
+                        committed: false,
+                    });
+                }
+            }
+            // A third finger ends the twist: wound back if it had armed and not committed.
+            n if n > 2 => acts.extend(self.end_dial(false)),
+            _ => {}
+        }
         acts
     }
 
@@ -180,13 +254,16 @@ impl Gestures {
             return Vec::new();
         }
         self.positions.insert(id, (wx, wy));
+        self.times.insert(id, t);
         // Dropping below three fingers forgets the many-finger anchor, so a 3→2→3 bounce
         // re-anchors instead of reading the count change as travel.
         if self.positions.len() < 3 {
             self.many_count = 0;
         }
         match self.positions.len() {
-            2 => self.scroll_by_centroid(),
+            2 => self
+                .dial_step(id, t)
+                .unwrap_or_else(|| self.scroll_by_centroid()),
             n if n >= 3 => {
                 self.many_fingers();
                 Vec::new()
@@ -203,9 +280,14 @@ impl Gestures {
     pub fn up(&mut self, id: u64, t: f64) -> Vec<Act> {
         let mut acts = Vec::new();
         self.positions.remove(&id);
+        self.times.remove(&id);
         if self.track_id == Some(id) {
             self.track_id = None;
         }
+        // Any lift ends the twist. Committed: the ring stays open and the UI owns it from
+        // here. Short of commit: it winds back in, and the finger still down (if any) must
+        // not start moving the cursor — the gesture stays "scrolling", i.e. inert.
+        acts.extend(self.end_dial(true));
         if !self.positions.is_empty() || !self.active {
             return acts; // other fingers still down (or no live gesture)
         }
@@ -273,12 +355,98 @@ impl Gestures {
     /// only clears state — it never re-emits wire events.
     pub fn reset(&mut self) {
         self.positions.clear();
+        self.times.clear();
         self.track_id = None;
         self.active = false;
         self.scrolling = false;
+        self.scroll_emitted = false;
+        self.dial = None;
         self.moved = false;
         self.drag_held = false;
         self.last_tap_up = 0.0;
+    }
+
+    /// The dial's share of a two-finger move; `Some` when the twist owns the gesture (the
+    /// scroll path then never runs), `None` when the hand is scrolling, or might still be.
+    ///
+    /// Rules, in order (design §2.1): a scroll notch already sent ⇒ never a dial; centroid
+    /// travel past `DIAL_SLOP` before arming ⇒ scroll; rotation ≥ `DIAL_ARM_DEG` ⇒ the twist
+    /// arms and owns the gesture; progress `(|Δφ| − arm) / (commit − arm)` feeds the ring; at
+    /// 1 the ring commits, and winding back to 0 after a commit closes it again. A pinch with
+    /// no rotation is nothing: it never arms and moves no centroid.
+    fn dial_step(&mut self, id: u64, t: f64) -> Option<Vec<Act>> {
+        let dial = self.dial?;
+        if !dial.armed && self.scroll_emitted {
+            return None;
+        }
+        // Judge the rotation only against a position of the other finger that is current:
+        // from this same input frame, or older than a pivot's stillness. In between, the
+        // other finger's event for this frame is still to come, and the vector would lie.
+        let other = if dial.ids.0 == id {
+            dial.ids.1
+        } else {
+            dial.ids.0
+        };
+        let gap = t - *self.times.get(&other)?;
+        if gap > DIAL_FRAME_MS && gap < DIAL_PIVOT_MS {
+            return dial.armed.then(Vec::new);
+        }
+        let (a, b) = (
+            *self.positions.get(&dial.ids.0)?,
+            *self.positions.get(&dial.ids.1)?,
+        );
+        let v = (b.0 - a.0, b.1 - a.1);
+        let cross = dial.vec.0 * v.1 - dial.vec.1 * v.0;
+        let dot = dial.vec.0 * v.0 + dial.vec.1 * v.1;
+        // Signed rotation of the finger-to-finger vector; positive = clockwise on a y-down
+        // screen.
+        let phi = cross.atan2(dot).to_degrees();
+        let (cx, cy) = self.centroid();
+        if !dial.armed {
+            let travel = (cx - dial.anchor.0).hypot(cy - dial.anchor.1);
+            if travel >= DIAL_SLOP {
+                return None;
+            }
+            // Undecided: under the slop and under the arm angle the pair may still become a
+            // twist, so no scroll notch goes out yet — a notch is final (`scroll_emitted`),
+            // and a real twist drifts its centroid past `SCROLL_DIV` long before it turns
+            // 10°. The anchor follows the centroid so the scroll starts smoothly once the
+            // slop is crossed.
+            if phi.abs() < DIAL_ARM_DEG {
+                self.scrolling = true;
+                self.scroll_anchor = (cx, cy);
+                return Some(Vec::new());
+            }
+            self.moved = true; // a twist is never a tap
+            self.scrolling = true; // and dropping to one finger must not jerk the cursor
+        }
+        let progress =
+            ((phi.abs() - DIAL_ARM_DEG) / (DIAL_COMMIT_DEG - DIAL_ARM_DEG)).clamp(0.0, 1.0);
+        let mut acts = vec![Act::Dial {
+            progress,
+            clockwise: phi > 0.0,
+            x: cx,
+            y: cy,
+        }];
+        let d = self.dial.as_mut()?;
+        d.armed = true;
+        if progress >= 1.0 && !d.committed {
+            d.committed = true;
+            acts.push(Act::DialCommit);
+        } else if progress <= 0.0 && d.committed {
+            d.committed = false;
+            acts.push(Act::DialCancel);
+        }
+        Some(acts)
+    }
+
+    /// The twist is over (a finger lifted or a third landed). `cancel_uncommitted` winds an
+    /// armed-but-uncommitted ring back in; a committed ring stays open for the UI.
+    fn end_dial(&mut self, _lift: bool) -> Vec<Act> {
+        match self.dial.take() {
+            Some(d) if d.armed && !d.committed => vec![Act::DialCancel],
+            _ => Vec::new(),
+        }
     }
 
     /// The live fingers' centroid.
@@ -311,6 +479,7 @@ impl Gestures {
             });
             self.scroll_anchor.1 = cy;
             self.moved = true;
+            self.scroll_emitted = true;
         }
         if notches_x != 0 {
             acts.push(Act::Scroll {
@@ -319,6 +488,7 @@ impl Gestures {
             });
             self.scroll_anchor.0 = cx;
             self.moved = true;
+            self.scroll_emitted = true;
         }
         acts
     }
@@ -383,8 +553,82 @@ impl Gestures {
     }
 }
 
+/// No finger drag moves this far in one SDL event; a leaked absolute position routinely does
+/// (the field capture read 300 to 450).
+const LEAK_PX: f32 = 150.0;
+
+/// Design §5.5: in Gaming Mode Steam Input owns the touchscreen and replays it as a mouse whose
+/// "relative" deltas are absolute positions — hundreds of pixels per event, which under the
+/// stream's relative-mouse lock walk the host cursor into a corner. SDL sees no fingers at all,
+/// so every touch model is bypassed, and `SDL_TOUCH_MOUSE_EVENTS` cannot help: the events are
+/// Steam's, not SDL's. This recognises that shape — a gamescope session, no finger event yet,
+/// a delta no finger drag produces — and drops the leaked motion. A real mouse in Gaming Mode
+/// keeps working: its deltas are small.
+pub struct SteamTouchMouse {
+    game_mode: bool,
+    /// A direct-touch finger reached SDL this session: the touchscreen is ours, nothing leaks.
+    pub fingers_seen: bool,
+    /// A finger from a NON-direct device was ignored this session — said once in the log.
+    pub indirect_seen: bool,
+    leaked: bool,
+    noticed: bool,
+}
+
+impl SteamTouchMouse {
+    pub fn new(game_mode: bool) -> Self {
+        Self {
+            game_mode,
+            fingers_seen: false,
+            indirect_seen: false,
+            leaked: false,
+            noticed: false,
+        }
+    }
+
+    /// Whether this relative motion is a leaked touch position, to be dropped.
+    pub fn leaks(&mut self, xrel: f32, yrel: f32) -> bool {
+        if !self.game_mode || self.fingers_seen {
+            return false;
+        }
+        let leak = xrel.abs() >= LEAK_PX || yrel.abs() >= LEAK_PX;
+        if leak {
+            self.leaked = true;
+        }
+        leak
+    }
+
+    /// `true` once, after the first leak: the caller shows the notice.
+    pub fn take_notice(&mut self) -> bool {
+        let first = self.leaked && !self.noticed;
+        if first {
+            self.noticed = true;
+        }
+        first
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gaming_mode_drops_leaked_touch_positions_until_a_finger_is_seen() {
+        let mut m = super::SteamTouchMouse::new(true);
+        // A mouse's deltas pass, and there is nothing to say.
+        assert!(!m.leaks(4.0, -3.0));
+        assert!(!m.take_notice());
+        // A leaked position is dropped, and said once.
+        assert!(m.leaks(340.0, 12.0));
+        assert!(m.take_notice());
+        assert!(!m.take_notice());
+        assert!(m.leaks(0.0, -420.0));
+        // A real finger reached SDL: the touchscreen is ours, nothing leaks any more.
+        m.fingers_seen = true;
+        assert!(!m.leaks(340.0, 12.0));
+        // Outside Gaming Mode a mouse may move that far in one event.
+        let mut d = super::SteamTouchMouse::new(false);
+        assert!(!d.leaks(340.0, 12.0));
+        assert!(!d.take_notice());
+    }
+
     use super::*;
 
     const ABS: Abs = Abs {
@@ -597,6 +841,159 @@ mod tests {
                 gs: BTN_LEFT,
                 down: false
             }]
+        );
+    }
+
+    /// Two fingers 40 px apart, rotated `deg` clockwise about `c`.
+    fn twisted(c: (f32, f32), deg: f32) -> ((f32, f32), (f32, f32)) {
+        let (s, k) = deg.to_radians().sin_cos();
+        let (rx, ry) = (20.0 * k, 20.0 * s); // half the finger-to-finger vector
+        ((c.0 - rx, c.1 - ry), (c.0 + rx, c.1 + ry))
+    }
+
+    fn dial_acts(acts: &[Act]) -> Vec<Act> {
+        acts.iter()
+            .copied()
+            .filter(|a| matches!(a, Act::Dial { .. } | Act::DialCommit | Act::DialCancel))
+            .collect()
+    }
+
+    #[test]
+    fn a_pure_scroll_never_arms_the_dial() {
+        let mut g = Gestures::new(true, false);
+        let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
+        let _ = g.down(2, 140.0, 200.0, ABS, 2.0);
+        let mut acts = Vec::new();
+        for step in 1..=10 {
+            let y = 200.0 - 4.0 * step as f32;
+            acts.extend(g.motion(1, 100.0, y, ABS, 10.0 * step as f64));
+            acts.extend(g.motion(2, 140.0, y, ABS, 10.0 * step as f64 + 1.0));
+        }
+        assert!(acts.iter().any(|a| matches!(a, Act::Scroll { .. })));
+        assert!(dial_acts(&acts).is_empty(), "{acts:?}");
+        acts.clear();
+        acts.extend(g.up(1, 200.0));
+        acts.extend(g.up(2, 201.0));
+        assert!(dial_acts(&acts).is_empty());
+    }
+
+    #[test]
+    fn a_thirty_five_degree_twist_commits_at_the_first_sample_past_thirty() {
+        let mut g = Gestures::new(true, false);
+        let c = (120.0, 200.0);
+        let (p1, p2) = twisted(c, 0.0);
+        let _ = g.down(1, p1.0, p1.1, ABS, 0.0);
+        let _ = g.down(2, p2.0, p2.1, ABS, 2.0);
+        let mut commit_at = None;
+        // 7° steps: no sample sits on a threshold, where float rounding decides the side.
+        for step in 1..=5 {
+            let deg = 7.0 * step as f32;
+            let (p1, p2) = twisted(c, deg);
+            let mut acts = g.motion(1, p1.0, p1.1, ABS, 10.0 * step as f64);
+            acts.extend(g.motion(2, p2.0, p2.1, ABS, 10.0 * step as f64 + 1.0));
+            assert!(
+                !acts.iter().any(|a| matches!(a, Act::Scroll { .. })),
+                "a twist never scrolls: {acts:?}"
+            );
+            let dial = dial_acts(&acts);
+            if deg < DIAL_ARM_DEG {
+                assert!(
+                    dial.is_empty(),
+                    "under the arm angle nothing fires: {dial:?}"
+                );
+            } else {
+                let Some(Act::Dial {
+                    progress,
+                    clockwise,
+                    ..
+                }) = dial.first()
+                else {
+                    panic!("expected a Dial act at {deg}°, got {dial:?}");
+                };
+                assert!(*clockwise, "the ring turns the way the hand turns");
+                let expected =
+                    ((deg - DIAL_ARM_DEG) / (DIAL_COMMIT_DEG - DIAL_ARM_DEG)).clamp(0.0, 1.0);
+                assert!(
+                    (progress - expected).abs() < 0.05,
+                    "{deg}°: {progress} vs {expected}"
+                );
+            }
+            if dial.contains(&Act::DialCommit) && commit_at.is_none() {
+                commit_at = Some(deg);
+            }
+        }
+        assert_eq!(
+            commit_at,
+            Some(35.0),
+            "commits exactly once, at the first sample past the commit angle"
+        );
+        // Committed: the lift leaves the ring open — no cancel, no click.
+        let mut acts = g.up(1, 100.0);
+        acts.extend(g.up(2, 101.0));
+        assert_eq!(acts, vec![]);
+    }
+
+    #[test]
+    fn a_twenty_degree_twist_then_a_lift_cancels_and_sends_nothing() {
+        let mut g = Gestures::new(true, false);
+        let c = (120.0, 200.0);
+        let (p1, p2) = twisted(c, 0.0);
+        let _ = g.down(1, p1.0, p1.1, ABS, 0.0);
+        let _ = g.down(2, p2.0, p2.1, ABS, 2.0);
+        let (p1, p2) = twisted(c, 20.0);
+        let mut acts = g.motion(1, p1.0, p1.1, ABS, 10.0);
+        acts.extend(g.motion(2, p2.0, p2.1, ABS, 11.0));
+        assert!(matches!(acts.first(), Some(Act::Dial { .. })));
+        assert!(!acts.contains(&Act::DialCommit));
+        let mut lift = g.up(1, 50.0);
+        assert_eq!(lift, vec![Act::DialCancel], "the ring winds back in");
+        // The finger still down must not move the cursor, and the last lift is not a tap.
+        lift.extend(g.motion(2, p2.0 + 40.0, p2.1, ABS, 60.0));
+        lift.extend(g.up(2, 70.0));
+        assert_eq!(lift, vec![Act::DialCancel]);
+    }
+
+    #[test]
+    fn a_drifting_twist_still_arms_and_scrolls_nothing() {
+        // Real fingers never pivot about a fixed point: the centroid drifts a few px per
+        // sample while the pair turns. Under the slop that drift is not a scroll — a single
+        // notch would lock the gesture as a scroll before the twist could reach 10°.
+        let mut g = Gestures::new(true, false);
+        let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
+        let _ = g.down(2, 140.0, 200.0, ABS, 2.0);
+        let mut acts = Vec::new();
+        for step in 1..=5 {
+            let c = (120.0 + 2.0 * step as f32, 200.0 - 2.0 * step as f32); // ~14 px in all
+            let (p1, p2) = twisted(c, 7.0 * step as f32);
+            acts.extend(g.motion(1, p1.0, p1.1, ABS, 10.0 * step as f64));
+            acts.extend(g.motion(2, p2.0, p2.1, ABS, 10.0 * step as f64 + 1.0));
+        }
+        assert!(
+            !acts.iter().any(|a| matches!(a, Act::Scroll { .. })),
+            "no notch while the pair is undecided: {acts:?}"
+        );
+        assert!(
+            acts.iter().any(|a| matches!(a, Act::Dial { .. })),
+            "the twist arms despite the drift: {acts:?}"
+        );
+        assert!(acts.contains(&Act::DialCommit), "35° commits: {acts:?}");
+    }
+
+    #[test]
+    fn a_scroll_then_a_rotation_stays_a_scroll() {
+        let mut g = Gestures::new(true, false);
+        let c = (120.0, 200.0);
+        let _ = g.down(1, 100.0, 200.0, ABS, 0.0);
+        let _ = g.down(2, 140.0, 200.0, ABS, 2.0);
+        let mut acts = g.motion(1, 100.0, 170.0, ABS, 10.0); // 30 px up: past the slop
+        acts.extend(g.motion(2, 140.0, 170.0, ABS, 11.0)); // notches fire
+        assert!(acts.iter().any(|a| matches!(a, Act::Scroll { .. })));
+        let (p1, p2) = twisted((c.0, 170.0), 40.0); // then a big twist around the new centroid
+        acts = g.motion(1, p1.0, p1.1, ABS, 20.0);
+        acts.extend(g.motion(2, p2.0, p2.1, ABS, 21.0));
+        assert!(
+            dial_acts(&acts).is_empty(),
+            "a scroll is a scroll for its lifetime: {acts:?}"
         );
     }
 

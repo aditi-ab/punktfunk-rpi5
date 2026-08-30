@@ -111,6 +111,15 @@ struct ContentView: View {
     /// The stats-OFF tier's touch-exit disc window (see the overlay in `stream(captureEnabled:)`
     /// — the disc must LEAVE the hierarchy so nothing composites over the metal layer).
     @State private var showTouchExit = false
+    #if os(iOS)
+    /// The quick-action ring (design/touch-client-overlay.md §2), one per session.
+    @StateObject private var ring = RingState()
+    #endif
+    #endif
+    #if os(tvOS)
+    /// The same ring on the Apple TV: a short Back on the remote or `Select+A` opens it, the
+    /// pad drives it (§2.5, §2.6).
+    @StateObject private var ring = RingState()
     #endif
     #if !os(macOS)
     @State private var showSettings = false
@@ -388,6 +397,35 @@ struct ContentView: View {
             case .streaming:
                 #if os(iOS)
                 showTouchExit = true // the off-tier exit disc's 8 s window, per session start
+                #if os(iOS)
+                ring.close()
+                // Host-action slots are pre-fetched here, never when the ring opens (§3.1).
+                if let host = model.activeHost { HostPowerStore.shared.refresh(host) }
+                // `Select+A` on a pad opens the ring at the screen centre; while it is up the
+                // pad belongs to it.
+                model.onRingChord = { [ring] in
+                    ring.pressTick &+= 1
+                    let b = UIScreen.main.bounds
+                    ring.openAt(CGPoint(x: b.midX, y: b.midY))
+                }
+                model.onRingNav = { [ring] nav in ring.nav(nav) }
+                #endif
+                #endif
+                #if os(tvOS)
+                ring.close()
+                if let host = model.activeHost { HostPowerStore.shared.refresh(host) }
+                // A short Back on the remote (or `Select+A`) toggles the ring at the screen
+                // centre; B or a second short Back closes it.
+                model.onRingChord = { [ring] in
+                    if ring.committed {
+                        ring.close()
+                    } else {
+                        ring.pressTick &+= 1
+                        let b = UIScreen.main.bounds
+                        ring.openAt(CGPoint(x: b.midX, y: b.midY))
+                    }
+                }
+                model.onRingNav = { [ring] nav in ring.nav(nav) }
                 #endif
                 // A session actually started — remember it on the card ("Connected … ago"
                 // plus the accent ring on the most recent host).
@@ -1086,6 +1124,7 @@ struct ContentView: View {
                     onDisconnectRequest: { [weak model] in
                         model?.disconnect() // the captured-state ⌃⌥⇧D combo
                     },
+                    onDial: dialSink,
                     onFrame: { [meter = model.meter, latency = model.latency,
                                 split = model.latencySplit, queue = model.clientQueue] au in
                         meter.note(byteCount: au.data.count)
@@ -1242,9 +1281,14 @@ struct ContentView: View {
                     if captureEnabled,
                        statsVerbosity == .compact || (statsVerbosity == .off && showTouchExit) {
                         HStack(spacing: 10) {
-                            Button { model.disconnect() } label: { touchDisc("xmark") }
+                            // Opens the quick-action ring (End stream is a slot inside, behind
+                            // a two-press arm), keeping the disc's fade rules.
+                            Button {
+                                ring.pressTick &+= 1
+                                ring.openAt(CGPoint(x: 30, y: 30))
+                            } label: { touchDisc("ellipsis.circle") }
                                 .buttonStyle(.plain)
-                                .accessibilityLabel("Disconnect")
+                                .accessibilityLabel("Quick actions")
                             // The mic toggle rides the same discs, for the same reason: in these
                             // tiers the HUD carries no buttons (compact is a stat pill, off is
                             // nothing), so this is a touch-only user's ONLY way to mute. Absent —
@@ -1267,10 +1311,91 @@ struct ContentView: View {
                         }
                     }
                 }
+                // The virtual controller: above the stream's touch surface, so its controls take
+                // their fingers first and every other finger falls through; below the ring, whose
+                // scrim owns every finger while it is up. Mounted only while shown (tenet 1).
+                .overlay {
+                    if captureEnabled, model.virtualPadShown, let pad = model.virtualPad {
+                        VirtualPadLayer(config: OverlayConfig.parse(SessionSettings.current.overlayActions).pad,
+                                        wire: pad)
+                    }
+                }
+                // The quick-action ring: opened by the two-finger twist under the fingers, or by
+                // the disc above. Mounted only while open — a closed overlay costs nothing.
+                .overlay {
+                    if captureEnabled, ring.visible {
+                        RingOverlay(
+                            state: ring,
+                            cfg: OverlayConfig.parse(SessionSettings.current.overlayActions),
+                            actions: ringActions(conn))
+                    }
+                }
+                .onChange(of: ring.committed) { _, open in model.setRingOpen(open) }
+                #endif
+                #if os(tvOS)
+                // The ring on the Apple TV: mounted only while open, like iOS.
+                .overlay {
+                    if captureEnabled, ring.visible {
+                        RingOverlay(
+                            state: ring,
+                            cfg: OverlayConfig.parse(SessionSettings.current.overlayActions),
+                            actions: ringActions(conn))
+                    }
+                }
+                .onChange(of: ring.committed) { _, open in model.setRingOpen(open) }
                 #endif
             }
         }
     }
+
+    #if os(iOS)
+    /// The two-finger twist → the ring. Nil on the platforms without a twist.
+    private var dialSink: ((DialEvent) -> Void)? { { [ring] event in ring.handle(event) } }
+    #endif
+
+    #if os(iOS) || os(tvOS)
+    /// The session's live state and commands behind each ring slot.
+    private func ringActions(_ conn: PunktfunkConnection) -> RingActions {
+        RingActions(
+            endStream: { [weak model] in model?.disconnect() },
+            disconnectLinger: { [weak model] in model?.disconnect(deliberate: false) },
+            touchMode: { TouchInputMode.current },
+            cycleTouchMode: {
+                // Passthrough is skipped toward a host that drops contacts (§5.4).
+                let order: [TouchInputMode] = conn.hostSupportsTouch ? [.trackpad, .pointer, .touch] : [.trackpad, .pointer]
+                let i = order.firstIndex(of: TouchInputMode.current) ?? 0
+                TouchInputMode.sessionOverride = order[(i + 1) % order.count]
+            },
+            keyboard: { NotificationCenter.default.post(name: .punktfunkShowSoftKeyboard, object: nil) },
+            stats: { [model] in model.statsVerbosity },
+            cycleStats: { StatsVerbosity.cycle() },
+            micAvailable: { [model] in model.micAvailable },
+            micMuted: { [model] in model.micMuted },
+            toggleMic: { [model] in model.toggleMicMute() },
+            hostActions: { [model] in model.activeHost.map { HostPowerStore.shared.actions(for: $0) } ?? [] },
+            invokeHost: { [model] action in
+                guard let host = model.activeHost else { return }
+                Task { _ = await HostPowerStore.shared.invoke(action, on: host) }
+            },
+            sendShortcut: { keys in
+                let vks = keys.compactMap(keyVk)
+                guard vks.count == keys.count, !vks.isEmpty else { return }
+                for vk in vks { conn.send(.key(vk, down: true)) }
+                for vk in vks.reversed() { conn.send(.key(vk, down: false)) }
+            },
+            padAvailable: { [model] in model.virtualPadAvailable },
+            padShown: { [model] in model.virtualPadShown },
+            togglePad: { [model] in model.toggleVirtualPad() },
+            currentMode: {
+                let m = conn.currentMode()
+                return (m.width, m.height, m.refreshHz)
+            },
+            requestMode: { w, h, hz in conn.requestMode(width: w, height: h, refreshHz: hz) })
+    }
+    #endif
+    #if !os(iOS)
+    private var dialSink: ((DialEvent) -> Void)? { nil }
+    #endif
 
     #if os(iOS)
     /// One touch-control disc: an SF Symbol on a floating glass disc over the frame (26+,

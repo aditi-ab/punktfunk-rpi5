@@ -97,6 +97,10 @@ pub mod os;
 // gamepad input mask, which SDL's own focus gate structurally cannot provide there.
 #[cfg(target_os = "linux")]
 pub mod overlay_focus;
+// The in-stream quick-action ring's setting (one JSON blob): pure data, every platform.
+pub mod overlay_actions;
+// The ring's portable contract (inputs, commands, session facts): pure data, every platform.
+pub mod ring;
 // Client settings profiles: the override catalog + the one connect-time resolver
 // (design/client-settings-profiles.md §4). Sits beside `trust`, which owns the host records
 // the bindings live on.

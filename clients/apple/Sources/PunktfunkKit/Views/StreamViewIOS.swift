@@ -54,6 +54,7 @@ public struct StreamView: UIViewControllerRepresentable {
     private let connection: PunktfunkConnection
     private let captureEnabled: Bool
     private let onCaptureChange: ((Bool) -> Void)?
+    private let onDial: ((DialEvent) -> Void)?
     private let onFrame: (@Sendable (AccessUnit) -> Void)?
     private let onSessionEnd: (@Sendable () -> Void)?
     private let onResizeTarget: ((UInt32, UInt32) -> Void)?
@@ -72,6 +73,7 @@ public struct StreamView: UIViewControllerRepresentable {
         captureEnabled: Bool = true,
         onCaptureChange: ((Bool) -> Void)? = nil,
         onDisconnectRequest: (() -> Void)? = nil,
+        onDial: ((DialEvent) -> Void)? = nil,
         onFrame: (@Sendable (AccessUnit) -> Void)? = nil,
         onSessionEnd: (@Sendable () -> Void)? = nil,
         onResizeTarget: ((UInt32, UInt32) -> Void)? = nil,
@@ -84,6 +86,7 @@ public struct StreamView: UIViewControllerRepresentable {
         self.connection = connection
         self.captureEnabled = captureEnabled
         self.onCaptureChange = onCaptureChange
+        self.onDial = onDial
         self.onFrame = onFrame
         self.onSessionEnd = onSessionEnd
         self.onResizeTarget = onResizeTarget
@@ -97,6 +100,7 @@ public struct StreamView: UIViewControllerRepresentable {
     public func makeUIViewController(context: Context) -> StreamViewController {
         let controller = StreamViewController()
         controller.onCaptureChange = onCaptureChange
+        controller.onDial = onDial
         controller.captureEnabled = captureEnabled
         controller.endToEndMeter = endToEndMeter
         controller.decodeMeter = decodeMeter
@@ -110,6 +114,7 @@ public struct StreamView: UIViewControllerRepresentable {
 
     public func updateUIViewController(_ controller: StreamViewController, context: Context) {
         controller.onCaptureChange = onCaptureChange
+        controller.onDial = onDial
         controller.captureEnabled = captureEnabled
         controller.endToEndMeter = endToEndMeter
         controller.decodeMeter = decodeMeter
@@ -248,6 +253,8 @@ public final class StreamViewController: StreamViewControllerBase {
     }
 
     var onCaptureChange: ((Bool) -> Void)?
+    /// The two-finger twist turning the quick-action ring (forwarded from the stream view).
+    var onDial: ((DialEvent) -> Void)?
     /// Resize-overlay START: forwarded to the Match-window follower so a scene resize drives the
     /// blur+spinner the instant the window differs from the live mode (iOS only — tvOS has no
     /// follower). See `MatchWindowFollower.onResizeTarget`.
@@ -482,6 +489,11 @@ public final class StreamViewController: StreamViewControllerBase {
         // Pencil stays a finger, exactly as before). Same trust gate as touch.
         streamView.penEnabled = connection.hostSupportsPen
         streamView.touchPassthroughEnabled = connection.hostSupportsTouch
+        // The two-finger twist → the quick-action ring, same trust gate as touch.
+        streamView.onDial = { [weak self] event in
+            guard let self, self.captureEnabled else { return }
+            self.onDial?(event)
+        }
         streamView.onPenBatch = { [weak self, weak connection] batch in
             guard self?.captureEnabled == true else { return }
             connection?.sendPen(batch)
@@ -683,6 +695,14 @@ public final class StreamViewController: StreamViewControllerBase {
                   self.view.window?.windowScene?.activationState == .foregroundActive else { return }
             self.setCaptured(false)
         })
+        // The ring's Keyboard slot summons the soft keyboard the three-finger swipe does.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .punktfunkShowSoftKeyboard, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self,
+                  self.view.window?.windowScene?.activationState == .foregroundActive else { return }
+            self.streamView.setSoftKeyboardVisible(true)
+        })
 
         if captureEnabled {
             setCaptured(true) // entering a session is the deliberate "capture me" moment
@@ -714,6 +734,8 @@ public final class StreamViewController: StreamViewControllerBase {
         // onTouchEvent can still deliver the button-up.
         streamView.resetTouchInput()
         streamView.onTouchEvent = nil
+        streamView.onDial = nil
+        TouchInputMode.sessionOverride = nil // the ring's mid-stream switch dies with the session
         streamView.onPenBatch = nil // after reset — the pen's leave-range sample rides it
         streamView.onPenProximity = nil // after reset — its leave-range transition fired above
         penBoostRelease?.cancel()
@@ -1082,6 +1104,8 @@ final class StreamLayerUIView: UIView {
     var onPointerButton: ((_ button: UInt32, _ down: Bool) -> Void)?
     /// Trackpad two-finger / wheel scroll (no lock) → host scroll deltas, WHEEL(120)-scaled.
     var onScroll: ((_ dx: Float, _ dy: Float) -> Void)?
+    /// The two-finger twist turning the quick-action ring.
+    var onDial: ((DialEvent) -> Void)?
 
     /// Wire touch ids per active direct UITouch; ids are reused after the touch ends.
     private var touchIDs: [ObjectIdentifier: UInt32] = [:]
@@ -1094,6 +1118,7 @@ final class StreamLayerUIView: UIView {
         mouse.send = { [weak self] event in self?.onTouchEvent?(event) }
         mouse.hostPoint = { [weak self] point in self?.hostPoint(from: point) }
         mouse.onKeyboardGesture = { [weak self] show in self?.setSoftKeyboardVisible(show) }
+        mouse.onDial = { [weak self] event in self?.onDial?(event) }
         return mouse
     }()
     /// The finger route latched at gesture start — a Settings change mid-gesture applies to

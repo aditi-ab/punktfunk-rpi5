@@ -703,6 +703,10 @@ fn commit_profile(active: &StreamProfile, touched: &Touched, values: &Settings) 
     if touched.has("allow_vrr") {
         o.allow_vrr = Some(values.allow_vrr);
     }
+    if touched.has("overlay_actions") {
+        // The whole ring, not a slot: a profile that touches it owns all of it (D10).
+        o.overlay_actions = Some(values.overlay_actions.clone());
+    }
     // Resets are not handled here: they clear the field and re-seed their row the moment the
     // user asks, so by the time this runs the catalog already reflects them and the row is no
     // longer marked touched.
@@ -1196,6 +1200,9 @@ pub fn show_scoped(
     let dialog = adw::PreferencesDialog::new();
     dialog.set_title("Preferences");
     dialog.set_search_enabled(true);
+    // The quick-action ring's row and editor, seeded with the scope's effective blob like
+    // every row; it lives on the Input page below and reports its edits to the profile block.
+    let quick = crate::ui_quick_actions::QuickActions::new(&dialog, &seed.overlay_actions);
     // Wide enough that the category switcher sits in the HEADER BAR (the tabbed look the
     // Apple/Windows clients have): AdwPreferencesDialog moves it to a bottom bar below a
     // breakpoint of 110pt × page count (≈ 733 px for our five pages). In a window that
@@ -1987,6 +1994,27 @@ pub fn show_scoped(
         );
         toggle!(vsync_row, "vsync", o.vsync.is_some(), vsync);
         toggle!(vrr_row, "allow_vrr", o.allow_vrr.is_some(), allow_vrr);
+        // The ring's editor reports every edit it makes; a reset puts the inherited blob back
+        // and the next open of the editor shows it.
+        {
+            let revert = {
+                let (quick, blob) = (quick.clone(), globals.overlay_actions.clone());
+                Box::new(move || quick.set_blob(&blob)) as Box<dyn Fn()>
+            };
+            let show = mark(
+                quick.row().upcast_ref(),
+                "overlay_actions",
+                o.overlay_actions.is_some(),
+                revert,
+            );
+            let t = touched.clone();
+            quick.connect_changed(move || {
+                t.mark("overlay_actions");
+                if let Some(show) = &show {
+                    show();
+                }
+            });
+        }
         toggle!(hdr_row, "hdr_enabled", o.hdr_enabled.is_some(), hdr_enabled);
         toggle!(chroma_row, "enable_444", o.enable_444.is_some(), enable_444);
         toggle!(
@@ -2124,6 +2152,15 @@ pub fn show_scoped(
     kbm_group.add(&invert_row);
     input.add(&touch_group);
     input.add(&kbm_group);
+    // The quick-action ring: one row that opens its editor — the ring itself (design
+    // touch-client-overlay.md §3.3). Built with the dialog above, like every row.
+    let ring_group = group(
+        "Quick actions",
+        "The ring a two-finger twist or Select+A opens in a stream: what its six buttons hold, \
+         and the shortcut chords they can send.",
+    );
+    ring_group.add(quick.row());
+    input.add(&ring_group);
 
     let audio = page("Audio", "audio-volume-high-symbolic");
     let audio_group = group("", "Applies from the next session.");
@@ -2204,6 +2241,7 @@ pub fn show_scoped(
     dialog.add(&audio);
     dialog.add(&controllers);
 
+    let quick_blob = quick.blob();
     dialog.connect_closed(move |_| {
         // One reader for the rows, two destinations: the globals, or a profile's overrides.
         // Sharing it is what keeps the two scopes from interpreting the same controls
@@ -2302,6 +2340,7 @@ pub fn show_scoped(
                 (buffer_row.selected() as u8).min(SMOOTH_BUFFER_LABELS.len() as u8 - 1);
             s.vsync = vsync_row.is_active();
             s.allow_vrr = vrr_row.is_active();
+            s.overlay_actions = quick_blob.borrow().clone();
         };
 
         match &active {

@@ -1086,7 +1086,7 @@ impl LibraryScreen {
                 Some(MenuPulse::Move)
             }
             MenuEvent::Move(MenuDir::Up) => Some(MenuPulse::Boundary),
-            MenuEvent::Secondary | MenuEvent::Tertiary => None,
+            MenuEvent::Secondary | MenuEvent::Tertiary | MenuEvent::Sector(_) => None,
         }
     }
 
@@ -1210,7 +1210,10 @@ impl LibraryScreen {
                 fx.push(Screen::Collections(screen));
                 Some(MenuPulse::Confirm)
             }
-            MenuEvent::Move(_) | MenuEvent::JumpBack | MenuEvent::JumpForward => None,
+            MenuEvent::Move(_)
+            | MenuEvent::Sector(_)
+            | MenuEvent::JumpBack
+            | MenuEvent::JumpForward => None,
         }
     }
 

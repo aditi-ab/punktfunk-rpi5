@@ -182,6 +182,10 @@ public enum DefaultsKey {
     /// the macOS wheel, the iOS trackpad pan, and a GCMouse wheel. For users whose host expects the
     /// opposite convention from their local OS preference.
     public static let invertScroll = "punktfunk.invertScroll"
+    /// The in-stream quick-action ring: one JSON blob parsed by `OverlayConfig.parse` (six slots,
+    /// shortcuts, the virtual pad's preset). Empty = the platform default ring. Cross-client
+    /// `overlay_actions`, profileable as the whole blob.
+    public static let overlayActions = "punktfunk.overlayActions"
     /// Location-based modifier mapping (a `ModifierLayout` value, default `.mac`): which Windows VK
     /// each PHYSICAL modifier position forwards to the host. `.mac` keeps ⌥ Option → Alt and
     /// ⌘ Command → Super/Win (the Apple positions). `.windows` swaps the Alt/Super ROLE between the
@@ -308,6 +312,8 @@ extension Notification.Name {
     /// menus) — it exists so the menu item is honest whenever it CAN fire, and as the shortcut's
     /// discoverable menu-bar surface.
     public static let punktfunkReleaseCapture = Notification.Name("io.unom.punktfunk.release-capture")
+    /// The quick-action ring's Keyboard slot: summon the stream view's soft keyboard (iOS).
+    public static let punktfunkShowSoftKeyboard = Notification.Name("io.unom.punktfunk.show-soft-keyboard")
 
     /// Posted by the app's Stream menu ("Toggle Fullscreen", ⌃⌘F) and by InputCapture's monitor
     /// when the same combo fires while input is captured (the menu key-equivalent never reaches a

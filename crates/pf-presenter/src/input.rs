@@ -28,6 +28,8 @@ use pf_client_core::trust::{MouseMode, TouchMode};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::input::{InputEvent, InputKind};
 use punktfunk_core::quic::{classify, GRANT_KEYBOARD, GRANT_POINTER};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 impl Act {
     /// The `(InputKind, code, x, y, flags)` this intent sends. `Button`/`CycleStats` don't map
@@ -45,12 +47,14 @@ impl Act {
                 ((a.w & 0xffff) << 16) | (a.h & 0xffff),
             )),
             Act::Scroll { axis, delta } => Some((InputKind::MouseScroll, axis, delta, 0, 0)),
-            Act::Button { .. } | Act::CycleStats => None,
+            Act::Button { .. }
+            | Act::CycleStats
+            | Act::Dial { .. }
+            | Act::DialCommit
+            | Act::DialCancel => None,
         }
     }
 }
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 /// Which transition a forwarded touchscreen finger is (SDL delivers one finger per event).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -570,8 +574,8 @@ impl Capture {
     /// physical window pixels (the trackpad ballistics + gesture geometry); `abs` is the same
     /// finger mapped into the letterboxed content rect (pointer moves + raw passthrough). In
     /// `Touch` mode fingers go on the wire as real contacts; in `Trackpad`/`Pointer` they
-    /// drive the gesture engine. Returns true when a three-finger tap asks to cycle the stats
-    /// overlay — the only signal the run loop must act on.
+    /// drive the gesture engine. Returns the intents the RUN LOOP owns — the three-finger
+    /// stats tap and the dial's turn/commit/cancel; everything else went on the wire here.
     pub fn dispatch_finger(
         &mut self,
         phase: FingerPhase,
@@ -580,7 +584,7 @@ impl Capture {
         wy: f32,
         abs: Abs,
         t_ms: f64,
-    ) -> bool {
+    ) -> Vec<Act> {
         match self.touch_mode {
             TouchMode::Touch => {
                 match phase {
@@ -588,26 +592,83 @@ impl Capture {
                     FingerPhase::Move => self.on_touch_move(id, abs.x, abs.y, abs.w, abs.h),
                     FingerPhase::Up => self.on_touch_up(id),
                 }
-                false
+                Vec::new()
             }
             TouchMode::Trackpad | TouchMode::Pointer => {
                 // Down/Move only while captured (the stream owns the glass); an Up always runs
                 // so a lift can conclude a gesture / release a held drag even if capture just
                 // dropped (focus loss mid-touch).
                 if !self.captured && phase != FingerPhase::Up {
-                    return false;
+                    return Vec::new();
                 }
                 let acts = match phase {
                     FingerPhase::Down => self.gestures.down(id, wx, wy, abs, t_ms),
                     FingerPhase::Move => self.gestures.motion(id, wx, wy, abs, t_ms),
                     FingerPhase::Up => self.gestures.up(id, t_ms),
                 };
-                let mut cycle_stats = false;
-                for act in acts {
-                    cycle_stats |= self.apply_touch_act(act);
-                }
-                cycle_stats
+                acts.into_iter()
+                    .filter_map(|act| self.apply_touch_act(act))
+                    .collect()
             }
+        }
+    }
+
+    pub fn touch_mode(&self) -> TouchMode {
+        self.touch_mode
+    }
+
+    /// The ring's Touch mode slot: switch the model mid-stream. Anything a gesture holds is
+    /// released first (a held drag must not survive a model switch), and the engine restarts.
+    pub fn set_touch_mode(&mut self, mode: TouchMode) {
+        for b in self.held_buttons.drain() {
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::MouseButtonUp,
+                b,
+                0,
+                0,
+                0,
+            );
+        }
+        for (_, slot) in self.touch_slots.drain() {
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::TouchUp,
+                slot,
+                0,
+                0,
+                0,
+            );
+        }
+        self.touch_mode = mode;
+        self.gestures = Gestures::new(mode == TouchMode::Trackpad, self.invert_scroll);
+    }
+
+    /// A ring shortcut: the chord's VKs down in order, then up in reverse.
+    pub fn send_chord(&mut self, vks: &[u8]) {
+        for &vk in vks {
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::KeyDown,
+                u32::from(vk),
+                0,
+                0,
+                0,
+            );
+        }
+        for &vk in vks.iter().rev() {
+            send(
+                &self.connector,
+                self.grants,
+                InputKind::KeyUp,
+                u32::from(vk),
+                0,
+                0,
+                0,
+            );
         }
     }
 
@@ -623,11 +684,13 @@ impl Capture {
     }
 
     /// Send one gesture [`Act`] on the wire, tracking button holds in `held_buttons` so a
-    /// capture release flushes them (a tap-drag's left button never sticks down). Returns
-    /// true for [`Act::CycleStats`], which is a run-loop signal, not a wire event.
-    fn apply_touch_act(&mut self, act: Act) -> bool {
+    /// capture release flushes them (a tap-drag's left button never sticks down). Hands back
+    /// the run-loop intents — [`Act::CycleStats`] and the dial's — which are not wire events.
+    fn apply_touch_act(&mut self, act: Act) -> Option<Act> {
         match act {
-            Act::CycleStats => return true,
+            Act::CycleStats | Act::Dial { .. } | Act::DialCommit | Act::DialCancel => {
+                return Some(act)
+            }
             Act::Button { gs, down } => {
                 if down {
                     self.flush_motion(); // the press lands where the cursor now is
@@ -660,6 +723,6 @@ impl Capture {
                 }
             }
         }
-        false
+        None
     }
 }

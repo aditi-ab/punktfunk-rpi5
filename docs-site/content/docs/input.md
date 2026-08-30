@@ -210,6 +210,30 @@ or Windows before 1809), a client set to Touch passthrough runs the trackpad mod
 session and says so in a short notice when the stream starts, instead of forwarding contacts the
 host would drop.
 
+## The quick-action ring
+
+On Android, iPhone and iPad a **two-finger twist** on the stream opens a ring of six buttons under
+your fingers: about 10° starts it opening, 30° commits it, and lifting short of that winds it back
+in and sends nothing. The centre button opens a sheet with the whole catalogue and the resolution
+presets. On Android the **Back** gesture opens the same ring at the screen centre instead of ending
+the session; on iPhone and iPad the corner disc does; on Apple TV a short press of the remote's
+Back; with a controller, **Select+A** (Select first) on every client, and the host never sees the
+two presses. What the six buttons hold is the **Quick actions** setting — on the phones the editor
+is the ring itself.
+
+### Virtual controller
+
+Android and iPhone/iPad can draw a controller over the stream, for a game that needs one when no
+controller is attached. Show or hide it from the ring's **Virtual controller** button. The host sees
+one controller arrive when it appears and one leave when it goes, exactly as for a real pad, on the
+next free pad index beside any real controller you have connected. A finger on one of its controls
+drives the game; a finger anywhere else still drives the touch mode, so tap-to-click keeps working
+beside it. A stick follows your thumb from wherever it lands, the D-pad reads eight directions, and a
+trigger reads how far down its pill your finger sits, so a slow press is a slow press. **Layout**,
+**Opacity** and **Scale** live under Quick actions in the [client settings](/docs/client-settings#input):
+Full (two sticks, D-pad, face buttons, bumpers and triggers), Sticks and shoulders, or D-pad and
+face buttons. Not on Apple TV, a Steam Deck or the desktop clients.
+
 ## Pen and stylus
 
 A stylus is not treated as a finger. Punktfunk carries **position, tip pressure, tilt angle and tilt

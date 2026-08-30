@@ -97,6 +97,10 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.invertScroll) var invertScroll = false
     @AppStorage(DefaultsKey.modifierLayout) var modifierLayout = ModifierLayout.mac.rawValue
     #endif
+    // The quick-action ring's blob — every platform, tvOS included (the pad opens the ring there).
+    @AppStorage(DefaultsKey.overlayActions) var overlayActions = ""
+    /// The quick-actions editor, as a sheet (the detail column is not a NavigationStack).
+    @State var showQuickActions = false
     #if DEBUG && !os(tvOS)
     @State var showControllerTest = false
     #endif

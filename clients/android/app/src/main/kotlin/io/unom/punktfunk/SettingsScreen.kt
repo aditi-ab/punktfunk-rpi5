@@ -131,6 +131,7 @@ fun SettingsScreen(
 
     var showLicenses by remember { mutableStateOf(false) }
     var showControllers by remember { mutableStateOf(false) }
+    var showQuickActions by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<EditIntent?>(null) }
     var deleting by remember { mutableStateOf<StreamProfile?>(null) }
 
@@ -194,6 +195,20 @@ fun SettingsScreen(
     }
     if (showControllers) {
         ControllersScreen(gamepadSetting = s.gamepad, onBack = { showControllers = false })
+        return
+    }
+    if (showQuickActions) {
+        QuickActionsScreen(
+            blob = s.overlayActions,
+            onChange = { update(s.copy(overlayActions = it)) },
+            // Reset drops the override in profile scope (design §3.3) and clears the global
+            // otherwise; an empty blob is the platform default.
+            onReset = {
+                if (active != null) resetField("overlay_actions") else update(s.copy(overlayActions = ""))
+            },
+            onBack = { showQuickActions = false },
+            overridden = active?.overrides?.overridden()?.contains("overlay_actions") == true,
+        )
         return
     }
 
@@ -262,6 +277,7 @@ fun SettingsScreen(
                             context = context,
                             onMicChange = onMicChange,
                             onOpenControllers = { showControllers = true },
+                            onOpenQuickActions = { showQuickActions = true },
                             onOpenLicenses = { showLicenses = true },
                             onBack = back,
                         )
@@ -528,6 +544,7 @@ private fun CategoryDetail(
     context: android.content.Context,
     onMicChange: (Boolean) -> Unit,
     onOpenControllers: () -> Unit,
+    onOpenQuickActions: () -> Unit,
     onOpenLicenses: () -> Unit,
     onBack: (() -> Unit)?,
 ) {
@@ -549,7 +566,7 @@ private fun CategoryDetail(
         when (category) {
             SettingsCategory.General -> GeneralSettings(settings, onChange)
             SettingsCategory.Display -> DisplaySettings(settings, onChange, context)
-            SettingsCategory.Input -> InputSettings(settings, onChange)
+            SettingsCategory.Input -> InputSettings(settings, onChange, onOpenQuickActions)
             SettingsCategory.Audio -> AudioSettings(settings, onChange, onMicChange)
             SettingsCategory.Controllers -> ControllerSettings(settings, onChange, onOpenControllers)
             SettingsCategory.About -> AboutSettings(context, onOpenLicenses)
@@ -785,7 +802,7 @@ private fun DisplaySettings(s: Settings, update: (Settings) -> Unit, context: an
 }
 
 @Composable
-private fun InputSettings(s: Settings, update: (Settings) -> Unit) {
+private fun InputSettings(s: Settings, update: (Settings) -> Unit, onOpenQuickActions: () -> Unit) {
     SettingsGroup("Touch & pointer") {
         SettingDropdown(
             label = "Touch input",
@@ -795,6 +812,15 @@ private fun InputSettings(s: Settings, update: (Settings) -> Unit) {
             caption = "Trackpad moves the cursor by relative swipes; Direct pointer jumps it " +
                 "to your finger; Passthrough sends real multi-touch.",
         ) { mode -> update(s.copy(touchMode = mode)) }
+        Column {
+            OverrideBadge("overlay_actions")
+            ClickableRow(
+                title = "Quick actions",
+                subtitle = "Which actions the in-stream ring offers and the shortcuts it can " +
+                    "send; a profile that changes it owns the whole ring",
+                onClick = onOpenQuickActions,
+            )
+        }
     }
     SettingsGroup("Keyboard & mouse") {
         SettingDropdown(
@@ -1027,7 +1053,7 @@ private fun AboutSettings(context: android.content.Context, onOpenLicenses: () -
  * per-field guidance lives on the fields themselves.
  */
 @Composable
-private fun SettingsGroup(
+internal fun SettingsGroup(
     header: String? = null,
     footer: String? = null,
     content: @Composable ColumnScope.() -> Unit,
@@ -1128,7 +1154,7 @@ private fun ClickableRow(title: String, subtitle: String, onClick: () -> Unit) {
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun <T> SettingDropdown(
+internal fun <T> SettingDropdown(
     label: String,
     options: List<Pair<T, String>>,
     selected: T,

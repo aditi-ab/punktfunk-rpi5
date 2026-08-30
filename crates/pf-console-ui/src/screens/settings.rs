@@ -77,6 +77,10 @@ enum RowId {
     Mouse,
     InvertScroll,
     Shortcuts,
+    /// The quick-action ring — `trust::Settings::overlay_actions`, the whole blob — edited
+    /// on the ring itself (an action row — opens [`super::ring_editor::RingEditorScreen`],
+    /// design touch-client-overlay.md §3.3).
+    QuickActions,
     Stats,
     Fullscreen,
     AutoWake,
@@ -257,6 +261,7 @@ const TABS: [(&str, &[RowId]); 7] = [
             RowId::Mouse,
             RowId::InvertScroll,
             RowId::Shortcuts,
+            RowId::QuickActions,
         ],
     ),
     (
@@ -738,6 +743,19 @@ impl SettingsScreen {
                     ListMsg::None => pulse,
                 };
             }
+            // The ring is edited on the ring itself, on its own screen; ◀ ▶ thud.
+            RowId::QuickActions => {
+                return match msg {
+                    ListMsg::Activate => {
+                        fx.push(Screen::RingEditor(Box::new(
+                            super::ring_editor::RingEditorScreen::new(ctx),
+                        )));
+                        pulse
+                    }
+                    ListMsg::Adjust(_) => Some(MenuPulse::Boundary),
+                    ListMsg::None => pulse,
+                };
+            }
             // Connected controllers is one of ours now — a shared Skia screen, so the console
             // keeps its own input on the page and only the grant dialogs go back to the host.
             RowId::Controllers => {
@@ -1047,6 +1065,11 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
         }
         RowId::Controllers => return RowSpec::action("Connected controllers", true),
         RowId::Licenses => return RowSpec::action("Open-source licences", true),
+        RowId::QuickActions => {
+            let mut r = RowSpec::action("Quick actions", true);
+            r.header = Some("Quick actions");
+            return r;
+        }
         _ => {}
     }
     let s = &ctx.settings;
@@ -1311,7 +1334,11 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             )
             .into(),
         ),
-        RowId::Profile(_) | RowId::NoProfiles | RowId::Controllers | RowId::Licenses => {
+        RowId::Profile(_)
+        | RowId::NoProfiles
+        | RowId::Controllers
+        | RowId::Licenses
+        | RowId::QuickActions => {
             unreachable!("returned above")
         }
     };
@@ -1443,6 +1470,10 @@ fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             }
         },
         RowId::InvertScroll => "Reverses the wheel and trackpad scroll direction sent to the host.",
+        RowId::QuickActions => {
+            "The ring a two-finger twist or Select+A opens in a stream: what its six buttons \
+             hold, and the shortcut chords they can send. Edited on the ring itself."
+        }
         RowId::Shortcuts => {
             "Alt+Tab, Super and friends reach the host while input is captured. \
              Off, they act on this device instead."
@@ -1795,7 +1826,11 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             })
         }
         // Navigation rows, handled before the settings path in `menu` — never a value edit.
-        RowId::Profile(_) | RowId::NoProfiles | RowId::Controllers | RowId::Licenses => None,
+        RowId::Profile(_)
+        | RowId::NoProfiles
+        | RowId::Controllers
+        | RowId::Licenses
+        | RowId::QuickActions => None,
     }
     .is_some()
 }
@@ -2614,6 +2649,37 @@ pub(super) mod tests {
         assert!(fx.nav.is_none());
     }
 
+    /// The quick-action row is an action row on every platform — the ring is edited on the
+    /// ring itself, not stepped here — and ◀ ▶ on it is never a value edit.
+    #[test]
+    fn the_quick_actions_row_opens_the_editor_and_steps_nothing() {
+        let (mut settings, pads) = ctx_parts();
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            hosts: &[],
+            library: &library,
+            settings: &mut settings,
+            store: crate::store::file_store(),
+            platform: crate::platform::Platform::Desktop,
+            pads: &pads,
+            deck: false,
+            fallback_ui: false,
+            device_name: "t",
+            t: 0.0,
+        };
+        let row = row_spec(RowId::QuickActions, &ctx, &[]);
+        assert!(row.value.is_none(), "an action row");
+        assert_eq!(row.label, "Quick actions");
+        assert!(!adjust(RowId::QuickActions, 1, false, &mut ctx));
+        assert!(
+            ctx.settings.overlay_actions.is_empty(),
+            "the row itself never writes the blob"
+        );
+        assert!(TABS
+            .iter()
+            .any(|(tab, rows)| *tab == "Input" && rows.contains(&RowId::QuickActions)));
+    }
+
     /// Every row the screen knows about must live in exactly one tab — a row missing from
     /// [`TABS`] is a setting that became unreachable in Gaming Mode, which is precisely
     /// what this screen exists to prevent.
@@ -2743,8 +2809,9 @@ pub(super) mod tests {
         // paired host now.
         // 37 desktop rows (the daily-driver batch added 10-bit SDR and Keep host audio) +
         // the ten Android-only ones (design android-skia-console-port.md D3): eight
-        // `extra`-backed settings and two platform-screen action rows.
-        assert_eq!(seen.len(), 47, "{seen:?}");
+        // `extra`-backed settings and two platform-screen action rows + the quick-action
+        // ring's one action row (every platform; the editor is the ring itself).
+        assert_eq!(seen.len(), 48, "{seen:?}");
         assert!(seen.contains(&RowId::Palette));
         assert!(seen.contains(&RowId::ReduceMotion));
         assert!(seen.contains(&RowId::ReduceUiResolution));

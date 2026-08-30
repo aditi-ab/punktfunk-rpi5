@@ -420,7 +420,7 @@ fn edit_profile_modal(
 /// fixed in "the override marker appears on touch". Bumping on global-scope edits too is
 /// deliberate: it is one code path, a same-value repaint is cheap, and it also refreshes
 /// rows whose displayed effective value derives from the field just written.
-fn commit(
+pub(super) fn commit(
     ctx: &Arc<AppCtx>,
     scope: &str,
     rev: (u64, &AsyncSetState<u64>),
@@ -508,6 +508,8 @@ struct OverrideFlags {
     smooth_buffer: bool,
     vsync: bool,
     allow_vrr: bool,
+    /// The whole ring: a profile that touches it owns all of it (D10).
+    overlay_actions: bool,
 }
 
 impl OverrideFlags {
@@ -546,12 +548,13 @@ impl OverrideFlags {
             smooth_buffer: o.smooth_buffer.is_some(),
             vsync: o.vsync.is_some(),
             allow_vrr: o.allow_vrr.is_some(),
+            overlay_actions: o.overlay_actions.is_some(),
         }
     }
 }
 
 /// The layer the settings screen is editing, resolved for display: `None` = the defaults.
-fn active_profile(scope: &str) -> Option<StreamProfile> {
+pub(super) fn active_profile(scope: &str) -> Option<StreamProfile> {
     (!scope.is_empty())
         .then(|| ProfilesFile::load().find_by_id(scope).cloned())
         .flatten()
@@ -1408,6 +1411,30 @@ pub(crate) fn settings_page(
             ));
             ("Input", out)
         }
+        // The quick-action ring, edited on the ring itself (design touch-client-overlay.md
+        // §3.3). The editor commits every edit itself; the override marker is the page's.
+        "quick_actions" => (
+            "Quick actions",
+            vec![described_overridable(
+                (rev, set_rev),
+                scope,
+                "overlay_actions",
+                "Quick actions",
+                over.overlay_actions,
+                component(
+                    super::quick_actions::quick_actions_section,
+                    super::quick_actions::Props {
+                        ctx: ctx.clone(),
+                        scope: scope.to_string(),
+                        rev,
+                        set_rev: set_rev.clone(),
+                    },
+                ),
+                "The ring a two-finger twist or Select+A opens in a stream: what its six buttons \
+                 hold, and the shortcut chords they can send. A profile that changes it owns the \
+                 whole ring.",
+            )],
+        ),
         "controllers" => (
             "Controllers",
             group(
@@ -1706,6 +1733,9 @@ pub(crate) fn settings_page(
         NavViewItem::new("Input")
             .tag("input")
             .icon(Symbol::Keyboard),
+        NavViewItem::new("Quick actions")
+            .tag("quick_actions")
+            .icon(Symbol::Rotate),
         NavViewItem::new("Audio").tag("audio").icon(Symbol::Volume),
         NavViewItem::new("Controllers")
             .tag("controllers")

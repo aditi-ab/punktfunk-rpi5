@@ -181,6 +181,7 @@ pub fn run(target: Option<&str>) -> u8 {
         mouse_mode: settings_at_start.mouse_mode(),
         invert_scroll: settings_at_start.invert_scroll,
         inhibit_shortcuts: settings_at_start.inhibit_shortcuts,
+        overlay_actions: settings_at_start.overlay_actions.clone(),
         // Presentation-tier like the rows above: latched at console start, a per-host
         // profile cannot move it in this mode (the documented P4 gap).
         present_priority: settings_at_start.present_priority(),
