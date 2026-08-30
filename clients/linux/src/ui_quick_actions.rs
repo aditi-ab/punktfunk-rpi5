@@ -406,8 +406,14 @@ fn disc_face(cfg: &OverlayConfig, slot: Option<&SlotId>) -> gtk::Widget {
 
 /// A chord as a stacked keycap: `Ctrl Shift` small over `Esc` large.
 fn keycap(keys: &[String]) -> gtk::Box {
+    // Expands, so that centring it means anything. Every holder this goes into is a fixed-size
+    // disc wider than the chord — a `gtk::Box` is horizontal by default and packs one child at
+    // the start, so without this the text sits on the disc's left edge whatever its alignment
+    // says. With it the chord takes the whole disc and its own centre alignment lands it.
     let b = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .vexpand(true)
         .valign(gtk::Align::Center)
         .halign(gtk::Align::Center)
         .build();
@@ -460,7 +466,13 @@ fn build_ring(
         .height_request(CENTRE_DIAMETER as i32)
         .tooltip_text("More — the rest of the actions, in the stream")
         .build();
-    centre.append(&crate::lucide::icon("ellipsis", ICON_PX));
+    // The mark has to EXPAND to be centred. A `gtk::Box` is horizontal by default and packs a
+    // single child at the start, so a child narrower than the box's requested width sits on its
+    // left edge however it aligns itself; expanding gives it the whole box to centre within.
+    let centre_mark = crate::lucide::icon("ellipsis", ICON_PX);
+    centre_mark.set_hexpand(true);
+    centre_mark.set_vexpand(true);
+    centre.append(&centre_mark);
     stage.put(
         &centre,
         cx - CENTRE_DIAMETER as f64 / 2.0,
@@ -613,11 +625,18 @@ fn picker(button: &gtk::Button, k: usize, shared: &Shared, rebuild: Option<Rc<dy
     // No "Move" section: dragging one disc onto another is the swap, and a slot can always be
     // set outright from the catalogue above — so the six "Swap with…" rows only lengthened the
     // list with a second way to do what the list already does.
+    // Wide enough for the rows it holds. A `ScrolledWindow` asks for its MINIMUM width unless
+    // told otherwise, so the popover came out at the 320 px floor and wrapped entries like
+    // "Disconnect, keep the game running" into a narrow column. Propagating the natural width
+    // sizes it to the list instead, with the floor kept as a floor and a ceiling so one long
+    // shortcut label cannot stretch the popover across the window.
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .propagate_natural_height(true)
+        .propagate_natural_width(true)
         .max_content_height(420)
-        .min_content_width(320)
+        .min_content_width(360)
+        .max_content_width(560)
         .child(&list)
         .build();
     popover.set_child(Some(&scroll));
