@@ -312,9 +312,10 @@ label can outrun the picture, and what to check when a stream comes out SDR.
 
 ## Notes & limits
 
-- **AMD / Intel encode is newer.** The NVENC path is the most exercised; AMF (AMD) and QSV (Intel) are
-  built and tested in CI but less battle-tested on real hardware. Software H.264 is the GPU-less
-  fallback.
+- **AMD / Intel encode is newer.** All three encoders ship in the installer and all three have been
+  validated on real hardware — AMF on a Ryzen 7000 iGPU (1080p120 HDR P010), QSV on Arc. NVENC still
+  has much the most field time, and several of QSV's newer arms are marked unvalidated in the code.
+  Software H.264 is the GPU-less fallback.
 - **x64-only.** No ARM64 build — no ARM64 NVIDIA driver, and the virtual-display driver is x64-only.
 - **Newer than the Linux host.** The Linux host is the most battle-tested path; the Windows host is
   more recent, with the virtual-mic and AMD/Intel encode backends the youngest pieces.

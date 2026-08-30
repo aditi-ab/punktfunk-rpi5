@@ -70,7 +70,7 @@ mechanics. The one exception is a gamescope the host only *attaches* to, which k
 | GNOME (Mutter) | ✅ ³ | ✅ | ✅ |
 | gamescope (SteamOS · Bazzite) | ✅ ⁴ | ⚠️ ⁵ | ✅ ⁶ |
 | sway ⁹ | ✅ | ✅ | ⚠️ ⁷ |
-| Hyprland | ⚠️ ⁸ | ✅ | ⚠️ ⁷ |
+| Hyprland | ✅ ⁸ | ✅ | ⚠️ ⁷ |
 | Cinnamon (Mint · LMDE) | ❌ ¹⁰ | ❌ ¹⁰ | ❌ ¹⁰ |
 | macOS / anything else | ❌ | ❌ | ❌ |
 
@@ -101,8 +101,9 @@ mechanics. The one exception is a gamescope the host only *attaches* to, which k
 7. Yes, but it needs managed configuration rather than being dialog-free by nature. The host
    writes and merges the portal's chooser configuration so a headless box can answer the
    "which output?" question that otherwise requires a GUI.
-8. Contracts are verified against Hyprland 0.55.4 with xdph 1.3.x, but the virtual output has
-   **not been exercised end to end on real display hardware** — see
+8. Contracts are verified against Hyprland 0.55.4 with xdph 1.3.x, and the virtual output was
+   exercised end to end on a real Omarchy 4.x box for 0.33.0 — create-output through live stream.
+   One piece of that box is still untested on glass; see
    [What is not verified](#what-is-not-verified).
 9. Sway specifically, not the wlroots family. Creating the headless output, setting its mode and
    listing your monitors all go through sway's IPC (`swaymsg`), so a wlroots compositor without it
@@ -618,9 +619,6 @@ what the [roadmap](/docs/roadmap)'s glass-to-glass work is about.) See
 The honest counterpart to the list above. Some of these are ❓ cells; more of them are ⚠️ cells
 whose caveat *is* "nobody has run this on real hardware" — a wrong ✅ is worse than either.
 
-- **Hyprland's virtual output on real display hardware.** Every contract is verified against
-  Hyprland 0.55.4 and the code reports a clear error rather than a black stream, but no one has run
-  create-output → negotiate → first frame on a physical Hyprland box. One session log settles it.
 - **Client-drawn cursor on sway/wlroots and Hyprland.** Wired, never confirmed on glass. A single
   cursor-forwarding session on each — checking the pointer arrives and is not drawn twice — settles
   it.
@@ -628,12 +626,13 @@ whose caveat *is* "nobody has run this on real hardware" — a wrong ✅ is wors
   well-trodden path, and there is no probe that would catch it failing. One spawn-and-capture run on
   an NVIDIA box settles it.
 - **Touch input from a Windows client.** Same shared code as Linux, no on-glass run.
-- **The whole Omarchy integration on an Omarchy box.** `punktfunk-omarchy setup`, the LAN-scoped
-  ufw rules, the webapp menu entry, the notification and idle hooks, and the screen-share picker
-  hand-back are all written against Omarchy 4.0.1's documented seams and unit-tested where they
-  parse or generate a file — but none of it has been run on Omarchy. Nothing about it is enabled
-  until an operator runs that command, so a plain Arch box is unaffected either way. One install →
-  setup → pair → stream run on a 4.x box settles it.
+- **Re-applying your resolution after an Omarchy theme switch.** The rest of the Omarchy
+  integration was run end to end on a real 4.x box for 0.33.0 — install, `punktfunk-omarchy setup`,
+  pair, stream — and five wrong assumptions were fixed there. This one piece was not: a theme
+  switch reloads Hyprland's config and discards the host's display settings, and the re-apply is
+  unit-tested with the trigger confirmed firing on that machine, but testing the re-application
+  itself meant interrupting the only live stream we had. If a theme switch still costs you your
+  resolution, say so.
 - **The `pf-webos` LG TV client.** A community project in another repository. Its codecs, HDR
   behaviour and feature set cannot be established from here.
 - **Everything client-side about Moonlight.** Wake-on-LAN, overlays, updates and which extensions
