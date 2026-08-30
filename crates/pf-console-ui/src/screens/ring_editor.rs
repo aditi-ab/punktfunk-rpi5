@@ -461,17 +461,29 @@ impl RingEditorScreen {
         );
 
         // The stage: a flat card face, like every other card on this shell (a gradient
-        // read as decoration on the Deck). On a screen too short or too narrow for the
-        // full-size ring, the whole stage scales down instead — the ring is drawn at the
-        // same reduced scale below, so it is never clipped, whatever the window.
+        // read as decoration on the Deck). On a screen too short for the ring AND the
+        // shortcut rows — a landscape phone — the rows move BESIDE the stage and the ring
+        // takes the height; only when even that cannot hold it does the stage scale down.
+        // The ring is as large as the screen allows, and never clipped.
         let caption_h = (CAPTION_H + 12.0) * k;
-        let stage_w = (ROW_MAX_W * k).min(f64::from(rect.width()) - 48.0 * k) as f32;
-        let fit_h = (f64::from(rect.height()) - caption_h - LIST_MIN * k) / (STAGE_H * k);
-        let fit_w = f64::from(stage_w) / (RING_W * k);
-        let fit = fit_h.min(fit_w).clamp(0.35, 1.0) as f32;
+        let fit_below = (f64::from(rect.height()) - caption_h - LIST_MIN * k) / (STAGE_H * k);
+        let side = fit_below < 0.75 && f64::from(rect.width()) >= (RING_W + 420.0) * k;
+        let (fit, stage_w) = if side {
+            let fit = ((f64::from(rect.height()) - caption_h) / (STAGE_H * k)).clamp(0.35, 1.0);
+            (fit as f32, (RING_W * k * fit) as f32)
+        } else {
+            let stage_w = (ROW_MAX_W * k).min(f64::from(rect.width()) - 48.0 * k) as f32;
+            let fit_w = f64::from(stage_w) / (RING_W * k);
+            (fit_below.min(fit_w).clamp(0.35, 1.0) as f32, stage_w)
+        };
         let rk = kf * fit;
+        let stage_x = if side {
+            rect.left + (EDGE_INSET * k) as f32
+        } else {
+            rect.center_x() - stage_w / 2.0
+        };
         let stage = Rect::from_xywh(
-            rect.center_x() - stage_w / 2.0,
+            stage_x,
             rect.top + caption_h as f32,
             stage_w,
             (STAGE_H * k) as f32 * fit,
@@ -481,7 +493,9 @@ impl RingEditorScreen {
         canvas.draw_rrect(rr, &fill(card_face(0.20)));
         canvas.draw_rrect(rr, &stroke(fg(0.14), kf));
         if self.focus == Focus::Ring && self.picker.is_none() {
-            focus_halo(canvas, stage, CORNER as f32 * kf, kf, 1.0);
+            // Corner in DESIGN units — the halo scales it itself, like `panel` does; a
+            // pre-scaled corner squares the scale and reads as a second, rounder card.
+            focus_halo(canvas, stage, CORNER as f32, kf, 1.0);
         }
 
         // The ring, one pad below the stage's top, at the stage's own scale; its pixels
@@ -502,9 +516,17 @@ impl RingEditorScreen {
         );
         canvas.restore();
 
-        // The shortcuts under it.
-        let list_rect =
-            Rect::from_ltrb(rect.left, stage.bottom + 10.0 * kf, rect.right, rect.bottom);
+        // The shortcuts: under the stage, or beside it on a short-wide screen.
+        let list_rect = if side {
+            Rect::from_ltrb(
+                stage.right + 8.0 * kf,
+                rect.top + caption_h as f32,
+                rect.right,
+                rect.bottom,
+            )
+        } else {
+            Rect::from_ltrb(rect.left, stage.bottom + 10.0 * kf, rect.right, rect.bottom)
+        };
         self.list_rect = list_rect;
         let rows = self.rows();
         self.list.render(
