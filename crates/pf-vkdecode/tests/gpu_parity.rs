@@ -1028,6 +1028,7 @@ fn field_h265_stream_writes_frame_hashes_for_ffmpeg_diff() {
 
     let mut au_errors = 0usize;
     let mut off_size = 0usize;
+    let mut concealed_aus: Vec<usize> = Vec::new();
     let hashes = {
         // SAFETY: as the golden legs — `setup` outlives this block and was created
         // with the H.265 decode extensions + timeline/sync2 features.
@@ -1074,6 +1075,17 @@ fn field_h265_stream_writes_frame_hashes_for_ffmpeg_diff() {
         for (au_index, range) in aus.iter().enumerate().skip(start_index) {
             match decoder.decode(&stream[range.clone()]) {
                 Ok(mut next) => {
+                    // A capture taken over a lossy link holds AUs the planner had to
+                    // conceal, and ffmpeg conceals them DIFFERENTLY — so a divergence
+                    // at such a frame says nothing about this decoder. Recording the
+                    // AUs is what separates "our bug" from "the field lost packets".
+                    let warnings = decoder.take_warnings();
+                    if warnings.iter().any(pf_vkdecode::is_integrity_warning_h265) {
+                        if concealed_aus.len() < 10 {
+                            eprintln!("AU {au_index}: planned with concealment {warnings:?}");
+                        }
+                        concealed_aus.push(au_index);
+                    }
                     while let Some(frame) = next {
                         sink(&mut decoder, frame, &mut hashes, &mut off_size);
                         next = decoder.take_ready();
@@ -1115,6 +1127,21 @@ fn field_h265_stream_writes_frame_hashes_for_ffmpeg_diff() {
          scripts/vkdecode-field-parity.sh",
         hashes.len()
     );
+    // The verdict's precondition, printed last so it is the thing a reader keeps:
+    // on a capture with NO concealed AU, every divergence the diff finds is this
+    // decoder's own — there is no second explanation left.
+    if concealed_aus.is_empty() {
+        eprintln!("integrity: no AU needed concealment — any divergence is OURS");
+    } else {
+        eprintln!(
+            "integrity: {} of {} AUs planned with concealment (first: {:?}) — a \
+             divergence AT or AFTER the first is likely ffmpeg concealing differently, \
+             not this decoder",
+            concealed_aus.len(),
+            aus.len() - start_index,
+            &concealed_aus[..concealed_aus.len().min(10)]
+        );
+    }
 }
 
 /// The H.265 twin of [`h264_parity_run`]; see its docs for why the AUs are a
