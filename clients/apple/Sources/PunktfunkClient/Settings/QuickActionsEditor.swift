@@ -88,7 +88,9 @@ struct QuickActionsEditor: View {
             Section {
                 GeometryReader { geo in
                     ZStack {
-                        Color(white: 0.42)
+                        // The Form's own cell colour, resolved dark (the scheme below), so the
+                        // backdrop reads as one more field rather than a stage.
+                        Color(.secondarySystemGroupedBackground)
                         // The backdrop runs the real twist. Its tap only dismisses the preview
                         // sheet: UIKit hands a disc tap to this view as well as to the SwiftUI
                         // button above it, so closing the ring here closed it on every pick.
