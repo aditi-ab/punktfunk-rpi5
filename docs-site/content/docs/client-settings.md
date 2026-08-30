@@ -152,8 +152,8 @@ Deck in Gaming Mode has no endpoint picker: the session uses what the Desktop-Mo
 
 ## Input
 
-Touch modes, mouse modes and the in-stream chords have their own page: [Input](/docs/input). Five
-more settings are worth naming here.
+Touch modes, mouse modes and the in-stream chords have their own page: [Input](/docs/input). The
+settings below are worth naming here.
 
 **Forward controllers** — *default: on*, everywhere. Off, controllers connected to *this* device
 are not sent to the host — what you want when the controller already reaches the host another way
@@ -241,6 +241,18 @@ compositors have it, X11 sessions grab the keyboard directly. Under [gamescope](
 there is nothing to inhibit.
 
 **Invert scroll direction** — *default: off*, i.e. the host scrolls the way this machine does.
+
+**Quick actions** — *Android, iPhone/iPad, Apple TV and the console home.* What the six buttons
+of the in-stream ring hold, and the custom shortcut chords they can send. On the phones the editor
+is the ring itself; the console edits the slots as rows and keeps the global ring only (it never
+edits profiles). See [the quick-action ring](/docs/input#the-quick-action-ring).
+
+**Virtual controller** — *Android and iPhone/iPad only*, under Quick actions. **Layout**
+(*default: Full*) picks which controls the on-screen controller shows: Full, Sticks and shoulders,
+or D-pad and face buttons. **Opacity** (*default: 45 %*) and **Scale** (*default: 100 %*) set how
+strongly and how large it draws over the picture. The controller itself is shown and hidden from
+the ring's Virtual controller button, per session. Not on Apple TV (no touch screen), a Steam Deck
+(real sticks) or the desktop clients (a keyboard).
 
 ## Behavior
 
