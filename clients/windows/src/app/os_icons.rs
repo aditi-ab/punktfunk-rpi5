@@ -1,9 +1,10 @@
-//! The host tiles' OS marks. Reactor's `ImageSource` is `file:///`-URI raster only (no
-//! vector element, no icon font with brand glyphs), so the monochrome PNGs under
-//! `assets/os/` (mid-gray — legible on both WinUI themes; derived from the
-//! `assets/os-icons` masters, see that README for provenance/licensing) are embedded in
-//! the exe and materialized once into `%LOCALAPPDATA%\punktfunk\os-icons\` — the same
-//! disk-cache-to-URI pattern as the library's poster art.
+//! The host card's OS mark — the avatar's face, and the only place this shell draws the host's
+//! operating system. Reactor's `ImageSource` is `file:///`-URI raster only (no vector element,
+//! no icon font with brand glyphs), so the monochrome PNGs under `assets/os/` (WHITE, because
+//! the avatar is an accent-filled circle on both themes; derived from the `assets/os-icons`
+//! masters, see that README for provenance/licensing) are embedded in the exe and materialized
+//! once into `%LOCALAPPDATA%\punktfunk\os-icons\` — the same disk-cache-to-URI pattern as the
+//! library's poster art.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -34,7 +35,8 @@ fn dir() -> Option<PathBuf> {
 }
 
 /// Materialize the embedded PNGs to disk (idempotent; size mismatch rewrites, so an icon
-/// refresh in a newer build lands). Called once at GUI startup, before any tile renders.
+/// refresh — or a re-baked colour or size — in a newer build lands). Called once at GUI
+/// startup, before any tile renders.
 pub fn install() {
     let Some(dir) = dir() else { return };
     if std::fs::create_dir_all(&dir).is_err() {
@@ -53,8 +55,9 @@ pub fn install() {
 
 /// The `file:///` URI of the mark for an OS-identity chain: walk most-specific-first
 /// (pf-client-core's shared order/aliases) and take the first token we ship art for.
-/// `None` (no image element at all) when the host doesn't advertise a chain or nothing
-/// in it is recognized — the tile then renders exactly as it did before the field.
+/// `None` (no image element at all) when the host doesn't advertise a chain or nothing in it
+/// is recognized — which is what keeps such a host's avatar on its name's initial rather than
+/// leaving an empty circle.
 pub fn uri(chain: &str) -> Option<String> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     let dir = DIR.get_or_init(dir).as_ref()?;

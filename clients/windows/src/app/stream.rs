@@ -2,6 +2,7 @@
 //! so the shell shows a status card in the app's card language — host header, the child's live
 //! `stats:` line as a chip row + stage lines, the in-window shortcuts, and a Disconnect.
 
+use super::lucide;
 use super::style::{edges, uniform};
 use std::sync::Arc;
 use windows_reactor::*;
@@ -33,7 +34,8 @@ pub(crate) fn session_page(ctx: &Arc<super::AppCtx>, hud: &HudSample) -> Element
 
     // Header: monogram + title + the one thing worth knowing (where the video went).
     let header: Element = grid((
-        avatar(&host)
+        // Monogram, as the comment above says: `Target` carries no OS chain to mark with.
+        avatar(&host, "")
             .grid_column(0)
             .vertical_alignment(VerticalAlignment::Center),
         vstack((
@@ -120,7 +122,7 @@ pub(crate) fn session_page(ctx: &Arc<super::AppCtx>, hud: &HudSample) -> Element
     body.push({
         let ctx = ctx.clone();
         button("Disconnect")
-            .icon(Symbol::Cancel)
+            .icon(lucide::icon("x"))
             .on_click(move || {
                 // Kill the child; its exit event (the reader thread) navigates to the
                 // host list, exactly like the session window closing.

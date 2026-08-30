@@ -155,28 +155,44 @@ pub(crate) fn busy_page(headline: &str, detail: &str, extra: Vec<Element>) -> El
         .into()
 }
 
-/// A rounded square "monogram" for a host, the first letter on an accent fill — a clean leading
-/// visual that avoids depending on an icon font being installed.
-pub(crate) fn avatar(name: &str) -> Border {
-    let initial = name
-        .chars()
-        .find(|c| c.is_alphanumeric())
-        .map(|c| c.to_uppercase().to_string())
-        .unwrap_or_else(|| "?".into());
-    border(
-        text_block(initial)
-            .font_size(17.0)
-            .semibold()
-            // NOT ThemeRef::AccentText — that's accent-COLOURED text for normal surfaces;
-            // on an accent fill it's accent-on-accent (unreadable). This is the on-accent brush.
-            .foreground(ThemeRef::custom("TextOnAccentFillColorPrimaryBrush"))
+/// The host card's leading visual: a circle on an accent fill carrying the host's OS mark —
+/// which machine this is answers a more useful question than which letter its name starts with,
+/// and the name is spelled out directly under the circle anyway. A host that advertises no OS
+/// chain (an older one) keeps the monogram, so nothing regresses to an empty circle.
+pub(crate) fn avatar(name: &str, os: &str) -> Border {
+    const SIZE: f64 = 44.0;
+    // `Image`, not `Icon` — an Image takes an explicit size, and reactor's icon elements do
+    // not. The marks bake white for this fill; see `os_icons`.
+    let face: Element = match super::os_icons::uri(os) {
+        Some(uri) => Image::new_with_uri(uri)
+            .stretch(Stretch::Uniform)
+            .width(SIZE * 0.5)
+            .height(SIZE * 0.5)
             .horizontal_alignment(HorizontalAlignment::Center)
-            .vertical_alignment(VerticalAlignment::Center),
-    )
-    .background(ThemeRef::Accent)
-    .corner_radius(10.0)
-    .width(40.0)
-    .height(40.0)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into(),
+        None => {
+            let initial = name
+                .chars()
+                .find(|c| c.is_alphanumeric())
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_else(|| "?".into());
+            text_block(initial)
+                .font_size(17.0)
+                .semibold()
+                // NOT ThemeRef::AccentText — that's accent-COLOURED text for normal surfaces;
+                // on an accent fill it's accent-on-accent (unreadable). The on-accent brush.
+                .foreground(ThemeRef::custom("TextOnAccentFillColorPrimaryBrush"))
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into()
+        }
+    };
+    border(face)
+        .background(ThemeRef::Accent)
+        .corner_radius(SIZE / 2.0)
+        .width(SIZE)
+        .height(SIZE)
 }
 
 /// Pill chip colour intent.

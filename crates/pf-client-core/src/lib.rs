@@ -97,6 +97,9 @@ pub mod os;
 // gamepad input mask, which SDL's own focus gate structurally cannot provide there.
 #[cfg(target_os = "linux")]
 pub mod overlay_focus;
+// The UI icon set (Lucide path data), shared by the Skia console and the GTK shell so one
+// mark cannot differ between them: pure data, every platform.
+pub mod lucide;
 // The in-stream quick-action ring's setting (one JSON blob): pure data, every platform.
 pub mod overlay_actions;
 // The ring's portable contract (inputs, commands, session facts): pure data, every platform.

@@ -1253,26 +1253,12 @@ impl Ring {
 }
 
 /// The icon a built-in slot draws instead of a word (Lucide, via [`crate::icons`]) — the
-/// mic swaps to its struck form while muted. `None` for what the set cannot know: a
-/// shortcut (its keycap chord IS its face) and any host action beyond the three powers.
+/// mic swaps to its struck form while muted. The mapping is the SHARED one, so a slot cannot
+/// carry one mark here and another in the GTK or Windows editor that configures it.
+/// `None` for what the set cannot know: a shortcut (its keycap chord IS its face) and any
+/// host action beyond the three powers.
 fn slot_icon(id: &str, state: &str) -> Option<crate::icons::Icon> {
-    use crate::icons;
-    Some(match id {
-        "end_stream" => icons::SQUARE,
-        "disconnect_linger" => icons::LOG_OUT,
-        "touch_mode" => icons::POINTER,
-        "keyboard" => icons::KEYBOARD,
-        "stats" => icons::CHART_COLUMN,
-        "mic" if state == "Muted" => icons::MIC_OFF,
-        "mic" => icons::MIC,
-        "pad" => icons::GAMEPAD_2,
-        "send_text" => icons::SEND,
-        "more" => icons::ELLIPSIS,
-        "host:power.sleep" => icons::MOON,
-        "host:power.reboot" => icons::ROTATE_CW,
-        "host:power.shutdown" => icons::POWER,
-        _ => return None,
-    })
+    crate::icons::by_name(pf_client_core::overlay_actions::slot_icon(id, state)?)
 }
 
 /// The pad's highlight on a disc: a soft white glow past the edge and a crisp ring on it,

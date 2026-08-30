@@ -6,7 +6,7 @@
 # because they cannot consume the master directly:
 #
 #   GTK shell     symbolic SVG, black fill  -> clients/linux/data/icons/scalable/actions/
-#   Windows shell PNG, h=32, mid-grey       -> clients/windows/assets/os/
+#   Windows shell PNG, h=96, white          -> clients/windows/assets/os/
 #   Apple clients vector PDF, black fill    -> clients/apple/.../OsIcons.xcassets/
 #
 # The web console, the Decky plugin and the Android client transcribe the master's path
@@ -23,10 +23,14 @@ GTK=clients/linux/data/icons/scalable/actions
 WIN=clients/windows/assets/os
 APPLE=clients/apple/Sources/PunktfunkKit/Resources/OsIcons.xcassets
 
-# The Windows shell has no vector element and no theme-aware tint, so its PNGs are baked in
-# one mid-grey that stays legible on both the light and the dark WinUI theme.
-WIN_GREY='#8A8F98'
-WIN_HEIGHT=32
+# The Windows shell has no vector element and no theme-aware tint, so its PNGs bake in one
+# colour. That colour is WHITE, because the shell draws these in exactly one place: the host
+# card's avatar, an accent-filled circle on both themes. (It was mid-grey while the mark sat
+# in the card's status row instead — grey is what stays legible on a card face, and it read
+# as smudged the moment the mark moved onto the accent fill.) Tall, because it is now the
+# card's leading visual rather than the smallest glyph in a row.
+WIN_WHITE='#FFFFFF'
+WIN_HEIGHT=96
 
 log() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 
@@ -52,10 +56,10 @@ for t in "${tokens[@]}"; do
   # from the fill it finds, so the value only has to be a real colour, not the final one.
   sed 's/currentColor/#000000/' "$src" > "$GTK/pf-os-$t-symbolic.svg"
 
-  # Windows: same black-to-grey substitution, rasterized at a fixed height so every mark
-  # shares an optical size and keeps its own aspect ratio.
-  sed "s/currentColor/$WIN_GREY/" "$src" > "$tmp/$t.grey.svg"
-  rsvg-convert -h "$WIN_HEIGHT" -f png -o "$WIN/$t.png" "$tmp/$t.grey.svg"
+  # Windows: white substitution, rasterized at a fixed height so every mark shares an
+  # optical size and keeps its own aspect ratio.
+  sed "s/currentColor/$WIN_WHITE/" "$src" > "$tmp/$t.white.svg"
+  rsvg-convert -h "$WIN_HEIGHT" -f png -o "$WIN/$t.png" "$tmp/$t.white.svg"
 
   # Apple: a vector PDF at the master's natural size, in a template imageset — SwiftUI
   # tints it from foregroundStyle, so the baked colour is irrelevant.

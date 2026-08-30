@@ -47,6 +47,8 @@ mod hosts;
 mod launcher_icons;
 mod library;
 mod licenses;
+/// The shell's Lucide icon set — the console's own marks, baked for WinUI.
+mod lucide;
 mod os_icons;
 mod pair;
 /// The quick-action ring's editor — the ring itself, a section of the settings page.
@@ -194,8 +196,9 @@ pub struct AppCtx {
 }
 
 pub fn run(identity: (String, String), gamepad: GamepadService) -> windows_reactor::Result<()> {
-    // The host tiles' OS marks and the library's launcher marks load as file:/// URIs — put the
-    // embedded PNGs on disk first.
+    // The BRAND marks load as file:/// URIs — the host tiles' OS marks and the library's
+    // launcher marks. Put the embedded PNGs on disk first. (The Lucide UI set needs nothing
+    // here: it is a font beside the exe, which XAML loads on demand.)
     os_icons::install();
     launcher_icons::install();
     let ctx = Arc::new(AppCtx {

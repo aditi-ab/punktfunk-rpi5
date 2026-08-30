@@ -1,18 +1,21 @@
 //! The quick-action ring's editor in the GTK shell (design/touch-client-overlay.md §3.3): the
-//! editor IS the ring — six round buttons on the ring's own geometry over a gradient stage,
+//! editor IS the ring — six round buttons on the ring's own geometry over a flat card stage,
 //! built from GTK's own widgets so the toolkit's focus, drag-and-drop and screen reader carry
-//! it. A click (or Enter) on a button picks what it holds from the catalogue by group; a button
+//! it. Each disc wears the slot's Lucide mark, the same mark the in-stream ring draws for it.
+//! A click (or Enter) on a button picks what it holds from the catalogue by group; a button
 //! dragged onto another swaps the two, and the picker offers the same swap for a keyboard.
 //! Under the ring the shortcuts sit as rows; a row opens the shortcut editor — a name, the four
 //! modifiers, the key on a keyboard-shaped grid or pressed on the real keyboard — as subpages
 //! of the preferences dialog. The blob lives in the dialog's state and is written with the other
-//! rows when the dialog closes; the model (catalogue, geometry, chords) is `pf_client_core`'s.
+//! rows when the dialog closes; the model (catalogue, geometry, chords, icons) is
+//! `pf_client_core`'s.
 
 use adw::prelude::*;
 use gtk::gdk;
 use gtk::glib;
 use pf_client_core::overlay_actions::{
-    catalogue, chord_chip, key_legend, OverlayConfig, RingPlatform, Shortcut, SlotId, RING_SLOTS,
+    catalogue, chord_chip, key_legend, slot_icon, OverlayConfig, RingPlatform, Shortcut, SlotId,
+    RING_SLOTS,
 };
 use pf_client_core::ring::{slot_offset, CENTRE_DIAMETER, RING_RADIUS, SLOT_DIAMETER};
 use std::cell::RefCell;
@@ -21,6 +24,9 @@ use std::rc::Rc;
 /// The stage the ring sits on, in px: the ring's diameter plus a disc plus a margin each way.
 const STAGE_W: i32 = 440;
 const STAGE_H: i32 = 340;
+/// The Lucide mark on a disc, in px. The console draws it at 1.05× the disc's radius; this is
+/// that, so a disc reads the same weight in the editor as it does in the stream.
+const ICON_PX: i32 = (SLOT_DIAMETER * 1.05 / 2.0) as i32;
 
 const MODIFIERS: [&str; 4] = ["ctrl", "alt", "shift", "win"];
 
@@ -225,7 +231,7 @@ impl QuickActions {
             .use_markup(false)
             .activatable(true)
             .build();
-        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        row.add_suffix(&crate::lucide::row_icon("chevron-right"));
         let shared = Shared {
             dialog: dialog.downgrade(),
             blob: Rc::new(RefCell::new(blob.to_string())),
@@ -375,19 +381,21 @@ fn editor_page(shared: &Shared) -> adw::NavigationPage {
     adw::NavigationPage::new(&view, "Quick actions")
 }
 
-/// A disc's face: the short word, or a stacked keycap for a shortcut (the modifiers small on
-/// top, the key large under them).
+/// A disc's face: the slot's Lucide mark, or a stacked keycap for a shortcut (the modifiers
+/// small on top, the key large under them). The mark comes from the SHARED slot table, so a
+/// disc here carries exactly what the in-stream ring draws for the same slot. Only an id the
+/// table cannot know — an unknown host action, a future slot — falls back to its short word,
+/// which is what the console does too.
 fn disc_face(cfg: &OverlayConfig, slot: Option<&SlotId>) -> gtk::Widget {
     let Some(slot) = slot else {
-        return gtk::Label::builder()
-            .label("+")
-            .css_classes(["pf-ring-word", "dim-label"])
-            .build()
-            .upcast();
+        return crate::lucide::icon("plus", 22).upcast();
     };
     if let SlotId::Shortcut(id) = slot {
         let keys = cfg.shortcut(id).map(|s| s.keys.clone()).unwrap_or_default();
         return keycap(&keys).upcast();
+    }
+    if let Some(name) = slot_icon(&slot.id(), "") {
+        return crate::lucide::icon(name, ICON_PX).upcast();
     }
     gtk::Label::builder()
         .label(short_label(cfg, slot))
@@ -398,8 +406,14 @@ fn disc_face(cfg: &OverlayConfig, slot: Option<&SlotId>) -> gtk::Widget {
 
 /// A chord as a stacked keycap: `Ctrl Shift` small over `Esc` large.
 fn keycap(keys: &[String]) -> gtk::Box {
+    // Expands, so that centring it means anything. Every holder this goes into is a fixed-size
+    // disc wider than the chord — a `gtk::Box` is horizontal by default and packs one child at
+    // the start, so without this the text sits on the disc's left edge whatever its alignment
+    // says. With it the chord takes the whole disc and its own centre alignment lands it.
     let b = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .vexpand(true)
         .valign(gtk::Align::Center)
         .halign(gtk::Align::Center)
         .build();
@@ -445,12 +459,20 @@ fn build_ring(
     let disc = SLOT_DIAMETER as f64;
 
     // The centre: what the sheet opens from in-stream, not editable here — dimmed and inert.
-    let centre = gtk::Label::builder()
-        .label("More")
-        .css_classes(["pf-ring-centre", "pf-ring-word"])
+    // The ring's own `more` mark, so the editor's centre is the centre people press.
+    let centre = gtk::Box::builder()
+        .css_classes(["pf-ring-centre"])
         .width_request(CENTRE_DIAMETER as i32)
         .height_request(CENTRE_DIAMETER as i32)
+        .tooltip_text("More — the rest of the actions, in the stream")
         .build();
+    // The mark has to EXPAND to be centred. A `gtk::Box` is horizontal by default and packs a
+    // single child at the start, so a child narrower than the box's requested width sits on its
+    // left edge however it aligns itself; expanding gives it the whole box to centre within.
+    let centre_mark = crate::lucide::icon("ellipsis", ICON_PX);
+    centre_mark.set_hexpand(true);
+    centre_mark.set_vexpand(true);
+    centre.append(&centre_mark);
     stage.put(
         &centre,
         cx - CENTRE_DIAMETER as f64 / 2.0,
@@ -584,7 +606,7 @@ fn picker(button: &gtk::Button, k: usize, shared: &Shared, rebuild: Option<Rc<dy
                 row.set_subtitle(&entry.note);
             }
             if entry.id == current {
-                row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
+                row.add_suffix(&crate::lucide::row_icon("check"));
             }
             let (shared, rebuild, popover, id) =
                 (shared.clone(), rebuild.clone(), popover.clone(), entry.id);
@@ -600,32 +622,25 @@ fn picker(button: &gtk::Button, k: usize, shared: &Shared, rebuild: Option<Rc<dy
             list.append(&row);
         }
     }
-    list.append(&header("Move"));
-    for j in (0..RING_SLOTS).filter(|&j| j != k) {
-        let row = adw::ActionRow::builder()
-            .title(format!("Swap with {}", CLOCK[j]))
-            .use_markup(false)
-            .activatable(true)
-            .build();
-        let (shared, rebuild, popover) = (shared.clone(), rebuild.clone(), popover.clone());
-        row.connect_activated(move |_| {
-            let mut cfg = shared.cfg();
-            cfg.ring.swap(k, j);
-            shared.write(&cfg);
-            popover.popdown();
-            if let Some(f) = &rebuild {
-                f();
-            }
-        });
-        list.append(&row);
-    }
+    // No "Move" section: dragging one disc onto another is the swap, and a slot can always be
+    // set outright from the catalogue above — so the six "Swap with…" rows only lengthened the
+    // list with a second way to do what the list already does.
+    // ⚠ `min_content_width` does NOT hold this open: a ScrolledWindow whose horizontal policy is
+    // `Never` propagates its CHILD's minimum width and ignores that property. The child is a
+    // ListBox of AdwActionRows whose titles wrap, and a wrapping label's minimum width is one
+    // word — so the popover collapsed to a column a character or two wide, which is what it did
+    // for real. `set_size_request` is a true minimum GTK cannot ignore; the natural width then
+    // grows it to fit the rows, up to a ceiling so one long shortcut label cannot stretch the
+    // popover across the window.
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .propagate_natural_height(true)
+        .propagate_natural_width(true)
         .max_content_height(420)
-        .min_content_width(320)
+        .max_content_width(560)
         .child(&list)
         .build();
+    scroll.set_size_request(380, -1);
     popover.set_child(Some(&scroll));
     popover.set_parent(button);
     // A popover must leave its parent once closed, or GTK complains when the disc goes; the
@@ -689,7 +704,7 @@ fn build_shortcuts(
         face.add_css_class("pf-keycap-small");
         face.set_size_request(36, 36);
         row.add_prefix(&face);
-        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        row.add_suffix(&crate::lucide::row_icon("chevron-right"));
         let (shared, rebuild, sc) = (shared.clone(), rebuild.clone(), sc.clone());
         row.connect_activated(move |_| {
             if let Some(dialog) = shared.dialog() {

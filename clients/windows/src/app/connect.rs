@@ -3,6 +3,7 @@
 //! session worker and drives navigation from its events, and the "request access"
 //! (delegated-approval) flow parks an identified connect until the operator approves it.
 
+use super::lucide;
 use super::style::*;
 use super::{AppCtx, Screen, Svc, Target};
 use crate::discovery::DiscoveredHost;
@@ -601,7 +602,7 @@ pub(crate) fn request_access_page(
     let cancel_btn = {
         let (ctx, ss) = (ctx.clone(), set_screen.clone());
         button("Cancel")
-            .icon(Symbol::Cancel)
+            .icon(lucide::icon("x"))
             .on_click(move || {
                 // Return the UI immediately; trip the flag this request's event loop
                 // captured so it tears down silently when the connect resolves (see
@@ -635,7 +636,7 @@ pub(crate) fn waking_page(ctx: &Arc<AppCtx>, set_screen: &AsyncSetState<Screen>)
     let cancel_btn = {
         let (ctx, ss) = (ctx.clone(), set_screen.clone());
         button("Cancel")
-            .icon(Symbol::Cancel)
+            .icon(lucide::icon("x"))
             .on_click(move || {
                 // Return the UI immediately and trip the flag the poll loop is watching so it stops
                 // re-sending and exits without touching a screen a later action may already own.

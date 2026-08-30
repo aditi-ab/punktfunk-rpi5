@@ -11,6 +11,7 @@
 //! where the BEHAVIOR differs the text is deliberately Windows-specific (the forwarded-
 //! controller picker especially: Apple forwards one pad, this client forwards them all).
 
+use super::lucide;
 use super::style::*;
 use super::{AppCtx, Screen};
 use crate::trust::{KnownHosts, Settings};
@@ -305,25 +306,27 @@ fn edit_profile_modal(
         buttons.push(
             {
                 let (id, set_scope) = (id.clone(), set_scope.clone());
-                button("Duplicate").icon(Symbol::Copy).on_click(move || {
-                    let mut catalog = ProfilesFile::load();
-                    let Some(source) = catalog.find_by_id(&id).cloned() else {
-                        return;
-                    };
-                    let name = (2..)
-                        .map(|n| format!("{} {n}", source.name))
-                        .find(|n| !catalog.name_taken(n, None))
-                        .unwrap_or_else(|| source.name.clone());
-                    let mut copy = StreamProfile::new(name);
-                    copy.overrides = source.overrides.clone();
-                    copy.accent = source.accent.clone();
-                    let new_id = copy.id.clone();
-                    catalog.profiles.push(copy);
-                    if catalog.save().is_ok() {
-                        // The sheet stays open and now edits the copy — scope follows it.
-                        set_scope.call(new_id);
-                    }
-                })
+                button("Duplicate")
+                    .icon(lucide::icon("copy"))
+                    .on_click(move || {
+                        let mut catalog = ProfilesFile::load();
+                        let Some(source) = catalog.find_by_id(&id).cloned() else {
+                            return;
+                        };
+                        let name = (2..)
+                            .map(|n| format!("{} {n}", source.name))
+                            .find(|n| !catalog.name_taken(n, None))
+                            .unwrap_or_else(|| source.name.clone());
+                        let mut copy = StreamProfile::new(name);
+                        copy.overrides = source.overrides.clone();
+                        copy.accent = source.accent.clone();
+                        let new_id = copy.id.clone();
+                        catalog.profiles.push(copy);
+                        if catalog.save().is_ok() {
+                            // The sheet stays open and now edits the copy — scope follows it.
+                            set_scope.call(new_id);
+                        }
+                    })
             }
             .into(),
         );
@@ -331,7 +334,7 @@ fn edit_profile_modal(
             {
                 let set_delete = set_delete.clone();
                 button("Delete\u{2026}")
-                    .icon(Symbol::Delete)
+                    .icon(lucide::icon("trash-2"))
                     .on_click(move || set_delete.call(Some(id.clone())))
             }
             .into(),
@@ -354,7 +357,7 @@ fn edit_profile_modal(
             let close_sheet = close_sheet.clone();
             button("Save")
                 .accent()
-                .icon(Symbol::Save)
+                .icon(lucide::icon("save"))
                 .on_click(close_sheet)
         }
         .into(),
@@ -1726,21 +1729,25 @@ pub(crate) fn settings_page(
     let items = vec![
         NavViewItem::new("General")
             .tag("general")
-            .icon(Symbol::Setting),
+            .icon(lucide::icon("settings")),
         NavViewItem::new("Display")
             .tag("display")
-            .icon(Symbol::FullScreen),
+            .icon(lucide::icon("maximize")),
         NavViewItem::new("Input")
             .tag("input")
-            .icon(Symbol::Keyboard),
+            .icon(lucide::icon("keyboard")),
         NavViewItem::new("Quick actions")
             .tag("quick_actions")
-            .icon(Symbol::Rotate),
-        NavViewItem::new("Audio").tag("audio").icon(Symbol::Volume),
+            .icon(lucide::icon("rotate-cw")),
+        NavViewItem::new("Audio")
+            .tag("audio")
+            .icon(lucide::icon("volume-2")),
         NavViewItem::new("Controllers")
             .tag("controllers")
-            .icon(Symbol::Play),
-        NavViewItem::new("About").tag("about").icon(Symbol::Help),
+            .icon(lucide::icon("gamepad-2")),
+        NavViewItem::new("About")
+            .tag("about")
+            .icon(lucide::icon("circle-help")),
     ];
     // The card is KEYED by section so switching panes REMOUNTS it instead of diffing one
     // section's controls into another's: an in-place diff re-sets a reused ComboBox's items

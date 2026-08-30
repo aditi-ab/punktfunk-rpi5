@@ -936,7 +936,7 @@ impl ChoiceRow {
             .activatable(true)
             .build();
         row.add_suffix(&value);
-        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        row.add_suffix(&crate::lucide::row_icon("chevron-right"));
         {
             let dialog = dialog.downgrade();
             let (options, sel, chg, value) = (
@@ -955,7 +955,7 @@ impl ChoiceRow {
                     .css_classes(["boxed-list"])
                     .build();
                 for (i, opt) in options.iter().enumerate() {
-                    let check = gtk::Image::from_icon_name("object-select-symbolic");
+                    let check = crate::lucide::row_icon("check");
                     check.set_visible(i as u32 == sel.get());
                     let opt_row = adw::ActionRow::builder()
                         .title(opt)
@@ -1814,7 +1814,7 @@ pub fn show_scoped(
                         .valign(gtk::Align::Center)
                         .build();
                     let reset = gtk::Button::builder()
-                        .icon_name("edit-undo-symbolic")
+                        .child(&crate::lucide::row_icon("undo-2"))
                         .tooltip_text("Reset to Default settings")
                         .valign(gtk::Align::Center)
                         .css_classes(["flat"])
@@ -2208,7 +2208,7 @@ pub fn show_scoped(
             } else {
                 row.set_subtitle(p.kind_label());
             }
-            row.add_prefix(&gtk::Image::from_icon_name("input-gaming-symbolic"));
+            row.add_prefix(&crate::lucide::row_icon("gamepad-2"));
             controllers_group.add(&row);
         }
     }

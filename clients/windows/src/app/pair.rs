@@ -3,6 +3,7 @@
 //! transcript. Also offers the no-PIN "request access" (delegated-approval) alternative.
 
 use super::connect::{connect, request_access};
+use super::lucide;
 use super::style::*;
 use super::{Screen, Svc};
 use crate::trust::{self, KnownHost, KnownHosts};
@@ -33,7 +34,7 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
         );
         button("Pair & Connect")
             .accent()
-            .icon(Symbol::Accept)
+            .icon(lucide::icon("check"))
             .on_click(move || {
                 let pin = live.borrow().trim().to_string();
                 let (ctx3, ss, st, target3) =
@@ -78,7 +79,7 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
     let cancel_btn = {
         let ss = set_screen.clone();
         button("Cancel")
-            .icon(Symbol::Cancel)
+            .icon(lucide::icon("x"))
             .on_click(move || ss.call(Screen::Hosts))
     };
     // The no-PIN alternative offered alongside the PIN ceremony: open an identified connect that
@@ -86,14 +87,15 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
     let request_btn = {
         let (svc, target2) = (props.clone(), target.clone());
         button("Request access without a PIN")
-            .icon(Symbol::Send)
+            .icon(lucide::icon("send"))
             .on_click(move || request_access(&svc, &target2))
             .horizontal_alignment(HorizontalAlignment::Stretch)
     };
 
     let content = card(vstack((
         grid((
-            avatar(&target.name)
+            // `Target` holds no OS chain, so the pairing card keeps the monogram.
+            avatar(&target.name, "")
                 .grid_column(0)
                 .vertical_alignment(VerticalAlignment::Center),
             vstack((
