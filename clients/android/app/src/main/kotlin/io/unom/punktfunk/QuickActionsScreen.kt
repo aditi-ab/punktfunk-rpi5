@@ -200,12 +200,16 @@ private fun RingStage(cfg: OverlayConfig, editing: RingEditing) {
     val ring = remember { RingState() }
     val haptics = rememberConsoleHaptics()
     var size by remember { mutableStateOf(IntSize.Zero) }
-    val centre = Offset(size.width / 2f, size.height / 2f)
-    LaunchedEffect(size) { if (size != IntSize.Zero && !ring.committed) ring.openAt(centre) }
+    // Read the size INSIDE the effects: a centre computed at composition was one step behind
+    // the size state on the first open and put the ring at (0, 0), clamped to the margin.
+    fun centre() = Offset(size.width / 2f, size.height / 2f)
+    LaunchedEffect(size) {
+        if (size != IntSize.Zero && !ring.committed) ring.openAt(centre())
+    }
     LaunchedEffect(ring.committed, ring.progress) {
         if (!ring.committed && ring.progress == 0f && size != IntSize.Zero) {
             delay(250)
-            if (!ring.committed && ring.progress == 0f) ring.openAt(centre)
+            if (!ring.committed && ring.progress == 0f) ring.openAt(centre())
         }
     }
     // No fill of its own: the card it sits in is the field. The twist surface is a SIBLING
