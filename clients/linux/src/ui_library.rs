@@ -228,7 +228,7 @@ fn build(
     stack.add_named(&scrolled, Some("grid"));
 
     let header = adw::HeaderBar::new();
-    let reload = gtk::Button::from_icon_name("view-refresh-symbolic");
+    let reload = crate::lucide::button("refresh-cw");
     reload.set_tooltip_text(Some("Reload"));
     header.pack_end(&reload);
 
@@ -425,7 +425,7 @@ fn game_card(state: &Rc<State>, game: &GameEntry) -> gtk::FlowBoxChild {
     let menu = gio::Menu::new();
     menu.append(Some("Copy link"), Some("game.copy-link"));
     let menu_btn = gtk::MenuButton::builder()
-        .icon_name("view-more-symbolic")
+        .child(&crate::lucide::row_icon("ellipsis"))
         .menu_model(&menu)
         .halign(gtk::Align::End)
         .valign(gtk::Align::Start)

@@ -1,18 +1,21 @@
 //! The quick-action ring's editor in the GTK shell (design/touch-client-overlay.md §3.3): the
-//! editor IS the ring — six round buttons on the ring's own geometry over a gradient stage,
+//! editor IS the ring — six round buttons on the ring's own geometry over a flat card stage,
 //! built from GTK's own widgets so the toolkit's focus, drag-and-drop and screen reader carry
-//! it. A click (or Enter) on a button picks what it holds from the catalogue by group; a button
+//! it. Each disc wears the slot's Lucide mark, the same mark the in-stream ring draws for it.
+//! A click (or Enter) on a button picks what it holds from the catalogue by group; a button
 //! dragged onto another swaps the two, and the picker offers the same swap for a keyboard.
 //! Under the ring the shortcuts sit as rows; a row opens the shortcut editor — a name, the four
 //! modifiers, the key on a keyboard-shaped grid or pressed on the real keyboard — as subpages
 //! of the preferences dialog. The blob lives in the dialog's state and is written with the other
-//! rows when the dialog closes; the model (catalogue, geometry, chords) is `pf_client_core`'s.
+//! rows when the dialog closes; the model (catalogue, geometry, chords, icons) is
+//! `pf_client_core`'s.
 
 use adw::prelude::*;
 use gtk::gdk;
 use gtk::glib;
 use pf_client_core::overlay_actions::{
-    catalogue, chord_chip, key_legend, OverlayConfig, RingPlatform, Shortcut, SlotId, RING_SLOTS,
+    catalogue, chord_chip, key_legend, slot_icon, OverlayConfig, RingPlatform, Shortcut, SlotId,
+    RING_SLOTS,
 };
 use pf_client_core::ring::{slot_offset, CENTRE_DIAMETER, RING_RADIUS, SLOT_DIAMETER};
 use std::cell::RefCell;
@@ -21,6 +24,9 @@ use std::rc::Rc;
 /// The stage the ring sits on, in px: the ring's diameter plus a disc plus a margin each way.
 const STAGE_W: i32 = 440;
 const STAGE_H: i32 = 340;
+/// The Lucide mark on a disc, in px. The console draws it at 1.05× the disc's radius; this is
+/// that, so a disc reads the same weight in the editor as it does in the stream.
+const ICON_PX: i32 = (SLOT_DIAMETER * 1.05 / 2.0) as i32;
 
 const MODIFIERS: [&str; 4] = ["ctrl", "alt", "shift", "win"];
 
@@ -225,7 +231,7 @@ impl QuickActions {
             .use_markup(false)
             .activatable(true)
             .build();
-        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        row.add_suffix(&crate::lucide::row_icon("chevron-right"));
         let shared = Shared {
             dialog: dialog.downgrade(),
             blob: Rc::new(RefCell::new(blob.to_string())),
@@ -375,19 +381,21 @@ fn editor_page(shared: &Shared) -> adw::NavigationPage {
     adw::NavigationPage::new(&view, "Quick actions")
 }
 
-/// A disc's face: the short word, or a stacked keycap for a shortcut (the modifiers small on
-/// top, the key large under them).
+/// A disc's face: the slot's Lucide mark, or a stacked keycap for a shortcut (the modifiers
+/// small on top, the key large under them). The mark comes from the SHARED slot table, so a
+/// disc here carries exactly what the in-stream ring draws for the same slot. Only an id the
+/// table cannot know — an unknown host action, a future slot — falls back to its short word,
+/// which is what the console does too.
 fn disc_face(cfg: &OverlayConfig, slot: Option<&SlotId>) -> gtk::Widget {
     let Some(slot) = slot else {
-        return gtk::Label::builder()
-            .label("+")
-            .css_classes(["pf-ring-word", "dim-label"])
-            .build()
-            .upcast();
+        return crate::lucide::icon("plus", 22).upcast();
     };
     if let SlotId::Shortcut(id) = slot {
         let keys = cfg.shortcut(id).map(|s| s.keys.clone()).unwrap_or_default();
         return keycap(&keys).upcast();
+    }
+    if let Some(name) = slot_icon(&slot.id(), "") {
+        return crate::lucide::icon(name, ICON_PX).upcast();
     }
     gtk::Label::builder()
         .label(short_label(cfg, slot))
@@ -445,12 +453,14 @@ fn build_ring(
     let disc = SLOT_DIAMETER as f64;
 
     // The centre: what the sheet opens from in-stream, not editable here — dimmed and inert.
-    let centre = gtk::Label::builder()
-        .label("More")
-        .css_classes(["pf-ring-centre", "pf-ring-word"])
+    // The ring's own `more` mark, so the editor's centre is the centre people press.
+    let centre = gtk::Box::builder()
+        .css_classes(["pf-ring-centre"])
         .width_request(CENTRE_DIAMETER as i32)
         .height_request(CENTRE_DIAMETER as i32)
+        .tooltip_text("More — the rest of the actions, in the stream")
         .build();
+    centre.append(&crate::lucide::icon("ellipsis", ICON_PX));
     stage.put(
         &centre,
         cx - CENTRE_DIAMETER as f64 / 2.0,
@@ -584,7 +594,7 @@ fn picker(button: &gtk::Button, k: usize, shared: &Shared, rebuild: Option<Rc<dy
                 row.set_subtitle(&entry.note);
             }
             if entry.id == current {
-                row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
+                row.add_suffix(&crate::lucide::row_icon("check"));
             }
             let (shared, rebuild, popover, id) =
                 (shared.clone(), rebuild.clone(), popover.clone(), entry.id);
@@ -689,7 +699,7 @@ fn build_shortcuts(
         face.add_css_class("pf-keycap-small");
         face.set_size_request(36, 36);
         row.add_prefix(&face);
-        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        row.add_suffix(&crate::lucide::row_icon("chevron-right"));
         let (shared, rebuild, sc) = (shared.clone(), rebuild.clone(), sc.clone());
         row.connect_activated(move |_| {
             if let Some(dialog) = shared.dialog() {

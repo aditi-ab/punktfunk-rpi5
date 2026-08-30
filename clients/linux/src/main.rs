@@ -17,6 +17,9 @@ pub use pf_client_core::{discovery, gamepad, library, os, trust, video, wol};
 mod app;
 #[cfg(target_os = "linux")]
 mod cli;
+// The shell's icons: Lucide marks stroked from the console's own shared table.
+#[cfg(target_os = "linux")]
+mod lucide;
 // "Create shortcut…" — the desktop-entry writer (design/client-deep-links.md §5).
 #[cfg(target_os = "linux")]
 mod shortcuts;

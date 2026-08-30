@@ -613,7 +613,7 @@ impl relm4::factory::FactoryComponent for HostCard {
                     menu.append_section(None, &manage);
                 }
                 let menu_btn = gtk::MenuButton::builder()
-                    .icon_name("view-more-symbolic")
+                    .child(&crate::lucide::row_icon("ellipsis"))
                     .menu_model(&menu)
                     .halign(gtk::Align::End)
                     .valign(gtk::Align::Start)
@@ -934,11 +934,11 @@ impl SimpleComponent for HostsPage {
         banner.connect_button_clicked(|b| b.set_revealed(false));
 
         let header = adw::HeaderBar::new();
-        let add_host_btn = gtk::Button::from_icon_name("list-add-symbolic");
+        let add_host_btn = crate::lucide::button("plus");
         add_host_btn.set_tooltip_text(Some("Add host"));
         add_host_btn.set_action_name(Some("win.add-host"));
         header.pack_start(&add_host_btn);
-        let rescan_btn = gtk::Button::from_icon_name("view-refresh-symbolic");
+        let rescan_btn = crate::lucide::button("refresh-cw");
         rescan_btn.set_tooltip_text(Some("Scan the network for hosts again"));
         {
             let sender = sender.clone();
@@ -948,7 +948,7 @@ impl SimpleComponent for HostsPage {
         // The couch UI's front door, beside the page's other actions (same placement the
         // WinUI shell gives it). It was previously reachable only as `--browse` on the
         // command line, which is no way to find a mode.
-        let console_btn = gtk::Button::from_icon_name("input-gaming-symbolic");
+        let console_btn = crate::lucide::button("gamepad-2");
         console_btn.set_tooltip_text(Some("Console UI — the controller-driven couch interface"));
         console_btn.set_action_name(Some("win.console"));
         let menu = gio::Menu::new();
@@ -957,7 +957,7 @@ impl SimpleComponent for HostsPage {
         menu.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
         menu.append(Some("About Punktfunk"), Some("win.about"));
         let menu_btn = gtk::MenuButton::builder()
-            .icon_name("open-menu-symbolic")
+            .child(&crate::lucide::row_icon("menu"))
             .menu_model(&menu)
             .primary(true)
             .tooltip_text("Main menu")

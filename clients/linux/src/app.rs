@@ -40,11 +40,13 @@ const CSS: &str = "
    -- a quote in here would end it.) */
 .pf-override-dot { min-width: 8px; min-height: 8px; border-radius: 999px;
                    background: @accent_color; }
-/* The quick-action ring's editor (ui_quick_actions.rs): the stage is the soft gradient glass
-   needs behind it; a disc is the in-stream ring's own surface -- dark, translucent, a white
-   hairline -- so the editor shows the real thing. (No quotes in here.) */
-.pf-ring-stage { border-radius: 22px;
-                 background: linear-gradient(135deg, #613aa8 0%, #1a608c 55%, #128276 100%); }
+/* The quick-action ring's editor (ui_quick_actions.rs): the stage is a flat card face like
+   every other card on this shell -- a gradient read as decoration, which is why the console's
+   editor dropped its own. A disc stays the in-stream ring's own surface -- dark, translucent,
+   a white hairline -- so the editor shows the real thing, and its white ink is what the
+   Lucide marks inherit. (No quotes in here.) */
+.pf-ring-stage { border-radius: 22px; background: @card_bg_color;
+                 border: 1px solid alpha(currentColor, 0.12); }
 .pf-ring-disc { background: rgba(0, 0, 0, 0.55); border: 1px solid rgba(255, 255, 255, 0.18);
                 border-radius: 999px; color: white; padding: 0; }
 .pf-ring-disc:hover { background: rgba(0, 0, 0, 0.7); }
