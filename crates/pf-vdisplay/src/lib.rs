@@ -92,27 +92,28 @@ pub(crate) mod proc;
 /// Live-session detection + session-epoch + env retargeting (plan §W3).
 #[path = "vdisplay/session.rs"]
 pub(crate) mod session;
+#[cfg(target_os = "linux")]
+pub use session::session_epoch;
 pub use session::{
     apply_session_env, compositor_for_kind, detect_active_session, observe_session_instance,
-    settle_desktop_portal, ActiveKind, ActiveSession, SessionEnv,
+    settle_desktop_portal, try_recover_session, ActiveKind, ActiveSession, SessionEnv,
 };
-#[cfg(target_os = "linux")]
-pub use session::{session_epoch, try_recover_session};
 
 /// Gamescope-session routing (plan §W3).
 #[path = "vdisplay/routing.rs"]
 pub(crate) mod routing;
+pub use routing::{
+    cancel_pending_tv_restore, input_backend_id, managed_session_available,
+    preflight_takeover_privilege, release_autologin_mask, resolve_gamescope_route,
+    restore_managed_session, restore_takeover_now, restore_takeover_on_startup,
+    start_restore_worker, takeover_privilege_verdict, wants_dedicated_game_session, GamescopeRoute,
+    TakeoverInapplicable, TakeoverVerdict,
+};
 #[cfg(target_os = "linux")]
 pub use routing::{
-    cancel_pending_tv_restore, dedicated_game_exited, focus_streamed_output,
-    gamescope_xwayland_cursor_targets, launch_into_gamescope_session, launch_is_nested,
-    steam_appid_from_launch, watch_steam_game_exit,
-};
-pub use routing::{
-    input_backend_id, managed_session_available, preflight_takeover_privilege,
-    release_autologin_mask, resolve_gamescope_route, restore_managed_session, restore_takeover_now,
-    restore_takeover_on_startup, start_restore_worker, takeover_privilege_verdict,
-    wants_dedicated_game_session, GamescopeRoute, TakeoverInapplicable, TakeoverVerdict,
+    dedicated_game_exited, focus_streamed_output, gamescope_xwayland_cursor_targets,
+    launch_into_gamescope_session, launch_is_nested, steam_appid_from_launch,
+    watch_steam_game_exit,
 };
 
 /// Compositors punktfunk knows how to drive (plan §6).

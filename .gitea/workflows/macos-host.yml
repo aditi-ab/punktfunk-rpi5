@@ -1,0 +1,100 @@
+# Does `punktfunk-host` still COMPILE on a third platform? Nothing more.
+#
+# There is no macOS host backend and none is shipped. What this protects is the seam: every
+# platform-gated call site saying which platform it means, rather than assuming Linux-or-Windows
+# and only being caught when someone tries. Left ungated the seam rots quietly — it drifted from
+# 9 unguarded call sites to 11 in the four weeks after it was first measured, with nobody working
+# on macOS at all (issue #299, Tier A). A compile check is the cheapest thing that notices.
+#
+# ⚠ WHY NOT A JOB IN apple.yml, which already owns this runner. Two reasons, both load-bearing:
+#   * That workflow's `paths:` filter is deliberately narrow — punktfunk-core and the Apple client
+#     — because the mac mini is shared and an xcframework build is heavy. A host-crate edit would
+#     never have fired it, so the gate would have been decorative.
+#   * `distribute` there is `needs: swift`. A sibling job is fine, but anything that grows a
+#     dependency on the Swift gate can block a TestFlight upload over a host-side compile hole
+#     that has nothing to do with the client.
+#
+# Runs on the same self-hosted `macos-arm64` runner (home-mac-mini-1; scripts/ci/setup-macos-runner.sh)
+# and shares apple.yml's sccache bucket, so the dependency graph is usually warm.
+name: macos-host
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.gitea/workflows/macos-host.yml'
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.gitea/workflows/macos-host.yml'
+  workflow_dispatch:
+
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_BUCKET: unom-ci-sccache
+  SCCACHE_ENDPOINT: https://storage.unom.io
+  SCCACHE_REGION: home-central
+  AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_SECRET_ACCESS_KEY }}
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # SECURITY: same caveat as apple.yml's `swift` job — this compiles PULL-REQUEST code on the
+  # host-mode, persistent runner that apple.yml's signing job also uses. The `if:` is the same
+  # fail-open backstop: it skips fork PRs where Gitea reports the fork flag, and still runs
+  # same-repo PRs (and any where the flag is absent), so it never blocks internal PR CI.
+  check:
+    runs-on: macos-arm64
+    if: >-
+      gitea.event_name != 'pull_request' ||
+      gitea.event.pull_request.head.repo.fork != true
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Rust toolchain (self-healing on a fresh runner)
+        run: |
+          if ! command -v rustup >/dev/null && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --profile minimal
+          fi
+          RUSTUP="$(command -v rustup || echo "$HOME/.cargo/bin/rustup")"
+          dirname "$RUSTUP" >> "$GITHUB_PATH"
+
+      - name: sccache (self-healing install)
+        run: sh scripts/ci/ensure-sccache.sh
+
+      # The mic pump decodes with `opus`, which vendors libopus through CMake — the same
+      # requirement, and the same self-healing install, as apple.yml's xcframework build.
+      - name: CMake (for the vendored libopus builds)
+        run: |
+          # Runner steps run with `bash --noprofile --norc`, so Homebrew's bin dir isn't on PATH.
+          for B in /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -x "$B" ] && BREW="$B" && break; done
+          if [ -z "$BREW" ]; then echo "::error::Homebrew not found on the runner"; exit 1; fi
+          BREW_BIN="$(dirname "$BREW")"; export PATH="$BREW_BIN:$PATH"
+          command -v cmake >/dev/null || "$BREW" install cmake
+          echo "$BREW_BIN" >> "$GITHUB_PATH"
+          # Homebrew's CMake 4 dropped compatibility with the vendored libopus's pre-3.5
+          # `cmake_minimum_required`; treat 3.5 as the policy minimum.
+          echo "CMAKE_POLICY_VERSION_MINIMUM=3.5" >> "$GITHUB_ENV"
+
+      # `check`, not `clippy`, and no `-D warnings`: the graph carries code that is dead on macOS
+      # (`pf-encode::vbv_frames_env`, the `hidout` sink in `native/input.rs`). Failing the gate on
+      # that would only teach people to ignore it. This asks one question — does it compile.
+      - name: Check (punktfunk-host, default features)
+        run: cargo check -p punktfunk-host --locked
+
+      - name: sccache stats (visibility only)
+        if: always()
+        run: sccache --show-stats

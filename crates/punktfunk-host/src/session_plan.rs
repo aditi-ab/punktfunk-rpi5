@@ -285,21 +285,23 @@ pub(crate) fn resolve_topology() -> SessionTopology {
 ///   `latched_mouse`) streamed cursorless. Metadata + host blend is the path that was
 ///   verified end-to-end; embedded remains only the can't-blend fallback (libav
 ///   VAAPI/NVENC, software).
-/// * **Windows**: never — the IDD capturer composites the pointer itself (`cursor_blend.rs` /
-///   DWM), and no Windows encode backend reads `frame.cursor`. Asking the encoder anyway made
-///   `open_video`'s blends-cursor backstop fire spuriously on every cursor-channel session.
+/// * **Everywhere else**: never. On Windows the IDD capturer composites the pointer itself
+///   (`cursor_blend.rs` / DWM), and no Windows encode backend reads `frame.cursor`; asking the
+///   encoder anyway made `open_video`'s blends-cursor backstop fire spuriously on every
+///   cursor-channel session. The rule is gated on Linux rather than against Windows because the
+///   terms it reads — the VAAPI/CUDA prediction and the zero-copy switch — exist only there.
 pub(crate) fn cursor_blend_for(
     cursor_forward: bool,
     gamescope: bool,
     codec: crate::encode::Codec,
     bit_depth: u8,
 ) -> bool {
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_os = "linux"))]
     {
         let _ = (cursor_forward, gamescope, codec, bit_depth);
         false
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
         if gamescope {
             // gamescope's capture carries no SPA_META_Cursor; the blend-capable term below

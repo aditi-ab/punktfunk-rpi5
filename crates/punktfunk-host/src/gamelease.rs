@@ -1225,10 +1225,9 @@ fn windows_term_ladder(shared: &LeaseShared) {
 ///
 /// Returns how many processes were still alive when asked.
 pub fn end_previous_launch(title: &str, procs: &[crate::procscan::ProcRef], why: &str) -> usize {
-    let scanner = crate::procscan::Scanner::system();
     // Re-verified before every signal, so a pid recycled since the watcher last published it is
     // never hit (procscan rule 2). This is the whole safety of signalling a remembered pid.
-    let live = || scanner.alive(procs);
+    let live = || crate::procscan::alive(procs);
 
     let first = live();
     if first.is_empty() {

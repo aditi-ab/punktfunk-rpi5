@@ -87,6 +87,22 @@ pub fn resolve(pid: u32) -> Option<ProcRef> {
     }
 }
 
+/// Which of `procs` are still the processes they were, re-read now. Empty on a platform with no
+/// matcher — where nothing can be adopted in the first place, so nothing can be outlived either.
+///
+/// The platform-neutral wrapper, so [`crate::gamelease`] stays free of `cfg`s.
+pub fn alive(procs: &[ProcRef]) -> Vec<ProcRef> {
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        Scanner::system().alive(procs)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = procs;
+        Vec::new()
+    }
+}
+
 /// Short names for the processes a lease adopted, in `procs` order.
 ///
 /// Diagnostics only — nothing decides anything on these, and they are deliberately not part of
