@@ -436,6 +436,34 @@ pub fn catalogue(cfg: &OverlayConfig, platform: RingPlatform) -> Vec<CatalogueGr
     g
 }
 
+/// The Lucide icon a slot draws instead of a word, by wire id — the mic swaps to its struck
+/// form while muted, and `more` is the ring's own centre. `None` for what the set cannot know:
+/// a shortcut (its keycap chord IS its face) and any host action beyond the three powers.
+///
+/// One table for every shell that draws the ring — the in-stream Skia console, its editor, the
+/// GTK shell's editor and the Windows client's — so a slot cannot carry one mark in the stream
+/// and another in the editor that configures it (design tenet 8). The name keys
+/// [`crate::lucide`] on the two Rust shells that stroke the path, and the baked PNG on the
+/// Windows shell, which cannot.
+pub fn slot_icon(id: &str, state: &str) -> Option<&'static str> {
+    Some(match id {
+        "end_stream" => "square",
+        "disconnect_linger" => "log-out",
+        "touch_mode" => "pointer",
+        "keyboard" => "keyboard",
+        "stats" => "chart-column",
+        "mic" if state == "Muted" => "mic-off",
+        "mic" => "mic",
+        "pad" => "gamepad-2",
+        "send_text" => "send",
+        "more" => "ellipsis",
+        "host:power.sleep" => "moon",
+        "host:power.reboot" => "rotate-cw",
+        "host:power.shutdown" => "power",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,5 +641,35 @@ mod tests {
         ] {
             assert_eq!(SlotId::parse(id).unwrap().id(), id);
         }
+    }
+
+    /// Every built-in slot the ring can hold names an icon, that icon really ships, and the
+    /// mic's muted form is its own mark. A slot with no icon draws its short word instead —
+    /// fine for an unknown host action, wrong for a slot the catalogue offers.
+    #[test]
+    fn every_built_in_slot_names_an_icon_that_ships() {
+        let cfg = OverlayConfig::platform_default(RingPlatform::Desktop);
+        for group in catalogue(&cfg, RingPlatform::Desktop) {
+            for entry in group.entries {
+                if entry.id.is_empty() {
+                    continue; // the empty slot draws a plus, not a slot icon
+                }
+                let name =
+                    slot_icon(&entry.id, "").unwrap_or_else(|| panic!("{} has no icon", entry.id));
+                assert!(
+                    crate::lucide::path(name).is_some(),
+                    "{}: the set does not ship '{name}'",
+                    entry.id
+                );
+            }
+        }
+        assert_eq!(slot_icon("more", ""), Some("ellipsis"), "the ring's centre");
+        assert_eq!(slot_icon("mic", "Muted"), Some("mic-off"));
+        assert_eq!(slot_icon("host:custom.eject", ""), None);
+        assert_eq!(
+            slot_icon("shortcut:s1", ""),
+            None,
+            "a chord IS its own face"
+        );
     }
 }
