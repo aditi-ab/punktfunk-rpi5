@@ -218,6 +218,11 @@ pub async fn run(
     // Close out any update-intent record a previous apply left behind (the update reports its
     // own outcome across its own restart — update/jobs.rs). Once per boot, before serving.
     crate::update::reconcile_at_boot();
+    // Keep a status tray alive for as long as this host runs. The tray has no supervisor of its
+    // own — the HKLM `Run` value is a sign-in trigger — so every upgrade's `StopTrays` (and every
+    // crash) left the box without an icon until the next logon. See `windows::tray::supervise`.
+    #[cfg(target_os = "windows")]
+    crate::tray::supervise();
 
     // The mgmt API is HTTPS + token-authenticated ALWAYS (even on loopback): `parse_serve`
     // guarantees a token (CLI flag / env / persisted ~/.config/punktfunk/mgmt-token / generated).

@@ -1,11 +1,11 @@
-//! Tray lifecycle: the one place that knows how to find, start, stop and check the per-user status
-//! tray. Shared by the `tray` CLI subcommand and by post-update reconciliation
-//! (`update::windows::relaunch_tray`).
+//! Tray lifecycle: the one place that knows how to find, start, stop, check and SUPERVISE the
+//! per-user status tray. Shared by the `tray` CLI subcommand and by [`supervise`], which the host
+//! service runs for its whole lifetime.
 //!
 //! Why this exists at all: `punktfunk-tray.exe` is a per-USER, per-SESSION GUI process with no
 //! recovery path of its own. The HKLM `Run` value only fires at sign-in, and nothing in the product
-//! restarts a tray that died — so anything that kills one (an upgrade's `StopTrays`, a crash) left
-//! the operator without an icon until they signed out and back in.
+//! restarted a tray that died — so anything that killed one (an upgrade's `StopTrays`, a crash) left
+//! the operator without an icon until they signed out and back in. [`supervise`] closes that.
 //!
 //! The launch has to cross a privilege boundary in one direction but not the other, so [`start`]
 //! tries the session-crossing path first and falls back to a plain spawn:
@@ -83,6 +83,62 @@ pub fn is_running() -> bool {
         .any(|n| n == stem)
 }
 
+/// How often [`supervise`] re-checks that a tray is up.
+const WATCH_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The installer's `trayicon` task writes this HKLM `Run` value. Its presence is the ONLY honest
+/// "this box wants a status icon" signal: `punktfunk-tray.exe` is installed unconditionally
+/// (it is small), so its mere existence on disk means nothing.
+fn wanted() -> bool {
+    winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+        .open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run")
+        .and_then(|k| k.get_value::<String, _>("PunktfunkTray"))
+        .is_ok()
+}
+
+/// Keep a status tray alive for as long as the host runs. Spawned once from `mgmt::run`.
+///
+/// This is the tray's missing supervisor. The HKLM `Run` value fires at sign-in and never again, so
+/// EVERY way a tray dies used to be terminal until the next logon: the installer's `StopTrays`
+/// (which every upgrade runs — console-initiated, winget, or a hand-run setup), an Explorer-level
+/// crash, an operator's `taskkill`. An update-specific remedy only ever covered the update path,
+/// and only when the *previous* binary already knew to record the intent. A tick that just asks
+/// "is one running?" covers all of them and depends on nothing the old version wrote.
+///
+/// The first check is immediate — that is the post-update restore — and later ones need TWO
+/// consecutive misses before acting. That grace tick is what keeps the watchdog from fighting the
+/// tray's own "Exit tray", which stops this service and takes the watchdog down with it a few
+/// seconds later.
+pub fn supervise() {
+    std::thread::spawn(|| {
+        if !wanted() {
+            tracing::debug!("no HKLM Run entry for the status tray — not supervising it");
+            return;
+        }
+        ensure();
+        let mut missed = false;
+        loop {
+            std::thread::sleep(WATCH_TICK);
+            let absent = !is_running();
+            if absent && missed {
+                ensure();
+            }
+            missed = absent;
+        }
+    });
+}
+
+/// One supervision beat. Best-effort by design: nobody's stream depends on the icon, and the
+/// ordinary "failure" is simply that nobody has signed in yet — so this stays at `debug`/`info`
+/// rather than handing the operator a warning they cannot act on.
+fn ensure() {
+    match start() {
+        Ok((Some(pid), how)) => tracing::info!(pid, how, "status tray started"),
+        Ok((None, _)) => tracing::trace!("status tray is already running"),
+        Err(e) => tracing::debug!(error = %e, "could not start the status tray"),
+    }
+}
+
 /// Start the tray if it is not already up.
 ///
 /// `Ok(None)` = one was already running (idempotent by design: the tray also guards itself with a
@@ -123,6 +179,10 @@ pub fn start() -> Result<(Option<u32>, &'static str)> {
 }
 
 /// Stop every tray instance. Returns whether one was running.
+///
+/// Note that [`supervise`] will put one back within a minute while this host runs — `tray stop` is
+/// a diagnostic, not a way to turn the icon off. Turning it off for good means clearing the
+/// installer's HKLM `Run` value (see [`wanted`]).
 ///
 /// Graceful first, mirroring the uninstaller's own order (`[UninstallRun]`): `--quit` posts
 /// WM_CLOSE to the tray window, which lets it remove its icon via `NIM_DELETE` instead of leaving a

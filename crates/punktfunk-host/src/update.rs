@@ -575,10 +575,6 @@ enum PostApply {
 pub(crate) fn reconcile_at_boot() {
     let path = jobs::intent_path();
     let intent = jobs::read_intent(&path);
-    // Read off the intent BEFORE `reconcile` consumes it. Restored on both terminal outcomes: a
-    // rolled-back or aborted install killed the tray just as thoroughly as a successful one. NOT on
-    // StillApplying — the installer may still be running and would only kill it again.
-    let restore_tray = intent.as_ref().is_some_and(|i| i.tray_was_running);
     match jobs::reconcile(intent, env!("PUNKTFUNK_VERSION"), now_unix()) {
         jobs::Reconciled::None | jobs::Reconciled::StillApplying => {}
         jobs::Reconciled::Success(record) => {
@@ -601,12 +597,6 @@ pub(crate) fn reconcile_at_boot() {
             let _ = std::fs::remove_file(&path);
         }
     }
-    #[cfg(target_os = "windows")]
-    if restore_tray {
-        windows::relaunch_tray();
-    }
-    #[cfg(not(target_os = "windows"))]
-    let _ = restore_tray; // the Linux packages never kill a running tray
 }
 
 /// What status hands to the API layer.

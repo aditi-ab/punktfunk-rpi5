@@ -27,7 +27,8 @@ use windows::Win32::Security::{
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessAsUserW, CREATE_BREAKAWAY_FROM_JOB, CREATE_UNICODE_ENVIRONMENT,
+    PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 /// `Some((own_session, console_session))` when this process is NOT in the active console session —
@@ -133,24 +134,44 @@ pub fn spawn_in_active_session(cmdline: &str, workdir: Option<&Path>) -> Result<
     };
 
     let mut pi = PROCESS_INFORMATION::default();
-    // SAFETY: `primary` is the live primary token; `cmd`, `desktop` (via `si.lpDesktop`), `workdir_w`
-    // (via `cwd`) and `merged_env` are locals that outlive the call, each NUL-terminated as the API
-    // requires — `merged_env` doubly so, per `merged_env_block`. `pi` is a live local out-param, and
-    // the API retains none of these pointers.
-    let created = unsafe {
-        CreateProcessAsUserW(
-            Some(primary),
-            None,
-            Some(PWSTR(cmd.as_mut_ptr())),
-            None,
-            None,
-            false, // no handle inheritance — fire-and-forget GUI launch, no stdio relay
-            CREATE_UNICODE_ENVIRONMENT,
-            Some(merged_env.as_ptr() as *const core::ffi::c_void),
-            cwd,
-            &si,
-            &mut pi,
-        )
+    // BREAKAWAY: the service worker that calls this sits in a kill-on-close job object
+    // (`crate::service`, `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK`), and
+    // a child joins its parent's job by default. Without the flag, everything launched here — the
+    // status tray, the user's game, a hook — is reaped the moment the service stops or restarts,
+    // which flatly contradicts this function's "the launched process outlives this call" contract.
+    // The job exists to stop a service crash orphaning the SYSTEM streamer; it was never meant to
+    // own processes running under the USER's token in the console session. Same reasoning, same
+    // flag, as the update installer spawn (`update/windows.rs`).
+    //
+    // The retry covers the one case the flag can fail: a job that does NOT permit breakaway (a
+    // hand-run host under some job-owning launcher) rejects `CreateProcessAsUserW` with
+    // ACCESS_DENIED. Launching into that job beats not launching at all.
+    let mut flags = CREATE_UNICODE_ENVIRONMENT | CREATE_BREAKAWAY_FROM_JOB;
+    let created = loop {
+        // SAFETY: `primary` is the live primary token; `cmd`, `desktop` (via `si.lpDesktop`),
+        // `workdir_w` (via `cwd`) and `merged_env` are locals that outlive the call, each
+        // NUL-terminated as the API requires — `merged_env` doubly so, per `merged_env_block`.
+        // `pi` is a live local out-param, and the API retains none of these pointers.
+        let r = unsafe {
+            CreateProcessAsUserW(
+                Some(primary),
+                None,
+                Some(PWSTR(cmd.as_mut_ptr())),
+                None,
+                None,
+                false, // no handle inheritance — fire-and-forget GUI launch, no stdio relay
+                flags,
+                Some(merged_env.as_ptr() as *const core::ffi::c_void),
+                cwd,
+                &si,
+                &mut pi,
+            )
+        };
+        if r.is_ok() || !flags.contains(CREATE_BREAKAWAY_FROM_JOB) {
+            break r;
+        }
+        tracing::debug!("breakaway launch refused ({r:?}) — retrying inside the job");
+        flags &= !CREATE_BREAKAWAY_FROM_JOB;
     };
     // SAFETY: `primary` is live and owned here, closed exactly once and not used after.
     let _ = unsafe { CloseHandle(primary) };
