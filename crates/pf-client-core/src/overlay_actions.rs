@@ -292,11 +292,227 @@ impl OverlayConfig {
     pub fn shortcut(&self, id: &str) -> Option<&Shortcut> {
         self.shortcuts.iter().find(|s| s.id == id)
     }
+
+    /// Write a shortcut: over its own entry when `id` names one, else appended with the next
+    /// `s<n>` id and into the first empty slot (design §3.3). Returns the id it went under.
+    /// One implementation for every editor, so a shortcut made on any client lands the same.
+    pub fn upsert_shortcut(&mut self, id: Option<&str>, label: &str, keys: Vec<String>) -> String {
+        let label = label.trim().to_string();
+        if let Some(sc) = id.and_then(|id| self.shortcuts.iter_mut().find(|s| s.id == id)) {
+            sc.label = label;
+            sc.keys = keys;
+            return sc.id.clone();
+        }
+        let next = self
+            .shortcuts
+            .iter()
+            .filter_map(|s| s.id.trim_start_matches('s').parse::<u32>().ok())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let id = format!("s{next}");
+        if let Some(slot) = self.ring.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(SlotId::Shortcut(id.clone()));
+        }
+        self.shortcuts.push(Shortcut {
+            id: id.clone(),
+            label,
+            keys,
+        });
+        id
+    }
+
+    /// Drop a shortcut and empty the slot that pointed at it (`parse` would on the next read;
+    /// doing it here shows it at once).
+    pub fn remove_shortcut(&mut self, id: &str) {
+        self.shortcuts.retain(|s| s.id != id);
+        for slot in self.ring.iter_mut() {
+            if matches!(slot, Some(SlotId::Shortcut(s)) if s == id) {
+                *slot = None;
+            }
+        }
+    }
+}
+
+/// One thing a slot can hold, as an editor lists it: the wire id (empty for the empty slot),
+/// the label, and the note that says where it is unavailable (empty when it is not).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogueEntry {
+    pub id: String,
+    pub label: String,
+    pub note: String,
+}
+
+/// A group of the catalogue, in the order every editor shows them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogueGroup {
+    pub title: &'static str,
+    pub entries: Vec<CatalogueEntry>,
+}
+
+/// The catalogue by group (design §3.3): Session, Input, View, Audio, Host, the blob's own
+/// Shortcuts (when there are any), Empty last. One table for every editor — the shells render
+/// it, they do not restate it. The notes are the platform's: a desktop has no virtual
+/// controller and no typed-text path; a phone has both.
+pub fn catalogue(cfg: &OverlayConfig, platform: RingPlatform) -> Vec<CatalogueGroup> {
+    let e = |id: &str, label: &str, note: &str| CatalogueEntry {
+        id: id.into(),
+        label: label.into(),
+        note: note.into(),
+    };
+    let desktop = platform == RingPlatform::Desktop;
+    let host = "Only where the host offers it";
+    let mut g = vec![
+        CatalogueGroup {
+            title: "Session",
+            entries: vec![
+                e("end_stream", "End stream", ""),
+                e("disconnect_linger", "Disconnect, keep the game running", ""),
+            ],
+        },
+        CatalogueGroup {
+            title: "Input",
+            entries: vec![
+                e("touch_mode", "Touch mode", ""),
+                e("keyboard", "Keyboard", ""),
+                e(
+                    "pad",
+                    "Virtual controller",
+                    if desktop {
+                        "Phones and tablets only"
+                    } else {
+                        ""
+                    },
+                ),
+                e(
+                    "send_text",
+                    "Send text",
+                    if desktop {
+                        "Not on this client yet"
+                    } else {
+                        ""
+                    },
+                ),
+            ],
+        },
+        CatalogueGroup {
+            title: "View",
+            entries: vec![e("stats", "Statistics", "")],
+        },
+        CatalogueGroup {
+            title: "Audio",
+            entries: vec![e("mic", "Microphone", "")],
+        },
+        CatalogueGroup {
+            title: "Host",
+            entries: vec![
+                e("host:power.sleep", "Sleep host", host),
+                e("host:power.reboot", "Restart host", host),
+                e("host:power.shutdown", "Shut down host", host),
+            ],
+        },
+    ];
+    if !cfg.shortcuts.is_empty() {
+        g.push(CatalogueGroup {
+            title: "Shortcuts",
+            entries: cfg
+                .shortcuts
+                .iter()
+                .map(|sc| {
+                    let chip = chord_chip(&sc.keys);
+                    if sc.label.is_empty() {
+                        e(&format!("shortcut:{}", sc.id), &chip, "")
+                    } else {
+                        e(&format!("shortcut:{}", sc.id), &sc.label, &chip)
+                    }
+                })
+                .collect(),
+        });
+    }
+    g.push(CatalogueGroup {
+        title: "Empty",
+        entries: vec![e("", "Empty slot", "")],
+    });
+    g
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The catalogue is one list in one order on every editor: the groups, the desktop notes
+    /// a phone does not carry, the blob's shortcuts by name with the legend as the note, and
+    /// Empty last — with no Shortcuts group when there are none.
+    #[test]
+    fn the_catalogue_is_grouped_noted_per_platform_and_ends_with_empty() {
+        let blob = r#"{"v":2,"ring":[],"shortcuts":[{"id":"s1","label":"Task Manager","keys":["ctrl","shift","escape"]},{"id":"s2","keys":["alt","f4"]}]}"#;
+        let cfg = OverlayConfig::parse(blob, RingPlatform::Desktop);
+        let groups = catalogue(&cfg, RingPlatform::Desktop);
+        let titles: Vec<&str> = groups.iter().map(|g| g.title).collect();
+        assert_eq!(
+            titles,
+            [
+                "Session",
+                "Input",
+                "View",
+                "Audio",
+                "Host",
+                "Shortcuts",
+                "Empty"
+            ]
+        );
+        let pad = &groups[1].entries[2];
+        assert_eq!(
+            (pad.id.as_str(), pad.note.as_str()),
+            ("pad", "Phones and tablets only")
+        );
+        let phone = catalogue(&cfg, RingPlatform::Touch);
+        assert_eq!(phone[1].entries[2].note, "", "a phone has the pad");
+        let s = &groups[5].entries;
+        assert_eq!(
+            (s[0].id.as_str(), s[0].label.as_str(), s[0].note.as_str()),
+            ("shortcut:s1", "Task Manager", "Ctrl+Shift+Esc")
+        );
+        assert_eq!(
+            (s[1].id.as_str(), s[1].label.as_str(), s[1].note.as_str()),
+            ("shortcut:s2", "Alt+F4", "")
+        );
+        assert_eq!(groups[6].entries[0].id, "");
+        let none = catalogue(
+            &OverlayConfig::parse("", RingPlatform::Desktop),
+            RingPlatform::Desktop,
+        );
+        assert!(none.iter().all(|g| g.title != "Shortcuts"));
+    }
+
+    /// A new shortcut takes the next id and the first empty slot; written again under its id
+    /// it changes in place; removed, its slot empties.
+    #[test]
+    fn a_shortcut_is_upserted_by_id_and_takes_the_first_empty_slot() {
+        let mut cfg = OverlayConfig::parse(
+            r#"{"v":2,"ring":["end_stream",null,null,null,null,null]}"#,
+            RingPlatform::Desktop,
+        );
+        let id = cfg.upsert_shortcut(
+            None,
+            " Task Manager ",
+            vec!["ctrl".into(), "shift".into(), "escape".into()],
+        );
+        assert_eq!(id, "s1");
+        assert_eq!(cfg.ring[1], Some(SlotId::Shortcut("s1".into())));
+        assert_eq!(cfg.shortcuts[0].label, "Task Manager");
+        let again = cfg.upsert_shortcut(Some("s1"), "Tasks", vec!["ctrl".into(), "escape".into()]);
+        assert_eq!(again, "s1");
+        assert_eq!(cfg.shortcuts.len(), 1);
+        assert_eq!(cfg.shortcuts[0].keys, vec!["ctrl", "escape"]);
+        let second = cfg.upsert_shortcut(None, "", vec!["alt".into(), "f4".into()]);
+        assert_eq!(second, "s2");
+        assert_eq!(cfg.ring[2], Some(SlotId::Shortcut("s2".into())));
+        cfg.remove_shortcut("s1");
+        assert_eq!(cfg.shortcuts.len(), 1);
+        assert_eq!(cfg.ring[1], None);
+        assert_eq!(cfg.ring[2], Some(SlotId::Shortcut("s2".into())));
+    }
 
     const FULL: &str = r#"{"v":2,
         "ring":["end_stream","shortcut:s1","host:power.sleep","stats",null,"pad"],

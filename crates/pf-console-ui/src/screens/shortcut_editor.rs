@@ -12,7 +12,7 @@ use crate::screens::{Ctx, Outbox};
 use crate::theme::{accent, fg, fill, focus_halo, on_accent, stroke, Fonts, EDGE_INSET, W};
 use crate::widgets::{permits, Charset, KeyMsg, Keyboard, ROW_MAX_W};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
-use pf_client_core::overlay_actions::{chord_chip, key_legend, OverlayConfig, Shortcut, SlotId};
+use pf_client_core::overlay_actions::{chord_chip, key_legend, OverlayConfig, Shortcut};
 use skia_safe::{Canvas, RRect, Rect};
 
 use super::ring_editor::ring_platform;
@@ -118,48 +118,15 @@ impl Draft {
     }
 }
 
-/// The draft into the blob: over its own entry, or appended with the next `s<n>` id and into
-/// the first empty slot. Pure, so a test can drive it without the shared settings file.
+/// The draft into the blob: the shared upsert (over its own entry, or appended into the first
+/// empty slot). Pure, so a test can drive it without the shared settings file.
 fn apply_draft(cfg: &mut OverlayConfig, d: &Draft) {
-    let chord = d.keys();
-    let label = d.label.trim().to_string();
-    match &d.id {
-        Some(id) => {
-            if let Some(sc) = cfg.shortcuts.iter_mut().find(|s| &s.id == id) {
-                sc.label = label;
-                sc.keys = chord;
-            }
-        }
-        None => {
-            let next = cfg
-                .shortcuts
-                .iter()
-                .filter_map(|s| s.id.trim_start_matches('s').parse::<u32>().ok())
-                .max()
-                .unwrap_or(0)
-                + 1;
-            let id = format!("s{next}");
-            if let Some(slot) = cfg.ring.iter_mut().find(|s| s.is_none()) {
-                *slot = Some(SlotId::Shortcut(id.clone()));
-            }
-            cfg.shortcuts.push(Shortcut {
-                id,
-                label,
-                keys: chord,
-            });
-        }
-    }
+    cfg.upsert_shortcut(d.id.as_deref(), &d.label, d.keys());
 }
 
-/// Drop a shortcut and empty the slot that pointed at it (`parse` would on the next read;
-/// doing it here shows it at once).
+/// Drop a shortcut and empty the slot that pointed at it.
 fn remove_shortcut(cfg: &mut OverlayConfig, id: &str) {
-    cfg.shortcuts.retain(|s| s.id != id);
-    for slot in cfg.ring.iter_mut() {
-        if matches!(slot, Some(SlotId::Shortcut(s)) if s == id) {
-            *slot = None;
-        }
-    }
+    cfg.remove_shortcut(id);
 }
 
 /// The key in `row` whose centre is nearest `x`, so Up and Down keep the column a keyboard
@@ -725,7 +692,7 @@ impl ShortcutEditorScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pf_client_core::overlay_actions::RingPlatform;
+    use pf_client_core::overlay_actions::{RingPlatform, SlotId};
 
     /// A new shortcut: Ctrl and Shift marked on, Esc chosen on the grid — applied, it is in
     /// the blob with its keys in send order and sits in the first empty slot; reopened, the

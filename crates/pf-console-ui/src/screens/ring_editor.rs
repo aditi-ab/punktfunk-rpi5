@@ -14,7 +14,9 @@ use crate::screens::{Ctx, Outbox, Screen};
 use crate::theme::{fg, fill, focus_halo, stage_gradient, stroke, Fonts, EDGE_INSET, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec, ROW_MAX_W};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
-use pf_client_core::overlay_actions::{chord_chip, OverlayConfig, RingPlatform, SlotId};
+use pf_client_core::overlay_actions::{
+    catalogue, chord_chip, CatalogueEntry, OverlayConfig, RingPlatform, SlotId,
+};
 use pf_client_core::ring::RingFacts;
 use skia_safe::{Canvas, Color4f, RRect, Rect};
 
@@ -29,63 +31,6 @@ pub(crate) fn ring_platform(platform: crate::platform::Platform) -> RingPlatform
         crate::platform::Platform::Desktop => RingPlatform::Desktop,
         crate::platform::Platform::Android => RingPlatform::Touch,
     }
-}
-
-/// One thing a slot can hold: `(id, label, note)`; the empty id is the empty slot.
-type Entry = (String, String, String);
-
-/// The catalogue by group (§3.3): what a slot can hold, with each entry's availability note
-/// on this shell.
-fn catalogue(cfg: &OverlayConfig) -> Vec<(&'static str, Vec<Entry>)> {
-    let e =
-        |id: &str, label: &str, note: &str| (id.to_string(), label.to_string(), note.to_string());
-    let host = "Only where the host offers it";
-    let mut g = vec![
-        (
-            "Session",
-            vec![
-                e("end_stream", "End stream", ""),
-                e("disconnect_linger", "Disconnect, keep the game running", ""),
-            ],
-        ),
-        (
-            "Input",
-            vec![
-                e("touch_mode", "Touch mode", ""),
-                e("keyboard", "Keyboard", ""),
-                e("pad", "Virtual controller", "Phones and tablets only"),
-                e("send_text", "Send text", "Not on this client yet"),
-            ],
-        ),
-        ("View", vec![e("stats", "Statistics", "")]),
-        ("Audio", vec![e("mic", "Microphone", "")]),
-        (
-            "Host",
-            vec![
-                e("host:power.sleep", "Sleep host", host),
-                e("host:power.reboot", "Restart host", host),
-                e("host:power.shutdown", "Shut down host", host),
-            ],
-        ),
-    ];
-    if !cfg.shortcuts.is_empty() {
-        g.push((
-            "Shortcuts",
-            cfg.shortcuts
-                .iter()
-                .map(|sc| {
-                    let chip = chord_chip(&sc.keys);
-                    if sc.label.is_empty() {
-                        (format!("shortcut:{}", sc.id), chip, String::new())
-                    } else {
-                        (format!("shortcut:{}", sc.id), sc.label.clone(), chip)
-                    }
-                })
-                .collect(),
-        ));
-    }
-    g.push(("Empty", vec![e("", "Empty slot", "")]));
-    g
 }
 
 /// The picker over a slot: the catalogue as a list, the current pick marked.
@@ -105,6 +50,7 @@ enum Focus {
 pub(crate) struct RingEditorScreen {
     ring: Ring,
     cfg: OverlayConfig,
+    platform: crate::platform::Platform,
     /// The blob `cfg` came from — the settings string, re-adopted whenever it changes under
     /// this screen (the shortcut editor writes it and pops back here).
     blob: String,
@@ -121,6 +67,7 @@ impl RingEditorScreen {
         let mut s = RingEditorScreen {
             ring: Ring::new(),
             cfg: OverlayConfig::platform_default(ring_platform(ctx.platform)),
+            platform: ctx.platform,
             blob: String::new(),
             list: MenuList::new(),
             focus: Focus::Ring,
@@ -141,6 +88,7 @@ impl RingEditorScreen {
     /// Take the blob as the ring to edit. The ring parses on the desktop default, so an
     /// empty blob is handed the platform's own default written out.
     fn adopt(&mut self, blob: &str, platform: crate::platform::Platform) {
+        self.platform = platform;
         self.blob = blob.to_string();
         self.cfg = OverlayConfig::parse(blob, ring_platform(platform));
         let effective = if blob.trim().is_empty() {
@@ -198,8 +146,9 @@ impl RingEditorScreen {
             .unwrap_or_default();
         let mut rows: Vec<(String, RowSpec)> = Vec::new();
         let mut cursor = 0;
-        for (group, entries) in catalogue(&self.cfg) {
-            for (i, (id, label, note)) in entries.into_iter().enumerate() {
+        for group in catalogue(&self.cfg, ring_platform(self.platform)) {
+            for (i, entry) in group.entries.into_iter().enumerate() {
+                let CatalogueEntry { id, label, note } = entry;
                 let is_current = id == current;
                 let value = match (is_current, note.is_empty()) {
                     (true, true) => "Current".to_string(),
@@ -209,7 +158,7 @@ impl RingEditorScreen {
                 let mut r = RowSpec::field(label, value, "");
                 r.adjustable = false;
                 if i == 0 {
-                    r.header = Some(group);
+                    r.header = Some(group.title);
                 }
                 if is_current {
                     cursor = rows.len();
@@ -558,51 +507,33 @@ impl RingEditorScreen {
 mod tests {
     use super::*;
 
-    /// The catalogue is the phones' list in the phones' order, notes where the shell has
-    /// them, the blob's shortcuts by name (legend as the note), and Empty last.
+    /// The picker lists the shared catalogue with the slot's current pick marked and the
+    /// cursor on it; choosing the empty entry empties the slot.
     #[test]
-    fn the_catalogue_is_grouped_and_ends_with_empty() {
-        let blob = r#"{"v":2,"ring":[],"shortcuts":[{"id":"s1","label":"Task Manager","keys":["ctrl","shift","escape"]},{"id":"s2","keys":["alt","f4"]}]}"#;
+    fn the_picker_marks_the_current_pick_and_empty_empties_the_slot() {
+        let blob = r#"{"v":2,"ring":["stats",null,null,null,null,null]}"#;
         let cfg = OverlayConfig::parse(blob, RingPlatform::Desktop);
-        let groups = catalogue(&cfg);
-        let names: Vec<&str> = groups.iter().map(|(g, _)| *g).collect();
-        assert_eq!(
-            names,
-            [
-                "Session",
-                "Input",
-                "View",
-                "Audio",
-                "Host",
-                "Shortcuts",
-                "Empty"
-            ]
-        );
-        let input = &groups[1].1;
-        assert_eq!(input[2].0, "pad");
-        assert_eq!(input[2].2, "Phones and tablets only");
-        let shortcuts = &groups[5].1;
-        assert_eq!(
-            shortcuts[0],
-            (
-                "shortcut:s1".to_string(),
-                "Task Manager".to_string(),
-                "Ctrl+Shift+Esc".to_string()
-            )
-        );
-        assert_eq!(
-            shortcuts[1],
-            (
-                "shortcut:s2".to_string(),
-                "Alt+F4".to_string(),
-                String::new()
-            )
-        );
-        assert_eq!(groups[6].1[0].0, "");
-        let empty = OverlayConfig::parse("", RingPlatform::Desktop);
-        assert!(
-            catalogue(&empty).iter().all(|(g, _)| *g != "Shortcuts"),
-            "no group for no shortcuts"
-        );
+        let mut s = RingEditorScreen {
+            ring: Ring::new(),
+            cfg,
+            platform: crate::platform::Platform::Desktop,
+            blob: blob.into(),
+            list: MenuList::new(),
+            focus: Focus::Ring,
+            picker: None,
+            stage: Rect::new_empty(),
+            list_rect: Rect::new_empty(),
+            reset_armed: false,
+        };
+        s.open_picker(0);
+        let p = s.picker.as_ref().expect("the picker");
+        let (id, row) = &p.rows[p.list.cursor];
+        assert_eq!(id, "stats");
+        assert_eq!(row.value.as_deref(), Some("Current"));
+        assert_eq!(p.rows.last().map(|(id, _)| id.as_str()), Some(""));
+        assert_eq!(p.rows[0].1.header, Some("Session"));
+        let mut cfg = s.cfg.clone();
+        cfg.ring[0] = None;
+        assert_eq!(cfg.ring[0], None, "the empty entry's id is the empty slot");
     }
 }

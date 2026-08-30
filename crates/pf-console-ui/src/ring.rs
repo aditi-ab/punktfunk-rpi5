@@ -23,10 +23,11 @@ use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
-/// Geometry in pixels at 100 % scale (`FrameCtx::scale` multiplies every metric).
-const RADIUS: f32 = 120.0;
-const SLOT_D: f32 = 56.0;
-const CENTRE_D: f32 = 64.0;
+/// Geometry in pixels at 100 % scale (`FrameCtx::scale` multiplies every metric) — the
+/// shared numbers every desktop drawing of the ring reads.
+const RADIUS: f32 = pf_client_core::ring::RING_RADIUS;
+const SLOT_D: f32 = pf_client_core::ring::SLOT_DIAMETER;
+const CENTRE_D: f32 = pf_client_core::ring::CENTRE_DIAMETER;
 const IDLE_CLOSE: Duration = Duration::from_secs(8);
 const HINT_LIFE: Duration = Duration::from_secs(2);
 /// Button k lags the previous one by this much of the twist, so the ring visibly unwinds.
@@ -899,7 +900,7 @@ impl Ring {
             // start and only fades (`q` still drives the alpha below).
             let travel = if reduce { 1.0 } else { q };
             let turn = if self.clockwise { -40.0 } else { 40.0 };
-            let deg = -90.0 + 60.0 * k as f32 + (1.0 - travel) * turn;
+            let deg = pf_client_core::ring::slot_angle_deg(k) + (1.0 - travel) * turn;
             let (s, c) = deg.to_radians().sin_cos();
             let (mut x, mut y) = (cx + radius * travel * c, cy + radius * travel * s);
             let mut r = slot_d / 2.0 * (0.6 + 0.4 * travel);

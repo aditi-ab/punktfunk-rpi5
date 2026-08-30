@@ -41,6 +41,50 @@ pub enum RingCommand {
     Shortcut(Vec<String>),
 }
 
+/// The ring's geometry at 100 % scale, in the client's design units (px on Skia, dp/pt on the
+/// phones). Every desktop drawing of the ring — the Skia console in-stream and its editor,
+/// the GTK shell's editor, the Windows client's editor — reads these, so the three cannot
+/// drift apart (design tenet 8).
+pub const RING_RADIUS: f32 = 120.0;
+pub const SLOT_DIAMETER: f32 = 56.0;
+pub const CENTRE_DIAMETER: f32 = 64.0;
+
+/// Slot `k` sits at 12, 2, 4… o'clock: its angle in degrees with 0 at 3 o'clock, clockwise.
+pub fn slot_angle_deg(k: usize) -> f32 {
+    -90.0 + 60.0 * k as f32
+}
+
+/// Slot `k`'s centre relative to the ring's centre, `radius` out, y down.
+pub fn slot_offset(k: usize, radius: f32) -> (f32, f32) {
+    let (s, c) = slot_angle_deg(k).to_radians().sin_cos();
+    (radius * c, radius * s)
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    /// Slot 0 is straight up, slot 3 straight down, and the six sit 60° apart on the circle.
+    #[test]
+    fn slots_sit_at_twelve_two_four_six_eight_and_ten() {
+        let (x0, y0) = slot_offset(0, 100.0);
+        assert!(
+            x0.abs() < 1e-3 && (y0 + 100.0).abs() < 1e-3,
+            "12 o'clock is up: {x0} {y0}"
+        );
+        let (x3, y3) = slot_offset(3, 100.0);
+        assert!(
+            x3.abs() < 1e-3 && (y3 - 100.0).abs() < 1e-3,
+            "6 o'clock is down"
+        );
+        let (x1, y1) = slot_offset(1, 100.0);
+        assert!(x1 > 0.0 && y1 < 0.0, "2 o'clock is up and right");
+        for k in 0..6 {
+            assert!((slot_angle_deg(k) - (-90.0 + 60.0 * k as f32)).abs() < 1e-6);
+        }
+    }
+}
+
 /// The session facts the ring's slots show and gate on, composed by the presenter per frame.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RingFacts {
