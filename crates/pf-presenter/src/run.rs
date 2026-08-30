@@ -382,6 +382,9 @@ struct StreamState {
     /// and when it went up — cleared after [`ACCESS_NOTICE_S`]. Rides the hint-pill slot
     /// with priority: an access change outranks "click to capture" for a few seconds.
     session_notice: Option<(String, Instant)>,
+    /// Gaming Mode's touch-as-mouse (design §5.5): drops the leaked positions Steam Input
+    /// sends as deltas, and says so once.
+    touch_mouse: crate::touch::SteamTouchMouse,
     /// The host's pinned fingerprint (hex) once connected — the key the pre-fetched host
     /// actions are cached under — and the mode the Welcome carried (the ring's "Native").
     fp_hex: String,
@@ -440,6 +443,9 @@ impl StreamState {
             cursor_chan: None,
             access: pf_client_core::access::SessionAccess::default(),
             session_notice: None,
+            touch_mouse: crate::touch::SteamTouchMouse::new(
+                pf_client_core::overlay_focus::gamescope_session(),
+            ),
             last_hint: None,
             hint_override: false,
             sent_client_draws: None,
@@ -1131,6 +1137,23 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                                         h: ah,
                                     });
                                 }
+                            } else if st.touch_mouse.leaks(xrel, yrel) {
+                                // Gaming Mode's touch-as-mouse (§5.5): a leaked position,
+                                // not a delta — dropped, and said once.
+                                if st.touch_mouse.take_notice() {
+                                    tracing::warn!(
+                                        xrel,
+                                        yrel,
+                                        "Steam Input is replaying the touchscreen as a mouse — \
+                                         dropping the leaked positions"
+                                    );
+                                    st.session_notice = Some((
+                                        "Steam Input is sending the touchscreen as a mouse — \
+                                         pick the Punktfunk controller layout for touch"
+                                            .into(),
+                                        Instant::now(),
+                                    ));
+                                }
                             } else {
                                 cap.on_motion(xrel, yrel);
                             }
@@ -1184,6 +1207,10 @@ fn run_inner(mut opts: SessionOpts, mut mode: ModeCtl) -> Result<Option<Outcome>
                     ..
                 } => {
                     if is_direct_touch(touch_id) {
+                        // A real finger reached SDL: the touchscreen is ours, not Steam's.
+                        if let Some(st) = stream.as_mut() {
+                            st.touch_mouse.fingers_seen = true;
+                        }
                         if ring_finger(&mut overlay, &window, FingerPhase::Down, x, y) {
                             continue;
                         }

@@ -16,6 +16,9 @@
 #                      iteration, non-reproducible). Default: offline (regenerates cargo-sources).
 #   BUILDER=...        override the flatpak-builder invocation (default: auto-detect host
 #                      flatpak-builder, else `flatpak run org.flatpak.Builder`).
+#   BRANCH=...         the flatpak branch to build and bundle (default: stable). A Deck tracking
+#                      the hosted `canary` takes a test build as BRANCH=canary, replacing it in
+#                      place — a second branch beside it would win the plain `flatpak run`.
 #   ARCH=...           target architecture (default: this machine's). `aarch64` builds the arm64
 #                      client — the manifest carries the per-arch PKG_CONFIG_PATH and the matching
 #                      prebuilt Skia archive. NOTE this is not a cross-compile: flatpak-builder
@@ -33,6 +36,7 @@ VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo 0
 VERSION="${VERSION#v}"
 # `flatpak --default-arch` reports flatpak's own name for this machine (x86_64 / aarch64).
 ARCH="${ARCH:-$(flatpak --default-arch 2>/dev/null || uname -m)}"
+BRANCH="${BRANCH:-stable}"
 # Arch-suffixed so an x86_64 and an aarch64 bundle can sit in dist/ together instead of the
 # second silently overwriting the first. (CI composes its own published filename.)
 BUNDLE="dist/punktfunk-client-${VERSION}-${ARCH}.flatpak"
@@ -101,7 +105,7 @@ echo "==> flatpak-builder ($APP_ID, version $VERSION, arch $ARCH)"
 # the .flatpak-builder state dir instead of re-fetching gamescope and its submodules (~2.5 min of
 # wlroots/libliftoff/vkroots/libdisplay-info that this manifest never even builds).
 "${FPB[@]}" --user --force-clean --disable-rofiles-fuse \
-  --default-branch=stable \
+  --default-branch="$BRANCH" \
   --disable-updates \
   --arch="$ARCH" \
   --install-deps-from=flathub \
@@ -110,7 +114,7 @@ echo "==> flatpak-builder ($APP_ID, version $VERSION, arch $ARCH)"
   "$ROOTDIR/.flatpak-build" "$MANIFEST"
 
 mkdir -p dist
-flatpak build-bundle --arch="$ARCH" "$ROOTDIR/.flatpak-repo" "$BUNDLE" "$APP_ID" stable
+flatpak build-bundle --arch="$ARCH" "$ROOTDIR/.flatpak-repo" "$BUNDLE" "$APP_ID" "$BRANCH"
 echo "built $BUNDLE"
 ls -lh "$BUNDLE"
 echo

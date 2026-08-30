@@ -553,8 +553,79 @@ impl Gestures {
     }
 }
 
+/// No finger drag moves this far in one SDL event; a leaked absolute position routinely does
+/// (the field capture read 300 to 450).
+const LEAK_PX: f32 = 150.0;
+
+/// Design §5.5: in Gaming Mode Steam Input owns the touchscreen and replays it as a mouse whose
+/// "relative" deltas are absolute positions — hundreds of pixels per event, which under the
+/// stream's relative-mouse lock walk the host cursor into a corner. SDL sees no fingers at all,
+/// so every touch model is bypassed, and `SDL_TOUCH_MOUSE_EVENTS` cannot help: the events are
+/// Steam's, not SDL's. This recognises that shape — a gamescope session, no finger event yet,
+/// a delta no finger drag produces — and drops the leaked motion. A real mouse in Gaming Mode
+/// keeps working: its deltas are small.
+pub struct SteamTouchMouse {
+    game_mode: bool,
+    /// A direct-touch finger reached SDL this session: the touchscreen is ours, nothing leaks.
+    pub fingers_seen: bool,
+    leaked: bool,
+    noticed: bool,
+}
+
+impl SteamTouchMouse {
+    pub fn new(game_mode: bool) -> Self {
+        Self {
+            game_mode,
+            fingers_seen: false,
+            leaked: false,
+            noticed: false,
+        }
+    }
+
+    /// Whether this relative motion is a leaked touch position, to be dropped.
+    pub fn leaks(&mut self, xrel: f32, yrel: f32) -> bool {
+        if !self.game_mode || self.fingers_seen {
+            return false;
+        }
+        let leak = xrel.abs() >= LEAK_PX || yrel.abs() >= LEAK_PX;
+        if leak {
+            self.leaked = true;
+        }
+        leak
+    }
+
+    /// `true` once, after the first leak: the caller shows the notice.
+    pub fn take_notice(&mut self) -> bool {
+        let first = self.leaked && !self.noticed;
+        if first {
+            self.noticed = true;
+        }
+        first
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gaming_mode_drops_leaked_touch_positions_until_a_finger_is_seen() {
+        let mut m = super::SteamTouchMouse::new(true);
+        // A mouse's deltas pass, and there is nothing to say.
+        assert!(!m.leaks(4.0, -3.0));
+        assert!(!m.take_notice());
+        // A leaked position is dropped, and said once.
+        assert!(m.leaks(340.0, 12.0));
+        assert!(m.take_notice());
+        assert!(!m.take_notice());
+        assert!(m.leaks(0.0, -420.0));
+        // A real finger reached SDL: the touchscreen is ours, nothing leaks any more.
+        m.fingers_seen = true;
+        assert!(!m.leaks(340.0, 12.0));
+        // Outside Gaming Mode a mouse may move that far in one event.
+        let mut d = super::SteamTouchMouse::new(false);
+        assert!(!d.leaks(340.0, 12.0));
+        assert!(!d.take_notice());
+    }
+
     use super::*;
 
     const ABS: Abs = Abs {
