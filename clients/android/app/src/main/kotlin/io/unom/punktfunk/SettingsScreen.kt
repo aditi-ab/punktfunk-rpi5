@@ -207,6 +207,7 @@ fun SettingsScreen(
                 if (active != null) resetField("overlay_actions") else update(s.copy(overlayActions = ""))
             },
             onBack = { showQuickActions = false },
+            overridden = active?.overrides?.overridden()?.contains("overlay_actions") == true,
         )
         return
     }

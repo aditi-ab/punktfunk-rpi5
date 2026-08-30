@@ -7,6 +7,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -60,6 +61,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -72,7 +74,9 @@ import androidx.compose.ui.unit.sp
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.RingNav
 import kotlinx.coroutines.delay
+import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.hypot
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
@@ -194,6 +198,12 @@ class RingActions(
     val requestMode: (Int, Int, Int) -> Unit,
 )
 
+/**
+ * The editor's hooks (design §3.3): a tap on a slot picks its action instead of firing it, and a
+ * disc dragged onto another slot swaps the two. Null in-stream.
+ */
+class RingEditing(val pick: (Int) -> Unit, val swap: (Int, Int) -> Unit)
+
 /** One button as the ring draws it: glyph or keycap chip, its state, and why it is dimmed. */
 private data class SlotSpec(
     val id: String,
@@ -284,6 +294,8 @@ fun RingOverlay(
     containerSize: IntSize,
     haptics: ConsoleHaptics,
     modifier: Modifier = Modifier,
+    /** Set by the settings editor; null in-stream. */
+    editing: RingEditing? = null,
 ) {
     if (!state.visible) return
     val density = LocalDensity.current
@@ -306,7 +318,7 @@ fun RingOverlay(
     }
     // Idle: the exit disc's 8 s rule, for the same latency reason — unless the sheet is up.
     LaunchedEffect(state.committed, state.lastTouch, state.sheet) {
-        if (state.committed && !state.sheet) {
+        if (state.committed && !state.sheet && editing == null) {
             delay(IDLE_CLOSE_MS)
             state.close()
         }
@@ -400,12 +412,21 @@ fun RingOverlay(
             // The scrim: a tap outside the ring closes it, and nothing reaches the stream while
             // it is open. No backdrop blur — a blur over a video surface is a full-screen pass.
             .background(Color.Black.copy(alpha = 0.18f * shown.value))
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-            ) { if (state.sheet) state.sheet = false else state.close() },
+            // In the editor the backdrop under the ring owns the twist; the scrim takes nothing.
+            .then(
+                if (editing == null) {
+                    Modifier.clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                    ) { if (state.sheet) state.sheet = false else state.close() }
+                } else {
+                    Modifier
+                },
+            ),
     ) {
         val slotHalf = slotPx / 2
+        // The disc under an editing drag and how far it has been carried.
+        var drag by remember { mutableStateOf<Pair<Int, Offset>?>(null) }
         cfg.ring.forEachIndexed { k, slot ->
             val q = ((shown.value - k * SLOT_LAG) / (1f - 5 * SLOT_LAG)).coerceIn(0f, 1f)
             if (q <= 0f) return@forEachIndexed
@@ -414,9 +435,38 @@ fun RingOverlay(
             val turn = if (state.clockwise) -40f else 40f
             val deg = -90f + 60f * k + (1f - q) * turn
             val rad = Math.toRadians(deg.toDouble())
-            val x = cx + radiusPx * q * cos(rad).toFloat() - slotHalf
-            val y = cy + radiusPx * q * sin(rad).toFloat() - slotHalf
+            val carried = drag?.takeIf { it.first == k }?.second ?: Offset.Zero
+            val x = cx + radiusPx * q * cos(rad).toFloat() - slotHalf + carried.x
+            val y = cy + radiusPx * q * sin(rad).toFloat() - slotHalf + carried.y
             val s = slot?.let { spec(it, cfg, actions) }
+            // Editing: a disc dragged onto another slot swaps the two (§3.3); released near the
+            // centre or over its own slot, nothing changes. The drag consumes past touch slop,
+            // which is what keeps the tap from also firing.
+            val dragModifier = if (editing != null) {
+                Modifier.pointerInput(k, editing) {
+                    detectDragGestures(
+                        onDragStart = { drag = k to Offset.Zero },
+                        onDragEnd = {
+                            val d = drag
+                            drag = null
+                            if (d == null || d.first != k) return@detectDragGestures
+                            val home = Math.toRadians(-90.0 + 60.0 * k)
+                            val px = radiusPx * cos(home).toFloat() + d.second.x
+                            val py = radiusPx * sin(home).toFloat() + d.second.y
+                            if (hypot(px, py) <= radiusPx / 2) return@detectDragGestures
+                            val angle = Math.toDegrees(atan2(py, px).toDouble()) + 90.0
+                            val target = (((angle / 60.0).roundToInt() % 6) + 6) % 6
+                            if (target != k) editing.swap(k, target)
+                        },
+                        onDragCancel = { drag = null },
+                    ) { change, delta ->
+                        change.consume()
+                        drag = (drag?.takeIf { it.first == k } ?: (k to Offset.Zero)).let { it.first to it.second + delta }
+                    }
+                }
+            } else {
+                Modifier
+            }
             RingButton(
                 spec = s,
                 size = SLOT_D,
@@ -424,8 +474,11 @@ fun RingOverlay(
                 alpha = q,
                 armed = s != null && state.armed == s.id,
                 highlighted = state.highlight == k,
-                modifier = Modifier.offset { IntOffset(x.roundToInt(), y.roundToInt()) },
-                onTap = { if (slot != null && s != null) fire(s, slot) },
+                modifier = Modifier.offset { IntOffset(x.roundToInt(), y.roundToInt()) }.then(dragModifier),
+                editable = editing != null,
+                onTap = {
+                    if (editing != null) editing.pick(k) else if (slot != null && s != null) fire(s, slot)
+                },
             )
         }
         // The centre arrives last and opens the sheet.
@@ -489,6 +542,8 @@ private fun RingButton(
     armed: Boolean,
     modifier: Modifier,
     highlighted: Boolean = false,
+    /** The editor: an empty slot is a pick target, not inert. */
+    editable: Boolean = false,
     onTap: () -> Unit,
 ) {
     val tint = when {
@@ -507,7 +562,7 @@ private fun RingButton(
                 Color.White.copy(alpha = if (highlighted) 0.8f else if (armed) 0.6f else 0.18f),
                 CircleShape,
             )
-            .clickable(enabled = spec != null, onClick = onTap)
+            .clickable(enabled = spec != null || editable, onClick = onTap)
             .semantics {
                 contentDescription = spec?.label ?: "Empty slot"
                 stateDescription = when {
@@ -520,26 +575,51 @@ private fun RingButton(
         contentAlignment = Alignment.Center,
     ) {
         when {
-            // A chord as a stacked keycap: modifiers small on top, the key large under them —
-            // one legend line ran past the disc's edge.
-            spec?.chip != null -> {
-                val parts = spec.chip.split("+")
-                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(size - 12.dp)) {
-                    if (parts.size > 1) {
-                        Text(
-                            parts.dropLast(1).joinToString("+"),
-                            color = tint, fontSize = 8.sp, fontWeight = FontWeight.SemiBold,
-                            maxLines = 1, softWrap = false,
-                        )
-                    }
-                    Text(
-                        parts.last(),
-                        color = tint, fontSize = if (parts.last().length > 3) 10.sp else 13.sp,
-                        fontWeight = FontWeight.SemiBold, maxLines = 1, softWrap = false,
-                    )
-                }
-            }
+            spec?.chip != null -> ChordKeycap(spec.chip, tint, size)
             spec?.icon != null -> Icon(spec.icon, contentDescription = null, tint = tint, modifier = Modifier.size(size / 2))
+        }
+    }
+}
+
+/**
+ * A chord as a stacked keycap: modifiers small on top, the key large under them — one legend
+ * line ran past the disc's edge. [chip] is `chordChip`'s text. The editor previews a chord with
+ * this same composable.
+ */
+@Composable
+internal fun ChordKeycap(chip: String, tint: Color, size: androidx.compose.ui.unit.Dp) {
+    val parts = chip.split("+")
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(size - 12.dp)) {
+        if (parts.size > 1) {
+            Text(
+                parts.dropLast(1).joinToString("+"),
+                color = tint, fontSize = 8.sp, fontWeight = FontWeight.SemiBold,
+                maxLines = 1, softWrap = false,
+            )
+        }
+        Text(
+            parts.last(),
+            color = tint, fontSize = if (parts.last().length > 3) 10.sp else 13.sp,
+            fontWeight = FontWeight.SemiBold, maxLines = 1, softWrap = false,
+        )
+    }
+}
+
+/** A chord on a disc the size the ring draws it, for lists and the editing screen. */
+@Composable
+internal fun KeycapDisc(keys: List<String>, size: androidx.compose.ui.unit.Dp = SLOT_D) {
+    Box(
+        Modifier
+            .size(size)
+            .clip(CircleShape)
+            .background(Color(0xFF383838))
+            .border(1.dp, Color.White.copy(alpha = 0.18f), CircleShape),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (keys.isEmpty()) {
+            Text("?", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+        } else {
+            ChordKeycap(chordChip(keys), Color.White, size)
         }
     }
 }
