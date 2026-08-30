@@ -200,9 +200,16 @@ tempfile = "3"
 # Opus encode for the host->client audio plane — stereo (`opus::Encoder`) AND 5.1/7.1 surround
 # (`opus::MSEncoder`, the safe multistream API the crate exposes; no `audiopus_sys` needed). The
 # crate vendors libopus (cmake-built from source — no system lib, no vcpkg), so it builds on Windows
-# MSVC too (needs CMake + NASM, both on the box). Both platforms that have an audio-capture backend.
-[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+# MSVC too (needs CMake + NASM, both on the box) and on macOS, where `punktfunk-core` already
+# vendors it for the client. The mic pump that decodes with it carries no platform code of its own.
+[target.'cfg(any(unix, windows))'.dependencies]
 opus = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+# The POSIX calls behind the `#[cfg(unix)]` helpers in `hooks.rs` (geteuid) and the SIGTERM
+# ladder in `gamelease.rs`. Declared for every unix, not just Linux, or a macOS build fails on
+# code whose own cfg already says it is portable.
+libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `screencast` gates the ScreenCast portal module; `remote_desktop` adds the RemoteDesktop
@@ -210,7 +217,6 @@ opus = "0.3"
 # `open_pipe_wire_remote` is unconditional, so ashpd's own `pipewire` feature is not
 # needed — we drive PipeWire with the `pipewire` crate below.
 ashpd = { version = "0.13", features = ["screencast", "remote_desktop"] }
-libc = "0.2"
 # Must match the pipewire crate ashpd 0.13 links (libspa/pipewire-sys `links` key is
 # unique per build), i.e. 0.9 — NOT the 0.10 the setup doc mentions.
 pipewire = "0.9"
