@@ -265,7 +265,11 @@ fn quit_existing() -> anyhow::Result<()> {
 /// Build/refresh the notify icon from the current status. Returns false when the shell rejected
 /// the call (no taskbar yet).
 fn update_icon(hwnd: HWND, add: bool) -> bool {
-    let status = app().status.lock().unwrap().clone();
+    let status = app()
+        .status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
@@ -325,7 +329,11 @@ fn update_icon(hwnd: HWND, add: bool) -> bool {
 /// renders `NIF_INFO` balloons as native toasts under the app's name — no WinRT/AUMID
 /// registration needed for a plain exe. Fired from the UI thread on WMAPP_STATUS.
 fn notify_on_connect(hwnd: HWND) {
-    let status = app().status.lock().unwrap().clone();
+    let status = app()
+        .status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let now: u8 = if status.is_streaming() { 2 } else { 1 };
     // 0 = first status since launch: record only. A tray started mid-session (sign-in while a
     // client already streams) must not fire a stale toast.
@@ -396,7 +404,11 @@ fn notify_on_connect(hwnd: HWND) {
 
 /// The right-click menu, rebuilt from the live status each time.
 fn show_menu(hwnd: HWND) {
-    let status = app().status.lock().unwrap().clone();
+    let status = app()
+        .status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let running = matches!(
         status,
         TrayStatus::Running(_) | TrayStatus::Starting | TrayStatus::Degraded
@@ -670,9 +682,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     // Same condition the menu labelled this entry with (`show_menu`): without a
                     // host exe there is no stop to attempt, and a refusal there would leave the
                     // operator with an icon they cannot close.
+                    // Poison-tolerant, like every other read of this mutex: a panic crossing an
+                    // extern boundary aborts the process (Rust 1.81+), which for the tray means
+                    // the icon vanishes with no way back. `check-unsafe-hygiene.sh` only reads
+                    // THIS function's body, so the same care in `update_icon`, `show_menu` and
+                    // `notify_on_connect` — all called from here — is not optional either.
                     let stop_first = app.host_exe.is_some()
                         && matches!(
-                            *app.status.lock().unwrap(),
+                            *app.status.lock().unwrap_or_else(|e| e.into_inner()),
                             TrayStatus::Running(_) | TrayStatus::Starting | TrayStatus::Degraded
                         );
                     if stop_first && !elevate_service(hwnd, "stop") {
