@@ -20,16 +20,21 @@
 //     that (nitro-entry/bun-https.mjs) so we don't sever our own stream.
 //   - An `event: dropped` frame means we fell off the ring and must resync — invalidate everything.
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+import { toast } from "@unom/ui/toast";
 import { useEffect, useSyncExternalStore } from "react";
 import { getListPairedClientsQueryKey } from "@/api/gen/clients/clients";
 import { getGetDisplayStateQueryKey } from "@/api/gen/display/display";
 import { getGetStatusQueryKey } from "@/api/gen/host/host";
 import { getGetLibraryQueryKey } from "@/api/gen/library/library";
-import { getListNativeClientsQueryKey } from "@/api/gen/native/native";
+import {
+	getListNativeClientsQueryKey,
+	getListPendingDevicesQueryKey,
+} from "@/api/gen/native/native";
 import { getGetPairingStatusQueryKey } from "@/api/gen/pairing/pairing";
 import { getGetUpdateStatusQueryKey } from "@/api/gen/update/update";
 import { boostPluginPolling, PLUGINS_KEY } from "@/api/plugins";
 import { storeKeys } from "@/api/store";
+import { m } from "@/paraglide/messages";
 
 /** Which query keys a given event kind invalidates. Unknown kinds are ignored on purpose.
  * (The generated key helpers return `readonly` tuples, which is what React Query wants.) */
@@ -51,9 +56,15 @@ function keysFor(kind: string): readonly (readonly unknown[])[] {
 		case "display.created":
 		case "display.released":
 			return [...status, getGetDisplayStateQueryKey()];
+		// A knock (and a denial clearing one) changes the pending list itself — which is the one
+		// an operator sits and waits on. It used to refresh only on its own 10 s timer.
 		case "pairing.pending":
 		case "pairing.denied":
-			return [...status, getGetPairingStatusQueryKey()];
+			return [
+				...status,
+				getGetPairingStatusQueryKey(),
+				getListPendingDevicesQueryKey(),
+			];
 		// A completed pairing also adds a device to whichever plane's list is on screen.
 		case "pairing.completed":
 			return [
@@ -204,7 +215,10 @@ function attach(): void {
 	for (const kind of KINDS) {
 		source.addEventListener(kind, (ev) => {
 			// Record it first: the feed should show an event even for a kind we invalidate nothing for.
-			recordActivity(kind, ev);
+			const entry = recordActivity(kind, ev);
+			// A knock needs someone to act on it, and it can land on any page — so it is the one
+			// event that interrupts rather than waiting to be noticed on the Pairing page.
+			if (kind === "pairing.pending") announceKnock(entry);
 			if (!client) return;
 			// The installed set changed — but the runner is probably still restarting, so keep
 			// checking for a while rather than trusting this one refetch (see boostPluginPolling).
@@ -221,19 +235,46 @@ function attach(): void {
 	});
 }
 
-/** Parse one SSE frame into the activity ring. A malformed frame is dropped, never thrown. */
-function recordActivity(kind: string, ev: Event): void {
+/**
+ * Parse one SSE frame into the activity ring, and hand back what it parsed so a caller can read
+ * the payload without parsing the same frame twice. A malformed frame is dropped, never thrown.
+ */
+function recordActivity(kind: string, ev: Event): ActivityEntry | null {
 	const raw = (ev as MessageEvent<string>).data;
-	if (typeof raw !== "string") return;
+	if (typeof raw !== "string") return null;
 	try {
 		const data = JSON.parse(raw) as Record<string, unknown>;
 		const seq = typeof data.seq === "number" ? data.seq : Number.NaN;
 		const ts = typeof data.ts_ms === "number" ? data.ts_ms : Number.NaN;
-		if (!Number.isFinite(seq) || !Number.isFinite(ts)) return;
-		pushActivity({ seq, ts_ms: ts, kind, data });
+		if (!Number.isFinite(seq) || !Number.isFinite(ts)) return null;
+		const entry: ActivityEntry = { seq, ts_ms: ts, kind, data };
+		pushActivity(entry);
+		return entry;
 	} catch {
 		// A frame we cannot parse is not worth breaking the stream over.
+		return null;
 	}
+}
+
+/**
+ * Tell the operator a device is knocking, wherever they are in the console.
+ *
+ * The pending list is on one page, and until now nothing said a request had arrived unless you
+ * were already looking at it — worst on a phone, where that page is several taps away.
+ *
+ * The action is a plain navigation rather than a router push: this module is not a component and
+ * has no router to reach. It costs a page load, on a button someone pressed on purpose.
+ */
+function announceKnock(entry: ActivityEntry | null): void {
+	const device = entry?.data.device as { name?: unknown } | undefined;
+	const name = typeof device?.name === "string" ? device.name : null;
+	toast.info(m.pairing_knock_title(), {
+		description: name ? m.pairing_knock_desc({ name }) : undefined,
+		action: {
+			label: m.pairing_knock_action(),
+			onClick: () => window.location.assign("/pairing"),
+		},
+	});
 }
 
 function release(): void {
