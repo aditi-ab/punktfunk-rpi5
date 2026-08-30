@@ -94,6 +94,26 @@ struct App {
     streaming_seen: AtomicU8,
 }
 
+impl App {
+    /// The tray status, tolerating a POISONED lock instead of unwrapping it.
+    ///
+    /// Every caller is reachable from `wndproc`, which is an `extern "system"` boundary: a panic
+    /// crossing it does not unwind, it ABORTS the process (Rust 1.81 onwards, which is what
+    /// `scripts/ci/check-unsafe-hygiene.sh` gate B exists to catch). Poisoning only means some
+    /// other thread panicked while holding this lock, and what it guards is a display enum — so
+    /// reading it is harmless, while taking the host's only visible surface down over it is not.
+    ///
+    /// The lexical gate saw one of these call sites, the one written inline in `wndproc`. The
+    /// other four sit in helpers it calls, where a panic unwinds into the same boundary and
+    /// aborts just the same; routing all five through here fixes the class rather than the
+    /// instance CI happened to be able to point at.
+    fn status(&self) -> std::sync::MutexGuard<'_, TrayStatus> {
+        self.status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 static APP: OnceLock<App> = OnceLock::new();
 
 fn app() -> &'static App {
@@ -226,7 +246,7 @@ pub fn run(args: crate::Args) -> anyhow::Result<()> {
         args.mgmt_port,
         args.web_port,
         Box::new(move |st, console_up| {
-            *app().status.lock().unwrap() = st;
+            *app().status() = st;
             app().web_console.store(console_up, Ordering::SeqCst);
             let hwnd = HWND(app().hwnd.load(Ordering::SeqCst) as *mut _);
             // SAFETY: PostMessageW is documented thread-safe; a stale/destroyed hwnd fails
@@ -265,7 +285,7 @@ fn quit_existing() -> anyhow::Result<()> {
 /// Build/refresh the notify icon from the current status. Returns false when the shell rejected
 /// the call (no taskbar yet).
 fn update_icon(hwnd: HWND, add: bool) -> bool {
-    let status = app().status.lock().unwrap().clone();
+    let status = app().status().clone();
     let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
@@ -325,7 +345,7 @@ fn update_icon(hwnd: HWND, add: bool) -> bool {
 /// renders `NIF_INFO` balloons as native toasts under the app's name — no WinRT/AUMID
 /// registration needed for a plain exe. Fired from the UI thread on WMAPP_STATUS.
 fn notify_on_connect(hwnd: HWND) {
-    let status = app().status.lock().unwrap().clone();
+    let status = app().status().clone();
     let now: u8 = if status.is_streaming() { 2 } else { 1 };
     // 0 = first status since launch: record only. A tray started mid-session (sign-in while a
     // client already streams) must not fire a stale toast.
@@ -396,7 +416,7 @@ fn notify_on_connect(hwnd: HWND) {
 
 /// The right-click menu, rebuilt from the live status each time.
 fn show_menu(hwnd: HWND) {
-    let status = app().status.lock().unwrap().clone();
+    let status = app().status().clone();
     let running = matches!(
         status,
         TrayStatus::Running(_) | TrayStatus::Starting | TrayStatus::Degraded
@@ -672,7 +692,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     // operator with an icon they cannot close.
                     let stop_first = app.host_exe.is_some()
                         && matches!(
-                            *app.status.lock().unwrap(),
+                            *app.status(),
                             TrayStatus::Running(_) | TrayStatus::Starting | TrayStatus::Degraded
                         );
                     if stop_first && !elevate_service(hwnd, "stop") {
