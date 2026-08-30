@@ -178,7 +178,7 @@ crates/pf-vdisplay/src/lib.rs:1
 crates/pf-vdisplay/src/vdisplay/routing.rs:4
 crates/pf-vdisplay/src/vdisplay/session.rs:10
 crates/pf-vkdecode/tests/common/mod.rs:1
-crates/pf-vkdecode/tests/gpu_parity.rs:5
+crates/pf-vkdecode/tests/gpu_parity.rs:2
 crates/pf-win-display/src/win_display.rs:2
 crates/punktfunk-core/src/quic/endpoint.rs:2
 crates/punktfunk-host/src/identity.rs:3

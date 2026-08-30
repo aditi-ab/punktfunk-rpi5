@@ -346,6 +346,22 @@ fn sha256_hex(data: &[u8]) -> String {
         })
 }
 
+/// Arm the decoders' readback hook: they read `PF_VKD_TEST_READBACK` at session creation, and it
+/// is what makes their pool images grow TRANSFER_SRC so `vkCmdCopyImageToBuffer` is legal.
+///
+/// The GPU lock guard is taken BY REFERENCE rather than the precondition being restated in prose
+/// at every leg. `env::set_var` is safe to call and unsound from a live multithreaded process, so
+/// "the caller holds the lock" IS the whole safety argument — and a borrow states it in the type
+/// system, where it cannot drift out of date. It also keeps this the file's ONLY `set_var`:
+/// `scripts/ci/check-unsafe-hygiene.sh` gate C counts them per file, and six near-identical
+/// copies of one argument is the shape that ratchet exists to discourage.
+fn arm_test_readback(_gpu: &std::sync::MutexGuard<'static, ()>) {
+    // SAFETY: the caller holds the binary-wide GPU lock (`common::gpu_lock`), proved by `_gpu`;
+    // the parity legs are this variable's only writers and readers, and they run one at a time
+    // under that lock.
+    unsafe { std::env::set_var("PF_VKD_TEST_READBACK", "1") };
+}
+
 /// Test-only GPU→CPU readback: one persistently mapped staging buffer plus one
 /// command buffer on the GRAPHICS queue. Each read follows the presenter's
 /// frame contract — wait the frame's timeline `value`, transition the image out
@@ -691,7 +707,7 @@ fn consume_frame(
     readback: &Readback,
     frame: &DecodedVkFrame,
     index: usize,
-) -> String {
+) -> Vec<u8> {
     assert_eq!(
         decoder.wait_status(frame),
         DecodeStatus::Ok,
@@ -714,7 +730,7 @@ fn consume_frame(
     decoder
         .release_frame(frame, true)
         .unwrap_or_else(|e| panic!("frame {index}: release failed: {e}"));
-    sha256_hex(&nv12)
+    nv12
 }
 
 /// Decode every AU, hash every delivered frame in display order, including the
@@ -742,8 +758,8 @@ fn collect_hashes(
             )
         });
         while let Some(frame) = next {
-            let hash = consume_frame(decoder, readback, &frame, hashes.len());
-            hashes.push(hash);
+            let planes = consume_frame(decoder, readback, &frame, hashes.len());
+            hashes.push(sha256_hex(&planes));
             next = decoder.take_ready();
         }
     }
@@ -751,8 +767,8 @@ fn collect_hashes(
     // the flush tail belongs in the comparison too.
     decoder.flush();
     while let Some(frame) = decoder.take_ready() {
-        let hash = consume_frame(decoder, readback, &frame, hashes.len());
-        hashes.push(hash);
+        let planes = consume_frame(decoder, readback, &frame, hashes.len());
+        hashes.push(sha256_hex(&planes));
     }
     eprintln!(
         "final state: {} status_queries={}",
@@ -828,11 +844,7 @@ fn h264_parity_run_against(
     // under this lock (see `common::gpu_lock`).
     let _gpu = common::gpu_lock();
 
-    // The decoder reads this at session creation (first decode call): pool
-    // images grow TRANSFER_SRC so vkCmdCopyImageToBuffer is legal.
-    // SAFETY: `_gpu` holds the binary-wide GPU lock (`common::gpu_lock`); the parity legs are
-    // this variable's only writers and readers, and they run one at a time under that lock.
-    unsafe { std::env::set_var("PF_VKD_TEST_READBACK", "1") };
+    arm_test_readback(&_gpu);
 
     let goldens = golden_hashes(goldens);
     assert_eq!(
@@ -928,6 +940,220 @@ fn low_delay_host_h264_every_frame_hashes_bit_identical_to_libavcodec() {
     );
 }
 
+/// AU boundaries of a `PUNKTFUNK_DUMP_VIDEO` capture: the `.idx` sidecar when it
+/// exists (`offset len flags complete` per line, `au_dump.rs`), the H.265 AU
+/// splitter otherwise. `complete == 0` lines are skipped — the client's native
+/// lanes are only ever fed complete AUs, so replaying a partial would test a path
+/// the field never took.
+fn field_aus(stream: &[u8], idx_path: &std::path::Path) -> Vec<std::ops::Range<usize>> {
+    let Ok(idx) = std::fs::read_to_string(idx_path) else {
+        return common::split_h265_aus(stream)
+            .iter()
+            .map(|au| {
+                let start = au.as_ptr() as usize - stream.as_ptr() as usize;
+                start..start + au.len()
+            })
+            .collect();
+    };
+    idx.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let offset: usize = parts.next()?.parse().ok()?;
+            let len: usize = parts.next()?.parse().ok()?;
+            let _flags = parts.next()?;
+            let complete = parts.next()? != "0";
+            (complete && offset + len <= stream.len()).then_some(offset..offset + len)
+        })
+        .collect()
+}
+
+/// Field-stream triage leg: decode a `PUNKTFUNK_DUMP_VIDEO` H.265 capture on the
+/// real GPU and write one SHA-256 per delivered frame (display order) to
+/// `<stream>.pfhash` — `scripts/vkdecode-field-parity.sh` diffs that against
+/// ffmpeg's software decode of the same bytes and names the FIRST divergent
+/// frame, which localises a silent-corruption defect the way the golden legs
+/// cannot (they only ever decode streams our hosts do not emit).
+///
+/// Environment:
+/// - `PF_VKD_FIELD_STREAM=/path/au-*.h265` — the capture (required).
+/// - `PF_VKD_FIELD_YUV=12,13` — display indices whose raw planes are written to
+///   `<stream>.frame<N>.yuv` for visual inspection (optional; second run,
+///   once the script has named the divergence).
+///
+/// Unlike the golden legs this one TOLERATES per-AU errors (a field capture can
+/// hold a truncated tail or a renegotiation) — errors are printed and counted,
+/// the recovery latch resumes at the next IRAP, exactly the client's behaviour.
+/// A mid-capture resolution change ends the comparable stretch: frames whose
+/// crop differs from the first planned picture are released unshown and counted.
+#[test]
+#[ignore = "field triage: set PF_VKD_FIELD_STREAM=/path/capture.h265 (needs a Vulkan Video H.265 decode device; RADV additionally RADV_PERFTEST=video_decode)"]
+fn field_h265_stream_writes_frame_hashes_for_ffmpeg_diff() {
+    let stream_path = std::env::var("PF_VKD_FIELD_STREAM").expect(
+        "PF_VKD_FIELD_STREAM must point at a PUNKTFUNK_DUMP_VIDEO .h265 capture \
+         (see this test's docs)",
+    );
+    let stream = std::fs::read(&stream_path).expect("read the capture");
+    let idx_path = std::path::PathBuf::from(format!("{stream_path}.idx"));
+    let aus = field_aus(&stream, &idx_path);
+    assert!(!aus.is_empty(), "no AUs in the capture");
+
+    // The join point + stream facts, exactly as the client found them: plan AUs
+    // until one succeeds (pre-IRAP AUs of a mid-session capture fail with
+    // AwaitingIdr-shaped errors, as they did in the field).
+    let mut planner = pf_bitstream::h265::H265Planner::new();
+    let mut first_planned = None;
+    for (index, range) in aus.iter().enumerate() {
+        if let Ok(plan) = planner.plan_au(&stream[range.clone()]) {
+            first_planned = Some((index, plan.picture));
+            break;
+        }
+    }
+    let (start_index, picture) = first_planned.expect("no AU in the capture plans");
+    let (format, label) = match picture.bit_depth_luma_minus8 {
+        0 => (pf_vkdecode::NV12, "H.265 (field capture, 8-bit)"),
+        2 => (pf_vkdecode::P010, "H.265 (field capture, 10-bit)"),
+        other => panic!("unsupported field bit depth: {}", other + 8),
+    };
+    assert_eq!(
+        picture.chroma_format_idc, 1,
+        "the readback speaks NV12/P010 — a 4:4:4 capture needs its own leg"
+    );
+    let display = (picture.display_crop.width, picture.display_crop.height);
+    let yuv_wanted: std::collections::BTreeSet<usize> = std::env::var("PF_VKD_FIELD_YUV")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|part| part.trim().parse().ok())
+        .collect();
+
+    // As the golden legs: one codec at a time, `set_var` under the lock.
+    let _gpu = common::gpu_lock();
+    arm_test_readback(&_gpu);
+
+    let setup = common::bring_up(&common::Request {
+        codec: common::H265,
+        graphics: common::Graphics::Required,
+        report_families: true,
+    });
+    let handles = setup.handles();
+
+    let mut au_errors = 0usize;
+    let mut off_size = 0usize;
+    let mut concealed_aus: Vec<usize> = Vec::new();
+    let hashes = {
+        // SAFETY: as the golden legs — `setup` outlives this block and was created
+        // with the H.265 decode extensions + timeline/sync2 features.
+        let mut decoder = unsafe { VkH265Decoder::new(&handles, Box::new(NoopQueueLock)) }
+            .expect("wrap the device");
+        decoder
+            .probe_stream_support(picture.chroma_format_idc, picture.bit_depth_luma_minus8)
+            .unwrap_or_else(|e| panic!("{label}: the box must host this shape — {e:?}"));
+        // SAFETY: as the golden legs — live instance/device, queue 0 of
+        // `graphics_qf` exists; destroyed at the end of this block.
+        let readback = unsafe {
+            Readback::new(
+                &setup.instance,
+                setup.pd,
+                &setup.device,
+                setup.graphics_qf,
+                display,
+                format,
+            )
+        };
+
+        let mut hashes: Vec<String> = Vec::new();
+        let sink = |decoder: &mut VkH265Decoder,
+                    frame: DecodedVkFrame,
+                    hashes: &mut Vec<String>,
+                    off_size: &mut usize| {
+            if (frame.crop.width, frame.crop.height) != display {
+                // A renegotiated stretch — not comparable against this readback.
+                *off_size += 1;
+                decoder
+                    .release_frame(&frame, false)
+                    .expect("release an off-size frame unshown");
+                return;
+            }
+            let index = hashes.len();
+            let planes = consume_frame(decoder, &readback, &frame, index);
+            if yuv_wanted.contains(&index) {
+                let path = format!("{stream_path}.frame{index}.yuv");
+                std::fs::write(&path, &planes).expect("write the requested .yuv");
+                eprintln!("frame {index}: planes written to {path}");
+            }
+            hashes.push(sha256_hex(&planes));
+        };
+        for (au_index, range) in aus.iter().enumerate().skip(start_index) {
+            match decoder.decode(&stream[range.clone()]) {
+                Ok(mut next) => {
+                    // A capture taken over a lossy link holds AUs the planner had to
+                    // conceal, and ffmpeg conceals them DIFFERENTLY — so a divergence
+                    // at such a frame says nothing about this decoder. Recording the
+                    // AUs is what separates "our bug" from "the field lost packets".
+                    let warnings = decoder.take_warnings();
+                    if warnings.iter().any(pf_vkdecode::is_integrity_warning_h265) {
+                        if concealed_aus.len() < 10 {
+                            eprintln!("AU {au_index}: planned with concealment {warnings:?}");
+                        }
+                        concealed_aus.push(au_index);
+                    }
+                    while let Some(frame) = next {
+                        sink(&mut decoder, frame, &mut hashes, &mut off_size);
+                        next = decoder.take_ready();
+                    }
+                }
+                // Field behaviour: print, count, continue — the recovery latch
+                // resumes at the next IRAP exactly as the client did.
+                Err(e) => {
+                    au_errors += 1;
+                    eprintln!("AU {au_index}: decode failed ({e}) — continuing");
+                }
+            }
+        }
+        decoder.flush();
+        while let Some(frame) = decoder.take_ready() {
+            sink(&mut decoder, frame, &mut hashes, &mut off_size);
+        }
+        eprintln!(
+            "final state: {} status_queries={}",
+            decoder.debug_snapshot(),
+            decoder.status_queries()
+        );
+        // SAFETY: every readback was fence-waited inside `read_nv12`; nothing
+        // else references its handles.
+        unsafe { readback.destroy() };
+        hashes
+    };
+
+    // SAFETY: the decoder is gone (its Drop drained the queue and destroyed its
+    // session/pools), the readback's handles are destroyed, and nothing else
+    // references the setup's handles.
+    unsafe { setup.destroy() };
+
+    let out = format!("{stream_path}.pfhash");
+    std::fs::write(&out, hashes.join("\n") + "\n").expect("write the hash file");
+    eprintln!(
+        "{label}: {} frames hashed → {out} (skipped {start_index} pre-join AUs, \
+         {au_errors} AU errors, {off_size} off-size frames); diff with \
+         scripts/vkdecode-field-parity.sh",
+        hashes.len()
+    );
+    // The verdict's precondition, printed last so it is the thing a reader keeps:
+    // on a capture with NO concealed AU, every divergence the diff finds is this
+    // decoder's own — there is no second explanation left.
+    if concealed_aus.is_empty() {
+        eprintln!("integrity: no AU needed concealment — any divergence is OURS");
+    } else {
+        eprintln!(
+            "integrity: {} of {} AUs planned with concealment (first: {:?}) — a \
+             divergence AT or AFTER the first is likely ffmpeg concealing differently, \
+             not this decoder",
+            concealed_aus.len(),
+            aus.len() - start_index,
+            &concealed_aus[..concealed_aus.len().min(10)]
+        );
+    }
+}
+
 /// The H.265 twin of [`h264_parity_run`]; see its docs for why the AUs are a
 /// parameter.
 fn h265_parity_run(
@@ -942,9 +1168,7 @@ fn h265_parity_run(
     // As the H.264 leg: one codec at a time, `set_var` under the lock.
     let _gpu = common::gpu_lock();
 
-    // SAFETY: `_gpu` holds the binary-wide GPU lock (`common::gpu_lock`); the parity legs are
-    // this variable's only writers and readers, and they run one at a time under that lock.
-    unsafe { std::env::set_var("PF_VKD_TEST_READBACK", "1") };
+    arm_test_readback(&_gpu);
 
     let goldens = golden_hashes(goldens_file);
     assert_eq!(
@@ -1128,9 +1352,7 @@ fn av1_parity_run_against(
     // happens only under this lock (see `common::gpu_lock`).
     let _gpu = common::gpu_lock();
 
-    // SAFETY: `_gpu` holds the binary-wide GPU lock (`common::gpu_lock`); the parity legs are
-    // this variable's only writers and readers, and they run one at a time under that lock.
-    unsafe { std::env::set_var("PF_VKD_TEST_READBACK", "1") };
+    arm_test_readback(&_gpu);
 
     let goldens = golden_hashes(goldens_file);
     // Non-vacuity, before any hardware is touched: the right number of entries, all
@@ -1271,9 +1493,7 @@ fn low_delay_host_av1_every_frame_hashes_bit_identical_to_libavcodec() {
 #[ignore = "needs a Vulkan Video AV1 decode device (fleet boxes; see module docs)"]
 fn av1_frame0_pixels_say_which_plane_and_how_badly() {
     let _gpu = common::gpu_lock();
-    // SAFETY: `_gpu` holds the binary-wide GPU lock (`common::gpu_lock`); the parity legs are
-    // this variable's only writers and readers, and they run one at a time under that lock.
-    unsafe { std::env::set_var("PF_VKD_TEST_READBACK", "1") };
+    arm_test_readback(&_gpu);
 
     let aus = common::split_av1_aus(common::TEST_25FPS_AV1);
     assert_eq!(
@@ -1346,9 +1566,7 @@ const MAX_LOOP_FILTER_LEVEL: u8 = 63;
 #[ignore = "needs a Vulkan Video AV1 decode device (fleet boxes; see module docs)"]
 fn av1_frame0_probes_whether_the_driver_reads_the_chroma_deblocking_levels() {
     let _gpu = common::gpu_lock();
-    // SAFETY: `_gpu` holds the binary-wide GPU lock (`common::gpu_lock`); the parity legs are
-    // this variable's only writers and readers, and they run one at a time under that lock.
-    unsafe { std::env::set_var("PF_VKD_TEST_READBACK", "1") };
+    arm_test_readback(&_gpu);
 
     let aus = common::split_av1_aus(common::TEST_25FPS_AV1);
     assert_eq!(aus.len(), FRAME_COUNT);
