@@ -78,6 +78,8 @@ struct QuickActionsEditor: View {
     @StateObject private var ring = RingState()
     @State private var picking: PickSlot?
     @State private var adding = false
+    /// The backdrop's middle, where the ring opens and re-opens.
+    @State private var centre = CGPoint.zero
 
     private var cfg: OverlayConfig { OverlayConfig.parse(blob) }
 
@@ -86,23 +88,16 @@ struct QuickActionsEditor: View {
             Section {
                 GeometryReader { geo in
                     ZStack {
-                        LinearGradient(
-                            colors: [
-                                Color(red: 0.36, green: 0.25, blue: 0.75),
-                                Color(red: 0.16, green: 0.45, blue: 0.80),
-                                Color(red: 0.90, green: 0.45, blue: 0.30),
-                            ],
-                            startPoint: .topLeading, endPoint: .bottomTrailing)
-                        DialCatcher(onDial: { ring.handle($0) }) {
-                            if ring.sheet { ring.sheet = false } else if ring.committed { ring.close() }
-                        }
+                        Color(white: 0.42)
+                        // The backdrop runs the real twist. Its tap only dismisses the preview
+                        // sheet: UIKit hands a disc tap to this view as well as to the SwiftUI
+                        // button above it, so closing the ring here closed it on every pick.
+                        DialCatcher(onDial: { ring.handle($0) }) { ring.sheet = false }
                         RingOverlay(state: ring, cfg: cfg, actions: preview,
                                     editing: RingEditing(pick: { picking = PickSlot(k: $0) }, swap: swap))
                         VStack {
                             Spacer()
-                            Text(ring.committed
-                                 ? "Tap a button to change it, drag one onto another to swap."
-                                 : "Twist two fingers here to open it, as on the stream.")
+                            Text("Tap a button to change it, drag one onto another to swap.")
                                 .font(.geist(12, .medium, relativeTo: .caption))
                                 .foregroundStyle(.white.opacity(0.9))
                                 .padding(.horizontal, 12).padding(.vertical, 6)
@@ -112,7 +107,16 @@ struct QuickActionsEditor: View {
                         .allowsHitTesting(false)
                     }
                     .environment(\.colorScheme, .dark)
-                    .onAppear { ring.openAt(CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)) }
+                    .onAppear {
+                        centre = CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)
+                        ring.openAt(centre)
+                    }
+                    // Whatever closes it — a twist wound back, a preview row that ends the
+                    // stream — the editor's ring springs back once the wind-in has played, so
+                    // there is never a dead editor with nothing to tap.
+                    .onChange(of: ring.closing) { _, closing in
+                        if !closing, !ring.committed, ring.progress == 0 { ring.openAt(centre) }
+                    }
                 }
                 .frame(height: 400)
                 .listRowInsets(EdgeInsets())
