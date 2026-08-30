@@ -3,9 +3,14 @@
 //! The host service (`PunktfunkHost`, LocalSystem) supervises from session 0 and its `serve`
 //! child runs as SYSTEM — neither can own a per-user tray icon, so this is a separate small
 //! process the installer puts in the HKLM `Run` key (one instance per interactive session,
-//! enforced by a `Local\` mutex). Start/Stop/Restart open one UAC consent prompt each
-//! (`ShellExecuteW "runas"` on `punktfunk-host.exe service …`) — service control is deliberately
-//! left admin-gated rather than DACL-opened to every local user.
+//! enforced by a `Local\` mutex). Start/Stop/Restart — and "Stop host and exit tray" — open one UAC
+//! consent prompt each (`ShellExecuteW "runas"` on `punktfunk-host.exe service …`); service control
+//! is deliberately left admin-gated rather than DACL-opened to every local user.
+//!
+//! The icon's lifetime tracks the host's in BOTH directions: the host supervises this process
+//! (`punktfunk-host`'s `windows/tray.rs`), and the menu's exit entry stops the host. Only that
+//! entry does — a sign-out (`WM_ENDSESSION`) or the uninstaller's `--quit` (`WM_CLOSE`) leaves a
+//! headless host running, which is the whole point of a headless host.
 
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
@@ -502,7 +507,19 @@ fn show_menu(hwnd: HWND) {
             Some(win_theme::GLYPH_FOLDER),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        add(IDM_EXIT, "Exit tray", false, Some(win_theme::GLYPH_POWER));
+        // Exiting takes the host down with it (see the IDM_EXIT arm), so the entry says so and
+        // carries the same shield as the other service actions — an operator must never be
+        // surprised by either the UAC prompt or the stop.
+        if can_control && running {
+            add(
+                IDM_EXIT,
+                "Stop host and exit tray",
+                false,
+                Some(win_theme::GLYPH_SHIELD),
+            );
+        } else {
+            add(IDM_EXIT, "Exit tray", false, Some(win_theme::GLYPH_POWER));
+        }
 
         let mut pt = Default::default();
         let _ = GetCursorPos(&mut pt);
@@ -537,16 +554,20 @@ fn shell_open(hwnd: HWND, target: &str) {
 }
 
 /// One UAC prompt per service action: relaunch the host exe elevated with `service <verb>`.
-/// A declined prompt (ERROR_CANCELLED) is deliberately ignored.
-fn elevate_service(hwnd: HWND, verb: &str) {
+///
+/// Returns whether the elevated child was actually launched. `false` covers a declined prompt
+/// (`ERROR_CANCELLED`) — harmless for start/stop/restart, which simply do nothing, but `IDM_EXIT`
+/// needs it: an exit that stops the host must not close the icon when the operator said no.
+/// ShellExecute reports failure as a return value at or below 32, per its contract.
+fn elevate_service(hwnd: HWND, verb: &str) -> bool {
     let Some(exe) = app().host_exe.as_ref() else {
-        return;
+        return false;
     };
     let exe_w = to_wide(&exe.to_string_lossy());
     let params = to_wide(&format!("service {verb}"));
     // SAFETY: nul-terminated strings live across the call; "runas" spawns the elevated child
     // (hidden console — the tray re-polls for the outcome instead of scraping its output).
-    unsafe {
+    let rc = unsafe {
         ShellExecuteW(
             Some(hwnd),
             w!("runas"),
@@ -554,11 +575,12 @@ fn elevate_service(hwnd: HWND, verb: &str) {
             PCWSTR(params.as_ptr()),
             PCWSTR::null(),
             SW_HIDE,
-        );
-    }
+        )
+    };
     if let Some(p) = app().poller.get() {
         p.poke();
     }
+    rc.0 as isize > 32
 }
 
 /// Open the web console at `path` ("" = dashboard). Deep links land the operator on the page the
@@ -627,14 +649,40 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 IDM_OPEN_WEB => open_web_console(hwnd, ""),
                 IDM_PAIRING => open_web_console(hwnd, "pairing"),
                 IDM_DISPLAYS => open_web_console(hwnd, "displays"),
-                IDM_START => elevate_service(hwnd, "start"),
-                IDM_STOP => elevate_service(hwnd, "stop"),
-                IDM_RESTART => elevate_service(hwnd, "restart"),
+                IDM_START => {
+                    let _ = elevate_service(hwnd, "start");
+                }
+                IDM_STOP => {
+                    let _ = elevate_service(hwnd, "stop");
+                }
+                IDM_RESTART => {
+                    let _ = elevate_service(hwnd, "restart");
+                }
                 IDM_LOGS => open_logs(hwnd),
-                // SAFETY: DestroyWindow on the wndproc's own window/thread.
-                IDM_EXIT => unsafe {
-                    let _ = DestroyWindow(hwnd);
-                },
+                IDM_EXIT => {
+                    // The icon is the host's only visible surface on this box, so closing it
+                    // stops the host rather than leaving a service running with no face. Only
+                    // this menu entry does that: WM_CLOSE (the uninstaller's `--quit`) and
+                    // WM_ENDSESSION (sign-out, shutdown) must leave a headless host alone.
+                    //
+                    // A declined UAC prompt cancels the exit too — the host is still up, and an
+                    // icon that vanished while its host kept running would be a lie.
+                    // Same condition the menu labelled this entry with (`show_menu`): without a
+                    // host exe there is no stop to attempt, and a refusal there would leave the
+                    // operator with an icon they cannot close.
+                    let stop_first = app.host_exe.is_some()
+                        && matches!(
+                            *app.status.lock().unwrap(),
+                            TrayStatus::Running(_) | TrayStatus::Starting | TrayStatus::Degraded
+                        );
+                    if stop_first && !elevate_service(hwnd, "stop") {
+                        return LRESULT(0);
+                    }
+                    // SAFETY: DestroyWindow on the wndproc's own window/thread.
+                    unsafe {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                }
                 _ => {}
             }
             LRESULT(0)

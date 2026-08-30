@@ -327,14 +327,19 @@ Filename: "powershell.exe"; Parameters: "{code:RestoreTasksParams}"; \
 Filename: "{app}\punktfunk-tray.exe"; Flags: runasoriginaluser nowait skipifsilent; Tasks: trayicon
 
 [UninstallRun]
-; Quit the tray FIRST - it is this exe being deleted, so it must not be running. --quit closes the
+; Uninstall the SERVICE FIRST, then the tray. Order matters since the host supervises the tray
+; (windows/tray.rs `supervise`): kill the tray while the service still runs and it can put a fresh
+; one back, re-locking punktfunk-tray.exe just as file deletion starts. Stopping the service first
+; takes its supervisor down with it, so the two entries below face nothing that fights them.
+;
+; Then quit the tray - it is this exe being deleted, so it must not be running. --quit closes the
 ; current session's instance (an elevated caller may message a medium-IL window; UIPI only blocks
 ; low->high); the taskkill then reaps instances in OTHER signed-in sessions. [UninstallRun] runs
 ; before file deletion, so a raced survivor only means a delete-on-reboot leftover, nothing worse.
 ; (runasoriginaluser is not valid in [UninstallRun] - both entries run elevated, which is fine.)
+Filename: "{app}\punktfunk-host.exe"; Parameters: "service uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkHostServiceUninstall"
 Filename: "{app}\punktfunk-tray.exe"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkTrayQuit"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM punktfunk-tray.exe"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkTrayKill"
-Filename: "{app}\punktfunk-host.exe"; Parameters: "service uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "PunktfunkHostServiceUninstall"
 ; Remove the punktfunk drivers we installed (pf-vdisplay devnode + driver package, then the gamepad
 ; driver packages). AFTER service uninstall so the host no longer holds the devices. Unconditional
 ; (not #ifdef'd on this build's bundled payload - an upgrade may have dropped a payload the original
