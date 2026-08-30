@@ -869,7 +869,7 @@ pub fn show_about(parent: &impl IsA<gtk::Widget>) {
 /// flashes the row but no list ever appears. Selection UI must stay inside the toplevel.
 fn gamescope_session() -> bool {
     std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.eq_ignore_ascii_case("gamescope"))
-        || std::env::var("GAMESCOPE_WAYLAND_DISPLAY").is_ok()
+        || pf_client_core::gamescope::under_gamescope()
 }
 
 type ChangedFn = Rc<RefCell<Vec<Box<dyn Fn(u32)>>>>;

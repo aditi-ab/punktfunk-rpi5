@@ -51,11 +51,11 @@ pub fn deep_link_arg() -> Option<String> {
 }
 
 /// Fullscreen the shell — the Gaming-Mode fallback for a bare launch (streams and the
-/// console library exec the session binary, which handles its own fullscreen).
+/// console library exec the session binary, which handles its own fullscreen). Gaming Mode
+/// means gamescope, never `SteamDeck`: that variable says which MACHINE this is, so it is set
+/// in desktop mode too, where a fullscreen shell is just wrong.
 pub fn fullscreen_mode() -> bool {
-    arg_flag("--fullscreen")
-        || std::env::var_os("SteamDeck").is_some()
-        || std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some()
+    arg_flag("--fullscreen") || pf_client_core::gamescope::under_gamescope()
 }
 
 /// Split `host[:port]`: no colon defaults the port to 9777; a colon with an unparsable
