@@ -17,7 +17,7 @@
 //
 // The two phases hand off within a single view update (HostWaker clears `waking` and starts the
 // connect in the same MainActor step), so the overlay never blinks between them. It swallows input to
-// the screen behind it, and on iOS/macOS the pad drives it (B cancels, A retries once timed out).
+// the screen behind it, and the pad drives it (B cancels, A retries once timed out).
 
 import PunktfunkKit
 import SwiftUI
@@ -77,7 +77,7 @@ struct ConnectOverlay: View {
             // The console takeover follows the palette; the default UI's modal stays dark.
             .environment(\.colorScheme, gamepadUI && ink.isLight ? .light : .dark)
             .transition(.opacity)
-            #if os(iOS) || os(macOS)
+            #if os(iOS) || os(macOS) || os(tvOS)
             .background { ConnectControllerInput(waker: waker, onCancelConnect: onCancelConnect) }
             #endif
         }
@@ -135,12 +135,21 @@ struct ConnectOverlay: View {
     }
 }
 
-#if os(iOS) || os(macOS)
+#if os(iOS) || os(macOS) || os(tvOS)
 /// Controller binding for the overlay: B cancels whatever's in flight (a dial or the wake wait); A
 /// retries once a wake has timed out. The closures read the live state on each press, so they stay
 /// correct across the Connecting ↔ Waking handoff without the view re-mounting. A zero-size backing
 /// view owning a `GamepadMenuInput` for the overlay's lifetime (the home is gated inactive while the
 /// overlay is up, so nothing else is consuming the pad).
+///
+/// tvOS was left out of this until #453 reported the wake prompt as a dead end there. It is not a
+/// platform that drives these buttons some other way: the console home it sits over runs this same
+/// binding on tvOS, so with the home inactive and no binding here, nothing read the pad at all.
+///
+/// `GamepadMenuInput` needs an EXTENDED gamepad, which is the same thing `gamepadUIActive` needs,
+/// so this covers the console takeover exactly. A Siri Remote is not an extended gamepad and does
+/// not reach these buttons through here — that path is the tvOS focus engine's, and whether focus
+/// lands in this overlay at all is unverified.
 private struct ConnectControllerInput: View {
     @ObservedObject var waker: HostWaker
     var onCancelConnect: () -> Void

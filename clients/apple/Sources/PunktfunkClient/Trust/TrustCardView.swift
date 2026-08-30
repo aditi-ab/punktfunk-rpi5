@@ -19,7 +19,7 @@ struct TrustCardView: View {
     let onTrust: () -> Void
     let onPairInstead: () -> Void
 
-    #if os(iOS) || os(macOS)
+    #if os(iOS) || os(macOS) || os(tvOS)
     /// Observed so the legend appears the moment a pad wakes up mid-prompt — and so it stays
     /// absent for the mouse/touch users this card is otherwise for.
     @ObservedObject private var gamepads = GamepadManager.shared
@@ -72,7 +72,7 @@ struct TrustCardView: View {
                 .buttonStyle(.borderless)
                 #endif
                 .font(.geist(16, relativeTo: .callout))
-            #if os(iOS) || os(macOS)
+            #if os(iOS) || os(macOS) || os(tvOS)
             // Only with a pad attached: controller glyphs in front of a trackpad user would be
             // naming buttons they don't have.
             if gamepads.active != nil {
@@ -96,7 +96,7 @@ struct TrustCardView: View {
         // Floating trust card over the blurred stream — Liquid Glass on 26+, .regularMaterial
         // fallback below. The inner fingerprint box stays .quaternary (content, not glass).
         .glassBackground(RoundedRectangle(cornerRadius: 18))
-        #if os(iOS) || os(macOS)
+        #if os(iOS) || os(macOS) || os(tvOS)
         .background {
             TrustControllerInput(onTrust: onTrust, onCancel: onCancel, onPairInstead: onPairInstead)
         }
@@ -115,7 +115,7 @@ struct TrustCardView: View {
     }
 }
 
-#if os(iOS) || os(macOS)
+#if os(iOS) || os(macOS) || os(tvOS)
 /// Controller binding for the trust prompt: A trusts, B cancels, X runs the PIN ceremony instead.
 /// The same zero-size-backing-view shape as `ConnectOverlay`'s `ConnectControllerInput` — mounted
 /// for exactly as long as the card is up, and `GamepadMenuInput`'s snapshot-on-start swallows
@@ -124,6 +124,11 @@ struct TrustCardView: View {
 ///
 /// Nothing else is polling the pad here: capture is off for the duration of the prompt, and the
 /// home screens are unmounted behind the session view.
+///
+/// tvOS was excluded alongside `ConnectOverlay` and for no better reason (#453). It left the trust
+/// card — which stands between a pad-only Apple TV user and every unknown host — with three
+/// buttons and nothing reading the pad. As there, this covers an EXTENDED gamepad; a Siri Remote
+/// reaches these buttons through the focus engine or not at all.
 private struct TrustControllerInput: View {
     let onTrust: () -> Void
     let onCancel: () -> Void
