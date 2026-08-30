@@ -130,33 +130,43 @@ pub fn key_vk(name: &str) -> Option<u8> {
     Some(vk)
 }
 
-/// A chord as a keycap chip reads it: `Ctrl+⇧+Esc`.
+/// A chord as a legend reads it: `Ctrl+Shift+Esc`.
 pub fn chord_chip(keys: &[String]) -> String {
     keys.iter()
-        .map(|k| match k.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => "Ctrl".to_string(),
-            "shift" => "⇧".into(),
-            "alt" | "option" => "Alt".into(),
-            "win" | "cmd" | "super" | "meta" => "❖".into(),
-            "escape" | "esc" => "Esc".into(),
-            "enter" | "return" => "↵".into(),
-            "backspace" => "⌫".into(),
-            "delete" | "del" => "Del".into(),
-            "space" => "␣".into(),
-            "up" => "↑".into(),
-            "down" => "↓".into(),
-            "left" => "←".into(),
-            "right" => "→".into(),
-            _ => {
-                let mut c = k.chars();
-                match c.next() {
-                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                    None => String::new(),
-                }
-            }
-        })
+        .map(|k| key_legend(k))
         .collect::<Vec<_>>()
         .join("+")
+}
+
+/// One key's legend: the word a keyboard prints on it (`Ctrl`, `Esc`, `PgUp`), arrows as
+/// arrows. Symbols like ❖ or ⇧ read as nothing to most people, so none are used here.
+pub fn key_legend(k: &str) -> String {
+    match k.trim().to_ascii_lowercase().as_str() {
+        "ctrl" | "control" => "Ctrl".to_string(),
+        "shift" => "Shift".into(),
+        "alt" | "option" => "Alt".into(),
+        "win" | "cmd" | "super" | "meta" => "Win".into(),
+        "escape" | "esc" => "Esc".into(),
+        "enter" | "return" => "Enter".into(),
+        "backspace" => "Backspace".into(),
+        "delete" | "del" => "Del".into(),
+        "insert" => "Ins".into(),
+        "pageup" => "PgUp".into(),
+        "pagedown" => "PgDn".into(),
+        "printscreen" => "PrtSc".into(),
+        "capslock" => "Caps".into(),
+        "up" => "↑".into(),
+        "down" => "↓".into(),
+        "left" => "←".into(),
+        "right" => "→".into(),
+        other => {
+            let mut c = other.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        }
+    }
 }
 
 /// The virtual controller's preset (Android and Apple only): `layout` is `full`, `sticks` or
@@ -364,7 +374,11 @@ mod tests {
         assert_eq!(key_vk("hyper"), None);
         assert_eq!(key_vk(""), None);
         let keys: Vec<String> = ["ctrl", "shift", "escape"].map(String::from).into();
-        assert_eq!(chord_chip(&keys), "Ctrl+⇧+Esc");
+        assert_eq!(chord_chip(&keys), "Ctrl+Shift+Esc");
+        assert_eq!(key_legend("win"), "Win");
+        assert_eq!(key_legend("pageup"), "PgUp");
+        assert_eq!(key_legend("f4"), "F4");
+        assert_eq!(key_legend("left"), "←");
     }
 
     #[test]

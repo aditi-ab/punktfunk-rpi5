@@ -99,26 +99,35 @@ public func keyVk(_ name: String) -> UInt32? {
     }
 }
 
-/// A chord as a keycap chip reads it: `Ctrl+⇧+Esc`.
+/// A chord as a legend reads it: `Ctrl+Shift+Esc`.
 public func chordChip(_ keys: [String]) -> String {
-    keys.map { k -> String in
-        switch k.lowercased() {
-        case "ctrl", "control": return "Ctrl"
-        case "shift": return "⇧"
-        case "alt", "option": return "Alt"
-        case "win", "cmd", "super", "meta": return "❖"
-        case "escape", "esc": return "Esc"
-        case "enter", "return": return "↵"
-        case "backspace": return "⌫"
-        case "delete", "del": return "Del"
-        case "space": return "␣"
-        case "up": return "↑"
-        case "down": return "↓"
-        case "left": return "←"
-        case "right": return "→"
-        default: return k.prefix(1).uppercased() + k.dropFirst()
-        }
-    }.joined(separator: "+")
+    keys.map(keyLegend).joined(separator: "+")
+}
+
+/// One key's legend: the word a keyboard prints on it (`Ctrl`, `Esc`, `PgUp`), arrows as
+/// arrows. Symbols like ❖ or ⇧ read as nothing to most people, so none are used here.
+public func keyLegend(_ k: String) -> String {
+    let n = k.trimmingCharacters(in: .whitespaces).lowercased()
+    switch n {
+    case "ctrl", "control": return "Ctrl"
+    case "shift": return "Shift"
+    case "alt", "option": return "Alt"
+    case "win", "cmd", "super", "meta": return "Win"
+    case "escape", "esc": return "Esc"
+    case "enter", "return": return "Enter"
+    case "backspace": return "Backspace"
+    case "delete", "del": return "Del"
+    case "insert": return "Ins"
+    case "pageup": return "PgUp"
+    case "pagedown": return "PgDn"
+    case "printscreen": return "PrtSc"
+    case "capslock": return "Caps"
+    case "up": return "↑"
+    case "down": return "↓"
+    case "left": return "←"
+    case "right": return "→"
+    default: return n.prefix(1).uppercased() + n.dropFirst()
+    }
 }
 
 /// The virtual controller's preset: `layout` is `full`, `sticks` or `dpad`.

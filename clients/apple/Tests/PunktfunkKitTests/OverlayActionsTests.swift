@@ -67,7 +67,11 @@ final class OverlayActionsTests: XCTestCase {
         XCTAssertNil(keyVk("f25"))
         XCTAssertNil(keyVk("hyper"))
         XCTAssertNil(keyVk(""))
-        XCTAssertEqual(chordChip(["ctrl", "shift", "escape"]), "Ctrl+⇧+Esc")
+        XCTAssertEqual(chordChip(["ctrl", "shift", "escape"]), "Ctrl+Shift+Esc")
+        XCTAssertEqual(keyLegend("win"), "Win")
+        XCTAssertEqual(keyLegend("pageup"), "PgUp")
+        XCTAssertEqual(keyLegend("f4"), "F4")
+        XCTAssertEqual(keyLegend("left"), "←")
     }
 
     func testSlotIdsAreStableStrings() {

@@ -77,7 +77,11 @@ class OverlayActionsTest {
         assertNull(keyVk("f25"))
         assertNull(keyVk("hyper"))
         assertNull(keyVk(""))
-        assertEquals("Ctrl+⇧+Esc", chordChip(listOf("ctrl", "shift", "escape")))
+        assertEquals("Ctrl+Shift+Esc", chordChip(listOf("ctrl", "shift", "escape")))
+        assertEquals("Win", keyLegend("win"))
+        assertEquals("PgUp", keyLegend("pageup"))
+        assertEquals("F4", keyLegend("f4"))
+        assertEquals("←", keyLegend("left"))
     }
 
     @Test

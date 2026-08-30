@@ -1,9 +1,11 @@
 // The quick-action ring's editor (design/touch-client-overlay.md §3.3): the editor IS the ring —
-// the in-stream `RingOverlay`, the same type, full size over a gradient backdrop that runs the
-// real twist (`DialCatcher`). Tap a slot to pick its action from the catalogue, drag a disc onto
-// another to swap, tap the centre to see depth two; the shortcuts list and the reset sit under
-// it. It edits whichever layer the settings surface is on — the binding comes from
-// `scoped(SettingsFields.overlayActions)` — so a profile that touches it owns the whole ring (D10).
+// the in-stream `RingOverlay`, the same type, full size over a backdrop that runs the real twist
+// (`DialCatcher`). Tap a slot to pick its action from the catalogue, drag a disc onto another to
+// swap, tap the centre to see depth two; the shortcuts list and the reset sit under it. A
+// shortcut is edited on its own sheet: a name, the modifiers as chips, the key on a keyboard
+// you tap, and the disc as it will look. It edits whichever layer the settings surface is on —
+// the binding comes from `scoped(SettingsFields.overlayActions)` — so a profile that touches it
+// owns the whole ring (D10).
 
 #if os(iOS)
 import PunktfunkKit
@@ -45,17 +47,29 @@ private let builtinGroups: [SlotGroup] = [
 ]
 
 private let modifierKeys = ["ctrl", "alt", "shift", "win"]
-/// The keys a chord can end on — names `keyVk` knows.
-private let chordKeys: [String] =
-    ["escape", "tab", "enter", "space", "backspace", "delete", "insert", "home", "end",
-     "pageup", "pagedown", "up", "down", "left", "right", "printscreen", "pause"]
-    + (1...12).map { "f\($0)" }
-    + "abcdefghijklmnopqrstuvwxyz".map(String.init)
-    + (0...9).map(String.init)
+
+/// The keys a chord can end on, as the keyboard the editor draws lays them out — every name
+/// `keyVk` knows, grouped the way a keyboard groups them.
+private let keyGroups: [(title: String, keys: [String])] = [
+    ("Function", ["escape"] + (1...12).map { "f\($0)" }),
+    ("Letters", "qwertyuiopasdfghjklzxcvbnm".map(String.init)),
+    ("Numbers", (1...9).map(String.init) + ["0"]),
+    ("Editing", ["tab", "space", "enter", "backspace", "delete", "insert"]),
+    ("Navigation", ["home", "end", "pageup", "pagedown", "up", "down", "left", "right"]),
+    ("Other", ["printscreen", "pause", "capslock"]),
+]
 
 private struct PickSlot: Identifiable {
     let k: Int
     var id: Int { k }
+}
+
+/// A shortcut on the editing sheet, new or existing.
+private struct ShortcutDraft: Identifiable {
+    var id: String
+    var label: String
+    var keys: [String]
+    var isNew: Bool
 }
 
 /// The three power actions as the ring would show them on a host that offers all three; the
@@ -77,7 +91,7 @@ struct QuickActionsEditor: View {
     let reset: () -> Void
     @StateObject private var ring = RingState()
     @State private var picking: PickSlot?
-    @State private var adding = false
+    @State private var editingShortcut: ShortcutDraft?
     /// The backdrop's middle, where the ring opens and re-opens.
     @State private var centre = CGPoint.zero
 
@@ -129,20 +143,41 @@ struct QuickActionsEditor: View {
             }
             Section {
                 ForEach(cfg.shortcuts, id: \.id) { sc in
-                    HStack {
-                        Text(sc.label.isEmpty ? chordChip(sc.keys) : sc.label)
-                        Spacer()
-                        Text(chordChip(sc.keys))
-                            .font(.geistFixed(13, .medium))
-                            .foregroundStyle(.secondary)
+                    Button {
+                        editingShortcut = ShortcutDraft(id: sc.id, label: sc.label, keys: sc.keys, isNew: false)
+                    } label: {
+                        HStack(spacing: 12) {
+                            KeycapDisc(keys: sc.keys, size: 40)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(sc.label.isEmpty ? chordChip(sc.keys) : sc.label)
+                                if !sc.label.isEmpty {
+                                    Text(chordChip(sc.keys)).font(.footnote).foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer(minLength: 8)
+                            Image(systemName: "chevron.right")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                                .accessibilityHidden(true)
+                        }
+                        .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
                 }
-                .onDelete(perform: removeShortcuts)
-                Button("Add shortcut") { adding = true }
+                .onDelete { offsets in
+                    for id in offsets.map({ cfg.shortcuts[$0].id }) { remove(id) }
+                }
+                Button {
+                    let next = (cfg.shortcuts.compactMap { Int($0.id.dropFirst()) }.max() ?? 0) + 1
+                    editingShortcut = ShortcutDraft(id: "s\(next)", label: "", keys: [], isNew: true)
+                } label: {
+                    Label("Add shortcut", systemImage: "plus")
+                }
             } header: {
                 Text("Shortcuts")
             } footer: {
-                Text("A new shortcut takes the first empty slot. Swipe one to remove it.")
+                Text("A chord the ring sends to the host. A new one takes the first empty slot; "
+                     + "tap one to change it, swipe to remove it.")
             }
             Section {
                 Button("Reset to default", role: .destructive, action: reset)
@@ -157,7 +192,9 @@ struct QuickActionsEditor: View {
                 picking = nil
             }
         }
-        .sheet(isPresented: $adding) { AddShortcut(done: add) }
+        .sheet(item: $editingShortcut) { draft in
+            ShortcutEditor(draft: draft, save: save, delete: { remove(draft.id) })
+        }
     }
 
     /// The ring's commands with nothing behind them: the editor shows, it never fires (§3.3).
@@ -177,7 +214,8 @@ struct QuickActionsEditor: View {
         var g = builtinGroups
         if !cfg.shortcuts.isEmpty {
             g.append(SlotGroup(id: "Shortcuts", options: cfg.shortcuts.map {
-                SlotOption(id: "shortcut:\($0.id)", label: $0.label.isEmpty ? chordChip($0.keys) : $0.label)
+                SlotOption(id: "shortcut:\($0.id)", label: $0.label.isEmpty ? chordChip($0.keys) : $0.label,
+                           note: $0.label.isEmpty ? nil : chordChip($0.keys))
             }))
         }
         g.append(SlotGroup(id: "Empty", options: [SlotOption(id: "", label: "Empty slot")]))
@@ -196,26 +234,48 @@ struct QuickActionsEditor: View {
         blob = c.toJSON()
     }
 
-    private func add(label: String, keys: [String]) {
+    private func save(_ d: ShortcutDraft) {
         var c = cfg
-        let next = (c.shortcuts.compactMap { Int($0.id.dropFirst()) }.max() ?? 0) + 1
-        let sc = OverlayShortcut(id: "s\(next)", label: label, keys: keys)
-        c.shortcuts.append(sc)
-        if let k = c.ring.firstIndex(where: { $0 == nil }) { c.ring[k] = .shortcut(sc.id) }
+        let sc = OverlayShortcut(id: d.id, label: d.label, keys: d.keys)
+        if let i = c.shortcuts.firstIndex(where: { $0.id == d.id }) {
+            c.shortcuts[i] = sc
+        } else {
+            c.shortcuts.append(sc)
+            if let k = c.ring.firstIndex(where: { $0 == nil }) { c.ring[k] = .shortcut(sc.id) }
+        }
         blob = c.toJSON()
     }
 
-    private func removeShortcuts(at offsets: IndexSet) {
+    private func remove(_ id: String) {
         var c = cfg
-        let gone = offsets.map { c.shortcuts[$0].id }
-        c.shortcuts.remove(atOffsets: offsets)
+        c.shortcuts.removeAll { $0.id == id }
         // `parse` would empty a dangling slot on the next read; write it empty now so the
         // ring shows it at once.
         c.ring = c.ring.map { s in
-            if case .shortcut(let id) = s, gone.contains(id) { return nil }
+            if case .shortcut(let sid) = s, sid == id { return nil }
             return s
         }
         blob = c.toJSON()
+    }
+}
+
+/// A chord on a disc the size the ring draws it, for lists and the editing sheet.
+private struct KeycapDisc: View {
+    let keys: [String]
+    var size: CGFloat = 56
+
+    var body: some View {
+        ZStack {
+            Circle().fill(Color(white: 0.22))
+            Circle().strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
+            if keys.isEmpty {
+                Image(systemName: "questionmark").font(.system(size: size * 0.35, weight: .semibold))
+            } else {
+                ChordKeycap(keys: keys).scaleEffect(size / 56)
+            }
+        }
+        .foregroundStyle(.white)
+        .frame(width: size, height: size)
     }
 }
 
@@ -259,45 +319,104 @@ private struct SlotPicker: View {
     }
 }
 
-/// One chord: a label, the modifiers held, and the key it ends on.
-private struct AddShortcut: View {
-    let done: (_ label: String, _ keys: [String]) -> Void
+/// One shortcut: a name, the modifiers held as chips, the key it ends on picked from a keyboard,
+/// and the disc as the ring will draw it.
+private struct ShortcutEditor: View {
+    @State var draft: ShortcutDraft
+    let save: (ShortcutDraft) -> Void
+    let delete: () -> Void
     @Environment(\.dismiss) private var dismiss
-    @State private var label = ""
-    @State private var mods: Set<String> = []
-    @State private var key = "escape"
 
-    private var keys: [String] { modifierKeys.filter { mods.contains($0) } + [key] }
+    private var mods: [String] { draft.keys.filter { modifierKeys.contains($0) } }
+    private var key: String? { draft.keys.first { !modifierKeys.contains($0) } }
+
+    private let grid = [GridItem(.adaptive(minimum: 44), spacing: 6)]
 
     var body: some View {
         NavigationStack {
             Form {
-                TextField("Label (optional)", text: $label)
-                Section("Modifiers") {
-                    ForEach(modifierKeys, id: \.self) { m in
-                        Toggle(chordChip([m]), isOn: Binding(
-                            get: { mods.contains(m) },
-                            set: { on in if on { mods.insert(m) } else { mods.remove(m) } }))
+                Section {
+                    HStack(spacing: 14) {
+                        KeycapDisc(keys: draft.keys)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(draft.label.isEmpty ? (key == nil ? "Pick a key" : chordChip(draft.keys)) : draft.label)
+                                .font(.geist(15, .medium))
+                            Text(key == nil ? "The disc as the ring will draw it" : chordChip(draft.keys))
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                    TextField("Name (optional)", text: $draft.label)
+                }
+                Section("Hold") {
+                    HStack(spacing: 8) {
+                        ForEach(modifierKeys, id: \.self) { m in
+                            let on = mods.contains(m)
+                            Button(keyLegend(m)) { toggle(m) }
+                                .buttonStyle(.bordered)
+                                .tint(on ? Color.brand : Color.secondary)
+                                .fontWeight(on ? .semibold : .regular)
+                                .accessibilityAddTraits(on ? .isSelected : [])
+                        }
                     }
                 }
-                Picker("Key", selection: $key) {
-                    ForEach(chordKeys, id: \.self) { Text(chordChip([$0])).tag($0) }
+                ForEach(keyGroups, id: \.title) { group in
+                    Section(group.title) {
+                        LazyVGrid(columns: grid, spacing: 6) {
+                            ForEach(group.keys, id: \.self) { k in
+                                let on = key == k
+                                Button {
+                                    pick(k)
+                                } label: {
+                                    Text(keyLegend(k))
+                                        .font(.geistFixed(13, on ? .semibold : .medium))
+                                        .frame(maxWidth: .infinity, minHeight: 30)
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(on ? Color.brand : Color.secondary)
+                                .accessibilityAddTraits(on ? .isSelected : [])
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
                 }
-                Section("Chord") {
-                    Text(chordChip(keys)).font(.geistFixed(15, .medium))
+                if !draft.isNew {
+                    Section {
+                        Button("Remove shortcut", role: .destructive) {
+                            delete()
+                            dismiss()
+                        }
+                    }
                 }
             }
-            .navigationTitle("New shortcut")
+            .navigationTitle(draft.isNew ? "New shortcut" : "Shortcut")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Add") {
-                        done(label, keys)
+                    Button(draft.isNew ? "Add" : "Save") {
+                        save(draft)
                         dismiss()
                     }
+                    .disabled(key == nil)
                 }
             }
         }
+    }
+
+    /// Modifiers first in keyboard order, then the key — the order the chord is sent.
+    private func rebuild(mods: [String], key: String?) {
+        draft.keys = modifierKeys.filter { mods.contains($0) } + (key.map { [$0] } ?? [])
+    }
+
+    private func toggle(_ m: String) {
+        var next = mods
+        if let i = next.firstIndex(of: m) { next.remove(at: i) } else { next.append(m) }
+        rebuild(mods: next, key: key)
+    }
+
+    private func pick(_ k: String) {
+        rebuild(mods: mods, key: k)
     }
 }
 #endif

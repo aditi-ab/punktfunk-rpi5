@@ -24,6 +24,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Insights
 import androidx.compose.material.icons.filled.Keyboard
@@ -34,6 +35,7 @@ import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Mouse
 import androidx.compose.material.icons.filled.PanTool
 import androidx.compose.material.icons.filled.PowerSettingsNew
+import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.SportsEsports
 import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material.icons.filled.TouchApp
@@ -246,8 +248,14 @@ private fun spec(slot: SlotId, cfg: OverlayConfig, a: RingActions): SlotSpec = w
     )
     is SlotId.Host -> {
         val act = a.hostActions().firstOrNull { it.id == slot.actionId }
+        // Three power actions, three glyphs — the same icon on all three made them one button.
+        val icon = when (slot.actionId) {
+            "power.sleep" -> Icons.Filled.Bedtime
+            "power.reboot" -> Icons.Filled.RestartAlt
+            else -> Icons.Filled.PowerSettingsNew
+        }
         SlotSpec(
-            "host:${slot.actionId}", act?.label ?: slot.actionId, Icons.Filled.PowerSettingsNew,
+            "host:${slot.actionId}", act?.label ?: slot.actionId, icon,
             enabled = act?.available == true,
             reason = act?.unavailableReason?.ifEmpty { null } ?: "This host does not offer it",
             armed = act?.danger ?: true,
@@ -512,7 +520,25 @@ private fun RingButton(
         contentAlignment = Alignment.Center,
     ) {
         when {
-            spec?.chip != null -> Text(spec.chip, color = tint, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+            // A chord as a stacked keycap: modifiers small on top, the key large under them —
+            // one legend line ran past the disc's edge.
+            spec?.chip != null -> {
+                val parts = spec.chip.split("+")
+                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(size - 12.dp)) {
+                    if (parts.size > 1) {
+                        Text(
+                            parts.dropLast(1).joinToString("+"),
+                            color = tint, fontSize = 8.sp, fontWeight = FontWeight.SemiBold,
+                            maxLines = 1, softWrap = false,
+                        )
+                    }
+                    Text(
+                        parts.last(),
+                        color = tint, fontSize = if (parts.last().length > 3) 10.sp else 13.sp,
+                        fontWeight = FontWeight.SemiBold, maxLines = 1, softWrap = false,
+                    )
+                }
+            }
             spec?.icon != null -> Icon(spec.icon, contentDescription = null, tint = tint, modifier = Modifier.size(size / 2))
         }
     }

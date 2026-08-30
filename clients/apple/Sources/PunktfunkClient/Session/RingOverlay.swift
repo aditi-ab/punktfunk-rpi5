@@ -138,7 +138,8 @@ private struct SlotSpec {
     var id: String
     var label: String
     var icon: String? = nil
-    var chip: String? = nil
+    /// A shortcut's chord, drawn as a stacked keycap (`ChordKeycap`).
+    var keys: [String]? = nil
     var enabled = true
     var reason = ""
     /// Destructive: two presses.
@@ -182,7 +183,15 @@ private func spec(_ slot: SlotId, _ cfg: OverlayConfig, _ a: RingActions) -> Slo
                         enabled: false, reason: "Use the keyboard on this device")
     case .host(let id):
         let act = a.hostActions().first { $0.id == id }
-        return SlotSpec(id: "host:\(id)", label: act?.label ?? id, icon: "power",
+        // Three power actions, three glyphs — the same icon on all three made them one button.
+        let icon: String
+        switch id {
+        case "power.sleep": icon = "moon.zzz.fill"
+        case "power.reboot": icon = "arrow.clockwise"
+        case "power.shutdown": icon = "power"
+        default: icon = "bolt.fill"
+        }
+        return SlotSpec(id: "host:\(id)", label: act?.label ?? id, icon: icon,
                         enabled: act?.available == true,
                         reason: act?.unavailableReason ?? "This host does not offer it",
                         armed: act?.danger ?? true)
@@ -191,7 +200,7 @@ private func spec(_ slot: SlotId, _ cfg: OverlayConfig, _ a: RingActions) -> Slo
         let keys = s?.keys ?? []
         let known = !keys.isEmpty && keys.allSatisfy { keyVk($0) != nil }
         return SlotSpec(id: "shortcut:\(id)", label: (s?.label.isEmpty == false ? s!.label : chordChip(keys)),
-                        chip: chordChip(keys), enabled: known, reason: "A key in this chord is unknown")
+                        keys: keys, enabled: known, reason: "A key in this chord is unknown")
     }
 }
 
@@ -486,8 +495,8 @@ struct RingOverlay: View {
                             highlighted: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Group {
-                if let chip = s?.chip {
-                    Text(chip).font(.geistFixed(11, .semibold))
+                if let keys = s?.keys {
+                    ChordKeycap(keys: keys)
                 } else {
                     Image(systemName: s?.icon ?? "circle.dashed")
                         .font(.system(size: size * 0.4, weight: .semibold))
@@ -509,6 +518,38 @@ struct RingOverlay: View {
         .accessibilityLabel(s?.label ?? "Empty slot")
         .accessibilityValue(
             armed ? "armed — press again" : (s?.enabled == false ? (s?.reason ?? "") : (s?.state ?? "")))
+    }
+}
+
+/// A chord on a disc: the modifiers as the compact glyphs Apple keyboards print (⌃ ⌥ ⇧ ⌘),
+/// the key large under them, shrinking to fit. One legend line ("Ctrl+Shift+Esc") ran past
+/// the disc's edge. The editor previews a chord with this same view.
+struct ChordKeycap: View {
+    let keys: [String]
+
+    var body: some View {
+        let mods = keys.dropLast().map(modGlyph).joined()
+        let key = keys.last.map(keyLegend) ?? ""
+        VStack(spacing: -1) {
+            if !mods.isEmpty {
+                Text(mods).font(.system(size: 11, weight: .semibold))
+            }
+            Text(key)
+                .font(.geistFixed(key.count > 3 ? 11 : 15, .semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+        }
+        .frame(width: 42)
+    }
+
+    private func modGlyph(_ k: String) -> String {
+        switch k.lowercased() {
+        case "ctrl", "control": return "⌃"
+        case "alt", "option": return "⌥"
+        case "shift": return "⇧"
+        case "win", "cmd", "super", "meta": return "⌘"
+        default: return keyLegend(k)
+        }
     }
 }
 

@@ -2908,8 +2908,9 @@ pub(super) mod tests {
         // paired host now.
         // 37 desktop rows (the daily-driver batch added 10-bit SDR and Keep host audio) +
         // the ten Android-only ones (design android-skia-console-port.md D3): eight
-        // `extra`-backed settings and two platform-screen action rows.
-        assert_eq!(seen.len(), 47, "{seen:?}");
+        // `extra`-backed settings and two platform-screen action rows + the quick-action
+        // ring's six slot rows and its reset (every platform).
+        assert_eq!(seen.len(), 54, "{seen:?}");
         assert!(seen.contains(&RowId::Palette));
         assert!(seen.contains(&RowId::ReduceMotion));
         assert!(seen.contains(&RowId::ReduceUiResolution));

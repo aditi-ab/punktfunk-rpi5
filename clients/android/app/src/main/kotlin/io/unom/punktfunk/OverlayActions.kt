@@ -105,24 +105,32 @@ fun keyVk(name: String): Int? {
     }
 }
 
-/** A chord as a keycap chip reads it: `Ctrl+⇧+Esc`. */
-fun chordChip(keys: List<String>): String = keys.joinToString("+") { k ->
-    when (k.lowercase()) {
-        "ctrl", "control" -> "Ctrl"
-        "shift" -> "⇧"
-        "alt", "option" -> "Alt"
-        "win", "cmd", "super", "meta" -> "❖"
-        "escape", "esc" -> "Esc"
-        "enter", "return" -> "↵"
-        "backspace" -> "⌫"
-        "delete", "del" -> "Del"
-        "space" -> "␣"
-        "up" -> "↑"
-        "down" -> "↓"
-        "left" -> "←"
-        "right" -> "→"
-        else -> k.replaceFirstChar { it.uppercase() }
-    }
+/** A chord as a legend reads it: `Ctrl+Shift+Esc`. */
+fun chordChip(keys: List<String>): String = keys.joinToString("+", transform = ::keyLegend)
+
+/**
+ * One key's legend: the word a keyboard prints on it (`Ctrl`, `Esc`, `PgUp`), arrows as arrows.
+ * Symbols like ❖ or ⇧ read as nothing to most people, so none are used here.
+ */
+fun keyLegend(k: String): String = when (k.trim().lowercase()) {
+    "ctrl", "control" -> "Ctrl"
+    "shift" -> "Shift"
+    "alt", "option" -> "Alt"
+    "win", "cmd", "super", "meta" -> "Win"
+    "escape", "esc" -> "Esc"
+    "enter", "return" -> "Enter"
+    "backspace" -> "Backspace"
+    "delete", "del" -> "Del"
+    "insert" -> "Ins"
+    "pageup" -> "PgUp"
+    "pagedown" -> "PgDn"
+    "printscreen" -> "PrtSc"
+    "capslock" -> "Caps"
+    "up" -> "↑"
+    "down" -> "↓"
+    "left" -> "←"
+    "right" -> "→"
+    else -> k.trim().lowercase().replaceFirstChar { it.uppercase() }
 }
 
 /** The virtual controller's preset: [layout] is `full`, `sticks` or `dpad`. */
