@@ -39,11 +39,21 @@ warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*"; }
 bad()  { printf '  %s✗%s %s\n' "$R" "$N" "$*"; }
 die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 
-ask() {  # ask "question" -> 0 on yes. Defaults to NO, and to no in a non-interactive shell.
-  [[ -t 0 ]] || return 1
-  local reply
-  read -r -p "  $1 [y/N] " reply
-  [[ "$reply" == [yY] || "$reply" == [yY][eE][sS] ]]
+# ask "question" [y|n] -> 0 on yes. The default is YES unless a caller says otherwise, and a
+# non-interactive shell TAKES the default: running `setup` is the consent act, and the first
+# polarity (everything defaulted no, non-tty always no) meant a `curl | sh` install delivered
+# the integration with every feature silently skipped. Enter accepts; `n` still declines; and
+# every step stays reversible through `remove`.
+ask() {
+  local q="$1" def="${2:-y}"
+  if [[ ! -t 0 ]]; then [[ "$def" == y ]]; return; fi
+  local reply hint="[Y/n]"
+  [[ "$def" == n ]] && hint="[y/N]"
+  read -r -p "  $q $hint " reply
+  case "${reply:-$def}" in
+    [yY]|[yY][eE][sS]) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -452,6 +462,21 @@ setup_plugin() {
   fi
 }
 
+# The CLIENT's side of the menu: connect/wake rows for saved hosts, "Open Punktfunk", the game
+# console. The client owns the block (`--omarchy-menu`, its preferences switch mirrors it) and
+# merges into the same "punktfunk" submenu as ours — this step just turns it on where the client
+# is installed, so one setup run delivers the whole menu, both directions.
+setup_client_menu() {
+  have punktfunk-client || return 0
+  step "Client menu"
+  ask "add your saved hosts to the Omarchy menu (connect and wake rows)?" || { warn "skipped"; return 0; }
+  if punktfunk-client --omarchy-menu on >/dev/null 2>&1; then
+    ok "client rows in the Omarchy menu — they follow your saved hosts from here"
+  else
+    warn "could not enable the client rows — run: punktfunk-client --omarchy-menu on"
+  fi
+}
+
 remove_plugin() {
   local dest; dest="$(plugin_dest)"
   # The manifest check keeps an rm -rf honest: only a directory that is actually our plugin goes.
@@ -562,6 +587,7 @@ then run this again. See https://punktfunk.com/docs/omarchy"
   setup_cert_trust
   setup_webapp
   setup_plugin
+  setup_client_menu
   # Both opt-ins land in ONE hooks.json, so they are asked for first and written once — two passes
   # over the same file is how the second one ends up printing "you already have hooks.json".
   WANT_TOASTS=0; WANT_IDLE=0
@@ -604,6 +630,10 @@ cmd_remove() {
           "$HOME/.local/share/applications/${WEBAPP_OLD// /}.desktop" 2>/dev/null || true
   fi
   remove_plugin
+  # The client block is the client's file region, so its own tool takes it out — same submenu,
+  # other direction. `off` removes exactly that block and nothing else.
+  have punktfunk-client && punktfunk-client --omarchy-menu off >/dev/null 2>&1 \
+    && ok "client menu rows removed" || true
   remove_menu
   # Hooks: only remove a hooks.json that is entirely OURS. A file the operator has since edited is
   # theirs — deleting it would take their webhooks with it — so we say what to remove instead.
