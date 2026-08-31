@@ -203,12 +203,56 @@ setup_units() {
   fi
 }
 
+# ── browser trust (the certificate warning) ────────────────────────────────────────────────────
+#
+# The console serves the host's NATIVE identity (ECDSA P-256 with real SANs — localhost, loopback,
+# the hostname; identity.rs, chosen in web/nitro-entry/tls-paths.mjs), so the one thing a browser
+# still objects to is that nobody vouches for it. Chromium on Linux reads per-user NSS
+# (~/.pki/nssdb): adding the cert there with "C,," makes https://localhost:47992 load with no
+# interstitial at all. Measured on Omarchy 4.0.1 / Chromium 151 with a fresh profile — the flag
+# matters, and `--ignore-certificate-errors` is not an alternative: current omarchy-webapp-install
+# swallows it as its custom-exec argument, so it never reached the browser anyway.
+#
+# The legacy cert.pem can never be fixed this way: CN-only with NO subjectAltName, and every
+# browser since Chrome 58 requires a SAN. A host still serving it (upgraded, with native pairings
+# pinning it) gets a warning instead of a trust entry that would change nothing.
+readonly NSSDB="$HOME/.pki/nssdb"
+readonly CERT_NICK="punktfunk-console"
+
+console_cert() { printf '%s/punktfunk/native-cert.pem' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+
+setup_cert_trust() {
+  step "Browser trust"
+  have certutil || { warn "certutil not found (pacman -S nss) — the certificate warning stays"; return 0; }
+  local cert; cert="$(console_cert)"
+  if [[ ! -r "$cert" ]]; then
+    warn "no native-cert.pem yet — start the host once, then re-run: punktfunk-omarchy setup"
+    return 0
+  fi
+  ask "trust the console's certificate in Chromium (removes the security warning)?" || { warn "skipped"; return 0; }
+  if [[ ! -f "$NSSDB/cert9.db" ]]; then
+    mkdir -p "$NSSDB"
+    certutil -N -d "sql:$NSSDB" --empty-password
+  fi
+  # Delete-then-add: a host that re-minted its identity gets the CURRENT cert trusted, not the one
+  # from last time. The delete failing (first run) is the normal case.
+  certutil -D -d "sql:$NSSDB" -n "$CERT_NICK" 2>/dev/null || true
+  if certutil -A -d "sql:$NSSDB" -n "$CERT_NICK" -t "C,," -i "$cert" 2>/dev/null; then
+    ok "console certificate trusted — a Chromium that is already running picks it up on restart"
+  else
+    bad "certutil refused the cert — the warning stays; click through once in the browser instead"
+  fi
+}
+
+remove_cert_trust() {
+  have certutil || return 0
+  [[ -f "$NSSDB/cert9.db" ]] || return 0
+  certutil -D -d "sql:$NSSDB" -n "$CERT_NICK" 2>/dev/null && ok "console certificate no longer trusted" || true
+}
+
 setup_webapp() {
   step "App menu"
   have omarchy-webapp-install || { warn "omarchy-webapp-install not found — skipping"; return 0; }
-  # Sunshine's own installer takes the same --ignore-certificate-errors: the console presents the
-  # host's self-signed certificate, which no browser will ever accept on a LAN name.
-  #
   # The icon is an ICON NAME, not a path — the desktop spec resolves it through the icon theme, and
   # the scalable `io.unom.Punktfunk` the host package ships scales to whatever size the launcher
   # asks for. Passing a path to a file that did not exist is how the first version produced an
@@ -221,8 +265,7 @@ setup_webapp() {
   local icon=io.unom.Punktfunk
   find /usr/share/icons -name "${icon}.*" -print -quit 2>/dev/null | grep -q . \
     || icon=punktfunk-tray   # older package: the tray mark is the only one installed
-  if omarchy-webapp-install "$WEBAPP" "https://localhost:47992" "$icon" \
-       --ignore-certificate-errors 2>/dev/null; then
+  if omarchy-webapp-install "$WEBAPP" "https://localhost:47992" "$icon" 2>/dev/null; then
     ok "\"$WEBAPP\" added to Apps (Super+Space)"
     # Point the entry at a one-shot ticket instead of the bare URL, so opening the console from the
     # launcher lands logged in. `ctl console-url` signs it with the management token, which only
@@ -230,7 +273,10 @@ setup_webapp() {
     local entry
     entry=$(grep -rl "^Name=$WEBAPP$" "$HOME/.local/share/applications" 2>/dev/null | head -1)
     if [[ -n "$entry" ]] && have punktfunk-host; then
-      sed -i "s|^Exec=.*|Exec=sh -c 'omarchy-launch-webapp \"\$(punktfunk-host ctl console-url)\"'|" "$entry"
+      # `|| echo`: a stopped host makes `ctl console-url` fail, and an EMPTY `--app=` opens a
+      # plain browser window instead of an app window — the bare URL keeps the shape right and
+      # shows the console's own error page.
+      sed -i "s|^Exec=.*|Exec=sh -c 'omarchy-launch-webapp \"\$(punktfunk-host ctl console-url \|\| echo https://localhost:47992)\"'|" "$entry"
       sed -i "s|^Icon=.*|Icon=$icon|" "$entry"
       grep -q '^Icon=' "$entry" || printf 'Icon=%s\n' "$icon" >> "$entry"
       ok "the console entry opens already logged in, with the Punktfunk mark"
@@ -257,7 +303,7 @@ readonly MENU_END="// <<< punktfunk"
 menu_rows() {
   cat <<'EOF'
   "punktfunk": {"icon":"󰍹","label":"Punktfunk","aliases":["streaming","stream"]},
-  "punktfunk.console": {"icon":"󰖟","label":"Open console","description":"Pairing, devices, settings — opens already logged in","action":"sh -c 'omarchy-launch-webapp \"$(punktfunk-host ctl console-url)\"'"},
+  "punktfunk.console": {"icon":"󰖟","label":"Open console","description":"Pairing, devices, settings — opens already logged in","action":"sh -c 'omarchy-launch-webapp \"$(punktfunk-host ctl console-url || echo https://localhost:47992)\"'"},
   "punktfunk.pair": {"icon":"󰐕","label":"Pair a device","description":"Open a pairing window and show the PIN","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl pair arm; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
   "punktfunk.pending": {"icon":"󰀦","label":"Devices waiting","description":"Approve or deny a device that is asking to pair","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl pending; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
   "punktfunk.devices": {"icon":"󰄋","label":"Paired devices","action":"omarchy-launch-or-focus-tui \"bash -c 'punktfunk-host ctl clients; echo; read -n1 -r -p \\\"Press any key…\\\"'\""},
@@ -267,7 +313,6 @@ menu_rows() {
 EOF
 }
 
-# Strip JSONC to JSON so python can parse it: line comments, then trailing commas.
 # JSONC as the menu reads it: strip `//` comments and forgive trailing commas, both
 # STRING-AWARE. Not pedantry — the console row's own action carries
 # `https://localhost:47992`, and the original sed pipeline cut that line mid-string and
@@ -370,6 +415,41 @@ remove_menu() {
   else rm -f "$tmp"; warn "could not remove the menu entries cleanly — edit $MENU_FILE by hand"; fi
 }
 
+# ── the bar widget (Quickshell plugin) ─────────────────────────────────────────────────────────
+#
+# The shell discovers third-party plugins in ~/.config/omarchy/plugins/<id> — the same place
+# `omarchy plugin add` clones into — so the package ships the files as data and this step copies
+# them there. Installing into /usr/share/omarchy/shell/plugins instead would drop unowned files
+# inside omarchy's own package: the exact "exists in filesystem" abort on its next upgrade.
+plugin_dest() { printf '%s/omarchy/plugins/punktfunk' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+
+setup_plugin() {
+  step "Bar widget"
+  [[ -d "$HOOKS_SRC/plugin" ]] || { warn "no plugin in $HOOKS_SRC — skipping"; return 0; }
+  ask "add the Punktfunk widget to the Omarchy bar (status, pairing, devices)?" || { warn "skipped"; return 0; }
+  local dest; dest="$(plugin_dest)"
+  mkdir -p "$dest"
+  install -m0644 -t "$dest" "$HOOKS_SRC"/plugin/manifest.json "$HOOKS_SRC"/plugin/*.qml \
+    "$HOOKS_SRC"/plugin/README.md
+  # `omarchy plugin enable` wires it into shell.json and reloads the shell. Outside a session
+  # shell it needs OMARCHY_PATH (measured on 4.0.1); the other omarchy tools here do not.
+  if OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}" omarchy plugin enable punktfunk >/dev/null 2>&1; then
+    ok "widget installed and enabled — the Punktfunk mark appears in the bar"
+  else
+    ok "widget installed to $dest"
+    warn "could not enable it automatically — run: omarchy plugin enable punktfunk"
+  fi
+}
+
+remove_plugin() {
+  local dest; dest="$(plugin_dest)"
+  # The manifest check keeps an rm -rf honest: only a directory that is actually our plugin goes.
+  [[ -d "$dest" ]] && grep -qs '"id": "punktfunk"' "$dest/manifest.json" || return 0
+  OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}" omarchy plugin disable punktfunk >/dev/null 2>&1 || true
+  rm -rf "$dest"
+  ok "bar widget removed"
+}
+
 # Hooks live in ~/.config/punktfunk/hooks.json — a LIST of {on, run} entries the host reads per
 # event (automation.md). We write that file only when the operator has none: merging JSON in bash
 # would need jq and, worse, would edit a document that is theirs. If they already have hooks, we
@@ -468,7 +548,9 @@ then run this again. See https://punktfunk.com/docs/omarchy"
   setup_units
   step "Firewall"
   open_firewall
+  setup_cert_trust
   setup_webapp
+  setup_plugin
   # Both opt-ins land in ONE hooks.json, so they are asked for first and written once — two passes
   # over the same file is how the second one ends up printing "you already have hooks.json".
   WANT_TOASTS=0; WANT_IDLE=0
@@ -508,6 +590,7 @@ cmd_remove() {
   else
     rm -f "$HOME/.local/share/applications/${WEBAPP// /}.desktop" 2>/dev/null || true
   fi
+  remove_plugin
   remove_menu
   # Hooks: only remove a hooks.json that is entirely OURS. A file the operator has since edited is
   # theirs — deleting it would take their webhooks with it — so we say what to remove instead.
@@ -519,6 +602,7 @@ cmd_remove() {
       warn "$hf has entries that are not ours — left alone. Remove the lines naming $HOOKS_SRC by hand."
     fi
   fi
+  remove_cert_trust
   local tpl="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/themed/punktfunk.json.tpl"
   [[ -f "$tpl" ]] && { rm -f "$tpl"; ok "theme template removed"; } || true
   # The screen-share picker: the host hands `custom_picker_binary` back on its own when the last
@@ -568,6 +652,21 @@ cmd_status() {
   if [[ -f /usr/lib/systemd/user/punktfunk-web.service ]]; then
     systemctl --user is-active --quiet punktfunk-web.service \
       && ok "web console running — https://localhost:47992" || warn "web console installed but not running"
+    # Trust is only as good as it being the cert the console serves TODAY: a host that re-minted
+    # its identity leaves a stale entry behind, and the warning comes back with no visible cause.
+    if have certutil && have openssl && [[ -r "$(console_cert)" ]]; then
+      local trusted served
+      trusted="$(certutil -L -d "sql:$NSSDB" -n "$CERT_NICK" -a 2>/dev/null \
+                   | openssl x509 -noout -fingerprint -sha256 2>/dev/null)" || trusted=""
+      served="$(openssl x509 -noout -fingerprint -sha256 -in "$(console_cert)" 2>/dev/null)" || served=""
+      if [[ -n "$trusted" && "$trusted" == "$served" ]]; then
+        ok "browser trusts the console certificate"
+      elif [[ -n "$trusted" ]]; then
+        warn "the trusted console certificate is STALE — re-run: punktfunk-omarchy setup"
+      else
+        warn "browser does not trust the console certificate (run: punktfunk-omarchy setup)"
+      fi
+    fi
   fi
   if [[ -f "$DROPIN" ]]; then
     if session_is_systemd_managed; then

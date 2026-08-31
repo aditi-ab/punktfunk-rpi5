@@ -338,6 +338,13 @@ package_punktfunk-host() {
   done
   install -Dm0644 "$R/packaging/linux/omarchy/themed/punktfunk.json.tpl" \
     "$pkgdir/usr/share/punktfunk/omarchy/themed/punktfunk.json.tpl"
+  # The Quickshell bar widget (see plugin/README.md). Shipped as data only — the shell discovers
+  # plugins in the USER's config dir, so `punktfunk-omarchy setup` copies it there with consent,
+  # the same split as the hooks above.
+  for f in manifest.json Panel.qml Service.qml README.md; do
+    install -Dm0644 "$R/packaging/linux/omarchy/plugin/$f" \
+      "$pkgdir/usr/share/punktfunk/omarchy/plugin/$f"
+  done
   # Firewall openers — NOT auto-enabled (an Arch package never touches the admin's running firewall).
   # Stock Arch ships no firewall; CachyOS ships ufw; some spins (EndeavourOS) enable firewalld — so we
   # install BOTH a ufw application profile and firewalld service definitions, and the one for whatever

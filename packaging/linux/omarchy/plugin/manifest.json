@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "punktfunk",
+  "name": "Punktfunk",
+  "version": "0.1.0",
+  "author": "unom",
+  "license": "MIT OR Apache-2.0",
+  "description": "Pair devices, watch sessions and control your Punktfunk streaming host from the bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Punktfunk",
+    "description": "One bar icon and one panel: what is streaming, who is asking to pair, and which devices are trusted.",
+    "category": "System",
+    "aliases": ["punktfunk", "streaming"],
+    "allowMultiple": false,
+    "defaults": {
+      "toasts": true
+    },
+    "schema": [
+      {
+        "key": "toasts",
+        "type": "boolean",
+        "label": "Notify on pairing requests",
+        "defaultValue": true,
+        "description": "Pop an Omarchy notification when a device asks to pair. The panel is where you approve it either way."
+      }
+    ]
+  }
+}

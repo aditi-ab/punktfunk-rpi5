@@ -17,4 +17,4 @@ body="$client connected"
 [[ -n "$app" ]] && body="$body · $app" || true
 
 command -v omarchy-notification-send >/dev/null || exit 0
-omarchy-notification-send --urgency=low --icon=video-display "Punktfunk streaming" "$body"
+omarchy-notification-send --urgency=low --icon=io.unom.Punktfunk "Punktfunk streaming" "$body"
