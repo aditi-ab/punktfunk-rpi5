@@ -24,6 +24,7 @@ on:
       - scripts/install.sh
       - data/platforms.json
       - crates/punktfunk-setup/**
+      - ci/omarchy/**
       - packaging/linux/omarchy/punktfunk-omarchy
       - packaging/linux/omarchy/selftest.sh
       - .gitea/workflows/installer-smoke.yml
@@ -32,6 +33,7 @@ on:
       - scripts/install.sh
       - data/platforms.json
       - crates/punktfunk-setup/**
+      - ci/omarchy/**
       - packaging/linux/omarchy/punktfunk-omarchy
       - packaging/linux/omarchy/selftest.sh
       - .gitea/workflows/installer-smoke.yml
@@ -75,6 +77,32 @@ jobs:
       # `set -euo pipefail`. It needs no container: bash and python3 are all the checks use.
       - name: Run the Omarchy integration self-check
         run: bash packaging/linux/omarchy/selftest.sh
+
+  # No Omarchy image exists and none is needed — the trap is a file. This wears Omarchy's
+  # os-release and its real libalpm update guard, proves the guard is ARMED before asserting
+  # anything else, and then requires the install to succeed anyway. See ci/omarchy/row.sh.
+  omarchy-install:
+    name: omarchy (armed update guard)
+    runs-on: ubuntu-24.04
+    needs: setup-binary
+    timeout-minutes: 25
+    container:
+      image: archlinux:base
+    env:
+      PF: sh scripts/install.sh
+      PUNKTFUNK_SETUP_BIN: /usr/local/bin/punktfunk-setup
+    steps:
+      - name: Prepare the container
+        run: pacman -Sy --noconfirm --needed curl git nodejs && (pacman-key --init >/dev/null 2>&1 || true)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@v3
+        with:
+          name: punktfunk-setup-musl
+          path: /usr/local/bin
+      - name: Make it executable
+        run: chmod +x /usr/local/bin/punktfunk-setup
+      - name: Install under Omarchy's update guard
+        run: bash ci/omarchy/row.sh
 
   smoke:
     name: smoke (${{ matrix.family }})
