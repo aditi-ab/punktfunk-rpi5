@@ -8,6 +8,7 @@ members = [
     # hardlink of, or a subcommand of, punktfunk-host (design/gpu-priority-capability-worker.md).
     "crates/punktfunk-encode-worker",
     "crates/punktfunk-tray",
+    "crates/punktfunk-setup",
     "crates/pf-bitstream",
     "crates/pf-bitstream/vendor/cros-codecs",
     "crates/pf-client-core",

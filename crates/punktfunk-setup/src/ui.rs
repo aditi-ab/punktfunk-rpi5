@@ -1,0 +1,110 @@
+//! The no-TTY / `--yes` renderer: the sh installer's `==>` / `ok` / `!!` lines, unchanged.
+//!
+//! D5 says a box with no terminal sees exactly today's output, so CI containers and scripts
+//! notice no regression. Warnings and the die line keep going to stderr for the same reason.
+//! The TUI (M2) renders the same `Plan` through a different surface; nothing below `ui` knows
+//! which one is attached.
+//!
+//! `Sink::Buffer` is what the golden suite renders into — one stream, so the ordering of
+//! warnings against commands is part of what the goldens pin.
+
+use std::cell::RefCell;
+use std::io::Write;
+use std::rc::Rc;
+
+pub type Buffer = Rc<RefCell<String>>;
+
+pub enum Sink {
+    Stdio,
+    Buffer(Buffer),
+}
+
+pub struct Plain {
+    sink: Sink,
+    color: bool,
+}
+
+impl Plain {
+    pub fn stdio(color: bool) -> Self {
+        Self {
+            sink: Sink::Stdio,
+            color,
+        }
+    }
+
+    /// Both streams into one buffer, uncoloured — the golden suite's renderer.
+    pub fn capture() -> (Self, Buffer) {
+        let buf: Buffer = Rc::new(RefCell::new(String::new()));
+        (
+            Self {
+                sink: Sink::Buffer(buf.clone()),
+                color: false,
+            },
+            buf,
+        )
+    }
+
+    fn emit(&self, stderr: bool, line: &str) {
+        match &self.sink {
+            Sink::Buffer(buf) => {
+                buf.borrow_mut().push_str(line);
+                buf.borrow_mut().push('\n');
+            }
+            Sink::Stdio if stderr => {
+                let mut e = std::io::stderr();
+                let _ = writeln!(e, "{line}");
+            }
+            Sink::Stdio => {
+                let mut o = std::io::stdout();
+                let _ = writeln!(o, "{line}");
+            }
+        }
+    }
+
+    fn tag(&self, code: &str, mark: &str) -> String {
+        if self.color {
+            format!("\x1b[1;{code}m{mark}\x1b[0m")
+        } else {
+            mark.to_string()
+        }
+    }
+
+    pub fn say(&self, msg: &str) {
+        let tag = self.tag("36", "==>");
+        self.emit(false, &format!("{tag} {msg}"));
+    }
+
+    pub fn ok(&self, msg: &str) {
+        let tag = self.tag("32", "  ok");
+        self.emit(false, &format!("{tag} {msg}"));
+    }
+
+    pub fn warn(&self, msg: &str) {
+        let tag = self.tag("33", "  !!");
+        self.emit(true, &format!("{tag} {msg}"));
+    }
+
+    pub fn die(&self, msg: &str) {
+        let tag = self.tag("31", "  xx");
+        self.emit(true, &format!("{tag} {msg}"));
+    }
+
+    /// The dim command echo. Every command prints before it runs — that transparency is a
+    /// trust feature and the terminal scrollback is the audit log.
+    pub fn plus(&self, cmd: &str) {
+        self.emit(false, &format!("  + {cmd}"));
+    }
+
+    /// Continuation text under a step, indented to line up with the `ok` column.
+    pub fn detail(&self, msg: &str) {
+        self.emit(false, &format!("     {msg}"));
+    }
+
+    pub fn blank(&self) {
+        self.emit(false, "");
+    }
+
+    pub fn line(&self, msg: &str) {
+        self.emit(false, msg);
+    }
+}

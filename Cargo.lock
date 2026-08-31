@@ -3698,6 +3698,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "punktfunk-setup"
+version = "0.34.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "punktfunk-tray"
 version = "0.34.0"
 dependencies = [
