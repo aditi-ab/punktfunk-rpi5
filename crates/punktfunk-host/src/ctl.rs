@@ -146,6 +146,7 @@ fn run(args: &[&str], json: bool) -> Result<()> {
         "rename" => rename(rest, json),
         "unpair" => unpair(rest, json),
         "access" => access(rest, json),
+        "display" => display(rest, json),
         "watch" => {
             let kinds = flag_value(rest, "--kinds");
             let since = flag_value(rest, "--since")
@@ -310,6 +311,177 @@ fn access(args: &[&str], json: bool) -> Result<()> {
     )?;
     out(json, &v, move |_| println!("{fp}: access set to {preset}"));
     Ok(())
+}
+
+// ── displays ───────────────────────────────────────────────────────────────────────────────────
+
+/// The virtual-display policy and what is live right now, in one answer.
+///
+/// Two GETs rather than one because the API keeps them apart on purpose — `/display/settings` is
+/// the stored policy and its preset catalogue, `/display/state` is the displays that exist this
+/// second — and a caller that had to make two calls to answer one question would show them at two
+/// different instants.
+///
+/// ⚠ `displays` is EMPTY on wlroots, and not because nothing is streaming: a wlroots capture
+/// arrives over a sandboxed xdp portal fd the host cannot re-open per attach, so
+/// `vdisplay::registry` passes those displays through rather than owning them (its own module docs
+/// say so) and never lists them. Measured on an Omarchy box: a live 2414x1188@240 head,
+/// `displays: []`. Read an empty list as "this host does not track them", never as "there are
+/// none" — the Omarchy panel shows no live-display section for exactly this reason.
+fn display(args: &[&str], json: bool) -> Result<()> {
+    let c = Client::connect(None)?;
+    match args.first().copied() {
+        Some("preset") => {
+            let id = args
+                .get(1)
+                .copied()
+                .ok_or_else(|| Failure::usage("display preset: <ID> (see `ctl display`)"))?;
+            let v = display_apply_preset(&c, id)?;
+            out(json, &v, move |_| println!("display preset set to {id}"));
+            Ok(())
+        }
+        Some("release") => {
+            // The slot is optional and releases exactly one head; omitting it releases every KEPT
+            // display. Never an active one — that is `stop-session`, and conflating the two would
+            // make "give me my screen back" able to kill somebody's stream.
+            let mut body = json!({});
+            if let Some(slot) = args.get(1) {
+                let n: u32 = slot
+                    .parse()
+                    .map_err(|_| Failure::usage("display release: SLOT must be a number"))?;
+                body["slot"] = json!(n);
+            }
+            let v = c.post("/api/v1/display/release", &body)?;
+            out(json, &v, |v| {
+                println!(
+                    "released {} kept display(s)",
+                    v["released"].as_i64().unwrap_or(0)
+                )
+            });
+            Ok(())
+        }
+        None | Some("status") => {
+            let mut v = c.get("/api/v1/display/settings")?;
+            // `/display/state` is unavailable on a build with no vdisplay backend; the policy half
+            // is still worth answering, so an empty list beats failing the whole verb.
+            let live = c
+                .get("/api/v1/display/state")
+                .map(|s| s["displays"].clone())
+                .unwrap_or(Value::Null);
+            v["displays"] = if live.is_array() { live } else { json!([]) };
+            out(json, &v, render_display);
+            Ok(())
+        }
+        Some(other) => Err(Failure::usage(format!(
+            "display: expected status | preset | release, got '{other}'"
+        ))),
+    }
+}
+
+/// Switch the stored policy to `id`, preserving every axis a preset does not own.
+///
+/// `PUT /display/settings` replaces the whole object, so this reads the stored policy first and
+/// edits it — the console does exactly this (`web/src/sections/Displays/DisplayCard.tsx`), and for
+/// the same reason: `capture_monitor` and the experimental Windows axes are NOT preset behavior,
+/// and a PUT that dropped them would swap the streamed screen out from under the operator because
+/// they picked a different lifecycle.
+///
+/// A saved custom preset has no apply route of its own: applying it means writing a `Custom` policy
+/// carrying its saved fields. That asymmetry is the API's, mirrored here so both kinds of id work.
+fn display_apply_preset(c: &Client, id: &str) -> Result<Value> {
+    let state = c.get("/api/v1/display/settings")?;
+    let policy = policy_with_preset(&state, id)?;
+    c.put("/api/v1/display/settings", &policy)
+}
+
+/// The edit itself, split from the two HTTP calls so it can be checked against a settings body
+/// without a running host. Everything that can go wrong here — dropping an orthogonal axis,
+/// accepting an id no preset has — is in this function, not in the transport around it.
+fn policy_with_preset(state: &Value, id: &str) -> Result<Value> {
+    let mut policy = state["settings"].clone();
+    if !policy.is_object() {
+        return Err(Failure::api("display: the host returned no stored policy"));
+    }
+
+    let custom = state["custom_presets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|p| p["id"].as_str() == Some(id))
+        .cloned();
+
+    if let Some(p) = custom {
+        policy["preset"] = json!("custom");
+        for (k, val) in p["fields"].as_object().into_iter().flatten() {
+            policy[k.as_str()] = val.clone();
+        }
+        // `game_session` is the one orthogonal axis a saved preset does carry.
+        if let Some(gs) = p.get("game_session") {
+            policy["game_session"] = gs.clone();
+        }
+    } else {
+        let known = state["presets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|p| p["id"].as_str() == Some(id));
+        if !known {
+            // Listing what exists beats "invalid preset": the built-ins and the operator's saved
+            // ones share one id space, and only the host knows the saved half.
+            return Err(Failure::usage(format!(
+                "display preset: no preset '{id}' — run `ctl display` for the list"
+            )));
+        }
+        policy["preset"] = json!(id);
+    }
+    Ok(policy)
+}
+
+fn render_display(v: &Value) {
+    let cur = v["settings"]["preset"].as_str().unwrap_or("custom");
+    println!("preset    {cur}");
+    let eff = &v["effective"];
+    println!(
+        "policy    topology {} · identity {} · conflict {} · max {}",
+        eff["topology"].as_str().unwrap_or("—"),
+        eff["identity"].as_str().unwrap_or("—"),
+        eff["mode_conflict"].as_str().unwrap_or("—"),
+        eff["max_displays"].as_i64().unwrap_or(0)
+    );
+    for p in v["presets"].as_array().into_iter().flatten() {
+        let id = p["id"].as_str().unwrap_or("");
+        println!(
+            "  {}{:<16} {}",
+            if id == cur { "*" } else { " " },
+            id,
+            trunc(p["summary"].as_str().unwrap_or(""), 60)
+        );
+    }
+    for p in v["custom_presets"].as_array().into_iter().flatten() {
+        println!(
+            "  {:<17} {} (saved)",
+            p["id"].as_str().unwrap_or(""),
+            trunc(p["name"].as_str().unwrap_or(""), 50)
+        );
+    }
+    let live = v["displays"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if live.is_empty() {
+        println!("live      none");
+        return;
+    }
+    for d in live {
+        println!(
+            "live      slot {} · {} · {} · {} session(s){}",
+            d["slot"].as_i64().unwrap_or(0),
+            d["mode"].as_str().unwrap_or("—"),
+            d["state"].as_str().unwrap_or("—"),
+            d["sessions"].as_i64().unwrap_or(0),
+            d["client"]
+                .as_str()
+                .map(|c| format!(" · {}", trunc(c, 24)))
+                .unwrap_or_default()
+        );
+    }
 }
 
 /// A one-shot console URL carrying a ticket that logs the operator straight in.
@@ -593,6 +765,18 @@ DEVICES
     access <FP> <full|controller|view>
     unpair <FP> | unpair --all [--yes]
 
+DISPLAYS
+    display                      the virtual-display policy, every preset, and the live displays.
+                                 `displays` is always empty on wlroots — the registry passes those
+                                 through rather than owning them, so read it as "not tracked here".
+    display preset <ID>          switch the policy to a preset — a built-in id or a saved one.
+                                 Reads the stored policy and edits it, so the axes a preset does
+                                 not own (the streamed screen, the experimental Windows ones)
+                                 survive the switch.
+    display release [SLOT]       tear down KEPT displays now, so a physical-screen user gets their
+                                 screen back without waiting out the linger. Omit SLOT for all.
+                                 Never touches a display that is actively streaming.
+
 OPTIONS
     --json                       versioned JSON on stdout (the contract; the tables are for humans)
 
@@ -649,5 +833,58 @@ mod tests {
         assert!(one_id(&["--expires-in", "3600"], "approve").is_err());
         assert!(one_id(&["newest"], "approve").is_err());
         assert!(one_id(&[], "approve").is_err());
+    }
+
+    /// A settings body shaped like `GET /display/settings`: a stored policy carrying axes no preset
+    /// owns, one built-in preset and one saved one.
+    fn display_state() -> Value {
+        json!({
+            "settings": {
+                "version": 1,
+                "preset": "default",
+                "topology": "auto",
+                "max_displays": 4,
+                "game_session": "auto",
+                "capture_monitor": "DP-2",
+                "ddc_power_off": true,
+            },
+            "presets": [{ "id": "gaming-rig", "summary": "…" }],
+            "custom_presets": [{
+                "id": "p-couch",
+                "name": "Couch",
+                "game_session": "dedicated",
+                "fields": { "topology": "exclusive", "max_displays": 2 },
+            }],
+        })
+    }
+
+    #[test]
+    fn a_preset_switch_keeps_the_axes_no_preset_owns() {
+        let p = policy_with_preset(&display_state(), "gaming-rig").unwrap();
+        assert_eq!(p["preset"], "gaming-rig");
+        // The streamed screen is not display BEHAVIOR. A whole-object PUT that rebuilt the policy
+        // from the verb's arguments would drop this and silently move the stream to a virtual
+        // display — the on-glass regression the console carries the same guard against.
+        assert_eq!(p["capture_monitor"], "DP-2");
+        assert_eq!(p["ddc_power_off"], true);
+    }
+
+    #[test]
+    fn a_saved_preset_is_applied_as_a_custom_policy_carrying_its_fields() {
+        // Saved presets have no apply route of their own — the API expects `custom` plus the
+        // fields. Getting this wrong stores the id in a field that only accepts the built-in names.
+        let p = policy_with_preset(&display_state(), "p-couch").unwrap();
+        assert_eq!(p["preset"], "custom");
+        assert_eq!(p["topology"], "exclusive");
+        assert_eq!(p["max_displays"], 2);
+        assert_eq!(p["game_session"], "dedicated");
+        assert_eq!(p["capture_monitor"], "DP-2");
+    }
+
+    #[test]
+    fn an_unknown_preset_is_refused_rather_than_stored() {
+        assert!(policy_with_preset(&display_state(), "hologram").is_err());
+        // No stored policy at all is the host's answer, not a preset the caller can fix.
+        assert!(policy_with_preset(&json!({}), "gaming-rig").is_err());
     }
 }
