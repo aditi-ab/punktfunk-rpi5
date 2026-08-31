@@ -560,21 +560,35 @@ pub struct ResolvedSpec {
 impl ResolvedSpec {
     /// Write the spec somewhere the child can read it, returning the path. Temp files rather
     /// than a pipe because the session already takes a file path elsewhere and a crashed
-    /// spawner leaves something inspectable; the name carries the pid so concurrent launches
-    /// (a shell and a CLI, or two Decky invocations) never overwrite each other's spec.
+    /// spawner leaves something inspectable.
     ///
-    /// The pid alone was not enough: it is the SPAWNER's, so two launches from one shell — a
-    /// cancelled connect and the retry right behind it — shared a single path, and the first
-    /// child's exit deleted the file the second was still starting up to read ("resolved spec:
-    /// No such file"). A per-launch counter separates them.
+    /// The name is a CSPRNG token, creation is `create_new` + 0600, and on Linux the file lives
+    /// in `$XDG_RUNTIME_DIR` (per-user 0700) rather than shared `/tmp`: the old predictable
+    /// `punktfunk-spec-<pid>-<n>` name let another local user pre-create the path as a symlink
+    /// or swap the spec before the child read it (security-review 2026-08-31 M-3). The token
+    /// also keys concurrent launches apart — a collision fails the exclusive create instead of
+    /// overwriting, and the caller already falls back to letting the child resolve for itself.
     pub fn write_temp(&self) -> std::io::Result<std::path::PathBuf> {
-        static LAUNCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = LAUNCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("punktfunk-spec-{}-{n}.json", std::process::id()));
         let json = serde_json::to_vec_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&path, json)?;
+        #[cfg(target_os = "linux")]
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        // Windows %TEMP% and the macOS $TMPDIR are already per-user private directories.
+        #[cfg(not(target_os = "linux"))]
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "punktfunk-spec-{:032x}.json",
+            u128::from_le_bytes(rand::random::<[u8; 16]>())
+        ));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        use std::io::Write as _;
+        opts.open(&path)?.write_all(&json)?;
         Ok(path)
     }
 
