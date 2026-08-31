@@ -11,10 +11,20 @@ import { confirmPassword } from "../../../../util/confirm";
 import { forwardJson } from "../../../../util/forward";
 
 export default defineEventHandler(async (event) => {
-	const body = await readBody<{ pin?: string; password?: string }>(event);
+	const body = await readBody<{
+		pin?: string;
+		uniqueid?: string;
+		fingerprint?: string;
+		password?: string;
+	}>(event);
 	confirmPassword(event, body?.password);
-	// Rebuild from the one field the host takes, so the password cannot leak upstream.
+	// Rebuild from exactly the fields the host takes, so the password cannot leak upstream.
+	// uniqueid/fingerprint address the PIN to one parked ceremony — the one the operator SAW in
+	// the pairing status — instead of whichever handshake is parked at delivery time
+	// (security-review 2026-08-31 H-4).
 	return forwardJson(event, "/api/v1/pair/pin", "POST", {
 		pin: String(body?.pin ?? ""),
+		...(body?.uniqueid ? { uniqueid: String(body.uniqueid) } : {}),
+		...(body?.fingerprint ? { fingerprint: String(body.fingerprint) } : {}),
 	});
 });

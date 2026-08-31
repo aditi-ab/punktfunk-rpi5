@@ -50,10 +50,29 @@ export function useApprovePendingDevice() {
 	});
 }
 
-/** Deliver the PIN a Moonlight client is showing, completing its handshake. */
+/**
+ * Deliver the PIN a Moonlight client is showing, completing its handshake.
+ *
+ * `uniqueid`/`fingerprint` address the PIN to the parked ceremony the operator SAW in the
+ * pairing status — never to whichever handshake happens to be parked at delivery time
+ * (security-review 2026-08-31 H-4).
+ */
 export function useSubmitPairingPin() {
 	return useMutation({
-		mutationFn: ({ pin, password }: { pin: string; password: string }) =>
-			apiFetch<void>("/api/v1/pair/pin", json({ pin, password })),
+		mutationFn: ({
+			pin,
+			password,
+			uniqueid,
+			fingerprint,
+		}: {
+			pin: string;
+			password: string;
+			uniqueid?: string;
+			fingerprint?: string;
+		}) =>
+			apiFetch<void>(
+				"/api/v1/pair/pin",
+				json({ pin, password, uniqueid, fingerprint }),
+			),
 	});
 }

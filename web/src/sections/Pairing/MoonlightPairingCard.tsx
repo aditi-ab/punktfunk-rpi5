@@ -14,6 +14,13 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+	Select,
+	SelectContent,
+	SelectItem,
+	SelectTrigger,
+	SelectValue,
+} from "@/components/ui/select";
 import type { Loadable } from "@/lib/query";
 import { m } from "@/paraglide/messages";
 
@@ -23,6 +30,8 @@ export const MoonlightPairingSection: FC = () => {
 	const [pin, setPin] = useState("");
 	const [password, setPassword] = useState("");
 	const [wrongPassword, setWrongPassword] = useState(false);
+	// Fingerprint of the ceremony the PIN is addressed to; "" = the first (sole) one.
+	const [target, setTarget] = useState("");
 	const pairing = useGetPairingStatus({ query: { refetchInterval: 2_000 } });
 	const submit = useSubmitPairingPin();
 
@@ -41,14 +50,26 @@ export const MoonlightPairingSection: FC = () => {
 			setPin("");
 			setPassword("");
 			setWrongPassword(false);
+			setTarget("");
 		}
 		wasPending.current = pending;
 	}, [pending, submit.reset]);
 
 	const onSubmit = () => {
 		setWrongPassword(false);
+		// Address the PIN to the ceremony the operator saw (the selected one, else the sole
+		// one) — never to whichever handshake is parked at delivery time (security-review
+		// 2026-08-31 H-4).
+		const ceremonies = pairing.data?.pending ?? [];
+		const chosen =
+			ceremonies.find((c) => c.fingerprint === target) ?? ceremonies[0];
 		submit.mutate(
-			{ pin, password },
+			{
+				pin,
+				password,
+				uniqueid: chosen?.uniqueid,
+				fingerprint: chosen?.fingerprint,
+			},
 			{
 				onSuccess: () => {
 					setPin("");
@@ -73,6 +94,8 @@ export const MoonlightPairingSection: FC = () => {
 			password={password}
 			onPasswordChange={setPassword}
 			wrongPassword={wrongPassword}
+			target={target}
+			onTargetChange={setTarget}
 			onSubmit={onSubmit}
 			isSubmitting={submit.isPending}
 			isSuccess={submit.isSuccess}
@@ -90,6 +113,9 @@ export const MoonlightPairing: FC<{
 	password: string;
 	onPasswordChange: (v: string) => void;
 	wrongPassword: boolean;
+	/** Fingerprint of the ceremony the PIN is addressed to; "" = the first (sole) one. */
+	target: string;
+	onTargetChange: (v: string) => void;
 	onSubmit: () => void;
 	isSubmitting: boolean;
 	isSuccess: boolean;
@@ -101,12 +127,15 @@ export const MoonlightPairing: FC<{
 	password,
 	onPasswordChange,
 	wrongPassword,
+	target,
+	onTargetChange,
 	onSubmit,
 	isSubmitting,
 	isSuccess,
 	isError,
 }) => {
 	const pending = pairing.data?.pin_pending ?? false;
+	const ceremonies = pairing.data?.pending ?? [];
 	return (
 		<QueryState
 			isLoading={pairing.isLoading}
@@ -132,6 +161,41 @@ export const MoonlightPairing: FC<{
 							className="space-y-4"
 						>
 							<p className="text-sm">{m.pairing_waiting()}</p>
+							{/* Name the ceremony the PIN answers, so the operator pairs the device
+							    they can SEE — and, with several parked, picks the one they mean; the
+							    host delivers the PIN only to the named handshake (security-review
+							    2026-08-31 H-4). */}
+							{ceremonies.length === 1 && ceremonies[0] && (
+								<p className="font-mono text-xs text-muted-foreground">
+									{m.pairing_ceremony_device({
+										uniqueid: ceremonies[0].uniqueid,
+										fp: ceremonies[0].fingerprint.slice(-10),
+									})}
+								</p>
+							)}
+							{ceremonies.length > 1 && (
+								<div className="space-y-2">
+									<p className="text-sm">{m.pairing_ceremony_select()}</p>
+									<Select
+										value={target || ceremonies[0]?.fingerprint}
+										onValueChange={onTargetChange}
+									>
+										<SelectTrigger id="pair-target">
+											<SelectValue />
+										</SelectTrigger>
+										<SelectContent>
+											{ceremonies.map((c) => (
+												<SelectItem key={c.fingerprint} value={c.fingerprint}>
+													{m.pairing_ceremony_device({
+														uniqueid: c.uniqueid,
+														fp: c.fingerprint.slice(-10),
+													})}
+												</SelectItem>
+											))}
+										</SelectContent>
+									</Select>
+								</div>
+							)}
 							<div className="space-y-2">
 								<Label htmlFor="pin">{m.pairing_pin_label()}</Label>
 								<Input

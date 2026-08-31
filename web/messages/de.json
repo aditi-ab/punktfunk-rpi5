@@ -262,6 +262,8 @@
 	"pairing_title": "Kopplung",
 	"pairing_idle": "Keine Kopplung aktiv. Starte die Kopplung in einem Moonlight-Client und gib hier die PIN ein.",
 	"pairing_waiting": "Ein Gerät wartet auf Kopplung. Gib die angezeigte PIN ein:",
+	"pairing_ceremony_device": "Gerät {uniqueid} — Zertifikat …{fp}",
+	"pairing_ceremony_select": "Mehrere Geräte warten. Wähle das Gerät, dessen PIN du eingibst — die PIN geht nur an dieses Gerät:",
 	"pairing_pin_label": "PIN",
 	"pairing_submit": "PIN bestätigen",
 	"pairing_pin_sent": "PIN gesendet. Wenn sie stimmt, schließt der Client die Kopplung ab und erscheint unten unter „Gekoppelte Geräte“.",

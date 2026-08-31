@@ -129,7 +129,16 @@ fn run(args: &[&str], json: bool) -> Result<()> {
                 .first()
                 .copied()
                 .ok_or_else(|| Failure::usage("pin: give the PIN the client is showing"))?;
-            let v = Client::connect(None)?.post("/api/v1/pair/pin", &json!({ "pin": pin }))?;
+            // Optional target: with several clients parked the PIN must be addressed to one
+            // ceremony (security-review 2026-08-31 H-4) — `ctl status` shows the identities.
+            let mut body = json!({ "pin": pin });
+            if let Some(uid) = rest.get(1) {
+                body["uniqueid"] = json!(uid);
+            }
+            if let Some(fp) = rest.get(2) {
+                body["fingerprint"] = json!(fp);
+            }
+            let v = Client::connect(None)?.post("/api/v1/pair/pin", &body)?;
             out(json, &v, |_| println!("PIN submitted"));
             Ok(())
         }
@@ -212,6 +221,7 @@ fn pair(args: &[&str], json: bool) -> Result<()> {
             let mut v = v;
             if let Ok(gs) = c.get("/api/v1/pair") {
                 v["pin_pending"] = gs.get("pin_pending").cloned().unwrap_or(json!(false));
+                v["pending"] = gs.get("pending").cloned().unwrap_or(json!([]));
             }
             out(json, &v, render_pair);
             Ok(())
@@ -910,7 +920,16 @@ fn render_pair(v: &Value) {
         println!("pin       {pin}  — enter this on the device");
     }
     if v["pin_pending"].as_bool().unwrap_or(false) {
-        println!("moonlight a client is waiting on its PIN — `ctl pin <PIN>`");
+        println!("moonlight a client is waiting on its PIN — `ctl pin <PIN> [UNIQUEID] [FP]`");
+        // Name each parked ceremony so the operator answers the device they can SEE, not a
+        // blind prompt a racer may have joined (security-review 2026-08-31 H-4).
+        for c in v["pending"].as_array().into_iter().flatten() {
+            println!(
+                "          waiting: uniqueid {}  cert …{}",
+                c["uniqueid"].as_str().unwrap_or("?"),
+                tail(c["fingerprint"].as_str().unwrap_or(""))
+            );
+        }
     }
     println!("paired    {}", v["paired_clients"].as_i64().unwrap_or(0));
 }
@@ -959,7 +978,8 @@ PAIRING
     pending                      devices knocking, awaiting approval
     approve <ID> [--name N] [--preset P] [--expires-in S]
     deny <ID>
-    pin <PIN>                    submit the PIN a Moonlight/GameStream client is showing
+    pin <PIN> [UNIQUEID] [FP]    submit the PIN a Moonlight/GameStream client is showing;
+                                 name the target when several clients wait (see `status`)
 
 CONSOLE
     console-url                  print a one-shot URL that opens the web console already logged in.
