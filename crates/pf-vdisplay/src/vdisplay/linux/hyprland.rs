@@ -190,6 +190,12 @@ pub struct HyprlandDisplay {
     /// first one to end re-enable the heads under the second. Closing it means giving the
     /// pass-through path group bookkeeping it does not have today — #284's territory.
     pending_restore: Option<Box<dyn FnOnce() + Send>>,
+    /// The output the last SUCCESSFUL [`create`](VirtualDisplay::create) on this instance minted.
+    /// A mid-stream resize replaces the head through this same instance (create-before-drop keeps
+    /// the old head alive while the replacement is built), so the next `create` can carry its
+    /// active workspace over — see [`adopt_active_workspace`]. Only set on success: the retry
+    /// loop's failed attempts must not make a half-created head the adoption source.
+    prev_output: Option<String>,
 }
 
 impl Drop for HyprlandDisplay {
@@ -210,6 +216,7 @@ impl HyprlandDisplay {
             hw_cursor: false,
             last_cursor_mode: None,
             pending_restore: None,
+            prev_output: None,
         })
     }
 
@@ -359,6 +366,16 @@ impl VirtualDisplay for HyprlandDisplay {
         // Display-management topology (design §5.2). Last, so no failure path unwinds past the
         // hand-off of the restore — see [`HyprlandDisplay::apply_topology`].
         self.apply_topology(&name);
+        // A mid-stream resize REPLACES the head (create-before-drop), and Hyprland hands every new
+        // monitor a fresh EMPTY workspace — so the client landed on that empty workspace while
+        // their windows stayed on the dying head's (field report, Omarchy .6, 2026-08-31). Carry
+        // the superseded head's active workspace over. After `apply_topology` like the restore
+        // hand-off: nothing can fail past this point, so no unwind path strands a moved workspace
+        // on a head the error cleanup is about to remove.
+        if let Some(prev) = self.prev_output.take() {
+            adopt_active_workspace(&prev, &name);
+        }
+        self.prev_output = Some(name.clone());
         Ok(VirtualOutput {
             node_id,
             remote_fd: Some(fd),
@@ -851,6 +868,103 @@ fn lua_dpms_expr(name: &str, on: bool) -> String {
         "hl.dsp.dpms(\"{}\", \"{name}\")",
         if on { "on" } else { "off" }
     )
+}
+
+/// The active workspace id Hyprland reports for monitor `name` — `hyprctl -j monitors`'s
+/// `activeWorkspace.id`. `None` when the monitor is not listed (already removed) or the field is
+/// missing.
+fn active_workspace_id(name: &str) -> Option<i64> {
+    let raw = hyprctl(&["-j", "monitors"]).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    parsed
+        .as_array()?
+        .iter()
+        .find(|m| m.get("name").and_then(|v| v.as_str()) == Some(name))?
+        .get("activeWorkspace")?
+        .get("id")?
+        .as_i64()
+}
+
+/// Move the ACTIVE workspace of the head this create supersedes onto the new head, then switch
+/// the new head to it.
+///
+/// Hyprland assigns every new monitor a fresh empty workspace and re-homes a removed monitor's
+/// workspaces elsewhere — so a resize's head swap left the client staring at an empty workspace
+/// while the session's windows sat on whatever monitor inherited the old one (measured on the .6
+/// box, Hyprland 0.56.2/Lua: create → new head gets the next free id; remove → the old
+/// workspace re-homes; nothing follows the stream). Two dispatches because `workspace.move` alone
+/// does NOT activate the moved workspace on its target (measured: the target kept its own).
+///
+/// When the predecessor is no longer listed this is a reconnect after teardown, not a live
+/// resize — nothing to carry, so it returns without dispatching. Best-effort throughout: a
+/// failure costs workspace continuity, never the stream.
+fn adopt_active_workspace(prev: &str, ours: &str) {
+    let Some(id) = active_workspace_id(prev) else {
+        return;
+    };
+    let ws = id.to_string();
+    // Classic first, Lua on rejection — same blind two-era probe as [`focus_output`]/[`dpms_one`]
+    // (there is no stable way to ask which config manager is loaded).
+    let both = |classic: &[&str], lua: &str| -> Result<()> {
+        match hyprctl_dispatch(classic) {
+            Ok(()) => Ok(()),
+            Err(classic_err) => hyprctl_dispatch(&["dispatch", lua])
+                .map_err(|lua_err| anyhow::anyhow!("hyprlang: {classic_err:#}; lua: {lua_err:#}")),
+        }
+    };
+    if let Err(e) = both(
+        &["dispatch", "moveworkspacetomonitor", &ws, ours],
+        &lua_workspace_move_expr(&ws, ours),
+    ) {
+        tracing::warn!(
+            workspace = id, from = %prev, to = %ours, error = %format!("{e:#}"),
+            "hyprland: could not move the streamed workspace to the replacement head — the \
+             client will land on an empty workspace after this resize"
+        );
+        return;
+    }
+    if let Err(e) = both(
+        &["dispatch", "workspace", &ws],
+        &lua_workspace_focus_expr(&ws),
+    ) {
+        tracing::warn!(
+            workspace = id, to = %ours, error = %format!("{e:#}"),
+            "hyprland: moved the streamed workspace but could not switch the replacement head \
+             to it — the client must switch workspaces by hand once"
+        );
+        return;
+    }
+    // Verify like `dpms_one`: both dispatchers answer `ok` even when the era mismatch made them
+    // do nothing, so the readback is the only real signal. An EMPTY adopted workspace evaporates
+    // on the move and the switch then re-creates it on the focused (new) head — converging on the
+    // same id — so the readback holds for that case too.
+    match active_workspace_id(ours) {
+        Some(now) if now == id => tracing::info!(
+            workspace = id, from = %prev, to = %ours,
+            "hyprland: carried the streamed workspace onto the replacement head"
+        ),
+        now => tracing::warn!(
+            workspace = id, active = ?now, to = %ours,
+            "hyprland: both workspace dispatches were accepted but the replacement head shows a \
+             different active workspace — the client may land on an empty workspace"
+        ),
+    }
+}
+
+/// The Lua-config-manager spelling of "move workspace N to monitor M". Pure, so a test pins the
+/// shape: the workspace is a quoted STRING (Omarchy's own SUPER+SHIFT+n binds pass strings, and
+/// that is the measured-working form), and the monitor name is quoted for the same reason as
+/// [`lua_focus_expr`].
+fn lua_workspace_move_expr(ws: &str, monitor: &str) -> String {
+    format!("hl.dsp.workspace.move({{ workspace = \"{ws}\", monitor = \"{monitor}\" }})")
+}
+
+/// The Lua-config-manager spelling of "switch to workspace N" — `hl.dsp.focus` with a `workspace`
+/// argument. Its unrecognized-arguments error does not list `workspace`, but Omarchy's own
+/// SUPER+n binds use exactly this form and it was measured working on 0.56.2; there is no
+/// `hl.dsp.workspace.*` member that switches.
+fn lua_workspace_focus_expr(ws: &str) -> String {
+    format!("hl.dsp.focus({{ workspace = \"{ws}\" }})")
 }
 
 /// Disable every non-managed head for an `exclusive` session, returning the ones actually disabled
@@ -1819,6 +1933,26 @@ mod tests {
         // The monitor name is never omitted: the no-name form answers `ok` and TOGGLES on 0.55.4,
         // which would flip a just-restored head back off.
         assert!(lua_dpms_expr("DP-2", true).contains("\"DP-2\""));
+    }
+
+    /// The Lua spellings of the resize workspace hand-off, pinned for the same reason as the
+    /// dpms/focus expressions: both dispatchers answer `ok` on the wrong era, so a drifted string
+    /// fails silently and the only symptom is the field report this exists to close — the client
+    /// landing on an empty workspace after every resize. The workspace id is a quoted STRING in
+    /// both (Omarchy's own workspace binds pass strings; that is the measured-working form on
+    /// 0.56.2), and `hl.dsp.workspace.move`'s key set is `workspace`/`monitor` — `move` requires
+    /// `monitor` and there is no `hl.dsp.workspace` member that merely switches, which is why the
+    /// switch half goes through `hl.dsp.focus`.
+    #[test]
+    fn the_lua_workspace_expressions_quote_their_arguments() {
+        assert_eq!(
+            lua_workspace_move_expr("2", "PF-1234-2"),
+            r#"hl.dsp.workspace.move({ workspace = "2", monitor = "PF-1234-2" })"#
+        );
+        assert_eq!(
+            lua_workspace_focus_expr("2"),
+            r#"hl.dsp.focus({ workspace = "2" })"#
+        );
     }
 
     #[test]
