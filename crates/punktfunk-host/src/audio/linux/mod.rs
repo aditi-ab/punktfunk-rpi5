@@ -99,6 +99,13 @@ impl CaptureMode {
 ///
 /// An unrecognised value resolves to the default rather than failing: this is a field-debugging
 /// lever, and a typo in it must not cost a session its audio.
+/// Whether this host's capture topology owns a per-capturer sink (null-sink/stream-sink modes) —
+/// i.e. whether an isolated session CAN have its own audio sink to env-route into. Monitor mode
+/// (`PUNKTFUNK_STREAM_SINK=0`) has no sink at all, so isolation's audio half degrades to shared.
+pub(crate) fn sink_capture_active() -> bool {
+    capture_mode().owns_sink()
+}
+
 fn capture_mode() -> CaptureMode {
     if crate::audio::capture_policy::session_keeps_default() {
         // A live session asked for the host's audio devices to be left alone
@@ -224,6 +231,23 @@ pub struct PwAudioCapturer {
 
 impl PwAudioCapturer {
     pub fn open(channels: u32, rate_hz: u32) -> Result<PwAudioCapturer> {
+        Self::open_named(channels, rate_hz, None)
+    }
+
+    /// [`open`](Self::open) with a caller-chosen SINK `node.name` — the isolated-session path
+    /// (`design/gamescope-multiuser.md`): the session mints a STABLE name before its gamescope
+    /// spawns, pins the nested apps to it by `PULSE_SINK`, and opens the capture against the same
+    /// name — so the routing target and the captured node cannot be two different sinks. A stable
+    /// name trades away the fresh-name-per-capturer aliasing guarantee below for exactly that
+    /// contract; the caller keeps names disjoint across sessions (the identity is per client).
+    /// Must keep the `punktfunk-speaker` prefix (the claim-staleness rule and the graph-driver
+    /// diagnostic match on it). Ignored in monitor mode (no sink exists — the caller checks
+    /// [`sink_capture_active`] and skips isolation's audio half).
+    pub fn open_named(
+        channels: u32,
+        rate_hz: u32,
+        sink_override: Option<&str>,
+    ) -> Result<PwAudioCapturer> {
         anyhow::ensure!(
             matches!(channels, 1 | 2 | 6 | 8),
             "unsupported audio channel count {channels} (want 2, 6 or 8)"
@@ -240,7 +264,9 @@ impl PwAudioCapturer {
             SEQ.fetch_add(1, Ordering::Relaxed)
         };
         let pid = std::process::id();
-        let sink_node = format!("{}-{pid}-{seq}", stream_sink::SINK_NAME_PREFIX);
+        let sink_node = sink_override
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{}-{pid}-{seq}", stream_sink::SINK_NAME_PREFIX));
         let nodes = CaptureNodes {
             mode,
             // In stream-sink mode the capture stream IS the sink, so it wears the sink's name.
@@ -524,10 +550,22 @@ struct MicRingShared {
 
 impl PwMicSource {
     pub fn open(channels: u32) -> Result<PwMicSource> {
+        Self::open_named(channels, None)
+    }
+
+    /// [`open`](Self::open) with a caller-chosen source `node.name` — the isolated-session mic
+    /// (`design/gamescope-multiuser.md`): the session's gamescope pins its nested apps to the
+    /// name by `PULSE_SOURCE`, so each session's uplink lands only in its own session. `None` =
+    /// the shared `punktfunk-mic`. ⚠ PipeWire 1.4 never assigns a driver to a NON-default
+    /// `Audio/Source` recorded by target (see the `priority.session` note below) — with several
+    /// per-session sources only one can win the default election, so per-session mic needs the
+    /// 1.6 daemon; on 1.4 the losers read silence.
+    pub fn open_named(channels: u32, source_name: Option<&str>) -> Result<PwMicSource> {
         anyhow::ensure!(
             matches!(channels, 1 | 2),
             "virtual mic supports 1 or 2 channels, got {channels}"
         );
+        let node_name = source_name.unwrap_or("punktfunk-mic").to_string();
         let (pcm_tx, pcm_rx) = sync_channel::<(std::time::Instant, Vec<f32>)>(64);
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Terminate>();
         let alive = Arc::new(AtomicBool::new(true));
@@ -541,7 +579,8 @@ impl PwMicSource {
         thread::Builder::new()
             .name("punktfunk-pw-mic".into())
             .spawn(move || {
-                if let Err(e) = mic_pw_thread(pcm_rx, quit_rx, channels, flush_t, ring_t, ready_tx)
+                if let Err(e) =
+                    mic_pw_thread(pcm_rx, quit_rx, channels, &node_name, flush_t, ring_t, ready_tx)
                 {
                     // Reaching here is always a setup/open failure (once the mainloop runs it exits
                     // Ok) — and it was already reported to the pump via the ready handshake, which
@@ -662,6 +701,7 @@ fn mic_pw_thread(
     pcm_rx: Receiver<(std::time::Instant, Vec<f32>)>,
     quit_rx: pipewire::channel::Receiver<Terminate>,
     channels: u32,
+    node_name: &str,
     flush: Arc<AtomicBool>,
     shared: Arc<MicRingShared>,
     ready: std::sync::mpsc::SyncSender<Result<()>>,
@@ -711,11 +751,11 @@ fn mic_pw_thread(
         // playback stream — without it, Direction::Output + Playback would route to the speakers.
         let stream = pw::stream::StreamBox::new(
             &core,
-            "punktfunk-mic",
+            node_name,
             properties! {
                 *pw::keys::MEDIA_TYPE        => "Audio",
                 *pw::keys::MEDIA_CLASS       => "Audio/Source",
-                *pw::keys::NODE_NAME         => "punktfunk-mic",
+                *pw::keys::NODE_NAME         => node_name,
                 *pw::keys::NODE_DESCRIPTION  => "Punktfunk Remote Microphone",
                 // ~5 ms quantum (one Opus frame) so recording apps get smooth low-latency chunks.
                 *pw::keys::NODE_LATENCY      => "240/48000",
