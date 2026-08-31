@@ -112,7 +112,7 @@ pub fn verify(
         }
     }
     nvidia_warnings(ui, facts);
-    next_steps(ui, facts, choices, outcome, opts);
+    next_steps(ui, run, facts, choices, outcome, opts);
 }
 
 /// GPU drivers are the docs pages' job — but these two failures are silent, and the install
@@ -138,12 +138,21 @@ fn nvidia_warnings(ui: &dyn Reporter, facts: &Facts) {
     }
 }
 
-fn next_steps(ui: &dyn Reporter, facts: &Facts, choices: &Choices, outcome: &Outcome, opts: Opts) {
+fn next_steps(
+    ui: &dyn Reporter,
+    run: &dyn CommandRunner,
+    facts: &Facts,
+    choices: &Choices,
+    outcome: &Outcome,
+    opts: Opts,
+) {
     let ip = facts.ip.clone().unwrap_or_else(|| "<host-ip>".to_string());
     ui.blank();
     ui.line("  Done. Next:");
     // --dry-run installs nothing by definition, so it shows the normal text.
-    if facts.has_web_server || opts.dry {
+    // Probed again here rather than read off Facts: the install that just ran is usually what
+    // put the console on the box, and step 1 must not deny a console that now exists.
+    if run.which("punktfunk-web-server") || opts.dry {
         ui.line(&format!(
             "  1. Open the web console:  https://{ip}:47992  (the certificate is the host's own — continue past the warning)"
         ));
