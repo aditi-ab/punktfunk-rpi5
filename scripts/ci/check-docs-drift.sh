@@ -24,7 +24,7 @@
 #      platforms.json — the snapshot the <Install/> and <Ports/> MDX components render from
 #      (the docs Docker build context is docs-site/ alone) — must be a byte copy of it, same
 #      rule as gate 1.
-#   6. scripts/install.sh (the guided installer, WP4) runs the install lines platforms.json
+#   6. scripts/install.sh (the download stub) parses, verifies its download, owns no options
 #      states — every `install` line of an apt/pacman/dnf/sysext host platform must appear in
 #      the script verbatim (it edits channel/group into the string at run time, never the
 #      literal), and the script must parse under sh.
@@ -119,106 +119,44 @@ if [ "$(cksum < data/platforms.json)" != "$(cksum < docs-site/src/data/platforms
     fail=1
 fi
 
-# ---------------------------------------------------------------- gate 6: installer quotes platforms.json
+# ---------------------------------------------------------------- gate 6: the installer stub stays dumb
+# scripts/install.sh is a stub: it downloads punktfunk-setup, verifies its sha256 and execs it
+# (design/installer-v2.md D1). Its whole value is being boring, so this checks that it still is.
+#
+# The install lines moved with the behaviour. The binary embeds data/platforms.json and generates
+# its commands from it, so they are verbatim by construction rather than by a substring check —
+# crates/punktfunk-setup/tests/plan_goldens.rs asserts it, and the detection and channel matrices
+# that used to live below are now scripts/ci/check-installer-behavior.sh, run in the rust lane
+# where a binary can be built.
 if ! sh -n scripts/install.sh; then
     echo "::error::scripts/install.sh does not parse under sh"
     fail=1
 fi
-installer_check='const fs=require("fs");const p=JSON.parse(fs.readFileSync("data/platforms.json","utf8"));const sh=fs.readFileSync("scripts/install.sh","utf8");let bad=0;for(const x of p.platforms){if(x.installs!=="host"||!["apt","pacman","dnf","sysext"].includes(x.packageManager))continue;for(const line of x.install||[]){if(!sh.includes(line)){console.error(`::error::scripts/install.sh no longer carries platforms.json\x27s ${x.id} install line verbatim: ${line}`);bad=1}}}process.exit(bad)'
+# An unverified download must never be executed.
+if ! grep -q 'checksum mismatch' scripts/install.sh; then
+    echo "::error::scripts/install.sh no longer refuses a download whose sha256 does not match"
+    fail=1
+fi
+# The override installer-smoke drives the PR's own binary with.
+if ! grep -q 'PUNKTFUNK_SETUP_BIN' scripts/install.sh; then
+    echo "::error::scripts/install.sh lost the PUNKTFUNK_SETUP_BIN override"
+    fail=1
+fi
+# The stub owns no options. A flag parsed here is a flag a years-old cached stub would not know,
+# which is exactly the skew the two-stage split exists to avoid.
+if grep -qE '^\s*--(yes|channel|uninstall|dry-run|client|host)\)' scripts/install.sh; then
+    echo "::error::scripts/install.sh parses an installer option — the binary owns the interface"
+    fail=1
+fi
+# A stub that still carried an install line would be a second place for one to drift.
+installer_check='const fs=require("fs");const p=JSON.parse(fs.readFileSync("data/platforms.json","utf8"));const sh=fs.readFileSync("scripts/install.sh","utf8");let bad=0;for(const x of p.platforms){for(const line of x.install||[]){if(line.length>30&&sh.includes(line)){console.error(`::error::scripts/install.sh carries a platforms.json install line; the stub must not know one: ${line}`);bad=1}}}process.exit(bad)'
 if command -v bun >/dev/null 2>&1; then
     bun -e "$installer_check" || fail=1
 elif command -v node >/dev/null 2>&1; then
     node -e "$installer_check" || fail=1
 fi
 
-# ---------------------------------------------------------------- gate 7: installer detection matrix (--dry-run)
-# Faked os-release files through the real script, nothing executed: each family must be detected
-# and print its own package-manager line, both for the install and for --uninstall; the unsupported
-# ones must stop with their pointer. A fix to the installer adds its case here.
-osr=$(mktemp -d)
-installer_case() {   # name os-release-body expected-substring [extra args...]
-    name=$1; printf '%b' "$2" > "$osr/$name"; want=$3; shift 3
-    out=$(PUNKTFUNK_INSTALL_OS_RELEASE="$osr/$name" sh scripts/install.sh --dry-run --yes --no-start "$@" 2>&1)
-    case "$out" in *"$want"*) ;; *)
-        echo "::error::scripts/install.sh --dry-run $* on a fake $name os-release did not print '$want':"
-        printf '%s\n' "$out" | sed 's/^/    /'
-        fail=1 ;;
-    esac
-}
-installer_case debian   'ID=debian\nVERSION_ID=13\n'                    'sudo apt install -y punktfunk-host punktfunk-web punktfunk-scripting'
-installer_case ubuntu   'ID=ubuntu\nID_LIKE=debian\nVERSION_ID=26.04\n'  'sudo apt install -y punktfunk-host punktfunk-web punktfunk-scripting'
-installer_case mint22   'ID=linuxmint\nID_LIKE="ubuntu debian"\nVERSION_ID=22.1\n' 'cannot host'
-installer_case fedora   'ID=fedora\nVERSION_ID=44\n'                    'sudo dnf install -y punktfunk punktfunk-web punktfunk-scripting'
-installer_case fedora43 'ID=fedora\nVERSION_ID=43\n'                    '/rpm/bazzite'
-installer_case arch     'ID=arch\n'                                    'sudo pacman -Syu --noconfirm punktfunk-host punktfunk-web punktfunk-scripting'
-installer_case cachyos  'ID=cachyos\nID_LIKE="arch"\n'                  'sudo pacman -Syu --noconfirm punktfunk-host punktfunk-web punktfunk-scripting'
-# Omarchy: arch family, but its libalpm guard kills any -S+-u transaction, so the install must
-# split into -Sy then -S (and --yes still has to reach that -S), and the run must hand off to
-# `punktfunk-omarchy setup` rather than do a second, weaker version of the same wiring.
-installer_case omarchy  'ID=omarchy\nID_LIKE=arch\nVERSION_ID=4.0.1\n'    'sudo pacman -S --noconfirm punktfunk-host punktfunk-web punktfunk-scripting'
-installer_case omarchy2 'ID=omarchy\nID_LIKE=arch\nVERSION_ID=4.0.1\n'    'punktfunk-omarchy setup'
-installer_case bazzite  'ID=bazzite\nID_LIKE="fedora"\nVERSION_ID=43\n' 'punktfunk-sysext.sh install'
-installer_case nixos    'ID=nixos\n'                                   'docs/nixos'
-installer_case steamos  'ID=steamos\nID_LIKE=arch\n'                    'docs/steamos-host'
-installer_case gentoo   'ID=gentoo\n'                                  'build-from-source'
-installer_case debian-rm 'ID=debian\nVERSION_ID=13\n'                   'sources.list.d/punktfunk.list' --uninstall
-installer_case fedora-rm 'ID=fedora\nVERSION_ID=44\n'                   'yum.repos.d/punktfunk.repo' --uninstall
-installer_case arch-rm   'ID=arch\n'                                   '/etc/pacman.conf' --uninstall
-installer_case omarchy-rm 'ID=omarchy\nID_LIKE=arch\n'                  'punktfunk-omarchy remove' --uninstall
-installer_case bazzite-rm 'ID=bazzite\nID_LIKE="fedora"\nVERSION_ID=43\n' 'punktfunk-sysext remove' --uninstall
-sh scripts/ci/check-install-defaults.sh || fail=1
-
-# ---------------------------------------------------------------- gate 8: channel switching
-# A box that already has all three binaries, on a repo config naming one channel, told --channel
-# <the other>: it must rewrite the repo AND re-resolve in a direction the package manager would
-# otherwise refuse (canary is always a minor ahead of stable, so canary->stable is a downgrade).
-# Two fakes make that reachable under --dry-run: stub binaries on PATH for the "already installed"
-# probe, and PUNKTFUNK_INSTALL_ETC pointing at the repo config the box is supposedly on.
-sw=$(mktemp -d); mkdir -p "$sw/bin"
-for b in punktfunk-host punktfunk-web-server punktfunk-scripting; do
-    printf '#!/bin/sh\necho 0.0.0-test\n' > "$sw/bin/$b"; chmod +x "$sw/bin/$b"
-done
-switch_case() {   # name os-release-body config-path config-body expected-substring [extra args...]
-    name=$1; printf '%b' "$2" > "$osr/$name"
-    mkdir -p "$sw/$name/$(dirname "$3")"; printf '%b' "$4" > "$sw/$name/$3"; want=$5; shift 5
-    out=$(PATH="$sw/bin:$PATH" PUNKTFUNK_INSTALL_OS_RELEASE="$osr/$name" PUNKTFUNK_INSTALL_ETC="$sw/$name" \
-          sh scripts/install.sh --dry-run --yes --no-start "$@" 2>&1)
-    case "$out" in *"$want"*) ;; *)
-        echo "::error::scripts/install.sh --dry-run $* on an installed $name box did not print '$want':"
-        printf '%s\n' "$out" | sed 's/^/    /'
-        fail=1 ;;
-    esac
-}
-APT_LIST=etc/apt/sources.list.d/punktfunk.list
-DEB13='ID=debian\nVERSION_ID=13\n'
-switch_case apt-up   "$DEB13" "$APT_LIST" 'deb [x] https://git.unom.io/api/packages/unom/debian stable main\n' \
-    'debian canary main' --channel canary
-switch_case apt-down "$DEB13" "$APT_LIST" 'deb [x] https://git.unom.io/api/packages/unom/debian canary main\n' \
-    '--allow-downgrades' --channel stable
-# The regression this gate exists for. A canary box missing one of the three packages, re-run with
-# no --channel at all: the missing ones must come from CANARY. Letting the flag's stable default
-# win there rewrites the repo and drags the whole box back a channel without ever saying so.
-mkdir -p "$sw/partial/bin" "$sw/partial/$(dirname "$APT_LIST")"
-printf '#!/bin/sh\necho 0.0.0-test\n' > "$sw/partial/bin/punktfunk-host"
-chmod +x "$sw/partial/bin/punktfunk-host"
-printf 'deb [x] https://git.unom.io/api/packages/unom/debian canary main\n' > "$sw/partial/$APT_LIST"
-printf '%b' "$DEB13" > "$osr/apt-partial"
-out=$(PATH="$sw/partial/bin:$PATH" PUNKTFUNK_INSTALL_OS_RELEASE="$osr/apt-partial" \
-      PUNKTFUNK_INSTALL_ETC="$sw/partial" sh scripts/install.sh --dry-run --yes --no-start 2>&1)
-case "$out" in *'debian canary main'*) ;; *)
-    echo "::error::scripts/install.sh with no --channel, on a canary box missing packages, did not stay on canary:"
-    printf '%s\n' "$out" | sed 's/^/    /'
-    fail=1 ;;
-esac
-switch_case dnf-up   'ID=fedora\nVERSION_ID=44\n' etc/yum.repos.d/punktfunk.repo \
-    'baseurl=https://git.unom.io/api/packages/unom/rpm/fedora-44\n' 'distro-sync' --channel canary
-switch_case pac-down 'ID=arch\n' etc/pacman.conf '[punktfunk-canary]\nServer = x\n' \
-    "/^Server = /d' /etc/pacman.conf" --channel stable
-switch_case sys-down 'ID=bazzite\nID_LIKE="fedora"\nVERSION_ID=43\n' etc/punktfunk-sysext.conf 'CHANNEL=canary\n' \
-    'punktfunk-sysext.sh install --channel stable' --channel stable
-rm -rf "$sw" "$osr"
-
-# ------------------------------------------------- gate 8: the web console's host-readiness gate
+# ------------------------------------------------- gate 7: the web console's host-readiness gate
 # scripts/web-init.sh is what stops punktfunk-web.service from starting before the host has written
 # the files it cannot start without. `After=punktfunk-host.service` never did that (the host is
 # Type=simple), and the console's first enable on a fresh install failed at the systemd level as a
