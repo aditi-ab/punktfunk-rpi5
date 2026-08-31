@@ -1,4 +1,6 @@
 import java.io.File
+import java.net.URI
+import java.security.MessageDigest
 import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
@@ -91,37 +93,109 @@ fun Exec.cargoNdkEnvironment() {
     environment("LIBOPUS_STATIC", "1")
     environment("LIBOPUS_NO_PKG", "1")
     // The Skia console (pf-console-ui over skia-bindings): prebuilt Skia archives are keyed by
-    // target + features. rust-skia's GitHub releases carry no armv7-linux-androideabi archive, so
-    // ALL three Android keys are served from our own release — public, R2-backed, unauthenticated:
-    //   https://git.unom.io/unom/skia-binaries/releases/download/{tag}/skia-binaries-{key}.tar.gz
-    // (the armv7 archive built by us, the two 64-bit ones byte-for-byte mirrors of rust-skia's —
-    // design/android-skia-console-port.md WP6; re-derive + re-upload on every skia-safe bump).
+    // target + features (see the fetchSkiaBinaries block below for provenance and digests).
+    // The default hands skia-bindings a file:// template into the directory fetchSkiaBinaries
+    // has already SHA-256-verified — skia-bindings itself downloads without any content check,
+    // so it must only ever see verified local bytes (security-review 2026-08-31 H-2).
     // Override with `-PskiaBinariesUrl=<template>` or the `SKIA_BINARIES_URL` env (`{tag}`/`{key}`
-    // placeholders, `file://` allowed) — e.g. a local mirror while cutting the next bump's archives.
-    // 🛑 skia-bindings never fails when no archive matches — it silently builds Skia from source
-    // for hours; every log must show `DOWNLOAD AND INSTALL SUCCEEDED` per target.
-    //
-    // The archives at rust-skia tag 0.99.0 (skia hash a25a0fdb7d90429aa2d1), key
-    // `<target>-gl-jpegd-jpege-pdf-textlayout`, sha256 — re-derive on every skia-safe bump:
-    //   aarch64-linux-android  fdbb25dd2e4ff22ce663b38d368ea696c88a522c73f54010662046b26bcf362c (GitHub)
-    //   x86_64-linux-android   93c1eaf379f539565343e99fdac4414fa22e45daa04de689bb0db2ef9290523b (GitHub)
-    //   armv7-linux-androideabi 4867856bcd1f01c197f796346ba555cffddb5e151f6cd072663ec1a56983d685 (ours:
-    //     FORCE_SKIA_BUILD=1 cargo ndk -t armeabi-v7a build -p pf-console-ui --no-default-features,
-    //     then OUT_DIR/skia/{libskia,libskshaper,libskparagraph,libskunicode_core,libskunicode_icu,
-    //     libskia-bindings}.a + bindings.rs + tag.txt + key.txt packed as skia-binaries/ in
-    //     skia-binaries-<key>.tar.gz)
+    // placeholders, `file://` allowed) — e.g. a local mirror while cutting the next bump's
+    // archives. 🛑 The override bypasses the digest check (its archives are by definition not the
+    // committed ones), and skia-bindings never fails when no archive matches — it silently builds
+    // Skia from source for hours; every log must show `DOWNLOAD AND INSTALL SUCCEEDED` per target.
     environment(
         "SKIA_BINARIES_URL",
-        (project.findProperty("skiaBinariesUrl") as String? ?: System.getenv("SKIA_BINARIES_URL"))
-            ?.takeIf { it.isNotBlank() }
-            ?: "https://git.unom.io/unom/skia-binaries/releases/download/{tag}/skia-binaries-{key}.tar.gz",
+        skiaBinariesOverride()
+            ?: "file://${skiaBinariesDir.get().asFile.absolutePath}/skia-binaries-{key}.tar.gz",
     )
+}
+
+// ------------------------------------------------------------------------------------------------
+// Verified Skia prebuilt fetch. rust-skia's GitHub releases carry no armv7-linux-androideabi
+// archive, so ALL three Android keys are served from our own release — public, R2-backed,
+// unauthenticated: git.unom.io/unom/skia-binaries/releases/download/{tag}/skia-binaries-{key}.tar.gz
+// (the armv7 archive built by us, the two 64-bit ones byte-for-byte mirrors of rust-skia's —
+// design/android-skia-console-port.md WP6; re-derive + re-upload on every skia-safe bump).
+//
+// A release asset is replaceable under the same name, so the download is authenticated by the
+// digests COMMITTED here, not by its URL: fetchSkiaBinaries downloads each archive, verifies its
+// SHA-256, and fails the build on any mismatch; the cargo-ndk tasks then read only the verified
+// local files (security-review 2026-08-31 H-2).
+//
+// The archives at rust-skia tag 0.99.0, key `<skia-hash>-<target>-gl-jpegd-jpege-pdf-textlayout`
+// (hash a25a0fdb7d90429aa2d1). Re-derive tag + hash + digests on every skia-safe bump.
+// armv7 provenance: FORCE_SKIA_BUILD=1 cargo ndk -t armeabi-v7a build -p pf-console-ui
+// --no-default-features, then OUT_DIR/skia/{libskia,libskshaper,libskparagraph,libskunicode_core,
+// libskunicode_icu,libskia-bindings}.a + bindings.rs + tag.txt + key.txt packed as skia-binaries/
+// in skia-binaries-<key>.tar.gz.
+// ------------------------------------------------------------------------------------------------
+val skiaBinariesTag = "0.99.0"
+val skiaBinariesHash = "a25a0fdb7d90429aa2d1"
+val skiaBinariesSha256 = mapOf(
+    "aarch64-linux-android" to "fdbb25dd2e4ff22ce663b38d368ea696c88a522c73f54010662046b26bcf362c",
+    "x86_64-linux-android" to "93c1eaf379f539565343e99fdac4414fa22e45daa04de689bb0db2ef9290523b",
+    "armv7-linux-androideabi" to "4867856bcd1f01c197f796346ba555cffddb5e151f6cd072663ec1a56983d685",
+)
+val skiaBinariesDir = layout.buildDirectory.dir("skia-binaries")
+
+fun skiaBinariesOverride(): String? =
+    (project.findProperty("skiaBinariesUrl") as String? ?: System.getenv("SKIA_BINARIES_URL"))
+        ?.takeIf { it.isNotBlank() }
+
+fun sha256Of(f: File): String {
+    val md = MessageDigest.getInstance("SHA-256")
+    f.inputStream().use { ins ->
+        val buf = ByteArray(1 shl 16)
+        while (true) {
+            val n = ins.read(buf)
+            if (n < 0) break
+            md.update(buf, 0, n)
+        }
+    }
+    return md.digest().joinToString("") { b -> "%02x".format(b) }
+}
+
+val fetchSkiaBinaries = tasks.register("fetchSkiaBinaries") {
+    group = "rust"
+    description = "Fetch + SHA-256-verify the prebuilt Skia archives for skia-bindings"
+    doLast {
+        val override = skiaBinariesOverride()
+        if (override != null) {
+            logger.warn(
+                "SKIA_BINARIES_URL override active ($override) — skia archives are NOT digest-verified",
+            )
+            return@doLast
+        }
+        val dir = skiaBinariesDir.get().asFile
+        dir.mkdirs()
+        val template =
+            "https://git.unom.io/unom/skia-binaries/releases/download/{tag}/skia-binaries-{key}.tar.gz"
+        for ((target, expected) in skiaBinariesSha256) {
+            val key = "$skiaBinariesHash-$target-gl-jpegd-jpege-pdf-textlayout"
+            val dest = dir.resolve("skia-binaries-$key.tar.gz")
+            if (!dest.exists() || sha256Of(dest) != expected) {
+                val url = template.replace("{tag}", skiaBinariesTag).replace("{key}", key)
+                logger.lifecycle("fetching $url")
+                URI(url).toURL().openStream().use { ins ->
+                    dest.outputStream().use { out -> ins.copyTo(out) }
+                }
+            }
+            val actual = sha256Of(dest)
+            if (actual != expected) {
+                dest.delete()
+                throw GradleException(
+                    "skia archive $key: sha256 $actual does not match the committed $expected — " +
+                        "refusing to compile unverified native code (security-review 2026-08-31 H-2)",
+                )
+            }
+        }
+    }
 }
 
 fun registerCargoNdk(taskName: String, release: Boolean) =
     tasks.register<Exec>(taskName) {
         group = "rust"
         description = "cargo-ndk build of punktfunk-client-android (${if (release) "release" else "debug"})"
+        dependsOn(fetchSkiaBinaries) // skia-bindings must only see digest-verified archives (H-2)
         workingDir = repoRoot
         cargoNdkEnvironment()
         // Resolve cargo by ABSOLUTE path: Gradle's Exec resolves command[0] via the JVM's
@@ -167,6 +241,7 @@ fun registerCargoNdkClippy(taskName: String) =
     tasks.register<Exec>(taskName) {
         group = "verification"
         description = "clippy (deny warnings) for punktfunk-client-android on both Android widths"
+        dependsOn(fetchSkiaBinaries) // skia-bindings must only see digest-verified archives (H-2)
         workingDir = repoRoot
         cargoNdkEnvironment()
         commandLine(
