@@ -581,7 +581,7 @@ object SkiaConsole {
                         ActiveSession(
                             h,
                             effective,
-                            clipboardSync = record?.clipboardSync ?: true,
+                            clipboardSync = record?.clipboardSync ?: false,
                             profileName = profile?.name,
                             hostId = record?.id,
                             launchedFromLibrary = launchId != null,

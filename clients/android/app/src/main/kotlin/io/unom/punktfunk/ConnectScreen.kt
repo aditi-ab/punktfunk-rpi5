@@ -354,7 +354,8 @@ fun ConnectScreen(
 
     // What the stream screen is handed: the settings this connect actually used, plus the HOST's
     // clipboard decision (a property of the record, not a global). A host we never saved — a
-    // connect that failed to pin — falls back to the on default the setting always had.
+    // connect that failed to pin — gets the secure default: no clipboard until the user enables
+    // it for that host (security-review 2026-08-31 M-8).
     fun session(handle: Long, record: KnownHost?, profile: StreamProfile?): ActiveSession {
         // The session's own Welcome carries where this host serves its library. Save it now: this
         // is the only source that does not need an mDNS advert, so it is what makes a host that
@@ -368,7 +369,7 @@ fun ConnectScreen(
         return ActiveSession(
             handle,
             settings.effectiveFor(profile),
-            clipboardSync = record?.clipboardSync ?: true,
+            clipboardSync = record?.clipboardSync ?: false,
             profileName = profile?.name,
             hostId = record?.id,
         )

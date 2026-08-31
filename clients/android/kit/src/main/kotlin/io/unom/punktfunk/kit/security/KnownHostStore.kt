@@ -50,8 +50,12 @@ data class KnownHost(
      * decision about that machine, so it is never in a settings profile and never global — the
      * work box and the couch box get their own answers. Only effective when the host advertises
      * the clipboard capability; the protocol is opt-in per session either way.
+     *
+     * Off until the user enables it for THIS host: a newly paired or TOFU-trusted machine must
+     * not read the clipboard by default, and every absent-value fallback matches (Rust and Apple
+     * already defaulted off; security-review 2026-08-31 M-8).
      */
-    val clipboardSync: Boolean = true,
+    val clipboardSync: Boolean = false,
     /**
      * The settings profile a plain tap on this host connects with — `null` (or an id whose profile
      * was deleted) means the global defaults, i.e. today's behaviour. A dangling id is never an
@@ -185,7 +189,10 @@ class KnownHostStore(context: Context) {
         if (prefs.getInt(K_SCHEMA, 0) >= SCHEMA_VERSION) return
         val settings =
             context.applicationContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-        val result = migrate(prefs.all, settings.getBoolean(K_GLOBAL_CLIPBOARD_SYNC, true))
+        // Fallback false: an install that never wrote the global gets the secure default, not
+        // the old implicit on (security-review 2026-08-31 M-8). A global the user DID set — either
+        // way — still lands on every host, which is the behaviour-preserving half below.
+        val result = migrate(prefs.all, settings.getBoolean(K_GLOBAL_CLIPBOARD_SYNC, false))
         // `commit`, not `apply`: the re-keyed records and the schema flag are one atomic write to
         // disk, and the global below is only retired once that write has landed. With `apply` a
         // process death in between could drop the old global while the hosts that were supposed to
@@ -217,7 +224,7 @@ class KnownHostStore(context: Context) {
             // A record without an id can only be one this build wrote before the migration ran, or
             // a hand-edited file; minting here keeps the parse total rather than dropping a host.
             id = j.optString("id", "").ifEmpty { newRecordId() },
-            clipboardSync = j.optBoolean("clip", true),
+            clipboardSync = j.optBoolean("clip", false),
             profileId = j.optString("profile", "").ifEmpty { null },
             pinnedProfileIds = stringList(j.optJSONArray("pins")),
         )
