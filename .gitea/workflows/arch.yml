@@ -445,6 +445,24 @@ jobs:
             exit 1
           fi
 
+      # The dry-resolve above stops BEFORE pacman's file-conflict phase (`-U --print` only
+      # resolves), so two packages shipping the same path sail through it and then refuse to
+      # coexist on a real box — found live when host and client both shipped the brand SVG and
+      # installing the second died with "exists in filesystem". File lists are in the packages
+      # we just built; compare them directly.
+      - name: Assert no two packages ship the same file
+        run: |
+          dup=$(for p in dist/*.pkg.tar.zst dist-gamescope/*.pkg.tar.zst; do
+                  [ -e "$p" ] || continue
+                  bsdtar -tf "$p" | grep -v '/$' | grep -v '^\.'
+                done | sort | uniq -d)
+          if [ -n "$dup" ]; then
+            echo "::error::shipped by more than one package (pacman will refuse to install them together):"
+            printf '%s\n' "$dup" | sed 's/^/    /'
+            exit 1
+          fi
+          echo "OK  no path is claimed twice across the built packages"
+
       # NOTE deliberately NO sysext image is built or published here: a prebuilt HOST binary on
       # SteamOS breaks on the next A/B soname bump (and /var — where sysexts live — is
       # per-partition-set), which is the standing packaging verdict behind the on-device
