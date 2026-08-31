@@ -1,33 +1,22 @@
 # Punktfunk writing standards
 
 House style for **commits**, **changelogs**, and **comments**.
+`scripts/ci/check-writing.sh` fails a PR that breaks the caps below.
 
-Audited against [unom/punktfunk](https://git.unom.io/unom/punktfunk) on 28 August 2026. The engineering in that tree is careful. The writing is careful too. The problem is the medium: git log, CHANGELOG.md, and rustdoc are being asked to hold design reviews.
-
-This document is the rulebook. The companion site shows the originals next to rewrites.
-
----
-
-## 0. The one sentence
-
-**Put each fact where someone can find it later.**
+## 0. Where facts go
 
 | Fact | Lives in |
 | --- | --- |
 | What changed, in one greppable line | Commit **subject** |
-| Why it changed, in a short body | Commit **body** (and the PR if it needs a diagram) |
+| Why it changed | Commit **body** (PR if it needs a diagram) |
 | What a user can do now | `docs/releases/vX.Y.Z.md` |
 | What an embedder must do | `CHANGELOG.md` |
-| The investigation, measurements, rejected paths | Pull request and `docs/adr/` |
-| The invariant that must remain true | Comment, type, or test |
-
-If you are writing a novel, you are in the wrong file.
+| Investigation, measurements, rejected paths | Pull request and `docs/adr/` |
+| Invariant that must remain true | Comment, type, or test |
 
 ---
 
 ## 1. Commits
-
-### Shape
 
 ```
 type(scope): imperative summary
@@ -38,12 +27,17 @@ What you changed. Wrap at 72.
 Fixes #123
 ```
 
-- **50 characters** is the aim for the subject. **72 is the hard cap.**
-- No trailing period on the subject.
-- Imperative, present tense: `keep`, `skip`, `advertise` — matching `git merge` / `git revert`.
-- One logical change per commit. A subject with “and” is two commits, or one theme named as a theme.
+- **50 characters** aim. **72 hard cap.** No trailing period.
+- Imperative, present tense: `keep`, `skip`, `advertise`.
+- One logical change. A subject with “and” or a semicolon is two commits.
+- Body: at most three short paragraphs, **200 words**.
+- Scope is a subsystem a newcomer greps: `host`, `hyprland`, `mdns`, `abr`, `console`,
+  `gamestream`, `android`, `web`, `core`.
+- No `Co-Authored-By`. Gitea 1.27 shows the trailer as a second committer. Credit in prose.
+- Field logs, SKUs, soak minutes, rejected paths, RFC numbers: **PR body**, not the commit.
 
-### Types
+CI checks every commit on the PR: missing `type(scope):`, subject starting `The …`,
+subject over 72 characters, body over 200 words, or a `Co-Authored-By` trailer fails the job.
 
 | Type | Use |
 | --- | --- |
@@ -57,43 +51,20 @@ Fixes #123
 | `ci` | Pipelines and gates |
 | `security` | Trust-boundary changes |
 
-Scopes are subsystem names a newcomer would grep: `host`, `hyprland`, `mdns`, `abr`, `console`, `gamestream`, `android`, `web`, `core`.
+Bad: `The retry loop stops eating the restore that re-lights the desk`
+Good: `fix(host/hyprland): keep topology restore across pipeline retries`
 
-### Why the current style fails
-
-Recent subjects on main (28 Aug 2026):
-
-| As written | Problem | Rewrite |
-| --- | --- | --- |
-| The retry loop stops eating the restore that re-lights the desk | Metaphor, no scope, 69 chars of plot | `fix(host/hyprland): keep topology restore across pipeline retries` |
-| The advert names its address, and the client stops rolling dice on the rest | Pun, two clauses, unsearchable | `fix(mdns): advertise a primary address so clients stop guessing` |
-| The streamed head can be focused on a Lua box, which is what makes it produce frames | Relative clause, slang | `fix(hyprland): focus the virtual head on Lua-configured compositors` |
-| The Omarchy box says otherwise: five things the plan got wrong, measured | Lab-notebook title | `docs(omarchy): correct five host-plan assumptions from measured hardware` |
-| The ticket parser proves its own segments exist | Anthropomorphic, no scope | `fix(web): narrow ticket-parser types so segments are proven present` |
-
-The last 200 subjects average **101 characters**. Longest: **211**. At the time of the audit, CONTRIBUTING.md’s entire commit rule was “end with the Co-Authored-By trailer.”
-
-### Body rules
-
-- Three short paragraphs is enough: user-visible failure, actual cause, what you changed.
-- Wrap at 72.
-- Do not paste CI logs, soak minutes, GPU SKUs, or RFC section numbers. Link the PR or the ADR.
-- No `Co-Authored-By` trailer in this repo. Attribution is off, because Gitea 1.27 promotes
-  the trailer to a second participant on the commit page. Credit a co-author in prose.
-
-### Pull requests
-
-The forensic essay is valuable. **Put it on the PR.** The merge commit subject is the conventional subject of the work, not the essay’s headline. Gitea PR titles become merge subjects — write the PR title as a conventional commit.
+The Gitea PR title is the merge subject. Write it as the conventional subject.
 
 ---
 
 ## 2. Changelogs
 
-Punktfunk already split the two audiences at v0.25.0. Keep that. Stop writing both files in the same voice.
+Two audiences. Do not write both files in the same voice.
 
 ### `docs/releases/vX.Y.Z.md` — people who stream
 
-Keep the existing template:
+Existing template:
 
 1. Compatibility line (plain language, no ABI numbers)
 2. `## TL;DR` — three to six one-line bullets
@@ -101,23 +72,14 @@ Keep the existing template:
 4. `## New` / `## Improved` / `## Fixed` / `## Security`
 5. `## For developers` — one link to CHANGELOG.md at the **tag**
 
-Voice rules already in `docs/releases/README.md` are correct. Follow them. Do not narrate lab sessions (“we watched one do exactly that on a local network, unprompted”) in the user notes. Say the default changed, and that clients that support it opt in.
+Voice: `docs/releases/README.md`. Do not narrate a lab session. Say what the default is.
 
 ### `CHANGELOG.md` — embedders, packagers, plugin authors
 
-Keep:
+Newest first. Version table (every row). Breaking changes with an action.
+New sections only; do not edit older ones. User notes stay in `docs/releases/`.
 
-- Newest first
-- The **version table** (every row, including unchanged)
-- Breaking changes with an action
-
-Replace:
-
-- Sentence-headings (“The auto-bitrate overhaul (four phases)”)
-- 454-line sections (v0.32.0)
-- Field-log storytelling, soak evidence, RFC chapter numbers
-
-Use [Keep a Changelog](https://keepachangelog.com/) categories:
+[Keep a Changelog](https://keepachangelog.com/) categories:
 
 ```markdown
 ## [0.32.0] — 2026-08-27
@@ -126,8 +88,7 @@ ABI 25 → 26 (additive). Wire protocol stays 2.
 
 ### Breaking
 - **Bitrate means the wire budget.** `live_bitrate` is no longer encoder rate.
-  FEC, framing and audio used to ride on top. Embedders that treated it as
-  encoder rate must stop.
+  Embedders that treated it as encoder rate must stop.
 
 ### Added
 - `punktfunk_connect_opts` replaces the `connect_ex*` ladder. Every `ex` remains.
@@ -147,21 +108,18 @@ Two sentences per bullet.
 1. What changed.
 2. What the reader must do, if anything.
 
-The bold lead is a noun or an API name, not a plot summary.
+The bold lead is a noun or an API name.
 Version-table Notes cells are one clause. If it needs a paragraph, it is a Breaking bullet.
 
-Forbidden in `CHANGELOG.md`:
+Do not put in `CHANGELOG.md`:
 
-- Metaphor (dice, floor, "lied", "wore", ratchet-as-plot)
+- Metaphor
 - Field measurements (SKU, soak minutes, underrun counts)
 - Causation chains ("so… which means… because…")
-- Meta ("first section written to this rulebook")
 - Why you did not take the other path
-- Behaviour restorations filed under **Breaking** — those are **Fixed**
+- Behaviour restorations under **Breaking** — those are **Fixed**
 
 Those belong on the PR or in `docs/adr/` / `design/`. Link them.
-
-A minor that "nothing versioned moves" still fits on two screens if the bullets follow this shape. Headings without this rule produce 200-line poems in boxes.
 
 ### Length
 
@@ -170,37 +128,52 @@ A minor that "nothing versioned moves" still fits on two screens if the bullets 
 | Patch | One screen |
 | Minor | Two screens |
 | Longer than that | Split, or link an ADR |
+| Newest section (CI) | 160 lines (`scripts/ci/check-writing.sh`) |
 
-`CHANGELOG.md` is currently **6,519 lines** for eight versions. That is not a changelog. It is an archive of design reviews. Move the reviews to `docs/adr/` and link them.
+Older sections are not counted.
 
 ---
 
 ## 3. Comments
 
-### Why
+A comment is the non-local reason: the trap, the lifetime, the unit on a magic number.
+Names and types are the what. If the next five lines already say it, delete the comment.
 
-Comments exist for the non-local reason: the invariant, the trap, the rejected alternative. Names and types are the what. If the next five lines already say it, delete the comment.
+### Caps
+
+- `//` : at most four lines (CI fails at six).
+- `//!` / `///` module map: what it is, the contract, how to pin it, where evidence lives.
+  8–20 lines (CI fails at 24).
+- Keep `// SAFETY:` and FFI/lifetime proofs exact.
+- A comment never enforces a trust boundary — a type, a test or an assertion does.
+
+CI counts comments this diff opened (the comment itself, or the comment above an item
+whose body changed). If it fails: shorten. Do not add `writing-ok` unless the extra
+lines are a SAFETY/lifetime trap.
+
+### When you touch a function, rewrite its comment
+
+Do not sweep the file. Do not open a comments-only PR.
+
+1. Restates the next five lines → delete.
+2. Field report (date, device, OS, log line) → delete. That is the commit body or the PR.
+3. Lab nickname (`ponytail:`), second copy of the commit body → delete.
+4. Lifetime / weak-ref / generation-vs-session / why this number → keep, one to three lines.
+
+A constant’s comment is why the number, not the incident that produced it.
+
+Bad (in the file): `Field 2026-08-28, iPad Pro / iOS 27 over Tailscale: …`
+Good (in the file): `250 ms ≈ 30 refreshes at 120 Hz. A miss freezes the picture.`
+Good (in the commit body): the iPad, the log lines, the reconnect.
 
 ### Module rustdoc
 
-A module header is a map, 8–20 lines:
+8–20 lines: what it is, the public contract, how to pin it, where evidence lives.
+Point at `design/` / `docs/adr/`. Do not paste the investigation into `//!`.
 
-1. What it is
-2. The public contract
-3. How to choose / pin it
-4. Where deeper evidence lives
+### SAFETY
 
-It is not a program-of-record. `crates/pf-client-core/src/video_vk_native.rs` opens with **8,940 characters** of `//!` before the first item: WP-C, M3 WP-2, M7, a 92-minute soak, an RTX 5070 Ti. That history is already in git and in `design/client-native-decode.md`. rustdoc should point there, not duplicate it.
-
-### A comment is not a spec
-
-The 2026-08-25 security review’s serious findings were documented promises the code had stopped keeping. One commit even named it: `the comments were the spec, and the code had drifted`.
-
-If a boundary matters, encode it: type, test, assertion, parser. Comments explain the boundary. They do not constitute it.
-
-### SAFETY, FFI, concurrency
-
-Keep these exact. This is already good:
+Keep proofs exact:
 
 ```rust
 // SAFETY: the clipboard is open (the `Clip` guard); the handle returned is
@@ -208,15 +181,8 @@ Keep these exact. This is already good:
 // never freed here.
 ```
 
-Do not restyle that into a narrative of how the bug was found.
-
-### History
-
-Dates, SKUs, soak durations, milestone codes, and “this used to” sentences go stale in the file. `git blame` and ADRs keep them honest.
-
-### Prefer a name
-
-`stash_topology_restore_first_wins` says what a twelve-line comment would. If you need a comment to explain a name, rename.
+Dates, SKUs, soak durations, and “this used to” go stale. Prefer a name:
+`stash_topology_restore_first_wins` over a twelve-line comment.
 
 ---
 
@@ -229,31 +195,16 @@ Dates, SKUs, soak durations, milestone codes, and “this used to” sentences g
 - [ ] User-facing fact updated in `docs/releases/` or the docs-site page that owns it
 - [ ] Embedder-facing fact is a bullet in CHANGELOG.md, not a new chapter
 - [ ] New comments state an invariant or a trap, not a recap of the diff
-- [ ] Module rustdoc still fits on one screen
+- [ ] Module rustdoc still fits on one screen (CI fails a touched `//!` / `///` at 24 lines)
+- [ ] Touched `//` blocks are at most four lines (CI fails at six), except SAFETY proofs
 - [ ] No new comment that is the only enforcement of a trust boundary
+- [ ] `scripts/ci/check-writing.sh` is green
 
 ---
 
-## 5. What this does not ask
+## 5. Adoption
 
-- It does not ask anyone to write less carefully. It asks them to file the care in the right place.
-- It does not ban long writing. It bans long writing in git subjects and changelog bullets.
-- It does not replace `docs/releases/README.md`. That voice guide stays. This document covers the three surfaces that guide does not.
+Do not rewrite old `CHANGELOG.md` sections. Do not sweep existing module rustdoc.
+New sections and files follow this file. Rewrite a comment when you already open that function.
 
----
-
-## 6. Adoption
-
-Adopted 28 August 2026. Three steps landed with this file:
-
-1. This file is `docs/writing.md`, linked from CONTRIBUTING.md and AGENTS.md.
-2. CONTRIBUTING.md’s commit rule points here.
-3. `.gitea/PULL_REQUEST_TEMPLATE.md` asks for a conventional PR title, because a Gitea PR
-   title becomes the merge subject.
-
-Two steps are ongoing, and deliberately not a sweep:
-
-4. Write each **new** `CHANGELOG.md` section in Keep a Changelog form. The archive under the
-   older headings stays as it is; do not rewrite it.
-5. **New** module files get the short rustdoc. Do not rewrite every existing header in one
-   pass — rewrite one when you are already changing that module.
+This document does not replace `docs/releases/README.md`.
