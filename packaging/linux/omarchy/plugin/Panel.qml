@@ -277,23 +277,121 @@ Panel {
         visible: root.tab === "now"
 
         readonly property bool active: service.sessions > 0 || service.games.length > 0
+        readonly property var s: service.stream
+
+        // The headline, in the shape the first-party panels use for theirs: what the host is doing,
+        // who it is doing it for, and the codec as a pill. `client_name` is why `ctl summary`
+        // exists — /status carries no device names, so nothing else can answer "who".
+        PanelHero {
+          Layout.fillWidth: true
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          title: service.state === "streaming" ? "Streaming"
+               : (service.state === "idle" ? "Idle" : "Not running")
+          meta: {
+            if (service.state === "stopped") return "Start the host to accept connections"
+            if (!nowTab.active) {
+              var n = service.summary.native_paired_clients || 0
+              return n === 1 ? "1 device paired, none connected"
+                             : n + " devices paired, none connected"
+            }
+            var who = service.summary.client_name || "a device"
+            return who + (service.audioStreaming ? " · video and audio" : " · video only")
+          }
+          detail: nowTab.s ? String(nowTab.s.codec || "").toUpperCase() : ""
+          iconComponent: Component {
+            Text {
+              text: service.state === "streaming" ? "󰕧"
+                  : (service.state === "idle" ? "󰒲" : "󰅗")
+              color: service.state === "streaming" ? root.foreground : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.display
+            }
+          }
+        }
+
+        // Facts in two columns, because a stream has more than one number worth reading and a
+        // stacked list of label/value pairs wastes the width. Idle has its own set: the tab should
+        // still answer "is this host ready, and for whom" when nothing is connected.
+        readonly property var facts: {
+          if (service.state === "stopped") return []
+          if (nowTab.active && nowTab.s) {
+            var out = [
+              { k: "Resolution", v: nowTab.s.width + " × " + nowTab.s.height },
+              { k: "Frame rate", v: nowTab.s.fps + " fps" },
+              { k: "Bitrate", v: root.mbps(nowTab.s.bitrate_kbps) + " Mbps" }
+            ]
+            // Bring-up is a diagnosis, not decoration: it is the number that says whether a slow
+            // start was the host or the network. Absent on the GameStream plane.
+            if (nowTab.s.time_to_first_frame_ms > 0)
+              out.push({ k: "First frame", v: nowTab.s.time_to_first_frame_ms + " ms" })
+            return out
+          }
+          return [
+            { k: "Devices paired", v: String(service.summary.native_paired_clients || 0) },
+            { k: "Pairing", v: service.armed ? "open" : "closed" },
+            { k: "Host", v: service.summary.version || "—" }
+          ]
+        }
+
+        GridLayout {
+          visible: nowTab.facts.length > 0
+          Layout.fillWidth: true
+          Layout.topMargin: Style.spacing.sm
+          columns: 2
+          columnSpacing: Style.spacing.md
+          rowSpacing: Style.spacing.sm
+
+          Repeater {
+            model: nowTab.facts
+            ColumnLayout {
+              // preferredWidth 1 + fillWidth is what makes the two columns split the panel evenly.
+              // Without it the grid sizes each cell to its text and the second column lands wherever
+              // the first one happened to end.
+              Layout.fillWidth: true
+              Layout.preferredWidth: 1
+              spacing: 0
+              Text {
+                Layout.fillWidth: true
+                text: modelData.k
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+              Text {
+                Layout.fillWidth: true
+                text: modelData.v
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                elide: Text.ElideRight
+              }
+            }
+          }
+        }
+
+        PanelSeparator { Layout.fillWidth: true; visible: service.games.length > 0 }
+
+        PanelSectionHeader {
+          visible: service.games.length > 0
+          text: "Playing"; foreground: root.dim; fontFamily: root.fontFamily
+        }
 
         Text {
-          visible: !nowTab.active
+          visible: nowTab.active && service.games.length === 0
           Layout.fillWidth: true
           wrapMode: Text.Wrap
-          text: service.state === "stopped"
-                  ? "The host is not running."
-                  : "Nothing is streaming. Devices you have paired can connect at any time."
+          text: "No game was launched through Punktfunk — this is the desktop."
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
         }
 
         Text {
-          visible: nowTab.active && service.games.length === 0
+          visible: !nowTab.active && service.state !== "stopped"
           Layout.fillWidth: true
-          text: "Streaming the desktop."
+          wrapMode: Text.Wrap
+          text: "A paired device can connect at any time. Nothing here needs doing first."
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -801,6 +899,17 @@ Panel {
                     + Number(service.statsSample.repeat_fps || 0).toFixed(1) + " fps repeated"
                   : ""
           color: root.foreground
+          font.family: "monospace"
+          font.pixelSize: Style.font.caption
+        }
+
+        Text {
+          visible: !!service.statsSample
+          Layout.fillWidth: true
+          text: service.statsSample
+                  ? Number(service.statsSample.repeat_fps || 0).toFixed(1) + " fps repeated"
+                  : ""
+          color: root.dim
           font.family: "monospace"
           font.pixelSize: Style.font.caption
         }

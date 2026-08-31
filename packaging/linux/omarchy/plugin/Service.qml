@@ -42,16 +42,23 @@ Item {
   property var displayPresets: []
   property var customPresets: []
 
+  // ── summary ──────────────────────────────────────────────────────────────────────────────────
+  // `/status` exposes no device names by design, so it cannot say WHO is streaming. This is the one
+  // endpoint that names the connected client, and it carries the host version with it.
+  property var summary: ({})
+
   // ── stats ────────────────────────────────────────────────────────────────────────────────────
   // `stream` is free and live: its `bitrate_kbps` is the encoder's current target, so it moves with
   // every adaptive-bitrate change. The rest only exists while a capture is armed, because that is
   // when the streaming loops emit samples at all.
   property var stream: null
   property var sessionMode: null
+  property bool audioStreaming: false
   property bool captureArmed: false
   property int captureSamples: 0
   property var statsSample: null
   property var statsMeta: null
+
 
   // A certificate mismatch is NOT "the host is down": something that is not our host answered on
   // the management port, and ctl refused to send the token. Surfaced separately so the panel can
@@ -144,12 +151,17 @@ Item {
   // ── snapshots ────────────────────────────────────────────────────────────────────────────────
   function refresh() {
     run(["status"], function (data, err) {
-      if (err) { root.state = "stopped"; root.sessions = 0; return }
+      if (err) { root.state = "stopped"; root.sessions = 0; root.stream = null; return }
       root.sessions = data.active_sessions || 0
       root.pinPending = !!data.pin_pending
       root.games = data.games || []
       root.state = root.sessions > 0 ? "streaming" : "idle"
+      // The Now tab shows the negotiated mode and codec, so `stream` is read here too and not only
+      // by the Stats poll — otherwise the tab is blank until someone visits Stats.
+      root.stream = data.stream || null
+      root.audioStreaming = !!data.audio_streaming
     })
+    refreshSummary()
     run(["pending"], function (data, err) {
       root.pendingDevices = (!err && data) ? data : []
       root.pending = root.pendingDevices.length
@@ -198,6 +210,12 @@ Item {
       root.captureSamples = (data.capture && data.capture.sample_count) || 0
       root.statsSample = data.sample || null
       root.statsMeta = data.meta || null
+    })
+  }
+
+  function refreshSummary() {
+    run(["summary"], function (data, err) {
+      root.summary = (!err && data) ? data : {}
     })
   }
 

@@ -6,7 +6,7 @@ Omarchy bar, without opening a browser.
 - **bar-widget** — host state and live session count, with a badge when a device is waiting for
   approval. Click opens the panel; right-click opens the web console.
 - **panel** — five tabs over a fixed header:
-  - *Now* — what is streaming, Stop / End game.
+  - *Now* — who is streaming and at what, as a hero plus a two-column fact grid. Stop / End game.
   - *Pairing* — open a window, approve or deny the queue, type a Moonlight PIN.
   - *Devices* — both planes, access level, unpair on hover.
   - *Displays* — pick the virtual-display preset, and read the policy it puts in force.
