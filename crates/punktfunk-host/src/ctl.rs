@@ -147,6 +147,7 @@ fn run(args: &[&str], json: bool) -> Result<()> {
         "unpair" => unpair(rest, json),
         "access" => access(rest, json),
         "display" => display(rest, json),
+        "stats" => stats(rest, json),
         "watch" => {
             let kinds = flag_value(rest, "--kinds");
             let since = flag_value(rest, "--since")
@@ -484,6 +485,162 @@ fn render_display(v: &Value) {
     }
 }
 
+// ── stats ──────────────────────────────────────────────────────────────────────────────────────
+
+/// What the stream is doing right now.
+///
+/// Two layers, because they cost different things. The **free** layer is `/status`: the negotiated
+/// mode and codec plus `bitrate_kbps`, which is the live encoder target and moves with every
+/// adaptive-bitrate change — so it is a real read-out, not a copy of the handshake. The **detail**
+/// layer (per-frame drops and stage percentiles) only exists while a performance capture is armed,
+/// because that is when the streaming loops emit samples at all.
+///
+/// This verb never arms a capture as a side effect of being read. Arming has a consequence a reader
+/// did not ask for — `stats record stop` writes a recording to disk, and the capture is a single
+/// host-wide slot the web console also drives — so it stays an explicit verb.
+fn stats(args: &[&str], json: bool) -> Result<()> {
+    let c = Client::connect(None)?;
+    match args.first().copied() {
+        Some("record") => match args.get(1).copied() {
+            Some("start") => {
+                let v = c.post("/api/v1/stats/capture/start", &json!({}))?;
+                out(json, &v, |_| println!("capture armed"));
+                Ok(())
+            }
+            Some("stop") => {
+                let v = c.post("/api/v1/stats/capture/stop", &json!({}))?;
+                out(json, &v, |v| {
+                    // 204 when nothing was recording — `finish` gives that back as a null body.
+                    match v["id"].as_str() {
+                        Some(id) => println!("capture saved as {id}"),
+                        None => println!("nothing was recording"),
+                    }
+                });
+                Ok(())
+            }
+            _ => Err(Failure::usage("stats record: expected start | stop")),
+        },
+        None | Some("status") => {
+            let status = c.get("/api/v1/status")?;
+            let capture = c
+                .get("/api/v1/stats/capture/status")
+                .unwrap_or_else(|_| json!({ "armed": false }));
+            // The live capture holds its WHOLE time-series (up to 5400 samples). A read-out wants
+            // the newest one, so the tail is taken here rather than shipping the series to every
+            // caller that only ever renders one row of numbers.
+            let mut sample = Value::Null;
+            let mut meta = Value::Null;
+            if capture["armed"].as_bool().unwrap_or(false) {
+                if let Ok(live) = c.get("/api/v1/stats/capture/live") {
+                    meta = live["meta"].clone();
+                    sample = live["samples"]
+                        .as_array()
+                        .and_then(|s| s.last())
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                }
+            }
+            let v = json!({
+                "video_streaming": status["video_streaming"],
+                "active_sessions": status["active_sessions"],
+                "session": status["session"],
+                "stream": status["stream"],
+                "games": status["games"],
+                "capture": capture,
+                "sample": sample,
+                "meta": meta,
+            });
+            out(json, &v, render_stats);
+            Ok(())
+        }
+        Some(other) => Err(Failure::usage(format!(
+            "stats: expected status | record, got '{other}'"
+        ))),
+    }
+}
+
+/// A stage duration in the unit that shows it. Encode lands around 2 300 µs and `send` around
+/// 15 µs, so one fixed unit loses an end: printing everything in ms flattens `send` to `0.0`, and
+/// printing everything in µs makes encode a five-digit number to squint at.
+fn dur_us(us: f64) -> String {
+    if us >= 1000.0 {
+        format!("{:.1} ms", us / 1000.0)
+    } else {
+        format!("{} µs", us.round() as i64)
+    }
+}
+
+fn render_stats(v: &Value) {
+    let s = &v["stream"];
+    if s.is_null() {
+        println!("stream    nothing is streaming");
+    } else {
+        println!(
+            "stream    {}x{}@{} {}",
+            s["width"].as_i64().unwrap_or(0),
+            s["height"].as_i64().unwrap_or(0),
+            s["fps"].as_i64().unwrap_or(0),
+            s["codec"].as_str().unwrap_or("—")
+        );
+        // The ENCODER TARGET, which is where adaptive bitrate has settled — not the throughput.
+        // Labelled as a target because the two differ by an order of magnitude on a still screen,
+        // and a single "300 Mbps" next to 11 Mbps of actual traffic is the kind of number that
+        // sends someone hunting a bandwidth problem that does not exist.
+        println!(
+            "target    {:.1} Mbps",
+            s["bitrate_kbps"].as_f64().unwrap_or(0.0) / 1000.0
+        );
+        if let Some(ms) = s["time_to_first_frame_ms"].as_i64() {
+            println!("bring-up  {ms} ms to first frame");
+        }
+    }
+    if let Some(backend) = v["meta"]["encoder_backend"].as_str() {
+        println!(
+            "encoder   {backend}{}",
+            v["meta"]["gpu"]
+                .as_str()
+                .map(|g| format!(" · {g}"))
+                .unwrap_or_default()
+        );
+    }
+    if !v["capture"]["armed"].as_bool().unwrap_or(false) {
+        println!("capture   idle — run `ctl stats record start` for frame timings");
+        return;
+    }
+    println!(
+        "capture   recording · {} samples",
+        v["capture"]["sample_count"].as_i64().unwrap_or(0)
+    );
+    let p = &v["sample"];
+    if p.is_null() {
+        return;
+    }
+    println!("sent      {:.1} Mbps", p["mbps"].as_f64().unwrap_or(0.0));
+    // `fps` counts NEW frames and `repeat_fps` the re-sent last one. Capture is damage-driven, so a
+    // still desktop legitimately reads 0 new fps while the stream is perfectly healthy — printing
+    // only `fps` there says "the stream is dead" about a stream that is not.
+    let new_fps = p["fps"].as_f64().unwrap_or(0.0);
+    let repeat_fps = p["repeat_fps"].as_f64().unwrap_or(0.0);
+    println!("frames    {new_fps:.1} fps new · {repeat_fps:.1} fps repeated");
+    if new_fps < 1.0 && repeat_fps > 1.0 {
+        println!("          (nothing on screen is changing — the last frame is being repeated)");
+    }
+    println!(
+        "loss      {} frames dropped · {} packets lost · {} recovered by FEC",
+        p["frames_dropped"].as_i64().unwrap_or(0),
+        p["packets_dropped"].as_i64().unwrap_or(0),
+        p["fec_recovered"].as_i64().unwrap_or(0)
+    );
+    for st in p["stages"].as_array().into_iter().flatten() {
+        println!(
+            "  {:<12} p50 {} · p99 {}",
+            st["name"].as_str().unwrap_or("—"),
+            dur_us(st["p50_us"].as_f64().unwrap_or(0.0)),
+            dur_us(st["p99_us"].as_f64().unwrap_or(0.0))
+        );
+    }
+}
+
 /// A one-shot console URL carrying a ticket that logs the operator straight in.
 ///
 /// **What is being trusted, and what is not.** The console binds all interfaces so it can be
@@ -777,6 +934,12 @@ DISPLAYS
                                  screen back without waiting out the linger. Omit SLOT for all.
                                  Never touches a display that is actively streaming.
 
+STATS
+    stats                        the live stream: mode, codec and the adaptive bitrate, plus frame
+                                 timings and drops while a capture is recording
+    stats record start|stop      arm or disarm the performance capture. `stop` writes the recording
+                                 to disk; the capture is one host-wide slot the web console shares.
+
 OPTIONS
     --json                       versioned JSON on stdout (the contract; the tables are for humans)
 
@@ -879,6 +1042,16 @@ mod tests {
         assert_eq!(p["max_displays"], 2);
         assert_eq!(p["game_session"], "dedicated");
         assert_eq!(p["capture_monitor"], "DP-2");
+    }
+
+    #[test]
+    fn stage_durations_keep_the_small_stages_visible() {
+        // Real numbers off an Omarchy box: `send` p50 15 µs against `encode` p50 2321 µs. One
+        // fixed unit loses an end of that range — ms prints send as "0.0 ms".
+        assert_eq!(dur_us(15.0), "15 µs");
+        assert_eq!(dur_us(0.0), "0 µs");
+        assert_eq!(dur_us(999.0), "999 µs");
+        assert_eq!(dur_us(2321.0), "2.3 ms");
     }
 
     #[test]
