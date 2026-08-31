@@ -11,6 +11,10 @@
     "file missing one is refused outright and the console keeps its own palette.",
     "The host reads nothing from this file — there is no host-side theme engine and no plan for one.",
     "",
+    "Consumer #2 is the Linux client (clients/linux/src/omarchy.rs), which redefines libadwaita's",
+    "named colours from the same four values. It parses HEX ONLY: it needs the numbers to mix its",
+    "surfaces, and GTK's CSS knows nothing of oklch. Colours only — the client keeps its GTK4 shape.",
+    "",
     "The webapp window already inherits Omarchy's Chromium theming, so this only has to carry the",
     "colours the page itself paints."
   ],

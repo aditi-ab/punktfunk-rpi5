@@ -402,7 +402,7 @@ setup_idle() {
 setup_theme() {
   step "Theme"
   [[ -r "$HOOKS_SRC/themed/punktfunk.json.tpl" ]] || { warn "no theme template — skipping"; return 0; }
-  ask "follow the Omarchy theme in the web console?" || { warn "skipped"; return 0; }
+  ask "follow the Omarchy theme in the web console and the Linux client?" || { warn "skipped"; return 0; }
   local themed="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/themed"
   mkdir -p "$themed"
   install -m0644 "$HOOKS_SRC/themed/punktfunk.json.tpl" "$themed/punktfunk.json.tpl"

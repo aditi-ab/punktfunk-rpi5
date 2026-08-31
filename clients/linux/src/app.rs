@@ -1260,6 +1260,10 @@ fn load_css() {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     }
+    // Every colour above resolves through libadwaita's named palette (`@accent_color` and
+    // friends), so redefining those names is all it takes to wear the desktop's theme. Does
+    // nothing off Omarchy.
+    crate::omarchy::install();
 }
 
 /// Window actions behind the hosts page's header (the primary menu + "+") — thin
