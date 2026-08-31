@@ -461,6 +461,12 @@ impl KnownHosts {
         std::fs::create_dir_all(p.parent().unwrap())?;
         // Temp+rename: losing this file to a torn write costs the user every pairing.
         write_atomic(&p, serde_json::to_string_pretty(self)?.as_bytes())?;
+        // The Omarchy menu mirrors this store (one connect row per host), and save() is the
+        // one door every mutation walks through — GTK pairing, the couch console, the CLI —
+        // so this is the whole of "the menu never goes stale". A no-op unless the operator
+        // opted in (`--omarchy-menu on`), which a scoped test HOME never has.
+        #[cfg(target_os = "linux")]
+        crate::omarchy_menu::sync_if_enabled();
         Ok(())
     }
 
@@ -1314,6 +1320,15 @@ pub struct Settings {
     /// newer client may have shipped a palette this binary doesn't know.
     #[serde(default = "default_ui_palette")]
     pub ui_palette: String,
+    /// Follow the desktop's own theme where the platform exposes one — today that is
+    /// Omarchy on Linux: the GTK shell recolours from it and the console builds its field
+    /// and ink from it, live across a theme switch. While it is on, [`ui_palette`]
+    /// (Self::ui_palette) stays stored but does not draw. Presentation only, a device
+    /// preference like the palette. The row is shown only where a theme exists; everywhere
+    /// else the value is inert, which is why defaulting ON is safe — following the desk IS
+    /// the integration, and the switch is the way out.
+    #[serde(default = "default_true")]
+    pub follow_os_theme: bool,
     /// Suppress the gamepad UI's decorative motion: the living backdrop freezes, screen
     /// transitions become a plain fade, entrances stop staggering, and refused moves keep
     /// their haptic but drop the recoil travel. Presentation only, exactly like
@@ -1563,6 +1578,7 @@ impl Default for Settings {
             stats_verbosity: None,
             fullscreen_on_stream: true,
             ui_palette: default_ui_palette(),
+            follow_os_theme: true,
             reduce_motion: false,
             library_sort: String::new(),
             library_view: String::new(),

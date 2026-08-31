@@ -275,6 +275,11 @@ pub(crate) struct Shell {
     /// re-colours under the cursor as the row is stepped, which is the whole point of putting
     /// the picker on a screen the backdrop is behind.
     mesh_palette: String,
+    /// Which OS-theme revision the compiled `mesh` bakes, when "Follow system theme" rules —
+    /// `None` while a curated palette draws. The pair with [`mesh_palette`](Self::mesh_palette)
+    /// is what lets `sync` rebuild on exactly two events: the row stepping, and the desk's
+    /// theme actually changing.
+    mesh_os: Option<u64>,
     /// The palette's ground × 0.4 — the calm lift, precomputed with `mesh`. Chosen so
     /// `col*0.6 + lift` leaves the ground EXACTLY where it was and pulls the bright pools down
     /// to it: the form screens lose the launcher's contrast, not its colour.
@@ -359,6 +364,7 @@ impl Shell {
             bus,
             actions: VecDeque::new(),
             mesh_palette: settings.ui_palette.clone(),
+            mesh_os: None,
             settings,
             store,
             platform: opts.platform,
@@ -680,27 +686,49 @@ impl Shell {
     // --- Model sync (hosts, pairing, wake) — before input and before render --------------
 
     fn sync(&mut self) {
-        // The settings screen writes `ui_palette` straight into `self.settings`; recompiling
-        // here is what makes the backdrop re-colour live under the row being stepped. A
-        // rejected compile keeps the palette that IS drawing — the field never goes black
-        // because someone picked a colour.
-        if self.settings.ui_palette != self.mesh_palette {
+        // The settings screen writes `ui_palette` and `follow_os_theme` straight into
+        // `self.settings`; recompiling here is what makes the backdrop re-colour live under
+        // the row being stepped — and what makes an `omarchy-theme-set` land mid-session:
+        // the service republishes the theme, the revision moves, this rebuilds. A rejected
+        // compile keeps the field that IS drawing — it never goes black because someone
+        // picked a colour, and the bookkeeping still advances so a broken build warns once
+        // rather than once per frame.
+        let (os_rev, os) = crate::os_theme::os_theme();
+        let want_os = if self.settings.follow_os_theme {
+            os
+        } else {
+            None
+        };
+        if let Some(t) = want_os {
+            if self.mesh_os != Some(os_rev) {
+                match build_mesh_os(&t) {
+                    Ok((mesh, lift, scrim, ink)) => {
+                        self.mesh = mesh;
+                        self.mesh_lift = lift;
+                        self.mesh_scrim = scrim;
+                        self.ink = ink;
+                    }
+                    Err(e) => tracing::warn!("console: OS theme rejected: {e}"),
+                }
+                self.mesh_os = Some(os_rev);
+            }
+        } else if self.mesh_os.is_some() || self.settings.ui_palette != self.mesh_palette {
             match build_mesh(&self.settings.ui_palette) {
                 Ok((mesh, lift, scrim, ink)) => {
                     self.mesh = mesh;
                     self.mesh_lift = lift;
                     self.mesh_scrim = scrim;
                     self.ink = ink;
-                    self.mesh_palette = self.settings.ui_palette.clone();
                 }
                 Err(e) => {
                     tracing::warn!(
                         "console: {} palette rejected: {e}",
                         self.settings.ui_palette
                     );
-                    self.mesh_palette = self.settings.ui_palette.clone();
                 }
             }
+            self.mesh_os = None;
+            self.mesh_palette = self.settings.ui_palette.clone();
         }
         if self.console.hosts_gen() != self.hosts_gen {
             (self.hosts, self.hosts_gen) = self.console.hosts_snapshot();
@@ -1342,16 +1370,54 @@ type MeshLook = (RuntimeEffect, [f32; 3], [f32; 4], crate::theme::Ink);
 
 fn build_mesh(palette_id: &str) -> Result<MeshLook> {
     let p = palette(palette_id);
-    let colors = p.mesh_colors();
-    let effect = RuntimeEffect::make_for_shader(mesh_sksl(&colors), None)
+    compile_mesh(&p.mesh_colors(), crate::theme::Ink::of(p), p.ground)
+}
+
+/// The follow-system field: a QUIET ramp derived from the theme's own colours — shade into
+/// the ground, then a low accent ember in the bright corner — rather than the curated ramps'
+/// big hue arcs. The desk's colour is the point; a loud gradient over it would upstage it.
+fn build_mesh_os(t: &crate::os_theme::OsTheme) -> Result<MeshLook> {
+    use crate::os_theme::mix;
+    let (bg, fg, ac) = (t.background, t.foreground, t.accent);
+    let stops: [(f64, f64, f64); 5] = if t.light {
+        // A pale field shades toward its own text colour, not toward black — darkening a
+        // pastel strands the dark ink on it (the scrim comment in `theme::Ink` says why).
+        [
+            mix(bg, fg, 0.10),
+            bg,
+            bg,
+            mix(bg, ac, 0.08),
+            mix(bg, ac, 0.18),
+        ]
+    } else {
+        [
+            mix(bg, (0.0, 0.0, 0.0), 0.35),
+            bg,
+            bg,
+            mix(bg, ac, 0.12),
+            mix(bg, ac, 0.30),
+        ]
+    };
+    compile_mesh(
+        &crate::library::mesh_colors_of(&stops),
+        crate::theme::Ink::of_os(t),
+        bg,
+    )
+}
+
+fn compile_mesh(
+    colors: &[(f64, f64, f64); 16],
+    ink: crate::theme::Ink,
+    ground: (f64, f64, f64),
+) -> Result<MeshLook> {
+    let effect = RuntimeEffect::make_for_shader(mesh_sksl(colors), None)
         .map_err(|e| anyhow!("mesh-gradient SkSL: {e}"))?;
     anyhow::ensure!(
         effect.uniform_size() == 48,
         "mesh uniform block is {} bytes, expected 48 (u_res, u_tc, u_lift, u_scrim)",
         effect.uniform_size()
     );
-    let ink = crate::theme::Ink::of(p);
-    let g = p.ground;
+    let g = ground;
     Ok((
         effect,
         [(g.0 * 0.4) as f32, (g.1 * 0.4) as f32, (g.2 * 0.4) as f32],

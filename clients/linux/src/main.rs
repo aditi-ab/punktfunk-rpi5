@@ -20,6 +20,9 @@ mod cli;
 // The shell's icons: Lucide marks stroked from the console's own shared table.
 #[cfg(target_os = "linux")]
 mod lucide;
+// Recolour the shell from the Omarchy theme, when the box has one.
+#[cfg(target_os = "linux")]
+mod omarchy;
 // "Create shortcut…" — the desktop-entry writer (design/client-deep-links.md §5).
 #[cfg(target_os = "linux")]
 mod shortcuts;

@@ -210,6 +210,32 @@ impl Ink {
             scrim: Color4f::new(1.0, 1.0, 1.0, 0.45),
         }
     }
+
+    /// The ink an OS theme calls for ("Follow system theme"). Unlike the curated table, an
+    /// OS theme is arbitrary, so its accent is not trusted as focus ink: it arrives already
+    /// lifted by [`crate::os_theme::readable_accent`]. The foreground is the theme's own —
+    /// that slightly tinted white (or near-black) is exactly what makes the console read as
+    /// the desk's rather than as ours recoloured.
+    pub(crate) fn of_os(t: &crate::os_theme::OsTheme) -> Ink {
+        let c = |(r, g, b): (f64, f64, f64), a: f32| Color4f::new(r as f32, g as f32, b as f32, a);
+        let accent = c(crate::os_theme::readable_accent(t), 1.0);
+        if !t.light {
+            return Ink {
+                fg: c(t.foreground, 1.0),
+                accent,
+                // Dark glass tinted from the theme's own field rather than the brand's
+                // violet-grey: a panel sits a shade above the ground it covers.
+                glass: c(crate::os_theme::mix(t.background, t.foreground, 0.10), 0.62),
+                scrim: Color4f::new(0.0, 0.0, 0.0, 1.0),
+            };
+        }
+        Ink {
+            fg: c(t.foreground, 1.0),
+            accent,
+            glass: Color4f::new(1.0, 1.0, 1.0, 0.66),
+            scrim: Color4f::new(1.0, 1.0, 1.0, 0.45),
+        }
+    }
 }
 
 thread_local! {

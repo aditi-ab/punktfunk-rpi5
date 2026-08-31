@@ -68,7 +68,7 @@ That one command, each step idempotent and each one reversible:
 | **App menu** | installs "Punktfunk Console" as an Omarchy webapp — it appears in Apps (`Super`+`Space`). |
 | **Toasts** *(optional)* | pairing requests and stream start/stop as Omarchy notifications, with **Approve** / **Deny** buttons on the pairing one. |
 | **Idle** *(optional)* | keeps the screen awake for the length of a stream and restores your own setting afterwards. |
-| **Theme** *(optional)* | a `~/.config/omarchy/themed/` template so the console follows `omarchy-theme-set`. |
+| **Theme** *(optional)* | a `~/.config/omarchy/themed/` template so the console **and the Linux client** follow `omarchy-theme-set`. |
 
 Check it any time with `punktfunk-omarchy status`, and undo all of it with `punktfunk-omarchy
 remove` (your pairings and `~/.config/punktfunk` are left alone).
@@ -84,6 +84,34 @@ punktfunk-host ctl approve 1
 ```
 
 See [the ctl reference](/docs/host-cli#ctl) for the full verb list.
+
+## The client on Omarchy
+
+The other direction — this box as the **screen**, streaming from a host elsewhere — is just as
+integrated, and needs none of the host setup above:
+
+```sh
+sudo pacman -S punktfunk-client
+```
+
+**The theme follows you automatically.** The client reads the active theme's own `colors.toml`
+(no template, no registration), so the app, and the couch console with it, wear your colours and
+track `omarchy-theme-set` live. Two switches turn it off if you'd rather keep Punktfunk's look:
+**Follow the Omarchy theme** in the app's preferences, and **Follow system theme** in the
+console's Interface settings. Both exist only on Omarchy.
+
+**Your hosts in the menu (`Super`+`Space`).** Opt in once —
+
+```sh
+punktfunk-client --omarchy-menu on     # or flip "Hosts in the Omarchy menu" in preferences
+```
+
+— and Punktfunk becomes a submenu: one **connect row per saved host** (type the host's name in
+the menu's search and press enter to stream), a **wake row** where a MAC is known, **Open
+Punktfunk** and the **Game console**. The rows follow your saved hosts from then on: pairing or
+forgetting a host anywhere — the app, the couch console, the CLI — rewrites them.
+`--omarchy-menu off` removes exactly Punktfunk's block and leaves the rest of your
+`omarchy-menu.jsonc` alone.
 
 ## Autostart and your session
 

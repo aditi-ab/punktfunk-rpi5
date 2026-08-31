@@ -268,9 +268,42 @@ EOF
 }
 
 # Strip JSONC to JSON so python can parse it: line comments, then trailing commas.
+# JSONC as the menu reads it: strip `//` comments and forgive trailing commas, both
+# STRING-AWARE. Not pedantry — the console row's own action carries
+# `https://localhost:47992`, and the original sed pipeline cut that line mid-string and
+# refused the very file this script had just written. The client mirrors this algorithm in
+# Rust (pf-client-core, omarchy_menu::jsonc_parse); change one, change both.
 menu_is_valid() {
-  sed -E 's://.*$::' "$1" \
-    | python3 -c 'import json,re,sys; json.loads(re.sub(r",(\s*[}\]])", r"\1", sys.stdin.read()))' 2>/dev/null
+  python3 - "$1" <<'PYJSONC' 2>/dev/null
+import json, sys
+s = open(sys.argv[1], encoding="utf-8").read()
+out, i, instr, held = [], 0, False, False
+while i < len(s):
+    c = s[i]
+    if instr:
+        out.append(c)
+        if c == "\\" and i + 1 < len(s):
+            out.append(s[i + 1]); i += 2; continue
+        if c == '"':
+            instr = False
+        i += 1; continue
+    if s.startswith("//", i):
+        while i < len(s) and s[i] != "\n":
+            i += 1
+        continue
+    if c == ",":
+        if held:
+            out.append(",")
+        held = True; i += 1; continue
+    if c in "}]":
+        held = False
+    elif held and not c.isspace():
+        out.append(","); held = False
+    if c == '"':
+        instr = True
+    out.append(c); i += 1
+json.loads("".join(out))
+PYJSONC
 }
 
 setup_menu() {
@@ -402,7 +435,7 @@ setup_idle() {
 setup_theme() {
   step "Theme"
   [[ -r "$HOOKS_SRC/themed/punktfunk.json.tpl" ]] || { warn "no theme template — skipping"; return 0; }
-  ask "follow the Omarchy theme in the web console?" || { warn "skipped"; return 0; }
+  ask "follow the Omarchy theme in the web console and the Linux client?" || { warn "skipped"; return 0; }
   local themed="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/themed"
   mkdir -p "$themed"
   install -m0644 "$HOOKS_SRC/themed/punktfunk.json.tpl" "$themed/punktfunk.json.tpl"

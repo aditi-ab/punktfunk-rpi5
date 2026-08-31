@@ -84,6 +84,11 @@ enum RowId {
     Stats,
     Fullscreen,
     AutoWake,
+    /// Wear the desktop's own theme instead of a picked palette — see
+    /// `trust::Settings::follow_os_theme`. Shown only when the embedding binary publishes
+    /// one (today: the session binary on Omarchy); while on it rules, and
+    /// [`RowId::Palette`] hides beneath it.
+    FollowOsTheme,
     /// The gamepad UI's background colour family — see [`crate::library::PALETTES`]. The
     /// backdrop behind this very row re-colours as it steps, which is the whole reason the
     /// picker lives on a screen rather than in a dialog.
@@ -267,6 +272,7 @@ const TABS: [(&str, &[RowId]); 7] = [
     (
         "Interface",
         &[
+            RowId::FollowOsTheme,
             RowId::Palette,
             RowId::ReduceMotion,
             RowId::ReduceUiResolution,
@@ -1031,6 +1037,13 @@ fn row_applies(id: RowId, ctx: &Ctx) -> bool {
         RowId::GamepadUiMode => {
             ctx.fallback_ui && extra_bool(ctx.settings, android_keys::GAMEPAD_UI, true)
         }
+        // Availability, not platform: the row exists wherever the embedding binary actually
+        // publishes a desktop theme (today: the session binary on Omarchy), and a platform
+        // that starts publishing needs no edit here.
+        RowId::FollowOsTheme => crate::os_theme::available(),
+        // Hidden while the system theme rules it — the GamepadUiMode pattern above: gone,
+        // not dimmed, and the row that drops it sits directly above where it was.
+        RowId::Palette => !(ctx.settings.follow_os_theme && crate::os_theme::available()),
         _ => true,
     }
 }
@@ -1256,6 +1269,11 @@ fn row_spec(id: RowId, ctx: &Ctx, profiles: &[(String, String)]) -> RowSpec {
             "Capture system shortcuts",
             on_off(s.inhibit_shortcuts).into(),
         ),
+        RowId::FollowOsTheme => (
+            None,
+            "Follow system theme",
+            on_off(s.follow_os_theme).into(),
+        ),
         RowId::Palette => (
             None,
             "Background",
@@ -1477,6 +1495,10 @@ fn detail(id: RowId, ctx: &Ctx) -> &'static str {
         RowId::Shortcuts => {
             "Alt+Tab, Super and friends reach the host while input is captured. \
              Off, they act on this device instead."
+        }
+        RowId::FollowOsTheme => {
+            "The console wears your desktop's theme — background, text and accent — and \
+             follows a theme switch live. Off, the Background row below picks the look."
         }
         RowId::Palette => {
             "The colour family this backdrop drifts through — it changes as you step, so \
@@ -1792,6 +1814,7 @@ fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             step_option(cur, StatsVerbosity::ALL.len(), delta, wrap)
                 .map(|i| s.set_stats_verbosity(StatsVerbosity::ALL[i]))
         }
+        RowId::FollowOsTheme => toggle(&mut s.follow_os_theme, delta, wrap),
         RowId::Palette => {
             let all = &crate::library::PALETTES;
             let cur = all.iter().position(|p| p.id == s.ui_palette);
@@ -2811,7 +2834,9 @@ pub(super) mod tests {
         // the ten Android-only ones (design android-skia-console-port.md D3): eight
         // `extra`-backed settings and two platform-screen action rows + the quick-action
         // ring's one action row (every platform; the editor is the ring itself).
-        assert_eq!(seen.len(), 48, "{seen:?}");
+        // 49 = the 48 below plus the follow-system-theme switch (Omarchy).
+        assert_eq!(seen.len(), 49, "{seen:?}");
+        assert!(seen.contains(&RowId::FollowOsTheme));
         assert!(seen.contains(&RowId::Palette));
         assert!(seen.contains(&RowId::ReduceMotion));
         assert!(seen.contains(&RowId::ReduceUiResolution));
@@ -2819,6 +2844,50 @@ pub(super) mod tests {
         // The catalog rows belong to the trailing tab, which builds them at render time.
         assert!(TABS[PROFILES_TAB].1.is_empty());
         assert_eq!(TABS[PROFILES_TAB].0, "Profiles");
+    }
+
+    /// ⚠ The ONE test in the crate that touches the process-wide `os_theme` slot — a
+    /// sibling anywhere would race it under libtest's parallel threads. It leaves the slot
+    /// cleared.
+    #[test]
+    fn the_follow_system_row_exists_only_where_a_theme_is_published() {
+        with_ctx(|ctx| {
+            assert!(
+                !row_applies(RowId::FollowOsTheme, ctx),
+                "no publisher, no row"
+            );
+            assert!(row_applies(RowId::Palette, ctx));
+
+            let t = crate::os_theme::OsTheme {
+                light: false,
+                background: (0.02, 0.04, 0.12),
+                foreground: (1.0, 0.81, 0.68),
+                accent: (0.49, 0.51, 0.85),
+            };
+            crate::os_theme::set_os_theme(Some(t));
+            let rev = crate::os_theme::os_theme().0;
+            crate::os_theme::set_os_theme(Some(t));
+            assert_eq!(
+                crate::os_theme::os_theme().0,
+                rev,
+                "an unchanged publish is free"
+            );
+
+            // The switch defaults ON — following the desk is the integration — so the
+            // moment a theme exists it rules, and the curated picker steps aside.
+            assert!(row_applies(RowId::FollowOsTheme, ctx));
+            assert!(
+                !row_applies(RowId::Palette, ctx),
+                "ruled by the system theme"
+            );
+
+            // Off is the way back to the curated table.
+            ctx.settings.follow_os_theme = false;
+            assert!(row_applies(RowId::Palette, ctx));
+
+            crate::os_theme::set_os_theme(None);
+            assert!(!row_applies(RowId::FollowOsTheme, ctx));
+        });
     }
 
     /// The collections entry is a plain off-by-default toggle, and it sits directly under the

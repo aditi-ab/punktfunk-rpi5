@@ -1402,6 +1402,16 @@ pub fn show_scoped(
         .title("Start streams in fullscreen")
         .subtitle("F11, the mouse at the top edge, or L1+R1+Start+Select lead back out")
         .build();
+    let theme_row = adw::SwitchRow::builder()
+        .title("Follow the Omarchy theme")
+        .subtitle("Colours track omarchy-theme-set live — off keeps Punktfunk's own look")
+        .build();
+    let menu_row = adw::SwitchRow::builder()
+        .title("Hosts in the Omarchy menu")
+        .subtitle(
+            "Super+Space: connect, wake, the console — this writes rows to omarchy-menu.jsonc",
+        )
+        .build();
     let wake_row = adw::SwitchRow::builder()
         .title("Auto-wake on connect")
         .subtitle(
@@ -1732,6 +1742,8 @@ pub fn show_scoped(
         decoder_row.set_selected(dec_i as u32);
         stats_row.set_selected(index::stats(s));
         fullscreen_row.set_active(s.fullscreen_on_stream);
+        theme_row.set_active(s.follow_os_theme);
+        menu_row.set_active(pf_client_core::omarchy_menu::enabled());
         wake_row.set_active(s.auto_wake);
         inhibit_row.set_active(s.inhibit_shortcuts);
         invert_row.set_active(s.invert_scroll);
@@ -2103,6 +2115,14 @@ pub fn show_scoped(
     if !profile_mode {
         session_group.add(&wake_row);
     }
+    // Appearance is device-level like the console's palette, never part of a profile, and
+    // the row exists only where the theme does — Omarchy — rather than sitting disabled.
+    if !profile_mode && pf_client_core::omarchy::present() {
+        let omarchy_group = group("Omarchy", "");
+        omarchy_group.add(&theme_row);
+        omarchy_group.add(&menu_row);
+        general.add(&omarchy_group);
+    }
     let stats_group = group("Statistics", "");
     stats_group.add(stats_row.widget());
     general.add(&session_group);
@@ -2300,6 +2320,23 @@ pub fn show_scoped(
                     [(stats_row.selected() as usize).min(StatsVerbosity::ALL.len() - 1)],
             );
             s.fullscreen_on_stream = fullscreen_row.is_active();
+            s.follow_os_theme = theme_row.is_active();
+            // Live: the switch must not wait out the shell's 2 s poll to mean something.
+            crate::omarchy::set_enabled(s.follow_os_theme);
+            // The menu switch is not a Settings field: the block's presence in the user's
+            // omarchy-menu.jsonc IS the state, so two installs can't disagree with it.
+            {
+                use pf_client_core::omarchy_menu as menu;
+                let want = menu_row.is_active();
+                let res = match (want, menu::enabled()) {
+                    (true, false) => menu::enable(),
+                    (false, true) => menu::disable(),
+                    _ => Ok(()),
+                };
+                if let Err(e) = res {
+                    tracing::warn!("omarchy menu: {e}");
+                }
+            }
             s.auto_wake = wake_row.is_active();
             s.inhibit_shortcuts = inhibit_row.is_active();
             s.invert_scroll = invert_row.is_active();
@@ -2404,8 +2441,10 @@ mod tests {
     /// its own thread, so the display tests can't be split). Gamescope mode: activating the
     /// row pushes the in-window selection subpage; activating an option updates the
     /// selection + suffix label, fires the change callback, and pops the subpage. Combo
-    /// mode: cell sync + change callback. Needs a display — run manually with
-    /// `cargo test -p punktfunk-client-linux -- --ignored` on a session box.
+    /// mode: cell sync + change callback. Needs a display AND its own process: `--ignored` alone
+    /// starts every display test in one process, and GTK refuses a second init from a second
+    /// thread. Run it by name on a session box:
+    /// `cargo test -p punktfunk-client-linux -- --ignored choice_row_modes`.
     #[test]
     #[ignore = "needs a Wayland/X display"]
     fn choice_row_modes() {
