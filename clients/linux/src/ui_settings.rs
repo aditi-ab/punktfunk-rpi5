@@ -1406,6 +1406,12 @@ pub fn show_scoped(
         .title("Follow the Omarchy theme")
         .subtitle("Colours track omarchy-theme-set live — off keeps Punktfunk's own look")
         .build();
+    let menu_row = adw::SwitchRow::builder()
+        .title("Hosts in the Omarchy menu")
+        .subtitle(
+            "Super+Space: connect, wake, the console — this writes rows to omarchy-menu.jsonc",
+        )
+        .build();
     let wake_row = adw::SwitchRow::builder()
         .title("Auto-wake on connect")
         .subtitle(
@@ -1737,6 +1743,7 @@ pub fn show_scoped(
         stats_row.set_selected(index::stats(s));
         fullscreen_row.set_active(s.fullscreen_on_stream);
         theme_row.set_active(s.follow_os_theme);
+        menu_row.set_active(pf_client_core::omarchy_menu::enabled());
         wake_row.set_active(s.auto_wake);
         inhibit_row.set_active(s.inhibit_shortcuts);
         invert_row.set_active(s.invert_scroll);
@@ -2113,6 +2120,7 @@ pub fn show_scoped(
     if !profile_mode && pf_client_core::omarchy::present() {
         let omarchy_group = group("Omarchy", "");
         omarchy_group.add(&theme_row);
+        omarchy_group.add(&menu_row);
         general.add(&omarchy_group);
     }
     let stats_group = group("Statistics", "");
@@ -2315,6 +2323,20 @@ pub fn show_scoped(
             s.follow_os_theme = theme_row.is_active();
             // Live: the switch must not wait out the shell's 2 s poll to mean something.
             crate::omarchy::set_enabled(s.follow_os_theme);
+            // The menu switch is not a Settings field: the block's presence in the user's
+            // omarchy-menu.jsonc IS the state, so two installs can't disagree with it.
+            {
+                use pf_client_core::omarchy_menu as menu;
+                let want = menu_row.is_active();
+                let res = match (want, menu::enabled()) {
+                    (true, false) => menu::enable(),
+                    (false, true) => menu::disable(),
+                    _ => Ok(()),
+                };
+                if let Err(e) = res {
+                    tracing::warn!("omarchy menu: {e}");
+                }
+            }
             s.auto_wake = wake_row.is_active();
             s.inhibit_shortcuts = inhibit_row.is_active();
             s.invert_scroll = invert_row.is_active();

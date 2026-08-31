@@ -105,6 +105,10 @@ pub mod overlay_focus;
 // recolour and the session console's follow-system palette both build from it.
 #[cfg(target_os = "linux")]
 pub mod omarchy;
+// Punktfunk's rows in the Omarchy menu (Super+Space) — opt-in, synced from the known-hosts
+// store by every binary that mutates it.
+#[cfg(target_os = "linux")]
+pub mod omarchy_menu;
 // The UI icon set (Lucide path data), shared by the Skia console and the GTK shell so one
 // mark cannot differ between them: pure data, every platform.
 pub mod lucide;

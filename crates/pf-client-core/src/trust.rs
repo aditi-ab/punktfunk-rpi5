@@ -461,6 +461,12 @@ impl KnownHosts {
         std::fs::create_dir_all(p.parent().unwrap())?;
         // Temp+rename: losing this file to a torn write costs the user every pairing.
         write_atomic(&p, serde_json::to_string_pretty(self)?.as_bytes())?;
+        // The Omarchy menu mirrors this store (one connect row per host), and save() is the
+        // one door every mutation walks through — GTK pairing, the couch console, the CLI —
+        // so this is the whole of "the menu never goes stale". A no-op unless the operator
+        // opted in (`--omarchy-menu on`), which a scoped test HOME never has.
+        #[cfg(target_os = "linux")]
+        crate::omarchy_menu::sync_if_enabled();
         Ok(())
     }
 

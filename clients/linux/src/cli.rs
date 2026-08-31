@@ -272,6 +272,42 @@ fn probe_all(hosts: &[KnownHost]) -> Vec<bool> {
     )
 }
 
+/// `--omarchy-menu on|off|sync` — Punktfunk's rows in the Omarchy menu (Super+Space): a root
+/// submenu, open/console rows, and one connect row per saved host, kept in sync by every
+/// binary that changes the store. `on` is the consent step (mirroring `punktfunk-omarchy
+/// setup` on the host side); `off` removes exactly our block; `sync` rewrites it now.
+fn headless_omarchy_menu(verb: &str) -> glib::ExitCode {
+    use pf_client_core::omarchy_menu as menu;
+    let done = |msg: &str| {
+        println!("{msg}");
+        glib::ExitCode::SUCCESS
+    };
+    let failed = |e: String| {
+        eprintln!("omarchy-menu: {e}");
+        glib::ExitCode::FAILURE
+    };
+    match verb {
+        "on" => match menu::enable() {
+            Ok(()) => done("Punktfunk added to the Omarchy menu (Super+Space) — it follows your saved hosts from here"),
+            Err(e) => failed(e),
+        },
+        "off" => match menu::disable() {
+            Ok(()) => done("Punktfunk removed from the Omarchy menu"),
+            Err(e) => failed(e),
+        },
+        "sync" => {
+            if !menu::enabled() {
+                return done("not enabled — run `punktfunk-client --omarchy-menu on` first");
+            }
+            match menu::enable() {
+                Ok(()) => done("menu rows rewritten from the saved hosts"),
+                Err(e) => failed(e),
+            }
+        }
+        other => failed(format!("unknown verb {other:?} — use on, off or sync")),
+    }
+}
+
 /// `--list-hosts [--probe]` — the saved known-hosts store as JSON (the store the Decky plugin
 /// renders). With `--probe`, each host carries an `online` bool from a live reachability probe
 /// (mDNS-independent); without it, `online` is `null` (unknown — the caller falls back to its
@@ -572,6 +608,9 @@ fn headless_apply_update() -> glib::ExitCode {
 /// caller proceeds to launch the GTK app). Kept in one place so `arg_flag` stays private and the
 /// dispatch in `app.rs` is a single line.
 pub fn headless_host_command() -> Option<glib::ExitCode> {
+    if let Some(v) = arg_value("--omarchy-menu") {
+        return Some(headless_omarchy_menu(&v));
+    }
     if arg_flag("--list-hosts") {
         return Some(headless_list_hosts());
     }
