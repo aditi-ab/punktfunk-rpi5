@@ -67,6 +67,7 @@ That one command, each step idempotent and each one reversible:
 | **Firewall** | adds ufw rules scoped to your local networks (and `tailscale0` if you have it), each tagged `punktfunk-omarchy` so `remove` finds them again. |
 | **Browser trust** *(optional)* | trusts the console's certificate in Chromium (`~/.pki/nssdb`), so it opens with no security warning at all. |
 | **App menu** | installs "Punktfunk Console" as an Omarchy webapp — it appears in Apps (`Super`+`Space`) and opens already logged in, in its own window. |
+| **Bar widget** *(optional)* | the Punktfunk Quickshell widget in the bar — live status, pairing approvals and devices without opening the console. |
 | **Toasts** *(optional)* | pairing requests and stream start/stop as Omarchy notifications, with **Approve** / **Deny** buttons on the pairing one. |
 | **Idle** *(optional)* | keeps the screen awake for the length of a stream and restores your own setting afterwards. |
 | **Theme** *(optional)* | a `~/.config/omarchy/themed/` template so the console **and the Linux client** follow `omarchy-theme-set`. |
@@ -253,5 +254,5 @@ sudo pacman -R punktfunk-host punktfunk-web   # the packages
 ```
 
 `remove` reverses every step of `setup` — units, drop-in, ufw rules, the certificate trust, the
-webapp, the hooks, the theme template — and restores the screen-share picker. Your config and pairings survive both; see
+webapp, the bar widget, the hooks, the theme template — and restores the screen-share picker. Your config and pairings survive both; see
 [Uninstall](/docs/uninstall) to clear those too.

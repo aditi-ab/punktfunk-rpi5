@@ -415,6 +415,41 @@ remove_menu() {
   else rm -f "$tmp"; warn "could not remove the menu entries cleanly — edit $MENU_FILE by hand"; fi
 }
 
+# ── the bar widget (Quickshell plugin) ─────────────────────────────────────────────────────────
+#
+# The shell discovers third-party plugins in ~/.config/omarchy/plugins/<id> — the same place
+# `omarchy plugin add` clones into — so the package ships the files as data and this step copies
+# them there. Installing into /usr/share/omarchy/shell/plugins instead would drop unowned files
+# inside omarchy's own package: the exact "exists in filesystem" abort on its next upgrade.
+plugin_dest() { printf '%s/omarchy/plugins/punktfunk' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+
+setup_plugin() {
+  step "Bar widget"
+  [[ -d "$HOOKS_SRC/plugin" ]] || { warn "no plugin in $HOOKS_SRC — skipping"; return 0; }
+  ask "add the Punktfunk widget to the Omarchy bar (status, pairing, devices)?" || { warn "skipped"; return 0; }
+  local dest; dest="$(plugin_dest)"
+  mkdir -p "$dest"
+  install -m0644 -t "$dest" "$HOOKS_SRC"/plugin/manifest.json "$HOOKS_SRC"/plugin/*.qml \
+    "$HOOKS_SRC"/plugin/README.md
+  # `omarchy plugin enable` wires it into shell.json and reloads the shell. Outside a session
+  # shell it needs OMARCHY_PATH (measured on 4.0.1); the other omarchy tools here do not.
+  if OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}" omarchy plugin enable punktfunk >/dev/null 2>&1; then
+    ok "widget installed and enabled — the Punktfunk mark appears in the bar"
+  else
+    ok "widget installed to $dest"
+    warn "could not enable it automatically — run: omarchy plugin enable punktfunk"
+  fi
+}
+
+remove_plugin() {
+  local dest; dest="$(plugin_dest)"
+  # The manifest check keeps an rm -rf honest: only a directory that is actually our plugin goes.
+  [[ -d "$dest" ]] && grep -qs '"id": "punktfunk"' "$dest/manifest.json" || return 0
+  OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}" omarchy plugin disable punktfunk >/dev/null 2>&1 || true
+  rm -rf "$dest"
+  ok "bar widget removed"
+}
+
 # Hooks live in ~/.config/punktfunk/hooks.json — a LIST of {on, run} entries the host reads per
 # event (automation.md). We write that file only when the operator has none: merging JSON in bash
 # would need jq and, worse, would edit a document that is theirs. If they already have hooks, we
@@ -515,6 +550,7 @@ then run this again. See https://punktfunk.com/docs/omarchy"
   open_firewall
   setup_cert_trust
   setup_webapp
+  setup_plugin
   # Both opt-ins land in ONE hooks.json, so they are asked for first and written once — two passes
   # over the same file is how the second one ends up printing "you already have hooks.json".
   WANT_TOASTS=0; WANT_IDLE=0
@@ -554,6 +590,7 @@ cmd_remove() {
   else
     rm -f "$HOME/.local/share/applications/${WEBAPP// /}.desktop" 2>/dev/null || true
   fi
+  remove_plugin
   remove_menu
   # Hooks: only remove a hooks.json that is entirely OURS. A file the operator has since edited is
   # theirs — deleting it would take their webhooks with it — so we say what to remove instead.
