@@ -31,6 +31,38 @@ pub(crate) struct PeerCertFingerprint(pub Option<String>);
 #[derive(Clone, Copy)]
 pub(crate) struct PeerAddr(pub SocketAddr);
 
+/// Ceilings for the governed HTTP(S) acceptors (security-review 2026-08-31 M-6): without them a
+/// LAN peer holding sockets open — incomplete TLS handshakes, never-sent request headers, idle
+/// connections — exhausts file descriptors and memory with no authentication at all. Generous
+/// for real deployments: a console browser holds a handful of connections, a paired client a few.
+const MAX_CONNS: usize = 256;
+const MAX_CONNS_PER_IP: usize = 32;
+/// A LAN handshake completes in milliseconds; a peer still negotiating after this is holding a
+/// slot, not pairing.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Bounds reading each request's header block (the slowloris shape). Response streaming — the
+/// mgmt event stream — is unaffected; hyper re-arms this per request on a keep-alive connection.
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Decrements its IP's live-connection count on drop, so the per-IP ceiling tracks reality on
+/// every exit path (handshake failure, served connection, task cancellation).
+struct IpGuard(
+    Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    std::net::IpAddr,
+);
+
+impl Drop for IpGuard {
+    fn drop(&mut self) {
+        let mut m = self.0.lock().unwrap();
+        if let Some(n) = m.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.1);
+            }
+        }
+    }
+}
+
 /// HTTPS server that surfaces the verified client cert to handlers. `axum_server` can't expose the
 /// peer cert, so this runs the rustls handshake itself (tokio-rustls), reads the peer certificate,
 /// and serves the axum `Router` over hyper with the peer's fingerprint attached to every request as
@@ -40,59 +72,113 @@ pub(crate) async fn serve_https(
     app: Router,
     tls: Arc<ServerConfig>,
 ) -> Result<()> {
-    use tower::ServiceExt;
-    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    serve_governed(bind, app, Some(tls)).await
+}
+
+/// The same governed acceptor without TLS — the plain nvhttp listener (47989), which is pre-auth
+/// by protocol design and needs the identical connection ceilings (security-review 2026-08-31 M-6).
+pub(crate) async fn serve_plain(bind: SocketAddr, app: Router) -> Result<()> {
+    serve_governed(bind, app, None).await
+}
+
+async fn serve_governed(
+    bind: SocketAddr,
+    app: Router,
+    tls: Option<Arc<ServerConfig>>,
+) -> Result<()> {
+    let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
-        .with_context(|| format!("bind HTTPS {bind}"))?;
+        .with_context(|| format!("bind HTTP(S) {bind}"))?;
+    let conns = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
+    let per_ip: Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>> =
+        Arc::default();
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
                 // A persistent accept() error (fd exhaustion / EMFILE) would otherwise hot-spin
                 // this loop and storm the log; back off so a stuck accept can't burn a core.
-                tracing::warn!(error = %e, "HTTPS accept failed — backing off 100ms");
+                tracing::warn!(error = %e, "HTTP(S) accept failed — backing off 100ms");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
         };
+        // Refuse (drop the socket) rather than queue when a ceiling is hit: a well-behaved
+        // client retries, and queuing is exactly the unbounded buildup the ceiling exists to
+        // prevent. Both guards travel into the task so every exit path releases them.
+        let Ok(permit) = conns.clone().try_acquire_owned() else {
+            tracing::warn!(%peer, "HTTP(S) connection ceiling reached — dropping new connection");
+            continue;
+        };
+        let ip_guard = {
+            let mut m = per_ip.lock().unwrap();
+            let n = m.entry(peer.ip()).or_insert(0);
+            if *n >= MAX_CONNS_PER_IP {
+                tracing::warn!(%peer, "per-IP connection ceiling reached — dropping new connection");
+                continue;
+            }
+            *n += 1;
+            IpGuard(per_ip.clone(), peer.ip())
+        };
         let acceptor = acceptor.clone();
         let app = app.clone();
         tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(tcp).await {
-                Ok(s) => s,
-                // A failed handshake is routine (port scan, a browser bailing on the self-signed
-                // cert, a peer that hung up) — not fatal.
-                Err(_) => return,
-            };
-            // The verified peer cert (the verifier accepts any well-formed one; handlers authorize
-            // by fingerprint) → its SHA-256, matched against the paired store.
-            let fp = tls_stream
-                .get_ref()
-                .1
-                .peer_certificates()
-                .and_then(|c| c.first())
-                .map(|c| hex::encode(punktfunk_core::quic::endpoint::cert_fingerprint(c.as_ref())));
-            let fp = PeerCertFingerprint(fp);
-            let addr = PeerAddr(peer);
-            let svc =
-                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                    let app = app.clone();
-                    let fp = fp.clone();
-                    async move {
-                        let mut req = req.map(axum::body::Body::new);
-                        req.extensions_mut().insert(fp);
-                        req.extensions_mut().insert(addr);
-                        app.oneshot(req).await // Router error is Infallible
-                    }
-                });
-            let io = hyper_util::rt::TokioIo::new(tls_stream);
-            let _ =
-                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection_with_upgrades(io, svc)
-                    .await;
+            let _permit = permit;
+            let _ip_guard = ip_guard;
+            match &acceptor {
+                Some(acceptor) => {
+                    let tls_stream =
+                        match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp))
+                            .await
+                        {
+                            Ok(Ok(s)) => s,
+                            // A failed or dawdling handshake is routine (port scan, a browser bailing
+                            // on the self-signed cert, a peer that hung up) — not fatal.
+                            _ => return,
+                        };
+                    // The verified peer cert (the verifier accepts any well-formed one; handlers
+                    // authorize by fingerprint) → its SHA-256, matched against the paired store.
+                    let fp = tls_stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|c| c.first())
+                        .map(|c| {
+                            hex::encode(punktfunk_core::quic::endpoint::cert_fingerprint(
+                                c.as_ref(),
+                            ))
+                        });
+                    serve_conn(tls_stream, app, PeerCertFingerprint(fp), PeerAddr(peer)).await;
+                }
+                // Plain HTTP carries no client cert by construction — handlers see `None` and
+                // treat the peer as unpaired, exactly as before.
+                None => serve_conn(tcp, app, PeerCertFingerprint(None), PeerAddr(peer)).await,
+            }
         });
     }
+}
+
+async fn serve_conn<S>(stream: S, app: Router, fp: PeerCertFingerprint, addr: PeerAddr)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tower::ServiceExt;
+    let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let app = app.clone();
+        let fp = fp.clone();
+        async move {
+            let mut req = req.map(axum::body::Body::new);
+            req.extensions_mut().insert(fp);
+            req.extensions_mut().insert(addr);
+            app.oneshot(req).await // Router error is Infallible
+        }
+    });
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    builder.http1().header_read_timeout(HEADER_READ_TIMEOUT);
+    let _ = builder.serve_connection_with_upgrades(io, svc).await;
 }
 
 /// Requests the client cert and **verifies its `CertificateVerify` signature**, but does not

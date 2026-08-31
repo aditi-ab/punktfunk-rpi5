@@ -36,11 +36,12 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
     let https_addr = SocketAddr::from(([0, 0, 0, 0], HTTPS_PORT));
     tracing::info!(%http_addr, %https_addr, "nvhttp listening (serverinfo + pair + launch)");
 
-    let http = axum_server::bind(http_addr).serve(router(state.clone(), false).into_make_service());
-    // HTTPS runs the handshake itself (super::tls::serve_https) so handlers see the verified peer
-    // cert as a PeerCertFingerprint extension; the post-pair endpoints gate on the paired allow-list.
+    // Both listeners run the governed acceptor (connection ceilings + header deadlines;
+    // security-review 2026-08-31 M-6). HTTPS additionally runs the handshake itself so handlers
+    // see the verified peer cert as a PeerCertFingerprint extension; the post-pair endpoints
+    // gate on the paired allow-list.
     tokio::try_join!(
-        async { http.await.context("nvhttp HTTP server") },
+        super::tls::serve_plain(http_addr, router(state.clone(), false)),
         super::tls::serve_https(https_addr, router(state, true), tls),
     )?;
     Ok(())
