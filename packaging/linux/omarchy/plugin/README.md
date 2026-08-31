@@ -9,14 +9,14 @@ Omarchy bar, without opening a browser.
   - *Now* — what is streaming, Stop / End game.
   - *Pairing* — open a window, approve or deny the queue, type a Moonlight PIN.
   - *Devices* — both planes, access level, unpair on hover.
+  - *Displays* — pick the virtual-display preset, and read the policy it puts in force.
 - **service** — one long-lived event stream that drives both of the above and pops an Omarchy toast
   when a device asks to pair.
 
 ### Why tabs
 
 The sections stacked in one column outgrew the popup: the ones at the bottom were reachable only by
-growing the panel past the screen. Tabs make each subject's height independent, and leave room for
-the subjects still to come.
+growing the panel past the screen. Tabs make each subject's height independent.
 
 ## Install
 
@@ -50,14 +50,16 @@ re-snapshot rather than trust what it has.
 
 ## Status
 
-**Loaded and exercised on Omarchy 4.0.2** (Hyprland 0.56.2) on 2026-08-31: `omarchy plugin validate`
-passes, the shell loads it with no QML warnings, and every tab renders against a running host.
+**Loaded and exercised on Omarchy 4.0.2** (Hyprland 0.56.2) on 2026-08-31, over a live
+2414x1188@240 HEVC session: `omarchy plugin validate` passes, the shell loads it with no QML
+warnings, and every tab renders against a running host.
 
 ### What running it caught this time
 
 - **A missing `open: root.opened` on the `KeyboardPanel` failed in total silence.** No QML warning,
   no log line — the panel simply never created its layer surface, while the bar icon kept working.
   If a panel stops opening and nothing is logged, check that binding first.
+- **`displays` is always empty on Hyprland.** See *Displays* below.
 
 Three things the first on-glass run caught, all still true:
 
@@ -69,6 +71,19 @@ Three things the first on-glass run caught, all still true:
   `sh -c 'exec "$@"' sh …`, which does the lookup without re-quoting our argv.
 - **`parent.<property>` does not resolve inside `StdioCollector`.** Assign through an explicit `id`
   or the whole call chain silently returns nothing.
+
+### Displays: presets, and no live list
+
+The tab picks the virtual-display preset and shows the policy it puts in force. It deliberately does
+**not** list live virtual displays, because on this compositor there are never any to list: a
+wlroots capture arrives over a sandboxed portal handle the host cannot re-open per attach, so
+`vdisplay::registry` passes those displays through rather than owning them, and `/display/state`
+comes back empty. Measured here against a screen you can point at — a live 2414x1188@240 head,
+`displays: []`. A "live displays" section would have been a permanent "none".
+
+The same limit is why the tab says a display cannot outlive a disconnect under Hyprland: several
+preset summaries promise exactly that, and this compositor cannot deliver it. The other axes —
+topology, identity, mode-conflict, layout — do apply.
 
 ### Known limitation: one watcher per monitor
 

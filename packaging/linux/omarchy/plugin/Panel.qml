@@ -9,13 +9,13 @@ import qs.Ui
 // (`plugins/panels/*/Panel.qml`): a `Panel` root owning the open/close lifecycle, a
 // `BarIconButton` for the bar, a `KeyboardPanel` for the popup, and a local service child.
 //
-// The daily 95 %: what is streaming, who is asking to pair, and which devices are trusted. The web
-// console stays the deep surface — the full access matrix, settings, logs and the game library are
-// one click away and deliberately not duplicated here.
+// The daily 95 %: what is streaming, who is asking to pair, which devices are trusted, and how the
+// virtual displays behave. The web console stays the deep surface — the full access matrix,
+// settings, logs and the game library are one click away and deliberately not duplicated here.
 //
 // **Why tabs.** The sections stacked in one column were taller than the popup could show, so the
 // ones at the bottom were reachable only by growing the panel past the screen. Tabs make each
-// subject's height independent, and leave room for the subjects still to come.
+// subject's height independent.
 Panel {
   id: root
   moduleName: "punktfunk"
@@ -52,6 +52,10 @@ Panel {
     return s.length > 10 ? "…" + s.slice(-10) : (s || "—")
   }
 
+  // kbps is what the encoder publishes; Mbps is what an operator reads. One decimal: the adaptive
+  // bitrate moves in steps far larger than 0.1 Mbps, so more digits would only ever be noise.
+  function mbps(kbps) { return (Number(kbps || 0) / 1000).toFixed(1) }
+
   Service {
     id: service
     toasts: root.setting("toasts", true)
@@ -65,7 +69,17 @@ Panel {
     if (root.needsYou) root.tab = "pairing"
     service.refresh()
     service.refreshClients()
+    root.syncTab()
   }
+
+  // A tab pays for its own data on arrival rather than every tab paying at open. `ctl` is one
+  // process per call, so refreshing all of them would fan out spawns for the one pane on screen.
+  function syncTab() {
+    if (!opened) return
+    if (root.tab === "displays") service.refreshDisplays()
+  }
+
+  onTabChanged: root.syncTab()
 
   BarIconButton {
     id: button
@@ -187,7 +201,7 @@ Panel {
       Timer {
         id: settle
         interval: 1500
-        onTriggered: { service.refresh(); service.refreshClients() }
+        onTriggered: { service.refresh(); service.refreshClients(); root.syncTab() }
       }
 
       // ── the one banner worth interrupting for ──────────────────────────────────────────────
@@ -215,7 +229,8 @@ Panel {
           // The count rides the label so the badge on the bar icon has somewhere to land.
           { value: "pairing",
             label: service.pending > 0 ? "Pairing · " + service.pending : "Pairing" },
-          { value: "devices", label: "Devices" }
+          { value: "devices", label: "Devices" },
+          { value: "displays", label: "Displays" }
         ]
         value: root.tab
         // Bar-widget panels drive their own cursor and never hand Tab focus to a ButtonGroup (the
@@ -497,6 +512,120 @@ Panel {
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           text: "Renaming and the full access matrix live in the console."
+        }
+      }
+
+      // ── DISPLAYS ───────────────────────────────────────────────────────────────────────────
+      // The preset picker and the policy it puts in force. NOT a list of live virtual displays:
+      // on wlroots the capture arrives over a sandboxed xdp portal fd, which the host cannot
+      // re-open per attach, so `vdisplay::registry` passes those displays through instead of
+      // owning them (its own module docs say so) and `/display/state` is structurally empty on
+      // every Omarchy box. Measured on glass: a live 2414x1188@240 head, `displays: []`. A "live
+      // displays" list here would be a permanent "none" beside a screen you can point at.
+      ColumnLayout {
+        id: displaysTab
+        Layout.fillWidth: true
+        spacing: Style.spacing.sm
+        visible: root.tab === "displays"
+
+        // Built-ins and the operator's saved presets share one id space (that is what lets
+        // `ctl display preset <id>` take either), so they render as one list. `name` is the saved
+        // ones' label; `summary` is the built-ins'.
+        readonly property var allPresets: service.displayPresets.concat(service.customPresets)
+
+        Text {
+          visible: displaysTab.allPresets.length === 0
+          Layout.fillWidth: true
+          wrapMode: Text.Wrap
+          text: service.state === "stopped"
+                  ? "The host is not running."
+                  : "This host reports no display presets."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        Repeater {
+          model: displaysTab.allPresets
+          Item {
+            id: presetRow
+            Layout.fillWidth: true
+            implicitHeight: presetCols.implicitHeight
+            // A saved preset is stored as a `custom` policy carrying its fields, so the stored
+            // preset id can never equal a saved one's — only the built-ins can be ticked. Ticking
+            // nothing beats ticking the wrong row; the "In force" line below covers that case.
+            readonly property bool current: service.displayPreset === modelData.id
+            HoverHandler { id: presetHover }
+            TapHandler { onTapped: service.setDisplayPreset(modelData.id) }
+            RowLayout {
+              id: presetCols
+              anchors.left: parent.left
+              anchors.right: parent.right
+              spacing: Style.spacing.sm
+              Text {
+                text: presetRow.current ? "󰄬" : " "
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+              ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 0
+                Text {
+                  Layout.fillWidth: true
+                  text: modelData.name || modelData.id
+                  color: presetRow.current || presetHover.hovered ? root.foreground : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  elide: Text.ElideRight
+                }
+                Text {
+                  Layout.fillWidth: true
+                  visible: text.length > 0
+                  text: modelData.summary || (modelData.fields ? "Saved preset." : "")
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.Wrap
+                }
+              }
+            }
+          }
+        }
+
+        PanelSeparator { Layout.fillWidth: true; visible: displaysTab.allPresets.length > 0 }
+
+        // What is actually in force, spelled out. The stored policy reads `custom` whenever a
+        // saved preset or a hand-edited console policy is the one ruling, and then no row above is
+        // ticked — this line is the only thing that answers "so what is it doing right now?".
+        Text {
+          visible: displaysTab.allPresets.length > 0 && text.length > 0
+          Layout.fillWidth: true
+          wrapMode: Text.Wrap
+          text: {
+            var e = service.displayEffective || {}
+            if (!e.topology) return ""
+            return "In force: " + e.topology + " topology · " + e.identity + " identity · "
+                 + e.mode_conflict + " on a mode clash · up to " + e.max_displays + " displays."
+          }
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        // Said once, here, because several preset summaries promise it and this compositor cannot
+        // deliver it: a wlroots portal capture cannot be re-opened per attach, so the display goes
+        // with the session whatever the preset's lifecycle says.
+        Text {
+          visible: displaysTab.allPresets.length > 0
+          Layout.fillWidth: true
+          wrapMode: Text.Wrap
+          text: "A display that outlives a disconnect needs a compositor whose capture survives "
+              + "one. Under Hyprland the capture is a portal handle, so the display is torn down "
+              + "with the session whichever preset is picked."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
         }
       }
 

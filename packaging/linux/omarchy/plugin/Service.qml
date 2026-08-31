@@ -32,6 +32,16 @@ Item {
   property var gamestreamClients: []
   property var games: []
 
+  // ── displays ─────────────────────────────────────────────────────────────────────────────────
+  // The stored policy's preset id, the resolved policy it expands to, and the two preset
+  // catalogues (built-in and saved presets share one id space). Deliberately NOT the live display
+  // list `ctl display` also carries: on wlroots the registry passes displays through rather than
+  // owning them, so that list is always empty here — see the Panel's DISPLAYS section.
+  property string displayPreset: ""
+  property var displayEffective: ({})
+  property var displayPresets: []
+  property var customPresets: []
+
   // A certificate mismatch is NOT "the host is down": something that is not our host answered on
   // the management port, and ctl refused to send the token. Surfaced separately so the panel can
   // say so instead of showing a plausible-looking "not running".
@@ -148,6 +158,22 @@ Item {
     })
   }
 
+  function refreshDisplays() {
+    run(["display"], function (data, err) {
+      if (err || !data) return
+      root.displayPreset = (data.settings && data.settings.preset) || ""
+      root.displayEffective = data.effective || {}
+      root.displayPresets = data.presets || []
+      root.customPresets = data.custom_presets || []
+    })
+  }
+
+  // Re-reads afterwards rather than assuming: the host validates and clamps the policy it stores,
+  // so what came back is the only trustworthy answer to "what is in force now".
+  function setDisplayPreset(id) {
+    run(["display", "preset", id], function () { root.refreshDisplays() })
+  }
+
   // ── the event stream ─────────────────────────────────────────────────────────────────────────
   Process {
     id: watcher
@@ -186,7 +212,9 @@ Item {
     var ev
     try { ev = JSON.parse(line) } catch (e) { return }
 
-    if (ev.kind === "ctl.resync") { refresh(); refreshClients(); return }
+    // The display policy is not evented — it only changes when a person edits it, here or in the
+    // console — so a resync re-reads it and the Displays tab re-reads it on arrival. Nothing polls.
+    if (ev.kind === "ctl.resync") { refresh(); refreshClients(); refreshDisplays(); return }
     if (ev.kind === "ctl.disconnected") { root.state = "stopped"; return }
 
     if (ev.kind === "pairing.pending") {
