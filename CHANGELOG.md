@@ -17,6 +17,40 @@ as they are. See `docs/writing.md` §2.
 
 ---
 
+## Unreleased
+
+The guided Linux installer is now a binary. Wire and C ABI unchanged.
+
+### Breaking
+
+- **`--yes` joins the `punktfunk` group on every box.** It used to do that only on Bazzite and
+  Nobara. The group grants usbip attach, so a fleet script that installs unattended on desktops
+  now grants it there too — pass `--no-punktfunk-group`, or set
+  `PUNKTFUNK_INSTALL_PUNKTFUNK_GROUP=0`, to keep the old behaviour.
+- **`scripts/install.sh` is a download stub.** It checks the architecture, fetches
+  `punktfunk-setup` from the generic package registry, verifies its sha256 and execs it; the
+  installer logic lives in `crates/punktfunk-setup`. Anything that vendored or sourced the old
+  789-line body must call the published binary instead.
+
+### Added
+
+- **`--host` / `--client` choose what to install.** `--client` installs `punktfunk-client` from
+  the family repo, or a user-scope flatpak where the family has none, so a distro with no
+  punktfunk repo can run the client.
+- **`--demo <preset>` walks the whole flow against a canned machine.** It changes nothing —
+  the plan is handed a runner that cannot spawn and a throwaway filesystem root.
+- **`PUNKTFUNK_INSTALL_OMARCHY_SETUP`** is the env twin for the Omarchy hand-off, which
+  previously could only be answered interactively. `PUNKTFUNK_SETUP_BIN` overrides the stub's
+  download with a local binary.
+
+### Changed
+
+- **The install commands are generated from `data/platforms.json`.** They were copied beside it
+  and kept in step by a CI substring check; the binary embeds the file, so the docs and the
+  installer cannot drift. Nothing to do.
+
+---
+
 ## v0.34.0
 
 140 commits since v0.33.0. Wire stays 2. **C ABI moves 26 → 28, and v27 widens a struct.**
