@@ -101,6 +101,9 @@ Source: "{#LayoutDir}\punktfunk.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#LayoutDir}\Microsoft.WindowsAppRuntime.Bootstrap.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#LayoutDir}\SDL3.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#LayoutDir}\resources.pri"; DestDir: "{app}"; Flags: ignoreversion
+; The Lucide icon font — app/lucide.rs loads ms-appx:///Assets/lucide.ttf, which resolves to
+; the install directory when unpackaged. Without it every shell icon is a private-use box.
+Source: "{#LayoutDir}\Assets\lucide.ttf"; DestDir: "{app}\Assets"; Flags: ignoreversion
 ; MIT/Apache + the client-scoped THIRD-PARTY-NOTICES — same payload the MSIX carries.
 Source: "{#LayoutDir}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion
 
