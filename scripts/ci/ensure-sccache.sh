@@ -23,8 +23,53 @@ set -e
 # (sccache's cache keys are not versioned across incompatible releases).
 SCCACHE_VERSION="${SCCACHE_VERSION:-0.10.0}"
 
+# Fork PRs do not receive SCCACHE_* secrets. CMake stores the launcher name
+# `sccache` in the build dir (and in a restored target/ cache), so the name has
+# to keep resolving — shadow it with a passthrough shim earlier on PATH. Never
+# overwrite the installed binary: the macOS runner is a persistent host, and a
+# clobbered binary stays broken for every job that follows this one.
+disable_sccache_wrappers() {
+    shim_dir="${RUNNER_TEMP:-$(mktemp -d)}/sccache-passthrough"
+    mkdir -p "$shim_dir"
+    printf '%s\n' \
+        '#!/bin/sh' \
+        'case "$1" in' \
+        '--version|--show-stats|--start-server|--stop-server) exit 0 ;;' \
+        'esac' \
+        'exec "$@"' > "$shim_dir/sccache"
+    chmod 0755 "$shim_dir/sccache"
+    PATH="$shim_dir:$PATH"
+    export PATH
+    if [ -n "${GITHUB_PATH:-}" ]; then
+        echo "$shim_dir" >> "$GITHUB_PATH"
+    fi
+    echo "sccache shimmed to a compiler passthrough at $shim_dir"
+}
+
+probe_sccache() {
+    [ "${RUSTC_WRAPPER:-}" = "sccache" ] || return 0
+    if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+        echo "sccache secrets absent; compiler passthrough"
+        disable_sccache_wrappers
+        return 0
+    fi
+    # --show-stats reaches a running server or starts one. --start-server fails
+    # on the server a previous job left behind (persistent macOS runner) and
+    # would read a healthy cache as broken storage.
+    probe_log=$(mktemp)
+    if sccache --show-stats >"$probe_log" 2>&1; then
+        rm -f "$probe_log"
+        return 0
+    fi
+    echo "sccache storage is not usable; compiler passthrough"
+    cat "$probe_log" >&2 || true
+    rm -f "$probe_log"
+    disable_sccache_wrappers
+}
+
 if command -v sccache >/dev/null 2>&1; then
     sccache --version
+    probe_sccache
     exit 0
 fi
 
@@ -86,3 +131,4 @@ case "$(uname -s)" in
 esac
 
 sccache --version
+probe_sccache

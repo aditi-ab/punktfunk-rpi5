@@ -443,8 +443,10 @@ jobs:
       # oven/bun ships neither git nor a real node, and the slim base has no CA bundle —
       # actions/checkout needs all three (see the web job).
       - name: Install git + node + CA certs
-        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git nodejs
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git nodejs python3
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       # OpenAPI snapshot in sync, PUNKTFUNK_* vars in docs still exist, undocumented-var
       # ratchet (baseline: scripts/ci/docs-undocumented-env-baseline.txt), host-cli.md commands
       # still exist, data/platforms.json parses.
@@ -454,3 +456,14 @@ jobs:
       # the repo's markdown. External URLs and #anchors are deliberately not checked.
       - name: Docs link check
         run: sh scripts/ci/check-docs-links.sh
+      # Newest CHANGELOG section ≤160 lines; touched Rust comments fail at 6 (`//`) / 24
+      # (`//!`/`///`). Self-test plants both failures before the live tree is checked.
+      - name: Writing-style gates
+        env:
+          WRITING_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "${WRITING_BASE:-}" ]; then
+            git fetch --depth=1 origin "$WRITING_BASE" 2>/dev/null || true
+          fi
+          sh scripts/ci/check-writing.sh --self-test
+          sh scripts/ci/check-writing.sh

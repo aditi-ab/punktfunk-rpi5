@@ -19,200 +19,96 @@ as they are. See `docs/writing.md` §2.
 
 ## v0.34.0
 
-140 commits since v0.33.0. Wire stays 2. **C ABI moves 26 → 28, and v27 WIDENS a struct** — an
-out-of-tree embedder must recompile, not just relink.
-Embedders: read **Breaking**. Detail: `design/touch-client-overlay.md`.
+140 commits since v0.33.0. Wire stays 2. **C ABI moves 26 → 28, and v27 widens a struct.**
+Out-of-tree embedders must recompile. Read **Breaking**. Detail: `design/touch-client-overlay.md`.
 
 ### Versions
 
 | | v0.33.0 | v0.34.0 | Notes |
 |---|---|---|---|
-| Wire protocol | 2 | **2** | unchanged. `HOST_CAP2_TOUCH` (`0x02`) joins the trailing `Welcome::host_caps2` byte (absent → `0`); the two raw-HID datagram forms already shipped with the Linux passthrough |
-| C ABI | 26 | **28** | **MOVES TWICE.** v27 = raw-HID passthrough over the C surface, and it **widens `PunktfunkHidOutput` 19 → 85 bytes** — Breaking. v28 = `punktfunk_connection_host_caps2` + `PUNKTFUNK_HOST_CAP2_TOUCH`, purely additive |
-| Rust edition | 2024 | **2024** | unchanged |
-| MSRV (`rust-version`) | 1.85 | **1.85** | unchanged |
-| Workspace crate dirs | 27 | **27** | unchanged (39 `[workspace] members`, also unchanged) |
-| Virtual-display driver protocol | 6 | **6** | unchanged (minimum accepted still 3). `pf-driver-proto` gains the Triton tables and the frame-statistics call, neither of which is a protocol event |
-| Windows virtual-gamepad channel | 3 | **3** | unchanged, but it carries two additions: `DEVTYPE_TRITON` = **7** (the next free slot) and `OUT_FEATURE_BIT` (`0x8000_0000`) on the out-length word, read only by the Triton devtype |
-| Plugin index schema | 1 | **1** | unchanged |
-| Host event schema | 1 | **1** | unchanged (`punktfunk-host/src/events.rs` shows no diff) |
-| `api/openapi.json` | 0.33.0 | **0.34.0** | **regenerated, and the surface is verified rather than assumed.** No path, operation or schema moved; the only non-stamp diff is the `disable_physical_monitors` description, rewritten because the second selector it documented now runs by default (see `standby_sink_neutralise` under **Changed**). ⭐ The staleness test that proves this — `mgmt::tests::openapi_document_is_complete_and_checked_in`, which normalises `info.version` so a bump alone cannot trip it — **now runs on macOS**, because `punktfunk-host` compiles there again. Every prior release carried a "re-stamped, not regenerated" caveat for exactly that reason; this one does not. `api/` and `docs-site/public/` are byte-identical to each other |
-| gamescope patch level (`+pfhdrN`) | 8 | **8** | unchanged; no new patch files, `packaging/gamescope/PKGBUILD` still declares `pfhdr8` |
-| `@punktfunk/host` (SDK) | 0.1.6 | **0.1.6** | unchanged; nothing under `sdk/` moved |
-| `@punktfunk/plugin-kit` | 0.4.4 | **0.4.4** | unchanged; nothing under `plugin-kit/` moved |
+| Wire protocol | 2 | **2** | Additive: `HOST_CAP2_TOUCH` (`0x02`) on `Welcome::host_caps2` |
+| C ABI | 26 | **28** | v27 widens `PunktfunkHidOutput` 19 → 85 bytes — Breaking. v28 additive |
+| Rust edition | 2024 | **2024** | |
+| MSRV (`rust-version`) | 1.85 | **1.85** | |
+| Workspace crate dirs | 27 | **27** | |
+| Virtual-display driver protocol | 6 | **6** | Additive Triton tables and frame-statistics call |
+| Windows virtual-gamepad channel | 3 | **3** | Additive: `DEVTYPE_TRITON` = 7; `OUT_FEATURE_BIT` |
+| Plugin index schema | 1 | **1** | |
+| Host event schema | 1 | **1** | |
+| `api/openapi.json` | 0.33.0 | **0.34.0** | Regenerated; no path moved. Completeness test now runs on macOS |
+| gamescope patch level (`+pfhdrN`) | 8 | **8** | |
+| `@punktfunk/host` (SDK) | 0.1.6 | **0.1.6** | |
+| `@punktfunk/plugin-kit` | 0.4.4 | **0.4.4** | |
 
 ### Breaking
 
-- **`PunktfunkHidOutput` grows 19 → 85 bytes (ABI v27).** The pre-v27 prefix layout is
-  byte-identical and the tail is appended (`hid_kind`, `raw_len`, `raw[PUNKTFUNK_HID_REPORT_MAX]`),
-  so a binary built against a v26 header passes a 19-byte out-slot that a v28 core overruns.
-  **`punktfunk_abi_version()` equality is the guard** and always has been: recompile against the
-  regenerated header. This is the first deliberate widening this surface has made — a second struct
-  plus a second pull symbol was considered and rejected, because the hidout plane has one puller by
-  contract and forking its drain loop would push that fork into every embedder forever.
-- **`punktfunk_connection_next_hidout` now returns events it used to skip.** `HidOutput::HidRaw`
-  previously fell out as `NoFrame`; it now surfaces as `PUNKTFUNK_HIDOUT_HID_RAW`. A puller that
-  assumed every event was DualSense feedback must switch on `kind` and ignore the kinds it does not
-  serve. Only an as-is Steam Controller 2 session emits these, so a client with no such capture sees
-  no change in practice.
+- **`PunktfunkHidOutput` is 85 bytes, was 19 (ABI v27).** Prefix is byte-identical; the tail is
+  `hid_kind`, `raw_len`, `raw[PUNKTFUNK_HID_REPORT_MAX]`. A v26 binary overruns. Recompile against
+  the regenerated header; `punktfunk_abi_version()` equality is the guard.
+- **`punktfunk_connection_next_hidout` returns `PUNKTFUNK_HIDOUT_HID_RAW`.** That event used to
+  surface as `NoFrame`. Switch on `kind` and ignore kinds you do not serve.
 
 ### Added
 
-- **Raw HID passthrough over the C ABI (v27).** `punktfunk_connection_send_hid_report` sends one
-  captured report up as `RichInput::HidReport` (`[0xCC][0x04]`, clamped to
-  `PUNKTFUNK_HID_REPORT_MAX` and masked into the 16-pad space); `PUNKTFUNK_HIDOUT_HID_RAW` (`6`)
-  brings the host's hidraw writes back down, tagged `PUNKTFUNK_HID_RAW_OUTPUT` or
-  `PUNKTFUNK_HID_RAW_FEATURE` so the client knows which device channel replays it. New wire
-  constants `PUNKTFUNK_RICH_HID_REPORT` (`4`) exist so client tests can pin the byte against the
-  header. Both datagram forms predate this release; what is new is that a C embedder can reach them.
-- **`punktfunk_connection_host_caps2` and `PUNKTFUNK_HOST_CAP2_TOUCH` (`0x02`) (v28).** The second
-  capability byte was unreadable from C. A client whose touch model is passthrough gates on the bit
-  and falls back to its cursor model with a notice, because a host without it drops every contact
-  silently. Linux sets it on the libei, gamescope-EIS and KWin backends; the wlroots virtual-pointer
-  backend has no touch protocol, and Windows below build 1809 cannot create a `PT_TOUCH` device.
-- **`DEVTYPE_TRITON` (`7`) and the shared Steam Controller 2 wire tables** in `pf-driver-proto`:
-  the `0x83` attributes reply, `0x8010`/`0x603D`-style report-length maps, `ID_GET_FIRMWARE_INFO`
-  (`0xF2`) and `ID_OUT_REPORT_HAPTIC_RUMBLE` (`0x80`). `OUT_FEATURE_BIT` (`0x8000_0000`) rides the
-  out-length word to separate a FEATURE report from an OUTPUT one; every other devtype writes plain
-  lengths, so the bit is additive.
-- **`pf_triton`, the eighth hardware id in the `pf_gamepad` driver package** (Windows). It installs
-  under the existing `pfGamepad` section — never `pfGamepadXbox`, which attaches the `xinputhid` bus
-  filter — and presents as *Punktfunk Virtual Steam Controller*. **Packager- and operator-visible:**
-  an existing install carries the seven-id package, so the Windows SC2 backend does nothing until
-  the package is reinstalled with `punktfunk-host.exe driver install --gamepad`.
+- **Raw HID over the C ABI (v27).** `punktfunk_connection_send_hid_report` sends one report as
+  `RichInput::HidReport`; `PUNKTFUNK_HIDOUT_HID_RAW` (`6`) returns host hidraw writes tagged
+  `PUNKTFUNK_HID_RAW_OUTPUT` or `PUNKTFUNK_HID_RAW_FEATURE`. `PUNKTFUNK_RICH_HID_REPORT` (`4`)
+  pins the wire byte. The datagrams already existed; C embedders can reach them.
+- **`punktfunk_connection_host_caps2` and `PUNKTFUNK_HOST_CAP2_TOUCH` (`0x02`) (v28).** A
+  passthrough-touch client gates on the bit and falls back to cursor otherwise. Linux sets it on
+  libei, gamescope-EIS and KWin; wlroots virtual-pointer and Windows < 1809 cannot.
+- **`DEVTYPE_TRITON` (`7`) and the Steam Controller 2 wire tables** in `pf-driver-proto`.
+  `OUT_FEATURE_BIT` (`0x8000_0000`) on the out-length word marks FEATURE vs OUTPUT.
+- **`pf_triton`, eighth hardware id in the `pf_gamepad` package** (Windows). Installs under
+  `pfGamepad`, never `pfGamepadXbox`. Reinstall with `punktfunk-host.exe driver install --gamepad`
+  or the SC2 backend does nothing.
 - **`PUNKTFUNK_STANDBY_SINK_KEEP`.** Set to anything but `0`/`off` to leave a connected-but-inactive
-  external sink powered while streaming. See **Changed** for why the default flipped.
-- **`overlay_actions`, a first-class client profile field** carrying the whole quick-action ring as
-  one versioned JSON blob (`{"v":2, "ring":[…six slots…], "shortcuts":[…], "pad":{…}}`). It
-  overrides and clears as one unit rather than per key, because a partially-applied ring is not a
-  state any client should have to render. `sc2_capture` joins it as an ordinary boolean.
-- **Frame statistics reported to the OS** from the vdisplay driver (`pf-vdisplay`), plus commit-mode
-  flag logging and a frame witness in the driver's swap-chain processor — the case-#4 A/B
-  instrumentation, on by default and cheap.
-- **A `pairing.pending` toast anywhere in the web console**, hung off the event frame that was
-  already arriving. The same event now also invalidates the pending list, which it did not: it
-  refreshed the status card and the pairing status and left the list an operator actually waits on
-  to its own 10 s timer.
-- **`punktfunk-host` compiles on macOS again, and CI keeps it that way.** Eleven errors across six
-  files, none of them missing functionality — every one a call site or dependency that assumed
-  Linux-or-Windows without saying so, grown from 9 to 11 in four weeks with nobody working on macOS.
-  `gamelease` reaching past `procscan`'s platform-neutral wrappers to `Scanner::system()` now goes
-  through a new `procscan::alive`, restoring that module's documented boundary. A new job checks the
-  compile, which is what stops the count climbing again.
-- **`pf-vkdecode` diffs a field capture against ffmpeg frame by frame**, decoding to per-frame
-  hashes and reporting which field access units needed concealment. One lock-proving helper replaces
-  six `set_var` copies.
+  external sink powered while streaming. See **Changed**.
+- **`overlay_actions` client profile field.** One versioned JSON blob for the quick-action ring;
+  override and clear are atomic. `sc2_capture` joins as a boolean.
+- **Frame statistics** from `pf-vdisplay` to the OS, plus commit-mode flag logging.
+- **`pairing.pending` toast** in the web console. The event now also invalidates the pending list.
+- **`punktfunk-host` compiles on macOS.** `gamelease` goes through `procscan::alive`. CI keeps it.
+- **`pf-vkdecode` diffs a field capture against ffmpeg** per frame, including concealment.
 
 ### Changed
 
-- **A connected-but-inactive external sink is disabled for the stream's duration, by default**
-  (Windows). A standby TV left on HDMI keeps Windows composing for a head nobody watches. On the lab
-  box the default cut the median compose hole from **6.3 s to 0.7 s over 16 alternating runs**. It
-  is an improvement, not a cure — some holes survive it. Only externals belonging to no topology are
-  ever picked, so laptop panels and active monitors stay untouched; `PUNKTFUNK_STANDBY_SINK_KEEP`
-  restores the old behaviour for a capture card or an AVR passthrough.
-- **A host power action releases its virtual displays first.** Sleep, restart and shutdown tore down
-  the session but left the display standing, so a wake resumed onto a display built for whoever put
-  the machine to sleep. A display pinned to keep-alive **Forever** is still kept deliberately — that
-  pin is what holds a gamescope game across disconnects.
+- **Windows disables a connected-but-inactive external sink for the stream, by default.** Laptop
+  panels and active monitors stay up. `PUNKTFUNK_STANDBY_SINK_KEEP` restores the old behaviour.
+- **A host power action releases its virtual displays first.** A display pinned **Forever** is
+  still kept, so a gamescope game survives disconnects.
 - **The Windows host supervises its status tray for the host's whole lifetime**, gated on the HKLM
-  `Run` value the trayicon task writes. The previous remedy covered console-initiated updates only,
-  and only when the outgoing binary had recorded the intent, so winget, a hand-run setup and a plain
-  crash all left the box iconless until the next sign-in. `spawn_in_active_session` now asks to
-  break away from the service worker's job object; without that, every process it launched — the
-  tray, the user's game, a hook — was reaped when the service stopped, contradicting its own
-  documented contract. The tray menu's **Exit** now stops the host and says so; a sign-out and the
-  uninstaller's `--quit` still leave a headless host running.
-- **`scripts/install.sh` asks about intent, not internals.** Its four questions became full
-  controller support, third-party Moonlight clients, clipboard and start-at-boot, and the defaults
-  are derived from the box: Bazzite and Nobara join the `punktfunk` group and linger, an active
-  Sunshine or Apollo host opts into Moonlight compat, a seatless SSH session lingers, clipboard
-  stays off. `scripts/ci/check-install-defaults.sh` is the new gate holding the script and the
-  per-system docs pages together. *(luxus, #439.)*
-- **The access chip is drawn only with the stats overlay** in the presenter, Apple and Android. It
-  previously stood for the whole of any limited session at every stats tier including off, which
-  reads as distraction rather than information. Expiry toasts stay at every tier, because they
-  announce a change rather than describe a state. tvOS already stated it inside the stats HUD.
-- **One Lucide icon set every Rust shell draws from.** The console drew Lucide marks first, but its
-  path table was private to `pf-console-ui` and its slot-to-icon map lived in `ring.rs`, so the two
-  desktop editors configuring the same ring could reach neither and drew words instead — three
-  shells, three vocabularies for one ring. Both tables move down into `pf-client-core`, derived from
-  masters in `assets/lucide` so a mark cannot drift between shells; a slot now hands out a **name**
-  that `by_name` resolves, rather than an alias per slot. No font ships and no dependency lands:
-  `scripts/gen-lucide-icons.py` folds each 24×24 source SVG into one path string (absolutising a
-  leading relative `m`, since concatenation would re-anchor it), which Skia's own parser strokes at
-  Lucide's native width 2. Lucide v0.462.0, ISC — `LUCIDE-LICENSE` is vendored and
-  `scripts/gen-third-party-notices.py` picks it up.
+  `Run` value. Tray **Exit** stops the host; sign-out and `--quit` still leave a headless host.
+- **`scripts/install.sh` asks about intent, not internals.** Defaults come from the box (group,
+  linger, Moonlight compat, clipboard). `scripts/ci/check-install-defaults.sh` holds the docs.
+- **The access chip is drawn only with the stats overlay** (presenter, Apple, Android). Expiry
+  toasts stay at every tier.
+- **One Lucide icon set** in `pf-client-core`, generated from `assets/lucide`. `LUCIDE-LICENSE`
+  is vendored.
 
 ### Fixed
 
-- **A refused swapchain costs fullscreen, not the session** (Windows presenter). A
-  `recreate_swapchain` failure in the resize handler propagated out of `run_session` and ended the
-  stream, after which the shell reported a live session as *"Couldn't connect"* — which is how F11
-  quit the session on the drivers that refuse a fullscreen-sized swapchain. It now warns, drops back
-  to windowed, and rebuilds against the geometry that was already working. A windowed failure still
-  propagates, because there is no smaller state to fall back to. Present-wait is drained before the
-  old swapchain is reused.
-- **Stage 4 relinks when the display link stops vending** (Apple). Field, iPad Pro on iOS 27: the
-  picture froze twice in one session while audio and input kept running, and only reconnecting
-  cleared it — decode ran at full rate against `ok=0`, `noDrawable=120` and no `vendLeadMs` samples
-  at all, so `CAMetalDisplayLink` had stopped calling back. Stage 4 has no drawable source of its
-  own, and stage 3's `PresentGate.staleAfter` insurance does not reach this path. The render thread
-  now retires the link generation past 250 ms without a vend while frames are still decoding, which
-  also covers an exhausted drawable pool. Logged to the send-logs ring.
-- **Switch Pro SPI-flash reads are served by range, not by exact (address, length) pair.** Both
-  sticks on a virtual Switch Pro sat in the top-right corner under Steam, centring only at full
-  down-left, while buttons, motion and the kernel's own evdev node were correct throughout. Steam
-  uses SDL's HIDAPI driver, not `hid-nintendo`, and it reads the same calibration as 18 bytes at
-  `0x603D` and 22 at `0x8010` — neither pair matched, so both fell to the zero-fill path, which
-  echoes the requested address, so SDL accepted the reply and parsed a zeroed calibration. A zero
-  centre is never subtracted, leaving every raw axis positive. Reads now come from a modelled flash
-  image; what `hid-nintendo` receives is byte-identical, and the caller loses its zero-fill fallback.
-- **Steam Input's touch-as-mouse no longer walks the host cursor on a Deck in Gaming Mode.** Steam
-  owns the touchscreen there and replays it as a mouse whose "relative" deltas are absolute
-  positions — a field capture read 0 finger events against 341 mouse motions of 300 to 450 px, each
-  of which walked the locked cursor further into a corner, and with no fingers reaching SDL all
-  three touch models were dead together. `SDL_TOUCH_MOUSE_EVENTS=0` never reached them because the
-  events are Steam's, not SDL's. `SteamTouchMouse` recognises the shape and the presenter drops
-  those motions, raising the session notice once.
-- **Touch on the letterbox bars reaches the gesture engine** (Android), **two-finger scrolling
-  honours invert-scroll**, **scroll requires exactly two fingers rather than two or more**, and
-  **long-press-to-drag works on every touch engine** rather than only some.
-- **The flatpak stopped claiming Gaming Mode on every desktop.** `cli::fullscreen_mode()` read
-  `GAMESCOPE_WAYLAND_DISPLAY` as proof of a Deck session, and our own
-  `packaging/flatpak/io.unom.Punktfunk.yml` exports `GAMESCOPE_WAYLAND_DISPLAY=gamescope-0`
-  unconditionally, because the vendored gamescope WSI layer reads that variable and nothing else to
-  decide whether to negotiate HDR10 (`e1adc5d6`, shipped in v0.25.0). Inside the sandbox it was
-  therefore set on every launch on every desktop — reproduced on plain GNOME with no Deck, no
-  gamescope process and no socket. The flatpak is the main Linux channel, so this reached most
-  Linux users.
-- **`--custom-refresh-rates` reaches a SteamOS-style session.** The two `gamescope-session-plus`
-  paths hand the set to the script as `CUSTOM_REFRESH_RATES`, but Valve's
-  `/usr/lib/steamos/gamescope-session` (as CachyOS ships it) has never read that variable and the
-  `PATH` shim forwards only `PF_HDR_ARGS` — so the flag reached no SteamOS session at all, and
-  Steam's in-session display menu showed one refresh entry, no resolutions, and paced games to that
-  single number. `refresh_rate_args` now chains into that drop-in's `PF_HDR_ARGS`, keyed on the
-  session's own mode.
-- **A poisoned status mutex no longer aborts the tray process.** `ci.yml`'s unsafe-hygiene gate had
-  been failing on main since `0329afcb`: `unwrap`/`expect`/`panic!` reachable in `extern fn`
-  `wndproc` with no `catch_unwind`. It was right to — a panic crossing an extern boundary aborts
-  since Rust 1.81, so a poisoned lock would take the tray icon away permanently, which is the exact
-  failure the supervisor work in that same commit exists to prevent. Every read of that mutex now
-  uses the poison-tolerant form.
-- **Two overlays on tvOS accept controller input.** `ConnectOverlay` and `TrustCardView` each mount
-  a zero-size view owning a `GamepadMenuInput`, and both gated it to iOS and macOS. The console home
-  underneath gates *itself* inactive while an overlay is up, so nothing read the pad at all: the
-  wake prompt was a dead end, with neither Cancel nor Try Again reachable, and the trust card had
-  the same hole between a pad-only Apple TV and every unknown host.
-- **Android TV hides the phone-body rows.** *Rumble on this phone* and *Gyro from this phone* were
-  gated on hardware alone, assuming a TV box answers no to a default `Vibrator` and to a
-  `SensorManager` gyroscope. An Nvidia Shield answers yes to both — most likely the attached
-  controller owning the vibrator and gyroscope the queries find.
-- **Stale support claims corrected in the README, roadmap and Windows host page.** All three said
-  the AMD (AMF) and Intel (QSV) encoders were CI-green only, while the support matrix — which the
-  roadmap itself names as the arbiter — has recorded since 0.31 that AMF was validated on a Ryzen
-  7000 iGPU and QSV on Arc. A reader comparing the two could only conclude AMD is unsupported in the
-  shipping build.
+- **A refused swapchain costs fullscreen, not the session** (Windows presenter). Warn, drop to
+  windowed, rebuild against the geometry that worked. A windowed failure still propagates.
+- **Stage 4 relinks when the display link stops vending** (Apple). Past 250 ms without a vend
+  while frames still decode, the render thread retires the link generation.
+- **Switch Pro SPI-flash reads are served by range**, not an exact (address, length) pair.
+  Steam's HIDAPI calibration reads no longer get a zero-fill.
+- **Steam Input's touch-as-mouse no longer walks the host cursor** on a Deck in Gaming Mode.
+  `SteamTouchMouse` drops those motions and raises the session notice once.
+- **Touch on the letterbox bars reaches the gesture engine** (Android). Two-finger scroll honours
+  invert-scroll and requires exactly two fingers. Long-press-to-drag works on every touch engine.
+- **The flatpak stopped claiming Gaming Mode on every desktop.** `GAMESCOPE_WAYLAND_DISPLAY` is
+  not proof of a Deck session; the manifest still exports it for the gamescope WSI layer.
+- **`--custom-refresh-rates` reaches a SteamOS-style session** via `PF_HDR_ARGS` on that drop-in.
+- **A poisoned status mutex no longer aborts the tray.** `wndproc` reads use the poison-tolerant
+  form so a panic cannot cross the extern boundary.
+- **Two overlays on tvOS accept controller input.** `ConnectOverlay` and `TrustCardView` no
+  longer gate `GamepadMenuInput` to iOS and macOS.
+- **Android TV hides the phone-body rows.** Rumble and gyro toggles were hardware-gated; a Shield
+  answers yes to both.
+- **Stale AMF/QSV support claims** in the README, roadmap and Windows host page now match the
+  support matrix (validated since 0.31).
 
 ---
 

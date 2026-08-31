@@ -2,19 +2,39 @@
 
 Guidance for coding agents working in this repository.
 
-## Writing standards
+## Writing
 
-Read `docs/writing.md` before you write a commit message, a `CHANGELOG.md` entry, or a comment.
-It is the house style for all three, and §4 is a per-PR checklist. The short version:
+`scripts/ci/check-writing.sh` fails the PR. If it fails: shorten. Do not add `writing-ok`
+unless the extra lines are a SAFETY/lifetime trap. Rules: `docs/writing.md`.
 
-- Commit subject is `type(scope): summary` — imperative, **72-character hard cap**, no trailing
-  period, one logical change. No `Co-Authored-By` trailer.
-- The commit body is *why*, wrapped at 72. The investigation, the measurements and the rejected
-  paths go on the pull request, never in the message.
-- Write the Gitea PR title as a conventional commit; Gitea makes it the merge subject.
-- New `CHANGELOG.md` sections use Keep a Changelog categories. Leave the older sections alone.
-- A comment states an invariant or a trap. A comment never enforces a trust boundary — a type,
-  a test or an assertion does.
+### Commits
+
+- `type(scope): summary` — imperative, ≤72 characters, no trailing period, no `and`,
+  no semicolon. Scope is a subsystem (`host`, `hyprland`, `abr`).
+- Body: three short paragraphs max, **200 words**. Why only. No `Co-Authored-By`.
+- Measurements and rejected paths go on the PR.
+- Gitea PR title is the merge subject. Same shape as the commit.
+
+Bad: `The retry loop stops eating the restore that re-lights the desk`
+Good: `fix(host/hyprland): keep topology restore across pipeline retries`
+
+### Changelog
+
+Newest `CHANGELOG.md` section only. Two sentences per bullet: what changed, then what
+the reader must do. Bold lead is a noun or an API name. Fail at 160 lines.
+
+### Comments
+
+Touch a function → rewrite its comment in the same diff. Do not sweep the file.
+
+- `//` : four lines (fail at 6). `//!` / `///` : 8–20 (fail at 24).
+- Keep `// SAFETY:` exact.
+- Delete restatement, field reports, `ponytail:`.
+- Keep lifetime, weak-ref, why this number. One to three lines.
+- A comment never enforces a trust boundary.
+
+Bad (in the file): `Field 2026-08-28, iPad Pro / iOS 27 over Tailscale: …`
+Good (in the file): `250 ms ≈ 30 refreshes at 120 Hz. A miss freezes the picture.`
 
 ## Agent skills
 

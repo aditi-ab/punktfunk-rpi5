@@ -111,12 +111,14 @@ expertise; the **reference track** (configuration, CLI, API, per-compositor page
 dense. When a change touches a user-facing fact, update the docs-site page that owns it in the same
 PR.
 
-CI enforces the cheap half of this (`scripts/ci/check-docs-drift.sh` and `check-docs-links.sh`):
+CI enforces the cheap half of this (`scripts/ci/check-docs-drift.sh`, `check-docs-links.sh`,
+and `check-writing.sh`):
 the OpenAPI snapshot must match `api/openapi.json`, the docs-site copy of `data/platforms.json` must
 match the canonical one, `scripts/install.sh` must carry the file's install lines verbatim, every `PUNKTFUNK_*` variable the docs mention
 must still exist in the tree, the counts of undocumented `PUNKTFUNK_*` variables and undocumented
 `punktfunk-host` subcommands may never grow (document the new knob, or consciously raise the
-baseline in the script), and internal docs links must resolve.
+baseline in the script), internal docs links must resolve, and the newest `CHANGELOG.md`
+section stays under 160 lines.
 
 Match the surrounding code's comment density and naming.
 
@@ -132,10 +134,14 @@ The three rules you need before your first commit:
 
 - **Commit subjects follow [Conventional Commits](https://www.conventionalcommits.org/) —
   `type(scope): summary`, 72-character cap, imperative, no trailing period.** The *why* goes in
-  the body, wrapped at 72. The investigation goes on the pull request, not in the message. A Gitea
-  PR title becomes the merge subject, so write the PR title as a conventional commit too.
+  the body, wrapped at 72, 200 words max. The investigation goes on the pull request, not in
+  the message. A Gitea PR title becomes the merge subject, so write the PR title as a
+  conventional commit too. `scripts/ci/check-writing.sh` fails the PR if a commit on it
+  breaks this.
 - **New `CHANGELOG.md` sections use [Keep a Changelog](https://keepachangelog.com/) categories**
-  — `Breaking` / `Added` / `Changed` / `Fixed` / `Security` — plus the version table. Keep the
-  existing sections as they are. What a *user* can do goes in `docs/releases/vX.Y.Z.md` instead.
-- **A comment states an invariant or a trap, not a recap of the diff.** If a trust boundary
-  matters, a type, test or assertion has to enforce it — a comment alone never does.
+  — `Breaking` / `Added` / `Changed` / `Fixed` / `Security` — plus the version table. Two
+  sentences per bullet. Keep the existing sections as they are. CI fails the newest section at
+  160 lines. What a *user* can do goes in `docs/releases/vX.Y.Z.md` instead.
+- **A comment states an invariant or a trap, not a recap of the diff.** `//` is four lines (CI
+  fails at six); a module `//!` is 8–20 (CI fails at 24). If a trust boundary matters, a type,
+  test or assertion has to enforce it — a comment alone never does.
