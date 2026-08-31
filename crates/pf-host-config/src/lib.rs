@@ -325,6 +325,15 @@ pub struct HostConfig {
     /// starts over (the "fresh gamescope output never delivers frames" field failure). Default ON;
     /// explicit-off grammar (`=0` disables, the on-glass A/B + emergency escape hatch).
     pub gamescope_splash: bool,
+    /// `PUNKTFUNK_GAMESCOPE_ISOLATE` — give every bare-spawn gamescope session its OWN
+    /// input/audio/mic plane (`design/gamescope-multiuser.md`): a per-session EIS relay + pinned
+    /// injector, the nested apps' audio routed to the session's stream sink by env, and a
+    /// per-session virtual mic — so concurrent independent sessions (multi-user on one box) never
+    /// hear or drive each other. Default ON; explicit-off grammar (`=0` restores the shared
+    /// host-lifetime planes, the one-release escape hatch while the isolation path soaks).
+    /// Shared-desktop backends (kwin/mutter/wlroots) and the managed/attach gamescope routes are
+    /// untouched either way — shared planes are the correct semantics there.
+    pub gamescope_isolate: bool,
     /// `PUNKTFUNK_GAMESCOPE_HDR` — allow HDR (10-bit BT.2020 PQ) sessions on the gamescope
     /// backend. Needs the punktfunk gamescope build (`packaging/gamescope`), which teaches
     /// gamescope's PipeWire node the 10-bit PQ capture formats; the host probes for it and stays
@@ -514,6 +523,7 @@ impl HostConfig {
             // Default ON, explicit-off grammar: the splash is what makes a fresh bare spawn deliver
             // its first frames at all; `=0` is the A/B + escape hatch.
             gamescope_splash: env_on("PUNKTFUNK_GAMESCOPE_SPLASH").unwrap_or(true),
+            gamescope_isolate: env_on("PUNKTFUNK_GAMESCOPE_ISOLATE").unwrap_or(true),
             // Default OFF for one canary release (design §4 rollout), then flip the `unwrap_or`.
             gamescope_hdr: env_on("PUNKTFUNK_GAMESCOPE_HDR").unwrap_or(true),
             gamescope_sdr_nits: val("PUNKTFUNK_GAMESCOPE_SDR_NITS")

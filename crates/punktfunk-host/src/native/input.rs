@@ -5,6 +5,36 @@
 
 use super::*;
 
+/// The session's pointer/keyboard injector target, swappable mid-stream
+/// (`design/gamescope-multiuser.md`): an ISOLATED gamescope-spawn session sends to its own pinned
+/// [`crate::inject::InjectorService`], everything else to the shared host-lifetime one — and a
+/// mid-stream Gaming↔Desktop switch or capture-loss rebuild re-points it (`set`) without touching
+/// the running [`input_thread`]. A `Mutex<Sender>` read per event, not a second channel: input is
+/// a few kHz at worst and the sender clone is cheap.
+#[derive(Clone)]
+pub(crate) struct InputRoute(std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Sender<InputEvent>>>);
+
+impl InputRoute {
+    pub(crate) fn new(tx: std::sync::mpsc::Sender<InputEvent>) -> InputRoute {
+        InputRoute(std::sync::Arc::new(std::sync::Mutex::new(tx)))
+    }
+
+    /// Forward one event to the current target. A send error (the target injector service is
+    /// gone) is ignorable exactly as it was on the bare sender — input is lossy.
+    pub(crate) fn send(
+        &self,
+        ev: InputEvent,
+    ) -> Result<(), std::sync::mpsc::SendError<InputEvent>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).send(ev)
+    }
+
+    /// Re-point the route (mid-stream compositor switch). Linux-only caller today.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn set(&self, tx: std::sync::mpsc::Sender<InputEvent>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = tx;
+    }
+}
+
 /// Per-pad accumulated state: punktfunk/1 gamepad events are incremental (one button or axis
 /// per datagram, see `punktfunk_core::input::gamepad`), the virtual xpad applies full frames.
 /// A snapshot-capable client replaces the whole state at once ([`PadState::set_snapshot`]).
@@ -992,8 +1022,9 @@ fn send_rumble(
     let _ = conn.send_datagram(d.into());
 }
 
-/// The per-session input thread: route pointer/keyboard events to the host-lifetime injector
-/// service (`inj_tx`) and gamepad events to this session's [`Pads`] router (`gamepad` — the
+/// The per-session input thread: route pointer/keyboard events to the session's injector target
+/// (`inj_tx` — the shared host-lifetime service, or an isolated session's own pinned one; see
+/// [`InputRoute`]) and gamepad events to this session's [`Pads`] router (`gamepad` — the
 /// resolved Hello preference is the per-pad default; clients declare each pad's kind so a session
 /// can mix uinput X-Box pads and virtual DualSense pads), with rich
 /// client→host input (touchpad / motion, [`ClientInput::Rich`]) applied on arrival and
@@ -1013,7 +1044,7 @@ fn send_rumble(
 pub(super) fn input_thread(
     rx: std::sync::mpsc::Receiver<ClientInput>,
     conn: quinn::Connection,
-    inj_tx: std::sync::mpsc::Sender<InputEvent>,
+    inj_tx: InputRoute,
     gamepad: GamepadPref,
     pad_audio_on: bool,
     // The session's LIVE grant mask (per-client access §5.4). The datagram dispatch already
@@ -1437,6 +1468,29 @@ pub(super) fn input_thread(
 mod tests {
     use super::*;
     use punktfunk_core::input::{InputEvent, InputKind};
+
+    /// The route is what lets a mid-stream compositor switch move a live input thread between
+    /// injector services: events land wherever the route CURRENTLY points, cheaply and losslessly.
+    #[test]
+    fn input_route_swaps_targets_mid_flight() {
+        let ev = InputEvent {
+            kind: InputKind::MouseMove,
+            _pad: [0; 3],
+            code: 0,
+            x: 1,
+            y: 2,
+            flags: 0,
+        };
+        let (shared_tx, shared_rx) = std::sync::mpsc::channel::<InputEvent>();
+        let (pinned_tx, pinned_rx) = std::sync::mpsc::channel::<InputEvent>();
+        let route = InputRoute::new(shared_tx);
+        route.send(ev).unwrap();
+        assert_eq!(shared_rx.try_recv().unwrap().x, 1);
+        route.set(pinned_tx);
+        route.send(ev).unwrap();
+        assert!(shared_rx.try_recv().is_err(), "old target no longer fed");
+        assert_eq!(pinned_rx.try_recv().unwrap().y, 2);
+    }
 
     #[test]
     fn pad_snapshot_replaces_state_and_seq_gates() {
