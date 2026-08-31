@@ -343,11 +343,12 @@ pub(crate) fn sync(state: &Arc<AppState>) -> Result<()> {
 /// lets an on-path attacker spoof the owner's source to feed the tracked peer. Once the owner IS
 /// known, filtering at the socket drops those datagrams before ENet allocates any per-peer state.
 ///
-/// The owner is read live from `launch` on each receive, so this covers only the window where a
-/// launch is recorded: before `/launch` (owner `None`) the filter passes everything, and what
-/// keeps an unauthenticated peer from squatting a slot through that whole idle window is
-/// [`accept_connect`] resetting the peer in the `Event::Connect` arm below.
-/// security-review 2026-08-15 findings 2 and 13; 2026-08-25 finding 1.
+/// The launch is read live on each receive: with NO live `/launch` every datagram is dropped
+/// here — nothing on this port is legitimate before a launch (`accept_connect` agrees), so a
+/// pre-launch datagram is only a way to make ENet allocate per-peer reassembly for an
+/// unauthenticated peer (security-review 2026-08-31 M-7); with a launch, only the owner's source
+/// IP passes. Dropping at the socket keeps those bytes from reaching ENet at all.
+/// security-review 2026-08-15 findings 2 and 13; 2026-08-25 finding 1; 2026-08-31 M-7.
 struct OwnerFilteredSocket {
     inner: UdpSocket,
     state: Arc<AppState>,
@@ -385,11 +386,15 @@ impl rusty_enet::Socket for OwnerFilteredSocket {
         loop {
             match rusty_enet::Socket::receive(&mut self.inner, buffer) {
                 Ok(Some((addr, received))) => {
-                    let owner = self.state.launch.lock().unwrap().and_then(|s| s.peer_ip);
-                    if owner.is_some_and(|ip| ip != addr.ip()) {
-                        continue;
+                    // Decide BEFORE returning the datagram to rusty_enet, which would otherwise
+                    // allocate per-peer reassembly for it. No live launch → drop (pre-launch peers
+                    // are illegitimate; M-7); launch with a known owner IP → keep only that IP.
+                    let launch = *self.state.launch.lock().unwrap();
+                    match launch.map(|s| s.peer_ip) {
+                        None => continue,
+                        Some(Some(ip)) if ip != addr.ip() => continue,
+                        _ => return Ok(Some((addr, received))),
                     }
-                    return Ok(Some((addr, received)));
                 }
                 Ok(None) => return Ok(None),
                 Err(e)
