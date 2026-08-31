@@ -114,12 +114,14 @@ jobs:
             image: fedora:44
             prep: dnf install -y -q curl git nodejs
             rmweb: dnf remove -y punktfunk-web
+            haveclient: rpm -q punktfunk-client
             oncanary: grep -q 'fedora-44-canary' /etc/yum.repos.d/punktfunk.repo
             onstable: grep -q 'rpm/fedora-44$' /etc/yum.repos.d/punktfunk.repo
           - family: arch
             image: archlinux:base
             prep: pacman -Sy --noconfirm --needed curl git nodejs && (pacman-key --init >/dev/null 2>&1 || true)
             rmweb: pacman -Rns --noconfirm punktfunk-web
+            haveclient: pacman -Q punktfunk-client
             oncanary: grep -q '^\[punktfunk-canary\]' /etc/pacman.conf && ! grep -q '^\[punktfunk\]' /etc/pacman.conf
             onstable: grep -q '^\[punktfunk\]' /etc/pacman.conf && ! grep -q '^\[punktfunk-canary\]' /etc/pacman.conf
     container:
@@ -197,6 +199,20 @@ jobs:
           test "$(punktfunk-host --version | head -1)" = "$canary_v" \
             || { echo "a bare re-run moved a canary box off $canary_v"; exit 1; }
           $PF --yes --no-start --channel stable
+      # M3: the client comes from the same family repo, so this is one more package from a
+      # repo the steps above already proved works. The flatpak fallback — the sysext boxes and
+      # any distro without a repo — is deliberately NOT installed here: flatpak in a container
+      # needs a session bus and buys nothing, so the crate's goldens assert its line instead.
+      #
+      # Debian has no leg on purpose. punktfunk-client is published there, but its deb depends
+      # on libc6 >= 2.43 and Debian 13 ships 2.41, so `--client` cannot resolve on the very
+      # release the host supports. That is a packaging floor to fix, not an installer bug; add
+      # the leg back the day the deb builds against trixie.
+      - name: The client installs from the same repo
+        if: matrix.haveclient != ''
+        run: |
+          $PF --yes --no-start --client
+          ${{ matrix.haveclient }}
       - name: --uninstall takes the packages and the repo off again
         run: |
           $PF --yes --uninstall
