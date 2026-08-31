@@ -71,7 +71,10 @@ That one command, each step idempotent and each one reversible:
 | **Toasts** *(optional)* | pairing requests and stream start/stop as Omarchy notifications, with **Approve** / **Deny** buttons on the pairing one. |
 | **Idle** *(optional)* | keeps the screen awake for the length of a stream and restores your own setting afterwards. |
 | **Theme** *(optional)* | a `~/.config/omarchy/themed/` template so the console **and the Linux client** follow `omarchy-theme-set`. |
+| **Client menu** *(optional)* | when `punktfunk-client` is installed: your saved hosts as connect and wake rows in the same Punktfunk submenu. |
 
+Every *(optional)* step defaults to **yes** — Enter accepts, `n` declines, and a run without a
+terminal takes the defaults, so the guided installer delivers the full integration on its own.
 Check it any time with `punktfunk-omarchy status`, and undo all of it with `punktfunk-omarchy
 remove` (your pairings and `~/.config/punktfunk` are left alone).
 

@@ -149,5 +149,22 @@ cp "$f" "$WORK/menu-broken"
 XDG_CONFIG_HOME="$WORK/menu" setup_menu >/dev/null 2>&1
 check "a config we cannot parse is left alone" "$WORK/menu-broken" "$f"
 
+echo "ask polarity"
+
+# Setup is the consent act, so a non-interactive shell takes each ask's DEFAULT — yes unless the
+# caller says n. The first polarity (always no without a tty) made a `curl | sh` install deliver
+# the integration with every optional feature silently skipped. </dev/null forces the non-tty
+# path even when this selftest runs in a terminal.
+if ask "test question" </dev/null >/dev/null 2>&1; then
+  printf '  ok   a non-interactive ask takes the yes default\n'
+else
+  printf '  FAIL a non-interactive ask said no\n'; fails=$((fails + 1))
+fi
+if ask "test question" n </dev/null >/dev/null 2>&1; then
+  printf '  FAIL an explicit n default was ignored\n'; fails=$((fails + 1))
+else
+  printf '  ok   an explicit n default still means no\n'
+fi
+
 echo
 if [[ $fails -eq 0 ]]; then echo "all checks passed"; else echo "$fails check(s) failed"; exit 1; fi
