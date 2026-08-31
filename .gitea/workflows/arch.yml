@@ -409,27 +409,33 @@ jobs:
             echo "::error::could not sync the Arch db — cannot prove these packages install"
             exit 1
           fi
-          check() {   # check FILE -> 0 installable, 1 not (reason on stdout)
-            pacman -U --print --noconfirm --dbpath /tmp/pf-instcheck --logfile /dev/null "$1" 2>&1
+          check() {   # check FILES... -> 0 installable together, 1 not (reason on stdout)
+            pacman -U --print --noconfirm --dbpath /tmp/pf-instcheck --logfile /dev/null "$@" 2>&1
           }
           ls dist/*.pkg.tar.zst >/dev/null 2>&1 || { echo "::error::nothing in dist/ to check"; exit 1; }
           rc=0
-          for pkg in dist/*.pkg.tar.zst; do
-            if out="$(check "$pkg")"; then
-              echo "OK  $(basename "$pkg")  ($(echo "$out" | wc -l) targets resolve)"
-            else
-              rc=1
-              echo "::error::$(basename "$pkg") CANNOT be installed on an up-to-date Arch box:"
-              echo "$out" | sed 's/^/    /'
-            fi
-          done
+          # ONE transaction for the whole built set — the shape reality takes (the published repo
+          # carries the siblings, so `pacman -S punktfunk-host` resolves punktfunk-icons from it)
+          # and the only shape -U --print can verify: file targets resolve against the sync db
+          # PLUS each other, and a split-package dependency exists only as a sibling file here.
+          # Checking one file at a time turned exactly that into a false "cannot be installed"
+          # (punktfunk-icons, run 16446). pacman's own error text names the offending package.
+          if out="$(check dist/*.pkg.tar.zst)"; then
+            echo "OK  the built set resolves together ($(echo "$out" | wc -l) targets)"
+          else
+            rc=1
+            echo "::error::the built set CANNOT be installed on an up-to-date Arch box:"
+            echo "$out" | sed 's/^/    /'
+          fi
           # gamescope stays best-effort, exactly as its build step is: a companion that cannot
           # install is dropped from the upload with a warning, never a reason to withhold the
           # packages this workflow exists to publish. (It is also the one package that can be
           # restored from a cache older than the current Arch snapshot.)
+          # The dist set rides along: gamescope may depend on punktfunk packages, and after the
+          # set proved itself above, a failure here is attributable to gamescope alone.
           for pkg in dist-gamescope/*.pkg.tar.zst; do
             [ -e "$pkg" ] || continue
-            if out="$(check "$pkg")"; then
+            if out="$(check "$pkg" dist/*.pkg.tar.zst)"; then
               echo "OK  $(basename "$pkg")  ($(echo "$out" | wc -l) targets resolve)"
             else
               echo "::warning::$(basename "$pkg") is not installable on current Arch — NOT publishing it"
