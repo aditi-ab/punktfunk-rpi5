@@ -255,12 +255,15 @@ fn rows_for(known: &KnownHosts) -> String {
     // JSON string literal, quotes included.
     let j = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
     let mut out = String::new();
-    // The same root row the host block writes: on a box running both, the ids merge.
+    // The `punktfunk` root is the CLIENT's alone: the host tool writes its rows under its own
+    // `punktfunk-host` root ("Punktfunk Host"), the same split the desktop entries use. One
+    // merged submenu predates the client being installed by default, and mixed "connect to a
+    // host" with "administer this host" in a single grab bag.
     out.push_str(
-        "  \"punktfunk\": {\"icon\":\"\u{f0379}\",\"label\":\"Punktfunk\",\"aliases\":[\"streaming\",\"stream\"]},\n",
+        "  \"punktfunk\": {\"icon\":\"\u{f0379}\",\"label\":\"Punktfunk\",\"aliases\":[\"stream\",\"connect\"]},\n",
     );
     out.push_str(
-        "  \"punktfunk.app\": {\"icon\":\"\u{f11b}\",\"label\":\"Open Punktfunk\",\"description\":\"Hosts, pairing, settings\",\"action\":\"uwsm-app -- punktfunk-client\"},\n",
+        "  \"punktfunk.app\": {\"icon\":\"\u{f003b}\",\"label\":\"Open Punktfunk\",\"description\":\"Hosts, pairing, settings\",\"action\":\"uwsm-app -- punktfunk-client\"},\n",
     );
     out.push_str(
         "  \"punktfunk.couch\": {\"icon\":\"\u{f0eb5}\",\"label\":\"Game console\",\"description\":\"The couch UI — library, hosts, pairing\",\"action\":\"uwsm-app -- punktfunk-client --browse\"},\n",
@@ -277,7 +280,7 @@ fn rows_for(known: &KnownHosts) -> String {
         let label = if h.name.is_empty() { &h.addr } else { &h.name };
         let target = format!("{}:{}", h.addr, h.port);
         out.push_str(&format!(
-            "  \"punktfunk.connect-{id}\": {{\"icon\":\"\u{f0379}\",\"label\":{},\"description\":{},\"aliases\":[\"connect\"],\"action\":{}}},\n",
+            "  \"punktfunk.connect-{id}\": {{\"icon\":\"\u{f0318}\",\"label\":{},\"description\":{},\"aliases\":[\"connect\"],\"action\":{}}},\n",
             j(label),
             j(&format!("Connect and stream — {target}")),
             j(&format!("uwsm-app -- punktfunk-client --connect '{target}'")),
