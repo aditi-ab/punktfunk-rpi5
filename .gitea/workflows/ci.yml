@@ -181,6 +181,12 @@ jobs:
       - name: Test (unit + loopback + proptest + C ABI harness)
         run: cargo test --workspace --locked
 
+      # Two installers exist until WP4.3, so parity between them is PROVEN by running both over
+      # the same fake boxes, not asserted (design/installer-v2.md implementation plan §0).
+      # Retire this step together with the sh script body.
+      - name: Installer parity (scripts/install.sh vs punktfunk-setup)
+        run: sh scripts/ci/check-installer-parity.sh
+
       # The deep half of the docs-drift gates (the `docs-drift` job checks the docs-site copy
       # and the textual rest): the committed spec must match what the binary actually serves.
       # Build already compiled punktfunk-host with default features, so this re-links at worst.
