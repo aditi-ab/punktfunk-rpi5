@@ -580,12 +580,15 @@ else
             # invocation carries both -S and -u, to funnel system upgrades through `omarchy update`.
             # So Arch's one-liner dies there with "Woah partner..." and installs nothing (measured
             # on 4.0.1). `-Sy` refreshes without a sysupgrade and is not blocked; `-S` then installs
-            # exactly the three packages. On plain Arch the full `-Syu` stays right — a partial
+            # exactly the listed packages. On plain Arch the full `-Syu` stays right — a partial
             # upgrade against a ROLLING repo is the thing that breaks those boxes, and Omarchy's
             # frozen snapshot mirror is precisely why it does not break here.
+            # Omarchy also gets the CLIENT by default: the integration is both directions there
+            # (themed app, couch console, menu rows), and the icon it shares with the host rides
+            # in as the punktfunk-icons dependency.
             if [ "$ID" = omarchy ]; then
                 run 'sudo pacman -Sy'
-                run 'sudo pacman -S punktfunk-host punktfunk-web punktfunk-scripting'
+                run 'sudo pacman -S punktfunk-host punktfunk-web punktfunk-scripting punktfunk-client'
             else
                 run 'sudo pacman -Syu punktfunk-host punktfunk-web punktfunk-scripting'
             fi
