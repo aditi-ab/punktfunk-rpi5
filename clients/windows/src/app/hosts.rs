@@ -137,6 +137,9 @@ impl PartialEq for HostsProps {
 ///
 /// Hover renders the WinUI card pointer-over look — the card background lifts to the control
 /// hover fill while the pointer is inside the tile (tracked via `hover`, see `HostsProps`).
+// Three call sites, each passing a different mix of the optional tail — grouping the eight into a
+// props struct would make every one of them construct it inline for no reader gain.
+#[allow(clippy::too_many_arguments)]
 fn host_tile(
     id: &str,
     hover: &Hover,
