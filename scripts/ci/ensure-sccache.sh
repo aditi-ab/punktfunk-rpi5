@@ -24,21 +24,26 @@ set -e
 SCCACHE_VERSION="${SCCACHE_VERSION:-0.10.0}"
 
 # Fork PRs do not receive SCCACHE_* secrets. CMake stores the launcher name
-# `sccache` in the build dir (and in a restored target/ cache). Replace the
-# binary on PATH so every remaining invocation execs the compiler.
+# `sccache` in the build dir (and in a restored target/ cache), so the name has
+# to keep resolving — shadow it with a passthrough shim earlier on PATH. Never
+# overwrite the installed binary: the macOS runner is a persistent host, and a
+# clobbered binary stays broken for every job that follows this one.
 disable_sccache_wrappers() {
-    bin=$(command -v sccache) || return 0
-    tmp=$(mktemp)
+    shim_dir="${RUNNER_TEMP:-$(mktemp -d)}/sccache-passthrough"
+    mkdir -p "$shim_dir"
     printf '%s\n' \
         '#!/bin/sh' \
         'case "$1" in' \
         '--version|--show-stats|--start-server|--stop-server) exit 0 ;;' \
         'esac' \
-        'exec "$@"' > "$tmp"
-    chmod 0755 "$tmp"
-    install -m0755 "$tmp" "$bin"
-    rm -f "$tmp"
-    echo "sccache at $bin is now a compiler passthrough"
+        'exec "$@"' > "$shim_dir/sccache"
+    chmod 0755 "$shim_dir/sccache"
+    PATH="$shim_dir:$PATH"
+    export PATH
+    if [ -n "${GITHUB_PATH:-}" ]; then
+        echo "$shim_dir" >> "$GITHUB_PATH"
+    fi
+    echo "sccache shimmed to a compiler passthrough at $shim_dir"
 }
 
 probe_sccache() {
@@ -48,11 +53,17 @@ probe_sccache() {
         disable_sccache_wrappers
         return 0
     fi
-    if sccache --start-server >/tmp/sccache-probe.log 2>&1; then
+    # --show-stats reaches a running server or starts one. --start-server fails
+    # on the server a previous job left behind (persistent macOS runner) and
+    # would read a healthy cache as broken storage.
+    probe_log=$(mktemp)
+    if sccache --show-stats >"$probe_log" 2>&1; then
+        rm -f "$probe_log"
         return 0
     fi
     echo "sccache storage is not usable; compiler passthrough"
-    cat /tmp/sccache-probe.log >&2 || true
+    cat "$probe_log" >&2 || true
+    rm -f "$probe_log"
     disable_sccache_wrappers
 }
 
