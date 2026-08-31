@@ -16,7 +16,9 @@ use crate::ui::Reporter;
 
 /// Under `--yes` a package manager must not stop for its own confirmation. Ported verbatim
 /// from the sh installer's rewrite table; `-Syu` is tested before `-S` so it wins.
-const NONINTERACTIVE: [(&str, &str); 9] = [
+const NONINTERACTIVE: [(&str, &str); 11] = [
+    ("flatpak install --user ", "flatpak install --user -y "),
+    ("flatpak uninstall --user ", "flatpak uninstall --user -y "),
     ("sudo apt install ", "sudo apt install -y "),
     ("sudo dnf install ", "sudo dnf install -y "),
     ("sudo pacman -Syu ", "sudo pacman -Syu --noconfirm "),
@@ -72,8 +74,10 @@ impl Executor<'_> {
         facts: &Facts,
         choices: &Choices,
     ) -> Result<Outcome, Failed> {
+        // A client-only run enables no services, so the verify pass must not go looking for a
+        // host that was never installed here.
         let mut outcome = Outcome {
-            started: choices.start,
+            started: choices.start && choices.components.host,
             ..Outcome::default()
         };
         for phase in &plan.phases {

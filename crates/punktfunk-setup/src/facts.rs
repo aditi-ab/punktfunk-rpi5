@@ -17,6 +17,9 @@ use crate::seam::{BasePaths, CommandRunner, Env};
 
 pub const DOCS: &str = "https://docs.punktfunk.unom.io/docs";
 
+/// The flatpak the client ships as, where a family has no native package for it.
+pub const FLATPAK_APP: &str = "io.unom.Punktfunk";
+
 /// The three binaries the installer asks about separately.
 ///
 /// "Is the host there?" is the wrong question: a box with the host but no console never grows
@@ -34,6 +37,9 @@ pub enum Family {
     Dnf,
     Pacman,
     Sysext,
+    /// No host repo here. The client still installs, user-scope, from the flatpak line —
+    /// which is why an unknown distro is a family rather than a dead end (§5).
+    Flatpak,
 }
 
 impl Family {
@@ -43,7 +49,14 @@ impl Family {
             Family::Dnf => "dnf",
             Family::Pacman => "pacman",
             Family::Sysext => "sysext",
+            Family::Flatpak => "flatpak",
         }
+    }
+
+    /// Whether this family carries `punktfunk-client` in the same repo as the host. Where it
+    /// does not, the client arrives as a user-scope flatpak instead.
+    pub fn has_native_client(self) -> bool {
+        matches!(self, Family::Apt | Family::Dnf | Family::Pacman)
     }
 }
 
@@ -202,8 +215,12 @@ pub struct Facts {
     /// transaction shape and a hand-off afterwards (`design/installer-v2.md` §4).
     pub omarchy: bool,
     pub docs_page: String,
+    /// Why a **host** install cannot happen here. A client install ignores it.
+    pub host_punt: Option<String>,
     pub rpm_group: Option<String>,
     pub floor: Option<Floor>,
+    /// The flatpak client is already on the box, so uninstall has a leg to sweep.
+    pub has_flatpak_client: bool,
     pub couch_box: bool,
     pub graphical_seat: bool,
     pub sunshine_active: bool,
@@ -233,7 +250,7 @@ impl Facts {
     pub fn probe(paths: &BasePaths, run: &dyn CommandRunner, env: &Env) -> Result<Facts, Punt> {
         let text = paths.read(&paths.os_release).ok_or(Punt::NoOsRelease)?;
         let os = OsRelease::parse(&text);
-        let (family, page) = detect_family(&os, run)?;
+        let (family, page, host_punt) = detect_family(&os, run)?;
         let omarchy = family == Family::Pacman && os.id == "omarchy";
 
         let (rpm_group, floor) = floors(&os, family);
@@ -259,8 +276,12 @@ impl Facts {
             family,
             omarchy,
             docs_page: format!("{DOCS}/{page}"),
+            host_punt: host_punt.map(|p| p.message()),
             rpm_group,
             floor,
+            has_flatpak_client: run
+                .probe("flatpak", &["info", FLATPAK_APP])
+                .is_some_and(|o| o.ok()),
             couch_box: os.like("bazzite") || os.like("nobara"),
             graphical_seat: graphical_seat(env),
             sunshine_active: sunshine_active(run),
@@ -304,7 +325,13 @@ impl Facts {
 
 /// The sh script's detection ladder, in the same order — `rpm-ostree`/`bootc` before the
 /// debian and fedora tests, because Bazzite answers `like fedora` too.
-fn detect_family(os: &OsRelease, run: &dyn CommandRunner) -> Result<(Family, &'static str), Punt> {
+/// The family, its docs page, and the punt a **host** install would hit here.
+///
+/// NixOS and SteamOS refuse outright — they own installers for both halves. An unknown distro
+/// is a dead end only for the host: the client still has a user-scope flatpak (§5).
+type Detected = (Family, &'static str, Option<Punt>);
+
+fn detect_family(os: &OsRelease, run: &dyn CommandRunner) -> Result<Detected, Punt> {
     if os.id == "nixos" {
         return Err(Punt::NixOs);
     }
@@ -312,32 +339,32 @@ fn detect_family(os: &OsRelease, run: &dyn CommandRunner) -> Result<(Family, &'s
         return Err(Punt::SteamOs);
     }
     if run.which("rpm-ostree") || run.which("bootc") || os.id == "bazzite" {
-        return Ok((Family::Sysext, "bazzite"));
+        return Ok((Family::Sysext, "bazzite", None));
     }
     if os.like("debian") || os.like("ubuntu") {
-        return Ok((
-            Family::Apt,
-            if os.id == "ubuntu" {
-                "ubuntu"
-            } else {
-                "debian"
-            },
-        ));
+        let page = if os.id == "ubuntu" {
+            "ubuntu"
+        } else {
+            "debian"
+        };
+        return Ok((Family::Apt, page, None));
     }
     if os.like("fedora") {
-        return Ok((Family::Dnf, "fedora"));
+        return Ok((Family::Dnf, "fedora", None));
     }
     if os.like("arch") {
-        return Ok((
-            Family::Pacman,
-            if os.id == "omarchy" {
-                "omarchy"
-            } else {
-                "arch"
-            },
-        ));
+        let page = if os.id == "omarchy" {
+            "omarchy"
+        } else {
+            "arch"
+        };
+        return Ok((Family::Pacman, page, None));
     }
-    Err(Punt::Unsupported(os.pretty.clone()))
+    Ok((
+        Family::Flatpak,
+        "install",
+        Some(Punt::Unsupported(os.pretty.clone())),
+    ))
 }
 
 /// Version floors the package cannot express, plus the Fedora RPM group they share a check with.
@@ -499,7 +526,7 @@ mod tests {
     #[test]
     fn cachyos_is_detected_through_id_like() {
         let r = FakeRunner::new();
-        let (family, page) = detect_family(&os("cachyos", "arch", ""), &r).unwrap();
+        let (family, page, _) = detect_family(&os("cachyos", "arch", ""), &r).unwrap();
         assert_eq!(family, Family::Pacman);
         assert_eq!(page, "arch");
     }
@@ -508,7 +535,7 @@ mod tests {
     #[test]
     fn an_ostree_box_is_sysext_even_though_it_looks_like_fedora() {
         let r = FakeRunner::new().with_path("rpm-ostree");
-        let (family, page) = detect_family(&os("bluefin", "fedora", "43"), &r).unwrap();
+        let (family, page, _) = detect_family(&os("bluefin", "fedora", "43"), &r).unwrap();
         assert_eq!(family, Family::Sysext);
         assert_eq!(page, "bazzite");
     }
@@ -516,7 +543,7 @@ mod tests {
     #[test]
     fn omarchy_is_a_pacman_flavour_with_its_own_docs_page() {
         let r = FakeRunner::new();
-        let (family, page) = detect_family(&os("omarchy", "arch", ""), &r).unwrap();
+        let (family, page, _) = detect_family(&os("omarchy", "arch", ""), &r).unwrap();
         assert_eq!(family, Family::Pacman);
         assert_eq!(page, "omarchy");
     }

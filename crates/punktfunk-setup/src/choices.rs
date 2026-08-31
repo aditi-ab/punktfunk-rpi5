@@ -147,6 +147,8 @@ mod tests {
             family,
             omarchy: id == "omarchy",
             docs_page: String::new(),
+            host_punt: None,
+            has_flatpak_client: false,
             rpm_group: None,
             floor: None,
             couch_box: id == "bazzite" || id == "nobara",

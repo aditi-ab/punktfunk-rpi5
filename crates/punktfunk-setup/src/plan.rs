@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::choices::{Action, Choices};
-use crate::facts::{Channel, Facts, Firewall, DOCS};
+use crate::facts::{Channel, Facts, Family, Firewall, DOCS};
 use crate::platform;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,10 +142,15 @@ pub fn build(facts: &Facts, choices: &Choices) -> Plan {
     let backend = platform::backend(facts.family);
 
     if choices.action == Action::Uninstall {
+        let mut steps = backend.uninstall(facts);
+        // The per-family sweep catches a native client; a flatpak one is invisible to it.
+        if facts.has_flatpak_client && facts.family != Family::Flatpak {
+            steps.extend(platform::backend(Family::Flatpak).uninstall(facts));
+        }
         plan.push(
             Phase::Uninstall,
             format!("Uninstalling the host ({DOCS}/uninstall)"),
-            backend.uninstall(facts),
+            steps,
         );
         return plan;
     }
@@ -245,15 +250,33 @@ fn install_phase(
         );
         return;
     }
-    let what = if choices.components.host {
+    let mut what = if choices.components.host {
         facts.missing.join(" ")
     } else {
-        "client".to_string()
+        String::new()
     };
+    let mut steps = vec![];
+    // The family backend covers the host and, where the repo carries it, the client in the
+    // same transaction — so it also runs for a client-only install on apt, dnf and pacman.
+    let native_client = choices.components.client && facts.family.has_native_client();
+    if choices.components.host || native_client {
+        steps.extend(backend.install(facts, choices));
+    }
+    // Where the family has no `punktfunk-client`, the client arrives as a user-scope flatpak
+    // instead of not at all — the same line the docs give for any other distro.
+    if choices.components.client {
+        if !what.is_empty() {
+            what.push(' ');
+        }
+        what.push_str("client");
+        if !facts.family.has_native_client() {
+            steps.extend(platform::backend(Family::Flatpak).install(facts, choices));
+        }
+    }
     plan.push(
         Phase::Install,
         format!("Installing: {what} ({} channel)", choices.channel.as_str()),
-        backend.install(facts, choices),
+        steps,
     );
 }
 

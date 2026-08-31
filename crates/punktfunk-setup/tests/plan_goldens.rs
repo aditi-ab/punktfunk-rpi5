@@ -30,6 +30,7 @@ fn fresh(id: &str, family: Family) -> Facts {
         Family::Sysext => "bazzite",
         Family::Pacman if id == "omarchy" => "omarchy",
         Family::Pacman => "arch",
+        Family::Flatpak => "install",
     };
     Facts {
         os: OsRelease {
@@ -41,6 +42,8 @@ fn fresh(id: &str, family: Family) -> Facts {
         family,
         omarchy: id == "omarchy",
         docs_page: format!("https://docs.punktfunk.unom.io/docs/{docs}"),
+        host_punt: None,
+        has_flatpak_client: false,
         rpm_group: (family == Family::Dnf).then(|| "fedora-44".to_string()),
         floor: None,
         couch_box: id == "bazzite" || id == "nobara",
@@ -309,6 +312,173 @@ fn an_nvidia_box_without_a_driver_is_warned_after_a_successful_install() {
     let mut facts = installed("fedora", Family::Dnf, Channel::Stable);
     facts.nvidia = Nvidia::NoDriver;
     check("fedora-nvidia-nodriver", &facts, &pins());
+}
+
+// ------------------------------------------------------------------------- M3, the client
+
+/// The client comes from the same family repo, so host+client is one transaction.
+///
+/// The `install` assertions are not decoration: a client-only plan once rendered its heading
+/// and then no commands at all, because the host guard also gated the family backend.
+#[test]
+fn client_installs_per_family() {
+    let client = Pins {
+        client: true,
+        ..pins()
+    };
+    let both = Pins {
+        host: true,
+        client: true,
+        ..pins()
+    };
+    // The expected line keeps the family's own flags. `pacman -Syu`, not `-S`: a client-only
+    // run adds the repo and installs in one go, and `-S` against a database that has never
+    // been fetched dies with "target not found" (measured in a container).
+    for (name, facts, line) in [
+        (
+            "debian-client-only",
+            fresh("debian", Family::Apt),
+            "sudo apt install punktfunk-client",
+        ),
+        (
+            "arch-client-only",
+            fresh("arch", Family::Pacman),
+            "sudo pacman -Syu punktfunk-client",
+        ),
+        (
+            "fedora-client-only",
+            fresh("fedora", Family::Dnf),
+            "sudo dnf install punktfunk-client",
+        ),
+    ] {
+        check(name, &facts, &client);
+        let cmds = plan_for(&facts, &client).commands();
+        assert!(
+            cmds.iter().any(|c| c == line),
+            "{name} should run `{line}`: {cmds:?}"
+        );
+    }
+
+    check(
+        "debian-host-and-client",
+        &fresh("debian", Family::Apt),
+        &both,
+    );
+    let cmds = plan_for(&fresh("debian", Family::Apt), &both).commands();
+    assert!(
+        cmds.iter()
+            .any(|c| c.ends_with("punktfunk-scripting punktfunk-client")),
+        "host and client should be one transaction: {cmds:?}"
+    );
+}
+
+/// A couch box has no `punktfunk-client` package, so the client arrives as a flatpak beside
+/// the sysext host rather than not at all.
+#[test]
+fn a_couch_box_gets_the_client_as_a_flatpak() {
+    let both = Pins {
+        host: true,
+        client: true,
+        ..pins()
+    };
+    check(
+        "bazzite-host-and-client",
+        &fresh("bazzite", Family::Sysext),
+        &both,
+    );
+    let cmds = plan_for(&fresh("bazzite", Family::Sysext), &both).commands();
+    assert!(
+        cmds.iter()
+            .any(|c| c.contains("punktfunk-sysext.sh install")),
+        "{cmds:?}"
+    );
+    assert!(
+        cmds.iter().any(|c| c.starts_with("flatpak install --user")),
+        "{cmds:?}"
+    );
+}
+
+/// §5: a client install on a distro with no punktfunk repo takes the flatpak line instead of
+/// dying. The host punt stays — `main` enforces that, this proves the plan exists at all.
+#[test]
+fn an_unsupported_distro_still_installs_a_client() {
+    let mut facts = fresh("voidlinux", Family::Flatpak);
+    facts.host_punt = Some("no package repo for 'Void Linux' yet".into());
+    let client = Pins {
+        client: true,
+        ..pins()
+    };
+    check("unsupported-client-only", &facts, &client);
+    let cmds = plan_for(&facts, &client).commands();
+    assert_eq!(
+        cmds.len(),
+        1,
+        "a client-only install wires nothing else: {cmds:?}"
+    );
+    assert!(cmds[0].starts_with("flatpak install --user"), "{cmds:?}");
+}
+
+/// The per-family sweep cannot see a flatpak, so uninstall needs its own leg for it.
+#[test]
+fn uninstall_sweeps_a_flatpak_client_too() {
+    let mut facts = installed("debian", Family::Apt, Channel::Stable);
+    facts.has_flatpak_client = true;
+    let un = Pins {
+        action: Action::Uninstall,
+        ..pins()
+    };
+    let cmds = plan_for(&facts, &un).commands();
+    assert!(
+        cmds.iter()
+            .any(|c| c == "flatpak uninstall --user io.unom.Punktfunk"),
+        "the flatpak client was left behind: {cmds:?}"
+    );
+    // A box without one must not be told to remove what is not there.
+    let mut bare = installed("debian", Family::Apt, Channel::Stable);
+    bare.has_flatpak_client = false;
+    assert!(!plan_for(&bare, &un)
+        .commands()
+        .iter()
+        .any(|c| c.contains("flatpak")));
+}
+
+/// Client-only asks almost nothing: no groups, gamestream, linger or firewall.
+#[test]
+fn a_client_only_plan_wires_none_of_the_host_setup() {
+    let client = Pins {
+        client: true,
+        ..pins()
+    };
+    let cmds = plan_for(&fresh("debian", Family::Apt), &client).commands();
+    assert!(!cmds.iter().any(|c| c.contains("usermod")), "{cmds:?}");
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| c.contains("ufw") || c.contains("firewall-cmd")),
+        "{cmds:?}"
+    );
+    assert!(!cmds.iter().any(|c| c.contains("loginctl")), "{cmds:?}");
+    assert!(
+        !cmds.iter().any(|c| c.contains("systemctl --user enable")),
+        "{cmds:?}"
+    );
+}
+
+/// The flatpak line is platforms.json's, verbatim — the same one the docs give.
+#[test]
+fn the_flatpak_line_is_carried_verbatim() {
+    let client = Pins {
+        client: true,
+        ..pins()
+    };
+    let facts = fresh("bazzite", Family::Sysext);
+    let text = render(&facts, &Choices::derive(&facts, &client));
+    for line in punktfunk_setup::platform::install_lines("linux-client") {
+        assert!(
+            text.contains(&line),
+            "the flatpak line drifted:\n  {line}\n\n{text}"
+        );
+    }
 }
 
 // -------------------------------------------------------- design/installer-v2.md §4 traps

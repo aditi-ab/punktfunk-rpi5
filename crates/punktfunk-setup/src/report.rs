@@ -39,6 +39,12 @@ pub fn choices_summary(ui: &dyn Reporter, choices: &Choices) {
         return;
     }
     ui.say("Choices (nothing below has run yet)");
+    // A client listens on nothing fixed and joins no groups, so none of the host rows apply
+    // to it — asking would be four questions with no consequence (§5).
+    if !choices.components.host {
+        ui.line(&format!("  Channel: {}", choices.channel.as_str()));
+        return;
+    }
     let rows: [(&str, bool, &Option<String>); 4] = [
         (
             "Full controller (joins the punktfunk group — grants usbip attach)",
@@ -149,6 +155,23 @@ fn next_steps(
     let ip = facts.ip.clone().unwrap_or_else(|| "<host-ip>".to_string());
     ui.blank();
     ui.line("  Done. Next:");
+    // Nothing on this box serves anything, so the console URL and the pairing side are the
+    // other machine's. Sending a client user to a console on localhost is the same mistake
+    // as printing one for a host that has none.
+    if !choices.components.host {
+        ui.line(
+            "  1. Open punktfunk and pick the host you want to stream from, or add it by address.",
+        );
+        ui.line(&format!(
+            "  2. Approve this device in that host's console — or enter a PIN ({DOCS}/pairing)."
+        ));
+        ui.line("  3. Stream. Ctrl+Alt+Shift+Q hands mouse and keyboard back on desktop clients.");
+        ui.line(&format!(
+            "  Stuck? {DOCS}/troubleshooting · client guide: {DOCS}/install-client"
+        ));
+        ui.blank();
+        return;
+    }
     // --dry-run installs nothing by definition, so it shows the normal text.
     // Probed again here rather than read off Facts: the install that just ran is usually what
     // put the console on the box, and step 1 must not deny a console that now exists.

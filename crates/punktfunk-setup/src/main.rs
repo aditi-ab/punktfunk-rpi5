@@ -289,6 +289,17 @@ fn main() -> ExitCode {
         report::choices_summary(ui, &choices);
     }
 
+    // A distro with no punktfunk repo stops a HOST install and nothing else: a client install
+    // there takes the flatpak line instead of dying (§5). Checked after the screen, because
+    // switching Components to client-only is exactly how a user gets past it.
+    if choices.action != Action::Uninstall
+        && choices.components.host
+        && let Some(msg) = &facts.host_punt
+    {
+        ui.die(msg);
+        return ExitCode::FAILURE;
+    }
+
     let plan = plan::build(&facts, &choices);
     let demo_runner = demo.as_ref().map(|_| {
         let at = cli

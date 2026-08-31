@@ -29,7 +29,7 @@ pub fn sandbox_paths() -> BasePaths {
 }
 
 /// One per flow worth reviewing (D9).
-pub const PRESETS: [&str; 8] = [
+pub const PRESETS: [&str; 9] = [
     "arch-fresh",
     "debian-fresh",
     "fedora-sunshine",
@@ -38,6 +38,7 @@ pub const PRESETS: [&str; 8] = [
     "arch-canary-installed",
     "debian-noweb",
     "ubuntu-old",
+    "unsupported-client",
 ];
 
 /// A box with nothing punktfunk on it — every preset is this with fields moved.
@@ -52,8 +53,10 @@ fn box_of(id: &str, pretty: &str, version: &str, family: Family, docs: &str) -> 
         family,
         omarchy: id == "omarchy",
         docs_page: format!("https://docs.punktfunk.unom.io/docs/{docs}"),
+        host_punt: None,
         rpm_group: (family == Family::Dnf).then(|| "fedora-44".to_string()),
         floor: None,
+        has_flatpak_client: false,
         couch_box: id == "bazzite" || id == "nobara",
         graphical_seat: true,
         sunshine_active: false,
@@ -167,6 +170,15 @@ pub fn preset(name: &str) -> Option<Facts> {
                 "ubuntu",
             );
             f.floor = crate::facts::floors(&f.os, Family::Apt).1;
+            f
+        }
+        // A distro with no punktfunk repo. The host punt stands; the client still installs.
+        "unsupported-client" => {
+            let mut f = box_of("void", "Void Linux", "", Family::Flatpak, "install");
+            f.host_punt = Some(
+                "no package repo for 'Void Linux' yet — https://docs.punktfunk.unom.io/docs/build-from-source"
+                    .into(),
+            );
             f
         }
         _ => return None,

@@ -12,7 +12,7 @@
 use std::sync::OnceLock;
 
 use crate::choices::Choices;
-use crate::facts::{Channel, Facts, Family};
+use crate::facts::{Channel, Facts, Family, FLATPAK_APP};
 use crate::plan::{switch_pkgs, Step, StepAction};
 use crate::seam::{BasePaths, CommandRunner};
 
@@ -59,8 +59,6 @@ pub trait PkgBackend {
     /// The packages this family installs for a host. Note dnf's is `punktfunk`, not
     /// `punktfunk-host`.
     fn base_pkgs(&self) -> Vec<&'static str>;
-    /// The verb a client-only install hangs `punktfunk-client` off.
-    fn install_verb(&self) -> &'static str;
     fn write_repo(&self, facts: &Facts, choices: &Choices) -> Vec<Step>;
     fn install(&self, facts: &Facts, choices: &Choices) -> Vec<Step>;
     fn switch(&self, facts: &Facts, choices: &Choices) -> Vec<Step>;
@@ -75,17 +73,29 @@ pub fn backend(family: Family) -> &'static dyn PkgBackend {
         Family::Dnf => &Dnf,
         Family::Pacman => &Pacman,
         Family::Sysext => &Sysext,
+        Family::Flatpak => &Flatpak,
     }
 }
 
 /// The install line for the chosen components: the platforms.json one verbatim for a host,
 /// plus or replaced by the client package when `--client` asked for it.
-fn compose_install(base_line: &str, verb: &str, choices: &Choices) -> String {
+fn compose_install(base_line: &str, choices: &Choices) -> String {
     match (choices.components.host, choices.components.client) {
-        (true, false) => base_line.to_string(),
         (true, true) => format!("{base_line} punktfunk-client"),
-        _ => format!("{verb} punktfunk-client"),
+        (false, true) => client_only(base_line),
+        _ => base_line.to_string(),
     }
+}
+
+/// Swap the package list out of the family's own install line rather than rebuilding it from a
+/// verb. The flags matter: a hand-written `pacman -S` dropped the `-Syu`, and `-S` against a
+/// repo whose database has never been fetched fails with "target not found".
+fn client_only(base_line: &str) -> String {
+    let head: Vec<&str> = base_line
+        .split_whitespace()
+        .take_while(|word| !word.starts_with("punktfunk"))
+        .collect();
+    format!("{} punktfunk-client", head.join(" "))
 }
 
 // ------------------------------------------------------------------------------------- apt
@@ -95,10 +105,6 @@ struct Apt;
 impl PkgBackend for Apt {
     fn base_pkgs(&self) -> Vec<&'static str> {
         vec!["punktfunk-host", "punktfunk-web", "punktfunk-scripting"]
-    }
-
-    fn install_verb(&self) -> &'static str {
-        "sudo apt install"
     }
 
     fn write_repo(&self, _facts: &Facts, choices: &Choices) -> Vec<Step> {
@@ -117,11 +123,7 @@ impl PkgBackend for Apt {
     fn install(&self, facts: &Facts, choices: &Choices) -> Vec<Step> {
         let (_, install) = split_at("debian", "sudo apt install");
         let mut steps = self.write_repo(facts, choices);
-        steps.push(Step::run(compose_install(
-            &install[0],
-            self.install_verb(),
-            choices,
-        )));
+        steps.push(Step::run(compose_install(&install[0], choices)));
         steps
     }
 
@@ -188,10 +190,6 @@ impl PkgBackend for Dnf {
         vec!["punktfunk", "punktfunk-web", "punktfunk-scripting"]
     }
 
-    fn install_verb(&self) -> &'static str {
-        "sudo dnf install"
-    }
-
     /// The repo block is one heredoc, so its lines rejoin into a single command; the group is
     /// then edited in, exactly as the sh installer does it.
     fn write_repo(&self, facts: &Facts, choices: &Choices) -> Vec<Step> {
@@ -213,11 +211,7 @@ impl PkgBackend for Dnf {
     fn install(&self, facts: &Facts, choices: &Choices) -> Vec<Step> {
         let (_, install) = split_at("fedora", "sudo dnf install");
         let mut steps = self.write_repo(facts, choices);
-        steps.push(Step::run(compose_install(
-            &install[0],
-            self.install_verb(),
-            choices,
-        )));
+        steps.push(Step::run(compose_install(&install[0], choices)));
         steps
     }
 
@@ -286,10 +280,6 @@ impl PkgBackend for Pacman {
         vec!["punktfunk-host", "punktfunk-web", "punktfunk-scripting"]
     }
 
-    fn install_verb(&self) -> &'static str {
-        "sudo pacman -S"
-    }
-
     fn write_repo(&self, facts: &Facts, choices: &Choices) -> Vec<Step> {
         let (repo, _) = split_at(Self::entry(facts), "sudo pacman -S");
         repo.into_iter()
@@ -319,11 +309,7 @@ impl PkgBackend for Pacman {
             .split_last()
             .expect("pacman entry has an install line");
         steps.extend(rest.iter().map(|l| Step::run(l.to_string())));
-        steps.push(Step::run(compose_install(
-            last,
-            self.install_verb(),
-            choices,
-        )));
+        steps.push(Step::run(compose_install(last, choices)));
         steps
     }
 
@@ -402,10 +388,6 @@ impl PkgBackend for Sysext {
         vec![]
     }
 
-    fn install_verb(&self) -> &'static str {
-        "sudo bash punktfunk-sysext.sh install"
-    }
-
     /// No repo file — punktfunk-sysext records the channel itself, in its own conf.
     fn write_repo(&self, _facts: &Facts, _choices: &Choices) -> Vec<Step> {
         vec![]
@@ -460,6 +442,48 @@ impl PkgBackend for Sysext {
             Some("canary") => Channel::Canary,
             _ => Channel::Stable,
         })
+    }
+
+    fn installed_pf(&self, _run: &dyn CommandRunner) -> Vec<String> {
+        vec![]
+    }
+}
+
+// -------------------------------------------------------------------------------- flatpak
+
+/// The client where the family carries no package for it: the sysext boxes, and any distro
+/// with no punktfunk repo at all. User-scope, so it needs no root — and it is why a client
+/// install on an unsupported distro is not a dead end (§5).
+struct Flatpak;
+
+impl PkgBackend for Flatpak {
+    fn base_pkgs(&self) -> Vec<&'static str> {
+        vec![]
+    }
+
+    fn write_repo(&self, _facts: &Facts, _choices: &Choices) -> Vec<Step> {
+        vec![]
+    }
+
+    /// The flatpakref is one feed with no channel in it, so `--channel` has nothing to say
+    /// here and the line is platforms.json's verbatim.
+    fn install(&self, _facts: &Facts, _choices: &Choices) -> Vec<Step> {
+        install_lines("linux-client")
+            .into_iter()
+            .map(Step::run)
+            .collect()
+    }
+
+    fn switch(&self, facts: &Facts, choices: &Choices) -> Vec<Step> {
+        self.install(facts, choices)
+    }
+
+    fn uninstall(&self, _facts: &Facts) -> Vec<Step> {
+        vec![Step::run(format!("flatpak uninstall --user {FLATPAK_APP}"))]
+    }
+
+    fn current_channel(&self, _paths: &BasePaths, _run: &dyn CommandRunner) -> Option<Channel> {
+        None
     }
 
     fn installed_pf(&self, _run: &dyn CommandRunner) -> Vec<String> {
