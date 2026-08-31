@@ -76,7 +76,9 @@ pub fn published_mgmt_port_in(dir: &std::path::Path) -> Option<u16> {
 /// by other local users via a traversable config path). On Windows, applies a restrictive DACL
 /// ([`restrict_dir_to_system_admins`]) so a local unprivileged user can't pre-create / plant files in
 /// the config tree (the default `%ProgramData%` ACL grants Users *create*; security-review
-/// 2026-06-28 #3/#11). Tightens (and re-owns) an already-existing dir too.
+/// 2026-06-28 #3/#11). Tightens (and re-owns) an already-existing dir too, and **refuses a reparse
+/// point** ([`reject_reparse_point`]): hardening a junction hardens the attacker-chosen target while
+/// the link object stays theirs (security-review 2026-08-31 W-1).
 pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -93,6 +95,8 @@ pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
+        #[cfg(windows)]
+        reject_reparse_point(dir)?;
         let r = std::fs::create_dir_all(dir);
         #[cfg(windows)]
         restrict_dir_to_system_admins(dir, first_hardening_of(dir), true);
@@ -113,12 +117,47 @@ pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
 pub fn create_secret_dir(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
+        reject_reparse_point(dir)?;
         let r = std::fs::create_dir_all(dir);
         restrict_dir_to_system_admins(dir, first_hardening_of(dir), false);
         r
     }
     #[cfg(not(windows))]
     create_private_dir(dir)
+}
+
+/// Refuse a path that exists as a reparse point — junction, symlink, or any other tag.
+///
+/// A standard user can ordinarily create a directory junction, `icacls` without `/L` follows a
+/// link to its target, and `std::fs::OpenOptions` follows reparse points on open — so hardening
+/// or writing through a pre-created link secures/feeds the ATTACKER-chosen target while the link
+/// object stays theirs to retarget (security-review 2026-08-31 W-1). `symlink_metadata` never
+/// follows, so this examines the object at `path` itself. A check-then-create race remains for a
+/// window after this returns; the fully handle-relative open needs raw Win32 and this crate is
+/// `forbid(unsafe_code)` — this closes the planted-before-install shape, which is the practical
+/// one against a config root created at first service start.
+#[cfg(windows)]
+fn reject_reparse_point(path: &std::path::Path) -> std::io::Result<()> {
+    // FILE_ATTRIBUTE_REPARSE_POINT — hard-coded (pure-std crate, no winapi dependency).
+    const REPARSE: u32 = 0x400;
+    match std::fs::symlink_metadata(path) {
+        Ok(md) => {
+            use std::os::windows::fs::MetadataExt;
+            if md.file_attributes() & REPARSE != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} is a reparse point (junction/symlink) — refusing to use it as a \
+                         security-sensitive path",
+                        path.display()
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Whether this is the first hardening pass of `dir` in this process — the pass that also does the
@@ -264,6 +303,10 @@ fn restrict_dir_to_system_admins(dir: &std::path::Path, deep: bool, users_read: 
 /// read. The open handle carries our own write access across the DACL change.
 pub fn write_secret_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    // Never write a secret THROUGH a link: a pre-created junction/symlink at this path would
+    // deliver the bytes to an attacker-chosen file (security-review 2026-08-31 W-1).
+    #[cfg(windows)]
+    reject_reparse_point(path)?;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
