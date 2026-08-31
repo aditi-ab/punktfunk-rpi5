@@ -95,6 +95,12 @@ jobs:
       - name: Check (punktfunk-host, default features)
         run: cargo check -p punktfunk-host --locked
 
+      # Tests, not `check`: the installer engine promises the whole flow is reviewable off-box
+      # (design/installer-v2.md D9), and that only stays true while facts/plan take no unix-only
+      # type. This runner is what enforces it — the suite is pure and needs no Linux.
+      - name: Test (punktfunk-setup, the installer engine)
+        run: cargo test -p punktfunk-setup --locked
+
       - name: sccache stats (visibility only)
         if: always()
         run: sccache --show-stats
