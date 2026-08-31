@@ -10,7 +10,8 @@ Omarchy bar, without opening a browser.
   - *Pairing* — open a window, approve or deny the queue, type a Moonlight PIN.
   - *Devices* — both planes, access level, unpair on hover.
   - *Displays* — pick the virtual-display preset, and read the policy it puts in force.
-  - *Stats* — the live stream, and frame timings while a capture is recording.
+  - *Stats* — the live stream, sparkline charts of how it is moving, and frame timings while a
+    capture is recording.
 - **service** — one long-lived event stream that drives both of the above and pops an Omarchy toast
   when a device asks to pair.
 
@@ -105,7 +106,15 @@ topology, identity, mode-conflict, layout — do apply.
 - **Target** is the encoder bitrate, where adaptive bitrate has settled. Always available.
 - **Sent** is what actually left the box. Only while a capture is recording.
 
-They differ by an order of magnitude on a still screen (300 Mbps target, 11 Mbps sent), because
+Each is drawn as a sparkline as well as a figure, because one number cannot tell a bitrate that has
+sat at 300 from one that just collapsed to it — and that difference is the reason to open the tab.
+The window is client-side: the panel keeps what its own two-second poll saw, rather than shipping
+the capture's whole time-series through a process spawn on every tick. It fills while you watch,
+holds about three minutes, and is cleared when a session ends so a chart never draws a line between
+two unrelated streams. Each chart's label carries its current value, so the charts replace the
+numeric read-outs rather than repeating them.
+
+Target and Sent differ by an order of magnitude on a still screen (300 Mbps against 11), because
 capture is damage-driven. For the same reason the tab shows **new** frames per second beside
 **repeated** ones: a healthy 240 Hz stream of a motionless desktop reads `0.0 fps new · 157.2 fps
 repeated`, and showing only the first number would report a dead stream. Stage percentiles switch

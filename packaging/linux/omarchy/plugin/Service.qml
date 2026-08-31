@@ -59,6 +59,32 @@ Item {
   property var statsSample: null
   property var statsMeta: null
 
+  // A rolling window of what the Stats poll saw, so the panel can draw the SHAPE of a number and
+  // not just its current value — a bitrate sitting at 300 and a bitrate that just collapsed from
+  // 300 read identically as one figure. Client-side because the host publishes no periodic event
+  // and the alternative, shipping the capture's whole time-series through a process spawn every
+  // two seconds, would cost far more than it shows. Filled only while the Stats tab is open, which
+  // is the only time anything reads it.
+  property var history: []
+  readonly property int historyMax: 90        // ≈ 3 minutes at the 2 s poll
+
+  function pushHistory() {
+    var p = {
+      target: root.stream ? Number(root.stream.bitrate_kbps || 0) / 1000 : null,
+      sent: null, fps: null, encode: null
+    }
+    if (root.statsSample) {
+      p.sent = Number(root.statsSample.mbps || 0)
+      p.fps = Number(root.statsSample.fps || 0)
+      for (var i = 0; i < (root.statsSample.stages || []).length; i++) {
+        var st = root.statsSample.stages[i]
+        if (st.name === "encode") p.encode = Number(st.p99_us || 0) / 1000
+      }
+    }
+    root.history = root.history.concat([p]).slice(-root.historyMax)
+  }
+
+  function clearHistory() { root.history = [] }
 
   // A certificate mismatch is NOT "the host is down": something that is not our host answered on
   // the management port, and ctl refused to send the token. Surfaced separately so the panel can
@@ -210,6 +236,8 @@ Item {
       root.captureSamples = (data.capture && data.capture.sample_count) || 0
       root.statsSample = data.sample || null
       root.statsMeta = data.meta || null
+      // After the assignments, never before: the point appended is the one just read.
+      root.pushHistory()
     })
   }
 
@@ -283,6 +311,9 @@ Item {
       refresh(); refreshClients(); return
     }
     if (ev.kind === "host.stopping") { root.state = "stopped"; root.sessions = 0; return }
+    // A graph that spans the gap between two sessions draws a line between numbers that were never
+    // related. The window belongs to one stream.
+    if (ev.kind === "stream.stopped" || ev.kind === "session.ended") clearHistory()
     refresh()
   }
 

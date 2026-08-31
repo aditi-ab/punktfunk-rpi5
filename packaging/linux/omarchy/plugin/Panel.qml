@@ -35,6 +35,7 @@ Panel {
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+  readonly property color accent: bar && bar.accent ? bar.accent : Color.accent
 
   // Devices waiting for approval, or a Moonlight client waiting on its PIN: the two states where
   // nothing happens until a person acts.
@@ -171,7 +172,9 @@ Panel {
     open: root.opened
     // Wider than the old single column: five tab chips have to sit on one row.
     contentWidth: panel.fittedContentWidth(Style.space(460))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(560))
+    // `fittedContentHeight` clamps to what the screen actually has, so the cap is only the ceiling
+    // we would like: the Stats tab with four charts is the tallest thing here at roughly 540.
+    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(720))
 
     ColumnLayout {
       id: column
@@ -876,33 +879,121 @@ Panel {
           font.pixelSize: Style.font.caption
         }
 
-        // What actually left the box, which is the number the target above is NOT.
-        Text {
-          visible: !!service.statsSample
-          Layout.fillWidth: true
-          text: service.statsSample
-                  ? Number(service.statsSample.mbps || 0).toFixed(1) + " Mbps sent"
-                  : ""
-          color: root.foreground
-          font.family: "monospace"
-          font.pixelSize: Style.font.body
+        // ── the charts ─────────────────────────────────────────────────────────────────────────
+        // A single figure cannot tell a bitrate that has sat at 300 from one that just collapsed to
+        // it, and that difference is the whole reason to open this tab. Each chart carries its own
+        // current value in the label, so these REPLACE the numeric lines rather than repeat them.
+        //
+        // Target is always drawable. The rest need a capture, because that is the only thing that
+        // makes the host emit samples at all.
+        Repeater {
+          model: {
+            var out = [{ key: "target", label: "Target", unit: "Mbps", digits: 1 }]
+            if (service.captureArmed) out = out.concat([
+              { key: "sent", label: "Sent", unit: "Mbps", digits: 1 },
+              { key: "fps", label: "New frames", unit: "fps", digits: 1 },
+              { key: "encode", label: "Encode p99", unit: "ms", digits: 1 }
+            ])
+            return out
+          }
+
+          ColumnLayout {
+            id: chart
+            Layout.fillWidth: true
+            Layout.topMargin: Style.spacing.sm
+            spacing: 2
+
+            // `.map` over the service's array, not a function call: a binding re-evaluates when the
+            // history is reassigned, and a function would leave the canvas painted with old points.
+            readonly property var pts: service.history.map(function (p) { return p[modelData.key] })
+            readonly property var last: {
+              for (var i = pts.length - 1; i >= 0; i--)
+                if (pts[i] !== null && pts[i] !== undefined) return pts[i]
+              return null
+            }
+
+            RowLayout {
+              Layout.fillWidth: true
+              spacing: Style.spacing.sm
+              Text {
+                text: modelData.label
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+              Item { Layout.fillWidth: true }
+              Text {
+                text: chart.last === null
+                        ? "—"
+                        : Number(chart.last).toFixed(modelData.digits) + " " + modelData.unit
+                color: root.foreground
+                font.family: "monospace"
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            Canvas {
+              id: spark
+              Layout.fillWidth: true
+              implicitHeight: Style.space(30)
+              readonly property var pts: chart.pts
+              onPtsChanged: requestPaint()
+              onPaint: {
+                var ctx = getContext("2d"); ctx.reset()
+                var vals = [], i
+                for (i = 0; i < pts.length; i++)
+                  if (pts[i] !== null && pts[i] !== undefined) vals.push(Number(pts[i]))
+                if (vals.length < 2) return
+
+                var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals)
+                // A flat series is the common case (a pinned bitrate) and must not divide by zero
+                // or fill the whole box with noise — it draws as a line through the middle.
+                if (hi - lo < 1e-6) { lo -= 1; hi += 1 }
+                var pad = Style.space(3)
+                var h = height - pad * 2
+                var xOf = function (n) { return vals.length < 2 ? 0 : n / (vals.length - 1) * width }
+                var yOf = function (v) { return pad + h - (v - lo) / (hi - lo) * h }
+
+                ctx.beginPath()
+                ctx.moveTo(xOf(0), yOf(vals[0]))
+                for (i = 1; i < vals.length; i++) ctx.lineTo(xOf(i), yOf(vals[i]))
+
+                // Fill under the line first, then stroke over it, so the stroke stays crisp.
+                var area = ctx
+                area.lineTo(xOf(vals.length - 1), height)
+                area.lineTo(xOf(0), height)
+                area.closePath()
+                ctx.fillStyle = Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.16)
+                ctx.fill()
+
+                ctx.beginPath()
+                ctx.moveTo(xOf(0), yOf(vals[0]))
+                for (i = 1; i < vals.length; i++) ctx.lineTo(xOf(i), yOf(vals[i]))
+                ctx.strokeStyle = String(root.accent)
+                ctx.lineWidth = 1.5
+                ctx.lineJoin = "round"
+                ctx.stroke()
+              }
+              Connections {
+                target: root
+                function onAccentChanged() { spark.requestPaint() }
+              }
+            }
+
+            Text {
+              visible: chart.pts.length < 2
+              Layout.fillWidth: true
+              text: "collecting…"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
         }
 
-        // NEW frames and REPEATED ones, always both. Capture is damage-driven, so a still desktop
-        // legitimately reads 0 new fps — measured on glass: 0.0 new against 156.8 repeated, on a
-        // perfectly healthy 240 Hz stream. Showing only `fps` there reports a dead stream.
-        Text {
-          visible: !!service.statsSample
-          Layout.fillWidth: true
-          text: service.statsSample
-                  ? Number(service.statsSample.fps || 0).toFixed(1) + " fps new · "
-                    + Number(service.statsSample.repeat_fps || 0).toFixed(1) + " fps repeated"
-                  : ""
-          color: root.foreground
-          font.family: "monospace"
-          font.pixelSize: Style.font.caption
-        }
-
+        // Repeated frames have no chart of their own — they are the inverse of new ones — but the
+        // number has to be here, because a damage-driven capture of a still screen reads 0 new fps
+        // on a perfectly healthy stream and the chart above would look like a dead stream.
         Text {
           visible: !!service.statsSample
           Layout.fillWidth: true
