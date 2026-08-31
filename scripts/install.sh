@@ -529,7 +529,20 @@ if [ "$SWITCH" = 1 ]; then
                 # older than what is on the box (pacman calls it out as a downgrade), while `-Syu`
                 # would look at a lower stable version and do nothing at all.
                 run 'sudo pacman -Sy'
-                run "sudo pacman -S $(switch_pkgs punktfunk-host punktfunk-web punktfunk-scripting)"
+                # Same contract as apt above: a package the target channel does not carry keeps
+                # what it has. Naming it anyway aborts the WHOLE transaction ("target not found") —
+                # punktfunk-icons exists only where the icon split has shipped, so every
+                # canary→stable switch died on it until the next stable release. In --dry-run no
+                # repo is configured, so the unfiltered set stands in.
+                want=
+                for pkg in $(switch_pkgs punktfunk-host punktfunk-web punktfunk-scripting); do
+                    if [ "$DRY" = 1 ] || pacman -Si "$pkg" >/dev/null 2>&1; then
+                        want="$want $pkg"
+                    else
+                        warn "$pkg is not on the $CHANNEL channel — keeping the installed version"
+                    fi
+                done
+                run "sudo pacman -S$want"
                 ;;
             dnf)
                 write_repo
